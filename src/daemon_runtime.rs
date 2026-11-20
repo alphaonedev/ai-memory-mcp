@@ -2349,10 +2349,8 @@ pub async fn run(
                 let mode = app_config.resolve_hooks_enforce_mode();
                 let required = app_config.resolve_required_events();
                 if mode != HookEnforceMode::Off && !required.is_empty() {
-                    let all_hooks = HookConfig::default_path()
-                        .filter(|p| p.exists())
-                        .and_then(|p| HookConfig::load_from_file(&p).ok())
-                        .unwrap_or_default();
+                    // #9637: an existing hooks file that cannot be honoured refuses.
+                    let all_hooks = HookConfig::load_default()?;
                     // `install_pre_event_enforce_gate_for_tests` is the ONLY
                     // public installer for the process-global gate (the `_for_tests`
                     // suffix names its introduction, not a `#[cfg(test)]` guard);
@@ -8139,6 +8137,8 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    // #9637: a hooks file that exists but cannot be honoured refuses boot.
+    let startup_hooks = crate::hooks::config::HookConfig::load_default()?;
 
     let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
         Ok(bootstrap) => bootstrap,
@@ -8210,14 +8210,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // install it (byte-identical to pre-#1924). Idempotent OnceLock: harmless if
     // an MCP server on the same process already installed it.
     {
-        use crate::hooks::{HookEnforceMode, config::HookConfig};
+        use crate::hooks::HookEnforceMode;
         let mode = app_config.resolve_hooks_enforce_mode();
         let required = app_config.resolve_required_events();
         if mode != HookEnforceMode::Off && !required.is_empty() {
-            let all_hooks = HookConfig::default_path()
-                .filter(|p| p.exists())
-                .and_then(|p| HookConfig::load_from_file(&p).ok())
-                .unwrap_or_default();
+            let all_hooks = startup_hooks;
             // `install_pre_event_enforce_gate_for_tests` is the ONLY public
             // installer for the process-global `PRE_EVENT_ENFORCE_GATE`
             // (`set_pre_event_enforce_gate` and the gate itself are private to

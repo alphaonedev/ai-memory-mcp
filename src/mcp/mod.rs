@@ -4549,6 +4549,8 @@ pub fn run_mcp_server(
 
     // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
     let _ = crate::identity::resolve_mcp_read_visibility_caller()?;
+    // #9637: one fail-closed load; an existing hooks file that cannot be honoured refuses boot.
+    let startup_hooks = crate::hooks::config::HookConfig::load_default()?;
 
     let mut conn = db::open(db_path)?;
 
@@ -4641,12 +4643,9 @@ pub fn run_mcp_server(
     // byte-identical to pre-#1714. `pre_signal_send` enforcement over MCP needs
     // a synchronous in-dispatch chain and is tracked separately.
     {
-        use crate::hooks::{HookChain, HookEvent, config::HookConfig, spawn_post_event_observer};
-        let all_hooks = HookConfig::default_path()
-            .filter(|p| p.exists())
-            .and_then(|p| HookConfig::load_from_file(&p).ok())
-            .unwrap_or_default();
-        let chain = HookChain::for_event(&all_hooks, HookEvent::PostSignalAck);
+        use crate::hooks::{HookChain, HookEvent, spawn_post_event_observer};
+        let all_hooks = &startup_hooks;
+        let chain = HookChain::for_event(all_hooks, HookEvent::PostSignalAck);
         if !chain.hooks().is_empty() {
             let registry = crate::hooks::ExecutorRegistry::from_hooks(chain.hooks());
             let sink = spawn_post_event_observer(
@@ -4673,12 +4672,8 @@ pub fn run_mcp_server(
     // `pre_signal_send` `[[hook]]` is configured; otherwise byte-identical to
     // pre-#1752. Design: 5-agent vote (memory `4d3ea1c5`).
     {
-        use crate::hooks::{HookChain, HookEvent, config::HookConfig};
-        let all_hooks = HookConfig::default_path()
-            .filter(|p| p.exists())
-            .and_then(|p| HookConfig::load_from_file(&p).ok())
-            .unwrap_or_default();
-        let chain = HookChain::for_event(&all_hooks, HookEvent::PreSignalSend);
+        use crate::hooks::{HookChain, HookEvent};
+        let chain = HookChain::for_event(&startup_hooks, HookEvent::PreSignalSend);
         if !chain.hooks().is_empty() {
             let registry = crate::hooks::ExecutorRegistry::from_hooks(chain.hooks());
             let n = chain.hooks().len();
@@ -4700,14 +4695,11 @@ pub fn run_mcp_server(
     // is active AND at least one required event is declared → default (off)
     // deployments are byte-identical to pre-#1885 (gate never installed).
     {
-        use crate::hooks::{HookEnforceMode, config::HookConfig};
+        use crate::hooks::HookEnforceMode;
         let mode = app_config.resolve_hooks_enforce_mode();
         let required = app_config.resolve_required_events();
         if mode != HookEnforceMode::Off && !required.is_empty() {
-            let all_hooks = HookConfig::default_path()
-                .filter(|p| p.exists())
-                .and_then(|p| HookConfig::load_from_file(&p).ok())
-                .unwrap_or_default();
+            let all_hooks = startup_hooks;
             let registry = crate::hooks::ExecutorRegistry::from_hooks(&all_hooks);
             eprintln!(
                 "ai-memory: #1885 — MCP pre-event enforcement gate installed \

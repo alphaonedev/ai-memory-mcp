@@ -307,6 +307,25 @@ reload task logs an error and **keeps the previous config**
 never reloads to an empty config because of operator typo — silent
 hook removal would be a security regression.
 
+### Startup load (fail closed, #9637)
+
+At startup `ai-memory serve`, `ai-memory mcp` and `ai-memory curator`
+(when it installs the enforcement gate) load the hooks file through one
+loader, [`HookConfig::load_default`](../src/hooks/config.rs). Only a
+path that does not exist (no file and no symlink) means zero hooks; an
+empty file is valid with zero hooks. A file that exists but cannot be
+honoured stops startup with exit code 78 (`EX_CONFIG`) and
+`ai-memory: boot refused — hooks file <path> cannot be loaded: <reason>`:
+a TOML syntax or schema error (for example an unknown `event`), a
+validation error (for example `timeout_ms` over 30000), a read error such as permission denied, a
+directory or other non-regular file, a dangling symlink, or a file over
+1 MiB. The parse reason is bounded and never quotes the file's lines.
+`ai-memory doctor --hooks` (and `doctor --tokens --hooks`) reports the
+same error and exits 2. Before #9637 these files started the process
+with zero hooks, so every configured deny gate was silently absent; a
+daemon that used to start with a broken `hooks.toml` now refuses to
+start until the file is fixed or removed.
+
 ## Security hardening
 
 - **Stderr redaction** — the executor unconditionally scrubs the
@@ -423,6 +442,7 @@ For deployment sizes:
 | `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook [`ExecutorMetrics`](../src/hooks/executor.rs) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
 | Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `hook spawn failed for <command>` error. Fix the helper, redeploy, `SIGHUP`. The chain fails open in the meantime (per `fail_mode = "open"` default). |
 | `mode = "exec"` hook intermittently DENIED under load (or spuriously fails-open) | The helper emits its decision and exits WITHOUT reading stdin, so the executor's envelope write hits `EPIPE` → `ExecutorError::Io` ("an I/O error occurred talking to the hook") | Make the exec helper drain stdin to EOF before writing its decision (`cat >/dev/null` in `sh`, or a `read`-to-EOF loop). See the exec stdin contract in §"Operator workflow". Daemon-mode helpers already read stdin and are unaffected. |
+| Daemon or MCP server exits 78 at startup with `hooks file <path> cannot be loaded` | The hooks file exists but does not read, parse or validate (#9637) | Run `ai-memory doctor --hooks` for the same reason, fix the file (or remove it to run with zero hooks), then start again. |
 | Reload didn't pick up new hook | TOML parse error | Look for `hooks: SIGHUP reload failed; keeping previous config` in the log. Validate the file with `cat ~/.config/ai-memory/hooks.toml | toml --check` (or `taplo lint`). |
 
 ## Operator runbook (3am procedures)

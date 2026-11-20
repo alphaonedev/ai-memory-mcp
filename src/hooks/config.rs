@@ -351,10 +351,14 @@ impl HookConfig {
                 .span()
                 .map(|s| byte_offset_to_line_col(contents, s.start))
                 .unwrap_or((0, 0));
+            // `message()` is the parser reason alone; `to_string()`
+            // would quote the offending source lines into the
+            // operator-facing error (#9637). Bounded on a char
+            // boundary.
             HooksConfigError::Toml {
                 line,
                 column: col,
-                message: e.to_string(),
+                message: e.message().chars().take(MAX_TOML_MESSAGE_CHARS).collect(),
             }
         })?;
 
@@ -369,6 +373,128 @@ impl HookConfig {
     /// platform-correct default location.
     pub fn default_path() -> Option<PathBuf> {
         dirs::config_dir().map(|p| p.join("ai-memory/hooks.toml"))
+    }
+
+    /// The one fail-closed door for loading a hooks file at a
+    /// startup or call site (#9637, ERRORS-02 / ERRORS-19).
+    ///
+    /// * `Ok(None)` — nothing exists at `path` (no file and no
+    ///   symlink). This is the ONLY "no hooks" outcome.
+    /// * `Ok(Some(hooks))` — a regular file that read, parsed and
+    ///   validated (an empty file is valid with zero hooks).
+    /// * `Err(_)` — anything else: a dangling symlink, a directory or
+    ///   other non-regular file, a read or permission error, a file
+    ///   over [`MAX_HOOKS_FILE_BYTES`], or a TOML / validation error.
+    ///   The error names the path and the reason.
+    ///
+    /// The file type is checked twice: on the path before `open`
+    /// (so a FIFO is never opened and cannot block) and on the opened
+    /// handle (so a swap between the check and the open is caught).
+    pub fn load_optional(path: &Path) -> Result<Option<Vec<HookConfig>>, HooksFileError> {
+        let refuse = |error: HooksConfigError| HooksFileError {
+            path: path.to_path_buf(),
+            error,
+        };
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // `metadata` follows links, so a dangling symlink is
+                // NotFound too; only a path with no entry is absent.
+                return match std::fs::symlink_metadata(path) {
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Ok(_) => Err(refuse(HooksConfigError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "dangling symlink (its target does not exist)",
+                    )))),
+                    Err(e2) => Err(refuse(HooksConfigError::Io(e2))),
+                };
+            }
+            Err(e) => return Err(refuse(HooksConfigError::Io(e))),
+        };
+        if !meta.is_file() {
+            return Err(refuse(not_a_regular_file()));
+        }
+        let file = std::fs::File::open(path).map_err(|e| refuse(HooksConfigError::Io(e)))?;
+        let opened = file
+            .metadata()
+            .map_err(|e| refuse(HooksConfigError::Io(e)))?;
+        if !opened.is_file() {
+            return Err(refuse(not_a_regular_file()));
+        }
+        if opened.len() > MAX_HOOKS_FILE_BYTES {
+            return Err(refuse(too_large()));
+        }
+        let mut contents = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(file, MAX_HOOKS_FILE_BYTES + 1),
+            &mut contents,
+        )
+        .map_err(|e| refuse(HooksConfigError::Io(e)))?;
+        if !u64::try_from(contents.len()).is_ok_and(|n| n <= MAX_HOOKS_FILE_BYTES) {
+            return Err(refuse(too_large()));
+        }
+        Self::load_from_str(&contents).map(Some).map_err(refuse)
+    }
+
+    /// [`Self::load_optional`] on [`Self::default_path`]: zero hooks
+    /// when no config directory resolves or nothing exists at the
+    /// path, an error for every file that exists but cannot be
+    /// honoured. Every startup site (serve, mcp, curator) uses this.
+    pub fn load_default() -> Result<Vec<HookConfig>, HooksFileError> {
+        match Self::default_path() {
+            Some(path) => Ok(Self::load_optional(&path)?.unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// Size ceiling for a hooks file. A hooks file is a few `[[hook]]`
+/// rows; anything larger is refused rather than read unbounded.
+pub const MAX_HOOKS_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Ceiling, in characters, on the parser message carried in a
+/// [`HooksConfigError::Toml`], so a refusal is bounded.
+const MAX_TOML_MESSAGE_CHARS: usize = 200;
+
+fn not_a_regular_file() -> HooksConfigError {
+    HooksConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "not a regular file",
+    ))
+}
+
+fn too_large() -> HooksConfigError {
+    HooksConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("file is larger than {MAX_HOOKS_FILE_BYTES} bytes"),
+    ))
+}
+
+/// A hooks file that exists but cannot be loaded, with its path
+/// (#9637). Startup sites propagate this so the process refuses to
+/// start; `main` maps it to `EX_CONFIG`.
+#[derive(Debug)]
+pub struct HooksFileError {
+    /// The hooks file path that was refused.
+    pub path: PathBuf,
+    /// Why it was refused.
+    pub error: HooksConfigError,
+}
+
+impl fmt::Display for HooksFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hooks file {} cannot be loaded: {}",
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for HooksFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -1185,6 +1311,128 @@ namespace = "*"
         let p = std::path::Path::new("/this/path/does/not/exist/hooks-test.toml");
         let err = HookConfig::load_from_file(p).unwrap_err();
         assert!(matches!(err, HooksConfigError::Io(_)));
+    }
+
+    /// #9637 — a scratch directory under the repo's `.local-runs/`.
+    fn door_scratch() -> tempfile::TempDir {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs/hooks-door-9637");
+        std::fs::create_dir_all(&root).expect("create scratch root");
+        tempfile::Builder::new()
+            .prefix("door-")
+            .tempdir_in(&root)
+            .expect("scratch dir")
+    }
+
+    const DOOR_VALID: &str = r#"
+[[hook]]
+event = "post_store"
+command = "/bin/true"
+priority = 0
+timeout_ms = 1000
+mode = "exec"
+enabled = true
+"#;
+
+    #[test]
+    fn door_absent_path_is_the_only_no_hooks_outcome_9637() {
+        let dir = door_scratch();
+        let got = HookConfig::load_optional(&dir.path().join("hooks.toml")).expect("absent is ok");
+        assert!(got.is_none(), "absent path must be Ok(None)");
+    }
+
+    #[test]
+    fn door_valid_and_empty_files_load_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        std::fs::write(&p, DOOR_VALID).expect("write");
+        let hooks = HookConfig::load_optional(&p).expect("valid").expect("Some");
+        assert_eq!(hooks.len(), 1);
+        std::fs::write(&p, "").expect("write empty");
+        let hooks = HookConfig::load_optional(&p).expect("empty").expect("Some");
+        assert!(hooks.is_empty(), "an empty file is valid with zero hooks");
+    }
+
+    #[test]
+    fn door_refuses_parse_validation_directory_and_oversize_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+
+        std::fs::write(&p, "[[hook]]\nevent = \"post_store\"\ncommand = \n").expect("write");
+        let err = HookConfig::load_optional(&p).expect_err("parse error refuses");
+        assert!(
+            matches!(err.error, HooksConfigError::Toml { .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.path, p);
+        assert!(err.to_string().contains(&p.display().to_string()), "{err}");
+
+        std::fs::write(&p, DOOR_VALID.replace("1000", "999999999")).expect("write");
+        let err = HookConfig::load_optional(&p).expect_err("validation refuses");
+        assert!(
+            matches!(err.error, HooksConfigError::Validation { .. }),
+            "{err:?}"
+        );
+
+        let d = dir.path().join("as-dir");
+        std::fs::create_dir(&d).expect("mkdir");
+        let err = HookConfig::load_optional(&d).expect_err("directory refuses");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+
+        let big = vec![b'#'; usize::try_from(MAX_HOOKS_FILE_BYTES).expect("fits") + 1];
+        std::fs::write(&p, big).expect("write big");
+        let err = HookConfig::load_optional(&p).expect_err("oversize refuses");
+        assert!(err.to_string().contains("larger than"), "{err}");
+    }
+
+    #[test]
+    fn door_toml_reason_is_bounded_and_echoes_no_source_line_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        let canary = "doorcanary9637";
+        std::fs::write(
+            &p,
+            format!("[[hook]]\nevent = \"post_store\"\ncommand = {canary} {canary}\n"),
+        )
+        .expect("write");
+        let err = HookConfig::load_optional(&p).expect_err("parse error refuses");
+        let HooksConfigError::Toml { message, .. } = &err.error else {
+            panic!("expected Toml, got {err:?}");
+        };
+        assert!(message.chars().count() <= MAX_TOML_MESSAGE_CHARS);
+        assert!(
+            !err.to_string().contains(canary),
+            "source line echoed: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn door_refuses_a_dangling_symlink_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing-target.toml"), &p).expect("symlink");
+        let err = HookConfig::load_optional(&p).expect_err("dangling symlink refuses");
+        assert!(err.to_string().contains("dangling symlink"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn door_refuses_an_unreadable_file_9637() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        std::fs::write(&p, DOOR_VALID).expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read(&p).is_ok() {
+            eprintln!("skip: running with privileges that read a mode-000 file");
+            return;
+        }
+        let err = HookConfig::load_optional(&p).expect_err("permission error refuses");
+        assert!(
+            matches!(&err.error, HooksConfigError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -198,7 +198,10 @@ impl Sandbox {
     }
 
     fn config_path(&self) -> PathBuf {
-        self.root().join("xdg").join("ai-memory").join("config.toml")
+        self.root()
+            .join("xdg")
+            .join("ai-memory")
+            .join("config.toml")
     }
 
     fn db_path(&self) -> PathBuf {
@@ -530,7 +533,11 @@ async fn sighup_reload_with_an_invalid_file_keeps_the_previous_deny_9637() {
     while start.elapsed() < RELOAD_KEEP_WINDOW {
         {
             let guard = snapshot.read().await;
-            assert_eq!(guard.len(), 1, "a failed reload must keep the previous deny");
+            assert_eq!(
+                guard.len(),
+                1,
+                "a failed reload must keep the previous deny"
+            );
             assert_eq!(guard[0].event, HookEvent::PreStore);
             assert_eq!(guard[0].command, PathBuf::from(NONEXISTENT_HOOK_BIN));
         }

@@ -621,7 +621,9 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     }
     if args.hooks {
         writeln!(out.stdout)?;
-        render_hooks_human(out)?;
+        if !render_hooks_human(out)? {
+            return Ok(2);
+        }
     }
     Ok(0)
 }
@@ -639,15 +641,9 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
     use crate::hooks::config::HookConfig;
 
     let path_opt = HookConfig::default_path();
-    let hooks: Vec<HookConfig> = match path_opt.as_ref() {
-        Some(p) if p.exists() => match HookConfig::load_from_file(p) {
-            Ok(h) => h,
-            Err(e) => {
-                writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
-                return Ok(2);
-            }
-        },
-        _ => Vec::new(),
+    // #9637: the fail-closed door; an existing file that cannot be loaded is an error (exit 2).
+    let Some(hooks) = load_hooks_for_doctor(path_opt.as_deref(), out)? else {
+        return Ok(2);
     };
 
     // #1734 PE-1 — resolve the mandatory-hook enforcement posture + the
@@ -720,14 +716,35 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
 
 /// Human-readable hooks block. Used by `--hooks` standalone *and*
 /// by the appended block when the operator combines `--tokens --hooks`.
-fn render_hooks_human(out: &mut CliOutput<'_>) -> Result<()> {
+/// Returns `false` when the hooks file exists but cannot be loaded
+/// (#9637); the error is on stderr and the caller exits 2.
+fn render_hooks_human(out: &mut CliOutput<'_>) -> Result<bool> {
     use crate::hooks::config::HookConfig;
     let path_opt = HookConfig::default_path();
-    let hooks: Vec<HookConfig> = match path_opt.as_ref() {
-        Some(p) if p.exists() => HookConfig::load_from_file(p).unwrap_or_default(),
-        _ => Vec::new(),
+    let Some(hooks) = load_hooks_for_doctor(path_opt.as_deref(), out)? else {
+        return Ok(false);
     };
-    render_hooks_human_with(out, path_opt.as_deref(), &hooks)
+    render_hooks_human_with(out, path_opt.as_deref(), &hooks)?;
+    Ok(true)
+}
+
+/// #9637 — doctor's use of the fail-closed door. `Ok(None)` means the
+/// file exists but cannot be loaded; the refusal (path and reason) is
+/// already on stderr.
+fn load_hooks_for_doctor(
+    path: Option<&Path>,
+    out: &mut CliOutput<'_>,
+) -> Result<Option<Vec<crate::hooks::config::HookConfig>>> {
+    let Some(p) = path else {
+        return Ok(Some(Vec::new()));
+    };
+    match crate::hooks::config::HookConfig::load_optional(p) {
+        Ok(hooks) => Ok(Some(hooks.unwrap_or_default())),
+        Err(e) => {
+            writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
+            Ok(None)
+        }
+    }
 }
 
 fn render_hooks_human_with(
