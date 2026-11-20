@@ -2048,5 +2048,176 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
                          "j: unrecognised runs-on form: '${{ inputs.runner }}'")
 
 
+# --- #9681 r3 (#9745, #9746, #9747) ----------------------------------------------------------------
+# Hand-written expected columns. Each unquoted spelling the YAML 1.2 core schema types as
+# something other than a string, with the form the refusal names.
+UNQUOTED_TYPED_FORMS: tuple[tuple[str, str], ...] = (
+    ("null", "null"), ("Null", "null"), ("NULL", "null"), ("~", "null"),
+    ("true", "boolean"), ("True", "boolean"), ("TRUE", "boolean"),
+    ("false", "boolean"), ("False", "boolean"), ("FALSE", "boolean"),
+    ("0x0", "integer"), ("0x1F", "integer"), ("0o7", "integer"), ("+1", "integer"),
+    ("01", "integer"), ("00", "integer"), ("-01", "integer"),
+    ("1.0", "float"), ("0.0e0", "float"), ("1e3", "float"), (".5", "float"), ("5.", "float"),
+    ("-0.0", "float"), (".nan", "float"), (".NaN", "float"), (".NAN", "float"),
+    (".inf", "float"), ("-.inf", "float"), ("+.INF", "float"),
+)
+# Unquoted text and canonical non-zero integers render as themselves: taken as written.
+UNQUOTED_TEXT_ROWS: tuple[str, ...] = ("1", "-5", "12", "debug", "line-tables-only", "1x", "0b1",
+                                       "nulls", "1_000", "0x", ".", "e3")
+# Quoted spellings are strings whatever they spell: taken as written.
+QUOTED_TEXT_ROWS: tuple[str, ...] = ("null", "~", "0", "0.0", "False", "0x0", "1.0", ".nan", "true")
+UNQUOTED_FORM_MESSAGE = ("K: matrix.cargo_debug = {value!r} is an unquoted YAML {form}, which the "
+                         "runner reads as a typed value, not as this text: "
+                         "\"${{{{ matrix.cargo_debug || 'line-tables-only' }}}}\"")
+
+STUB_SHA = "0" * 40
+STUB_CACHE_STEP = (f"      - name: Cache\n        uses: {RUST_CACHE}@{STUB_SHA}\n"
+                   "        with:\n          save-if: ${{ github.event_name == 'push' }}\n")
+
+
+def _stub_workflow(event: str, jobs: str) -> str:
+    return f"name: stub\non:\n  {event}:\njobs:\n{jobs}"
+
+
+def _stub_job(job_id: str, matrix: str = "", steps: str = STUB_CACHE_STEP) -> str:
+    return f"  {job_id}:\n    runs-on: ubuntu-latest\n{matrix}    steps:\n{steps}"
+
+
+def _stub_matrix(*legs: str) -> str:
+    body = "".join(f"          - {leg}\n" for leg in legs)
+    return f"    strategy:\n      matrix:\n        include:\n{body}"
+
+
+def _with_stub_workflows(texts: dict[str, str]):
+    """Patch the workflow tree seen by the enumerators to in-memory text (no file is written)."""
+    from unittest import mock
+    module = sys.modules[__name__]
+
+    def load(name: str) -> Workflow:
+        return Workflow(name, texts[name].splitlines())
+
+    stack = mock.patch.object(module, "_all_workflow_names", lambda: sorted(texts))
+    load_patch = mock.patch.object(Workflow, "load", staticmethod(load))
+    return stack, load_patch
+
+
+class ReachableWorkflowSites9681R3(unittest.TestCase):
+    """#9681 r3: the key-env evaluator reads typed YAML (#9745); the site enumerator names every
+    leg (#9746) and follows job-level `uses:` (#9747)."""
+
+    def _sites(self, texts: dict[str, str]):
+        names_patch, load_patch = _with_stub_workflows(texts)
+        with names_patch, load_patch:
+            return _hosted_pr_rust_cache_sites()
+
+    def _writers(self, texts: dict[str, str]):
+        names_patch, load_patch = _with_stub_workflows(texts)
+        with names_patch, load_patch:
+            return _pr_cache_writers()
+
+    def test_unquoted_typed_matrix_values_are_refused_naming_the_form(self) -> None:
+        for value, form in UNQUOTED_TYPED_FORMS:
+            with self.subTest(value=value):
+                with self.assertRaises(AssertionError) as caught:
+                    _effective_env_value("K", KEY_ENV_MATRIX_FORM, {"cargo_debug": value})
+                self.assertEqual(str(caught.exception),
+                                 UNQUOTED_FORM_MESSAGE.format(value=value, form=form))
+
+    def test_unquoted_text_and_quoted_values_are_taken_as_written(self) -> None:
+        for value in UNQUOTED_TEXT_ROWS:
+            with self.subTest(value=value, quoted=False):
+                self.assertEqual(
+                    _effective_env_value("K", KEY_ENV_MATRIX_FORM, {"cargo_debug": value}), value)
+        for value in QUOTED_TEXT_ROWS:
+            for quote in ("'", '"'):
+                with self.subTest(value=value, quote=quote):
+                    job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:",
+                                    "        include:",
+                                    f"          - cargo_debug: {quote}{value}{quote}"])
+                    (leg,) = _matrix_include(job)
+                    self.assertEqual(_effective_env_value("K", KEY_ENV_MATRIX_FORM, leg), value)
+
+    def test_unquoted_matrix_spelling_is_refused_end_to_end(self) -> None:
+        for value, form in (("null", "null"), ("0x0", "integer"), ("1.0", "float")):
+            with self.subTest(value=value):
+                job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:",
+                                "        include:", f"          - cargo_debug: {value}"])
+                (leg,) = _matrix_include(job)
+                with self.assertRaises(AssertionError) as caught:
+                    _effective_env_value("K", KEY_ENV_MATRIX_FORM, leg)
+                self.assertEqual(str(caught.exception),
+                                 UNQUOTED_FORM_MESSAGE.format(value=value, form=form))
+
+    def test_two_hosted_legs_with_one_first_key_are_a_problem(self) -> None:
+        legs = _stub_matrix("target: t", "target: t\n            os: other")
+        sites, problems = self._sites({"w.yml": _stub_workflow(
+            "pull_request", _stub_job("m", legs))})
+        self.assertEqual(sorted(sites), [("w.yml", "m", "target=t")])
+        self.assertEqual(problems, ["two hosted legs of one job share the site key "
+                                    "w.yml:m[target=t]: the second would overwrite the first; "
+                                    "give them different first keys"])
+        legs = _stub_matrix("target: t", "target: u")
+        sites, problems = self._sites({"w.yml": _stub_workflow(
+            "pull_request", _stub_job("m", legs))})
+        self.assertEqual((sorted(sites), problems),
+                         ([("w.yml", "m", "target=t"), ("w.yml", "m", "target=u")], []))
+
+    def test_called_workflow_jobs_are_sites_of_the_caller(self) -> None:
+        call = "  call:\n    uses: ./.github/workflows/called.yml\n"
+        texts = {"caller.yml": _stub_workflow("pull_request", call),
+                 "called.yml": _stub_workflow("workflow_call", _stub_job("inner"))}
+        sites, problems = self._sites(texts)
+        self.assertEqual((sorted(sites), problems), ([("caller.yml", "call/inner", "")], []))
+        # the same workflow behind a push-only caller is not reached by a pull request
+        texts["caller.yml"] = _stub_workflow("push", call)
+        self.assertEqual(self._sites(texts), ({}, []))
+        # two levels
+        texts = {"a.yml": _stub_workflow("pull_request", "  x:\n    uses: ./.github/workflows/b.yml\n"),
+                 "b.yml": _stub_workflow("workflow_call", "  y:\n    uses: ./.github/workflows/c.yml\n"),
+                 "c.yml": _stub_workflow("workflow_call", _stub_job("z"))}
+        sites, problems = self._sites(texts)
+        self.assertEqual((sorted(sites), problems), ([("a.yml", "x/y/z", "")], []))
+
+    def test_unreadable_reusable_workflow_calls_fail_closed(self) -> None:
+        forms = {
+            "remote": ("owner/repo/.github/workflows/r.yml@v1",
+                       "job-level uses of a reusable workflow that is not a local "
+                       "./.github/workflows/<name>.yml: 'owner/repo/.github/workflows/r.yml@v1'"),
+            "local-with-ref": ("./.github/workflows/called.yml@main",
+                               "job-level uses of a reusable workflow that is not a local "
+                               "./.github/workflows/<name>.yml: './.github/workflows/called.yml@main'"),
+            "outside-tree": ("./other/called.yml",
+                             "job-level uses of a reusable workflow that is not a local "
+                             "./.github/workflows/<name>.yml: './other/called.yml'"),
+            "subdirectory": ("./.github/workflows/sub/called.yml",
+                             "job-level uses of a reusable workflow that is not a local "
+                             "./.github/workflows/<name>.yml: './.github/workflows/sub/called.yml'"),
+            "missing": ("./.github/workflows/nothere.yml",
+                        "reusable workflow './.github/workflows/nothere.yml' is not a file"),
+        }
+        for label, (uses, reason) in forms.items():
+            with self.subTest(form=label):
+                texts = {"caller.yml": _stub_workflow("pull_request", f"  call:\n    uses: {uses}\n"),
+                         "called.yml": _stub_workflow("workflow_call", _stub_job("inner"))}
+                for fn in (self._sites, self._writers):
+                    result = fn(texts)
+                    self.assertEqual(result[1], [f"caller.yml: call: {reason}"])
+        cycle = {"a.yml": _stub_workflow("pull_request", "  x:\n    uses: ./.github/workflows/b.yml\n"),
+                 "b.yml": _stub_workflow("workflow_call", "  y:\n    uses: ./.github/workflows/b.yml\n")}
+        self.assertEqual(self._sites(cycle)[1], [
+            "a.yml: x/y: reusable workflow call cycle or deeper than 8: './.github/workflows/b.yml'"])
+
+    def test_cache_writer_in_a_called_workflow_is_reached(self) -> None:
+        writer = ("      - name: Docker layers\n        uses: actions/cache@" + STUB_SHA + "\n")
+        call = "  call:\n    uses: ./.github/workflows/called.yml\n"
+        texts = {"caller.yml": _stub_workflow("pull_request", call),
+                 "called.yml": _stub_workflow("workflow_call", _stub_job("inner", steps=writer))}
+        reached, problems = self._writers(texts)
+        self.assertEqual(problems, ["('caller.yml', 'call/inner', 'Docker layers'): actions/cache "
+                                    "saves in its post step on every event"])
+        texts["caller.yml"] = _stub_workflow("push", call)
+        self.assertEqual(self._writers(texts), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()
