@@ -186,8 +186,8 @@ Repository runners: 9 self-hosted. macOS ARM64 label `macos-fed`: 5 (3 online, 2
 
 Owner and larger runners. The owner `alphaonedev` is a `User` account (no organization exists at that name), so the
 org hosted-runner endpoints return 404 and the larger-runner API was not reachable: "not measured: HTTP 404 on every
-`orgs/alphaonedev/actions/hosted-runners*` endpoint". GitHub's page
-https://docs.github.com/en/billing/reference/actions-runner-pricing (read 2026-11-20 through a page fetch) states
+`orgs/alphaonedev/actions/hosted-runners*` endpoint". the GitHub Docs
+"Billing" reference page for Actions runner rates (docs.github.com, read 2026-11-20 through a page fetch) states
 "Larger runners are only available for organizations and enterprises using the GitHub Team or GitHub Enterprise Cloud
 plans". The page shows no last-updated date, so per-minute prices are "price not read". Plan name of the account:
 not measured (`GET user` returned no `plan` field for this token).
