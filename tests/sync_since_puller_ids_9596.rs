@@ -26,8 +26,19 @@
 //! - the catch-up test harness, `federation::catchup_once_for_tests`.
 //!
 //! No environment variable is set or removed here.
+//!
+//! Scheduling (#9596 r1, M1): the verdict must not depend on host load.
+//! Each case runs on its own OS thread with its own current-thread runtime,
+//! so a puller that opens its database synchronously (`sync_cycle_once`
+//! does, CONCURRENCY-22) blocks only its own case, never another case's
+//! capture server. The fixture database is opened before the case's
+//! runtime starts, at most [`CASES_IN_FLIGHT`] cases run at once, and the
+//! one hang guard wraps the pull alone. A puller that sent nothing is a
+//! row failure naming the form, the id and what the puller returned.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -61,12 +72,17 @@ const ID_CORPUS: &[&str] = &[
     "a/b:c@d.e_f-g",
     "UPPER-lower-0123456789",
 ];
-/// The catch-up loop sleeps 5 s before its first pull; one day keeps it
-/// from pulling twice inside the test.
+/// One day keeps the catch-up loop from pulling twice inside the test.
 const LOOP_INTERVAL: Duration = Duration::from_hours(24);
-/// Upper bound for one captured pull (the loop's 5 s start delay included).
-const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The catch-up loop's fixed delay before its first pull
+/// (`src/federation/receive.rs`, both loop bodies).
+const LOOP_START_DELAY: Duration = Duration::from_secs(5);
+/// Hang guard for one pull: the puller's HTTP client timeout and the bound
+/// on the pull call itself. It detects a hung puller; it is not a speed
+/// claim, and no database open or runtime start runs inside it.
+const PULL_HANG_GUARD: Duration = Duration::from_secs(30);
+/// Cases running at once, one OS thread each.
+const CASES_IN_FLIGHT: usize = 4;
 const DAEMON_BATCH: usize = 10;
 
 /// The three clock fields as the server decodes them.
@@ -137,7 +153,7 @@ async fn spawn_capture() -> (String, mpsc::UnboundedReceiver<Captured>) {
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(CLIENT_TIMEOUT)
+        .timeout(PULL_HANG_GUARD)
         .build()
         .expect("reqwest client")
 }
@@ -158,30 +174,37 @@ fn fed_config(peer_url: &str, local_id: &str) -> FederationConfig {
     }
 }
 
-/// Drive one puller form against a fresh capture server and return the
-/// first pull it sent.
-async fn first_pull(form: PullerForm, local_id: String) -> Captured {
+/// Drive one puller form against a fresh capture server on the case's own
+/// runtime and return the first pull it sent, or why there was none.
+async fn first_pull(
+    form: PullerForm,
+    local_id: &str,
+    db_path: PathBuf,
+    conn: rusqlite::Connection,
+) -> Result<Captured, String> {
     let (url, mut rx) = spawn_capture().await;
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
-    let db_path = db_tmp.path().to_path_buf();
-    let conn = ai_memory::db::open(&db_path).expect("db::open");
-    match form {
+    let puller_outcome = match form {
         PullerForm::SyncDaemon => {
             drop(conn);
             // The cycle pushes after the pull; the capture server has no push
-            // route, so the cycle's result is not the subject here.
-            let _ = tokio::time::timeout(
-                CAPTURE_TIMEOUT,
+            // route, so an `Err` after the pull is expected and only reported.
+            match tokio::time::timeout(
+                PULL_HANG_GUARD,
                 ai_memory::daemon_runtime::sync_cycle_once(
                     &client(),
                     &db_path,
-                    &local_id,
+                    local_id,
                     &url,
                     None,
                     DAEMON_BATCH,
                 ),
             )
-            .await;
+            .await
+            {
+                Ok(Ok(())) => "returned Ok".to_string(),
+                Ok(Err(e)) => format!("returned Err({e})"),
+                Err(_) => format!("hung past {PULL_HANG_GUARD:?}"),
+            }
         }
         PullerForm::CatchupLoop => {
             let db: Db = Arc::new(Mutex::new((
@@ -190,23 +213,51 @@ async fn first_pull(form: PullerForm, local_id: String) -> Captured {
                 ResolvedTtl::default(),
                 true,
             )));
-            let handle = spawn_catchup_loop(fed_config(&url, &local_id), db, LOOP_INTERVAL);
-            let got = tokio::time::timeout(CAPTURE_TIMEOUT, rx.recv()).await;
+            let handle = spawn_catchup_loop(fed_config(&url, local_id), db, LOOP_INTERVAL);
+            let wait = LOOP_START_DELAY + PULL_HANG_GUARD;
+            let got = tokio::time::timeout(wait, rx.recv()).await;
             handle.abort();
-            return got
-                .expect("catch-up loop pulled within the bound")
-                .expect("capture channel open");
+            return match got {
+                Ok(Some(captured)) => Ok(captured),
+                Ok(None) => Err("capture channel closed before a pull".to_string()),
+                Err(_) => Err(format!("loop sent no pull within {wait:?}")),
+            };
         }
         PullerForm::CatchupHarness => {
             drop(conn);
-            catchup_once_for_tests(&fed_config(&url, &local_id)).await;
+            match tokio::time::timeout(
+                PULL_HANG_GUARD,
+                catchup_once_for_tests(&fed_config(&url, local_id)),
+            )
+            .await
+            {
+                Ok(()) => "returned".to_string(),
+                Err(_) => format!("hung past {PULL_HANG_GUARD:?}"),
+            }
         }
-    }
-    tokio::time::timeout(CAPTURE_TIMEOUT, rx.recv())
-        .await
-        .expect("puller pulled within the bound")
-        .expect("capture channel open")
+    };
+    // The capture handler forwards the request before it answers, so a
+    // puller that got any answer has already been captured: no wait here.
+    rx.try_recv()
+        .map_err(|e| format!("no pull captured (puller {puller_outcome}; channel {e})"))
 }
+
+/// One table row, run on the calling OS thread: the fixture database is
+/// opened before the case's runtime starts, then the pull runs on a
+/// current-thread runtime nobody else shares.
+fn run_case(form: PullerForm, local_id: &str) -> Result<Captured, String> {
+    let db_tmp = tempfile::NamedTempFile::new().map_err(|e| format!("db tempfile: {e}"))?;
+    let db_path = db_tmp.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).map_err(|e| format!("db::open: {e}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("case runtime: {e}"))?;
+    runtime.block_on(first_pull(form, local_id, db_path, conn))
+}
+
+/// One finished row: `(puller label, local id, what it sent or why not)`.
+type CaseResult<'a> = (&'a str, &'a str, Result<Captured, String>);
 
 fn id_corpus() -> Vec<String> {
     let mut ids: Vec<String> = ID_CORPUS.iter().map(|s| (*s).to_string()).collect();
@@ -218,8 +269,8 @@ fn id_corpus() -> Vec<String> {
     ids
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_puller_form_sends_one_identity_in_all_clock_fields_9596() {
+#[test]
+fn every_puller_form_sends_one_identity_in_all_clock_fields_9596() {
     let ids = id_corpus();
     for id in &ids {
         assert!(
@@ -227,27 +278,54 @@ async fn every_puller_form_sends_one_identity_in_all_clock_fields_9596() {
             "corpus id {id:?} must be a valid agent id"
         );
     }
-    let mut cases = tokio::task::JoinSet::new();
-    for &(form, label) in PULLER_FORMS {
-        for id in &ids {
-            let id = id.clone();
-            cases.spawn(async move { (label, id.clone(), first_pull(form, id).await) });
+    let cases: Vec<(PullerForm, &str, &str)> = PULLER_FORMS
+        .iter()
+        .flat_map(|&(form, label)| ids.iter().map(move |id| (form, label, id.as_str())))
+        .collect();
+    let next_case = AtomicUsize::new(0);
+    let results: StdMutex<Vec<CaseResult<'_>>> = StdMutex::new(Vec::with_capacity(cases.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..CASES_IN_FLIGHT {
+            scope.spawn(|| {
+                while let Some(&(form, label, id)) =
+                    cases.get(next_case.fetch_add(1, Ordering::Relaxed))
+                {
+                    let got = run_case(form, id);
+                    results
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((label, id, got));
+                }
+            });
         }
-    }
-    let mut rows = 0_usize;
-    while let Some(done) = cases.join_next().await {
-        let (label, id, got) = done.expect("case task");
-        let want = Captured {
-            peer_id_header: Some(id.clone()),
-            peer_param: Some(id.clone()),
-            agent_id_header: Some(id.clone()),
-        };
-        assert_eq!(
-            got, want,
-            "#9596 A-2: puller form `{label}` with local id {id:?} must send X-Peer-Id, \
-             ?peer= and X-Agent-Id all equal to its local id"
-        );
-        rows += 1;
-    }
-    assert_eq!(rows, PULLER_FORMS.len() * ids.len(), "every table row ran");
+    });
+    let results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(results.len(), cases.len(), "every table row ran");
+    let failures: Vec<String> = results
+        .iter()
+        .filter_map(|(label, id, got)| {
+            let want = Captured {
+                peer_id_header: Some((*id).to_string()),
+                peer_param: Some((*id).to_string()),
+                agent_id_header: Some((*id).to_string()),
+            };
+            match got {
+                Ok(captured) if *captured == want => None,
+                Ok(captured) => Some(format!(
+                    "form `{label}` id {id:?}: sent {captured:?}, want {want:?}"
+                )),
+                Err(why) => Some(format!("form `{label}` id {id:?}: {why}")),
+            }
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "#9596 A-2: every puller form must send X-Peer-Id, ?peer= and X-Agent-Id all \
+         equal to its local id; {} of {} rows failed:\n{}",
+        failures.len(),
+        results.len(),
+        failures.join("\n")
+    );
 }
