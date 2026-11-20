@@ -1397,6 +1397,8 @@ def _matrix_include(job: Job) -> list[dict[str, object]]:
 
 
 def _hosted_legs(job: Job) -> list[dict[str, object]]:
+    """The legs of a job that run on a GitHub-hosted runner, read from `runs-on` (#9681 r2: a
+    runs-on form `_runs_on` does not read fails instead of counting as hosted)."""
     legs = _matrix_include(job)
     if not legs:
         return [{}]
@@ -2004,6 +2006,23 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(AssertionError) as caught:
                 _runs_on(job(raw), leg)
             self.assertEqual(str(caught.exception), reason)
+
+    def test_hosted_legs_read_runs_on_and_fail_closed(self) -> None:
+        """Sibling (#9681 r2): the PAIRS leg filter reads `runs-on`, not one matrix field's text."""
+        def job(runs_on: str, *legs: str) -> Job:
+            lines = [f"    runs-on: {runs_on}", "    strategy:", "      matrix:", "        include:"]
+            for leg in legs:
+                lines.append(f"          - {leg}")
+            return Job("j", lines)
+
+        by_os = job("${{ matrix.os }}", "os: ubuntu-latest", "os: '[self-hosted, linux-fed]'")
+        self.assertEqual(_hosted_legs(by_os), [{"os": "ubuntu-latest"}])
+        self.assertEqual(_hosted_legs(job("[self-hosted, linux-fed]")), [])
+        self.assertEqual(_hosted_legs(job("ubuntu-latest")), [{}])
+        with self.assertRaises(AssertionError) as caught:
+            _hosted_legs(job("${{ inputs.runner }}", "runner: ubuntu-latest"))
+        self.assertEqual(str(caught.exception),
+                         "j: unrecognised runs-on form: '${{ inputs.runner }}'")
 
 
 if __name__ == "__main__":
