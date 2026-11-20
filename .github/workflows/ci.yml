@@ -1175,17 +1175,25 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
-      # #7188 - concurrency cap: at most 3 of this job's 4 legs run at once per
-      # workflow run, so the self-hosted linux-fed leg and the two macOS legs
-      # never wait on each other while a fourth leg cannot pile on. N = 3 and
-      # not lower because a lower cap would serialise the macOS legs behind the
-      # hosted sqlite leg (~75 min) with no benefit to the f2 disk. The host-level
-      # bound lives elsewhere: every linux-fed enterprise-fed job builds into the
-      # PER-RUNNER CARGO_TARGET_DIR of the runner it runs on (below), so a target
-      # has exactly one writer and compiles once across that runner's jobs.
+      # #7188/#9682 - concurrency cap: N = 4 = the number of legs. The cap of 3
+      # held the fourth leg back until one of the other three finished; 4 lets
+      # every leg queue for its runner as soon as `classify` is done, and its
+      # start time then depends on a free runner. Measured on run 44716882423
+      # (PR 9579, 2 macos-fed runners online): macos-fed,sqlite, inside the cap
+      # of 3, started 73 minutes after creation and macos-fed,enterprise-fed
+      # 102 minutes, so most of that wait was the macos-fed runner pool and not
+      # the cap. 4 is safe because only
+      # ONE leg runs on the Linux host (linux-fed,enterprise-fed), where the
+      # host semaphore (2 slots, "Run tests (impact-aware)") bounds the compile
+      # +test phases, and the fourth leg runs on the macOS host, which has its
+      # own runner pool. The host-level bound lives elsewhere: every linux-fed
+      # enterprise-fed job builds into the PER-RUNNER CARGO_TARGET_DIR of the
+      # runner it runs on (below), so a target has exactly one writer and
+      # compiles once across that runner's jobs. Keep N >= the leg count
+      # (pinned by test_ci_check_matrix_max_parallel_9682).
       # A cross-run `concurrency` group is deliberately NOT used: GitHub replaces
       # a PENDING run in a group, which would silently cancel a required check.
-      max-parallel: 3
+      max-parallel: 4
       matrix:
         # 2x2 via `include:` so the single name variable `leg` co-varies with
         # `runner` (runs-on labels), `node` (a descriptive tag used by the
