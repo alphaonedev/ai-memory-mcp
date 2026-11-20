@@ -818,6 +818,10 @@ RUN_EMPTY = "run is empty text"
 RUN_NOT_TEXT_ROW = f"{SYNTH}/{JOB}: step {UNREAD_STEP!r}: {RUN_NOT_TEXT}"
 VERDICT_UNCLASSIFIABLE = "unclassifiable"
 VERDICT_NO_PR_CODE = "no-pr-code"
+VERDICT_TRUSTED_ONLY = "trusted-only"
+# A blank the shell lexer does not skip is an unread command word: the job is a finding, by carrier.
+# Written by hand: (i) a secret held by the job, (ii) a write scope or id-token for a tainted job.
+VERDICT_FINDING_BY_CARRIER = {"step secret": "i", "write scope": "ii", "id token": "ii"}
 RUN_FORMS = (
     ("int", "5", 5, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
     ("negative int", "-1", -1, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
@@ -825,6 +829,31 @@ RUN_FORMS = (
     ("empty string", '""', "", RUN_EMPTY, VERDICT_NO_PR_CODE),
     ("whitespace string", '"   "', "   ", RUN_EMPTY, VERDICT_NO_PR_CODE),
     ("single-quoted whitespace", "'  '", "  ", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    # 9566 r2 L1: every blank form of str.strip() with no argument, alone and mixed. The YAML
+    # text uses double-quoted escapes; the value column is the character itself. The pre-scan
+    # reason is RUN_EMPTY for every row. The full analysis reads only space, tab and newline as
+    # an empty step (taint_boundary.py _Sh._lex); any other blank is an unread command word, so
+    # its job is a finding by carrier (a shell would run that word as a command).
+    ("tab only", '"\\t"', "\t", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("newline only", '"\\n"', "\n", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("mixed space tab newline", '" \\t\\n"', " \t\n", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("crlf only", '"\\r\\n"', "\r\n", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("vertical tab", '"\\u000b"', "\x0b", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("form feed", '"\\u000c"', "\x0c", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("file separator", '"\\u001c"', "\x1c", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("group separator", '"\\u001d"', "\x1d", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("record separator", '"\\u001e"', "\x1e", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("unit separator", '"\\u001f"', "\x1f", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("next line", '"\\u0085"', "\x85", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("no-break space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("ogham space mark", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("em space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("line separator", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("paragraph separator", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("narrow no-break space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("medium mathematical space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("ideographic space", '"　"', "　", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("mixed unicode blanks", '" \\t 　 "', " \t 　 ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
     ("flow list", "[echo a]", ["echo a"], RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
     ("block list", "\n          - echo a", ["echo a"], RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
     ("flow map", "{a: b}", {"a": "b"}, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
@@ -836,7 +865,13 @@ RUN_FORMS = (
     ("false", "false", False, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
 )
 RUN_FORM_NAMES = frozenset({"int", "negative int", "float", "empty string", "whitespace string",
-                            "single-quoted whitespace", "flow list", "block list", "flow map", "block map",
+                            "single-quoted whitespace", "tab only", "newline only", "crlf only",
+                            "mixed space tab newline", "vertical tab", "form feed", "file separator",
+                            "group separator", "record separator", "unit separator",
+                            "next line", "no-break space", "ogham space mark", "em space",
+                            "line separator", "paragraph separator", "narrow no-break space",
+                            "medium mathematical space", "ideographic space", "mixed unicode blanks",
+                            "flow list", "block list", "flow map", "block map",
                             "null", "tilde null", "empty value", "true", "false"})
 RUN_FORM_BULK_ITEMS = 30_000
 
@@ -853,6 +888,9 @@ class PreScanRefusesRunThatIsNotText(unittest.TestCase):
     def test_9566_run_form_table_is_the_hand_written_set(self) -> None:
         self.assertEqual({name for name, *_ in RUN_FORMS}, RUN_FORM_NAMES)
         self.assertEqual(len(RUN_FORMS), len(RUN_FORM_NAMES))
+        for name, _, _, _, verdict in RUN_FORMS:
+            expected = set(verdict.values()) if isinstance(verdict, dict) else {verdict}
+            self.assertNotIn(VERDICT_TRUSTED_ONLY, expected, name)
 
     def test_9566_reader_gives_the_value_of_each_run_form(self) -> None:
         _need_module(self)
@@ -875,8 +913,11 @@ class PreScanRefusesRunThatIsNotText(unittest.TestCase):
                 for name, value, _, _, verdict in RUN_FORMS:
                     with self.subTest(event=event, carrier=carrier, form=name):
                         result = _scan(_run_value_workflow(event, perms, env, value))
-                        self.assertEqual(result.verdicts.get((SYNTH, JOB)), verdict)
-                        expected_rows = [RUN_NOT_TEXT_ROW] if verdict == VERDICT_UNCLASSIFIABLE else []
+                        expected = verdict[carrier] if isinstance(verdict, dict) else verdict
+                        got = result.verdicts.get((SYNTH, JOB))
+                        self.assertNotEqual(got, VERDICT_TRUSTED_ONLY)
+                        self.assertEqual(got, expected)
+                        expected_rows = [RUN_NOT_TEXT_ROW] if expected == VERDICT_UNCLASSIFIABLE else []
                         self.assertEqual(result.unclassifiable, expected_rows)
 
     def test_9566_uses_step_stays_with_its_own_lane(self) -> None:
