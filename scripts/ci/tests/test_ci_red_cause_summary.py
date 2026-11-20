@@ -39,17 +39,95 @@ WALL_CLOCK_CEILING_SECONDS = 20.0
 # The hand-written set of test jobs (every job with a step that runs ``cargo test`` or ``cargo llvm-cov``): file ->
 # job -> (names of its test steps in order, the one command line of the red-cause step).
 LOG_DIR_ARG = '"${RUNNER_TEMP}/red-cause"'
+SHARD_DIR_ARG = '"${RUNNER_TEMP}/ci-shard"'
+CHECK_LOG_ARG = '"${TEST_RESULT_LOG:-}"'
+SCRIPT_COMMAND = "python3 -I scripts/ci/red_cause_summary.py"
+RED_STEP_TIMEOUT_LINE = "        timeout-minutes: 5"
+FAILED_OR_CANCELLED = "failure() || cancelled()"
+FORK_GUARD = ("(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == "
+              "github.repository)")
+CLASSIFY_GUARD = "needs.classify.outputs.cargo_skip != 'true'"
+
+
+def red_log(name):
+    return '"${RUNNER_TEMP}/red-cause/%s"' % name
+
+
+# The ONE wiring table (#9709 r1, C-M2): per test job, the paths its red-cause step reads and, per step that writes a
+# log, (step name, the --step log argument, the run line that writes the log, the mkdir argument run before it, a
+# run line that hands the log path to later steps). A step whose writer pipes into tee also needs ``shell: bash``
+# (errexit + pipefail), so a red command is never masked by tee's exit code.
+WIRING = {
+    ("ci.yml", "check"): {
+        "reads": (CHECK_LOG_ARG, SHARD_DIR_ARG),
+        "steps": (("Run tests (impact-aware)", CHECK_LOG_ARG, 'run_all 2>&1 | tee "$RESULT_LOG"', None,
+                   'echo "TEST_RESULT_LOG=$RESULT_LOG" >> "$GITHUB_ENV"'),),
+    },
+    ("ci.yml", "sal-feature"): {
+        "reads": (LOG_DIR_ARG,),
+        "steps": (
+            ("Clippy (sal feature)", red_log("sal-clippy.log"),
+             "cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic 2>&1 | tee "
+             + red_log("sal-clippy.log"), LOG_DIR_ARG, None),
+            ("Build release (sal feature)", red_log("sal-build.log"),
+             "cargo build --release --features sal 2>&1 | tee " + red_log("sal-build.log"), LOG_DIR_ARG, None),
+            ("Run lib tests (sal feature)", red_log("sal-lib.log"),
+             "cargo test --features sal --lib 2>&1 | tee " + red_log("sal-lib.log"), LOG_DIR_ARG, None),
+        ),
+    },
+    ("ci.yml", "vectorlite-feature"): {
+        "reads": (LOG_DIR_ARG,),
+        "steps": (
+            ("Clippy (vectorlite feature, all targets)", red_log("vectorlite-clippy.log"),
+             "cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic 2>&1 | tee "
+             + red_log("vectorlite-clippy.log"), LOG_DIR_ARG, None),
+            ("Run vectorlite no-native-lib seam tests (#1860)", red_log("vectorlite-1860.log"),
+             "cargo test --features vectorlite --test vectorlite_1860 2>&1 | tee " + red_log("vectorlite-1860.log"),
+             LOG_DIR_ARG, None),
+            ("Run config-precedence under vectorlite (#2256 feature-gated pin)", red_log("config-precedence.log"),
+             "cargo test --features vectorlite --test config_precedence 2>&1 | tee " + red_log("config-precedence.log"),
+             LOG_DIR_ARG, None),
+        ),
+    },
+    ("coverage.yml", "per-module-thresholds"): {
+        "reads": (LOG_DIR_ARG,),
+        # Section E pins the llvm-cov command lines, so the step leaves a start marker (not a .log, so it is never
+        # parsed as cargo output) that names it as the failing step.
+        "steps": (("Generate coverage JSON", red_log("coverage-json.started"),
+                   "touch " + red_log("coverage-json.started"), LOG_DIR_ARG, None),),
+    },
+}
+
+
+def expected_command(workflow, job):
+    """The one command line of the job's red-cause step, built from the wiring table."""
+    wiring = WIRING[(workflow, job)]
+    parts = [SCRIPT_COMMAND]
+    for name, log_arg, _writer, _mkdir, _bridge in wiring["steps"]:
+        parts.append('--step %s "%s"' % (log_arg, name))
+    parts.extend(wiring["reads"])
+    return " ".join(parts)
+
+
+def expected_if(workflow, job):
+    """The red-cause step's ``if:``: failed or cancelled; check adds its classify guard (rule b3 of
+    check-required-contexts.sh) and the fork guard its sibling shared-target steps carry (#9709 S-M2)."""
+    if (workflow, job) == ("ci.yml", "check"):
+        return "(%s) && %s && %s" % (FAILED_OR_CANCELLED, CLASSIFY_GUARD, FORK_GUARD)
+    return FAILED_OR_CANCELLED
+
+
 EXPECTED_JOBS = {
     "ci.yml": {
-        "check": (("Run tests (impact-aware)",), 'python3 -I scripts/ci/red_cause_summary.py "${TEST_RESULT_LOG:-}" "${RUNNER_TEMP}/ci-shard"'),
-        "sal-feature": (("Run lib tests (sal feature)",), "python3 -I scripts/ci/red_cause_summary.py " + LOG_DIR_ARG),
+        "check": (("Run tests (impact-aware)",), expected_command("ci.yml", "check")),
+        "sal-feature": (("Run lib tests (sal feature)",), expected_command("ci.yml", "sal-feature")),
         "vectorlite-feature": (
             ("Run vectorlite no-native-lib seam tests (#1860)", "Run config-precedence under vectorlite (#2256 feature-gated pin)"),
-            "python3 -I scripts/ci/red_cause_summary.py " + LOG_DIR_ARG,
+            expected_command("ci.yml", "vectorlite-feature"),
         ),
     },
     "coverage.yml": {
-        "per-module-thresholds": (("Generate coverage JSON",), "python3 -I scripts/ci/red_cause_summary.py " + LOG_DIR_ARG),
+        "per-module-thresholds": (("Generate coverage JSON",), expected_command("coverage.yml", "per-module-thresholds")),
     },
 }
 RED_STEP_NAME = "Red cause summary (#9709)"
@@ -62,6 +140,12 @@ BOUND_SUMMARY_BYTES = 32768
 BOUND_ANNOTATIONS = 10
 BOUND_FILE_BYTES = 16 * 1024 * 1024
 BOUND_INPUT_FILES = 64
+BOUND_WALK_ENTRIES = 10000
+BOUND_TOTAL_BYTES = 64 * 1024 * 1024
+CAUSE_TITLE = "::error title=red cause::"
+CENSUS_FIXTURE = REPO / "scripts" / "ci" / "tests" / "fixtures" / "red_cause_census_9709.txt"
+CENSUS_FLOOR = 0.99
+CENSUS_MIN_NAMES = 1000
 
 TITLE_LINE = "**Red cause (#9709)**"
 NOTICE = "::notice title=red cause summary::"
@@ -164,14 +248,23 @@ class Scratch(unittest.TestCase):
         path.write_bytes(data)
         return path
 
-    def run_script(self, args, summary="summary.md", script=None, extra_env=None):
-        """(rc, stdout, stderr, summary text or None) of the script run in the scratch directory."""
+    def run_script(self, args, summary="summary.md", script=None, extra_env=None, address_space=None):
+        """(rc, stdout, stderr, summary text or None) of the script run in the scratch directory.
+
+        ``address_space`` caps the child's RLIMIT_AS in bytes where the platform enforces it (Linux); elsewhere the
+        cap is not set and the caller's other assertions carry the test."""
         env = {"PATH": CHILD_PATH, "TMPDIR": str(self.dir), "LC_ALL": "C.UTF-8"}
         if summary is not None:
             env["GITHUB_STEP_SUMMARY"] = summary
         env.update(extra_env or {})
+        preexec = None
+        if address_space is not None and sys.platform.startswith("linux"):
+            import resource
+
+            def preexec():
+                resource.setrlimit(resource.RLIMIT_AS, (address_space, address_space))
         proc = subprocess.run([sys.executable, "-I", str(script or SCRIPT)] + list(args), cwd=str(self.dir), env=env,
-                              capture_output=True, timeout=120)
+                              capture_output=True, timeout=120, preexec_fn=preexec)
         written = None
         if summary is not None and (self.dir / summary).is_file():
             written = (self.dir / summary).read_text(encoding="utf-8")
@@ -236,8 +329,8 @@ class ParseAndRender(Scratch):
         self.write("a.log", "     Running tests/fine.rs (target/debug/deps/fine-0123456789abcdef)\n\nrunning 1 test\n"
                             "test t ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
         rc, out, err, summary = self.run_script(["a.log"])
-        self.assertEqual((rc, out), (0, NOTICE + "no failing test or test binary found in 1 input file(s)\n"))
-        self.assertEqual(summary, TITLE_LINE + "\nno failing test or test binary found in 1 input file(s)\n")
+        self.assertEqual((rc, out), (0, NOTICE + "cause not identified; no failing test or test binary found in 1 input file(s)\n"))
+        self.assertEqual(summary, TITLE_LINE + "\ncause not identified; no failing test or test binary found in 1 input file(s)\n")
 
     def test_failures_list_without_failed_lines_names_the_tests(self):
         self.write("a.log", "     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\n\nfailures:\n    m::one\n    m::two\n\n"
@@ -266,7 +359,7 @@ class ParseAndRender(Scratch):
     def test_no_failure_prints_one_notice_and_a_summary_line(self):
         self.write("a.log", "test a ... ok\n")
         rc, out, err, summary = self.run_script(["a.log"])
-        self.assertEqual((rc, out), (0, NOTICE + "no failing test or test binary found in 1 input file(s)\n"))
+        self.assertEqual((rc, out), (0, NOTICE + "cause not identified; no failing test or test binary found in 1 input file(s)\n"))
 
 
 HOSTILE_CASES = (
@@ -279,7 +372,11 @@ HOSTILE_CASES = (
     ("angle bracket", "<b>x", "&lt;b>x", "<b>x"),
     ("pipe", "a|b", "a&#124;b", "a|b"),
     ("ampersand entity", "&amp;", "&amp;amp;", "&amp;"),
-    ("markdown link", "[x](http://e)", "&#91;x](http://e)", "[x](http://e)"),
+    ("markdown link", "[x](http://e)", "&#91;x](http:​//e)", "[x](http://e)"),
+    # GFM autolinks and @mentions are broken by a zero-width space in the summary only (#9709 r1 LOW).
+    ("mention", "a@b", "a@​b", "a@b"),
+    ("bare url", "x https://e.example", "x https:​//e.example", "x https://e.example"),
+    ("www autolink", "WWW.e.example", "WWW​.e.example", "WWW.e.example"),
     ("workflow command", "::error::boom", "\\x3a:error\\x3a:boom", "\\x3a:error\\x3a:boom"),
     ("v1 command", "##[error]x", "\\x23#&#91;error]x", "\\x23\\x23\\x5berror]x"),
     ("line separator", "a\u2028b", "a\\u2028b", "a\\u2028b"),
@@ -434,12 +531,48 @@ class Bounds(Scratch):
         self.assertIn("| (unknown binary) | early |\n", summary)
         self.assertNotIn("input file over the limit", summary)
 
-    def test_file_one_byte_over_the_bound_says_so_with_exact_numbers(self):
-        self.write("a.log", self.filler_file(16777217, b"test early ... FAILED\n"))
+    def test_file_one_byte_over_the_bound_reads_the_tail_and_says_so(self):
+        # cargo prints the verdict at the end: a log over the bound keeps its last 16 MiB (#9709 r1 LOW).
+        head = b"test early ... FAILED\n"
+        self.write("a.log", self.filler_file(16777217 - len(b"test late ... FAILED\n"), head) + b"\ntest late ... FAILED\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| (unknown binary) | early |\n", summary)
-        self.assertTrue(summary.endswith("\ninput file over the limit: a.log has 16777217 bytes, first 16777216 read\n"))
+        self.assertIn("| (unknown binary) | late |\n", summary)
+        self.assertNotIn("early", summary)
+        self.assertTrue(summary.endswith("\ninput file over the limit: a.log has 16777218 bytes, last 16777216 read\n"))
+
+    def test_file_with_the_verdict_at_the_tail_of_4_gib_is_found_in_bounded_memory(self):
+        # M4: a sparse 4 GiB log whose FAILED block is at the tail; the child's address space is capped at 1.5 GiB
+        # where the platform enforces RLIMIT_AS, so a whole-file read fails the test.
+        path = self.dir / "a.log"
+        tail = b"\n     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\ntest m::late ... FAILED\n"
+        with open(path, "wb") as handle:
+            handle.truncate(4 * 1024 ** 3 - len(tail))
+            handle.seek(0, os.SEEK_END)
+            handle.write(tail)
+        rc, out, err, summary = self.run_script(["a.log"], address_space=1536 * 1024 ** 2)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("| x | m\\x3a:late |\n", summary)
+        self.assertIn("input file over the limit: a.log has 4294967296 bytes, last 16777216 read\n", summary)
+
+    def test_a_directory_walk_over_the_entry_bound_stops_and_says_so(self):
+        for index in range(BOUND_WALK_ENTRIES + 5):
+            self.write("logs/d%05d.txt" % index, "")
+        rc, out, err, summary = self.run_script(["logs"])
+        self.assertEqual(rc, 0)
+        self.assertIn("directory walk over the limit: logs has more than %d entries, rest skipped\n" % BOUND_WALK_ENTRIES,
+                      summary)
+
+    def test_total_bytes_over_the_budget_stop_reading_and_say_so(self):
+        block = (b"x" * 199 + b"\n") * (BOUND_FILE_BYTES // 200)
+        for index in range(BOUND_TOTAL_BYTES // len(block) + 1):
+            self.write("logs/f%02d.log" % index, block)
+        self.write("logs/zz.log", "test late ... FAILED\n")
+        rc, out, err, summary = self.run_script(["logs"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("late", summary)
+        self.assertRegex(summary, r"\ninput bytes over the limit: [1-9][0-9]* file\(s\) not read \(limit %d bytes\)\n"
+                         % BOUND_TOTAL_BYTES)
 
     def numbered_files(self, count):
         for index in range(count):
@@ -515,7 +648,7 @@ class FailsOpen(Scratch):
 
     def test_no_arguments(self):
         written = self.check([], "no input paths given")
-        self.assertEqual(written, TITLE_LINE + "\nno failing test or test binary found in 0 input file(s)\n")
+        self.assertEqual(written, TITLE_LINE + "\ncause not identified; no failing test or test binary found in 0 input file(s)\n")
 
     def test_missing_file(self):
         self.check(["missing.log"], "cannot read input missing.log: No such file or directory")
@@ -716,9 +849,7 @@ class WorkflowInvariant(unittest.TestCase):
         for workflow, expected in EXPECTED_JOBS.items():
             for job in expected:
                 (_, item), = self.red_steps(self.workflows[workflow][job])
-                # check has no job-level if: rule (b3) of check-required-contexts.sh wants a classify guard on every step.
-                want = "failure() && needs.classify.outputs.cargo_skip != 'true'" if (workflow, job) == ("ci.yml", "check") else "failure()"
-                self.assertEqual(item["if"], want, (workflow, job))
+                self.assertEqual(item["if"], expected_if(workflow, job), (workflow, job))
                 self.assertEqual(item["coe"], "true", (workflow, job))
 
     def test_the_step_command_is_exactly_the_expected_one(self):
@@ -757,6 +888,325 @@ class WorkflowInvariant(unittest.TestCase):
         self.assertLess(names.index("PostgreSQL package repair + preflight (#9235)"), names.index("Generate coverage JSON"))
         self.assertIsNone(pre["if"])
         self.assertIsNone(pre["coe"])
+
+
+def job_block(text, job):
+    """Every line of one job of a workflow file (job-level keys included), by indentation."""
+    out = []
+    inside = False
+    for line in text.splitlines():
+        if re.match(r"^  [A-Za-z0-9_-]+:\s*(?:#.*)?$", line) or re.match(r"^[A-Za-z]", line):
+            inside = line.startswith("  %s:" % job)
+            continue
+        if inside:
+            out.append(line)
+    return out
+
+
+def wiring_problems(text, workflow, job):
+    """Every way the job breaks the WIRING table: [] when the red-cause step reads exactly what the steps write."""
+    wiring = WIRING[(workflow, job)]
+    steps = parse_jobs(text).get(job, [])
+    problems = []
+    reds = [item for item in steps if any(SCRIPT_REL in line for line in item["active"])]
+    if len(reds) != 1:
+        problems.append("red-cause steps: %d" % len(reds))
+    else:
+        red = reds[0]
+        if red["if"] != expected_if(workflow, job):
+            problems.append("red-cause if: %r" % (red["if"],))
+        if red["coe"] != "true":
+            problems.append("red-cause continue-on-error: %r" % (red["coe"],))
+        if RED_STEP_TIMEOUT_LINE not in red["active"]:
+            problems.append("red-cause step has no timeout-minutes: 5")
+        if red["run"] != [expected_command(workflow, job)]:
+            problems.append("red-cause command: %r" % (red["run"],))
+    for name, log_arg, writer, mkdir_arg, bridge in wiring["steps"]:
+        found = [item for item in steps if item["name"] == name]
+        if len(found) != 1:
+            problems.append("%s: %d steps of this name" % (name, len(found)))
+            continue
+        item = found[0]
+        run = item["run"]
+        if run.count(writer) != 1:
+            problems.append("%s: writer line found %d times" % (name, run.count(writer)))
+            continue
+        at = run.index(writer)
+        if "| tee " in writer and "        shell: bash" not in item["active"]:
+            problems.append("%s: tee without shell: bash (a red command is masked)" % name)
+        if mkdir_arg is not None:
+            if "mkdir -p " + mkdir_arg not in run[:at]:
+                problems.append("%s: no mkdir -p %s before the writer" % (name, mkdir_arg))
+            if log_arg.rsplit("/", 1)[0] + '"' != mkdir_arg:
+                problems.append("%s: the log is not in the made directory" % name)
+            if mkdir_arg not in wiring["reads"]:
+                problems.append("%s: the red-cause step does not read %s" % (name, mkdir_arg))
+            if log_arg not in writer:
+                problems.append("%s: the writer does not write the --step log" % name)
+        if bridge is not None:
+            if bridge not in run[:at]:
+                problems.append("%s: no %s before the writer" % (name, bridge))
+            if log_arg not in wiring["reads"]:
+                problems.append("%s: the red-cause step does not read %s" % (name, log_arg))
+    listed = {entry[0] for entry in wiring["steps"]}
+    tee_steps = {item["name"] for item in steps if any("| tee " in line for line in item["run"])}
+    if tee_steps - listed:
+        problems.append("tee steps outside the wiring table: %s" % sorted(tee_steps - listed))
+    if any("secrets." in line for line in job_block(text, job)):
+        problems.append("the job reads secrets.")
+    return problems
+
+
+# The three reviewer-planted workflow edits of #9709 r1 (C-M2) plus the other ways to break the wiring.
+PLANTED_EDITS = (
+    ("R14 config-precedence loses shell: bash", ("ci.yml", "vectorlite-feature"),
+     "      - name: Run config-precedence under vectorlite (#2256 feature-gated pin)\n        shell: bash\n",
+     "      - name: Run config-precedence under vectorlite (#2256 feature-gated pin)\n"),
+    ("R15 sal lib tests lose mkdir", ("ci.yml", "sal-feature"),
+     '          mkdir -p "${RUNNER_TEMP}/red-cause"\n          cargo test --features sal --lib',
+     "          cargo test --features sal --lib"),
+    ("R16 tee writes outside the read dir", ("ci.yml", "vectorlite-feature"),
+     'tee "${RUNNER_TEMP}/red-cause/config-precedence.log"', 'tee "${RUNNER_TEMP}/config-precedence.log"'),
+    ("check loses the fork guard", ("ci.yml", "check"),
+     "        if: (failure() || cancelled()) && " + CLASSIFY_GUARD + " && " + FORK_GUARD + "\n",
+     "        if: (failure() || cancelled()) && " + CLASSIFY_GUARD + "\n"),
+    ("sal clippy loses its tee", ("ci.yml", "sal-feature"),
+     " 2>&1 | tee " + red_log("sal-clippy.log"), ""),
+)
+
+
+class Wiring(unittest.TestCase):
+    """ONE table over every tee step and every red-cause step: shell: bash, mkdir before tee, the tee dir is the dir
+    the step reads, the fork guard, timeout-minutes, no secrets. (#9709 r1 C-M2, S-M2)"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {"ci.yml": CI_YML.read_text(encoding="utf-8"), "coverage.yml": COVERAGE_YML.read_text(encoding="utf-8")}
+
+    def test_the_table_covers_every_red_cause_job(self):
+        self.assertEqual(set(WIRING), {(wf, job) for wf, jobs in EXPECTED_JOBS.items() for job in jobs})
+
+    def test_the_workflows_have_no_wiring_problems(self):
+        for (workflow, job) in WIRING:
+            with self.subTest(job=job):
+                self.assertEqual(wiring_problems(self.texts[workflow], workflow, job), [])
+
+    def test_every_planted_edit_is_a_wiring_problem(self):
+        for case, (workflow, job), old, new in PLANTED_EDITS:
+            with self.subTest(case=case):
+                text = self.texts[workflow]
+                self.assertEqual(text.count(old), 1, case)
+                self.assertNotEqual(wiring_problems(text.replace(old, new), workflow, job), [], case)
+
+    def test_a_secret_read_in_a_red_cause_job_is_a_wiring_problem(self):
+        text = self.texts["ci.yml"]
+        anchor = "      - name: Build release (sal feature)\n"
+        self.assertEqual(text.count(anchor), 1)
+        planted = text.replace(anchor, anchor + "        env:\n          X: ${{ secrets.X }}\n")
+        self.assertIn("the job reads secrets.", wiring_problems(planted, "ci.yml", "sal-feature"))
+
+
+def planted(prefix, length, alphabet="A1b2C3d4E5f6G7h8"):
+    """A synthetic secret of one token shape, built at run time (never a literal in the tree)."""
+    return prefix + (alphabet * (length // len(alphabet) + 1))[:length]
+
+
+def planted_secrets():
+    jwt_part = planted("", 40, "aB3dE5fG7hJ9kL1m")
+    return (
+        ("gh" + "p_", planted("gh" + "p_", 36)),
+        ("gh" + "o_", planted("gh" + "o_", 36)),
+        ("gh" + "s_", planted("gh" + "s_", 36)),
+        ("gh" + "u_", planted("gh" + "u_", 36)),
+        ("gh" + "r_", planted("gh" + "r_", 36)),
+        ("github" + "_pat_", planted("github" + "_pat_", 22) + "_" + planted("", 59)),
+        ("s" + "k-", planted("s" + "k-", 48)),
+        ("jwt", "ey" + "J" + jwt_part + ".ey" + "J" + jwt_part + "." + planted("", 43)),
+        ("hex64", planted("", 64, "0123456789abcdef")),
+        ("base64 32", planted("", 32, "QWxhZGRpbjpvcGVu")),
+    )
+
+
+class CleanedByConstruction(Scratch):
+    """Every shown value is a Cleaned made only by clean()/render_name(); counting runs on raw values (#9709 r1)."""
+
+    def module(self):
+        module = load_module()
+        module.load_redaction()
+        return module
+
+    def test_cleaned_cannot_be_made_outside_clean(self):
+        module = self.module()
+        with self.assertRaises(TypeError):
+            module.Cleaned("x", object())
+        self.assertIsInstance(module.clean("x"), module.Cleaned)
+        self.assertIsInstance(module.render_name("x"), module.Cleaned)
+
+    def test_add_methods_refuse_a_str(self):
+        module = self.module()
+        findings = module.Findings()
+        shown = module.clean("b")
+        with self.assertRaises(TypeError):
+            findings.add_binary("b", "r", "b", shown)
+        with self.assertRaises(TypeError):
+            findings.add_binary("b", "r", shown, "r")
+        with self.assertRaises(TypeError):
+            findings.add_test("b", "n", "b", shown)
+        with self.assertRaises(TypeError):
+            findings.add_test("b", "n", shown, "n")
+
+    def test_a_token_shaped_binary_never_reaches_any_output(self):
+        token = planted("gh" + "p_", 36)
+        running = "     Running tests/x.rs (target/debug/deps/%s-0123456789abcdef)\n" % token
+        self.write("a.log", running + "test m::a ... FAILED\n" + RESULT_FAILED_LINE + "\n"
+                   + running + "failures:\n    m::b\n\n" + RESULT_FAILED_LINE + "\n"
+                   + running + "running 1 test\n" + "  process didn't exit successfully: `x`\n"
+                   + "test " + token + " ... FAILED\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0, err)
+        for text in (out, err, summary):
+            self.assertNotIn(token[4:20], text)
+        self.assertIn("failing tests: 3\n", summary)
+
+    def test_three_long_failing_names_print_three_rows(self):
+        names = ["tests::store_rejects_oversized_content_with_exact_reason_4410",
+                 "tests::recall_returns_memories_in_namespace_order_9123",
+                 "tests::link_refuses_cross_namespace_target_without_grant_7001"]
+        lines = ["     Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)", "", "running 4 tests"]
+        lines += ["test %s ... FAILED" % name for name in names] + ["test tests::short_ok ... ok", "", "failures:"]
+        lines += ["    " + name for name in names] + ["", RESULT_FAILED_LINE]
+        self.write("a.log", "\n".join(lines) + "\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("failing tests: 3\n", summary)
+        for name in names:
+            self.assertIn("| ai_memory | %s |\n" % name.replace("::", "\\x3a:"), summary)
+        self.assertEqual(out.count("::error title=failing test::"), 3)
+
+    def test_every_planted_secret_shape_is_masked(self):
+        module = self.module()
+        for shape, secret in planted_secrets():
+            for raw in (secret, "tests::" + secret, "tests::x_" + secret):
+                with self.subTest(shape=shape, raw=raw[:12]):
+                    shown = module.render_name(raw).text
+                    self.assertNotIn(secret, shown)
+                    self.assertNotEqual(shown, raw)
+
+    def test_every_planted_secret_is_masked_end_to_end(self):
+        secrets_ = [secret for _shape, secret in planted_secrets()]
+        self.write("a.log", "     Running tests/h.rs (target/debug/deps/h-0123456789abcdef)\n"
+                   + "".join("test tests::%s ... FAILED\n" % secret for secret in secrets_))
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("failing tests: %d\n" % len(secrets_), summary)
+        for secret in secrets_:
+            for text in (out, summary):
+                self.assertNotIn(secret, text)
+
+
+class Census(unittest.TestCase):
+    """At least 99% of the repository's real fn names print unmasked (fixture: gen_red_cause_census_9709.py)."""
+
+    def test_real_fn_names_print_unmasked(self):
+        module = load_module()
+        module.load_redaction()
+        names = CENSUS_FIXTURE.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(names), CENSUS_MIN_NAMES)
+        self.assertEqual(names, sorted(set(names)))
+        for prefix in ("", "tests::", "store::sqlite::tests::"):
+            kept = sum(module.render_name(prefix + name).text == prefix + name for name in names)
+            self.assertGreaterEqual(kept / len(names), CENSUS_FLOOR, (prefix, kept, len(names)))
+
+
+class SectionsAndLabels(Scratch):
+    """Only cargo's column shape opens a section; lib and bin unittests get distinct labels; crash detail and the
+    blank line before a note (R2, R7)."""
+
+    def test_a_running_line_not_in_cargo_columns_opens_no_section(self):
+        self.write("a.log", "    Running tests/fake4.rs (target/debug/deps/fake4-0123456789abcdef)\n"
+                            "      Running tests/fake6.rs (target/debug/deps/fake6-0123456789abcdef)\n"
+                            "Running tests/fake0.rs (target/debug/deps/fake0-0123456789abcdef)\n"
+                            "  Doc-tests fakedoc\n"
+                            "test t ... FAILED\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("fake", summary)
+        self.assertIn("| (unknown binary) | t |\n", summary)
+        self.assertNotIn("failing test binaries", summary)
+
+    def test_lib_and_bin_unittests_are_distinct(self):
+        block = ("     Running unittests %s (target/debug/deps/ai_memory-%s)\n\nrunning 2 tests\ntest tests::a ... FAILED\n\n"
+                 "failures:\n    tests::a\n\n" + RESULT_FAILED_LINE + "\n")
+        self.write("a.log", block % ("src/lib.rs", "0123456789abcdef") + block % ("src/main.rs", "fedcba9876543210"))
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("failing tests: 2\n", summary)
+        self.assertIn("| ai_memory | tests\\x3a:a |\n", summary)
+        self.assertIn("| ai_memory (src/main.rs) | tests\\x3a:a |\n", summary)
+        self.assertIn("failing test binaries: 2\n", summary)
+
+    def test_the_first_crash_detail_is_kept(self):
+        self.write("a.log", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n"
+                            "  process didn't exit successfully: first\n"
+                            "  process didn't exit successfully: second\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("| c | ended without a test result line (crash, timeout or signal); "
+                      "process didn't exit successfully: first |\n", summary)
+        self.assertNotIn("second", summary)
+
+    def test_a_note_after_a_table_has_a_blank_line_first(self):
+        self.write("a.log", "test t ... FAILED\n" + "x" * (BOUND_LINE_BYTES + 1) + "\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(summary.endswith("| (unknown binary) | t |\n\ninput lines over 300 bytes cut: 1\n"), summary)
+
+
+class NamedCause(Scratch):
+    """A red job always names a cause: the first error line of the failing step, or "cause not identified" with the
+    failing step's name (#9709 r1, invariant 4)."""
+
+    STEPS = ("--step", "logs/sal-clippy.log", "Clippy (sal feature)", "--step", "logs/sal-build.log",
+             "Build release (sal feature)", "--step", "logs/sal-lib.log", "Run lib tests (sal feature)")
+
+    def test_a_compile_error_is_named_with_its_step(self):
+        self.write("logs/sal-clippy.log", "    Checking ai-memory v1.0.0 (/w)\n")
+        self.write("logs/sal-build.log", "   Compiling ai-memory v1.0.0 (/w)\n\x1b[31merror[E0308]\x1b[0m: mismatched types\n"
+                                         " --> src/lib.rs:10:5\nerror: could not compile `ai-memory`\n")
+        rc, out, err, summary = self.run_script(list(self.STEPS) + ["logs"])
+        self.assertEqual((rc, out), (0, CAUSE_TITLE + "Build release (sal feature): error[E0308]: mismatched types\n"))
+        self.assertEqual(summary, TITLE_LINE + "\ncause: Build release (sal feature): error&#91;E0308]: mismatched types\n")
+
+    def test_an_unknown_cause_names_the_last_step_whose_log_exists(self):
+        self.write("logs/sal-clippy.log", "    Checking ai-memory v1.0.0 (/w)\n")
+        self.write("logs/sal-build.log", "   Compiling ai-memory v1.0.0 (/w)\n")
+        rc, out, err, summary = self.run_script(list(self.STEPS) + ["logs"])
+        line = "cause not identified; failing step: Build release (sal feature) (the last step whose log exists)"
+        self.assertEqual((rc, out), (0, NOTICE + line + "\n"))
+        self.assertEqual(summary, TITLE_LINE + "\n" + line + "\n")
+
+    def test_no_step_log_names_a_step_before_the_first(self):
+        (self.dir / "logs").mkdir()
+        rc, out, err, summary = self.run_script(list(self.STEPS) + ["logs"])
+        line = "cause not identified; failing step: a step before Clippy (sal feature) (no step log exists)"
+        self.assertEqual((rc, out), (0, NOTICE + line + "\n"))
+        self.assertEqual(summary, TITLE_LINE + "\n" + line + "\n")
+
+    def test_a_failing_test_is_the_cause_and_no_cause_line_is_added(self):
+        self.write("logs/sal-lib.log", FIXTURE_A)
+        rc, out, err, summary = self.run_script(list(self.STEPS) + ["logs"])
+        self.assertEqual((rc, out, summary), (0, FIXTURE_A_STDOUT, FIXTURE_A_SUMMARY))
+
+    def test_a_hostile_error_line_is_cleaned_and_escaped(self):
+        token = planted("gh" + "p_", 36)
+        self.write("logs/sal-build.log", "error: ::error::pwn " + token + " @x\n")
+        rc, out, err, summary = self.run_script(list(self.STEPS) + ["logs"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(token[4:20], out + summary)
+        for line in out.splitlines():
+            self.assertRegex(line, ALLOWED_STDOUT_LINE)
+            self.assertNotIn("::", line.split("::", 2)[2])
+        self.assertIn("@​x", summary)
 
 
 if __name__ == "__main__":
