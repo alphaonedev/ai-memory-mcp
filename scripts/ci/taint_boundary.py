@@ -273,6 +273,10 @@ OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset(
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
+# decision: raise the violation ceiling once, 17 -> 33 (58dd50570), over keeping 17, because the
+# pre-scan of #9566 sends release.yml jobs to the full analysis, which reports 16 rows of classes i
+# and ii that #9570 fixes; each row names 9570 and leaves with it. Stage 1 of #9455 removed the
+# lifetime-tests row (33 -> 32 at the merge of chain tip fd43a727).
 PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 32, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
