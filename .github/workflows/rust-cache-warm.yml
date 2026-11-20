@@ -7,8 +7,7 @@
 # the fed self-hosted legs and the Postgres coverage suite a second time on every chain
 # push, so this workflow is separate, hosted only, and runs no tests: it runs exactly
 # the cargo command lines of the two hosted PR jobs whose output rust-cache keeps (their
-# builds and the pinned cargo-audit install) and lets rust-cache save it under the
-# same shared-key and the same key env.
+# builds) and lets rust-cache save them under the same shared-key and the same key env.
 #
 #   ci.yml `check` (ubuntu-latest,sqlite leg)  <- job check-hosted-sqlite (shared-key ci-check-hosted-sqlite)
 #   coverage.yml `per-module-thresholds`       <- job coverage            (shared-key coverage-per-module)
@@ -175,26 +174,13 @@ jobs:
             echo "RUSTFLAGS=-C debuginfo=0"
           } >> "$GITHUB_ENV"
 
-      # The debug test build of the hosted sqlite leg (FEAT is empty there) and its
-      # release-profile smoke. Not trimmed in between: the saved target/ keeps both
-      # profiles' dependencies, which is what the PR job compiles against.
+      # The debug test build of the hosted sqlite leg (FEAT is empty there), its one
+      # cache-kept cargo command. Since #9680 the release-profile smoke and the pinned
+      # cargo-audit install run on the android entry of ci.yml `mobile-cross-compile`
+      # (its own cache key), so this job builds neither.
       - name: Build the test targets (no run)
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: cargo test --no-run
-
-      - name: Build release
-        if: steps.rust-cache.outputs.cache-hit != 'true'
-        run: cargo build --release
-
-      # The pinned cargo-audit of ci.yml `check` (Security audit, the same line and pin).
-      # rust-cache keeps a binary installed during the job in ~/.cargo/bin (its cleanBin
-      # removes only the binaries present when the cache step ran), so the PR step's version
-      # probe finds 0.22.2 and skips its from-source install.
-      - name: Install cargo-audit (the PR job's pinned install)
-        if: steps.rust-cache.outputs.cache-hit != 'true'
-        env:
-          CARGO_AUDIT_VERSION: "0.22.2"
-        run: cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
 
   coverage:
     name: Rust cache warm (Per-Module Coverage deps)

@@ -168,8 +168,6 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
                   "Run the pg_isolated_binary live cells (enterprise-fed legs only)",
                   "Load gate (#6795)",
                   "Run tests (impact-aware)",
-                  "Security audit",
-                  "Build release (once leg — release-profile smoke)",
                   "Cleanup enterprise-fed ephemeral db",
                   "sccache hit-rate summary (#7199)",
                   "sccache stop CI server (#7199)",
@@ -177,7 +175,10 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
                   "Sweep target/debug to the size cap (self-hosted)",
                   "Sweep per-runner cargo target to the size cap (self-hosted,"),
         "postgres-feature": ("Clippy (sal-postgres feature, lib + tests)",),
-        "mobile-cross-compile": ("cargo check (--lib --features sqlite-bundled)",),
+        # #9680 moved `Security audit` and the release smoke from `check` to the android entry.
+        "mobile-cross-compile": ("cargo check (--lib --features sqlite-bundled)",
+                                 "Security audit",
+                                 "Build release (once leg — release-profile smoke)"),
         "sal-feature": ("Clippy (sal feature)", "Build release (sal feature)",
                         "Run lib tests (sal feature)"),
         "vectorlite-feature": ("Clippy (vectorlite feature, all targets)",
@@ -261,10 +262,10 @@ MIRRORED_STEPS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
 }
 # The cargo commands of each pair are derived, not listed: WarmCommandList9681 compares the
-# exact command lines of the hosted PR legs and the warm job in both directions. That includes
-# `cargo install cargo-audit`: rust-cache keeps a binary installed during the job in
-# ~/.cargo/bin (cleanBin removes only the binaries present when the cache step ran), so the
-# warm install is what lets the PR step's version probe skip its from-source build.
+# exact command lines of the hosted PR legs and the warm job in both directions. Since #9680
+# the hosted `check` leg runs neither `cargo build --release` nor `cargo install cargo-audit`
+# (both moved to the android entry of `mobile-cross-compile`, which is not a PAIRS job), so a
+# warm copy of either is an only-in-warm-job finding.
 
 # HuggingFace model cache of coverage.yml: restore on every event, save on push only.
 HF_CACHE_SITES = {
