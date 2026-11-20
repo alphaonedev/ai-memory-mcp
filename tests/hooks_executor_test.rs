@@ -18,7 +18,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use ai_memory::hooks::{
     DaemonExecutor, ExecExecutor, ExecutorRegistry, FailMode, HookConfig, HookDecision, HookEvent,
@@ -53,6 +52,21 @@ fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Per-fire hook deadline for the load tests that prove a concurrency or
+/// throughput property (100 concurrent exec fires, 1000 sequential daemon
+/// fires, daemon reconnect). Issues #9232 and #8541: a 5 s deadline made
+/// those tests depend on runner load, because 100 forks queued behind a
+/// loaded macOS runner can each wait longer than 5 s before their child
+/// is even scheduled. The property under test is that every fire is
+/// allowed, so the deadline must never decide the outcome; this value is
+/// ten minutes, far above any scheduling delay, and exists only so that a
+/// truly hung child still ends the test instead of blocking the job until
+/// the CI job-level timeout.
+const LOAD_TEST_FIRE_TIMEOUT_MS: u32 = 600_000;
+
+/// Number of concurrent fires in `exec_mode_100_concurrent_fires_all_allow`.
+const EXEC_CONCURRENT_FIRES: usize = 100;
+
 fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
     let _ =
         ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
@@ -72,14 +86,18 @@ fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
 // exec mode — 100 concurrent fires
 // ---------------------------------------------------------------------------
 
-/// 100 concurrent fires through `ExecExecutor` must all complete
-/// inside their per-fire timeout. The script reads its stdin, then
-/// writes a fixed `{"action":"allow"}` decision. The test asserts:
+/// 100 concurrent fires through `ExecExecutor` must all be allowed.
+/// The script reads its stdin, then writes a fixed
+/// `{"action":"allow"}` decision. The test asserts:
 ///
-///   * every fire returned `Allow`;
-///   * the *aggregate* wall-clock stayed within 30s (a slack ceiling
-///     to avoid CI flakes on cold containers; per-fire timeout is
-///     5s, far above the ~50ms a fork+exec costs).
+///   * every one of the 100 fires returned exactly `Allow` (each
+///     decision is checked, in fire order);
+///   * the executor counted 100 fires and 0 drops.
+///
+/// There is deliberately no wall-clock assertion (issues #9232,
+/// #8541): elapsed time measures runner load, not correctness. The
+/// per-fire deadline is [`LOAD_TEST_FIRE_TIMEOUT_MS`], which only
+/// guards against a hung child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_mode_100_concurrent_fires_all_allow() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -93,35 +111,38 @@ printf '%s\n' '{"action":"allow"}'
 "#,
     );
 
-    let executor = Arc::new(ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000)));
+    let executor = Arc::new(ExecExecutor::new(cfg_for(
+        script,
+        HookMode::Exec,
+        LOAD_TEST_FIRE_TIMEOUT_MS,
+    )));
 
-    let started = Instant::now();
-    let mut handles = Vec::with_capacity(100);
-    for i in 0..100u32 {
+    let mut handles = Vec::with_capacity(EXEC_CONCURRENT_FIRES);
+    for i in 0..EXEC_CONCURRENT_FIRES {
         let exec = Arc::clone(&executor);
         handles.push(tokio::spawn(async move {
             exec.fire(HookEvent::PostStore, json!({"i": i})).await
         }));
     }
-    let mut allowed = 0u32;
-    for h in handles {
+    let mut allowed = 0usize;
+    for (i, h) in handles.into_iter().enumerate() {
         let r = h.await.expect("join");
         match r {
             Ok(HookDecision::Allow) => allowed += 1,
-            Ok(other) => panic!("expected Allow, got {other:?}"),
-            Err(e) => panic!("exec mode fire failed: {e}"),
+            Ok(other) => panic!("fire {i}: expected Allow, got {other:?}"),
+            Err(e) => panic!("fire {i}: exec mode fire failed: {e}"),
         }
     }
-    assert_eq!(allowed, 100, "all 100 fires must Allow");
-
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "100 fires took {elapsed:?}; expected <30s wall-clock"
+    assert_eq!(
+        allowed, EXEC_CONCURRENT_FIRES,
+        "all {EXEC_CONCURRENT_FIRES} fires must Allow"
     );
 
     let metrics = executor.metrics();
-    assert_eq!(metrics.events_fired, 100);
+    assert_eq!(
+        metrics.events_fired,
+        u64::try_from(EXEC_CONCURRENT_FIRES).expect("fire count fits u64")
+    );
     assert_eq!(metrics.events_dropped, 0);
 }
 
@@ -153,8 +174,7 @@ sleep 5
 // daemon mode — 1000 fires through one child
 // ---------------------------------------------------------------------------
 
-/// 1000 fires through a single daemon child complete within the
-/// deadline. The script's read-write loop is the simplest possible
+/// 1000 fires through a single daemon child are all allowed. The script's read-write loop is the simplest possible
 /// NDJSON echo: read one line, write `{"action":"allow"}\n`, repeat.
 /// We assert all 1000 returned Allow and the connection was reused
 /// (one process for the whole test).
@@ -171,9 +191,11 @@ while IFS= read -r _line; do
 done
 "#,
     );
-    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
+    let executor =
+        DaemonExecutor::new(cfg_for(script, HookMode::Daemon, LOAD_TEST_FIRE_TIMEOUT_MS));
 
-    let started = Instant::now();
+    // No wall-clock ceiling on the loop (issues #9232, #8541): elapsed
+    // time measures runner load. Every decision is checked exactly.
     for i in 0..1000u32 {
         let r = executor
             .fire(HookEvent::PostStore, json!({"i": i}))
@@ -181,11 +203,6 @@ done
             .unwrap_or_else(|e| panic!("fire {i} failed: {e}"));
         assert_eq!(r, HookDecision::Allow, "fire {i} returned {r:?}");
     }
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_mins(1),
-        "1000 daemon fires took {elapsed:?}; expected <60s"
-    );
 
     let m = executor.metrics();
     assert_eq!(m.events_fired, 1_000);
@@ -214,7 +231,8 @@ while IFS= read -r _line; do
 done
 "#,
     );
-    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
+    let executor =
+        DaemonExecutor::new(cfg_for(script, HookMode::Daemon, LOAD_TEST_FIRE_TIMEOUT_MS));
 
     // First 5 must Allow.
     for i in 0..5u32 {
