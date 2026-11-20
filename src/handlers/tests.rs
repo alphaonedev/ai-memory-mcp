@@ -81,9 +81,35 @@ fn test_state() -> Db {
     // #3498 battery: isolated handler slices must install the network gate
     // before fanout, just as the federation test fixtures do (#3515).
     crate::governance::wire_check::ensure_installed_for_test();
+    // #9730 — a hand-built `AppState` (no `test_app_state`) over this handle
+    // reaches the HTTP-direct attestation gate, whose default is "required"
+    // (403). `test_app_state` pins the permissive posture for the process;
+    // pin it here too so a test that skips it does not depend on a sibling
+    // having run first (nextest runs each test in its own process).
+    crate::identity::attest::permissive_attestation_for_lib_tests();
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)))
+}
+
+/// #9730 — class guard: every handler test obtains its handle through
+/// `test_state`, so the wire-action hook and the permissive attestation pin
+/// must both be in place afterwards, in a fresh process (nextest) as well as
+/// in the shared `cargo test` process.
+#[test]
+fn test_state_seeds_process_wide_state_9730() {
+    let _db = test_state();
+    assert!(
+        crate::governance::wire_check::GOVERNANCE_PRE_ACTION
+            .get()
+            .is_some(),
+        "test_state must install the wire-action hook (#9730)"
+    );
+    assert_eq!(
+        std::env::var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION").as_deref(),
+        Ok("0"),
+        "test_state must pin the permissive attestation posture (#9730)"
+    );
 }
 
 /// S5-C1 fix campaign (2026-05-13): tests that hit

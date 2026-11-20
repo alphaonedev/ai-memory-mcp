@@ -1265,11 +1265,45 @@ mod tests {
         }
     }
 
+    /// #9730 — point `AI_MEMORY_KEY_DIR` at `dir` for one test, robustly.
+    ///
+    /// The process-wide key-dir sandbox binds `AI_MEMORY_KEY_DIR` to itself on
+    /// its FIRST `install()`, overwriting whatever a test set earlier. Under
+    /// `cargo test` a sibling had already triggered that; under nextest (one
+    /// process per test) the first `default_key_dir()` call inside `run` did,
+    /// redirecting the signing load to the sandbox where the test's key is
+    /// absent. Install the sandbox FIRST (idempotent), then set the override,
+    /// so the test's own value is the one that stays in force. The caller
+    /// holds [`locked_env`]. Every sign test goes through this helper;
+    /// `key_dir_override_goes_through_bind_key_dir_9730` keeps it that way.
+    fn bind_key_dir(dir: &std::path::Path) -> EnvVarGuard {
+        let _ = crate::identity::test_key_dir::install();
+        EnvVarGuard::set("AI_MEMORY_KEY_DIR", dir.as_os_str())
+    }
+
+    /// #9730 — class guard: no sign test in this module may set
+    /// `AI_MEMORY_KEY_DIR` by hand. The raw setters that remain are the one
+    /// inside [`bind_key_dir`] and the one in
+    /// `env_var_guard_restores_previous_value_on_drop`, which tests the guard
+    /// itself. A new sign test that skips the helper adds a third and fails
+    /// here in every run.
+    #[test]
+    fn key_dir_override_goes_through_bind_key_dir_9730() {
+        const ALLOWED_RAW_SETTERS: usize = 2;
+        let src = include_str!("store.rs");
+        let needle = ["EnvVarGuard::set(", "\"AI_MEMORY_KEY_DIR\""].concat();
+        let hits = src.matches(needle.as_str()).count();
+        assert_eq!(
+            hits, ALLOWED_RAW_SETTERS,
+            "AI_MEMORY_KEY_DIR must be set through bind_key_dir (#9730); found {hits} raw setters"
+        );
+    }
+
     #[test]
     fn test_store_sign_with_bound_key_stamps_agent_attested() {
         let _lock = locked_env();
         let key_dir = tempfile::tempdir().unwrap();
-        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _kd = bind_key_dir(key_dir.path());
         // #1751 — pin "0" (never clear): clearing would open a strict
         // required-default window that leaks into concurrent unsigned
         // store tests in this parallel lib-test binary.
@@ -1315,7 +1349,7 @@ mod tests {
     fn store_sign_without_bound_key_refuses_3409() {
         let _lock = locked_env();
         let key_dir = tempfile::tempdir().unwrap();
-        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _kd = bind_key_dir(key_dir.path());
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
             std::ffi::OsStr::new("0"),
@@ -1362,7 +1396,7 @@ mod tests {
     fn store_sign_with_allow_claimed_stores_claimed_and_warns_3409() {
         let _lock = locked_env();
         let key_dir = tempfile::tempdir().unwrap();
-        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _kd = bind_key_dir(key_dir.path());
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
             std::ffi::OsStr::new("0"),
@@ -1394,7 +1428,7 @@ mod tests {
     fn store_sign_with_bound_key_is_agent_attested_3409() {
         let _lock = locked_env();
         let key_dir = tempfile::tempdir().unwrap();
-        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _kd = bind_key_dir(key_dir.path());
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
             std::ffi::OsStr::new("0"),
@@ -1440,7 +1474,7 @@ mod tests {
         let _lock = locked_env();
         // Empty key dir — no `<agent_id>.priv` to load.
         let key_dir = tempfile::tempdir().unwrap();
-        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _kd = bind_key_dir(key_dir.path());
         // #1751 — pin "0" (never clear); see the sibling test above.
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
