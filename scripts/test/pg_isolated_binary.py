@@ -12,12 +12,22 @@ from a never-connected template, so binaries can run side by side.
 
 Sub-commands (``-h`` on each):
 
-``setup``     check the LIVE connection budget (``max_connections`` minus
-              reserved slots minus the sessions open right now) and create
-              ``<db>_tpl`` (age + vector, ``IS_TEMPLATE true
-              ALLOW_CONNECTIONS false``). ``--emit-env`` prints
-              ``AI_MEMORY_TEST_PG_TEMPLATE=`` and ``AI_MEMORY_TEST_PG_RUN_ID=``
-              lines for ``$GITHUB_ENV``. Fails closed.
+``setup``     refuse a base ``--db`` that is not an ephemeral CI base
+              (``ai_memory_test_ci_<run>_<attempt>_<leg>``: run 1-20 digits,
+              attempt 1-5 digits, leg 1-36 of ``[a-z0-9_]``) unless
+              ``--allow-shared-base "<reason>"`` names why a shared base is safe
+              (the URL default is a shared base; no base is ever created here),
+              refuse a base whose ``lineage_integrity_watermark.high_water`` is
+              above ``count(*)`` of ``agent_lineage`` in any schema (#6983; a
+              row the precheck cannot read is a refusal too), check the LIVE
+              connection budget (``max_connections`` minus reserved slots minus
+              the sessions open right now) and create ``<db>_tpl`` (age +
+              vector, ``IS_TEMPLATE true ALLOW_CONNECTIONS false``).
+              ``--emit-env`` prints ``AI_MEMORY_TEST_PG_TEMPLATE=`` and
+              ``AI_MEMORY_TEST_PG_RUN_ID=`` lines for ``$GITHUB_ENV``. Fails
+              closed. One ownership guard holds every name this run CREATEd:
+              any exception, and SIGTERM / SIGINT / SIGHUP in any window, drop
+              exactly those names (plain DROP, never FORCE) before the exit.
 ``run``       run ``cargo test --no-fail-fast --test <bin>`` once per binary,
               each against its own clone (held by a keepalive session while in
               use), ``--jobs`` at a time (degraded to what the live budget
@@ -26,7 +36,10 @@ Sub-commands (``-h`` on each):
               binary under ``--log-dir``; a failing binary's tail is echoed.
               SIGTERM/SIGINT stop dispatch, signal every child group, drop the
               clones and exit 143.
-``teardown``  drop THIS run's clones (``--run-id``) and the template.
+``teardown``  drop THIS run's clones (``--run-id``) and the template. The
+              ``--db`` is classified as in setup, and a ``--db`` whose template
+              is not the ``AI_MEMORY_TEST_PG_TEMPLATE`` setup emitted is
+              refused. A signal does not stop it: every drop is still tried.
 ``sweep``     ADMIN ONLY, never run by CI: drop idle clones of any run that
               are older than ``--older-than`` seconds (at least 600).
 
@@ -44,9 +57,13 @@ uses the same shape.
 
 Exit codes: 0 success, 2 usage or wrapper error (fails closed), 3 a clone
 could not be minted or held, 143 terminated, otherwise the worst exit code of
-the cargo runs. Standard library only, Python 3.9+.
+the cargo runs. ``setup`` and ``teardown`` also exit 5 when a database of this
+run is still on the server (or may be, after a CREATE without a clean answer),
+naming it, and 128 + the signal number after SIGTERM / SIGINT / SIGHUP; 5 wins
+over a signal, a signal over 2. Standard library only, Python 3.12+.
 """
 import argparse
+import contextlib
 import os
 import re
 import signal
@@ -58,7 +75,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, IO, List, Optional, Set, Tuple
+from typing import Dict, IO, Iterator, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 
@@ -148,6 +165,22 @@ IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
 EXIT_MINT = 3
 EXIT_TERM = 143
+EXIT_UNRELEASED = 5  # setup / teardown: a database of this run is (or may be) still on the server
+SIGNAL_EXIT_BASE = 128  # setup / teardown exit 128 + signum after a handled signal
+HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# decision: an ephemeral base is recognised by a string parse over a new regex, because the parse is linear by
+# construction on at most IDENT_MAX characters and every regex of this module is pinned by the regex audit.
+EPHEMERAL_PREFIX = 'ai_memory_test_ci_'
+EPHEMERAL_RUN_MAX = 20
+EPHEMERAL_ATTEMPT_MAX = 5
+EPHEMERAL_LEG_MAX = 36  # a 59-byte base (IDENT_MAX minus the template suffix) leaves at most this for the leg
+EPHEMERAL_LEG_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz0123456789_')
+SHARED_REASON_MAX = 200
+WATERMARK_TABLE = 'lineage_integrity_watermark'
+LINEAGE_RELATION = 'agent_lineage'
+WATERMARK_MAX_ROWS = 64  # rows per schema, and schemas per base, the precheck reads (LIMIT one more to see excess)
+HIGH_WATER_MAX_DIGITS = 19  # a BIGINT has at most 19 digits
+ROW_QUOTE_MAX = 200  # a refused row or count is quoted at most this many characters: the output stays bounded
 
 # URL query keys and the libpq variable each maps to. Anything else fails
 # closed rather than being silently dropped.
@@ -221,7 +254,7 @@ def quote_ident(name: str) -> str:
 
 
 def valid_run_id(run_id: str) -> bool:
-    return bool(_RUN_ID_RE.match(run_id or ''))
+    return bool(_RUN_ID_RE.fullmatch(run_id or ''))
 
 
 def new_run_id() -> str:
@@ -242,7 +275,7 @@ def isolated_db_name(run_id: str, now: Optional[int] = None) -> str:
 
 def parse_isolated_name(name: str, run_id: Optional[str] = None) -> Optional[int]:
     """Creation time of a clone name; with ``run_id`` only that run's clones."""
-    found = _ANY_NAME_RE.match(name or '')
+    found = _ANY_NAME_RE.fullmatch(name or '')
     if not found:
         return None
     if run_id is not None and found.group(1) != run_id:
@@ -256,7 +289,7 @@ def run_prefix(run_id: str) -> str:
 
 def parse_target_line(line: str) -> List[str]:
     """``--test foo`` or ``--bin foo`` only; anything else is refused."""
-    found = _TARGET_RE.match(line.strip())
+    found = _TARGET_RE.fullmatch(line.strip())
     if not found:
         raise WrapperError('refusing target selector %r' % line)
     return ['--' + found.group(1), found.group(2)]
@@ -274,9 +307,46 @@ def template_name(db_name: str) -> str:
 
 
 def _checked_ident(name: str) -> str:
-    if not _IDENT_RE.match(name or ''):
+    if not _IDENT_RE.fullmatch(name or ''):
         raise WrapperError('unsafe database name %r' % name)
     return name
+
+
+def _ascii_digits(text: str, most: int) -> bool:
+    """1 to ``most`` ASCII digits and nothing else (``str.isdigit`` alone accepts other scripts' digits)."""
+    return 1 <= len(text) <= most and text.isascii() and text.isdigit()
+
+
+def is_ephemeral_base(name: str) -> bool:
+    """``ai_memory_test_ci_<run>_<attempt>_<leg>`` as ci.yml names a job's base: run 1-20 digits, attempt 1-5
+    digits, leg 1-36 of ``[a-z0-9_]``. A string parse on an already-checked identifier: linear, no regex."""
+    if not name.startswith(EPHEMERAL_PREFIX):
+        return False
+    parts = name[len(EPHEMERAL_PREFIX):].split('_', 2)
+    if len(parts) != 3:
+        return False
+    run, attempt, leg = parts
+    return (_ascii_digits(run, EPHEMERAL_RUN_MAX) and _ascii_digits(attempt, EPHEMERAL_ATTEMPT_MAX)
+            and 1 <= len(leg) <= EPHEMERAL_LEG_MAX and all(ch in EPHEMERAL_LEG_CHARS for ch in leg))
+
+
+def checked_base(db_name: str, allow_shared: Optional[str] = None) -> str:
+    """I1: the base a template is built beside. Every name is first a safe identifier; then only an ephemeral CI
+    base passes, unless ``allow_shared`` gives a reason for using a shared one. No SQL runs before this, and no
+    base is ever created: a refused name stays refused (#7031)."""
+    _checked_ident(db_name)
+    if allow_shared is not None:
+        reason = allow_shared.strip()
+        if not reason or len(allow_shared) > SHARED_REASON_MAX or not allow_shared.isprintable():
+            raise WrapperError('refusing --allow-shared-base: the reason must be 1 to %d printable characters that '
+                               'say why a shared base is safe here' % SHARED_REASON_MAX)
+        log('shared base %r allowed: %s' % (db_name, reason))
+        return db_name
+    if not is_ephemeral_base(db_name):
+        raise WrapperError('refusing base database %r: only an ephemeral CI base (%s<run>_<attempt>_<leg>) may back '
+                           'a template; pass --allow-shared-base "<reason>" to use a shared base on purpose'
+                           % (db_name, EPHEMERAL_PREFIX))
+    return db_name
 
 
 # --- connection budget ----------------------------------------------------
@@ -858,7 +928,13 @@ def drop(admin_url: str, name: str, run_id: Optional[str], attempts: int = DROP_
     retried while the session drains, then the drop fails."""
     if parse_isolated_name(name, run_id) is None:
         raise WrapperError('refusing to drop %r: not a clone of run %r' % (name, run_id))
-    sql = 'DROP DATABASE IF EXISTS %s' % quote_ident(name)
+    _drop_settled(admin_url, name, attempts)
+
+
+def _drop_settled(admin_url: str, name: str, attempts: int = DROP_ATTEMPTS) -> None:
+    """Plain ``DROP DATABASE IF EXISTS`` (never FORCE) of a name the caller owns, retried while a session drains;
+    any other error, or the last in-use answer, is raised."""
+    sql = 'DROP DATABASE IF EXISTS %s' % quote_ident(_checked_ident(name))
     for attempt in range(1, attempts + 1):
         try:
             psql(admin_url, sql)
@@ -924,71 +1000,251 @@ def _proved_absent(url: str, check: str) -> Tuple[bool, str]:
     return True, ''
 
 
-def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
-    """Check the live budget, then create the locked template. Returns its name."""
-    _checked_ident(db_name)
+def _describe(exc: BaseException) -> str:
+    """The message of a WrapperError, else ``unexpected <type>[: <text>]``: every exception type gets one line."""
+    if isinstance(exc, WrapperError):
+        return str(exc)
+    text = str(exc)
+    return 'unexpected %s%s' % (type(exc).__name__, (': %s' % text) if text else '')
+
+
+class _Interrupted(BaseException):
+    """A handled signal arrived; raised only at a checkpoint between two statements, never inside one."""
+
+
+class _Lifetime:
+    """I3/I4, the one ownership guard of setup and teardown. A name is owned only after a CREATE of it succeeded in
+    this run; ``release`` drops exactly the owned names (plain DROP, never FORCE) and names every one it could not
+    drop in ``left``. ``maybe`` holds a name whose CREATE ended without a clean answer: never dropped, always named.
+    ``signum`` is set by the flag-only signal handler; ``checkpoint`` turns it into ``_Interrupted``."""
+
+    def __init__(self) -> None:
+        self.owned: List[str] = []
+        self.locked: Set[str] = set()
+        self.maybe: List[str] = []
+        self.left: List[Tuple[str, str]] = []
+        self.signum: Optional[int] = None
+
+    def note_signal(self, signum: int, _frame: object) -> None:
+        if self.signum is None:
+            self.signum = signum
+
+    def checkpoint(self) -> None:
+        if self.signum is not None:
+            raise _Interrupted()
+
+    def own(self, name: str) -> None:
+        self.owned.append(name)
+
+    def release(self, url: str) -> None:
+        """Drop every owned name, newest first. Runs to the end whatever is raised or signalled meanwhile."""
+        while self.owned:
+            name = self.owned.pop()
+            q = quote_ident(name)
+            try:
+                if name in self.locked:
+                    try:
+                        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
+                    except WrapperError:
+                        pass  # the DROP below reports what is wrong
+                _drop_settled(url, name)
+            except BaseException as exc:  # every type: a name not dropped is named, never lost
+                self.left.append((name, _describe(exc)))
+            self.locked.discard(name)
+
+
+@contextlib.contextmanager
+def _signals(lifetime: _Lifetime) -> Iterator[_Lifetime]:
+    """Flag-only handlers for SIGTERM / SIGINT / SIGHUP while setup or teardown runs; the previous handlers are
+    restored on the way out. A flag handler never raises inside a statement, so a CREATE is never cut between the
+    server's commit and the ownership record (PEP 475 retries the interrupted wait)."""
+    previous = {}
+    try:
+        for sig in HANDLED_SIGNALS:
+            previous[sig] = signal.signal(sig, lifetime.note_signal)
+        yield lifetime
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _report(lifetime: _Lifetime, error: Optional[str]) -> int:
+    """I4: one line per fact, then the exit code: 5 while a name of this run is (or may be) on the server, else
+    128 + signum after a signal, else 2 after an error, else 0."""
+    lines = [error] if error else []
+    if lifetime.signum is not None:
+        lines.append('interrupted by signal %d (%s)' % (lifetime.signum, signal.Signals(lifetime.signum).name))
+    for name, cause in lifetime.left:
+        lines.append('unreleased: database %s of this run is still on the server: %s; drop it with a plain DROP '
+                     'DATABASE once no session holds it' % (name, cause))
+    for name in lifetime.maybe:
+        lines.append("unreleased: database %s may exist with no owner record (the CREATE ended without a clean "
+                     "answer); check with `SELECT 1 FROM pg_database WHERE datname = '%s'` and drop it with a plain "
+                     "DROP DATABASE if this run made it" % (name, name))
+    with _PRINT_LOCK:
+        for text in lines:
+            print(wa.log_line('pg_isolated_binary: %s' % text), file=sys.stderr, flush=True)
+    if lifetime.left or lifetime.maybe:
+        return EXIT_UNRELEASED
+    if lifetime.signum is not None:
+        return SIGNAL_EXIT_BASE + lifetime.signum
+    return EXIT_USAGE if error else 0
+
+
+def _quoted(text: str) -> str:
+    """A bounded excerpt of server output for a refusal message."""
+    return text[:ROW_QUOTE_MAX]
+
+
+def _precheck_read(base_url: str, db_name: str, sql: str) -> str:
+    try:
+        return psql(base_url, sql, tuples=True)
+    except WrapperError as exc:
+        raise WrapperError('refusing base database %r: the lineage precheck could not read it: %s' % (db_name, exc))
+
+
+_WATERMARK_SCHEMAS_SQL = (
+    "SELECT n.nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relname = '%s' AND c.relkind IN ('r', 'p') ORDER BY n.nspname LIMIT %d"
+    % (WATERMARK_TABLE, WATERMARK_MAX_ROWS + 1))
+
+
+def _high_water(db_name: str, schema: str, raw: str) -> Optional[int]:
+    """The highest ``agent_lineage`` mark of one schema's watermark rows, None when it has none. Every row must be
+    exactly ``agent_lineage|<1-19 ASCII digits>``; anything else is a refusal, never a skip (#7157)."""
+    rows = [row for row in raw.split('\n') if row]
+    if len(rows) > WATERMARK_MAX_ROWS:
+        raise WrapperError('refusing base database %r: %s in schema %s has more than %d rows'
+                           % (db_name, WATERMARK_TABLE, schema, WATERMARK_MAX_ROWS))
+    highest = None
+    for row in rows:
+        fields = row.split('|')
+        why = None
+        if len(fields) != 2:
+            why = 'not two fields'
+        elif fields[0] != LINEAGE_RELATION:
+            why = 'relation is not %s' % LINEAGE_RELATION
+        elif not _ascii_digits(fields[1], HIGH_WATER_MAX_DIGITS):
+            why = 'high_water is not a non-negative integer of at most %d digits' % HIGH_WATER_MAX_DIGITS
+        if why:
+            raise WrapperError('refusing base database %r: %s in schema %s has a row the precheck cannot read '
+                               '(%s): %r' % (db_name, WATERMARK_TABLE, schema, why, _quoted(row)))
+        mark = int(fields[1])
+        highest = mark if highest is None else max(highest, mark)
+    return highest
+
+
+def lineage_precheck(url: str, db_name: str) -> None:
+    """I2: refuse a base whose ``lineage_integrity_watermark.high_water`` is above ``count(*)`` of
+    ``agent_lineage`` in any schema (#6983). Reads only, on the base itself, one statement per call, every
+    answer bounded (schemas and rows LIMIT 65, a row quoted at most ROW_QUOTE_MAX characters)."""
+    base_url = with_database(url, db_name)
+    schemas = [name for name in _precheck_read(base_url, db_name, _WATERMARK_SCHEMAS_SQL).split('\n') if name]
+    if len(schemas) > WATERMARK_MAX_ROWS:
+        raise WrapperError('refusing base database %r: %s sits in more than %d schemas'
+                           % (db_name, WATERMARK_TABLE, WATERMARK_MAX_ROWS))
+    for schema in sorted(schemas):
+        if not _IDENT_RE.fullmatch(schema):
+            raise WrapperError('refusing base database %r: %s sits in a schema with an unsafe name %r'
+                               % (db_name, WATERMARK_TABLE, _quoted(schema)))
+    for schema in sorted(schemas):
+        raw = _precheck_read(base_url, db_name, 'SELECT relation, high_water FROM %s.%s ORDER BY relation LIMIT %d'
+                             % (quote_ident(schema), WATERMARK_TABLE, WATERMARK_MAX_ROWS + 1))
+        highest = _high_water(db_name, schema, raw)
+        if highest is None:
+            continue
+        counted = _precheck_read(base_url, db_name, 'SELECT count(*) FROM %s.%s'
+                                 % (quote_ident(schema), quote_ident(LINEAGE_RELATION))).strip()
+        if not _ascii_digits(counted, HIGH_WATER_MAX_DIGITS):
+            raise WrapperError('refusing base database %r: count(*) of %s.%s is not an integer (%r)'
+                               % (db_name, schema, LINEAGE_RELATION, _quoted(counted)))
+        if highest > int(counted):
+            raise WrapperError('refusing base database %r: the append-only relation `%s.%s` REGRESSED from a '
+                               'previously-recorded high-water mark of %d row(s) to %d; a template built beside it '
+                               'would run the suite on a poisoned base (#6983)'
+                               % (db_name, schema, LINEAGE_RELATION, highest, int(counted)))
+
+
+def setup(url: str, db_name: str, jobs: int = MAX_JOBS, allow_shared: Optional[str] = None,
+          lifetime: Optional[_Lifetime] = None) -> str:
+    """Classify the base (I1), precheck its lineage (I2), check the live budget, then create the locked template
+    under the ownership guard (I3). Returns its name. On any exception the template this call created is dropped
+    before the exception goes on; a name that could not be dropped is in ``lifetime.left``."""
+    checked_base(db_name, allow_shared)
     tpl = _checked_ident(template_name(db_name))
     need = required_connections(clamp_jobs(jobs))
-    most, reserved, now, available = connection_budget(url)
-    if available < need:
-        raise WrapperError('only %d free connection slots (max_connections=%d, reserved=%d, open now=%d); '
-                           '%d needed for %d parallel binaries' % (available, most, reserved, now, need, jobs))
-    q = quote_ident(tpl)
-    # Ownership comes only from a successful CREATE. An occupied name (a foreign
-    # or leftover template) or a missing privilege refuses: this function never
-    # ALTERs or DROPs a database it did not create (#7127).
+    life = _Lifetime() if lifetime is None else lifetime
     try:
-        psql(url, 'CREATE DATABASE %s' % q)
-    except WrapperError as exc:
-        if ALREADY_EXISTS in str(exc):
-            raise WrapperError('refusing to use template %s, it was not created by this run: %s; if it is a '
-                               'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
-                               '--run-id <run id>` first, otherwise choose a different --db'
-                               % (tpl, exc, db_name))
-        check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
-        if exc.returncode is None:
-            why = 'psql timed out, so the server may still commit the statement'
-        else:
-            why = 'psql ended with status %s, not a plain SQL error' % exc.returncode
-        absent = False
-        if exc.returncode == PSQL_SQL_ERROR:
-            absent, why = _proved_absent(url, check)
-        if not absent:
-            # Status 1 means refused only when the existence check run just above succeeds with no row. A row, a
-            # failed check or any other status (2 lost connection, a negative signal status such as -9, None, an
-            # unexpected code) may follow a committed CREATE, so the outcome is unknown: setup neither claims the
-            # template nor DROPs it (#7388, #7400, #7427, #7428).
-            raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
-                               'template may exist with no owner record: %s; %s; to check by hand run `%s` and, if '
-                               'the template is from this run, run `pg_isolated_binary.py teardown --db %s '
-                               '--run-id <run id>`'
-                               % (tpl, exc, why, check, db_name), exc.returncode)
-        raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
-    try:
-        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age')
-        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS vector')
-        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
-    except BaseException:
-        # The template is ours now and nothing else will drop it: plain DROP,
-        # never FORCE; the primary error stays the one raised.
+        lineage_precheck(url, db_name)
+        life.checkpoint()
+        most, reserved, now, available = connection_budget(url)
+        if available < need:
+            raise WrapperError('only %d free connection slots (max_connections=%d, reserved=%d, open now=%d); '
+                               '%d needed for %d parallel binaries' % (available, most, reserved, now, need, jobs))
+        life.checkpoint()
+        q = quote_ident(tpl)
+        # Ownership comes only from a successful CREATE. An occupied name (a foreign
+        # or leftover template) or a missing privilege refuses: this function never
+        # ALTERs or DROPs a database it did not create (#7127).
         try:
-            psql(url, 'DROP DATABASE IF EXISTS %s' % q)
-        except WrapperError as cleanup:
-            log('WARN could not drop the half-built template %s: %s' % (tpl, cleanup))
+            psql(url, 'CREATE DATABASE %s' % q)
+        except WrapperError as exc:
+            if ALREADY_EXISTS in str(exc):
+                raise WrapperError('refusing to use template %s, it was not created by this run: %s; if it is a '
+                                   'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
+                                   '--run-id <run id>` first, otherwise choose a different --db'
+                                   % (tpl, exc, db_name))
+            check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
+            if exc.returncode is None:
+                why = 'psql timed out, so the server may still commit the statement'
+            else:
+                why = 'psql ended with status %s, not a plain SQL error' % exc.returncode
+            absent = False
+            if exc.returncode == PSQL_SQL_ERROR:
+                absent, why = _proved_absent(url, check)
+            if not absent:
+                # Status 1 means refused only when the existence check run just above succeeds with no row. A row,
+                # a failed check or any other status (2 lost connection, a negative signal status such as -9, None,
+                # an unexpected code) may follow a committed CREATE, so the outcome is unknown: setup neither claims
+                # the template nor DROPs it, and the exit names it (#7388, #7400, #7427, #7428, #7200).
+                life.maybe.append(tpl)
+                raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
+                                   'template may exist with no owner record: %s; %s; to check by hand run `%s` and, '
+                                   'if the template is from this run, run `pg_isolated_binary.py teardown --db %s '
+                                   '--run-id <run id>`'
+                                   % (tpl, exc, why, check, db_name), exc.returncode)
+            raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
+        life.own(tpl)
+        life.checkpoint()
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age')
+        life.checkpoint()
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS vector')
+        life.checkpoint()
+        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
+        life.locked.add(tpl)
+        life.checkpoint()
+    except BaseException:
+        # Only what this call created is dropped: plain DROP, never FORCE; the primary error stays the one raised.
+        done = len(life.left)
+        life.release(url)
+        for name, cause in life.left[done:]:
+            log('WARN could not drop the half-built template %s: %s' % (name, cause))
         raise
     log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
     return tpl
 
 
 def _names(url: str, sql: str) -> List[str]:
-    return [n for n in psql(url, sql, tuples=True).split() if _IDENT_RE.match(n)]
+    return [n for n in psql(url, sql, tuples=True).split() if _IDENT_RE.fullmatch(n)]
 
 
-def teardown(url: str, db_name: str, run_id: str) -> int:
-    """Drop this run's clones, then the template. Returns how many drops failed."""
+def teardown(url: str, db_name: str, run_id: str, lifetime: Optional[_Lifetime] = None) -> int:
+    """Drop this run's clones, then the template (ALTER IS_TEMPLATE false, then a plain DROP that waits out the
+    settle window). Every drop is tried; a name not dropped goes to ``lifetime.left``. Returns how many failed."""
     _checked_ident(db_name)
     prefix = run_prefix(run_id)
     tpl = _checked_ident(template_name(db_name))
+    life = _Lifetime() if lifetime is None else lifetime
     failed = 0
     names = [n for n in _names(url, "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')" % prefix)
              if parse_isolated_name(n, run_id) is not None]
@@ -997,6 +1253,7 @@ def teardown(url: str, db_name: str, run_id: str) -> int:
             drop(url, name, run_id)
         except WrapperError as exc:
             failed += 1
+            life.left.append((name, str(exc)))
             log('WARN could not drop %s: %s' % (name, exc))
     q = quote_ident(tpl)
     try:
@@ -1004,9 +1261,10 @@ def teardown(url: str, db_name: str, run_id: str) -> int:
     except WrapperError:
         pass  # already gone
     try:
-        psql(url, 'DROP DATABASE IF EXISTS %s' % q)
+        _drop_settled(url, tpl)
     except WrapperError as exc:
         failed += 1
+        life.left.append((tpl, str(exc)))
         log('WARN could not drop the template %s: %s' % (tpl, exc))
     log('teardown of run %s: %d clone(s) and template %s, %d failure(s)' % (run_id, len(names), tpl, failed))
     return failed
@@ -1229,11 +1487,15 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument('--run-id', help='run id for the clone names (default: generated)')
     setup_p.add_argument('--emit-env', action='store_true',
                          help='print %s= and %s= lines for $GITHUB_ENV' % (TEMPLATE_VAR, RUN_ID_VAR))
+    setup_p.add_argument('--allow-shared-base', metavar='REASON',
+                         help='build the template beside a base that is not an ephemeral CI base, for this reason')
 
     down = sub.add_parser('teardown', help="drop this run's clones and the template")
     down.add_argument('--url', help=url_help)
     down.add_argument('--db', help='base database (default: the URL database)')
     down.add_argument('--run-id', help='the run whose clones are dropped (default: $%s)' % RUN_ID_VAR)
+    down.add_argument('--allow-shared-base', metavar='REASON',
+                      help='tear down the template of a base that is not an ephemeral CI base, for this reason')
 
     sweep_p = sub.add_parser('sweep', help='ADMIN ONLY: drop idle clones of any run older than N s')
     sweep_p.add_argument('--url', help=url_help)
@@ -1282,6 +1544,59 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     return runner.run_all(targets, residual)
 
 
+def _guarded(url: str, body) -> int:
+    """Run ``body(lifetime)`` under the flag-only signal handlers; every outcome, including every exception type,
+    ends in ``_report`` (I4). Owned names are released before the report."""
+    life = _Lifetime()
+    error = None
+    with _signals(life):
+        try:
+            body(life)
+        except _Interrupted:
+            pass
+        except BaseException as exc:  # every type gets a line and a non-zero exit, never a traceback
+            error = _describe(exc)
+        finally:
+            life.release(url)
+    return _report(life, error)
+
+
+def _cmd_setup(args: argparse.Namespace, url: str) -> int:
+    db = args.db or database_name(url)
+
+    def body(life: _Lifetime) -> None:
+        run_id = checked_run_id(args.run_id or new_run_id())
+        tpl = setup(url, db, args.jobs, args.allow_shared_base, life)
+        # decision: the hand-over runs with the handled signals blocked over a second checkpoint after the emit,
+        # because a signal that lands between the emit and the hand-over would otherwise exit 128+signum with an
+        # emitted template nobody names; blocked, a signal before the hand-over drops the template (nothing is
+        # emitted), and one after it is delivered once the job owns the template its teardown drops.
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+        try:
+            life.checkpoint()
+            if args.emit_env:
+                _emit('%s=%s' % (TEMPLATE_VAR, tpl))
+                _emit('%s=%s' % (RUN_ID_VAR, run_id))
+            life.owned.clear()  # handed over: from here the template belongs to the job, and teardown drops it
+            life.locked.clear()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+    return _guarded(url, body)
+
+
+def _cmd_teardown(args: argparse.Namespace, url: str) -> int:
+    db = args.db or database_name(url)
+
+    def body(life: _Lifetime) -> None:
+        checked_base(db, args.allow_shared_base)
+        emitted = os.environ.get(TEMPLATE_VAR)
+        if emitted and emitted != template_name(db):
+            raise WrapperError("refusing teardown --db %r: its template %r is not %s=%r, the template this job's "
+                               "setup emitted" % (db, template_name(db), TEMPLATE_VAR, emitted))
+        teardown(url, db, checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR)), life)
+    return _guarded(url, body)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     try:
         args = build_parser().parse_args(argv)
@@ -1290,17 +1605,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         url = _url(args)
         if args.cmd == 'setup':
-            db = args.db or database_name(url)
-            run_id = checked_run_id(args.run_id or new_run_id())
-            tpl = setup(url, db, args.jobs)
-            if args.emit_env:
-                _emit('%s=%s' % (TEMPLATE_VAR, tpl))
-                _emit('%s=%s' % (RUN_ID_VAR, run_id))
-            return 0
+            return _cmd_setup(args, url)
         if args.cmd == 'teardown':
-            db = args.db or database_name(url)
-            teardown(url, db, checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR)))
-            return 0
+            return _cmd_teardown(args, url)
         if args.cmd == 'sweep':
             sweep(url, args.older_than)
             return 0

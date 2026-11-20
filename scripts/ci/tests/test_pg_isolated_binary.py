@@ -2522,7 +2522,7 @@ class LiveEndToEnd(unittest.TestCase):
     def test_setup_run_teardown_creates_and_drops_a_clone(self):
         url = _live_url()
         d = Path(scratch_dir())
-        db = 'ai_memory_e2e_%s' % uuid.uuid4().hex[:8]
+        db = 'ai_memory_test_ci_7031_1_e%s' % uuid.uuid4().hex[:8]  # an ephemeral base (#7031)
         run_id = 'e' + uuid.uuid4().hex[:10]
         probe = d / 'probe.py'
         probe.write_text(
@@ -2535,6 +2535,9 @@ class LiveEndToEnd(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
         env.update({pib.URL_VAR: url, pib.FLAG_VAR: '1'})
         env.pop(pib.KILL_VAR, None)
+        # setup never creates its base (#7031): the job creates it first, as ci.yml does, and drops it after.
+        pib.psql(url, 'CREATE DATABASE %s' % pib.quote_ident(db))
+        self.addCleanup(pib.psql, url, 'DROP DATABASE IF EXISTS %s' % pib.quote_ident(db))
         setup = subprocess.run([sys.executable, str(SCRIPT), 'setup', '--db', db, '--jobs', '1',
                                 '--run-id', run_id, '--emit-env'], env=env, capture_output=True, text=True)
         self.assertEqual(setup.returncode, 0, setup.stderr)
@@ -2598,7 +2601,7 @@ class ConnectTimeout7866(unittest.TestCase):
                                AI_MEMORY_TEST_POSTGRES_URL=BASE + '&connect_timeout=' + '9' * digits,
                                PYTHONPATH=str(directory), PSQL_MARKER_7866=str(marker))
                     result = subprocess.run(
-                        [sys.executable, str(SCRIPT), 'setup', '--db', 'issue7866', '--jobs', '1'],
+                        [sys.executable, str(SCRIPT), 'setup', '--db', 'ai_memory_test_ci_7866_1_x', '--jobs', '1'],
                         env=env, capture_output=True, text=True, timeout=30)
                     self.assertFalse(marker.exists(), "refusal must precede psql")
                     self.assertEqual(result.returncode, 2, result.stderr[:1000])
