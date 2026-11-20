@@ -628,6 +628,11 @@ class MirrorInputs9732(unittest.TestCase):
                 _problems(warm_job_ops=(("sub", "id: rust-cache", "id: rust-cache2"),)),
                 [f"{base.WARM}:{WARM_JOB_ID} step {CACHE_ID!r}: key 'id' is 'rust-cache2', the "
                  f"hand table says 'rust-cache'"])
+        with self.subTest(case="warm cache name"):
+            self.assertEqual(
+                _problems(warm_job_ops=(("sub", f"name: {CACHE_WARM_NAME}", "name: Rust cache"),)),
+                [f"{base.WARM}:{WARM_JOB_ID} step {CACHE_ID!r}: key 'name' is 'Rust cache', the "
+                 f"hand table says {CACHE_WARM_NAME!r}"])
         with self.subTest(case="warm toolchain gets an if"):
             self.assertEqual(
                 _problems(warm_job_ops=(("after", "name: Install Rust 1.99.1",
