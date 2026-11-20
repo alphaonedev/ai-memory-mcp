@@ -698,7 +698,9 @@ class HandlerReasons(unittest.TestCase):
         fetch = [tb._Step("get", {"run": "git fetch origin pull/1/head"}, 0)]
         self.assertEqual(tb._pre_scan_fetch(fetch, {}, {}), "step 'get' fetches a pull-request tree")
         self.assertIsNone(tb._pre_scan_fetch([tb._Step("ok", {"run": "echo ok"}, 0)], {}, {}))
-        self.assertIsNone(tb._pre_scan_fetch([tb._Step("uses", {"uses": "./x"}, 0)], {}, {}))
+        # 9566 item 3: a uses: step is a form the pre-scan does not read; it is never skipped.
+        self.assertEqual(tb._pre_scan_fetch([tb._Step("uses", {"uses": "./x"}, 0)], {}, {}),
+                         "step 'uses' uses an action, which the pre-scan does not read")
 
     def test_9452_pre_scan_unread_job_is_analysed_in_full(self) -> None:
         _need_module(self)
@@ -756,7 +758,8 @@ class HandlerReasons(unittest.TestCase):
 # 9566: a job with no pull-request trigger is trusted-only only when the pre-scan read every
 # run step. Corpus: non-PR event x carrier (step secret, write scope, id token) x one step
 # form the pre-scan does not read; each row is the run text and the exact pre-scan reason.
-# The uses: column of this corpus arrives with the second PR of 9566.
+# The uses:, shell:, defaults and container forms (9566 item 3) are the corpus of
+# test_ci_tainted_job_boundary_prescan_uses.py.
 # ---------------------------------------------------------------------------------------
 
 UNREAD_STEP = "s"

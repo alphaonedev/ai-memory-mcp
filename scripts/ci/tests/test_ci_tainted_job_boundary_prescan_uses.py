@@ -145,7 +145,8 @@ CLEAN_FORMS: tuple[tuple[str, dict, dict, dict], ...] = (
 # --- P-4: one mutant per syntactic form of the pre-scan. Each row: the form, the exact source
 # line, its replacement and the STEP_FORMS row that must go red. ---
 MUTANTS: tuple[tuple[str, str, str, str], ...] = (
-    ("steps container is a list", "    if not isinstance(steps, list):", "    if False:", "steps-not-list"),
+    ("steps container is a list", "    if not isinstance(steps, list):  # the pre-scan steps container",
+     "    if False:", "steps-not-list"),
     ("defaults container is a map", "    if not isinstance(defaults, dict):", "    if False:", "job-defaults-not-map"),
     ("defaults key is run", '        if key != "run":', "        if False:", "job-defaults-other-key"),
     ("defaults.run container is a map", "    if not isinstance(run, dict):", "    if False:",
@@ -355,7 +356,8 @@ class EveryMutantIsRed(unittest.TestCase):
                 _, bodies, job, doc, reason = _form(case)
                 try:
                     got = module._pre_scan_fetch(_steps(module, bodies), job, doc)
-                except Exception as exc:  # a crash is red too; name it
+                except (AttributeError, KeyError, TypeError, ValueError, module.Unclassifiable) as exc:
+                    # a crash on a mutant form is red too; the exception is named in the result
                     got = f"raised {type(exc).__name__}"
                 self.assertNotEqual(got, reason, f"mutant {form!r} survived")
 

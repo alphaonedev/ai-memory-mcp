@@ -39,12 +39,12 @@ else:
     PYYAML_IMPORT_ERROR = ""
 
 # Three row kinds, three pins (FINAL efb2b9e8, correction 0773f6ce); each pin only goes down.
-# Kind violation: the 13 rows before PR 9508, 4 class (iii) rows of #9553 and the 16 release.yml
-# rows of #9570.
-ALLOW_PIN_EXPECTED = 33
+# Kind violation: the 13 rows before PR 9508, 4 class (iii) rows of #9553 and the 18 release.yml
+# rows of #9570 (two of them the docker job, reached by the full analysis of 9566 item 3).
+ALLOW_PIN_EXPECTED = 35
 ALLOW_ROW_COUNT = 13
 NEW_VIOLATION_ROW_COUNT = 4
-RELEASE_ROW_COUNT = 16
+RELEASE_ROW_COUNT = 18
 OPEN_PIN_EXPECTED = 33
 NOT_ANALYSED_PIN_EXPECTED = 3
 JOB_COUNT_LARGE = 200
@@ -182,7 +182,8 @@ JOB_CLEAN_BASE_TREE = """\
           python3 -I "$base_dir/tool.py" --data .
 """
 
-# 9566: trusted-only needs every run step read in full and running no tree code.
+# 9566: trusted-only needs every step read in full and running no tree code; the uses: step
+# below is a form the pre-scan does not read (item 3), so this job is no-pr-code, never trusted-only.
 JOB_CLEAN_TRUSTED_ONLY = """\
   clean-trusted-only:
     if: github.event_name == 'push'
@@ -260,7 +261,9 @@ SYNTH_VERDICTS = {
     "clean-secret-before": "i",
     "clean-output-before": "clean",
     "clean-base-tree": "no-pr-code",
-    "clean-trusted-only": "trusted-only",
+    # 9566 item 3: a uses: step is a form the pre-scan does not read, so the job is never
+    # trusted-only; the full analysis finds no pull-request code in it.
+    "clean-trusted-only": "no-pr-code",
     "push-publish": "no-pr-code",
     "clean-hosted": "clean",
     "trusted-self-hosted": "iv",
@@ -874,6 +877,16 @@ REAL_RELEASE_VIOLATIONS = (
         'release.yml', 'crates-io', 'Publish to crates.io (with retry)', 'i',
         'secret or token used after pull-request code ran',
     ),
+    # 9566 item 3: the docker job, which the pre-scan skipped (its uses: steps were never read).
+    (
+        'release.yml', 'docker', 'Attest build provenance (Docker image)', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    ('release.yml', 'docker', 'Attest build provenance (Docker image)', 'ii', 'job token has a write scope'),
+    (
+        'release.yml', 'docker', 'Log in to GitHub Container Registry', 'i',
+        'secret held before pull-request code ran can persist into it',
+    ),
     (
         'release.yml', 'homebrew', 'Checkout Homebrew tap', 'i',
         'checkout keeps the token in the workspace for later pull-request code',
@@ -932,6 +945,7 @@ REAL_RELEASE_VIOLATIONS = (
 REAL_RELEASE_VERDICTS = {
     ('release.yml', 'copr'): 'i',
     ('release.yml', 'crates-io'): 'i',
+    ('release.yml', 'docker'): 'i,ii',
     ('release.yml', 'homebrew'): 'i',
     ('release.yml', 'mobile-android'): 'i,ii',
     ('release.yml', 'mobile-ios'): 'i,ii',
