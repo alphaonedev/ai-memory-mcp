@@ -1782,14 +1782,15 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                 } else if let Some(b) = behind {
                     format!(
                         "database at {} is on schema v{}, behind this binary (v{}) — \
-                         refusing to operate it (read-only; {}). Repair: `{}` or {}. \
+                         refusing to operate it (read-only; {}). {}. \
                          Every other section is N/A.",
                         db_path.display(),
                         b.observed,
                         b.supported,
                         crate::storage::schema_guard::SCHEMA_BEHIND_READ_ONLY_REFUSAL,
-                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR,
-                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR_DAEMON,
+                        crate::storage::schema_guard::schema_behind_repair_clause(
+                            crate::storage::schema_guard::BACKEND_SQLITE
+                        ),
                     )
                 } else if e.to_string().contains(db::MISSING_DATABASE_REFUSAL) {
                     format!(
@@ -9819,7 +9820,9 @@ mod cov_doctor_identity_posture_3521 {
             "expected the typed behind refusal: {stdout}"
         );
         assert!(
-            stdout.contains(crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR),
+            stdout.contains(&crate::storage::schema_guard::schema_behind_repair_clause(
+                crate::storage::schema_guard::BACKEND_SQLITE
+            )),
             "expected the repair verb: {stdout}"
         );
         let still: i64 = rusqlite::Connection::open(&db_path)

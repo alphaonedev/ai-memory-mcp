@@ -73,7 +73,6 @@ SELF_HOSTED_JOBS = {
     ("ci.yml", "check"),
     ("cert-postgres-age.yml", "cert-postgres-age"),
     ("postgres-ignored.yml", "postgres-ignored"),
-    ("session-boot-lifetime.yml", "lifetime-tests"),
 }
 DROPPED_ROOT = "/mnt/t9/tmp"
 CONFIRMED_ROOT_CONSTANTS = ("F2_RUNNER_ROOT",)
