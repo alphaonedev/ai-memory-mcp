@@ -33,7 +33,7 @@ FAST_STEP = "Shard partition and wiring unit tests (#6344)"
 # cargo-skip read-set tests (8322, 8328) red (#9646 N1).
 FAST_COMMAND = "python3 -m unittest discover -s scripts/ci/tests -p \"*_shard_wiring_6344.py\""
 FULL_STEP = "All scripts/ci unit tests (#9734)"
-FULL_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
+FULL_COMMAND = "python3 scripts/ci/run_unit_modules.py"
 # The invariant of #9734: the step runs under this many seconds on a GitHub-hosted runner.
 FAST_STEP_CEILING_S = 10.0
 # This module's own wall time (it runs the step command once) may not pass the same ceiling.
