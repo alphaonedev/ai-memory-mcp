@@ -7,6 +7,10 @@ unchanged (invariant for every push):
   (c) the scripts/ci unit-test step lives in exactly one job that is no `needs` ancestor of any
       Check leg, runs on every push and carries no path filter or job-level `if:`.
   (d) the job ids and names of ci.yml equal the list pinned from the base (6c67b17b7).
+  (e) what the moved unit-test step needs holds in its new job: the checkout keeps
+      `fetch-depth: 2` (a push anchors the corpus ratchet on HEAD^), the 7987, 7988 and 9303
+      preparation steps run right before it in that order with their load-bearing lines,
+      and the job timeout stays above the measured step time with headroom.
 
 Every check is a pure function over workflow TEXT that returns the problem lines; the cells
 assert an empty list on the real files and an exact message on a deliberately broken copy.
@@ -29,6 +33,26 @@ DEBUG_EXPR = "${{ matrix.cargo_debug || 'line-tables-only' }}"
 UNIT_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
 UNIT_JOB = "build-script-vetting"
 UNIT_STEP = "Shard partition and wiring unit tests (#6344)"
+# (e) The checkout line a push needs: the Resolve step anchors the ratchet on HEAD^.
+UNIT_CHECKOUT_ACTION = "actions/checkout@"
+UNIT_CHECKOUT_DEPTH = "          fetch-depth: 2"
+# (e) The steps the unit-test step needs, in this order, right before it, each with the line
+# that does its work (moved byte for byte from `classify` at the base 6c67b17b7).
+UNIT_PREP_STEPS = (
+    ("Resolve the corpus ratchet base (#7987)", 'echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"'),
+    ("Fetch the corpus replay objects (#7988)",
+     "run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas"
+     " | xargs git fetch --no-tags --depth=1 origin"),
+    ("Fetch the amendment ledger replay objects (#9303)",
+     "run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas"
+     " | xargs git fetch --no-tags --depth=1 origin"),
+)
+# (e) Timeout floor: the step took 674.9 s in build-script-vetting (run 44738653471) and
+# 11.7 min in classify; the job's own gate work is about 0.5 min. Rounded up, then doubled.
+UNIT_STEP_MEASURED_MIN = 12
+UNIT_JOB_OWN_MIN = 1
+TIMEOUT_HEADROOM_FACTOR = 2
+UNIT_JOB_TIMEOUT_FLOOR_MIN = TIMEOUT_HEADROOM_FACTOR * (UNIT_STEP_MEASURED_MIN + UNIT_JOB_OWN_MIN)
 # Job id -> `name:` of ci.yml at the base 6c67b17b7, in file order.
 PINNED_JOBS = (
     ("select", "Impact selection"),
@@ -200,6 +224,69 @@ def problems_unit_placement(workflows: dict) -> list:
 
 
 # ---------------------------------------------------------------------------------------
+# (e) what the moved unit-test step needs, in its new job
+# ---------------------------------------------------------------------------------------
+
+STEP_START_RE = re.compile(r"^      - ")
+STEP_NAME_RE = re.compile(r"^      (?:- |  )name: (.*)$")
+
+
+def job_steps(block: list) -> list:
+    """(step name, its lines) per step of a job block; a `uses:` step without a name gets ''."""
+    steps: list = []
+    for line in block:
+        if STEP_START_RE.match(line):
+            steps.append(["", []])
+        if steps:
+            steps[-1][1].append(line)
+            match = STEP_NAME_RE.match(line)
+            if match and not steps[-1][0]:
+                steps[-1][0] = match.group(1).strip()
+    return [(name, lines) for name, lines in steps]
+
+
+def job_timeout(block: list):
+    for line in block:
+        match = KEY_RE.match(line)
+        if match and match.group(1) == "timeout-minutes":
+            value = match.group(2).strip()
+            return int(value) if value.isdigit() else None
+    return None
+
+
+def problems_unit_needs(workflows: dict) -> list:
+    out: list = []
+    block = jobs_of(workflows[CI]).get(UNIT_JOB, [])
+    where = "ci.yml %s" % UNIT_JOB
+    steps = job_steps(block)
+    checkouts = [lines for _name, lines in steps if any(UNIT_CHECKOUT_ACTION in line for line in lines[:1])]
+    if len(checkouts) != 1 or UNIT_CHECKOUT_DEPTH not in checkouts[0]:
+        out.append("%s: the checkout must set fetch-depth: 2 (a push anchors the corpus ratchet on HEAD^)" % where)
+    names = [name for name, _lines in steps]
+    if UNIT_STEP not in names:
+        out.append("%s: the step %r is missing" % (where, UNIT_STEP))
+        return out
+    unit_at = names.index(UNIT_STEP)
+    present = []
+    for name, line_needed in UNIT_PREP_STEPS:
+        if name not in names:
+            out.append("%s: the step %r the unit-test step needs is missing" % (where, name))
+            continue
+        present.append(name)
+        if not any(line.strip() == line_needed for line in steps[names.index(name)][1]):
+            out.append("%s: the step %r must carry %r" % (where, name, line_needed))
+    if names[max(unit_at - len(present), 0):unit_at] != present:
+        out.append("%s: the preparation steps must run right before the unit-test step, in the order "
+                   "7987, 7988, 9303" % where)
+    timeout = job_timeout(block)
+    if timeout is None or timeout < UNIT_JOB_TIMEOUT_FLOOR_MIN:
+        out.append("%s: timeout-minutes %s is under the floor %d (%d x (%d min measured unit step + %d min own work))"
+                   % (where, timeout, UNIT_JOB_TIMEOUT_FLOOR_MIN, TIMEOUT_HEADROOM_FACTOR,
+                      UNIT_STEP_MEASURED_MIN, UNIT_JOB_OWN_MIN))
+    return out
+
+
+# ---------------------------------------------------------------------------------------
 # (d) job ids and names pinned from the base
 # ---------------------------------------------------------------------------------------
 
@@ -225,6 +312,57 @@ class RealFiles(unittest.TestCase):
 
     def test_9593_job_ids_and_names_equal_the_pinned_base_list(self):
         self.assertEqual(problems_job_names(real_workflows()), [])
+
+    def test_9593_unit_step_keeps_what_it_needs_in_its_new_job(self):
+        self.assertEqual(problems_unit_needs(real_workflows()), [])
+
+
+# (e) Broken copies of the unit-test job: (cell id, text in the job, replacement, exact problems).
+WHERE = "ci.yml " + UNIT_JOB
+NEEDS_MUTANTS = (
+    ("fetch_depth_removed", UNIT_CHECKOUT_DEPTH + "\n", "",
+     [WHERE + ": the checkout must set fetch-depth: 2 (a push anchors the corpus ratchet on HEAD^)"]),
+    ("replay_fetch_7988_dropped",
+     "      - name: Fetch the corpus replay objects (#7988)\n        " + UNIT_PREP_STEPS[1][1] + "\n", "",
+     [WHERE + ": the step 'Fetch the corpus replay objects (#7988)' the unit-test step needs is missing"]),
+    ("timeout_lowered_40_to_15", "    timeout-minutes: 40\n", "    timeout-minutes: 15\n",
+     [WHERE + ": timeout-minutes 15 is under the floor 26 (2 x (12 min measured unit step + 1 min own work))"]),
+    ("ratchet_anchor_line_changed", 'echo "CERT_MANIFEST_BASE_REF=HEAD^"', 'echo "CERT_MANIFEST_BASE_REF=HEAD"',
+     [WHERE + ": the step 'Resolve the corpus ratchet base (#7987)' must carry "
+      + repr(UNIT_PREP_STEPS[0][1])]),
+    ("step_between_prep_and_unit",
+     "      - name: " + UNIT_STEP + "\n", "      - name: Interloper\n        run: true\n      - name: " + UNIT_STEP + "\n",
+     [WHERE + ": the preparation steps must run right before the unit-test step, in the order 7987, 7988, 9303"]),
+    ("replay_fetch_9303_dropped",
+     "      - name: Fetch the amendment ledger replay objects (#9303)\n        " + UNIT_PREP_STEPS[2][1] + "\n", "",
+     [WHERE + ": the step 'Fetch the amendment ledger replay objects (#9303)' the unit-test step needs is missing"]),
+)
+
+
+class NeedsBrokenCopies(unittest.TestCase):
+    """(e) Each need of the moved step is red, with its exact message, when a copy breaks it."""
+
+    @staticmethod
+    def _broken_job(old: str, new: str) -> dict:
+        workflows = real_workflows()
+        text = workflows[CI]
+        start = text.index("\n  %s:\n" % UNIT_JOB) + 1
+        rest = text[start:].split("\n")
+        end = start + len(rest[0]) + 1
+        for line in rest[1:]:
+            if JOB_RE.match(line):
+                break
+            end += len(line) + 1
+        job = text[start:end]
+        if job.count(old) != 1:
+            raise AssertionError("mutant anchor %r occurs %d times in the %s job" % (old, job.count(old), UNIT_JOB))
+        workflows[CI] = text[:start] + job.replace(old, new) + text[end:]
+        return workflows
+
+    def test_each_need_is_red_on_its_broken_copy(self):
+        for cell, old, new, want in NEEDS_MUTANTS:
+            with self.subTest(cell=cell):
+                self.assertEqual(problems_unit_needs(self._broken_job(old, new)), want)
 
 
 class BrokenCopies(unittest.TestCase):
