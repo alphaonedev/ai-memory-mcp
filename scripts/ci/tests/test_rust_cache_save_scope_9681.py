@@ -540,6 +540,32 @@ MATRIX_OR_LITERAL_RE = re.compile(
     r"^\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\|\|\s*'([^']*)'\s*\}\}$")
 
 
+class QuotedStr(str):
+    """A matrix value written in quotes: YAML types it as a string whatever its spelling."""
+
+
+# YAML 1.2 core schema (https://yaml.org/spec/1.2.2/#103-core-schema) spellings of a non-string.
+YAML_NULL_RE = re.compile(r"^(?:~|null|Null|NULL)$")
+YAML_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+YAML_INT_RE = re.compile(r"^(?:[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$")
+YAML_FLOAT_RE = re.compile(
+    r"^(?:[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?|[-+]?\.(?:inf|Inf|INF)"
+    r"|\.(?:nan|NaN|NAN))$")
+CANONICAL_INT_RE = re.compile(r"^-?[1-9][0-9]*$")
+
+
+def _yaml_typed_form(text: str) -> str:
+    """The YAML form an unquoted scalar takes when it is not a string, or "" when it is text or a
+    canonical non-zero integer (rendered back as the same text)."""
+    if CANONICAL_INT_RE.match(text):
+        return ""
+    for form, pattern in (("null", YAML_NULL_RE), ("boolean", YAML_BOOL_RE),
+                          ("integer", YAML_INT_RE), ("float", YAML_FLOAT_RE)):
+        if pattern.match(text):
+            return form
+    return ""
+
+
 def _effective_env_value(name: str, raw: str, leg: dict[str, object]) -> str:
     """The value env var `name` takes on one leg; an expression form other than one fails."""
     if EXPRESSION_OPEN not in raw:
@@ -551,11 +577,20 @@ def _effective_env_value(name: str, raw: str, leg: dict[str, object]) -> str:
     value = leg.get(field_name)
     if value is None or value == "":
         return literal
-    # `||` takes the literal for a falsy matrix value (false, 0, ''). _scalar drops quoting, so a
-    # quoted '0' (a truthy string) and a bare 0 (falsy) read the same: refuse rather than guess.
+    # `||` takes the literal for a falsy matrix value (false, 0, ''). A quoted value is a string
+    # and is taken as written (QuotedStr, set by _matrix_include). An unquoted one is typed by
+    # YAML: a bare 0 is falsy and a bare 1.0 renders as 1, so only a canonical non-zero integer is
+    # read as its text; every other bare null, boolean or number spelling is refused (#9745).
+    if isinstance(value, QuotedStr):
+        return str(value)
     if isinstance(value, bool) or str(value).strip() in ("0", "0.0", "-0"):
         raise AssertionError(f"{name}: matrix.{field_name} = {value!r} is truthy when quoted and "
                              f"falsy when not, and this parser drops the quotes: {raw!r}")
+    form = _yaml_typed_form(str(value))
+    if form:
+        raise AssertionError(f"{name}: matrix.{field_name} = {value!r} is an unquoted YAML "
+                             f"{form}, which the runner reads as a typed value, not as this "
+                             f"text: {raw!r}")
     return str(value)
 
 
@@ -1392,7 +1427,10 @@ def _matrix_include(job: Job) -> list[dict[str, object]]:
             continue
         name, _, value = stripped.partition(":")
         scalar = _scalar(value)
-        entries[-1][name.strip()] = {"true": True, "false": False}.get(scalar, scalar)
+        if value.strip()[:1] in ("'", '"'):
+            entries[-1][name.strip()] = QuotedStr(scalar)
+        else:
+            entries[-1][name.strip()] = {"true": True, "false": False}.get(scalar, scalar)
     return entries
 
 
@@ -1598,6 +1636,44 @@ def _event_gated(step: Step, how: str) -> bool:
     return value is None or value.startswith("${{ github.event_name == 'push' && ")
 
 
+# --- #9681 r3 (#9747): a job-level `uses:` reaches the called workflow's jobs -----------------------
+LOCAL_WORKFLOW_PREFIX = "./.github/workflows/"
+CALL_DEPTH_MAX = 8
+
+
+def _reachable_jobs(wf: Workflow, prefix: str = "", trail: tuple[str, ...] = ()
+                    ) -> tuple[list[tuple[str, Workflow, Job]], list[str]]:
+    """(every job a run of `wf` reaches as (job id, its workflow, job), the problems).
+
+    A job of `wf` is itself. A job with a job-level `uses: ./.github/workflows/<x>.yml` stands for
+    the jobs of that workflow, id `<caller job>/<called job>`, followed to CALL_DEPTH_MAX. Any
+    other job-level `uses` (a remote reusable workflow, a `@ref`, a path outside the tree, a
+    missing file, a cycle) is a problem: its jobs cannot be read, so the rule fails closed."""
+    jobs: list[tuple[str, Workflow, Job]] = []
+    problems: list[str] = []
+    for job_id, job in wf.jobs().items():
+        uses = job.scalar("uses")
+        if uses is None:
+            jobs.append((prefix + job_id, wf, job))
+            continue
+        called = uses[len(LOCAL_WORKFLOW_PREFIX):]
+        where = f"{prefix}{job_id}"
+        if (not uses.startswith(LOCAL_WORKFLOW_PREFIX) or "@" in called or "/" in called
+                or not called.endswith((".yml", ".yaml"))):
+            problems.append(f"{where}: job-level uses of a reusable workflow that is not a "
+                            f"local {LOCAL_WORKFLOW_PREFIX}<name>.yml: {uses!r}")
+        elif called in (*trail, wf.name) or len(trail) >= CALL_DEPTH_MAX:
+            problems.append(f"{where}: reusable workflow call cycle or deeper than "
+                            f"{CALL_DEPTH_MAX}: {uses!r}")
+        elif called not in _all_workflow_names():
+            problems.append(f"{where}: reusable workflow {uses!r} is not a file")
+        else:
+            inner, found = _reachable_jobs(Workflow.load(called), f"{where}/", (*trail, wf.name))
+            jobs.extend(inner)
+            problems.extend(found)
+    return jobs, problems
+
+
 def _pr_cache_writers() -> tuple[list[tuple[str, str, str]], list[str]]:
     """(writers a PR run reaches, problems) across every PR-startable workflow and the warm one."""
     reached: list[tuple[str, str, str]] = []
@@ -1607,7 +1683,9 @@ def _pr_cache_writers() -> tuple[list[tuple[str, str, str]], list[str]]:
         pr_run = bool(PR_EVENTS & set(wf.events()))
         if not pr_run and name != WARM:
             continue
-        for job_id, job in wf.jobs().items():
+        jobs, found = _reachable_jobs(wf)
+        problems.extend(f"{name}: {problem}" for problem in found)
+        for job_id, _job_wf, job in jobs:
             for step in job.steps():
                 where = (name, job_id, step.label())
                 uses = step.uses_name()
@@ -1812,7 +1890,9 @@ def _hosted_pr_rust_cache_sites() -> tuple[dict[SiteKey, tuple[Workflow, Job, di
         wf = Workflow.load(name)
         if not PR_EVENTS & set(wf.events()):
             continue
-        for job_id, job in wf.jobs().items():
+        jobs, found = _reachable_jobs(wf)
+        problems.extend(f"{name}: {problem}" for problem in found)
+        for job_id, job_wf, job in jobs:
             caches = [s for s in job.steps() if s.uses_name() == RUST_CACHE]
             if not caches or not _maybe_reached(job.scalar("if"), {}):
                 continue
@@ -1830,8 +1910,19 @@ def _hosted_pr_rust_cache_sites() -> tuple[dict[SiteKey, tuple[Workflow, Job, di
                 if SELF_HOSTED in runner:
                     continue
                 if any(_maybe_reached(s.keys.get("if"), leg) for s in caches):
-                    sites[(name, job_id, _leg_id(leg))] = (wf, job, leg)
+                    _add_site(sites, problems, (name, job_id, _leg_id(leg)), (job_wf, job, leg))
     return sites, problems
+
+
+def _add_site(sites: dict[SiteKey, tuple[Workflow, Job, dict[str, object]]],
+              problems: list[str], key: SiteKey,
+              value: tuple[Workflow, Job, dict[str, object]]) -> None:
+    """Record one site; a second leg with the same key is a problem, never an overwrite (#9746)."""
+    if key in sites:
+        problems.append(f"two hosted legs of one job share the site key {_site_name(key)}: the "
+                        f"second would overwrite the first; give them different first keys")
+        return
+    sites[key] = value
 
 
 def _cold_commands(wf: Workflow, job: Job, leg: dict[str, object]) -> tuple[tuple[str, ...], list[str]]:
@@ -2206,6 +2297,23 @@ class ReachableWorkflowSites9681R3(unittest.TestCase):
                  "b.yml": _stub_workflow("workflow_call", "  y:\n    uses: ./.github/workflows/b.yml\n")}
         self.assertEqual(self._sites(cycle)[1], [
             "a.yml: x/y: reusable workflow call cycle or deeper than 8: './.github/workflows/b.yml'"])
+
+    def test_call_chain_deeper_than_the_limit_fails_closed(self) -> None:
+        names = [f"w{n}.yml" for n in range(CALL_DEPTH_MAX + 2)]
+        texts = {name: _stub_workflow(
+            "pull_request" if n == 0 else "workflow_call",
+            f"  c:\n    uses: ./.github/workflows/{names[n + 1]}\n")
+            for n, name in enumerate(names[:-1])}
+        texts[names[-1]] = _stub_workflow("workflow_call", _stub_job("leaf"))
+        sites, problems = self._sites(texts)
+        self.assertEqual(sites, {})
+        self.assertEqual(problems, [
+            "w0.yml: c/c/c/c/c/c/c/c/c: reusable workflow call cycle or deeper than 8: "
+            "'./.github/workflows/w9.yml'"])
+        del texts[names[-2]]
+        texts[names[-3]] = _stub_workflow("workflow_call", _stub_job("leaf"))
+        sites, problems = self._sites(texts)
+        self.assertEqual((sorted(sites), problems), ([("w0.yml", "c/c/c/c/c/c/c/leaf", "")], []))
 
     def test_cache_writer_in_a_called_workflow_is_reached(self) -> None:
         writer = ("      - name: Docker layers\n        uses: actions/cache@" + STUB_SHA + "\n")
