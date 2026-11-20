@@ -2,11 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Arithmetic of scripts/ci/measure_ci_time.py on a hand-written jobs-API fixture (#9710)."""
 
+import contextlib
 import importlib.util
+import io
+import os
+import time
 import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "measure_ci_time.py"
+SCRATCH = Path(os.environ.get("TMPDIR") or ".local-runs")
 spec = importlib.util.spec_from_file_location("measure_ci_time", SCRIPT)
 mct = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mct)
@@ -63,6 +68,154 @@ class SplitJobTests(unittest.TestCase):
     def test_finished_line_outside_the_step_window_is_ignored(self):
         late = ["2026-01-01T09:00:00.0000000Z     Finished `test` profile [x] target(s) in 1m 0s"]
         self.assertIsNone(mct.split_job(JOB, late)["test"])
+
+
+def step_index(name_prefix):
+    return next(i for i, s in enumerate(JOB["steps"]) if s["name"].startswith(name_prefix))
+
+
+def job_with_step(index, **changes):
+    steps = [dict(s) for s in JOB["steps"]]
+    steps[index].update(changes)
+    return dict(JOB, steps=steps)
+
+
+MAIN = step_index("Run tests")
+SETUP = step_index("Run actions/checkout")
+# One row per reason: (case name, job, log, stage that must be None, "stage:reason" that must be reported).
+UNMEASURED_CASES = (
+    ("setup step without timestamps", job_with_step(SETUP, started_at=None, completed_at=None), LOG, "setup", "setup:missing-timestamp"),
+    ("setup step with a garbage timestamp", job_with_step(SETUP, completed_at="not-a-time"), LOG, "setup", "setup:missing-timestamp"),
+    ("setup step that ends before it starts", job_with_step(SETUP, completed_at="2026-01-01T00:00:01Z"), LOG, "setup", "setup:negative"),
+    ("main step without timestamps", job_with_step(MAIN, started_at=None, completed_at=None), LOG, "compile", "compile:missing-timestamp"),
+    ("main step that ends before it starts", job_with_step(MAIN, completed_at="2026-01-01T00:00:01Z"), LOG, "test", "test:negative"),
+    ("job without a completed_at", dict(JOB, completed_at=None), LOG, "total", "total:missing-timestamp"),
+    ("job that ends before it starts", dict(JOB, completed_at="2026-01-01T00:00:00Z"), LOG, "total", "total:negative"),
+    ("compile reported longer than the step", JOB, ["2026-01-01T00:05:40.0000000Z     Finished `test` profile [x] target(s) in 20m 0s"], "compile", "compile:compile-longer-than-step"),
+    ("compile reported longer than the step (test side)", JOB, ["2026-01-01T00:05:40.0000000Z     Finished `test` profile [x] target(s) in 20m 0s"], "test", "test:compile-longer-than-step"),
+)
+
+
+class UnmeasuredTests(unittest.TestCase):
+    def test_each_bad_input_is_unmeasured_with_a_named_reason(self):
+        for case, job, log, stage, reason in UNMEASURED_CASES:
+            with self.subTest(case):
+                got = mct.split_job(job, log)
+                self.assertIsNone(got[stage])
+                self.assertIn(reason, got["unmeasured"])
+
+    def test_no_stage_is_ever_reported_as_zero_for_bad_input(self):
+        for case, job, log, _stage, _reason in UNMEASURED_CASES:
+            with self.subTest(case):
+                got = mct.split_job(job, log)
+                flagged = {entry.split(":")[0] for entry in got["unmeasured"]}
+                for stage in mct.STAGES:
+                    if stage in flagged:
+                        self.assertIsNone(got[stage])
+
+    def test_good_input_has_no_unmeasured_entry(self):
+        self.assertEqual(mct.split_job(JOB, LOG)["unmeasured"], [])
+
+    def test_main_step_without_timestamps_does_not_accept_a_finished_line_from_another_day(self):
+        other_day = ["2026-03-05T09:00:00.0000000Z     Finished `test` profile [x] target(s) in 1m 0s"]
+        got = mct.split_job(job_with_step(MAIN, started_at=None, completed_at=None), other_day)
+        self.assertIsNone(got["compile"])
+        self.assertIsNone(got["test"])
+
+    def test_unmeasured_rows_stay_out_of_median_and_sum(self):
+        good = mct.split_job(JOB, LOG)
+        bad = mct.split_job(job_with_step(SETUP, started_at=None, completed_at=None), LOG)
+        stat = mct.summarize([good["setup"], bad["setup"]])
+        self.assertEqual(stat, (60.0, 60.0, 60.0, 1))
+
+    def test_footer_counts_every_reason(self):
+        rows = []
+        for _case, job, log, _stage, _reason in UNMEASURED_CASES:
+            row = mct.split_job(job, log)
+            row.update(workflow="ci.yml", job="Check (x)", kind="hosted")
+            rows.append(row)
+        line = mct.unmeasured_footer(rows)
+        self.assertTrue(line.startswith("unmeasured: "))
+        for reason in ("missing-timestamp", "negative", "compile-longer-than-step"):
+            self.assertIn(f"{reason}=", line)
+        self.assertEqual(mct.unmeasured_footer([mct.split_job(JOB, LOG)]), "unmeasured: 0 cells in 0 of 1 rows")
+
+
+class NullStepNameTests(unittest.TestCase):
+    def test_null_step_name_is_a_row_reason_not_a_traceback(self):
+        job = job_with_step(SETUP, name=None)
+        got = mct.split_job(job, LOG)
+        self.assertIn("setup:missing-step-name", got["unmeasured"])
+        self.assertIsNone(got["setup"])
+
+    def test_missing_name_key_behaves_like_null(self):
+        steps = [dict(s) for s in JOB["steps"]]
+        del steps[SETUP]["name"]
+        got = mct.split_job(dict(JOB, steps=steps), LOG)
+        self.assertIn("setup:missing-step-name", got["unmeasured"])
+
+    def test_malformed_payload_exits_with_the_documented_code_and_one_stderr_line(self):
+        def boom(*_args, **_kwargs):
+            raise TypeError("expected string or bytes-like object, got 'NoneType'")
+        original = mct.collect
+        mct.collect = boom
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                rc = mct.main(["--repo", "o/n", "--branch", "b", "--scratch", str(SCRATCH)])
+        finally:
+            mct.collect = original
+        self.assertEqual(rc, mct.EXIT_BAD_INPUT)
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertIn("unexpected input", err.getvalue())
+
+
+class TimezoneTests(unittest.TestCase):
+    def _interval(self, tz_name):
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = tz_name
+        time.tzset()
+        try:
+            return mct.parse_ts("2026-11-01T02:30:00Z") - mct.parse_ts("2026-11-01T01:30:00Z")
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+
+    def test_interval_across_a_dst_change_is_the_same_in_every_zone(self):
+        self.assertEqual(self._interval("UTC"), 3600.0)
+        self.assertEqual(self._interval("America/New_York"), 3600.0)
+
+    def test_fraction_is_kept(self):
+        self.assertEqual(mct.parse_ts("2026-01-01T00:00:01.5000000Z") - mct.parse_ts("2026-01-01T00:00:00Z"), 1.5)
+
+    def test_unusable_timestamps_are_none(self):
+        for bad in (None, "", "garbage", 12345, "2026-13-45T99:00:00Z"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(mct.parse_ts(bad))
+
+
+class RunsArgumentTests(unittest.TestCase):
+    def _run(self, value):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+            mct.main(["--repo", "o/n", "--branch", "b", "--runs", value, "--scratch", str(SCRATCH)])
+        return raised.exception.code, err.getvalue()
+
+    def test_out_of_range_or_non_numeric_runs_exit_2_with_the_reason(self):
+        for value in ("0", "-3", "31", "1000", "abc", "2.5"):
+            with self.subTest(value):
+                code, text = self._run(value)
+                self.assertEqual(code, 2)
+                self.assertIn("--runs", text)
+                self.assertIn(f"1..{mct.MAX_RUNS}", text)
+
+    def test_bounds_are_accepted(self):
+        for value, expected in (("1", 1), ("30", 30)):
+            with self.subTest(value):
+                self.assertEqual(mct.runs_arg(value), expected)
 
 
 class RankTests(unittest.TestCase):
