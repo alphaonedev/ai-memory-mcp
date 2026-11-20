@@ -26,6 +26,13 @@ use std::time::{Duration, SystemTime};
 /// First line of the default config template (`write_default_if_missing`).
 const DEFAULT_CONFIG_FIRST_LINE: &str = "# ai-memory configuration";
 
+/// Fixed text before the path in the refused-write warning. Source:
+/// `src/main.rs`, the `eprintln!` after `write_default_if_missing()` fails
+/// (`ai-memory: WARN could not write the default config {path}: {e}`). The
+/// binary crate is not reachable from an integration test, so the text is
+/// pinned here.
+const REFUSED_WRITE_WARN_PREFIX: &str = "ai-memory: WARN could not write the default config ";
+
 /// Body of the config a pre-existing-file cell plants. Valid TOML (comment
 /// only) so it changes no setting if it is read.
 const SENTINEL_CONFIG: &str = "# sentinel 9620 - must survive byte for byte\n";
@@ -262,40 +269,37 @@ fn writing_verb_still_creates_the_default_config_9620() {
     );
 }
 
-/// (d) a config directory that refuses the write: the verb still runs, and
-/// stderr names the path that could not be written.
+/// (d) a config directory that cannot be created: the verb still runs, and
+/// stderr carries the full fixed WARN text, then the path, then the reason.
+///
+/// The refusal does not depend on the uid: the config directory's path is a
+/// dangling symlink, so reading the config finds nothing (`NotFound`) while
+/// creating the directory fails for root and for every other user, and the
+/// cell asserts on every run. (A regular file at that path would make the
+/// config READ fail first and refuse boot, which is a different path.)
 #[cfg(unix)]
 #[test]
 fn refused_default_config_write_is_reported_by_path_9620() {
-    use std::os::unix::fs::PermissionsExt;
     let sb = Sandbox::new();
-    fs::create_dir_all(sb.config_dir()).expect("mkdir config dir");
-    fs::set_permissions(sb.config_dir(), fs::Permissions::from_mode(0o500))
-        .expect("make config dir read-only");
-    // A superuser ignores the mode bits; the cell proves nothing there.
-    let probe = sb.config_dir().join("probe");
-    if fs::write(&probe, b"x").is_ok() {
-        fs::remove_file(&probe).expect("remove probe");
-        fs::set_permissions(sb.config_dir(), fs::Permissions::from_mode(0o700))
-            .expect("restore mode");
-        eprintln!("skipped: the mode bits do not bind this user");
-        return;
-    }
+    let dangling = sb.xdg.join("no-such-target-9620");
+    std::os::unix::fs::symlink(&dangling, sb.config_dir()).expect("plant a dangling symlink");
     let out = sb.run(&["store", "--title", "t", "--content", "c"]);
-    fs::set_permissions(sb.config_dir(), fs::Permissions::from_mode(0o700)).expect("restore mode");
     let stderr = stderr_of(&out);
-    let named = sb.config_path().display().to_string();
-    assert!(
-        stderr.contains(&named),
-        "#9620: a refused default-config write must name the path {named}; stderr={stderr}"
+    let expected_prefix = format!(
+        "{REFUSED_WRITE_WARN_PREFIX}{}: ",
+        sb.config_path().display()
     );
     assert!(
-        stderr.contains("WARN"),
-        "#9620: a refused default-config write must be a WARN; stderr={stderr}"
+        stderr.contains(&expected_prefix),
+        "#9620: a refused default-config write must print {expected_prefix:?}; stderr={stderr}"
     );
     assert!(
         sb.db().is_file(),
         "the command must still run after the refused write; exit={:?} stderr={stderr}",
         out.status.code()
+    );
+    assert!(
+        !dangling.exists(),
+        "the refused write must not create the symlink target"
     );
 }

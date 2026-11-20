@@ -11744,6 +11744,11 @@ legacy_scoring = false
         assert!(body.starts_with("# ai-memory configuration"), "{body:.40}");
     }
 
+    /// Kind `create_dir_all` reports when the parent path is a regular file
+    /// (measured on Linux: the std fallback maps a non-directory that already
+    /// exists to `AlreadyExists`).
+    const REFUSED_PARENT_KIND_9620: std::io::ErrorKind = std::io::ErrorKind::AlreadyExists;
+
     /// #9620 — a refused write is an Err, never dropped: here the parent
     /// path is a regular file, so the directory cannot be created.
     #[test]
@@ -11755,7 +11760,11 @@ legacy_scoring = false
         let err = AppConfig::write_default_at(&path).expect_err("parent is a file");
         // `create_dir_all` reports a non-directory in the way as an error;
         // it must reach the caller instead of being read as "already there".
-        assert!(!err.to_string().is_empty(), "error carries a message");
+        assert_eq!(
+            err.kind(),
+            REFUSED_PARENT_KIND_9620,
+            "a file in the way of the parent directory must give exactly this kind: {err}"
+        );
         assert!(!path.exists());
         assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "x");
     }
