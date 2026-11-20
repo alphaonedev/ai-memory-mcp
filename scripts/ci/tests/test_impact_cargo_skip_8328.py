@@ -504,6 +504,9 @@ def consumer_shape_problems():
 
 FAKE_CARGO = "#!%s -I\nimport json, sys\nwith open(%r, 'a') as log:\n    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
 MARGIN_GATE_SCRIPTS = ("scripts/ci/suite_budget.py", "scripts/ci/workflow_annotation.py")
+# #9592: the step reads the kill switch through scripts/ci/pg_isolate_serial_step.py, which fails closed
+# when CI_PG_ISOLATE_OFF is absent; the step env always carries it (ci.yml `CI_PG_ISOLATE_OFF: ${{ vars... }}`).
+STEP_HELPER_SCRIPTS = MARGIN_GATE_SCRIPTS + ("scripts/ci/pg_isolate_serial_step.py",)
 STEP_ENV_DROP = ("TEST_IMPACT", "TEST_IMPACT_REASON", "TEST_IMPACT_COUNT", "TEST_IMPACT_TOTAL",
                  "DOCS_ONLY", "TIER", "CI_NODE", "JOB_T0", "HOST_SEMAPHORE_HELD",
                  "CI_PG_ISOLATE_OFF", "AI_MEMORY_TEST_PG_ISOLATE", "TEST_RESULT_LOG")
@@ -523,7 +526,7 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         # #9229: the step's margin gate runs scripts/ci/suite_budget.py (and its shared module)
         # from the working directory; a missing gate script fails the step closed.
         (work / "scripts" / "ci").mkdir(parents=True)
-        for rel in MARGIN_GATE_SCRIPTS:
+        for rel in STEP_HELPER_SCRIPTS:
             shutil.copyfile(str(REPO / rel), str(work / rel))
         # #9229 cdfe800f: the full suite's whole-suite plan reads the job timeout of the running
         # leg from ci.yml in the working directory, so the scratch tree carries it and a real leg.
@@ -538,7 +541,7 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         env.update(PATH="%s%s%s" % (work / "bin", os.pathsep, os.environ.get("PATH", "")),
                    TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="ubuntu-latest",
                    HOST_SEMAPHORE_SLOTS="0", JOB_TIMEOUT_MIN="60", AI_MEMORY_NO_CONFIG="1",
-                   RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env"))
+                   RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env"), CI_PG_ISOLATE_OFF="")
         res = subprocess.run(RUNNER_BASH + [consumer_step_body()], cwd=str(work), env=env,
                              capture_output=True, text=True, timeout=TIMEOUT_S)
         argv = []
