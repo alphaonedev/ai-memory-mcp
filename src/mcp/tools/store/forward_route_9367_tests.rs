@@ -50,8 +50,10 @@ fn refused_rows() -> Vec<(&'static str, String, &'static str)> {
     ]
 }
 
-fn transition(url: &str, id: &Value) -> Result<Value, String> {
+/// The forwarder's local error for `id`, or `None` when the request went out.
+fn transition_err(url: &str, id: &Value) -> Option<String> {
     forward_action_transition_to_http(url, &json!({"id": id, "to": "claimed"}), Some("ai:test"))
+        .err()
 }
 
 /// The request line of a raw HTTP request.
@@ -74,7 +76,7 @@ fn every_non_segment_action_id_is_refused_before_any_byte_9367() {
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     for (row, id, want) in refused_rows() {
-        let err = transition(&url, &json!(id)).expect_err(row);
+        let err = transition_err(&url, &json!(id)).expect(row);
         assert_eq!(err, want, "row {row}");
     }
     for (row, id) in [
@@ -82,7 +84,7 @@ fn every_non_segment_action_id_is_refused_before_any_byte_9367() {
         ("blank", json!("  ")),
         ("number", json!(7)),
     ] {
-        let err = transition(&url, &id).expect_err(row);
+        let err = transition_err(&url, &id).expect(row);
         assert_eq!(err, MISSING, "row {row}");
     }
     let requests = drain(&rx);
@@ -108,7 +110,7 @@ fn a_refused_action_id_is_checked_before_the_key_is_read_9367() {
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     for (row, id, want) in refused_rows() {
-        let err = transition(&url, &json!(id)).expect_err(row);
+        let err = transition_err(&url, &json!(id)).expect(row);
         assert_eq!(err, want, "row {row}: the id is checked first");
     }
     assert!(drain(&rx).is_empty(), "no request without a usable key");
@@ -133,7 +135,9 @@ fn a_valid_action_id_is_one_exact_path_segment_9367() {
     let ids = ["act-1", "ns:act_2.v@host", ceiling.as_str()];
     for base in [url.clone(), format!("{url}/")] {
         for id in ids {
-            transition(&base, &json!(id)).unwrap_or_else(|e| panic!("{id}: {e}"));
+            if let Some(e) = transition_err(&base, &json!(id)) {
+                panic!("{id}: {e}");
+            }
         }
     }
     let requests = drain(&rx);
@@ -161,7 +165,7 @@ fn a_huge_action_id_is_refused_in_bounded_time_9367() {
     let (url, rx) = server(vec![OK_200.to_string()]);
     let id = "a/".repeat(HUGE_ID_BYTES / 2);
     let started = Instant::now();
-    let err = transition(&url, &json!(id)).expect_err("huge id");
+    let err = transition_err(&url, &json!(id)).expect("huge id");
     assert!(
         started.elapsed() < OVERSIZE_CEILING,
         "{:?}",
