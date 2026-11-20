@@ -260,14 +260,11 @@ MIRRORED_STEPS: dict[tuple[str, str], tuple[str, ...]] = {
         "Install cargo-llvm-cov",
     ),
 }
-# Compile commands: each must appear in the PR job's run text and in the warm job's run text.
-WARM_COMPILES: dict[tuple[str, str], tuple[str, ...]] = {
-    # Not `cargo install cargo-audit`: the PR job installs it with --force into a throwaway
-    # target, so a warm install would cost hosted minutes and restore nothing the PR uses.
-    ("ci.yml", "check"): ("cargo test --no-run", "cargo build --release"),
-    ("coverage.yml", "per-module-thresholds"): (
-        "cargo llvm-cov --no-report --features sal,sal-postgres --lib --tests --workspace",),
-}
+# The cargo commands of each pair are derived, not listed: WarmCommandList9681 compares the
+# exact command lines of the hosted PR legs and the warm job in both directions. That includes
+# `cargo install cargo-audit`: rust-cache keeps a binary installed during the job in
+# ~/.cargo/bin (cleanBin removes only the binaries present when the cache step ran), so the
+# warm install is what lets the PR step's version probe skip its from-source build.
 
 # HuggingFace model cache of coverage.yml: restore on every event, save on push only.
 HF_CACHE_SITES = {
@@ -721,29 +718,6 @@ class RustCacheSaveScope9681(unittest.TestCase):
                     self.assertEqual(warm_step.run(), pr_step.run(), label)
                     before_pr = pr_steps.index(pr_step) < pr_cache
                     self.assertEqual(warm_steps.index(warm_step) < warm_cache, before_pr, label)
-            with self.subTest(pair=warm_job_id, part="compiles"):
-                pr_text = _flat("\n".join(s.run() for s in pr_steps))
-                warm_text = _flat("\n".join(s.run() for s in warm_steps[warm_cache + 1:]))
-                for command in WARM_COMPILES[(pr_name, pr_job_id)]:
-                    self.assertIn(command, pr_text)
-                    self.assertIn(command, warm_text)
-            with self.subTest(pair=warm_job_id, part="skip-on-full-match"):
-                cache_id = warm_steps[warm_cache].keys["id"]
-                gate = f"steps.{cache_id}.outputs.cache-hit != 'true'"
-                for step in warm_steps[warm_cache + 1:]:
-                    if any(c in _flat(step.run()) for c in WARM_COMPILES[(pr_name, pr_job_id)]):
-                        self.assertIn(gate, step.keys.get("if", ""), step.label())
-
-    def test_warm_jobs_run_only_the_hand_table_cargo_commands(self) -> None:
-        warm_jobs = Workflow.load(WARM).jobs()
-        for pr_name, pr_job_id, warm_job_id, _ in PAIRS:
-            compiles = WARM_COMPILES[(pr_name, pr_job_id)]
-            for step in warm_jobs[warm_job_id].steps():
-                for line in _flat(step.run()).splitlines():
-                    if "cargo " not in line or line.lstrip().startswith("#"):
-                        continue
-                    with self.subTest(job=warm_job_id, line=line.strip()):
-                        self.assertTrue(any(c in line for c in compiles), line)
 
     def test_taint_boundary_knows_the_split_cache_actions(self) -> None:
         sys.path.insert(0, str(REPO / "scripts" / "ci"))
