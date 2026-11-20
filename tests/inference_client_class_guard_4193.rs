@@ -206,9 +206,9 @@ const ALLOWLIST: [Allowed; 10] = [
         file: "src/mcp/tools/store/transport.rs",
         func: "forward_to_http",
         count: 1,
-        reason: "non-inference: remote store transport (memory_store forwarding to a daemon); default redirect and env-proxy behaviour tracked #9318",
-        credential: "X-Agent-Id principal header + memory body",
-        redirect: Redirect::DefaultFollow,
+        reason: "non-inference: remote store transport (memory_store forwarding to a daemon); Policy::none (#9367), env-proxy behaviour tracked #9318",
+        credential: "X-Agent-Id principal header + x-api-key (when the forward key file is set) + memory body",
+        redirect: Redirect::Refused,
         proxy: Proxy::HonoursEnv,
     },
     Allowed {
