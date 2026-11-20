@@ -21,7 +21,13 @@ Usage:
 
 `--rank-job` prints the test binaries with the longest `finished in` time from one job log.
 
-Exit codes: 0 done, 2 usage error (argparse), 3 a gh call failed, 4 no green run found.
+Every duration is computed from two UTC timestamps that are both present and ordered, or the row is reported as
+`unmeasured` with a named reason (missing-timestamp, negative, compile-longer-than-step, missing-step-name) and left
+out of every median and range. The table is followed by a footer line that counts them. A value that could not be
+measured is never printed as 0 s. Link time is inside cargo's one `Finished` compile figure and is not split out.
+
+Exit codes: 0 done, 2 usage error (argparse; `--runs` outside 1..30 is one), 3 a gh call failed, 4 no green run found,
+5 the API payload had an unexpected shape (one line on stderr).
 """
 import argparse
 import json
@@ -30,14 +36,16 @@ import statistics
 import subprocess
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 EXIT_OK = 0
 EXIT_GH_FAILED = 3
 EXIT_NO_RUNS = 4
+EXIT_BAD_INPUT = 5
+MIN_RUNS = 1
 WORKFLOWS = ("ci.yml", "coverage.yml")
-MAX_RUNS = 30  # one API page is 100 rows; the request is capped well below that
+MAX_RUNS = 30  # one API page is 100 rows; a request above this is refused, not cut
 MAX_JOB_PAGES = 3
 JOBS_PER_PAGE = 100
 GH_TIMEOUT_SECS = 120
@@ -53,17 +61,36 @@ RESULT_RE = re.compile(r"test result: \w+\. (\d+) passed;.* finished in ([\d.]+)
 RANK_TOP = 16
 STAGES = ("queue", "setup", "compile", "test", "post", "total")
 NOT_MEASURED = "not measured"
+REASON_MISSING_TS = "missing-timestamp"
+REASON_NEGATIVE = "negative"
+REASON_COMPILE_LONGER = "compile-longer-than-step"
+REASON_MISSING_NAME = "missing-step-name"
+REASONS = (REASON_MISSING_TS, REASON_NEGATIVE, REASON_COMPILE_LONGER, REASON_MISSING_NAME)
+UNMEASURED_KEY = "unmeasured"
 
 
 def parse_ts(text):
-    """GitHub timestamp (`2026-11-16T01:54:55Z` or with a fraction) to epoch seconds, None when unusable."""
-    if not text:
+    """GitHub timestamp (`2026-11-16T01:54:55Z` or with a fraction) to UTC epoch seconds, None when unusable.
+
+    The value is read as UTC whatever the TZ of the process is.
+    """
+    if not text or not isinstance(text, str):
         return None
     try:
-        return datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S").timestamp() + (
-            float("0." + text[20:-1]) if len(text) > 20 and text[19] == "." else 0.0)
+        base = datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        return base + (float("0." + text[20:-1]) if len(text) > 20 and text[19] == "." else 0.0)
     except ValueError:
         return None
+
+
+def duration(start_text, end_text):
+    """(seconds, None) when both timestamps are usable and ordered, else (None, reason)."""
+    start, end = parse_ts(start_text), parse_ts(end_text)
+    if start is None or end is None:
+        return None, REASON_MISSING_TS
+    if end < start:
+        return None, REASON_NEGATIVE
+    return end - start, None
 
 
 def runner_kind(labels):
@@ -76,8 +103,20 @@ def runner_kind(labels):
 
 
 def step_secs(step):
-    start, end = parse_ts(step.get("started_at")), parse_ts(step.get("completed_at"))
-    return max(0.0, end - start) if start is not None and end is not None else 0.0
+    """(seconds, reason) of one jobs-API step."""
+    return duration(step.get("started_at"), step.get("completed_at"))
+
+
+def sum_steps(steps):
+    """(sum of step seconds, None), or (None, reason) when any step in the range is unmeasured."""
+    total, bad = 0.0, None
+    for step in steps:
+        secs, why = step_secs(step)
+        if why:
+            bad = bad or why
+        else:
+            total += secs
+    return (None, bad) if bad else (total, None)
 
 
 def first_finished(lines, win_start=None, win_end=None):
@@ -89,6 +128,8 @@ def first_finished(lines, win_start=None, win_end=None):
         if not hit or not stamp:
             continue
         when = parse_ts(stamp.group(1) + ("." + stamp.group(2) if stamp.group(2) else "") + "Z")
+        if when is None:
+            continue
         if (win_start is not None and when < win_start - 1) or (win_end is not None and when > win_end + 1):
             continue
         return when, int(hit.group(1) or 0) * 60 + float(hit.group(2))
@@ -101,27 +142,65 @@ def split_job(job, log_lines=None):
     queue: created to started, None when the job was carried over from an earlier attempt (started before created).
     setup: every step before the first compile/test step. compile/test: the combined step split by the log, or the
     separate compile steps. post: every step after the combined step except a compile step.
+    Link time is inside the compile figure: cargo prints one `Finished` time for compile and link together.
+    A stage that cannot be derived because a timestamp is missing, a duration is negative, the compile time cargo
+    reported is longer than its step or a step has no name is None, and `unmeasured` lists `stage:reason` for it.
     """
-    created, started, done = parse_ts(job.get("created_at")), parse_ts(job.get("started_at")), parse_ts(job.get("completed_at"))
     out = dict.fromkeys(STAGES)
-    out["total"] = done - started if started is not None and done is not None else None
-    if created is not None and started is not None and started >= created:
+    out[UNMEASURED_KEY] = []
+
+    def flag(stage, reason):
+        out[stage] = None
+        out[UNMEASURED_KEY].append(f"{stage}:{reason}")
+
+    total, why = duration(job.get("started_at"), job.get("completed_at"))
+    out["total"] = total
+    if why:
+        flag("total", why)
+    created, started = parse_ts(job.get("created_at")), parse_ts(job.get("started_at"))
+    if created is None or started is None:
+        flag("queue", REASON_MISSING_TS)
+    elif started >= created:
         out["queue"] = started - created
     steps = job.get("steps") or []
-    main = next((i for i, s in enumerate(steps) if COMBINED_STEP_RE.match(s.get("name", ""))), None)
+    main = next((i for i, s in enumerate(steps) if COMBINED_STEP_RE.match(s.get("name") or "")), None)
     if main is None:
         return out
-    out["setup"] = sum(step_secs(s) for s in steps[:main] if not COMPILE_STEP_RE.match(s["name"]))
-    extra_compile = sum(step_secs(s) for s in steps if COMPILE_STEP_RE.match(s["name"]))
-    out["post"] = sum(step_secs(s) for s in steps[main + 1:] if not COMPILE_STEP_RE.match(s["name"]))
-    wall = step_secs(steps[main])
+    if any(not s.get("name") for s in steps):
+        for stage in ("setup", "compile", "test", "post"):
+            flag(stage, REASON_MISSING_NAME)
+        out["combined_wall"] = None
+        return out
+
+    def named(chunk, wanted):
+        return [s for s in chunk if bool(COMPILE_STEP_RE.match(s["name"])) is wanted]
+
+    setup, why = sum_steps(named(steps[:main], False))
+    if why:
+        flag("setup", why)
+    else:
+        out["setup"] = setup
+    post, why = sum_steps(named(steps[main + 1:], False))
+    if why:
+        flag("post", why)
+    else:
+        out["post"] = post
+    extra_compile, extra_why = sum_steps(named(steps, True))
+    wall, wall_why = step_secs(steps[main])
+    out["combined_wall"] = wall
+    if wall_why or extra_why:
+        for stage in ("compile", "test"):
+            flag(stage, wall_why or extra_why)
+        return out
     found = first_finished(log_lines, parse_ts(steps[main].get("started_at")), parse_ts(steps[main].get("completed_at"))) if log_lines else None
-    if found:
+    if found and found[1] > wall:
+        for stage in ("compile", "test"):
+            flag(stage, REASON_COMPILE_LONGER)
+    elif found:
         out["compile"] = found[1] + extra_compile
-        out["test"] = max(0.0, wall - found[1])
+        out["test"] = wall - found[1]
     else:
         out["compile"] = extra_compile or None
-    out["combined_wall"] = wall
     return out
 
 
@@ -149,6 +228,21 @@ def summarize(values):
     return (statistics.median(nums), min(nums), max(nums), len(nums)) if nums else None
 
 
+def unmeasured_footer(rows):
+    """One line counting the cells left out of the table, by reason."""
+    counts = dict.fromkeys(REASONS, 0)
+    cells = bad_rows = 0
+    for row in rows:
+        entries = row.get(UNMEASURED_KEY) or []
+        bad_rows += bool(entries)
+        for entry in entries:
+            cells += 1
+            reason = entry.split(":", 1)[1]
+            counts[reason] = counts.get(reason, 0) + 1
+    detail = f" ({', '.join(f'{r}={n}' for r, n in counts.items() if n)})" if cells else ""
+    return f"unmeasured: {cells} cells in {bad_rows} of {len(rows)} rows{detail}"
+
+
 def fmt(stat):
     if stat is None:
         return NOT_MEASURED
@@ -164,7 +258,7 @@ def gh_get(args):
 
 
 def list_runs(repo, workflow, branch, count):
-    path = f"repos/{repo}/actions/workflows/{workflow}/runs?branch={branch}&status=success&per_page={min(count, MAX_RUNS)}"
+    path = f"repos/{repo}/actions/workflows/{workflow}/runs?branch={branch}&status=success&per_page={count}"
     rows = json.loads(gh_get([path, "--jq", "[.workflow_runs[]|{id,head_sha,run_attempt,created_at}]"]))
     return rows[:count]
 
@@ -201,7 +295,7 @@ def collect(repo, branch, count, scratch, want_logs):
     for workflow in WORKFLOWS:
         for run in list_runs(repo, workflow, branch, count):
             for job in list_jobs(repo, run["id"]):
-                if not TEST_JOB_RE.match(job["name"]):
+                if not TEST_JOB_RE.match(job.get("name") or ""):
                     continue
                 lines = None
                 if want_logs:
@@ -222,13 +316,25 @@ def print_table(rows):
     print("workflow | job | runner kind | " + " | ".join(f"{s} s" for s in STAGES))
     for key in sorted(groups):
         print(" | ".join(key) + " | " + " | ".join(fmt(summarize([r[s] for r in groups[key]])) for s in STAGES))
+    print(unmeasured_footer(rows))
+
+
+def runs_arg(text):
+    """argparse type for --runs: an integer in MIN_RUNS..MAX_RUNS, else a reason."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer; --runs takes {MIN_RUNS}..{MAX_RUNS}") from None
+    if not MIN_RUNS <= value <= MAX_RUNS:
+        raise argparse.ArgumentTypeError(f"{value} is outside {MIN_RUNS}..{MAX_RUNS}; --runs takes {MIN_RUNS}..{MAX_RUNS}")
+    return value
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", required=True)
     parser.add_argument("--branch", required=True)
-    parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--runs", type=runs_arg, default=10, metavar=f"{MIN_RUNS}..{MAX_RUNS}")
     parser.add_argument("--scratch", type=Path, default=Path(".local-runs"))
     parser.add_argument("--no-logs", action="store_true", help="skip the log split; compile/test stay unseparated")
     parser.add_argument("--json-out", type=Path)
@@ -248,6 +354,9 @@ def main(argv=None):
     except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
         print(f"gh failed: {exc}", file=sys.stderr)
         return EXIT_GH_FAILED
+    except (KeyError, TypeError, AttributeError, ValueError, IndexError) as exc:
+        print(f"unexpected input from the API: {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+        return EXIT_BAD_INPUT
     if not rows:
         print("no green test job found", file=sys.stderr)
         return EXIT_NO_RUNS

@@ -14,7 +14,10 @@ Queue is `started_at - created_at` of the job. A job carried over from an earlie
 `created_at`; its queue is "not measurable" and is left out, so queue has n = 8 or 9 on those rows. Compile and test
 share one step (`Run tests (impact-aware)`, `Generate coverage JSON`): compile is the first cargo
 `Finished ... target(s) in <duration>` line inside the step plus any separate prebuild step, test is the rest of the
-step wall time. For the linux-fed enterprise-fed leg the "test" figure includes the host-semaphore wait inside the
+step wall time. Link time is inside the compile figure and is not split out: cargo prints one `Finished` time for
+compile and link together, so the compile / link / test-run split of the issue is a compile-with-link / test-run split.
+A row whose timestamps are missing or inconsistent is `unmeasured` (named reason, footer line under the table) and is
+left out of every median; the table below has 0 such cells (`unmeasured: 0 cells in 0 of 50 rows`). For the linux-fed enterprise-fed leg the "test" figure includes the host-semaphore wait inside the
 step (up to 3600 s) and any later cargo invocation. A compile of 1 s is a warm cache or a cargo skip.
 
 | Job | Runner kind | Queue | Setup/cache | Compile | Test | Post | Total |
@@ -67,7 +70,8 @@ Under `cargo test` 0 tests failed in both runs. Under nextest 131 distinct tests
 both. Every failure message that was read names the same cause: `#3354: refusing to start a ledger-writing command as
 host:<name>: no signing key for that id is loadable and one could not be generated (no key was loadable after the
 ensure step)`, plus the follow-on `invalid JSON response` and `status.success()` assertions. The failing set changes
-between runs, which a per-test isolation difference would not do. Probes on the same build:
+between runs (two runs only; the failing sets were compared, not repeated further). Probes on the same build, one run
+of each command (n = 1):
 
 | Command | Result |
 |---|---|
@@ -75,9 +79,10 @@ between runs, which a per-test isolation difference would not do. Probes on the 
 | `cargo nextest run --test integration test_link_creation test_budget_truncates_to_fit test_boundary_confidence_one` | 0 passed, 3 failed (2.4 s) |
 | the same three tests with `-j 1` | 3 passed (3.9 s) |
 
-The tests pass alone and one at a time and fail when several nextest processes start together, so the measured
-mechanism is concurrent first-start generation of the per-host signing key (`src/governance/audit.rs`, the #3354
-refusal). Under `cargo test` the tests of one binary share a process. The cause in the code was not traced further.
+The tests pass alone and one at a time and fail when several nextest processes start together. This is consistent with
+a hypothesis, not a traced cause: concurrent first-start generation of the per-host signing key
+(`src/governance/audit.rs`, the #3354 refusal), where under `cargo test` the tests of one binary share a process. The
+hypothesis rests on this one 3-test probe and on the failing set changing between two runs. Not traced; trace in #9719.
 
 Failed in both nextest runs (63; `L:` = lib, `I:` = the `integration` binary):
 
