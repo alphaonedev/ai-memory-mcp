@@ -833,12 +833,12 @@ mod authenticated_pull_peer_9596_tests {
                 Some(ASSERTED),
             ),
         ];
-        for &(cert, outcome, header, want) in cases {
+        for (case, &(cert, outcome, header, want)) in cases.iter().enumerate() {
             let got = authenticated_pull_peer(cert, outcome, header);
             assert_eq!(
                 got.as_ref().map(AuthenticatedPullPeer::as_str),
                 want,
-                "#9596: authenticated_pull_peer outcome={outcome:?}"
+                "#9596 case {case}: authenticated_pull_peer outcome={outcome:?}"
             );
         }
     }
@@ -934,7 +934,7 @@ mod read_agent_id_header_9665_tests {
             (&[b"", P.as_bytes()], AGENT_ID_REASON_REPEATED),
             (&[NON_ASCII], AGENT_ID_REASON_NOT_VISIBLE_ASCII),
         ];
-        for &(values, reason) in cases {
+        for (case, &(values, reason)) in cases.iter().enumerate() {
             let map = headers(values);
             let Err(resp) = read_agent_id_header(&map) else {
                 panic!("values={values:?} must be refused");
@@ -942,7 +942,7 @@ mod read_agent_id_header_9665_tests {
             assert_eq!(
                 resp.status(),
                 StatusCode::BAD_REQUEST,
-                "#9665: an unreadable agent id must be refused"
+                "#9665 case {case}: an unreadable agent id must be refused"
             );
             let bytes = axum::body::to_bytes(resp.into_body(), BODY_CAP)
                 .await

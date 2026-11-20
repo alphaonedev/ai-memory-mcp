@@ -367,7 +367,7 @@ const MISMATCH_CASES: &[(Option<&str>, Option<&str>)] = &[
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_peer_naming_another_principal_is_refused_and_writes_no_clock_9596() {
     let _g = env_lock();
-    for &(peer_param, agent_header) in MISMATCH_CASES {
+    for (case, &(peer_param, agent_header)) in MISMATCH_CASES.iter().enumerate() {
         set_posture(true);
         let host = setup();
         let query = query_for(peer_param);
@@ -377,23 +377,23 @@ async fn authenticated_peer_naming_another_principal_is_refused_and_writes_no_cl
         assert_eq!(
             rows,
             Vec::<(String, String)>::new(),
-            "#9596: a pull authenticated as {ALICE} naming another principal \
+            "#9596 case {case}: a pull authenticated as {ALICE} naming another principal \
              must write no clock row"
         );
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "#9596: a mismatched principal must be refused"
+            "#9596 case {case}: a mismatched principal must be refused"
         );
         assert_eq!(
             body["error"].as_str(),
             Some(MISMATCH_TAG),
-            "#9596: refusal must carry the exact tag"
+            "#9596 case {case}: refusal must carry the exact tag"
         );
         assert_eq!(
             body["authenticated_peer"].as_str(),
             Some(ALICE),
-            "#9596: refusal names the authenticated peer"
+            "#9596 case {case}: refusal names the authenticated peer"
         );
     }
 }
@@ -413,7 +413,8 @@ const UNAUTHENTICATED_CASES: &[(Option<&str>, Option<&str>, Option<&str>)] = &[
 #[tokio::test(flavor = "current_thread")]
 async fn unauthenticated_pull_writes_no_clock_9596() {
     let _g = env_lock();
-    for &(peer_header, peer_param, agent_header) in UNAUTHENTICATED_CASES {
+    for (case, &(peer_header, peer_param, agent_header)) in UNAUTHENTICATED_CASES.iter().enumerate()
+    {
         set_posture(false);
         let host = setup();
         let query = query_for(peer_param);
@@ -423,17 +424,17 @@ async fn unauthenticated_pull_writes_no_clock_9596() {
         assert_eq!(
             rows,
             Vec::<(String, String)>::new(),
-            "#9596: an unauthenticated pull must write no clock row"
+            "#9596 case {case}: an unauthenticated pull must write no clock row"
         );
         assert_eq!(
             status,
             StatusCode::OK,
-            "#9596: the unauthenticated pull itself is still served"
+            "#9596 case {case}: the unauthenticated pull itself is still served"
         );
         assert_eq!(
             body["count"].as_u64(),
             Some(1),
-            "#9596: the seeded row is still projected"
+            "#9596 case {case}: the seeded row is still projected"
         );
     }
 }
@@ -469,7 +470,7 @@ const OWN_CLOCK_AGENT_HEADERS: &[Option<&str>] = &[Some(ALICE), None, Some("")];
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_peer_records_only_its_own_clock_9596() {
     let _g = env_lock();
-    for &agent_header in OWN_CLOCK_AGENT_HEADERS {
+    for (case, &agent_header) in OWN_CLOCK_AGENT_HEADERS.iter().enumerate() {
         set_posture(true);
         let host = setup();
         let query = query_for(Some(ALICE));
@@ -480,16 +481,16 @@ async fn authenticated_peer_records_only_its_own_clock_9596() {
             ai_memory::db::sync_state_load(&conn, ALICE).expect("load clock")
         };
         clear_posture();
-        assert_eq!(status, StatusCode::OK, "#9596: pull served");
+        assert_eq!(status, StatusCode::OK, "#9596 case {case}: pull served");
         assert_eq!(
             rows,
             vec![(ALICE.to_string(), ALICE.to_string())],
-            "#9596: the clock is keyed (authenticated peer, authenticated peer)"
+            "#9596 case {case}: the clock is keyed (authenticated peer, authenticated peer)"
         );
         assert_eq!(
             watermarks.entries.get(ALICE).map(String::as_str),
             Some(SEED_UPDATED_AT),
-            "#9596: the recorded watermark is the pulled row's timestamp, under the \
+            "#9596 case {case}: the recorded watermark is the pulled row's timestamp, under the \
              authenticated peer"
         );
     }
@@ -545,7 +546,7 @@ fn unreadable_agent_id_cases() -> Vec<(Vec<HeaderValue>, &'static str)> {
 #[tokio::test(flavor = "current_thread")]
 async fn unreadable_agent_id_is_refused_and_writes_no_clock_9665() {
     let _g = env_lock();
-    for (values, reason) in unreadable_agent_id_cases() {
+    for (case, (values, reason)) in unreadable_agent_id_cases().into_iter().enumerate() {
         set_posture(true);
         let host = setup();
         let query = query_for(Some(ALICE));
@@ -555,19 +556,23 @@ async fn unreadable_agent_id_is_refused_and_writes_no_clock_9665() {
         assert_eq!(
             rows,
             Vec::<(String, String)>::new(),
-            "#9665: an unreadable agent id must write no clock row"
+            "#9665 case {case}: an unreadable agent id must write no clock row"
         );
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "#9665: an unreadable agent id must be refused"
+            "#9665 case {case}: an unreadable agent id must be refused"
         );
         assert_eq!(
             body["error"].as_str(),
             Some(AGENT_ID_UNREADABLE_TAG),
-            "#9665: exact tag"
+            "#9665 case {case}: exact tag"
         );
-        assert_eq!(body["reason"].as_str(), Some(reason), "#9665: exact reason");
+        assert_eq!(
+            body["reason"].as_str(),
+            Some(reason),
+            "#9665 case {case}: exact reason"
+        );
     }
 }
 
@@ -638,7 +643,7 @@ fn cert_binding_cases() -> Vec<(ClientCertPeerId, &'static str, ClockRows)> {
 #[tokio::test(flavor = "current_thread")]
 async fn cert_bound_to_exactly_the_asserted_peer_records_its_clock_9596() {
     let _g = env_lock();
-    for (binding, peer_header, want) in cert_binding_cases() {
+    for (case, (binding, peer_header, want)) in cert_binding_cases().into_iter().enumerate() {
         set_posture(false);
         // SAFETY: env mutation under `env_lock()` (see `set_posture`).
         unsafe {
@@ -649,10 +654,14 @@ async fn cert_bound_to_exactly_the_asserted_peer_records_its_clock_9596() {
         let (status, _) = pull(&host, &query, Some(peer_header), Some(peer_header), false).await;
         let rows = clock_rows(&host);
         clear_posture();
-        assert_eq!(status, StatusCode::OK, "#9596: cert-bound pull served");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "#9596 case {case}: cert-bound pull served"
+        );
         assert_eq!(
             rows, want,
-            "#9596: the cert binding must record exactly the expected clock rows"
+            "#9596 case {case}: the cert binding must record exactly the expected clock rows"
         );
     }
 }
