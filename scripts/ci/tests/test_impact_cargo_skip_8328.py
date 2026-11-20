@@ -45,6 +45,7 @@ Round 5 (REVIEW-8328-code-r4 F1/F2/F3, REVIEW-8328-security-r4 F1/F2/INFO):
     before the boundary, and exactly two dispatch arms.
 14. The cls verdict-shape guard forces false/false on a malformed verdict.
 """
+import errno
 import json
 import os
 import re
@@ -654,6 +655,103 @@ class HostSedProbe(unittest.TestCase):
         self.assertTrue(real)
         gnu = subprocess.run(["sed", "--version"], capture_output=True, text=True).returncode == 0
         self.assertEqual(state, SED_GNU if gnu else SED_BSD)
+
+
+FAKE_SED = "/x/sed"
+PROBE_ARGV = [FAKE_SED, "--version"]
+
+
+def fake_run_returning(code):
+    """Return a stand-in for subprocess.run that answers with exit code `code`."""
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, code, "", "")
+    return fake_run
+
+
+def fake_run_raising(exc):
+    """Return a stand-in for subprocess.run that raises `exc`."""
+    def fake_run(argv, **kwargs):
+        raise exc
+    return fake_run
+
+
+# (label, which() answer, run stand-in, expected). Written out by hand: a (state, path) tuple,
+# or (exception type, exact message) for a sed that resolves but whose probe is not an answer.
+PROBE_ROWS = (
+    ("which-none", None, fake_run_raising(AssertionError("run must not be called")),
+     (("absent", None))),
+    ("exec-file-not-found", FAKE_SED, fake_run_raising(FileNotFoundError(errno.ENOENT, "gone")),
+     (("absent", None))),
+    ("permission-error", FAKE_SED, fake_run_raising(PermissionError(errno.EACCES, "denied")),
+     ("raises", "host sed /x/sed is present but its probe failed: errno 13 (EACCES)")),
+    ("oserror-eio", FAKE_SED, fake_run_raising(OSError(errno.EIO, "io")),
+     ("raises", "host sed /x/sed is present but its probe failed: errno 5 (EIO)")),
+    ("oserror-without-errno", FAKE_SED, fake_run_raising(OSError("odd")),
+     ("raises", "host sed /x/sed is present but its probe failed: errno None (unknown)")),
+    ("timeout", FAKE_SED, fake_run_raising(subprocess.TimeoutExpired(PROBE_ARGV, 120)),
+     ("raises", "host sed /x/sed is present but its probe failed: timeout after 120 s")),
+    ("gnu-answer", FAKE_SED, fake_run_returning(0), ("gnu", FAKE_SED)),
+    ("bsd-answer", FAKE_SED, fake_run_returning(1), ("bsd", FAKE_SED)),
+    ("unknown-exit-2", FAKE_SED, fake_run_returning(2),
+     ("raises", "host sed /x/sed is present but its probe failed: exit 2 is neither GNU (0) nor BSD (1)")),
+    ("unknown-exit-127", FAKE_SED, fake_run_returning(127),
+     ("raises", "host sed /x/sed is present but its probe failed: exit 127 is neither GNU (0) nor BSD (1)")),
+    ("killed-by-signal", FAKE_SED, fake_run_returning(-9),
+     ("raises", "host sed /x/sed is present but its probe failed: exit -9 is neither GNU (0) nor BSD (1)")),
+)
+
+
+class HostSedProbeStates(unittest.TestCase):
+    """#9744 r2: only 'no sed resolves on PATH' is absent; a sed that resolves and misbehaves fails."""
+
+    def test_probe_table(self):
+        for label, found, run, expected in PROBE_ROWS:
+            with self.subTest(row=label):
+                if expected[0] == "raises":
+                    with self.assertRaises(HostSedProbeError) as ctx:
+                        probe_host_sed(which=lambda name, path=None: found, run=run)
+                    self.assertEqual(str(ctx.exception), expected[1])
+                else:
+                    got = probe_host_sed(which=lambda name, path=None: found, run=run)
+                    self.assertEqual(got, expected)
+
+    def test_probe_runs_the_resolved_path_with_version(self):
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        probe_host_sed(which=lambda name, path=None: FAKE_SED, run=fake_run)
+        self.assertEqual(seen, [PROBE_ARGV])
+
+    def test_a_failing_probe_fails_a_dependent_cell_and_does_not_skip_it(self):
+        broken = fake_run_raising(OSError(errno.EIO, "io"))
+
+        class Dependent(unittest.TestCase):
+            def test_cell(self):
+                work = scratch_dir()
+                try:
+                    bsd_sed_shim_dir(
+                        work, probe=lambda sp: probe_host_sed(sp, which=lambda n, path=None: FAKE_SED,
+                                                              run=broken))
+                finally:
+                    shutil.rmtree(str(work), ignore_errors=True)
+
+        result = unittest.TestResult()
+        unittest.defaultTestLoader.loadTestsFromTestCase(Dependent).run(result)
+        self.assertEqual((result.testsRun, len(result.skipped), len(result.errors)), (1, 0, 0))
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("errno 5 (EIO)", result.failures[0][1])
+
+    def test_absent_state_alone_prints_the_skip_reason(self):
+        work = scratch_dir()
+        try:
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                bsd_sed_shim_dir(work, probe=lambda sp: ("absent", None))
+            self.assertEqual(str(ctx.exception), ABSENT_SED_REASON)
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
 
 
 class SedShimOnlyRepairsTheProgram(unittest.TestCase):
