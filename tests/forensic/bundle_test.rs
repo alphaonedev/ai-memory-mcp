@@ -328,3 +328,87 @@ fn transcripts_flag_includes_replay_union() {
         "transcript content must be bundled when --include-transcripts is set"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// #9505 — an unreadable `signed_events` read on the export path is an
+// error, never a chain report with "no events".
+// ─────────────────────────────────────────────────────────────────────
+
+/// Message of the injected `signed_events` read fault.
+const SIGNED_EVENTS_FAULT_9505: &str = "injected #9505 signed_events read fault";
+/// SQL name of the scalar function that injects the fault.
+const SIGNED_EVENTS_FAULT_FN_9505: &str = "fault_9505";
+/// `signed_events` reads the export makes with `include_atomisation_chain`
+/// off: the bundle's own slice (step 4) and the embedded chain report
+/// (`build_chain_report_at`, step 6).
+const SIGNED_EVENTS_READS_9505: usize = 2;
+
+/// The export reads `signed_events` twice: its own slice first, then the
+/// chain report through `build_chain_report_at`. A dropped table fails the
+/// first read, so the fault is stateful: a TEMP view shadows the table and a
+/// deterministic scalar (evaluated once per statement) passes the first read
+/// and fails every later one. The chain report must surface that failure as
+/// the exact rusqlite error, and no bundle may be written.
+#[test]
+fn export_fails_when_chain_report_signed_events_read_fails_9505() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open_db(&db_path);
+    let d0 = insert_memory(&conn, "fb-9505", 0, MemoryKind::Observation);
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&reads);
+    conn.create_scalar_function(
+        SIGNED_EVENTS_FAULT_FN_9505,
+        0,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        move |_| -> rusqlite::Result<i64> {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(1)
+            } else {
+                Err(rusqlite::Error::UserFunctionError(
+                    SIGNED_EVENTS_FAULT_9505.into(),
+                ))
+            }
+        },
+    )
+    .unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TEMP VIEW signed_events AS \
+         SELECT * FROM main.signed_events WHERE {SIGNED_EVENTS_FAULT_FN_9505}() = 1"
+    ))
+    .unwrap();
+
+    let bundle_path = tmp.path().join("bundle.tar");
+    let args = ExportForensicBundleArgs {
+        memory_id: d0,
+        include_reflections: true,
+        include_transcripts: false,
+        include_atomisation_chain: false,
+        output: Some(bundle_path.clone()),
+    };
+    let err = bundle::build(&conn, &args, &bundle_path, None)
+        .expect_err("an unreadable signed_events read must fail the export");
+
+    assert_eq!(err.to_string(), "build_chain_report for bundle");
+    match err.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(code, Some(msg))) => {
+            assert_eq!(code.code, rusqlite::ErrorCode::Unknown, "{err:#}");
+            assert_eq!(msg, SIGNED_EVENTS_FAULT_9505, "{err:#}");
+        }
+        other => panic!("expected the injected rusqlite failure, got {other:?} ({err:#})"),
+    }
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        SIGNED_EVENTS_READS_9505,
+        "the fault must hit the chain-report read, after the bundle's own slice"
+    );
+    assert!(
+        !bundle_path.exists(),
+        "no bundle may be written on a read fault"
+    );
+}

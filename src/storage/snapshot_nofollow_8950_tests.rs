@@ -342,6 +342,12 @@ const VACUUM_INTO_FILES: [&str; 3] = [
 /// Regenerate with `write_site_census.py` (rules mirrored in
 /// [`production_census`]).
 const RAW_WRITE_CENSUS_8950: &[(&str, usize)] = &[
+    // #9367: the one site is the READ-only key-file open of
+    // `read_checked_key_file` (src/agent_key_file.rs:95, `.read(true)`, no
+    // create/truncate/write flag): it creates and replaces nothing, so the
+    // no-follow write primitive does not fit. Guard:
+    // `agent_key_file::k1_shared_checks_9367_tests::key_file_open_is_read_only_8950_9367`.
+    ("src/agent_key_file.rs", 1),
     ("src/audit.rs", 14),
     ("src/background/fts_integrity.rs", 4),
     ("src/bench.rs", 2),

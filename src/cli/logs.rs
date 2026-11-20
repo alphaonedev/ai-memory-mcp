@@ -1559,11 +1559,15 @@ mod tests {
         assert_eq!(e.matches("rotated or truncated").count(), 1, "note: {e:?}");
     }
 
-    /// The production half of this file (everything before the test module),
-    /// for the structural guards below.
+    /// The production text of this file (every line outside its test
+    /// modules, from the ONE resolver, #9367), for the structural guards below.
     fn prod_source() -> &'static str {
-        let all = include_str!("logs.rs");
-        all.split("#[cfg(test)]\nmod tests").next().unwrap_or(all)
+        static PROD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PROD.get_or_init(|| {
+            crate::test_resolver::cfg_test_modules::strip_cfg_test_inline_mods(include_str!(
+                "logs.rs"
+            ))
+        })
     }
 
     /// The text of `all` from `from` up to the next `to`.

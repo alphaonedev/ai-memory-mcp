@@ -331,7 +331,15 @@ Current `src/governance/agent_action.rs::Decision` variants are `Allow`,
 When `ai-memory verify-audit-trail`, `verify-signed-events-chain`, or
 `verify-reflection-chain` reports an integrity failure, the command returns a
 non-zero result and identifies the implemented failing check and available
-row/sequence context. Operators should retain the database and companion audit
+row/sequence context. `verify-reflection-chain` exits `0` when the chain
+verifies, `1` when the root memory is not found or the arguments are wrong
+(exit 1 also: the report could not be written), and `2` when verification fails: an edge signature, the `max_reflection_depth`
+cap, a root content-id genesis that mismatches its cid or cannot be read
+(#9505), with `--cid` a swept row that mismatches or cannot be read (#9634), or
+an input that could not be read at all (the database, the root row, the chain
+or the sweep query), printed as one unreadable document that names the stage
+and the error class (#9505). Stored values
+in the text report are escaped and bounded (#9636). Operators should retain the database and companion audit
 artifacts, stop relying on the affected chain as trusted evidence, and
 investigate against independently retained witnesses or forensic exports.
 
