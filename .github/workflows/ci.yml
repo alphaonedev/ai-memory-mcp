@@ -2815,7 +2815,8 @@ jobs:
   #
   # #9680: the android entry also carries the once-per-run extras that used
   # to sit at the end of `Check (ubuntu-latest,sqlite)` — `Security audit`
-  # (a sha256-pinned cargo-audit prebuilt) and the release-profile smoke
+  # (cargo-audit built with `cargo install --locked` at the #3138 pin) and
+  # the release-profile smoke
   # build. This job is a required context with no `needs` on `check`, so
   # the extras run in parallel with the test legs and a red in either still
   # reds a required context and `ci-gate`. The flag is `once`, not a
@@ -2941,52 +2942,27 @@ jobs:
         with:
           python-version: '3.12'
 
-      # cargo-audit runs once (the advisory DB is platform-independent).
-      # #9680: a prebuilt rustsec release binary replaces the ~6-7 min
-      # `cargo install` source build. The archive AND the extracted binary are
-      # checked against pinned sha256 values before anything runs; any
-      # mismatch, a binary that is not the verified one on PATH, or a version
-      # other than the pin reds the step. The binary lives in a private
-      # $RUNNER_TEMP directory, never in ~/.cargo/bin (which rust-cache saves).
-      # cargo searches $CARGO_HOME/bin for a subcommand before PATH, so any
-      # cargo-audit there (the runner image ships one) is removed first; the
-      # verified directory then goes first on PATH.
+      # cargo-audit runs once (the advisory DB is platform-independent) — on
+      # the android `once` entry so it does not multiply across the targets.
+      # #9680 (ruling 7fd3cd38): it is still built from source with
+      # `cargo install --locked` at the #3138 pin; the step runs beside the
+      # test legs, off the critical path, so no prebuilt is downloaded.
       - name: Security audit
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
         env:
-          # #3138: named pin for the cargo-audit version this job runs.
+          # #3138: named pin for the cargo-audit version this job installs.
           CARGO_AUDIT_VERSION: "0.22.2"
-          # sha256 of cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
-          # (6648968 bytes) from the rustsec/rustsec release
-          # `cargo-audit/v0.22.2`, and of its `cargo-audit` member.
-          CARGO_AUDIT_TGZ_SHA256: "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
-          CARGO_AUDIT_BIN_SHA256: "66f9c8f530950d106c1869ce27ef5a4008bcea53c7716c3ed8117586337ee7d8"
         run: |
-          set -euo pipefail
-          asset="cargo-audit-x86_64-unknown-linux-musl-v${CARGO_AUDIT_VERSION}"
-          tgz="${RUNNER_TEMP}/${asset}.tgz"
-          bindir="${RUNNER_TEMP}/cargo-audit-bin"
-          curl -fsSL --retry 3 -o "${tgz}" \
-            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv${CARGO_AUDIT_VERSION}/${asset}.tgz"
-          if ! echo "${CARGO_AUDIT_TGZ_SHA256}  ${tgz}" | sha256sum -c -; then
-            echo "::error::cargo-audit archive does not match the pinned sha256"
-            exit 1
+          # #3138: install when cargo-audit is missing OR its version differs
+          # from the pin (a stale preinstalled one on a warm self-hosted runner
+          # must not run). A matching install is left alone. The job fails when
+          # the pinned version is still not what runs; the audit is never skipped.
+          if ! command -v cargo-audit >/dev/null 2>&1 \
+             || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
+            cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
           fi
-          rm -rf "${bindir}"
-          mkdir -m 0700 "${bindir}"
-          tar -xzf "${tgz}" -C "${bindir}" --no-same-owner --strip-components=1 "${asset}/cargo-audit"
-          if ! echo "${CARGO_AUDIT_BIN_SHA256}  ${bindir}/cargo-audit" | sha256sum -c -; then
-            echo "::error::cargo-audit binary does not match the pinned sha256"
-            exit 1
-          fi
-          rm -f "${CARGO_HOME:-${HOME}/.cargo}/bin/cargo-audit"
-          export PATH="${bindir}:${PATH}"
-          if [ "$(command -v cargo-audit)" != "${bindir}/cargo-audit" ]; then
-            echo "::error::the verified cargo-audit is not the one on PATH"
-            exit 1
-          fi
-          if ! cargo audit --version | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
-            echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the version that runs"
+          if ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
+            echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the installed version"
             exit 1
           fi
           python3 -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py

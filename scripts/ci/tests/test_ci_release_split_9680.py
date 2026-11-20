@@ -11,7 +11,9 @@ The invariant holds for EVERY job of `.github/workflows/ci.yml`:
   3. no gate step is dropped or gains a condition;
   4. a consumer of a downloaded artifact verifies the commit sha and fails closed;
      the ci-gate aggregator treats a skipped, failed or cancelled need as red.
-The cargo-audit binary is a pinned prebuilt verified by sha256 before it runs.
+cargo-audit comes only from `cargo install --locked` at the #3138 pin (the base
+fd43a727 form), once, in the job that runs it; no step downloads, extracts or
+checksums a prebuilt cargo-audit (ruling 7fd3cd38).
 
 Every expected set is written by hand (rule d54c4b0e); nothing is derived from
 the workflow under test. CI_9680_WORKFLOW and CI_9680_GATE point the test at a
@@ -165,12 +167,7 @@ EXPECTED_STEP_IFS = {
 RELEASE_SMOKE_RUN = "cargo build --release"
 SETUP_PYTHON_USES = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5"
 
-# cargo-audit prebuilt pin (rustsec/rustsec release cargo-audit/v0.22.2).
-CARGO_AUDIT_VERSION = "0.22.2"
-CARGO_AUDIT_TGZ_SHA256 = "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
-CARGO_AUDIT_BIN_SHA256 = "66f9c8f530950d106c1869ce27ef5a4008bcea53c7716c3ed8117586337ee7d8"
-CARGO_AUDIT_URL_PREFIX = "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv"
-SHA_CHECK = "sha256sum -c"
+# The audit gate lines the Security audit step runs after the install (base form).
 AUDIT_GATE_LINES = (
     "python3 -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py",
     "python3 scripts/ci/check_cargo_audit.py",
@@ -454,68 +451,6 @@ class Steps9680(unittest.TestCase):
         self.assertEqual(len(setup), 1)
         self.assertEqual(self.wf.steps[job][setup[0]]["if"], ONCE_GUARD)
         self.assertLess(setup[0], self.wf.index(job, SECURITY_AUDIT))
-
-
-def audit_problems(step):
-    """Every way the Security audit step can fail open or run an unverified binary."""
-    if step is None:
-        return ["no Security audit step"]
-    problems = []
-    env = {k: unquote(v) for k, v in (step["env"] or {}).items()}
-    if env.get("CARGO_AUDIT_VERSION") != CARGO_AUDIT_VERSION:
-        problems.append("version pin")
-    if env.get("CARGO_AUDIT_TGZ_SHA256") != CARGO_AUDIT_TGZ_SHA256:
-        problems.append("archive sha256 pin")
-    if env.get("CARGO_AUDIT_BIN_SHA256") != CARGO_AUDIT_BIN_SHA256:
-        problems.append("binary sha256 pin")
-    run = step["run"] or ""
-    code = "\n".join(l for l in run.splitlines() if not l.strip().startswith("#"))
-    if not code.startswith("set -euo pipefail"):
-        problems.append("set -euo pipefail first")
-    if "cargo install" in code:
-        problems.append("source build")
-    if CARGO_AUDIT_URL_PREFIX not in code:
-        problems.append("download URL")
-    for line in code.splitlines():
-        if "curl " in line and ("|" in line or " -f" not in line):
-            problems.append("curl must be -f and never piped")
-    checks = [m.start() for m in re.finditer(re.escape(SHA_CHECK), code)]
-    tar = code.find("tar ")
-    audit = code.find("cargo audit")
-    if len(checks) < 2:
-        problems.append("two sha256 checks")
-    elif tar < 0 or checks[0] > tar or audit < 0 or checks[1] > audit:
-        problems.append("sha256 check before extract and before run")
-    for var in ("${CARGO_AUDIT_TGZ_SHA256}", "${CARGO_AUDIT_BIN_SHA256}"):
-        if var not in code:
-            problems.append("checks use " + var)
-    if code.count("::error::") < 3 or code.count("exit 1") < 3:
-        problems.append("checksum, path and version mismatch are red")
-    if 'grep -Fqw -- "${CARGO_AUDIT_VERSION}"' not in code:
-        problems.append("version check")
-    for line in AUDIT_GATE_LINES:
-        if line not in code:
-            problems.append("gate line " + line)
-    return problems
-
-
-class CargoAudit9680(unittest.TestCase):
-    """The audit runs a sha256-verified pinned prebuilt; a mismatch is red."""
-
-    def test_audit_step_is_verified(self):
-        wf = Workflow(CI_YML)
-        self.assertEqual(audit_problems(wf.step("mobile-cross-compile", SECURITY_AUDIT)), [])
-
-    def test_checker_bites(self):
-        wf = Workflow(CI_YML)
-        step = wf.step("mobile-cross-compile", SECURITY_AUDIT)
-        self.assertIsNotNone(step)
-        no_check = dict(step, run=(step["run"] or "").replace(SHA_CHECK, "true"))
-        self.assertIn("two sha256 checks", audit_problems(no_check))
-        source = dict(step, run=(step["run"] or "") + "cargo install cargo-audit --locked\n")
-        self.assertIn("source build", audit_problems(source))
-        wrong = dict(step, env=dict(step["env"], CARGO_AUDIT_TGZ_SHA256='"00"'))
-        self.assertIn("archive sha256 pin", audit_problems(wrong))
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +891,20 @@ class CargoAuditSource9680(unittest.TestCase):
         installs = [" ".join(l.split()) for l in shell_lines(step["run"] or "")
                     if INSTALL_RE.search(l)]
         self.assertEqual(installs, [CARGO_AUDIT_INSTALL])
+
+    def test_the_audit_step_checks_the_version_then_runs_the_gate(self):
+        step = Workflow(CI_YML).step(AUDIT_JOB, SECURITY_AUDIT)
+        self.assertIsNotNone(step)
+        code = [" ".join(l.split()) for l in shell_lines(step["run"] or "")]
+        self.assertEqual(code.count(CARGO_AUDIT_INSTALL), 1, "the base install line, once")
+        install = code.index(CARGO_AUDIT_INSTALL)
+        self.assertEqual(code[install + 1:install + 5], [
+            "fi",
+            'if ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then',
+            'echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the installed version"',
+            "exit 1",
+        ])
+        self.assertEqual(code[-len(AUDIT_GATE_LINES):], list(AUDIT_GATE_LINES))
 
     def test_rows(self):
         for row, text, want in AUDIT_SOURCE_ROWS:
