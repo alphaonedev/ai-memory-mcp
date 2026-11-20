@@ -241,6 +241,18 @@ PAIRS = (
     ("coverage.yml", "per-module-thresholds", "coverage", "coverage-per-module"),
 )
 
+# #9732: one hosted matrix leg of a PR job whose other legs stay unpaired. Site key (workflow, job,
+# leg id) -> (warm job, shared-key). The PR job spells the key once for every leg, so the template
+# below resolves per leg to the literal the warm job spells; test_chain_android_cache_9732.py pins
+# the pair (steps, key env, cargo commands) the way WarmCommandList9681 pins PAIRS.
+LEG_PAIRS: dict[tuple[str, str, str], tuple[str, str]] = {
+    ("ci.yml", "mobile-cross-compile", "target=aarch64-linux-android"): (
+        "mobile-android-audit-release", "mobile-aarch64-linux-android-audit-release"),
+}
+LEG_SHARED_KEY_TEMPLATES: dict[tuple[str, str], str] = {
+    ("ci.yml", "mobile-cross-compile"): "mobile-${{ matrix.target }}-audit-release",
+}
+
 # Steps before the cache step that may export to GITHUB_ENV in a PR job of PAIRS (none of them
 # runs on the hosted leg: each is gated on a self-hosted-only matrix field), and the
 # post-cache GITHUB_ENV steps the warm job must mirror byte for byte.
