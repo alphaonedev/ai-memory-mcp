@@ -69,19 +69,21 @@ OPERAND_PARAM_REF = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 KIND_UNCLASSIFIABLE = "unclassifiable"
 KIND_VIOLATION = "violation"
 KIND_NOT_ANALYSED = "not-analysed"
-OPEN_PIN = 47
+OPEN_PIN = 33
 NOT_ANALYSED_PIN = 3
-VIOLATION_PIN = 17
+VIOLATION_PIN = 32  # 33 after the pre-scan of #9566; stage 1 of #9455 removed the lifetime-tests R2 row
 PIN_CEILINGS = {KIND_UNCLASSIFIABLE: OPEN_PIN, KIND_VIOLATION: VIOLATION_PIN, KIND_NOT_ANALYSED: NOT_ANALYSED_PIN}
 # The name each kind's table carries in a pin line.
 TABLE_NAMES = {KIND_UNCLASSIFIABLE: "unclassifiable", KIND_VIOLATION: "allow", KIND_NOT_ANALYSED: "not-analysed"}
-PINS_LINE = "unclassifiable 47; not-analysed 3; violation 17"
+PINS_LINE = "unclassifiable 33; not-analysed 3; violation 32"
 
 # The fixed issue set of each kind; a row naming any other value is a finding.
-# 9559, 9560 and 9561: the three issues of forms the merge of the chain tip brought (baseline of the landing tree).
-OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | frozenset({9559, 9560, 9561})
+# 9561: the issue of a form the merge of the chain tip brought (baseline of the landing tree); the pre-scan
+# of #9566 leaves no row of 9534, 9547, 9559 or 9560.
+OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset({9544, 9545, 9546, 9548, 9549})
+                   | frozenset({9561}))
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
-VIOLATION_ROW_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+VIOLATION_ROW_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 # Gate-step places (E-5, conductor's word b29): a change there needs the conductor's word. The
 # mark follows the place: the gate jobs of each workflow file and the one gate step of job check.
 GATE_JOBS = {"ci.yml": frozenset({"classify", "select", "ci-gate"}), "coverage.yml": frozenset({"classify"})}
@@ -132,6 +134,47 @@ OPERAND_SHAPE_ACCEPTED = {
     ELAPSED_OPERAND: r"$$\\t$", "$line": "$line", "$RUNNER_TEMP/impact/gate.py": "$RUNNER_TEMP/impact/gate.py",
     "apt-get": "apt-get",
 }
+# Every other operator spelling of a bash parameter expansion (issue 9581), each refused by the
+# brace pattern of the classifier alone: one cell per operator character.
+PARAM_OPERATOR_SPELLINGS = {
+    "remove shortest prefix": "${a#b}",
+    "remove longest prefix": "${a##b}",
+    "remove shortest suffix": "${a%b}",
+    "remove longest suffix": "${a%%b}",
+    "replace first": "${a/b/c}",
+    "replace all": "${a//b/c}",
+    "replace at start": "${a/#b/c}",
+    "replace at end": "${a/%b/c}",
+    "indirect reference": "${!a}",
+    "names with a prefix, star": "${!a*}",
+    "names with a prefix, at": "${!a@}",
+    "keys of an array": "${!a[@]}",
+    "upper case all": "${a^^}",
+    "upper case first": "${a^}",
+    "lower case all": "${a,,}",
+    "lower case first": "${a,}",
+    "quoted transform": "${a@Q}",
+    "prompt transform": "${a@P}",
+    "escape transform": "${a@E}",
+    "assignment transform": "${a@A}",
+    "attribute transform": "${a@a}",
+    "assign default without colon": "${a=b}",
+    "error if unset without colon": "${a?b}",
+    "alternate value without colon": "${a+b}",
+    "substring offset": "${a:1}",
+    "substring offset and length": "${a:1:2}",
+    "all elements, at": "${a[@]}",
+    "all elements, star": "${a[*]}",
+    "star after a name, no bash form": "${a*}",
+    "length of an array": "${#a[@]}",
+    "special parameter at": "${@}",
+    "special parameter star": "${*}",
+    "special parameter count": "${#}",
+    "special parameter status": "${?}",
+    "special parameter pid": "${$}",
+    "special parameter background pid": "${!}",
+    "special parameter flags": "${-}",
+}
 OPERAND_SHAPE_REFUSED = {
     "command substitution": "$(date)",
     "command substitution after a reference": "${x}$(id)",
@@ -155,14 +198,39 @@ OPERAND_SHAPE_REFUSED = {
     "positional digit": "${1}",
     "unterminated brace": "${a",
     "unterminated after a reference": "${x}${a",
+    # Every other shell form that runs a command or reads a file inside one word (issue 9580).
+    "process substitution, input": "<(date)",
+    "process substitution, output": ">(cat)",
+    "process substitution inside a word": "a<(id)b",
+    "function substitution": "${ date; }",
+    "value substitution": "${| date; }",
+    "arithmetic expansion, legacy form": "$[1+2]",
+    "extended glob, one or more": "+(a|b)",
+    "extended glob, exactly one": "@(a|b)",
+    "extended glob, none of": "!(a)",
+    "extended glob, zero or one": "?(a)",
+    "extended glob, any number": "*(a)",
+    "tilde": "~",
+    "tilde of a user": "~root/x",
+    "tilde after a colon": "a:~/b",
+    "glob star": "a*",
+    "glob question mark": "a?",
+    "glob bracket": "[ab]",
+    "brace list": "{a,b}",
+    "brace sequence": "{1..3}",
+    **PARAM_OPERATOR_SPELLINGS,
 }
+# The substring forms the classifier refuses in any operand (issue 9580): each runs a command or
+# reads a file, and each has a cell above.
+OPERAND_COMMAND_FORMS = ("$(", "`", "<(", ">(", "+(", "@(", "!(", "~")
 # One operand of each long shape, 100K+ characters, read under the ceiling (the check is linear).
 OPERAND_LINEAR_REPEAT = 50_000
 OPERAND_LINEAR_MIN_LEN = 100_000
 OPERAND_LINEAR_CEILING_S = 1.0
 OPERAND_LINEAR_SHAPES = {"accepted references": ("${a}", True), "open braces": ("${", False),
                          "unterminated names": ("${a", False), "substitutions": ("$(", False),
-                         "backticks": ("``", False), "nested": ("${a${b}", False)}
+                         "backticks": ("``", False), "nested": ("${a${b}", False),
+                         "process substitutions": ("<(", False)}
 # Shell text that raises exactly the form of its class with the operand filled in.
 FORM_TEXTS = {
     FORM_NOT_LITERAL: '"{}" --version',
@@ -177,6 +245,9 @@ SECOND_OPERANDS = {
     FORM_PY_MODULE: "second_form",
     FORM_INTERP_PATH: "$SECOND_FORM_DIR/x.py",
 }
+# The command word of the synthetic off-list form: a word no handler reads, with its own open row group.
+UNLISTED = "adb"
+UNLISTED_ISSUE = 9546
 DEFAULT = object()  # the reason the form class raises for the operand
 INSERT_AT_START = "start"
 INSERT_AT_END = "end"
@@ -184,7 +255,6 @@ INSERT_AT_END = "end"
 # The issue of each row group (FACTS groups, ruling f367b2f1): (form, operand or NO-CLASS reason).
 GROUP_ISSUES = {
     (FORM_NOT_LITERAL, "$BIN"): 9533,
-    (FORM_NOT_LISTED, "apt-get"): 9534,
     (FORM_NOT_LITERAL, "$PSQL"): 9535,
     (FORM_PY_MODULE, "os"): 9536,
     (FORM_PY_MODULE, "shutil"): 9536,
@@ -200,15 +270,7 @@ GROUP_ISSUES = {
     (FORM_NOT_LISTED, "swapon"): 9544,
     (FORM_NOT_LISTED, "mold"): 9545,
     (FORM_NOT_LISTED, "adb"): 9546,
-    (FORM_NOT_LISTED, "--test"): 9547,
-    (FORM_NOT_LISTED, "--lib"): 9547,
-    (FORM_NOT_LISTED, "--skip"): 9547,
     (FORM_NOT_LITERAL, "$TIMEOUT_BIN"): 9548,
-    (FORM_NOT_LITERAL, "$l"): 9548,
-    (FORM_NOT_LITERAL, "$tflag"): 9548,
-    (FORM_NOT_LITERAL, ELAPSED_OPERAND): 9559,
-    (FORM_NOT_LITERAL, "$line"): 9547,
-    (FORM_NOT_LISTED, "line"): 9560,
     (FORM_PY_MODULE, "stat"): 9536,
     (FORM_PY_MODULE, "workflow_annotation"): 9561,
     (FORM_NO_CLASS, "python code uses a dunder name"): 9549,
@@ -242,9 +304,10 @@ REMOVAL_RULE_PHRASES = (
     "each pin only goes down",
     "a pin above its ceiling in ``PIN_CEILINGS`` is a failure",
     "a pin that differs from its row count is a failure",
-    "Pins at PR 9508: unclassifiable 47, not-analysed 3, violation 17",
+    "Pins at PR 9508: unclassifiable 33, not-analysed 3, violation 33",
     "The pins are the baseline of the tree PR 9508 lands on",
-    "moved the unclassifiable pin 41 -> 47 once); after it lands they only go down",
+    "the pre-scan of #9566 moved it 47 -> 33 and the violation pin 17 -> 33 once); after it lands they only go down",
+    "lowered the violation pin by one (17 -> 16 on the chain, 33 -> 32 after the pre-scan of #9566)",
     "is a proof for what the scan reaches only",
     "the list behind these rows is NOT complete",
     "rest-not-analysed",
@@ -284,7 +347,7 @@ def _wf(jobs: dict[str, list[tuple[str, str]]]) -> str:
     return "\n".join(out) + "\n"
 
 
-def _open(form: str = FORM_NOT_LISTED, operand: str = "apt-get", issue: object = 9534, gate_step: object = False,
+def _open(form: str = FORM_NOT_LISTED, operand: str = UNLISTED, issue: object = UNLISTED_ISSUE, gate_step: object = False,
           workflow: str = SYNTH, job: str = JOB, step: str = STEP, reason: object = DEFAULT) -> object:
     if reason is DEFAULT:
         reason = _reason(form, operand) if form in FORM_REASONS else "no reason"
@@ -461,7 +524,7 @@ class RowTables(unittest.TestCase):
 
     def test_9452_check_refuses_a_row_without_an_exact_place(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
         for workflow, job, step in (("", JOB, STEP), (SYNTH, "", STEP), (SYNTH, JOB, ""), (SYNTH, JOB, " "),
                                     (SYNTH, JOB, "*"), (SYNTH, JOB, "S*"), (SYNTH, JOB, "S?"), (SYNTH, JOB, "[S]"),
                                     ("*.yml", JOB, STEP), (SYNTH, "*", STEP), (SYNTH, "{j,k}", STEP),
@@ -474,13 +537,13 @@ class RowTables(unittest.TestCase):
 
     def test_9452_check_refuses_a_row_with_an_unknown_form(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        apt = _reason(FORM_NOT_LISTED, "apt-get")
-        for form, operand, reason in (("", "apt-get", apt), ("command", "apt-get", apt), ("*", "apt-get", apt),
-                                      (FORM_NOT_LISTED, "", apt), (FORM_NOT_LISTED, "*", apt),
-                                      (FORM_NOT_LISTED, None, apt), (FORM_NOT_LISTED, "xcrun", apt),
-                                      (FORM_NOT_LITERAL, "apt-get", apt), (FORM_NO_CLASS, "apt-get", apt),
-                                      (FORM_NOT_LISTED, "apt-get", None), (FORM_NOT_LISTED, "apt-get", "x")):
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
+        unlisted = _reason(FORM_NOT_LISTED, UNLISTED)
+        for form, operand, reason in (("", UNLISTED, unlisted), ("command", UNLISTED, unlisted), ("*", UNLISTED, unlisted),
+                                      (FORM_NOT_LISTED, "", unlisted), (FORM_NOT_LISTED, "*", unlisted),
+                                      (FORM_NOT_LISTED, None, unlisted), (FORM_NOT_LISTED, "xcrun", unlisted),
+                                      (FORM_NOT_LITERAL, UNLISTED, unlisted), (FORM_NO_CLASS, UNLISTED, unlisted),
+                                      (FORM_NOT_LISTED, UNLISTED, None), (FORM_NOT_LISTED, UNLISTED, "x")):
             with self.subTest(form=form, operand=operand, reason=reason):
                 row = _open(form=form, operand=operand, reason=reason)
                 self.assertIn(f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}", _problems(workflows, (row,)))
@@ -530,13 +593,41 @@ class RowTables(unittest.TestCase):
                 self.assertIs(tb._exact_operand(big), accepted)
                 self.assertLess(time.monotonic() - start, OPERAND_LINEAR_CEILING_S)
 
+    def test_9580_every_refused_command_form_has_a_shape_cell(self) -> None:
+        """The refused substring forms are exactly the command forms, each with a refused cell in
+        the corpus, and each alone, inside a word and after a reference is refused."""
+        _need_module(self)
+        self.assertEqual(tb.OPERAND_REFUSED_EXPANSIONS, OPERAND_COMMAND_FORMS)
+        unknown = [f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}"]
+        for form in OPERAND_COMMAND_FORMS:
+            with self.subTest(form=form):
+                self.assertTrue(any(form in operand for operand in OPERAND_SHAPE_REFUSED.values()))
+                for operand in (form, f"a{form}b", f"${{x}}{form}"):
+                    self.assertFalse(tb._exact_operand(operand), operand)
+                    self.assertEqual(tb._form_row_problems([_open(FORM_NOT_LITERAL, operand, 9548)], "open row",
+                                                           tb.OPEN_ROW_ISSUES), unknown)
+
+    def test_9581_each_parameter_operator_spelling_is_refused_by_the_brace_pattern(self) -> None:
+        """No spelling holds a refused substring form, so the brace pattern alone refuses each one:
+        its span never fully matches, the plain form is None and the row is an unknown form."""
+        _need_module(self)
+        unknown = [f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}"]
+        for label, operand in PARAM_OPERATOR_SPELLINGS.items():
+            with self.subTest(spelling=label):
+                self.assertFalse(any(form in operand for form in OPERAND_COMMAND_FORMS))
+                self.assertIsNone(tb.OPERAND_PARAM_REF_RE.fullmatch(operand))
+                self.assertIsNone(tb._operand_plain_form(operand))
+                self.assertFalse(tb._exact_operand(operand))
+                self.assertEqual(tb._form_row_problems([_open(FORM_NOT_LITERAL, operand, 9548)], "open row",
+                                                       tb.OPEN_ROW_ISSUES), unknown)
+
     def test_9452_two_rows_for_one_form_are_a_failure(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        key = (SYNTH, JOB, STEP, FORM_NOT_LISTED, "apt-get", "")
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
+        key = (SYNTH, JOB, STEP, FORM_NOT_LISTED, UNLISTED, "")
         self.assertIn(f"duplicate open row {key}", _problems(workflows, (_open(), _open())))
         # Two forms in one step, one row each: no failure.
-        two = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get") + "\n"
+        two = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED) + "\n"
                                   + _form_text(FORM_NOT_LISTED, "xcrun"))]})}
         self.assertEqual(_problems(two, (_open(), _open(operand="xcrun", issue=9538))), [])
 
@@ -570,8 +661,8 @@ class OneRowOneForm(unittest.TestCase):
         _need_module(self)
         # (row form, row operand, form in the step): same class other operand, same operand other class.
         for row_form, row_operand, found_form, found_operand in (
-                (FORM_NOT_LISTED, "apt-get", FORM_NOT_LISTED, "fallocate"),
-                (FORM_NOT_LISTED, "fallocate", FORM_NOT_LISTED, "apt-get"),
+                (FORM_NOT_LISTED, UNLISTED, FORM_NOT_LISTED, "fallocate"),
+                (FORM_NOT_LISTED, "fallocate", FORM_NOT_LISTED, UNLISTED),
                 (FORM_NOT_LISTED, "xcrun", FORM_NOT_LISTED, "xcrunx"),
                 (FORM_NOT_LITERAL, "$BIN", FORM_INTERP_PATH, "$BIN"),
                 (FORM_INTERP_PATH, "$BIN", FORM_NOT_LITERAL, "$BIN"),
@@ -580,7 +671,7 @@ class OneRowOneForm(unittest.TestCase):
                 (FORM_PY_MODULE, "os", FORM_PY_MODULE, "shutil")):
             with self.subTest(row=(row_form, row_operand), found=(found_form, found_operand)):
                 workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(found_form, found_operand))]})}
-                row = _open(row_form, row_operand, 9534)
+                row = _open(row_form, row_operand, UNLISTED_ISSUE)
                 self.assertEqual(sorted(_problems(workflows, (row,))),
                                  sorted([f"stale open row (no such form in the step): {SYNTH}/{JOB}/{STEP}",
                                          UNCLASSIFIABLE_PREFIX
@@ -695,26 +786,26 @@ class KindsNeverMix(unittest.TestCase):
                 self.assertEqual(_check(result, tables),
                                  [f"violation class ({klass}) without an allow row: {wf}/{job}/{step}: {detail}"])
         # A violation row at the step of a form never covers the form.
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
         allow = (tb.AllowRow(SYNTH, JOB, STEP, ("iii",), 9553),)
         self.assertEqual(sorted(_problems(workflows, allow=allow)),
                          sorted([f"stale allow row (no longer violates class iii): {SYNTH}/{JOB}/{STEP}",
                                  UNCLASSIFIABLE_PREFIX
-                                 + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, "apt-get"))]))
+                                 + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, UNLISTED))]))
 
     def test_9452_an_open_row_never_covers_a_not_analysed_form_and_back(self) -> None:
         _need_module(self)
         run, reason, note = BEHIND_SILENT[0]
         workflows = {SYNTH: _wf({JOB: [(STEP, run)]})}
-        as_open = _open(FORM_NO_CLASS, "--version", 9547, reason=reason)
+        as_open = _open(FORM_NO_CLASS, "--version", 9548, reason=reason)
         self.assertEqual(sorted(_problems(workflows, (as_open,))),
                          sorted([f"stale open row (no such form in the step): {SYNTH}/{JOB}/{STEP}",
                                  f"{NOT_ANALYSED_PREFIX}{_message(SYNTH, JOB, STEP, reason)}: {note}"]))
-        plain = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        as_stop = _stop(reason=_reason(FORM_NOT_LISTED, "apt-get"), operand="apt-get", note=note)
+        plain = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
+        as_stop = _stop(reason=_reason(FORM_NOT_LISTED, UNLISTED), operand=UNLISTED, note=note)
         problems = _problems(plain, stops=(as_stop,))
         self.assertIn(f"stale not-analysed row (no such form and line in the step): {SYNTH}/{JOB}/{STEP}", problems)
-        self.assertIn(UNCLASSIFIABLE_PREFIX + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, "apt-get")), problems)
+        self.assertIn(UNCLASSIFIABLE_PREFIX + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, UNLISTED)), problems)
 
     def test_9452_a_row_without_a_kind_is_refused_in_every_table(self) -> None:
         _need_module(self)
@@ -877,7 +968,7 @@ class Pins(unittest.TestCase):
 
     def test_9452_an_issue_outside_the_fixed_set_fails_for_every_kind(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
         stop_wf = {SYNTH: _wf({JOB: [(STEP, BEHIND_SILENT[0][0])]})}
         for issue in BAD_OPEN_ISSUES:
             with self.subTest(kind=KIND_UNCLASSIFIABLE, issue=issue):
