@@ -2540,6 +2540,9 @@ class LiveEndToEnd(unittest.TestCase):
         # setup never creates its base (#7031): the job creates it first, as ci.yml does, and drops it after.
         pib.psql(url, 'CREATE DATABASE %s' % pib.quote_ident(db))
         self.addCleanup(pib.psql, url, 'DROP DATABASE IF EXISTS %s' % pib.quote_ident(db))
+        # The wrapper cross-checks --db and the template against the URL database (S2 of PR 9686), so every
+        # wrapper call gets the URL of this base, as a CI job does; the cell's own psql calls keep the server URL.
+        env[pib.URL_VAR] = pib.with_database(url, db)
         setup = subprocess.run([sys.executable, str(SCRIPT), 'setup', '--db', db, '--jobs', '1',
                                 '--run-id', run_id, '--emit-env'], env=env, capture_output=True, text=True)
         self.assertEqual(setup.returncode, 0, setup.stderr)
