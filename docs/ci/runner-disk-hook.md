@@ -64,6 +64,15 @@ the log and on stderr, and nothing is removed.
    cannot be entered is a refusal with its reason. Each tag problem (missing, symlink, not a regular file,
    wrong signature, unreadable) has its own reason.
 
+At job start, after a successful free-space read, the hook also removes `.local-runs/test-tmp` from the work root
+and from each real (non-symlink) directory directly below it, through the same descriptor-based engine (every open
+is relative to its parent descriptor with `O_NOFOLLOW`, on the work root's device, no tag required). A symlinked
+`.local-runs` or `test-tmp` is a refusal and is never followed. There is no ACL strip and no `chmod` subprocess: a
+tree the removal cannot enter or unlink is a refusal that names the operating system's reason. `job-completed`
+never touches `test-tmp`, a failed free-space read removes nothing, and `--dry-run` only lists what would go. Each
+outcome is one note in the line's `reason` (`test-tmp removed`, `test-tmp would be removed`, `test-tmp partial`,
+`test-tmp not cleared`); `removed=` and `entries=` count `target` directories only.
+
 A free-space read that fails, returns nothing or returns a negative value is a refusal to decide: nothing is
 removed and the reason is logged. It is never read as 0 free or as plenty.
 

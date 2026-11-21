@@ -23,6 +23,7 @@ import datetime
 import errno
 import importlib.util
 import io
+import json
 import os
 import random
 import shutil
@@ -1142,7 +1143,7 @@ class FolderThroughRun(Base):
         self.assertEqual(
             row["reason"],
             f'"free space 100.00 GiB is at or above the 60 GiB floor; work folder size read failed under '
-            f'{self.work_root}: Permission denied"',
+            f'{self.work_root}: Permission denied; {self.work_root}/sealed: test-tmp not cleared, directory cannot be opened: Permission denied"',
         )
 
     def test_over_the_ceiling_clears_although_free_is_above_the_floor(self):
@@ -1375,6 +1376,115 @@ class Wrapper(unittest.TestCase):
                     self.assertEqual(done.returncode, 0, done.stderr)
                 else:
                     self.assertEqual(done.returncode == 75, "decision=below-floor" in row, (done.returncode, row))
+
+
+class TestTmpPort(Base):
+    """The old shell hook's .local-runs/test-tmp cleanup (#8216), through descriptors and the same removal engine."""
+
+    def make_test_tmp(self, base: Path) -> Path:
+        test_tmp = base / ".local-runs" / "test-tmp"
+        (test_tmp / "sub").mkdir(parents=True)
+        (test_tmp / "a.txt").write_text("a")
+        (test_tmp / "sub" / "b.txt").write_text("b")
+        return test_tmp
+
+    def reason(self) -> str:
+        return json.loads(fields(self.log_lines()[0])["reason"].removesuffix(" dry-run"))
+
+    def test_job_started_removes_the_work_root_and_the_checkout_test_tmp_with_exact_notes(self):
+        at_root = self.make_test_tmp(self.work_root)
+        at_repo = self.make_test_tmp(self.repo)
+        code, err = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertFalse(at_root.exists())
+        self.assertFalse(at_repo.exists())
+        self.assertTrue((self.work_root / ".local-runs").is_dir())
+        reason = self.reason()
+        self.assertIn(f"test-tmp removed: {at_root} (3 entries)", reason)
+        self.assertIn(f"test-tmp removed: {at_repo} (3 entries)", reason)
+        row = fields(self.log_lines()[-1])
+        self.assertEqual(row["decision"], "enough-free")
+        self.assertEqual((row["removed"], row["entries"]), ("0", "0"))
+
+    def test_job_completed_leaves_test_tmp_alone(self):
+        at_repo = self.make_test_tmp(self.repo)
+        code, _ = self.completed(disk=FakeDisk(500 * GIB))
+        self.assertEqual(code, 0)
+        self.assertTrue(at_repo.is_dir())
+        self.assertNotIn("test-tmp", self.reason())
+
+    def test_dry_run_lists_and_removes_nothing(self):
+        at_repo = self.make_test_tmp(self.repo)
+        code, _ = self.started("--dry-run", disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertTrue((at_repo / "sub" / "b.txt").exists())
+        self.assertIn(f"test-tmp would be removed: {at_repo} (3 entries)", self.reason())
+
+    def test_failed_free_read_clears_no_test_tmp(self):
+        at_repo = self.make_test_tmp(self.repo)
+        code, _ = self.started(disk=FakeDisk(OSError("boom")))
+        self.assertEqual(code, 0)
+        self.assertTrue((at_repo / "sub" / "b.txt").exists())
+        self.assertEqual(fields(self.log_lines()[-1])["decision"], "refused-measure")
+
+    def test_symlinked_test_tmp_is_not_followed(self):
+        outside = self.scratch / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("k")
+        local_runs = self.repo / ".local-runs"
+        local_runs.mkdir()
+        (local_runs / "test-tmp").symlink_to(outside)
+        code, _ = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertTrue((outside / "keep.txt").exists())
+        self.assertTrue((local_runs / "test-tmp").is_symlink())
+        self.assertIn(f"{local_runs}/test-tmp: test-tmp not cleared, directory is a symlink", self.reason())
+
+    def test_symlinked_local_runs_is_not_followed(self):
+        outside = self.scratch / "outside"
+        (outside / "test-tmp").mkdir(parents=True)
+        (outside / "test-tmp" / "keep.txt").write_text("k")
+        (self.repo / ".local-runs").symlink_to(outside)
+        code, _ = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertTrue((outside / "test-tmp" / "keep.txt").exists())
+        self.assertIn(f"{self.repo}/.local-runs/test-tmp: test-tmp not cleared, directory is a symlink", self.reason())
+
+    def test_symlinked_checkout_directory_is_not_entered(self):
+        outside = self.scratch / "outside"
+        victim = self.make_test_tmp(outside)
+        (self.work_root / "linked").symlink_to(outside)
+        code, _ = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertTrue((victim / "sub" / "b.txt").exists())
+        self.assertNotIn("linked", self.reason())
+
+    def test_read_only_subdirectory_is_removed_without_a_chmod_subprocess(self):
+        at_repo = self.make_test_tmp(self.repo)
+        (at_repo / "sub").chmod(0o500)
+        code, _ = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertFalse(at_repo.exists())
+
+    def test_absent_test_tmp_adds_no_note(self):
+        code, _ = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertNotIn("test-tmp", self.reason())
+
+    def test_test_tmp_cleared_and_targets_cleared_below_the_floor_keep_the_exit_code(self):
+        at_repo = self.make_test_tmp(self.repo)
+        target = self.target("tagged")
+        code, _ = self.started(disk=FakeDisk(10 * GIB, 100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertFalse(at_repo.exists())
+        self.assertFalse(target.exists())
+        self.assertEqual(fields(self.log_lines()[-1])["decision"], "clear")
+
+    def test_test_tmp_cleared_does_not_lift_a_below_floor_exit(self):
+        self.make_test_tmp(self.repo)
+        code, _ = self.started(disk=FakeDisk(1 * GIB))
+        self.assertEqual(code, 75)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "below-floor")
 
 
 if __name__ == "__main__":

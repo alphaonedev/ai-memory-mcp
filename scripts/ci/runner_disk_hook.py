@@ -94,6 +94,8 @@ LOG_DIR_MODE = 0o700
 LOG_FILE_MODE = 0o600
 TARGET_DIR_NAME = "target"
 MARKER_FILE_NAME = "CACHEDIR.TAG"
+LOCAL_RUNS_DIR_NAME = ".local-runs"
+TEST_TMP_DIR_NAME = "test-tmp"
 MARKER_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
 RUNNER_WORK_DIR_NAME = "_work"
 WORK_ROOT_MIN_PARTS = 3
@@ -625,6 +627,80 @@ def clear_targets(config: Config) -> TargetReport:
     return TargetReport(tuple(completed), tuple(partial), tuple(would), entries, candidates, tuple(notes))
 
 
+def clear_test_tmp(config: Config) -> tuple[str, ...]:
+    """The old shell hook's ``.local-runs/test-tmp`` cleanup, through descriptors; one note per outcome.
+
+    The bases are the work root and each repository directory directly below it (the checkout). Every open is
+    relative to its parent descriptor with ``O_NOFOLLOW`` on the work root's device, and the removal is
+    ``safe_remove.check_and_remove`` without a tag. There is no ``chmod`` or ACL subprocess: a directory the
+    removal cannot enter or unlink is a refusal with the operating system's reason.
+    """
+    notes: list[str] = []
+    root = config.work_root
+    try:
+        before = os.lstat(root)
+        root_fd = os.open(root, DIR_OPEN_FLAGS)
+    except OSError as exc:
+        return (f"{root}: test-tmp cannot be cleared, work root cannot be opened: {exc.strerror or exc}",)
+    try:
+        opened = os.fstat(root_fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            return (f"{root}: test-tmp not cleared, work root changed while it was opened",)
+        with os.scandir(root_fd) as scan:
+            repos = sorted(entry.name for entry in scan if entry.is_dir(follow_symlinks=False))
+        for name in (None, *repos):
+            base = root if name is None else root / name
+            base_fd = root_fd
+            if name is not None:
+                try:
+                    base_fd = safe_remove.open_directory(
+                        root_fd, name, expected_dev=opened.st_dev, device_label="the work root"
+                    )
+                except safe_remove.NotProven as exc:
+                    notes.append(f"{base}: test-tmp not cleared, {exc.reason}")
+                    continue
+            try:
+                notes.extend(_clear_test_tmp_in(base_fd, base, opened.st_dev, config.dry_run))
+            finally:
+                if name is not None:
+                    os.close(base_fd)
+    except OSError as exc:
+        notes.append(f"{root}: test-tmp not cleared, cannot list the work root: {exc.strerror or exc}")
+    finally:
+        os.close(root_fd)
+    return tuple(notes)
+
+
+def _clear_test_tmp_in(base_fd: int, base: Path, dev: int, dry_run: bool) -> list[str]:
+    shown = base / LOCAL_RUNS_DIR_NAME / TEST_TMP_DIR_NAME
+    try:
+        local_fd = safe_remove.open_directory(
+            base_fd, LOCAL_RUNS_DIR_NAME, expected_dev=dev, device_label="the work root"
+        )
+    except safe_remove.NotProven as exc:
+        return [] if exc.absent else [f"{shown}: test-tmp not cleared, {exc.reason}"]
+    try:
+        result = safe_remove.check_and_remove(
+            local_fd, TEST_TMP_DIR_NAME, tag=None, dry_run=dry_run, expected_dev=dev, device_label="the work root"
+        )
+    finally:
+        os.close(local_fd)
+    S = safe_remove.Status
+    match result.status:
+        case S.REMOVED:
+            return [f"test-tmp removed: {shown} ({result.entries} entries)"]
+        case S.WOULD_REMOVE:
+            return [f"test-tmp would be removed: {shown} ({result.entries} entries)"]
+        case S.PARTIAL:
+            return [f"{shown}: test-tmp partial, {result.entries} entries removed: {result.reason}"]
+        case S.REFUSED:
+            return [f"{shown}: test-tmp not cleared, {result.reason}"]
+        case S.ABSENT:
+            return []
+        case _:
+            raise ValueError(f"unknown status {result.status!r}")
+
+
 def read_free_bytes(config: Config, disk_free: Callable[[Path], object]) -> tuple[int, bool]:
     """Free bytes of the work root's volume and whether the value is an input; raise Undecidable with the reason."""
     if config.free_gib_override is not None:
@@ -728,6 +804,7 @@ def run(
         except MeasureError as exc:
             folder_state = exc.state
             folder_reason = exc.reason
+    test_tmp_notes: tuple[str, ...] = clear_test_tmp(config) if config.event is Event.JOB_STARTED else ()
     need_clear = before < floor_bytes or over
     report = TargetReport((), (), (), 0, 0, ())
     action = Action.NOT_NEEDED
@@ -736,7 +813,7 @@ def run(
         action = _action_of(report, config.dry_run)
     after: int | None = before
     folder_after = folder_before
-    notes = list(report.notes)
+    notes = list(test_tmp_notes) + list(report.notes)
     if report.completed or report.partial:
         try:
             after, _ = read_free_bytes(config, disk_free)
