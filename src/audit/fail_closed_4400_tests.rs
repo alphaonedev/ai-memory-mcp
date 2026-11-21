@@ -4,9 +4,13 @@
 //! #4400 — the opt-in fail-closed audit trail, end to end in one process:
 //! a failed append latches, the record-stop chokepoints refuse mutations
 //! (reads stay live), and a successful retry clears the latch and writes a
-//! `trail_resumed` record. Every cell holds `sink_test_lock` (the sink and the
-//! latch are process-global) and turns the mode on through the test override,
-//! never the process environment.
+//! `trail_resumed` record. Every cell runs in an isolated child process (#7321:
+//! the latch is process-global and read by every write path, so a latched
+//! shared test process refuses unrelated concurrent writes; the isolation
+//! helper is `crate::test_support::run_env_isolated_child_or_spawn`, copied
+//! from `with_legacy_push_env` in `handlers/tests.rs`), holds `sink_test_lock`
+//! there and turns the mode on through the test override, never the process
+//! environment.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -70,6 +74,11 @@ fn memory(title: &str) -> crate::models::Memory {
 /// the insert succeeded (the failure was only counted).
 #[test]
 fn a_failed_audit_append_refuses_the_next_write_but_not_reads_4400() {
+    if crate::test_support::run_env_isolated_child_or_spawn(
+        "audit::fail_closed_4400_tests::a_failed_audit_append_refuses_the_next_write_but_not_reads_4400",
+    ) {
+        return;
+    }
     let _g = sink_test_lock();
     force_on_for_test(true);
     let (_buf, fail) = install();
@@ -113,6 +122,11 @@ fn a_failed_audit_append_refuses_the_next_write_but_not_reads_4400() {
 /// `trail_resumed` append, the latch clears, and the write goes through.
 #[test]
 fn a_recovered_trail_clears_the_latch_and_records_the_resumption_4400() {
+    if crate::test_support::run_env_isolated_child_or_spawn(
+        "audit::fail_closed_4400_tests::a_recovered_trail_clears_the_latch_and_records_the_resumption_4400",
+    ) {
+        return;
+    }
     let _g = sink_test_lock();
     force_on_for_test(true);
     let (buf, fail) = install();
@@ -148,6 +162,11 @@ fn a_recovered_trail_clears_the_latch_and_records_the_resumption_4400() {
 /// byte-identical pre-#4400 behaviour).
 #[test]
 fn with_the_mode_off_a_failure_never_latches_4400() {
+    if crate::test_support::run_env_isolated_child_or_spawn(
+        "audit::fail_closed_4400_tests::with_the_mode_off_a_failure_never_latches_4400",
+    ) {
+        return;
+    }
     let _g = sink_test_lock();
     force_on_for_test(false);
     let (_buf, fail) = install();
@@ -166,6 +185,11 @@ fn with_the_mode_off_a_failure_never_latches_4400() {
 #[cfg(feature = "sal")]
 #[test]
 fn the_store_gate_refuses_with_its_own_variant_4400() {
+    if crate::test_support::run_env_isolated_child_or_spawn(
+        "audit::fail_closed_4400_tests::the_store_gate_refuses_with_its_own_variant_4400",
+    ) {
+        return;
+    }
     let _g = sink_test_lock();
     force_on_for_test(true);
     let (_buf, fail) = install();
