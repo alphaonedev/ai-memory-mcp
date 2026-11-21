@@ -57,6 +57,8 @@ TIMEOUT_S = 120
 # Hand-written: a rules.json version bump must come with a reviewed table update.
 V = "cargo_skip-rules-v1"
 PR_BASE_REF = "chain/promo6-ssh-r2"
+# The chain tip tree that predates #9263 (its decider does not know --stdin0).
+CHAIN_TIP = "b5b1f8bbf3e8e867baa0bb36f901463c06d16a1f"
 MAX_PATHS = 5000
 # Cost bound of the cap rows: two rows read the lists, and one path is matched
 # by at most this many passes (ci tree, docs, skip, each with its blocked check).
@@ -768,6 +770,82 @@ class CoverageClassifyRuns(unittest.TestCase):
             with self.subTest(label):
                 values = self.planted_answer(label, docs_only, skip, reason)
                 self.expect(label, values, *run)
+
+    def planted_files(self, files, label, rel_path):
+        """Commit these files as the trusted impact tree, then edit `rel_path` in the PR."""
+        target = self.repo / "scripts" / "ci" / "impact"
+        for name, data in files.items():
+            (target / name).write_bytes(data)
+        run_git(self.repo, "add", "-A")
+        run_git(self.repo, "commit", "-q", "--allow-empty", "-m", "trusted impact tree " + label)
+        base = run_git(self.repo, "rev-parse", "HEAD")
+        self.write(rel_path, "# changed %s\n" % label)
+        self.commit()
+        values, _ = self.run_cls(base)
+        return values
+
+    @staticmethod
+    def chain_tip_files():
+        """The impact files of the chain tip, or None when the objects are not here."""
+        out = {}
+        for name in CoverageClassifyRuns.IMPACT_FILES:
+            res = subprocess.run(
+                ["git", "-C", str(REPO), "show", "%s:scripts/ci/impact/%s" % (CHAIN_TIP, name)],
+                capture_output=True, timeout=TIMEOUT_S, env=base_env())
+            if res.returncode != 0:
+                return None
+            out[name] = res.stdout
+        return out
+
+    def test_a_decider_that_does_not_answer_in_the_new_shape_runs(self):
+        """A PR whose merge-base predates #9263 runs the old decider with `--stdin0`.
+
+        Forms used. Stand-in rows (a) to (d) always run: they are the minimal
+        deciders that do not answer in the new shape and they do not depend on
+        the repository history. The REAL row reads the decider of the chain tip
+        (CHAIN_TIP) with `git show` from the repository this test runs in; it
+        runs when those objects are readable and its rows are left out
+        otherwise (the stand-ins still assert the same invariant), because a
+        shallow checkout cannot read them: the coverage.yml checkout fetches
+        with `fetch-depth: 2`. Measured on this clone: the tip
+        objects are readable and its decider rejects `--stdin0` with exit 2
+        (the same outcome as row (a)).
+
+        Invariant: every such decider ends as a RUN with the exact reason
+        `classifier-error-fail-closed`, never a skip, on a docs-only diff and on
+        a tests-only diff. The expected column is written by hand.
+        """
+        self.commit_base()
+        argparse_old = (
+            "import argparse\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--stdin', action='store_true')\n"
+            "p.add_argument('--rules')\n"
+            "p.add_argument('--event-name')\n"
+            "p.add_argument('--base-ref')\n"
+            "p.parse_args()\n"
+            "print('docs_only=true')\nprint('cargo_skip=true')\n"
+            "print('cargo_skip_reason=old-skip')\n").encode()
+        silent = b"import sys\n"
+        old_shape = b"print('docs_only=true')\n"
+        exit_one = (b"import sys\nprint('docs_only=true')\nprint('cargo_skip=true')\n"
+                    b"print('cargo_skip_reason=old-skip')\nsys.exit(1)\n")
+        deciders = [
+            ("(a) rejects --stdin0 with exit 2", {"cargo_skip.py": argparse_old}),
+            ("(b) exit 0, prints nothing", {"cargo_skip.py": silent}),
+            ("(c) exit 0, old shape docs_only=true only", {"cargo_skip.py": old_shape}),
+            ("(d) exit 1 after a full skip answer", {"cargo_skip.py": exit_one}),
+        ]
+        tip = self.chain_tip_files()
+        if tip is not None:
+            deciders.append(("REAL chain tip decider", tip))
+        diffs = [("docs only", "docs/a.md"), ("tests only", "scripts/ci/tests/x.py")]
+        for dlabel, files in deciders:
+            for flabel, rel in diffs:
+                label = "%s | %s" % (dlabel, flabel)
+                with self.subTest(label):
+                    values = self.planted_files(files, label, rel)
+                    self.expect(label, values, "false", "false", FAIL_CLOSED)
 
     def test_a_pr_cannot_replace_its_own_classifier(self):
         base = self.commit_base()
