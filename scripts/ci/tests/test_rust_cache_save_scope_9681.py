@@ -3100,5 +3100,205 @@ class UnreadEnvForms9745R1(unittest.TestCase):
         self.assertEqual(_effective_key_env({ENV_NAME: ENV_EXPRESSION}, leg), {ENV_NAME: "it's"})
 
 
+# --- #9771 r1 (finding 1): every plain leg scalar is typed or refused ------------------------------
+# The expected column is written out by hand from the YAML 1.2 core schema and the runner's rules
+# (a plain `false` is a boolean, `null`/`~`/empty is null, a canonical integer is a number).
+SKIP_IF_STEP = (f"      - name: Cache\n        uses: {RUST_CACHE}@{STUB_SHA}\n"
+                "        if: ${{ !matrix.skip }}\n"
+                "        with:\n          save-if: ${{ github.event_name == 'push' }}\n")
+EQ_ONE_IF_STEP = SKIP_IF_STEP.replace("${{ !matrix.skip }}", "${{ matrix.skip == 1 }}")
+SKIP_WHERE = "w.yml: j: strategy.matrix.include[0].skip: unread YAML form, "
+SITE_PREFIX = ("w.yml", "j")
+RAN = "ran"          # the step runs on the leg: the site is listed
+SKIPPED = "skipped"  # the step does not run on the leg: no site, no problem
+# (written after `skip:`, step `if:` form, outcome); outcome is RAN, SKIPPED or the exact problem.
+LEG_SCALAR_ROWS: tuple[tuple[str, str, str], ...] = (
+    ("False", "!", RAN), ("false", "!", RAN), ("FALSE", "!", RAN),
+    ("True", "!", SKIPPED), ("true", "!", SKIPPED), ("TRUE", "!", SKIPPED),
+    ("null", "!", RAN), ("Null", "!", RAN), ("NULL", "!", RAN), ("~", "!", RAN),
+    ("", "!", RAN),
+    ("0", "!", RAN), ("1", "!", SKIPPED), ("12", "!", SKIPPED),
+    ("1.0", "!", SKIP_WHERE + "unquoted YAML float: '1.0'"),
+    ("0x10", "!", SKIP_WHERE + "unquoted YAML integer: '0x10'"),
+    ("0o7", "!", SKIP_WHERE + "unquoted YAML integer: '0o7'"),
+    ("+1", "!", SKIP_WHERE + "unquoted YAML integer: '+1'"),
+    ("01", "!", SKIP_WHERE + "unquoted YAML integer: '01'"),
+    ("-0", "!", SKIP_WHERE + "unquoted YAML integer: '-0'"),
+    (".5", "!", SKIP_WHERE + "unquoted YAML float: '.5'"),
+    (".nan", "!", SKIP_WHERE + "unquoted YAML float: '.nan'"),
+    ("yes", "!", SKIPPED), ("no", "!", SKIPPED), ("on", "!", SKIPPED), ("off", "!", SKIPPED),
+    ("abc", "!", SKIPPED),
+    ("'false'", "!", SKIPPED), ('"false"', "!", SKIPPED), ("''", "!", RAN), ('""', "!", RAN),
+    ("'0'", "!", SKIPPED), ("'null'", "!", SKIPPED),
+    ("1", "== 1", RAN), ("0", "== 1", SKIPPED), ("'1'", "== 1", RAN), ("true", "== 1", RAN),
+    ("1.0", "== 1", SKIP_WHERE + "unquoted YAML float: '1.0'"),
+    ("0x10", "== 1", SKIP_WHERE + "unquoted YAML integer: '0x10'"),
+    ("null", "== 1", SKIPPED),
+)
+
+
+def _leg_scalar_sites(written: str, condition: str):
+    step = SKIP_IF_STEP if condition == "!" else EQ_ONE_IF_STEP
+    job = _stub_job("j", _stub_matrix(f"skip: {written}"), step)
+    names_patch, load_patch = _with_stub_workflows(
+        {"w.yml": _stub_workflow("pull_request", job)})
+    with names_patch, load_patch:
+        sites, problems = _hosted_pr_rust_cache_sites()
+    return sorted(sites), problems
+
+
+class LegScalarForms9771R1(unittest.TestCase):
+    """#9771 r1 finding 1: for every plain scalar a matrix leg can carry, a consumer of the leg
+    reader gets the typed value or the reader reports a problem; a running rust-cache site is never
+    returned as no site without a problem."""
+
+    def test_every_scalar_form_gives_the_exact_site_set_or_problem(self) -> None:
+        for written, condition, want in LEG_SCALAR_ROWS:
+            with self.subTest(written=written, condition=condition):
+                sites, problems = _leg_scalar_sites(written, condition)
+                if want == RAN:
+                    self.assertEqual((len(sites), problems), (1, []))
+                    self.assertEqual(sites[0][:2], SITE_PREFIX)
+                elif want == SKIPPED:
+                    self.assertEqual((sites, problems), ([], []))
+                else:
+                    self.assertEqual((sites, problems), ([], [want]))
+
+    def test_exact_site_keys_for_the_typed_rows(self) -> None:
+        self.assertEqual(_leg_scalar_sites("False", "!"), ([("w.yml", "j", "skip=False")], []))
+        self.assertEqual(_leg_scalar_sites("false", "!"), ([("w.yml", "j", "skip=False")], []))
+        self.assertEqual(_leg_scalar_sites("0", "!"), ([("w.yml", "j", "skip=0")], []))
+        self.assertEqual(_leg_scalar_sites("null", "!"), ([("w.yml", "j", "skip=None")], []))
+
+    def test_typed_values_reach_every_consumer(self) -> None:
+        def leg_of(written: str) -> dict[str, object]:
+            (leg,) = _matrix_include(_leg_job("          - skip: " + written))
+            return leg
+        self.assertEqual(leg_of("False"), {"skip": False})
+        self.assertEqual(leg_of("null"), {"skip": None})
+        self.assertEqual(leg_of("~"), {"skip": None})
+        self.assertEqual(leg_of(""), {"skip": None})
+        self.assertEqual(leg_of("0"), {"skip": 0})
+        self.assertEqual(leg_of("12"), {"skip": 12})
+        self.assertEqual(leg_of("no"), {"skip": "no"})
+        self.assertEqual(leg_of("'false'"), {"skip": "false"})
+        self.assertIsInstance(leg_of("'false'")["skip"], QuotedStr)
+        self.assertIs(_eval_if("!matrix.skip", {"skip": False}), True)
+        self.assertIs(_eval_if("matrix.skip == 1", {"skip": 1}), True)
+
+    def test_a_typed_value_in_runs_on_and_commands_renders_as_the_runner_text(self) -> None:
+        self.assertEqual(_runs_on(Job("j", ["    runs-on: ${{ matrix.os }}"]), {"os": 12}), "12")
+        self.assertEqual(_expand_matrix("cargo build -j ${{ matrix.n }}", {"n": 4}),
+                         "cargo build -j 4")
+        with self.assertRaises(AssertionError) as caught:
+            _runs_on(Job("j", ["    runs-on: ${{ matrix.os }}"]), {"os": None})
+        self.assertEqual(str(caught.exception),
+                         "j: runs-on reads matrix.os, which is null on leg 'os=None'")
+
+
+# --- #9771 r1 (finding 2): a called workflow that reads as nothing is a problem --------------------
+NO_JOBS_PROBLEM = ("caller.yml: call: reusable workflow './.github/workflows/inner.yml' has no "
+                   "readable jobs")
+NEITHER_PROBLEM = "caller.yml: call: job has neither a readable runs-on nor a readable uses"
+CALLEE_ROWS: tuple[tuple[str, str], ...] = (
+    ("", NO_JOBS_PROBLEM),
+    ("   \n\n", NO_JOBS_PROBLEM),
+    ("this is not a workflow\njust text\n", NO_JOBS_PROBLEM),
+    ("name: x\non:\n  workflow_call:\njobs: {}\n", NO_JOBS_PROBLEM),
+    ("name: x\non:\n  workflow_call:\njobs:\n", NO_JOBS_PROBLEM),
+    ("name: x\non:\n  workflow_call:\n", NO_JOBS_PROBLEM),
+)
+CALLER_FORMS: tuple[tuple[str, str], ...] = (
+    ("  call:\n    uses: ./.github/workflows/inner.yml\n", ""),
+    ("  call:\n    'uses': ./.github/workflows/inner.yml\n", ""),
+    ('  call:\n    "uses": ./.github/workflows/inner.yml\n', ""),
+    ("  call:\n    uses: './.github/workflows/inner.yml'\n", ""),
+    ("  call:\n    uses: ./.github/workflows/inner.yml # c\n", ""),
+    ("  call:\n      uses: ./.github/workflows/inner.yml\n", ""),
+    ("  call:\n      'uses': ./.github/workflows/inner.yml\n", ""),
+    ("  call:\n    name: x\n", NEITHER_PROBLEM),
+    ("  call:\n      name: x\n", NEITHER_PROBLEM),
+    ("  call:\n    'runs-on': ubuntu-latest\n", NEITHER_PROBLEM),
+)
+
+
+class UnreadableCallee9771R1(unittest.TestCase):
+    """#9771 r1 finding 2: a called workflow with zero readable jobs, or a job with neither a
+    readable runs-on nor a readable uses, is a problem with an exact reason, never a pass."""
+
+    def test_a_callee_with_no_readable_jobs_is_a_problem(self) -> None:
+        for text, problem in CALLEE_ROWS:
+            with self.subTest(callee=text):
+                texts = {"caller.yml": _stub_workflow("pull_request", CALLER_CALLS_INNER),
+                         "inner.yml": text}
+                self.assertEqual(_under_stubs(texts, _hosted_pr_rust_cache_sites), ({}, [problem]))
+
+    def test_every_caller_spelling_is_read_as_a_call_or_a_problem(self) -> None:
+        inner = _stub_workflow("workflow_call", _stub_job("inner"))
+        for call, problem in CALLER_FORMS:
+            with self.subTest(call=call):
+                texts = {"caller.yml": _stub_workflow("pull_request", call), "inner.yml": inner}
+                sites, problems = _under_stubs(texts, _hosted_pr_rust_cache_sites)
+                if problem:
+                    self.assertEqual((sorted(sites), problems), ([], [problem]))
+                else:
+                    self.assertEqual((sorted(sites), problems),
+                                     ([("caller.yml", "call/inner", "")], []))
+
+    def test_an_unreadable_uses_value_is_refused_by_name(self) -> None:
+        inner = _stub_workflow("workflow_call", _stub_job("inner"))
+        call = "  call:\n    uses: &a ./.github/workflows/inner.yml\n"
+        texts = {"caller.yml": _stub_workflow("pull_request", call), "inner.yml": inner}
+        self.assertEqual(_under_stubs(texts, _hosted_pr_rust_cache_sites), ({}, [
+            "caller.yml: call.uses: unread YAML form, anchor: '&a ./.github/workflows/inner.yml'"]))
+
+
+# --- #9771 r1 (finding 3): the line readers are linear ----------------------------------------------
+LINEAR_COST_CEILING_SECONDS = 2.0  # measured at the reviewed head: 21.50 s and 7.76 s
+ENV_KEYS_LARGE = 100_000
+AXIS_KEYS_LARGE = 20_000
+
+
+class LinearCost9771R1(unittest.TestCase):
+    """#9771 r1 finding 3: Job.env() and the matrix key reader take linear time in the number of
+    keys (an index look-ahead and a set of seen keys, no list copy or scan per key)."""
+
+    def test_job_env_with_100k_keys_is_linear(self) -> None:
+        lines = ["    env:", *(f"      K{i}: v{i}" for i in range(ENV_KEYS_LARGE))]
+        start = time.monotonic()
+        env = Job("j", lines).env()
+        elapsed = time.monotonic() - start
+        self.assertEqual((len(env), env["K0"], env[f"K{ENV_KEYS_LARGE - 1}"]),
+                         (ENV_KEYS_LARGE, "v0", f"v{ENV_KEYS_LARGE - 1}"))
+        self.assertLess(elapsed, LINEAR_COST_CEILING_SECONDS)
+
+    def test_job_env_nested_lookahead_is_exact(self) -> None:
+        lines = ["    env:", "      A: x", "        deeper", "      B:", "        c: 1", "      D: z"]
+        env = Job("j", lines).env()
+        self.assertEqual([(k, v.nested) for k, v in env.items()],
+                         [("A", "deeper"), ("B", "c: 1"), ("D", "")])
+
+    def test_matrix_with_20k_axis_keys_is_refused_fast_with_the_first_axis(self) -> None:
+        axes = [f"        axis{i}: x" for i in range(AXIS_KEYS_LARGE)]
+        job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:", *axes])
+        start = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            _matrix_include(job)
+        elapsed = time.monotonic() - start
+        self.assertEqual(str(caught.exception), _unread("j: strategy.matrix", R_AXIS, "axis0: x"))
+        self.assertLess(elapsed, LINEAR_COST_CEILING_SECONDS)
+
+    def test_a_duplicate_key_at_the_end_of_20k_keys_is_found_fast(self) -> None:
+        axes = [f"        axis{i}: x" for i in range(AXIS_KEYS_LARGE)] + ["        axis0: y"]
+        job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:", *axes])
+        start = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            _matrix_include(job)
+        elapsed = time.monotonic() - start
+        self.assertEqual(str(caught.exception),
+                         _unread("j: strategy.matrix", R_DUPLICATE, "axis0: y"))
+        self.assertLess(elapsed, LINEAR_COST_CEILING_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()
