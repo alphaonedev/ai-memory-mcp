@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
 
@@ -85,6 +86,36 @@ class ScratchCase(GuardedCase):
             with self.subTest(leg="native"):
                 self.skipTest(NATIVE_RENAME_SKIP_REASON)
         yield "portable", None
+
+
+class NativeLegs9705(ScratchCase):
+    """native_legs fails on Linux when the kernel rename is missing and skips, with the exact reason, elsewhere."""
+
+    class NoNative:
+        rename_noreplace_native = None
+
+    def test_missing_native_rename_fails_on_linux_9705(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            try:
+                list(self.native_legs(self.NoNative))
+            except unittest.SkipTest:
+                self.fail("a missing native rename was skipped on Linux instead of failing")
+            except self.failureException as err:
+                self.assertEqual(str(err), NATIVE_RENAME_MISSING_ON_LINUX)
+            else:
+                self.fail("a missing native rename on Linux did not fail")
+
+    def test_missing_native_rename_skips_with_the_reason_elsewhere_9705(self):
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(self, "skipTest") as skip:
+            labels = [label for label, _ in self.native_legs(self.NoNative)]
+        skip.assert_called_once_with(NATIVE_RENAME_SKIP_REASON)
+        self.assertEqual(labels, ["portable"])
+
+    def test_present_native_rename_runs_both_legs_9705(self):
+        class Present:
+            rename_noreplace_native = staticmethod(len)
+
+        self.assertEqual([label for label, _ in self.native_legs(Present)], ["native", "portable"])
 
 
 class CheckRun5042(ScratchCase):
