@@ -261,6 +261,7 @@ jobs:
           # Shape guard. Each of the three values is checked on its own:
           # docs_only and cargo_skip must each be exactly `true` or `false`
           # (so a split value such as `falset` + `rue`, an empty, blank, CR or
+          # newline-carrying value is refused), docs_only=true needs
           # cargo_skip=true, and the reason must hold at least one non-blank
           # printable character, no control character and at most reason_max
           # characters. Anything else is a RUN with the fail-closed reason,
