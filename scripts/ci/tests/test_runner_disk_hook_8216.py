@@ -1,63 +1,60 @@
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Pin scripts/ci/runner_disk_hook.py (#8216, umbrella: CI shard budget, load wait and watchdog scripts).
+"""Pin scripts/ci/runner_disk_hook.py and runner_disk_hook.sh (#8216, PR 9812 round 1).
 
-Defect class: unbounded cost (disk) with a destructive remedy, so also matcher
-bypass and fail-open on the remove path. Invariant, for all inputs: the hook
-removes a directory only when the work root is proven, the candidate is named
-exactly ``target`` at ``<work root>/<repo>/target``, is a real directory
-inside the resolved work root on the same device, and holds cargo's
-CACHEDIR.TAG with the cache directory signature on its first line; every other
-case is a refusal with its own exact reason and nothing is removed. A free-space
-read that fails, returns nothing or is negative is a refusal to decide. The hook
-exits 0 on every path.
+Defect classes (one invariant each, checked for all inputs of its table):
+  state-report   decision, reason, removed, byte figures and exit code come from the state after the action
+                 (one ``decide`` over the ``Action`` enum); a refusal never prints as ``enough-free`` or ``clear``.
+  start-floor    at job-started a free space still under the floor after the clear exits EXIT_BELOW_FLOOR with the
+                 fixed line; job-completed, a dry run and a switched-off ENFORCE_START_FLOOR never do (3-agent vote
+                 71472661, conditions V-1 and V-2).
+  untrusted text no byte of a path, name or environment value reaches stderr or the log unescaped.
+  guards         the work-root guard and the allocated-bytes measure are exactly as wide as the docs say.
+  wiring         the runner's ``.sh`` hook path starts the Python hook and names the event.
 
-Class cells, each over a named corpus: EVENT_FREE_TABLE (event x free space at
-floor-1, floor, floor+1 of both floors), WORK_ROOT_FORMS (every way the work root
-can be wrong), CANDIDATE_FORMS (every way a target can fail the proof),
-FREE_READ_FORMS (every way the disk read can fail). The expected column of every
-table is written out by hand.
-
-All trees live under <clone>/.local-runs/ and the tests remove nothing outside it.
+Every expected value is a literal written by hand, never taken from the code under test. All trees live under
+<clone>/.local-runs/. The removal engine has its own tests in test_safe_remove_8216.py.
 
 Run: python3.12 -I -m unittest discover -s scripts/ci/tests -p test_runner_disk_hook_8216.py
 Python 3.12+, standard library only.
 """
 
-import contextlib
+import datetime
 import errno
 import importlib.util
 import io
-import json
 import os
-import platform
-import re
+import random
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-HOOK_PATH = REPO_ROOT / "scripts" / "ci" / "runner_disk_hook.py"
+CI_DIR = REPO_ROOT / "scripts" / "ci"
+HOOK_PATH = CI_DIR / "runner_disk_hook.py"
+WRAPPER_PATH = CI_DIR / "runner_disk_hook.sh"
 LOCAL_RUNS = REPO_ROOT / ".local-runs"
 
 GIB = 1024**3
-RUNNER = "runner-test-1"
-SIGNATURE_LINE = "Signature: 8a477f597d28d172789f06886806bc55"
-BIG_TREE_DIRS = 20
-BIG_TREE_FILES_PER_DIR = 1000  # 20K files in all
-BIG_TREE_CEILING_SECS = 30.0
-SUBPROCESS_TIMEOUT_SECS = 60
-
-LINE_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) runner=(?P<runner>\S+) event=(?P<event>\S+) "
-    r"free_before_gib=(?P<before>\S+) free_after_gib=(?P<after>\S+) "
-    r"folder_bytes_before=(?P<fbefore>\S+) folder_bytes_after=(?P<fafter>\S+) decision=(?P<decision>\S+) "
-    r"removed=(?P<removed>\d+) paths=(?P<rest>.*)$"
-)
+MIB = 1024**2
+START_FLOOR_BYTES = 64_424_509_440  # 60 GiB
+COMPLETED_FLOOR_BYTES = 161_061_273_600  # 150 GiB
+SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
+NOW = datetime.datetime(2026, 11, 21, 12, 0, 0, tzinfo=datetime.timezone.utc)
+STAMP = "2026-11-21T12:00:00Z"
+RUNNER = "r1"
+REPO_NAME = "repo"
+STDERR_PREFIX = "runner-disk-hook: "
+WALL_CLOCK_CEILING_SECS = 30.0
+BIG_WALK_ENTRIES = 100_000
+WRAPPER_PYTHON = Path("/opt/homebrew/bin/python3.12")
 
 
 def load_hook():
@@ -71,853 +68,1313 @@ def load_hook():
 hook = load_hook()
 
 
-def parse_line(line):
-    """Split one log line into a dict; paths and reason are JSON values."""
-    assert "\n" not in line.rstrip("\n"), "log line must be exactly one line"
-    match = LINE_RE.match(line.rstrip("\n"))
-    assert match, f"log line does not match the format: {line!r}"
-    fields = match.groupdict()
-    decoder = json.JSONDecoder()
-    rest = fields.pop("rest")
-    fields["paths"], end = decoder.raw_decode(rest)
-    rest = rest[end:]
-    assert rest.startswith(" reason="), rest
-    rest = rest[len(" reason="):]
-    fields["reason"], end = decoder.raw_decode(rest)
-    tail = rest[end:]
-    assert tail in ("", " dry-run"), tail
-    fields["dry_run"] = tail == " dry-run"
-    return fields
+def force_remove(path: Path) -> None:
+    """Test cleanup under .local-runs only: restore owner bits, then remove."""
+    assert str(path).startswith(str(LOCAL_RUNS)), path
+    for root, dirs, _files in os.walk(path):
+        for name in dirs:
+            try:
+                os.chmod(os.path.join(root, name), 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
 
 
-class HookCase(unittest.TestCase):
+class FakeDisk:
+    """Returns the given readings in order; the last one repeats."""
+
+    def __init__(self, *readings):
+        self.readings = list(readings)
+        self.calls = 0
+
+    def __call__(self, _path):
+        index = min(self.calls, len(self.readings) - 1)
+        self.calls += 1
+        value = self.readings[index]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class Base(unittest.TestCase):
     def setUp(self):
         LOCAL_RUNS.mkdir(exist_ok=True)
-        self.tmp = Path(tempfile.mkdtemp(prefix="hook8216-", dir=str(LOCAL_RUNS)))
-        self.addCleanup(self._cleanup)
-        # <tmp>/runner-1/_work/ai-memory-mcp is the work root (RUNNER_WORKSPACE).
-        self.work_root = self.tmp / "runner-1" / "_work" / "ai-memory-mcp"
+        self.scratch = Path(tempfile.mkdtemp(prefix="runner-disk-hook-8216-", dir=LOCAL_RUNS))
+        self.addCleanup(force_remove, self.scratch)
+        self.home = self.scratch / "home"
+        self.home.mkdir()
+        self.work_root = self.scratch / "runner" / "_work" / REPO_NAME
         self.work_root.mkdir(parents=True)
-        self.repo = self.work_root / "ai-memory-mcp"
+        self.repo = self.work_root / REPO_NAME
         self.repo.mkdir()
-        self.log = self.tmp / "hook.log"
-        self.outside = self.tmp / "outside"
-        self.outside.mkdir()
-        self.canary = self.outside / "canary.txt"
-        self.canary.write_text("keep")
+        self.log = self.scratch / "hook.log"
 
-    def _cleanup(self):
-        resolved = self.tmp.resolve()
-        assert str(resolved).startswith(str(LOCAL_RUNS.resolve()) + os.sep), resolved
-        for path in self.tmp.rglob("*"):
-            with contextlib.suppress(OSError):
-                path.chmod(0o755) if path.is_dir() and not path.is_symlink() else None
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def make_target(self, repo=None, tag=True, files=2, name="target"):
-        repo = repo or self.repo
-        target = repo / name
-        (target / "debug" / "deps").mkdir(parents=True, exist_ok=True)
-        for index in range(files):
-            (target / "debug" / "deps" / f"f{index}.o").write_text("x" * 16)
-        if tag is True:
-            (target / "CACHEDIR.TAG").write_text(SIGNATURE_LINE + "\nrest\n")
-        elif tag is not False:
-            (target / "CACHEDIR.TAG").write_text(tag)
+    def target(self, kind: str) -> Path:
+        target = self.repo / "target"
+        match kind:
+            case "none":
+                (self.repo / "src.txt").write_text("x")
+            case "tagged" | "partial":
+                target.mkdir()
+                (target / "CACHEDIR.TAG").write_text(SIGNATURE + "\n# cache\n")
+                (target / "file.bin").write_text("x")
+                if kind == "partial":
+                    (target / "sub").mkdir()
+                    (target / "sub" / "inner.bin").write_text("y")
+            case "untagged":
+                target.mkdir()
+                (target / "file.bin").write_text("x")
+            case _:
+                raise AssertionError(kind)
         return target
 
-    def run_hook(self, event, free_gib=None, root="default", extra=(), env=None, home=None,
-                 disk_free=None, run_cmd=None, runner=RUNNER, log="default", ceiling_bytes=None):
-        argv = ["--event", event, "--log", str(self.log if log == "default" else log)]
-        if root == "default":
-            root = self.work_root
-        if root is not None:
-            argv += ["--work-root", str(root)]
-        if runner is not None:
-            argv += ["--runner-name", runner]
-        if free_gib is not None:
-            argv += ["--free-gib", str(free_gib)]
-        argv += list(extra)
-        commands = []
-
-        def recorder(cmd):
-            commands.append(list(cmd))
-            return 0
-
-        err = io.StringIO()
-        before = len(self.log.read_text().splitlines()) if self.log.exists() else 0
-        rc = hook.main(
-            argv, env={} if env is None else env,
-            home=home or (self.tmp / "no-such-home"),
-            disk_free=disk_free, run_cmd=run_cmd or recorder, stderr=err,
-            **({} if ceiling_bytes is None else {"ceiling_bytes": ceiling_bytes}),
+    def call(self, argv, *, disk, env=None, ceiling=None, max_walk=None, free_env=True):
+        stderr = io.StringIO()
+        environ = {} if env is None else dict(env)
+        if free_env:
+            environ.setdefault("RUNNER_NAME", RUNNER)
+            environ.setdefault("RUNNER_WORKSPACE", str(self.work_root))
+        kwargs = {}
+        if ceiling is not None:
+            kwargs["ceiling_bytes"] = ceiling
+        if max_walk is not None:
+            kwargs["max_walk_entries"] = max_walk
+        code = hook.main(
+            list(argv), environ, home=self.home, disk_free=disk, stderr=stderr, now=lambda: NOW, **kwargs
         )
-        line = None
-        if self.log.exists():
-            lines = self.log.read_text().splitlines()
-            self.assertEqual(len(lines), before + 1, lines)
-            line = parse_line(lines[-1] + "\n")
-        return rc, line, err.getvalue(), commands
+        return code, stderr.getvalue()
+
+    def started(self, *extra, disk, **kwargs):
+        return self.call(["--event", "job-started", "--log", str(self.log), *extra], disk=disk, **kwargs)
+
+    def completed(self, *extra, disk, **kwargs):
+        return self.call(["--event", "job-completed", "--log", str(self.log), *extra], disk=disk, **kwargs)
+
+    def log_lines(self):
+        return self.log.read_text().splitlines()
 
 
-class EventFreeTable(HookCase):
-    """EVENT_FREE_TABLE: every event x free space at floor-1, floor, floor+1 of both floors."""
+def fields(line: str) -> dict:
+    """key=value fields of a log line (reason and paths are JSON, so they are cut by their own prefix)."""
+    reason = line.split(" reason=", 1)[1]
+    head = line.split(" paths=", 1)[0]
+    out = dict(item.split("=", 1) for item in head.split(" ")[1:] if "=" in item)
+    out["reason"] = reason
+    return out
 
-    def test_constants(self):
+
+# ----------------------------------------------------------------------------------------------------------------
+# The exhaustive table: event x free x target x dry-run.  Expected column written by hand.
+# (decision, exit, removed, target still present afterwards)
+# ----------------------------------------------------------------------------------------------------------------
+ENOUGH = ("enough-free", 0, 0, True)
+UNDER_ONE_BYTE = {
+    # event job-started: floor 60 GiB, the after-clear reading is above the floor
+    ("job-started", "none", False): ("below-floor", 75, 0, None),
+    ("job-started", "none", True): ("no-target", 0, 0, None),
+    ("job-started", "tagged", False): ("clear", 0, 1, False),
+    ("job-started", "tagged", True): ("would-remove", 0, 0, True),
+    ("job-started", "untagged", False): ("below-floor", 75, 0, True),
+    ("job-started", "untagged", True): ("refused-target", 0, 0, True),
+    ("job-started", "partial", False): ("partial", 0, 0, True),
+    ("job-started", "partial", True): ("would-remove", 0, 0, True),
+    # event job-completed: floor 150 GiB, never a non-zero exit
+    ("job-completed", "none", False): ("no-target", 0, 0, None),
+    ("job-completed", "none", True): ("no-target", 0, 0, None),
+    ("job-completed", "tagged", False): ("clear", 0, 1, False),
+    ("job-completed", "tagged", True): ("would-remove", 0, 0, True),
+    ("job-completed", "untagged", False): ("refused-target", 0, 0, True),
+    ("job-completed", "untagged", True): ("refused-target", 0, 0, True),
+    ("job-completed", "partial", False): ("partial", 0, 0, True),
+    ("job-completed", "partial", True): ("would-remove", 0, 0, True),
+}
+FLOORS = {"job-started": START_FLOOR_BYTES, "job-completed": COMPLETED_FLOOR_BYTES}
+
+
+class ExhaustiveTable(Base):
+    def run_row(self, event, free_kind, kind, dry):
+        floor = FLOORS[event]
+        before = {"above": floor + GIB, "at": floor, "under": floor - 1}[free_kind]
+        after = floor + 10 * GIB
+        target = self.target(kind)
+        argv = ["--event", event, "--log", str(self.log)] + (["--dry-run"] if dry else [])
+        disk = FakeDisk(before, after)
+        patches = []
+        if kind == "partial" and not dry:
+            real = os.rmdir
+
+            def failing(path, *args, **kwargs):
+                if path == "sub" and kwargs.get("dir_fd") is not None:
+                    raise OSError(errno.EACCES, "Permission denied")
+                return real(path, *args, **kwargs)
+
+            patches.append(mock.patch.object(os, "rmdir", side_effect=failing))
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        code, _err = self.call(argv, disk=disk)
+        for item in patches:
+            item.stop()
+        return code, self.log_lines(), target
+
+    def test_every_row(self):
+        for event in ("job-started", "job-completed"):
+            for free_kind in ("above", "at", "under"):
+                for kind in ("none", "tagged", "untagged", "partial"):
+                    for dry in (False, True):
+                        with self.subTest(event=event, free=free_kind, target=kind, dry=dry):
+                            self.setUp()
+                            expected = ENOUGH if free_kind != "under" else UNDER_ONE_BYTE[(event, kind, dry)]
+                            decision, exit_code, removed, present = expected
+                            code, lines, target = self.run_row(event, free_kind, kind, dry)
+                            row = fields(lines[0])
+                            self.assertEqual(row["decision"], decision)
+                            self.assertEqual(code, exit_code)
+                            self.assertEqual(row["removed"], str(removed))
+                            if present is not None and kind != "none":
+                                self.assertEqual(target.exists(), present)
+                            self.assertEqual(lines[0].endswith(" dry-run"), dry)
+
+    def test_every_action_has_a_row_in_the_unit_table(self):
+        self.assertEqual(
+            {action.name for action in hook.Action},
+            {"NOT_NEEDED", "CLEARED", "WOULD_CLEAR", "PARTIAL", "NO_TARGET", "REFUSED_TARGET"},
+        )
+        self.assertEqual(set(DECIDE_ROWS), {action for action in hook.Action})
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# decide(): one function over the Action enum
+# ----------------------------------------------------------------------------------------------------------------
+def facts(**overrides):
+    base = dict(
+        event=hook.Event.JOB_COMPLETED, dry_run=False, floor_bytes=COMPLETED_FLOOR_BYTES, free_before=149 * GIB,
+        free_after=None, free_is_input=False, free_reason="", folder_state=hook.FolderState.NOT_MEASURED,
+        folder_before=None, folder_after=None, folder_reason="", over_ceiling=False, ceiling_bytes=40 * GIB,
+        action=hook.Action.NOT_NEEDED, completed=(), partial=(), would=(), entries=0, notes=(),
+    )
+    base.update(overrides)
+    return hook.Facts(**base)
+
+
+A = hook.Action
+DECIDE_ROWS = {
+    A.NOT_NEEDED: (
+        dict(free_before=150 * GIB),
+        hook.Decision.ENOUGH_FREE, "free space 150.00 GiB is at or above the 150 GiB floor", 0, 0,
+    ),
+    A.CLEARED: (
+        dict(action=A.CLEARED, completed=("p",), free_after=151 * GIB, entries=4),
+        hook.Decision.CLEAR, "free space 149.00 GiB is under the 150 GiB floor", 0, 1,
+    ),
+    A.WOULD_CLEAR: (
+        dict(action=A.WOULD_CLEAR, would=("p", "q")),
+        hook.Decision.WOULD_REMOVE, "free space 149.00 GiB is under the 150 GiB floor", 0, 0,
+    ),
+    A.PARTIAL: (
+        dict(action=A.PARTIAL, partial=("p",), free_after=149 * GIB, entries=3),
+        hook.Decision.PARTIAL,
+        "free space 149.00 GiB is under the 150 GiB floor; removal stopped part way after 3 entries removed", 0, 0,
+    ),
+    A.NO_TARGET: (
+        dict(action=A.NO_TARGET),
+        hook.Decision.NO_TARGET, "free space 149.00 GiB is under the 150 GiB floor; no cargo target directory found",
+        0, 0,
+    ),
+    A.REFUSED_TARGET: (
+        dict(action=A.REFUSED_TARGET, notes=("note one",)),
+        hook.Decision.REFUSED_TARGET, "free space 149.00 GiB is under the 150 GiB floor; note one", 0, 0,
+    ),
+}
+
+
+class DecideUnit(unittest.TestCase):
+    def test_each_action_gives_its_own_decision_reason_and_exit(self):
+        for action, (overrides, decision, reason, exit_code, removed) in DECIDE_ROWS.items():
+            with self.subTest(action=action.name):
+                verdict = hook.decide(facts(**overrides))
+                self.assertEqual(verdict.decision, decision)
+                self.assertEqual(verdict.reason, reason)
+                self.assertEqual(verdict.exit_code, exit_code)
+                self.assertEqual(verdict.removed, removed)
+
+    def test_unreadable_free_space_is_refused_measure_with_its_reason_and_exit_zero(self):
+        verdict = hook.decide(facts(free_before=None, free_reason="free-space read returned nothing"))
+        self.assertEqual(
+            (verdict.decision, verdict.reason, verdict.exit_code, verdict.removed),
+            (hook.Decision.REFUSED_MEASURE, "free-space read returned nothing", 0, 0),
+        )
+
+    def test_an_unknown_action_or_folder_state_raises_never_falls_through(self):
+        with self.assertRaises(ValueError) as action:
+            hook.decide(facts(action="bogus"))
+        self.assertEqual(str(action.exception), "unknown action 'bogus'")
+        with self.assertRaises(ValueError) as folder:
+            hook.decide(facts(folder_state="odd"))
+        self.assertEqual(str(folder.exception), "unknown folder state 'odd'")
+
+    def test_below_floor_rows(self):
+        started = dict(event=hook.Event.JOB_STARTED, floor_bytes=START_FLOOR_BYTES)
+        under = 60 * GIB - 1
+        rows = (
+            # (overrides, decision, exit)
+            (dict(free_before=under, action=A.NO_TARGET), "below-floor", 75),
+            (dict(free_before=under, action=A.REFUSED_TARGET), "below-floor", 75),
+            (dict(free_before=under, action=A.CLEARED, completed=("p",), free_after=under), "below-floor", 75),
+            (dict(free_before=under, action=A.CLEARED, completed=("p",), free_after=60 * GIB), "clear", 0),
+            (dict(free_before=under, action=A.CLEARED, completed=("p",), free_after=None), "below-floor", 75),
+            (dict(free_before=under, action=A.PARTIAL, partial=("p",), free_after=under), "below-floor", 75),
+            (dict(free_before=under, action=A.WOULD_CLEAR, would=("p",)), "would-remove", 0),
+            (dict(free_before=under, action=A.NO_TARGET, dry_run=True), "no-target", 0),
+            (dict(free_before=60 * GIB, action=A.NOT_NEEDED), "enough-free", 0),
+        )
+        for overrides, decision, exit_code in rows:
+            with self.subTest(overrides=overrides):
+                verdict = hook.decide(facts(**started, **overrides))
+                self.assertEqual((verdict.decision.value, verdict.exit_code), (decision, exit_code))
+
+    def test_job_completed_never_exits_non_zero_for_the_floor(self):
+        for action in hook.Action:
+            for after in (None, 0, 149 * GIB, 150 * GIB):
+                with self.subTest(action=action.name, after=after):
+                    verdict = hook.decide(facts(action=action, free_after=after, free_before=1))
+                    self.assertEqual(verdict.exit_code, 0)
+
+    def test_switch_off_never_exits_non_zero(self):
+        with mock.patch.object(hook, "ENFORCE_START_FLOOR", False):
+            verdict = hook.decide(
+                facts(event=hook.Event.JOB_STARTED, floor_bytes=START_FLOOR_BYTES, free_before=1, action=A.NO_TARGET)
+            )
+        self.assertEqual((verdict.decision, verdict.exit_code), (hook.Decision.NO_TARGET, 0))
+
+    def test_floor_text_is_truncated_never_rounded_up(self):
+        under = 60 * GIB - 1
+        verdict = hook.decide(
+            facts(event=hook.Event.JOB_STARTED, floor_bytes=START_FLOOR_BYTES, free_before=under, action=A.NO_TARGET)
+        )
+        self.assertIn("free space 59.99 GiB is under the 60 GiB floor", verdict.reason)
+        self.assertNotIn("60.00", verdict.reason)
+
+    def test_gib_text_boundaries(self):
+        rows = (
+            (0, "0.00"), (1, "0.00"), (GIB // 100 - 1, "0.00"), (GIB // 100 + 1, "0.01"), (GIB, "1.00"),
+            (60 * GIB - 1, "59.99"), (60 * GIB, "60.00"), (150 * GIB - 1, "149.99"), (10_000 * GIB, "10000.00"),
+        )
+        for value, text in rows:
+            with self.subTest(value=value):
+                self.assertEqual(hook._gib_text(value), text)
+
+    def test_constants_are_the_documented_literals(self):
+        self.assertEqual(hook.GIB, 1_073_741_824)
         self.assertEqual(hook.CLEAR_BELOW_GIB_AFTER_JOB, 150)
         self.assertEqual(hook.START_FLOOR_GIB, 60)
-        self.assertEqual(hook.TARGET_DIR_NAME, "target")
-        self.assertEqual(hook.MARKER_FILE_NAME, "CACHEDIR.TAG")
-        self.assertEqual(hook.DEFAULT_LOG_ENV, "RUNNER_DISK_HOOK_LOG")
-        self.assertEqual(hook.DEFAULT_LOG_PARTS, ("ai-tmp", "runner-disk-hook.log"))
+        self.assertEqual(hook.WORK_FOLDER_CEILING_GIB, 40)
+        self.assertEqual(hook.WORK_FOLDER_CEILING_BYTES, 42_949_672_960)
+        self.assertEqual(hook.MAX_WALK_ENTRIES, 5_000_000)
+        self.assertEqual(hook.EXIT_BELOW_FLOOR, 75)
+        self.assertIs(hook.ENFORCE_START_FLOOR, True)
+        self.assertEqual(hook.SAFE_TEXT_MAX, 512)
 
-    def test_default_log_path_resolution(self):
-        home = self.tmp / "home"
-        explicit = str(self.tmp / "explicit.log")
-        from_env = str(self.tmp / "env.log")
-        rows = [
-            (explicit, {hook.DEFAULT_LOG_ENV: from_env}, Path(explicit)),
-            (None, {hook.DEFAULT_LOG_ENV: from_env}, Path(from_env)),
-            (None, {hook.DEFAULT_LOG_ENV: "relative.log"}, home / "ai-tmp" / "runner-disk-hook.log"),
-            (None, {hook.DEFAULT_LOG_ENV: ""}, home / "ai-tmp" / "runner-disk-hook.log"),
-            (None, {}, home / "ai-tmp" / "runner-disk-hook.log"),
-        ]
-        for given, env, expected in rows:
-            with self.subTest(given=given, env=env):
-                self.assertEqual(hook.resolve_log_path(given, env, home), expected)
+    def test_floor_gib_is_one_value_per_event(self):
+        self.assertEqual({event.value: hook.floor_gib(event) for event in hook.Event},
+                         {"job-started": 60, "job-completed": 150})
 
-    def test_event_free_table(self):
-        after_job = hook.CLEAR_BELOW_GIB_AFTER_JOB
-        start = hook.START_FLOOR_GIB
-        # (event, free GiB, decision value, target removed)
-        rows = [
-            ("job-started", start - 1, "clear", True),
-            ("job-started", start, "enough-free", False),
-            ("job-started", start + 1, "enough-free", False),
-            ("job-started", after_job - 1, "enough-free", False),
-            ("job-started", after_job, "enough-free", False),
-            ("job-started", after_job + 1, "enough-free", False),
-            ("job-completed", start - 1, "clear", True),
-            ("job-completed", start, "clear", True),
-            ("job-completed", start + 1, "clear", True),
-            ("job-completed", after_job - 1, "clear", True),
-            ("job-completed", after_job, "enough-free", False),
-            ("job-completed", after_job + 1, "enough-free", False),
-        ]
-        for event, free, decision, removed in rows:
-            with self.subTest(event=event, free=free):
-                target = self.make_target()
-                self.log.unlink(missing_ok=True)
-                rc, line, err, _ = self.run_hook(event, free_gib=free)
-                self.assertEqual(rc, 0)
-                self.assertEqual(line["decision"], decision)
-                self.assertEqual(line["event"], event)
-                self.assertEqual(line["runner"], RUNNER)
-                self.assertEqual(line["before"], f"{free:.2f}")
-                self.assertFalse(line["dry_run"])
-                self.assertEqual(target.exists(), not removed)
-                if removed:
-                    self.assertEqual(line["removed"], "1")
-                    self.assertEqual(line["paths"], [str(target)])
-                    self.assertEqual(line["reason"], "")
-                else:
-                    floor = 60 if event == "job-started" else 150
-                    self.assertEqual(line["removed"], "0")
-                    self.assertEqual(line["paths"], [])
-                    self.assertEqual(
-                        line["reason"],
-                        f"free space {free:.2f} GiB is at or above the {floor} GiB floor",
-                    )
-                shutil.rmtree(target, ignore_errors=True)
 
-    def test_log_line_time_is_utc_and_one_line_per_call(self):
-        self.make_target()
-        self.run_hook("job-completed", free_gib=10)
-        self.run_hook("job-completed", free_gib=10)
-        lines = self.log.read_text().splitlines()
+# ----------------------------------------------------------------------------------------------------------------
+# start-floor enforcement: V-1 and V-2 of the vote
+# ----------------------------------------------------------------------------------------------------------------
+class StartFloor(Base):
+    UNDER = START_FLOOR_BYTES - 1
+
+    def test_v2_the_below_floor_line_is_one_fixed_form_on_stderr_and_in_the_log(self):
+        self.target("none")
+        code, err = self.started(disk=FakeDisk(self.UNDER))
+        fixed = "decision=below-floor event=job-started free_bytes=64424509439 floor_bytes=64424509440 runner=r1"
+        self.assertEqual(code, 75)
+        self.assertIn(STDERR_PREFIX + fixed + "\n", err)
+        lines = self.log_lines()
         self.assertEqual(len(lines), 2)
-        for line in lines:
-            parse_line(line + "\n")
+        self.assertEqual(lines[1], f"{STAMP} {fixed}")
 
-    def test_free_after_is_remeasured(self):
-        target = self.make_target()
-        reads = iter([10 * GIB, 200 * GIB])
-        rc, line, _, _ = self.run_hook("job-completed", disk_free=lambda path: next(reads))
-        self.assertEqual(rc, 0)
-        self.assertEqual((line["before"], line["after"]), ("10.00", "200.00"))
+    def test_v1_job_completed_one_byte_under_exits_zero_with_no_below_floor_line(self):
+        self.target("none")
+        code, err = self.completed(disk=FakeDisk(COMPLETED_FLOOR_BYTES - 1))
+        self.assertEqual(code, 0)
+        self.assertNotIn("below-floor", err)
+        self.assertEqual(len(self.log_lines()), 1)
+
+    def test_v1_job_completed_after_a_clear_still_under_exits_zero(self):
+        self.target("tagged")
+        code, _err = self.completed(disk=FakeDisk(COMPLETED_FLOOR_BYTES - 1, COMPLETED_FLOOR_BYTES - 1))
+        self.assertEqual(code, 0)
+
+    def test_switch_on_exits_75_and_off_exits_0_with_the_same_state(self):
+        self.target("none")
+        with mock.patch.object(hook, "ENFORCE_START_FLOOR", True):
+            on, _ = self.started(disk=FakeDisk(self.UNDER))
+        force_remove(self.log) if self.log.is_dir() else self.log.unlink()
+        with mock.patch.object(hook, "ENFORCE_START_FLOOR", False):
+            off, err = self.started(disk=FakeDisk(self.UNDER))
+        self.assertEqual((on, off), (75, 0))
+        self.assertNotIn("below-floor", err)
+        self.assertEqual(len(self.log_lines()), 1)
+
+    def test_dry_run_never_exits_non_zero(self):
+        self.target("none")
+        code, err = self.started("--dry-run", disk=FakeDisk(self.UNDER))
+        self.assertEqual(code, 0)
+        self.assertNotIn("below-floor", err)
+
+    def test_clear_that_brings_the_volume_to_the_floor_starts_the_job(self):
+        self.target("tagged")
+        code, _ = self.started(disk=FakeDisk(self.UNDER, START_FLOOR_BYTES))
+        self.assertEqual(code, 0)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "clear")
+
+    def test_clear_that_leaves_the_volume_one_byte_under_refuses_the_start(self):
+        self.target("tagged")
+        code, err = self.started(disk=FakeDisk(self.UNDER, self.UNDER))
+        self.assertEqual(code, 75)
+        self.assertIn("free_bytes=64424509439", err)
+
+    def test_a_failed_read_after_the_clear_refuses_the_start_with_free_bytes_unknown(self):
+        target = self.target("tagged")
+        code, err = self.started(disk=FakeDisk(self.UNDER, OSError("boom")))
+        self.assertEqual(code, 75)
         self.assertFalse(target.exists())
+        self.assertIn(
+            STDERR_PREFIX + "decision=below-floor event=job-started free_bytes=unknown floor_bytes=64424509440 runner=r1\n",
+            err,
+        )
+        reason = fields(self.log_lines()[0])["reason"]
+        self.assertIn("free space after the removal could not be read, so the floor is not proven", reason)
+
+    def test_a_refused_free_read_at_job_started_is_refused_measure_exit_zero(self):
+        self.target("tagged")
+        code, _ = self.started(disk=FakeDisk(OSError("boom")))
+        self.assertEqual(code, 0)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "refused-measure")
+
+    def test_exit_code_pin(self):
+        self.assertEqual(hook.EXIT_OK, 0)
+        self.assertEqual(hook.EXIT_BELOW_FLOOR, 75)
 
 
-class WorkRootForms(HookCase):
-    """WORK_ROOT_FORMS: every way the work root can be wrong ends in a named refusal."""
-
-    def assert_refused(self, root, reason, env=None, home=None, free=10):
-        target = self.make_target()
-        self.log.unlink(missing_ok=True)
-        rc, line, err, cmds = self.run_hook("job-started", free_gib=free, root=root, env=env, home=home)
-        self.assertEqual(rc, 0)
-        self.assertEqual(line["decision"], "refused")
-        self.assertEqual(line["reason"], reason)
-        self.assertEqual(line["removed"], "0")
-        self.assertIn(reason, err)
-        self.assertEqual(cmds, [])
-        self.assertTrue(target.exists())
-        return line
-
-    def test_unset(self):
-        self.assert_refused(None, "work root is not set")
-
-    def test_unset_env_does_not_fall_back_to_workspace(self):
-        self.assert_refused(None, "work root is not set", env={"GITHUB_WORKSPACE": str(self.repo)})
-
-    def test_empty_and_blank(self):
-        self.assert_refused("", "work root is empty")
-        self.assert_refused("   ", "work root is empty")
-
-    def test_relative(self):
-        self.assert_refused("relative/work", "work root is not an absolute path")
-
-    def test_dotdot_component(self):
-        self.assert_refused(f"{self.work_root}/../ai-memory-mcp", "work root contains a '..' component")
-
-    def test_filesystem_root(self):
-        self.assert_refused("/", "work root is the filesystem root")
-
-    def test_missing(self):
-        self.assert_refused(self.tmp / "nope" / "a" / "b", "work root does not exist")
-
-    def test_symlinked(self):
-        link = self.tmp / "runner-link" / "x" / "y"
-        link.parent.mkdir(parents=True)
-        link.symlink_to(self.work_root)
-        self.assert_refused(link, "work root is a symlink")
-
-    def test_not_a_directory(self):
-        plain = self.tmp / "a" / "b" / "file"
-        plain.parent.mkdir(parents=True)
-        plain.write_text("x")
-        self.assert_refused(plain, "work root is not a directory")
-
-    def test_home_directory(self):
-        home = self.tmp / "home" / "u" / "v"
-        home.mkdir(parents=True)
-        self.assert_refused(home, "work root is the home directory", home=home)
-
-    def test_volume_root(self):
-        with self._mounted(self.work_root):
-            self.assert_refused(self.work_root, "work root is a volume root")
-
-    @contextlib.contextmanager
-    def _mounted(self, path):
-        real = os.path.ismount
-        original = str(path)
-
-        def fake(candidate):
-            return str(candidate) == original or real(candidate)
-
-        os.path.ismount = fake
-        try:
-            yield
-        finally:
-            os.path.ismount = real
-
-    def test_fewer_than_three_parts(self):
-        # the depth rule is lexical and checked before the file system, so it holds on every host.
+# ----------------------------------------------------------------------------------------------------------------
+# exact lines
+# ----------------------------------------------------------------------------------------------------------------
+class ExactLines(Base):
+    def test_enough_free_line(self):
+        self.target("tagged")
+        code, err = self.completed(disk=FakeDisk(150 * GIB))
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
         self.assertEqual(
-            hook.work_root_refusal(Path("/srv/ci"), home=Path("/nonexistent-home-dir")),
-            "work root has fewer than 3 path parts",
+            self.log_lines(),
+            [
+                f"{STAMP} runner=r1 event=job-completed free_before_gib=150.00 free_after_gib=150.00 "
+                "folder_bytes_before=unknown folder_bytes_after=unknown decision=enough-free removed=0 entries=0 "
+                'paths=[] reason="free space 150.00 GiB is at or above the 150 GiB floor"'
+            ],
         )
 
-    def test_env_input_is_used_when_no_argument(self):
-        target = self.make_target()
-        env = {"RUNNER_WORKSPACE": str(self.work_root), "RUNNER_NAME": RUNNER}
-        err = io.StringIO()
-        rc = hook.main(["--event", "job-completed", "--log", str(self.log), "--free-gib", "5"],
-                       env=env, home=self.tmp / "h", stderr=err, run_cmd=lambda c: 0)
-        self.assertEqual(rc, 0)
+    def test_clear_line_with_the_remeasured_after_figure(self):
+        target = self.target("tagged")
+        code, err = self.completed(disk=FakeDisk(150 * GIB - 1, 200 * GIB))
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
         self.assertFalse(target.exists())
-        self.assertEqual(parse_line(self.log.read_text())["runner"], RUNNER)
+        self.assertEqual(
+            self.log_lines(),
+            [
+                f"{STAMP} runner=r1 event=job-completed free_before_gib=149.99 free_after_gib=200.00 "
+                "folder_bytes_before=unknown folder_bytes_after=unknown decision=clear removed=1 entries=2 "
+                f'paths=["{target}"] reason="free space 149.99 GiB is under the 150 GiB floor"'
+            ],
+        )
 
-    def test_runner_name_unset_and_invalid(self):
-        target = self.make_target()
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=5, runner=None)
-        self.assertEqual((rc, line["decision"], line["reason"], line["runner"]),
-                         (0, "refused", "runner name is not set", "unknown"))
-        self.log.unlink()
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=5, runner="bad name/../x")
-        self.assertEqual((rc, line["decision"], line["reason"], line["runner"]),
-                         (0, "refused", "runner name is invalid", "invalid"))
+    def test_dry_run_line_says_would_remove_and_removed_zero(self):
+        target = self.target("tagged")
+        code, _ = self.completed("--dry-run", disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
         self.assertTrue(target.exists())
+        self.assertEqual(
+            self.log_lines(),
+            [
+                f"{STAMP} runner=r1 event=job-completed free_before_gib=100.00 free_after_gib=100.00 "
+                "folder_bytes_before=unknown folder_bytes_after=unknown decision=would-remove removed=0 entries=0 "
+                f'paths=["{target}"] reason="free space 100.00 GiB is under the 150 GiB floor" dry-run'
+            ],
+        )
 
-    def test_bad_arguments_exit_zero_with_reason(self):
-        target = self.make_target()
-        err = io.StringIO()
-        rc = hook.main(["--event", "job-finished", "--log", str(self.log)], env={},
-                       home=self.tmp / "h", stderr=err, run_cmd=lambda c: 0)
-        self.assertEqual(rc, 0)
-        line = parse_line(self.log.read_text())
-        self.assertEqual(line["decision"], "refused")
-        self.assertTrue(line["reason"].startswith("invalid arguments: "), line["reason"])
-        self.assertTrue(target.exists())
+    def test_partial_line_counts_the_entries_and_remeasures(self):
+        target = self.target("partial")
+        real = os.rmdir
 
-    def test_non_finite_free_gib_refused(self):
-        target = self.make_target()
-        for value in ("nan", "inf", "-inf"):
-            with self.subTest(value=value):
-                self.log.unlink(missing_ok=True)
-                rc, line, _, _ = self.run_hook("job-completed", free_gib=value)
-                self.assertEqual(rc, 0)
-                self.assertEqual(line["decision"], "refused")
-                self.assertTrue(line["reason"].startswith("invalid arguments: "), line["reason"])
-                self.assertTrue(target.exists())
+        def failing(path, *args, **kwargs):
+            if path == "sub" and kwargs.get("dir_fd") is not None:
+                raise OSError(errno.EACCES, "Permission denied")
+            return real(path, *args, **kwargs)
 
+        with mock.patch.object(os, "rmdir", side_effect=failing):
+            code, err = self.completed(disk=FakeDisk(100 * GIB, 120 * GIB))
+        self.assertEqual(code, 0)
+        line = self.log_lines()[0]
+        self.assertEqual(
+            line,
+            f"{STAMP} runner=r1 event=job-completed free_before_gib=100.00 free_after_gib=120.00 "
+            "folder_bytes_before=unknown folder_bytes_after=unknown decision=partial removed=0 entries=2 "
+            f'paths=["{target}"] reason="free space 100.00 GiB is under the 150 GiB floor; removal stopped part way '
+            f'after 2 entries removed; {target}: partial, 2 entries removed: remove failed: Permission denied"',
+        )
+        self.assertIn(f"partial: {target}: partial, 2 entries removed: remove failed: Permission denied\n", err)
+        self.assertTrue((target / "CACHEDIR.TAG").exists())
 
-class CandidateForms(HookCase):
-    """CANDIDATE_FORMS: every way a target can fail the proof is kept, with its own reason."""
+    def test_refused_target_line_carries_the_exact_reason(self):
+        target = self.target("untagged")
+        code, err = self.completed(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        note = f"{target}: CACHEDIR.TAG is missing"
+        self.assertEqual(
+            self.log_lines(),
+            [
+                f"{STAMP} runner=r1 event=job-completed free_before_gib=100.00 free_after_gib=100.00 "
+                "folder_bytes_before=unknown folder_bytes_after=unknown decision=refused-target removed=0 entries=0 "
+                f'paths=[] reason="free space 100.00 GiB is under the 150 GiB floor; {note}"'
+            ],
+        )
+        self.assertEqual(err, f"{STDERR_PREFIX}refused-target: {note}\n")
 
-    def refused_once(self, target, reason, event="job-completed"):
-        self.log.unlink(missing_ok=True)
-        rc, line, err, _ = self.run_hook(event, free_gib=1)
-        self.assertEqual(rc, 0)
-        self.assertEqual(line["decision"], "refused")
-        self.assertEqual(line["reason"], reason)
-        self.assertEqual(line["removed"], "0")
-        self.assertIn(reason, err)
-        return line
+    def test_no_target_line(self):
+        self.target("none")
+        code, _ = self.completed(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.log_lines(),
+            [
+                f"{STAMP} runner=r1 event=job-completed free_before_gib=100.00 free_after_gib=100.00 "
+                "folder_bytes_before=unknown folder_bytes_after=unknown decision=no-target removed=0 entries=0 "
+                'paths=[] reason="free space 100.00 GiB is under the 150 GiB floor; no cargo target directory found"'
+            ],
+        )
 
-    def test_target_without_tag_is_kept(self):
-        target = self.make_target(tag=False)
-        self.refused_once(target, f"{target}: target has no CACHEDIR.TAG")
-        self.assertTrue((target / "debug" / "deps" / "f0.o").exists())
+    def test_job_started_line_carries_both_folder_figures(self):
+        self.target("tagged")
+        code, _ = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        row = fields(self.log_lines()[0])
+        self.assertEqual(row["decision"], "enough-free")
+        self.assertRegex(row["folder_bytes_before"], r"^\d+$")
+        self.assertEqual(row["folder_bytes_after"], row["folder_bytes_before"])
 
-    def test_tag_with_other_first_line_is_kept(self):
-        for content in ("Signature: 00000000000000000000000000000000\n", "\n" + SIGNATURE_LINE + "\n", ""):
-            with self.subTest(content=content):
-                target = self.make_target(tag=content)
-                self.refused_once(
-                    target, f"{target}: CACHEDIR.TAG first line is not the cache directory signature")
-                self.assertTrue(target.exists())
-                shutil.rmtree(target)
-
-    def test_tag_that_is_a_symlink_is_kept(self):
-        target = self.make_target(tag=False)
-        real = self.outside / "tag"
-        real.write_text(SIGNATURE_LINE + "\n")
-        (target / "CACHEDIR.TAG").symlink_to(real)
-        self.refused_once(target, f"{target}: target has no CACHEDIR.TAG")
-        self.assertTrue(target.exists())
-
-    def test_target_symlink_to_outside_directory(self):
-        victim = self.outside / "victim"
-        (victim / "sub").mkdir(parents=True)
-        (victim / "CACHEDIR.TAG").write_text(SIGNATURE_LINE + "\n")
-        (victim / "sub" / "keep.txt").write_text("keep")
-        link = self.repo / "target"
-        link.symlink_to(victim)
-        self.refused_once(link, f"{link}: target is a symlink")
-        self.assertTrue((victim / "sub" / "keep.txt").exists())
-        self.assertTrue((victim / "CACHEDIR.TAG").exists())
-        self.assertTrue(link.is_symlink())
-
-    def test_target_that_is_a_file(self):
-        target = self.repo / "target"
-        target.write_text("x")
-        self.refused_once(target, f"{target}: target is not a directory")
-        self.assertTrue(target.exists())
-
-    def test_resolves_outside_root_direct_call(self):
-        victim = self.outside / "target"
-        victim.mkdir()
-        (victim / "CACHEDIR.TAG").write_text(SIGNATURE_LINE + "\n")
-        reason = hook.classify_candidate(self.work_root, victim)
-        self.assertEqual(reason, f"{victim}: target resolves outside the work root")
-        self.assertTrue(victim.exists())
-
-    def test_classify_accepts_a_proven_target(self):
-        target = self.make_target()
-        self.assertIsNone(hook.classify_candidate(self.work_root, target))
-
-    def test_other_names_and_depths_are_kept(self):
-        kept = []
-        for repo_name, dir_name in (("a", "Target"), ("b", "target2"), ("c", "targets"), ("d", "mytarget")):
-            repo = self.work_root / repo_name
-            repo.mkdir()
-            kept.append(self.make_target(repo=repo, name=dir_name))
-        # nested target at another depth: <root>/<repo>/sub/target and <root>/target
-        nested_repo = self.work_root / "e"
-        (nested_repo / "sub").mkdir(parents=True)
-        kept.append(self.make_target(repo=nested_repo / "sub"))
-        kept.append(self.make_target(repo=self.work_root))
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1)
-        self.assertEqual(rc, 0)
-        self.assertEqual(line["decision"], "clear")
-        self.assertEqual(line["removed"], "0")
-        self.assertEqual(line["reason"], "no cargo target directory found")
-        for path in kept:
-            self.assertTrue((path / "CACHEDIR.TAG").exists(), path)
-
-    def test_repo_directory_symlink_is_not_entered(self):
-        victim_repo = self.outside / "repo"
-        self.make_target(repo=victim_repo)
-        link = self.work_root / "linked"
-        link.symlink_to(victim_repo)
-        self.refused_once(link, f"{link}: repo directory is a symlink, not entered")
-        self.assertTrue((victim_repo / "target" / "CACHEDIR.TAG").exists())
-
-    def test_symlink_inside_target_is_unlinked_not_followed(self):
-        target = self.make_target()
-        outside_dir = self.outside / "tree"
-        outside_dir.mkdir()
-        (outside_dir / "inner.txt").write_text("keep")
-        (target / "debug" / "dir-link").symlink_to(outside_dir)
-        (target / "debug" / "file-link").symlink_to(self.canary)
-        (target / "debug" / "dangling").symlink_to(self.tmp / "missing")
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1)
-        self.assertEqual((rc, line["decision"], line["removed"]), (0, "clear", "1"))
-        self.assertFalse(target.exists())
-        self.assertEqual(self.canary.read_text(), "keep")
-        self.assertEqual((outside_dir / "inner.txt").read_text(), "keep")
-
-    def test_two_repos_both_removed_and_listed(self):
-        second = self.work_root / "other-repo"
-        second.mkdir()
-        first_target = self.make_target()
-        second_target = self.make_target(repo=second)
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1)
-        self.assertEqual((rc, line["removed"]), (0, "2"))
-        self.assertEqual(sorted(line["paths"]), sorted([str(first_target), str(second_target)]))
-
-    def test_another_runners_work_folder_is_untouched(self):
-        other = self.tmp / "runner-2" / "_work" / "ai-memory-mcp" / "ai-memory-mcp"
-        other.mkdir(parents=True)
-        other_target = self.make_target(repo=other)
-        mine = self.make_target()
-        self.run_hook("job-completed", free_gib=1)
-        self.assertFalse(mine.exists())
-        self.assertTrue(other_target.exists())
-
-    def test_dry_run_removes_nothing_and_says_so(self):
-        target = self.make_target()
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1, extra=["--dry-run"])
-        self.assertEqual(rc, 0)
-        self.assertTrue(line["dry_run"])
-        self.assertEqual((line["decision"], line["removed"], line["paths"]), ("clear", "1", [str(target)]))
-        self.assertEqual((line["before"], line["after"]), ("1.00", "1.00"))
-        self.assertTrue((target / "debug" / "deps" / "f0.o").exists())
-        self.assertTrue(self.log.read_text().rstrip("\n").endswith(" dry-run"))
-
-    def test_removal_failure_is_one_reason_and_exit_zero(self):
-        target = self.make_target()
-        locked = target / "debug"
-        locked.chmod(0o500)
-        try:
-            rc, line, err, _ = self.run_hook("job-completed", free_gib=1)
-        finally:
-            locked.chmod(0o755)
-        self.assertEqual(rc, 0)
-        if os.geteuid() == 0:
-            self.skipTest("root ignores directory permissions")
-        self.assertEqual((line["decision"], line["removed"]), ("refused", "0"))
-        self.assertTrue(line["reason"].startswith(f"{target}: remove failed: "), line["reason"])
-        self.assertIn("remove failed", err)
-
-    def test_big_tree_in_bounded_time(self):
-        target = self.make_target(files=0)
-        for dir_index in range(BIG_TREE_DIRS):
-            sub = target / "debug" / f"d{dir_index}"
-            sub.mkdir(parents=True)
-            for file_index in range(BIG_TREE_FILES_PER_DIR):
-                (sub / f"f{file_index}").write_bytes(b"")
-        started = time.monotonic()
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1)
-        elapsed = time.monotonic() - started
-        self.assertEqual((rc, line["removed"]), (0, "1"))
-        self.assertFalse(target.exists())
-        self.assertLess(elapsed, BIG_TREE_CEILING_SECS)
-
-    def test_deep_tree_is_removed(self):
-        target = self.make_target()
-        deep = target
-        for index in range(100):
-            deep = deep / "d"
-        deep.mkdir(parents=True)
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1)
-        self.assertEqual((rc, line["removed"]), (0, "1"))
-        self.assertFalse(target.exists())
+    def test_free_gib_input_is_marked_and_the_disk_is_not_read(self):
+        self.target("tagged")
+        disk = FakeDisk(1)
+        code, _ = self.completed("--free-gib", "10", disk=disk)
+        self.assertEqual(code, 0)
+        self.assertEqual(disk.calls, 0)
+        row = fields(self.log_lines()[0])
+        self.assertEqual((row["free_before_gib"], row["free_after_gib"]), ("input:10.00", "input:10.00"))
+        self.assertEqual(row["decision"], "clear")
 
 
-class FreeReadForms(HookCase):
-    """FREE_READ_FORMS: a failed, empty or negative read is a refusal to decide, never 0 and never plenty."""
+# ----------------------------------------------------------------------------------------------------------------
+# free-space reading refusals
+# ----------------------------------------------------------------------------------------------------------------
+class FreeRead(Base):
+    ROWS = (
+        (None, "free-space read returned nothing"),
+        (True, "free-space read returned a bool: True"),
+        (False, "free-space read returned a bool: False"),
+        ("5", "free-space read returned a str, not an integer"),
+        (1.5, "free-space read returned a float, not an integer"),
+        (-1, "free-space read returned a negative value: -1"),
+        (OSError("boom"), "free-space read failed: boom"),
+    )
 
-    def test_forms(self):
-        def raises_oserror(path):
-            raise OSError(errno.EIO, "boom")
-
-        def raises_other(path):
-            raise RuntimeError("odd")
-
-        rows = [
-            (raises_oserror, "free-space read failed: [Errno 5] boom"),
-            (lambda path: None, "free-space read returned nothing"),
-            (lambda path: -1, "free-space read returned a negative value: -1"),
-            (lambda path: -(5 * GIB), f"free-space read returned a negative value: {-(5 * GIB)}"),
-            (raises_other, "internal error: RuntimeError: odd"),
-        ]
-        for reader, reason in rows:
-            for event in ("job-started", "job-completed"):
-                with self.subTest(reason=reason, event=event):
-                    target = self.make_target()
-                    self.log.unlink(missing_ok=True)
-                    rc, line, err, cmds = self.run_hook(event, disk_free=reader)
-                    self.assertEqual(rc, 0)
-                    self.assertEqual(line["decision"], "refused")
-                    self.assertEqual(line["reason"], reason)
-                    self.assertEqual((line["before"], line["after"], line["removed"]), ("unknown", "unknown", "0"))
-                    self.assertIn(reason, err)
-                    self.assertEqual(cmds, [])
+    def test_each_bad_reading_is_refused_by_kind_for_both_events(self):
+        for event in ("job-started", "job-completed"):
+            for value, reason in self.ROWS:
+                with self.subTest(event=event, value=repr(value)):
+                    self.setUp()
+                    target = self.target("tagged")
+                    code, err = self.call(["--event", event, "--log", str(self.log)], disk=FakeDisk(value))
+                    self.assertEqual(code, 0)
                     self.assertTrue(target.exists())
-                    shutil.rmtree(target)
-
-    def test_zero_free_is_a_real_zero(self):
-        target = self.make_target()
-        rc, line, _, _ = self.run_hook("job-completed", disk_free=lambda path: 0)
-        self.assertEqual((rc, line["decision"], line["before"]), (0, "clear", "0.00"))
-        self.assertFalse(target.exists())
-
-    def test_default_reader_reads_the_work_root_volume(self):
-        seen = []
-        real = shutil.disk_usage
-
-        def spy(path):
-            seen.append(str(path))
-            return real(path)
-
-        shutil.disk_usage = spy
-        try:
-            self.make_target()
-            rc, line, _, _ = self.run_hook("job-completed")
-        finally:
-            shutil.disk_usage = real
-        self.assertEqual(rc, 0)
-        self.assertIn(str(self.work_root), seen)
-        self.assertRegex(line["before"], r"^\d+\.\d\d$")
-
-
-class LogForms(HookCase):
-    def test_unwritable_log_still_removes_and_says_so(self):
-        # decision: a failing audit log does not stop the remedy. A full disk is the usual reason
-        # the log cannot be written, and refusing to clear then would keep the disk full.
-        target = self.make_target()
-        bad = self.tmp / "no-such-dir" / "hook.log"
-        rc, line, err, _ = self.run_hook("job-completed", free_gib=1, log=bad)
-        self.assertEqual(rc, 0)
-        self.assertIsNone(line)
-        self.assertFalse(target.exists())
-        self.assertIn("log write failed: ", err)
-        self.assertIn("decision=clear", err)
-        self.assertIn(str(bad), err)
-
-    def test_log_that_is_a_directory(self):
-        target = self.make_target()
-        rc, _, err, _ = self.run_hook("job-completed", free_gib=1, log=self.tmp)
-        self.assertEqual(rc, 0)
-        self.assertIn("log write failed: ", err)
-        self.assertFalse(target.exists())
-
-    def test_hostile_runner_name_cannot_forge_a_line(self):
-        self.make_target()
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1, runner="a\nb decision=forged")
-        self.assertEqual((rc, line["runner"], line["decision"]), (0, "invalid", "refused"))
-
-    def test_hostile_path_names_stay_on_one_line(self):
-        weird = self.work_root / "re po\nx"
-        weird.mkdir()
-        target = self.make_target(repo=weird)
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=1)
-        self.assertEqual((rc, line["removed"]), (0, "1"))
-        self.assertEqual(line["paths"], [str(target)])
-
-
-class TestTmpPort(HookCase):
-    """The job-started event also does what the old shell hook did, through an injected command runner."""
-
-    def make_test_tmp(self):
-        test_tmp = self.repo / ".local-runs" / "test-tmp"
-        (test_tmp / "a" / "b").mkdir(parents=True)
-        (test_tmp / "a" / "b" / "f").write_text("x")
-        return test_tmp
-
-    def started(self, **kw):
-        return self.run_hook("job-started", extra=["--workspace", str(self.repo)], **kw)
-
-    def test_started_strips_acls_then_removes_with_argument_lists(self):
-        test_tmp = self.make_test_tmp()
-        target = self.make_target()
-        rc, line, _, cmds = self.started(free_gib=500)
-        self.assertEqual(rc, 0)
-        self.assertEqual(cmds, [["chmod", "-RN", str(test_tmp)], ["chmod", "-R", "u+rwx", str(test_tmp)]])
-        self.assertFalse(test_tmp.exists())
-        self.assertTrue(target.exists())
-        self.assertEqual((line["decision"], line["removed"], line["paths"]), ("enough-free", "1", [str(test_tmp)]))
-        self.assertEqual(line["reason"], "free space 500.00 GiB is at or above the 60 GiB floor")
-
-    def test_started_below_floor_clears_both(self):
-        test_tmp = self.make_test_tmp()
-        target = self.make_target()
-        rc, line, _, _ = self.started(free_gib=1)
-        self.assertEqual((rc, line["decision"], line["removed"]), (0, "clear", "2"))
-        self.assertEqual(sorted(line["paths"]), sorted([str(target), str(test_tmp)]))
-        self.assertFalse(test_tmp.exists() or target.exists())
-
-    def test_completed_leaves_test_tmp(self):
-        test_tmp = self.make_test_tmp()
-        rc, line, _, cmds = self.run_hook("job-completed", free_gib=500, extra=["--workspace", str(self.repo)])
-        self.assertEqual(rc, 0)
-        self.assertEqual(cmds, [])
-        self.assertTrue(test_tmp.exists())
-
-    def test_runner_workspace_base_is_also_searched(self):
-        test_tmp = self.work_root / ".local-runs" / "test-tmp"
-        test_tmp.mkdir(parents=True)
-        rc, line, _, cmds = self.started(free_gib=500)
-        self.assertEqual(rc, 0)
-        self.assertEqual(cmds[0], ["chmod", "-RN", str(test_tmp)])
-        self.assertFalse(test_tmp.exists())
-
-    def test_dry_run_keeps_test_tmp_and_runs_no_command(self):
-        test_tmp = self.make_test_tmp()
-        rc, line, _, cmds = self.run_hook("job-started", free_gib=1,
-                                          extra=["--workspace", str(self.repo), "--dry-run"])
-        self.assertEqual((rc, cmds, line["dry_run"], line["removed"]), (0, [], True, "1"))
-        self.assertTrue(test_tmp.exists())
-
-    def test_symlinked_test_tmp_is_refused(self):
-        victim = self.outside / "tt"
-        victim.mkdir()
-        (victim / "keep").write_text("keep")
-        runs = self.repo / ".local-runs"
-        runs.mkdir()
-        (runs / "test-tmp").symlink_to(victim)
-        rc, line, _, cmds = self.started(free_gib=500)
-        self.assertEqual(rc, 0)
-        reason = f"{runs / 'test-tmp'}: test-tmp path has a symlink component"
-        self.assertEqual((line["decision"], line["removed"]), ("refused", "0"))
-        self.assertIn(reason, line["reason"])
-        self.assertEqual(cmds, [])
-        self.assertTrue((victim / "keep").exists())
-
-    def test_symlinked_local_runs_is_refused(self):
-        victim = self.outside / "runs"
-        (victim / "test-tmp").mkdir(parents=True)
-        (self.repo / ".local-runs").symlink_to(victim)
-        rc, line, _, cmds = self.started(free_gib=500)
-        self.assertIn(f"{self.repo / '.local-runs' / 'test-tmp'}: test-tmp path has a symlink component",
-                      line["reason"])
-        self.assertEqual(cmds, [])
-        self.assertTrue((victim / "test-tmp").exists())
-
-    def test_workspace_outside_root_is_refused(self):
-        foreign = self.outside / "ws"
-        (foreign / ".local-runs" / "test-tmp").mkdir(parents=True)
-        rc, line, _, cmds = self.run_hook("job-started", free_gib=500, extra=["--workspace", str(foreign)])
-        self.assertEqual(rc, 0)
-        self.assertIn(f"{foreign}: workspace is outside the work root", line["reason"])
-        self.assertEqual(cmds, [])
-        self.assertTrue((foreign / ".local-runs" / "test-tmp").exists())
-
-    def test_command_failure_does_not_stop_removal(self):
-        test_tmp = self.make_test_tmp()
-
-        def failing(cmd):
-            raise OSError(errno.ENOENT, "no chmod")
-
-        rc, line, _, _ = self.started(free_gib=500, run_cmd=failing)
-        self.assertEqual(rc, 0)
-        self.assertFalse(test_tmp.exists())
-
-    @unittest.skipUnless(platform.system() == "Darwin",
-                         "macOS only: the deny-only ACL that blocks rmdir exists only on macOS (chmod +a)")
-    def test_real_macos_acl_directory_is_removed(self):
-        test_tmp = self.make_test_tmp()
-        subprocess.run(["chmod", "+a", "everyone deny delete", str(test_tmp / "a")], check=True)
-        err = io.StringIO()
-        rc = hook.main(["--event", "job-started", "--work-root", str(self.work_root), "--runner-name", RUNNER,
-                        "--workspace", str(self.repo), "--free-gib", "500", "--log", str(self.log)],
-                       env={}, home=self.tmp / "h", stderr=err)
-        self.assertEqual(rc, 0)
-        self.assertFalse(test_tmp.exists(), err.getvalue())
-
-
-class WorkFolderCeiling(HookCase):
-    """Class: every runner work folder has a byte ceiling checked at job start; over it, build output goes."""
-
-    FREE_ENOUGH_GIB = 500
-    FREE_TEXT = "free space 500.00 GiB is at or above the 60 GiB floor"
-
-    def setUp(self):
-        super().setUp()
-        self.target = self.make_target()
-        (self.repo / "src").mkdir()
-        (self.repo / "src" / "lib.rs").write_text("fn main() {}\n")
-        (self.work_root / "keep.txt").write_text("keep")
-        self.size = hook.measure_folder_bytes(self.work_root)
-
-    def started(self, ceiling, **kwargs):
-        return self.run_hook("job-started", free_gib=self.FREE_ENOUGH_GIB, ceiling_bytes=ceiling, **kwargs)
-
-    def test_constants_are_named_and_consistent(self):
-        self.assertEqual(hook.WORK_FOLDER_CEILING_BYTES, hook.WORK_FOLDER_CEILING_GIB * GIB)
-        self.assertGreater(hook.WORK_FOLDER_CEILING_GIB, 0)
-
-    def test_default_ceiling_is_the_named_constant(self):
-        import inspect
-        self.assertEqual(
-            inspect.signature(hook.main).parameters["ceiling_bytes"].default, hook.WORK_FOLDER_CEILING_BYTES)
-        self.assertEqual(
-            inspect.signature(hook.run).parameters["ceiling_bytes"].default, hook.WORK_FOLDER_CEILING_BYTES)
-
-    def test_under_exactly_at_over_table(self):
-        # (ceiling relative to the measured size, removed count, decision, target survives)
-        rows = [(1, 0, "enough-free", True), (0, 0, "enough-free", True), (-1, 1, "clear", False)]
-        for delta, removed, decision, survives in rows:
-            with self.subTest(delta=delta):
-                if not self.target.exists():
-                    self.make_target()
-                size = hook.measure_folder_bytes(self.work_root)
-                rc, line, err, _ = self.started(size + delta)
-                self.assertEqual(rc, 0)
-                self.assertEqual(line["decision"], decision)
-                self.assertEqual(int(line["removed"]), removed)
-                self.assertEqual(self.target.exists(), survives)
-                self.assertEqual(line["fbefore"], str(size))
-                self.assertEqual(line["fafter"], str(hook.measure_folder_bytes(self.work_root)))
-                if survives:
-                    self.assertEqual(line["fafter"], line["fbefore"])
-                    self.assertEqual(line["reason"], self.FREE_TEXT)
-                else:
-                    self.assertLess(int(line["fafter"]), int(line["fbefore"]))
-                    self.assertEqual(line["paths"], [str(self.target)])
                     self.assertEqual(
-                        line["reason"], f"{self.FREE_TEXT}; work folder {size} bytes is over the {size + delta} byte ceiling")
+                        self.log_lines(),
+                        [
+                            f"{STAMP} runner=r1 event={event} free_before_gib=unknown free_after_gib=unknown "
+                            "folder_bytes_before=unknown folder_bytes_after=unknown decision=refused-measure "
+                            f'removed=0 entries=0 paths=[] reason="{reason}"'
+                        ],
+                    )
+                    self.assertEqual(err, f"{STDERR_PREFIX}refused-measure: {reason}\n")
 
-    def test_over_removes_target_directories_only(self):
-        rc, line, _, _ = self.started(1)
-        self.assertEqual(line["decision"], "clear")
-        self.assertFalse(self.target.exists())
-        self.assertTrue((self.repo / "src" / "lib.rs").is_file())
-        self.assertTrue((self.work_root / "keep.txt").is_file())
-        self.assertTrue(self.canary.is_file())
+    def test_zero_free_is_a_reading_not_a_refusal(self):
+        self.target("tagged")
+        code, _ = self.completed(disk=FakeDisk(0, 0))
+        self.assertEqual(code, 0)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "clear")
 
-    def test_over_with_no_proven_target_removes_nothing_and_says_why(self):
-        shutil.rmtree(self.target)
-        self.make_target(tag=False)
-        rc, line, err, _ = self.started(1)
-        self.assertEqual(line["decision"], "refused")
-        self.assertEqual(line["removed"], "0")
-        self.assertTrue(self.target.is_dir())
-        self.assertIn("CACHEDIR.TAG", line["reason"])
+    def test_crash_in_the_run_is_a_logged_refusal(self):
+        self.target("tagged")
+        with mock.patch.object(hook, "clear_targets", side_effect=RuntimeError("boom")):
+            code, err = self.completed(disk=FakeDisk(1))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.log_lines(),
+            [
+                f"{STAMP} runner=r1 event=job-completed free_before_gib=unknown free_after_gib=unknown "
+                "folder_bytes_before=unknown folder_bytes_after=unknown decision=refused removed=0 entries=0 "
+                'paths=[] reason="internal error: RuntimeError: boom"'
+            ],
+        )
+        self.assertEqual(err, f"{STDERR_PREFIX}refused: internal error: RuntimeError: boom\n")
 
-    def test_dry_run_over_removes_nothing(self):
-        rc, line, _, _ = self.started(1, extra=["--dry-run"])
-        self.assertTrue(line["dry_run"])
-        self.assertEqual(line["decision"], "clear")
-        self.assertEqual(line["paths"], [str(self.target)])
-        self.assertTrue(self.target.is_dir())
-        self.assertEqual(line["fafter"], line["fbefore"])
+
+# ----------------------------------------------------------------------------------------------------------------
+# argument and environment refusals
+# ----------------------------------------------------------------------------------------------------------------
+class Refusals(Base):
+    def refuse(self, argv, *, env=None, reason, runner="r1", event="unknown"):
+        self.target("tagged")
+        disk = FakeDisk(1)
+        code, err = self.call(argv, disk=disk, env=env)
+        self.assertEqual(code, 0)
+        self.assertEqual(disk.calls, 0, "a refusal reads no disk")
+        self.assertTrue((self.repo / "target").exists(), "a refusal removes nothing")
+        line = self.log_lines()[0]
+        self.assertEqual(
+            line,
+            f"{STAMP} runner={runner} event={event} free_before_gib=unknown free_after_gib=unknown "
+            "folder_bytes_before=unknown folder_bytes_after=unknown decision=refused removed=0 entries=0 "
+            f'paths=[] reason="{reason}"',
+        )
+        self.assertEqual(err, f"{STDERR_PREFIX}refused: {reason}\n")
+        self.log.unlink()
+
+    def test_event_is_required_and_has_no_default(self):
+        self.refuse(
+            ["--log", str(self.log)],
+            reason="invalid arguments: one of the arguments --event --invoked-as is required",
+        )
+
+    def test_event_and_invoked_as_together(self):
+        self.refuse(
+            ["--event", "job-started", "--invoked-as", "runner_disk_hook_job-started.sh", "--log", str(self.log)],
+            reason="invalid arguments: argument --invoked-as: not allowed with argument --event",
+        )
+
+    def test_event_spelling_is_exact(self):
+        for bad in ("JOB-STARTED", " job-started", "job-started ", "Job-Completed", "job_started", "started", ""):
+            with self.subTest(event=bad):
+                self.setUp()
+                self.refuse(
+                    ["--event", bad, "--log", str(self.log)],
+                    reason=f"invalid arguments: argument --event: invalid event {bad!r} "
+                    "(choose from job-started, job-completed)",
+                )
+
+    def test_invoked_as_names_are_exact(self):
+        message = (
+            "invoked as {name!r}: no event (start it as runner_disk_hook_job-started.sh or "
+            "runner_disk_hook_job-completed.sh)"
+        )
+        for bad in (
+            "evil.sh", "", "RUNNER_DISK_HOOK_JOB-STARTED.SH", "runner_disk_hook_job-started.sh ",
+            "/x/runner_disk_hook_job-started.sh", "runner_disk_hook.sh", "runner_disk_hook_job-started.py",
+        ):
+            with self.subTest(name=bad):
+                self.setUp()
+                self.refuse(
+                    ["--invoked-as", bad, "--log", str(self.log)],
+                    reason=message.format(name=bad),
+                )
+
+    def test_invoked_as_maps_each_name_to_its_event(self):
+        for name, event, floor in (
+            ("runner_disk_hook_job-started.sh", "job-started", START_FLOOR_BYTES),
+            ("runner_disk_hook_job-completed.sh", "job-completed", COMPLETED_FLOOR_BYTES),
+        ):
+            with self.subTest(name=name):
+                self.setUp()
+                code, _ = self.call(["--invoked-as", name, "--log", str(self.log)], disk=FakeDisk(floor))
+                self.assertEqual(code, 0)
+                self.assertEqual(fields(self.log_lines()[0])["event"], event)
+
+    def test_free_gib_must_be_finite(self):
+        for bad, text in (("nan", "'nan'"), ("inf", "'inf'"), ("-inf", "'-inf'")):
+            with self.subTest(value=bad):
+                self.setUp()
+                self.refuse(
+                    ["--event", "job-started", "--free-gib=" + bad, "--log", str(self.log)],
+                    reason=f"invalid arguments: argument --free-gib: not a finite number: {text}",
+                )
+        self.setUp()
+        self.refuse(
+            ["--event", "job-started", "--free-gib", "x", "--log", str(self.log)],
+            reason="invalid arguments: argument --free-gib: not a number: 'x'",
+        )
+
+    def test_unknown_argument_and_abbreviation_are_refused(self):
+        self.refuse(
+            ["--event", "job-started", "--bogus", "--log", str(self.log)],
+            reason="invalid arguments: unrecognized arguments: --bogus",
+        )
+        self.setUp()
+        self.refuse(
+            ["--event", "job-started", "--dry", "--log", str(self.log)],
+            reason="invalid arguments: unrecognized arguments: --dry",
+        )
+
+    def test_runner_name_missing_and_invalid_are_logged_with_their_marker(self):
+        self.target("tagged")
+        for env_name, runner_marker, reason in (
+            (None, "unknown", "runner name is not set"),
+            ("", "unknown", "runner name is not set"),
+            ("bad name", "invalid", "runner name is invalid"),
+            ("a/b", "invalid", "runner name is invalid"),
+            ("x" * 65, "invalid", "runner name is invalid"),
+            ("r\n::error::pwn", "invalid", "runner name is invalid"),
+        ):
+            with self.subTest(runner=env_name):
+                environ = {"RUNNER_WORKSPACE": str(self.work_root)}
+                if env_name is not None:
+                    environ["RUNNER_NAME"] = env_name
+                code, _ = self.call(
+                    ["--event", "job-started", "--log", str(self.log)], disk=FakeDisk(1), env=environ, free_env=False
+                )
+                self.assertEqual(code, 0)
+                lines = self.log_lines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith(f"{STAMP} runner={runner_marker} event=job-started "), lines[0])
+                self.assertTrue(lines[0].endswith(f'decision=refused removed=0 entries=0 paths=[] reason="{reason}"'))
+                self.log.unlink()
+
+    def test_argument_refusal_logs_the_real_runner_name_from_the_environment(self):
+        self.refuse(["--event", "nope", "--log", str(self.log)], env={"RUNNER_NAME": "fed-3"}, runner="fed-3",
+                    reason="invalid arguments: argument --event: invalid event 'nope' "
+                           "(choose from job-started, job-completed)")
+
+    def test_a_relative_log_is_a_named_refusal_logged_at_the_default_path(self):
+        self.target("tagged")
+        code, err = self.call(["--event", "job-started", "--log", "rel.log"], disk=FakeDisk(1))
+        default = self.home / "ai-tmp" / "runner-disk-hook.log"
+        self.assertEqual(code, 0)
+        self.assertEqual(err, f"{STDERR_PREFIX}refused: --log is not an absolute path\n")
+        self.assertFalse((Path.cwd() / "rel.log").exists())
+        self.assertTrue(default.read_text().rstrip().endswith('decision=refused removed=0 entries=0 paths=[] reason="--log is not an absolute path"'))
+        self.assertTrue((self.repo / "target").exists())
+
+    def test_a_relative_log_from_the_environment_is_a_named_refusal(self):
+        self.target("tagged")
+        code, err = self.call(
+            ["--event", "job-completed"], disk=FakeDisk(1), env={"RUNNER_DISK_HOOK_LOG": "rel.log"}
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, f"{STDERR_PREFIX}refused: RUNNER_DISK_HOOK_LOG is not an absolute path\n")
+
+    def test_the_environment_log_is_used_when_absolute(self):
+        self.target("tagged")
+        code, _ = self.call(
+            ["--event", "job-completed"], disk=FakeDisk(150 * GIB), env={"RUNNER_DISK_HOOK_LOG": str(self.log)}
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.log_lines()), 1)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# work-root guard
+# ----------------------------------------------------------------------------------------------------------------
+def fake_lstat(table):
+    """table: path string -> (mode, dev) or an exception."""
+
+    def lstat(path):
+        entry = table[str(path)]
+        if isinstance(entry, BaseException):
+            raise entry
+        mode, dev = entry
+        return types.SimpleNamespace(st_mode=mode, st_dev=dev)
+
+    return lstat
+
+
+class WorkRootGuard(unittest.TestCase):
+    HOME = Path("/Users/example")
+    ROOT = "/Users/example/runner/_work/repo"
+    PARENT = "/Users/example/runner/_work"
+
+    def refusal(self, root, table=None, home=None):
+        return hook.work_root_refusal(root, home or self.HOME, lstat=fake_lstat(table or {}))
+
+    def test_lexical_rows(self):
+        rows = (
+            (None, "work root is not set"),
+            ("", "work root is empty"),
+            ("   ", "work root is empty"),
+            ("relative/_work/repo", "work root is not an absolute path"),
+            ("/a/b/../_work/repo", "work root contains a '..' component"),
+            ("/", "work root is the filesystem root"),
+            ("/Users/example", "work root is the home directory"),
+            ("/Users/example/", "work root is the home directory"),
+            ("//Users//example/.", "work root is the home directory"),
+            ("/System/Volumes/Data", "work root is on the forbidden volume path /System/Volumes/Data"),
+            ("/System/Volumes/Data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
+            ("//System/Volumes/Data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
+            ("/System/./Volumes//Data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
+            ("/system/volumes/data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
+            ("/Volumes/_work", "work root has fewer than 3 path parts"),
+            ("/a/_work", "work root has fewer than 3 path parts"),
+            ("/Users/example/runner/work/repo", "work root is not <runner root>/_work/<repo>"),
+            ("/a/b/c", "work root is not <runner root>/_work/<repo>"),
+        )
+        for root, reason in rows:
+            with self.subTest(root=root):
+                self.assertEqual(self.refusal(root), reason)
+
+    def test_system_volumes_data_prefix_lookalike_is_not_forbidden(self):
+        table = {self.ROOT: (stat.S_IFDIR, 7), self.PARENT: (stat.S_IFDIR, 7)}
+        self.assertIsNone(self.refusal("/System/Volumes/Datax/runner/_work/repo", {
+            "/System/Volumes/Datax/runner/_work/repo": (stat.S_IFDIR, 7),
+            "/System/Volumes/Datax/runner/_work": (stat.S_IFDIR, 7),
+        }))
+        self.assertIsNone(self.refusal(self.ROOT, table))
+
+    def test_file_system_rows(self):
+        parent_ok = (stat.S_IFDIR, 7)
+        rows = (
+            ({self.ROOT: FileNotFoundError()}, "work root does not exist"),
+            ({self.ROOT: PermissionError(errno.EACCES, "Permission denied")},
+             "work root cannot be examined: Permission denied"),
+            ({self.ROOT: (stat.S_IFLNK, 7), self.PARENT: parent_ok}, "work root is a symlink"),
+            ({self.ROOT: (stat.S_IFREG, 7), self.PARENT: parent_ok}, "work root is not a directory"),
+            ({self.ROOT: (stat.S_IFDIR, 8), self.PARENT: parent_ok}, "work root is a volume root"),
+            ({self.ROOT: (stat.S_IFDIR, 7), self.PARENT: PermissionError(errno.EACCES, "Permission denied")},
+             "work root parent cannot be examined: Permission denied"),
+            ({self.ROOT: (stat.S_IFDIR, 7), self.PARENT: parent_ok}, None),
+        )
+        for table, reason in rows:
+            with self.subTest(reason=reason):
+                self.assertEqual(self.refusal(self.ROOT, table), reason)
+
+    def test_real_tree_is_accepted_and_a_real_symlink_is_not(self):
+        LOCAL_RUNS.mkdir(exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix="work-root-8216-", dir=LOCAL_RUNS))
+        self.addCleanup(force_remove, scratch)
+        root = scratch / "runner" / "_work" / "repo"
+        root.mkdir(parents=True)
+        self.assertIsNone(hook.work_root_refusal(root, scratch / "home"))
+        link = scratch / "runner" / "_work" / "link"
+        link.symlink_to(root)
+        self.assertEqual(hook.work_root_refusal(link, scratch / "home"), "work root is a symlink")
+
+
+class WorkRootThroughMain(Base):
+    def test_refused_roots_remove_nothing_and_log_the_reason(self):
+        self.target("tagged")
+        other = self.scratch / "elsewhere"
+        other.mkdir()
+        for root, reason in (
+            (str(self.home), "work root is the home directory"),
+            (str(other), "work root is not <runner root>/_work/<repo>"),
+            ("/System/Volumes/Data/x/_work/r", "work root is on the forbidden volume path /System/Volumes/Data"),
+        ):
+            with self.subTest(root=root):
+                code, err = self.call(
+                    ["--event", "job-completed", "--log", str(self.log), "--work-root", root], disk=FakeDisk(1)
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(err, f"{STDERR_PREFIX}refused: {reason}\n")
+                self.assertTrue(self.log_lines()[-1].endswith(f'decision=refused removed=0 entries=0 paths=[] reason="{reason}"'))
+                self.assertTrue((self.repo / "target").exists())
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# untrusted text
+# ----------------------------------------------------------------------------------------------------------------
+class SafeText(unittest.TestCase):
+    ROWS = (
+        ("plain", "plain"),
+        ("a\nb", "a\\x0ab"),
+        ("a\rb", "a\\x0db"),
+        ("tab\there", "tab\\x09here"),
+        ("::error::boom", ":\\x3aerror:\\x3aboom"),
+        ("::add-mask::secret", ":\\x3aadd-mask:\\x3asecret"),
+        ("::set-output name=x::y", ":\\x3aset-output name=x:\\x3ay"),
+        (":::", ":\\x3a:"),
+        ("::", ":\\x3a"),
+        (":", ":"),
+        ("%0A", "%250A"),
+        ("100%", "100%25"),
+        ("\x1b[31mred", "\\x1b[31mred"),
+        ("\x00", "\\x00"),
+        ("\x7f", "\\x7f"),
+        ("\x85", "\\x85"),
+        ("\x9f", "\\x9f"),
+        ("\xa0", "\xa0"),
+        ("\\", "\\\\"),
+        ("\\x0a", "\\\\x0a"),
+        ("\n::error::x", "\\x0a:\\x3aerror:\\x3ax"),
+        ("caf\u00e9", "caf\u00e9"),
+        ("a" * 512, "a" * 512),
+        ("a" * 513, "a" * 512 + "...(+1 chars)"),
+        ("a" * 10_000, "a" * 512 + "...(+9488 chars)"),
+    )
+
+    def test_table(self):
+        for value, expected in self.ROWS:
+            with self.subTest(value=value[:20]):
+                self.assertEqual(hook.safe_text(value), expected)
+
+    def test_generated_corpus_never_leaks_a_control_character_or_a_command_prefix(self):
+        rng = random.Random(8216)
+        alphabet = ["a", "Z", "0", ":", "::", "%", "\n", "\r", "\x1b", "\x7f", "\x85", "\\", " ", "é", "\u2028", "="]
+        for _ in range(2_000):
+            value = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 40)))
+            out = hook.safe_text(value)
+            self.assertNotIn("::", out)
+            self.assertFalse(out.startswith("::"))
+            for char in out:
+                code = ord(char)
+                self.assertFalse(code < 0x20 or code == 0x7F or 0x80 <= code < 0xA0, (value, out))
+
+    def test_cost_is_linear_on_a_large_input(self):
+        started = time.monotonic()
+        out = hook.safe_text(":" * 1_000_000 + "\n" * 1_000_000)
+        self.assertLess(time.monotonic() - started, WALL_CLOCK_CEILING_SECS)
+        self.assertTrue(out.endswith(" chars)"))
+
+
+class UntrustedTextThroughMain(Base):
+    def test_hostile_repo_name_reaches_neither_stderr_nor_the_log_unescaped(self):
+        hostile = self.work_root / "r\n::error::pwn %0A"
+        (hostile / "target").mkdir(parents=True)
+        (hostile / "target" / "f").write_text("x")
+        code, err = self.completed(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 1, "no raw newline inside the log line")
+        for line in err.splitlines() + lines:
+            self.assertFalse(line.startswith("::"), line)
+        for line in err.splitlines():
+            self.assertTrue(line.startswith(STDERR_PREFIX), line)
+        self.assertNotIn("\x0a::", err)
+        self.assertIn("r\\\\x0a:\\\\x3aerror:\\\\x3apwn %250A", lines[0])
+
+    def test_hostile_invalid_event_text_is_one_stderr_line(self):
+        code, err = self.call(
+            ["--event", "x\n::error::pwn", "--log", str(self.log)], disk=FakeDisk(1)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertTrue(err.startswith(STDERR_PREFIX))
+        self.assertNotIn("\n::", err)
+        self.assertEqual(len(self.log_lines()), 1)
+
+    def test_hostile_runner_name_from_the_environment_is_marked_invalid(self):
+        code, err = self.call(
+            ["--event", "job-started", "--log", str(self.log)],
+            disk=FakeDisk(1),
+            env={"RUNNER_NAME": "r\n::error::x", "RUNNER_WORKSPACE": str(self.work_root)}, free_env=False,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, f"{STDERR_PREFIX}refused: runner name is invalid\n")
+        self.assertIn(" runner=invalid ", self.log_lines()[0])
+
+    def test_hostile_log_path_in_a_write_failure_is_escaped(self):
+        bad = self.scratch / "dir\n::error::x"
+        bad.mkdir()
+        code, err = self.call(["--event", "job-completed", "--log", str(bad)], disk=FakeDisk(150 * GIB))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertTrue(err.startswith(f"{STDERR_PREFIX}log write failed: "))
+        self.assertIn("dir\\x0a:\\x3aerror:\\x3ax: Is a directory", err)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the allocated-bytes measure
+# ----------------------------------------------------------------------------------------------------------------
+class AllocatedBytes(Base):
+    def test_a_real_file_counts_its_allocated_bytes(self):
+        (self.repo / "data.bin").write_bytes(os.urandom(MIB))
+        measured = hook.measure_folder_bytes(self.work_root)
+        self.assertGreaterEqual(measured, 1_048_576)
+        self.assertLessEqual(measured, 1_048_576 + 65_536)
+
+    def test_a_sparse_file_counts_what_it_allocates_not_its_size(self):
+        with open(self.repo / "sparse.bin", "wb") as handle:
+            handle.truncate(GIB)
+        self.assertLess(hook.measure_folder_bytes(self.work_root), 1_048_576)
+
+    def test_hard_links_count_once(self):
+        (self.repo / "data.bin").write_bytes(os.urandom(MIB))
+        os.link(self.repo / "data.bin", self.repo / "second.bin")
+        os.link(self.repo / "data.bin", self.work_root / "third.bin")
+        measured = hook.measure_folder_bytes(self.work_root)
+        self.assertGreaterEqual(measured, 1_048_576)
+        self.assertLessEqual(measured, 1_048_576 + 65_536)
+
+    def test_a_symlink_is_not_followed(self):
+        outside = self.scratch / "outside.bin"
+        outside.write_bytes(os.urandom(MIB))
+        (self.repo / "link").symlink_to(outside)
+        (self.repo / "dirlink").symlink_to(self.scratch)
+        self.assertLess(hook.measure_folder_bytes(self.work_root), 65_536)
+
+    def test_a_directory_on_another_device_is_not_entered(self):
+        (self.repo / "mount").mkdir()
+        (self.repo / "mount" / "big.bin").write_bytes(os.urandom(MIB))
+        real = os.fstat
+        mount_ino = (self.repo / "mount").stat().st_ino
+
+        def fake(fd):
+            info = real(fd)
+            if info.st_ino == mount_ino:
+                return types.SimpleNamespace(st_dev=info.st_dev + 1, st_mode=info.st_mode, st_ino=info.st_ino)
+            return info
+
+        with mock.patch.object(os, "fstat", side_effect=fake):
+            self.assertLess(hook.measure_folder_bytes(self.work_root), 65_536)
+
+    def test_entry_cap_is_exact_for_files_and_directories(self):
+        for index in range(3):
+            (self.repo / f"d{index}").mkdir()
+        # work root holds repo (1) + d0 d1 d2 (3) = 4 entries
+        self.assertIsInstance(hook.measure_folder_bytes(self.work_root, 4), int)
+        with self.assertRaises(hook.MeasureError) as caught:
+            hook.measure_folder_bytes(self.work_root, 3)
+        self.assertEqual((caught.exception.reason, caught.exception.state), ("more than 3 entries", hook.FolderState.CAP))
+
+    def test_directories_alone_exceed_the_cap(self):
+        for index in range(4):
+            (self.repo / f"d{index}").mkdir()
+        # 1 repo dir + 4 empty directories = 5 names, no file among them
+        with self.assertRaises(hook.MeasureError) as caught:
+            hook.measure_folder_bytes(self.work_root, 4)
+        self.assertEqual(caught.exception.reason, "more than 4 entries")
+
+    def test_depth_over_the_cap_is_unreadable_with_its_reason(self):
+        fd = os.open(self.repo, hook.DIR_OPEN_FLAGS)
+        try:
+            for index in range(258):
+                os.mkdir(f"d{index}", dir_fd=fd)
+                child = os.open(f"d{index}", hook.DIR_OPEN_FLAGS, dir_fd=fd)
+                os.close(fd)
+                fd = child
+        finally:
+            os.close(fd)
+        with self.assertRaises(hook.MeasureError) as caught:
+            hook.measure_folder_bytes(self.work_root)
+        self.assertEqual(
+            (caught.exception.reason, caught.exception.state),
+            ("tree deeper than 256 levels", hook.FolderState.UNREADABLE),
+        )
+        deep = self.repo / "d0"
+        self.addCleanup(
+            lambda: hook.safe_remove.check_and_remove(
+                os.open(self.repo, hook.DIR_OPEN_FLAGS), "d0", tag=None, max_depth=10_000
+            )
+        )
+        self.assertTrue(deep.exists())
+
+    def test_100k_entries_are_walked_inside_the_ceiling(self):
+        for index in range(BIG_WALK_ENTRIES):
+            (self.repo / f"f{index}").write_bytes(b"")
+        started = time.monotonic()
+        measured = hook.measure_folder_bytes(self.work_root)
+        elapsed = time.monotonic() - started
+        self.assertEqual(measured, 0)
+        self.assertLess(elapsed, WALL_CLOCK_CEILING_SECS)
+        with self.assertRaises(hook.MeasureError) as caught:
+            hook.measure_folder_bytes(self.work_root, BIG_WALK_ENTRIES)
+        self.assertEqual(caught.exception.reason, "more than 100000 entries")
+
+    def test_unreadable_subdirectory_is_unreadable_with_its_cause(self):
+        sealed = self.repo / "sealed"
+        sealed.mkdir()
+        sealed.chmod(0)
+        with self.assertRaises(hook.MeasureError) as caught:
+            hook.measure_folder_bytes(self.work_root)
+        self.assertEqual(caught.exception.state, hook.FolderState.UNREADABLE)
+        self.assertEqual(
+            caught.exception.reason, f"work folder size read failed under {self.work_root}: Permission denied"
+        )
+
+    def test_missing_root_is_unreadable(self):
+        with self.assertRaises(hook.MeasureError) as caught:
+            hook.measure_folder_bytes(self.scratch / "nope")
+        self.assertEqual(
+            caught.exception.reason,
+            f"work folder size read failed under {self.scratch / 'nope'}: No such file or directory",
+        )
+
+
+class FolderThroughRun(Base):
+    def test_cap_hit_with_enough_free_is_entry_cap_and_exit_zero(self):
+        self.target("tagged")
+        code, err = self.started(disk=FakeDisk(100 * GIB), max_walk=2)
+        self.assertEqual(code, 0)
+        row = fields(self.log_lines()[0])
+        self.assertEqual(row["decision"], "entry-cap")
+        self.assertEqual(row["reason"], '"free space 100.00 GiB is at or above the 60 GiB floor; more than 2 entries"')
+        self.assertEqual((row["folder_bytes_before"], row["folder_bytes_after"]), ("unknown", "unknown"))
+        self.assertTrue((self.repo / "target").exists())
+        self.assertEqual(err, f"{STDERR_PREFIX}entry-cap: more than 2 entries\n")
+
+    def test_the_cap_is_exact_through_run(self):
+        self.target("tagged")  # repo, target, CACHEDIR.TAG, file.bin = 4 entries under the work root
+        code, _ = self.started(disk=FakeDisk(100 * GIB), max_walk=4)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "enough-free")
+        self.log.unlink()
+        code, _ = self.started(disk=FakeDisk(100 * GIB), max_walk=3)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "entry-cap")
+
+    def test_unreadable_folder_with_enough_free_is_refused_measure_exit_zero(self):
+        self.target("tagged")
+        sealed = self.work_root / "sealed"
+        sealed.mkdir()
+        sealed.chmod(0)
+        code, err = self.started(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        row = fields(self.log_lines()[0])
+        self.assertEqual(row["decision"], "refused-measure")
+        self.assertEqual(
+            row["reason"],
+            f'"free space 100.00 GiB is at or above the 60 GiB floor; work folder size read failed under '
+            f'{self.work_root}: Permission denied"',
+        )
+
+    def test_over_the_ceiling_clears_although_free_is_above_the_floor(self):
+        target = self.target("tagged")
+        (target / "big.bin").write_bytes(os.urandom(MIB))
+        code, _ = self.started(disk=FakeDisk(100 * GIB, 100 * GIB), ceiling=1_000_000)
+        self.assertEqual(code, 0)
+        self.assertFalse(target.exists())
+        row = fields(self.log_lines()[0])
+        self.assertEqual(row["decision"], "clear")
+        self.assertRegex(
+            row["reason"], r'^"work folder \d+ allocated bytes is over the 1000000 byte ceiling"$'
+        )
+        self.assertGreater(int(row["folder_bytes_before"]), 1_000_000)
+        self.assertLess(int(row["folder_bytes_after"]), 1_000_000)
+
+    def test_the_ceiling_boundary_is_strict(self):
+        target = self.target("tagged")
+        (target / "big.bin").write_bytes(os.urandom(MIB))
+        measured = hook.measure_folder_bytes(self.work_root)
+        code, _ = self.started(disk=FakeDisk(100 * GIB), ceiling=measured)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "enough-free")
+        self.assertTrue(target.exists())
+        self.log.unlink()
+        code, _ = self.started(disk=FakeDisk(100 * GIB, 100 * GIB), ceiling=measured - 1)
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "clear")
 
     def test_job_completed_does_not_measure_the_folder(self):
-        rc, line, _, _ = self.run_hook("job-completed", free_gib=self.FREE_ENOUGH_GIB, ceiling_bytes=1)
-        self.assertEqual(line["decision"], "enough-free")
-        self.assertEqual((line["fbefore"], line["fafter"]), ("unknown", "unknown"))
-        self.assertTrue(self.target.is_dir())
-
-    def test_unreadable_folder_refuses_with_exact_reason_never_under(self):
-        if os.geteuid() == 0:
-            self.skipTest("root ignores directory permissions")
-        locked = self.repo / "locked"
-        locked.mkdir()
-        locked.chmod(0o000)
-        self.addCleanup(locked.chmod, 0o755)
-        for ceiling in (1, hook.WORK_FOLDER_CEILING_BYTES):
-            with self.subTest(ceiling=ceiling):
-                rc, line, err, _ = self.started(ceiling)
-                self.assertEqual(rc, 0)
-                self.assertEqual(line["decision"], "refused")
-                self.assertEqual(line["removed"], "0")
-                self.assertEqual(
-                    line["reason"],
-                    f"{self.FREE_TEXT}; work folder size read failed under {self.work_root}: Permission denied")
-                self.assertEqual((line["fbefore"], line["fafter"]), ("unknown", "unknown"))
-                self.assertTrue(self.target.is_dir())
-
-    def test_symlinks_are_counted_as_links_and_not_followed(self):
-        big = self.outside / "big.bin"
-        big.write_bytes(b"x" * (1 << 20))
-        link = self.repo / "link-to-outside"
-        link.symlink_to(self.outside)
-        loop = self.repo / "link-to-root"
-        loop.symlink_to(self.work_root)
-        grown = hook.measure_folder_bytes(self.work_root)
-        links = os.lstat(link).st_size + os.lstat(loop).st_size
-        self.assertGreaterEqual(grown - self.size, links)  # the directory entry sizes may grow too
-        self.assertLess(grown - self.size, 4096)  # far below the 1 MiB file behind the link
-        rc, line, _, _ = self.started(grown)
-        self.assertEqual(line["decision"], "enough-free")
-        self.assertTrue(big.is_file())
-
-    def test_entry_cap_is_a_refusal_not_a_zero(self):
-        with self.assertRaises(hook.Undecidable) as caught:
-            hook.measure_folder_bytes(self.work_root, max_entries=1)
-        self.assertIn("more than 1 entries", str(caught.exception))
-        self.assertTrue(str(caught.exception).startswith(f"work folder size read failed under {self.work_root}: "))
-
-    def test_missing_folder_is_a_refusal_not_a_zero(self):
-        gone = self.tmp / "gone"
-        with self.assertRaises(hook.Undecidable) as caught:
-            hook.measure_folder_bytes(gone)
-        self.assertEqual(
-            str(caught.exception), f"work folder size read failed under {gone}: No such file or directory")
+        self.target("tagged")
+        with mock.patch.object(hook, "measure_folder_bytes", side_effect=AssertionError("measured")):
+            code, _ = self.completed(disk=FakeDisk(150 * GIB))
+        self.assertEqual(code, 0)
 
 
-class CliForms(HookCase):
-    def test_subprocess_exit_zero_and_stderr_reason(self):
-        env = {k: v for k, v in os.environ.items() if k not in ("RUNNER_WORKSPACE", "GITHUB_WORKSPACE", "RUNNER_NAME")}
-        done = subprocess.run(
-            [sys.executable, "-I", str(HOOK_PATH), "--event", "job-completed", "--log", str(self.log),
-             "--runner-name", RUNNER, "--free-gib", "1"],
-            env=env, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECS, check=False,
-        )
-        self.assertEqual(done.returncode, 0)
-        self.assertIn("work root is not set", done.stderr)
-        self.assertEqual(parse_line(self.log.read_text())["reason"], "work root is not set")
+# ----------------------------------------------------------------------------------------------------------------
+# the log
+# ----------------------------------------------------------------------------------------------------------------
+class LogFile(Base):
+    def test_the_log_file_is_created_0600(self):
+        self.target("tagged")
+        old = os.umask(0)
+        try:
+            self.completed(disk=FakeDisk(150 * GIB))
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(self.log.stat().st_mode), 0o600)
 
-    def test_subprocess_removes_with_env_inputs(self):
-        target = self.make_target()
-        env = {"RUNNER_WORKSPACE": str(self.work_root), "RUNNER_NAME": RUNNER,
-               "GITHUB_WORKSPACE": str(self.repo), "PATH": os.environ.get("PATH", "")}
-        done = subprocess.run(
-            [sys.executable, "-I", str(HOOK_PATH), "--event", "job-completed", "--log", str(self.log),
-             "--free-gib", "1"],
-            env=env, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECS, check=False,
-        )
-        self.assertEqual((done.returncode, done.stderr), (0, ""))
+    def test_the_default_log_directory_is_created_0700_and_the_file_0600(self):
+        self.target("tagged")
+        old = os.umask(0)
+        try:
+            code, _ = self.call(["--event", "job-completed"], disk=FakeDisk(150 * GIB))
+        finally:
+            os.umask(old)
+        default_dir = self.home / "ai-tmp"
+        self.assertEqual(code, 0)
+        self.assertEqual(stat.S_IMODE(default_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((default_dir / "runner-disk-hook.log").stat().st_mode), 0o600)
+
+    def test_an_explicit_log_directory_is_not_created(self):
+        missing = self.scratch / "no-such-dir" / "hook.log"
+        code, err = self.call(["--event", "job-completed", "--log", str(missing)], disk=FakeDisk(150 * GIB))
+        self.assertEqual(code, 0)
+        self.assertFalse(missing.parent.exists())
+        self.assertTrue(err.startswith(f"{STDERR_PREFIX}log write failed: {missing}: No such file or directory; line: "))
+
+    def test_log_lines_append(self):
+        self.target("tagged")
+        self.completed(disk=FakeDisk(150 * GIB))
+        self.completed(disk=FakeDisk(150 * GIB))
+        self.assertEqual(len(self.log_lines()), 2)
+
+    def test_a_log_write_failure_does_not_stop_the_removal_and_prints_the_line(self):
+        target = self.target("tagged")
+        self.log.mkdir()
+        code, err = self.completed(disk=FakeDisk(100 * GIB, 200 * GIB))
+        self.assertEqual(code, 0)
         self.assertFalse(target.exists())
+        self.assertTrue(err.startswith(f"{STDERR_PREFIX}log write failed: {self.log}: Is a directory; line: {STAMP} runner=r1 "))
+        self.assertIn("decision=clear removed=1", err)
 
-    def test_help_marks_free_gib_as_a_test_input(self):
-        done = subprocess.run([sys.executable, "-I", str(HOOK_PATH), "--help"], capture_output=True, text=True,
-                              timeout=SUBPROCESS_TIMEOUT_SECS, check=False)
-        self.assertEqual(done.returncode, 0)
-        self.assertIn("test input", " ".join(done.stdout.split()))
+    def test_a_symlink_log_is_not_followed(self):
+        victim = self.scratch / "victim.txt"
+        victim.write_text("keep")
+        self.log.symlink_to(victim)
+        code, err = self.completed(disk=FakeDisk(150 * GIB))
+        self.assertEqual(code, 0)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertIn("log write failed", err)
 
-    def test_no_forbidden_constructs_in_the_script(self):
-        source = HOOK_PATH.read_text()
-        self.assertTrue(source.startswith("#!/opt/homebrew/bin/python3.12\n"))
-        for forbidden in ("shell=True", "os.system", "except:", "sudo"):
-            # sudo may only appear in the docstring decision line, never as a command
-            if forbidden == "sudo":
-                self.assertNotIn('"sudo"', source)
-                continue
-            self.assertNotIn(forbidden, source)
+    def test_the_below_floor_line_is_also_written_when_the_log_is_the_default(self):
+        self.target("none")
+        code, _ = self.call(["--event", "job-started"], disk=FakeDisk(START_FLOOR_BYTES - 1))
+        self.assertEqual(code, 75)
+        lines = (self.home / "ai-tmp" / "runner-disk-hook.log").read_text().splitlines()
+        self.assertEqual(
+            lines[1],
+            f"{STAMP} decision=below-floor event=job-started free_bytes=64424509439 floor_bytes=64424509440 runner=r1",
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# what is cleared, and what is kept
+# ----------------------------------------------------------------------------------------------------------------
+class Targets(Base):
+    def test_only_tagged_targets_of_this_work_root_are_removed(self):
+        tagged = self.target("tagged")
+        other_repo = self.work_root / "other"
+        (other_repo / "target").mkdir(parents=True)
+        (other_repo / "target" / "f").write_text("x")  # untagged: kept
+        nested = self.repo / "sub" / "target"
+        nested.mkdir(parents=True)
+        (nested / "CACHEDIR.TAG").write_text(SIGNATURE + "\n")  # not <work root>/<repo>/target: kept
+        code, err = self.completed(disk=FakeDisk(100 * GIB, 200 * GIB))
+        self.assertEqual(code, 0)
+        self.assertFalse(tagged.exists())
+        self.assertTrue((other_repo / "target" / "f").exists())
+        self.assertTrue(nested.exists())
+        self.assertEqual(err, f"{STDERR_PREFIX}clear: {other_repo}/target: CACHEDIR.TAG is missing\n")
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "clear")
+
+    def test_a_symlinked_target_is_refused_and_its_destination_untouched(self):
+        outside = self.scratch / "outside"
+        outside.mkdir()
+        (outside / "CACHEDIR.TAG").write_text(SIGNATURE + "\n")
+        (outside / "precious").write_text("keep")
+        (self.repo / "target").symlink_to(outside)
+        code, err = self.completed(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertEqual((outside / "precious").read_text(), "keep")
+        self.assertEqual(fields(self.log_lines()[0])["decision"], "refused-target")
+        self.assertIn(f"{self.repo}/target: directory is a symlink", err)
+
+    def test_a_symlinked_repo_directory_is_not_entered(self):
+        outside = self.scratch / "outside"
+        (outside / "target").mkdir(parents=True)
+        (outside / "target" / "CACHEDIR.TAG").write_text(SIGNATURE + "\n")
+        (self.work_root / "linked").symlink_to(outside)
+        code, err = self.completed(disk=FakeDisk(100 * GIB))
+        self.assertEqual(code, 0)
+        self.assertTrue((outside / "target" / "CACHEDIR.TAG").exists())
+        self.assertIn(f"{self.work_root}/linked: repo directory is a symlink, not entered", err)
+
+    def test_every_tag_state_has_its_exact_reason_through_the_hook(self):
+        target = self.repo / "target"
+        target.mkdir()
+        rows = (
+            (None, "CACHEDIR.TAG is missing"),
+            (b"Signature: 00000000000000000000000000000000\n", "CACHEDIR.TAG first line is not the expected signature"),
+            (b"", "CACHEDIR.TAG first line is not the expected signature"),
+        )
+        for content, reason in rows:
+            with self.subTest(reason=reason, content=content):
+                tag = target / "CACHEDIR.TAG"
+                if tag.exists():
+                    tag.unlink()
+                if content is not None:
+                    tag.write_bytes(content)
+                code, err = self.completed(disk=FakeDisk(100 * GIB))
+                self.assertEqual(code, 0)
+                self.assertIn(f"{target}: {reason}", err)
+                self.assertTrue(target.exists())
+                self.log.unlink()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the one-line .sh wiring
+# ----------------------------------------------------------------------------------------------------------------
+class Wrapper(unittest.TestCase):
+    def lines(self):
+        return WRAPPER_PATH.read_text().splitlines()
+
+    def test_the_wrapper_is_one_exec_line_and_the_only_sh_file_in_scripts_ci(self):
+        code = [line for line in self.lines() if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(len(code), 1, code)
+        self.assertTrue(code[0].startswith("exec /opt/homebrew/bin/python3.12 -I "), code[0])
+        self.assertEqual(self.lines()[0], "#!/bin/bash")
+        self.assertTrue(os.access(WRAPPER_PATH, os.X_OK))
+        self.assertEqual(sorted(p.name for p in CI_DIR.rglob("*.sh")), ["runner_disk_hook.sh"])
+
+    @unittest.skipUnless(
+        WRAPPER_PYTHON.exists(), "the wrapper starts the macOS Homebrew interpreter /opt/homebrew/bin/python3.12"
+    )
+    def test_the_wrapper_starts_the_hook_under_each_symlink_name(self):
+        LOCAL_RUNS.mkdir(exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix="wrapper-8216-", dir=LOCAL_RUNS))
+        self.addCleanup(force_remove, scratch)
+        install = scratch / "hooks"
+        install.mkdir()
+        (install / "runner_disk_hook.py").symlink_to(HOOK_PATH)
+        names = ("runner_disk_hook_job-started.sh", "runner_disk_hook_job-completed.sh", "evil.sh")
+        for name in names:
+            (install / name).symlink_to(WRAPPER_PATH)
+        work_root = scratch / "runner" / "_work" / "repo"
+        (work_root / "repo").mkdir(parents=True)
+        home = scratch / "home"
+        home.mkdir()
+        elsewhere = scratch / "elsewhere"
+        elsewhere.mkdir()
+        log = scratch / "hook.log"
+        env = {
+            "RUNNER_WORKSPACE": str(work_root), "RUNNER_NAME": "r1", "RUNNER_DISK_HOOK_LOG": str(log),
+            "HOME": str(home), "PATH": "/usr/bin:/bin",
+        }
+        expected = {
+            "runner_disk_hook_job-started.sh": "job-started",
+            "runner_disk_hook_job-completed.sh": "job-completed",
+            "evil.sh": "unknown",
+        }
+        for name in names:
+            with self.subTest(name=name):
+                if log.exists():
+                    log.unlink()
+                done = subprocess.run(
+                    [str(install / name)], cwd=elsewhere, env=env, capture_output=True, text=True, timeout=60,
+                    check=False,
+                )
+                row = log.read_text().splitlines()[0]
+                self.assertIn(f" runner=r1 event={expected[name]} ", row)
+                if name == "evil.sh":
+                    self.assertEqual(done.returncode, 0)
+                    self.assertTrue(
+                        row.endswith(
+                            "reason=\"invoked as 'evil.sh': no event (start it as runner_disk_hook_job-started.sh "
+                            "or runner_disk_hook_job-completed.sh)\""
+                        ),
+                        row,
+                    )
+                elif name == "runner_disk_hook_job-completed.sh":
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                else:
+                    self.assertEqual(done.returncode == 75, "decision=below-floor" in row, (done.returncode, row))
 
 
 if __name__ == "__main__":
