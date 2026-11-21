@@ -68,6 +68,9 @@ HUGE_VALUE_CHARS = 100_001
 HUGE_WALL_CLOCK_SECS = 20.0
 SUBPROCESS_TIMEOUT_SECS = 60
 
+# #9705: a file system may refuse a name that is not UTF-8 (APFS: errno 92, ``errno.EILSEQ``); these are the bytes of
+# that row. Its escaped text is written out by hand below (``NON_UTF8_NAME_ESCAPED``), never computed from the code.
+NON_UTF8_NAME_BYTES = b"bad\xff\xfe::x"
 HOSTILE = {
     "command": "::error::x",
     "set_output": "%0A::set-output name=pwn::1",
@@ -77,14 +80,12 @@ HOSTILE = {
     "colons": "a::b",
     "percent": "100%25",
     "long_name": "n" * 4096,
-    "non_utf8": os.fsdecode(b"bad\xff\xfe::x"),
+    "non_utf8": os.fsdecode(NON_UTF8_NAME_BYTES),
     "separators": "a\u2028::error::b\x85::error::c",
 }
 FILE_NAME_CORPUS = ("command", "raw_newline", "raw_cr", "colons", "percent", "non_utf8")
-# #9705: a file system may refuse a name that is not UTF-8 (APFS: errno 92). The bytes of the row, and its escaped text
-# written out by hand (``\udcff``/``\udcfe`` are the surrogate-escaped bytes 0xff/0xfe, ``::`` keeps its first colon
-# as ``\x3a``), never computed from the code under test.
-NON_UTF8_NAME_BYTES = b"bad\xff\xfe::x"
+FILE_NAME_CORPUS_UTF8 = frozenset(FILE_NAME_CORPUS) - {"non_utf8"}  # the rows every file system takes
+# ``\udcff``/``\udcfe`` are the surrogate-escaped bytes 0xff/0xfe, ``::`` keeps its second colon and escapes the first
 NON_UTF8_NAME_ESCAPED = "bad\\udcff\\udcfe\\x3a:x"
 INTERPRETER_PLACEHOLDER = "<interpreter>"
 PRUNE_WARNING_FLOOR_GIB = 100000000
@@ -148,28 +149,52 @@ def scratch_dir(label):
     return Path(tempfile.mkdtemp(prefix=label + "-", dir=str(SCRATCH_ROOT)))
 
 
-def fs_accepts_non_utf8_names(directory):
-    """Probe once whether ``directory`` takes a directory name that is not UTF-8 (#9705); the probe leaves nothing."""
+def fs_accepts_non_utf8_names(directory, mkdir=os.mkdir, rmdir=os.rmdir):
+    """Probe once whether ``directory`` takes a directory name that is not UTF-8 (#9705); the probe leaves nothing.
+
+    False only for ``errno.EILSEQ`` (what APFS raises, errno 92); every other ``OSError`` propagates, so a host that
+    takes the name but fails for another reason (permission, space) does not silently pick the weaker form. ``mkdir``
+    and ``rmdir`` are parameters so a test can inject each outcome."""
     probe = os.path.join(os.fsencode(str(directory)), NON_UTF8_NAME_BYTES)
     try:
-        os.mkdir(probe)
-    except OSError:
-        return False
-    os.rmdir(probe)
+        mkdir(probe)
+    except OSError as err:
+        if err.errno == errno.EILSEQ:
+            return False
+        raise
+    rmdir(probe)
     return True
 
 
-def mask_interpreter(text):
-    """``text`` with each spelling of the interpreter path (``sys.executable``, its realpath and its directory's
-    realpath with the file name kept, which a ``-S`` child reports under Homebrew; raw and escaped by the oracle)
-    replaced by one placeholder, longest spelling first; every other byte is untouched (#9705)."""
-    directory, file_name = os.path.split(sys.executable)
-    spellings = {sys.executable, os.path.realpath(sys.executable),
-                 os.path.join(os.path.realpath(directory), file_name)}
-    spellings |= {oracle_escape(spelling) for spelling in spellings}
-    for spelling in sorted(spellings, key=len, reverse=True):
-        text = text.replace(spelling, INTERPRETER_PLACEHOLDER)
-    return text
+def row_forms(accepts):
+    """For each row of ``FILE_NAME_CORPUS``: True when the row runs on a made directory (the form before #9705), False
+    when the file system refuses the row's name and the row runs without a directory."""
+    return {key: accepts or key != "non_utf8" for key in FILE_NAME_CORPUS}
+
+
+def interpreter_spellings(executable=None, realpath=os.path.realpath):
+    """The spellings of the interpreter path a child run can print: ``executable`` (default ``sys.executable``), its
+    realpath, and its directory's realpath with the file name kept (a ``-S`` child reports that under Homebrew),
+    each raw and as the oracle escapes it."""
+    executable = sys.executable if executable is None else executable
+    directory, file_name = os.path.split(executable)
+    spellings = {executable, realpath(executable), os.path.join(realpath(directory), file_name)}
+    return spellings | {oracle_escape(spelling) for spelling in spellings}
+
+
+EXECUTABLE_FIELD_RE = re.compile(r"((?:^|\s)executable=)([^\r\n]*)", re.M)
+
+
+def mask_interpreter(text, spellings=None):
+    """``text`` with the value of each ``executable=`` field (the field ``prune_runner_tmp.py`` prints, whose value runs
+    to the end of the line) replaced by one placeholder when the whole value is one of ``spellings`` (default
+    ``interpreter_spellings()``); every other byte is untouched (#9705)."""
+    spellings = interpreter_spellings() if spellings is None else spellings
+
+    def replace(match):
+        return match.group(1) + INTERPRETER_PLACEHOLDER if match.group(2) in spellings else match.group(0)
+
+    return EXECUTABLE_FIELD_RE.sub(replace, text)
 
 
 def load_module(path, name):
@@ -464,9 +489,11 @@ class ScriptBehaviour(CommandAssertions):
                 self.assert_commands(out + err, ["error"])
 
     def prune_warning_row(self, key, on_disk):
-        """One row of the prune warning. ``on_disk``: the fixture directory is made and the script is run (the only
-        form before #9705); otherwise the warning of ``evict_idle_targets`` is made for a root named by the row's
-        bytes without a directory, so the row asserts on a file system that refuses the name."""
+        """One row of the prune warning: ``(command lines printed, the one line expected)``. ``on_disk``: the fixture
+        directory is made and the script is run (the only form before #9705), and the expected root text is the
+        oracle's escape of the made path; otherwise the warning of ``evict_idle_targets`` is made for a root named by
+        the row's bytes without a directory, so the row asserts on a file system that refuses the name, and the
+        expected line is the hand-written ``PRUNE_WARNING_ROOT_ESCAPED`` row."""
         value = HOSTILE[key]
         if on_disk:
             home = self.tmp / ("home-" + value)
@@ -480,8 +507,9 @@ class ScriptBehaviour(CommandAssertions):
                 "--free-floor-gib", str(PRUNE_WARNING_FLOOR_GIB)], isolated=False)
             self.assertEqual(rc, 0, (out + err)[-800:])
             self.assert_commands(out + err, ["warning"], oracle_escape(str(base))[:200])
-            return self.command_lines(out + err)[0]
-        name = os.fsdecode(b"home-" + NON_UTF8_NAME_BYTES) if key == "non_utf8" else "home-" + value
+            return (self.command_lines(out + err),
+                    PRUNE_WARNING_PREFIX + oracle_escape(str(base)) + PRUNE_WARNING_SUFFIX)
+        name = "home-" + value
 
         class RootNamedByBytes:
             """Stands for the eviction root: a directory with no entries whose text is ``name``."""
@@ -503,21 +531,20 @@ class ScriptBehaviour(CommandAssertions):
             module.evict_idle_targets("unused", "me", "unused", 1, PRUNE_WARNING_FLOOR_GIB, time.time(),
                                       free_bytes=lambda _path: 0)
         self.assert_commands(buf.getvalue(), ["warning"], oracle_escape(name)[:200])
-        if key == "non_utf8":
-            self.assertIn("home-" + NON_UTF8_NAME_ESCAPED, buf.getvalue())
-        return self.command_lines(buf.getvalue())[0]
+        return (self.command_lines(buf.getvalue()),
+                PRUNE_WARNING_PREFIX + PRUNE_WARNING_ROOT_ESCAPED[key] + PRUNE_WARNING_SUFFIX)
 
     def assert_prune_warning_row(self, key, on_disk):
-        """The row's warning line comes back from the helper, so a branch that returned without asserting is red."""
-        line = self.prune_warning_row(key, on_disk)
-        self.assertIsNotNone(line, f"{key}: the row asserted nothing")
-        self.assertTrue(line.startswith("::warning"), line[:300])
+        """The command lines the row printed are exactly the one expected line: a branch that returned without calling
+        the function under test, or an assertion weakened to a substring, is red."""
+        lines, expected = self.prune_warning_row(key, on_disk)
+        self.assertEqual(lines, [expected], key)
 
     def test_prune_runner_artifacts_warning_9365(self):
-        accepts = fs_accepts_non_utf8_names(self.tmp)
+        forms = row_forms(fs_accepts_non_utf8_names(self.tmp))
         for key in FILE_NAME_CORPUS:
             with self.subTest(key):
-                self.assert_prune_warning_row(key, on_disk=accepts or key != "non_utf8")
+                self.assert_prune_warning_row(key, on_disk=forms[key])
 
     def test_prune_warning_without_a_directory_asserts_every_row_9705(self):
         """The probe-false branch, on every host: the same escaping of every row of the corpus, no directory made."""
@@ -527,9 +554,7 @@ class ScriptBehaviour(CommandAssertions):
 
     def test_prune_warning_with_a_directory_asserts_every_utf8_row_9705(self):
         """The probe-true branch, on every host: every row the file system takes runs the script on a made directory."""
-        for key in FILE_NAME_CORPUS:
-            if key == "non_utf8":
-                continue
+        for key in sorted(FILE_NAME_CORPUS_UTF8):
             with self.subTest(key):
                 self.assert_prune_warning_row(key, on_disk=True)
 
@@ -976,12 +1001,15 @@ class PruneLoadInvariant(unittest.TestCase):
             rc, out, err = fix.run(args=(), flags=flags)  # a real prune of the fixture runner dir
             self.assertFalse(fix.marker.exists(), f"{label}: the planted module ran")
             left = sorted(path.relative_to(fix.root).as_posix() for path in fix.root.rglob("*"))
-            # #9705: sys.executable and its realpath differ under Homebrew; both spellings become one placeholder
+            # #9705: under Homebrew a child prints sys.executable, its realpath or its directory's realpath; the value
+            # of the executable= field (and only that) becomes one placeholder
             results[label] = (rc, mask_interpreter(out.replace(str(fix.base), "<base>")).splitlines(), left)
         self.assertEqual(results["plain"][0], EXIT_OK_CODE, results["plain"])
         self.assertEqual(results["plain"][2], sorted([FIXTURE_RUNNER_NAME, "outside-canary"]), "the old entries are pruned")
-        self.assertTrue(any(line.endswith("executable=" + INTERPRETER_PLACEHOLDER) for line in results["plain"][1]),
-                        results["plain"])  # the mask found the interpreter path; it did not match nothing
+        facts = [line for line in results["plain"][1] if "executable=" in line]
+        self.assertTrue(facts, results["plain"])
+        for line in facts:  # the mask found the interpreter path in every facts line; it did not match nothing
+            self.assertTrue(line.endswith(" executable=" + INTERPRETER_PLACEHOLDER), line)
         self.assertEqual(results["-I"], results["plain"])
         self.assertEqual(results["-S"], results["plain"])
 
