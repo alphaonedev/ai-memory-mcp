@@ -511,15 +511,21 @@ pub async fn handle_reflect_http(
     // present the shipped #1317 body-only zero-config contract stands: `None`
     // here leaves both branches on their pre-#3423 body-derived path, so a
     // legitimate body-only caller is not 403'd.
-    let authenticated_caller: Option<String> = if headers.contains_key(crate::HEADER_AGENT_ID) {
-        let body_agent = body.get("agent_id").and_then(Value::as_str);
-        match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
-            Ok(id) => Some(id),
-            Err(e) => return err_response(e),
-        }
-    } else {
-        None
-    };
+    // #9616 — presence is read through the one header funnel, so a repeated
+    // or non-UTF-8 header is its named 400 here too, never a presence bit.
+    let authenticated_caller: Option<String> =
+        match crate::handlers::caller_identity::header_agent_id(&headers) {
+            Err(refusal) => return refusal.into_response(),
+            Ok(None) => None,
+            Ok(Some(_)) => {
+                let body_agent = body.get("agent_id").and_then(Value::as_str);
+                match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
+                {
+                    Ok(id) => Some(id),
+                    Err(e) => return err_response(e),
+                }
+            }
+        };
     // #1924 (CWE-288) — consult the PRE-REFLECT enforcement gate before the
     // reflection write (HTTP parity with the MCP gate). INERT by default.
     // #2390 (N9) — a reflection lands in `namespace` when supplied, else in the
