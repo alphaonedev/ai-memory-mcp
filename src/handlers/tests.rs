@@ -929,6 +929,8 @@ mod tests_3582_legacy_push {
             .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
             .env("TMPDIR", std::env::temp_dir())
             .env("AI_MEMORY_NO_CONFIG", "1")
+            // The audit latch mutators accept only an isolated child (#7321).
+            .env(crate::test_support::TEST_ENV_ISOLATION_ROLE_ENV, "child")
             .env(REQUIRE_SCOPE, "0")
             .output()
             .expect("isolated legacy push test child");
