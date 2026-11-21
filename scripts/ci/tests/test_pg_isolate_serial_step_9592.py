@@ -527,6 +527,131 @@ class Cleanup(Base):
         self.assertEqual(host.calls, [])
 
 
+# #9753: run ids the run-file pattern admits (1..63 characters) but the wrapper refuses (over 20), and the
+# longest id the wrapper accepts. Written by hand, not taken from the code under test.
+RUN_ID_ACCEPTED_9753 = 'r' + 'a' * 19
+RUN_IDS_REFUSED_9753 = ('r' + 'a' * 20, 'r' + 'b' * 62)
+OTHER_TEMPLATE_9753 = 'ai_memory_other_9592_tpl'
+# #9753 (V16): a keyword value the funnel redacts to a longer text; a whole line of them grows past the cap.
+EXPANDING_UNIT_9753 = 'password=x '
+
+
+class StepGuards9753(Base):
+    """#9753: one killing test per guard of the serial step that no test pinned (V12, V14, V15, V16, V22)."""
+
+    def cleanup(self, host, **env_over):
+        env = dict(self.env, **env_over)
+        env = {k: v for k, v in env.items() if v is not None}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = self.e.cmd_cleanup(host, env)
+        out = buf.getvalue()
+        self.assertNotIn(SECRET_URL, out)
+        return rc, out
+
+    def leftovers(self, host):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = self.e.cmd_leftovers(host, self.env)
+        return rc, buf.getvalue()
+
+    def test_a_run_file_id_the_wrapper_refuses_is_malformed_in_cleanup_and_leftovers(self):
+        # V12: the run-file pattern admits up to 63 characters; the wrapper admits 20. Both readers refuse.
+        (self.root / 'ci-iso-ledger.txt').write_text(ledger_text(TARGETS, 'rabc'))
+        for run_id in RUN_IDS_REFUSED_9753:
+            with self.subTest(length=len(run_id)):
+                (self.root / 'ci-iso-run.txt').write_text('AI_MEMORY_TEST_PG_RUN_ID=%s\n' % run_id)
+                host = FakeHost(self.e)
+                rc, out = self.cleanup(host)
+                self.assertEqual(rc, 1)
+                self.assertIn('serial shard step FAIL: ci-iso-run.txt is malformed', out)
+                self.assertEqual(host.calls, [])
+                host = FakeHost(self.e)
+                rc, out = self.leftovers(host)
+                self.assertEqual(rc, 1)
+                self.assertIn('serial shard step FAIL: ci-iso-run.txt is malformed', out)
+                self.assertEqual(host.leftover_checks, 0)
+
+    def test_the_longest_run_id_the_wrapper_accepts_is_read(self):
+        (self.root / 'ci-iso-run.txt').write_text('AI_MEMORY_TEST_PG_RUN_ID=%s\n' % RUN_ID_ACCEPTED_9753)
+        self.assertEqual(self.e._read_run_file(self.root), RUN_ID_ACCEPTED_9753)
+
+    def test_mode_none_or_killswitch_with_a_run_file_or_a_ledger_is_red(self):
+        # V14: either file alone is a sign the isolated step ran on a leg whose mode says it did not.
+        (self.shard / 'iso_targets.txt').write_text('')
+        for mode in ('none', 'killswitch'):
+            for present in (('ci-iso-run.txt',), ('ci-iso-ledger.txt',), ('ci-iso-run.txt', 'ci-iso-ledger.txt')):
+                with self.subTest(mode=mode, present=present):
+                    (self.root / 'ci-iso-mode.txt').write_text(mode + '\n')
+                    for name in ('ci-iso-run.txt', 'ci-iso-ledger.txt'):
+                        (self.root / name).unlink(missing_ok=True)
+                    for name in present:
+                        (self.root / name).write_text('AI_MEMORY_TEST_PG_RUN_ID=rabc\n')
+                    host = FakeHost(self.e)
+                    rc, out = self.cleanup(host)
+                    self.assertEqual(rc, 1)
+                    self.assertIn('serial shard step FAIL: mode %s but ci-iso-run.txt or ci-iso-ledger.txt exists'
+                                  % mode, out)
+                    self.assertEqual(host.calls, [])
+
+    def test_mode_none_with_neither_file_is_green(self):
+        (self.shard / 'iso_targets.txt').write_text('')
+        (self.root / 'ci-iso-mode.txt').write_text('none\n')
+        rc, out = self.cleanup(FakeHost(self.e))
+        self.assertEqual(rc, 0, out)
+        self.assertIn('mode none: this leg created no clones', out)
+
+    def test_a_log_directory_that_already_holds_logs_refuses_the_step(self):
+        # V15: logs of an earlier run would be read as this run's evidence.
+        log_dir = self.shard / 'iso-logs'
+        log_dir.mkdir()
+        (log_dir / 'alpha_9592.log').write_text(good_log('alpha_9592', SHARED_DB, 'isolated'))
+        host = FakeHost(self.e, write_logs=all_good)
+        rc, out = self.step(host)
+        self.assertEqual(rc, 1)
+        self.assertIn('serial shard step FAIL: the log directory already holds logs: %s' % log_dir, out)
+        self.assertEqual(host.calls, [])
+        self.assertFalse((self.root / 'ci-iso-run.txt').exists())
+
+    def test_an_empty_log_directory_is_allowed(self):
+        (self.shard / 'iso-logs').mkdir()
+        rc, out = self.step(FakeHost(self.e, write_logs=all_good))
+        self.assertEqual(rc, 0, out)
+
+    def test_a_line_that_redaction_grows_past_the_cap_is_cut_and_marked(self):
+        # V16: a line under the byte cap whose redacted text is longer than the cap is still bounded.
+        cap = self.e.STREAM_LINE_MAX
+        units = (cap - 1) // len(EXPANDING_UNIT_9753)
+        raw = EXPANDING_UNIT_9753 * units
+        self.assertLess(len(raw) + 1, cap)
+        self.assertGreater(len(self.e.redact(raw)), cap, 'the fixture must grow past the cap')
+        emitted = []
+        self.e.redact_lines(io.BytesIO(raw.encode() + b'\n').readline, emitted.append)
+        self.assertEqual(len(emitted), 1)
+        self.assertTrue(emitted[0].endswith(self.e.TRUNCATED_MARK))
+        self.assertEqual(len(emitted[0]), cap + len(self.e.TRUNCATED_MARK))
+        self.assertNotIn('password=x', emitted[0])
+
+    def test_a_line_redaction_keeps_under_the_cap_is_not_marked(self):
+        emitted = []
+        self.e.redact_lines(io.BytesIO(b'password=x tail\n').readline, emitted.append)
+        self.assertEqual(emitted, ['password=<redacted> tail'])
+
+    def test_cleanup_refuses_a_template_that_is_not_the_url_databases(self):
+        # V22: a template from another run or database is never torn down or checked by this leg.
+        (self.root / 'ci-iso-run.txt').write_text('AI_MEMORY_TEST_PG_RUN_ID=rabc\n')
+        (self.root / 'ci-iso-ledger.txt').write_text(ledger_text(TARGETS, 'rabc'))
+        host = FakeHost(self.e)
+        rc, out = self.cleanup(host, AI_MEMORY_TEST_PG_TEMPLATE=OTHER_TEMPLATE_9753)
+        self.assertEqual(rc, 1)
+        self.assertIn('serial shard step FAIL: AI_MEMORY_TEST_PG_TEMPLATE is not %s' % TEMPLATE, out)
+        self.assertEqual(host.calls, [])
+        for same in ('', TEMPLATE):
+            with self.subTest(template=same):
+                rc, out = self.cleanup(FakeHost(self.e), AI_MEMORY_TEST_PG_TEMPLATE=same)
+                self.assertEqual(rc, 0, out)
+
+
 class Termination(Base):
     """I-11: a TERM while the wrapper runs still tears down and checks for leftovers."""
 

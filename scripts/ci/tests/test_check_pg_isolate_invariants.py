@@ -9,6 +9,8 @@ proven twice: the real ci.yml passes, and a mutant that breaks exactly that
 invariant fails with that check's id.
 """
 import importlib.util
+import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -505,6 +507,63 @@ class SourceChecks(unittest.TestCase):
         helper = (REPO / 'tests' / 'common' / 'pg_isolate.rs').read_text()
         self.assertIsNone(chk.source_failure('helper', helper))
         self.assertIsNotNone(chk.source_failure('helper', helper + '\n// WITH (FORCE)\n'))
+
+
+WORKFLOW_TEXT = REPO / 'scripts' / 'ci' / 'tests' / 'workflow_text.py'
+MODE_BLOCK_FIRST = 'PG_ISO_KILL="$(python3 scripts/ci/pg_isolate_serial_step.py killswitch)"'
+MODE_BLOCK_LAST = 'echo "$PG_ISO_MODE" > "$PG_ISO_MODE_FILE"'
+MODE_SCRATCH = REPO / '.local-runs' / 'test-pg-isolate-mode-9753'
+# The full domain of the mode decision, and the expected (mode file, defer flag) per row, written by hand:
+# only the linux-fed enterprise-fed leg defers (kill switch off) or runs in-line (kill switch on).
+MODE_TABLE_9753 = (
+    ('linux-fed', 'enterprise-fed', '1', 'killswitch', '0'),
+    ('linux-fed', 'enterprise-fed', '', 'none', '1'),
+    ('linux-fed', 'sqlite', '1', 'none', '0'),
+    ('linux-fed', 'sqlite', '', 'none', '0'),
+    ('macos-fed', 'enterprise-fed', '1', 'none', '0'),
+    ('macos-fed', 'enterprise-fed', '', 'none', '0'),
+    ('macos-fed', 'sqlite', '1', 'none', '0'),
+    ('macos-fed', 'sqlite', '', 'none', '0'),
+    ('linux', 'enterprise-fed', '1', 'none', '0'),
+    ('linux', 'enterprise-fed', '', 'none', '0'),
+    ('linux', 'sqlite', '1', 'none', '0'),
+    ('linux', 'sqlite', '', 'none', '0'),
+)
+
+
+def mode_block():
+    """The lines of the Run tests step body that decide the kill switch, the deferral and the mode file."""
+    spec = importlib.util.spec_from_file_location('workflow_text_9753', WORKFLOW_TEXT)
+    wt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wt)
+    (step,) = [s for s in wt.read_steps(REPO / CI_REL, 'check') if s['name'] == RUN_TESTS_STEP]
+    lines = step['run'].split('\n')
+    first = [i for i, line in enumerate(lines) if line.strip() == MODE_BLOCK_FIRST]
+    last = [i for i, line in enumerate(lines) if line.strip() == MODE_BLOCK_LAST]
+    if len(first) != 1 or len(last) != 1 or last[0] < first[0]:
+        raise LookupError('the mode block of %r is not one span' % RUN_TESTS_STEP)
+    return '\n'.join(lines[first[0]:last[0] + 1]) + '\necho "defer=$PG_ISO_DEFER"\n'
+
+
+class KillSwitchMode9753(unittest.TestCase):
+    """#9753 (V04): the ci.yml mode block, executed, writes the mode each leg and kill-switch value implies."""
+
+    def test_every_leg_and_kill_switch_value_writes_its_mode(self):
+        block = mode_block()
+        for node, tier, kill, want_mode, want_defer in MODE_TABLE_9753:
+            with self.subTest(node=node, tier=tier, kill=kill):
+                temp = MODE_SCRATCH / ('%s-%s-%s' % (node, tier, kill or 'off'))
+                if temp.exists():
+                    shutil.rmtree(temp)
+                temp.mkdir(parents=True)
+                env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'CI_NODE': node, 'TIER': tier,
+                       'CI_PG_ISOLATE_OFF': kill, 'RUNNER_TEMP': str(temp)}
+                done = subprocess.run(['bash', '-c', block], cwd=str(REPO), env=env, capture_output=True,
+                                      text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual((temp / 'ci-iso-mode.txt').read_text(), want_mode + '\n')
+                self.assertEqual(done.stdout.strip().splitlines()[-1], 'defer=' + want_defer)
+                shutil.rmtree(temp)
 
 
 if __name__ == '__main__':
