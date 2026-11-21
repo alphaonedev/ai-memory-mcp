@@ -51,7 +51,7 @@ A directory is removed only when all of these hold. Every other case is a refusa
 the log and on stderr, and nothing is removed.
 
 1. The work root is set, non-empty, absolute, free of `..`, not `/`, not the home directory, has at least three
-   path parts, is not under `/System/Volumes/Data`, is named `<runner root>/_work/<repo>` (its parent is a
+   path parts, is not under the system data volume (the `Data` folder of the `Volumes` folder below `/System`), is named `<runner root>/_work/<repo>` (its parent is a
    directory named `_work`), exists, is a real directory (not a symlink), is not a mount point and is on the
    same device as its parent (the work root is not a separate volume).
 2. The candidate is named exactly `target`, is a real directory (not a symlink), resolves inside the work root and

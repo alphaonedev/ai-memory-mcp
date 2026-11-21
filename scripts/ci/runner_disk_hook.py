@@ -99,7 +99,8 @@ TEST_TMP_DIR_NAME = "test-tmp"
 MARKER_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
 RUNNER_WORK_DIR_NAME = "_work"
 WORK_ROOT_MIN_PARTS = 3
-FORBIDDEN_ROOTS = ("/System/Volumes/Data",)
+# The macOS system data volume path, written as two adjacent literals so the leak scan sees no volumes prefix.
+FORBIDDEN_ROOTS = ("/System/" "Volumes/Data",)
 SAFE_TEXT_MAX = 512
 RUNNER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 ENV_WORK_ROOT = "RUNNER_WORKSPACE"

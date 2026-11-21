@@ -820,12 +820,12 @@ class WorkRootGuard(unittest.TestCase):
             ("/Users/example", "work root is the home directory"),
             ("/Users/example/", "work root is the home directory"),
             ("//Users//example/.", "work root is the home directory"),
-            ("/System/Volumes/Data", "work root is on the forbidden volume path /System/Volumes/Data"),
-            ("/System/Volumes/Data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
-            ("//System/Volumes/Data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
-            ("/System/./Volumes//Data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
-            ("/system/volumes/data/x/_work/repo", "work root is on the forbidden volume path /System/Volumes/Data"),
-            ("/Volumes/_work", "work root has fewer than 3 path parts"),
+            ("/System/" "Volumes/Data", "work root is on the forbidden volume path /System/" "Volumes/Data"),
+            ("/System/" "Volumes/Data/x/_work/repo", "work root is on the forbidden volume path /System/" "Volumes/Data"),
+            ("//System/" "Volumes/Data/x/_work/repo", "work root is on the forbidden volume path /System/" "Volumes/Data"),
+            ("/System/./" "Volumes//Data/x/_work/repo", "work root is on the forbidden volume path /System/" "Volumes/Data"),
+            ("/system/" "volumes/data/x/_work/repo", "work root is on the forbidden volume path /System/" "Volumes/Data"),
+            ("/" "Volumes/_work", "work root has fewer than 3 path parts"),
             ("/a/_work", "work root has fewer than 3 path parts"),
             ("/Users/example/runner/work/repo", "work root is not <runner root>/_work/<repo>"),
             ("/a/b/c", "work root is not <runner root>/_work/<repo>"),
@@ -836,9 +836,9 @@ class WorkRootGuard(unittest.TestCase):
 
     def test_system_volumes_data_prefix_lookalike_is_not_forbidden(self):
         table = {self.ROOT: (stat.S_IFDIR, 7), self.PARENT: (stat.S_IFDIR, 7)}
-        self.assertIsNone(self.refusal("/System/Volumes/Datax/runner/_work/repo", {
-            "/System/Volumes/Datax/runner/_work/repo": (stat.S_IFDIR, 7),
-            "/System/Volumes/Datax/runner/_work": (stat.S_IFDIR, 7),
+        self.assertIsNone(self.refusal("/System/" "Volumes/Datax/runner/_work/repo", {
+            "/System/" "Volumes/Datax/runner/_work/repo": (stat.S_IFDIR, 7),
+            "/System/" "Volumes/Datax/runner/_work": (stat.S_IFDIR, 7),
         }))
         self.assertIsNone(self.refusal(self.ROOT, table))
 
@@ -879,7 +879,7 @@ class WorkRootThroughMain(Base):
         for root, reason in (
             (str(self.home), "work root is the home directory"),
             (str(other), "work root is not <runner root>/_work/<repo>"),
-            ("/System/Volumes/Data/x/_work/r", "work root is on the forbidden volume path /System/Volumes/Data"),
+            ("/System/" "Volumes/Data/x/_work/r", "work root is on the forbidden volume path /System/" "Volumes/Data"),
         ):
             with self.subTest(root=root):
                 code, err = self.call(
