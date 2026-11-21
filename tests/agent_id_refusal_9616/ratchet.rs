@@ -493,7 +493,7 @@ const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UNICODE_ESCAPE: usize = 10;
 
 #[derive(Clone, Debug, PartialEq)]
-enum Tok {
+pub(super) enum Tok {
     Ident(String),
     Str(String),
     /// A char or byte-char literal, decoded.
@@ -620,7 +620,7 @@ fn is_ident_char(c: char) -> bool {
 
 /// The tokens of `src`, or the reason the file ends in an open state. A file
 /// never ends silently inside a comment, a string or a char literal.
-fn lex(src: &str) -> Result<Vec<Tok>, &'static str> {
+pub(super) fn lex(src: &str) -> Result<Vec<Tok>, &'static str> {
     let chars: Vec<char> = src.chars().collect();
     let len = chars.len();
     let mut out = Vec::new();

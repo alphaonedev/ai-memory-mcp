@@ -956,3 +956,6 @@ mod ratchet;
 
 #[path = "agent_id_refusal_9616/bind_request_9666.rs"]
 mod bind_request_9666;
+
+#[path = "agent_id_refusal_9616/plain_router_9661.rs"]
+mod plain_router_9661;
