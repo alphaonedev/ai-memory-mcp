@@ -61,7 +61,26 @@ FORMS = (
     ("env export single-quoted", "export PGPASSWORD='%s'" % FAKE, "export PGPASSWORD=%s" % VAL),
     ("clean line unchanged", "test alpha_9750 ... ok", "test alpha_9750 ... ok"),
     ("key without a value unchanged", "password= ", "password= "),
+    # SQL role form (REVIEW-9592-delta-r3 D3-L1): the keyword, blanks, then a quoted literal.
+    ("sql alter role", "ALTER ROLE u PASSWORD '%s';" % FAKE, "ALTER ROLE u PASSWORD %s;" % VAL),
+    ("sql create role with", "CREATE ROLE u WITH LOGIN PASSWORD '%s' VALID UNTIL 'infinity'" % FAKE,
+     "CREATE ROLE u WITH LOGIN PASSWORD %s VALID UNTIL 'infinity'" % VAL),
+    ("sql lower case", "alter user u password '%s'" % FAKE, "alter user u password %s" % VAL),
+    ("sql encrypted tab", "ALTER ROLE u ENCRYPTED PASSWORD\t'%s'" % FAKE, "ALTER ROLE u ENCRYPTED PASSWORD\t%s" % VAL),
+    ("sql doubled quote", "PASSWORD 'fa''%s' x" % FAKE, "PASSWORD %s x" % VAL),
+    ("sql e-string backslash quote", "PASSWORD E'fa\\'%s' x" % FAKE, "PASSWORD %s x" % VAL),
+    ("sql e-string lower doubled", "password e'fa''%s' x" % FAKE, "password %s x" % VAL),
+    ("sql unclosed literal", "PASSWORD '%s" % FAKE, "PASSWORD %s" % VAL),
+    ("sql empty literal", "PASSWORD '' x", "PASSWORD %s x" % VAL),
+    # Must NOT be redacted: the word password with no quoted literal right after it.
+    ("sql password word then text", 'FATAL:  password authentication failed for user "u"',
+     'FATAL:  password authentication failed for user "u"'),
+    ("sql password null", "ALTER ROLE u PASSWORD NULL", "ALTER ROLE u PASSWORD NULL"),
+    ("sql password at line end", "set a password", "set a password"),
+    ("sql password then double quote", 'password "u" x', 'password "u" x'),
+    ("sql other keyword literal", "VALID UNTIL 'infinity'", "VALID UNTIL 'infinity'"),
 )
+BIG_SQL_CHARS = 200_000
 
 
 def load(name, path):
@@ -208,6 +227,20 @@ class LinearBound(unittest.TestCase):
                      "x=" * (BIG_CHARS // 2) + " password=" + FAKE,
                      'password="' + "\\" * BIG_CHARS + FAKE):
             with self.subTest(prefix=line[:12]):
+                self.assert_fast(line)
+
+    def test_200k_char_sql_literal_lines(self):
+        """D3-L1: the SQL literal rule stays linear on 200K-character lines built to make it rescan."""
+        n = BIG_SQL_CHARS
+        lines = ("PASSWORD '" + "''" * (n // 2) + FAKE,
+                 "password " * (n // 9) + "'" + FAKE + "'",
+                 "a '" + "b ''" * (n // 4) + " PASSWORD '" + FAKE + "'",
+                 "x '" * (n // 3) + " PASSWORD '" + FAKE + "'",
+                 "w '''" * (n // 5) + " PASSWORD E'" + FAKE + "'",
+                 "PASSWORD E'" + "\\" * n + FAKE)
+        for line in lines:
+            with self.subTest(prefix=line[:12]):
+                self.assertGreaterEqual(len(line), n)
                 self.assert_fast(line)
 
 
