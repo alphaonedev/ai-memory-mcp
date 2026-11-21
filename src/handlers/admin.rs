@@ -147,11 +147,10 @@ pub async fn register_agent(
     // actor so the chain entry pins the unattested call. Emitted
     // BEFORE any storage write to preserve the audit trail even if
     // the storage layer fails downstream.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
 
     // #3398 (security, 2026-09-03) — BIND the registered principal to the
     // authenticated caller. Pre-#3398 this route had NEITHER `require_admin`
@@ -804,18 +803,9 @@ pub async fn quota_status_handler(
     // Authenticate via `X-Agent-Id` header; when `body.agent_id` is
     // supplied it must MATCH the authenticated caller else 403. The
     // operator-facing list path (body.agent_id absent) is preserved.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     if let Some(agent_id) = body.agent_id.as_deref() {
         if let Err(e) = validate::validate_agent_id(agent_id) {

@@ -123,18 +123,9 @@ pub async fn transition_action(
     Path(action_id): Path<String>,
     Json(body): Json<ActionTransitionRequest>,
 ) -> impl IntoResponse {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let node_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let node_agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     let Some(to) = crate::models::ActionState::from_str(&body.to) else {
         return (
@@ -244,18 +235,9 @@ pub async fn send_signal(
     headers: HeaderMap,
     Json(body): Json<SendSignalRequest>,
 ) -> impl IntoResponse {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let node_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let node_agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     // #3226 — reject an unknown `signal_type` like MCP `handle_signal_send`
     // (A6-13 / #3007 sibling). An ABSENT value still defaults; a PRESENT
@@ -757,18 +739,9 @@ pub async fn resolve_checkpoint(
     Path(checkpoint_id): Path<String>,
     Json(body): Json<CheckpointResolveHttpRequest>,
 ) -> impl IntoResponse {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let node_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let node_agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     // Only the two terminal resolution states are accepted — same filter as the
     // MCP `memory_checkpoint_resolve` handler.

@@ -142,11 +142,10 @@ pub(crate) fn resolve_caller_agent_id(
 ) -> Result<String, String> {
     // 1. Header (or anonymous fallback) is authoritative. Delegate to
     //    the identity primitive so the body-match check there runs once.
-    let header_val = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let resolved = crate::identity::resolve_http_agent_id(body, header_val)
-        .map_err(|e| crate::errors::msg::invalid("agent_id", e))?;
+    //    #9616 — through the one header reader, so a non-UTF-8 or
+    //    repeated header is the same named refusal as a malformed one.
+    let resolved = crate::handlers::caller_identity::resolve_caller(headers, body)
+        .map_err(|refusal| refusal.message().to_string())?;
 
     // 2. Query refinement — same posture as body: when non-empty it
     //    MUST match the authoritative resolved id. Validate first so a
@@ -183,34 +182,28 @@ pub(crate) fn resolve_caller_agent_id(
 /// so handlers can switch from the legacy hardcode with a one-line
 /// change.
 ///
-/// On a missing / invalid `X-Agent-Id` header the function synthesizes
-/// `anonymous:req-<uuid8>` (mirrors the same fallback path as
+/// On a MISSING `X-Agent-Id` header the function synthesizes
+/// `anonymous:req-<uuid8>` (the documented anonymous default of
 /// `crate::identity::resolve_http_agent_id`), keeping anonymous writes
 /// possible while still binding the write + the subsequent read to
 /// the SAME synthesized principal within a request scope (NOT across
 /// requests — clients that need cross-request visibility on
 /// scope=private memories MUST set `X-Agent-Id` explicitly).
+///
+/// v1.0.0 #9616 — an INVALID header (bad shape, reserved, oversize, not
+/// UTF-8, repeated) or a disagreeing body claim is no longer folded into the
+/// `anonymous:invalid` sentinel principal: it is the named `400`.
+///
+/// # Errors
+/// The #9616 `400` refusal response.
 #[cfg(feature = "sal")]
 pub(crate) fn http_caller_ctx(
     headers: &axum::http::HeaderMap,
     body_agent_id: Option<&str>,
-) -> crate::store::CallerContext {
-    let resolved = resolve_caller_agent_id(body_agent_id, headers, None).unwrap_or_else(|e| {
-        // QC Obs #2 (2026-05-20): the prior shape silently fell back
-        // to `"anonymous:invalid"` on resolve error, polluting audit
-        // trails with a bogus principal. Log the failure as a WARN so
-        // operators see the anomaly; the full Result-propagation
-        // refactor (return `Result<CallerContext, Response>` so the
-        // handler can map to a 4xx) is tracked as a v0.7.1 follow-up
-        // since it requires touching every call site.
-        tracing::warn!(
-            target: "handlers::parity",
-            error = %e,
-            "http_caller_ctx: invalid X-Agent-Id / body.agent_id, falling back to anonymous:invalid"
-        );
-        crate::identity::sentinels::ANONYMOUS_INVALID.to_string()
-    });
-    crate::store::CallerContext::for_agent(resolved)
+) -> Result<crate::store::CallerContext, axum::response::Response> {
+    crate::handlers::caller_identity::resolve_caller(headers, body_agent_id)
+        .map(crate::store::CallerContext::for_agent)
+        .map_err(axum::response::IntoResponse::into_response)
 }
 
 /// #1886 / #1911 — single SSOT for the create / bulk-create `expires_at`

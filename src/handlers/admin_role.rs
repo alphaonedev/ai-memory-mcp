@@ -462,9 +462,6 @@ pub fn require_admin(
     headers: &HeaderMap,
     endpoint: &'static str,
 ) -> Result<String, Response> {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
     // v0.7.0 #984 — surface `resolve_http_agent_id` errors as 400
     // BAD_REQUEST instead of papering them with the
     // `"anonymous:invalid"` sentinel. Pre-#984 a wire caller who
@@ -481,9 +478,11 @@ pub fn require_admin(
     // attempted spoof of a reserved name. Surfacing 400 with the
     // validator's error message gives operators the diagnostic
     // they need + closes the audit-pollution path.
-    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+    // #9616 — a header that is not UTF-8 or appears twice is refused
+    // here too, with the same deny audit and the same named 400.
+    let caller = match crate::handlers::caller_identity::resolve_caller(headers, None) {
         Ok(c) => c,
-        Err(e) => {
+        Err(refusal) => {
             // Record a `deny` audit decision with the actual error
             // so the forensic chain captures the rejected probe
             // BEFORE the wire 400.
@@ -496,13 +495,9 @@ pub fn require_admin(
                     .label("endpoint", endpoint)
                     .label("outcome", "agent_id_resolve_failed")
                     // The error text can echo the hostile header value.
-                    .commit("reason", &e.to_string()),
+                    .commit("reason", refusal.message()),
             );
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response());
+            return Err(refusal.into_response());
         }
     };
 

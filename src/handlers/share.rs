@@ -73,11 +73,10 @@ pub async fn share_memory(
     // `anonymous:req-…` principal which owns nothing. The substrate primitive
     // then refuses any source this caller cannot read, with the identical
     // not-found body an absent id produces.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let share_caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+    let share_caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
 
     let mut params: Value = json!({
         (field_names::SOURCE_MEMORY_ID): body.source_memory_id,

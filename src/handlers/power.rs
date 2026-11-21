@@ -119,7 +119,10 @@ pub async fn detect_contradictions(
         // sweep to memories the caller can actually see. Pre-fix the
         // hardcoded `for_agent("http")` caller mismatched every
         // memory's metadata.agent_id and zeroed the candidate pool.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         let filter = crate::store::Filter {
             namespace: q.namespace.clone(),
             limit,
@@ -235,12 +238,9 @@ pub async fn detect_contradictions(
     // namespace without a caller filter; any caller could enumerate
     // contradiction candidates across tenants. Admin callers bypass
     // the filter (matches the cross-cutting admin posture).
-    let caller = {
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     let caller_is_admin =
         crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
@@ -900,12 +900,9 @@ pub async fn check_duplicate(
         // an attacker must not learn whether their input matches another
         // tenant's private memory. Admin bypasses. Same disposition as
         // the sqlite arm below.
-        let caller = {
-            let header_agent_id = headers
-                .get(crate::HEADER_AGENT_ID)
-                .and_then(|v| v.to_str().ok());
-            crate::identity::resolve_http_agent_id(None, header_agent_id)
-                .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+        let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+            Ok(caller) => caller,
+            Err(refusal) => return refusal,
         };
         let caller_is_admin =
             crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
@@ -919,7 +916,10 @@ pub async fn check_duplicate(
                     // Clone the id so the SAL get does not hold a borrow of
                     // `check` across `.await` (CONCURRENCY-20 / OWNERSHIP-11).
                     let near_id = near.id.clone();
-                    let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+                    let ctx = match crate::handlers::parity::http_caller_ctx(&headers, None) {
+                        Ok(ctx) => ctx,
+                        Err(refusal) => return refusal,
+                    };
                     // SAL `get` is already visibility-filtered (unlike sqlite
                     // `db::get`): NotFound / any Err ⇒ hide. On Ok, still
                     // apply `is_visible_to_caller` so an adapter that
@@ -996,12 +996,9 @@ pub async fn check_duplicate(
     // full namespace's embeddings without a caller filter; an
     // attacker could probe whether their input matches another
     // tenant's private memory. Admin bypasses the filter.
-    let caller = {
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     let caller_is_admin =
         crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);

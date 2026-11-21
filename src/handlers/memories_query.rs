@@ -59,18 +59,9 @@ pub async fn list_memories(
     // agents by listing their namespace. Header-only authentication
     // (no body field on this GET path); anonymous callers get a
     // per-request `anonymous:req-…` id and see only non-private rows.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
 
     // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate on the BULK read
@@ -313,11 +304,10 @@ pub async fn search_memories(
     // MUST equal the header-resolved caller id, else 403. This fails
     // closed for anonymous callers too (a synthesized `anonymous:req-…`
     // id never matches an attacker-chosen namespace).
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let resolved_caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+    let resolved_caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     if let Some(claimed) = p.as_agent.as_deref()
         && claimed != resolved_caller
     {
@@ -427,11 +417,10 @@ pub async fn search_memories(
         // as the same synthetic principal, so the visibility filter
         // only filtered out rows owned by other-than-"ai:http" —
         // effectively no filter for tenant-facing reads.
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+        let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+            Ok(caller) => caller,
+            Err(refusal) => return refusal,
+        };
         let ctx = crate::store::CallerContext {
             agent_id: caller,
             as_agent: p.as_agent.clone(),
@@ -473,13 +462,14 @@ pub async fn search_memories(
     // (agent_id IS the agent's namespace prefix per
     // src/identity/mod.rs); `compute_visibility_prefixes` walks
     // ancestors from there.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let effective_as_agent: Option<String> = p
-        .as_agent
-        .clone()
-        .or_else(|| crate::identity::resolve_http_agent_id(None, header_agent_id).ok());
+    // #9616 — ONE resolution of the header-side caller; an unusable header
+    // is the named 400, never "no caller".
+    let header_caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
+    let effective_as_agent: Option<String> =
+        p.as_agent.clone().or_else(|| Some(header_caller.clone()));
 
     // v0.8.0 #1720 A3 — owner-keyed scope=private visibility caller for
     // the sqlite `db::search` / `db::list_by_source_uri` paths. This is
@@ -488,8 +478,7 @@ pub async fn search_memories(
     // team/unit/org subtree arms). Threaded to the owner-keyed
     // `visibility_clause` private arm. `None` would be fail-closed, but
     // the header resolver always synthesizes a principal here.
-    let visibility_caller: Option<String> =
-        crate::identity::resolve_http_agent_id(None, header_agent_id).ok();
+    let visibility_caller: Option<String> = Some(header_caller);
 
     // v0.6.2 (S40): mirror the `list_memories` ceiling raise so search
     // over a bulk-populated namespace isn't also capped at 200.
@@ -775,7 +764,10 @@ pub async fn forget_memories(
         // hardcoded `for_agent("http")` would have let any caller
         // delete memories that matched the namespace/pattern filter
         // regardless of ownership — a destructive privacy bug.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         return match store_forget_ids(&app, &ctx, &body, archive_flag).await {
             Ok((n, erased)) => {
                 // #9023 (p2-siblings-06) — the erasure travels to the peers

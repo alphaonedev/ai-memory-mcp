@@ -156,9 +156,11 @@ pub async fn entity_register(
             Ok(id) => id,
             Err(msg) if msg.contains("agent_id_body_header_mismatch") => {
                 let claimed = body.agent_id.clone().unwrap_or_default();
-                let subject = headers
-                    .get(crate::HEADER_AGENT_ID)
-                    .and_then(|v| v.to_str().ok())
+                // A mismatch means the header itself resolved (#9616: an
+                // unusable header is refused before any comparison).
+                let subject = crate::handlers::caller_identity::header_agent_id(&headers)
+                    .ok()
+                    .flatten()
                     .map(str::trim)
                     .unwrap_or_default()
                     .to_string();
@@ -422,12 +424,9 @@ pub async fn entity_get_by_alias(
             Ok(Some(rec)) => {
                 // Apply the post-fix visibility mask: hide the entity
                 // if the caller cannot see the underlying memory row.
-                let caller = {
-                    let header_agent_id = headers
-                        .get(crate::HEADER_AGENT_ID)
-                        .and_then(|v| v.to_str().ok());
-                    crate::identity::resolve_http_agent_id(None, header_agent_id)
-                        .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+                let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+                    Ok(caller) => caller,
+                    Err(refusal) => return refusal,
                 };
                 let caller_is_admin =
                     crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
@@ -467,7 +466,10 @@ pub async fn entity_get_by_alias(
         // 2. Fallback walk: legacy SAL `list` so the title-eq-alias
         //    branch and `metadata.aliases` array case-insensitive
         //    match stay functional.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         let filter = crate::store::Filter {
             namespace: namespace.map(str::to_string),
             limit: 1000,
@@ -528,12 +530,9 @@ pub async fn entity_get_by_alias(
     // caller for the visibility post-filter on entity aliases. Pre-fix
     // any caller could resolve a private entity by alias in the sqlite
     // branch. Admin bypasses the filter.
-    let caller = {
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     let caller_is_admin =
         crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
@@ -1250,18 +1249,9 @@ pub async fn kg_find_paths(
     // visibility filter (path-traversal flavour) sees the right
     // principal. Header-only authentication on this POST surface;
     // anonymous callers get a per-request `anonymous:req-…` id.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
 
     #[cfg(feature = "sal")]
@@ -1504,18 +1494,9 @@ pub async fn kg_query(
     // agents by walking from a public source row. Anonymous callers
     // get a per-request `anonymous:req-…` id and see only
     // non-private targets.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
 
     // Astra cross-file review (2026-09-09): normalise ONCE at ingress exactly

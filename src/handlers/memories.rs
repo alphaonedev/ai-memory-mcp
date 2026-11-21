@@ -20,7 +20,6 @@ use axum::{
 use serde_json::json;
 
 use crate::db;
-use crate::identity::sentinels;
 use crate::models::{Tier, UpdateMemory};
 use crate::validate;
 
@@ -69,11 +68,10 @@ pub async fn get_memory(
         // `anonymous:req-…` id and see only non-private rows. Bound
         // inside the cfg block so default-features builds don't flag
         // it as unused.
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+        let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+            Ok(caller) => caller,
+            Err(refusal) => return refusal,
+        };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.get(&ctx, &id).await {
             Ok(mem) => {
@@ -121,11 +119,10 @@ pub async fn get_memory(
     // single-record GET surface didn't extract X-Agent-Id and didn't
     // gate on ownership. Mirrors the postgres SAL branch above which
     // routes through `app.store.get(&ctx, &id)` with caller context.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
 
     // #1580 (PERF, supersedes the PERF-1/FX-3 `db_op` wrap): `get_memory`
     // is a pure read (resolve_id + get_links), so it dispatches through
@@ -433,7 +430,10 @@ async fn update_memory_write(
         // X-Agent-Id header so update() can authorize against the
         // memory's owner. Pre-fix this hardcoded "ai:http" which made
         // every update appear as if from the legacy daemon principal.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         // FBL-12 residual (#2378) — charge the storage-byte GROWTH of this
         // in-place update against the row OWNER's per-namespace storage cap
         // BEFORE the trait write lands, mirroring the sqlite branch below.
@@ -1057,11 +1057,10 @@ pub async fn delete_memory(
     // The existing `audit::emit(AuditAction::Delete)` further down writes
     // the SIEM-shaped enterprise audit row AFTER the delete commits;
     // these two channels are intentionally complementary.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller_for_forensic = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    let caller_for_forensic = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     crate::governance::audit::record_decision(
         &caller_for_forensic,
         "allow",
@@ -1084,11 +1083,9 @@ pub async fn delete_memory(
         // Resolve the target memory before delete so the audit emit
         // captures namespace + title metadata (Phase 9 — audit emit
         // parity on postgres).
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        let agent_id = crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| sentinels::AI_HTTP.to_string());
+        // #9616 — the ONE caller this request resolved above (an unusable
+        // header was already refused there; never the `ai:http` literal).
+        let agent_id = caller_for_forensic.clone();
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE into the caller context;
         // inert unless `[capabilities].enabled`.
@@ -1282,19 +1279,8 @@ pub async fn delete_memory(
     // Task 1.9: governance enforcement (delete-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-            Ok(a) => a,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-                )
-                    .into_response();
-            }
-        };
+        // #9616 — the one caller resolved at the top of this handler.
+        let agent_id = caller_for_forensic.clone();
         let mem_owner = target
             .metadata
             .get("agent_id")
@@ -1457,13 +1443,7 @@ pub async fn delete_memory(
                 .get("agent_id")
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
-                .unwrap_or_else(|| {
-                    headers
-                        .get(crate::HEADER_AGENT_ID)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("anonymous")
-                        .to_string()
-                });
+                .unwrap_or_else(|| caller_for_forensic.clone());
             crate::audit::emit(crate::audit::EventBuilder::new(
                 crate::audit::AuditAction::Delete,
                 crate::audit::actor(owner, crate::audit::synthesis_sources::HTTP_HEADER, None),
@@ -1579,18 +1559,9 @@ pub async fn promote_memory(
     // reset) and returns 404 — the documented Wave 4 R2 flake.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-            Ok(a) => a,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-                )
-                    .into_response();
-            }
+        let agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+            Ok(caller) => caller,
+            Err(refusal) => return refusal,
         };
         // v0.9.0 G10.1 (#1827) — edge-parse the optional
         // `X-AI-Memory-Capability` header ONCE into the caller context;
@@ -1789,18 +1760,9 @@ pub async fn promote_memory(
     // Task 1.9: governance enforcement (promote-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-            Ok(a) => a,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-                )
-                    .into_response();
-            }
+        let agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+            Ok(caller) => caller,
+            Err(refusal) => return refusal,
         };
         let mem_owner = target
             .metadata

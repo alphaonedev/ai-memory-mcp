@@ -97,11 +97,13 @@ pub async fn authority_layer(
         return next.run(req).await;
     }
 
-    let header_agent_id = req
-        .headers()
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    // #9616 — the header through the one reader: a non-UTF-8 or repeated
+    // header is refused here with the same envelope as a malformed one,
+    // never read as absent (anonymous) or as its first value.
+    let header_agent_id = match crate::handlers::caller_identity::header_agent_id(req.headers()) {
+        Ok(header) => header.map(str::to_string),
+        Err(refusal) => return refuse_unresolved_caller(&path, refusal.message()),
+    };
 
     // The per-agent-key principal, if the presented key is enrolled. ONE
     // snapshot (#3418) so the emptiness fact and the lookup agree.
@@ -144,37 +146,42 @@ pub async fn authority_layer(
             req.extensions_mut().insert(authority);
             next.run(req).await
         }
-        Err(e) => {
-            // Forensic capture BEFORE the wire 400 — the chain records the
-            // rejected probe exactly as `require_admin` did when it was the
-            // first gate a malformed header met (#984).
-            crate::governance::audit::record_decision(
-                "anonymous:resolve-failed",
-                "deny",
-                AUDIT_KIND_AUTHORITY,
-                "",
-                crate::governance::audit::ForensicPayload::new()
-                    .ident("endpoint", &path)
-                    .label("outcome", "agent_id_resolve_failed")
-                    // The error text can echo the hostile header value.
-                    .commit("reason", &e.to_string()),
-            );
-            tracing::warn!(
-                target: super::AUTHZ_TRACE_TARGET,
-                endpoint = %path,
-                error = %e,
-                "#3549: request refused at the authority chokepoint"
-            );
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "code": crate::errors::error_codes::VALIDATION_FAILED,
-                    "error": e.to_string(),
-                })),
-            )
-                .into_response()
-        }
+        Err(e) => refuse_unresolved_caller(&path, &e.to_string()),
     }
+}
+
+/// The authority chokepoint's one refusal for an unresolvable caller
+/// identity (#3549, #9616): the forensic deny row, then the `400`
+/// `VALIDATION_FAILED` envelope whose `error` is `invalid agent_id: ...`.
+fn refuse_unresolved_caller(path: &str, reason: &str) -> Response {
+    // Forensic capture BEFORE the wire 400 — the chain records the
+    // rejected probe exactly as `require_admin` did when it was the
+    // first gate a malformed header met (#984).
+    crate::governance::audit::record_decision(
+        "anonymous:resolve-failed",
+        "deny",
+        AUDIT_KIND_AUTHORITY,
+        "",
+        crate::governance::audit::ForensicPayload::new()
+            .ident("endpoint", path)
+            .label("outcome", "agent_id_resolve_failed")
+            // The error text can echo the hostile header value.
+            .commit("reason", reason),
+    );
+    tracing::warn!(
+        target: super::AUTHZ_TRACE_TARGET,
+        endpoint = %path,
+        error = %reason,
+        "#3549: request refused at the authority chokepoint"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "code": crate::errors::error_codes::VALIDATION_FAILED,
+            "error": reason,
+        })),
+    )
+        .into_response()
 }
 
 /// Read the resolved authority back out of a handler's request parts.

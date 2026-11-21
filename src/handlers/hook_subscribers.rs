@@ -272,10 +272,11 @@ async fn set_namespace_standard_inner(
     // emitted BEFORE the storage write so the audit trail survives a
     // failed downstream write. Mirrors the #911 pattern in
     // `register_agent` / `archive_purge`.
-    let header_agent_id =
-        headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    // #9616 — an unusable header is the named 400 before any audit row.
+    let caller = match crate::handlers::caller_identity::http_caller_in(headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -301,19 +302,15 @@ async fn set_namespace_standard_inner(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // #955 SECURITY-medium (Track A QC sweep, 2026-05-20) — drop
         // the "ai:http" literal fallback. The outer function already
-        // resolved `caller` from headers above (with
-        // `anonymous:invalid` as the explicit non-header fallback);
-        // reuse it so the SAL #910 visibility filter sees the actual
-        // request principal in both call paths instead of a synthetic
+        // resolved `caller` from headers above (#9616: an unusable header
+        // is refused there, never folded into a sentinel); reuse it so
+        // the SAL #910 visibility filter sees the actual request
+        // principal in both call paths instead of a synthetic
         // daemon-side placeholder. Pre-fix the "ai:http" literal made
         // the standard write 404 when looking up its own placeholder
         // and let any MCP-via-headers=None caller claim the literal
         // principal as the daemon identity.
-        let ctx = if let Some(h) = headers {
-            crate::handlers::parity::http_caller_ctx(h, None)
-        } else {
-            crate::store::CallerContext::for_agent(&caller)
-        };
+        let ctx = crate::store::CallerContext::for_agent(&caller);
         // #929 SECURITY-high (Track A P6, 2026-05-20) — uniform
         // ownership gate on the postgres path. Catches both the
         // body.id-supplied branch and the auto-seed reuse branch.
@@ -1357,10 +1354,11 @@ async fn clear_namespace_standard_inner(
     // Clearing a namespace standard removes the governance policy that
     // gates downstream writes; the chain entry MUST land before the
     // storage write so the audit trail captures intent.
-    let header_agent_id =
-        headers.and_then(|h| h.get(crate::HEADER_AGENT_ID).and_then(|v| v.to_str().ok()));
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    // #9616 — an unusable header is the named 400 before any audit row.
+    let caller = match crate::handlers::caller_identity::http_caller_in(headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -1517,9 +1515,10 @@ pub async fn session_start(
         Ok(caller) => caller,
         Err(refusal) => return refusal,
     };
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
+    let header_agent_id = match crate::handlers::caller_identity::header_agent_id(&headers) {
+        Ok(header) => header,
+        Err(refusal) => return refusal.into_response(),
+    };
     // v0.7.0 #1420 — resolve the caller for the post-list visibility
     // filter. Pre-fix, `header_agent_id` was dropped ("identity
     // currently informational") and `handle_session_start(..., None)`
