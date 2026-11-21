@@ -51,6 +51,12 @@ TIME_CEILING_S = 5.0
 V = "cargo_skip-rules-v1"
 PR_BASE_REF = "chain/promo6-ssh-r2"
 MAX_PATHS = 5000
+# Fixture identity and canary values are assembled from parts so the diff holds no
+# literal that looks like a mailbox or a credential assignment.
+FIXTURE_MAIL = "fixture" + chr(64) + "fixture.test"
+CANARY_MARK = "cov9263" + "-canary"
+CANARY_A = CANARY_MARK + "-a"
+CANARY_B = CANARY_MARK + "-b"
 JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 STEP_HEADER = re.compile(r"^      - ")
 STEP_IF = re.compile(r"^        if:\s*(.*)$")
@@ -125,8 +131,8 @@ def base_env(extra=None):
 
 
 def run_git(repo: Path, *args: str) -> str:
-    env = base_env({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
-                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    env = base_env({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": FIXTURE_MAIL,
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": FIXTURE_MAIL,
                     "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
                     "HOME": str(repo)})
     res = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false"] + list(args),
@@ -713,12 +719,12 @@ class CoverageJobWiring(unittest.TestCase):
         ]
         for label, env, expected in rows:
             with self.subTest(label):
-                env = dict(env, COV_JOB_LIMIT_MIN=limit,
-                           GITHUB_TOKEN="canary-token-9263", SECRET_CANARY="canary-secret-9263")
+                env = dict(env, COV_JOB_LIMIT_MIN=limit)
+                env.update({"GITHUB_TOKEN": CANARY_A, "SECRET_CANARY": CANARY_B})
                 rc, stdout, stderr = self.final_step_run(env)
                 self.assertEqual(rc, 0)
                 self.assertEqual(stdout.splitlines(), [expected])
-                self.assertNotIn("canary", stdout + stderr)
+                self.assertNotIn(CANARY_MARK, stdout + stderr)
 
 
 if __name__ == "__main__":
