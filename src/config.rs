@@ -138,6 +138,9 @@ pub use shape::{
 /// #3808 + #3819 — the `[llm.auto_tag]` reality gap (ignored endpoint keys +
 /// the live model override). Child module so config.rs stays under its ceiling.
 mod auto_tag_endpoint;
+/// #9620 — the default config write. Child module so config.rs stays under
+/// its ceiling.
+mod default_config_write;
 /// v1.0.0 #3715 item 3 — the key deprecation lifecycle, as data.
 pub mod deprecated_keys;
 /// #3823 — refuse a non-loopback plaintext inference endpoint at config

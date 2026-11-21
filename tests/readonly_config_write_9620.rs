@@ -303,3 +303,190 @@ fn refused_default_config_write_is_reported_by_path_9620() {
         "the refused write must not create the symlink target"
     );
 }
+
+/// Last line of the default config template; a file that ends here is the
+/// complete template, not a partial one.
+const DEFAULT_CONFIG_LAST_LINE: &str = "# redact_titles = false";
+
+/// File-size limit (bytes) the injected-failure cells give the child: far
+/// below the template size, so the default config write fails part way.
+const INJECTED_FSIZE_LIMIT_BYTES: libc::rlim_t = 64;
+
+/// Reason the binary gives when the config path is a symbolic link (written
+/// out by hand from the #9620 invariant, not taken from the code).
+const SYMLINK_REFUSAL: &str =
+    "config path exists and is a symbolic link, not a regular file; it was left unchanged";
+
+/// Body of the file an outside symlink points at; must survive unchanged.
+const OUTSIDE_BODY: &str = "# outside 9620 - must survive byte for byte\n";
+
+/// Exact line `config check` prints for a missing config at the resolved
+/// default path, after the path.
+const CHECK_NO_CONFIG_SUFFIX: &str =
+    "; the daemon starts on compiled defaults (nothing to check)";
+
+/// Run `argv` with `RLIMIT_FSIZE` set to `INJECTED_FSIZE_LIMIT_BYTES` in the
+/// child only (set between fork and exec), and SIGXFSZ ignored, so an
+/// over-limit `write(2)` fails with EFBIG instead of killing the child.
+#[cfg(unix)]
+fn run_with_fsize_limit(sb: &Sandbox, argv: &[&str]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let db = sb.db();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    cmd.arg("--db")
+        .arg(&db)
+        .args(argv)
+        .current_dir(&sb.cwd)
+        .env("HOME", &sb.home)
+        .env("XDG_CONFIG_HOME", &sb.xdg)
+        .env("AI_MEMORY_KEY_DIR", sb.home.join("keydir"))
+        .env_remove("AI_MEMORY_DB")
+        .env_remove("AI_MEMORY_NO_CONFIG");
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe functions (`signal`, `getrlimit`, `setrlimit`) on a
+    // stack-local, fully initialized `rlimit`; it allocates nothing and takes
+    // no lock.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            lim.rlim_cur = INJECTED_FSIZE_LIMIT_BYTES;
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &raw const lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.output().expect("spawn ai-memory under an RLIMIT_FSIZE")
+}
+
+/// (e) finding 1 — an injected write failure part way through the default
+/// config leaves no file at the path and no temp file beside it, and the
+/// run prints the WARN; a second failing run behaves exactly as the first;
+/// a run without the limit then writes the complete template.
+#[cfg(unix)]
+#[test]
+fn injected_write_failure_leaves_no_partial_config_9620() {
+    let sb = Sandbox::new();
+    let warn = format!(
+        "{REFUSED_WRITE_WARN_PREFIX}{}: ",
+        sb.config_path().display()
+    );
+    for attempt in 1..=2 {
+        let out = run_with_fsize_limit(&sb, &["store", "--title", "t", "--content", "c"]);
+        let stderr = stderr_of(&out);
+        assert!(
+            !sb.config_path().exists(),
+            "#9620 attempt {attempt}: a failed default config write left a file at the path \
+             ({} bytes); stderr={stderr}",
+            fs::metadata(sb.config_path()).map(|m| m.len()).unwrap_or(0)
+        );
+        assert_eq!(
+            tree(&sb.config_dir()),
+            Vec::<String>::new(),
+            "#9620 attempt {attempt}: a failed write left a temp file beside the path"
+        );
+        assert!(
+            stderr.contains(&warn),
+            "#9620 attempt {attempt}: the failed write must print {warn:?}; stderr={stderr}"
+        );
+    }
+    let out = sb.run(&["store", "--title", "t", "--content", "c"]);
+    let body = fs::read_to_string(sb.config_path()).unwrap_or_else(|e| {
+        panic!(
+            "an unlimited run must write the config: {e}; stderr={}",
+            stderr_of(&out)
+        )
+    });
+    assert!(
+        body.starts_with(DEFAULT_CONFIG_FIRST_LINE)
+            && body.trim_end().ends_with(DEFAULT_CONFIG_LAST_LINE),
+        "the default config must be the complete template; got {} bytes",
+        body.len()
+    );
+    assert_eq!(tree(&sb.config_dir()), vec!["config.toml".to_string()]);
+}
+
+/// (f) finding 2 — a symlink at the config path (dangling, or to a file
+/// outside the config root) is refused with the named error in the WARN,
+/// the link is left as it was and its target is unchanged (or still absent).
+/// The directory and FIFO rows are pinned at the unit level
+/// (`write_default_at_refuses_every_non_regular_path_9620`): the boot
+/// loader reads the path before the write, so the binary refuses a directory
+/// there before it reaches the write.
+#[cfg(unix)]
+#[test]
+fn symlink_at_config_path_is_refused_and_left_unchanged_9620() {
+    for outside in [false, true] {
+        let sb = Sandbox::new();
+        fs::create_dir_all(sb.config_dir()).expect("mkdir config dir");
+        let target = if outside {
+            let t = sb.home.join("elsewhere").join("dotfile.toml");
+            fs::create_dir_all(t.parent().expect("parent")).expect("mkdir outside");
+            fs::write(&t, OUTSIDE_BODY).expect("plant outside target");
+            t
+        } else {
+            sb.home.join("no-such-target-9620.toml")
+        };
+        std::os::unix::fs::symlink(&target, sb.config_path()).expect("plant symlink");
+        let out = sb.run(&["store", "--title", "t", "--content", "c"]);
+        let stderr = stderr_of(&out);
+        let expected = format!(
+            "{REFUSED_WRITE_WARN_PREFIX}{}: {SYMLINK_REFUSAL}",
+            sb.config_path().display()
+        );
+        assert!(
+            stderr.lines().any(|l| l == expected),
+            "#9620 outside={outside}: expected the line {expected:?}; stderr={stderr}"
+        );
+        assert_eq!(
+            fs::read_link(sb.config_path()).ok(),
+            Some(target.clone()),
+            "#9620 outside={outside}: the symlink was changed"
+        );
+        if outside {
+            assert_eq!(
+                fs::read_to_string(&target).ok().as_deref(),
+                Some(OUTSIDE_BODY),
+                "#9620: the outside target was changed"
+            );
+        } else {
+            assert!(!target.exists(), "#9620: the dangling target was created");
+        }
+        assert_eq!(
+            tree(&sb.config_dir()),
+            vec!["config.toml".to_string()],
+            "#9620 outside={outside}: a temp file was left beside the path"
+        );
+    }
+}
+
+/// (g) finding 4 — `config check` on an empty config root (no `--file`) is
+/// a success: exit 0 and one OK line naming the resolved path. It writes
+/// nothing.
+#[test]
+fn config_check_on_an_empty_root_exits_zero_9620() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["config", "check"]);
+    let stderr = stderr_of(&out);
+    let expected = format!(
+        "OK: no config file at {}{CHECK_NO_CONFIG_SUFFIX}",
+        sb.config_path().display()
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "#9620: config check on an empty root must exit 0; stderr={stderr}"
+    );
+    assert!(
+        stderr.lines().any(|l| l == expected),
+        "#9620: expected the line {expected:?}; stderr={stderr}"
+    );
+    assert_eq!(tree(&sb.xdg), Vec::<String>::new());
+}
