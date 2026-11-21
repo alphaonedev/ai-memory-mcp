@@ -895,6 +895,9 @@ jobs:
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
+        with:
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
@@ -1585,6 +1588,18 @@ jobs:
           # the hit-rate high across PRs. Worst case degrades to a colder
           # cache (slower, never wrong). rust-cache@v2 is the repo's existing
           # house action — no new/unpinned Action is introduced.
+          #
+          # #9681: a PR into chain/** restores from its base ref, but chain/**
+          # is not in push.branches here, so nothing ever saved there. The
+          # hosted-only, push-only rust-cache-warm.yml writes this exact
+          # shared-key on every chain/** push (same toolchain, same key env,
+          # same compile commands); the only hosted leg of this matrix is
+          # ubuntu-latest,sqlite, so one key per lock state is unambiguous.
+          # The #9681 save-scope invariant test pins the pair.
+          # The chain cache generation (rust-cache-warm.yml header); equal at all four
+          # paired steps, so one bump invalidates every chain cache.
+          prefix-key: chain-cache-g1
+          shared-key: ci-check-hosted-sqlite
           save-if: ${{ github.event_name == 'push' }}
 
       # v0.9.0 pre-GA (#1853) — e1 macOS anti-flake. The
@@ -3097,6 +3112,9 @@ jobs:
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
+        with:
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Clippy (sal feature)
         run: cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic
@@ -3154,6 +3172,9 @@ jobs:
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
+        with:
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Clippy (vectorlite feature, all targets)
         run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
