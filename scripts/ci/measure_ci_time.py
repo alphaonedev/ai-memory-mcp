@@ -155,7 +155,6 @@ WAIT_STAGES = ("load_gate", "semaphore")
 WAIT_HEADERS = ("load gate s", "semaphore s")
 LOAD_GATE_STEP_NAME = "Load gate (#6795)"
 SEMAPHORE_MARKER = "[#7914 semaphore]"  # TAG of scripts/ci/host_semaphore.py
-SEMAPHORE_NOTICE = "##[notice]"  # the runner's annotation prefix on a ::notice:: line
 SEMAPHORE_ACQUIRED_TEXT = " acquired after "
 SEMAPHORE_LINE_MAX = 8192  # a line longer than this is never read as the semaphore line
 SEMAPHORE_LABEL_MAX = 256
@@ -352,8 +351,9 @@ def semaphore_candidate(raw):
         if len(first_word) == 2:
             bodies.append(first_word[1])
     for body in bodies:
-        if body.startswith(SEMAPHORE_NOTICE):
-            body = body[len(SEMAPHORE_NOTICE):]
+        # The runner's annotation prefix on a ::notice:: line is one literal handed to removeprefix (the #9365 ratchet
+        # allows a whole literal handed on and not one bound to a name). One prefix is removed; a doubled one stays and fails the match.
+        body = body.removeprefix("##[notice]")
         if body.startswith(SEMAPHORE_MARKER) and SEMAPHORE_ACQUIRED_TEXT in body:
             return body, log_line_time(line)
     return None
