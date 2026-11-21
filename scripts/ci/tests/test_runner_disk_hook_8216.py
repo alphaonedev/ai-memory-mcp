@@ -116,7 +116,7 @@ class HookCase(unittest.TestCase):
     def make_target(self, repo=None, tag=True, files=2, name="target"):
         repo = repo or self.repo
         target = repo / name
-        (target / "debug" / "deps").mkdir(parents=True)
+        (target / "debug" / "deps").mkdir(parents=True, exist_ok=True)
         for index in range(files):
             (target / "debug" / "deps" / f"f{index}.o").write_text("x" * 16)
         if tag is True:
@@ -144,6 +144,7 @@ class HookCase(unittest.TestCase):
             return 0
 
         err = io.StringIO()
+        before = len(self.log.read_text().splitlines()) if self.log.exists() else 0
         rc = hook.main(
             argv, env={} if env is None else env,
             home=home or (self.tmp / "no-such-home"),
@@ -152,8 +153,8 @@ class HookCase(unittest.TestCase):
         line = None
         if self.log.exists():
             lines = self.log.read_text().splitlines()
-            self.assertEqual(len(lines), 1, lines)
-            line = parse_line(lines[0] + "\n")
+            self.assertEqual(len(lines), before + 1, lines)
+            line = parse_line(lines[-1] + "\n")
         return rc, line, err.getvalue(), commands
 
 
