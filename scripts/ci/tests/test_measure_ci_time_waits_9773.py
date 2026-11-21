@@ -606,7 +606,8 @@ class ConclusionTests(unittest.TestCase):
         all_skipped = [table.row(default_log(), gate=self.gate_with("skipped")) for _ in range(3)]
         line = table.render(all_skipped)[1]
         self.assertIn("| absent: load-gate-skipped | 300 (300-300) n=3", line)
-        self.assertNotIn("0 (0-0)", line)
+        self.assertNotIn("1200 (1200-1200)", line)  # the skipped gate's own timestamps are never a figure
+        self.assertNotIn("| 0 (0-0) n=3 | absent", line)  # and never a zero (the queue cell before them is a real 0)
         mixed = [table.row(default_log()), table.row(default_log(), gate=self.gate_with("skipped"))]
         line = table.render(mixed)[1]
         self.assertIn("| 1200 (1200-1200) n=1 (absent in 1 of 2 rows: load-gate-skipped) | 300 (300-300) n=2", line)

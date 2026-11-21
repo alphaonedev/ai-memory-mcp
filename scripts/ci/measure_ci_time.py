@@ -21,24 +21,43 @@ Usage:
 
 `--rank-job` prints the test binaries with the longest `finished in` time from one job log.
 
-Wait figures (#9773). Two waits are reported apart from compile and test, each from the state it names:
+Wait figures (#9773, PR #9799). Two waits are reported apart from compile and test, each from the state it names:
 `load gate` is the wall time of the step `Load gate (#6795)` from the step list of the jobs API, and `semaphore` is the
 `<N>` of the line `[#7914 semaphore] ... acquired after <N>s` that scripts/ci/host_semaphore.py prints before it runs
 the cargo command. The four figures load gate, semaphore, compile and test never overlap: for a test step,
-test = step wall time - compile - semaphore. Only a semaphore line stamped inside the step and not later than the
-first cargo `Finished` line is read (a test that prints the marker runs after `Finished`); a step whose log holds no
-`Finished` line reads every stamped line inside the step, because nothing can be told apart there. A wait that cannot
-be read is `absent` with its own reason (a column cell `absent: <reason>`, never 0): no-load-gate-step,
-multiple-load-gate-steps, load-gate-missing-timestamp, load-gate-negative, no-log, empty-log, no-semaphore-line,
-multiple-semaphore-lines (two lines are refused, not summed), malformed-semaphore-wait,
-semaphore-wait-longer-than-step, compile-plus-wait-longer-than-step. The last three and multiple-semaphore-lines also
-leave `test` unmeasured with the same reason, because the wait cannot then be taken out of it. No line at all leaves
-`test` as step minus compile.
+test = step wall time - compile - semaphore.
 
-Every duration is computed from two UTC timestamps that are both present and ordered, or the row is reported as
-`unmeasured` with a named reason (missing-timestamp, negative, compile-longer-than-step, missing-step-name) and left
-out of every median and range. The table is followed by a footer line that counts them. A value that could not be
-measured is never printed as 0 s. Link time is inside cargo's one `Finished` compile figure and is not split out.
+The log is split on the newline only (a downloaded log is read as bytes, split on "\\n", one trailing "\\r" dropped per
+line), so a carriage return, form feed, U+2028 or any other line terminator inside a test's output never starts a
+second line. A semaphore line is read strictly, with no search: after the runner's stamp and one optional `##[notice]`
+the line is exactly `[#7914 semaphore] '<label>': slot <n> of <m> acquired after <N>s (load=<F> cores=<C>)` (the form
+host_semaphore.py prints; label at most 256 characters without a quote, numbers ASCII digits, N at most 9 digits).
+Text in front of the marker (a quoted source line, a build-script `warning:`), text after the closing parenthesis, a
+second `acquired after` and every other number form are not a wait. A line longer than 8192 characters is never
+read. The line must carry a readable stamp, lie inside the step and be strictly before the first cargo `Finished`
+line (a stamp equal to it is refused; a test that prints the marker runs after `Finished`). Decision: a step whose log
+holds no `Finished` line reads every exact-form line inside the step (nothing can be told apart there, so a test that
+prints an exact copy of the line is read as the wait; this is the base behaviour of issue 9809 and is unchanged).
+
+A wait that cannot be read is `absent` with its own reason (a column cell `absent: <reason>`, never 0):
+no-load-gate-step, multiple-load-gate-steps, load-gate-missing-timestamp, load-gate-negative, load-gate-skipped,
+load-gate-not-success, load-gate-no-conclusion, no-test-step, no-log, empty-log, no-semaphore-line,
+semaphore-line-no-timestamp (a semaphore line whose stamp cannot be read), multiple-semaphore-lines (two lines are
+refused, not summed), malformed-semaphore-wait, semaphore-wait-longer-than-step, compile-plus-wait-longer-than-step.
+The last four, semaphore-line-no-timestamp and multiple-semaphore-lines also leave `test` unmeasured with the same
+reason, because the wait cannot then be taken out of it. No line at all leaves `test` as step minus compile.
+
+A figure comes only from a step that ran: a step whose jobs-API `conclusion` is `skipped` is step-skipped, any other
+conclusion except `success` is step-not-success, and a missing conclusion is step-no-conclusion (a skipped step is left
+out of a sum of steps, since it took no time; the other two make the sum unmeasured). For the load gate these are
+load-gate-skipped, load-gate-not-success and load-gate-no-conclusion.
+
+Every duration is computed from two UTC timestamps that are both present and ordered, from a step that succeeded, or
+the row is reported as `unmeasured` with a named reason (missing-timestamp, negative, compile-longer-than-step,
+missing-step-name, step-skipped, step-not-success, step-no-conclusion) and left out of every median and range. The
+table is followed by a footer line that counts them. A value that could not be measured is never printed as 0 s. Link
+time is inside cargo's one `Finished` compile figure and is not split out. A log line over 4096 characters is not
+matched against the `Finished` and `test result:` patterns, so reading a log is linear in its size.
 
 `--bench-dir DIR` reads the stored logs of the nextest-against-cargo-test runs (compile.log, cglist.log, nxlist.log,
 cargotest-1/2.log, nextest-1/2.log, nextest-solo1.log, nextest-solo.log, nextest-solo-j1.log) and prints, with the UTC
@@ -68,6 +87,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 
 EXIT_OK = 0
@@ -85,7 +105,8 @@ TEST_JOB_RE = re.compile(r"^(Check \(|Per-Module Coverage)")
 COMBINED_STEP_RE = re.compile(r"^(Run tests|Generate coverage JSON)")
 COMPILE_STEP_RE = re.compile(r"^(Prebuild|Build release)")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-LOG_TS_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z ")
+LOG_TS_RE = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?Z ")
+LINE_MATCH_MAX = 4096  # a log line longer than this is not matched against FINISHED_RE or RESULT_RE (their cost is quadratic)
 FINISHED_RE = re.compile(r"Finished `[^`]+` profile .* target\(s\) in (?:(\d+)m )?([\d.]+)s")
 RUNNING_RE = re.compile(r"Running (?:unittests )?(\S+)")
 RESULT_RE = re.compile(r"test result: \w+\. (\d+) passed;.* finished in ([\d.]+)s")
@@ -120,8 +141,15 @@ WAIT_STAGES = ("load_gate", "semaphore")
 WAIT_HEADERS = ("load gate s", "semaphore s")
 LOAD_GATE_STEP_NAME = "Load gate (#6795)"
 SEMAPHORE_MARKER = "[#7914 semaphore]"  # TAG of scripts/ci/host_semaphore.py
-SEMAPHORE_ACQUIRED_RE = re.compile(re.escape(SEMAPHORE_MARKER) + r" .*?\bacquired after (.*)$")
-SEMAPHORE_WAIT_RE = re.compile(r"([0-9]{1,9})s(?:\s|$)")  # host_semaphore.py prints an int with %d
+SEMAPHORE_NOTICE = "##[notice]"  # the runner's annotation prefix on a ::notice:: line
+SEMAPHORE_ACQUIRED_TEXT = " acquired after "
+SEMAPHORE_LINE_MAX = 8192  # a line longer than this is never read as the semaphore line
+SEMAPHORE_LABEL_MAX = 256
+# The one form scripts/ci/host_semaphore.py prints (after the stamp and the optional notice prefix), matched whole.
+SEMAPHORE_LINE_RE = re.compile(
+    re.escape(SEMAPHORE_MARKER) + r" '[^'\n]{0," + str(SEMAPHORE_LABEL_MAX) + r"}': slot [0-9]{1,4} of [0-9]{1,4}"
+    r" acquired after ([0-9]{1,9})s \(load=[0-9]+\.[0-9]{2} cores=[0-9]{1,6}\)")
+SLACK_SECS = 1  # a log stamp has whole-second precision; a window edge gets one second each side
 NOT_MEASURED = "not measured"
 REASON_MISSING_TS = "missing-timestamp"
 REASON_NEGATIVE = "negative"
@@ -138,10 +166,25 @@ REASON_NO_LOAD_GATE = "no-load-gate-step"
 REASON_MULTIPLE_LOAD_GATE = "multiple-load-gate-steps"
 REASON_LOAD_GATE_NO_TS = "load-gate-missing-timestamp"
 REASON_LOAD_GATE_NEGATIVE = "load-gate-negative"
+REASON_LOAD_GATE_SKIPPED = "load-gate-skipped"
+REASON_LOAD_GATE_NOT_SUCCESS = "load-gate-not-success"
+REASON_LOAD_GATE_NO_CONCLUSION = "load-gate-no-conclusion"
+REASON_NO_TEST_STEP = "no-test-step"
+REASON_SEMAPHORE_NO_TS = "semaphore-line-no-timestamp"
+REASON_STEP_SKIPPED = "step-skipped"
+REASON_STEP_NOT_SUCCESS = "step-not-success"
+REASON_STEP_NO_CONCLUSION = "step-no-conclusion"
+CONCLUSION_SUCCESS = "success"
+CONCLUSION_SKIPPED = "skipped"
+# a jobs-API step reason to the reason of the load gate step
+LOAD_GATE_STEP_REASONS = {REASON_STEP_SKIPPED: REASON_LOAD_GATE_SKIPPED,
+                          REASON_STEP_NOT_SUCCESS: REASON_LOAD_GATE_NOT_SUCCESS,
+                          REASON_STEP_NO_CONCLUSION: REASON_LOAD_GATE_NO_CONCLUSION}
 # reasons that leave the test figure unmeasured, because the wait cannot be taken out of it
 TEST_REFUSING_WAIT_REASONS = (REASON_MULTIPLE_SEMAPHORE, REASON_MALFORMED_WAIT, REASON_WAIT_LONGER,
-                              REASON_WAIT_COMPILE_OVERLAP)
-REASONS = (REASON_MISSING_TS, REASON_NEGATIVE, REASON_COMPILE_LONGER, REASON_MISSING_NAME, *TEST_REFUSING_WAIT_REASONS)
+                              REASON_WAIT_COMPILE_OVERLAP, REASON_SEMAPHORE_NO_TS)
+REASONS = (REASON_MISSING_TS, REASON_NEGATIVE, REASON_COMPILE_LONGER, REASON_MISSING_NAME, *TEST_REFUSING_WAIT_REASONS,
+           REASON_STEP_SKIPPED, REASON_STEP_NOT_SUCCESS, REASON_STEP_NO_CONCLUSION)
 UNMEASURED_KEY = "unmeasured"
 WAIT_ABSENT_KEY = "wait_absent"
 
@@ -188,15 +231,32 @@ def runner_kind(labels):
 
 
 def step_secs(step):
-    """(seconds, reason) of one jobs-API step."""
+    """(seconds, reason) of one jobs-API step; only a step whose conclusion is `success` has a duration.
+
+    The conclusion is read first: `skipped` is step-skipped, a missing or non-string conclusion is step-no-conclusion
+    and any other value (failure, cancelled, ...) is step-not-success. A step that did not run to success has
+    timestamps that say nothing about the work, so no figure is taken from it.
+    """
+    conclusion = step.get("conclusion")
+    if conclusion == CONCLUSION_SKIPPED:
+        return None, REASON_STEP_SKIPPED
+    if not isinstance(conclusion, str) or not conclusion:
+        return None, REASON_STEP_NO_CONCLUSION
+    if conclusion != CONCLUSION_SUCCESS:
+        return None, REASON_STEP_NOT_SUCCESS
     return duration(step.get("started_at"), step.get("completed_at"))
 
 
 def sum_steps(steps):
-    """(sum of step seconds, None), or (None, reason) when any step in the range is unmeasured."""
+    """(sum of step seconds, None), or (None, reason) when any step in the range is unmeasured.
+
+    A skipped step took no time and is left out of the sum; every other unmeasured step makes the sum unmeasured.
+    """
     total, bad = 0.0, None
     for step in steps:
         secs, why = step_secs(step)
+        if why == REASON_STEP_SKIPPED:
+            continue
         if why:
             bad = bad or why
         else:
@@ -205,22 +265,30 @@ def sum_steps(steps):
 
 
 def log_line_time(line):
-    """UTC epoch of the timestamp a job-log line starts with, None when it has none."""
+    """UTC epoch (an exact Fraction, so two stamps one tick apart never round to the same instant) of the stamp a
+    job-log line starts with; None when it has none or it is not a date."""
     stamp = LOG_TS_RE.match(line)
     if not stamp:
         return None
-    return parse_ts(stamp.group(1) + ("." + stamp.group(2) if stamp.group(2) else "") + "Z")
+    whole = parse_ts(stamp.group(1) + "Z")
+    if whole is None:
+        return None
+    fraction = stamp.group(2)
+    return Fraction(int(whole)) + (Fraction(int(fraction), 10 ** len(fraction)) if fraction else 0)
 
 
 def in_window(when, win_start, win_end):
     """True when the time is inside the window (one second of slack each side); an open end accepts everything."""
-    return not ((win_start is not None and when < win_start - 1) or (win_end is not None and when > win_end + 1))
+    return not ((win_start is not None and when < win_start - SLACK_SECS)
+                or (win_end is not None and when > win_end + SLACK_SECS))
 
 
 def first_finished(lines, win_start=None, win_end=None):
     """(timestamp, reported compile seconds) of the first cargo Finished line inside the window, else None."""
     for raw in lines:
         line = ANSI_RE.sub("", raw)
+        if len(line) > LINE_MATCH_MAX:
+            continue
         hit = FINISHED_RE.search(line)
         if not hit:
             continue
@@ -231,41 +299,85 @@ def first_finished(lines, win_start=None, win_end=None):
     return None
 
 
-def parse_semaphore_wait(lines, win_start, win_end, cutoff):
-    """Seconds (int) of the one `acquired after <N>s` semaphore line inside the step window and not after cutoff.
+def semaphore_candidate(raw):
+    """(body, when) of a line that may be the semaphore line, else None; when is None for an unreadable stamp.
 
-    cutoff is the time of the first cargo `Finished` line (None when the step has none). The semaphore wraps the
-    cargo command and prints before it, so a later line is a test's own output. Raises WaitUnavailable with the
-    reason: no line, two or more lines (refused, not summed), or a number that is not 1 to 9 ASCII digits then `s`.
+    The body is what follows the runner's stamp and one optional `##[notice]`, and it must start with the marker and
+    hold ` acquired after `. A line whose stamp does not have the runner's shape is still a candidate when the marker
+    starts the line or follows its first word (a stamp cut short, a byte order mark, a missing zone letter), and so is
+    a line whose stamp has the shape but is not a date (month 13): both come back with when None and are refused
+    with their own reason, never skipped.
     """
-    found = []
+    line = ANSI_RE.sub("", raw)
+    stamp = LOG_TS_RE.match(line)
+    if stamp:
+        bodies = [line[stamp.end():]]
+    else:
+        bodies = [line]
+        first_word = line.split(" ", 1)
+        if len(first_word) == 2:
+            bodies.append(first_word[1])
+    for body in bodies:
+        if body.startswith(SEMAPHORE_NOTICE):
+            body = body[len(SEMAPHORE_NOTICE):]
+        if body.startswith(SEMAPHORE_MARKER) and SEMAPHORE_ACQUIRED_TEXT in body:
+            return body, log_line_time(line)
+    return None
+
+
+def parse_semaphore_wait(lines, win_start, win_end, cutoff):
+    """Seconds (int) of the one exact-form `acquired after <N>s` semaphore line inside the step window.
+
+    A line is read only in the form host_semaphore.py prints (SEMAPHORE_LINE_RE, matched whole, no search) after the
+    runner's stamp and one optional `##[notice]`; text in front of the marker is never a wait. The line must carry a
+    readable stamp, lie inside the window (one second of slack each side) and be strictly before cutoff, the time of
+    the first cargo `Finished` line (the semaphore wraps the cargo command and prints before it, so a later line is a
+    test's own output). cutoff None (the step has no `Finished` line) reads every in-window exact-form line.
+    Raises WaitUnavailable with the reason: semaphore-line-no-timestamp, no-semaphore-line, multiple-semaphore-lines
+    (refused, not summed) or malformed-semaphore-wait (not the exact form). A line longer than SEMAPHORE_LINE_MAX is never read.
+    """
+    first, count, unstamped = None, 0, False
     for raw in lines:
-        line = ANSI_RE.sub("", raw)
-        hit = SEMAPHORE_ACQUIRED_RE.search(line)
-        if not hit:
+        if len(raw) > SEMAPHORE_LINE_MAX:
+            continue  # the wrapper's line is a few hundred characters; a longer one is never read
+        candidate = semaphore_candidate(raw)
+        if candidate is None:
             continue
-        when = log_line_time(line)
-        if when is None or not in_window(when, win_start, win_end) or (cutoff is not None and when > cutoff):
+        body, when = candidate
+        if when is None:
+            unstamped = True
             continue
-        found.append(hit.group(1))
-    if not found:
+        if not in_window(when, win_start, win_end) or (cutoff is not None and when >= cutoff):
+            continue
+        count += 1
+        if first is None:
+            first = body
+    if unstamped:
+        raise WaitUnavailable(REASON_SEMAPHORE_NO_TS)
+    if count == 0:
         raise WaitUnavailable(REASON_NO_SEMAPHORE_LINE)
-    if len(found) > 1:
+    if count > 1:
         raise WaitUnavailable(REASON_MULTIPLE_SEMAPHORE)
-    number = SEMAPHORE_WAIT_RE.match(found[0])
-    if not number:
+    hit = SEMAPHORE_LINE_RE.fullmatch(first)
+    if not hit:
         raise WaitUnavailable(REASON_MALFORMED_WAIT)
-    return int(number.group(1))
+    return int(hit.group(1))
 
 
 def load_gate_wait(steps):
-    """Wall seconds of the one step named LOAD_GATE_STEP_NAME; raises WaitUnavailable with the reason otherwise."""
+    """Wall seconds of the one step named LOAD_GATE_STEP_NAME; raises WaitUnavailable with the reason otherwise.
+
+    The step's conclusion is read before its timestamps: skipped, not-success and no-conclusion are the load-gate-*
+    reasons, so a gate that did not run is never printed as a number.
+    """
     gates = [s for s in steps if (s.get("name") or "") == LOAD_GATE_STEP_NAME]
     if not gates:
         raise WaitUnavailable(REASON_NO_LOAD_GATE)
     if len(gates) > 1:
         raise WaitUnavailable(REASON_MULTIPLE_LOAD_GATE)
     secs, why = step_secs(gates[0])
+    if why in LOAD_GATE_STEP_REASONS:
+        raise WaitUnavailable(LOAD_GATE_STEP_REASONS[why])
     if why == REASON_MISSING_TS:
         raise WaitUnavailable(REASON_LOAD_GATE_NO_TS)
     if why:
@@ -311,7 +423,7 @@ def split_job(job, log_lines=None):
         wait_absent("load_gate", exc.reason)
     main = next((i for i, s in enumerate(steps) if COMBINED_STEP_RE.match(s.get("name") or "")), None)
     if main is None:
-        wait_absent("semaphore", REASON_NO_SEMAPHORE_LINE)
+        wait_absent("semaphore", REASON_NO_TEST_STEP)
         return out
     if any(not s.get("name") for s in steps):
         for stage in ("setup", "compile", "test", "post"):
@@ -389,7 +501,7 @@ def rank_binaries(lines):
         if run:
             pending.append(run.group(1))
             continue
-        res = RESULT_RE.search(body)
+        res = RESULT_RE.search(body) if len(body) <= LINE_MATCH_MAX else None
         if res and pending:
             rows.append((float(res.group(2)), int(res.group(1)), pending.pop(0)))
     return sorted(rows, reverse=True)
@@ -604,7 +716,8 @@ def bench_report(directory, now):
 
     build_secs = None
     if BENCH_COMPILE not in reasons:
-        build = next((FINISHED_RE.search(ln) for ln in logs[BENCH_COMPILE] if FINISHED_RE.search(ln)), None)
+        hits = (FINISHED_RE.search(ln) for ln in logs[BENCH_COMPILE] if len(ln) <= LINE_MATCH_MAX)
+        build = next((hit for hit in hits if hit), None)
         if build is None:
             reasons[BENCH_COMPILE] = "no Finished line"
         else:
@@ -752,6 +865,19 @@ def list_jobs(repo, run_id):
     return jobs
 
 
+def split_log_text(text):
+    """Lines of a downloaded job log: split on the newline only, one trailing carriage return dropped per line.
+
+    str.splitlines() also ends a line on CR, VT, FF, FS, GS, RS, NEL, U+2028 and U+2029, and Path.read_text turns a
+    lone CR into a newline, so a test that prints one of them could start a second physical line that looks like the
+    wrapper's. The runner puts every real line on its own stamped line, so only the newline is a line end.
+    """
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def fetch_log_lines(repo, job_id, scratch):
     """Download one job log to scratch, return its lines, delete the file. None plus the error when it fails."""
     target = scratch / f"job-{job_id}.log"
@@ -761,7 +887,7 @@ def fetch_log_lines(repo, job_id, scratch):
                                   stdout=handle, stderr=subprocess.PIPE, timeout=LOG_TIMEOUT_SECS, check=False)
         if proc.returncode != 0:
             return None, f"gh exit {proc.returncode}: {proc.stderr.decode(errors='replace').strip()[:200]}"
-        return target.read_text(encoding="utf-8", errors="replace").splitlines(), None
+        return split_log_text(target.read_bytes().decode("utf-8", errors="replace")), None
     except (subprocess.TimeoutExpired, OSError) as exc:
         return None, str(exc)[:200]
     finally:
