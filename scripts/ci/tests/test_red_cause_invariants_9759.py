@@ -205,6 +205,18 @@ class WorkBeforeTheCap(Base):
         self.assertLessEqual(len(calls), REDACTION_CALLS)
         self.assertLess(elapsed, 20.0)
 
+    def test_b_the_redaction_budget_stops_at_its_bound(self):
+        """The budget is a backstop the row limits never reach in a log, so it is driven through clean() directly."""
+        module = load_script()
+        calls = self.counting(module)
+        module.load_redaction()
+        over = 5
+        shown = [module.clean("value %d" % index).text for index in range(REDACTION_CALLS + over)]
+        self.assertEqual(len(calls), REDACTION_CALLS)
+        self.assertEqual(shown[:2], ["value 0", "value 1"])
+        self.assertEqual(shown[REDACTION_CALLS:], ["<redaction budget spent>"] * over)
+        self.assertEqual(module._budget_spent, over)
+
     def test_100k_failing_names_are_counted_in_linear_time(self):
         lines = ["test t::n%06d ... FAILED" % index for index in range(100000)]
         started = time.monotonic()
@@ -415,6 +427,11 @@ class Survivors(Base):
         shown = module.clean(":" * 400).text
         self.assertEqual(len(shown.encode("utf-8")), LINE_BYTES)
         self.assertEqual(module.clean(":" * LINE_BYTES).text, ":" * LINE_BYTES)
+        cuts = module._shown_cuts
+        one_over = module.clean(":" * (LINE_BYTES + 1)).text  # the first length that is cut (both sides of the bound)
+        self.assertEqual(len(one_over.encode("utf-8")), LINE_BYTES)
+        self.assertNotEqual(one_over, ":" * (LINE_BYTES + 1))
+        self.assertEqual(module._shown_cuts, cuts + 1, "the cut of a value one byte over the bound is counted")
 
     def test_m27_a_step_log_of_the_file_bound_and_one_above_names_its_last_error(self):
         tail = b"error: at the end\n"
