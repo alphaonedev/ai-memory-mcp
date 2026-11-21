@@ -3100,5 +3100,534 @@ class UnreadEnvForms9745R1(unittest.TestCase):
         self.assertEqual(_effective_key_env({ENV_NAME: ENV_EXPRESSION}, leg), {ENV_NAME: "it's"})
 
 
+# ---------------------------------------------------------------------------------------------
+# #9770: whole-step and job-level mirror comparison of every PAIRS row (fixtures).
+# Each fixture feeds `pair_mirror_problems` a mutated copy of the real workflow text and asserts
+# the exact refusal. The hand tables (`PAIR_TABLES`) are written by hand in the module above.
+# ---------------------------------------------------------------------------------------------
+FIXTURE_ENV_NAME = "FOO"
+FIXTURE_ENV_VALUE = "bar"
+FIXTURE_ENV_BLOCK = f"{FIXTURE_ENV_NAME}: {FIXTURE_ENV_VALUE}"
+FIXTURE_EXTRA_STEP = "Extra step 9770"
+# Hand-written per pair: (PR cargo step, warm cargo step, a mirrored disk step, a mirrored run step).
+PAIR_STEP_NAMES_9770 = {
+    "ci.yml": ("Run tests (impact-aware)", "Build the test targets (no run)",
+               "Free disk before tests (hosted image only,",
+               "Install Rust 1.99.1 (matches rust-toolchain.toml pin)"),
+    "coverage.yml": ("Generate coverage JSON", "Build the instrumented coverage targets (no test runs)",
+                     "Free disk + add swap (#1148 belt-and-suspenders, aggressive)",
+                     "Install Rust 1.99.1"),
+}
+UNPINNED_ABSENT_STEP_KEYS = ("working-directory", "continue-on-error", "timeout-minutes")
+UNPINNED_ABSENT_JOB_KEYS = ("services", "concurrency", "outputs", "environment", "continue-on-error")
+SIDES_9770 = ("pr", "warm")
+
+
+def _job_range_9770(lines: list[str], job_id: str) -> tuple[int, int]:
+    jobs_at = next(i for i, line in enumerate(lines) if line.startswith("jobs:"))
+    starts = [i for i in range(jobs_at + 1, len(lines)) if lines[i].rstrip() == f"  {job_id}:"]
+    if len(starts) != 1:
+        raise AssertionError(f"fixture: job {job_id!r} found {len(starts)} times")
+    end = len(lines)
+    for i in range(starts[0] + 1, len(lines)):
+        if lines[i].strip() and not lines[i].lstrip().startswith("#") and _indent(lines[i]) <= 2:
+            end = i
+            break
+    return starts[0], end
+
+
+def _step_range_9770(lines: list[str], job_id: str, ident: str) -> tuple[int, int]:
+    start, end = _job_range_9770(lines, job_id)
+    steps_at = next(i for i in range(start, end) if lines[i].rstrip() == "    steps:")
+    bounds = [i for i in range(steps_at + 1, end)
+              if _indent(lines[i]) == STEP_INDENT and lines[i].lstrip().startswith("- ")]
+    found = []
+    for n, first in enumerate(bounds):
+        stop = bounds[n + 1] if n + 1 < len(bounds) else end
+        if _step_ident(_parse_step(lines[first:stop])) == ident:
+            found.append((first, stop))
+    if len(found) != 1:
+        raise AssertionError(f"fixture: step {ident!r} found {len(found)} times in {job_id!r}")
+    return found[0]
+
+
+def _on_step_9770(wf: Workflow, job_id: str, ident: str,
+                  edit: Callable[[list[str]], list[str]]) -> Workflow:
+    lines = list(wf.lines)
+    first, stop = _step_range_9770(lines, job_id, ident)
+    return Workflow(wf.name, lines[:first] + edit(lines[first:stop]) + lines[stop:])
+
+
+def _on_job_9770(wf: Workflow, job_id: str,
+                 edit: Callable[[list[str]], list[str]]) -> Workflow:
+    lines = list(wf.lines)
+    start, end = _job_range_9770(lines, job_id)
+    return Workflow(wf.name, lines[:start] + edit(lines[start:end]) + lines[end:])
+
+
+def _key_lines_9770(indent: int, key: str, value: str | list[str]) -> list[str]:
+    pad = " " * indent
+    if isinstance(value, str):
+        return [f"{pad}{key}: {value}"]
+    return [f"{pad}{key}:", *[f"{pad}  {item}" for item in value]]
+
+
+def _add_step_key_9770(key: str, value: str | list[str]) -> Callable[[list[str]], list[str]]:
+    def edit(seg: list[str]) -> list[str]:
+        step = _parse_step(seg)
+        if key in step.keys or key in step.blocks:
+            raise AssertionError(f"fixture: the step already has {key!r}")
+        return [seg[0], *_key_lines_9770(KEY_INDENT, key, value), *seg[1:]]
+    return edit
+
+
+def _sub_in_lines_9770(old: str, new: str) -> Callable[[list[str]], list[str]]:
+    def edit(seg: list[str]) -> list[str]:
+        hits = [i for i, line in enumerate(seg) if old in line]
+        if len(hits) != 1:
+            raise AssertionError(f"fixture: {old!r} matched {len(hits)} lines")
+        out = list(seg)
+        out[hits[0]] = out[hits[0]].replace(old, new, 1)
+        return out
+    return edit
+
+
+def _append_run_line_9770(seg: list[str]) -> list[str]:
+    at = next((i for i, line in enumerate(seg)
+               if _indent(line) == KEY_INDENT and line.strip().startswith("run:")), None)
+    if at is None or seg[at].strip() != "run: |":
+        raise AssertionError("fixture: the step has no block run")
+    stop = len(seg)
+    for i in range(at + 1, len(seg)):
+        if seg[i].strip() and _indent(seg[i]) <= KEY_INDENT and not seg[i].lstrip().startswith("#"):
+            stop = i
+            break
+    while stop > at + 1 and not seg[stop - 1].strip():
+        stop -= 1
+    return [*seg[:stop], " " * (KEY_INDENT + 2) + "echo mutated-9770", *seg[stop:]]
+
+
+def _add_job_key_9770(key: str, value: str | list[str]) -> Callable[[list[str]], list[str]]:
+    def edit(seg: list[str]) -> list[str]:
+        if any(_indent(line) == 4 and line.strip().startswith(key + ":") for line in seg):
+            raise AssertionError(f"fixture: the job already has {key!r}")
+        return [seg[0], *_key_lines_9770(4, key, value), *seg[1:]]
+    return edit
+
+
+def _set_job_line_9770(key: str, value: str) -> Callable[[list[str]], list[str]]:
+    def edit(seg: list[str]) -> list[str]:
+        hits = [i for i, line in enumerate(seg)
+                if _indent(line) == 4 and line.strip().startswith(key + ":")]
+        if len(hits) != 1:
+            raise AssertionError(f"fixture: job key {key!r} found {len(hits)} times")
+        out = list(seg)
+        out[hits[0]] = f"    {key}: {value}"
+        return out
+    return edit
+
+
+def _add_env_9770(header_indent: int) -> Callable[[list[str]], list[str]]:
+    def edit(seg: list[str]) -> list[str]:
+        hits = [i for i, line in enumerate(seg)
+                if _indent(line) == header_indent and line.strip() == "env:"]
+        if len(hits) != 1:
+            raise AssertionError(f"fixture: env block found {len(hits)} times")
+        return [*seg[:hits[0] + 1], " " * (header_indent + 2) + FIXTURE_ENV_BLOCK,
+                *seg[hits[0] + 1:]]
+    return edit
+
+
+def _add_step_9770(job_id: str, wf: Workflow) -> Workflow:
+    lines = list(wf.lines)
+    start, end = _job_range_9770(lines, job_id)
+    last = max(i for i in range(start, end)
+               if lines[i].strip() and not lines[i].lstrip().startswith("#"))
+    new = [f"      - name: {FIXTURE_EXTRA_STEP}", "        run: echo extra"]
+    return Workflow(wf.name, [*lines[:last + 1], *new, *lines[last + 1:]])
+
+
+def _drop_step_9770(wf: Workflow, job_id: str, ident: str) -> Workflow:
+    lines = list(wf.lines)
+    first, stop = _step_range_9770(lines, job_id, ident)
+    return Workflow(wf.name, lines[:first] + lines[stop:])
+
+
+def _duplicate_step_9770(wf: Workflow, job_id: str, ident: str) -> Workflow:
+    lines = list(wf.lines)
+    first, stop = _step_range_9770(lines, job_id, ident)
+    return Workflow(wf.name, lines[:stop] + lines[first:stop] + lines[stop:])
+
+
+def _pair_problems_9770(pair: tuple[str, str, str, str], pr_wf: Workflow | None = None,
+                        warm_wf: Workflow | None = None) -> list[str]:
+    pr_name, pr_job_id, warm_job_id, _ = pair
+    legs = _hosted_legs(Workflow.load(pr_name).jobs()[pr_job_id])
+    pr_wf = pr_wf or Workflow.load(pr_name)
+    warm_wf = warm_wf or Workflow.load(WARM)
+    out: list[str] = []
+    for leg in legs:
+        out.extend(pair_mirror_problems(pr_wf, pr_job_id, warm_wf, warm_job_id, leg))
+    return out
+
+
+def _mutated_9770(pair: tuple[str, str, str, str], side: str,
+                  edit: Callable[[Workflow, str], Workflow]) -> list[str]:
+    """The problems after `edit(workflow, job_id)` rewrote the PR or the warm side of `pair`."""
+    pr_name, pr_job_id, warm_job_id, _ = pair
+    if side == "pr":
+        return _pair_problems_9770(pair, pr_wf=edit(Workflow.load(pr_name), pr_job_id))
+    return _pair_problems_9770(pair, warm_wf=edit(Workflow.load(WARM), warm_job_id))
+
+
+def _differs_9770(pair: tuple[str, str, str, str], pr_id: str, warm_id: str, key: str,
+                  pr_value: object, warm_value: object) -> str:
+    return (f"{pair[0]}:{pair[1]} step {pr_id!r} vs {WARM}:{pair[2]} step {warm_id!r}: "
+            f"key {key!r} differs: {pair[0]} has {pr_value!r}, {WARM} has {warm_value!r}")
+
+
+def _table_9770(pair: tuple[str, str, str, str], side: str, ident: str, key: str,
+                actual: object, expected: object) -> str:
+    wf, job = (pair[0], pair[1]) if side == "pr" else (WARM, pair[2])
+    return (f"{wf}:{job} step {ident!r}: key {key!r} is {actual!r}, "
+            f"the hand table says {expected!r}")
+
+
+def _side_ids_9770(pair: tuple[str, str, str, str], side: str) -> tuple[str, str]:
+    """(workflow file, job id) of one side of a pair."""
+    return (pair[0], pair[1]) if side == "pr" else (WARM, pair[2])
+
+
+def _cache_edit_9770(side: str, pair: tuple[str, str, str, str],
+                     edit: Callable[[list[str]], list[str]]) -> list[str]:
+    return _mutated_9770(pair, side, lambda wf, job: _on_step_9770(wf, job, RUST_CACHE, edit))
+
+
+class PairMirrorFixtures9770(unittest.TestCase):
+    """#9770: every PAIRS row compares the whole rust-cache step and each mirrored cargo step."""
+
+    def test_the_real_workflows_have_no_pair_mirror_problem(self) -> None:
+        for pair in PAIRS:
+            with self.subTest(pair=pair[2]):
+                self.assertEqual(_pair_problems_9770(pair), [])
+
+    def test_issue_mutant_step_env_on_the_pr_rust_cache_step(self) -> None:
+        for pair in PAIRS:
+            with self.subTest(pair=pair[2]):
+                problems = _cache_edit_9770("pr", pair,
+                                            _add_step_key_9770("env", [FIXTURE_ENV_BLOCK]))
+                self.assertEqual(problems, [_differs_9770(
+                    pair, RUST_CACHE, RUST_CACHE, "env", FIXTURE_ENV_BLOCK, None)])
+
+    def test_issue_mutant_step_env_on_a_warm_cargo_step(self) -> None:
+        for pair in PAIRS:
+            _, warm_cargo = PAIR_STEP_NAMES_9770[pair[0]][:2]
+            with self.subTest(pair=pair[2]):
+                problems = _mutated_9770(pair, "warm", lambda wf, job: _on_step_9770(
+                    wf, job, warm_cargo, _add_step_key_9770("env", [FIXTURE_ENV_BLOCK])))
+                self.assertEqual(problems, [_table_9770(
+                    pair, "warm", warm_cargo, "env", FIXTURE_ENV_BLOCK, None)])
+
+    def test_a_step_env_on_the_pr_cargo_step_is_pinned_too(self) -> None:
+        for pair in PAIRS:
+            pr_cargo = PAIR_STEP_NAMES_9770[pair[0]][0]
+            with self.subTest(pair=pair[2]):
+                if pair[0] == "coverage.yml":
+                    problems = _mutated_9770(pair, "pr", lambda wf, job: _on_step_9770(
+                        wf, job, pr_cargo, _add_step_key_9770("env", [FIXTURE_ENV_BLOCK])))
+                    self.assertEqual(problems, [_table_9770(
+                        pair, "pr", pr_cargo, "env", FIXTURE_ENV_BLOCK, None)])
+                else:
+                    problems = _mutated_9770(pair, "pr", lambda wf, job: _on_step_9770(
+                        wf, job, pr_cargo, _sub_in_lines_9770("CI_NODE: ubuntu-latest",
+                                                              "CI_NODE: other")))
+                    self.assertEqual(len(problems), 1)
+                    self.assertTrue(problems[0].startswith(
+                        f"{pair[0]}:{pair[1]} step {pr_cargo!r}: key 'env' is "), problems)
+                    self.assertIn("CI_NODE: other", problems[0])
+                    self.assertTrue(problems[0].endswith(
+                        "the hand table says " + repr(PAIR_TABLES[(pair[0], pair[1])]
+                                                      .row_for(pr_cargo).allowed["env"][0])))
+
+    def test_every_added_step_key_on_either_side_of_the_rust_cache_step(self) -> None:
+        added = (("env", [FIXTURE_ENV_BLOCK], FIXTURE_ENV_BLOCK), ("run", "echo x", "echo x"),
+                 ("shell", "bash", "bash"), ("working-directory", "x", "x"),
+                 ("continue-on-error", "true", "true"), ("timeout-minutes", "5", "5"))
+        for pair in PAIRS:
+            for side in SIDES_9770:
+                for key, value, seen in added:
+                    with self.subTest(pair=pair[2], side=side, key=key):
+                        problems = _cache_edit_9770(side, pair, _add_step_key_9770(key, value))
+                        pr_value, warm_value = (seen, None) if side == "pr" else (None, seen)
+                        self.assertEqual(problems, [_differs_9770(
+                            pair, RUST_CACHE, RUST_CACHE, key, pr_value, warm_value)])
+
+    def test_every_unpinned_step_key_added_to_either_cargo_step(self) -> None:
+        added = (*[(key, "x", "x") for key in UNPINNED_ABSENT_STEP_KEYS],
+                 ("uses", "owner/action@v1", "owner/action@v1"),
+                 ("with", ["a: b"], "a: b"), ("id", "x", "x"))
+        for pair in PAIRS:
+            pr_cargo, warm_cargo = PAIR_STEP_NAMES_9770[pair[0]][:2]
+            for side in SIDES_9770:
+                ident = pr_cargo if side == "pr" else warm_cargo
+                for key, value, seen in added:
+                    with self.subTest(pair=pair[2], side=side, key=key):
+                        problems = _mutated_9770(pair, side, lambda wf, job: _on_step_9770(
+                            wf, job, ident, _add_step_key_9770(key, value)))
+                        pr_value, warm_value = (seen, None) if side == "pr" else (None, seen)
+                        self.assertEqual(problems, [_differs_9770(
+                            pair, pr_cargo, warm_cargo, key, pr_value, warm_value)])
+
+    def test_a_changed_uses_or_with_on_a_mirrored_step_on_either_side(self) -> None:
+        for pair in PAIRS:
+            real_pr = {s.label() if s.uses_name() != RUST_CACHE else RUST_CACHE: s
+                       for s in Workflow.load(pair[0]).jobs()[pair[1]].steps()}
+            real_with = _relative(real_pr[RUST_CACHE].blocks["with"], KEY_INDENT + 2)
+            real_uses = real_pr["actions/checkout"].keys["uses"]
+            for side in SIDES_9770:
+                with self.subTest(pair=pair[2], side=side, key="uses"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _on_step_9770(
+                        wf, job, "actions/checkout", _sub_in_lines_9770("@", "@v0-")))
+                    mutated = real_uses.replace("@", "@v0-", 1)
+                    pr_value, warm_value = ((mutated, real_uses) if side == "pr"
+                                            else (real_uses, mutated))
+                    self.assertEqual(problems, [_differs_9770(
+                        pair, "actions/checkout", "actions/checkout", "uses", pr_value, warm_value)])
+                with self.subTest(pair=pair[2], side=side, key="with"):
+                    shared = pair[3]
+                    problems = _cache_edit_9770(side, pair, _sub_in_lines_9770(
+                        f"shared-key: {shared}", f"shared-key: {shared}-x"))
+                    mutated = real_with.replace(f"shared-key: {shared}",
+                                                f"shared-key: {shared}-x", 1)
+                    pr_value, warm_value = ((mutated, real_with) if side == "pr"
+                                            else (real_with, mutated))
+                    self.assertEqual(problems, [_differs_9770(
+                        pair, RUST_CACHE, RUST_CACHE, "with", pr_value, warm_value)])
+
+    def test_a_changed_run_on_a_mirrored_step_on_either_side(self) -> None:
+        for pair in PAIRS:
+            run_step = PAIR_STEP_NAMES_9770[pair[0]][3]
+            real = {s.label(): s for s in Workflow.load(pair[0]).jobs()[pair[1]].steps()}[run_step]
+            for side in SIDES_9770:
+                with self.subTest(pair=pair[2], side=side):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _on_step_9770(
+                        wf, job, run_step, _append_run_line_9770))
+                    mutated = real.run() + "\necho mutated-9770"
+                    pr_value, warm_value = ((mutated, real.run()) if side == "pr"
+                                            else (real.run(), mutated))
+                    self.assertEqual(problems, [_differs_9770(
+                        pair, run_step, run_step, "run", pr_value, warm_value)])
+
+    def test_an_unknown_step_key_on_either_side_names_workflow_job_step_and_key(self) -> None:
+        for pair in PAIRS:
+            for side in SIDES_9770:
+                wf_name, job_id = _side_ids_9770(pair, side)
+                with self.subTest(pair=pair[2], side=side):
+                    problems = _cache_edit_9770(side, pair, _add_step_key_9770("bogus-key", "1"))
+                    self.assertIn(f"{wf_name}:{job_id} step {RUST_CACHE!r}: step key "
+                                  "'bogus-key' is not a known step key", problems)
+
+    def test_an_unmapped_missing_or_duplicated_step_is_a_problem(self) -> None:
+        for pair in PAIRS:
+            disk = PAIR_STEP_NAMES_9770[pair[0]][2]
+            for side in SIDES_9770:
+                wf_name, job_id = _side_ids_9770(pair, side)
+                with self.subTest(pair=pair[2], side=side, case="unmapped"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _add_step_9770(job, wf))
+                    self.assertEqual(problems, [f"{wf_name}:{job_id} step {FIXTURE_EXTRA_STEP!r}: "
+                                                "no row in the mirror table"])
+                with self.subTest(pair=pair[2], side=side, case="missing"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _drop_step_9770(
+                        wf, job, disk))
+                    self.assertEqual(problems, [f"{wf_name}:{job_id}: no step {disk!r} "
+                                                "(the mirror table needs it)"])
+                with self.subTest(pair=pair[2], side=side, case="duplicate"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _duplicate_step_9770(
+                        wf, job, disk))
+                    self.assertIn(f"{wf_name}:{job_id}: step {disk!r} appears 2 times", problems)
+
+    def test_the_hand_table_pins_the_allowed_differences(self) -> None:
+        ci_if_hosted = "needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'"
+        ci = PAIR_TABLES[("ci.yml", "check")]
+        self.assertEqual(ci.row_for(RUST_CACHE).allowed["if"], (ci_if_hosted, None))
+        self.assertEqual(ci.row_for(RUST_CACHE).allowed["id"], (None, "rust-cache"))
+        self.assertEqual(ci.row_for("Install Rust 1.99.1 (matches rust-toolchain.toml pin)")
+                         .allowed["if"], ("needs.classify.outputs.cargo_skip != 'true'", None))
+        self.assertEqual(ci.row_for("Run tests (impact-aware)").allowed["shell"], ("bash", None))
+        self.assertEqual(ci.row_for("Run tests (impact-aware)").allowed["if"],
+                         ("needs.classify.outputs.cargo_skip != 'true'",
+                          "steps.rust-cache.outputs.cache-hit != 'true'"))
+        self.assertEqual(ci.row_for("Run tests (impact-aware)").allowed["env"][1], None)
+        self.assertEqual(ci.job_allowed["needs"], ("classify", None))
+        self.assertEqual(ci.job_allowed["runs-on"], ('["ubuntu-latest"]', "ubuntu-latest"))
+        self.assertEqual(ci.env_one_sided, {"SELF_HOSTED_TARGET_CAP_BYTES": "pr"})
+        cov = PAIR_TABLES[("coverage.yml", "per-module-thresholds")]
+        self.assertEqual(cov.row_for("Install cargo-llvm-cov").allowed["if"],
+                         (None, "steps.rust-cache.outputs.cache-hit != 'true'"))
+        self.assertEqual(cov.row_for("Generate coverage JSON").allowed["env"], (None, None))
+        self.assertEqual(cov.job_allowed["if"], ("needs.classify.outputs.docs_only != 'true'", None))
+        self.assertEqual(cov.job_allowed["permissions"],
+                         ("contents: read\npull-requests: write", None))
+        self.assertEqual(cov.env_one_sided, {})
+        for table in PAIR_TABLES.values():
+            self.assertNotIn("steps", table.job_allowed)
+            self.assertNotIn("env", table.job_allowed)
+
+    def test_every_added_job_key_on_either_side(self) -> None:
+        for pair in PAIRS:
+            for side in SIDES_9770:
+                wf_name, job_id = _side_ids_9770(pair, side)
+                for key in UNPINNED_ABSENT_JOB_KEYS:
+                    with self.subTest(pair=pair[2], side=side, key=key):
+                        problems = _mutated_9770(pair, side, lambda wf, job: _on_job_9770(
+                            wf, job, _add_job_key_9770(key, "x")))
+                        pr_value, warm_value = ("x", None) if side == "pr" else (None, "x")
+                        self.assertEqual(problems, [
+                            f"{pair[0]}:{pair[1]} vs {WARM}:{pair[2]}: job key {key!r} differs: "
+                            f"{pair[0]} has {pr_value!r}, {WARM} has {warm_value!r}"])
+                with self.subTest(pair=pair[2], side=side, key="defaults"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _on_job_9770(
+                        wf, job, _add_job_key_9770("defaults", ["run:", "  shell: bash"])))
+                    seen = "run:\n  shell: bash"
+                    pr_value, warm_value = (seen, None) if side == "pr" else (None, seen)
+                    self.assertEqual(problems, [
+                        f"{pair[0]}:{pair[1]} vs {WARM}:{pair[2]}: job key 'defaults' differs: "
+                        f"{pair[0]} has {pr_value!r}, {WARM} has {warm_value!r}"])
+                with self.subTest(pair=pair[2], side=side, key="container"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _on_job_9770(
+                        wf, job, _add_job_key_9770("container", "ubuntu:24.04")))
+                    pr_value, warm_value = (("ubuntu:24.04", None) if side == "pr"
+                                            else (None, "ubuntu:24.04"))
+                    self.assertEqual(problems, [
+                        f"{pair[0]}:{pair[1]} vs {WARM}:{pair[2]}: job key 'container' differs: "
+                        f"{pair[0]} has {pr_value!r}, {WARM} has {warm_value!r}"])
+                with self.subTest(pair=pair[2], side=side, key="bogus"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _on_job_9770(
+                        wf, job, _add_job_key_9770("bogus-job-key", "1")))
+                    self.assertIn(f"{wf_name}:{job_id}: job key 'bogus-job-key' is not a known "
+                                  "job key", problems)
+
+    def test_a_changed_runs_on_on_either_side(self) -> None:
+        expected = {
+            ("ci.yml", "pr"): "job key 'runs-on' is 'ubuntu-22.04', the hand table says "
+                              "'[\"ubuntu-latest\"]'",
+            ("ci.yml", "warm"): "job key 'runs-on' is 'ubuntu-22.04', the hand table says "
+                                "'ubuntu-latest'",
+        }
+        for pair in PAIRS:
+            for side in SIDES_9770:
+                wf_name, job_id = _side_ids_9770(pair, side)
+                with self.subTest(pair=pair[2], side=side):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _on_job_9770(
+                        wf, job, _set_job_line_9770("runs-on", "ubuntu-22.04")))
+                    if (pair[0], side) in expected:
+                        self.assertEqual(problems, [f"{wf_name}:{job_id}: " + expected[(pair[0], side)]])
+                    else:
+                        pr_value, warm_value = (("ubuntu-22.04", "ubuntu-latest") if side == "pr"
+                                                else ("ubuntu-latest", "ubuntu-22.04"))
+                        self.assertEqual(problems, [
+                            f"{pair[0]}:{pair[1]} vs {WARM}:{pair[2]}: job key 'runs-on' differs: "
+                            f"{pair[0]} has {pr_value!r}, {WARM} has {warm_value!r}"])
+
+    def test_the_pinned_job_keys_refuse_a_change_on_either_side(self) -> None:
+        for side in SIDES_9770:
+            wf_name, job_id = _side_ids_9770(PAIRS[0], side)
+            with self.subTest(pair="ci", side=side, key="needs"):
+                problems = _mutated_9770(PAIRS[0], side, lambda wf, job: _on_job_9770(
+                    wf, job, _set_job_line_9770("needs", "other") if side == "pr"
+                    else _add_job_key_9770("needs", "classify")))
+                actual, expected = ("other", "classify") if side == "pr" else ("classify", None)
+                self.assertEqual(problems, [f"{wf_name}:{job_id}: job key 'needs' is {actual!r}, "
+                                            f"the hand table says {expected!r}"])
+        for side in SIDES_9770:
+            wf_name, job_id = _side_ids_9770(PAIRS[1], side)
+            with self.subTest(pair="coverage", side=side, key="if"):
+                problems = _mutated_9770(PAIRS[1], side, lambda wf, job: _on_job_9770(
+                    wf, job, _set_job_line_9770("if", "true") if side == "pr"
+                    else _add_job_key_9770("if", "true")))
+                expected = "needs.classify.outputs.docs_only != 'true'" if side == "pr" else None
+                self.assertEqual(problems, [f"{wf_name}:{job_id}: job key 'if' is 'true', "
+                                            f"the hand table says {expected!r}"])
+            with self.subTest(pair="coverage", side=side, key="permissions"):
+                problems = _mutated_9770(PAIRS[1], side, lambda wf, job: _on_job_9770(
+                    wf, job, _add_job_key_9770("permissions", "write-all") if side == "warm"
+                    else _set_perm_9770))
+                actual = "write-all" if side == "warm" else "write-all"
+                expected = None if side == "warm" else "contents: read\npull-requests: write"
+                self.assertEqual(problems, [f"{wf_name}:{job_id}: job key 'permissions' is "
+                                            f"{actual!r}, the hand table says {expected!r}"])
+
+    def test_a_workflow_or_job_env_var_on_either_side(self) -> None:
+        for pair in PAIRS:
+            for side in SIDES_9770:
+                for level in ("workflow", "job"):
+                    with self.subTest(pair=pair[2], side=side, level=level):
+                        if level == "workflow":
+                            def edit(wf: Workflow, job: str) -> Workflow:
+                                return Workflow(wf.name, _top_env_9770(wf.lines))
+                        else:
+                            def edit(wf: Workflow, job: str) -> Workflow:
+                                return _on_job_9770(wf, job, _add_env_9770(4))
+                        problems = _mutated_9770(pair, side, edit)
+                        pr_value, warm_value = ((FIXTURE_ENV_VALUE, None) if side == "pr"
+                                                else (None, FIXTURE_ENV_VALUE))
+                        self.assertEqual(problems, [
+                            f"{pair[0]}:{pair[1]} vs {WARM}:{pair[2]}: env {FIXTURE_ENV_NAME!r} "
+                            f"differs: {pair[0]} has {pr_value!r}, {WARM} has {warm_value!r}"])
+
+    def test_the_one_sided_env_is_allowed_on_the_pr_side_only(self) -> None:
+        pair = PAIRS[0]
+        name = "SELF_HOSTED_TARGET_CAP_BYTES"
+        problems = _mutated_9770(pair, "warm", lambda wf, job: Workflow(
+            wf.name, _top_env_9770(wf.lines, f"{name}: 1")))
+        self.assertEqual(problems, [
+            f"{pair[0]}:{pair[1]} vs {WARM}:{pair[2]}: env {name!r} differs: "
+            f"{pair[0]} has None, {WARM} has '1'"])
+
+    def test_an_unevaluable_env_value_is_a_problem_naming_the_variable(self) -> None:
+        pair = PAIRS[0]
+        problems = _mutated_9770(pair, "pr", lambda wf, job: Workflow(
+            wf.name, _top_env_9770(wf.lines, "FOO: ${{ weird }}")))
+        self.assertEqual(problems, [
+            f"{pair[0]}:{pair[1]}: env 'FOO' cannot be evaluated: FOO: unrecognised expression "
+            "form in an env value: '${{ weird }}'"])
+
+    def test_a_workflow_level_defaults_on_either_side(self) -> None:
+        for pair in PAIRS:
+            for side in SIDES_9770:
+                with self.subTest(pair=pair[2], side=side):
+                    problems = _mutated_9770(pair, side, lambda wf, job: Workflow(
+                        wf.name, _top_defaults_9770(wf.lines)))
+                    seen = "run:\n  shell: bash"
+                    pr_value, warm_value = (seen, None) if side == "pr" else (None, seen)
+                    self.assertEqual(problems, [
+                        f"{pair[0]} vs {WARM}: workflow key 'defaults' differs: "
+                        f"{pair[0]} has {pr_value!r}, {WARM} has {warm_value!r}"])
+
+
+def _top_env_9770(lines: list[str], entry: str = FIXTURE_ENV_BLOCK) -> list[str]:
+    hits = [i for i, line in enumerate(lines) if line.rstrip() == "env:"]
+    if len(hits) != 1:
+        raise AssertionError(f"fixture: top-level env found {len(hits)} times")
+    return [*lines[:hits[0] + 1], f"  {entry}", *lines[hits[0] + 1:]]
+
+
+def _top_defaults_9770(lines: list[str]) -> list[str]:
+    hits = [i for i, line in enumerate(lines) if line.startswith("jobs:")]
+    if len(hits) != 1:
+        raise AssertionError("fixture: jobs: found more than once")
+    return [*lines[:hits[0]], "defaults:", "  run:", "    shell: bash", *lines[hits[0]:]]
+
+
+def _set_perm_9770(seg: list[str]) -> list[str]:
+    hits = [i for i, line in enumerate(seg)
+            if _indent(line) == 4 and line.strip().startswith("permissions:")]
+    if len(hits) != 1:
+        raise AssertionError("fixture: permissions found other than once")
+    stop = next((i for i in range(hits[0] + 1, len(seg))
+                 if seg[i].strip() and _indent(seg[i]) <= 4), len(seg))
+    return [*seg[:hits[0]], "    permissions: write-all", *seg[stop:]]
+
+
 if __name__ == "__main__":
     unittest.main()
