@@ -325,7 +325,7 @@ class LinkContainmentTest(unittest.TestCase):
         )
 
     def test_unresolvable_target_is_broken_by_name(self):
-        target = "a" * 300 + ".md"
+        target = overlong_name(host_limit(self.guarded, "PC_NAME_MAX"))
         self.write("a.md", "[a](%s)\n" % target)
         self.assertEqual(
             broken_links(self.root),
@@ -386,8 +386,16 @@ class LinkContainmentTest(unittest.TestCase):
             previous = name
         return previous
 
+    def host_chain_limit(self):
+        """Longest symlink chain this host's kernel follows, probed in its own directory."""
+        probe = self.base / "probe"
+        probe.mkdir()
+        limit = kernel_symlink_limit(probe)
+        self.assertGreater(limit, 0)
+        return limit
+
     def test_symlink_chain_past_kernel_limit_is_unresolvable_8291_r6(self):
-        last = self.chain(41)
+        last = self.chain(self.host_chain_limit() + 1)
         self.write("a.md", "[a](%s)\n" % last)
         self.assertEqual(
             broken_links(self.root),
@@ -395,7 +403,7 @@ class LinkContainmentTest(unittest.TestCase):
         )
 
     def test_symlink_chain_at_kernel_limit_resolves_8291_r6(self):
-        last = self.chain(40)
+        last = self.chain(self.host_chain_limit())
         self.write("a.md", "[a](%s)\n" % last)
         self.assertEqual(broken_links(self.root), [])
 
@@ -458,8 +466,9 @@ class LinkContainmentTest(unittest.TestCase):
         self.assertEqual(state, ("unresolvable", "MISMATCH"))
 
     def test_resolution_past_path_max_never_reports_an_outside_target_8291_r7(self):
-        if os.mkdir not in os.supports_dir_fd or os.symlink not in os.supports_dir_fd:
-            self.skipTest("dir_fd unsupported")
+        # The fixture needs dir_fd on both calls; a host without it fails here, loudly.
+        self.assertIn(os.mkdir, os.supports_dir_fd)
+        self.assertIn(os.symlink, os.supports_dir_fd)
         (self.outside / "y.md").write_text("# y\n", encoding="utf-8")
         self.long_prefix_tree()
         spellings = ["L/M/out", "L/M/outd/y.md", "L/M/outd/", "L/M/outd///", "L/M/outd/y.md/.."]
@@ -479,8 +488,12 @@ class LinkContainmentTest(unittest.TestCase):
 
         The raw target ``L/M/out`` is short, but user-space resolution expands it past
         PATH_MAX, while the kernel follows ``out`` and ``outd`` to the outside directory.
+        The name width and count come from this host's NAME_MAX and PATH_MAX.
         """
-        names = [("%d" % n).ljust(250, "n") for n in range(9)]
+        width, count = path_max_fixture_shape(
+            host_limit(self.root, "PC_NAME_MAX"), host_limit(self.root, "PC_PATH_MAX")
+        )
+        names = [("%d" % n).ljust(width, "n") for n in range(count)]
         (self.root / "L").symlink_to(os.path.join(*names))
         root_fd = os.open(str(self.root), os.O_RDONLY)
         try:
@@ -508,6 +521,130 @@ class LinkContainmentTest(unittest.TestCase):
             os.close(fd)
             fd = child
         return fd
+
+
+class HostLimitProbeTest(unittest.TestCase):
+    """#9765: the host-limit helpers read the host, catch only their own errno and say why they refuse."""
+
+    def setUp(self):
+        scratch = REPO_ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        self.base = Path(tempfile.mkdtemp(prefix="probe9765-", dir=str(scratch))).resolve()
+        self.addCleanup(shutil.rmtree, str(self.base), True)
+
+    def stat_failing_from(self, first_failing_length, error):
+        """Fake ``os.stat``: raises ``error`` for chain link ``c<n>`` once n reaches the given length."""
+
+        def fake(path, *args, **kwargs):
+            name = os.path.basename(path)
+            if name.startswith("c") and int(name[1:]) >= first_failing_length:
+                raise error
+            return os.stat(path, *args, **kwargs)
+
+        return fake
+
+    def test_host_limit_returns_the_pathconf_answer_for_the_directory(self):
+        calls = []
+
+        def fake(directory, name):
+            calls.append((directory, name))
+            return {"PC_NAME_MAX": 143, "PC_PATH_MAX": 777}[name]
+
+        self.assertEqual(host_limit(self.base, "PC_NAME_MAX", fake), 143)
+        self.assertEqual(host_limit(self.base, "PC_PATH_MAX", fake), 777)
+        self.assertEqual(
+            calls, [(str(self.base), "PC_NAME_MAX"), (str(self.base), "PC_PATH_MAX")]
+        )
+
+    def test_host_limit_refuses_an_unlimited_or_nonsense_answer_by_name(self):
+        for answer in (-1, 0):
+            with self.assertRaises(ValueError) as caught:
+                host_limit(self.base, "PC_NAME_MAX", lambda directory, name: answer)
+            self.assertEqual(
+                str(caught.exception), "PC_NAME_MAX reports no usable limit: %d" % answer
+            )
+
+    def test_host_limit_lets_an_os_error_through_with_its_type_and_errno(self):
+        def fake(directory, name):
+            raise OSError(errno.EIO, "boom")
+
+        with self.assertRaises(OSError) as caught:
+            host_limit(self.base, "PC_NAME_MAX", fake)
+        self.assertIs(type(caught.exception), OSError)
+        self.assertEqual(caught.exception.errno, errno.EIO)
+
+    def test_probe_returns_the_longest_chain_before_eloop(self):
+        for limit in (1, 2, 32, 40):
+            directory = self.base / ("p%d" % limit)
+            directory.mkdir()
+            fake = self.stat_failing_from(limit + 1, OSError(errno.ELOOP, "loop"))
+            self.assertEqual(kernel_symlink_limit(directory, fake), limit)
+
+    def test_probe_treats_eloop_on_the_first_link_as_a_limit_of_zero(self):
+        fake = self.stat_failing_from(1, OSError(errno.ELOOP, "loop"))
+        self.assertEqual(kernel_symlink_limit(self.base, fake), 0)
+
+    def test_probe_lets_every_other_errno_through_with_type_and_errno(self):
+        cases = (
+            (errno.ENAMETOOLONG, OSError),
+            (errno.EIO, OSError),
+            (errno.EACCES, PermissionError),
+            (errno.ENOENT, FileNotFoundError),
+        )
+        for code, expected_type in cases:
+            directory = self.base / ("e%d" % code)
+            directory.mkdir()
+            fake = self.stat_failing_from(3, OSError(code, "injected"))
+            with self.assertRaises(OSError) as caught:
+                kernel_symlink_limit(directory, fake)
+            self.assertIs(type(caught.exception), expected_type)
+            self.assertEqual(caught.exception.errno, code)
+
+    def test_probe_refuses_a_host_that_never_reports_a_limit_by_name(self):
+        with self.assertRaises(ValueError) as caught:
+            kernel_symlink_limit(self.base, os.stat, 3)
+        self.assertEqual(str(caught.exception), "no ELOOP within 3 links")
+
+    def test_fixture_shape_table_is_hand_written(self):
+        # (name_max, path_max, width, count)
+        table = (
+            (255, 4096, 250, 9),  # Linux: the fixture this guard shipped with
+            (255, 1024, 250, 3),  # macOS
+            (255, 2048, 250, 5),
+            (143, 4096, 138, 15),  # a 143-byte NAME_MAX (eCryptfs)
+        )
+        for name_max, path_max, width, count in table:
+            self.assertEqual(
+                path_max_fixture_shape(name_max, path_max), (width, count), (name_max, path_max)
+            )
+
+    def test_fixture_shape_target_is_below_path_max_and_two_of_them_are_past_it(self):
+        for name_max, path_max in ((255, 4096), (255, 1024), (255, 2048), (143, 4096), (64, 1024)):
+            width, count = path_max_fixture_shape(name_max, path_max)
+            target = count * (width + 1) - 1
+            self.assertLess(target, path_max, (name_max, path_max))
+            self.assertGreater(2 * target, path_max, (name_max, path_max))
+            self.assertLessEqual(width, name_max, (name_max, path_max))
+
+    def test_fixture_shape_refuses_limits_it_cannot_build_for_by_name(self):
+        cases = (
+            ((7, 4096), "NAME_MAX 7 leaves no room for a fixture name"),
+            ((255, 200), "NAME_MAX 255 is too long for PATH_MAX 200"),
+        )
+        for args, message in cases:
+            with self.assertRaises(ValueError) as caught:
+                path_max_fixture_shape(*args)
+            self.assertEqual(str(caught.exception), message)
+
+    def test_overlong_name_is_past_name_max_and_is_the_old_name_on_a_255_host(self):
+        self.assertEqual(overlong_name(255), "a" * 300 + ".md")
+        self.assertEqual(overlong_name(143), "a" * 188 + ".md")
+
+    def test_overlong_name_is_refused_by_the_host_it_was_sized_for(self):
+        name = overlong_name(host_limit(self.base, "PC_NAME_MAX"))
+        with self.assertRaises(OSError) as caught:
+            os.stat(str(self.base / name))
+        self.assertEqual(caught.exception.errno, errno.ENAMETOOLONG)
 
 
 class DocstringStatesBehaviourTest(unittest.TestCase):
