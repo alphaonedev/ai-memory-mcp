@@ -51,6 +51,7 @@ sys.path.append(str(REPO / "scripts" / "ci"))
 from impact import cargo_skip  # noqa: E402
 
 WORKFLOW = REPO / ".github" / "workflows" / "coverage.yml"
+CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 IMPACT_DIR = REPO / "scripts" / "ci" / "impact"
 SCRATCH = REPO / ".local-runs"
 SCRIPT = IMPACT_DIR / "cargo_skip.py"
@@ -79,6 +80,7 @@ LIST_PASSES = 3
 FAIL_CLOSED = "classifier-error-fail-closed"
 # Hand-written copy of the cap on the classify reason (reason_max in coverage.yml).
 REASON_MAX = 300
+CI_FAIL_CLOSED = "classifier-error-fail-closed cargo_skip-rules"
 RUN_NOTICE = "::notice::coverage RUN (%s) \u2014 full coverage pipeline" % FAIL_CLOSED
 
 
@@ -101,10 +103,10 @@ RUN_INDENT = 10
 BASE_ENV_KEYS = ("PATH", "LANG", "LC_ALL")
 
 
-def job_lines(job: str):
-    """Return the lines of a job of coverage.yml."""
+def job_lines(job: str, workflow: Path = WORKFLOW):
+    """Return the lines of a job of coverage.yml (or of `workflow`)."""
     out, inside = [], False
-    for line in WORKFLOW.read_text().splitlines():
+    for line in workflow.read_text().splitlines():
         header = JOB_HEADER.match(line)
         if header:
             inside = header.group(1) == job
@@ -114,10 +116,10 @@ def job_lines(job: str):
     return out
 
 
-def steps_of(job: str):
+def steps_of(job: str, workflow: Path = WORKFLOW):
     """Return the steps of a job as lists of lines."""
     steps, current = [], None
-    for line in job_lines(job):
+    for line in job_lines(job, workflow):
         if STEP_HEADER.match(line):
             current = [line]
             steps.append(current)
@@ -130,9 +132,9 @@ def step_first(step) -> str:
     return step[0].strip()
 
 
-def find_step(job: str, first: str):
+def find_step(job: str, first: str, workflow: Path = WORKFLOW):
     """Return the step of `job` whose first line is `first` (exact)."""
-    for step in steps_of(job):
+    for step in steps_of(job, workflow):
         if step_first(step) == first:
             return step
     raise AssertionError("no step %r in job %s of coverage.yml" % (first, job))
@@ -513,7 +515,7 @@ class DeciderCli(unittest.TestCase):
         self.assertEqual(sorted(got), ["docs/a.md", "src/a.rs"])
 
 
-class CoverageClassifyRuns(unittest.TestCase):
+class ClsHarness(unittest.TestCase):
     """The coverage.yml cls block, extracted and run against git fixtures."""
 
     BASE_FILES = {
@@ -524,10 +526,6 @@ class CoverageClassifyRuns(unittest.TestCase):
         "scripts/ci/tests/t.py": "# t\n",
     }
     IMPACT_FILES = ("__init__.py", "common.py", "cargo_skip.py", "rules.json")
-
-    @classmethod
-    def setUpClass(cls):
-        cls.body = run_body(find_step("classify", "- id: cls"))
 
     def setUp(self):
         self.work = scratch_dir()
@@ -560,6 +558,19 @@ class CoverageClassifyRuns(unittest.TestCase):
     def commit(self, message="change"):
         run_git(self.repo, "add", "-A")
         run_git(self.repo, "commit", "-q", "-m", message)
+
+    def expect(self, label, values, docs_only, skip, reason):
+        self.assertEqual(
+            (values.get("docs_only"), values.get("cargo_skip"), values.get("cargo_skip_reason")),
+            (docs_only, skip, reason), label)
+
+
+class CoverageClassifyRuns(ClsHarness):
+    """The coverage.yml cls block run against git fixtures."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.body = run_body(find_step("classify", "- id: cls"))
 
     def failing_diff_path(self):
         """PATH whose `git diff` exits 129 and whose other git verbs run as usual."""
@@ -597,11 +608,6 @@ class CoverageClassifyRuns(unittest.TestCase):
             key, _, value = line.partition("=")
             values[key] = value
         return values, res.stdout
-
-    def expect(self, label, values, docs_only, skip, reason):
-        self.assertEqual(
-            (values.get("docs_only"), values.get("cargo_skip"), values.get("cargo_skip_reason")),
-            (docs_only, skip, reason), label)
 
     def test_block_has_no_inline_expression(self):
         self.assertNotIn("${{", self.body,
@@ -1101,6 +1107,82 @@ class CoverageJobWiring(unittest.TestCase):
         self.assertIn("runs no later step", comment)
         self.assertNotIn("ended on the job time limit", comment)
         self.assertNotIn("time limit cancels it", comment)
+
+
+
+class CiClassifyReasonRuns(ClsHarness):
+    """The ci.yml cls block (same invariant on its cargo_skip_reason), run against git fixtures."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.body = run_body(find_step("classify", "- id: cls", CI_WORKFLOW))
+
+    def run_cls(self, base):
+        script = self.work / "cls.sh"
+        script.write_text(self.body)
+        out = self.work / "gh_output"
+        out.write_text("")
+        temp = self.work / "rt"
+        temp.mkdir(exist_ok=True)
+        env = base_env({
+            "GITHUB_OUTPUT": str(out), "RUNNER_TEMP": str(temp),
+            "EVENT_NAME": "pull_request", "PR_BEFORE": "", "PR_ACTION": "opened",
+            "PR_BASE_SHA": base, "PR_BASE_REF": PR_BASE_REF,
+            "HOME": str(self.work), "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull})
+        res = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+                             cwd=str(self.repo), env=env, capture_output=True, text=True,
+                             timeout=TIMEOUT_S)
+        values = {}
+        for line in out.read_text().splitlines():
+            key, _, value = line.partition("=")
+            values[key] = value
+        return values, res.stdout
+
+    def planted_run(self, label, docs_only, skip, reason):
+        planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
+        text = "docs_only=%s\ncargo_skip=%s\ncargo_skip_reason=%s\n" % (docs_only, skip, reason)
+        planted.write_text("import sys\nsys.stdout.write(%r)\n" % text)
+        self.commit("trusted decider " + label)
+        base = run_git(self.repo, "rev-parse", "HEAD")
+        self.write("docs/a.md", "# changed %s\n" % label)
+        self.commit()
+        return self.run_cls(base)
+
+    def test_a_bad_reason_never_yields_a_success_in_ci_yml(self):
+        """Same table as the coverage.yml step; the fail-closed reason carries the rules suffix."""
+        self.commit_base()
+        cap = "x" * REASON_MAX
+        fail = CI_FAIL_CLOSED
+        run = ("false", "false", fail)
+
+        def why(text):
+            return "::notice::cargo_skip reason rejected (%s), fail-closed RUN" % text
+
+        run_notice = "::notice::cargo_skip=false (%s) - running full pipeline" % fail
+        rows = [
+            ("empty", "false", "true", "", run, [why("empty"), run_notice]),
+            ("one space", "false", "true", " ", run, [why("blank-only"), run_notice]),
+            ("three spaces", "false", "true", "   ", run, [why("blank-only"), run_notice]),
+            ("tab only", "false", "true", "\t", run, [why("control-character"), run_notice]),
+            ("space plus tab", "false", "true", " \t", run,
+             [why("control-character"), run_notice]),
+            ("NUL only", "false", "true", "\x00", run, [why("control-character"), run_notice]),
+            ("text with a control character", "false", "true", "ab\x01cd", run,
+             [why("control-character"), run_notice]),
+            ("cap plus one", "false", "true", cap + "x", run,
+             [why("over-cap-%d" % REASON_MAX), run_notice]),
+            ("cap", "false", "true", cap, ("false", "true", cap),
+             ["::notice::cargo_skip=true (%s) - cargo legs no-op" % cap]),
+        ]
+        for label, docs_only, skip, reason, expected, lines in rows:
+            with self.subTest(label):
+                values, stdout = self.planted_run(label, docs_only, skip, reason)
+                self.assertEqual(
+                    (values.get("docs_only"), values.get("cargo_skip"),
+                     values.get("cargo_skip_reason")), expected, label)
+                head = [ln for ln in stdout.splitlines() if ln.startswith("::notice::cargo_skip")]
+                self.assertEqual(head, lines, label)
 
 
 if __name__ == "__main__":
