@@ -8,21 +8,26 @@
 // production hooks will use. Two end-to-end scenarios:
 //
 //   * exec mode — 100 concurrent fires through 100 short-lived
-//     children complete within the configured timeout.
+//     children all return Allow; the executor counts 100 fires and 0
+//     drops.
 //   * daemon mode — 1000 fires through a *single* long-lived child
-//     complete inside the deadline; mid-stream child crash (the
-//     test script self-kills after N requests) triggers a
-//     reconnect and the next fire still succeeds.
+//     (one pid, reported by the child itself) all return Allow, with
+//     exact fire and drop counts; mid-stream child crash (the test
+//     script self-kills after N requests) triggers a reconnect and a
+//     later fire still succeeds.
+//
+// None of these tests asserts elapsed time (issues #9232, #8541): the
+// per-fire deadline only ends a hung child, see
+// `LOAD_TEST_FIRE_TIMEOUT_MS`.
 
 #![cfg(unix)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use ai_memory::hooks::{
-    DaemonExecutor, ExecExecutor, ExecutorRegistry, FailMode, HookConfig, HookDecision, HookEvent,
-    HookExecutor, HookMode,
+    DaemonExecutor, ExecExecutor, ExecutorError, ExecutorRegistry, FailMode, HookConfig,
+    HookDecision, HookEvent, HookExecutor, HookMode,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -53,6 +58,29 @@ fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Per-fire hook deadline for the load tests that prove a concurrency or
+/// throughput property (100 concurrent exec fires, 1000 sequential daemon
+/// fires, daemon reconnect). Issues #9232 and #8541: a 5 s deadline made
+/// those tests depend on runner load, because 100 forks queued behind a
+/// loaded macOS runner can each wait longer than 5 s before their child
+/// is even scheduled. The property under test is that every fire is
+/// allowed, so the deadline must never decide the outcome; this value is
+/// ten minutes, far above any scheduling delay, and exists only so that a
+/// truly hung child still ends the test instead of blocking the job until
+/// the CI job-level timeout.
+const LOAD_TEST_FIRE_TIMEOUT_MS: u32 = 600_000;
+
+/// Number of concurrent fires in `exec_mode_100_concurrent_fires_all_allow`.
+const EXEC_CONCURRENT_FIRES: usize = 100;
+
+/// Number of sequential fires in `daemon_mode_1000_fires_one_child`.
+const DAEMON_SEQUENTIAL_FIRES: usize = 1000;
+
+/// Fires `crash_after_5.sh` answers before it exits, in
+/// `daemon_mode_reconnect_after_crash`. The script gets the same value
+/// through the `@CRASH_AFTER@` token.
+const DAEMON_CRASH_AFTER_FIRES: u32 = 5;
+
 fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
     let _ =
         ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
@@ -72,14 +100,18 @@ fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
 // exec mode — 100 concurrent fires
 // ---------------------------------------------------------------------------
 
-/// 100 concurrent fires through `ExecExecutor` must all complete
-/// inside their per-fire timeout. The script reads its stdin, then
-/// writes a fixed `{"action":"allow"}` decision. The test asserts:
+/// 100 concurrent fires through `ExecExecutor` must all be allowed.
+/// The script reads its stdin, then writes a fixed
+/// `{"action":"allow"}` decision. The test asserts:
 ///
-///   * every fire returned `Allow`;
-///   * the *aggregate* wall-clock stayed within 30s (a slack ceiling
-///     to avoid CI flakes on cold containers; per-fire timeout is
-///     5s, far above the ~50ms a fork+exec costs).
+///   * every one of the 100 fires returned exactly `Allow` (each
+///     decision is checked, in fire order);
+///   * the executor counted 100 fires and 0 drops.
+///
+/// There is deliberately no wall-clock assertion (issues #9232,
+/// #8541): elapsed time measures runner load, not correctness. The
+/// per-fire deadline is [`LOAD_TEST_FIRE_TIMEOUT_MS`], which only
+/// guards against a hung child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_mode_100_concurrent_fires_all_allow() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -93,35 +125,38 @@ printf '%s\n' '{"action":"allow"}'
 "#,
     );
 
-    let executor = Arc::new(ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000)));
+    let executor = Arc::new(ExecExecutor::new(cfg_for(
+        script,
+        HookMode::Exec,
+        LOAD_TEST_FIRE_TIMEOUT_MS,
+    )));
 
-    let started = Instant::now();
-    let mut handles = Vec::with_capacity(100);
-    for i in 0..100u32 {
+    let mut handles = Vec::with_capacity(EXEC_CONCURRENT_FIRES);
+    for i in 0..EXEC_CONCURRENT_FIRES {
         let exec = Arc::clone(&executor);
         handles.push(tokio::spawn(async move {
             exec.fire(HookEvent::PostStore, json!({"i": i})).await
         }));
     }
-    let mut allowed = 0u32;
-    for h in handles {
+    let mut allowed = 0usize;
+    for (i, h) in handles.into_iter().enumerate() {
         let r = h.await.expect("join");
         match r {
             Ok(HookDecision::Allow) => allowed += 1,
-            Ok(other) => panic!("expected Allow, got {other:?}"),
-            Err(e) => panic!("exec mode fire failed: {e}"),
+            Ok(other) => panic!("fire {i}: expected Allow, got {other:?}"),
+            Err(e) => panic!("fire {i}: exec mode fire failed: {e}"),
         }
     }
-    assert_eq!(allowed, 100, "all 100 fires must Allow");
-
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "100 fires took {elapsed:?}; expected <30s wall-clock"
+    assert_eq!(
+        allowed, EXEC_CONCURRENT_FIRES,
+        "all {EXEC_CONCURRENT_FIRES} fires must Allow"
     );
 
     let metrics = executor.metrics();
-    assert_eq!(metrics.events_fired, 100);
+    assert_eq!(
+        metrics.events_fired,
+        u64::try_from(EXEC_CONCURRENT_FIRES).expect("fire count fits u64")
+    );
     assert_eq!(metrics.events_dropped, 0);
 }
 
@@ -153,71 +188,115 @@ sleep 5
 // daemon mode — 1000 fires through one child
 // ---------------------------------------------------------------------------
 
-/// 1000 fires through a single daemon child complete within the
-/// deadline. The script's read-write loop is the simplest possible
-/// NDJSON echo: read one line, write `{"action":"allow"}\n`, repeat.
-/// We assert all 1000 returned Allow and the connection was reused
-/// (one process for the whole test).
+/// 1000 fires through a single daemon child are all allowed. The
+/// script's read-write loop is the simplest possible NDJSON echo: read
+/// one line, write `{"action":"allow"}\n`, repeat. The script also
+/// appends its pid (`$$`) to a sidecar file once, at start. We assert
+/// all 1000 returned Allow, the executor counted 1000 fires and 0
+/// drops, and the sidecar holds exactly one pid line: the connection
+/// was reused, one process for the whole test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_mode_1000_fires_one_child() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let pid_file = dir.path().join("child.pids");
     let script = write_script(
         &dir,
         "echo_allow.sh",
-        r#"#!/bin/sh
-# NDJSON loop: one input line, one output line.
+        &r#"#!/bin/sh
+# Report this process once, then run the NDJSON loop: one input line,
+# one output line.
+printf '%s\n' "$$" >> '@PIDFILE@'
 while IFS= read -r _line; do
   printf '%s\n' '{"action":"allow"}'
 done
-"#,
+"#
+        .replace("@PIDFILE@", &pid_file.display().to_string()),
     );
-    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
+    let executor =
+        DaemonExecutor::new(cfg_for(script, HookMode::Daemon, LOAD_TEST_FIRE_TIMEOUT_MS));
 
-    let started = Instant::now();
-    for i in 0..1000u32 {
+    // No wall-clock ceiling on the loop (issues #9232, #8541): elapsed
+    // time measures runner load. Every decision is checked exactly.
+    for i in 0..DAEMON_SEQUENTIAL_FIRES {
         let r = executor
             .fire(HookEvent::PostStore, json!({"i": i}))
             .await
             .unwrap_or_else(|e| panic!("fire {i} failed: {e}"));
         assert_eq!(r, HookDecision::Allow, "fire {i} returned {r:?}");
     }
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_mins(1),
-        "1000 daemon fires took {elapsed:?}; expected <60s"
-    );
 
     let m = executor.metrics();
-    assert_eq!(m.events_fired, 1_000);
+    assert_eq!(
+        m.events_fired,
+        u64::try_from(DAEMON_SEQUENTIAL_FIRES).expect("fire count fits u64")
+    );
     assert_eq!(m.events_dropped, 0);
+
+    // One process for the whole test: the child wrote exactly one pid
+    // line, so a respawn per fire (many lines) goes red.
+    let pids = std::fs::read_to_string(&pid_file).expect("child pid file");
+    assert_eq!(
+        pids.lines().count(),
+        1,
+        "daemon child must be spawned once, pid file was {pids:?}"
+    );
+}
+
+/// Error kinds the crash window of `daemon_mode_reconnect_after_crash`
+/// tolerates, each named (no wildcard arm, so a new `ExecutorError`
+/// variant breaks the build until it is classified):
+///
+///   * `ChildExit`: the child closed stdout without a decision;
+///   * `Io`: the request was written into the closing pipe;
+///   * `DaemonUnavailable`: the reconnect budget ran out while the
+///     replacement child was coming up; the next fire retries.
+///
+/// Fatal: `Timeout` (a hung reconnect must fail at the first 600 s
+/// deadline, not after six of them), `Spawn` (the script is gone),
+/// `Decode` (the child wrote garbage) and `GovernanceRefused` (the
+/// test installs an allow-all pre-action hook).
+fn crash_window_tolerates(e: &ExecutorError) -> bool {
+    match e {
+        ExecutorError::ChildExit { .. }
+        | ExecutorError::Io(_)
+        | ExecutorError::DaemonUnavailable { .. } => true,
+        ExecutorError::Timeout { .. }
+        | ExecutorError::Spawn { .. }
+        | ExecutorError::Decode { .. }
+        | ExecutorError::GovernanceRefused { .. } => false,
+    }
 }
 
 /// A daemon child that exits mid-stream must trigger a reconnect on
 /// the next fire. The test script answers the first 5 fires, then
-/// `exit 0`s. We assert (a) the 6th fire either succeeds (after
-/// reconnect) or surfaces a child-exit error we can recover from on
-/// retry, and (b) at least one fire after the crash returns Allow.
+/// `exit 0`s. We assert (a) the first 5 fires Allow, (b) the 6th fire
+/// either succeeds (after reconnect) or surfaces a child-exit error
+/// named in [`crash_window_tolerates`], and (c) at least one fire
+/// after the crash returns Allow. A `Timeout` anywhere is fatal, so a
+/// hung reconnect fails at the first deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_mode_reconnect_after_crash() {
     let dir = tempfile::tempdir().expect("tempdir");
     let script = write_script(
         &dir,
         "crash_after_5.sh",
-        r#"#!/bin/sh
+        &r#"#!/bin/sh
 n=0
 while IFS= read -r _line; do
   n=$((n + 1))
   printf '%s\n' '{"action":"allow"}'
-  if [ "$n" -ge 5 ]; then
+  if [ "$n" -ge @CRASH_AFTER@ ]; then
     exit 0
   fi
 done
-"#,
+"#
+        .replace("@CRASH_AFTER@", &DAEMON_CRASH_AFTER_FIRES.to_string()),
     );
-    let executor = DaemonExecutor::new(cfg_for(script, HookMode::Daemon, 5_000));
+    let executor =
+        DaemonExecutor::new(cfg_for(script, HookMode::Daemon, LOAD_TEST_FIRE_TIMEOUT_MS));
 
-    // First 5 must Allow.
-    for i in 0..5u32 {
+    // The fires before the crash must Allow.
+    for i in 0..DAEMON_CRASH_AFTER_FIRES {
         let r = executor.fire(HookEvent::PostStore, json!({"i": i})).await;
         assert_eq!(r.expect("first 5 succeed"), HookDecision::Allow);
     }
@@ -225,19 +304,44 @@ done
     // The 6th may surface ChildExit (we wrote into a closing pipe)
     // OR Allow (if the child finished writing the 5th decision
     // before exiting and the read happened before the write fails).
-    // Either way, the executor must reset its connection and the
-    // *next* fire after that must reconnect successfully.
-    let _ = executor.fire(HookEvent::PostStore, json!({"i": 5})).await;
+    // Its result is asserted: Allow, or an error the crash window
+    // tolerates. Either way, the executor must reset its connection
+    // and a later fire must reconnect successfully.
+    let crash_fire = DAEMON_CRASH_AFTER_FIRES;
+    match executor
+        .fire(HookEvent::PostStore, json!({"i": crash_fire}))
+        .await
+    {
+        Ok(HookDecision::Allow) => {}
+        Ok(other) => panic!("fire {crash_fire}: expected Allow, got {other:?}"),
+        Err(ExecutorError::Timeout { ms }) => {
+            panic!("fire {crash_fire}: reconnect hung, timed out after {ms} ms")
+        }
+        Err(e) => assert!(
+            crash_window_tolerates(&e),
+            "fire {crash_fire}: error not tolerated in the crash window: {e:?}"
+        ),
+    }
 
     // Drive a few more fires; the executor's reconnect-with-backoff
-    // path should bring us back online. We tolerate a transient
-    // failure but require at least one Allow inside the next 5.
+    // path should bring us back online. We tolerate the errors named
+    // in `crash_window_tolerates` but require at least one Allow
+    // inside the next 5.
     let mut recovered = false;
-    for i in 6..11u32 {
-        if let Ok(HookDecision::Allow) = executor.fire(HookEvent::PostStore, json!({"i": i})).await
-        {
-            recovered = true;
-            break;
+    for i in (crash_fire + 1)..(crash_fire + 6) {
+        match executor.fire(HookEvent::PostStore, json!({"i": i})).await {
+            Ok(HookDecision::Allow) => {
+                recovered = true;
+                break;
+            }
+            Ok(other) => panic!("fire {i}: expected Allow, got {other:?}"),
+            Err(ExecutorError::Timeout { ms }) => {
+                panic!("fire {i}: reconnect hung, timed out after {ms} ms")
+            }
+            Err(e) => assert!(
+                crash_window_tolerates(&e),
+                "fire {i}: error not tolerated in the crash window: {e:?}"
+            ),
         }
     }
     assert!(
