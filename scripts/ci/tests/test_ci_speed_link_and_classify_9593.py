@@ -30,9 +30,9 @@ LINUX_FED_LEG = "linux-fed,enterprise-fed"
 OTHER_CHECK_LEGS = ("ubuntu-latest,sqlite", "macos-fed,sqlite", "macos-fed,enterprise-fed")
 DEBUG_KEY = "cargo_debug"
 DEBUG_EXPR = "${{ matrix.cargo_debug || 'line-tables-only' }}"
-UNIT_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
+UNIT_COMMAND = "python3 scripts/ci/run_unit_modules.py"
 UNIT_JOB = "build-script-vetting"
-UNIT_STEP = "Shard partition and wiring unit tests (#6344)"
+UNIT_STEP = "All scripts/ci unit tests (#9734)"
 # (e) The checkout line a push needs: the Resolve step anchors the ratchet on HEAD^.
 UNIT_CHECKOUT_ACTION = "actions/checkout@"
 UNIT_CHECKOUT_DEPTH = "          fetch-depth: 2"
