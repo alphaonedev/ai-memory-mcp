@@ -22,12 +22,12 @@ JOB = {
     "started_at": "2026-01-01T00:00:10Z",
     "completed_at": "2026-01-01T00:11:50Z",
     "steps": [
-        {"name": "Set up job", "started_at": "2026-01-01T00:00:10Z", "completed_at": "2026-01-01T00:00:20Z"},
-        {"name": "Run actions/checkout@x", "started_at": "2026-01-01T00:00:20Z", "completed_at": "2026-01-01T00:00:40Z"},
-        {"name": "Run Swatinem/rust-cache@x", "started_at": "2026-01-01T00:00:40Z", "completed_at": "2026-01-01T00:01:10Z"},
-        {"name": "Run tests (impact-aware)", "started_at": "2026-01-01T00:01:10Z", "completed_at": "2026-01-01T00:11:10Z"},
-        {"name": "Upload test results", "started_at": "2026-01-01T00:11:10Z", "completed_at": "2026-01-01T00:11:15Z"},
-        {"name": "Post Run Swatinem/rust-cache@x", "started_at": "2026-01-01T00:11:15Z", "completed_at": "2026-01-01T00:11:30Z"},
+        {"name": "Set up job", "started_at": "2026-01-01T00:00:10Z", "completed_at": "2026-01-01T00:00:20Z", "conclusion": "success"},
+        {"name": "Run actions/checkout@x", "started_at": "2026-01-01T00:00:20Z", "completed_at": "2026-01-01T00:00:40Z", "conclusion": "success"},
+        {"name": "Run Swatinem/rust-cache@x", "started_at": "2026-01-01T00:00:40Z", "completed_at": "2026-01-01T00:01:10Z", "conclusion": "success"},
+        {"name": "Run tests (impact-aware)", "started_at": "2026-01-01T00:01:10Z", "completed_at": "2026-01-01T00:11:10Z", "conclusion": "success"},
+        {"name": "Upload test results", "started_at": "2026-01-01T00:11:10Z", "completed_at": "2026-01-01T00:11:15Z", "conclusion": "success"},
+        {"name": "Post Run Swatinem/rust-cache@x", "started_at": "2026-01-01T00:11:15Z", "completed_at": "2026-01-01T00:11:30Z", "conclusion": "success"},
     ],
 }
 # cargo reported 4m 30s (270 s) of compile; the step runs 600 s, so 330 s remain for the test run.
@@ -60,7 +60,7 @@ class SplitJobTests(unittest.TestCase):
 
     def test_separate_compile_step_adds_to_compile_not_post(self):
         job = dict(JOB, steps=JOB["steps"] + [
-            {"name": "Build release (once leg)", "started_at": "2026-01-01T00:11:30Z", "completed_at": "2026-01-01T00:11:50Z"}])
+            {"name": "Build release (once leg)", "started_at": "2026-01-01T00:11:30Z", "completed_at": "2026-01-01T00:11:50Z", "conclusion": "success"}])
         got = mct.split_job(job, LOG)
         self.assertEqual(got["compile"], 290.0)
         self.assertEqual(got["post"], 20.0)
