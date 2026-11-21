@@ -31,6 +31,7 @@ CONSUMER_LINE = "consumer-check rows=17 problems=0"
 # Every `python3 -I "$ROOT/<file>"` call form in the gate script, written out by hand.
 GATE_ISOLATED_TARGETS = (
     CONSUMER_FILE,
+    "scripts/ci/tests/test_coverage_classify_9263.py",
     "scripts/test/test_workflow_edited_cancel_8332.py",
     "scripts/test/test_pr_retarget_check_8332.py",
 )

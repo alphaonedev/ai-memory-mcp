@@ -26,6 +26,13 @@ PARITY_CEILING_SECS = 10.0
 TAG = '[#9592] parity'
 OUTCOMES = {'ok': 'ok', 'FAILED': 'failed', 'ignored': 'ignored'}
 
+# ci.yml sets CARGO_TERM_COLOR=always, so cargo's status word arrives as
+# ``ESC[1mESC[92m     RunningESC[0m ...`` (job 136822077211). plain() removes the
+# well-formed 7-bit escape sequences of a line before any match: CSI
+# (ESC [ params intermediates final, ECMA-48 5.4) and OSC (ESC ] ... BEL or ESC \).
+# A lone or cut-off ESC is left in place, so such a line never matches.
+# Linear: no class of either pattern contains ESC, so each match is read once.
+ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
 RUNNING_RE = re.compile(r'^\s*Running \S+ \((?:\S*/)?deps/([A-Za-z0-9_]+)-[0-9a-f]+(?:\.exe)?\)\s*$')
 TEST_RE = re.compile(r'^test (\S+) \.\.\. (ok|FAILED|ignored)\b')
 # A test that spawns a child process: the child's stderr follows "test X ... "
@@ -47,11 +54,17 @@ class Segment:
         self.totals: tuple[int, int, int] | None = None
 
 
+def plain(line: str) -> str:
+    """``line`` without its ANSI CSI / OSC escape sequences (cargo colour, hyperlinks)."""
+    return ANSI_RE.sub('', line) if '\x1b' in line else line
+
+
 def segments(text: str) -> list[Segment]:
-    """Every ``Running`` segment of ``text``, in order (one linear pass)."""
+    """Every ``Running`` segment of ``text``, in order (one linear pass, colour codes ignored)."""
     out: list[Segment] = []
     open_test: str | None = None
-    for line in text.splitlines():
+    for raw in text.splitlines():
+        line = plain(raw)
         if (m := RUNNING_RE.match(line)):
             out.append(Segment(m.group(1)))
             open_test = None

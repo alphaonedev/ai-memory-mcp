@@ -27,8 +27,8 @@ and this step only proves that nothing was deferred.
 
 The step fails closed on: a wrapper exit other than 0, a missing log, a log
 without its current_database evidence line, its binary path or its ``test
-result:`` line, a binary that ran zero tests, a binary that is not on a clone of
-this run, two binaries on one clone, a residual off the shared database, any
+result:`` line, a binary with no test line (passed, failed and ignored all
+zero), a binary that is not on a clone of this run, two binaries on one clone, a residual off the shared database, any
 test that prints a skip message, an ignored total that differs from the
 binary's own ``--list --ignored``, a teardown failure and any clone or template
 left after teardown. Teardown, the leftover check and the log redaction run in
@@ -268,7 +268,8 @@ def ledger_reasons(text: str, targets: list[str], run_id: str, residual: set[str
         if len(reasons) > REASONS_MAX:
             break
         if (row := LEDGER_ROW_RE.fullmatch(line)):
-            name, tests, mode, db = row.group(1), int(row.group(2)), row.group(4), row.group(5)
+            name, mode, db = row.group(1), row.group(4), row.group(5)
+            tests = int(row.group(2)) + int(row.group(3))  # ran + ignored: zero means no test line
             if name in seen:
                 reasons.append('ledger names a binary twice: %s' % name)
             elif name not in deferred:
@@ -541,7 +542,9 @@ def _log_reasons(host, env: dict, log_dir: Path, names: list[str], residual: set
             continue
         passed, failed, ignored = seg.totals
         ran = (sum(1 for o in seg.tests.values() if o == 'ok'), sum(1 for o in seg.tests.values() if o == 'FAILED'))
-        if passed + failed == 0:
+        # Zero tests means no test line at all, as in parity().structural: an all-#[ignore] binary
+        # is accounted by the --list --ignored check below (#9592 B(iii) follow-on).
+        if passed + failed + ignored == 0:
             reasons.append('zero tests: %s' % name)
             continue
         if ran != (passed, failed):
@@ -563,8 +566,9 @@ def _log_reasons(host, env: dict, log_dir: Path, names: list[str], residual: set
         if skips:
             reasons += ['self-skipped PG test in %s: %s' % (name, hit) for hit in skips]
             continue
+        # The same colour-free view as parity().segments (CARGO_TERM_COLOR=always, #9592 B(iii)).
         binary = next((b.group(1) for line in text.splitlines()
-                       if (b := BIN_PATH_RE.match(line)) and b.group(2) == name), None)
+                       if (b := BIN_PATH_RE.match(parity().plain(line))) and b.group(2) == name), None)
         if binary is None or '..' in binary.split('/'):
             reasons.append('no test binary path in the log: %s' % name)
             continue

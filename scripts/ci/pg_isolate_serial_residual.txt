@@ -4,6 +4,17 @@
 # Ceilings only fall: remove a name when its binary no longer needs it.
 a2a_campaign_round1
 
+# #9592 B(i)/(ii): a clone starts empty and un-migrated (the template holds the
+# age and vector extensions only), and these two cannot hold on that by design
+# (pinned by scripts/ci/tests/test_pg_isolate_residual_by_design_9592.py):
+# tests/pg_health_probe_constant_cost_2617.rs:153-170 never writes a row and
+# needs the rows other binaries left in `memories` (cell B, corpus >= 2).
+pg_health_probe_constant_cost_2617
+# tests/pg_record_stop_write_gate_ttl_3276.rs:171 needs the first write inside
+# the 1000 ms re-check window, which src/store/postgres.rs:3309 seeds before
+# the migration ladder at :3326; on a fresh clone the ladder uses it up.
+pg_record_stop_write_gate_ttl_3276
+
 # #9592 (3-agent vote (71472661) I-7): every binary below has a hit of
 # scripts/ci/pg_isolate_cluster_audit.py (a wall-time assert, the load-sensitive
 # class of PR 8230 defect 2 / issue 6796, directly or through tests/common/mcp_wait.rs).

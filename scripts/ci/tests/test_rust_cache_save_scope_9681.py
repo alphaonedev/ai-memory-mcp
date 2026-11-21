@@ -171,6 +171,10 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
                   "Run the pg_isolated_binary live cells (enterprise-fed legs only)",
                   "Load gate (#6795)",
                   "Run tests (impact-aware)",
+                  # #9592 runs the deferred serial set per binary on isolated clones, then redacts
+                  # the per-binary logs before upload.
+                  "Serial shard isolated binaries (linux-fed enterprise-fed, issue 9592)",
+                  "Redact isolated-lane per-binary logs (issue 9592)",
                   "Cleanup enterprise-fed ephemeral db",
                   "sccache hit-rate summary (#7199)",
                   "sccache stop CI server (#7199)",
@@ -1186,8 +1190,6 @@ RESOLVED_PR_COMMANDS: dict[tuple[str, str, str], tuple[str | None, str]] = {
     ("ci.yml", "check", 'cargo test --doc --no-fail-fast "$@"'): (
         "cargo test --no-run",
         "doctests link the library the prebuild built; rustdoc's doctest binaries are not in target/"),
-    ("ci.yml", "check", 'cargo test --no-run "$@" "${sel[@]}"'): (
-        None, "run_isolated_lane: enterprise-fed tier only, never the hosted sqlite leg"),
     ("ci.yml", "check", 'cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@"'): (
         None, "run_sharded: enterprise-fed tier only, never the hosted sqlite leg"),
     ("coverage.yml", "per-module-thresholds",
