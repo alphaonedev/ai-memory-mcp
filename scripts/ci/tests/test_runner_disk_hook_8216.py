@@ -166,7 +166,23 @@ class EventFreeTable(HookCase):
         self.assertEqual(hook.START_FLOOR_GIB, 60)
         self.assertEqual(hook.TARGET_DIR_NAME, "target")
         self.assertEqual(hook.MARKER_FILE_NAME, "CACHEDIR.TAG")
-        self.assertEqual(hook.DEFAULT_LOG_PATH, "/Users/fate/ai-tmp/runner-disk-hook.log")
+        self.assertEqual(hook.DEFAULT_LOG_ENV, "RUNNER_DISK_HOOK_LOG")
+        self.assertEqual(hook.DEFAULT_LOG_PARTS, ("ai-tmp", "runner-disk-hook.log"))
+
+    def test_default_log_path_resolution(self):
+        home = self.tmp / "home"
+        explicit = str(self.tmp / "explicit.log")
+        from_env = str(self.tmp / "env.log")
+        rows = [
+            (explicit, {hook.DEFAULT_LOG_ENV: from_env}, Path(explicit)),
+            (None, {hook.DEFAULT_LOG_ENV: from_env}, Path(from_env)),
+            (None, {hook.DEFAULT_LOG_ENV: "relative.log"}, home / "ai-tmp" / "runner-disk-hook.log"),
+            (None, {hook.DEFAULT_LOG_ENV: ""}, home / "ai-tmp" / "runner-disk-hook.log"),
+            (None, {}, home / "ai-tmp" / "runner-disk-hook.log"),
+        ]
+        for given, env, expected in rows:
+            with self.subTest(given=given, env=env):
+                self.assertEqual(hook.resolve_log_path(given, env, home), expected)
 
     def test_event_free_table(self):
         after_job = hook.CLEAR_BELOW_GIB_AFTER_JOB
@@ -306,7 +322,7 @@ class WorkRootForms(HookCase):
     def test_fewer_than_three_parts(self):
         # the depth rule is lexical and checked before the file system, so it holds on every host.
         self.assertEqual(
-            hook.work_root_refusal(Path("/Volumes/f1dev"), home=Path("/nonexistent-home-dir")),
+            hook.work_root_refusal(Path("/srv/ci"), home=Path("/nonexistent-home-dir")),
             "work root has fewer than 3 path parts",
         )
 

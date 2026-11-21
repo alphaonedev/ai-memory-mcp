@@ -45,7 +45,8 @@ Exit code is 0 on every path, refusals and errors included, with the reason in t
 stderr. decision: exit 0 over a failing exit, because a failing runner hook turns every job on that
 runner red and hides the real result; the conductor's disk waiter is the backstop.
 
-Log: every call appends exactly one line to the log (``--log``, default DEFAULT_LOG_PATH):
+Log: every call appends exactly one line to the log (``--log``, else the absolute path in $RUNNER_DISK_HOOK_LOG,
+else ``<home>/ai-tmp/runner-disk-hook.log``; no host path is written in this file):
   <UTC time> runner=<name> event=<event> free_before_gib=<n|unknown> free_after_gib=<n|unknown>
   decision=<clear|enough-free|refused> removed=<count> paths=<JSON list> reason=<JSON string>[ dry-run]
 ``removed`` counts the directories removed (in a dry run, the ones that would be). decision: a log
@@ -78,7 +79,8 @@ from pathlib import Path
 GIB = 1024**3
 CLEAR_BELOW_GIB_AFTER_JOB = 150
 START_FLOOR_GIB = 60
-DEFAULT_LOG_PATH = "/Users/fate/ai-tmp/runner-disk-hook.log"
+DEFAULT_LOG_ENV = "RUNNER_DISK_HOOK_LOG"
+DEFAULT_LOG_PARTS = ("ai-tmp", "runner-disk-hook.log")
 TARGET_DIR_NAME = "target"
 MARKER_FILE_NAME = "CACHEDIR.TAG"
 MARKER_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
@@ -201,7 +203,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-root", help=f"the runner's work folder (default: ${ENV_WORK_ROOT})")
     parser.add_argument("--workspace", help=f"the job workspace (default: ${ENV_WORKSPACE})")
     parser.add_argument("--runner-name", help=f"this runner's name (default: ${ENV_RUNNER_NAME})")
-    parser.add_argument("--log", default=DEFAULT_LOG_PATH, help="append the one log line here")
+    parser.add_argument(
+        "--log",
+        help=f"append the one log line here (default: ${DEFAULT_LOG_ENV}, else <home>/{'/'.join(DEFAULT_LOG_PARTS)})",
+    )
     parser.add_argument("--dry-run", action="store_true", help="decide and log, remove nothing")
     parser.add_argument(
         "--free-gib",
@@ -211,15 +216,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _scan_log_arg(argv: Sequence[str]) -> str:
+def resolve_log_path(explicit: str | None, env: Mapping[str, str], home: Path) -> Path:
+    """``--log``, else an absolute $RUNNER_DISK_HOOK_LOG, else ``<home>/ai-tmp/runner-disk-hook.log``."""
+    if explicit:
+        return Path(explicit)
+    from_env = env.get(DEFAULT_LOG_ENV, "")
+    if from_env and os.path.isabs(from_env):
+        return Path(from_env)
+    return home.joinpath(*DEFAULT_LOG_PARTS)
+
+
+def _scan_log_arg(argv: Sequence[str], env: Mapping[str, str], home: Path) -> Path:
     """Best-effort ``--log`` value from arguments that may not parse, so a refusal still reaches the right log."""
     items = list(argv)
+    explicit: str | None = None
     for index, item in enumerate(items):
-        if item == "--log" and index + 1 < len(items) and items[index + 1] != "":
-            return items[index + 1]
-        if item.startswith("--log=") and item != "--log=":
-            return item[len("--log="):]
-    return DEFAULT_LOG_PATH
+        if item == "--log" and index + 1 < len(items):
+            explicit = items[index + 1]
+        elif item.startswith("--log="):
+            explicit = item[len("--log="):]
+    return resolve_log_path(explicit, env, home)
 
 
 def work_root_refusal(root: "str | os.PathLike[str] | None", home: Path) -> str | None:
@@ -259,13 +275,14 @@ def work_root_refusal(root: "str | os.PathLike[str] | None", home: Path) -> str 
 
 def parse_config(argv: Sequence[str], env: Mapping[str, str], home: Path) -> Config:
     """Turn arguments and environment into a Config, or raise Refusal with the exact reason."""
-    unparsed = LogContext(UNKNOWN, UNKNOWN, Path(_scan_log_arg(argv)), False)
+    unparsed = LogContext(UNKNOWN, UNKNOWN, _scan_log_arg(argv, env, home), False)
     try:
         args = build_parser().parse_args(list(argv))
     except _ArgError as exc:
         raise Refusal(f"invalid arguments: {exc}", unparsed) from exc
     runner_raw = args.runner_name if args.runner_name is not None else env.get(ENV_RUNNER_NAME)
-    context = LogContext(args.event.value, UNKNOWN, Path(args.log), args.dry_run)
+    log_path = resolve_log_path(args.log, env, home)
+    context = LogContext(args.event.value, UNKNOWN, log_path, args.dry_run)
     if runner_raw is None or runner_raw == "":
         raise Refusal("runner name is not set", context)
     if RUNNER_NAME_PATTERN.match(runner_raw) is None:
@@ -282,7 +299,7 @@ def parse_config(argv: Sequence[str], env: Mapping[str, str], home: Path) -> Con
         work_root=Path(root_raw),
         workspace=workspace,
         runner_name=runner_raw,
-        log_path=Path(args.log),
+        log_path=log_path,
         dry_run=args.dry_run,
         free_gib_override=args.free_gib,
     )
@@ -629,7 +646,7 @@ def main(
         home_dir = Path.home() if home is None else home
     except (RuntimeError, KeyError):
         home_dir = Path("/nonexistent-home")
-    context = LogContext(UNKNOWN, UNKNOWN, Path(_scan_log_arg(argv)), False)
+    context = LogContext(UNKNOWN, UNKNOWN, _scan_log_arg(argv, env, home_dir), False)
     try:
         config = parse_config(argv, env, home_dir)
         context = config.context()

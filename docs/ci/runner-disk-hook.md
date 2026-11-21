@@ -50,7 +50,9 @@ and on stderr; the conductor's disk waiter is the backstop.
 
 ## Log
 
-Every call appends exactly one line to the log (`--log`, default `/Users/fate/ai-tmp/runner-disk-hook.log`):
+Every call appends exactly one line to the log. The path is `--log`, else the absolute path in the environment
+variable `RUNNER_DISK_HOOK_LOG`, else `<home>/ai-tmp/runner-disk-hook.log` (set the variable in the runner `.env`
+to move it):
 
 ```
 <UTC time> runner=<name> event=<event> free_before_gib=<n|unknown> free_after_gib=<n|unknown> decision=<clear|enough-free|refused> removed=<count> paths=<JSON list> reason=<JSON string>[ dry-run]
