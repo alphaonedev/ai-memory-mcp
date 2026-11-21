@@ -40,6 +40,9 @@ LONG_LINE_SECONDS_CEILING = 0.5  # a linear read of one 200K-character line take
 LONG_LINE_RATIO_LIMIT = 3.0  # doubling the line may not more than triple the time
 LONG_LINE_RATIO_FLOOR_SECONDS = 0.05  # below this a timing is noise and the ratio is not judged
 LABEL_MAX = 256  # longest label host_semaphore.py prints in a semaphore line
+SEMAPHORE_LINE_CAP = 8192  # a longer line is never read as the semaphore line (finding N1, mutant G02)
+LINE_MATCH_CAP = 4096  # a longer line is not matched against the Finished and test result patterns
+CAP_LINE_COUNT = 150_000  # lines of exactly LINE_MATCH_CAP characters (finding N4)
 # Every character str.splitlines() ends a line on besides "\n", written out (not computed): CR, VT, FF, FS, GS, RS, NEL,
 # LINE SEPARATOR, PARAGRAPH SEPARATOR.
 LINE_TERMINATORS = ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " ")
@@ -66,10 +69,16 @@ R_STEP_NO_CONCLUSION = "step-no-conclusion"
 R_MISSING_TS = "missing-timestamp"
 R_COMPILE_LONGER = "compile-longer-than-step"
 R_MISSING_NAME = "missing-step-name"
-ALL_REASONS = (R_NO_LINE, R_NO_LOG, R_EMPTY_LOG, R_MALFORMED, R_MULTIPLE, R_WAIT_LONGER, R_OVERLAP, R_NO_GATE,
-               R_GATE_NO_TS, R_GATE_NEGATIVE, R_GATE_MULTIPLE, R_GATE_SKIPPED, R_GATE_NOT_SUCCESS,
-               R_GATE_NO_CONCLUSION, R_SEM_NO_TS, R_NO_TEST_STEP, R_STEP_SKIPPED, R_STEP_NOT_SUCCESS,
-               R_STEP_NO_CONCLUSION)
+R_NEGATIVE = "negative"
+# Every reason a wait column can print as `absent: <reason>`, written out (not taken from the script).
+WAIT_ABSENT_EXPECTED = (R_NO_LINE, R_NO_LOG, R_EMPTY_LOG, R_MALFORMED, R_MULTIPLE, R_WAIT_LONGER, R_OVERLAP, R_NO_GATE,
+                        R_GATE_NO_TS, R_GATE_NEGATIVE, R_GATE_MULTIPLE, R_GATE_SKIPPED, R_GATE_NOT_SUCCESS,
+                        R_GATE_NO_CONCLUSION, R_SEM_NO_TS, R_NO_TEST_STEP, R_STEP_SKIPPED, R_STEP_NOT_SUCCESS,
+                        R_STEP_NO_CONCLUSION, R_MISSING_TS, R_NEGATIVE, R_MISSING_NAME)
+# Every reason the docstring must name: the absent ones and the one that only leaves compile and test unmeasured.
+ALL_REASONS = (*WAIT_ABSENT_EXPECTED, R_COMPILE_LONGER)
+# The documented limit of the strict parser (finding N2), written out.
+LIMIT_TEXT = "prints the whole exact line itself"
 NO_FINISHED_DECISION = "a step whose log holds no `Finished` line reads every exact-form line inside the step"
 
 
@@ -92,6 +101,16 @@ def sem_line(clock, wait_text="300s", prefix="##[notice]", label="T"):
 
 def finished_line(clock, took="34m 41s"):
     return log_line(clock, f"    Finished `test` profile [unoptimized] target(s) in {took}")
+
+
+def stamped(clock_fraction, text):
+    """A log line stamped with the given time of day, whole seconds or with a fraction of any length."""
+    return f"{DAY}T{clock_fraction}Z {text}"
+
+
+def at_line_length(prefix, total):
+    """The prefix padded with blanks and one trailing x so that the line is exactly total characters long."""
+    return prefix + " " * (total - len(prefix) - 1) + "x"
 
 
 def step(name, start, end, conclusion="success"):
@@ -319,8 +338,38 @@ class StrictLineTests(unittest.TestCase):
             ("text after the closing parenthesis", [log_line("22:05:01", sem_body() + " extra")], None, R_MALFORMED),
             ("slot field not a number", [log_line("22:05:01", sem_body().replace("slot 1 of 2", "slot x of 2"))], None, R_MALFORMED),
             ("load field not a number", [log_line("22:05:01", sem_body().replace("load=26.90", "load=high"))], None, R_MALFORMED),
+            ("slot total not a number", [log_line("22:05:01", sem_body().replace("slot 1 of 2", "slot 1 of many"))], None, R_MALFORMED),
+            ("cores not a number", [log_line("22:05:01", sem_body().replace("cores=14", "cores=abc"))], None, R_MALFORMED),
+            ("doubled notice prefix", [log_line("22:05:01", sem_body(prefix="##[notice]##[notice]"))], None, R_NO_LINE),
+            ("a line of one word with no stamp", ["oneword"], None, R_NO_LINE),
+            ("line of exactly the 8192 cap is read (and is malformed)",
+             [at_line_length(log_line("22:05:01", sem_body()), SEMAPHORE_LINE_CAP)], None, R_MALFORMED),
+            ("line one over the 8192 cap is never read",
+             [at_line_length(log_line("22:05:01", sem_body()), SEMAPHORE_LINE_CAP + 1)], None, R_NO_LINE),
+            # the documented limit (finding N2): the line is produced inside the job and no trusted side channel exists.
+            ("whole exact line printed by a build-time program, no real line", [log_line("22:10:00", sem_body("7s"))], 7.0, None),
+            ("whole exact line printed by a build-time program, beside the real line",
+             [real, log_line("22:10:00", sem_body("7s"))], None, R_MULTIPLE),
         )
         self.run_rows(rows)
+
+    def test_stamp_fraction_is_compared_exactly_with_the_finished_stamp(self):
+        # (semaphore stamp, Finished stamp, expected wait, expected reason); both stamps are in the same second.
+        rows = (
+            ("22:39:43.1000000", "22:39:43.9000000", 300.0, None),
+            ("22:39:43.9000000", "22:39:43.1000000", None, R_NO_LINE),
+            ("22:39:43.4", "22:39:43.45", 300.0, None),
+            ("22:39:43.5", "22:39:43.45", None, R_NO_LINE),
+            ("22:39:43", "22:39:43.0000001", 300.0, None),
+            ("22:39:43.0000001", "22:39:43", None, R_NO_LINE),
+            ("22:39:43", "22:39:43", None, R_NO_LINE),
+        )
+        for sem_at, finished_at, expected_wait, expected_reason in rows:
+            with self.subTest(f"{sem_at} before {finished_at}"):
+                log = [log_line("22:00:02", "##[group]Run tests"), stamped(sem_at, sem_body()),
+                       stamped(finished_at, "    Finished `test` profile [unoptimized] target(s) in 34m 41s"),
+                       log_line("23:54:00", "test result: ok. 1 passed; finished in 1.00s")]
+                self.assertEqual(figures(issue_job(), log), (expected_wait, expected_reason))
 
     def test_unreadable_stamp_is_its_own_reason(self):
         body = sem_body()
@@ -497,6 +546,81 @@ class LongLineTests(unittest.TestCase):
         self.assert_linear("rank_binaries", make_call)
 
 
+class CapLengthLineTests(unittest.TestCase):
+    """Class B: a log of 100K+ lines, each as long as the match cap and full of the pattern's own text, is read in
+    linear time (150K such lines took 76.88 s at the previous head: one pass from every start in the line)."""
+
+    def capped(self, unit):
+        return (unit * (LINE_MATCH_CAP // len(unit) + 1))[:LINE_MATCH_CAP]
+
+    def timed_under_ceiling(self, name, call):
+        began = time.monotonic()
+        result = call()
+        elapsed = time.monotonic() - began
+        self.assertLess(elapsed, BIG_LOG_SECONDS_CEILING, f"{name}: {CAP_LINE_COUNT} lines took {elapsed:.2f}s")
+        return result
+
+    def test_150k_lines_at_the_cap_length_are_read_within_the_ceiling(self):
+        finished = [self.capped("Finished `a` profile ")] * CAP_LINE_COUNT
+        self.assertEqual(len(finished[0]), LINE_MATCH_CAP)
+        self.assertIsNone(self.timed_under_ceiling("first_finished", lambda: mct.first_finished(finished)))
+        results = [self.capped("test result: ok. 1 passed; ")] * CAP_LINE_COUNT
+        self.assertEqual(self.timed_under_ceiling("rank_binaries", lambda: mct.rank_binaries(["Running x"] + results)), [])
+
+    def test_real_finished_and_result_lines_are_still_read(self):
+        # the linear form reads the same lines the search did: one Finished line, one result line, text in front of both.
+        text = "    Finished `test` profile [unoptimized] target(s) in 34m 41s"
+        self.assertEqual(mct.first_finished([log_line("22:39:43", text)])[1], 2081.0)
+        rows = [log_line("22:10:00", "Running unittests src/lib.rs"),
+                log_line("22:10:01", "test result: ok. 3 passed; 0 failed; finished in 4.50s")]
+        self.assertEqual(mct.rank_binaries(rows), [(4.5, 3, "src/lib.rs")])
+
+
+class BranchPinTests(unittest.TestCase):
+    """Class D (finding N1): one row per remaining branch of step_secs, sum_steps, parse_ts, duration and first_finished."""
+
+    FINISHED_TEXT = "    Finished `test` profile [unoptimized] target(s) in 34m 41s"
+
+    def test_sum_steps_names_the_first_unmeasured_step_whatever_the_order(self):
+        ok = step("a", "10:00:00", "10:00:05")
+        failed = step("b", "10:00:05", "10:00:06", "failure")
+        no_conclusion = step("c", "10:00:06", "10:00:07", None)
+        self.assertEqual(mct.sum_steps([ok, failed, no_conclusion]), (None, R_STEP_NOT_SUCCESS))
+        self.assertEqual(mct.sum_steps([ok, no_conclusion, failed]), (None, R_STEP_NO_CONCLUSION))
+        self.assertEqual(mct.sum_steps([ok, step("s", "10:00:06", "10:00:07", "skipped"), ok]), (10.0, None))
+
+    def test_fractions_of_a_second_and_a_zero_length_step_are_measured(self):
+        fractional = {"conclusion": "success", "started_at": f"{DAY}T10:00:00.250Z", "completed_at": f"{DAY}T10:00:01.750Z"}
+        self.assertEqual(mct.step_secs(fractional), (1.5, None))
+        self.assertEqual(mct.duration(stamp("10:00:00"), stamp("10:00:00")), (0.0, None))
+        self.assertEqual(mct.duration(stamp("10:00:01"), stamp("10:00:00")), (None, R_NEGATIVE))
+        gate = issue_job(gate_steps=[step(mct.LOAD_GATE_STEP_NAME, "21:40:01", "21:40:01")])
+        self.assertEqual(mct.split_job(gate, default_log())["load_gate"], 0.0)
+
+    def test_first_finished_reads_a_coloured_line_and_the_cap_boundary(self):
+        coloured = log_line("22:39:43", "\x1b[32m    Finished\x1b[0m `test` profile [unoptimized] target(s) in 34m 41s")
+        self.assertEqual(mct.first_finished([coloured])[1], 2081.0)  # colour codes are stripped before the match
+        painted = log_line("22:39:43", "\x1b[1m" + self.FINISHED_TEXT + "\x1b[0m")
+        self.assertEqual(mct.first_finished([painted])[1], 2081.0)
+        base = log_line("22:39:43", self.FINISHED_TEXT)
+        at_cap = base.replace("    Finished", " " * (LINE_MATCH_CAP - len(base)) + "    Finished", 1)
+        self.assertEqual(len(at_cap), LINE_MATCH_CAP)
+        self.assertEqual(mct.first_finished([at_cap])[1], 2081.0)
+        over = at_cap.replace("    Finished", " " + "    Finished", 1)
+        self.assertEqual(len(over), LINE_MATCH_CAP + 1)
+        self.assertIsNone(mct.first_finished([over]))
+
+    def test_first_finished_needs_a_stamp_and_a_time_inside_the_window(self):
+        self.assertIsNone(mct.first_finished([self.FINISHED_TEXT]))  # no stamp
+        inside = log_line("22:39:43", self.FINISHED_TEXT)
+        start = mct.log_line_time(log_line("22:39:00", "x"))
+        end = mct.log_line_time(log_line("22:40:00", "x"))
+        self.assertEqual(mct.first_finished([inside], start, end)[1], 2081.0)
+        before = log_line("22:30:00", self.FINISHED_TEXT)
+        after = log_line("22:50:00", self.FINISHED_TEXT)
+        self.assertEqual(mct.first_finished([before, after, inside], start, end)[0], mct.log_line_time(inside))
+
+
 class LoadGateTests(unittest.TestCase):
     def test_step_list_without_the_load_gate_step_is_absent(self):
         got = mct.split_job(issue_job(gate_steps=[]), default_log())
@@ -564,6 +688,10 @@ class ConclusionTests(unittest.TestCase):
             ("failure", None, R_GATE_NOT_SUCCESS),
             ("neutral", None, R_GATE_NOT_SUCCESS),
             (None, None, R_GATE_NO_CONCLUSION),
+            ("", None, R_GATE_NO_CONCLUSION),
+            (0, None, R_GATE_NO_CONCLUSION),
+            ([], None, R_GATE_NO_CONCLUSION),
+            (True, None, R_GATE_NO_CONCLUSION),
         )
         for conclusion, expected, reason in rows:
             with self.subTest(str(conclusion)):
@@ -590,7 +718,9 @@ class ConclusionTests(unittest.TestCase):
 
     def test_test_step_conclusion_table(self):
         rows = (("skipped", R_STEP_SKIPPED), ("cancelled", R_STEP_NOT_SUCCESS), ("failure", R_STEP_NOT_SUCCESS),
-                (None, R_STEP_NO_CONCLUSION))
+                (None, R_STEP_NO_CONCLUSION), ("", R_STEP_NO_CONCLUSION), (0, R_STEP_NO_CONCLUSION),
+                ([], R_STEP_NO_CONCLUSION), (True, R_STEP_NO_CONCLUSION), ("SUCCESS", R_STEP_NOT_SUCCESS),
+                ("success ", R_STEP_NOT_SUCCESS))
         for conclusion, reason in rows:
             with self.subTest(str(conclusion)):
                 got = mct.split_job(issue_job(main_conclusion=conclusion), default_log())
@@ -740,6 +870,82 @@ class DocstringTests(unittest.TestCase):
             with self.subTest(reason):
                 self.assertIn(reason, text)
         self.assertIn(NO_FINISHED_DECISION, text)
+
+    def test_docstring_names_the_documented_limit_of_the_strict_parser(self):
+        text = " ".join(mct.__doc__.split())
+        self.assertIn(LIMIT_TEXT, text)
+        self.assertIn("multiple-semaphore-lines", text.split(LIMIT_TEXT, 1)[1])  # and what that program causes beside the real line
+
+
+class WaitReasonSetTests(unittest.TestCase):
+    """Class E: the docstring's list of absent reasons equals the set of reasons the code can print."""
+
+    def reached(self):
+        """Run one row per absent reason through split_job; return the set of reasons the rows expect."""
+        main_name = "Run tests (impact-aware)"
+
+        def gate(**changes):
+            return dict(step(mct.LOAD_GATE_STEP_NAME, "21:40:01", "22:00:01"), **changes)
+
+        def with_main(**changes):
+            job = issue_job()
+            next(s for s in job["steps"] if s["name"] == main_name).update(changes)
+            return job
+
+        nameless = issue_job()
+        nameless["steps"].append({"name": None, "started_at": stamp("23:54:46"), "completed_at": stamp("23:54:46"), "conclusion": "success"})
+        no_test = issue_job()
+        no_test["steps"] = [s for s in no_test["steps"] if s["name"] != main_name]
+        rows = (
+            (R_NO_GATE, "load_gate", issue_job(gate_steps=[]), default_log()),
+            (R_GATE_MULTIPLE, "load_gate", issue_job(gate_steps=[gate(), gate()]), default_log()),
+            (R_GATE_NO_TS, "load_gate", issue_job(gate_steps=[gate(completed_at=None)]), default_log()),
+            (R_GATE_NEGATIVE, "load_gate", issue_job(gate_steps=[gate(completed_at=stamp("21:40:00"))]), default_log()),
+            (R_GATE_SKIPPED, "load_gate", issue_job(gate_steps=[gate(conclusion="skipped")]), default_log()),
+            (R_GATE_NOT_SUCCESS, "load_gate", issue_job(gate_steps=[gate(conclusion="failure")]), default_log()),
+            (R_GATE_NO_CONCLUSION, "load_gate", issue_job(gate_steps=[gate(conclusion=None)]), default_log()),
+            (R_NO_TEST_STEP, "semaphore", no_test, default_log()),
+            (R_MISSING_NAME, "semaphore", nameless, default_log()),
+            (R_STEP_SKIPPED, "semaphore", with_main(conclusion="skipped"), default_log()),
+            (R_STEP_NOT_SUCCESS, "semaphore", with_main(conclusion="failure"), default_log()),
+            (R_STEP_NO_CONCLUSION, "semaphore", with_main(conclusion=None), default_log()),
+            (R_MISSING_TS, "semaphore", with_main(completed_at=None), default_log()),
+            (R_NEGATIVE, "semaphore", with_main(completed_at=stamp("21:00:00")), default_log()),
+            (R_NO_LOG, "semaphore", issue_job(), None),
+            (R_EMPTY_LOG, "semaphore", issue_job(), []),
+            (R_NO_LINE, "semaphore", issue_job(), issue_log()),
+            (R_SEM_NO_TS, "semaphore", issue_job(), issue_log(sem_body())),
+            (R_MULTIPLE, "semaphore", issue_job(), issue_log(sem_line("22:05:01"), sem_line("22:06:01"))),
+            (R_MALFORMED, "semaphore", issue_job(), issue_log(sem_line("22:05:01", "5.0s"))),
+            (R_WAIT_LONGER, "semaphore", issue_job(), issue_log(sem_line("22:05:01", "6868s"))),
+            (R_OVERLAP, "semaphore", issue_job(), issue_log(sem_line("22:05:01", "4787s"))),
+        )
+        for reason, column, job, log in rows:
+            with self.subTest(reason):
+                self.assertEqual(mct.split_job(job, log)["wait_absent"].get(column), reason)
+        return {reason for reason, _, _, _ in rows}
+
+    def test_the_constant_is_the_set_the_code_prints_and_the_docstring_names_every_member(self):
+        self.assertEqual(self.reached(), set(WAIT_ABSENT_EXPECTED))
+        self.assertEqual(len(WAIT_ABSENT_EXPECTED), len(set(WAIT_ABSENT_EXPECTED)))
+        self.assertEqual(sorted(mct.WAIT_ABSENT_REASONS), sorted(WAIT_ABSENT_EXPECTED))
+        text = " ".join(mct.__doc__.split())
+        for reason in mct.WAIT_ABSENT_REASONS:
+            with self.subTest(reason):
+                self.assertIn(reason, text)
+
+    def test_every_reason_constant_is_listed_and_no_print_site_holds_a_bare_literal(self):
+        constants = {name: value for name, value in vars(mct).items() if name.startswith("REASON_") and isinstance(value, str)}
+        self.assertEqual(sorted(constants.values()), sorted(ALL_REASONS))
+        source = SCRIPT.read_text(encoding="utf-8")
+        for reason in ALL_REASONS:
+            with self.subTest(reason):
+                self.assertEqual(source.count(f'"{reason}"'), 1)  # the one definition; every print site uses the constant
+
+    def test_an_unlisted_reason_is_refused_when_a_wait_is_marked_absent(self):
+        with mock.patch.object(mct, "REASON_NO_LOG", "an-unlisted-reason"):
+            with self.assertRaises(ValueError):
+                mct.split_job(issue_job(), None)
 
 
 if __name__ == "__main__":
