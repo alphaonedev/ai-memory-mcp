@@ -183,8 +183,8 @@ RUN_ROWS = [
     ("include_str! target: a migration",
      ["migrations/sqlite/0081_v97_agent_pubkey_history.sql"], "false", "false",
      "rust-observable-path migrations/sqlite/0081_v97_agent_pubkey_history.sql " + V),
-    ("markdown under coverage/", ["coverage/README.md"], "false", "false",
-     "rust-observable-path coverage/README.md " + V),
+    ("markdown under coverage/", ["coverage/notes.md"], "false", "false",
+     "rust-observable-path coverage/notes.md " + V),
     ("markdown under .cargo/", [".cargo/notes.md"], "false", "false",
      "rust-observable-path .cargo/notes.md " + V),
     ("a Cargo.* name that ends in .md", ["tools/Cargo.md"], "false", "false",
@@ -450,7 +450,20 @@ class CoverageClassifyRuns(unittest.TestCase):
         run_git(self.repo, "add", "-A")
         run_git(self.repo, "commit", "-q", "-m", message)
 
-    def run_cls(self, base, event="pull_request", base_ref=PR_BASE_REF):
+    def failing_diff_path(self):
+        """PATH whose `git diff` exits 129 and whose other git verbs run as usual."""
+        real = shutil.which("git")
+        self.assertIsNotNone(real)
+        shim_dir = self.work / "shim"
+        shim_dir.mkdir(exist_ok=True)
+        shim = shim_dir / "git"
+        shim.write_text("#!%s\nimport os\nimport sys\n"
+                        "if sys.argv[1:2] == [\"diff\"]:\n    sys.exit(129)\n"
+                        "os.execv(%r, [%r] + sys.argv[1:])\n" % (sys.executable, real, real))
+        shim.chmod(0o755)
+        return str(shim_dir) + os.pathsep + os.environ.get("PATH", "")
+
+    def run_cls(self, base, event="pull_request", base_ref=PR_BASE_REF, path=None):
         script = self.work / "cls.sh"
         script.write_text(self.body)
         out = self.work / "gh_output"
@@ -463,6 +476,8 @@ class CoverageClassifyRuns(unittest.TestCase):
             "COV_PR_BASE_SHA": base, "COV_PUSH_BEFORE": "",
             "HOME": str(self.work), "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_SYSTEM": os.devnull})
+        if path is not None:
+            env["PATH"] = path
         res = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
                              cwd=str(self.repo), env=env, capture_output=True, text=True,
                              timeout=TIMEOUT_S)
@@ -557,6 +572,14 @@ class CoverageClassifyRuns(unittest.TestCase):
         run_git(self.repo, "revert", "--no-edit", "HEAD")
         values, _ = self.run_cls(base)
         self.expect("empty net diff", values, "false", "false", "empty-diff-fail-closed")
+
+    def test_an_unreadable_diff_runs_never_an_empty_list(self):
+        base = self.commit_base()
+        self.write("docs/a.md", "# changed\n")
+        self.commit()
+        values, out = self.run_cls(base, path=self.failing_diff_path())
+        self.expect("git diff fails", values, "false", "false", "diff-unreadable-fail-closed")
+        self.assertIn("::notice::coverage RUN (diff-unreadable-fail-closed)", out)
 
     def test_unresolvable_base_runs(self):
         self.commit_base()
