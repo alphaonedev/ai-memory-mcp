@@ -18,6 +18,7 @@ the load-gate step name are the script's named constants, used by the script and
 import contextlib
 import importlib.util
 import io
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -313,6 +314,7 @@ class StrictLineTests(unittest.TestCase):
             ("longest label", [sem_line("22:05:01", label="a" * LABEL_MAX)], 300.0, None),
             ("label one over the cap", [sem_line("22:05:01", label="a" * (LABEL_MAX + 1))], None, R_MALFORMED),
             ("label holding a quote", [sem_line("22:05:01", label="it's")], None, R_MALFORMED),
+            ("acquired-after text with no space before it", [log_line("22:05:01", sem_body().replace(" acquired after ", "_acquired after "))], None, R_NO_LINE),
             ("two acquired-after in one line", [log_line("22:05:01", sem_body("7s") + " acquired after 9s (load=1.00 cores=2)")], None, R_MALFORMED),
             ("text after the closing parenthesis", [log_line("22:05:01", sem_body() + " extra")], None, R_MALFORMED),
             ("slot field not a number", [log_line("22:05:01", sem_body().replace("slot 1 of 2", "slot x of 2"))], None, R_MALFORMED),
@@ -329,8 +331,12 @@ class StrictLineTests(unittest.TestCase):
             ("byte order mark before the stamp", ["﻿" + log_line("22:05:01", body)], None, R_SEM_NO_TS),
             ("stamp shaped right but month 13", [f"2026-13-20T22:05:01.0000000Z " + body], None, R_SEM_NO_TS),
             ("unreadable stamp beside the real line", [log_line("22:05:01", body), body], None, R_SEM_NO_TS),
+            ("non-ASCII digits in the stamp year", ["٢٠٢٦-11-20T22:05:01.0000000Z " + body], None, R_SEM_NO_TS),
         )
         self.run_rows(rows)
+        got = mct.split_job(issue_job(), issue_log(body))
+        self.assertIsNone(got["test"])  # the wait cannot be taken out of the test run
+        self.assertEqual(got["unmeasured"], [f"test:{R_SEM_NO_TS}"])
 
     def test_step_window_boundaries_are_pinned(self):
         # the step starts 22:00:01 and ends 23:54:28; a log stamp may sit one second outside it (second granularity).
@@ -433,6 +439,7 @@ class ForgedTerminatorTests(unittest.TestCase):
         self.assertEqual(fetch_text("a b\x85c\x0cd\ne\n".encode("utf-8")), ["a b\x85c\x0cd", "e"])
         self.assertEqual(fetch_text(b"x\n\ny\n"), ["x", "", "y"])
         self.assertEqual(fetch_text(b""), [])
+        self.assertEqual(fetch_text(b"a\xff\xfeb\n"), ["a��b"])  # bad UTF-8 is replaced, not raised
 
 
 class LongLineTests(unittest.TestCase):
@@ -466,6 +473,20 @@ class LongLineTests(unittest.TestCase):
             line = log_line("22:10:00", unit * (chars // len(unit)))
             return lambda: self.assertIsNone(mct.first_finished([line]))
         self.assert_linear("finished", make_call)
+
+    def test_bench_compile_log_scan_is_linear_on_repeated_finished_text(self):
+        unit = "Finished `a` profile "
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+
+        def make_call(chars):
+            def call():
+                with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as tmp:
+                    for name in mct.BENCH_FILES:
+                        body = unit * (chars // len(unit)) if name == mct.BENCH_COMPILE else "x"
+                        (Path(tmp) / name).write_text(body + "\n", encoding="utf-8")
+                    mct.bench_report(Path(tmp), 0.0)
+            return call
+        self.assert_linear("bench compile log", make_call)
 
     def test_rank_binaries_scan_is_linear_on_repeated_result_text(self):
         unit = "test result: ok. 1 passed; "
