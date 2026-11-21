@@ -203,6 +203,26 @@ def age(path, secs):
     os.utime(path, (stamp, stamp), follow_symlinks=False)
 
 
+def bind_unix_socket(parent, name):
+    """Bind an AF_UNIX socket called ``name`` inside ``parent`` whatever the length of ``parent`` (#9460).
+
+    The kernel limits the bound path to SOCKET_PATH_LIMIT bytes, so the bind uses the bare name from a working
+    directory of ``parent``; the previous directory is restored also when the bind fails. decision: relative name
+    over a short directory plus rename because the socket must be a child of ``parent`` (the prune cell scans it)
+    and a rename cannot cross filesystems, so a short directory elsewhere could not hold it.
+    """
+    if len(name.encode()) >= SOCKET_PATH_LIMIT:
+        raise ValueError(f"socket name is {len(name.encode())} bytes, limit {SOCKET_PATH_LIMIT}: {name}")
+    previous = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.chdir(parent)
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.bind(name)
+    finally:
+        os.fchdir(previous)
+        os.close(previous)
+
+
 def snapshot(top):
     """Relative path -> (kind, content or link target, mtime_ns); no symlink followed."""
     seen = {}
@@ -467,9 +487,7 @@ class EntryKinds(Base):
         made["symlink"] = parent / "k-link"
         os.mkfifo(parent / "k-fifo")
         made["fifo"] = parent / "k-fifo"
-        sock = socket.socket(socket.AF_UNIX)
-        sock.bind(str(parent / "k-sock"))
-        sock.close()
+        bind_unix_socket(parent, "k-sock")
         made["socket"] = parent / "k-sock"
         for path in (parent / "k-dir" / "inner" / "f", parent / "k-dir" / "inner", *made.values()):
             age(path, OLD_AGE_SECS)
@@ -2432,6 +2450,22 @@ class SocketPathLimit9460(unittest.TestCase):
         long_tmp.mkdir(parents=True)
         self.assertGreaterEqual(len(str(long_tmp)), LONG_TMPDIR_BYTES)
         self.assert_cell_green(self.run_socket_cell(ROOT / "scripts/ci/tests", long_tmp))
+
+    def test_bind_helper_restores_the_working_directory_on_success_and_on_failure(self):
+        parent = self.scratch / "bind-parent"
+        parent.mkdir()
+        before = os.getcwd()
+        bind_unix_socket(parent, "ok-sock")
+        self.assertEqual(os.getcwd(), before)
+        self.assertTrue(stat.S_ISSOCK(os.lstat(parent / "ok-sock").st_mode))
+        with self.assertRaises(OSError) as raised:  # the name is taken: bind raises after the chdir
+            bind_unix_socket(parent, "ok-sock")
+        self.assertEqual(raised.exception.errno, errno.EADDRINUSE)
+        self.assertEqual(os.getcwd(), before)
+        too_long = "n" * SOCKET_PATH_LIMIT
+        with self.assertRaises(ValueError):
+            bind_unix_socket(parent, too_long)
+        self.assertEqual(os.getcwd(), before)
 
     def test_socket_cell_from_a_checkout_path_past_the_socket_limit(self):
         checkout = self.scratch
