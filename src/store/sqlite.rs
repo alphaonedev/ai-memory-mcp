@@ -295,31 +295,32 @@ fn pubkey_bind_err(error: anyhow::Error, agent_id: &str) -> StoreError {
     }
 }
 
-/// v1.0.0 #3275 — `(agent_id, target_agent_id)` owner strings of a memory
-/// (empty when the key is absent), for the SAL `delete_link` caller-owns gate.
-fn link_owner_target_of(m: &Memory) -> (String, String) {
-    let owner = m
-        .metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let target = m
-        .metadata
-        .get(crate::META_KEY_TARGET_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    (owner, target)
-}
+/// #9466 — the one `delete_link` owner read: the raw `metadata` column of
+/// row `id`, unfiltered by lifecycle (a tombstoned endpoint is still
+/// owner-checked). `None` = no such row. A query error is returned as
+/// `what: <error>`, the same context words the postgres adapter uses.
+const DELETE_LINK_METADATA_SQL: &str = crate::storage::MEMORY_METADATA_BY_ID_SQL;
 
-/// v1.0.0 #3275 — the `agent_id` owner string of a memory (empty when absent).
-fn link_owner_of(m: &Memory) -> String {
-    m.metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+/// #9466 — the decoded `metadata` of a present endpoint row, or `None` when
+/// the column is not JSON text (never folded to `{}`: that would read the
+/// row as unstamped and could take the legacy-unowned admission).
+fn delete_link_metadata(
+    conn: &rusqlite::Connection,
+    id: &str,
+    what: &str,
+) -> StoreResult<Option<Option<serde_json::Value>>> {
+    let raw: Option<rusqlite::types::Value> = conn
+        .query_row(
+            crate::store::delete_link_owner_sql(id, DELETE_LINK_METADATA_SQL),
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| box_err(format!("{what}: {e}")))?;
+    Ok(raw.map(|value| match value {
+        rusqlite::types::Value::Text(text) => serde_json::from_str(&text).ok(),
+        _ => None,
+    }))
 }
 
 /// Parity finding #4 (2026-08) — SAL-level caller-owns mutation gate for
@@ -559,6 +560,8 @@ fn owner_gate_test_hook(id: &str) {
 #[cfg(not(test))]
 fn owner_gate_test_hook(_id: &str) {}
 
+#[cfg(test)]
+mod delete_link_owner_9466;
 #[cfg(test)]
 mod owner_gate_txn_3957;
 #[cfg(test)]
@@ -1598,26 +1601,35 @@ impl MemoryStore for SqliteStore {
         // so there is no existence oracle. Endpoint owners are read UNFILTERED
         // (`db::get_any`) so a tombstoned endpoint is still owner-checked.
         // Operator lanes (`ctx.bypass_visibility`) skip the gate.
+        // #9466 — the gate reads each endpoint as Absent / present-with-its-
+        // stamps (`delete_link_gate`, the ONE shared predicate): an absent row
+        // is a refusal, never an unstamped row; a failed read is returned as
+        // the store error and deletes nothing. The reads and the DELETE run in
+        // ONE `BEGIN IMMEDIATE` transaction (D-6), so no writer can re-stamp
+        // or remove an endpoint between the decision and the delete.
+        let txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         if !ctx.bypass_visibility {
-            let caller = ctx.effective_principal();
-            let (source_owner, source_target) = db::get_any(&conn, source_id)
-                .map_err(box_err)?
-                .map(|m| link_owner_target_of(&m))
-                .unwrap_or_default();
-            let target_owner = db::get_any(&conn, target_id)
-                .map_err(box_err)?
-                .map(|m| link_owner_of(&m))
-                .unwrap_or_default();
-            if !crate::store::caller_may_delete_link(
-                &source_owner,
-                &source_target,
-                &target_owner,
-                caller,
-            ) {
+            let source =
+                delete_link_metadata(&conn, source_id, crate::store::DELETE_LINK_SOURCE_LOOKUP)?;
+            let target =
+                delete_link_metadata(&conn, target_id, crate::store::DELETE_LINK_TARGET_LOOKUP)?;
+            if !crate::store::delete_link_gate(
+                crate::store::LinkEndpoint::of_stored(source.as_ref().map(Option::as_ref)),
+                crate::store::LinkEndpoint::of_stored(target.as_ref().map(Option::as_ref)),
+                source_id,
+                ctx.effective_principal(),
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::UNLINK,
+                ),
+            )? {
+                // Nothing was written; the guard's drop rolls back.
                 return Ok(false);
             }
         }
-        db::delete_link(&conn, source_id, target_id).map_err(box_err)
+        owner_gate_test_hook(source_id);
+        let removed = db::delete_link(&conn, source_id, target_id).map_err(box_err)?;
+        txn.commit().map_err(box_err)?;
+        Ok(removed)
     }
 
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {

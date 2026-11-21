@@ -153,7 +153,14 @@ impl<'a> OwnerStamp<'a> {
     /// Classify a row's `metadata` object (the one Rust-side definition).
     #[must_use]
     pub fn of(metadata: &'a Value) -> Self {
-        match metadata.get(crate::META_KEY_AGENT_ID) {
+        Self::of_field(metadata.get(crate::META_KEY_AGENT_ID))
+    }
+
+    /// Classify one metadata FIELD value by the same rules (`None` = the key
+    /// is missing) — e.g. `metadata.target_agent_id`.
+    #[must_use]
+    pub fn of_field(field: Option<&'a Value>) -> Self {
+        match field {
             None | Some(Value::Null) => Self::Unstamped,
             Some(Value::String(s)) if s.is_empty() => Self::Unstamped,
             Some(Value::String(s)) => Self::Stamped(s.as_str()),
@@ -344,43 +351,201 @@ pub fn metadata_admits_mutation_with_mode(
     metadata_would_admit(metadata, caller, allow_inbox, mode)
 }
 
-/// The ONE predicate specialised to a link DELETE, whose authority is
-/// symmetric (either endpoint's owner may sever the edge):
+/// #9466 — endpoint name carried by [`UnlinkVerdict::Unreadable`] (and the
+/// SAL `IntegrityFailed` detail) for the link's SOURCE row.
+pub const UNLINK_ENDPOINT_SOURCE: &str = "source endpoint";
+/// #9466 — see [`UNLINK_ENDPOINT_SOURCE`]; the link's TARGET row.
+pub const UNLINK_ENDPOINT_TARGET: &str = "target endpoint";
+
+/// #9466 — one endpoint row of a link as the link-DELETE gate READ it. A row
+/// that is absent is its own state: it is never read as an unstamped row
+/// (pre-#9466 both the HTTP gate and the SAL gate folded a missing row into
+/// `""` and could take the both-unstamped legacy admission over it). A read
+/// that FAILED has no `LinkEndpoint` at all — the caller returns that error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEndpoint<'a> {
+    /// No row with that id.
+    Absent,
+    /// The row exists. `owner` is its `metadata.agent_id` stamp; `addressee`
+    /// is its `metadata.target_agent_id` (the inbox recipient — consulted on
+    /// the SOURCE only) classified by the same [`OwnerStamp`] rules.
+    Present {
+        /// The row's author stamp.
+        owner: OwnerStamp<'a>,
+        /// The row's inbox addressee, by the same rules.
+        addressee: OwnerStamp<'a>,
+    },
+}
+
+impl<'a> LinkEndpoint<'a> {
+    /// A present row whose metadata could not be decoded (sqlite only): no
+    /// field of it can be read, so both are [`OwnerStamp::Malformed`].
+    pub const UNDECODABLE: Self = Self::Present {
+        owner: OwnerStamp::Malformed,
+        addressee: OwnerStamp::Malformed,
+    };
+
+    /// One endpoint as the sqlite reads deliver it: `None` = no row
+    /// ([`Self::Absent`]), `Some(None)` = a present row whose stored metadata
+    /// did not decode ([`Self::UNDECODABLE`]), `Some(Some(m))` = [`Self::of`].
+    #[must_use]
+    pub fn of_stored(row: Option<Option<&'a Value>>) -> Self {
+        match row {
+            None => Self::Absent,
+            Some(None) => Self::UNDECODABLE,
+            Some(Some(metadata)) => Self::of(metadata),
+        }
+    }
+
+    /// A present row's decoded `metadata`. Metadata that is not a JSON object
+    /// has no owner key to read, so it is [`Self::UNDECODABLE`] — never
+    /// unstamped (sqlite only: the postgres `memories_metadata_is_object`
+    /// CHECK refuses such a row).
+    #[must_use]
+    pub fn of(metadata: &'a Value) -> Self {
+        if !metadata.is_object() {
+            return Self::UNDECODABLE;
+        }
+        Self::Present {
+            owner: OwnerStamp::of(metadata),
+            addressee: OwnerStamp::of_field(metadata.get(crate::META_KEY_TARGET_AGENT_ID)),
+        }
+    }
+
+    /// A present postgres row, from the `(jsonb_typeof, ->>)` pairs of its
+    /// `agent_id` and `target_agent_id` — identical verdicts to [`Self::of`]
+    /// over the same JSON.
+    #[must_use]
+    pub fn of_pg(
+        owner_type: Option<&str>,
+        owner: Option<&'a str>,
+        addressee_type: Option<&str>,
+        addressee: Option<&'a str>,
+    ) -> Self {
+        Self::Present {
+            owner: OwnerStamp::of_pg(owner_type, owner),
+            addressee: OwnerStamp::of_pg(addressee_type, addressee),
+        }
+    }
+
+    /// The row's owner stamp, `None` for an absent row.
+    #[must_use]
+    pub fn owner(&self) -> Option<OwnerStamp<'a>> {
+        match self {
+            Self::Absent => None,
+            Self::Present { owner, .. } => Some(*owner),
+        }
+    }
+
+    /// The owner string for logs: the stamp, `""` unstamped, the malformed
+    /// label, or `<absent row>`.
+    #[must_use]
+    pub fn owner_for_display(&self) -> &'a str {
+        self.owner()
+            .map_or(ABSENT_ROW_LABEL, |owner| owner.owner_for_display())
+    }
+}
+
+/// Log label for an absent link endpoint row (angle-bracketed, like
+/// [`MALFORMED_OWNER_LABEL`], so no agent id can equal it).
+pub const ABSENT_ROW_LABEL: &str = "<absent row>";
+
+/// #9466 — what the link-DELETE gate decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlinkVerdict {
+    /// The caller may sever the edge.
+    Admit,
+    /// The caller may not. With an absent endpoint row this is the same
+    /// "no edge removed" answer a non-owner gets (no existence oracle).
+    Refuse,
+    /// Both rows exist and the named endpoint's owner stamp is malformed: a
+    /// named refusal, never a decision taken from a default.
+    Unreadable(&'static str),
+}
+
+/// #9466 — THE link-DELETE ownership predicate, the one decision every
+/// surface takes (SAL sqlite + postgres `delete_link`, the HTTP
+/// `DELETE /api/v1/links` gate on both backends). Links are symmetric: either
+/// endpoint's owner may sever the edge. In order:
 ///
-/// * the caller owns the SOURCE (stamped), or is the inbox recipient of a
-///   stamped source → admitted;
-/// * the caller owns the TARGET (stamped) → admitted;
-/// * the source is UNSTAMPED and either the caller is its addressed
-///   recipient or the target is unstamped / missing → an unstamped admission,
-///   decided by [`admit_unstamped`] (the pre-#3124 outcome under `warn`);
-/// * anything else → refused.
+/// 1. the `daemon` principal, the stamped owner of either endpoint, or the
+///    addressed recipient of a source that is NOT unstamped → [`UnlinkVerdict::Admit`];
+/// 2. both rows present and an owner stamp malformed (source first) →
+///    [`UnlinkVerdict::Unreadable`];
+/// 3. either row absent → [`UnlinkVerdict::Refuse`] — an absent row is never
+///    an unstamped one, so no legacy admission is taken over it;
+/// 4. an UNSTAMPED source whose addressee is the caller, or an UNSTAMPED
+///    source with NO addressee over an UNSTAMPED target (the legacy
+///    single-operator admission) → [`admit_unstamped`] (the #3124 knob:
+///    `refuse` refuses);
+/// 5. anything else → [`UnlinkVerdict::Refuse`].
 ///
-/// `target_metadata` is `None` when the target row does not exist.
+/// A FAILED row read never reaches here: the caller returns its error and
+/// deletes nothing. Operator lanes (`bypass_visibility`) skip the gate.
 #[must_use]
-pub fn unlink_admitted(
-    source_metadata: &Value,
-    target_metadata: Option<&Value>,
+pub fn unlink_verdict(
+    source: LinkEndpoint<'_>,
+    target: LinkEndpoint<'_>,
     source_id: &str,
     caller: &str,
     site: MutationSite,
-) -> bool {
-    let source = OwnerStamp::of(source_metadata);
-    let target = target_metadata.map(OwnerStamp::of);
-    let addressed_to_caller = source_metadata
-        .get(crate::META_KEY_TARGET_AGENT_ID)
-        .and_then(Value::as_str)
-        .is_some_and(|t| !t.is_empty() && t == caller);
-    if source.is_owned_by(caller)
-        || (addressed_to_caller && !source.is_unstamped())
-        || target.is_some_and(|t| t.is_owned_by(caller))
+) -> UnlinkVerdict {
+    unlink_verdict_with_mode(source, target, source_id, caller, site, mode())
+}
+
+/// [`unlink_verdict`] under an explicit `mode` — the seam that lets unit
+/// tests pin the `refuse` posture without mutating the process environment
+/// (the [`metadata_admits_mutation_with_mode`] precedent).
+#[must_use]
+pub fn unlink_verdict_with_mode(
+    source: LinkEndpoint<'_>,
+    target: LinkEndpoint<'_>,
+    source_id: &str,
+    caller: &str,
+    site: MutationSite,
+    mode: UnstampedMutationMode,
+) -> UnlinkVerdict {
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
+        return UnlinkVerdict::Admit;
+    }
+    if let LinkEndpoint::Present { owner, addressee } = source
+        && (owner.is_owned_by(caller) || (addressee.is_owned_by(caller) && !owner.is_unstamped()))
     {
-        return true;
+        return UnlinkVerdict::Admit;
     }
-    let target_unstamped = target.is_none_or(|t| t.is_unstamped());
-    if source.is_unstamped() && (addressed_to_caller || target_unstamped) {
-        return admit_unstamped(site, source_id, caller);
+    if target
+        .owner()
+        .is_some_and(|owner| owner.is_owned_by(caller))
+    {
+        return UnlinkVerdict::Admit;
     }
-    false
+    let (
+        LinkEndpoint::Present {
+            owner: source_owner,
+            addressee,
+        },
+        LinkEndpoint::Present {
+            owner: target_owner,
+            ..
+        },
+    ) = (source, target)
+    else {
+        return UnlinkVerdict::Refuse;
+    };
+    if source_owner == OwnerStamp::Malformed {
+        return UnlinkVerdict::Unreadable(UNLINK_ENDPOINT_SOURCE);
+    }
+    if target_owner == OwnerStamp::Malformed {
+        return UnlinkVerdict::Unreadable(UNLINK_ENDPOINT_TARGET);
+    }
+    let legacy = target_owner.is_unstamped() && addressee.is_unstamped();
+    if source_owner.is_unstamped()
+        && (addressee.is_owned_by(caller) || legacy)
+        && admit_unstamped_rows(site, source_id, caller, 1, mode)
+    {
+        return UnlinkVerdict::Admit;
+    }
+    UnlinkVerdict::Refuse
 }
 
 /// The side-effect-free form of the ONE predicate: the same verdict as

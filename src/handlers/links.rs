@@ -36,6 +36,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
+use crate::identity::owner_stamp::{LinkEndpoint, UnlinkVerdict};
 use crate::identity::sentinels;
 use crate::models::LinkBody;
 #[cfg(feature = "sal")]
@@ -985,59 +986,59 @@ pub async fn delete_link(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        // Owner-gate parity with the sqlite #939 gate below: the caller
-        // must own EITHER endpoint (links are symmetric — either party
-        // can sever). A missing source memory falls through to
-        // delete_link, which reports `deleted:false` (the pair can't
-        // hold an edge), mirroring the sqlite missing-source path.
-        match app.store.get(&ctx, &source_id).await {
-            Ok(source_mem) => {
-                let source_owner =
-                    crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
-                        .owner_for_display()
-                        .to_string();
-                let target_meta = app
-                    .store
-                    .get(&ctx, &target_id)
-                    .await
-                    .ok()
-                    .map(|m| m.metadata);
-                let target_mem_owner = target_meta.as_ref().map(|m| {
-                    crate::identity::owner_stamp::OwnerStamp::of(m)
-                        .owner_for_display()
-                        .to_string()
-                });
-                // #3124 — the ONE predicate, link-delete (symmetric) form.
-                if caller != sentinels::DAEMON_PRINCIPAL
-                    && !crate::identity::owner_stamp::unlink_admitted(
-                        &source_mem.metadata,
-                        target_meta.as_ref(),
-                        &source_id,
-                        &caller,
-                        crate::identity::owner_stamp::MutationSite::postgres(
-                            crate::identity::owner_stamp::funnel::UNLINK,
-                        ),
-                    )
-                {
-                    tracing::warn!(
-                        target: super::AUTHZ_TRACE_TARGET,
-                        "DELETE /api/v1/links 403 (postgres): caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
-                        target_mem_owner.as_deref().unwrap_or("")
-                    );
-                    // #3426 — leak-resistant refusal: both endpoint owners
-                    // stay in the AUTHZ trace line above, never on the wire.
-                    return crate::handlers::parity::owner_gate_refusal(
-                        crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
-                        Some(caller.as_str()),
-                        crate::handlers::parity::RefusedResource::Link {
-                            source_id: &source_id,
-                            target_id: &target_id,
-                        },
-                    );
-                }
-            }
-            Err(crate::store::StoreError::NotFound { .. }) => {}
+        // #9466 — owner-gate parity with the sqlite #939 gate below: the ONE
+        // shared predicate (`owner_stamp::unlink_verdict`) over the endpoint
+        // rows as read. A FAILED read of either endpoint is the store error
+        // (never folded into "no row"); a 403 is given only when both rows
+        // are visible and the caller is refused. An endpoint the caller
+        // cannot see (absent or invisible) is decided by the SAL gate on the
+        // rows themselves, which refuses an absent row as `deleted:false`
+        // (E-1) and keeps the owner of the other endpoint's admission (D-3).
+        let read = |res: Result<crate::models::Memory, crate::store::StoreError>| match res {
+            Ok(m) => Ok(Some(m)),
+            Err(crate::store::StoreError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let source_mem = match read(app.store.get(&ctx, &source_id).await) {
+            Ok(m) => m,
             Err(e) => return store_err_to_response(e),
+        };
+        if let Some(source_mem) = source_mem.as_ref() {
+            let target_mem = match read(app.store.get(&ctx, &target_id).await) {
+                Ok(m) => m,
+                Err(e) => return store_err_to_response(e),
+            };
+            let source = LinkEndpoint::of(&source_mem.metadata);
+            let target = target_mem
+                .as_ref()
+                .map_or(LinkEndpoint::Absent, |m| LinkEndpoint::of(&m.metadata));
+            let verdict = crate::identity::owner_stamp::unlink_verdict(
+                source,
+                target,
+                &source_id,
+                &caller,
+                crate::identity::owner_stamp::MutationSite::postgres(
+                    crate::identity::owner_stamp::funnel::UNLINK,
+                ),
+            );
+            if verdict != UnlinkVerdict::Admit && target != LinkEndpoint::Absent {
+                tracing::warn!(
+                    target: super::AUTHZ_TRACE_TARGET,
+                    "DELETE /api/v1/links 403 (postgres): caller {caller} refused ({verdict:?}); source owner {} target owner {} (source_id={source_id})",
+                    source.owner_for_display(),
+                    target.owner_for_display()
+                );
+                // #3426 — leak-resistant refusal: both endpoint owners stay
+                // in the AUTHZ trace line above, never on the wire.
+                return crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
+                    Some(caller.as_str()),
+                    crate::handlers::parity::RefusedResource::Link {
+                        source_id: &source_id,
+                        target_id: &target_id,
+                    },
+                );
+            }
         }
         return match app.store.delete_link(&ctx, &source_id, &target_id).await {
             Ok(removed) => Json(json!({"deleted": removed})).into_response(),
@@ -1051,77 +1052,85 @@ pub async fn delete_link(
     // authored either endpoint. The audit row above logs intent;
     // this gate enforces the actual write authorization.
     //
-    // Permits: caller owns EITHER endpoint (mirrors the symmetric
-    // nature of a link delete — either party can sever), inbox
-    // carve-out on either endpoint, legacy "daemon" sentinel, legacy
-    // unowned rows.
+    // #9466 — the decision is the ONE shared predicate
+    // (`owner_stamp::unlink_verdict`, the SAL gate's too) over each
+    // endpoint row AS READ:
+    //   * an absent row (either endpoint, #9483 the source) is a refusal,
+    //     `{"deleted": false}` with no DELETE — never an unstamped row and
+    //     never an ungated fall-through. The owner of the OTHER endpoint and
+    //     the daemon still sever the orphan edge (D-3, E-7);
+    //   * a FAILED read of either endpoint is a 500 and no DELETE runs;
+    //   * the both-unstamped legacy admission needs an EMPTY source
+    //     addressee and goes through `admit_unstamped` (E-3, E-4).
+    // The reads and the DELETE run in ONE `BEGIN IMMEDIATE` transaction
+    // (D-6), so no writer can change an endpoint between them.
     let lock = app.db.lock().await;
-    let source_mem = match db::get(&lock.0, &source_id) {
-        Ok(Some(m)) => Some(m),
-        // #939 followup (2026-05-20) — when the source memory does
-        // not exist, fall through to the substrate `db::delete_link`
-        // which will report `deleted: false` (the canonical
-        // legacy contract — non-existent source is not an
-        // existence-leak the gate needs to protect; the link itself
-        // can't exist either, so the delete is a no-op the caller
-        // gets to learn about). Pre-followup the handler 404'd here,
-        // which broke the test surface that exercises the
-        // `deleted: false` semantic.
-        Ok(None) => None,
-        Err(e) => {
-            drop(lock);
-            tracing::error!("delete_link: source lookup failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-            )
-                .into_response();
-        }
-    };
-    // Owner gate only fires when the source memory actually exists.
-    // Missing-source path falls through to the substrate (delete-
-    // returns-false) below.
-    let source_mem = match source_mem {
-        Some(m) => m,
-        None => {
-            let delete_result = db::delete_link(&lock.0, &source_id, &target_id);
-            drop(lock);
-            return match delete_result {
-                Ok(removed) => Json(json!({"deleted": removed})).into_response(),
-                Err(e) => crate::handlers::errors::handler_error_500(&e),
-            };
-        }
-    };
-    let target_meta = db::get(&lock.0, &target_id)
-        .ok()
-        .flatten()
-        .map(|m| m.metadata);
-    let target_mem_owner = target_meta.as_ref().map(|m| {
-        crate::identity::owner_stamp::OwnerStamp::of(m)
-            .owner_for_display()
-            .to_string()
-    });
-    let source_owner = crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
-        .owner_for_display()
-        .to_string();
-    // #3124 — the ONE predicate, link-delete (symmetric) form.
-    if caller != sentinels::DAEMON_PRINCIPAL
-        && !crate::identity::owner_stamp::unlink_admitted(
-            &source_mem.metadata,
-            target_meta.as_ref(),
-            &source_id,
-            &caller,
-            crate::identity::owner_stamp::MutationSite::sqlite(
-                crate::identity::owner_stamp::funnel::UNLINK,
-            ),
+    let internal_error = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
         )
-    {
+            .into_response()
+    };
+    let txn = match crate::storage::connection::WriteTxn::begin(&lock.0) {
+        Ok(txn) => txn,
+        Err(e) => {
+            tracing::error!("delete_link: begin transaction failed: {e}");
+            return internal_error();
+        }
+    };
+    let (source_mem, target_mem) =
+        match (db::get(&lock.0, &source_id), db::get(&lock.0, &target_id)) {
+            (Ok(source), Ok(target)) => (source, target),
+            (Err(e), _) | (_, Err(e)) => {
+                drop(txn);
+                drop(lock);
+                tracing::error!("delete_link: endpoint lookup failed: {e}");
+                return internal_error();
+            }
+        };
+    // `db::get` folds an undecodable `metadata` column to `{}` (an unstamped
+    // row); the owner decision reads the column AS STORED instead, so a
+    // corrupt owner is `Malformed` (refused), as on the SAL path.
+    let (source_meta, target_meta) = match (
+        endpoint_metadata_as_stored(&lock.0, &source_id),
+        endpoint_metadata_as_stored(&lock.0, &target_id),
+    ) {
+        (Ok(source), Ok(target)) => (source, target),
+        (Err(e), _) | (_, Err(e)) => {
+            drop(txn);
+            drop(lock);
+            tracing::error!("delete_link: endpoint metadata lookup failed: {e}");
+            return internal_error();
+        }
+    };
+    let (source, target) = (
+        stored_endpoint(source_mem.as_ref(), source_meta.as_ref()),
+        stored_endpoint(target_mem.as_ref(), target_meta.as_ref()),
+    );
+    let verdict = crate::identity::owner_stamp::unlink_verdict(
+        source,
+        target,
+        &source_id,
+        &caller,
+        crate::identity::owner_stamp::MutationSite::sqlite(
+            crate::identity::owner_stamp::funnel::UNLINK,
+        ),
+    );
+    if verdict != UnlinkVerdict::Admit {
+        drop(txn);
         drop(lock);
         tracing::warn!(
             target: super::AUTHZ_TRACE_TARGET,
-            "DELETE /api/v1/links 403: caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
-            target_mem_owner.as_deref().unwrap_or("")
+            "DELETE /api/v1/links refused: caller {caller} ({verdict:?}); source owner {} target owner {} (source_id={source_id})",
+            source.owner_for_display(),
+            target.owner_for_display()
         );
+        if source == LinkEndpoint::Absent || target == LinkEndpoint::Absent {
+            // E-1: the same "no edge removed" a missing edge gives; no
+            // existence oracle, no DELETE.
+            return Json(json!({"deleted": false})).into_response();
+        }
         // #3426 — leak-resistant refusal: both endpoint owners stay in the
         // AUTHZ trace line above, never on the wire.
         return crate::handlers::parity::owner_gate_refusal(
@@ -1134,12 +1143,47 @@ pub async fn delete_link(
         );
     }
 
-    let delete_result = db::delete_link(&lock.0, &source_id, &target_id);
+    let delete_result = db::delete_link(&lock.0, &source_id, &target_id)
+        .and_then(|removed| txn.commit().map(|()| removed).map_err(Into::into));
     drop(lock);
     match delete_result {
         Ok(removed) => Json(json!({"deleted": removed})).into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
+}
+
+/// #9466 — one endpoint of the sqlite `DELETE /api/v1/links` decision: an
+/// absent row is `Absent`, a present row is classified from its `metadata`
+/// AS STORED, and a present row whose stored column did not decode is
+/// `LinkEndpoint::UNDECODABLE` (never `{}`).
+fn stored_endpoint<'a>(
+    row: Option<&crate::models::Memory>,
+    stored: Option<&'a serde_json::Value>,
+) -> LinkEndpoint<'a> {
+    LinkEndpoint::of_stored(row.map(|_| stored))
+}
+
+/// #9466 — the `metadata` column of one endpoint row AS STORED, for the
+/// sqlite `DELETE /api/v1/links` owner decision: `Some(value)` when it is
+/// JSON text, `None` when it is anything else (the decision reads that as an
+/// undecodable owner, never as `{}`), and `None` for an absent row too (the
+/// caller already knows absence from `db::get`).
+fn endpoint_metadata_as_stored(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> rusqlite::Result<Option<serde_json::Value>> {
+    use rusqlite::OptionalExtension as _;
+    let raw: Option<rusqlite::types::Value> = conn
+        .query_row(
+            crate::storage::MEMORY_METADATA_BY_ID_SQL,
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match raw {
+        Some(rusqlite::types::Value::Text(text)) => serde_json::from_str(&text).ok(),
+        _ => None,
+    })
 }
 
 pub async fn get_links(

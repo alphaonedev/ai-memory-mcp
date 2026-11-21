@@ -20010,6 +20010,8 @@ fn normalize_app_search_path(search_path: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod delete_link_owner_9466;
+#[cfg(test)]
 mod normalize_app_search_path_tests;
 
 /// v1.0.0 #3055 — relocate ai-memory app tables out of the AGE `ag_catalog`
@@ -25257,31 +25259,73 @@ impl MemoryStore for PostgresStore {
         // so there is no existence oracle. Endpoint owners are read INSIDE the
         // tx (raw metadata, unfiltered by lifecycle). Operator lanes
         // (`ctx.bypass_visibility`) skip the gate.
+        // #9466 — each owner is read with its JSON type, so a present
+        // non-string `agent_id` refuses with a named error, and an absent row
+        // is `LinkEndpoint::Absent` (a refusal, never an unstamped row): the
+        // ONE shared predicate (`delete_link_gate`). Both endpoint rows are
+        // read `FOR SHARE` inside the DELETE's transaction (E-6), so no
+        // writer can re-stamp or delete an endpoint between the decision and
+        // the DELETE.
         if !ctx.bypass_visibility {
-            let source: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-                "SELECT metadata->>'agent_id', metadata->>'target_agent_id' \
-                 FROM memories WHERE id = $1",
-            )
+            /// `(jsonb_typeof(field), field text)` of one owner field.
+            type OwnerCols = (Option<String>, Option<String>);
+            /// The source row's owner and addressee [`OwnerCols`], flattened.
+            type SourceCols = (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let source: Option<SourceCols> = sqlx::query_as(crate::store::delete_link_owner_sql(
+                source_id,
+                "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
+                     jsonb_typeof(metadata->'target_agent_id'), metadata->>'target_agent_id' \
+                     FROM memories WHERE id = $1 FOR SHARE",
+            ))
             .bind(source_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| to_store_err("delete_link source owner lookup", e))?;
-            let target_owner: Option<Option<String>> =
-                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
-                    .bind(target_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("delete_link target owner lookup", e))?;
-            let (source_owner, source_target) = source
-                .map(|(o, t)| (o.unwrap_or_default(), t.unwrap_or_default()))
-                .unwrap_or_default();
-            let target_owner = target_owner.flatten().unwrap_or_default();
-            if !crate::store::caller_may_delete_link(
-                &source_owner,
-                &source_target,
-                &target_owner,
+            .map_err(|e| to_store_err(crate::store::DELETE_LINK_SOURCE_LOOKUP, e))?;
+            let target: Option<OwnerCols> = sqlx::query_as(crate::store::delete_link_owner_sql(
+                target_id,
+                "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id' \
+                 FROM memories WHERE id = $1 FOR SHARE",
+            ))
+            .bind(target_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err(crate::store::DELETE_LINK_TARGET_LOOKUP, e))?;
+            let source = source.as_ref().map_or(
+                crate::store::LinkEndpoint::Absent,
+                |(owner_type, owner, addressee_type, addressee)| {
+                    crate::store::LinkEndpoint::of_pg(
+                        owner_type.as_deref(),
+                        owner.as_deref(),
+                        addressee_type.as_deref(),
+                        addressee.as_deref(),
+                    )
+                },
+            );
+            let target = target.as_ref().map_or(
+                crate::store::LinkEndpoint::Absent,
+                |(owner_type, owner)| {
+                    crate::store::LinkEndpoint::of_pg(
+                        owner_type.as_deref(),
+                        owner.as_deref(),
+                        None,
+                        None,
+                    )
+                },
+            );
+            if !crate::store::delete_link_gate(
+                source,
+                target,
+                source_id,
                 ctx.effective_principal(),
-            ) {
+                crate::identity::owner_stamp::MutationSite::postgres(
+                    crate::identity::owner_stamp::funnel::UNLINK,
+                ),
+            )? {
                 return Ok(false);
             }
         }

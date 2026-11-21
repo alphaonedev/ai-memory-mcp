@@ -33,6 +33,10 @@ pub const MSG_VERTICAL_STORE_PAYLOAD_INCOMPLETE: &str =
     "vertical promote pending-store payload missing id or to_namespace";
 
 pub(crate) const TABLE_MEMORIES: &str = "memories";
+/// #9466 — the raw `metadata` text of the `memories` row `id`, unfiltered by
+/// lifecycle. Shared by the SQLite store adapter and the HTTP unlink gate
+/// (`handlers/links.rs`), which builds in every feature set.
+pub(crate) const MEMORY_METADATA_BY_ID_SQL: &str = "SELECT metadata FROM memories WHERE id = ?1";
 /// Cold mirror of [`TABLE_MEMORIES`]; see its docs.
 pub(crate) const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
 /// v70 / #1771 / #3250 — edge-preservation snapshot of `memory_links`.
@@ -5629,11 +5633,7 @@ pub(crate) fn caller_may_mutate_live_row(
 ) -> Result<bool> {
     use rusqlite::OptionalExtension;
     let metadata: Option<String> = conn
-        .query_row(
-            "SELECT metadata FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
+        .query_row(MEMORY_METADATA_BY_ID_SQL, params![id], |r| r.get(0))
         .optional()?;
     let Some(metadata) = metadata else {
         return Ok(false);

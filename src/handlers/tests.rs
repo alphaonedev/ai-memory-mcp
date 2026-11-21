@@ -934,6 +934,19 @@ async fn http_update_illegal_edge_rolls_the_content_patch_back_3152() {
 
 use tests_3582_legacy_push::with_legacy_push_env;
 
+/// `DELETE /api/v1/links` alone over the shared test fixtures, for the
+/// #9466 module. Built here (like `lineage_router`) because the #3549
+/// structural pin keeps every `.route(` call in the router builder or in a
+/// `tests.rs` file.
+fn delete_link_router(state: Db) -> Router {
+    Router::new()
+        .route("/api/v1/links", axum::routing::delete(delete_link))
+        .with_state(test_app_state(state))
+}
+
+#[path = "tests/delete_link_owner_9466.rs"]
+mod delete_link_owner_9466;
+
 #[cfg(test)]
 mod tests_3582_legacy_push {
     /// #3582: downstream push controls use the explicit Standard namespace opt-out.

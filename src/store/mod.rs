@@ -866,38 +866,107 @@ impl CallerContext {
 /// store::is_visible_to_caller`) used by the SAL adapter ports and
 /// substrate code so the move is a no-op for callers.
 
-/// v1.0.0 #3275 — shared caller-owns-a-link-endpoint predicate for the SAL
-/// `delete_link` funnel. Returns `true` when `caller` may sever the
-/// `(source, target)` edge. Mirrors the #939 HTTP `delete_link` gate exactly,
-/// so wiring it into the SAL adapters refuses precisely the set the handler
-/// already refuses (defense-in-depth; no legitimate call is newly rejected):
+/// #9466 — `IntegrityFailed` detail prefix of the `delete_link` refusal for
+/// a present endpoint whose owner cannot be read. The endpoint follows.
+pub(crate) const DELETE_LINK_UNREADABLE_OWNER: &str =
+    "delete_link refused: unreadable owner metadata on the";
+/// #9466 — the endpoint names the refusal detail carries (the shared
+/// predicate's names, so the HTTP log and the SAL error agree).
+pub(crate) const DELETE_LINK_ENDPOINT_SOURCE: &str =
+    crate::identity::owner_stamp::UNLINK_ENDPOINT_SOURCE;
+/// #9466 — see [`DELETE_LINK_ENDPOINT_SOURCE`].
+pub(crate) const DELETE_LINK_ENDPOINT_TARGET: &str =
+    crate::identity::owner_stamp::UNLINK_ENDPOINT_TARGET;
+/// #9466 — `to_store_err` / `box_err` context of the two owner reads, the
+/// same words on both backends.
+pub(crate) const DELETE_LINK_SOURCE_LOOKUP: &str = "delete_link source owner lookup";
+/// #9466 — see [`DELETE_LINK_SOURCE_LOOKUP`].
+pub(crate) const DELETE_LINK_TARGET_LOOKUP: &str = "delete_link target owner lookup";
+
+/// v1.0.0 #3275 / #9466 — the SAL `delete_link` caller-owns gate both
+/// adapters call, over the endpoint rows AS READ (each
+/// [`LinkEndpoint::Absent`] or present with its owner stamps; a FAILED read
+/// never reaches here — the adapter returns that error and deletes nothing).
 ///
-///   * caller owns EITHER endpoint — links are symmetric, either party may
-///     sever (author `agent_id` on source or target, or the source's inbox
-///     `target_agent_id`);
-///   * the legacy-unowned carve-out — BOTH endpoints unstamped (the
-///     single-operator default, where rows may carry no `agent_id`);
-///   * the `daemon` sentinel (curator / internal paths).
+/// The decision is [`crate::identity::owner_stamp::unlink_verdict`], the ONE
+/// predicate the HTTP `DELETE /api/v1/links` gate also takes, so the SAL and
+/// the handler refuse exactly the same set:
 ///
-/// The owner strings are the raw `metadata.agent_id` / `metadata.target_agent_id`
-/// of the endpoints (empty string when absent / row missing). NOTE: `agent_id`
-/// is a CLAIMED identity, so this gate's strength is bounded by caller
-/// attestation (#48) — it closes the cross-id gap, not impersonation.
-#[must_use]
-pub(crate) fn caller_may_delete_link(
-    source_owner: &str,
-    source_target: &str,
-    target_owner: &str,
+///   * the `daemon` sentinel, the stamped owner of EITHER endpoint, or the
+///     addressee of a source that is not unstamped → `Ok(true)` (sever);
+///   * an absent endpoint row → `Ok(false)`, the same "no edge removed" a
+///     non-owner gets (#9466 E-1: no `NotFound`, no distinct text). An
+///     absent row is never read as an unstamped one;
+///   * both rows present and an owner stamp malformed →
+///     [`StoreError::IntegrityFailed`] naming the endpoint;
+///   * both rows present and unstamped with NO source addressee (or the
+///     caller is the addressee of an unstamped source) →
+///     [`crate::identity::owner_stamp::admit_unstamped`] (UNLINK funnel), so
+///     `AI_MEMORY_UNSTAMPED_MUTATION=refuse` refuses it (#9466 E-3/E-4);
+///   * anything else → `Ok(false)`.
+///
+/// `agent_id` is a CLAIMED identity, so this gate's strength is bounded by
+/// caller attestation (#48) — it closes the cross-id gap, not impersonation.
+///
+/// # Errors
+///
+/// [`StoreError::IntegrityFailed`] as described above.
+pub(crate) fn delete_link_gate(
+    source: LinkEndpoint<'_>,
+    target: LinkEndpoint<'_>,
+    source_id: &str,
     caller: &str,
-) -> bool {
-    let is_unowned_legacy = source_owner.is_empty() && target_owner.is_empty();
-    let owns_source = source_owner == caller || source_target == caller;
-    let owns_target = !target_owner.is_empty() && target_owner == caller;
-    is_unowned_legacy
-        || owns_source
-        || owns_target
-        || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+    site: crate::identity::owner_stamp::MutationSite,
+) -> StoreResult<bool> {
+    delete_link_gate_with_mode(
+        source,
+        target,
+        source_id,
+        caller,
+        site,
+        crate::identity::owner_stamp::mode(),
+    )
 }
+
+/// [`delete_link_gate`] under an explicit #3124 `mode`, so a cell pins the
+/// `refuse` posture without mutating the process environment.
+pub(crate) fn delete_link_gate_with_mode(
+    source: LinkEndpoint<'_>,
+    target: LinkEndpoint<'_>,
+    source_id: &str,
+    caller: &str,
+    site: crate::identity::owner_stamp::MutationSite,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> StoreResult<bool> {
+    use crate::identity::owner_stamp::{UnlinkVerdict, unlink_verdict_with_mode};
+    match unlink_verdict_with_mode(source, target, source_id, caller, site, mode) {
+        UnlinkVerdict::Admit => Ok(true),
+        UnlinkVerdict::Refuse => Ok(false),
+        UnlinkVerdict::Unreadable(endpoint) => Err(StoreError::IntegrityFailed {
+            detail: format!("{DELETE_LINK_UNREADABLE_OWNER} {endpoint}"),
+        }),
+    }
+}
+
+pub(crate) use crate::identity::owner_stamp::LinkEndpoint;
+
+/// #9466 — the SQL of one `delete_link` owner read. In a test build a cell
+/// can arm a read fault for ONE row id (so concurrent cells never see it):
+/// the read then runs against a relation that does not exist, which fails
+/// on both backends through the real error path.
+#[must_use]
+pub(crate) fn delete_link_owner_sql(id: &str, sql: &'static str) -> &'static str {
+    #[cfg(test)]
+    if delete_link_owner_9466::take_read_fault(id) {
+        return delete_link_owner_9466::READ_FAULT_SQL;
+    }
+    let _ = id;
+    sql
+}
+
+#[cfg(test)]
+#[path = "delete_link_owner_9466_tests.rs"]
+pub(crate) mod delete_link_owner_9466;
 
 // ---------------------------------------------------------------------------
 // #3176 — backend-blind `clear_namespace_standard` authorization core
