@@ -1274,9 +1274,9 @@ mod tests {
     /// redirecting the signing load to the sandbox where the test's key is
     /// absent. Install the sandbox FIRST (idempotent), then set the override,
     /// so the test's own value is the one that stays in force. The caller
-    /// holds [`locked_env`]. Every sign test goes through this helper;
-    /// `tests/key_dir_bind_guard_9730.rs` (`key_dir_override_goes_through_bind_key_dir_9730`,
-    /// its own test binary) keeps it that way.
+    /// holds [`locked_env`]. Every sign test goes through this helper; the
+    /// structural guard for that invariant is tracked under issues #9730 and
+    /// #9786 and is not in the tree at this commit.
     fn bind_key_dir(dir: &std::path::Path) -> EnvVarGuard {
         let _ = crate::identity::test_key_dir::install();
         EnvVarGuard::set("AI_MEMORY_KEY_DIR", dir.as_os_str())
