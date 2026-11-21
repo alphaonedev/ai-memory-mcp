@@ -44,6 +44,10 @@ use ai_memory::spawn_audit::{
 };
 use std::path::{Path, PathBuf};
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 /// The single allowlisted production module that may construct a raw
 /// `Command::new` — it IS the audited chokepoint.
 const CHOKEPOINT_REL_PATH: &str = "src/spawn_audit.rs";
@@ -91,20 +95,16 @@ fn is_test_submodule_file(src_dir: &Path, path: &Path) -> bool {
         .any(|c| c.as_os_str() == "tests")
 }
 
-/// Scan a file's PRODUCTION lines (everything before the first `mod tests`,
-/// comments stripped) and return the 1-based line numbers that contain a raw
-/// spawn constructor.
+/// Scan a file's PRODUCTION lines (every line outside its `cfg(test)` modules,
+/// from the ONE resolver, #9367, comments stripped) and return the 1-based
+/// production-text line numbers that contain a raw spawn constructor.
 fn production_spawn_ctor_lines(path: &Path) -> Vec<usize> {
-    let src =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let src = cfg_test_modules::strip_cfg_test_inline_mods(
+        &std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+    );
     let mut hits = Vec::new();
     for (idx, line) in src.lines().enumerate() {
         let trimmed = line.trim_start();
-        // Stop at the unit-test module boundary — test spawns are exempt
-        // (they exercise real subprocesses and are not production paths).
-        if trimmed.starts_with("mod tests") || trimmed.starts_with("pub mod tests") {
-            break;
-        }
         if is_comment_line(trimmed) {
             continue;
         }

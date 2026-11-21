@@ -17,7 +17,7 @@ const MAX_SOURCE_LEN: usize = 64;
 const MAX_TAG_LEN: usize = 128;
 const MAX_TAGS_COUNT: usize = 50;
 const MAX_RELATION_LEN: usize = 64;
-const MAX_ID_LEN: usize = 128;
+pub(crate) const MAX_ID_LEN: usize = 128;
 const MAX_AGENT_ID_LEN: usize = 128;
 /// Max characters in a wire-supplied base64 Ed25519 public key. A raw
 /// 32-byte key is 44 chars padded / 43 unpadded; 128 leaves generous
