@@ -55,6 +55,9 @@ def red_log(name):
 # #9759 r1 L7: log capture is best effort, so a failing mkdir, touch or tee never turns a passing step red, and a
 # tee step takes its status from cargo alone. The exact lines around each tee writer, written out.
 BEST_EFFORT = " || true"
+# #9759 r1 (merge of the chain tip): the #9263 sweep-end record (if: always(), one echo into GITHUB_ENV) stays right
+# after the coverage sweep, so the red-cause step follows it; no other step may stand between.
+BOOKKEEPING_BEFORE_RED = {("coverage.yml", "per-module-thresholds"): ("Record the coverage sweep end (#9263)",)}
 TEE_BEFORE = ("set +e",)
 TEE_AFTER = ('status="${PIPESTATUS[0]}"', "set -e", 'exit "$status"')
 
@@ -939,7 +942,9 @@ class WorkflowInvariant(unittest.TestCase):
                 for name in test_names:
                     self.assertIn(name, names, (workflow, job, name))
                 (index, item), = self.red_steps(steps)
-                self.assertEqual(index, last_test + 1, (workflow, job))
+                # #9759 r1 (chain merge): only the named bookkeeping steps may stand between, written out.
+                between = tuple(entry["name"] for entry in steps[last_test + 1:index])
+                self.assertEqual(between, BOOKKEEPING_BEFORE_RED.get((workflow, job), ()), (workflow, job))
                 self.assertEqual(item["name"], RED_STEP_NAME)
 
     def test_the_step_never_changes_the_job_result(self):

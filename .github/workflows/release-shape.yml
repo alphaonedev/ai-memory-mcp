@@ -75,6 +75,9 @@ jobs:
           toolchain: 1.99.1
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Release feature declaration guard
         run: python3 scripts/check_release_features.py

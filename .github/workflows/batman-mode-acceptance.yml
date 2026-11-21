@@ -132,6 +132,8 @@ jobs:
         if: runner.environment == 'github-hosted'
         with:
           shared-key: batman-mode-acceptance
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
       - name: Build release binary
         run: cargo build --release --bin ai-memory
       - name: Compose stack boot smoke (#3838)
@@ -223,6 +225,8 @@ jobs:
         if: runner.environment == 'github-hosted'
         with:
           shared-key: batman-mode-acceptance
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
       - name: Install sqlite3 + jq (bounded+retry #3090/#2960)
         timeout-minutes: 5
         run: |

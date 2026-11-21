@@ -10,6 +10,14 @@ GITHUB_OUTPUT:
     git diff --no-renames --name-only <base> HEAD | \\
         python3 -I scripts/ci/impact/cargo_skip.py --stdin
     python3 -I scripts/ci/impact/cargo_skip.py --repo . --base <sha> --head <sha>
+    git diff --no-renames --name-only -z <base> HEAD > paths.z   # the coverage job
+    python3 -I scripts/ci/impact/cargo_skip.py --stdin0 < paths.z
+
+The coverage job (#9263) reads the same verdict. RUN is the default: a list that
+is cut short (--stdin0 data without its final NUL), empty, over MAX_PATHS or
+holding an odd path (a `.`/`..` or empty component, a backslash, a control
+character, bytes that are not UTF-8) gives both verdicts false, and so does any
+path that no skip glob names.
 
 The skip set lives in rules.json under "cargo_skip" and is the ONLY source: the
 workflow reads it through this module and the guard test
@@ -85,6 +93,12 @@ REASON_RUST = "rust-observable-path"
 REASON_EVENT = "push-event-full-ci"
 REASON_MERGE_GROUP = "merge-group-full-ci"
 REASON_BASE = "protected-base-full-ci"
+REASON_TRUNCATED = "truncated-list-fail-closed"
+REASON_OVER_CAP = "path-count-over-cap-fail-closed"
+REASON_ODD_PATH = "odd-path-fail-closed"
+# A PR diff over this many paths runs in full. The whole-repo run is the safe
+# answer and the scan stays bounded (#9263).
+MAX_PATHS = 5000
 REASON_CI_TREE = "ci-tree-edited-full-ci"
 REASON_SYMLINK = "registered-read-path-is-symlink-full-ci"
 REASON_TRACKED_SYMLINK = "tracked-symlink-full-ci"
@@ -296,19 +310,51 @@ def full_ci_reason(section: dict, event_name: str, base_ref: str) -> Optional[st
     return None
 
 
+def odd_path(path: str) -> bool:
+    """Return True for a path no glob can judge safely (#9263).
+
+    A `.` or `..` component, an empty component (a leading, trailing or doubled
+    slash, or an empty name), a backslash, a control character (C0, DEL, C1) and
+    a character that is not Unicode (a surrogate left by a non-UTF-8 byte) are
+    all odd. The globs match NAMES, so `docs/../src/x.rs` would otherwise pass
+    for a docs path. Cost is linear in the length of the path.
+    """
+    if not path or "\\" in path:
+        return True
+    if any(part in ("", ".", "..") for part in path.split("/")):
+        return True
+    return any(ch < " " or "\x7f" <= ch <= "\x9f" or "\ud800" <= ch <= "\udfff"
+               for ch in path)
+
+
 def classify(section: dict, paths: List[str], event_name: str = "",
-             base_ref: str = "", repo: Optional[Path] = None) -> Dict[str, str]:
+             base_ref: str = "", repo: Optional[Path] = None,
+             truncated: bool = False) -> Dict[str, str]:
     """Return the three output values for the changed `paths`.
 
     With `repo` set, any tracked symlink, any tracked gitlink or a symlinked
     test_read_globs path forces cargo (#8493); a git failure fails closed.
+
+    RUN by default (#9263): a list that was cut short (`truncated`), is empty,
+    is over MAX_PATHS, or holds an odd path never short-circuits. After the
+    forced full runs the order is truncated, empty, over-cap, odd path, symlink
+    scan, CI tree, then the allow-list verdicts.
     """
     version = "cargo_skip-rules-v%s" % section["version"]
     forced = full_ci_reason(section, event_name, base_ref)
     if forced:
         return verdict(FALSE, FALSE, "%s %s" % (forced, version))
+    if truncated:
+        return verdict(FALSE, FALSE, "%s %s" % (REASON_TRUNCATED, version))
     if not paths:
         return verdict(FALSE, FALSE, "%s %s" % (REASON_EMPTY, version))
+    if len(paths) > MAX_PATHS:
+        return verdict(FALSE, FALSE, "%s %d>%d %s" % (
+            REASON_OVER_CAP, len(paths), MAX_PATHS, version))
+    for path in paths:
+        if odd_path(path):
+            return verdict(FALSE, FALSE, "%s %s %s" % (
+                REASON_ODD_PATH, clean_text(path), version))
     if repo is not None:
         try:
             tracked, top = tracked_symlink(repo)
@@ -357,6 +403,21 @@ def stdin_paths(text: str) -> List[str]:
     return [line for line in text.splitlines() if line]
 
 
+def stdin0_paths(data: bytes) -> Tuple[List[str], bool]:
+    """Return (paths, truncated) for a NUL-terminated list (`git diff -z`).
+
+    Every path must end in a NUL. Data that does not is cut short (a killed
+    writer): the last piece is NOT a path and `truncated` is True. A name with
+    a newline stays one path. Bytes that are not UTF-8 become surrogates, which
+    odd_path refuses. Empty data is an empty list.
+    """
+    if not data:
+        return [], False
+    pieces = data.split(common.NUL.encode())
+    truncated = pieces[-1] != b""
+    return [p.decode("utf-8", "surrogateescape") for p in pieces[:-1]], truncated
+
+
 def emit(values: Dict[str, str]) -> None:
     """Print the output lines in a fixed order."""
     for key in ("docs_only", "cargo_skip", "cargo_skip_reason"):
@@ -372,6 +433,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--stdin", action="store_true",
                         help="read newline-separated changed paths from stdin")
+    parser.add_argument("--stdin0", action="store_true",
+                        help="read NUL-terminated changed paths from stdin "
+                             "(git diff -z); a list without its final NUL runs in full")
     parser.add_argument("--event-name", default="",
                         help="github.event_name; a push always runs the full pipeline")
     parser.add_argument("--base-ref", default="",
@@ -379,14 +443,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         section = load_section(Path(args.rules))
-        if args.stdin:
+        truncated = False
+        if args.stdin0:
+            paths, truncated = stdin0_paths(sys.stdin.buffer.read())
+        elif args.stdin:
             paths = stdin_paths(sys.stdin.read())
         elif args.base:
             paths = diff_paths(Path(args.repo), args.base, args.head)
         else:
-            parser.error("give --stdin or --base")
+            parser.error("give --stdin, --stdin0 or --base")
         emit(classify(section, paths, args.event_name, args.base_ref,
-                      Path(args.repo)))
+                      Path(args.repo), truncated))
     except TypeError as exc:
         # A structurally wrong rules file (null, a non-list glob set): say so
         # and exit 1 with no verdict; the workflow then keeps both outputs false.

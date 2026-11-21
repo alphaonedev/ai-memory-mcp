@@ -33,6 +33,7 @@ Run: python3 -m unittest scripts/ci/tests/test_ci_annotation_escape_9365.py
 
 import ast
 import contextlib
+import errno
 import importlib.util
 import io
 import os
@@ -43,8 +44,10 @@ import sys
 import tempfile
 import textwrap
 import time
+import unicodedata
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 CI_DIR = REPO / "scripts" / "ci"
@@ -54,8 +57,12 @@ SHARED_MODULE_NAME = "workflow_annotation.py"
 # single_line is the base-selector's own copy of env_file_value (see test_single_line_matches_env_file_value_9365);
 # version_text is prune_runner_tmp's own copy of safe_value for the version refusal, which runs before the shared
 # module is loaded (see test_local_version_escape_equals_safe_value_for_every_code_point_9365)
+# summary_text is red_cause_summary's escape for the GITHUB_STEP_SUMMARY markdown file (#9709, PR 9759): the runner never
+# parses that file for workflow commands, so ``::`` stays readable there; it keeps every value on one line (see
+# test_summary_text_keeps_one_line_for_every_code_point_9709)
 SHARED_FIELD_FUNCTIONS = frozenset({"safe_text", "property_value", "annotation", "log_line", "env_file_value", "single_line",
-                                    "version_text"})
+                                    "version_text", "summary_text"})
+RED_CAUSE_SCRIPT_NAME = "red_cause_summary.py"
 # v2 form: "::name" at a line start; v1 form: "##[" anywhere in a line (actions/runner ActionCommand.TryParse uses
 # message.IndexOf("##[") with no trim; TryParseV2 uses message.TrimStart().StartsWith("::"))
 COMMAND_RE = re.compile(r"(?m)^::[a-z][a-z-]*|##\[")
@@ -66,6 +73,9 @@ HUGE_VALUE_CHARS = 100_001
 HUGE_WALL_CLOCK_SECS = 20.0
 SUBPROCESS_TIMEOUT_SECS = 60
 
+# #9705: a file system may refuse a name that is not UTF-8 (APFS: errno 92, ``errno.EILSEQ``); these are the bytes of
+# that row. Its escaped text is written out by hand below (``NON_UTF8_NAME_ESCAPED``), never computed from the code.
+NON_UTF8_NAME_BYTES = b"bad\xff\xfe::x"
 HOSTILE = {
     "command": "::error::x",
     "set_output": "%0A::set-output name=pwn::1",
@@ -75,10 +85,35 @@ HOSTILE = {
     "colons": "a::b",
     "percent": "100%25",
     "long_name": "n" * 4096,
-    "non_utf8": os.fsdecode(b"bad\xff\xfe::x"),
+    "non_utf8": os.fsdecode(NON_UTF8_NAME_BYTES),
     "separators": "a\u2028::error::b\x85::error::c",
 }
 FILE_NAME_CORPUS = ("command", "raw_newline", "raw_cr", "colons", "percent", "non_utf8")
+FILE_NAME_CORPUS_UTF8 = frozenset(FILE_NAME_CORPUS) - {"non_utf8"}  # the rows every file system takes
+# ``\udcff``/``\udcfe`` are the surrogate-escaped bytes 0xff/0xfe, ``::`` keeps its second colon and escapes the first
+NON_UTF8_NAME_ESCAPED = "bad\\udcff\\udcfe\\x3a:x"
+INTERPRETER_PLACEHOLDER = "<interpreter>"
+PRUNE_WARNING_FLOOR_GIB = 100000000
+# #9705 (review r1, L1): the whole warning line of every row, written out by hand. The prefix and suffix are the fixed
+# text of the warning in ``prune_runner_artifacts.py`` with the floor above; the middle is the escaped root name.
+PRUNE_WARNING_PREFIX = "::warning::free space under "
+PRUNE_WARNING_SUFFIX = " is below the 100000000 GiB floor and no idle sibling target is left to evict"
+PRUNE_WARNING_ROOT_ESCAPED = {
+    "command": "home-\\x3a:error\\x3a:x",
+    "raw_newline": "home-a\\x0a\\x3a:error\\x3a:injected",
+    "raw_cr": "home-a\\x0d\\x3a:error\\x3a:injected",
+    "colons": "home-a\\x3a:b",
+    "percent": "home-100\\x2525",
+    "non_utf8": "home-" + NON_UTF8_NAME_ESCAPED,
+}
+# #9705 (review r1, L2): the three spellings of an interpreter and the text a hand-written table masks (see
+# ``HostProbePins9705``); all invented paths, so the table does not depend on the host.
+FAKE_EXECUTABLE = "/opt/h/bin/python3.12"
+FAKE_REAL_EXECUTABLE = "/opt/h/Cellar/3.12.16/bin/python3.12.16"
+FAKE_REAL_DIRECTORY = "/opt/h/Cellar/3.12.16/bin"
+FAKE_DIRECTORY_SPELLING = "/opt/h/Cellar/3.12.16/bin/python3.12"
+FAKE_COLON_EXECUTABLE = "/opt/a\\x3a:b/bin/python3.12"
+FAKE_SPELLINGS = frozenset({FAKE_EXECUTABLE, FAKE_REAL_EXECUTABLE, FAKE_DIRECTORY_SPELLING, FAKE_COLON_EXECUTABLE})
 
 
 def oracle_escape(text):
@@ -117,6 +152,54 @@ def oracle_escape(text):
 def scratch_dir(label):
     SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=label + "-", dir=str(SCRATCH_ROOT)))
+
+
+def fs_accepts_non_utf8_names(directory, mkdir=os.mkdir, rmdir=os.rmdir):
+    """Probe once whether ``directory`` takes a directory name that is not UTF-8 (#9705); the probe leaves nothing.
+
+    False only for ``errno.EILSEQ`` (what APFS raises, errno 92); every other ``OSError`` propagates, so a host that
+    takes the name but fails for another reason (permission, space) does not silently pick the weaker form. ``mkdir``
+    and ``rmdir`` are parameters so a test can inject each outcome."""
+    probe = os.path.join(os.fsencode(str(directory)), NON_UTF8_NAME_BYTES)
+    try:
+        mkdir(probe)
+    except OSError as err:
+        if err.errno == errno.EILSEQ:
+            return False
+        raise
+    rmdir(probe)
+    return True
+
+
+def row_forms(accepts):
+    """For each row of ``FILE_NAME_CORPUS``: True when the row runs on a made directory (the form before #9705), False
+    when the file system refuses the row's name and the row runs without a directory."""
+    return {key: accepts or key != "non_utf8" for key in FILE_NAME_CORPUS}
+
+
+def interpreter_spellings(executable=None, realpath=os.path.realpath):
+    """The spellings of the interpreter path a child run can print: ``executable`` (default ``sys.executable``), its
+    realpath, and its directory's realpath with the file name kept (a ``-S`` child reports that under Homebrew),
+    each raw and as the oracle escapes it."""
+    executable = sys.executable if executable is None else executable
+    directory, file_name = os.path.split(executable)
+    spellings = {executable, realpath(executable), os.path.join(realpath(directory), file_name)}
+    return spellings | {oracle_escape(spelling) for spelling in spellings}
+
+
+EXECUTABLE_FIELD_RE = re.compile(r"((?:^|\s)executable=)([^\r\n]*)", re.M)
+
+
+def mask_interpreter(text, spellings=None):
+    """``text`` with the value of each ``executable=`` field (the field ``prune_runner_tmp.py`` prints, whose value runs
+    to the end of the line) replaced by one placeholder when the whole value is one of ``spellings`` (default
+    ``interpreter_spellings()``); every other byte is untouched (#9705)."""
+    spellings = interpreter_spellings() if spellings is None else spellings
+
+    def replace(match):
+        return match.group(1) + INTERPRETER_PLACEHOLDER if match.group(2) in spellings else match.group(0)
+
+    return EXECUTABLE_FIELD_RE.sub(replace, text)
 
 
 def load_module(path, name):
@@ -410,21 +493,111 @@ class ScriptBehaviour(CommandAssertions):
                 self.assertEqual(rc, 2, (out + err)[-500:])
                 self.assert_commands(out + err, ["error"])
 
+    def prune_warning_row(self, key, on_disk):
+        """One row of the prune warning: ``(command lines printed, the one line expected)``. ``on_disk``: the fixture
+        directory is made and the script is run (the only form before #9705), and the expected root text is the
+        oracle's escape of the made path; otherwise the warning of ``evict_idle_targets`` is made for a root named by
+        the row's bytes without a directory, so the row asserts on a file system that refuses the name, and the
+        expected line is the hand-written ``PRUNE_WARNING_ROOT_ESCAPED`` row."""
+        value = HOSTILE[key]
+        if on_disk:
+            home = self.tmp / ("home-" + value)
+            base = home / ".cache" / "ai-memory-ci" / "cargo-target"
+            base.mkdir(parents=True)
+            work = home / "work"
+            work.mkdir(exist_ok=True)
+            rc, out, err = run_script(CI_DIR / "prune_runner_artifacts.py", [
+                "--work-root", str(work), "--workspace", str(work / "ws"), "--protected-root", str(base),
+                "--evict-root", str(base), "--runner-name", "me", "--home", str(home),
+                "--free-floor-gib", str(PRUNE_WARNING_FLOOR_GIB)], isolated=False)
+            self.assertEqual(rc, 0, (out + err)[-800:])
+            self.assert_commands(out + err, ["warning"], oracle_escape(str(base))[:200])
+            return (self.command_lines(out + err),
+                    PRUNE_WARNING_PREFIX + oracle_escape(str(base)) + PRUNE_WARNING_SUFFIX)
+        name = "home-" + value
+
+        class RootNamedByBytes:
+            """Stands for the eviction root: a directory with no entries whose text is ``name``."""
+
+            def is_dir(self):
+                return True
+
+            def iterdir(self):
+                return iter(())
+
+            def __str__(self):
+                return name
+
+        module = load_module(CI_DIR / "prune_runner_artifacts.py", "prune_runner_artifacts_9705_" + key)
+        module.eviction_problem = lambda *_args: None
+        module.resolve = lambda _path: RootNamedByBytes()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            module.evict_idle_targets("unused", "me", "unused", 1, PRUNE_WARNING_FLOOR_GIB, time.time(),
+                                      free_bytes=lambda _path: 0)
+        self.assert_commands(buf.getvalue(), ["warning"], oracle_escape(name)[:200])
+        return (self.command_lines(buf.getvalue()),
+                PRUNE_WARNING_PREFIX + PRUNE_WARNING_ROOT_ESCAPED[key] + PRUNE_WARNING_SUFFIX)
+
+    def assert_prune_warning_row(self, key, on_disk):
+        """The command lines the row printed are exactly the one expected line: a branch that returned without calling
+        the function under test, or an assertion weakened to a substring, is red."""
+        lines, expected = self.prune_warning_row(key, on_disk)
+        self.assertEqual(lines, [expected], key)
+
     def test_prune_runner_artifacts_warning_9365(self):
+        forms = row_forms(fs_accepts_non_utf8_names(self.tmp))
         for key in FILE_NAME_CORPUS:
-            value = HOSTILE[key]
             with self.subTest(key):
-                home = self.tmp / ("home-" + value)
-                base = home / ".cache" / "ai-memory-ci" / "cargo-target"
-                base.mkdir(parents=True)
-                work = home / "work"
-                work.mkdir(exist_ok=True)
-                rc, out, err = run_script(CI_DIR / "prune_runner_artifacts.py", [
-                    "--work-root", str(work), "--workspace", str(work / "ws"), "--protected-root", str(base),
-                    "--evict-root", str(base), "--runner-name", "me", "--home", str(home),
-                    "--free-floor-gib", "100000000"], isolated=False)
-                self.assertEqual(rc, 0, (out + err)[-800:])
-                self.assert_commands(out + err, ["warning"], oracle_escape(str(base))[:200])
+                self.assert_prune_warning_row(key, on_disk=forms[key])
+
+    def test_prune_warning_without_a_directory_asserts_every_row_9705(self):
+        """The probe-false branch, on every host: the same escaping of every row of the corpus, no directory made."""
+        for key in FILE_NAME_CORPUS:
+            with self.subTest(key):
+                self.assert_prune_warning_row(key, on_disk=False)
+
+    def test_prune_warning_with_a_directory_asserts_every_utf8_row_9705(self):
+        """The probe-true branch, on every host: every row the file system takes runs the script on a made directory."""
+        for key in sorted(FILE_NAME_CORPUS_UTF8):
+            with self.subTest(key):
+                self.assert_prune_warning_row(key, on_disk=True)
+
+    def test_prune_warning_expected_table_is_the_oracle_text_9705(self):
+        """The hand-written whole-line table agrees with the oracle for every row (two independent sources)."""
+        self.assertEqual(sorted(PRUNE_WARNING_ROOT_ESCAPED), sorted(FILE_NAME_CORPUS))
+        for key in FILE_NAME_CORPUS:
+            with self.subTest(key):
+                self.assertEqual(PRUNE_WARNING_ROOT_ESCAPED[key], oracle_escape("home-" + HOSTILE[key]))
+
+    def test_prune_warning_row_check_compares_the_whole_line_9705(self):
+        """The check every row goes through is red for a line that is not exactly the expected one (L1)."""
+        expected = PRUNE_WARNING_PREFIX + PRUNE_WARNING_ROOT_ESCAPED["colons"] + PRUNE_WARNING_SUFFIX
+        self.assertEqual(expected, "::warning::free space under home-a\\x3a:b is below the 100000000 GiB floor and no "
+                                   "idle sibling target is left to evict")
+        near_misses = (
+            [],
+            ["::warning::skipped"],
+            [expected + "x"],
+            ["x" + expected],
+            [expected[:-1]],
+            [expected.replace("warning", "error", 1)],
+            [expected, expected],
+            [expected, "::notice::extra"],
+        )
+        for lines in near_misses:
+            with self.subTest(lines=lines):
+                with mock.patch.object(self, "prune_warning_row", return_value=(lines, expected)):
+                    with self.assertRaises(AssertionError):
+                        self.assert_prune_warning_row("colons", on_disk=False)
+        with mock.patch.object(self, "prune_warning_row", return_value=([expected], expected)):
+            self.assert_prune_warning_row("colons", on_disk=False)
+
+    def test_prune_warning_row_forms_choose_the_on_disk_form_when_the_probe_accepts_9705(self):
+        every_row_on_disk = {"command": True, "raw_newline": True, "raw_cr": True, "colons": True, "percent": True,
+                             "non_utf8": True}
+        self.assertEqual(row_forms(True), every_row_on_disk)
+        self.assertEqual(row_forms(False), {**every_row_on_disk, "non_utf8": False})
 
     def test_tier_cred_preflight_error_9365(self):
         for key, value in self.hostile_values(FILE_NAME_CORPUS):
@@ -490,6 +663,20 @@ class ScriptBehaviour(CommandAssertions):
                 self.assertEqual(common.single_line(value), shared.env_file_value(value))
                 self.assertEqual(len(common.single_line(value).splitlines()), 1)
 
+    def test_summary_text_keeps_one_line_for_every_code_point_9709(self):
+        """The summary file's own escape leaves no line break, control or surrogate over all code points, in bounded
+        time, and every hostile value stays one line (#9709: the allowlisted ``summary_text``)."""
+        red = load_module(CI_DIR / RED_CAUSE_SCRIPT_NAME, "red_cause_summary_9365_pin")
+        corpus = "".join(chr(code) for code in range(ALL_CODEPOINTS)) + "::" * HUGE_VALUE_CHARS
+        started = time.monotonic()
+        escaped = red.summary_text(corpus)
+        self.assertLess(time.monotonic() - started, HUGE_WALL_CLOCK_SECS)
+        self.assertEqual(escaped.splitlines(), [escaped])
+        self.assertEqual([char for char in escaped if unicodedata.category(char) in ("Cc", "Cs", "Zl", "Zp")], [])
+        for key, value in self.hostile_values():
+            with self.subTest(key):
+                self.assertEqual(red.summary_text(value).splitlines(), [red.summary_text(value)] if value else [])
+
     def test_shared_cargo_target_env_file_9365(self):
         for key in ("raw_newline", "raw_cr", "command"):
             with self.subTest(key):
@@ -502,6 +689,119 @@ class ScriptBehaviour(CommandAssertions):
                 self.assertEqual(rc, 0, err[-500:])
                 lines = env_file.read_text(errors="surrogateescape").splitlines()
                 self.assertEqual(len(lines), 2, lines)
+
+
+class HostProbePins9705(unittest.TestCase):
+    """The host-dependent helpers of #9705 (the non-UTF-8 probe, the interpreter mask), pinned by hand-written rows."""
+
+    PROBE_DIRECTORY = "/probe-dir"
+    PROBE_PATH = b"/probe-dir/bad\xff\xfe::x"
+
+    def test_probe_reports_refused_for_eilseq_and_leaves_nothing_9705(self):
+        """APFS raises errno 92 (``errno.EILSEQ`` on darwin) for the name: the one errno the probe was built for."""
+        removed = []
+
+        def refuse(path):
+            raise OSError(errno.EILSEQ, "Illegal byte sequence")
+
+        self.assertIs(fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=refuse, rmdir=removed.append), False)
+        self.assertEqual(removed, [])
+
+    def test_probe_accepts_when_the_directory_is_made_and_removes_it_9705(self):
+        made, removed = [], []
+        self.assertIs(fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=made.append, rmdir=removed.append), True)
+        self.assertEqual(made, [self.PROBE_PATH])
+        self.assertEqual(removed, [self.PROBE_PATH])
+
+    def test_probe_raises_every_other_oserror_with_its_type_and_errno_9705(self):
+        rows = ((errno.EACCES, PermissionError), (errno.ENOSPC, OSError), (errno.EROFS, OSError),
+                (errno.EEXIST, FileExistsError), (errno.ENOENT, FileNotFoundError), (errno.EIO, OSError),
+                (errno.EILSEQ + 1, OSError))
+        for code, error_type in rows:
+            with self.subTest(errno=code):
+                removed = []
+
+                def fail(path, code=code):
+                    raise OSError(code, "injected")
+
+                with self.assertRaises(OSError) as caught:
+                    fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=fail, rmdir=removed.append)
+                self.assertIs(type(caught.exception), error_type)
+                self.assertEqual(caught.exception.errno, code)
+                self.assertEqual(removed, [])
+
+    def test_probe_raises_an_oserror_without_an_errno_9705(self):
+        def fail(path):
+            raise OSError("no errno")
+
+        with self.assertRaises(OSError) as caught:
+            fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=fail, rmdir=lambda path: None)
+        self.assertIsNone(caught.exception.errno)
+
+    def test_probe_raises_when_the_directory_cannot_be_removed_9705(self):
+        def fail(path):
+            raise PermissionError(errno.EACCES, "injected")
+
+        with self.assertRaises(PermissionError):
+            fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=lambda path: None, rmdir=fail)
+
+    def test_probe_on_this_host_leaves_the_directory_as_it_found_it_9705(self):
+        directory = scratch_dir("probe")
+        self.addCleanup(shutil.rmtree, str(directory), True)
+        before = sorted(os.listdir(directory))
+        self.assertIn(fs_accepts_non_utf8_names(directory), (True, False))
+        self.assertEqual(sorted(os.listdir(directory)), before)
+
+    def test_interpreter_spellings_are_exactly_the_three_and_their_escapes_9705(self):
+        """``sys.executable``, its realpath and its directory's realpath with the file name kept; nothing else."""
+        real = {FAKE_EXECUTABLE: FAKE_REAL_EXECUTABLE, "/opt/h/bin": FAKE_REAL_DIRECTORY}
+        self.assertEqual(interpreter_spellings(FAKE_EXECUTABLE, realpath=real.__getitem__),
+                         {FAKE_EXECUTABLE, FAKE_REAL_EXECUTABLE, FAKE_DIRECTORY_SPELLING})
+        colon_real = {"/opt/a::b/bin/python3.12": "/opt/a::b/bin/python3.12", "/opt/a::b/bin": "/opt/a::b/bin"}
+        self.assertEqual(interpreter_spellings("/opt/a::b/bin/python3.12", realpath=colon_real.__getitem__),
+                         {"/opt/a::b/bin/python3.12", FAKE_COLON_EXECUTABLE})
+
+    def test_mask_replaces_only_a_whole_executable_field_9705(self):
+        rows = (
+            ("executable=" + FAKE_EXECUTABLE, "executable=<interpreter>"),
+            ("executable=" + FAKE_REAL_EXECUTABLE, "executable=<interpreter>"),
+            ("executable=" + FAKE_DIRECTORY_SPELLING, "executable=<interpreter>"),
+            ("executable=" + FAKE_COLON_EXECUTABLE, "executable=<interpreter>"),
+            ("tmpdir=/x python=3.12 executable=" + FAKE_EXECUTABLE, "tmpdir=/x python=3.12 executable=<interpreter>"),
+            ("a\nexecutable=" + FAKE_EXECUTABLE + "\nb\nexecutable=" + FAKE_REAL_EXECUTABLE + "\n",
+             "a\nexecutable=<interpreter>\nb\nexecutable=<interpreter>\n"),
+            # the directory alone is not a spelling
+            ("executable=" + FAKE_REAL_DIRECTORY, "executable=" + FAKE_REAL_DIRECTORY),
+            ("executable=/opt/h/bin", "executable=/opt/h/bin"),
+            # the bare file name is not a spelling, in the field or elsewhere
+            ("python=python3.12 executable=python3.12", "python=python3.12 executable=python3.12"),
+            ("tmpdir=/x/python3.12 executable=/x/python3.12", "tmpdir=/x/python3.12 executable=/x/python3.12"),
+            # a spelling in another field is not replaced
+            ("tmpdir=" + FAKE_EXECUTABLE + " resolved=" + FAKE_REAL_EXECUTABLE,
+             "tmpdir=" + FAKE_EXECUTABLE + " resolved=" + FAKE_REAL_EXECUTABLE),
+            ("tmpdir=" + FAKE_EXECUTABLE + " executable=" + FAKE_EXECUTABLE,
+             "tmpdir=" + FAKE_EXECUTABLE + " executable=<interpreter>"),
+            # only a complete value counts
+            ("executable=" + FAKE_EXECUTABLE + "-extra", "executable=" + FAKE_EXECUTABLE + "-extra"),
+            ("executable=" + FAKE_EXECUTABLE + " ", "executable=" + FAKE_EXECUTABLE + " "),
+            ("executable=x" + FAKE_EXECUTABLE, "executable=x" + FAKE_EXECUTABLE),
+            ("notexecutable=" + FAKE_EXECUTABLE, "notexecutable=" + FAKE_EXECUTABLE),
+            # no path at all
+            ("::notice::nothing to mask here", "::notice::nothing to mask here"),
+            ("executable=", "executable="),
+            ("", ""),
+        )
+        for text, expected in rows:
+            with self.subTest(text=text):
+                self.assertEqual(mask_interpreter(text, FAKE_SPELLINGS), expected)
+
+    def test_mask_default_spellings_are_this_interpreters_9705(self):
+        spellings = interpreter_spellings()
+        self.assertIn(sys.executable, spellings)
+        self.assertIn(os.path.realpath(sys.executable), spellings)
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                self.assertEqual(mask_interpreter("python=3 executable=" + spelling), "python=3 executable=<interpreter>")
 
 
 class TemplateRendering(unittest.TestCase):
@@ -720,9 +1020,15 @@ class PruneLoadInvariant(unittest.TestCase):
             rc, out, err = fix.run(args=(), flags=flags)  # a real prune of the fixture runner dir
             self.assertFalse(fix.marker.exists(), f"{label}: the planted module ran")
             left = sorted(path.relative_to(fix.root).as_posix() for path in fix.root.rglob("*"))
-            results[label] = (rc, out.replace(str(fix.base), "<base>").splitlines(), left)
+            # #9705: under Homebrew a child prints sys.executable, its realpath or its directory's realpath; the value
+            # of the executable= field (and only that) becomes one placeholder
+            results[label] = (rc, mask_interpreter(out.replace(str(fix.base), "<base>")).splitlines(), left)
         self.assertEqual(results["plain"][0], EXIT_OK_CODE, results["plain"])
         self.assertEqual(results["plain"][2], sorted([FIXTURE_RUNNER_NAME, "outside-canary"]), "the old entries are pruned")
+        facts = [line for line in results["plain"][1] if "executable=" in line]
+        self.assertTrue(facts, results["plain"])
+        for line in facts:  # the mask found the interpreter path in every facts line; it did not match nothing
+            self.assertTrue(line.endswith(" executable=" + INTERPRETER_PLACEHOLDER), line)
         self.assertEqual(results["-I"], results["plain"])
         self.assertEqual(results["-S"], results["plain"])
 
