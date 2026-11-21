@@ -22,8 +22,11 @@ identically to v0.6.4 at the lifecycle layer.
 - **Helper binary:** [`tools/auto-link-detector/`](../tools/auto-link-detector/)
   is the R3 reference `pre_link` hook (~775 LoC).
 - **Capability registry entry:** [`CapabilityHooks`](../src/config.rs).
-- **Config file:** `~/.config/ai-memory/hooks.toml` — hot-reloadable
-  via `SIGHUP` ([`spawn_reload_task`](../src/hooks/config.rs)).
+- **Config file:** `~/.config/ai-memory/hooks.toml` — read at startup.
+  A `SIGHUP` reload task exists
+  ([`spawn_reload_task`](../src/hooks/config.rs)) but no shipped
+  command starts it yet ([#9779](https://github.com/alphaonedev/ai-memory-mcp/issues/9779)):
+  restart the process to pick up a changed file.
 
 ## Configuration
 
@@ -280,6 +283,12 @@ the recall path for a full second.
 
 ## Hot-reload (SIGHUP)
 
+**Status:** no shipped command (`serve`, `mcp`, `curator`) starts the
+reload task yet; wiring it is
+[#9779](https://github.com/alphaonedev/ai-memory-mcp/issues/9779).
+Until then a `SIGHUP` does not reload hooks and a changed `hooks.toml`
+takes effect on restart. This section describes the task as built.
+
 [`spawn_reload_task`](../src/hooks/config.rs)
 listens for `SIGHUP` on Linux/macOS and atomically swaps the chain's
 config snapshot (a shared `Arc<HookConfigSnapshot>`, i.e.
@@ -301,10 +310,14 @@ emitted by the reload task ("hooks: reloaded config on SIGHUP") — if
 the operator wants strict observability they grep for the line
 before treating the reload as effective.
 
-On parse failure (TOML error, validation error, missing file) the
-reload task logs an error and **keeps the previous config**
-([`spawn_reload_task`](../src/hooks/config.rs)). The daemon
-never reloads to an empty config because of operator typo — silent
+Each reload reads the file through the same loader as startup,
+[`HookConfig::try_load_from_optional`](../src/hooks/config.rs), so every
+file startup refuses is refused here too. Only a file that loads in full
+replaces the snapshot. On any refusal (TOML or schema error, validation
+error, read error, non-regular file, oversize file) and on a missing
+file the reload task logs an error and **keeps the previous config**
+([`spawn_reload_task`](../src/hooks/config.rs)). It
+never reloads to an empty config because of an operator typo — silent
 hook removal would be a security regression.
 
 ### Startup load (fail closed, #9637)
@@ -316,11 +329,17 @@ path that does not exist (no file and no symlink) means zero hooks; an
 empty file is valid with zero hooks. A file that exists but cannot be
 honoured stops startup with exit code 78 (`EX_CONFIG`) and
 `ai-memory: boot refused — hooks file <path> cannot be loaded: <reason>`:
-a TOML syntax or schema error (for example an unknown `event`), a
-validation error (for example `timeout_ms` over 30000), a read error such as permission denied, a
-directory or other non-regular file, a dangling symlink, a file that is
-not valid UTF-8, or a file over 1 MiB. The parse reason is bounded and
-never quotes the file's lines. Exit code 78 is the same code the #3166
+a TOML syntax or schema error (for example an unknown `event`, or a
+key or table the schema does not know, such as a misspelt `fail_mode`
+or `[[hooks]]` for `[[hook]]`), a validation error (for example
+`timeout_ms` over 30000), a read error such as permission denied, a
+directory, FIFO or other non-regular file, a dangling symlink, a file
+that is not valid UTF-8, or a file over 1 MiB. The file type and size
+are checked on the opened handle, and the open does not wait on a FIFO.
+The parse reason never quotes the file's lines or values: a reason that
+would quote a key or value keeps only its kind and the expected form,
+control and display-altering characters are escaped, and it is cut at
+200 characters. Exit code 78 is the same code the #3166
 `config.toml` boot refusal uses. `ai-memory mcp` refuses before the
 stdio loop opens, so it never answers a handshake with partial hooks.
 There is no environment variable or flag that turns the refusal off;
@@ -328,9 +347,10 @@ the recovery is to fix or remove the file. When no config directory
 resolves at all, no hooks file can exist: startup continues with zero
 hooks and logs that once.
 
-`ai-memory doctor --hooks` (and `doctor --tokens --hooks`) still runs
-with such a file: it reports the same error (path and reason) on
-stderr and exits 2.
+`ai-memory doctor --hooks` (and `doctor --tokens --hooks`, in the human,
+`--json` and `--raw-table` forms) still runs with such a file: it
+reports the same error (path and reason) on stderr and exits 2; the
+JSON forms also print it as `hooks_error`.
 
 **Upgrade note.** Before #9637 these files started the process with
 zero hooks, so every configured deny gate was silently absent. A
@@ -396,12 +416,12 @@ Pinned by [`tests/hooks_executor_test.rs`](../tests/hooks_executor_test.rs),
    requests — so the contract binds `exec` helpers specifically.)
 2. **Drop the binary on `PATH`** and `chmod +x`.
 3. **Edit `~/.config/ai-memory/hooks.toml`** with the row schema above.
-4. **Reload** with `kill -HUP $(pgrep -f 'ai-memory mcp')` or restart
-   the daemon. The reload task logs `hooks: reloaded config on SIGHUP`
-   on success.
-5. **Verify** the reload landed via the
-   `hooks: reloaded config on SIGHUP` log line (it carries the loaded
-   hook count). The capabilities `hooks` block
+4. **Check** the file with `ai-memory doctor --hooks` (exit 2 names
+   the reason a file is refused), then **restart** the daemon or MCP
+   server: no shipped command reloads hooks on `SIGHUP` yet
+   ([#9779](https://github.com/alphaonedev/ai-memory-mcp/issues/9779)).
+5. **Verify** with `ai-memory doctor --hooks`, which lists the hooks
+   the file loads. The capabilities `hooks` block
    (`memory_capabilities` over MCP, e.g.
    `printf '<JSON-RPC tools/call>' | ai-memory mcp --profile full`)
    reports `hook_events_count` (26) and `registered_count` — it does
@@ -448,15 +468,15 @@ For deployment sizes:
 
 | Symptom | Likely cause | Diagnostic recipe |
 |---|---|---|
-| Hook not firing | Namespace mismatch, `enabled = false`, or config not loaded | Confirm the `hooks: reloaded config on SIGHUP` line reported a non-zero hook count (or restart and watch boot logs). Then `RUST_LOG=ai_memory::hooks=debug` and watch the chain's per-hook warn/debug lines. |
+| Hook not firing | Namespace mismatch, `enabled = false`, or config not loaded | Confirm `ai-memory doctor --hooks` lists the hook, and restart after editing the file (no `SIGHUP` reload yet, #9779). Then `RUST_LOG=ai_memory::hooks=debug` and watch the chain's per-hook warn/debug lines. |
 | Hook fires but result ignored | Returned `Modify` on a `post_*` event | Check [`is_pre_event`](../src/hooks/decision.rs) — `Modify` is only valid on pre-events. Daemon log carries the rejection reason. |
 | No hook log lines on any write | No `hooks.toml`, or zero matching rows (an empty chain is a silent no-op returning `Allow`) | This is the **expected v0.6.4-equivalent behavior**. Confirms hooks aren't quietly firing. |
 | Recall p95 regressed after enabling hook | Hook is `mode = "exec"` on a hot-path event | Switch to `mode = "daemon"`. If already daemon, reduce `timeout_ms` and inspect helper-binary tracing for the slow path. |
 | `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook [`ExecutorMetrics`](../src/hooks/executor.rs) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
-| Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `hook spawn failed for <command>` error. Fix the helper, redeploy, `SIGHUP`. The chain fails open in the meantime (per `fail_mode = "open"` default). |
+| Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `hook spawn failed for <command>` error. Fix the helper, redeploy, restart. The chain fails open in the meantime (per `fail_mode = "open"` default). |
 | `mode = "exec"` hook intermittently DENIED under load (or spuriously fails-open) | The helper emits its decision and exits WITHOUT reading stdin, so the executor's envelope write hits `EPIPE` → `ExecutorError::Io` ("an I/O error occurred talking to the hook") | Make the exec helper drain stdin to EOF before writing its decision (`cat >/dev/null` in `sh`, or a `read`-to-EOF loop). See the exec stdin contract in §"Operator workflow". Daemon-mode helpers already read stdin and are unaffected. |
 | Daemon or MCP server exits 78 at startup with `hooks file <path> cannot be loaded` | The hooks file exists but does not read, parse or validate (#9637) | Run `ai-memory doctor --hooks` for the same reason, fix the file (or remove it to run with zero hooks), then start again. |
-| Reload didn't pick up new hook | TOML parse error | Look for `hooks: SIGHUP reload failed; keeping previous config` in the log. Validate the file with `cat ~/.config/ai-memory/hooks.toml | toml --check` (or `taplo lint`). |
+| Edited hook not picked up | The process was not restarted (no `SIGHUP` reload yet, #9779), or the file is refused | Run `ai-memory doctor --hooks` for the reason, fix the file, restart. |
 
 ## Operator runbook (3am procedures)
 
@@ -470,29 +490,26 @@ For deployment sizes:
    additionally log `hooks: chain hook errored; fail_mode=closed,
    denying` lines naming the hook command and event.
 3. To unblock: edit `~/.config/ai-memory/hooks.toml`, set
-   `enabled = false` on the offending row, `kill -HUP`. Confirm via
-   the `hooks: reloaded config on SIGHUP` log line.
+   `enabled = false` on the offending row, check it with
+   `ai-memory doctor --hooks`, restart (no `SIGHUP` reload yet, #9779).
 4. RCA after the bleeding stops — replay the captured payload against
    the helper binary on the command line (daemon-mode helpers speak
    framed JSON-RPC on stdin/stdout, so a single-request replay is a
    `printf | helper` one-liner).
 
-**Reload appears to have hung.**
+**An edited hooks file has no effect.**
 
-`SIGHUP` reload is async and idempotent. If you don't see the
-`hooks: reloaded config on SIGHUP` log line within ~1s, the most
-likely cause is a TOML parse error — look for the warning line.
-Re-issue `kill -HUP` after fixing the file. If the daemon process
-itself is unresponsive, fall through to standard restart procedure
+No shipped command reloads hooks on `SIGHUP` yet (#9779); do not send
+one expecting a reload. Run `ai-memory doctor --hooks`, fix any reason
+it reports, then restart the process
 (`scripts/dogfood-rebuild.sh` documents the live-binary swap dance).
 
 **Hot-path latency regressed; suspect a hook.**
 
-1. Review `~/.config/ai-memory/hooks.toml` (and the loaded-count on
-   the last `hooks: reloaded config on SIGHUP` line) — confirm which
-   events have hooks attached.
+1. Review `~/.config/ai-memory/hooks.toml` (or `ai-memory doctor
+   --hooks`) — confirm which events have hooks attached.
 2. Temporarily disable hot-path hooks (`enabled = false` on
-   `post_recall` / `post_search` / `pre_recall_expand` rows), `SIGHUP`.
+   `post_recall` / `post_search` / `pre_recall_expand` rows), restart.
 3. Re-measure recall p95. If recovered, the hook was the cause.
 4. Look at per-hook `ExecutorMetrics` for the trip — usually the
    helper binary blocked on an upstream (Ollama, network). Move the
