@@ -3492,6 +3492,28 @@ class FoldText8346(ast.NodeTransformer):
 class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
     """The docs census of src/encryption/mod.rs, run on every PR."""
 
+    def test_memoized_parsers_copy_lists_and_key_on_the_text_9705(self):
+        """The parser cache hands out a fresh list per call, keys on every argument and never caches an error."""
+        calls = []
+
+        @memoized
+        def parse(text, where="a"):
+            calls.append((text, where))
+            if text == "bad":
+                raise AssertionError("bad text")
+            return [text, where]
+
+        first = parse("x")
+        first.append("changed")
+        self.assertEqual(parse("x"), ["x", "a"], "a caller changed the cached list")
+        self.assertEqual(parse("y"), ["y", "a"])
+        self.assertEqual(parse("x", "b"), ["x", "b"])
+        self.assertEqual(calls, [("x", "a"), ("y", "a"), ("x", "b")], "one parse per distinct argument tuple")
+        for _ in range(2):
+            with self.assertRaises(AssertionError):
+                parse("bad")
+        self.assertEqual(calls.count(("bad", "a")), 2, "an error must be raised again, not cached")
+
     @classmethod
     def setUpClass(cls):
         cls.text = read(RUST_SRC)
