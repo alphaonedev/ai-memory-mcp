@@ -1,16 +1,24 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #9616 source ratchet: an ALLOWLIST over every tracked `.rs` file of the
-//! crate, refusing by default.
+//! #9616 source ratchet: an ALLOWLIST over every tracked `.rs` file under
+//! the listed source roots ([`SCANNED_ROOTS`]), refusing by default. It opens
+//! no other file ([`open_source`]).
 //!
-//! Each scanned file is lexed (comments dropped, string literals decoded,
-//! char literals and lifetimes told apart) and four counts are taken:
+//! Each scanned file is lexed (comments dropped, string and char literals
+//! decoded, char literals and lifetimes told apart), every `concat!` call is
+//! folded into the one literal the compiler makes of it, and literals that
+//! follow one another with at most a comma between them are joined into one
+//! run. Five counts are taken:
 //!
 //! * [`Class::HeaderName`]: the `HEADER_AGENT_ID` identifier, plus every
-//!   string literal (plain, raw, byte, escaped, line-continued) whose
-//!   decoded text holds `x-agent` in any case. An alias is counted at its
-//!   `use` line, a name split into fragments at the `x-agent` fragment.
+//!   literal run (plain, raw, byte, escaped, line-continued, `concat!`, an
+//!   array of pieces or of chars) whose text holds `x-agent` in any case. An
+//!   alias is counted at its `use` line.
+//! * [`Class::Fragment`]: a literal run that holds `agent-id` in any case
+//!   with neither `x-` nor `--` (a command-line flag) before it, plus one
+//!   when runs of the file that hold neither needle can be put end to end to
+//!   spell the name (pieces kept in separate constants).
 //! * [`Class::Resolver`]: the raw resolver `resolve_http_agent_id`.
 //! * [`Class::Sentinel`]: the `ANONYMOUS_INVALID` identifier and every
 //!   string literal holding `anonymous:invalid`.
@@ -21,12 +29,19 @@
 //! A count that is not exactly what [`ALLOW`] grants that file (no row
 //! grants 0) is an offender. A tracked `.rs` file under a root that is
 //! neither scanned nor in [`LEFT_OUT`] is an offender too, so a new crate
-//! directory cannot hide a read. One run lists every offender.
+//! directory cannot hide a read. A file that ends inside a comment, a string
+//! or a char literal, or that cannot be read as a regular UTF-8 file at its
+//! tracked path within the size cap, is an offender with its reason
+//! (`<file>: <reason>`). One run lists every offender.
 //!
-//! What a token scan cannot see is a header name built at run time from
-//! fragments that never spell `x-agent` and a refusal discarded by a `match`
-//! arm; the behaviour census in the parent module pins every route for
-//! those.
+//! What stays out of reach is a header name that code builds (at run time,
+//! for example by `format!`, or in a `const fn`) from pieces that hold no
+//! needle and do not tile the name within one file: pieces kept in two
+//! files, a piece sliced out of a longer literal, and a further tiling in a
+//! file whose row already grants one (the tile count is 0 or 1 per file;
+//! `src/storage/mod.rs` has such a row). For the fold count, a refusal
+//! discarded by a `match` arm is not seen either. The behaviour census in
+//! the parent module pins every route for both.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -38,13 +53,21 @@ enum Class {
     Resolver,
     Sentinel,
     Fold,
+    Fragment,
 }
 
 impl Class {
-    const ALL: [Self; 4] = [Self::HeaderName, Self::Resolver, Self::Sentinel, Self::Fold];
+    const ALL: [Self; 5] = [
+        Self::HeaderName,
+        Self::Resolver,
+        Self::Sentinel,
+        Self::Fold,
+        Self::Fragment,
+    ];
 
     fn label(self) -> &'static str {
         match self {
+            Self::Fragment => "header-fragment",
             Self::HeaderName => "header-name",
             Self::Resolver => "raw-resolver",
             Self::Sentinel => "anonymous-invalid",
@@ -78,8 +101,11 @@ const fn allow(file: &'static str, class: Class, grant: Grant, reason: &'static 
     }
 }
 
-use Class::{Fold, HeaderName, Resolver, Sentinel};
+use Class::{Fold, Fragment, HeaderName, Resolver, Sentinel};
 use Grant::{AnyNonZero, Exactly};
+
+/// Reason shared by the rows for a clap `long = "agent-id"` attribute.
+const CLI_FLAG: &str = "clap long flag name `agent-id`: a command-line argument, never a header";
 
 /// Every permitted site. Anything not granted here is refused.
 const ALLOW: &[Allow] = &[
@@ -244,8 +270,98 @@ const ALLOW: &[Allow] = &[
     allow(
         "src/mcp/tools/store/transport.rs",
         HeaderName,
-        Exactly(5),
-        "outbound header writes and their test",
+        Exactly(3),
+        "outbound header writes on the forwarded request",
+    ),
+    allow(
+        "src/mcp/tools/store/forward_key_9367_tests.rs",
+        HeaderName,
+        Exactly(4),
+        "cfg(test): asserts the header line of the request the forward sites sent; reads no \
+         inbound header",
+    ),
+    allow(
+        "src/mcp/tools/store/forward_key_daemon_9367_tests.rs",
+        HeaderName,
+        Exactly(1),
+        "cfg(test): writes the header on a raw loopback request; reads no inbound header",
+    ),
+    allow(
+        "examples/fed_issue.rs",
+        Fragment,
+        Exactly(1),
+        "help text about certificate subject ids (`subject-agent-ids`)",
+    ),
+    allow(
+        "src/cli/commands/entity_register.rs",
+        Fragment,
+        Exactly(1),
+        CLI_FLAG,
+    ),
+    allow("src/cli/commands/inbox.rs", Fragment, Exactly(1), CLI_FLAG),
+    allow(
+        "src/cli/commands/kg_invalidate.rs",
+        Fragment,
+        Exactly(1),
+        CLI_FLAG,
+    ),
+    allow(
+        "src/cli/commands/notify.rs",
+        Fragment,
+        Exactly(1),
+        "clap long flag name `target-agent-id`: a command-line argument, never a header",
+    ),
+    allow(
+        "src/cli/commands/reflect.rs",
+        Fragment,
+        Exactly(1),
+        CLI_FLAG,
+    ),
+    allow("src/cli/commands/replay.rs", Fragment, Exactly(1), CLI_FLAG),
+    allow(
+        "src/cli/commands/swarm_rewind.rs",
+        Fragment,
+        Exactly(1),
+        CLI_FLAG,
+    ),
+    allow(
+        "src/cli/governance_check_action.rs",
+        Fragment,
+        Exactly(1),
+        CLI_FLAG,
+    ),
+    allow("src/cli/wake_listen.rs", Fragment, Exactly(1), CLI_FLAG),
+    allow(
+        "src/handlers/agent_api_key.rs",
+        Fragment,
+        Exactly(1),
+        "message text: the signed-approval grammar names `<approver-agent-id>`",
+    ),
+    allow(
+        "src/handlers/identity_binding.rs",
+        Fragment,
+        Exactly(1),
+        "message text: the `ai-memory agents bind-api-key <agent-id>` command line",
+    ),
+    allow(
+        "src/mtls_agent_binding.rs",
+        Fragment,
+        Exactly(2),
+        "the map-file grammar `<sha256-hex> <agent-id>`, in a constant and in one message",
+    ),
+    allow(
+        "src/tls.rs",
+        Fragment,
+        Exactly(1),
+        "message text: `(agent-id shape)` of a certificate subject",
+    ),
+    allow(
+        "src/storage/mod.rs",
+        Fragment,
+        Exactly(1),
+        "no literal holds a needle; unrelated short literals of this 35K-line file (`x`, `-`, \
+         `agent`, `id`) tile the name. The tile count is at most one per file, so a second \
+         tiling here is not told apart",
     ),
     allow(
         "src/confidence/calibrate.rs",
@@ -292,19 +408,20 @@ const ALLOW: &[Allow] = &[
     ),
 ];
 
-/// Tracked top-level directories that hold `.rs` files and are scanned.
+/// The explicit source roots the ratchet walks: tracked `.rs` files under
+/// these directories are the only files it opens.
 const SCANNED_ROOTS: &[&str] = &[
     "src",
     "benches",
-    "benchmarks",
+    "benchmarks/longmemeval_reflection",
     "examples",
     "fuzz",
     "loadtest",
     "tools",
 ];
 
-/// Tracked top-level directories that hold `.rs` files and are not scanned,
-/// each with its reason.
+/// Tracked directories that hold `.rs` files and are not scanned, each with
+/// its reason.
 const LEFT_OUT: &[(&str, &str)] = &[
     (
         "tests",
@@ -343,6 +460,13 @@ const FOLDS: &[&str] = &[
 /// The header name, lower case (ASCII).
 const HEADER_NAME: &str = "x-agent-id";
 const HEADER_NEEDLE: &str = "x-agent";
+/// The hyphenated tail of the name. It is counted wherever neither
+/// [`NAME_HEAD`] (the text is then a header name already) nor [`FLAG_HEAD`]
+/// stands before it.
+const FRAGMENT_NEEDLE: &str = "agent-id";
+const NAME_HEAD: &str = "x-";
+/// A command-line flag (`--agent-id`): no join puts two hyphens in the name.
+const FLAG_HEAD: &str = "--";
 const SENTINEL_NEEDLE: &str = "anonymous:invalid";
 
 // Reasons for a file that is refused whole (`<file>: <reason>`).
@@ -365,68 +489,96 @@ const EMPTY_ROOT: &str = "scanned root holds no tracked .rs file";
 const MAX_RAW_HASHES: usize = 255;
 /// No tracked source is near this size; a larger file is refused unread.
 const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+/// The longest escape after its backslash, `u{10FFFF}`, in chars.
+const MAX_UNICODE_ESCAPE: usize = 10;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Tok {
     Ident(String),
     Str(String),
+    /// A char or byte-char literal, decoded.
+    Chr(String),
     Punct(char),
+}
+
+/// Decode the escape whose first char after the backslash is at `i`, append
+/// what it denotes and return the index past it. Bounded: no escape looks
+/// further than [`MAX_UNICODE_ESCAPE`] chars ahead.
+fn escape(b: &[char], i: usize, out: &mut String) -> usize {
+    let scalar = |hex: &[char]| {
+        let hex: String = hex.iter().collect();
+        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+    };
+    match b.get(i) {
+        None => i,
+        Some('n') => {
+            out.push('\n');
+            i + 1
+        }
+        Some('t') => {
+            out.push('\t');
+            i + 1
+        }
+        Some('r') => {
+            out.push('\r');
+            i + 1
+        }
+        Some('0') => {
+            out.push('\0');
+            i + 1
+        }
+        Some('\n') => {
+            let mut j = i + 1;
+            while b.get(j).is_some_and(|c| c.is_whitespace()) {
+                j += 1;
+            }
+            j
+        }
+        Some('x') => {
+            let end = (i + 3).min(b.len());
+            out.extend(scalar(&b[i + 1..end]));
+            end
+        }
+        Some('u') => {
+            let close = b[i..]
+                .iter()
+                .take(MAX_UNICODE_ESCAPE)
+                .position(|&c| c == '}')
+                .map(|p| i + p);
+            match close {
+                Some(close) if b.get(i + 1) == Some(&'{') => {
+                    out.extend(scalar(&b[i + 2..close]));
+                    close + 1
+                }
+                _ => i + 1,
+            }
+        }
+        Some(&other) => {
+            out.push(other);
+            i + 1
+        }
+    }
 }
 
 /// Decode a non-raw string literal body starting at `i` (just past the
 /// opening quote). Returns the text and the index past the closing quote.
-fn cooked_string(b: &[char], mut i: usize) -> (String, usize) {
+fn cooked_string(b: &[char], mut i: usize) -> Result<(String, usize), &'static str> {
     let mut out = String::new();
-    while i < b.len() {
-        match b[i] {
-            '"' => return (out, i + 1),
-            '\\' if i + 1 < b.len() => {
-                i += 1;
-                match b[i] {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    'r' => out.push('\r'),
-                    '0' => out.push('\0'),
-                    '\n' => {
-                        while i + 1 < b.len() && b[i + 1].is_whitespace() {
-                            i += 1;
-                        }
-                    }
-                    'x' => {
-                        let hex: String = b[i + 1..(i + 3).min(b.len())].iter().collect();
-                        if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
-                        {
-                            out.push(c);
-                        }
-                        i += 2;
-                    }
-                    'u' => {
-                        let close = b[i..].iter().position(|&c| c == '}').map(|p| i + p);
-                        if let Some(close) = close {
-                            let hex: String = b[i + 2..close].iter().collect();
-                            if let Some(c) =
-                                u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
-                            {
-                                out.push(c);
-                            }
-                            i = close;
-                        }
-                    }
-                    other => out.push(other),
-                }
-                i += 1;
-            }
-            c => {
+    while let Some(&c) = b.get(i) {
+        match c {
+            '"' => return Ok((out, i + 1)),
+            '\\' => i = escape(b, i + 1, &mut out),
+            _ => {
                 out.push(c);
                 i += 1;
             }
         }
     }
-    (out, i)
+    Err(UNTERMINATED_STRING)
 }
 
 /// A raw string body from `i` up to `"` followed by `hashes` `#`.
-fn raw_string(b: &[char], mut i: usize, hashes: usize) -> (String, usize) {
+fn raw_string(b: &[char], mut i: usize, hashes: usize) -> Result<(String, usize), &'static str> {
     let start = i;
     while i < b.len() {
         if b[i] == '"'
@@ -437,30 +589,38 @@ fn raw_string(b: &[char], mut i: usize, hashes: usize) -> (String, usize) {
                 .count()
                 == hashes
         {
-            return (b[start..i].iter().collect(), i + 1 + hashes);
+            return Ok((b[start..i].iter().collect(), i + 1 + hashes));
         }
         i += 1;
     }
-    (b[start..].iter().collect(), i)
+    Err(UNTERMINATED_RAW_STRING)
 }
 
-/// The end of a char literal opening at `i`, or `None` for a lifetime.
-fn char_literal_end(b: &[char], i: usize) -> Option<usize> {
+/// The char literal opening at the quote at `i`: its decoded text and the
+/// index past its closing quote, or `None` for a lifetime.
+fn char_literal(b: &[char], i: usize) -> Result<Option<(String, usize)>, &'static str> {
     if b.get(i + 1) == Some(&'\\') {
-        let mut j = i + 3;
-        while j < b.len() && b[j] != '\'' {
-            j += 1;
-        }
-        return Some(j + 1);
+        let mut text = String::new();
+        let j = escape(b, i + 2, &mut text);
+        return if b.get(j) == Some(&'\'') {
+            Ok(Some((text, j + 1)))
+        } else {
+            Err(UNTERMINATED_CHAR)
+        };
     }
-    (b.get(i + 2) == Some(&'\'')).then_some(i + 3)
+    Ok(match (b.get(i + 1), b.get(i + 2)) {
+        (Some(c), Some('\'')) => Some((c.to_string(), i + 3)),
+        _ => None,
+    })
 }
 
 fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-fn lex(src: &str) -> Vec<Tok> {
+/// The tokens of `src`, or the reason the file ends in an open state. A file
+/// never ends silently inside a comment, a string or a char literal.
+fn lex(src: &str) -> Result<Vec<Tok>, &'static str> {
     let chars: Vec<char> = src.chars().collect();
     let len = chars.len();
     let mut out = Vec::new();
@@ -474,25 +634,33 @@ fn lex(src: &str) -> Vec<Tok> {
                 i += 1;
             }
         } else if ch == '/' && chars.get(i + 1) == Some(&'*') {
-            let mut depth = 1;
+            let mut depth = 1usize;
             i += 2;
-            while i < len && depth > 0 {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
+            while depth > 0 {
+                match (chars.get(i), chars.get(i + 1)) {
+                    (None, _) => return Err(UNTERMINATED_BLOCK_COMMENT),
+                    (Some('/'), Some('*')) => {
+                        depth += 1;
+                        i += 2;
+                    }
+                    (Some('*'), Some('/')) => {
+                        depth -= 1;
+                        i += 2;
+                    }
+                    _ => i += 1,
                 }
             }
         } else if ch == '"' {
-            let (text, j) = cooked_string(&chars, i + 1);
+            let (text, j) = cooked_string(&chars, i + 1)?;
             out.push(Tok::Str(text));
             i = j;
         } else if ch == '\'' {
-            i = char_literal_end(&chars, i).unwrap_or(i + 1);
+            if let Some((text, j)) = char_literal(&chars, i)? {
+                out.push(Tok::Chr(text));
+                i = j;
+            } else {
+                i += 1;
+            }
         } else if ch.is_alphabetic() || ch == '_' {
             let start = i;
             while i < len && is_ident_char(chars[i]) {
@@ -502,11 +670,18 @@ fn lex(src: &str) -> Vec<Tok> {
             let next = chars.get(i).copied();
             match (word.as_str(), next) {
                 ("b" | "c", Some('"')) => {
-                    let (text, j) = cooked_string(&chars, i + 1);
+                    let (text, j) = cooked_string(&chars, i + 1)?;
                     out.push(Tok::Str(text));
                     i = j;
                 }
-                ("b", Some('\'')) => i = char_literal_end(&chars, i).unwrap_or(i + 1),
+                ("b", Some('\'')) => {
+                    if let Some((text, j)) = char_literal(&chars, i)? {
+                        out.push(Tok::Chr(text));
+                        i = j;
+                    } else {
+                        out.push(Tok::Ident(word));
+                    }
+                }
                 ("r" | "br" | "cr", Some('"' | '#')) => {
                     let mut j = i;
                     while j < len && chars[j] == '#' {
@@ -514,7 +689,10 @@ fn lex(src: &str) -> Vec<Tok> {
                     }
                     let hashes = j - i;
                     if chars.get(j) == Some(&'"') {
-                        let (text, k) = raw_string(&chars, j + 1, hashes);
+                        if hashes > MAX_RAW_HASHES {
+                            return Err(TOO_MANY_RAW_HASHES);
+                        }
+                        let (text, k) = raw_string(&chars, j + 1, hashes)?;
                         out.push(Tok::Str(text));
                         i = k;
                     } else if word == "r" && hashes == 1 {
@@ -539,7 +717,107 @@ fn lex(src: &str) -> Vec<Tok> {
             i += 1;
         }
     }
+    Ok(out)
+}
+
+/// Replace every `concat!` call (any bracket, nested calls included) by one
+/// `Str` token holding its arguments joined, as the compiler joins them. An
+/// identifier that is not a macro name and any other punctuation are kept as
+/// text, so `stringify!` arguments join too.
+fn fold_concat(toks: &[Tok]) -> Vec<Tok> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut k = 0;
+    while k < toks.len() {
+        let opens = matches!(&toks[k], Tok::Ident(name) if name == "concat")
+            && toks.get(k + 1) == Some(&Tok::Punct('!'))
+            && matches!(toks.get(k + 2), Some(Tok::Punct('(' | '[' | '{')));
+        if !opens {
+            out.push(toks[k].clone());
+            k += 1;
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut text = String::new();
+        let mut j = k + 2;
+        while let Some(tok) = toks.get(j) {
+            match tok {
+                Tok::Punct('(' | '[' | '{') => depth += 1,
+                Tok::Punct(')' | ']' | '}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Punct(',' | '!') => {}
+                Tok::Punct(c) => text.push(*c),
+                Tok::Str(s) | Tok::Chr(s) => text.push_str(s),
+                Tok::Ident(name) => {
+                    if toks.get(j + 1) != Some(&Tok::Punct('!')) {
+                        text.push_str(name);
+                    }
+                }
+            }
+            j += 1;
+        }
+        out.push(Tok::Str(text));
+        k = j + 1;
+    }
     out
+}
+
+/// The joined text of every run of string and char literals that follow one
+/// another with at most one comma between them (array rows, call and macro
+/// arguments). A literal on its own is a run of one.
+fn literal_runs(toks: &[Tok]) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut k = 0;
+    while k < toks.len() {
+        let (Tok::Str(first) | Tok::Chr(first)) = &toks[k] else {
+            k += 1;
+            continue;
+        };
+        let mut text = first.clone();
+        k += 1;
+        loop {
+            let comma = usize::from(toks.get(k) == Some(&Tok::Punct(',')));
+            let Some(Tok::Str(next) | Tok::Chr(next)) = toks.get(k + comma) else {
+                break;
+            };
+            text.push_str(next);
+            k += comma + 1;
+        }
+        runs.push(text);
+    }
+    runs
+}
+
+/// Whether literal runs of one file, none of which holds a needle, can be
+/// put end to end to hold the header name: a first one ending with the head
+/// of the name, any number equal to a middle slice, a last one starting with
+/// the rest. Catches fragments that are not adjacent (separate constants, a
+/// macro that expands to one piece).
+fn runs_tile_the_name(runs: &[String]) -> bool {
+    let n = HEADER_NAME.len();
+    let mut head = vec![false; n + 1];
+    let mut tail = vec![false; n + 1];
+    let mut middle = vec![vec![false; n + 1]; n + 1];
+    for lower in runs {
+        if lower.contains(HEADER_NEEDLE) || lower.contains(FRAGMENT_NEEDLE) {
+            continue;
+        }
+        for cut in 1..n {
+            head[cut] |= lower.ends_with(&HEADER_NAME[..cut]);
+            tail[cut] |= lower.starts_with(&HEADER_NAME[cut..]);
+            for from in 1..cut {
+                middle[from][cut] |= lower == &HEADER_NAME[from..cut];
+            }
+        }
+    }
+    let mut reach = head;
+    for cut in 1..n {
+        reach[cut] = reach[cut] || (1..cut).any(|from| reach[from] && middle[from][cut]);
+    }
+    (1..n).any(|cut| reach[cut] && tail[cut])
 }
 
 /// The index of the `)` matching the `(` at `open`.
@@ -581,48 +859,67 @@ fn chain_folds(toks: &[Tok], mut close: usize) -> bool {
     }
 }
 
-fn counts(src: &str) -> BTreeMap<Class, usize> {
-    let toks = lex(src);
+/// The count of each class in `src`, or the reason the file is refused whole.
+fn counts(src: &str) -> Result<BTreeMap<Class, usize>, &'static str> {
+    let toks = fold_concat(&lex(src)?);
     let mut out: BTreeMap<Class, usize> = Class::ALL.iter().map(|&c| (c, 0)).collect();
-    let mut bump = |class| *out.entry(class).or_default() += 1;
+    let mut add = |class, n: usize| *out.entry(class).or_default() += n;
     for (k, tok) in toks.iter().enumerate() {
-        match tok {
-            Tok::Ident(name) => {
-                match name.as_str() {
-                    "HEADER_AGENT_ID" => bump(HeaderName),
-                    "ANONYMOUS_INVALID" => bump(Sentinel),
-                    _ => {}
-                }
-                if name == "resolve_http_agent_id" {
-                    bump(Resolver);
-                }
-                if FUNNEL_CALLS.contains(&name.as_str())
-                    && toks.get(k + 1) == Some(&Tok::Punct('('))
-                    && close_paren(&toks, k + 1).is_some_and(|close| chain_folds(&toks, close))
-                {
-                    bump(Fold);
-                }
-            }
-            Tok::Str(text) => {
-                let lower = text.to_lowercase();
-                for _ in lower.matches(HEADER_NEEDLE) {
-                    bump(HeaderName);
-                }
-                for _ in lower.matches(SENTINEL_NEEDLE) {
-                    bump(Sentinel);
-                }
-            }
-            Tok::Punct(_) => {}
+        let Tok::Ident(name) = tok else { continue };
+        match name.as_str() {
+            "HEADER_AGENT_ID" => add(HeaderName, 1),
+            "ANONYMOUS_INVALID" => add(Sentinel, 1),
+            "resolve_http_agent_id" => add(Resolver, 1),
+            _ => {}
+        }
+        if FUNNEL_CALLS.contains(&name.as_str())
+            && toks.get(k + 1) == Some(&Tok::Punct('('))
+            && close_paren(&toks, k + 1).is_some_and(|close| chain_folds(&toks, close))
+        {
+            add(Fold, 1);
         }
     }
-    out
+    let runs: Vec<String> = literal_runs(&toks)
+        .iter()
+        .map(|run| run.to_lowercase())
+        .collect();
+    for lower in &runs {
+        add(HeaderName, lower.matches(HEADER_NEEDLE).count());
+        add(Sentinel, lower.matches(SENTINEL_NEEDLE).count());
+        // `at` is the start of an ASCII match, so the cut is a char boundary.
+        let bare = lower
+            .match_indices(FRAGMENT_NEEDLE)
+            .filter(|(at, _)| {
+                let before = &lower[..*at];
+                !before.ends_with(NAME_HEAD) && !before.ends_with(FLAG_HEAD)
+            })
+            .count();
+        add(Fragment, bare);
+    }
+    add(Fragment, usize::from(runs_tile_the_name(&runs)));
+    Ok(out)
 }
 
-/// The offenders among `files` (`(repo-relative path, source)`), sorted.
-fn offenders(files: &[(String, String)]) -> Vec<String> {
+/// A scanned file: its repo-relative path and its source, or the reason it
+/// could not be read.
+type Scanned = (String, Result<String, &'static str>);
+
+/// The offenders among `files`, sorted.
+fn offenders(files: &[Scanned]) -> Vec<String> {
     let mut found = Vec::new();
-    for (path, src) in files {
-        for (class, n) in counts(src) {
+    for (path, read) in files {
+        let counted = match read {
+            Ok(src) => counts(src),
+            Err(reason) => Err(*reason),
+        };
+        let counted = match counted {
+            Ok(counted) => counted,
+            Err(reason) => {
+                found.push(format!("{path}: {reason}"));
+                continue;
+            }
+        };
+        for (class, n) in counted {
             let row = ALLOW.iter().find(|a| a.file == path && a.class == class);
             let ok = match row.map(|a| a.grant) {
                 None => n == 0,
@@ -653,6 +950,87 @@ fn offenders(files: &[(String, String)]) -> Vec<String> {
     found
 }
 
+/// Whether `path` is inside the directory `root` (whole path components).
+fn under(path: &str, root: &str) -> bool {
+    path.strip_prefix(root)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Where a repo-relative path stands for the walk.
+#[derive(Debug, PartialEq)]
+enum Place {
+    Scanned,
+    LeftOut,
+    Unknown,
+}
+
+/// A path is scanned only when it is a `.rs` file under a scanned root and
+/// has no empty, `.` or `..` component (so no absolute and no climbing path).
+fn place(path: &str) -> Place {
+    let plain = path
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..");
+    // Case-sensitive on purpose: the walk lists `*.rs`, the form cargo builds.
+    let rust = Path::new(path).extension().is_some_and(|ext| ext == "rs");
+    if !plain || !rust {
+        Place::Unknown
+    } else if SCANNED_ROOTS.iter().any(|root| under(path, root)) {
+        Place::Scanned
+    } else if LEFT_OUT.iter().any(|(root, _)| under(path, root)) {
+        Place::LeftOut
+    } else {
+        Place::Unknown
+    }
+}
+
+/// The walk over the tracked `.rs` paths: the paths to open, and a problem
+/// for every path under no listed root and every scanned root that is empty.
+fn plan(tracked: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut open = Vec::new();
+    let mut problems = Vec::new();
+    for path in tracked {
+        match place(path) {
+            Place::Scanned => open.push(path.clone()),
+            Place::LeftOut => {}
+            Place::Unknown => problems.push(format!("{path}: {NO_ROOT}")),
+        }
+    }
+    for root in SCANNED_ROOTS {
+        if !open.iter().any(|path| under(path, root)) {
+            problems.push(format!("{root}: {EMPTY_ROOT}"));
+        }
+    }
+    (open, problems)
+}
+
+/// The one place the ratchet opens a file. It refuses every path that is not
+/// a `.rs` file under a scanned root before touching the file system, then a
+/// path that a symlink leads away from its tracked place, then (on the opened
+/// descriptor) anything that is not a regular UTF-8 file within the size cap.
+fn open_source(root: &Path, rel: &str) -> Result<String, &'static str> {
+    use std::io::Read as _;
+    if place(rel) != Place::Scanned {
+        return Err(OUTSIDE_ROOTS);
+    }
+    let tracked = root.canonicalize().map_err(|_| UNREADABLE)?.join(rel);
+    let resolved = root.join(rel).canonicalize().map_err(|_| UNREADABLE)?;
+    if resolved != tracked {
+        return Err(RESOLVES_ELSEWHERE);
+    }
+    let file = std::fs::File::open(&resolved).map_err(|_| UNREADABLE)?;
+    if !file.metadata().map_err(|_| UNREADABLE)?.is_file() {
+        return Err(NOT_REGULAR);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| UNREADABLE)?;
+    if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_SOURCE_BYTES) {
+        return Err(TOO_LARGE);
+    }
+    String::from_utf8(bytes).map_err(|_| NOT_UTF8)
+}
+
 fn tracked_rs(root: &Path) -> Vec<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -670,27 +1048,19 @@ fn tracked_rs(root: &Path) -> Vec<String> {
 }
 
 /// The real tree: every tracked `.rs` file under a scanned root holds exactly
-/// what [`ALLOW`] grants, and every tracked root is scanned or left out with
-/// a reason.
+/// what [`ALLOW`] grants, every tracked `.rs` file is under a scanned or a
+/// left-out root, and every file is opened through [`open_source`].
 #[test]
 fn every_agent_id_site_in_the_tree_is_allow_listed_9616() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    let mut problems = Vec::new();
-    for path in tracked_rs(root) {
-        let top = path.split_once('/').map_or(".", |(top, _)| top);
-        if LEFT_OUT.iter().any(|(r, _)| *r == top) {
-            continue;
-        }
-        if !SCANNED_ROOTS.contains(&top) {
-            problems.push(format!(
-                "{path}: tracked root {top} is neither scanned nor left out"
-            ));
-            continue;
-        }
-        let src = std::fs::read_to_string(root.join(&path)).expect("read tracked source");
-        files.push((path, src));
-    }
+    let (open, mut problems) = plan(&tracked_rs(root));
+    let files: Vec<Scanned> = open
+        .into_iter()
+        .map(|path| {
+            let read = open_source(root, &path);
+            (path, read)
+        })
+        .collect();
     for (left, reason) in LEFT_OUT {
         assert!(
             root.join(left).is_dir(),
@@ -699,6 +1069,19 @@ fn every_agent_id_site_in_the_tree_is_allow_listed_9616() {
     }
     problems.extend(offenders(&files));
     assert_eq!(problems, Vec::<String>::new());
+}
+
+/// The offenders of one file read as `read`, without the stale-row check
+/// (the corpus is one file).
+fn one_read(path: &str, read: Result<String, &'static str>) -> Vec<String> {
+    offenders(&[(path.to_owned(), read)])
+        .into_iter()
+        .filter(|line| !line.contains("names no scanned file"))
+        .collect()
+}
+
+fn one(path: &str, src: &str) -> Vec<String> {
+    one_read(path, Ok(src.to_owned()))
 }
 
 /// A synthetic handler file with no allow row.
@@ -739,46 +1122,6 @@ const FOLD_PARITY: &str =
     "fn f(h: &HeaderMap) -> String { resolve_caller_agent_id(None, h, None).unwrap_or_default() }";
 const FOLD_HTTP_CALLER: &str =
     "fn f(h: &HeaderMap) -> String { http_caller(h).map_or_else(|_| String::new(), |c| c) }";
-
-// Round-2 red shims (PR 9661): the entry points the round-2 rows call, with
-// the behaviour of the round-1 head, so each new row fails by assertion. The
-// fix commit replaces them.
-
-/// [`offenders`] of one file, without the stale-row check.
-fn one(path: &str, src: &str) -> Vec<String> {
-    offenders(&[(path.to_owned(), src.to_owned())])
-        .into_iter()
-        .filter(|line| !line.contains("names no scanned file"))
-        .collect()
-}
-
-fn one_read(path: &str, read: Result<String, &'static str>) -> Vec<String> {
-    read.map_or_else(|_| Vec::new(), |src| one(path, &src))
-}
-
-fn open_source(root: &Path, rel: &str) -> Result<String, &'static str> {
-    let bytes = std::fs::read(root.join(rel)).unwrap_or_default();
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn plan(tracked: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut open = Vec::new();
-    let mut problems = Vec::new();
-    for path in tracked {
-        let top = path.split_once('/').map_or(".", |(top, _)| top);
-        if LEFT_OUT.iter().any(|(r, _)| *r == top) {
-            continue;
-        }
-        if SCANNED_ROOTS.contains(&top) {
-            open.push(path.clone());
-        } else {
-            problems.push(format!(
-                "{path}: tracked root {top} is neither scanned nor left out"
-            ));
-        }
-    }
-    (open, problems)
-}
 
 /// Every deny form is refused with its exact offender line.
 #[test]
@@ -839,10 +1182,14 @@ fn deny_corpus_is_refused_with_the_exact_offender_9616() {
         one(PROBE_OUTSIDE_HANDLERS, VERDICT_GET_LITERAL),
         vec![header(PROBE_OUTSIDE_HANDLERS)]
     );
-    // A second read in an allow-listed file breaks its exact count.
+    // A second read in an allow-listed file breaks its exact count, and a
+    // row whose sites are gone (here the grammar text) is an offender too.
     assert_eq!(
         one("src/mtls_agent_binding.rs", VERDICT_GET_REF),
-        vec!["src/mtls_agent_binding.rs: header-name 1 (allowed 4)".to_owned()]
+        vec![
+            "src/mtls_agent_binding.rs: header-fragment 0 (allowed 2)".to_owned(),
+            "src/mtls_agent_binding.rs: header-name 1 (allowed 4)".to_owned(),
+        ]
     );
 }
 
@@ -871,7 +1218,7 @@ fn ratchet_scan_is_bounded_on_a_large_source_9616() {
     const LINES: usize = 200_000;
     let src = "let _ = h.get(crate::HEADER_AGENT_ID); // x-agent-id\n".repeat(LINES);
     let start = std::time::Instant::now();
-    let n = counts(&src)[&HeaderName];
+    let n = counts(&src).expect("the source ends in no open state")[&HeaderName];
     assert!(start.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(n, LINES);
 }
