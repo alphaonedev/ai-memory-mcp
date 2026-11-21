@@ -775,6 +775,57 @@ async fn postgres_handler_refuses_every_form_without_the_authority_layer_9616() 
     postgres_census(Leg::HandlerOnly).await;
 }
 
+/// The reflect body refusal a request past the caller step meets, written by
+/// hand.
+const REFLECT_BODY_ERROR: &str = "title is required";
+
+/// `POST /api/v1/memory_reflect` reads header presence before it picks a
+/// backend branch: every invalid form is the handler's exact refusal there
+/// too, with no authority layer in front of it, and a request with no header
+/// is not refused at that step.
+#[tokio::test]
+async fn sqlite_reflect_presence_refuses_every_form_9616() {
+    use ai_memory::handlers::routes::MEMORY_REFLECT;
+    common::permissive_attestation_for_tests();
+    std::fs::create_dir_all(".local-runs").unwrap();
+    let dir = tempfile::tempdir_in(".local-runs").unwrap();
+    let app = sqlite_app_state(&dir.path().join("reflect.db"));
+    let router = axum::Router::new()
+        .route(
+            MEMORY_REFLECT,
+            axum::routing::post(ai_memory::handlers::route_1111::handle_reflect_http),
+        )
+        .with_state(app);
+    let body = json!({"source_ids": [ABSENT_TARGET_ID]});
+    for form in INVALID_FORMS {
+        assert_eq!(
+            call(
+                &router,
+                "POST",
+                MEMORY_REFLECT,
+                &form.values(),
+                Some(body.clone())
+            )
+            .await,
+            (
+                StatusCode::BAD_REQUEST,
+                expected_body(*form, Layer::Handler)
+            ),
+            "reflect form={}",
+            form.name()
+        );
+    }
+    // Past the caller step: the body (no title) is what the handler refuses.
+    assert_eq!(
+        call(&router, "POST", MEMORY_REFLECT, &[], Some(body)).await,
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"error": REFLECT_BODY_ERROR})
+        ),
+        "reflect with no header"
+    );
+}
+
 /// Documented prefix of the per-request anonymous principal a request with
 /// NO `X-Agent-Id` header receives (`docs/API_REFERENCE.md`).
 const ANONYMOUS_REQUEST_PREFIX: &str = "anonymous:req-";
