@@ -52,15 +52,27 @@ MIN_FIXTURE_NAME_WIDTH = 3
 # Upper bound of the symlink-hop probe; far above every kernel limit (Linux 40,
 # macOS 32) and below the interpreter recursion limit.
 SYMLINK_PROBE_CAP = 256
+# Upper bound of an ``os.pathconf`` answer that sizes a fixture (#9781): far above
+# Linux PATH_MAX 4096 and every NAME_MAX, so a host that reports more (a FUSE or
+# network filesystem) is refused rather than turned into millions of mkdir calls.
+HOST_LIMIT_CEILING = 65536
 
 
 def host_limit(directory, name, pathconf=os.pathconf):
     """The host's ``os.pathconf`` limit ``name`` (``PC_NAME_MAX``, ``PC_PATH_MAX``) for ``directory``.
 
     ``pathconf`` is a parameter so a test injects an answer or a failure. An
-    ``OSError`` from it propagates unchanged; an unlimited (-1) or zero answer is refused.
+    ``OSError`` from it propagates unchanged. Only a value ``v`` with
+    ``0 < v <= HOST_LIMIT_CEILING`` is returned; a non-integer (``bool`` included),
+    an unlimited (-1), zero or above-ceiling answer is refused.
     """
     value = pathconf(str(directory), name)
+    if type(value) is not int:
+        raise ValueError("%s reports a non-integer limit: %r" % (name, value))
+    if value > HOST_LIMIT_CEILING:
+        raise ValueError(
+            "%s reports a limit above the ceiling %d: %d" % (name, HOST_LIMIT_CEILING, value)
+        )
     if value <= 0:
         raise ValueError("%s reports no usable limit: %d" % (name, value))
     return value
