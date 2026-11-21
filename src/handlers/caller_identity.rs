@@ -25,7 +25,9 @@
 //! [`crate::identity::resolve_http_agent_id`].
 //!
 //! `tests/agent_id_refusal_9616.rs` holds the per-route, per-backend census
-//! and the source ratchet that keeps every header read under `src/handlers`
+//! (each cell compares the whole refusal body and names the layer that
+//! answered) and the source ratchet: an allowlist over every `.rs` file under
+//! `src/` that keeps every read of the header, and every resolver fallback,
 //! inside this module.
 
 use axum::Json;
@@ -153,9 +155,97 @@ mod tests {
         headers
     }
 
+    /// One invalid header form: its `X-Agent-Id` values and the exact,
+    /// hand-written `error` text every funnel entry must refuse it with.
+    struct InvalidForm {
+        name: &'static str,
+        values: &'static [&'static [u8]],
+        error: &'static str,
+    }
+
+    /// 129 bytes: one past the 128-byte agent_id cap.
+    const OVERSIZE_VALUE: &[u8] = &[b'a'; 129];
+
+    /// The expected column is written out by hand, never derived from the
+    /// code under test.
+    const INVALID_FORMS: &[InvalidForm] = &[
+        InvalidForm {
+            name: "bad shape",
+            values: &[b"bad id"],
+            error: "invalid agent_id: agent_id contains invalid character ' ' \
+                    (allowed: alphanumeric, _-:@./)",
+        },
+        InvalidForm {
+            name: "leading blank",
+            values: &[b" ai:a"],
+            error: "invalid agent_id: agent_id contains invalid character ' ' \
+                    (allowed: alphanumeric, _-:@./)",
+        },
+        InvalidForm {
+            name: "reserved",
+            values: &[b"daemon"],
+            error: "invalid agent_id: agent_id 'daemon' is reserved for internal use \
+                    and cannot be supplied by wire callers",
+        },
+        InvalidForm {
+            name: "oversize",
+            values: &[OVERSIZE_VALUE],
+            error: "invalid agent_id: agent_id exceeds max length of 128 bytes",
+        },
+        InvalidForm {
+            name: "non-utf8",
+            values: &[b"ai:\xffx"],
+            error: "invalid agent_id: X-Agent-Id header is not valid UTF-8",
+        },
+        InvalidForm {
+            name: "duplicate, distinct",
+            values: &[b"ai:a", b"ai:b"],
+            error: "invalid agent_id: more than one X-Agent-Id header",
+        },
+        InvalidForm {
+            name: "duplicate, equal",
+            values: &[b"ai:a", b"ai:a"],
+            error: "invalid agent_id: more than one X-Agent-Id header",
+        },
+        InvalidForm {
+            name: "duplicate, second invalid",
+            values: &[b"ai:a", b"\xff"],
+            error: "invalid agent_id: more than one X-Agent-Id header",
+        },
+    ];
+
+    async fn status_and_body(resp: Response) -> (StatusCode, serde_json::Value) {
+        /// Far above any refusal body; a refusal never echoes the value.
+        const BODY_LIMIT: usize = 64 * 1024;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), BODY_LIMIT)
+            .await
+            .expect("refusal body");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("refusal body is JSON"),
+        )
+    }
+
+    /// The exact response every funnel entry answers an invalid form with.
+    fn refusal_response(error: &str) -> (StatusCode, serde_json::Value) {
+        (StatusCode::BAD_REQUEST, json!({ "error": error }))
+    }
+
     #[test]
     fn absent_header_is_the_documented_anonymous_default_9616() {
         let caller = resolve_caller(&HeaderMap::new(), None).expect("anonymous default");
+        assert!(
+            crate::identity::is_anonymous_request_id(&caller),
+            "{caller}"
+        );
+    }
+
+    /// An empty value is read as no claim, exactly as
+    /// `identity::resolve_http_agent_id` reads it: the anonymous default.
+    #[test]
+    fn empty_header_is_the_anonymous_default_9616() {
+        let caller = resolve_caller(&with(&[b""]), None).expect("anonymous default");
         assert!(
             crate::identity::is_anonymous_request_id(&caller),
             "{caller}"
@@ -168,37 +258,103 @@ mod tests {
             resolve_caller(&with(&[b"ai:alice"]), None).as_deref(),
             Ok("ai:alice")
         );
+        assert_eq!(header_agent_id(&with(&[b"ai:alice"])), Ok(Some("ai:alice")));
+        assert_eq!(header_agent_id(&HeaderMap::new()), Ok(None));
     }
 
     #[test]
-    fn every_invalid_form_is_one_named_refusal_9616() {
-        let cases: &[(&[&[u8]], &str)] = &[
-            (&[b"ai:\xffx"], NON_UTF8_REASON),
-            (&[b"ai:a", b"ai:b"], MULTIPLE_REASON),
-            (&[b"ai:a", b"ai:a"], MULTIPLE_REASON),
-        ];
-        for (values, reason) in cases {
-            let refusal = resolve_caller(&with(values), None).expect_err("refused");
+    fn resolve_caller_refuses_every_invalid_form_with_its_exact_message_9616() {
+        for form in INVALID_FORMS {
             assert_eq!(
-                refusal.message(),
-                crate::errors::msg::invalid(AGENT_ID_FIELD, reason)
+                resolve_caller(&with(form.values), None).map_err(|r| r.message().to_owned()),
+                Err(form.error.to_owned()),
+                "{}",
+                form.name
             );
         }
-        for bad in [&b"bad id"[..], b"daemon", &[b'a'; 129][..]] {
-            let refusal = resolve_caller(&with(&[bad]), None).expect_err("refused");
-            assert!(
-                refusal.message().starts_with("invalid agent_id: "),
-                "{refusal}"
+    }
+
+    #[tokio::test]
+    async fn http_caller_answers_every_invalid_form_with_the_exact_400_9616() {
+        for form in INVALID_FORMS {
+            let resp = http_caller(&with(form.values)).expect_err(form.name);
+            assert_eq!(
+                status_and_body(resp).await,
+                refusal_response(form.error),
+                "{}",
+                form.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn http_caller_in_answers_every_invalid_form_with_the_exact_400_9616() {
+        for form in INVALID_FORMS {
+            let headers = with(form.values);
+            let resp = http_caller_in(Some(&headers)).expect_err(form.name);
+            assert_eq!(
+                status_and_body(resp).await,
+                refusal_response(form.error),
+                "{}",
+                form.name
+            );
+        }
+        let caller = http_caller_in(None).expect("no headers is the anonymous default");
+        assert!(
+            crate::identity::is_anonymous_request_id(&caller),
+            "{caller}"
+        );
+        match http_caller_in(Some(&with(&[b"ai:alice"]))) {
+            Ok(caller) => assert_eq!(caller, "ai:alice"),
+            Err(_) => panic!("one valid header was refused"),
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn http_caller_ctx_answers_every_invalid_form_with_the_exact_400_9616() {
+        for form in INVALID_FORMS {
+            let resp = crate::handlers::parity::http_caller_ctx(&with(form.values), None)
+                .expect_err(form.name);
+            assert_eq!(
+                status_and_body(resp).await,
+                refusal_response(form.error),
+                "{}",
+                form.name
+            );
+        }
+        match crate::handlers::parity::http_caller_ctx(&with(&[b"ai:alice"]), None) {
+            Ok(ctx) => assert_eq!(ctx.agent_id, "ai:alice"),
+            Err(_) => panic!("one valid header was refused"),
+        }
+    }
+
+    /// `audit_actor` is a label on a path already refusing: every invalid
+    /// form records the `anonymous:invalid` sentinel, a valid one the caller.
+    #[test]
+    fn audit_actor_labels_every_invalid_form_anonymous_invalid_9616() {
+        for form in INVALID_FORMS {
+            assert_eq!(
+                audit_actor(&with(form.values)),
+                "anonymous:invalid",
+                "{}",
+                form.name
+            );
+        }
+        assert_eq!(audit_actor(&with(&[b"ai:alice"])), "ai:alice");
     }
 
     #[test]
     fn body_claim_must_match_the_header_9616() {
-        let refusal = resolve_caller(&with(&[b"ai:alice"]), Some("ai:bob")).expect_err("mismatch");
-        assert!(
-            refusal.message().contains("agent_id_body_header_mismatch"),
-            "{refusal}"
+        assert_eq!(
+            resolve_caller(&with(&[b"ai:alice"]), Some("ai:bob")).map_err(|r| r.message().to_owned()),
+            Err("invalid agent_id: agent_id_body_header_mismatch: body-supplied agent_id \
+                 \"ai:bob\" disagrees with authenticated header-resolved id \"ai:alice\""
+                .to_owned())
+        );
+        assert_eq!(
+            resolve_caller(&with(&[b"ai:alice"]), Some("ai:alice")).as_deref(),
+            Ok("ai:alice")
         );
     }
 
@@ -218,16 +374,18 @@ mod tests {
         let start = std::time::Instant::now();
         let refusal = header_agent_id(&headers).expect_err("refused");
         assert!(start.elapsed() < bound);
-        assert!(refusal.message().ends_with(MULTIPLE_REASON), "{refusal}");
+        assert_eq!(
+            refusal.message(),
+            "invalid agent_id: more than one X-Agent-Id header"
+        );
 
         let huge = vec![b'a'; HUGE_VALUE];
         let start = std::time::Instant::now();
         let refusal = resolve_caller(&with(&[&huge]), None).expect_err("refused");
         assert!(start.elapsed() < bound);
-        assert!(refusal.message().starts_with("invalid agent_id: "));
-        assert!(
-            refusal.message().len() < HUGE_VALUE,
-            "the refusal must not echo the whole value"
+        assert_eq!(
+            refusal.message(),
+            "invalid agent_id: agent_id exceeds max length of 128 bytes"
         );
     }
 }

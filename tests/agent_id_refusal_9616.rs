@@ -15,11 +15,21 @@
 //!
 //! The invariant pinned here, for every route in the census and every
 //! invalid form in [`INVALID_FORMS`], on sqlite and on postgres: the answer
-//! is `400` with an `error` that starts with [`INVALID_AGENT_ID_PREFIX`], and
-//! a refused destructive request leaves the memory in place. A route that the
-//! postgres route gate does not serve answers its gate status (501) for the
-//! valid control AND every invalid form, so no principal is formed there
-//! either; that cell is reported as `pg-gate`.
+//! is `400` with EXACTLY the body [`expected_body`] gives for the layer that
+//! refuses it, and a refused destructive request leaves the memory in place.
+//! Two legs run per backend:
+//!
+//! * the full router: every route under the authority layer answers that
+//!   layer's envelope (`{"code":"VALIDATION_FAILED","error":..}`), and
+//!   `GET /api/v1/sync/since`, which the layer exempts, answers the handler's
+//!   `CallerRefusal` (`{"error":..}`);
+//! * a router with NO authority layer, the same handlers on the same paths:
+//!   every route answers the handler's `CallerRefusal`, so the handler's own
+//!   refusal is pinned and not hidden behind the layer.
+//!
+//! A route that the postgres route gate does not serve answers its gate
+//! status (501) for the valid control AND every invalid form, so no principal
+//! is formed there either; that cell is reported as `pg-gate`.
 //!
 //! The missing header keeps its documented anonymous default
 //! (`docs/API_REFERENCE.md`), so it is not an invalid form here.
@@ -31,7 +41,6 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, StatusCode};
 use serde_json::{Value, json};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
@@ -50,8 +59,11 @@ fn namespace() -> &'static str {
     static RUN_NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RUN_NAMESPACE.get_or_init(|| format!("{NAMESPACE_PREFIX}{}", uuid::Uuid::new_v4().simple()))
 }
-/// The named-400 prefix (`errors::msg::invalid("agent_id", ..)`).
-const INVALID_AGENT_ID_PREFIX: &str = "invalid agent_id:";
+/// The authority layer's error code (`errors::error_codes::VALIDATION_FAILED`).
+const VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+/// The one route the authority layer exempts that resolves a caller: its
+/// handler's `CallerRefusal` is the only defence there.
+const SYNC_SINCE: &str = "/api/v1/sync/since";
 /// One byte past the 128-byte `validate_agent_id` ceiling.
 const OVERSIZE_LEN: usize = 129;
 /// Bytes that are a legal header value (obs-text) but not UTF-8.
@@ -59,7 +71,7 @@ const NON_UTF8_BYTES: &[u8] = b"ai:\xffmallory-9616";
 const BODY_LIMIT: usize = 1024 * 1024;
 
 /// One invalid identity form, as the header values the request carries.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
     BadShape,
     Reserved,
@@ -101,6 +113,120 @@ impl Form {
     }
 }
 
+/// The exact `error` text each invalid form is refused with, written out by
+/// hand (never computed from the code under test). The same text is the
+/// handler's `CallerRefusal` message and the authority layer's `error`.
+const EXPECTED_ERROR: [(Form, &str); 5] = [
+    (
+        Form::BadShape,
+        "invalid agent_id: agent_id contains invalid character ' ' (allowed: alphanumeric, _-:@./)",
+    ),
+    (
+        Form::Reserved,
+        "invalid agent_id: agent_id 'daemon' is reserved for internal use and cannot be supplied \
+         by wire callers",
+    ),
+    (
+        Form::Oversize,
+        "invalid agent_id: agent_id exceeds max length of 128 bytes",
+    ),
+    (
+        Form::NonUtf8,
+        "invalid agent_id: X-Agent-Id header is not valid UTF-8",
+    ),
+    (
+        Form::Duplicate,
+        "invalid agent_id: more than one X-Agent-Id header",
+    ),
+];
+
+/// The layer a census cell pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layer {
+    /// `handlers::authority::authority_layer`: `{"code","error"}`.
+    Authority,
+    /// The handler's own `CallerRefusal`: `{"error"}` only.
+    Handler,
+    /// `handlers::create::resolve_create_caller`: the create and bulk wire
+    /// contract maps the `CallerRefusal` into its `{"code","error"}` field
+    /// error, so the body equals the authority layer's.
+    CreateFunnel,
+    /// The v2 approval-signature check that pending approve / reject run
+    /// before caller resolution; it fails closed with a `401` on a header
+    /// that is one valid-UTF-8 value, whatever its shape.
+    ApprovalSignature,
+    /// A build without `sal`: `verify_link_handler` is a stub that answers
+    /// `501` before it reads any input.
+    SalStub,
+}
+
+impl Layer {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Authority => "authority",
+            Self::Handler => "handler",
+            Self::CreateFunnel => "create-funnel",
+            Self::ApprovalSignature => "approval-signature",
+            Self::SalStub => "sal-stub",
+        }
+    }
+
+    fn status(self) -> StatusCode {
+        match self {
+            Self::Authority | Self::Handler | Self::CreateFunnel => StatusCode::BAD_REQUEST,
+            Self::ApprovalSignature => StatusCode::UNAUTHORIZED,
+            Self::SalStub => StatusCode::NOT_IMPLEMENTED,
+        }
+    }
+}
+
+/// The non-`sal` `verify_link_handler` stub body, hand-written.
+const SAL_STUB_ERROR: &str = "verify_link requires --features sal";
+
+/// The approval-signature refusal, hand-written.
+const APPROVAL_SIGNATURE_ERROR: &str = "invalid or missing X-AI-Memory-Signature";
+const APPROVAL_SIGNATURE_HINT: &str = r#"approval decides require signature layout v2: X-AI-Memory-Signature: sha256=<HMAC-SHA256(SHA256(secret), "<ts>.<METHOD>.<n>:<pending_id>@<m>:<X-Agent-Id>.<body>")> (<n>, <m> = the decimal byte lengths of the two ids) with X-AI-Memory-Timestamp: <unix-epoch-secs>. The approver named by X-Agent-Id is inside the signed subject; a v1 signature over <ts>.<METHOD>.<pending_id>.<body> does not bind the approver and is refused."#;
+const APPROVAL_SIGNATURE_LAYOUT: u64 = 2;
+
+fn expected_error(form: Form) -> &'static str {
+    EXPECTED_ERROR
+        .iter()
+        .find(|(f, _)| *f == form)
+        .map(|(_, text)| *text)
+        .expect("every form has a hand-written row")
+}
+
+/// The whole body a refused request must answer at `layer`.
+fn expected_body(form: Form, layer: Layer) -> Value {
+    match layer {
+        Layer::Authority | Layer::CreateFunnel => {
+            json!({"code": VALIDATION_FAILED, "error": expected_error(form)})
+        }
+        Layer::Handler => json!({"error": expected_error(form)}),
+        Layer::ApprovalSignature => json!({
+            "error": APPROVAL_SIGNATURE_ERROR,
+            "hint": APPROVAL_SIGNATURE_HINT,
+            "signature_layout_version": APPROVAL_SIGNATURE_LAYOUT,
+        }),
+        Layer::SalStub => json!({"error": SAL_STUB_ERROR}),
+    }
+}
+
+/// The layer that refuses `form` on a route when the request reaches the
+/// production handler directly (no authority layer in front of it).
+fn handler_layer(method: &str, uri: &str, form: Form) -> Layer {
+    let approval = method == "POST"
+        && (uri == "/api/v1/pending/{id}/approve" || uri == "/api/v1/pending/{id}/reject");
+    let verify_stub =
+        cfg!(not(feature = "sal")) && method == "POST" && uri == "/api/v1/links/verify";
+    match form {
+        _ if verify_stub => Layer::SalStub,
+        Form::BadShape | Form::Reserved | Form::Oversize if approval => Layer::ApprovalSignature,
+        _ if method == "POST" && uri == "/api/v1/memories" => Layer::CreateFunnel,
+        _ => Layer::Handler,
+    }
+}
+
 /// One census route: method, uri (with `{id}` for the fixture memory and
 /// `{ns}` for the per-run fixture namespace) and
 /// an optional JSON body.
@@ -126,8 +252,12 @@ fn create_body(_: &str) -> Value {
     })
 }
 
+/// A well-formed id that names no memory: the link target, so the body is
+/// not refused as a self-link before the caller is resolved.
+const ABSENT_TARGET_ID: &str = "00000000-0000-4000-8000-000000009616";
+
 fn link_body(id: &str) -> Value {
-    json!({"source_id": id, "target_id": id, "relation": "related_to"})
+    json!({"source_id": id, "target_id": ABSENT_TARGET_ID, "relation": "related_to"})
 }
 
 fn namespace_body(id: &str) -> Value {
@@ -189,7 +319,7 @@ fn census_routes() -> Vec<Route> {
             None,
             false,
         ),
-        r("POST", "/api/v1/links/verify", Some(empty_body), false),
+        r("POST", "/api/v1/links/verify", Some(link_body), false),
         r("POST", "/api/v1/archive", Some(ids_body), true),
         r("DELETE", "/api/v1/archive", None, true),
         r("POST", "/api/v1/archive/{id}/restore", None, false),
@@ -222,7 +352,81 @@ fn census_routes() -> Vec<Route> {
             Some(empty_body),
             false,
         ),
+        r("GET", SYNC_SINCE, None, false),
     ]
+}
+
+/// The layer that refuses an invalid form on `uri` in the FULL router.
+fn full_router_layer(uri: &str) -> Layer {
+    if uri == SYNC_SINCE {
+        Layer::Handler
+    } else {
+        Layer::Authority
+    }
+}
+
+/// The census routes registered on their production handlers with NO
+/// authority layer, no transport auth and no postgres gate: a request reaches
+/// the handler with the header exactly as sent.
+fn handler_router(app: AppState) -> axum::Router {
+    use ai_memory::handlers as h;
+    use axum::routing::{delete, get, post};
+    axum::Router::new()
+        .route(
+            "/api/v1/memories/{id}",
+            get(h::get_memory).delete(h::delete_memory),
+        )
+        .route(
+            "/api/v1/memories",
+            get(h::list_memories).post(h::create_memory),
+        )
+        .route("/api/v1/search", get(h::search_memories))
+        .route("/api/v1/contradictions", get(h::detect_contradictions))
+        .route("/api/v1/links", delete(h::delete_link))
+        .route("/api/v1/links/{id}", get(h::get_links))
+        .route("/api/v1/memories/{id}/lineage", get(h::get_lineage))
+        .route(
+            "/api/v1/namespaces",
+            post(h::set_namespace_standard_qs).delete(h::clear_namespace_standard_qs),
+        )
+        .route("/api/v1/check_duplicate", post(h::check_duplicate))
+        .route("/api/v1/entities/by_alias", get(h::entity_get_by_alias))
+        .route("/api/v1/links/verify", post(h::verify_link_handler))
+        .route(
+            "/api/v1/archive",
+            post(h::archive_by_ids).delete(h::purge_archive),
+        )
+        .route("/api/v1/archive/{id}/restore", post(h::restore_archive))
+        .route("/api/v1/agents", post(h::register_agent))
+        .route("/api/v1/pending", get(h::list_pending))
+        .route("/api/v1/pending/{id}/approve", post(h::approve_pending))
+        .route("/api/v1/pending/{id}/reject", post(h::reject_pending))
+        .route("/api/v1/share", post(h::share_memory))
+        .route(
+            h::routes::MEMORY_REFLECTION_ORIGIN,
+            post(h::route_1111::handle_reflection_origin_http),
+        )
+        .route(
+            h::routes::MEMORY_DEPENDENTS_OF_INVALIDATED,
+            post(h::route_1111::handle_dependents_of_invalidated_http),
+        )
+        .route(
+            h::routes::MEMORY_VERIFY,
+            post(h::route_1111::handle_verify_http),
+        )
+        .route(
+            h::routes::MEMORY_SMART_LOAD,
+            post(h::route_1111::handle_smart_load_http),
+        )
+        .route(SYNC_SINCE, get(h::sync_since))
+        .with_state(app)
+}
+
+/// Which router a census leg drives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    Full,
+    HandlerOnly,
 }
 
 #[cfg_attr(
@@ -304,7 +508,7 @@ async fn postgres_app_state(url: &str) -> AppState {
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(Mutex::new((
         conn,
-        PathBuf::from(":memory:"),
+        std::path::PathBuf::from(":memory:"),
         ResolvedTtl::default(),
         true,
     )));
@@ -397,16 +601,20 @@ async fn create_fixture(router: &axum::Router) -> String {
 /// one run reports EVERY broken cell, not only the first. A destructive cell
 /// that removed the fixture is reported and the fixture is recreated, so one
 /// removal never cascades into the cells after it.
-async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
-    let router = router(app);
+async fn census(app: AppState, backend: &str, leg: Leg) -> (Vec<String>, Vec<String>) {
+    let router = match leg {
+        Leg::Full => router(app),
+        Leg::HandlerOnly => handler_router(app),
+    };
     let mut id = create_fixture(&router).await;
 
     let mut table = Vec::new();
     let mut broken = Vec::new();
     for route in census_routes() {
-        // The valid control only classifies a postgres-gated route; it is
-        // never sent to a destructive route (it would act on the fixture).
-        let gated = if backend == "postgres" && !route.destructive {
+        // The valid control only classifies a postgres-gated route (the gate
+        // is in the full router only); it is never sent to a destructive
+        // route (it would act on the fixture).
+        let gated = if backend == "postgres" && leg == Leg::Full && !route.destructive {
             let uri = route.uri.replace("{id}", &id).replace("{ns}", namespace());
             let control_body = route.body.map(|b| b(&id));
             let (control, _) = call(&router, route.method, &uri, &alice(), control_body).await;
@@ -415,6 +623,10 @@ async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
             false
         };
         for form in INVALID_FORMS {
+            let layer = match leg {
+                Leg::Full => full_router_layer(route.uri),
+                Leg::HandlerOnly => handler_layer(route.method, route.uri, *form),
+            };
             let uri = route.uri.replace("{id}", &id).replace("{ns}", namespace());
             let (status, body) = call(
                 &router,
@@ -424,19 +636,19 @@ async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
                 route.body.map(|b| b(&id)),
             )
             .await;
-            let error = body["error"].as_str().unwrap_or_default();
-            let refused =
-                status == StatusCode::BAD_REQUEST && error.starts_with(INVALID_AGENT_ID_PREFIX);
+            let expected = (layer.status(), expected_body(*form, layer));
+            let refused = (status, &body) == (expected.0, &expected.1);
             let gate_held = gated && status == StatusCode::NOT_IMPLEMENTED;
             let cell = if refused {
-                "400 named"
+                "exact"
             } else if gate_held {
                 "pg-gate"
             } else {
                 "BROKEN"
             };
             table.push(format!(
-                "{backend} | {} {} | {} | {} | {cell}",
+                "{backend} | {} | {} {} | {} | {} | {cell}",
+                layer.name(),
                 route.method,
                 route.uri,
                 form.name(),
@@ -444,10 +656,13 @@ async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
             ));
             if !(refused || gate_held) {
                 broken.push(format!(
-                    "{backend} {} {} form={} -> {status} {body}",
+                    "{backend} layer={} {} {} form={} -> {status} {body}; expected {} {}",
+                    layer.name(),
                     route.method,
                     route.uri,
-                    form.name()
+                    form.name(),
+                    expected.0,
+                    expected.1
                 ));
             }
             if route.destructive {
@@ -475,36 +690,89 @@ async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn report(table: &[String], broken: &[String]) {
-    eprintln!("backend | route | form | status | cell");
+    eprintln!("backend | layer | route | form | status | cell");
     for line in table {
         eprintln!("{line}");
     }
-    assert!(
-        broken.is_empty(),
-        "{} census cell(s) broke the #9616 invariant:\n{}",
-        broken.len(),
-        broken.join("\n")
+    assert_eq!(
+        broken,
+        Vec::<String>::new(),
+        "{} census cell(s) broke the #9616 invariant",
+        broken.len()
     );
+}
+
+/// Every census row on one backend: the cell count is the route count times
+/// the form count, so a row that silently dropped out is a red.
+fn assert_full_table(table: &[String]) {
+    assert_eq!(table.len(), census_routes().len() * INVALID_FORMS.len());
+}
+
+/// `GET /api/v1/sync/since` checks the per-message federation signature
+/// BEFORE it reads `X-Agent-Id` (default on, `AI_MEMORY_FED_REQUIRE_SIG`).
+/// The census sends no signature, so this binary runs with the check off to
+/// let the request reach the caller resolution the cell pins. Set once, for
+/// the life of this test process (its own binary), before any request.
+fn unsigned_sync_since_for_tests() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // SAFETY: `Once`-gated process-global env write before the calling
+        // test issues any request; never mutated again in this process.
+        unsafe {
+            std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        }
+    });
+}
+
+async fn sqlite_census(leg: Leg) {
+    common::permissive_attestation_for_tests();
+    unsigned_sync_since_for_tests();
+    std::fs::create_dir_all(".local-runs").unwrap();
+    let dir = tempfile::tempdir_in(".local-runs").unwrap();
+    let (table, broken) = census(
+        sqlite_app_state(&dir.path().join("memories.db")),
+        "sqlite",
+        leg,
+    )
+    .await;
+    report(&table, &broken);
+    assert_full_table(&table);
+}
+
+#[cfg(feature = "sal-postgres")]
+async fn postgres_census(leg: Leg) {
+    let Some(url) = common::postgres_url() else {
+        return;
+    };
+    common::permissive_attestation_for_tests();
+    unsigned_sync_since_for_tests();
+    let (table, broken) = census(postgres_app_state(&url).await, "postgres", leg).await;
+    report(&table, &broken);
+    assert_full_table(&table);
 }
 
 #[tokio::test]
 async fn sqlite_invalid_agent_id_is_one_named_400_on_every_route_9616() {
-    common::permissive_attestation_for_tests();
-    std::fs::create_dir_all(".local-runs").unwrap();
-    let dir = tempfile::tempdir_in(".local-runs").unwrap();
-    let (table, broken) = census(sqlite_app_state(&dir.path().join("memories.db")), "sqlite").await;
-    report(&table, &broken);
+    sqlite_census(Leg::Full).await;
 }
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_invalid_agent_id_is_one_named_400_on_every_route_9616() {
-    let Some(url) = common::postgres_url() else {
-        return;
-    };
-    common::permissive_attestation_for_tests();
-    let (table, broken) = census(postgres_app_state(&url).await, "postgres").await;
-    report(&table, &broken);
+    postgres_census(Leg::Full).await;
+}
+
+/// The handler's own refusal, with no authority layer in front of it.
+#[tokio::test]
+async fn sqlite_handler_refuses_every_form_without_the_authority_layer_9616() {
+    sqlite_census(Leg::HandlerOnly).await;
+}
+
+/// The handler's own refusal, with no authority layer in front of it.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_handler_refuses_every_form_without_the_authority_layer_9616() {
+    postgres_census(Leg::HandlerOnly).await;
 }
 
 /// Documented prefix of the per-request anonymous principal a request with
@@ -628,91 +896,8 @@ async fn postgres_missing_agent_id_stays_anonymous_9616() {
     assert_missing_header_stays_anonymous(postgres_app_state(&url).await, "postgres").await;
 }
 
-/// The one module allowed to read the `X-Agent-Id` header under
-/// `src/handlers`.
-const CALLER_IDENTITY_MODULE: &str = "caller_identity.rs";
+#[path = "agent_id_refusal_9616/ratchet.rs"]
+mod ratchet;
 
-/// Source forms that re-open the #9616 class, matched on whitespace-free
-/// source: a raw header read (non-UTF-8 read as absent, a duplicate read as
-/// its first value) and a resolver result folded into a fallback principal.
-const FORBIDDEN_FORMS: &[(&str, &str)] = &[
-    (".get(crate::HEADER_AGENT_ID)", "raw X-Agent-Id read"),
-    (".get(HEADER_AGENT_ID)", "raw X-Agent-Id read"),
-    (
-        "resolve_http_agent_id(None,header_agent_id).unwrap_or",
-        "resolver error folded into a fallback",
-    ),
-    (
-        "resolve_http_agent_id(None,header_agent_id).ok()",
-        "resolver error folded into None",
-    ),
-    // The sibling class the census found beyond the 26 header sites: the
-    // shared parity resolver with its error folded into a principal.
-    (
-        "resolve_caller_agent_id(None,&headers,None).unwrap_or",
-        "resolver error folded into a fallback",
-    ),
-    (
-        "resolve_caller_agent_id(None,&headers,None).ok()",
-        "resolver error folded into None",
-    ),
-    (
-        "sentinels::ANONYMOUS_INVALID.to_string()",
-        "invalid header folded into the anonymous:invalid principal",
-    ),
-];
-
-fn handler_sources(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("read src/handlers") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            handler_sources(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-/// Ratchet: every `X-Agent-Id` read under `src/handlers` goes through
-/// `caller_identity`, and no resolver error is folded into a principal. One
-/// run lists every offending site.
-#[test]
-fn handlers_read_the_agent_id_header_only_through_caller_identity_9616() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
-    let mut files = Vec::new();
-    handler_sources(&root, &mut files);
-    files.sort();
-    assert!(
-        files.iter().any(|f| f.ends_with(CALLER_IDENTITY_MODULE)),
-        "src/handlers/{CALLER_IDENTITY_MODULE} is the one header reader and must exist"
-    );
-    let mut offenders = Vec::new();
-    for file in &files {
-        let name = file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if name == CALLER_IDENTITY_MODULE || name == "tests.rs" || name.ends_with("_tests.rs") {
-            continue;
-        }
-        let source = std::fs::read_to_string(file).expect("read handler source");
-        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
-        for (form, why) in FORBIDDEN_FORMS {
-            let hits = compact.matches(form).count();
-            if hits > 0 {
-                offenders.push(format!(
-                    "{} : {hits} x {why} ({form})",
-                    file.strip_prefix(env!("CARGO_MANIFEST_DIR"))
-                        .unwrap_or(file)
-                        .display()
-                ));
-            }
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "{} handler site group(s) bypass caller_identity:\n{}",
-        offenders.len(),
-        offenders.join("\n")
-    );
-}
+#[path = "agent_id_refusal_9616/bind_request_9666.rs"]
+mod bind_request_9666;
