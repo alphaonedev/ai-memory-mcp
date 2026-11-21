@@ -986,6 +986,11 @@ class RustCacheSaveScope9681(unittest.TestCase):
                     self.assertEqual(warm_step.run(), pr_step.run(), label)
                     before_pr = pr_steps.index(pr_step) < pr_cache
                     self.assertEqual(warm_steps.index(warm_step) < warm_cache, before_pr, label)
+            # #9770: the whole rust-cache step, each mirrored cargo step and the job-level keys.
+            for leg in legs:
+                with self.subTest(pair=warm_job_id, part="pair-mirror", leg=_leg_id(leg)):
+                    self.assertEqual(
+                        pair_mirror_problems(pr_wf, pr_job_id, warm, warm_job_id, leg), [])
 
     def test_taint_boundary_knows_the_split_cache_actions(self) -> None:
         sys.path.insert(0, str(REPO / "scripts" / "ci"))
@@ -3101,6 +3106,351 @@ class UnreadEnvForms9745R1(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
+# #9770: whole-step and job-level mirror comparison of every PAIRS row.
+# For every PAIRS row the whole rust-cache step and each mirrored cargo step on both sides are
+# compared against a HAND-WRITTEN table with a closed allowed-difference list. Every step key and
+# every job-level key is compared; a key the table does not allow to differ must be equal on both
+# sides, and a key outside the known sets fails naming workflow, job, step and key. The expected
+# column below is written by hand from the workflow files and never derived from their text.
+# ---------------------------------------------------------------------------------------------
+class _Any:
+    """Marks a value the hand table lets differ without pinning it."""
+
+    def __repr__(self) -> str:
+        return "ANY"
+
+
+ANY = _Any()
+Expected = object  # a str, None (the key is absent) or ANY
+KNOWN_STEP_KEYS = ("id", "name", "if", "uses", "with", "env", "run", "shell", "working-directory",
+                   "continue-on-error", "timeout-minutes")
+KNOWN_JOB_KEYS = ("name", "needs", "if", "permissions", "runs-on", "timeout-minutes", "strategy",
+                  "defaults", "container", "services", "concurrency", "outputs", "environment",
+                  "continue-on-error")
+JOB_KEYS_COMPARED_ELSEWHERE = ("steps", "env")
+ONE_SIDED_PR = "pr"
+ONE_SIDED_WARM = "warm"
+
+
+@dataclass(frozen=True)
+class Row:
+    """One mirrored step: its identity on the PR side and on the warm side, and the keys that may
+    differ as (PR value, warm value); a value of None means the key is absent."""
+
+    pr_id: str
+    warm_id: str
+    allowed: dict[str, tuple[object, object]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PairTable:
+    rows: tuple[Row, ...]
+    pr_only: tuple[str, ...]
+    job_allowed: dict[str, tuple[object, object]]
+    env_one_sided: dict[str, str]
+
+    def row_for(self, pr_id: str) -> Row:
+        for row in self.rows:
+            if row.pr_id == pr_id:
+                return row
+        raise KeyError(pr_id)
+
+
+CI_IF_NOT_SKIPPED = "needs.classify.outputs.cargo_skip != 'true'"
+CI_IF_HOSTED = CI_IF_NOT_SKIPPED + " && runner.environment == 'github-hosted'"
+CI_IF_LOW_MEM = CI_IF_NOT_SKIPPED + " && matrix.leg == 'ubuntu-latest,sqlite'"
+WARM_IF_CACHE_MISS = "steps.rust-cache.outputs.cache-hit != 'true'"
+WARM_CACHE_ID = "rust-cache"
+WARM_CACHE_NAME = "Rust cache (write the key the PR job restores)"
+CI_CARGO_ENV = "\n".join((
+    'AI_MEMORY_NO_CONFIG: "1"',
+    "TIER: sqlite",
+    "CI_NODE: ubuntu-latest",
+    "TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}",
+    "DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}",
+    "TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}",
+    "TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}",
+    "TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}",
+    "JOB_TIMEOUT_MIN: 95",
+    "CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}",
+    "HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' "
+    "&& '2' || '0' }}",
+    "HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'",
+))
+CI_RUST_CACHE_ALLOWED = {"if": (CI_IF_HOSTED, None), "id": (None, WARM_CACHE_ID),
+                         "name": (None, WARM_CACHE_NAME)}
+COV_RUST_CACHE_ALLOWED = {"id": (None, WARM_CACHE_ID), "name": (None, WARM_CACHE_NAME)}
+
+PAIR_TABLES: dict[tuple[str, str], PairTable] = {
+    ("ci.yml", "check"): PairTable(
+        rows=(
+            Row("actions/checkout", "actions/checkout"),
+            Row("Free disk before tests (hosted image only,",
+                "Free disk before tests (hosted image only,", {"if": (CI_IF_HOSTED, None)}),
+            Row("actions/setup-python", "actions/setup-python", {"if": (CI_IF_HOSTED, None)}),
+            Row("actions/setup-node", "actions/setup-node", {"if": (CI_IF_HOSTED, None)}),
+            Row("Install Rust 1.99.1 (matches rust-toolchain.toml pin)",
+                "Install Rust 1.99.1 (matches rust-toolchain.toml pin)",
+                {"if": (CI_IF_NOT_SKIPPED, None)}),
+            Row(RUST_CACHE, RUST_CACHE, CI_RUST_CACHE_ALLOWED),
+            Row("Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)",
+                "Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)",
+                {"if": (CI_IF_LOW_MEM, None)}),
+            Row("Run tests (impact-aware)", "Build the test targets (no run)", {
+                "name": (ANY, ANY), "run": (ANY, ANY), "shell": ("bash", None),
+                "if": (CI_IF_NOT_SKIPPED, WARM_IF_CACHE_MISS), "env": (CI_CARGO_ENV, None)}),
+        ),
+        pr_only=(
+            "Record job start (#6795)",
+            "Fork-PR refusal (self-hosted legs never run fork code)",
+            "Prune stale runner TMPDIR (#8634)",
+            "cargo_skip short-circuit",
+            "Per-runner cargo target (#7188)",
+            "sccache build cache (#7199)",
+            "Ensure python3 + node present (self-hosted;",
+            "Assert rustup is provisioned (self-hosted; fail-closed",
+            "Prebuild t0 orchestrator (macOS e1 anti-flake,",
+            "Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)",
+            "Run the pg_isolated_binary live cells (enterprise-fed legs only)",
+            "Scrub inherited passphrase env (self-hosted only, issue 3539 hygiene)",
+            "Load gate (#6795)",
+            "Upload test results (durable audit history)",
+            "Upload shard logs (#6344)",
+            "Upload isolated-lane per-binary logs (#6383)",
+            "Trim target/debug before the cache save (hosted)",
+            "Cleanup enterprise-fed ephemeral db",
+            "sccache hit-rate summary (#7199)",
+            "sccache stop CI server (#7199)",
+            "Prune stale runner artifacts (#7188)",
+            "Sweep target/debug to the size cap (self-hosted)",
+            "Sweep per-runner cargo target to the size cap (self-hosted,",
+        ),
+        job_allowed={
+            "name": (ANY, ANY), "needs": ("classify", None), "strategy": (ANY, None),
+            "runs-on": ('["ubuntu-latest"]', "ubuntu-latest"),
+        },
+        env_one_sided={"SELF_HOSTED_TARGET_CAP_BYTES": ONE_SIDED_PR},
+    ),
+    ("coverage.yml", "per-module-thresholds"): PairTable(
+        rows=(
+            Row("actions/checkout", "actions/checkout"),
+            Row("Free disk + add swap (#1148 belt-and-suspenders, aggressive)",
+                "Free disk + add swap (#1148 belt-and-suspenders, aggressive)"),
+            Row("Install Rust 1.99.1", "Install Rust 1.99.1"),
+            Row("Install mold linker (#1148, pinned+bounded",
+                "Install mold linker (#1148, pinned+bounded"),
+            Row(RUST_CACHE, RUST_CACHE, COV_RUST_CACHE_ALLOWED),
+            Row("Restore HuggingFace models (#2019)", "Restore HuggingFace models (#2019)"),
+            Row("Pre-stage HF models with retry (#2019)", "Pre-stage HF models with retry (#2019)"),
+            Row("Verify staged HF cache is hf-hub-resolvable (#2019)",
+                "Verify staged HF cache is hf-hub-resolvable (#2019)"),
+            Row("Save HuggingFace models (#2019, push only)",
+                "Save HuggingFace models (#2019, push only)"),
+            Row("Install cargo-llvm-cov", "Install cargo-llvm-cov",
+                {"if": (None, WARM_IF_CACHE_MISS)}),
+            Row("Generate coverage JSON",
+                "Build the instrumented coverage targets (no test runs)", {
+                    "name": (ANY, ANY), "run": (ANY, ANY), "if": (None, WARM_IF_CACHE_MISS),
+                    "env": (None, None)}),
+        ),
+        pr_only=(
+            "Install jq + postgresql-client (bounded+retry",
+            "Start TLS PostgreSQL + AGE (#3705)",
+            "Install pgvector + provision AGE/vector extensions",
+            "PostgreSQL package repair + preflight (#9235)",
+            "Enforce per-module thresholds",
+            "Render coverage comment body (#1993)",
+            "Post coverage to PR (sticky) (#1993)",
+            "Upload coverage JSON",
+        ),
+        job_allowed={
+            "name": (ANY, ANY), "needs": ("classify", None),
+            "if": ("needs.classify.outputs.docs_only != 'true'", None),
+            "permissions": ("contents: read\npull-requests: write", None),
+        },
+        env_one_sided={},
+    ),
+}
+
+
+def _step_ident(step: Step) -> str:
+    """The identity a hand-table row names: the action for a rust-cache step, else the step label."""
+    return RUST_CACHE if step.uses_name() == RUST_CACHE else step.label()
+
+
+def _relative(lines: list[str], indent: int) -> str:
+    """The non-comment lines of a block with `indent` columns taken off, joined by newlines."""
+    out = []
+    for line in lines:
+        if _is_comment_or_blank(line):
+            continue
+        out.append(line.rstrip()[indent:] if _indent(line) >= indent else line.strip())
+    return "\n".join(out)
+
+
+def _step_value(step: Step, key: str, leg: dict[str, object]) -> str | None:
+    """One step key as text (a matrix reference of `leg` expanded), or None when absent."""
+    if key == "run":
+        value: str | None = step.run() if "run" in step.blocks else None
+    elif step.keys.get(key) is not None:
+        value = step.keys[key]
+        more = _relative(step.blocks.get(key, []), KEY_INDENT + 2)
+        if more:
+            value += "\n" + more
+    elif key in step.blocks:
+        value = _relative(step.blocks[key], KEY_INDENT + 2) or None
+    else:
+        return None
+    return None if value is None else _expand_matrix(value, leg)
+
+
+def _job_value(job: Job, key: str, leg: dict[str, object]) -> str | None:
+    value = _relative(job.block(key), 6)
+    return _expand_matrix(value, leg) if value else None
+
+
+def _job_keys(job: Job) -> list[str]:
+    keys = [line.strip().partition(":")[0] for line in job.lines
+            if _indent(line) == 4 and not _is_comment_or_blank(line)
+            and not line.lstrip().startswith("- ")]
+    return list(dict.fromkeys(keys))
+
+
+def _side_steps(wf: Workflow, job_id: str, known: set[str], problems: list[str]) -> dict[str, Step]:
+    """The steps of one job by identity; a duplicate or an unmapped step is a problem."""
+    found: dict[str, list[Step]] = {}
+    for step in wf.jobs()[job_id].steps():
+        found.setdefault(_step_ident(step), []).append(step)
+    out: dict[str, Step] = {}
+    for ident, steps in found.items():
+        if len(steps) > 1:
+            problems.append(f"{wf.name}:{job_id}: step {ident!r} appears {len(steps)} times")
+        if ident not in known:
+            problems.append(f"{wf.name}:{job_id} step {ident!r}: no row in the mirror table")
+        out[ident] = steps[0]
+    return out
+
+
+def _table_problem(where: str, key_text: str, key: str, actual: object, expected: object) -> str:
+    return f"{where}: {key_text} {key!r} is {actual!r}, the hand table says {expected!r}"
+
+
+def _compare_key(key: str, pr_value: str | None, warm_value: str | None,
+                 allowed: dict[str, tuple[object, object]], pr_where: str, warm_where: str,
+                 key_text: str, differs: str, problems: list[str]) -> None:
+    """One key: pinned to the hand table when it may differ, equal on both sides when not."""
+    if key in allowed:
+        for actual, expected, where in ((pr_value, allowed[key][0], pr_where),
+                                        (warm_value, allowed[key][1], warm_where)):
+            if expected is not ANY and actual != expected:
+                problems.append(_table_problem(where, key_text, key, actual, expected))
+    elif pr_value != warm_value:
+        problems.append(differs.format(key=key, pv=pr_value, wv=warm_value))
+
+
+def _step_problems(pr_wf: Workflow, pr_job_id: str, warm_wf: Workflow, warm_job_id: str,
+                   table: PairTable, leg: dict[str, object]) -> list[str]:
+    problems: list[str] = []
+    pr_steps = _side_steps(pr_wf, pr_job_id,
+                           {row.pr_id for row in table.rows} | set(table.pr_only), problems)
+    warm_steps = _side_steps(warm_wf, warm_job_id, {row.warm_id for row in table.rows}, problems)
+    for row in table.rows:
+        for wf_name, job_id, steps, ident in ((pr_wf.name, pr_job_id, pr_steps, row.pr_id),
+                                              (warm_wf.name, warm_job_id, warm_steps, row.warm_id)):
+            if ident not in steps:
+                problems.append(f"{wf_name}:{job_id}: no step {ident!r} "
+                                "(the mirror table needs it)")
+        if row.pr_id not in pr_steps or row.warm_id not in warm_steps:
+            continue
+        pr_step, warm_step = pr_steps[row.pr_id], warm_steps[row.warm_id]
+        for wf_name, job_id, step, ident in ((pr_wf.name, pr_job_id, pr_step, row.pr_id),
+                                             (warm_wf.name, warm_job_id, warm_step, row.warm_id)):
+            for key in dict.fromkeys([*step.blocks, *step.keys]):
+                if key not in KNOWN_STEP_KEYS:
+                    problems.append(f"{wf_name}:{job_id} step {ident!r}: step key {key!r} is not "
+                                    "a known step key")
+        differs = (f"{pr_wf.name}:{pr_job_id} step {row.pr_id!r} vs {warm_wf.name}:{warm_job_id} "
+                   f"step {row.warm_id!r}: key {{key!r}} differs: {pr_wf.name} has {{pv!r}}, "
+                   f"{warm_wf.name} has {{wv!r}}")
+        for key in KNOWN_STEP_KEYS:
+            _compare_key(key, _step_value(pr_step, key, leg), _step_value(warm_step, key, {}),
+                         row.allowed, f"{pr_wf.name}:{pr_job_id} step {row.pr_id!r}",
+                         f"{warm_wf.name}:{warm_job_id} step {row.warm_id!r}", "key", differs,
+                         problems)
+    return problems
+
+
+def _job_problems(pr_wf: Workflow, pr_job_id: str, warm_wf: Workflow, warm_job_id: str,
+                  table: PairTable, leg: dict[str, object]) -> list[str]:
+    problems: list[str] = []
+    pr_job, warm_job = pr_wf.jobs()[pr_job_id], warm_wf.jobs()[warm_job_id]
+    for wf_name, job in ((pr_wf.name, pr_job), (warm_wf.name, warm_job)):
+        for key in _job_keys(job):
+            if key not in (*KNOWN_JOB_KEYS, *JOB_KEYS_COMPARED_ELSEWHERE):
+                problems.append(f"{wf_name}:{job.job_id}: job key {key!r} is not a known job key")
+    differs = (f"{pr_wf.name}:{pr_job_id} vs {warm_wf.name}:{warm_job_id}: job key {{key!r}} "
+               f"differs: {pr_wf.name} has {{pv!r}}, {warm_wf.name} has {{wv!r}}")
+    for key in KNOWN_JOB_KEYS:
+        try:
+            if key == "runs-on":
+                pr_value, warm_value = _runs_on(pr_job, leg), _runs_on(warm_job, {})
+            else:
+                pr_value, warm_value = _job_value(pr_job, key, leg), _job_value(warm_job, key, {})
+        except AssertionError as exc:
+            problems.append(f"{pr_wf.name}:{pr_job_id}: runs-on cannot be read: {exc}")
+            continue
+        _compare_key(key, pr_value, warm_value, table.job_allowed, f"{pr_wf.name}:{pr_job_id}",
+                     f"{warm_wf.name}:{warm_job_id}", "job key", differs, problems)
+    return problems
+
+
+def _effective_env(wf: Workflow, job_id: str, dropped: set[str]) -> dict[str, str]:
+    env = {**wf.env(), **wf.jobs()[job_id].env()}
+    return {name: raw for name, raw in env.items() if name not in dropped}
+
+
+def _env_problems(pr_wf: Workflow, pr_job_id: str, warm_wf: Workflow, warm_job_id: str,
+                  table: PairTable, leg: dict[str, object]) -> list[str]:
+    problems: list[str] = []
+    pr_env = _effective_env(pr_wf, pr_job_id,
+                            {n for n, side in table.env_one_sided.items() if side == ONE_SIDED_PR})
+    warm_env = _effective_env(warm_wf, warm_job_id,
+                              {n for n, side in table.env_one_sided.items()
+                               if side == ONE_SIDED_WARM})
+    for name in dict.fromkeys([*pr_env, *warm_env]):
+        values: list[str | None] = []
+        for wf_name, job_id, env, side_leg in ((pr_wf.name, pr_job_id, pr_env, leg),
+                                               (warm_wf.name, warm_job_id, warm_env, {})):
+            try:
+                values.append(_effective_env_value(name, env[name], side_leg)
+                              if name in env else None)
+            except AssertionError as exc:
+                problems.append(f"{wf_name}:{job_id}: env {name!r} cannot be evaluated: {exc}")
+                values.append(None)
+                break
+        if len(values) == 2 and values[0] != values[1]:
+            problems.append(f"{pr_wf.name}:{pr_job_id} vs {warm_wf.name}:{warm_job_id}: env "
+                            f"{name!r} differs: {pr_wf.name} has {values[0]!r}, "
+                            f"{warm_wf.name} has {values[1]!r}")
+    return problems
+
+
+def pair_mirror_problems(pr_wf: Workflow, pr_job_id: str, warm_wf: Workflow, warm_job_id: str,
+                         leg: dict[str, object]) -> list[str]:
+    """Every difference between a PR job and its warm job that the hand table does not allow."""
+    table = PAIR_TABLES[(pr_wf.name, pr_job_id)]
+    problems = _step_problems(pr_wf, pr_job_id, warm_wf, warm_job_id, table, leg)
+    problems.extend(_job_problems(pr_wf, pr_job_id, warm_wf, warm_job_id, table, leg))
+    problems.extend(_env_problems(pr_wf, pr_job_id, warm_wf, warm_job_id, table, leg))
+    pr_defaults = _relative(pr_wf.top("defaults"), 2) or None
+    warm_defaults = _relative(warm_wf.top("defaults"), 2) or None
+    if pr_defaults != warm_defaults:
+        problems.append(f"{pr_wf.name} vs {warm_wf.name}: workflow key 'defaults' differs: "
+                        f"{pr_wf.name} has {pr_defaults!r}, {warm_wf.name} has {warm_defaults!r}")
+    return problems
+
+
+# ---------------------------------------------------------------------------------------------
 # #9770: whole-step and job-level mirror comparison of every PAIRS row (fixtures).
 # Each fixture feeds `pair_mirror_problems` a mutated copy of the real workflow text and asserts
 # the exact refusal. The hand tables (`PAIR_TABLES`) are written by hand in the module above.
@@ -3202,7 +3552,8 @@ def _append_run_line_9770(seg: list[str]) -> list[str]:
         if seg[i].strip() and _indent(seg[i]) <= KEY_INDENT and not seg[i].lstrip().startswith("#"):
             stop = i
             break
-    while stop > at + 1 and not seg[stop - 1].strip():
+    while stop > at + 1 and (not seg[stop - 1].strip() or (
+            seg[stop - 1].lstrip().startswith("#") and _indent(seg[stop - 1]) <= KEY_INDENT)):
         stop -= 1
     return [*seg[:stop], " " * (KEY_INDENT + 2) + "echo mutated-9770", *seg[stop:]]
 
@@ -3339,7 +3690,7 @@ class PairMirrorFixtures9770(unittest.TestCase):
                         pair, "pr", pr_cargo, "env", FIXTURE_ENV_BLOCK, None)])
                 else:
                     problems = _mutated_9770(pair, "pr", lambda wf, job: _on_step_9770(
-                        wf, job, pr_cargo, _sub_in_lines_9770("CI_NODE: ubuntu-latest",
+                        wf, job, pr_cargo, _sub_in_lines_9770("CI_NODE: ${{ matrix.node }}",
                                                               "CI_NODE: other")))
                     self.assertEqual(len(problems), 1)
                     self.assertTrue(problems[0].startswith(
@@ -3406,7 +3757,7 @@ class PairMirrorFixtures9770(unittest.TestCase):
 
     def test_a_changed_run_on_a_mirrored_step_on_either_side(self) -> None:
         for pair in PAIRS:
-            run_step = PAIR_STEP_NAMES_9770[pair[0]][3]
+            run_step = PAIR_STEP_NAMES_9770[pair[0]][2]  # a mirrored step with a block run
             real = {s.label(): s for s in Workflow.load(pair[0]).jobs()[pair[1]].steps()}[run_step]
             for side in SIDES_9770:
                 with self.subTest(pair=pair[2], side=side):
