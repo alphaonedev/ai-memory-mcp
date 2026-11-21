@@ -28,6 +28,8 @@ WRITTEN_EPOCH = 1767225600  # 2026-01-01T00:00:00Z
 READ_EPOCH = 1767312000  # 2026-01-02T00:00:00Z
 WRITTEN = "2026-01-01T00:00:00Z"
 READ = "2026-01-02T00:00:00Z"
+CAP_LINE_ROWS = 12_000  # lines of exactly LINE_MATCH_MAX characters: about 49 MB, under BENCH_LOG_MAX_BYTES
+CAP_LINE_SECONDS_CEILING = 5.0  # same ceiling as BIG_LOG_SECONDS_CEILING in the waits test module
 ROW = "test result: ok. {p} passed; 0 failed; {i} ignored; 0 measured; {f} filtered out; finished in {s}s"
 
 # A lib binary of 5 tests (3 pass, 2 ignored) whose output holds one child-process run of 1 test; then a binary of 2.
@@ -343,6 +345,19 @@ class BenchReportTests(unittest.TestCase):
         lines, missing, unmeasured = self.report()
         self.assertEqual((missing, unmeasured), ([], []))
         self.assertEqual(lines, FULL)
+
+    def test_a_compile_log_of_cap_length_lines_is_read_within_the_ceiling(self):
+        # finding N4 (#9799): the Finished pattern is matched once per line, anchored, so 12,000 lines of 4096
+        # characters made of the pattern's own words (about 49 MB, under the log byte cap) are read in linear time.
+        unit = "Finished `a` profile "
+        cap = (unit * (mct.LINE_MATCH_MAX // len(unit) + 1))[:mct.LINE_MATCH_MAX]
+        lines = [cap] * CAP_LINE_ROWS + COMPILE[1:]
+        began = time.monotonic()
+        report, missing, unmeasured = self.report(files_override={"compile.log": lines})
+        elapsed = time.monotonic() - began
+        self.assertLess(elapsed, CAP_LINE_SECONDS_CEILING, f"{CAP_LINE_ROWS} cap-length lines took {elapsed:.2f}s")
+        self.assertEqual((missing, unmeasured), ([], []))
+        self.assertEqual(report[I_BUILD], f"build: compile.log (written {WRITTEN}) cargo Finished in 135 s")
 
     def test_the_write_time_is_the_modification_time_not_the_access_time(self):
         lines, _, _ = self.report()

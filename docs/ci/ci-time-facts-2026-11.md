@@ -32,7 +32,10 @@ linux-fed enterprise-fed leg it is run time only (any later cargo invocation is 
 cannot read is `absent: <reason>`, never 0: the legs that have no semaphore wrapper print no such line
 (`no-semaphore-line`), `coverage.yml` has no `Load gate (#6795)` step (`no-load-gate-step`), and a step whose
 conclusion is not `success` gives no figure (`load-gate-skipped`). The semaphore line is read only in the exact form
-the wrapper prints, on one physical line. A compile of 1 s is a
+the wrapper prints, on one physical line, before the first cargo `Finished` line. Documented limit: a build-time
+program (a build script, a proc macro) that prints the whole exact line itself is read as the wait when the step has no
+real line, and two lines (it beside the real one) are refused as `multiple-semaphore-lines`; the script has no trusted
+side channel to tell them apart (tracked in #8216). A compile of 1 s is a
 warm cache or a cargo skip.
 
 | Job | Runner kind | Queue | Setup/cache | Compile | Test | Post | Total | Load gate | Semaphore |

@@ -39,17 +39,26 @@ line (a stamp equal to it is refused; a test that prints the marker runs after `
 holds no `Finished` line reads every exact-form line inside the step (nothing can be told apart there, so a test that
 prints an exact copy of the line is read as the wait; this is the base behaviour of issue 9809 and is unchanged).
 
-A wait that cannot be read is `absent` with its own reason (a column cell `absent: <reason>`, never 0):
-no-load-gate-step, multiple-load-gate-steps, load-gate-missing-timestamp, load-gate-negative, load-gate-skipped,
-load-gate-not-success, load-gate-no-conclusion, no-test-step, no-log, empty-log, no-semaphore-line,
-semaphore-line-no-timestamp (a semaphore line whose stamp cannot be read), multiple-semaphore-lines (two lines are
-refused, not summed), malformed-semaphore-wait, semaphore-wait-longer-than-step, compile-plus-wait-longer-than-step.
-The reasons multiple-semaphore-lines, malformed-semaphore-wait, semaphore-wait-longer-than-step,
+Documented limit of the strict form (finding N2, tracked in #8216): the line is produced inside the job and this
+script has no trusted side channel to tell the wrapper's line from a line with the same text that a build-time program
+(a build script, a proc macro) prints before the first `Finished` line, since both carry the runner's stamp. A program
+that prints the whole exact line itself, with no real line in the step, is read as the wait; next to the real line it
+makes two lines, which are refused as multiple-semaphore-lines. A test's own output after `Finished` is never read.
+
+A wait that cannot be read is `absent` with its own reason (a column cell `absent: <reason>`, never 0). The reasons
+are the members of WAIT_ABSENT_REASONS, and the code prints no other text there. For the load gate: no-load-gate-step,
+multiple-load-gate-steps, load-gate-missing-timestamp, load-gate-negative, load-gate-skipped, load-gate-not-success,
+load-gate-no-conclusion. For the semaphore: no-test-step, missing-step-name (a step has no name), step-skipped,
+step-not-success, step-no-conclusion, missing-timestamp, negative (the three of them are the test step's own conclusion
+and timestamps), no-log, empty-log, no-semaphore-line, semaphore-line-no-timestamp (a semaphore line whose stamp cannot
+be read), multiple-semaphore-lines (two lines are refused, not summed), malformed-semaphore-wait,
+semaphore-wait-longer-than-step, compile-plus-wait-longer-than-step. The reasons multiple-semaphore-lines, malformed-semaphore-wait, semaphore-wait-longer-than-step,
 compile-plus-wait-longer-than-step and semaphore-line-no-timestamp also leave `test` unmeasured with the same reason,
 because the wait cannot then be taken out of it. No line at all leaves `test` as step minus compile.
 
 A figure comes only from a step that ran: a step whose jobs-API `conclusion` is `skipped` is step-skipped, any other
-conclusion except `success` is step-not-success, and a missing conclusion is step-no-conclusion (a skipped step is left
+conclusion except `success` is step-not-success, and a conclusion that is missing, empty or not a string is
+step-no-conclusion (a skipped step is left
 out of a sum of steps, since it took no time; the other two make the sum unmeasured). For the load gate these are
 load-gate-skipped, load-gate-not-success and load-gate-no-conclusion.
 
@@ -58,7 +67,9 @@ the row is reported as `unmeasured` with a named reason (missing-timestamp, nega
 missing-step-name, step-skipped, step-not-success, step-no-conclusion) and left out of every median and range. The
 table is followed by a footer line that counts them. A value that could not be measured is never printed as 0 s. Link
 time is inside cargo's one `Finished` compile figure and is not split out. A log line over 4096 characters is not
-matched against the `Finished` and `test result:` patterns, so reading a log is linear in its size.
+matched against the `Finished` and `test result:` patterns, and a shorter line is matched once, anchored at the first
+place it holds the text "Finished `" or "test result: " (find, then one anchored match, never a search from every
+start), so reading a log is linear in its size.
 
 `--bench-dir DIR` reads the stored logs of the nextest-against-cargo-test runs (compile.log, cglist.log, nxlist.log,
 cargotest-1/2.log, nextest-1/2.log, nextest-solo1.log, nextest-solo.log, nextest-solo-j1.log) and prints, with the UTC
@@ -107,7 +118,9 @@ COMBINED_STEP_RE = re.compile(r"^(Run tests|Generate coverage JSON)")
 COMPILE_STEP_RE = re.compile(r"^(Prebuild|Build release)")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 LOG_TS_RE = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?Z ")
-LINE_MATCH_MAX = 4096  # a log line longer than this is not matched against FINISHED_RE or RESULT_RE (their cost is quadratic)
+LINE_MATCH_MAX = 4096  # a log line longer than this is not matched against FINISHED_RE or RESULT_RE
+FINISHED_LITERAL = "Finished `"  # FINISHED_RE is matched only at the first place a line holds this text
+RESULT_LITERAL = "test result: "  # RESULT_RE is matched only at the first place a line holds this text
 FINISHED_RE = re.compile(r"Finished `[^`]+` profile .* target\(s\) in (?:(\d+)m )?([\d.]+)s")
 RUNNING_RE = re.compile(r"Running (?:unittests )?(\S+)")
 RESULT_RE = re.compile(r"test result: \w+\. (\d+) passed;.* finished in ([\d.]+)s")
@@ -184,6 +197,15 @@ LOAD_GATE_STEP_REASONS = {REASON_STEP_SKIPPED: REASON_LOAD_GATE_SKIPPED,
 # reasons that leave the test figure unmeasured, because the wait cannot be taken out of it
 TEST_REFUSING_WAIT_REASONS = (REASON_MULTIPLE_SEMAPHORE, REASON_MALFORMED_WAIT, REASON_WAIT_LONGER,
                               REASON_WAIT_COMPILE_OVERLAP, REASON_SEMAPHORE_NO_TS)
+# Every reason a wait figure can print as `absent: <reason>`; wait_absent() refuses any other text, and the module
+# docstring names each member (a test pins both).
+WAIT_ABSENT_REASONS = (
+    REASON_NO_LOAD_GATE, REASON_MULTIPLE_LOAD_GATE, REASON_LOAD_GATE_NO_TS, REASON_LOAD_GATE_NEGATIVE,
+    REASON_LOAD_GATE_SKIPPED, REASON_LOAD_GATE_NOT_SUCCESS, REASON_LOAD_GATE_NO_CONCLUSION,
+    REASON_NO_TEST_STEP, REASON_MISSING_NAME, REASON_STEP_SKIPPED, REASON_STEP_NOT_SUCCESS, REASON_STEP_NO_CONCLUSION,
+    REASON_MISSING_TS, REASON_NEGATIVE, REASON_NO_LOG, REASON_EMPTY_LOG, REASON_NO_SEMAPHORE_LINE,
+    REASON_SEMAPHORE_NO_TS, REASON_MULTIPLE_SEMAPHORE, REASON_MALFORMED_WAIT, REASON_WAIT_LONGER,
+    REASON_WAIT_COMPILE_OVERLAP)
 REASONS = (REASON_MISSING_TS, REASON_NEGATIVE, REASON_COMPILE_LONGER, REASON_MISSING_NAME, *TEST_REFUSING_WAIT_REASONS,
            REASON_STEP_SKIPPED, REASON_STEP_NOT_SUCCESS, REASON_STEP_NO_CONCLUSION)
 UNMEASURED_KEY = "unmeasured"
@@ -284,13 +306,24 @@ def in_window(when, win_start, win_end):
                 or (win_end is not None and when > win_end + SLACK_SECS))
 
 
+def find_then_match(regex, literal, text):
+    """regex.match anchored at the first place `literal` occurs in text, else None; one pass, never a search.
+
+    A search retries the pattern from every start in the text, which is quadratic for a line made of the pattern's own
+    first words. Only the first occurrence of the literal is read, so a line whose first occurrence does not match is
+    not a match even when a later occurrence would have.
+    """
+    at = text.find(literal)
+    return regex.match(text, at) if at >= 0 else None
+
+
 def first_finished(lines, win_start=None, win_end=None):
     """(timestamp, reported compile seconds) of the first cargo Finished line inside the window, else None."""
     for raw in lines:
         line = ANSI_RE.sub("", raw)
         if len(line) > LINE_MATCH_MAX:
             continue
-        hit = FINISHED_RE.search(line)
+        hit = find_then_match(FINISHED_RE, FINISHED_LITERAL, line)
         if not hit:
             continue
         when = log_line_time(line)
@@ -405,6 +438,8 @@ def split_job(job, log_lines=None):
         out[UNMEASURED_KEY].append(f"{stage}:{reason}")
 
     def wait_absent(stage, reason):
+        if reason not in WAIT_ABSENT_REASONS:
+            raise ValueError(f"wait reason not in WAIT_ABSENT_REASONS: {reason!r}")
         out[stage] = None
         out[WAIT_ABSENT_KEY][stage] = reason
 
@@ -502,7 +537,7 @@ def rank_binaries(lines):
         if run:
             pending.append(run.group(1))
             continue
-        res = RESULT_RE.search(body) if len(body) <= LINE_MATCH_MAX else None
+        res = find_then_match(RESULT_RE, RESULT_LITERAL, body) if len(body) <= LINE_MATCH_MAX else None
         if res and pending:
             rows.append((float(res.group(2)), int(res.group(1)), pending.pop(0)))
     return sorted(rows, reverse=True)
@@ -717,7 +752,7 @@ def bench_report(directory, now):
 
     build_secs = None
     if BENCH_COMPILE not in reasons:
-        hits = (FINISHED_RE.search(ln) for ln in logs[BENCH_COMPILE] if len(ln) <= LINE_MATCH_MAX)
+        hits = (find_then_match(FINISHED_RE, FINISHED_LITERAL, ln) for ln in logs[BENCH_COMPILE] if len(ln) <= LINE_MATCH_MAX)
         build = next((hit for hit in hits if hit), None)
         if build is None:
             reasons[BENCH_COMPILE] = "no Finished line"
