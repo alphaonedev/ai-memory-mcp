@@ -103,16 +103,20 @@ jobs:
   # Issue #1343 — docs-only PRs should skip the heavy llvm-cov sweep.
   # Mirrors the same classify pattern used by `.github/workflows/ci.yml`
   # (see the classify job there for the canonical implementation).
-  # When `docs_only == 'true'`, the `per-module-thresholds` job below
-  # is skipped, which GitHub reports as `status: skipping` on the PR
-  # check page — branch-protection treats a skipped required check as
-  # passing (same handling that ci.yml's downstream jobs already rely
-  # on for docs-only PRs).
+  # When `cargo_skip == 'true'` (#9263: the same superset verdict the cargo
+  # legs of ci.yml read; docs_only is its docs-only subset), the
+  # `per-module-thresholds` job below is skipped, which GitHub reports as
+  # `status: skipping` on the PR check page — branch-protection treats a
+  # skipped required check as passing (same handling that ci.yml's downstream
+  # jobs already rely on for docs-only PRs). The job-level `if:` and both
+  # required context names are unchanged.
   classify:
     name: Coverage classify (docs-only short-circuit)
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.cls.outputs.docs_only }}
+      cargo_skip: ${{ steps.cls.outputs.cargo_skip }}
+      cargo_skip_reason: ${{ steps.cls.outputs.cargo_skip_reason }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { persist-credentials: false, fetch-depth: 2 }
@@ -121,6 +125,8 @@ jobs:
         env:
           COV_EVENT_NAME: ${{ github.event_name }}
           COV_BASE_REF: ${{ github.base_ref }}
+          COV_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          COV_PUSH_BEFORE: ${{ github.event.before }}
         run: |
           # LOAD-BEARING (#2496): on `pull_request` this base is the PR
           # BASE, spanning the WHOLE PR — NOT `github.event.before` (the
@@ -135,21 +141,39 @@ jobs:
           # group MUST run the full llvm-cov sweep (never a docs-only skip).
           # Pin docs_only=false explicitly (the fail-closed `else`/empty-base
           # arm below would also yield it, but the queue depends on it).
-          if [ "${{ github.event_name }}" = "merge_group" ]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::merge_group event — running the full coverage sweep (not docs-only)"
+          #
+          # #9263: RUN is the default. The job is short-circuited only when the
+          # changed-path list was read in full, is not empty and the decider
+          # (scripts/ci/impact/cargo_skip.py, read from the merge-base tree)
+          # says every path is positively known not to move coverage. Every
+          # other case (merge group, unresolvable base, unreadable, empty,
+          # truncated or over-cap list, an edited CI tree, any decider
+          # failure) writes cargo_skip=false. Every exit writes all three
+          # outputs and ONE notice that names the case, so the reason of a
+          # skip or a run is in the job log.
+          emit() {
+            # $1 docs_only, $2 cargo_skip, $3 reason (printable, one line)
+            {
+              echo "docs_only=$1"
+              echo "cargo_skip=$2"
+              echo "cargo_skip_reason=$3"
+            } >> "$GITHUB_OUTPUT"
+          }
+          if [ "$COV_EVENT_NAME" = "merge_group" ]; then
+            emit false false merge-group-full-ci
+            echo "::notice::coverage RUN (merge-group-full-ci) — merge_group event, full coverage sweep"
             exit 0
           fi
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            base="${{ github.event.before }}"
+          if [ "$COV_EVENT_NAME" = "pull_request" ]; then
+            base="$COV_PR_BASE_SHA"
+          elif [ "$COV_EVENT_NAME" = "push" ]; then
+            base="$COV_PUSH_BEFORE"
           else
             base=""
           fi
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git rev-parse "$base" >/dev/null 2>&1; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::cannot resolve base commit ($base) — running full pipeline"
+            emit false false base-unresolvable-full-ci
+            echo "::notice::coverage RUN (base-unresolvable-full-ci) — cannot resolve base commit ($base)"
             exit 0
           fi
           # Per issue #1193 / PR #1203 — fetch-depth=2 is too shallow
@@ -161,29 +185,42 @@ jobs:
               git fetch --unshallow origin 2>/dev/null || true
           fi
           if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::cannot fetch base tree ($base) after retry — running full pipeline"
+            emit false false base-unresolvable-full-ci
+            echo "::notice::coverage RUN (base-unresolvable-full-ci) — cannot fetch base tree ($base) after retry"
             exit 0
           fi
-          changed=$(git diff --name-only "$base" HEAD)
-          if [ -z "$changed" ]; then
+          # The whole PR diff (base..HEAD), NUL-separated, with renames split
+          # into their old and new names (--no-renames): a rename out of src/
+          # lists src/<old> as a deleted path and a rename into src/ lists the
+          # new name, so neither side can hide behind an allowed path. -z keeps
+          # a newline inside a name as one path. The list goes through a file
+          # (never a variable, which cannot hold a NUL) and a diff failure is a
+          # RUN, never an empty list.
+          paths_z="${RUNNER_TEMP:-.}/cov-paths.z"
+          if ! git diff --no-renames --name-only -z "$base" HEAD > "$paths_z"; then
+            emit false false diff-unreadable-fail-closed
+            echo "::notice::coverage RUN (diff-unreadable-fail-closed) — could not list the changed files"
+            exit 0
+          fi
+          if [ ! -s "$paths_z" ]; then
             # FAIL CLOSED (#2494 §3 / #2496). "No net changes" is NOT
             # "docs only": an amend-force-push yields a fresh SHA with an
             # identical tree, and `Per-Module Coverage Thresholds` is a
             # REQUIRED context whose job carries a job-level `if:`, so a
-            # `docs_only=true` here made it report `skipped` — counted as
-            # SATISFIED — on a PR that is not docs-only at all.
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::no net diff vs base — failing CLOSED (full coverage sweep), NOT docs-only"
+            # skip here made it report `skipped` — counted as SATISFIED —
+            # on a PR that is not docs-only at all.
+            emit false false empty-diff-fail-closed
+            echo "::notice::coverage RUN (empty-diff-fail-closed) — no net diff vs base, full coverage sweep"
             exit 0
           fi
-          # #8328: the old shape (docs/** or *.md anywhere is docs-only) treated
-          # docs that Rust tests read as skippable, so the llvm-cov sweep was
-          # skipped on a diff those tests observe. docs_only now comes from the
-          # same decider as ci.yml (scripts/ci/impact/cargo_skip.py), loaded from
-          # the MERGE-BASE tree and run with -I from outside the workspace, so a
-          # PR cannot edit its own judgement. Anything unexpected is false.
+          # #8328 / #9263: docs_only AND cargo_skip come from the same decider
+          # as ci.yml (scripts/ci/impact/cargo_skip.py), loaded from the
+          # MERGE-BASE tree (git merge-base HEAD "$base", the whole PR) and run
+          # with -I from outside the workspace, so a PR cannot edit its own
+          # judgement. Anything unexpected is false.
           docs_only=false
+          cargo_skip=false
+          reason="classifier-error-fail-closed"
           trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
           trust_impact="$trust_dir/scripts/ci/impact"
           trust_ref=$(git merge-base HEAD "$base" 2>/dev/null || echo "$base")
@@ -194,28 +231,54 @@ jobs:
           done
           skip_out="${RUNNER_TEMP:-.}/cov-skip.out"
           : > "$skip_out"
+          # No `grep -q` at the end of a pipe (pipefail turns the SIGPIPE of
+          # the first grep into a failure): capture the lines instead.
+          ci_edit=$(tr '\0' '\n' < "$paths_z" | grep -E '^(\.github/|scripts/ci/)' | grep -vE '^scripts/ci/tests/' || true)
           if [ "$trusted" != "true" ]; then
-            echo "::notice::trusted classifier missing in base — running full pipeline"
-          elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
-            echo "::notice::classifier or workflow edited — running full pipeline"
-          elif echo "$changed" | python3 -I "$trust_impact/cargo_skip.py" --stdin --rules "$trust_impact/rules.json" --event-name "$COV_EVENT_NAME" --base-ref "$COV_BASE_REF" > "$skip_out"; then
-            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ]; then
+            reason="trusted-classifier-missing-in-base-fail-closed"
+          elif [ -n "$ci_edit" ]; then
+            reason="classifier-or-workflow-edited-fail-closed"
+          elif python3 -I "$trust_impact/cargo_skip.py" --stdin0 --rules "$trust_impact/rules.json" --event-name "$COV_EVENT_NAME" --base-ref "$COV_BASE_REF" < "$paths_z" > "$skip_out"; then
+            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ] \
+              && [ "$(grep -c '^cargo_skip=' "$skip_out")" = "1" ] \
+              && [ "$(grep -c '^cargo_skip_reason=' "$skip_out")" = "1" ]; then
               docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
+              cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
+              reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out" | tr -cd '[:print:]' | cut -c1-300)
             fi
           fi
-          case "$docs_only" in true|false) ;; *) docs_only=false ;; esac
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          if [ "$docs_only" = "true" ]; then
-            echo "::notice::all changed files are docs no Rust test reads — skipping heavy llvm-cov sweep"
+          # Shape guard. Each of the three values is checked on its own:
+          # docs_only and cargo_skip must each be exactly `true` or `false`
+          # (so a split value such as `falset` + `rue`, an empty, blank, CR or
+          # newline-carrying value is refused), docs_only=true needs
+          # cargo_skip=true, and the reason must not be empty. Anything else
+          # is a RUN with the fail-closed reason, never a skip.
+          shape_ok=1
+          case "$docs_only" in true|false) ;; *) shape_ok=0 ;; esac
+          case "$cargo_skip" in true|false) ;; *) shape_ok=0 ;; esac
+          if [ "$docs_only" = "true" ] && [ "$cargo_skip" != "true" ]; then
+            shape_ok=0
+          fi
+          if [ -z "$reason" ]; then
+            shape_ok=0
+          fi
+          if [ "$shape_ok" != "1" ]; then
+            docs_only=false
+            cargo_skip=false
+            reason=classifier-error-fail-closed
+          fi
+          emit "$docs_only" "$cargo_skip" "$reason"
+          if [ "$cargo_skip" = "true" ]; then
+            echo "::notice::coverage short-circuit: $reason — skipping heavy llvm-cov sweep"
           else
-            echo "::notice::running the full coverage pipeline"
+            echo "::notice::coverage RUN ($reason) — full coverage pipeline"
           fi
 
   per-module-thresholds:
     name: Per-Module Coverage Thresholds
     runs-on: ubuntu-latest
     needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
+    if: needs.classify.outputs.cargo_skip != 'true'
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
     # pinning a runner for hours. Root cause fixed in
@@ -379,6 +442,15 @@ jobs:
           # PR + merge_group runs restore-only. See ci.yml's `check` job for
           # the full rationale (no poison from a failed compile; no LRU
           # eviction of the warm trunk cache). No new Action introduced.
+          #
+          # #9681: a PR into chain/** restores from its base ref; the hosted,
+          # push-only rust-cache-warm.yml writes this exact shared-key on every
+          # chain/** push (same toolchain, same key env, same llvm-cov build).
+          # The #9681 save-scope invariant test pins the pair.
+          # The chain cache generation (rust-cache-warm.yml header); equal at all four
+          # paired steps, so one bump invalidates every chain cache.
+          prefix-key: chain-cache-g1
+          shared-key: coverage-per-module
           save-if: ${{ github.event_name == 'push' }}
 
       # #2019 — the reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) + embedder
@@ -390,8 +462,14 @@ jobs:
       # (81.71% / 86.01% / 85.97%) — red on main AND every PR until the fetch
       # succeeds. Cache the HF dir + retry-prefetch so the model tests ALWAYS run.
       # huggingface_hub writes the same standard hub cache the Rust hf-hub Api reads.
-      - name: Cache HuggingFace models (#2019)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      #
+      # #9681: restore and save are split. The combined actions/cache step saved
+      # in its post step on every event, so a pull_request run wrote a cache
+      # entry; the save below runs on a push only, after the staged cache is
+      # verified, and only when the restore was not already an exact hit.
+      - name: Restore HuggingFace models (#2019)
+        id: hf-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/huggingface
           # Bump the version suffix (…-v2) whenever the pinned model set or
@@ -460,6 +538,13 @@ jobs:
             echo "::notice::$repo resolvable at $snap (all 3 artifacts present)"
           done
 
+      - name: Save HuggingFace models (#2019, push only)
+        if: github.event_name == 'push' && steps.hf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-minilm-l6-v2-marco-l6-v2-v2
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@6001e75680da9482e125349961b715573ec77af8 # cargo-llvm-cov
 
@@ -522,7 +607,7 @@ jobs:
             bash -c 'mkdir -p /certs && cp /certs-src/server.crt /certs-src/server.key /certs && chown postgres:postgres /certs/* && chmod 600 /certs/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key'
           # Bounded readiness wait (fail LOUD, never hang to the job timeout).
           ready=0
-          for attempt in $(seq 1 60); do
+          for _attempt in $(seq 1 60); do
             if docker exec pg-age pg_isready -U ai_memory -d ai_memory_test >/dev/null 2>&1; then
               ready=1; break
             fi
@@ -609,7 +694,12 @@ jobs:
           PGPASSWORD: ai_memory_test
         run: python3 scripts/ci/pg_env_preflight.py --container pg-age --restart --label coverage-pg
 
+      - name: Record the coverage sweep start (#9263)
+        run: |
+          echo "COV_SWEEP_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Generate coverage JSON
+        id: sweep
         # v0.7.x (#1148) — dev profile (default) WITH env-var
         # overrides from the job-level `env:` block above
         # (debuginfo=1, lto=false). Keeps artifacts under the default
@@ -651,6 +741,11 @@ jobs:
         # serialisation + llvm-cov-memory reasons. Coverage line/region
         # counts are thread-count-independent, so the per-module thresholds
         # are unaffected; the 110-minute job timeout (#7070) absorbs the serial run.
+
+      - name: Record the coverage sweep end (#9263)
+        if: always()
+        run: |
+          echo "COV_SWEEP_END=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Enforce per-module thresholds
         id: thresholds
@@ -709,3 +804,54 @@ jobs:
         with:
           name: coverage-json
           path: coverage/current.json
+
+      # #9263 — name the coverage sweep end. The 59-minute run of issue
+      # #9792 lost its runner (annotation: "The hosted runner lost
+      # communication with the server"); it did not end on the job limit, and
+      # a lost runner runs no later step, so no step of this job can report
+      # that case (it is handled through the runner resource record, umbrella
+      # #8216). This last step covers a job that fails or is cancelled (the
+      # job limit cancels it) and prints ONE line chosen from the outcome of
+      # the sweep step: an error annotation for a failed, cancelled or unknown
+      # sweep; a notice when the sweep succeeded and a later step ended the
+      # job; a notice when the sweep never ran. `elapsed` is the sweep alone
+      # (start and end recorded around it). It prints no environment and no
+      # secret, it exits 0 and is `continue-on-error`, so it can never turn a
+      # job's color. The job limit is read from the one `timeout-minutes`
+      # of this job through COV_JOB_LIMIT_MIN (a test pins that they are equal).
+      - name: Name the coverage sweep end (#9263)
+        if: cancelled() || failure()
+        continue-on-error: true
+        env:
+          SWEEP_OUTCOME: ${{ steps.sweep.outcome }}
+          GATE_OUTCOME: ${{ steps.thresholds.outcome }}
+          COV_JOB_LIMIT_MIN: "110"
+        run: |
+          outcome="${SWEEP_OUTCOME:-}"
+          [[ "$outcome" =~ ^[a-z]+$ ]] || outcome=unknown
+          gate="${GATE_OUTCOME:-}"
+          [[ "$gate" =~ ^[a-z]+$ ]] || gate=unknown
+          limit="${COV_JOB_LIMIT_MIN:-}"
+          [[ "$limit" =~ ^[0-9]+$ ]] || limit=unknown
+          start="${COV_SWEEP_START:-}"
+          end="${COV_SWEEP_END:-}"
+          if [ -z "$start" ]; then
+            elapsed=not-started
+          elif [[ "$start" =~ ^[0-9]{1,12}$ ]] && [[ "$end" =~ ^[0-9]{1,12}$ ]] && [ "$((10#$end))" -ge "$((10#$start))" ]; then
+            elapsed="$(( (10#$end - 10#$start) / 60 )) min"
+          else
+            elapsed=unknown
+          fi
+          what='step "Generate coverage JSON"'
+          case "$outcome" in
+            success)
+              echo "::notice title=Coverage sweep finished::${what} outcome=success elapsed=${elapsed}; Enforce per-module thresholds outcome=${gate}"
+              ;;
+            skipped)
+              echo "::notice title=Coverage sweep not run::${what} outcome=skipped (an earlier step ended the job)"
+              ;;
+            *)
+              echo "::error title=Coverage sweep ended::${what} outcome=${outcome} elapsed=${elapsed} (job limit ${limit} min)"
+              ;;
+          esac
+          exit 0

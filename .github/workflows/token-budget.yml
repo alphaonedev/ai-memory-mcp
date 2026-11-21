@@ -96,6 +96,8 @@ jobs:
         if: steps.docs.outputs.docs_only != 'true'
         with:
           shared-key: token-budget
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
       - name: per-tool ceiling (1500 tokens cl100k_base)
         if: steps.docs.outputs.docs_only != 'true'
         env:

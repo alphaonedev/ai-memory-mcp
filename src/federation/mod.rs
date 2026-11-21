@@ -2512,11 +2512,34 @@ mod tests {
     /// #3654 — `post_once` / `post_and_classify` take the whole peer so every
     /// attempt is recorded against its freshness; the direct tests below wrap
     /// a bare URL in a throwaway endpoint.
+    ///
+    /// #9730 — `post_once` reaches the `check_governed` outbound sink, which
+    /// fails closed while no wire-action hook is installed. Under `cargo test`
+    /// a sibling that went through `build_config` installed it for the whole
+    /// process; under nextest (one process per test) a direct caller sees an
+    /// empty hook. This is the only way the direct tests obtain a peer, so it
+    /// seeds the hook itself (the same call `build_config` makes, #3515).
     fn test_peer(url: &str) -> PeerEndpoint {
+        crate::governance::wire_check::ensure_installed_for_test();
         PeerEndpoint {
             id: format!("peer-test-{}", uuid::Uuid::new_v4()),
             sync_push_url: url.to_string(),
         }
+    }
+
+    /// #9730 — the class guard: obtaining a direct-test peer installs the
+    /// wire-action hook, so a test that sends through `test_peer` cannot
+    /// depend on a sibling having installed it. Red alone in a fresh process
+    /// (nextest) when `test_peer` skips the install.
+    #[test]
+    fn test_peer_seeds_the_wire_action_gate_9730() {
+        let _peer = test_peer("http://127.0.0.1:1/api/v1/sync/push");
+        assert!(
+            crate::governance::wire_check::GOVERNANCE_PRE_ACTION
+                .get()
+                .is_some(),
+            "test_peer must install the wire-action hook (#9730)"
+        );
     }
 
     /// W12-G #1: `post_and_classify` returns `Fail` after retry also fails,

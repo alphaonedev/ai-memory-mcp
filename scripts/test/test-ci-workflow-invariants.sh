@@ -1043,6 +1043,34 @@ else
         "$(grep -E '^(FAIL|ERROR)|AssertionError' "$SCRATCH/h-8332-retarget.out" | head -12)"
 fi
 
+# ===========================================================================
+# SECTION I — #9263: the coverage job runs by default and short-circuits only
+# on a read, non-empty, fully allow-listed path list; it reports success with a
+# reason line, keeps both required context names and the job-level `if:`, and
+# its last step names the sweep outcome and elapsed minutes on cancel or
+# failure. The extracted `cls` block is run against git fixtures (renames, a
+# newline name, an unreadable base, an edited classifier, a merge group) by
+# scripts/ci/tests/test_coverage_classify_9263.py; the decider table and the
+# 5000-path cap are in the same file.
+# ===========================================================================
+if python3 -I "$ROOT/scripts/ci/tests/test_coverage_classify_9263.py" >"$SCRATCH/i-9263.out" 2>&1; then
+    ok "I: coverage classify runs by default, skips only on an allow-listed list, names the sweep end (#9263)"
+else
+    bad "I: coverage classify short-circuit contract failed (#9263)" \
+        "$(grep -E '^(FAIL|ERROR)|AssertionError' "$SCRATCH/i-9263.out" | head -12)"
+fi
+
+# The two required context names the coverage workflow owns stay byte-equal, and
+# only the per-module job carries a job-level `if:` (so a skip reads `skipped`).
+if [ "$(grep -Fxc '    name: Coverage classify (docs-only short-circuit)' "$COVERAGE_YML" || true)" -eq 1 ] \
+    && [ "$(grep -Fxc '    name: Per-Module Coverage Thresholds' "$COVERAGE_YML" || true)" -eq 1 ] \
+    && [ "$(grep -Fxc "    if: needs.classify.outputs.cargo_skip != 'true'" "$COVERAGE_YML" || true)" -eq 1 ]; then
+    ok "I: coverage required context names unchanged; the job-level gate reads cargo_skip (#9263)"
+else
+    bad "I: coverage required context names or the job-level gate drifted (#9263)" \
+        "expect one classify name, one Per-Module name and one cargo_skip job-level if"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"

@@ -156,7 +156,8 @@ def decide(section: dict, raw: bytes, event: str, base_ref: str,
     if paths is None:
         return EXIT_UNREADABLE, "unreadable diff: %s" % why
     unique = list(dict.fromkeys(paths))
-    verdict = cargo_skip.classify(section, unique, event, base_ref, repo)
+    verdict = cargo_skip.classify(section, unique, event, base_ref, repo,
+                                  max_paths=MAX_PATHS)
     reason = verdict["cargo_skip_reason"]
     if verdict["docs_only"] == cargo_skip.TRUE:
         return EXIT_DOCS_ONLY, reason
