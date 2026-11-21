@@ -2849,7 +2849,7 @@ jobs:
   # we never build a CLI binary for mobile; the consumer is FFI from an
   # iOS / Android app. No-ops on docs-only PRs alongside the rest of
   # the heavy matrix. CI cost: ~5-8 min per target on a cold cache, ~1
-  # min on a warm cache; well under the $5/mo budget the issue projected.
+  # min on a warm cache.
   #
   # #9680: the android entry also carries the once-per-run extras that used
   # to sit at the end of `Check (ubuntu-latest,sqlite)` — `Security audit`
