@@ -25,7 +25,7 @@ that the named watchdog, not a nameless job-level cancel, is what fires (#6411).
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. On the sharded
 `enterprise-fed` legs the stricter rule applies: job `timeout-minutes` >=
 watchdog minutes + 28 (pre-watchdog compile and database setup) + 2 (teardown)
-= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 600 s since #9231 (was 3600 s), counted against the cap; identity: cap 18000 s >= load-gate wait 1200 + semaphore wait 600 + cold compile 4100 + safety 300 + serial shard 7800 (= 14000 s)). All four rows meet both.
+= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 600 s since #9231 (was 3600 s), counted against the cap; no slot ends as the named outcome `infra-no-slot` with exit code 82 (83 `infra-unknown-runner`, 84 a command that exited with a reserved code), the job and the gate stay red; identity: cap 18000 s >= load-gate wait 1200 + semaphore wait 600 + cold compile 4100 + safety 300 + serial shard 7800 (= 14000 s)). All four rows meet both.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
 
