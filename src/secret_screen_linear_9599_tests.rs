@@ -202,6 +202,21 @@ fn jwt_dotted_run_cost_is_linear_9599() {
     );
 }
 
+#[test]
+fn dotted_run_cursor_serves_every_position_9599() {
+    // Dots at 3, 7, 11, 15 in one 16-byte run; a space ends it.
+    let content = "aaa.bbb.ccc.ddd. tail";
+    let mut run = DottedRun::default();
+    assert_eq!(run.at(content, 0), (16, &[3, 7, 11, 15][..]));
+    assert_eq!(run.at(content, 8), (16, &[11, 15][..]));
+    assert_eq!(run.at(content, 15), (16, &[15][..]));
+    assert_eq!(run.at(content, 16), (16, &[][..]));
+    // A smaller position than the last one served rescans from it, never
+    // reads the cursor that has already moved past its dots.
+    assert_eq!(run.at(content, 4), (16, &[7, 11, 15][..]));
+    assert_eq!(run.at(content, 12), (16, &[15][..]));
+}
+
 /// xorshift64* — deterministic, dependency-free corpus generator.
 struct Rng(u64);
 

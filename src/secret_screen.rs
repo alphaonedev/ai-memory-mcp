@@ -491,10 +491,15 @@ fn jwt_shape(start: usize, end: usize, dots: &[usize]) -> bool {
 }
 
 /// #9599 — the token run under the JWT detector plus the offsets of its
-/// dots, memoised like [`TokenRun`]; `next_dot` only moves right, so the
-/// dots inside the token at any candidate are a suffix of `dots`.
+/// dots, memoised like [`TokenRun`]. The dots inside the token at a
+/// candidate are the suffix of `dots` from the first dot at or after it;
+/// `next_dot` is a cursor that only moves right to that dot, one dot per
+/// step, so all the lookups of one run cost at most its dot count and the
+/// pass stays linear. `from` is the last position served: a call at a
+/// smaller position rescans instead of reading a cursor already past it.
 #[derive(Debug, Default)]
 struct DottedRun {
+    /// The last position served (the cursor is valid for any `pos >= from`).
     from: usize,
     end: usize,
     valid: bool,
@@ -521,14 +526,14 @@ impl DottedRun {
             self.valid = true;
             self.next_dot = 0;
         }
-        let mut probes = 0usize;
-        let skipped = self.dots[self.next_dot..].partition_point(|&d| {
-            probes += 1;
-            d < pos
-        });
-        // Charge every probe of the search, not only the dots it skipped.
-        charge_scan(probes);
-        self.next_dot += skipped;
+        // Forward-only cursor: each dot is stepped over at most once per run.
+        let mut next = self.next_dot;
+        while self.dots.get(next).is_some_and(|&d| d < pos) {
+            next += 1;
+        }
+        charge_scan(next - self.next_dot);
+        self.next_dot = next;
+        self.from = pos;
         (self.end, &self.dots[self.next_dot..])
     }
 }
@@ -538,8 +543,9 @@ impl DottedRun {
 /// not flag arbitrary dotted identifiers.
 ///
 /// #9599: each candidate is judged on its own full token exactly as before;
-/// the run end and its dot offsets are memoised per run, so the pass is
-/// linear in the input.
+/// the run end and its dot offsets are memoised per run and the dot lookup
+/// is a forward-only cursor ([`DottedRun`]), so the pass is linear in the
+/// input (pinned by `jwt_dotted_run_cost_is_linear_9599`).
 fn redact_jwts(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
