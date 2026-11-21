@@ -1,4 +1,5 @@
 """Shared constants and helpers for the impact-selection scripts (#8240)."""
+import functools
 import json
 import re
 import sqlite3
@@ -62,8 +63,12 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+GLOB_CACHE_SIZE = 4096
+
+
+@functools.lru_cache(maxsize=GLOB_CACHE_SIZE)
 def glob_to_regex(glob: str) -> Pattern:
-    """Translate a path glob to a full-match regex.
+    """Translate a path glob to a full-match regex (compiled once per glob).
 
     `**/` matches zero or more directories, `**` matches anything, `*`
     matches within one path segment and `?` matches one non-slash character.

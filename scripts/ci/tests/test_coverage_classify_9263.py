@@ -58,6 +58,10 @@ TIMEOUT_S = 120
 V = "cargo_skip-rules-v1"
 PR_BASE_REF = "chain/promo6-ssh-r2"
 MAX_PATHS = 5000
+# Cost bound of the cap rows: two rows read the lists, and one path is matched
+# by at most this many passes (ci tree, docs, skip, each with its blocked check).
+LIST_READING_ROWS = 2
+LIST_PASSES = 3
 FAIL_CLOSED = "classifier-error-fail-closed"
 # Fixture identity and canary values are assembled from parts so the diff holds no
 # literal that looks like a mailbox or a credential assignment.
@@ -399,8 +403,9 @@ class DeciderTable(unittest.TestCase):
         self.assertGreater(ops.matches, 0)
         self.assertLessEqual(ops.compiles, globs,
                              "COMPILES %d over %d distinct globs" % (ops.compiles, globs))
-        self.assertLessEqual(ops.matches, 2 * MAX_PATHS * globs,
-                             "MATCHES %d over the bound" % ops.matches)
+        bound = LIST_READING_ROWS * MAX_PATHS * globs * LIST_PASSES
+        self.assertLessEqual(ops.matches, bound,
+                             "MATCHES %d over the bound %d" % (ops.matches, bound))
 
     def test_an_over_cap_list_costs_no_glob_operation(self):
         paths = ["docs/f%05d.md" % i for i in range(9999)] + ["src/z.rs"]
@@ -904,7 +909,8 @@ class CoverageJobWiring(unittest.TestCase):
         limit = self.job_limit()
         self.assertIsNotNone(limit)
         text = "\n".join(job_lines("per-module-thresholds"))
-        self.assertNotIn("COV_JOB_LIMIT_MIN:-", text)
+        self.assertEqual(re.findall(r"COV_JOB_LIMIT_MIN:?-[^}\s]", text), [],
+                         "a default value for the job limit")
         values = re.findall(r'COV_JOB_LIMIT_MIN:\s*"?(\d+)"?', text)
         self.assertEqual(values, [limit])
         self.assertEqual(re.findall(r"\b%s\b" % limit, run_body(steps_of("per-module-thresholds")[-1])), [])

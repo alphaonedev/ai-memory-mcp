@@ -247,12 +247,26 @@ jobs:
               reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out" | tr -cd '[:print:]' | cut -c1-300)
             fi
           fi
-          # Shape guard: docs_only implies cargo_skip; anything else is a RUN.
-          case "$docs_only$cargo_skip" in
-            falsefalse|falsetrue|truetrue) ;;
-            *) docs_only=false; cargo_skip=false; reason=classifier-error-fail-closed ;;
-          esac
-          [ -n "$reason" ] || reason=classifier-error-fail-closed
+          # Shape guard. Each of the three values is checked on its own:
+          # docs_only and cargo_skip must each be exactly `true` or `false`
+          # (so a split value such as `falset` + `rue`, an empty, blank, CR or
+          # newline-carrying value is refused), docs_only=true needs
+          # cargo_skip=true, and the reason must not be empty. Anything else
+          # is a RUN with the fail-closed reason, never a skip.
+          shape_ok=1
+          case "$docs_only" in true|false) ;; *) shape_ok=0 ;; esac
+          case "$cargo_skip" in true|false) ;; *) shape_ok=0 ;; esac
+          if [ "$docs_only" = "true" ] && [ "$cargo_skip" != "true" ]; then
+            shape_ok=0
+          fi
+          if [ -z "$reason" ]; then
+            shape_ok=0
+          fi
+          if [ "$shape_ok" != "1" ]; then
+            docs_only=false
+            cargo_skip=false
+            reason=classifier-error-fail-closed
+          fi
           emit "$docs_only" "$cargo_skip" "$reason"
           if [ "$cargo_skip" = "true" ]; then
             echo "::notice::coverage short-circuit: $reason — skipping heavy llvm-cov sweep"
@@ -706,6 +720,11 @@ jobs:
         # counts are thread-count-independent, so the per-module thresholds
         # are unaffected; the 110-minute job timeout (#7070) absorbs the serial run.
 
+      - name: Record the coverage sweep end (#9263)
+        if: always()
+        run: |
+          echo "COV_SWEEP_END=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Enforce per-module thresholds
         id: thresholds
         run: |
@@ -764,31 +783,53 @@ jobs:
           name: coverage-json
           path: coverage/current.json
 
-      # #9263 — the 59-minute run of 2026-11-21 ended on the job time limit
-      # with no log line that named the step. This last step runs only when
-      # the job was cancelled (the time limit cancels it) or failed, and
-      # writes ONE error annotation: the sweep step, its outcome and its
-      # elapsed minutes. It prints no environment and no secret, it exits 0
-      # and is `continue-on-error`, so it can never turn a job's color.
+      # #9263 — name the coverage sweep end. The 59-minute run of issue
+      # #9792 lost its runner (annotation: "The hosted runner lost
+      # communication with the server"); it did not end on the job limit, and
+      # a lost runner runs no later step, so no step of this job can report
+      # that case (it is handled through the runner resource record, umbrella
+      # #8216). This last step covers a job that fails or is cancelled (the
+      # job limit cancels it) and prints ONE line chosen from the outcome of
+      # the sweep step: an error annotation for a failed, cancelled or unknown
+      # sweep; a notice when the sweep succeeded and a later step ended the
+      # job; a notice when the sweep never ran. `elapsed` is the sweep alone
+      # (start and end recorded around it). It prints no environment and no
+      # secret, it exits 0 and is `continue-on-error`, so it can never turn a
+      # job's color. The job limit is read from the one `timeout-minutes`
+      # of this job through COV_JOB_LIMIT_MIN (a test pins that they are equal).
       - name: Name the coverage sweep end (#9263)
         if: cancelled() || failure()
         continue-on-error: true
         env:
           SWEEP_OUTCOME: ${{ steps.sweep.outcome }}
+          GATE_OUTCOME: ${{ steps.thresholds.outcome }}
           COV_JOB_LIMIT_MIN: "110"
         run: |
-          outcome="${SWEEP_OUTCOME:-unknown}"
+          outcome="${SWEEP_OUTCOME:-}"
           [[ "$outcome" =~ ^[a-z]+$ ]] || outcome=unknown
-          start="${COV_SWEEP_START:-}"
-          limit="${COV_JOB_LIMIT_MIN:-110}"
+          gate="${GATE_OUTCOME:-}"
+          [[ "$gate" =~ ^[a-z]+$ ]] || gate=unknown
+          limit="${COV_JOB_LIMIT_MIN:-}"
           [[ "$limit" =~ ^[0-9]+$ ]] || limit=unknown
-          now=$(date +%s)
+          start="${COV_SWEEP_START:-}"
+          end="${COV_SWEEP_END:-}"
           if [ -z "$start" ]; then
             elapsed=not-started
-          elif [[ "$start" =~ ^[0-9]{1,12}$ ]] && [ "$start" -le "$now" ]; then
-            elapsed="$(( (now - start) / 60 )) min"
+          elif [[ "$start" =~ ^[0-9]{1,12}$ ]] && [[ "$end" =~ ^[0-9]{1,12}$ ]] && [ "$((10#$end))" -ge "$((10#$start))" ]; then
+            elapsed="$(( (10#$end - 10#$start) / 60 )) min"
           else
             elapsed=unknown
           fi
-          echo "::error title=Coverage sweep ended::step \"Generate coverage JSON\" outcome=${outcome} elapsed=${elapsed} (job limit ${limit} min)"
+          what='step "Generate coverage JSON"'
+          case "$outcome" in
+            success)
+              echo "::notice title=Coverage sweep finished::${what} outcome=success elapsed=${elapsed}; Enforce per-module thresholds outcome=${gate}"
+              ;;
+            skipped)
+              echo "::notice title=Coverage sweep not run::${what} outcome=skipped (an earlier step ended the job)"
+              ;;
+            *)
+              echo "::error title=Coverage sweep ended::${what} outcome=${outcome} elapsed=${elapsed} (job limit ${limit} min)"
+              ;;
+          esac
           exit 0
