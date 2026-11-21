@@ -24,23 +24,47 @@ share one step (`Run tests (impact-aware)`, `Generate coverage JSON`): compile i
 step wall time. Link time is inside the compile figure and is not split out: cargo prints one `Finished` time for
 compile and link together, so the compile / link / test-run split of the issue is a compile-with-link / test-run split.
 A row whose timestamps are missing or inconsistent is `unmeasured` (named reason, footer line under the table) and is
-left out of every median; the table below has 0 such cells (`unmeasured: 0 cells in 0 of 50 rows`). For the linux-fed enterprise-fed leg the "test" figure includes the host-semaphore wait inside the
-step (up to 3600 s) and any later cargo invocation. A compile of 1 s is a warm cache or a cargo skip.
+left out of every median; the table below has 0 such cells (`unmeasured: 0 cells in 0 of 50 rows`). Two waits are
+reported apart from compile and test (#9773): `Load gate` is the wall time of the step `Load gate (#6795)`, and
+`Semaphore` is the `<N>` of the line `[#7914 semaphore] ... acquired after <N>s` that the step prints before its cargo
+command. The four figures never overlap: Test is the step wall time minus compile minus the semaphore wait, so for the
+linux-fed enterprise-fed leg it is run time only (any later cargo invocation is still inside it). A wait the script
+cannot read is `absent: <reason>`, never 0: the legs that have no semaphore wrapper print no such line
+(`no-semaphore-line`), `coverage.yml` has no `Load gate (#6795)` step (`no-load-gate-step`), and a step whose
+conclusion is not `success` gives no figure (`load-gate-skipped`). The semaphore line is read only in the exact form
+the wrapper prints, on one physical line, before the first cargo `Finished` line. Documented limit: a build-time
+program (a build script, a proc macro) that prints the whole exact line itself is read as the wait when the step has no
+real line, and two lines (it beside the real one) are refused as `multiple-semaphore-lines`; the script has no trusted
+side channel to tell them apart (tracked in #8216). A compile of 1 s is a
+warm cache or a cargo skip.
 
-| Job | Runner kind | Queue | Setup/cache | Compile | Test | Post | Total |
-|---|---|---|---|---|---|---|---|
-| ci.yml Check (linux-fed,enterprise-fed) | self-hosted Linux | 189 (1-2438) n=9 | 66 (21-959) | 2975 (1-6442) | 3775 (1008-7285) | 8 (4-56) | 7318 (1059-10739) |
-| ci.yml Check (macos-fed,enterprise-fed) | macos-fed | 1990 (598-2433) n=8 | 20 (18-25) | 512 (181-832) | 2070 (319-2440) | 4 (2-4) | 2624 (553-3301) |
-| ci.yml Check (macos-fed,sqlite) | macos-fed | 1 (1-3) n=8 | 8 (5-73) | 368 (155-549) | 1564 (421-1939) | 2 (1-4) | 1988 (597-2430) |
-| ci.yml Check (ubuntu-latest,sqlite) | hosted | 2 (1-2) n=9 | 160 (115-188) | 1952 (1190-2572) | 1529 (309-2020) | 356 (12-449) | 3774 (1942-5188) |
-| coverage.yml Per-Module Coverage Thresholds | hosted | 3 (1-7) n=10 | 192 (148-237) | 999 (835-1073) | 3924 (2631-4277) | 26 (18-77) | 5164 (3695-5580) |
+| Job | Runner kind | Queue | Setup/cache | Compile | Test | Post | Total | Load gate | Semaphore |
+|---|---|---|---|---|---|---|---|---|---|
+| ci.yml Check (linux-fed,enterprise-fed) | self-hosted Linux | 189 (1-2438) n=9 | 66 (21-959) | 2975 (1-6442) | 3775 (996-6565) | 8 (4-56) | 7318 (1059-10739) | 45 (0-930) n=10 | 0 (0-1410) n=10 |
+| ci.yml Check (macos-fed,enterprise-fed) | macos-fed | 1990 (598-2433) n=8 | 20 (18-25) | 512 (181-832) | 2070 (319-2440) | 4 (2-4) | 2624 (553-3301) | 0 (0-1) n=10 | absent: no-semaphore-line |
+| ci.yml Check (macos-fed,sqlite) | macos-fed | 1 (1-3) n=8 | 8 (5-73) | 368 (155-549) | 1564 (421-1939) | 2 (1-4) | 1988 (597-2430) | 0 (0-60) n=10 | absent: no-semaphore-line |
+| ci.yml Check (ubuntu-latest,sqlite) | hosted | 2 (1-2) n=9 | 160 (115-188) | 1952 (1190-2572) | 1529 (309-2020) | 356 (12-449) | 3774 (1942-5188) | absent: load-gate-skipped | absent: no-semaphore-line |
+| coverage.yml Per-Module Coverage Thresholds | hosted | 3 (1-7) n=10 | 192 (148-237) | 999 (835-1073) | 3924 (2631-4277) | 26 (18-77) | 5164 (3695-5580) | absent: no-load-gate-step | absent: no-semaphore-line |
+
+The Load gate and Semaphore columns, and the linux-fed Test cell (its range was 1008-7285 before the semaphore wait
+was taken out), were measured on 2026-11-21 by the script as fixed in PR #9799 (issue #9773), over the same runs:
+`python3.12 -I scripts/ci/measure_ci_time.py --repo alphaonedev/ai-memory-mcp --branch chain/promo6-ssh-r2 --runs 10`.
+The `Load gate (#6795)` step of the ubuntu-latest leg has the jobs-API conclusion `skipped` in all 10 runs, so its cell
+is `absent: load-gate-skipped`, not the `0 (0-0)` that the timestamps of a step that did not run gave in an earlier
+version. Footer of that run: `waits absent: load_gate load-gate-skipped=10, load_gate no-load-gate-step=10, semaphore
+no-semaphore-line=40` and `unmeasured: 0 cells in 0 of 50 rows`.
+
+The job of issue #9773 (run 44813346880, job 136556334572, `Check (linux-fed,enterprise-fed)`), measured by the same
+script from its jobs-API step list and its log: Load gate 1200 s, Semaphore 300 s, Compile 2081 s, Test 4486 s, step
+wall time 6867 s (6867 - 2081 - 300 = 4486; the 4485 s of the issue is a difference of two timestamps).
 
 ci.yml run ids, newest first: 43787761690, 43754672049, 43726986530, 43699071569, 43671113552, 42455028843,
 42404345563, 42389131152, 42381644290, 42363891711.
 coverage.yml run ids: 43787761588, 43754671906, 43726986507, 43699071556, 43671113588, 43401706402, 42455028967,
 42404345599, 42389131185, 42381644438.
 The per-run rows (job ids, head shas) are in the script's `--json-out` file; the unit test is
-`scripts/ci/tests/test_measure_ci_time_9710.py` (hand-written fixture).
+`scripts/ci/tests/test_measure_ci_time_9710.py` (hand-written fixture), and for the wait figures
+`scripts/ci/tests/test_measure_ci_time_waits_9773.py`.
 
 ## 2. cargo-nextest against `cargo test`, sqlite suite, one build
 
