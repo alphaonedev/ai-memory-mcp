@@ -624,9 +624,11 @@ class CoverageJobWiring(unittest.TestCase):
     def test_the_sweep_step_has_an_id_and_a_recorded_start(self):
         steps = steps_of("per-module-thresholds")
         names = [step_first(s) for s in steps]
-        sweep = names.index("- id: sweep") if "- id: sweep" in names else -1
+        # The name stays the first line: test_check_pg_preflight_workflows_9235
+        # locates the sweep step by "      - name: Generate coverage JSON".
+        sweep = names.index("- name: Generate coverage JSON") if "- name: Generate coverage JSON" in names else -1
         self.assertGreaterEqual(sweep, 1, names)
-        self.assertTrue(any(ln.strip() == "name: Generate coverage JSON" for ln in steps[sweep]))
+        self.assertTrue(any(ln.strip() == "id: sweep" for ln in steps[sweep]))
         start = steps[sweep - 1]
         self.assertIn('echo "COV_SWEEP_START=$(date +%s)" >> "$GITHUB_ENV"', run_body(start))
 
