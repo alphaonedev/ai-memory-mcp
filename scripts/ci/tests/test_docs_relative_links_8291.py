@@ -44,7 +44,8 @@ TRAILING_SLASH_REASON = "trailing slash on a file target"
 EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "#", "tel:", "ftp://")
 # Fixture sizes are derived from the host (#9765). These two constants keep the
 # fixture this guard shipped with on a host with NAME_MAX 255 and PATH_MAX 4096
-# (Linux): names of 250 bytes, and a name 300 bytes long for the ENAMETOOLONG row.
+# (Linux): names of 250 bytes, and for the ENAMETOOLONG row a name with a 300-byte
+# stem plus ".md" (303 bytes, 48 past NAME_MAX).
 FIXTURE_NAME_MARGIN = 5
 OVERLONG_NAME_EXCESS = 45
 MIN_FIXTURE_NAME_WIDTH = 3
@@ -107,7 +108,10 @@ def path_max_fixture_shape(name_max, path_max):
 
 
 def overlong_name(name_max):
-    """A ``.md`` file name 45 bytes past ``name_max`` (300 bytes on a NAME_MAX 255 host)."""
+    """A ``.md`` file name 48 bytes past ``name_max``: a stem of ``name_max`` plus the excess, then ``.md``.
+
+    On a NAME_MAX 255 host the stem is 300 bytes, the ``.md`` suffix 3, the whole name 303.
+    """
     return "a" * (name_max + OVERLONG_NAME_EXCESS) + ".md"
 
 
