@@ -221,6 +221,9 @@ jobs:
           docs_only=false
           cargo_skip=false
           reason="classifier-error-fail-closed"
+          # Cap on the reason length. A longer reason is rejected, never cut.
+          reason_max=300
+          reason_why=""
           trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
           trust_impact="$trust_dir/scripts/ci/impact"
           trust_ref=$(git merge-base HEAD "$base" 2>/dev/null || echo "$base")
@@ -244,23 +247,46 @@ jobs:
               && [ "$(grep -c '^cargo_skip_reason=' "$skip_out")" = "1" ]; then
               docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
               cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
-              reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out" | tr -cd '[:print:]' | cut -c1-300)
+              reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
+              # Any character that is not printable (a tab, a NUL, a carriage
+              # return or another control character) anywhere in the answer is
+              # a rejection: the reason is never cleaned up and then trusted.
+              # The file is read directly because a shell variable drops NUL.
+              nonprint=$(tr -d '[:print:]\n' < "$skip_out" | wc -c)
+              if [ "$nonprint" -ne 0 ]; then
+                reason_why="control-character"
+              fi
             fi
           fi
           # Shape guard. Each of the three values is checked on its own:
           # docs_only and cargo_skip must each be exactly `true` or `false`
           # (so a split value such as `falset` + `rue`, an empty, blank, CR or
           # newline-carrying value is refused), docs_only=true needs
-          # cargo_skip=true, and the reason must not be empty. Anything else
-          # is a RUN with the fail-closed reason, never a skip.
+          # cargo_skip=true, and the reason must hold at least one non-blank
+          # printable character, no control character and at most reason_max
+          # characters. Anything else is a RUN with the fail-closed reason,
+          # never a skip, and one line names why.
           shape_ok=1
           case "$docs_only" in true|false) ;; *) shape_ok=0 ;; esac
           case "$cargo_skip" in true|false) ;; *) shape_ok=0 ;; esac
           if [ "$docs_only" = "true" ] && [ "$cargo_skip" != "true" ]; then
             shape_ok=0
           fi
-          if [ -z "$reason" ]; then
+          if [ -z "$reason_why" ]; then
+            if [ -z "$reason" ]; then
+              reason_why="empty"
+            elif [ "${#reason}" -gt "$reason_max" ]; then
+              reason_why="over-cap-$reason_max"
+            else
+              case "$reason" in
+                *[![:space:]]*) ;;
+                *) reason_why="blank-only" ;;
+              esac
+            fi
+          fi
+          if [ -n "$reason_why" ]; then
             shape_ok=0
+            echo "::notice::coverage classify: reason rejected ($reason_why), fail-closed RUN"
           fi
           if [ "$shape_ok" != "1" ]; then
             docs_only=false
