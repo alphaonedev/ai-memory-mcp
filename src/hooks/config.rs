@@ -1457,7 +1457,13 @@ namespace = "*"
         let p = dir.path().join("hooks.toml");
         std::os::unix::fs::symlink(dir.path().join("missing-target.toml"), &p).expect("symlink");
         let err = HookConfig::try_load_from_optional(&p).expect_err("dangling symlink refuses");
-        assert!(err.to_string().contains("dangling symlink"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "hooks file {} cannot be loaded: hooks.toml read error: dangling symlink (its target does not exist)",
+                p.display()
+            )
+        );
     }
 
     #[test]
@@ -1466,8 +1472,13 @@ namespace = "*"
         let p = dir.path().join("hooks.toml");
         std::fs::write(&p, [0x23, 0x20, 0xff, 0xfe, 0x0a]).expect("write non-UTF-8");
         let err = HookConfig::try_load_from_optional(&p).expect_err("non-UTF-8 refuses");
-        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
-        assert!(err.to_string().contains(&p.display().to_string()), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "hooks file {} cannot be loaded: hooks.toml read error: not valid UTF-8",
+                p.display()
+            )
+        );
     }
 
     #[test]
@@ -1491,22 +1502,27 @@ namespace = "*"
         );
     }
 
+    /// An unreadable path that no privilege can read: the parent of the
+    /// hooks file is a regular file, so the open fails with `ENOTDIR`
+    /// for root as well. No skip arm (#9637).
     #[cfg(unix)]
     #[test]
-    fn door_refuses_an_unreadable_file_9637() {
-        use std::os::unix::fs::PermissionsExt;
+    fn door_refuses_an_unreadable_path_9637() {
         let dir = door_scratch();
-        let p = dir.path().join("hooks.toml");
-        std::fs::write(&p, DOOR_VALID).expect("write");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-        if std::fs::read(&p).is_ok() {
-            eprintln!("skip: running with privileges that read a mode-000 file");
-            return;
-        }
-        let err = HookConfig::try_load_from_optional(&p).expect_err("permission error refuses");
+        let parent = dir.path().join("xdg-as-file");
+        std::fs::write(&parent, DOOR_VALID).expect("write the parent as a regular file");
+        let p = parent.join("hooks.toml");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("ENOTDIR refuses");
         assert!(
-            matches!(&err.error, HooksConfigError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            matches!(&err.error, HooksConfigError::Io(e) if e.raw_os_error() == Some(libc::ENOTDIR)),
             "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "hooks file {} cannot be loaded: hooks.toml read error: Not a directory (os error 20)",
+                p.display()
+            )
         );
     }
 
@@ -1545,3 +1561,7 @@ namespace = "   "
         assert!(line >= 3);
     }
 }
+
+#[cfg(test)]
+#[path = "config_door_9637_tests.rs"]
+mod door_9637_tests;

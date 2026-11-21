@@ -57,6 +57,14 @@ const SOURCE_LINE_CANARY: &str = "canary9637sourceline";
 const NONEXISTENT_HOOK_BIN: &str = "/nonexistent/ai-memory-9637-deny-hook";
 /// The namespace the deny cell stores into.
 const DENY_NS: &str = "ns-9637";
+/// The hooks file size cap (1 MiB), mirrored as the external contract.
+const HOOKS_FILE_CAP_BYTES: usize = 1024 * 1024;
+/// The stderr prefix of a refused boot (`serve`, `mcp`, `curator`).
+const BOOT_REFUSED_PREFIX: &str = "ai-memory: boot refused \u{2014} ";
+/// The stderr prefix of a `doctor --hooks` refusal.
+const DOCTOR_HOOKS_PREFIX: &str = "ai-memory doctor --hooks: ";
+/// The raw ESC byte: a refusal line must never carry it.
+const ESC: char = '\u{1b}';
 
 fn scratch_root() -> PathBuf {
     let root = std::env::current_dir()
@@ -125,10 +133,87 @@ fn plant_non_utf8(p: &Path) {
     std::fs::write(p, [b'#', b' ', 0xff, 0xfe, b'\n']).expect("write non-UTF-8 fixture");
 }
 
-fn plant_mode_000(p: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::write(p, deny_hook_toml(NONEXISTENT_HOOK_BIN)).expect("write mode-000 fixture");
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+/// A path no privilege can open: the hooks path is a link to `hooks.toml`
+/// under a regular file, so the open fails with `ENOTDIR` for root as well.
+/// This replaces a mode-000 file, which root reads, so the cell needs no skip
+/// arm. The config directory itself stays a directory, so the key directory
+/// every entry point creates under it is not what refuses.
+fn plant_parent_is_a_file(p: &Path) {
+    let parent = p.with_file_name("parent-is-a-file");
+    std::fs::write(&parent, deny_hook_toml(NONEXISTENT_HOOK_BIN))
+        .expect("write the regular file that stands where a directory should");
+    std::os::unix::fs::symlink(parent.join("hooks.toml"), p)
+        .expect("link the hooks path under the regular file");
+}
+
+/// `[[hooks]]` for `[[hook]]`: the table the operator meant is never read.
+fn plant_misspelt_table(p: &Path) {
+    std::fs::write(
+        p,
+        deny_hook_toml(NONEXISTENT_HOOK_BIN).replace("[[hook]]", "[[hooks]]"),
+    )
+    .expect("write misspelt-table fixture");
+}
+
+/// `fail_mod` for `fail_mode`: the deny hook would load with the default
+/// (weaker) fail mode.
+fn plant_misspelt_fail_mode(p: &Path) {
+    std::fs::write(
+        p,
+        deny_hook_toml(NONEXISTENT_HOOK_BIN).replace("fail_mode", "fail_mod"),
+    )
+    .expect("write misspelt-fail-mode fixture");
+}
+
+fn plant_unknown_top_level_key(p: &Path) {
+    std::fs::write(
+        p,
+        format!("enforce = true\n{}", deny_hook_toml(NONEXISTENT_HOOK_BIN)),
+    )
+    .expect("write unknown-key fixture");
+}
+
+/// An ESC byte (TOML `\u001b`) in a table name, echoed by the duplicate-key
+/// message.
+fn plant_esc_in_key(p: &Path) {
+    std::fs::write(p, "[\"x\\u001by\"]\na = 1\na = 2\n").expect("write ESC-key fixture");
+}
+
+/// A newline (TOML `\n`) in a table name, echoed by the duplicate-key message.
+fn plant_newline_in_key(p: &Path) {
+    std::fs::write(p, "[\"x\\ny\"]\na = 1\na = 2\n").expect("write newline-key fixture");
+}
+
+/// An ESC byte in the `event` value.
+fn plant_esc_in_value(p: &Path) {
+    std::fs::write(
+        p,
+        deny_hook_toml(NONEXISTENT_HOOK_BIN).replace("\"pre_store\"", "\"x\\u001b\""),
+    )
+    .expect("write ESC-value fixture");
+}
+
+/// A newline in the `event` value.
+fn plant_newline_in_value(p: &Path) {
+    std::fs::write(
+        p,
+        deny_hook_toml(NONEXISTENT_HOOK_BIN).replace("\"pre_store\"", "\"x\\ny\""),
+    )
+    .expect("write newline-value fixture");
+}
+
+/// One byte over the 1 MiB cap, all comment: it would parse as zero hooks.
+fn plant_oversize(p: &Path) {
+    std::fs::write(p, vec![b'#'; HOOKS_FILE_CAP_BYTES + 1]).expect("write oversize fixture");
+}
+
+/// A FIFO at the hooks path with no writer: a plain open waits forever.
+fn plant_fifo(p: &Path) {
+    let c_path = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).expect("no NUL in path");
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+    // call; mkfifo(3) only reads it.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
 }
 
 fn plant_directory(p: &Path) {
@@ -140,41 +225,99 @@ fn plant_dangling_symlink(p: &Path) {
     std::os::unix::fs::symlink(&target, p).expect("dangling symlink at the hooks path");
 }
 
+/// The unknown-variant reason for an `event` value on line 2: the kind and the
+/// expected set only (never the value), cut at the 200-character message cap.
+const UNKNOWN_EVENT_REASON: &str = "hooks.toml parse error at line 2, column 9: unknown variant, \
+     expected one of `pre_store`, `post_store`, `post_recall`, `post_search`, `pre_delete`, \
+     `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, \
+     `post_";
+/// The reason for a directory or a FIFO at the hooks path.
+const NOT_A_REGULAR_FILE_REASON: &str = "hooks.toml read error: not a regular file";
+
+/// Every invalid fixture with the exact reason bytes the refusal carries
+/// (written out by hand, not computed from the loader).
 const INVALID_CASES: &[InvalidCase] = &[
     InvalidCase {
         name: "toml_syntax_error",
         plant: plant_toml_syntax,
-        reason: "parse error",
+        reason: "hooks.toml parse error at line 3, column 8: invalid string\\nexpected `\"`, `'`",
     },
     InvalidCase {
         name: "timeout_over_ceiling",
         plant: plant_timeout_over_ceiling,
-        reason: "validation error in hook[0].timeout_ms",
+        reason: "hooks.toml validation error in hook[0].timeout_ms: 60000 exceeds maximum 30000ms",
     },
     InvalidCase {
         name: "unknown_event",
         plant: plant_unknown_event,
-        reason: "parse error",
+        reason: UNKNOWN_EVENT_REASON,
     },
     InvalidCase {
         name: "non_utf8",
         plant: plant_non_utf8,
-        reason: "not valid UTF-8",
+        reason: "hooks.toml read error: not valid UTF-8",
     },
     InvalidCase {
-        name: "mode_000",
-        plant: plant_mode_000,
-        reason: "ermission denied",
+        name: "parent_is_a_file",
+        plant: plant_parent_is_a_file,
+        reason: "hooks.toml read error: Not a directory (os error 20)",
     },
     InvalidCase {
         name: "directory",
         plant: plant_directory,
-        reason: "not a regular file",
+        reason: NOT_A_REGULAR_FILE_REASON,
     },
     InvalidCase {
         name: "dangling_symlink",
         plant: plant_dangling_symlink,
-        reason: "dangling symlink",
+        reason: "hooks.toml read error: dangling symlink (its target does not exist)",
+    },
+    InvalidCase {
+        name: "misspelt_table",
+        plant: plant_misspelt_table,
+        reason: "hooks.toml parse error at line 1, column 3: unknown field, expected `hook`",
+    },
+    InvalidCase {
+        name: "misspelt_fail_mode",
+        plant: plant_misspelt_fail_mode,
+        reason: "hooks.toml parse error at line 9, column 1: unknown field, expected one of \
+                 `event`, `command`, `priority`, `timeout_ms`, `mode`, `enabled`, `namespace`, \
+                 `fail_mode`",
+    },
+    InvalidCase {
+        name: "unknown_top_level_key",
+        plant: plant_unknown_top_level_key,
+        reason: "hooks.toml parse error at line 1, column 1: unknown field, expected `hook`",
+    },
+    InvalidCase {
+        name: "esc_in_key",
+        plant: plant_esc_in_key,
+        reason: "hooks.toml parse error at line 3, column 1: duplicate key `a` in table `x\\u{1b}y`",
+    },
+    InvalidCase {
+        name: "newline_in_key",
+        plant: plant_newline_in_key,
+        reason: "hooks.toml parse error at line 3, column 1: duplicate key `a` in table `x\\ny`",
+    },
+    InvalidCase {
+        name: "esc_in_value",
+        plant: plant_esc_in_value,
+        reason: UNKNOWN_EVENT_REASON,
+    },
+    InvalidCase {
+        name: "newline_in_value",
+        plant: plant_newline_in_value,
+        reason: UNKNOWN_EVENT_REASON,
+    },
+    InvalidCase {
+        name: "oversize",
+        plant: plant_oversize,
+        reason: "hooks.toml read error: file is larger than 1048576 bytes",
+    },
+    InvalidCase {
+        name: "fifo",
+        plant: plant_fifo,
+        reason: NOT_A_REGULAR_FILE_REASON,
     },
 ];
 
@@ -220,19 +363,10 @@ impl Sandbox {
         self.root().join("store.db")
     }
 
-    /// Plant `case`; `false` when this runner cannot observe the case (a
-    /// mode-000 file is readable by root / `CAP_DAC_OVERRIDE`).
-    fn plant(&self, case: &InvalidCase) -> bool {
+    /// Plant `case` at the hooks path. Every case is observable by every
+    /// runner, root included: there is no skip.
+    fn plant(&self, case: &InvalidCase) {
         (case.plant)(&self.hooks_path());
-        if case.name == "mode_000" && std::fs::read(self.hooks_path()).is_ok() {
-            eprintln!(
-                "skipping {}: this runner can read a mode-000 file (euid 0 or \
-                 CAP_DAC_OVERRIDE), so there is no permission error to observe",
-                case.name
-            );
-            return false;
-        }
-        true
     }
 
     /// Run the shipped binary with `--db <scratch> <args>`. `no_config`
@@ -283,39 +417,57 @@ impl Sandbox {
     }
 }
 
-/// The refusal contract every cell shares: the expected exit code, the hooks
-/// path and the reason on stderr, and no echoed source line.
-fn assert_refused(site: &str, case: &InvalidCase, sb: &Sandbox, run: &Run, expected_code: i32) {
-    let path = sb.hooks_path().display().to_string();
+/// The refusal error text for `case` in sandbox `sb`, exactly as the binary
+/// prints it after its site prefix.
+fn refusal_text(case: &InvalidCase, sb: &Sandbox) -> String {
+    format!(
+        "hooks file {} cannot be loaded: {}",
+        sb.hooks_path().display(),
+        case.reason
+    )
+}
+
+/// The refusal contract every cell shares: the expected exit code, and one
+/// whole stderr line that is exactly `prefix` + the refusal text (so the reason
+/// bytes are pinned, no control byte reaches stderr and no source line is
+/// echoed).
+fn assert_refused(
+    site: &str,
+    case: &InvalidCase,
+    sb: &Sandbox,
+    run: &Run,
+    expected_code: i32,
+    prefix: &str,
+) {
     assert!(
         !run.timed_out,
         "#9637 {site}/{}: the entry point was still running after {REFUSAL_DEADLINE:?}; \
-         an invalid hooks file must stop it. stderr={}",
+         an invalid hooks file must stop it. stderr={:?}",
         case.name, run.stderr
     );
     assert_eq!(
         run.code,
         Some(expected_code),
-        "#9637 {site}/{}: wrong exit code for an invalid hooks file. stderr={}",
+        "#9637 {site}/{}: wrong exit code for an invalid hooks file. stderr={:?}",
         case.name,
         run.stderr
     );
+    let want = format!("{prefix}{}", refusal_text(case, sb));
     assert!(
-        run.stderr.contains(&path),
-        "#9637 {site}/{}: the error must name the hooks file path {path}. stderr={}",
+        run.stderr.lines().any(|l| l == want),
+        "#9637 {site}/{}: stderr must hold the exact line {want:?}. stderr={:?}",
         case.name,
         run.stderr
     );
+    // Other log lines may carry the logger's own colour codes; no line that
+    // names the hooks file may carry a raw ESC.
     assert!(
-        run.stderr.contains(case.reason),
-        "#9637 {site}/{}: the error must carry the reason {:?}. stderr={}",
-        case.name,
-        case.reason,
         run.stderr
-    );
-    assert!(
-        !run.stderr.contains(SOURCE_LINE_CANARY),
-        "#9637 {site}/{}: the error must not echo source lines. stderr={}",
+            .lines()
+            .filter(|l| l.contains("hooks.toml"))
+            .all(|l| !l.contains(ESC))
+            && !run.stderr.contains(SOURCE_LINE_CANARY),
+        "#9637 {site}/{}: the error must carry no raw ESC and no source line. stderr={:?}",
         case.name,
         run.stderr
     );
@@ -329,11 +481,9 @@ fn assert_refused(site: &str, case: &InvalidCase, sb: &Sandbox, run: &Run, expec
 fn mcp_refuses_every_invalid_hooks_file_9637() {
     for case in INVALID_CASES {
         let sb = Sandbox::new();
-        if !sb.plant(case) {
-            continue;
-        }
+        sb.plant(case);
         let run = sb.run(MCP_ARGS, true);
-        assert_refused("mcp", case, &sb, &run, EX_CONFIG);
+        assert_refused("mcp", case, &sb, &run, EX_CONFIG, BOOT_REFUSED_PREFIX);
         // V-4: the refusal lands before the stdio loop, so nothing is served.
         assert!(
             run.stdout.trim().is_empty(),
@@ -348,19 +498,18 @@ fn mcp_refuses_every_invalid_hooks_file_9637() {
 fn doctor_hooks_reports_every_invalid_hooks_file_9637() {
     for case in INVALID_CASES {
         let sb = Sandbox::new();
-        if !sb.plant(case) {
-            continue;
+        sb.plant(case);
+        for args in [&["doctor", "--hooks"][..], &["doctor", "--hooks", "--json"]] {
+            let run = sb.run(args, true);
+            assert_refused(
+                &args.join(" "),
+                case,
+                &sb,
+                &run,
+                DOCTOR_HOOKS_INVALID_EXIT,
+                DOCTOR_HOOKS_PREFIX,
+            );
         }
-        let run = sb.run(&["doctor", "--hooks"], true);
-        assert_refused("doctor --hooks", case, &sb, &run, DOCTOR_HOOKS_INVALID_EXIT);
-        let run = sb.run(&["doctor", "--hooks", "--json"], true);
-        assert_refused(
-            "doctor --hooks --json",
-            case,
-            &sb,
-            &run,
-            DOCTOR_HOOKS_INVALID_EXIT,
-        );
     }
 }
 
@@ -368,9 +517,7 @@ fn doctor_hooks_reports_every_invalid_hooks_file_9637() {
 fn doctor_tokens_hooks_reports_every_invalid_hooks_file_9637() {
     for case in INVALID_CASES {
         let sb = Sandbox::new();
-        if !sb.plant(case) {
-            continue;
-        }
+        sb.plant(case);
         let run = sb.run(&["doctor", "--tokens", "--hooks"], true);
         assert_refused(
             "doctor --tokens --hooks",
@@ -378,7 +525,46 @@ fn doctor_tokens_hooks_reports_every_invalid_hooks_file_9637() {
             &sb,
             &run,
             DOCTOR_HOOKS_INVALID_EXIT,
+            DOCTOR_HOOKS_PREFIX,
         );
+    }
+}
+
+/// `doctor --tokens --hooks` with `--json` and with `--raw-table` loads the
+/// hooks file too: exit 2, the stderr refusal line, and a JSON body whose
+/// `hooks_error` is exactly the refusal text (#9637 finding 7).
+#[test]
+fn doctor_tokens_hooks_json_and_raw_table_report_every_invalid_hooks_file_9637() {
+    for case in INVALID_CASES {
+        let sb = Sandbox::new();
+        sb.plant(case);
+        for form in ["--json", "--raw-table"] {
+            let args = ["doctor", "--tokens", "--hooks", form];
+            let run = sb.run(&args, true);
+            assert_refused(
+                &args.join(" "),
+                case,
+                &sb,
+                &run,
+                DOCTOR_HOOKS_INVALID_EXIT,
+                DOCTOR_HOOKS_PREFIX,
+            );
+            let v: Value = serde_json::from_str(run.stdout.trim()).unwrap_or_else(|e| {
+                panic!(
+                    "#9637 {}/{}: stdout must be one JSON object ({e}); stdout={:?}",
+                    args.join(" "),
+                    case.name,
+                    run.stdout
+                )
+            });
+            assert_eq!(
+                v["hooks_error"],
+                json!(refusal_text(case, &sb)),
+                "#9637 {}/{}: hooks_error must be the exact refusal text: {v}",
+                args.join(" "),
+                case.name
+            );
+        }
     }
 }
 
@@ -387,16 +573,16 @@ fn doctor_tokens_hooks_reports_every_invalid_hooks_file_9637() {
 /// and a file that is not there but whose link is).
 #[test]
 fn serve_refuses_an_invalid_hooks_file_9637() {
-    for case in INVALID_CASES
-        .iter()
-        .filter(|c| matches!(c.name, "toml_syntax_error" | "dangling_symlink"))
-    {
+    for case in INVALID_CASES.iter().filter(|c| {
+        matches!(
+            c.name,
+            "toml_syntax_error" | "dangling_symlink" | "esc_in_key" | "newline_in_value" | "fifo"
+        )
+    }) {
         let sb = Sandbox::new();
-        if !sb.plant(case) {
-            continue;
-        }
+        sb.plant(case);
         let run = sb.run(&["serve", "--host", "127.0.0.1", "--port", "0"], true);
-        assert_refused("serve", case, &sb, &run, EX_CONFIG);
+        assert_refused("serve", case, &sb, &run, EX_CONFIG, BOOT_REFUSED_PREFIX);
         assert!(
             !sb.db_path().exists(),
             "#9637 serve/{}: the refusal must fire before the database is opened",
@@ -409,19 +595,22 @@ fn serve_refuses_an_invalid_hooks_file_9637() {
 /// required event, so this cell turns both on in the sandbox `config.toml`.
 #[test]
 fn curator_refuses_an_invalid_hooks_file_under_enforce_9637() {
-    let case = INVALID_CASES
-        .iter()
-        .find(|c| c.name == "timeout_over_ceiling")
-        .expect("case present");
-    let sb = Sandbox::new();
-    assert!(sb.plant(case));
-    std::fs::write(
-        sb.config_path(),
-        "[hooks]\nenforce_mode = \"enforce\"\nrequired_events = [\"pre_store\"]\n",
-    )
-    .expect("write config.toml");
-    let run = sb.run(&["curator", "--once", "--dry-run"], false);
-    assert_refused("curator", case, &sb, &run, EX_CONFIG);
+    for case in INVALID_CASES.iter().filter(|c| {
+        matches!(
+            c.name,
+            "timeout_over_ceiling" | "misspelt_fail_mode" | "esc_in_key" | "newline_in_value"
+        )
+    }) {
+        let sb = Sandbox::new();
+        sb.plant(case);
+        std::fs::write(
+            sb.config_path(),
+            "[hooks]\nenforce_mode = \"enforce\"\nrequired_events = [\"pre_store\"]\n",
+        )
+        .expect("write config.toml");
+        let run = sb.run(&["curator", "--once", "--dry-run"], false);
+        assert_refused("curator", case, &sb, &run, EX_CONFIG, BOOT_REFUSED_PREFIX);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +748,25 @@ async fn sighup_reload_with_an_invalid_file_keeps_the_previous_deny_9637() {
             );
             assert_eq!(guard[0].event, HookEvent::PreStore);
             assert_eq!(guard[0].command, PathBuf::from(NONEXISTENT_HOOK_BIN));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // #9637 finding 4: the reload task reads through the one loader, so a file
+    // over the size cap (all comment, which would parse as zero hooks) keeps
+    // the previous deny as well.
+    plant_oversize(&path);
+    self_sighup();
+    let start = Instant::now();
+    while start.elapsed() < RELOAD_KEEP_WINDOW {
+        {
+            let guard = snapshot.read().await;
+            assert_eq!(
+                guard.len(),
+                1,
+                "a reload of a file over the size cap must keep the previous deny"
+            );
+            assert_eq!(guard[0].event, HookEvent::PreStore);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
