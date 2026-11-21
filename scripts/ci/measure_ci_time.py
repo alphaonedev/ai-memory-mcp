@@ -44,8 +44,9 @@ no-load-gate-step, multiple-load-gate-steps, load-gate-missing-timestamp, load-g
 load-gate-not-success, load-gate-no-conclusion, no-test-step, no-log, empty-log, no-semaphore-line,
 semaphore-line-no-timestamp (a semaphore line whose stamp cannot be read), multiple-semaphore-lines (two lines are
 refused, not summed), malformed-semaphore-wait, semaphore-wait-longer-than-step, compile-plus-wait-longer-than-step.
-The last four, semaphore-line-no-timestamp and multiple-semaphore-lines also leave `test` unmeasured with the same
-reason, because the wait cannot then be taken out of it. No line at all leaves `test` as step minus compile.
+The reasons multiple-semaphore-lines, malformed-semaphore-wait, semaphore-wait-longer-than-step,
+compile-plus-wait-longer-than-step and semaphore-line-no-timestamp also leave `test` unmeasured with the same reason,
+because the wait cannot then be taken out of it. No line at all leaves `test` as step minus compile.
 
 A figure comes only from a step that ran: a step whose jobs-API `conclusion` is `skipped` is step-skipped, any other
 conclusion except `success` is step-not-success, and a missing conclusion is step-no-conclusion (a skipped step is left
