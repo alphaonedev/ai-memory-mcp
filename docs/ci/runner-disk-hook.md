@@ -16,6 +16,18 @@ clear them by hand.
 Free space is exactly at the floor: nothing is removed (the comparison is strictly below). Both constants are
 module-level names in the script and the tests use them.
 
+## Work-folder byte ceiling
+
+Every runner work folder has a byte ceiling, `WORK_FOLDER_CEILING_GIB = 40` (`WORK_FOLDER_CEILING_BYTES` is the same
+value in bytes). At `--event job-started` the hook measures the bytes of this runner's own work root and, when the
+folder is strictly over the ceiling, removes the cargo target directories (the same proven candidates as above and
+nothing else in the work folder), whatever the free space is. At exactly the ceiling nothing is removed. The
+measurement walks with `O_NOFOLLOW` directory fds: a symlink is counted as the link and never followed, and a
+directory on another device is not entered. A folder that cannot be read, or has more than `MAX_WALK_ENTRIES`
+entries, is a refusal with its own reason (`work folder size read failed under <root>: <cause>`); it is never counted
+as under the ceiling and nothing is removed on that basis. `job-completed` does not measure the folder. The log line
+carries `folder_bytes_before` and `folder_bytes_after` (`unknown` when the folder was not measured).
+
 There is no sudo fallback: a hook must never wait on a password prompt. A directory that still cannot be removed
 is one reason in the log line. The old hook's unbounded `find` fallback for a `test-tmp` directory is not ported:
 only `<base>/.local-runs/test-tmp` for the work root, the workspace and the workspace's parent is cleared.
@@ -55,7 +67,7 @@ variable `RUNNER_DISK_HOOK_LOG`, else `<home>/ai-tmp/runner-disk-hook.log` (set 
 to move it):
 
 ```
-<UTC time> runner=<name> event=<event> free_before_gib=<n|unknown> free_after_gib=<n|unknown> decision=<clear|enough-free|refused> removed=<count> paths=<JSON list> reason=<JSON string>[ dry-run]
+<UTC time> runner=<name> event=<event> free_before_gib=<n|unknown> free_after_gib=<n|unknown> folder_bytes_before=<n|unknown> folder_bytes_after=<n|unknown> decision=<clear|enough-free|refused> removed=<count> paths=<JSON list> reason=<JSON string>[ dry-run]
 ```
 
 A log that cannot be written (a full disk is the usual cause) does not stop the removal: the failure and the line

@@ -46,9 +46,10 @@ stderr. decision: exit 0 over a failing exit, because a failing runner hook turn
 runner red and hides the real result; the conductor's disk waiter is the backstop.
 
 Log: every call appends exactly one line to the log (``--log``, else the absolute path in $RUNNER_DISK_HOOK_LOG,
-else ``<home>/ai-tmp/runner-disk-hook.log``; no host path is written in this file):
+else ``<home>/ai-tmp/runner-disk-hook.log``; no host path is written in this file; the line also carries
+folder_bytes_before and folder_bytes_after, the work folder size at job start; WORK_FOLDER_CEILING_GIB is its ceiling):
   <UTC time> runner=<name> event=<event> free_before_gib=<n|unknown> free_after_gib=<n|unknown>
-  decision=<clear|enough-free|refused> removed=<count> paths=<JSON list> reason=<JSON string>[ dry-run]
+  folder_bytes_before=<n|unknown> folder_bytes_after=<n|unknown> decision=<clear|enough-free|refused> removed=<count> paths=<JSON list> reason=<JSON string>[ dry-run]
 ``removed`` counts the directories removed (in a dry run, the ones that would be). decision: a log
 that cannot be written (a full disk is the usual cause) does not stop the removal; the failure goes
 to stderr with the line, because refusing to clear would keep the disk full.
@@ -79,6 +80,9 @@ from pathlib import Path
 GIB = 1024**3
 CLEAR_BELOW_GIB_AFTER_JOB = 150
 START_FLOOR_GIB = 60
+WORK_FOLDER_CEILING_GIB = 40
+WORK_FOLDER_CEILING_BYTES = WORK_FOLDER_CEILING_GIB * GIB
+MAX_WALK_ENTRIES = 5_000_000
 DEFAULT_LOG_ENV = "RUNNER_DISK_HOOK_LOG"
 DEFAULT_LOG_PARTS = ("ai-tmp", "runner-disk-hook.log")
 TARGET_DIR_NAME = "target"
@@ -163,6 +167,8 @@ class Outcome:
     removed: tuple[str, ...]
     reason: str
     notes: tuple[str, ...]
+    folder_before: str = UNKNOWN
+    folder_after: str = UNKNOWN
 
 
 class _ArgError(Exception):
@@ -537,6 +543,44 @@ def read_free_bytes(config: Config, disk_free: Callable[[Path], int | None]) -> 
     return value
 
 
+def _walk_bytes(fd: int, dev: int, depth: int, seen: list[int], max_entries: int) -> int:
+    if depth > MAX_TREE_DEPTH:
+        raise OSError(errno.ELOOP, f"tree deeper than {MAX_TREE_DEPTH} levels")
+    with os.scandir(fd) as scan:
+        names = [entry.name for entry in scan]
+    total = 0
+    for name in names:
+        seen[0] += 1
+        if seen[0] > max_entries:
+            raise OSError(errno.EFBIG, f"more than {max_entries} entries")
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue  # removed while walking: it holds no bytes any more
+        total += info.st_size
+        if not stat.S_ISDIR(info.st_mode):
+            continue  # a symlink is counted as the link, never followed
+        child = os.open(name, DIR_OPEN_FLAGS, dir_fd=fd)
+        try:
+            if os.fstat(child).st_dev == dev:
+                total += _walk_bytes(child, dev, depth + 1, seen, max_entries)
+        finally:
+            os.close(child)
+    return total
+
+
+def measure_folder_bytes(root: Path, max_entries: int = MAX_WALK_ENTRIES) -> int:
+    """Bytes of every entry under ``root`` (symlinks not followed, other devices not entered); raise Undecidable."""
+    try:
+        fd = os.open(root, DIR_OPEN_FLAGS)
+        try:
+            return _walk_bytes(fd, os.fstat(fd).st_dev, 0, [0], max_entries)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise Undecidable(f"work folder size read failed under {root}: {_reason_of(exc)}") from exc
+
+
 def _default_disk_free(path: Path) -> int:
     return shutil.disk_usage(path).free
 
@@ -550,6 +594,7 @@ def run(
     *,
     disk_free: Callable[[Path], int | None],
     run_cmd: Callable[[Sequence[str]], int],
+    ceiling_bytes: int = WORK_FOLDER_CEILING_BYTES,
 ) -> Outcome:
     context = config.context()
     floor = floor_gib(config.event)
@@ -565,18 +610,35 @@ def run(
         removed += got
         notes += more
     below = before < floor * GIB
-    if below:
+    folder_before = UNKNOWN
+    over = False
+    if config.event is Event.JOB_STARTED:
+        try:
+            measured = measure_folder_bytes(config.work_root)
+            folder_before = str(measured)
+            over = measured > ceiling_bytes
+        except Undecidable as exc:
+            notes.append(str(exc))
+    should_clear = below or over
+    if should_clear:
         got, more = clear_targets(config)
         removed += got
         notes += more
     after_text = _gib_text(before)
+    folder_after = folder_before
     if removed and not config.dry_run:
         try:
             after_text = _gib_text(read_free_bytes(config, disk_free))
         except Undecidable as exc:
             after_text = UNKNOWN
             notes.append(f"{exc} after the removal")
-    match (below, bool(removed), bool(notes)):
+        if folder_before != UNKNOWN:
+            try:
+                folder_after = str(measure_folder_bytes(config.work_root))
+            except Undecidable as exc:
+                folder_after = UNKNOWN
+                notes.append(f"{exc} after the removal")
+    match (should_clear, bool(removed), bool(notes)):
         case (_, False, True):
             decision = Decision.REFUSED
         case (True, _, _):
@@ -588,10 +650,15 @@ def run(
     parts: list[str] = []
     if not below:
         parts.append(f"free space {_gib_text(before)} GiB is at or above the {floor} GiB floor")
+    if over:
+        parts.append(f"work folder {folder_before} bytes is over the {ceiling_bytes} byte ceiling")
     parts += notes
-    if below and not removed and not notes:
+    if should_clear and not removed and not notes:
         parts.append("no cargo target directory found")
-    return Outcome(context, _gib_text(before), after_text, decision, tuple(removed), REASON_SEPARATOR.join(parts), tuple(notes))
+    return Outcome(
+        context, _gib_text(before), after_text, decision, tuple(removed), REASON_SEPARATOR.join(parts), tuple(notes),
+        folder_before, folder_after,
+    )
 
 
 def format_line(outcome: Outcome, now: datetime.datetime) -> str:
@@ -599,7 +666,8 @@ def format_line(outcome: Outcome, now: datetime.datetime) -> str:
     context = outcome.context
     line = (
         f"{stamp} runner={context.runner} event={context.event} free_before_gib={outcome.free_before} "
-        f"free_after_gib={outcome.free_after} decision={outcome.decision.value} removed={len(outcome.removed)} "
+        f"free_after_gib={outcome.free_after} folder_bytes_before={outcome.folder_before} "
+        f"folder_bytes_after={outcome.folder_after} decision={outcome.decision.value} removed={len(outcome.removed)} "
         f"paths={json.dumps(list(outcome.removed))} reason={json.dumps(outcome.reason)}"
     )
     return line + " dry-run" if context.dry_run else line
@@ -637,6 +705,7 @@ def main(
     run_cmd: Callable[[Sequence[str]], int] | None = None,
     stderr=None,
     now: Callable[[], datetime.datetime] | None = None,
+    ceiling_bytes: int = WORK_FOLDER_CEILING_BYTES,
 ) -> int:
     argv = sys.argv[1:] if argv is None else argv
     env = os.environ if env is None else env
@@ -650,7 +719,8 @@ def main(
     try:
         config = parse_config(argv, env, home_dir)
         context = config.context()
-        outcome = run(config, disk_free=disk_free or _default_disk_free, run_cmd=run_cmd or _default_run_cmd)
+        outcome = run(config, disk_free=disk_free or _default_disk_free, run_cmd=run_cmd or _default_run_cmd,
+                      ceiling_bytes=ceiling_bytes)
     except Refusal as refusal:
         outcome = Outcome(refusal.context, UNKNOWN, UNKNOWN, Decision.REFUSED, (), refusal.reason, (refusal.reason,))
     except Exception as exc:  # noqa: BLE001 - the hook exits 0 on every path; the reason is logged

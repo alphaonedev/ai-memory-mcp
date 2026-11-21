@@ -54,7 +54,8 @@ SUBPROCESS_TIMEOUT_SECS = 60
 
 LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) runner=(?P<runner>\S+) event=(?P<event>\S+) "
-    r"free_before_gib=(?P<before>\S+) free_after_gib=(?P<after>\S+) decision=(?P<decision>\S+) "
+    r"free_before_gib=(?P<before>\S+) free_after_gib=(?P<after>\S+) "
+    r"folder_bytes_before=(?P<fbefore>\S+) folder_bytes_after=(?P<fafter>\S+) decision=(?P<decision>\S+) "
     r"removed=(?P<removed>\d+) paths=(?P<rest>.*)$"
 )
 
@@ -126,7 +127,7 @@ class HookCase(unittest.TestCase):
         return target
 
     def run_hook(self, event, free_gib=None, root="default", extra=(), env=None, home=None,
-                 disk_free=None, run_cmd=None, runner=RUNNER, log="default"):
+                 disk_free=None, run_cmd=None, runner=RUNNER, log="default", ceiling_bytes=None):
         argv = ["--event", event, "--log", str(self.log if log == "default" else log)]
         if root == "default":
             root = self.work_root
@@ -149,6 +150,7 @@ class HookCase(unittest.TestCase):
             argv, env={} if env is None else env,
             home=home or (self.tmp / "no-such-home"),
             disk_free=disk_free, run_cmd=run_cmd or recorder, stderr=err,
+            **({} if ceiling_bytes is None else {"ceiling_bytes": ceiling_bytes}),
         )
         line = None
         if self.log.exists():
@@ -744,6 +746,137 @@ class TestTmpPort(HookCase):
                        env={}, home=self.tmp / "h", stderr=err)
         self.assertEqual(rc, 0)
         self.assertFalse(test_tmp.exists(), err.getvalue())
+
+
+class WorkFolderCeiling(HookCase):
+    """Class: every runner work folder has a byte ceiling checked at job start; over it, build output goes."""
+
+    FREE_ENOUGH_GIB = 500
+    FREE_TEXT = "free space 500.00 GiB is at or above the 60 GiB floor"
+
+    def setUp(self):
+        super().setUp()
+        self.target = self.make_target()
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "lib.rs").write_text("fn main() {}\n")
+        (self.work_root / "keep.txt").write_text("keep")
+        self.size = hook.measure_folder_bytes(self.work_root)
+
+    def started(self, ceiling, **kwargs):
+        return self.run_hook("job-started", free_gib=self.FREE_ENOUGH_GIB, ceiling_bytes=ceiling, **kwargs)
+
+    def test_constants_are_named_and_consistent(self):
+        self.assertEqual(hook.WORK_FOLDER_CEILING_BYTES, hook.WORK_FOLDER_CEILING_GIB * GIB)
+        self.assertGreater(hook.WORK_FOLDER_CEILING_GIB, 0)
+
+    def test_default_ceiling_is_the_named_constant(self):
+        import inspect
+        self.assertEqual(
+            inspect.signature(hook.main).parameters["ceiling_bytes"].default, hook.WORK_FOLDER_CEILING_BYTES)
+        self.assertEqual(
+            inspect.signature(hook.run).parameters["ceiling_bytes"].default, hook.WORK_FOLDER_CEILING_BYTES)
+
+    def test_under_exactly_at_over_table(self):
+        # (ceiling relative to the measured size, removed count, decision, target survives)
+        rows = [(1, 0, "enough-free", True), (0, 0, "enough-free", True), (-1, 1, "clear", False)]
+        for delta, removed, decision, survives in rows:
+            with self.subTest(delta=delta):
+                if not self.target.exists():
+                    self.make_target()
+                size = hook.measure_folder_bytes(self.work_root)
+                rc, line, err, _ = self.started(size + delta)
+                self.assertEqual(rc, 0)
+                self.assertEqual(line["decision"], decision)
+                self.assertEqual(int(line["removed"]), removed)
+                self.assertEqual(self.target.exists(), survives)
+                self.assertEqual(line["fbefore"], str(size))
+                self.assertEqual(line["fafter"], str(hook.measure_folder_bytes(self.work_root)))
+                if survives:
+                    self.assertEqual(line["fafter"], line["fbefore"])
+                    self.assertEqual(line["reason"], self.FREE_TEXT)
+                else:
+                    self.assertLess(int(line["fafter"]), int(line["fbefore"]))
+                    self.assertEqual(line["paths"], [str(self.target)])
+                    self.assertEqual(
+                        line["reason"], f"{self.FREE_TEXT}; work folder {size} bytes is over the {size + delta} byte ceiling")
+
+    def test_over_removes_target_directories_only(self):
+        rc, line, _, _ = self.started(1)
+        self.assertEqual(line["decision"], "clear")
+        self.assertFalse(self.target.exists())
+        self.assertTrue((self.repo / "src" / "lib.rs").is_file())
+        self.assertTrue((self.work_root / "keep.txt").is_file())
+        self.assertTrue(self.canary.is_file())
+
+    def test_over_with_no_proven_target_removes_nothing_and_says_why(self):
+        shutil.rmtree(self.target)
+        self.make_target(tag=False)
+        rc, line, err, _ = self.started(1)
+        self.assertEqual(line["decision"], "refused")
+        self.assertEqual(line["removed"], "0")
+        self.assertTrue(self.target.is_dir())
+        self.assertIn("CACHEDIR.TAG", line["reason"])
+
+    def test_dry_run_over_removes_nothing(self):
+        rc, line, _, _ = self.started(1, extra=["--dry-run"])
+        self.assertTrue(line["dry_run"])
+        self.assertEqual(line["decision"], "clear")
+        self.assertEqual(line["paths"], [str(self.target)])
+        self.assertTrue(self.target.is_dir())
+        self.assertEqual(line["fafter"], line["fbefore"])
+
+    def test_job_completed_does_not_measure_the_folder(self):
+        rc, line, _, _ = self.run_hook("job-completed", free_gib=self.FREE_ENOUGH_GIB, ceiling_bytes=1)
+        self.assertEqual(line["decision"], "enough-free")
+        self.assertEqual((line["fbefore"], line["fafter"]), ("unknown", "unknown"))
+        self.assertTrue(self.target.is_dir())
+
+    def test_unreadable_folder_refuses_with_exact_reason_never_under(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        locked = self.repo / "locked"
+        locked.mkdir()
+        locked.chmod(0o000)
+        self.addCleanup(locked.chmod, 0o755)
+        for ceiling in (1, hook.WORK_FOLDER_CEILING_BYTES):
+            with self.subTest(ceiling=ceiling):
+                rc, line, err, _ = self.started(ceiling)
+                self.assertEqual(rc, 0)
+                self.assertEqual(line["decision"], "refused")
+                self.assertEqual(line["removed"], "0")
+                self.assertEqual(
+                    line["reason"],
+                    f"{self.FREE_TEXT}; work folder size read failed under {self.work_root}: Permission denied")
+                self.assertEqual((line["fbefore"], line["fafter"]), ("unknown", "unknown"))
+                self.assertTrue(self.target.is_dir())
+
+    def test_symlinks_are_counted_as_links_and_not_followed(self):
+        big = self.outside / "big.bin"
+        big.write_bytes(b"x" * (1 << 20))
+        link = self.repo / "link-to-outside"
+        link.symlink_to(self.outside)
+        loop = self.repo / "link-to-root"
+        loop.symlink_to(self.work_root)
+        grown = hook.measure_folder_bytes(self.work_root)
+        links = os.lstat(link).st_size + os.lstat(loop).st_size
+        self.assertGreaterEqual(grown - self.size, links)  # the directory entry sizes may grow too
+        self.assertLess(grown - self.size, 4096)  # far below the 1 MiB file behind the link
+        rc, line, _, _ = self.started(grown)
+        self.assertEqual(line["decision"], "enough-free")
+        self.assertTrue(big.is_file())
+
+    def test_entry_cap_is_a_refusal_not_a_zero(self):
+        with self.assertRaises(hook.Undecidable) as caught:
+            hook.measure_folder_bytes(self.work_root, max_entries=1)
+        self.assertIn("more than 1 entries", str(caught.exception))
+        self.assertTrue(str(caught.exception).startswith(f"work folder size read failed under {self.work_root}: "))
+
+    def test_missing_folder_is_a_refusal_not_a_zero(self):
+        gone = self.tmp / "gone"
+        with self.assertRaises(hook.Undecidable) as caught:
+            hook.measure_folder_bytes(gone)
+        self.assertEqual(
+            str(caught.exception), f"work folder size read failed under {gone}: No such file or directory")
 
 
 class CliForms(HookCase):
