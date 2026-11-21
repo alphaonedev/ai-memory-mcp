@@ -18,7 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
 
