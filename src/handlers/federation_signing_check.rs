@@ -2868,11 +2868,24 @@ pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<
     fed_signing::canonical_get_bytes(method, path, query)
 }
 
+/// What [`verify_get_signature_or_reject`] established about a request it
+/// let through (#9596).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GetSignatureOutcome {
+    /// `X-Memory-Sig` verified against the enrolled key of the asserted
+    /// `X-Peer-Id`: the request is authenticated as that peer.
+    Verified,
+    /// The gate allowed the request without verifying a signature
+    /// (`AI_MEMORY_FED_REQUIRE_SIG=0`, or the unenrolled-peer rollout arm):
+    /// the asserted `X-Peer-Id` is NOT authenticated by this gate.
+    Unverified,
+}
+
 /// v0.7.0 #1031 — verify an `X-Memory-Sig` header against the
 /// canonical GET-request bytes and apply the nonce-freshness gate.
 ///
-/// Returns `Some(Response)` to short-circuit the handler with a 401
-/// when verification is required and fails; `None` when verification
+/// Returns `Err(Response)` to short-circuit the handler with a 401
+/// when verification is required and fails; `Ok(..)` when verification
 /// passed OR the receiver opted out via `AI_MEMORY_FED_REQUIRE_SIG=0`.
 ///
 /// Wire shape mirrors `/sync/push`:
@@ -2895,6 +2908,13 @@ pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<
 /// arms fire once an operator enrols a peer key.
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch (mirrors the
 /// `/sync/push` env-var posture).
+///
+/// #9596 — `Ok` says WHAT the gate established, so a caller that keys
+/// durable state on the peer can tell a verified peer from a request the
+/// gate merely let through: [`GetSignatureOutcome::Verified`] only on the
+/// arms where `X-Memory-Sig` verified against the enrolled key of
+/// `peer_id`, [`GetSignatureOutcome::Unverified`] on the bypass and the
+/// degraded-permissive arms. `Err` carries the refusal to return as is.
 pub(super) fn verify_get_signature_or_reject(
     method: &str,
     path: &str,
@@ -2902,9 +2922,9 @@ pub(super) fn verify_get_signature_or_reject(
     headers: &HeaderMap,
     peer_id: Option<&str>,
     federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
-) -> Option<Response> {
+) -> Result<GetSignatureOutcome, Response> {
     if !fed_signing::require_sig() {
-        return None;
+        return Ok(GetSignatureOutcome::Unverified);
     }
     let sig_header = headers
         .get(fed_signing::SIGNATURE_HEADER)
@@ -2936,23 +2956,23 @@ pub(super) fn verify_get_signature_or_reject(
                     remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                     "sync_since: X-Memory-Sig verification failed"
                 );
-                return Some(
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({
-                            "error": e.tag(),
-                            "note": crate::handlers::federation_wire_notes::wire::SIG_INVALID,
-                        })),
-                    )
-                        .into_response(),
-                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": e.tag(),
+                        "note": crate::handlers::federation_wire_notes::wire::SIG_INVALID,
+                    })),
+                )
+                    .into_response());
             }
             // Nonce-freshness gate (same shape as /sync/push).
             let pid_for_cache = peer_id.unwrap_or("");
             match nonce_header {
                 Some(nonce) if !nonce.is_empty() => {
                     match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
-                        crate::identity::replay::ReplayDecision::Fresh => None,
+                        crate::identity::replay::ReplayDecision::Fresh => {
+                            Ok(GetSignatureOutcome::Verified)
+                        }
                         crate::identity::replay::ReplayDecision::Replay => {
                             tracing::warn!(
                                 target: crate::federation::SIGNING_TRACE_TARGET,
@@ -2961,7 +2981,7 @@ pub(super) fn verify_get_signature_or_reject(
                                 remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                                 "sync_since: X-Memory-Nonce replay detected"
                             );
-                            Some(
+                            Err(
                                 (
                                     StatusCode::UNAUTHORIZED,
                                     Json(json!({
@@ -2983,23 +3003,24 @@ pub(super) fn verify_get_signature_or_reject(
                             remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                             "sync_since: X-Memory-Nonce header absent — strict refusal"
                         );
-                        Some(
-                            (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({
-                                    "error": fed_signing::VerifyError::NonceMissing.tag(),
-                                    "note": crate::handlers::federation_wire_notes::wire::NONCE_MISSING,
-                                })),
-                            )
-                                .into_response(),
+                        Err((
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({
+                                "error": fed_signing::VerifyError::NonceMissing.tag(),
+                                "note": crate::handlers::federation_wire_notes::wire::NONCE_MISSING,
+                            })),
                         )
+                            .into_response())
                     } else {
                         tracing::warn!(
                             target: crate::federation::SIGNING_TRACE_TARGET,
                             peer_id = %pid_for_cache,
                             "sync_since: X-Memory-Nonce absent — permissive, accepting"
                         );
-                        None
+                        // The signature itself verified above; only the
+                        // replay token is absent, and the operator chose
+                        // the permissive nonce posture.
+                        Ok(GetSignatureOutcome::Verified)
                     }
                 }
             }
@@ -3011,16 +3032,14 @@ pub(super) fn verify_get_signature_or_reject(
                 remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_since: X-Memory-Sig present but no enrolled public key for peer-id (#1031)"
             );
-            Some(
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({
-                        "error": "x_memory_sig_no_enrolled_key",
-                        "note": crate::handlers::federation_wire_notes::wire::SIG_NO_ENROLLED_KEY,
-                    })),
-                )
-                    .into_response(),
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "x_memory_sig_no_enrolled_key",
+                    "note": crate::handlers::federation_wire_notes::wire::SIG_NO_ENROLLED_KEY,
+                })),
             )
+                .into_response())
         }
         (None, Some(_)) => {
             tracing::warn!(
@@ -3029,16 +3048,14 @@ pub(super) fn verify_get_signature_or_reject(
                 remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_since: enrolled peer omitted X-Memory-Sig header (#1031)"
             );
-            Some(
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({
-                        "error": fed_signing::VerifyError::Missing.tag(),
-                        "note": crate::handlers::federation_wire_notes::wire::SIG_MISSING,
-                    })),
-                )
-                    .into_response(),
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": fed_signing::VerifyError::Missing.tag(),
+                    "note": crate::handlers::federation_wire_notes::wire::SIG_MISSING,
+                })),
             )
+                .into_response())
         }
         (None, None) => {
             // v0.7.0 #1088 — same fail-CLOSED arm as
@@ -3055,23 +3072,21 @@ pub(super) fn verify_get_signature_or_reject(
                     remediation = crate::handlers::federation_wire_notes::remediation::PEER_ENROLLMENT,
                     "sync_since: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
-                return Some(
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({
-                            "error": "peer_not_enrolled",
-                            "note": crate::handlers::federation_wire_notes::wire::PEER_NOT_ENROLLED,
-                        })),
-                    )
-                        .into_response(),
-                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": "peer_not_enrolled",
+                        "note": crate::handlers::federation_wire_notes::wire::PEER_NOT_ENROLLED,
+                    })),
+                )
+                    .into_response());
             }
             tracing::warn!(
                 target: crate::federation::SIGNING_TRACE_TARGET,
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_since: unsigned (no enrolled key for peer-id) — strict enforcement skipped"
             );
-            None
+            Ok(GetSignatureOutcome::Unverified)
         }
     }
 }
@@ -3109,8 +3124,9 @@ mod verify_arm_tests {
     //! with synthetic headers rather than going through the router.
 
     use super::{
-        allow_unenrolled_peers_enabled, canonical_get_bytes, require_peer_enrollment_enabled,
-        verify_get_signature_or_reject, verify_signature_or_reject,
+        GetSignatureOutcome, allow_unenrolled_peers_enabled, canonical_get_bytes,
+        require_peer_enrollment_enabled, verify_get_signature_or_reject,
+        verify_signature_or_reject,
     };
     use crate::federation::signing::{
         ED25519_PREFIX, REQUIRE_NONCE_ENV, REQUIRE_SIG_ENV, SIGNATURE_HEADER,
@@ -3350,7 +3366,7 @@ mod verify_arm_tests {
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
-        assert!(out.is_none());
+        assert_eq!(out.ok(), Some(GetSignatureOutcome::Unverified));
     }
 
     #[test]
@@ -3375,7 +3391,7 @@ mod verify_arm_tests {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var(REQUIRE_NONCE_ENV);
         }
-        let resp = out.expect("get sig-present + no-key MUST refuse");
+        let resp = out.err().expect("get sig-present + no-key MUST refuse");
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
@@ -3400,7 +3416,7 @@ mod verify_arm_tests {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         }
-        let resp = out.expect("#1088 strict must refuse on GET path");
+        let resp = out.err().expect("#1088 strict must refuse on GET path");
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
@@ -3426,9 +3442,10 @@ mod verify_arm_tests {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
-        assert!(
-            out.is_none(),
-            "escape hatch must allow unenrolled peer on GET during rollout"
+        assert_eq!(
+            out.ok(),
+            Some(GetSignatureOutcome::Unverified),
+            "escape hatch must allow unenrolled peer on GET during rollout, unauthenticated"
         );
     }
 }

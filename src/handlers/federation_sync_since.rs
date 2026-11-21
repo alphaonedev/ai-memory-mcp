@@ -26,7 +26,7 @@ use crate::validate;
 
 use super::AppState;
 use super::federation_receive::{SyncSinceQuery, extract_peer_id};
-use super::federation_signing_check::verify_get_signature_or_reject;
+use super::federation_signing_check::{GetSignatureOutcome, verify_get_signature_or_reject};
 #[cfg(feature = "sal")]
 use super::{StorageBackend, store_err_to_response};
 
@@ -38,6 +38,134 @@ const SYNC_SINCE_NO_SCOPE_REFUSAL: &str = "sync_since: no scope allowlist for pe
      AI_MEMORY_FED_SYNC_TRUST_PEER=1 disables the scope allowlist for this endpoint, leaving mTLS \
      as the only guarantee, and the enterprise posture check reports it as a weakening; use it \
      only for a legacy-peer migration window.";
+
+/// #9596 — `error` tag of the refusal a clock-writing pull gets when its
+/// `?peer=` or `X-Agent-Id` names a principal other than the authenticated
+/// peer.
+const SYNC_SINCE_PEER_MISMATCH: &str = "sync_since_peer_mismatch";
+/// #9596 — `note` carried by that refusal.
+const SYNC_SINCE_PEER_MISMATCH_NOTE: &str = "a /sync/since pull may record only its own sync clock: \
+     `peer` and `X-Agent-Id`, when present, must equal the authenticated peer id";
+
+/// #9665 — `error` tag of the 400 a `/sync/since` request gets when its
+/// `X-Agent-Id` header cannot be read as exactly one value.
+const SYNC_SINCE_AGENT_ID_UNREADABLE: &str = "sync_since_agent_id_unreadable";
+/// #9665 — `note` carried by that refusal.
+const SYNC_SINCE_AGENT_ID_UNREADABLE_NOTE: &str = "send X-Agent-Id at most once, as visible ASCII; \
+     an empty value counts as absent";
+/// #9665 — `reason` of that refusal: the header was sent more than once.
+const AGENT_ID_REASON_REPEATED: &str = "repeated";
+/// #9665 — `reason` of that refusal: the value is not visible ASCII.
+const AGENT_ID_REASON_NOT_VISIBLE_ASCII: &str = "not_visible_ascii";
+
+/// #9665 / #9596 — the ONE reader of `X-Agent-Id` on this route, shared by
+/// the clock-field check and the visibility caller ladder so the two can
+/// never read different values.
+///
+/// - absent, or one empty value: `Ok(None)`. An empty value counts as
+///   absent, exactly as `identity::resolve_http_agent_id` treats it
+///   (#9656 owns the fleet-wide empty-header question).
+/// - one visible-ASCII value: `Ok(Some(value))`.
+/// - a repeated header, or a value that is not visible ASCII: a 400 with
+///   the exact `sync_since_agent_id_unreadable` tag. Pre-fix the raw
+///   `get(..).to_str().ok()` read silently dropped such a value (or kept
+///   only the first copy), so the request was served as if the header
+///   said something it did not.
+fn read_agent_id_header(headers: &HeaderMap) -> Result<Option<&str>, axum::response::Response> {
+    let mut values = headers.get_all(crate::HEADER_AGENT_ID).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(agent_id_unreadable(AGENT_ID_REASON_REPEATED));
+    }
+    let Ok(text) = first.to_str() else {
+        return Err(agent_id_unreadable(AGENT_ID_REASON_NOT_VISIBLE_ASCII));
+    };
+    Ok((!text.is_empty()).then_some(text))
+}
+
+fn agent_id_unreadable(reason: &'static str) -> axum::response::Response {
+    tracing::warn!(
+        target: crate::federation::SCOPE_TRACE_TARGET,
+        reason,
+        "sync_since: refusing a pull whose X-Agent-Id cannot be read as one value (#9665)"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": SYNC_SINCE_AGENT_ID_UNREADABLE,
+            "reason": reason,
+            "note": SYNC_SINCE_AGENT_ID_UNREADABLE_NOTE,
+        })),
+    )
+        .into_response()
+}
+
+/// #9596 — the peer a `/sync/since` request is authenticated as. Built only
+/// by [`authenticated_pull_peer`], so holding one proves the id came from a
+/// verified signature or a cert binding, never from a bare request field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedPullPeer(String);
+
+impl AuthenticatedPullPeer {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// #9596 — resolve the authenticated peer of a pull, or `None`.
+///
+/// The asserted `X-Peer-Id` is authenticated when the GET signature gate
+/// verified `X-Memory-Sig` against that peer's enrolled key, or when the
+/// mTLS client certificate is bound to exactly that id. Every other request
+/// (signature not required, unenrolled-peer rollout arm, no header, a cert
+/// bound to a different id or to none) has no authenticated peer, and the
+/// handler then records no durable clock row for it.
+fn authenticated_pull_peer(
+    cert_peer: Option<&crate::tls::ClientCertPeerId>,
+    sig_outcome: GetSignatureOutcome,
+    peer_header: Option<&str>,
+) -> Option<AuthenticatedPullPeer> {
+    let asserted = peer_header?;
+    let cert_bound = cert_peer
+        .and_then(|c| c.0.as_deref())
+        .is_some_and(|bound| bound == asserted);
+    (sig_outcome == GetSignatureOutcome::Verified || cert_bound)
+        .then(|| AuthenticatedPullPeer(asserted.to_string()))
+}
+
+/// #9596 — the refusal for an authenticated pull whose clock fields name
+/// another principal, or `None` when the request may proceed. A pull with
+/// no `?peer=` asks for no clock and is never refused here.
+fn clock_field_mismatch(
+    authn: Option<&AuthenticatedPullPeer>,
+    peer_param: Option<&str>,
+    agent_header: Option<&str>,
+) -> Option<axum::response::Response> {
+    let authn = authn?;
+    peer_param?;
+    let named_other = |field: Option<&str>| field.is_some_and(|v| v != authn.as_str());
+    if !named_other(peer_param) && !named_other(agent_header) {
+        return None;
+    }
+    tracing::warn!(
+        target: crate::federation::SCOPE_TRACE_TARGET,
+        authenticated_peer = authn.as_str(),
+        "sync_since: refusing a pull whose clock fields name another principal (#9596)"
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": SYNC_SINCE_PEER_MISMATCH,
+                "authenticated_peer": authn.as_str(),
+                "note": SYNC_SINCE_PEER_MISMATCH_NOTE,
+            })),
+        )
+            .into_response(),
+    )
+}
 
 /// #2441 — compute the honest PULL CURSOR for one `/sync/since` page.
 ///
@@ -156,7 +284,7 @@ pub async fn sync_since(
     ) {
         return rejection;
     }
-    if let Some(rejection) = verify_get_signature_or_reject(
+    let sig_outcome = match verify_get_signature_or_reject(
         "GET",
         original_uri.path(),
         original_uri.query().unwrap_or(""),
@@ -164,7 +292,27 @@ pub async fn sync_since(
         peer_header_for_sig.as_deref(),
         &app.federation_nonce_cache,
     ) {
-        return rejection;
+        Ok(outcome) => outcome,
+        Err(rejection) => return rejection,
+    };
+    // #9596 — the durable sync clock this pull may record is keyed on the
+    // AUTHENTICATED peer only. A clock-writing request whose `?peer=` or
+    // `X-Agent-Id` names anyone else is refused here, before either backend
+    // runs, never silently re-keyed. #9665 — the header is read once, fail
+    // closed, by `read_agent_id_header`.
+    let header_agent_id = match read_agent_id_header(&headers) {
+        Ok(value) => value,
+        Err(refusal) => return refusal,
+    };
+    let authn_peer = authenticated_pull_peer(
+        cert_peer.as_ref().map(|e| &e.0),
+        sig_outcome,
+        peer_header_for_sig.as_deref(),
+    );
+    if let Some(refusal) =
+        clock_field_mismatch(authn_peer.as_ref(), q.peer.as_deref(), header_agent_id)
+    {
+        return refusal;
     }
     // Validate `since` parses as RFC 3339 BEFORE hitting the DB so a
     // garbage timestamp returns a clear 400 instead of a 200 with the
@@ -213,8 +361,9 @@ pub async fn sync_since(
     // Caller resolution ladder (federation contract):
     //   1. `X-Peer-Id` (the syncing peer's wire-attested identity —
     //      the same value that already drives `scope_for(...)` above).
-    //   2. `X-Agent-Id` (the daemon principal of the syncing process,
-    //      mirroring the side-effect write path at line ~169 below).
+    //   2. `X-Agent-Id` (the daemon principal of the syncing process).
+    //      This read-side ladder is unchanged by #9596; the durable clock
+    //      write below is keyed on the authenticated peer, never on it.
     //   3. Empty string ("") — opaque/unknown caller; the visibility
     //      helper denies every scope=private row to a blank caller,
     //      including owner-less and target-less rows (#9356: a blank
@@ -227,12 +376,7 @@ pub async fn sync_since(
         .as_ref()
         .and_then(|e| e.0.effective_agent_id())
         .or_else(|| peer_header.as_deref().filter(|s| !s.is_empty()))
-        .or_else(|| {
-            headers
-                .get(crate::HEADER_AGENT_ID)
-                .and_then(|v| v.to_str().ok())
-                .filter(|s| !s.is_empty())
-        })
+        .or(header_agent_id)
         .unwrap_or("")
         .to_string();
 
@@ -449,22 +593,27 @@ pub async fn sync_since(
     // Record the puller as a peer so subsequent incremental push/pull
     // pairs have a durable clock entry. Best-effort; don't fail the
     // response if the side-effect write fails.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
+    //
+    // #9596 — both key columns are the authenticated peer: the row is that
+    // peer's own clock, `(P, P)`. `clock_field_mismatch` above already
+    // refused a `?peer=` / `X-Agent-Id` naming anyone else, and a pull with
+    // no authenticated peer records nothing, so no request field can write
+    // or advance another principal's row (the server's own catch-up cursor
+    // rows `(local_id, peer)` included).
     // #2441 — the durable per-peer clock entry must advance on rows
     // EXAMINED, exactly like the wire cursor. Pre-fix this used
     // `mems.last()` (post namespace + visibility filter), so a window
     // that filtered to empty left the server's own record of the peer's
     // watermark pinned as well — the stall was recorded on BOTH sides.
-    if let (Some(peer), Ok(local_agent_id)) = (
-        q.peer.as_deref(),
-        crate::identity::resolve_http_agent_id(None, header_agent_id),
-    ) && validate::validate_agent_id(peer).is_ok()
+    if let Some(peer) = authn_peer.as_ref().map(AuthenticatedPullPeer::as_str)
+        && q.peer.as_deref() == Some(peer)
+        && validate::validate_agent_id(peer).is_ok()
         && let Some(watermark) = next_since.as_deref()
-        && let Err(e) = db::sync_state_observe(&lock.0, &local_agent_id, peer, watermark)
+        && let Err(e) = db::sync_state_observe(&lock.0, peer, peer, watermark)
     {
-        tracing::debug!("sync_since: sync_state_observe failed: {e}");
+        // #9596 — WARN, like the `/sync/push` and catch-up clock writes: the
+        // pull is served, but the durable record of it is missing.
+        tracing::warn!("sync_since: sync_state_observe failed: {e}");
     }
 
     // S39 diagnostic echo (v0.6.2). The testbook scenario writes 6 rows
@@ -616,6 +765,203 @@ mod refusal_hint_8290_tests {
         assert!(
             text.contains("posture"),
             "hint must mention the posture finding: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod authenticated_pull_peer_9596_tests {
+    use super::{
+        AuthenticatedPullPeer, GetSignatureOutcome, SYNC_SINCE_PEER_MISMATCH,
+        authenticated_pull_peer, clock_field_mismatch,
+    };
+    use crate::tls::ClientCertPeerId;
+    use axum::http::StatusCode;
+
+    const ASSERTED: &str = "ai:peer-alice";
+    const OTHER: &str = "ai:peer-victim";
+
+    fn bound(id: &str) -> ClientCertPeerId {
+        ClientCertPeerId(Some(id.to_string()))
+    }
+
+    /// Every (cert, signature outcome, header) combination and the peer it
+    /// authenticates; only a verified signature or a cert bound to exactly
+    /// the asserted id yields one.
+    #[test]
+    fn authenticated_pull_peer_table_9596() {
+        let unbound = ClientCertPeerId(None);
+        let same = bound(ASSERTED);
+        let other = bound(OTHER);
+        let cases: &[(
+            Option<&ClientCertPeerId>,
+            GetSignatureOutcome,
+            Option<&str>,
+            Option<&str>,
+        )] = &[
+            (
+                None,
+                GetSignatureOutcome::Verified,
+                Some(ASSERTED),
+                Some(ASSERTED),
+            ),
+            (None, GetSignatureOutcome::Unverified, Some(ASSERTED), None),
+            (None, GetSignatureOutcome::Verified, None, None),
+            (
+                Some(&same),
+                GetSignatureOutcome::Unverified,
+                Some(ASSERTED),
+                Some(ASSERTED),
+            ),
+            (
+                Some(&other),
+                GetSignatureOutcome::Unverified,
+                Some(ASSERTED),
+                None,
+            ),
+            (
+                Some(&unbound),
+                GetSignatureOutcome::Unverified,
+                Some(ASSERTED),
+                None,
+            ),
+            (Some(&same), GetSignatureOutcome::Unverified, None, None),
+            (
+                Some(&other),
+                GetSignatureOutcome::Verified,
+                Some(ASSERTED),
+                Some(ASSERTED),
+            ),
+        ];
+        for (case, &(cert, outcome, header, want)) in cases.iter().enumerate() {
+            let got = authenticated_pull_peer(cert, outcome, header);
+            assert_eq!(
+                got.as_ref().map(AuthenticatedPullPeer::as_str),
+                want,
+                "#9596 case {case}: authenticated_pull_peer outcome={outcome:?}"
+            );
+        }
+    }
+
+    /// The refusal fires exactly when an authenticated clock-writing pull
+    /// names another principal in `?peer=` or `X-Agent-Id`.
+    #[test]
+    fn clock_field_mismatch_table_9596() {
+        let authn = AuthenticatedPullPeer(ASSERTED.to_string());
+        let cases: &[(bool, Option<&str>, Option<&str>, bool)] = &[
+            (true, Some(ASSERTED), None, false),
+            (true, Some(ASSERTED), Some(ASSERTED), false),
+            (true, Some(OTHER), None, true),
+            (true, Some(OTHER), Some(ASSERTED), true),
+            (true, Some(ASSERTED), Some(OTHER), true),
+            (true, None, Some(OTHER), false),
+            (false, Some(OTHER), Some(OTHER), false),
+        ];
+        for (case, &(authenticated, peer, agent, refused)) in cases.iter().enumerate() {
+            let a = authenticated.then_some(&authn);
+            let got = clock_field_mismatch(a, peer, agent);
+            assert_eq!(
+                got.as_ref().map(axum::response::Response::status),
+                refused.then_some(StatusCode::FORBIDDEN),
+                "#9596 case {case}: the clock-field mismatch verdict must match the table"
+            );
+        }
+        assert_eq!(SYNC_SINCE_PEER_MISMATCH, "sync_since_peer_mismatch");
+    }
+}
+
+#[cfg(test)]
+mod read_agent_id_header_9665_tests {
+    use super::{
+        AGENT_ID_REASON_NOT_VISIBLE_ASCII, AGENT_ID_REASON_REPEATED,
+        SYNC_SINCE_AGENT_ID_UNREADABLE, read_agent_id_header,
+    };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    const P: &str = "ai:peer-alice";
+    const Q: &str = "ai:peer-victim";
+    /// A long value: the reader is one pass over the header list, so a
+    /// header far past any agent-id length is read once, never rescanned.
+    const LONG_VALUE_LEN: usize = 100_000;
+    const BODY_CAP: usize = 64 * 1024;
+    /// `é` in UTF-8: readable bytes, but not visible ASCII.
+    const NON_ASCII: &[u8] = b"\xc3\xa9";
+
+    fn headers(values: &[&[u8]]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for v in values {
+            map.append(
+                crate::HEADER_AGENT_ID,
+                HeaderValue::from_bytes(v).expect("header value"),
+            );
+        }
+        map
+    }
+
+    /// Every accepted shape and the value the route reads from it.
+    #[test]
+    fn accepted_agent_id_header_shapes_9665() {
+        let long = "a".repeat(LONG_VALUE_LEN);
+        let padded = format!(" {P} ");
+        let cases: &[(&[&[u8]], Option<&str>)] = &[
+            (&[], None),
+            // #9656: empty counts as absent, as in resolve_http_agent_id.
+            (&[b""], None),
+            (&[P.as_bytes()], Some(P)),
+            // read verbatim; a padded value never equals the trimmed id,
+            // so the clock check refuses it rather than re-keying it.
+            (&[padded.as_bytes()], Some(padded.as_str())),
+            (&[long.as_bytes()], Some(long.as_str())),
+        ];
+        for (case, &(values, want)) in cases.iter().enumerate() {
+            let map = headers(values);
+            let got = read_agent_id_header(&map);
+            assert_eq!(
+                got.as_ref().ok().copied(),
+                Some(want),
+                "#9665 case {case}: a readable agent id must be accepted verbatim"
+            );
+        }
+    }
+
+    /// Every unreadable shape is a 400 with the exact tag and reason.
+    #[tokio::test]
+    async fn unreadable_agent_id_header_is_refused_9665() {
+        let cases: &[(&[&[u8]], &str)] = &[
+            (&[P.as_bytes(), P.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[P.as_bytes(), Q.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[Q.as_bytes(), P.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[b"", P.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[NON_ASCII], AGENT_ID_REASON_NOT_VISIBLE_ASCII),
+        ];
+        for (case, &(values, reason)) in cases.iter().enumerate() {
+            let map = headers(values);
+            let Err(resp) = read_agent_id_header(&map) else {
+                panic!("#9665 case {case}: an unreadable agent id must be refused");
+            };
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "#9665 case {case}: an unreadable agent id must be refused"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), BODY_CAP)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+            assert_eq!(
+                body["error"].as_str(),
+                Some(SYNC_SINCE_AGENT_ID_UNREADABLE),
+                "#9665 case {case}: the refusal body must carry the expected tag and reason"
+            );
+            assert_eq!(
+                body["reason"].as_str(),
+                Some(reason),
+                "#9665 case {case}: the refusal body must carry the expected tag and reason"
+            );
+        }
+        assert_eq!(
+            SYNC_SINCE_AGENT_ID_UNREADABLE,
+            "sync_since_agent_id_unreadable"
         );
     }
 }

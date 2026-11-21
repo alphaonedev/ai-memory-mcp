@@ -1526,11 +1526,42 @@ signed-message gate over canonical GET bytes
 ### `GET /api/v1/sync/since`
 
 Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
-`peer` (attribution tag).
+`peer` (optional; the peer id whose sync clock this pull records).
 
 ```json
 { "count": 5, "limit": 500, "memories": [ … ] }
 ```
+
+**Sync clock (#9596).** Only an authenticated pull records a durable
+`sync_state` clock row. The pull is authenticated when `X-Memory-Sig`
+verified against the enrolled key of the asserted `X-Peer-Id`, or when the
+mTLS client certificate is bound to exactly that id. The row is keyed
+`(peer, peer)` on that authenticated id, and only when `?peer=` names it. A
+pull with no authenticated peer (signature not required, the
+unenrolled-peer rollout arm, no `X-Peer-Id`, or a certificate bound to
+another id or to none) is still served and records nothing. An absent
+`X-Agent-Id`, or one with an empty value (treated as absent, #9656), is not
+compared: an authenticated pull without it still records its own
+`(peer, peer)` row, and an unauthenticated pull is served and records
+nothing.
+
+Refusals specific to this route:
+
+- `403` when an authenticated pull sends `?peer=` and its `?peer=` or
+  `X-Agent-Id` names anyone other than the authenticated peer:
+
+  ```json
+  { "error": "sync_since_peer_mismatch", "authenticated_peer": "<id>", "note": "…" }
+  ```
+
+- `400` when `X-Agent-Id` cannot be read as one value (#9665): `reason` is
+  `repeated` (the header was sent more than once) or `not_visible_ascii`:
+
+  ```json
+  { "error": "sync_since_agent_id_unreadable", "reason": "repeated", "note": "…" }
+  ```
+
+A failed clock write is logged at WARN and the pull is still served.
 
 ## Import / export
 
