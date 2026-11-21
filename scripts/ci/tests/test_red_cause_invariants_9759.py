@@ -19,9 +19,12 @@ import builtins
 import contextlib
 import importlib.util
 import io
+import itertools
 import os
+import re
 import sys
 import time
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -550,6 +553,379 @@ class SourceRatchet(unittest.TestCase):
         for row, _old, new in RATCHET_MUTANTS:
             mutated = source.replace(anchor, anchor + new, 1)
             self.assertNotEqual(ratchet_problems(mutated), [], row)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 2 (#9830 class A, #9831 class C): the class-fix designs of NOTICE-9759-r2.md.
+# ---------------------------------------------------------------------------------------------------------------------
+REDACTOR = SCRIPT.parent.parent / "cert_gate_evidence.py"
+WORKFLOWS = SCRIPT.parent.parent.parent / ".github" / "workflows"
+PRE_CAP_BYTES = 400
+LINE_NOT_SHOWN = "<line not shown: %d bytes>"
+NAMES_NOT_AVAILABLE = "failed, names not available"
+FRAGMENT_CHARS = 3
+SWEEP_OFFSETS = tuple(range(250, 301)) + tuple(range(350, 401))  # across the line cut (300) and the pre-cap (400)
+CANARY_VALUE = "Q7W9ZR4KX2LP8VN3TY6HB1MC5JD0FG2WS4EA7"
+CANARY_HEX = "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c" * 2
+CANARY_URL_VALUE = CANARY_VALUE[:12] + "!" + CANARY_VALUE[12:20]
+
+# One row per compiled pattern of the shared redactor (scripts/cert_gate_evidence.py), written out by hand: the
+# pattern name, the line shape it masks and the secret value placed in it.
+CANARY_ROWS = {
+    "PEM_BEGIN": ("-----BEGIN RSA PRIVATE KEY----- {v}", CANARY_VALUE),
+    "PEM_END": ("{v} -----END RSA PRIVATE KEY-----", CANARY_VALUE),
+    "SECRET_KEY_VALUE": ("api_key={v}", CANARY_VALUE),
+    "WEAK_KEY_VALUE": ("session={v}", CANARY_VALUE),
+    "WEAK_KEY_SPACE": ("pass {v}", CANARY_VALUE),
+    "JSON_KEY_NAME": ('{{"pwd": "{v}"}}', CANARY_VALUE),
+    "AUTHORIZATION": ("Authorization: Basic {v}", CANARY_VALUE),
+    "COOKIE_HEADER": ("Cookie: a={v}", CANARY_VALUE),
+    "BEARER": ("Bearer {v}", CANARY_VALUE),
+    "TOKEN_SHAPES": ("ghp_{v}", CANARY_VALUE),
+    "URL_CREDENTIALS": ("https://user:{v}@example.com/x", CANARY_URL_VALUE),
+    "LONG_HEX": ("{v}", CANARY_HEX),
+    "LONG_B64": ("{v}", CANARY_VALUE),
+    "ABS_PATH": ("/home/{v}", CANARY_VALUE),
+    "KEY_ESCAPE": ("\\u0074oken={v}", CANARY_VALUE),
+    "PUBLIC_KEY_LINE": ("pub_b64=AAAA;signing_key={v}", CANARY_VALUE),
+}
+# Compiled patterns that mask nothing on their own: each one is a helper another pattern's rule calls.
+HELPER_PATTERNS = {
+    "GIT_SHA": "keeps a 40-hex commit id readable inside LONG_HEX",
+    "SEG_LOWER": "path segment test used by ABS_PATH and PATH_LIKE",
+    "PATH_LIKE": "keeps a plain relative path readable inside LONG_B64",
+    "PUBLIC_VALUE": "keeps a public key value readable inside PUBLIC_KEY_LINE",
+}
+
+
+def canary_line(pattern):
+    """(line, secret) of a canary row: the shape between a fixed head and tail."""
+    template, value = CANARY_ROWS[pattern]
+    return "x " + template.format(v=value) + " tail", value
+
+
+def shown_form(text):
+    """``text`` without format characters and backslashes, so an escape inserted into a run cannot hide a fragment."""
+    return "".join(char for char in text if char != "\\" and unicodedata.category(char) != "Cf")
+
+
+def load_redactor():
+    spec = importlib.util.spec_from_file_location("cert_gate_evidence_9830", str(REDACTOR))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class CanaryTable(unittest.TestCase):
+    """#9830: the canary table has one row per redactor pattern and every row is masked whole."""
+
+    def test_the_table_has_one_row_per_redactor_pattern(self):
+        patterns = {name for name, value in vars(load_redactor()).items() if isinstance(value, re.Pattern)}
+        self.assertEqual(set(CANARY_ROWS) | set(HELPER_PATTERNS), patterns)
+        self.assertEqual(set(CANARY_ROWS) & set(HELPER_PATTERNS), set())
+
+    def test_the_redactor_masks_every_row_whole(self):
+        redactor = load_redactor()
+        for pattern in CANARY_ROWS:
+            line, value = canary_line(pattern)
+            shown = shown_form(redactor.redact_line(line))
+            leaked = [value[at:at + FRAGMENT_CHARS] for at in range(len(value) - FRAGMENT_CHARS + 1)
+                      if value[at:at + FRAGMENT_CHARS] in shown]
+            self.assertEqual(leaked, [], pattern)
+
+
+class CanaryEverySite(Base):
+    """#9830: every canary row at every offset across the line cut and the pre-cap, at every site that shows log
+    text (a progress name, a result line, a crash detail, a section label, a step log's error line), leaves no
+    fragment of 3 characters in any output."""
+
+    def assert_no_fragment(self, text, value, where):
+        shown = shown_form(text)
+        leaked = [value[at:at + FRAGMENT_CHARS] for at in range(len(value) - FRAGMENT_CHARS + 1)
+                  if value[at:at + FRAGMENT_CHARS] in shown]
+        self.assertEqual(leaked, [], where)
+
+    def test_every_row_at_every_offset_of_every_site(self):
+        module = load_script()
+        for pattern in sorted(CANARY_ROWS):
+            line, value = canary_line(pattern)
+            for offset in SWEEP_OFFSETS:
+                where = "%s at offset %d" % (pattern, offset)
+                log = (RUNNING_B + padded("test n ", offset) + line + " ... FAILED\n"
+                       + padded("test result: FAILED. ", offset) + line + "\n"
+                       + RUNNING_CRASHY + padded("  process didn't exit successfully: `/x/c` ", offset) + line + "\n"
+                       + padded("     Running tests/", offset) + line + " (target/debug/deps/x-0123456789abcdef)\n"
+                       + "test t ... FAILED\n" + RESULT_FAILED_LINE + "\n")
+                out, summary = self.run_inproc([str(self.write("c.log", log))], module)
+                self.assertIn("failing test binaries: 3\n", summary, where)
+                self.assertIn("failing tests: 2\n", summary, where)
+                self.assert_no_fragment(out + summary, value, where)
+                step = self.write("s.log", padded("error: ", offset) + line + "\n")
+                out, summary = self.run_inproc([str(self.write("e.log", "")), "--step", str(step), "build"], module)
+                self.assertIn(CAUSE_PREFIX + "build: ", summary, where)
+                self.assert_no_fragment(out + summary, value, where + " (step log)")
+
+
+class OneFunnel(Base):
+    """#9830: one function is the only way from raw text to shown text; the cut and the writers refuse a str."""
+
+    def test_the_cut_and_every_writer_refuse_a_plain_str(self):
+        module = load_script()
+        module.load_redaction()
+        shown = module.redact_shown("plain")
+        self.assertIs(type(shown), module.Redacted)
+        self.assertEqual(shown.text, "plain")
+        for call in (lambda: module.Redacted("x"), lambda: module.cut_redacted("x"), lambda: module.md_cell("x"),
+                     lambda: module.notice("x"), lambda: module.summary_text("x"),
+                     lambda: module.compose(module.NAMES_NOT_AVAILABLE_REASON, "x")):
+            with self.assertRaises(TypeError):
+                call()
+
+    def test_a_line_over_the_pre_cap_is_a_fixed_marker_with_its_byte_length(self):
+        module = load_script()
+        module.load_redaction()
+        self.assertEqual(module.PRE_CAP_BYTES, PRE_CAP_BYTES)
+        unit = "a b "
+        rows = (
+            # (raw line, shown text, cuts counted)
+            (unit * 75, unit * 75, 0),
+            (unit * 75 + "c", (unit * 75)[:LINE_BYTES - 3] + "...", 1),
+            (unit * 100, (unit * 100)[:LINE_BYTES - 3] + "...", 1),
+            (unit * 100 + "c", LINE_NOT_SHOWN % (PRE_CAP_BYTES + 1), 1),
+            (unit * 99 + "a b" + "é", LINE_NOT_SHOWN % (PRE_CAP_BYTES + 1), 1),
+        )
+        for raw, expected, cuts in rows:
+            before = module._shown_cuts
+            self.assertEqual(module.redact_shown(raw).text, expected, len(raw))
+            self.assertEqual(module._shown_cuts - before, cuts, len(raw))
+
+    def test_a_mutant_that_passes_raw_text_to_the_cut_is_refused_by_the_type(self):
+        script = self.fixture_copy()
+        source = script.read_text(encoding="utf-8")
+        target = "redact_shown(raw_line)"
+        self.assertIn(target, source)
+        script.write_text(source.replace(target, "cut_redacted(raw_line)"), encoding="utf-8")
+        line, value = canary_line("TOKEN_SHAPES")
+        self.write("in.log", RUNNING_B + "test " + line + " ... FAILED\n" + RESULT_FAILED_LINE + "\n")
+        rc, out, err, summary = self.run_script(["in.log"], script=str(script))
+        self.assertIn("TypeError", out + err + (summary or ""))
+        self.assertNotIn(value[:8], out + err + (summary or ""))
+
+
+class ShowLogTextSwitch(Base):
+    """The pre-armed split: SHOW_LOG_TEXT = False shows counts and step names only, no text taken from a log."""
+
+    def test_the_switch_off_shows_no_log_text(self):
+        module = load_script()
+        self.assertIs(module.SHOW_LOG_TEXT, True)
+        module.SHOW_LOG_TEXT = False
+        log = self.write("in.log", RUNNING_B + "test a::secretname ... FAILED\n" + RESULT_FAILED_LINE + "\n"
+                         + RUNNING_CRASHY + "  " + CRASH_DETAIL + "\n")
+        out, summary = self.run_inproc([str(log)], module)
+        self.assertIn("failing test binaries: 2\n", summary)
+        self.assertIn("failing tests: 1\n", summary)
+        for text in ("secretname", "test result", "process didn't exit", "crashy.rs", "tests/b.rs"):
+            self.assertNotIn(text, out + summary, text)
+        step = self.write("s.log", "error: secretline\n")
+        out, summary = self.run_inproc([str(self.write("e.log", "")), "--step", str(step), "build"], module)
+        self.assertNotIn("secretline", out + summary)
+        self.assertIn("failing step: build", summary)
+
+
+# The forged lines of class C, each a line shape the runner itself prints.
+FORGED = {
+    "header": "failures:",
+    "name": "test a::forged ... FAILED",
+    "list": "    a::forged",
+    "ok": RESULT_OK_LINE,
+    "failed": "test result: FAILED. 0 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "section": "     Running tests/forged.rs (target/debug/deps/forged-0123456789abcdef)",
+    "doc": "   Doc-tests forged",
+}
+CAPTURE_HEAD = "\nfailures:\n\n---- a::bad stdout ----\n"
+# (row, the log before the captured output, the log after it, failing test binaries, failing tests)
+CAPTURE_BASES = (
+    ("failing-test", RUNNING_B + "test a::good ... ok\ntest a::bad ... FAILED\n" + CAPTURE_HEAD,
+     "\nfailures:\n    a::bad\n\n" + RESULT_FAILED_LINE + "\n", 1, 1),
+    ("passing-result", RUNNING_B + "test a::good ... ok\n" + CAPTURE_HEAD, "\n" + RESULT_OK_LINE + "\n", 1, 0),
+)
+
+
+def forged_captures():
+    """Every ordered combination of {header, name, result ok or FAILED, section line} (each at most once)."""
+    for results in ((), ("ok",), ("failed",)):
+        for size in range(4):
+            for chosen in itertools.combinations(("header", "name", "section"), size):
+                for order in itertools.permutations(chosen + results):
+                    yield order
+
+
+def counts(summary):
+    """(failing test binaries, failing tests) as printed (0 when the line is absent)."""
+    found = []
+    for label in ("failing test binaries: ", "failing tests: "):
+        match = re.search("^" + label + r"(\d+)$", summary, re.M)
+        found.append(int(match.group(1)) if match else 0)
+    return tuple(found)
+
+
+class CaptureCannotForge(Base):
+    """#9831: one section yields at most one binary row and one result; no byte of captured output can add a
+    binary, a name or a section, or change a count."""
+
+    def test_p1_a_forged_header_name_and_failed_result_change_nothing(self):
+        capture = "failures:\n    a::forged\n\ntest a::forged ... FAILED\n" + FORGED["failed"] + "\n"
+        row, head, tail, binaries, tests = CAPTURE_BASES[0]
+        out, summary = self.run_log(head + capture + tail)
+        self.assertEqual(counts(summary), (binaries, tests))
+        self.assertNotIn("forged", out + summary)
+        self.assertNotIn("9 failed", out + summary)
+
+    def test_p2_a_forged_running_line_after_a_header_opens_no_section(self):
+        capture = FORGED["section"] + "\ntest a::x ... FAILED\n" + FORGED["failed"] + "\n" + FORGED["doc"] + "\n"
+        row, head, tail, binaries, tests = CAPTURE_BASES[0]
+        out, summary = self.run_log(head + capture + tail)
+        self.assertEqual(counts(summary), (binaries, tests))
+        self.assertNotIn("forged", out + summary)
+
+    def test_p3_100000_result_lines_in_one_section_are_one_row(self):
+        started = time.monotonic()
+        out, summary = self.run_log(RUNNING_B + (RESULT_FAILED_LINE + "\n") * 100000)
+        self.assertLess(time.monotonic() - started, 20.0)
+        self.assertEqual(counts(summary), (1, 0))
+        self.assertEqual(out.count(BINARY_TITLE), 1)
+
+    def test_every_forged_combination_leaves_the_counts_unchanged(self):
+        module = load_script()
+        for row, head, tail, binaries, tests in CAPTURE_BASES:
+            out, summary = self.run_inproc([str(self.write("base.log", head + tail))], module)
+            self.assertEqual(counts(summary), (binaries, tests), row)
+            for order in forged_captures():
+                capture = "".join(FORGED[piece] + "\n" for piece in order)
+                out, summary = self.run_inproc([str(self.write("f.log", head + capture + tail))], module)
+                self.assertEqual(counts(summary), (binaries, tests), (row, order))
+                self.assertNotIn("forged", out + summary, (row, order))
+
+    def test_a_failed_result_with_no_progress_name_is_names_not_available(self):
+        out, summary = self.run_log(RUNNING_B + RESULT_FAILED_LINE + "\n")
+        self.assertIn(BINARY_TITLE + "b: " + NAMES_NOT_AVAILABLE + "; " + RESULT_FAILED_LINE + "\n", out)
+        self.assertEqual(counts(summary), (1, 0))
+
+    def test_the_100k_line_capture_stays_inside_the_time_bound(self):
+        capture = "".join(FORGED[piece] + "\n" for piece in ("header", "name", "section", "failed")) * 25000
+        row, head, tail, binaries, tests = CAPTURE_BASES[0]
+        started = time.monotonic()
+        out, summary = self.run_log(head + capture + tail)
+        self.assertLess(time.monotonic() - started, 20.0)
+        self.assertEqual(counts(summary), (binaries, tests))
+
+
+class CaptureResidual(unittest.TestCase):
+    """#9831 residual: text a test prints under --nocapture or --show-output lands in the progress region, so no
+    workflow may pass either to the test steps (a contract pin next to the behaviour tests above)."""
+
+    def test_no_workflow_passes_nocapture_or_show_output(self):
+        files = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
+        self.assertGreater(len(files), 0)
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            for flag in ("--nocapture", "RUST_TEST_NOCAPTURE", "--show-output"):
+                self.assertNotIn(flag, text, path.name)
+
+
+# #9830 source conformance: the sites that may slice or cut text, and every funnel call, as allowlists of
+# (function, source text) pairs; a new site in any form is a problem line.
+SLICE_SITES = {
+    ("cut_bytes", "data[:limit]"): "the byte cut of redacted text, on a character boundary",
+    ("read_input", "data[newline + 1:]"): "drops the partial first line of a file tail (input framing, not shown)",
+    ("read_line", "raw[:-1]"): "drops the newline of a read line (input framing, not shown)",
+}
+CUT_SITES = {
+    ("cut_redacted", "cut_bytes(value.text, MAX_LINE_BYTES - len(CUT_MARK))"): "the one cut, behind the type",
+}
+REDACT_SITES = {
+    ("progress_name", "redact_shown(raw_line)"),
+    ("section_label", "redact_shown(raw_line)"),
+    ("close_section", "redact_shown(section.result_raw)"),
+    ("close_section", "redact_shown(section.crash_raw)"),
+    ("last_error_line", "redact_shown(raw_line)"),
+    ("describe", "redact_shown(text)"),
+    ("shown_arg", "redact_shown(text)"),
+}
+WA_ATTRS = {"annotation", "safe_text"}
+
+
+def function_of(parents, node):
+    while node is not None and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        node = parents.get(node)
+    return node.name if node is not None else "<module>"
+
+
+def funnel_problems(source):
+    """Every slice, cut, funnel call and shared-helper attribute of ``source`` outside the allowlists."""
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    problems = []
+    redact = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            site = (function_of(parents, node), ast.unparse(node))
+            if site not in SLICE_SITES:
+                problems.append("slice %r" % (site,))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            site = (function_of(parents, node), ast.unparse(node))
+            if node.func.id == "cut_bytes" and site not in CUT_SITES:
+                problems.append("cut %r" % (site,))
+            if node.func.id == "redact_shown":
+                redact.add(site)
+            if node.func.id in ("compose", "fixed") and not (
+                    node.args and isinstance(node.args[0], ast.Name) and node.args[0].id.isupper()):
+                problems.append("template not a constant %r" % (site,))
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "wa":
+            if node.attr not in WA_ATTRS:
+                problems.append("wa.%s" % node.attr)
+        elif isinstance(node, ast.keyword) and node.arg == "max_chars":
+            site = (function_of(parents, node), ast.unparse(node))
+            if site != ("run", "max_chars=ANNOTATION_MAX_CHARS"):
+                problems.append("max_chars %r" % (site,))
+    if redact != REDACT_SITES:
+        problems.append("funnel calls %r" % (sorted(redact ^ REDACT_SITES),))
+    return problems
+
+
+FUNNEL_MUTANTS = (
+    ("F1 slice in a new function", "def leak(text):\n    return text[:10]\n"),
+    ("F2 slice through a constant", "LEAK_N = 10\n\n\ndef leak(text):\n    return text[:LEAK_N]\n"),
+    ("F3 slice object", "def leak(text):\n    return text[slice(0, 10)]\n"),
+    ("F4 textwrap.shorten", "import textwrap\n\n\ndef leak(text):\n    return textwrap.shorten(text, 10)\n"),
+    ("F5 a helper in another file", "def leak(text):\n    return wa.shorten(text, 10)\n"),
+    ("F6 a second cut", "def leak(text):\n    return cut_bytes(text, 10)\n"),
+    ("F7 a funnel call on a part", "def leak(raw_line):\n    return redact_shown(raw_line.split()[0])\n"),
+    ("F8 a template from text", "def leak(raw_line):\n    return compose(raw_line)\n"),
+    ("F9 a max_chars cut", "def leak(text):\n    return wa.annotation('error', text, max_chars=9)\n"),
+)
+
+
+class FunnelConformance(unittest.TestCase):
+    """#9830: the slice, cut and funnel sites of the script as allowlists, each mutant form caught."""
+
+    def test_the_script_conforms(self):
+        self.assertEqual(funnel_problems(SCRIPT.read_text(encoding="utf-8")), [])
+
+    def test_every_mutant_form_is_caught(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        anchor = "\nISSUE = \"#9709\"\n"
+        self.assertIn(anchor, source)
+        for row, new in FUNNEL_MUTANTS:
+            mutated = source.replace(anchor, anchor + "\n\n" + new + "\n\n", 1)
+            self.assertNotEqual(funnel_problems(mutated) + ratchet_problems(mutated), [], row)
+
+    def test_a_slice_added_inside_an_allowed_function_is_caught(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        target = "    return raw[:-1]"
+        self.assertIn(target, source)
+        mutated = source.replace(target, "    return raw[:-1][:200]", 1)
+        self.assertNotEqual(funnel_problems(mutated), [])
 
 
 if __name__ == "__main__":
