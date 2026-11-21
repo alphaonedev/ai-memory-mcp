@@ -340,8 +340,31 @@ const FOLDS: &[&str] = &[
     "map_or_else",
 ];
 
+/// The header name, lower case (ASCII).
+const HEADER_NAME: &str = "x-agent-id";
 const HEADER_NEEDLE: &str = "x-agent";
 const SENTINEL_NEEDLE: &str = "anonymous:invalid";
+
+// Reasons for a file that is refused whole (`<file>: <reason>`).
+const UNTERMINATED_BLOCK_COMMENT: &str = "unterminated block comment";
+const UNTERMINATED_RAW_STRING: &str = "unterminated raw string";
+const UNTERMINATED_STRING: &str = "unterminated string literal";
+const UNTERMINATED_CHAR: &str = "unterminated char literal";
+const TOO_MANY_RAW_HASHES: &str = "raw string opened with more than 255 hashes";
+const UNREADABLE: &str = "unreadable file";
+const NOT_REGULAR: &str = "not a regular file";
+const NOT_UTF8: &str = "not UTF-8";
+const TOO_LARGE: &str = "larger than the source size cap";
+const RESOLVES_ELSEWHERE: &str = "resolves outside its tracked path";
+const OUTSIDE_ROOTS: &str = "outside the scanned source roots";
+// Reasons for the walk itself.
+const NO_ROOT: &str = "is under neither a scanned root nor a left-out root";
+const EMPTY_ROOT: &str = "scanned root holds no tracked .rs file";
+
+/// rustc's own limit on the hashes of a raw string.
+const MAX_RAW_HASHES: usize = 255;
+/// No tracked source is near this size; a larger file is refused unread.
+const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
 enum Tok {
@@ -717,16 +740,44 @@ const FOLD_PARITY: &str =
 const FOLD_HTTP_CALLER: &str =
     "fn f(h: &HeaderMap) -> String { http_caller(h).map_or_else(|_| String::new(), |c| c) }";
 
-fn one(path: &str, src: &str) -> Vec<String> {
-    offenders_for(&[(path.to_owned(), src.to_owned())])
-}
+// Round-2 red shims (PR 9661): the entry points the round-2 rows call, with
+// the behaviour of the round-1 head, so each new row fails by assertion. The
+// fix commit replaces them.
 
-/// [`offenders`] without the stale-row check (the corpus is one file).
-fn offenders_for(files: &[(String, String)]) -> Vec<String> {
-    offenders(files)
+/// [`offenders`] of one file, without the stale-row check.
+fn one(path: &str, src: &str) -> Vec<String> {
+    offenders(&[(path.to_owned(), src.to_owned())])
         .into_iter()
         .filter(|line| !line.contains("names no scanned file"))
         .collect()
+}
+
+fn one_read(path: &str, read: Result<String, &'static str>) -> Vec<String> {
+    read.map_or_else(|_| Vec::new(), |src| one(path, &src))
+}
+
+fn open_source(root: &Path, rel: &str) -> Result<String, &'static str> {
+    let bytes = std::fs::read(root.join(rel)).unwrap_or_default();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn plan(tracked: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut open = Vec::new();
+    let mut problems = Vec::new();
+    for path in tracked {
+        let top = path.split_once('/').map_or(".", |(top, _)| top);
+        if LEFT_OUT.iter().any(|(r, _)| *r == top) {
+            continue;
+        }
+        if SCANNED_ROOTS.contains(&top) {
+            open.push(path.clone());
+        } else {
+            problems.push(format!(
+                "{path}: tracked root {top} is neither scanned nor left out"
+            ));
+        }
+    }
+    (open, problems)
 }
 
 /// Every deny form is refused with its exact offender line.
@@ -823,4 +874,344 @@ fn ratchet_scan_is_bounded_on_a_large_source_9616() {
     let n = counts(&src)[&HeaderName];
     assert!(start.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(n, LINES);
+}
+
+// Round 2 (PR 9661): every compile-time join of the header name.
+const CONCAT_PLAIN: &str = r#"fn f(h: &HeaderMap) { let _ = h.get(concat!("x-", "agent-id")); }"#;
+const CONCAT_NESTED: &str =
+    r#"fn f() -> &'static str { concat!("x", concat!("-ag", "ent"), "-id") }"#;
+const CONCAT_CONST: &str = "const NAME: &str = concat!(\"X-Ag\", \"ent-Id\");\nfn f(h: &HeaderMap) { let _ = h.get(NAME); }";
+const CONCAT_BRACKET: &str = r#"const NAME: &str = concat!["x-a", "gent-id"];"#;
+const CONCAT_STRINGIFY: &str = r#"const NAME: &str = concat!("x-", stringify!(agent), "-id");"#;
+const ADJACENT_PAIR: &str = r#"const PARTS: [&str; 2] = ["x-ag", "ent-id"];"#;
+const ADJACENT_TRIPLE: &str = r#"fn f() -> String { ["x-a", "gent", "-id"].concat() }"#;
+const CHAR_ARRAY: &str =
+    "const NAME: [char; 10] = ['x', '-', 'a', 'g', 'e', 'n', 't', '-', 'i', 'd'];";
+const BYTE_CHAR_ARRAY: &str =
+    "const NAME: [u8; 10] = [b'x', b'-', b'a', b'g', b'e', b'n', b't', b'-', b'i', b'd'];";
+const LONE_FRAGMENT: &str = r#"fn f(head: &str) -> String { format!("{head}agent-id") }"#;
+const LONE_FRAGMENT_RAW_BYTES: &str = r##"const TAIL: &[u8] = br#"-Agent-ID"#;"##;
+const MACRO_TAIL: &str =
+    r#"macro_rules! name { ($head:literal) => { concat!($head, "agent-id") }; }"#;
+const SPLIT_CONSTS: &str = "const HEAD: &str = \"x-ag\";\nconst TAIL: &str = \"ent-id\";";
+
+/// Every compile-time join is refused with its exact offender line.
+#[test]
+fn compile_time_joins_are_refused_with_the_exact_offender_9616() {
+    let header = vec![format!("{PROBE}: header-name 1 (allowed 0)")];
+    let fragment = vec![format!("{PROBE}: header-fragment 1 (allowed 0)")];
+    let rows: &[(&str, &str, &Vec<String>)] = &[
+        ("concat", CONCAT_PLAIN, &header),
+        ("nested concat", CONCAT_NESTED, &header),
+        ("const built from concat", CONCAT_CONST, &header),
+        ("concat with brackets", CONCAT_BRACKET, &header),
+        ("concat of stringify", CONCAT_STRINGIFY, &header),
+        ("adjacent pair", ADJACENT_PAIR, &header),
+        ("adjacent triple", ADJACENT_TRIPLE, &header),
+        ("char array", CHAR_ARRAY, &header),
+        ("byte char array", BYTE_CHAR_ARRAY, &header),
+        ("lone fragment", LONE_FRAGMENT, &fragment),
+        (
+            "lone fragment, raw bytes",
+            LONE_FRAGMENT_RAW_BYTES,
+            &fragment,
+        ),
+        ("macro tail", MACRO_TAIL, &fragment),
+        ("split constants", SPLIT_CONSTS, &fragment),
+    ];
+    for (name, src, want) in rows {
+        assert_eq!(&one(PROBE, src), *want, "{name}");
+    }
+}
+
+const UNRELATED_HEADERS: &str = r#"fn f(h: &HeaderMap) { let _ = (h.get("x-api-key"), h.get("x-request-id"), h.get("user-agent")); }"#;
+const FLAG_TEXT: &str = r#"fn f() -> &'static str { "pass --agent-id <ID> or set AGENT_ID" }"#;
+const COMMENTED_JOIN: &str =
+    "// concat!(\"x-\", \"agent-id\")\n/* [\"x-ag\", \"ent-id\"] and \"agent-id\" */\nfn f() {}";
+const CONCAT_UNRELATED: &str = r#"const NAME: &str = concat!("x-", "api", "-key");"#;
+
+/// Forms that cannot yield the header name raise no offender.
+#[test]
+fn round_2_allow_corpus_raises_no_offender_9616() {
+    for (name, src) in [
+        ("unrelated headers", UNRELATED_HEADERS),
+        ("command-line flag text", FLAG_TEXT),
+        ("joins inside comments", COMMENTED_JOIN),
+        ("concat of an unrelated header", CONCAT_UNRELATED),
+    ] {
+        assert_eq!(one(PROBE, src), Vec::<String>::new(), "{name}");
+    }
+}
+
+const CASE_MODES: usize = 3;
+
+/// `text` as written, in upper case, or in alternating case.
+fn cased(text: &str, mode: usize) -> String {
+    match mode {
+        0 => text.to_owned(),
+        1 => text.to_uppercase(),
+        _ => text
+            .chars()
+            .enumerate()
+            .map(|(k, c)| {
+                if k % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    }
+}
+
+/// A refused name stays refused under every case change and every re-split:
+/// all cut positions, in two and in three pieces, joined by `concat!`, laid
+/// side by side, or kept in separate constants. The name is ASCII, so every
+/// cut is a char boundary.
+#[test]
+fn a_refused_name_stays_refused_under_case_change_and_re_split_9616() {
+    let header = vec![format!("{PROBE}: header-name 1 (allowed 0)")];
+    let fragment = vec![format!("{PROBE}: header-fragment 1 (allowed 0)")];
+    // What two separate constants yield, by cut position 1 to 9.
+    let separate = [
+        &fragment, &fragment, &fragment, &fragment, &fragment, &fragment, &header, &header, &header,
+    ];
+    assert_eq!(separate.len(), HEADER_NAME.len() - 1);
+    for mode in 0..CASE_MODES {
+        let name = cased(HEADER_NAME, mode);
+        let whole = format!("const N: &str = \"{name}\";");
+        assert_eq!(one(PROBE, &whole), header, "{whole}");
+        for cut in 1..name.len() {
+            let (a, rest) = name.split_at(cut);
+            let joined = format!("const N: &str = concat!(\"{a}\", \"{rest}\");");
+            assert_eq!(one(PROBE, &joined), header, "{joined}");
+            let beside = format!("const N: [&str; 2] = [\"{a}\", \"{rest}\"];");
+            assert_eq!(one(PROBE, &beside), header, "{beside}");
+            let apart = format!("const A: &str = \"{a}\";\nconst B: &str = \"{rest}\";");
+            assert_eq!(&one(PROBE, &apart), separate[cut - 1], "{apart}");
+            for cut2 in 1..rest.len() {
+                let (b, c) = rest.split_at(cut2);
+                let three = format!("const N: &str = concat!(\"{a}\", \"{b}\", \"{c}\");");
+                assert_eq!(one(PROBE, &three), header, "{three}");
+            }
+        }
+    }
+}
+
+/// The lexer never ends a file silently in an open state, and a file that
+/// could not be read is an offender: one row per degenerate input, each with
+/// its exact offender line.
+#[test]
+fn a_file_in_an_open_or_unread_state_is_refused_whole_9616() {
+    let line = |reason: &str| vec![format!("{PROBE}: {reason}")];
+    let raw = |hashes: usize| {
+        let h = "#".repeat(hashes);
+        format!("const S: &str = r{h}\"x\"{h};")
+    };
+    let read = "fn f(h: &HeaderMap) { let _ = h.get(\"x-agent-id\"); }";
+    let rows: Vec<(&str, Result<String, &'static str>, Vec<String>)> = vec![
+        (
+            "block comment",
+            Ok(format!("/* never closed\n{read}")),
+            line(UNTERMINATED_BLOCK_COMMENT),
+        ),
+        (
+            "nested block comment, inner one closed",
+            Ok(format!("/* a /* b */ still open\n{read}")),
+            line(UNTERMINATED_BLOCK_COMMENT),
+        ),
+        (
+            "block comment opened at the end",
+            Ok("fn f() {}\n/*".to_owned()),
+            line(UNTERMINATED_BLOCK_COMMENT),
+        ),
+        (
+            "block comment nested 1000 deep",
+            Ok("/*".repeat(1_000)),
+            line(UNTERMINATED_BLOCK_COMMENT),
+        ),
+        (
+            "raw string",
+            Ok("fn f() { let _ = r#\"x-agent-id\"; }".to_owned()),
+            line(UNTERMINATED_RAW_STRING),
+        ),
+        (
+            "raw string closed with too few hashes",
+            Ok("const S: &[u8] = br##\"x-agent-id\"#;".to_owned()),
+            line(UNTERMINATED_RAW_STRING),
+        ),
+        (
+            "string",
+            Ok("fn f() { let _ = \"x-agent-id; }".to_owned()),
+            line(UNTERMINATED_STRING),
+        ),
+        (
+            "string ending in a backslash",
+            Ok("const S: &[u8] = b\"x-agent-id\\".to_owned()),
+            line(UNTERMINATED_STRING),
+        ),
+        (
+            "char",
+            Ok("fn f() -> char { '\\n }".to_owned()),
+            line(UNTERMINATED_CHAR),
+        ),
+        (
+            "raw string, one hash over the limit",
+            Ok(raw(MAX_RAW_HASHES + 1)),
+            line(TOO_MANY_RAW_HASHES),
+        ),
+        (
+            "raw string at the hash limit",
+            Ok(raw(MAX_RAW_HASHES)),
+            Vec::new(),
+        ),
+        ("unreadable", Err(UNREADABLE), line(UNREADABLE)),
+        ("not regular", Err(NOT_REGULAR), line(NOT_REGULAR)),
+        ("not UTF-8", Err(NOT_UTF8), line(NOT_UTF8)),
+        ("too large", Err(TOO_LARGE), line(TOO_LARGE)),
+        (
+            "resolves elsewhere",
+            Err(RESOLVES_ELSEWHERE),
+            line(RESOLVES_ELSEWHERE),
+        ),
+        ("outside the roots", Err(OUTSIDE_ROOTS), line(OUTSIDE_ROOTS)),
+    ];
+    for (name, read, want) in rows {
+        assert_eq!(one_read(PROBE, read), want, "{name}");
+    }
+}
+
+/// One row per file state: [`open_source`] returns the text of a regular
+/// UTF-8 `.rs` file under a scanned root and refuses every other path with
+/// its exact reason, so no path outside the roots is ever read.
+#[test]
+fn open_source_refuses_every_degenerate_or_outside_path_9616() {
+    const OK_SRC: &str = "fn f() {}";
+    const OUTSIDE_SRC: &str = "fn outside() {}";
+    std::fs::create_dir_all(".local-runs").unwrap();
+    let dir = tempfile::tempdir_in(".local-runs").unwrap();
+    let root = dir.path();
+    let put = |rel: &str, bytes: &[u8]| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    };
+    let cap = usize::try_from(MAX_SOURCE_BYTES).unwrap();
+    put("src/ok.rs", OK_SRC.as_bytes());
+    put("src/bad.rs", &[0xff, 0xfe, b'\n']);
+    put("src/cap.rs", &vec![b' '; cap]);
+    put("src/big.rs", &vec![b' '; cap + 1]);
+    put("src/notes.md", OUTSIDE_SRC.as_bytes());
+    for outside in [
+        "elsewhere/a.rs",
+        "srcx/a.rs",
+        "benchmarks/notes.rs",
+        "tests/a.rs",
+    ] {
+        put(outside, OUTSIDE_SRC.as_bytes());
+    }
+    std::fs::create_dir_all(root.join("src/dir.rs")).unwrap();
+    let absolute = root.join("src/ok.rs").canonicalize().unwrap();
+    let mut rows: Vec<(&str, Result<String, &'static str>)> = vec![
+        ("src/ok.rs", Ok(OK_SRC.to_owned())),
+        ("src/cap.rs", Ok(" ".repeat(cap))),
+        ("src/big.rs", Err(TOO_LARGE)),
+        ("src/missing.rs", Err(UNREADABLE)),
+        ("src/bad.rs", Err(NOT_UTF8)),
+        ("src/dir.rs", Err(NOT_REGULAR)),
+        ("src/notes.md", Err(OUTSIDE_ROOTS)),
+        ("elsewhere/a.rs", Err(OUTSIDE_ROOTS)),
+        ("srcx/a.rs", Err(OUTSIDE_ROOTS)),
+        ("benchmarks/notes.rs", Err(OUTSIDE_ROOTS)),
+        ("tests/a.rs", Err(OUTSIDE_ROOTS)),
+        ("src/../elsewhere/a.rs", Err(OUTSIDE_ROOTS)),
+        ("./src/ok.rs", Err(OUTSIDE_ROOTS)),
+        ("src//ok.rs", Err(OUTSIDE_ROOTS)),
+        (absolute.to_str().unwrap(), Err(OUTSIDE_ROOTS)),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../elsewhere/a.rs", root.join("src/link.rs")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", root.join("src/linked")).unwrap();
+        rows.push(("src/link.rs", Err(RESOLVES_ELSEWHERE)));
+        rows.push(("src/linked/a.rs", Err(RESOLVES_ELSEWHERE)));
+    }
+    // A long text is compared by its length, so a red row stays readable.
+    let brief = |read: Result<String, &'static str>| {
+        read.map(|text| {
+            if text.len() > OK_SRC.len() {
+                format!("{} bytes", text.len())
+            } else {
+                text
+            }
+        })
+    };
+    for (rel, want) in rows {
+        assert_eq!(brief(open_source(root, rel)), brief(want), "{rel}");
+    }
+}
+
+/// The walk is pinned to the listed source roots: a tracked `.rs` path under
+/// any other directory is a problem and is never handed to [`open_source`].
+#[test]
+fn the_walk_opens_only_the_listed_source_roots_9616() {
+    assert_eq!(
+        SCANNED_ROOTS,
+        [
+            "src",
+            "benches",
+            "benchmarks/longmemeval_reflection",
+            "examples",
+            "fuzz",
+            "loadtest",
+            "tools",
+        ]
+    );
+    let left_out: Vec<&str> = LEFT_OUT.iter().map(|(root, _)| *root).collect();
+    assert_eq!(left_out, ["tests", "vendor"]);
+    let inside = [
+        "src/a.rs",
+        "benches/b.rs",
+        "benchmarks/longmemeval_reflection/runner.rs",
+        "examples/e.rs",
+        "fuzz/fuzz_targets/f.rs",
+        "loadtest/src/main.rs",
+        "tools/t/src/main.rs",
+    ];
+    let skipped = ["tests/a.rs", "vendor/v/src/lib.rs"];
+    let outside = [
+        "benchmarks/notes.rs",
+        "benchmarks/other/src/main.rs",
+        "srcx/a.rs",
+        "src/../elsewhere/a.rs",
+        "./src/a.rs",
+        "/src/a.rs",
+        "src//a.rs",
+        "build.rs",
+        "elsewhere/a.rs",
+    ];
+    let tracked: Vec<String> = inside
+        .iter()
+        .chain(&skipped)
+        .chain(&outside)
+        .map(|path| (*path).to_owned())
+        .collect();
+    let (open, problems) = plan(&tracked);
+    assert_eq!(open, inside);
+    assert_eq!(problems, outside.map(|path| format!("{path}: {NO_ROOT}")));
+    // A scanned root with no tracked file is a problem, not a silent pass.
+    let (open, problems) = plan(&["src/a.rs".to_owned()]);
+    assert_eq!(open, ["src/a.rs"]);
+    assert_eq!(
+        problems,
+        [
+            "benches",
+            "benchmarks/longmemeval_reflection",
+            "examples",
+            "fuzz",
+            "loadtest",
+            "tools",
+        ]
+        .map(|root| format!("{root}: {EMPTY_ROOT}"))
+    );
 }
