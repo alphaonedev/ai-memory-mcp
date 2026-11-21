@@ -1346,7 +1346,9 @@ malformed secret refuses `exec` instead of booting a keyless daemon.
 |------|------|---------|-------|
 | `--file PATH` | path | resolved `~/.config/ai-memory/config.toml` | File to validate. |
 
-Exit codes: `0` valid TOML; `2` file not found; `3` not valid TOML
+Exit codes: `0` valid TOML, or no `--file` and no file at the default
+path (stderr `OK: no config file at <path>; the daemon starts on compiled
+defaults (nothing to check)`, #9620); `2` the `--file` path not found; `3` not valid TOML
 (error line names the path only — never the toml crate's `Display`,
 which can echo the offending source); `4` unreadable.
 
