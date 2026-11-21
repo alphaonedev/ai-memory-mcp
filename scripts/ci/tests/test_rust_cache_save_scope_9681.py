@@ -570,6 +570,26 @@ def _effective_key_env(env: dict[str, str], leg: dict[str, object]) -> dict[str,
     return out
 
 
+DEBUG_NAMES = ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG")
+
+
+def _debug_pair_problems(warm_key_env: dict[str, str], pr_key_env: dict[str, str], leg: str) -> list[str]:
+    """#8216: the two debuginfo variables read the same in the key env of a warm job and of the
+    hosted PR leg it serves (an absent name counts as a value), and DEV equals TEST on each side
+    that declares both. A pair that declares neither (coverage's TEST) is equal and passes here;
+    the 9593 pin owns the self-hosted declaration rule."""
+    out: list[str] = []
+    for name in DEBUG_NAMES:
+        warm_value, leg_value = warm_key_env.get(name), pr_key_env.get(name)
+        if warm_value != leg_value:
+            out.append(f"{leg}: warm {name} {warm_value!r} differs from the leg's {leg_value!r}")
+    for side, env in (("warm", warm_key_env), ("leg", pr_key_env)):
+        dev, test = (env.get(n) for n in DEBUG_NAMES)
+        if dev is not None and test is not None and dev != test:
+            out.append(f"{leg}: {side} DEV {dev!r} differs from TEST {test!r}")
+    return out
+
+
 def _leg_id(leg: dict[str, object]) -> str:
     """A leg's name: the first key of its matrix entry (`leg`, `target`), or "" without a matrix."""
     if not leg:
@@ -750,6 +770,9 @@ class RustCacheSaveScope9681(unittest.TestCase):
                 with self.subTest(pair=warm_job_id, part="key-env", leg=_leg_id(leg)):
                     self.assertEqual(_effective_key_env(warm_env, {}),
                                      _effective_key_env(pr_env, leg))
+                    self.assertEqual(
+                        _debug_pair_problems(_effective_key_env(warm_env, {}),
+                                             _effective_key_env(pr_env, leg), _leg_id(leg)), [])
                     other = sorted(k for k in warm_env if not k.startswith(KEY_ENV_PREFIXES))
                     self.assertEqual([k for k in other if k not in pr_env], [])
                     self.assertEqual(
@@ -771,6 +794,27 @@ class RustCacheSaveScope9681(unittest.TestCase):
                     self.assertEqual(warm_step.run(), pr_step.run(), label)
                     before_pr = pr_steps.index(pr_step) < pr_cache
                     self.assertEqual(warm_steps.index(warm_step) < warm_cache, before_pr, label)
+
+    def test_debug_pair_problems_names_each_broken_shape(self) -> None:
+        good = {"CARGO_PROFILE_DEV_DEBUG": "0", "CARGO_PROFILE_TEST_DEBUG": "0"}
+        lto = {"CARGO_PROFILE_DEV_DEBUG": "line-tables-only", "CARGO_PROFILE_TEST_DEBUG": "line-tables-only"}
+        dev_only = {"CARGO_PROFILE_DEV_DEBUG": "0"}
+        cases = (
+            (good, good, []),
+            (dev_only, dev_only, []),
+            ({}, {}, []),
+            (good, lto,
+             ["x: warm CARGO_PROFILE_DEV_DEBUG '0' differs from the leg's 'line-tables-only'",
+              "x: warm CARGO_PROFILE_TEST_DEBUG '0' differs from the leg's 'line-tables-only'"]),
+            (dev_only, good, ["x: warm CARGO_PROFILE_TEST_DEBUG None differs from the leg's '0'"]),
+            (good, dev_only, ["x: warm CARGO_PROFILE_TEST_DEBUG '0' differs from the leg's None"]),
+            ({"CARGO_PROFILE_DEV_DEBUG": "0", "CARGO_PROFILE_TEST_DEBUG": "1"}, good,
+             ["x: warm CARGO_PROFILE_TEST_DEBUG '1' differs from the leg's '0'",
+              "x: warm DEV '0' differs from TEST '1'"]),
+        )
+        for warm_env, leg_env, expected in cases:
+            with self.subTest(warm=warm_env, leg=leg_env):
+                self.assertEqual(_debug_pair_problems(warm_env, leg_env, "x"), expected)
 
     def test_taint_boundary_knows_the_split_cache_actions(self) -> None:
         sys.path.insert(0, str(REPO / "scripts" / "ci"))

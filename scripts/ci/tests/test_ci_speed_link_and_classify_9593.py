@@ -3,7 +3,11 @@
 
 Class: the changes that must leave the set of tests and the set of reported check names
 unchanged (invariant for every push):
-  (a) debuginfo is off on the self-hosted linux-fed enterprise-fed Check leg ONLY;
+  (a) debuginfo (#8216, widening the #9593 pin): every job in every workflow that runs cargo
+      on a SELF-HOSTED runner declares CARGO_PROFILE_DEV_DEBUG and CARGO_PROFILE_TEST_DEBUG,
+      they are equal, and both are 0 on every self-hosted leg (a job with no declaration is a
+      finding, never a default). The domain is read from the workflow files; the expected
+      runner kind and values per job and leg are the hand table EXPECTED_CARGO_DEBUG;
   (c) the scripts/ci unit-test step lives in exactly one job that is no `needs` ancestor of any
       Check leg, runs on every push and carries no path filter or job-level `if:`.
   (d) the job ids and names of ci.yml equal the list pinned from the base (6c67b17b7).
@@ -26,10 +30,65 @@ REPO = Path(__file__).resolve().parents[3]
 WORKFLOWS = REPO / ".github" / "workflows"
 
 CI = "ci.yml"
-LINUX_FED_LEG = "linux-fed,enterprise-fed"
-OTHER_CHECK_LEGS = ("ubuntu-latest,sqlite", "macos-fed,sqlite", "macos-fed,enterprise-fed")
+SELF_HOSTED = "self-hosted"
 DEBUG_KEY = "cargo_debug"
 DEBUG_EXPR = "${{ matrix.cargo_debug || 'line-tables-only' }}"
+DEBUG_VARS = ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG")
+DEBUG_WORKFLOW_VALUE = "line-tables-only"
+SELF_HOSTED_VALUE = "0"
+# The `cargo` subcommands that make a job a cargo job (a `name:` line is not a command).
+CARGO_CMD_RE = re.compile(
+    r"(?:^|[\s;&|(`\"'])cargo\s+(?:\+\S+\s+)?(?:build|test|check|clippy|fmt|run|llvm-cov|bench|doc|install|"
+    r"fetch|metadata|audit|rustc|nextest|miri|fuzz|clean|tree|vet|deny|publish|package|search|update|"
+    r"generate-lockfile|login|yank|nm|ndk|xtask|rustdoc|tarpaulin|hack|machete|udeps|about|cyclonedx|sbom)\b")
+# Hand table (written from the workflow files at 5955a3e1d, never derived): (workflow, job, leg)
+# -> (runner kind, CARGO_PROFILE_DEV_DEBUG, CARGO_PROFILE_TEST_DEBUG) as the leg builds. `leg` is
+# the value of the first key of the matrix entry, "" without a matrix. "" as a value = undeclared.
+# Hosted rows outside ci.yml keep what they have (release-shaped, coverage and bench builds are
+# not changed); every ci.yml row is declared by the workflow-level env, and every self-hosted
+# row is 0 and 0.
+_H, _S = "hosted", "self-hosted"
+_LTO = DEBUG_WORKFLOW_VALUE
+EXPECTED_CARGO_DEBUG: dict = {
+    ("batman-mode-acceptance.yml", "rust-integration", ""): (_H, "", ""),
+    ("batman-mode-acceptance.yml", "bash-integration", ""): (_H, "", ""),
+    ("bench.yml", "bench", ""): (_H, "", ""),
+    ("bench.yml", "regenerate-baseline", ""): (_H, "", ""),
+    ("cert-postgres-age.yml", "cert-postgres-age", ""): (_S, "0", "0"),
+    ("ci.yml", "lint", ""): (_H, _LTO, _LTO),
+    ("ci.yml", "build-script-vetting", ""): (_H, _LTO, _LTO),
+    ("ci.yml", "msrv", ""): (_H, _LTO, _LTO),
+    ("ci.yml", "check", "ubuntu-latest,sqlite"): (_H, "0", "0"),
+    ("ci.yml", "check", "linux-fed,enterprise-fed"): (_S, "0", "0"),
+    ("ci.yml", "check", "macos-fed,sqlite"): (_S, "0", "0"),
+    ("ci.yml", "check", "macos-fed,enterprise-fed"): (_S, "0", "0"),
+    ("ci.yml", "postgres-feature", ""): (_H, _LTO, _LTO),
+    ("ci.yml", "mobile-cross-compile", "aarch64-apple-ios"): (_H, _LTO, _LTO),
+    ("ci.yml", "mobile-cross-compile", "aarch64-linux-android"): (_H, _LTO, _LTO),
+    ("ci.yml", "sal-feature", ""): (_H, _LTO, _LTO),
+    ("ci.yml", "vectorlite-feature", ""): (_H, _LTO, _LTO),
+    ("coverage.yml", "per-module-thresholds", ""): (_H, "0", ""),
+    ("fuzz.yml", "fuzz", ""): (_H, "", ""),
+    ("mobile-runtime.yml", "ios-simulator", ""): (_H, "", ""),
+    ("mobile-runtime.yml", "android-emulator", ""): (_H, "", ""),
+    ("postgres-ignored.yml", "postgres-ignored", ""): (_S, "0", "0"),
+    ("release-shape.yml", "release-shape", ""): (_H, "", ""),
+    ("release.yml", "supply-chain", ""): (_H, "", ""),
+    ("release.yml", "release", "x86_64-unknown-linux-gnu"): (_H, "", ""),
+    ("release.yml", "release", "aarch64-unknown-linux-gnu"): (_H, "", ""),
+    ("release.yml", "release", "x86_64-apple-darwin"): (_H, "", ""),
+    ("release.yml", "release", "aarch64-apple-darwin"): (_H, "", ""),
+    ("release.yml", "sbom", ""): (_H, "", ""),
+    ("release.yml", "mobile-ios", ""): (_H, "", ""),
+    ("release.yml", "mobile-android", ""): (_H, "", ""),
+    ("release.yml", "crates-io", ""): (_H, "", ""),
+    ("rust-cache-warm.yml", "check-hosted-sqlite", ""): (_H, "0", "0"),
+    ("rust-cache-warm.yml", "coverage", ""): (_H, "0", ""),
+    ("session-boot-lifetime.yml", "lifetime-tests", "ubuntu-latest"): (_H, "", ""),
+    ("session-boot-lifetime.yml", "lifetime-tests", "macos-fed"): (_H, "", ""),
+    ("token-budget.yml", "budget", ""): (_H, "", ""),
+    ("yank.yml", "yank", ""): (_H, "", ""),
+}
 UNIT_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
 UNIT_JOB = "build-script-vetting"
 UNIT_STEP = "Shard partition and wiring unit tests (#6344)"
@@ -161,32 +220,199 @@ def step_run(text: str, name: str) -> str:
 
 
 # ---------------------------------------------------------------------------------------
-# (a) debuginfo on the linux-fed leg only
+# (a) debuginfo: every self-hosted cargo job declares both variables, equal, and 0
 # ---------------------------------------------------------------------------------------
 
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _live(line: str) -> bool:
+    return bool(line.strip()) and not line.strip().startswith("#")
+
+
+def _value(raw: str) -> str:
+    """A scalar as written, one trailing ` # comment` and the quotes removed."""
+    raw = re.sub(r"\s+#.*$", "", raw.strip())
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    return raw
+
+
+def _mapping_under(lines: list, header_indent: int, header: str) -> dict:
+    """`NAME: value` pairs of the block `<header>:` at HEADER_INDENT; keys at HEADER_INDENT + 2."""
+    out: dict = {}
+    inside = False
+    for line in lines:
+        if not _live(line):
+            continue
+        if _indent(line) <= header_indent:
+            inside = _indent(line) == header_indent and line.strip() == header + ":"
+            continue
+        if inside and _indent(line) == header_indent + 2 and ":" in line:
+            name, _, raw = line.strip().partition(":")
+            out[name] = _value(raw)
+    return out
+
+
+def workflow_env(text: str) -> dict:
+    return _mapping_under(text.split("\n"), 0, "env")
+
+
+def job_env(block: list) -> dict:
+    return _mapping_under(block, 4, "env")
+
+
+def matrix_legs(block: list) -> list:
+    """The `strategy.matrix.include` entries as raw-scalar dicts (quotes kept), in file order."""
+    legs: list = []
+    include_indent = -1
+    for line in block:
+        if not _live(line):
+            continue
+        if include_indent < 0:
+            if line.strip() == "include:" and _indent(line) == 8:
+                include_indent = _indent(line)
+            continue
+        if _indent(line) <= include_indent:
+            break
+        stripped = line.strip()
+        if stripped.startswith("- ") and _indent(line) == include_indent + 2:
+            legs.append({})
+            stripped = stripped[2:]
+        elif _indent(line) != include_indent + 4:
+            continue
+        name, _, raw = stripped.partition(":")
+        legs[-1][name.strip()] = re.sub(r"\s+#.*$", "", raw.strip())
+    return legs
+
+
+def leg_id(leg: dict) -> str:
+    return _value(next(iter(leg.values()))) if leg else ""
+
+
+def runner_of(block: list, leg: dict) -> str:
+    """The runner labels of one leg; a runs-on form that is not read here is returned as written."""
+    for line in block:
+        if _indent(line) == 4 and line.strip().startswith("runs-on:"):
+            raw = line.strip()[len("runs-on:"):].strip()
+            if "matrix.os" in raw:
+                return _value(leg.get("os", ""))
+            if "matrix.runner" in raw:
+                return _value(leg.get("runner", ""))
+            return raw
+    return ""
+
+
+def effective_value(raw: str, leg: dict) -> tuple:
+    """(value, problem): the value one env entry takes on a leg. `${{ matrix.K || 'L' }}` is the
+    leg's K when K is a QUOTED non-empty scalar, L when K is unset; any other expression form, and
+    an unquoted 0 (falsy in the expression, so it would silently take L), is a problem."""
+    if "${{" not in raw:
+        return raw, ""
+    match = re.match(r"^\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\|\|\s*'([^']*)'\s*\}\}$", raw)
+    if not match:
+        return "", "unrecognised expression form %r" % raw
+    key, literal = match.groups()
+    if key not in leg:
+        return literal, ""
+    written = leg[key]
+    if not (len(written) >= 2 and written[0] == written[-1] and written[0] in "'\""):
+        return "", "matrix.%s = %s is not a quoted string, so `||` may take the literal" % (key, written)
+    return written[1:-1] or literal, ""
+
+
+def step_exports(block: list, leg: str) -> dict:
+    """`echo "VAR=value"` exports of a debug variable in steps that apply to LEG: a step whose `if:`
+    names `matrix.leg == '<other>'` is skipped."""
+    out: dict = {}
+    starts = [i for i, line in enumerate(block) if _indent(line) == 6 and line.startswith("      - ")]
+    for n, start in enumerate(starts):
+        step = block[start:starts[n + 1] if n + 1 < len(starts) else len(block)]
+        text = "\n".join(line for line in step if _live(line))
+        named = re.findall(r"matrix\.leg == '([^']*)'", text)
+        if named and leg not in named:
+            continue
+        for var in DEBUG_VARS:
+            found = re.findall(r'echo "%s=([^"]*)"' % var, text)
+            if found:
+                out[var] = found[-1]
+    return out
+
+
+def cargo_jobs(text: str) -> dict:
+    return {job: block for job, block in jobs_of(text).items()
+            if any(_live(line) and "name:" not in line and CARGO_CMD_RE.search(line) for line in block)}
+
+
+def cargo_debug_rows(workflows: dict) -> tuple:
+    """({(workflow, job, leg): (kind, dev, test)}, [problems]) read from the workflow files."""
+    rows: dict = {}
+    problems: list = []
+    for name in sorted(workflows):
+        text = workflows[name]
+        wf_env = workflow_env(text)
+        for job, block in cargo_jobs(text).items():
+            legs = matrix_legs(block) or [{}]
+            env = {**wf_env, **job_env(block)}
+            for leg in legs:
+                lid = leg_id(leg)
+                kind = "self-hosted" if SELF_HOSTED in runner_of(block, leg) else "hosted"
+                values = []
+                for var in DEBUG_VARS:
+                    raw = env.get(var)
+                    value, problem = ("", "") if raw is None else effective_value(raw, leg)
+                    if problem:
+                        problems.append("%s %s leg %r: %s: %s" % (name, job, lid, var, problem))
+                    values.append(value)
+                exported = step_exports(block, lid)
+                values = [exported.get(var, value) for var, value in zip(DEBUG_VARS, values)]
+                rows[(name, job, lid)] = (kind, values[0], values[1])
+    return rows, problems
+
+
 def problems_debuginfo(workflows: dict) -> list:
-    out: list = []
+    rows, out = cargo_debug_rows(workflows)
+    for var in DEBUG_VARS:
+        if workflow_env(workflows[CI]).get(var) != DEBUG_WORKFLOW_VALUE:
+            out.append("ci.yml: the workflow env must declare %s: %s" % (var, DEBUG_WORKFLOW_VALUE))
     jobs = jobs_of(workflows[CI])
     check = jobs.get("check", [])
-    for var in ("CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"):
+    for var in DEBUG_VARS:
         want = "      %s: %s" % (var, DEBUG_EXPR)
         if want not in check:
             out.append("ci.yml check: the job env must read %r" % want)
-    fed = matrix_entry(check, LINUX_FED_LEG)
-    if "            %s: '0'" % DEBUG_KEY not in fed:
-        out.append("ci.yml check: leg %s must set %s: '0'" % (LINUX_FED_LEG, DEBUG_KEY))
-    for leg in OTHER_CHECK_LEGS:
-        entry = matrix_entry(check, leg)
-        if not entry:
-            out.append("ci.yml check: leg %s is missing from the matrix" % leg)
-        elif any(DEBUG_KEY in line for line in entry):
-            out.append("ci.yml check: leg %s must not set %s" % (leg, DEBUG_KEY))
+    for leg in matrix_legs(check):
+        hosted = SELF_HOSTED not in runner_of(check, leg)
+        if hosted and DEBUG_KEY in leg:
+            out.append("ci.yml check: leg %s is hosted and must not set %s" % (leg_id(leg), DEBUG_KEY))
     for job, block in jobs.items():
         if job != "check" and any("CARGO_PROFILE_" in line and "_DEBUG" in line for line in block):
             out.append("ci.yml %s: only the check job may set a CARGO_PROFILE_*_DEBUG variable" % job)
     for name, text in workflows.items():
         if name != CI and DEBUG_KEY in text:
             out.append("%s: release-shaped and coverage builds must not use %s" % (name, DEBUG_KEY))
+    for key in sorted(set(rows) - set(EXPECTED_CARGO_DEBUG)):
+        out.append("%s %s leg %r: a cargo job with no row in EXPECTED_CARGO_DEBUG" % key)
+    for key in sorted(set(EXPECTED_CARGO_DEBUG) - set(rows)):
+        out.append("%s %s leg %r: a row of EXPECTED_CARGO_DEBUG names no cargo job" % key)
+    for key in sorted(set(rows) & set(EXPECTED_CARGO_DEBUG)):
+        kind, dev, test = rows[key]
+        label = "%s %s leg %r" % key
+        found = False
+        if kind == "self-hosted":
+            for var, value in zip(DEBUG_VARS, (dev, test)):
+                if value == "":
+                    out.append("%s: self-hosted job leaves %s undeclared" % (label, var))
+                    found = True
+                elif value != SELF_HOSTED_VALUE:
+                    out.append("%s: self-hosted job sets %s to %r, must be 0" % (label, var, value))
+                    found = True
+        if dev and test and dev != test:
+            out.append("%s: CARGO_PROFILE_DEV_DEBUG %r differs from CARGO_PROFILE_TEST_DEBUG %r" % (label, dev, test))
+            found = True
+        if not found and (kind, dev, test) != EXPECTED_CARGO_DEBUG[key]:
+            out.append("%s: reads %r, the hand table says %r" % (label, (kind, dev, test), EXPECTED_CARGO_DEBUG[key]))
     return out
 
 
@@ -374,21 +600,91 @@ class BrokenCopies(unittest.TestCase):
         workflows[name] = workflows[name].replace(old, new)
         return workflows
 
-    def test_debuginfo_key_on_a_second_leg(self):
-        workflows = self._broken(CI, "            node: macos-fed\n            tier: sqlite\n",
-                                 "            node: macos-fed\n            tier: sqlite\n            cargo_debug: '0'\n")
-        self.assertEqual(problems_debuginfo(workflows), ["ci.yml check: leg macos-fed,sqlite must not set cargo_debug"])
-
-    def test_debuginfo_key_missing_on_the_linux_fed_leg(self):
-        workflows = self._broken(CI, "            cargo_debug: '0'\n", "")
+    def test_debuginfo_key_on_a_hosted_leg(self):
+        leg = "ubuntu-latest,sqlite"
+        workflows = real_workflows()
+        text = workflows[CI]
+        start = text.index("          - leg: %s\n" % leg)
+        at = text.index("            tier: sqlite\n", start) + len("            tier: sqlite\n")
+        workflows[CI] = text[:at] + "            cargo_debug: '0'\n" + text[at:]
         self.assertEqual(problems_debuginfo(workflows),
-                         ["ci.yml check: leg linux-fed,enterprise-fed must set cargo_debug: '0'"])
+                         ["ci.yml check: leg %s is hosted and must not set cargo_debug" % leg])
+
+    def _without_debug_key(self, leg: str) -> dict:
+        """A copy of ci.yml whose matrix entry for LEG has no `cargo_debug: '0'` line."""
+        workflows = real_workflows()
+        text = workflows[CI]
+        start = text.index("          - leg: %s\n" % leg)
+        line = "            %s: '0'\n" % DEBUG_KEY
+        end = text.find("          - leg: ", start + 1)
+        at = text.find(line, start, end if end >= 0 else len(text))
+        self.assertGreaterEqual(at, 0, "leg %s has no %s line to remove" % (leg, DEBUG_KEY))
+        workflows[CI] = text[:at] + text[at + len(line):]
+        return workflows
+
+    def test_debuginfo_key_missing_on_each_self_hosted_leg(self):
+        for leg in ("linux-fed,enterprise-fed", "macos-fed,sqlite", "macos-fed,enterprise-fed"):
+            with self.subTest(leg=leg):
+                self.assertEqual(problems_debuginfo(self._without_debug_key(leg)), [
+                    "ci.yml check leg %r: self-hosted job sets CARGO_PROFILE_DEV_DEBUG to 'line-tables-only', must be 0" % leg,
+                    "ci.yml check leg %r: self-hosted job sets CARGO_PROFILE_TEST_DEBUG to 'line-tables-only', must be 0" % leg])
 
     def test_debuginfo_key_in_a_coverage_style_workflow(self):
         workflows = real_workflows()
         workflows["coverage.yml"] += "\n# cargo_debug\n"
         self.assertEqual(problems_debuginfo(workflows),
                          ["coverage.yml: release-shaped and coverage builds must not use cargo_debug"])
+
+    def test_self_hosted_cargo_job_with_no_declaration(self):
+        workflows = self._broken("cert-postgres-age.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n', "")
+        self.assertEqual(problems_debuginfo(workflows), [
+            "cert-postgres-age.yml cert-postgres-age leg '': self-hosted job leaves CARGO_PROFILE_TEST_DEBUG undeclared"])
+
+    def test_self_hosted_dev_and_test_differ(self):
+        workflows = self._broken("postgres-ignored.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n',
+                                 '  CARGO_PROFILE_TEST_DEBUG: "1"\n')
+        self.assertEqual(problems_debuginfo(workflows), [
+            "postgres-ignored.yml postgres-ignored leg '': self-hosted job sets CARGO_PROFILE_TEST_DEBUG to '1', must be 0",
+            "postgres-ignored.yml postgres-ignored leg '': CARGO_PROFILE_DEV_DEBUG '0' differs from "
+            "CARGO_PROFILE_TEST_DEBUG '1'"])
+
+    def test_hosted_ci_job_dev_and_test_differ(self):
+        workflows = self._broken(CI, "\n  CARGO_PROFILE_TEST_DEBUG: line-tables-only\n",
+                                 "\n  CARGO_PROFILE_TEST_DEBUG: full\n")
+        got = problems_debuginfo(workflows)
+        self.assertIn("ci.yml: the workflow env must declare CARGO_PROFILE_TEST_DEBUG: line-tables-only", got)
+        self.assertIn("ci.yml lint leg '': CARGO_PROFILE_DEV_DEBUG 'line-tables-only' differs from "
+                      "CARGO_PROFILE_TEST_DEBUG 'full'", got)
+
+    def test_workflow_env_missing_in_ci(self):
+        workflows = self._broken(CI, "\n  CARGO_PROFILE_DEV_DEBUG: line-tables-only\n", "\n")
+        got = problems_debuginfo(workflows)
+        self.assertEqual(got[0], "ci.yml: the workflow env must declare CARGO_PROFILE_DEV_DEBUG: line-tables-only")
+        self.assertIn("ci.yml lint leg '': reads ('hosted', '', 'line-tables-only'), the hand table says "
+                      "('hosted', 'line-tables-only', 'line-tables-only')", got)
+
+    def test_new_self_hosted_cargo_job_has_no_row(self):
+        workflows = real_workflows()
+        workflows["yank.yml"] += ("\n  extra-8216:\n    name: Extra\n    runs-on: [self-hosted, linux-fed]\n"
+                                  "    steps:\n      - run: cargo test --no-run\n")
+        self.assertEqual(problems_debuginfo(workflows),
+                         ["yank.yml extra-8216 leg '': a cargo job with no row in EXPECTED_CARGO_DEBUG"])
+
+    def test_a_row_that_names_no_cargo_job(self):
+        workflows = real_workflows()
+        workflows["yank.yml"] = workflows["yank.yml"].replace("cargo yank", "echo yank")
+        self.assertEqual(problems_debuginfo(workflows),
+                         ["yank.yml yank leg '': a row of EXPECTED_CARGO_DEBUG names no cargo job"])
+
+    def test_unquoted_zero_in_a_matrix_is_refused(self):
+        workflows = real_workflows()
+        text = workflows[CI]
+        start = text.index("          - leg: linux-fed,enterprise-fed\n")
+        at = text.index("            cargo_debug: '0'\n", start)
+        workflows[CI] = text[:at] + "            cargo_debug: 0\n" + text[at + len("            cargo_debug: '0'\n"):]
+        got = problems_debuginfo(workflows)
+        self.assertIn("ci.yml check leg 'linux-fed,enterprise-fed': CARGO_PROFILE_DEV_DEBUG: matrix.cargo_debug = 0 "
+                      "is not a quoted string, so `||` may take the literal", got)
 
     def test_unit_step_back_in_classify(self):
         workflows = real_workflows()
