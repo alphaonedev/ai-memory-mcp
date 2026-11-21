@@ -34,6 +34,7 @@ Invariant 4 (cost). The cost of the decider is bounded by operation counts
 The expected columns are hand-written literals; none is computed from the code
 under test.
 """
+import locale
 import os
 import re
 import contextlib
@@ -44,6 +45,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.append(str(REPO / "scripts" / "ci"))
@@ -60,10 +62,11 @@ TIMEOUT_S = 120
 V = "cargo_skip-rules-v1"
 PR_BASE_REF = "chain/promo6-ssh-r2"
 # The sha the frozen decider rows were taken at: the tree that predates #9263 (its
-# decider does not know --stdin0). It is NOT the current chain tip and nothing
-# reads it from git: the four files live under FROZEN_DIR and are pinned below.
+# decider does not know --stdin0). It is an old chain commit, not the current tip,
+# and nothing reads it from git: the four files live under FROZEN_DIR and are pinned
+# below.
 FROZEN_AT_SHA = "b5b1f8bbf3e8e867baa0bb36f901463c06d16a1f"
-FROZEN_DIR = Path(__file__).resolve().parent / "fixtures" / "chain_tip_b5b1f8bb_impact"
+FROZEN_DIR = Path(__file__).resolve().parent / "fixtures" / "frozen_pre_9263_impact"
 # Hand-written sha256 of each frozen file (taken once from `git show FROZEN_AT_SHA:...`).
 FROZEN_SHA256 = {
     "__init__.py": "639ea34a77304d66e9bff28210587a4c6a3dc342222e79861d13b13205a67a2c",
@@ -72,6 +75,13 @@ FROZEN_SHA256 = {
     "rules.json": "86a9e788f37e50a8892c8cfe3135a80ce818a8381164f31660501c1a843df392",
 }
 FROZEN_SUFFIX = ".frozen"
+# The exact texts frozen_files() raises; a test pins each one.
+FROZEN_MISMATCH_TEXT = "frozen fixture %s no longer matches its pinned sha256 (taken at %s)"
+FROZEN_MISSING_TEXT = "frozen fixture %s is missing from %s (taken at %s)"
+
+
+class FrozenFixtureError(Exception):
+    """A frozen fixture file is missing or its bytes differ from the pinned sha256."""
 MAX_PATHS = 5000
 # Cost bound of the cap rows: two rows read the lists, and one path is matched
 # by at most this many passes (ci tree, docs, skip, each with its blocked check).
@@ -183,6 +193,178 @@ def run_git(repo: Path, *args: str) -> str:
 def scratch_dir() -> Path:
     SCRATCH.mkdir(exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="cov9263-", dir=str(SCRATCH)))
+
+
+# The reject tokens of the two classify steps, written out by hand (the one fixed token
+# each rejection prints; the decider's answer text is never printed).
+WHY_EMPTY = "empty"
+WHY_BLANK = "blank-only"
+WHY_NONPRINT = "not-printable-ascii"
+WHY_OVER = "over-cap-%d" % REASON_MAX
+WHY_EXTRA = "extra-line"
+# A row whose values are not each `true` or `false` ends as a RUN with the fixed
+# fail-closed reason and prints no rejection line.
+WHY_SHAPE = ""
+# Carriage return, DEL, ESC, NUL and a line feed as bytes.
+CR, DEL, ESC, NUL, LF = b"\r", b"\x7f", b"\x1b", b"\x00", b"\n"
+# A marker that sits in a rejected reason; it must reach no output line and no output value.
+ZQ = b"zq7"
+UTF8_LOCALE_CANDIDATES = ("C.UTF-8", "en_US.UTF-8")
+BIG_REASON_BYTES = 100000
+
+
+class Row(NamedTuple):
+    """One decider answer and what each classify step must do with it.
+
+    why: the reject token the step prints, WHY_SHAPE for a RUN that prints none,
+    None for an accepted answer. passed: the (docs_only, cargo_skip, reason) an
+    accepted answer passes through. canary: bytes that must appear in no output.
+    """
+    label: str
+    answer: bytes
+    why: Optional[str]
+    canary: Optional[bytes]
+    passed: Optional[tuple]
+
+
+def answer_of(docs_only: bytes, skip: bytes, reason: bytes) -> bytes:
+    return (b"docs_only=" + docs_only + LF + b"cargo_skip=" + skip + LF
+            + b"cargo_skip_reason=" + reason + LF)
+
+
+def rej(label, why, reason=b"", docs=b"false", skip=b"true", canary=None, answer=None):
+    body = answer if answer is not None else answer_of(docs, skip, reason)
+    return Row(label, body, why, canary, None)
+
+
+def acc(label, docs, skip, reason, answer=None):
+    body = answer if answer is not None else answer_of(docs, skip, reason)
+    return Row(label, body, None, None, (docs.decode(), skip.decode(), reason.decode()))
+
+
+OK_REASON = ZQ + b"-ok"
+# ONE row list drives both step tables (written out by hand): a row added here runs
+# against coverage.yml and against ci.yml, on every locale in locale_cases().
+REASON_ROWS = [
+    # empty and blank
+    rej("run with an empty reason", WHY_EMPTY, skip=b"false"),
+    rej("skip with an empty reason", WHY_EMPTY),
+    rej("docs skip with an empty reason", WHY_EMPTY, docs=b"true"),
+    rej("one space", WHY_BLANK, b" "),
+    rej("three spaces", WHY_BLANK, b"   "),
+    # control characters, one row per form and position
+    rej("tab only", WHY_NONPRINT, b"\t"),
+    rej("space plus tab", WHY_NONPRINT, b" \t"),
+    rej("NUL only", WHY_NONPRINT, NUL),
+    rej("text with a NUL inside", WHY_NONPRINT, ZQ + NUL + b"cd", canary=ZQ),
+    rej("control characters only", WHY_NONPRINT, b"\x01\x02", docs=b"true"),
+    rej("control character at the start", WHY_NONPRINT, b"\x01" + ZQ, canary=ZQ),
+    rej("control character inside", WHY_NONPRINT, ZQ + b"\x01cd", canary=ZQ),
+    rej("control character at the end", WHY_NONPRINT, ZQ + b"\x01", canary=ZQ),
+    rej("bare DEL", WHY_NONPRINT, DEL),
+    rej("text with a DEL inside", WHY_NONPRINT, ZQ + DEL + b"cd", canary=ZQ),
+    rej("CR at the end", WHY_NONPRINT, ZQ + CR, canary=ZQ),
+    rej("CR inside", WHY_NONPRINT, ZQ + CR + b"cd", canary=ZQ),
+    rej("ESC inside", WHY_NONPRINT, ZQ + ESC + b"[31m", canary=ZQ),
+    rej("CRLF line endings", WHY_NONPRINT, canary=ZQ,
+        answer=b"docs_only=false\r\ncargo_skip=true\r\ncargo_skip_reason=" + ZQ + b"\r\n"),
+    # bytes outside printable ASCII, in every width and form
+    rej("2-byte character", WHY_NONPRINT, ZQ + "é".encode(), canary=ZQ),
+    rej("3-byte character", WHY_NONPRINT, ZQ + "€".encode(), canary=ZQ),
+    rej("4-byte character", WHY_NONPRINT, ZQ + "\U0001f600".encode(), canary=ZQ),
+    rej("invalid byte 0xff", WHY_NONPRINT, ZQ + b"\xff", canary=ZQ),
+    rej("overlong form c0 af", WHY_NONPRINT, ZQ + b"\xc0\xaf", canary=ZQ),
+    rej("no-break space only", WHY_NONPRINT, " ".encode()),
+    rej("300 characters in 300 bytes", WHY_NONPRINT, ZQ + "é".encode() * 150, canary=ZQ),
+    rej("300 characters in 600 bytes", WHY_NONPRINT, "é".encode() * REASON_MAX,
+        canary="é".encode()),
+    rej("a RUN answer with a non-ASCII reason", WHY_NONPRINT,
+        ZQ + b"-rust-observable-path src/caf" + "é".encode() + b".rs v1",
+        skip=b"false", canary=ZQ),
+    # length
+    rej("cap plus one", WHY_OVER, b"x" * (REASON_MAX + 1), canary=b"x" * (REASON_MAX + 1)),
+    rej("a RUN answer over the cap", WHY_OVER, ZQ + b"x" * REASON_MAX, skip=b"false", canary=ZQ),
+    rej("a big reason", WHY_OVER, ZQ + b"y" * BIG_REASON_BYTES, canary=ZQ),
+    # answers that are not exactly the three key lines
+    rej("LF inside the reason", WHY_EXTRA, ZQ + LF + b"cd", canary=ZQ),
+    rej("a stray fourth line", WHY_EXTRA, canary=ZQ,
+        answer=answer_of(b"false", b"true", OK_REASON) + ZQ + b"=1\n"),
+    rej("an empty line at the end", WHY_EXTRA, canary=ZQ,
+        answer=answer_of(b"false", b"true", OK_REASON) + LF),
+    rej("an empty line first", WHY_EXTRA, canary=ZQ,
+        answer=LF + answer_of(b"false", b"true", OK_REASON)),
+    rej("a look-alike key line", WHY_EXTRA, canary=ZQ,
+        answer=answer_of(b"false", b"true", OK_REASON) + b"cargo_skip_reasonX=" + ZQ + LF),
+    rej("a duplicate docs_only key", WHY_EXTRA, canary=ZQ,
+        answer=b"docs_only=false\n" + answer_of(b"false", b"true", OK_REASON)),
+    rej("a duplicate key and a missing key", WHY_EXTRA, canary=ZQ,
+        answer=b"docs_only=false\ndocs_only=false\ncargo_skip=true\n"),
+    rej("a duplicate reason key", WHY_EXTRA, canary=ZQ,
+        answer=answer_of(b"false", b"true", OK_REASON) + b"cargo_skip_reason=" + ZQ + LF),
+    rej("the reason line missing", WHY_EXTRA, answer=b"docs_only=false\ncargo_skip=true\n"),
+    rej("docs_only missing", WHY_EXTRA, canary=ZQ,
+        answer=b"cargo_skip=true\ncargo_skip_reason=" + OK_REASON + LF),
+    rej("cargo_skip missing", WHY_EXTRA, canary=ZQ,
+        answer=b"docs_only=false\ncargo_skip_reason=" + OK_REASON + LF),
+    rej("no answer at all", WHY_EXTRA, answer=b""),
+    rej("a reason that carries a key line", WHY_EXTRA, ZQ + b"\ncargo_skip=true", canary=ZQ),
+    rej("an extra line and a control character", WHY_EXTRA, ZQ + b"\n\x01", canary=ZQ),
+    # values that are not each true or false
+    rej("docs true, skip false", WHY_SHAPE, b"planted", docs=b"true", skip=b"false"),
+    rej("docs valid, skip invalid", WHY_SHAPE, b"planted", docs=b"true", skip=b"maybe"),
+    rej("docs invalid, skip valid true", WHY_SHAPE, b"planted", docs=b"maybe", skip=b"true"),
+    rej("docs valid false, skip invalid", WHY_SHAPE, b"planted", docs=b"false", skip=b"maybe"),
+    rej("docs invalid, skip valid false", WHY_SHAPE, b"planted", docs=b"maybe", skip=b"false"),
+    rej("split values falset + rue", WHY_SHAPE, b"planted", docs=b"falset", skip=b"rue"),
+    rej("split values truet + rue", WHY_SHAPE, b"planted", docs=b"truet", skip=b"rue"),
+    rej("split values tru + efalse", WHY_SHAPE, b"planted", docs=b"tru", skip=b"efalse"),
+    rej("both values empty", WHY_SHAPE, b"planted", docs=b"", skip=b""),
+    rej("docs empty", WHY_SHAPE, b"planted", docs=b"", skip=b"true"),
+    rej("skip empty", WHY_SHAPE, b"planted", docs=b"true", skip=b""),
+    rej("docs trailing blank", WHY_SHAPE, b"planted", docs=b"true ", skip=b"true"),
+    rej("docs leading blank", WHY_SHAPE, b"planted", docs=b" true", skip=b"true"),
+    rej("skip trailing blank", WHY_SHAPE, b"planted", docs=b"true", skip=b"true "),
+    rej("skip tab", WHY_NONPRINT, b"planted", docs=b"false", skip=b"\t"),
+    rej("docs carriage return", WHY_NONPRINT, b"planted", docs=b"true" + CR, skip=b"true"),
+    rej("skip carriage return", WHY_NONPRINT, b"planted", docs=b"true", skip=b"true" + CR),
+    rej("newline inside docs", WHY_EXTRA, b"planted", docs=b"tr\nue", skip=b"true"),
+    rej("newline inside skip", WHY_EXTRA, b"planted", docs=b"true", skip=b"tr\nue"),
+    rej("upper case", WHY_SHAPE, b"planted", docs=b"TRUE", skip=b"TRUE"),
+    # accepted answers, each a pinned choice
+    acc("a run answer", b"false", b"false", b"planted-run"),
+    acc("a skip answer", b"false", b"true", b"planted-skip"),
+    acc("a docs skip answer", b"true", b"true", b"planted-docs"),
+    acc("cap", b"false", b"true", b"x" * REASON_MAX),
+    acc("blanks around text", b"false", b"true", b"  ok  "),
+    acc("printable punctuation", b"false", b"true", b"a$b\"c'd;e\\f"),
+    acc("no line feed after the last line", b"false", b"true", b"ok-no-lf",
+        answer=b"docs_only=false\ncargo_skip=true\ncargo_skip_reason=ok-no-lf"),
+    acc("keys in another order", b"false", b"true", b"ok-order",
+        answer=b"cargo_skip_reason=ok-order\ncargo_skip=true\ndocs_only=false\n"),
+]
+
+
+def utf8_locale() -> str:
+    """The first UTF-8 locale of UTF8_LOCALE_CANDIDATES this host has; an error if none."""
+    saved = locale.setlocale(locale.LC_CTYPE)
+    try:
+        for name in UTF8_LOCALE_CANDIDATES:
+            try:
+                locale.setlocale(locale.LC_CTYPE, name)
+            except locale.Error:
+                continue
+            return name
+    finally:
+        locale.setlocale(locale.LC_CTYPE, saved)
+    raise AssertionError("no UTF-8 locale among %r on this host: the locale rows cannot run"
+                         % (UTF8_LOCALE_CANDIDATES,))
+
+
+def locale_cases():
+    """(label, env) for the locales every row runs under: C, and a UTF-8 one of the caller."""
+    name = utf8_locale()
+    return [("LC_ALL=C", {"LC_ALL": "C", "LANG": "C"}),
+            ("LC_ALL=%s" % name, {"LC_ALL": name, "LANG": name})]
 
 
 # (label, paths, docs_only, cargo_skip, reason): written out by hand.
@@ -564,6 +746,66 @@ class ClsHarness(unittest.TestCase):
             (values.get("docs_only"), values.get("cargo_skip"), values.get("cargo_skip_reason")),
             (docs_only, skip, reason), label)
 
+    # Set by each step class: the fail-closed reason and the notice lines of a row.
+    FAIL_REASON = FAIL_CLOSED
+
+    def run_script(self, script, out, env):
+        """Run one extracted step body; keep the raw stdout, the output file and the rc."""
+        res = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+                             cwd=str(self.repo), env=env, capture_output=True,
+                             timeout=TIMEOUT_S)
+        self.last_rc = res.returncode
+        self.last_stderr = res.stderr
+        self.last_stdout = res.stdout
+        self.last_output = out.read_bytes()
+        values = {}
+        for line in self.last_output.decode("utf-8", "replace").splitlines():
+            key, _, value = line.partition("=")
+            values[key] = value
+        return values, res.stdout.decode("utf-8", "replace")
+
+    def plant(self, row):
+        """Commit a trusted decider that prints this exact answer; return the base to run from."""
+        planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
+        planted.write_text("import sys\nsys.stdout.buffer.write(%r)\n" % row.answer)
+        self.commit("trusted decider " + row.label)
+        base = run_git(self.repo, "rev-parse", "HEAD")
+        self.write("docs/a.md", "# changed %s\n" % row.label)
+        self.commit()
+        return base
+
+    def check_reason_rows(self):
+        """Every row of REASON_ROWS, under every locale of locale_cases(), against this step."""
+        self.commit_base()
+        labels = [row.label for row in REASON_ROWS]
+        self.assertEqual(len(labels), len(set(labels)), "row labels are unique")
+        for row in REASON_ROWS:
+            base = self.plant(row)
+            for loc_label, loc_env in locale_cases():
+                label = "%s | %s" % (row.label, loc_label)
+                with self.subTest(label):
+                    values, stdout = self.run_cls(base, locale_env=loc_env)
+                    self.assert_row(label, row, values, stdout)
+
+    def assert_row(self, label, row, values, stdout):
+        self.assertEqual(self.last_rc, 0, "%s: rc, stderr %r" % (label, self.last_stderr[-200:]))
+        shown = self.last_stdout.decode("utf-8").replace("\u2014", "")
+        self.assertTrue(shown.isascii(), label + ": stdout holds only ASCII and the fixed dash")
+        if row.why is None:
+            self.expect(label, values, *row.passed)
+        else:
+            self.expect(label, values, "false", "false", self.FAIL_REASON)
+        lines = stdout.splitlines()
+        notices = [ln for ln in lines if ln.startswith("::notice::")]
+        others = [ln for ln in lines if not ln.startswith("::notice::")]
+        self.assertEqual(notices, self.expected_notices(row), label)
+        self.check_other_lines(label, others)
+        if row.canary is not None:
+            self.assertNotIn(row.canary, self.last_stdout, label + ": stdout")
+            self.assertNotIn(row.canary, self.last_output, label + ": output file")
+        if row.why:
+            self.assertEqual(stdout.count(row.why), 1, label + ": the token is on one line")
+
 
 class CoverageClassifyRuns(ClsHarness):
     """The coverage.yml cls block run against git fixtures."""
@@ -585,7 +827,8 @@ class CoverageClassifyRuns(ClsHarness):
         shim.chmod(0o755)
         return str(shim_dir) + os.pathsep + os.environ.get("PATH", "")
 
-    def run_cls(self, base, event="pull_request", base_ref=PR_BASE_REF, path=None):
+    def run_cls(self, base, event="pull_request", base_ref=PR_BASE_REF, path=None,
+                locale_env=None):
         script = self.work / "cls.sh"
         script.write_text(self.body)
         out = self.work / "gh_output"
@@ -600,14 +843,8 @@ class CoverageClassifyRuns(ClsHarness):
             "GIT_CONFIG_SYSTEM": os.devnull})
         if path is not None:
             env["PATH"] = path
-        res = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
-                             cwd=str(self.repo), env=env, capture_output=True, text=True,
-                             timeout=TIMEOUT_S)
-        values = {}
-        for line in out.read_text().splitlines():
-            key, _, value = line.partition("=")
-            values[key] = value
-        return values, res.stdout
+        env.update(locale_env or {})
+        return self.run_script(script, out, env)
 
     def test_block_has_no_inline_expression(self):
         self.assertNotIn("${{", self.body,
@@ -729,114 +966,34 @@ class CoverageClassifyRuns(ClsHarness):
         self.expect("no trusted classifier", values, "false", "false",
                     "trusted-classifier-missing-in-base-fail-closed")
 
-    def planted_answer(self, label, docs_only, skip, reason):
-        """Commit a trusted decider that prints this exact answer; return a docs-edit result."""
-        planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
-        text = "docs_only=%s\ncargo_skip=%s\ncargo_skip_reason=%s\n" % (docs_only, skip, reason)
-        planted.write_text("import sys\nsys.stdout.write(%r)\n" % text)
-        self.commit("trusted decider " + label)
-        base = run_git(self.repo, "rev-parse", "HEAD")
-        self.write("docs/a.md", "# changed %s\n" % label)
-        self.commit()
-        values, _ = self.run_cls(base)
-        return values
+    FAIL_REASON = FAIL_CLOSED
 
-    def test_a_decider_answer_of_the_wrong_shape_runs(self):
-        """Each of the two values is checked on its own against {true, false}."""
-        self.commit_base()
-        run = ("false", "false", FAIL_CLOSED)
-        rows = [
-            ("docs true, skip false", "true", "false", "planted"),
-            ("docs valid, skip invalid", "true", "maybe", "planted"),
-            ("docs invalid, skip valid true", "maybe", "true", "planted"),
-            ("docs valid false, skip invalid", "false", "maybe", "planted"),
-            ("docs invalid, skip valid false", "maybe", "false", "planted"),
-            ("split values falset + rue", "falset", "rue", "planted"),
-            ("split values truet + rue", "truet", "rue", "planted"),
-            ("split values tru + efalse", "tru", "efalse", "planted"),
-            ("both empty", "", "", "planted"),
-            ("docs empty", "", "true", "planted"),
-            ("skip empty", "true", "", "planted"),
-            ("docs trailing blank", "true ", "true", "planted"),
-            ("docs leading blank", " true", "true", "planted"),
-            ("skip trailing blank", "true", "true ", "planted"),
-            ("skip tab", "false", "\t", "planted"),
-            ("docs carriage return", "true\r", "true", "planted"),
-            ("skip carriage return", "true", "true\r", "planted"),
-            ("newline inside docs", "tr\nue", "true", "planted"),
-            ("newline inside skip", "true", "tr\nue", "planted"),
-            ("upper case", "TRUE", "TRUE", "planted"),
-        ]
-        for label, docs_only, skip, reason in rows:
-            with self.subTest(label):
-                values = self.planted_answer(label, docs_only, skip, reason)
-                self.expect(label, values, *run)
+    def expected_notices(self, row):
+        """Hand-written: the notice lines the coverage.yml step prints for a row."""
+        if row.passed is None:
+            return ([reject(row.why)] if row.why else []) + [RUN_NOTICE]
+        _docs, skip, reason = row.passed
+        if skip == "true":
+            return ["::notice::coverage short-circuit: %s \u2014 skipping heavy llvm-cov sweep"
+                    % reason]
+        return ["::notice::coverage RUN (%s) \u2014 full coverage pipeline" % reason]
 
-    def test_a_valid_decider_answer_passes_through_with_its_reason(self):
-        self.commit_base()
-        rows = [
-            ("false false", "false", "false", "planted-run"),
-            ("false true", "false", "true", "planted-skip"),
-            ("true true", "true", "true", "planted-docs"),
-        ]
-        for label, docs_only, skip, reason in rows:
-            with self.subTest(label):
-                values = self.planted_answer(label, docs_only, skip, reason)
-                self.expect(label, values, docs_only, skip, reason)
+    def check_other_lines(self, label, others):
+        self.assertEqual(others, [], label + ": the step prints only notice lines")
 
-    def planted_run(self, label, docs_only, skip, reason):
-        """Like planted_answer, and also return the stdout of the cls block."""
-        planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
-        text = "docs_only=%s\ncargo_skip=%s\ncargo_skip_reason=%s\n" % (docs_only, skip, reason)
-        planted.write_text("import sys\nsys.stdout.write(%r)\n" % text)
-        self.commit("trusted decider " + label)
-        base = run_git(self.repo, "rev-parse", "HEAD")
-        self.write("docs/a.md", "# changed %s\n" % label)
-        self.commit()
-        return self.run_cls(base)
+    def test_every_decider_answer_ends_as_a_run_or_a_well_formed_skip(self):
+        """The whole row list of REASON_ROWS, on every locale, against the coverage.yml step.
 
-    def test_an_empty_reason_never_yields_a_success_without_a_reason_line(self):
-        """A short-circuit success needs a reason with one non-blank printable character.
-
-        Invariant for all inputs: a reason that is empty, blanks only, holds a tab,
-        a NUL, any other control character, or is longer than REASON_MAX ends as a
-        RUN with the fail-closed reason and exactly one rejection line naming why;
-        a reason of at most REASON_MAX printable characters with one non-blank one
-        is reported unchanged. The expected column is written by hand.
+        Invariant for all decider answers: a SKIP is honoured only for an answer of
+        exactly the three key lines (each once) whose values are `true` / `false` and
+        whose reason is 1 to REASON_MAX printable ASCII bytes with one non-blank
+        character; every other answer ends as a RUN with the fixed reason and at
+        most one rejection line holding one fixed token. A legitimate RUN answer
+        whose reason holds a byte outside printable ASCII is also rejected and
+        prints the fixed fail-closed text. The answer text reaches no output line
+        and no output value. Expected columns are written by hand in REASON_ROWS.
         """
-        self.commit_base()
-        cap = "x" * REASON_MAX
-        run = ("false", "false", FAIL_CLOSED)
-        ctl = reject("control-character")
-        rows = [
-            # (label, docs_only, skip, reason, expected values, expected stdout lines)
-            ("run with an empty reason", "false", "false", "", run, [reject("empty"), RUN_NOTICE]),
-            ("skip with an empty reason", "false", "true", "", run, [reject("empty"), RUN_NOTICE]),
-            ("docs skip with an empty reason", "true", "true", "", run,
-             [reject("empty"), RUN_NOTICE]),
-            ("one space", "false", "true", " ", run, [reject("blank-only"), RUN_NOTICE]),
-            ("three spaces", "false", "true", "   ", run, [reject("blank-only"), RUN_NOTICE]),
-            ("tab only", "false", "true", "\t", run, [ctl, RUN_NOTICE]),
-            ("space plus tab", "false", "true", " \t", run, [ctl, RUN_NOTICE]),
-            ("NUL only", "false", "true", "\x00", run, [ctl, RUN_NOTICE]),
-            ("text with a NUL inside", "false", "true", "ab\x00cd", run, [ctl, RUN_NOTICE]),
-            ("skip with control characters only", "true", "true", "\x01\x02", run,
-             [ctl, RUN_NOTICE]),
-            ("text with a control character inside", "false", "true", "ab\x01cd", run,
-             [ctl, RUN_NOTICE]),
-            ("skip with a bare DEL", "false", "true", "\x7f", run, [ctl, RUN_NOTICE]),
-            ("cap plus one", "false", "true", cap + "x", run,
-             [reject("over-cap-%d" % REASON_MAX), RUN_NOTICE]),
-            ("cap", "false", "true", cap, ("false", "true", cap),
-             ["::notice::coverage short-circuit: %s \u2014 skipping heavy llvm-cov sweep" % cap]),
-            ("blanks around text", "false", "true", "  ok  ", ("false", "true", "  ok  "),
-             ["::notice::coverage short-circuit:   ok   \u2014 skipping heavy llvm-cov sweep"]),
-        ]
-        for label, docs_only, skip, reason, expected, lines in rows:
-            with self.subTest(label):
-                values, stdout = self.planted_run(label, docs_only, skip, reason)
-                self.expect(label, values, *expected)
-                self.assertEqual(stdout.splitlines(), lines, label)
+        self.check_reason_rows()
 
     def planted_files(self, files, label, rel_path):
         """Commit these files as the trusted impact tree, then edit `rel_path` in the PR."""
@@ -894,16 +1051,42 @@ class CoverageClassifyRuns(ClsHarness):
                     self.expect(label, values, "false", "false", FAIL_CLOSED)
 
     @staticmethod
-    def frozen_files():
-        """The committed bytes of the pre-#9263 impact files, each checked against its pin."""
+    def frozen_files(directory=FROZEN_DIR, pins=None):
+        """The committed bytes of the pre-#9263 impact files, each checked against its pin.
+
+        Raises FrozenFixtureError with FROZEN_MISSING_TEXT or FROZEN_MISMATCH_TEXT.
+        """
+        pins = FROZEN_SHA256 if pins is None else pins
         out = {}
-        for name, digest in FROZEN_SHA256.items():
-            data = (FROZEN_DIR / (name + FROZEN_SUFFIX)).read_bytes()
-            assert hashlib.sha256(data).hexdigest() == digest, (
-                "frozen fixture %s no longer matches its pinned sha256 (taken at %s)"
-                % (name, FROZEN_AT_SHA))
+        for name, digest in pins.items():
+            path = directory / (name + FROZEN_SUFFIX)
+            if not path.is_file():
+                raise FrozenFixtureError(FROZEN_MISSING_TEXT % (name, directory.name, FROZEN_AT_SHA))
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise FrozenFixtureError(FROZEN_MISMATCH_TEXT % (name, FROZEN_AT_SHA))
             out[name] = data
         return out
+
+    def test_a_changed_or_missing_frozen_fixture_raises_the_named_error(self):
+        """A flipped byte and a missing file each raise FrozenFixtureError with the exact text."""
+        copy = self.work / "frozen_copy"
+        shutil.copytree(str(FROZEN_DIR), str(copy))
+        self.assertEqual(sorted(self.frozen_files(copy)), sorted(FROZEN_SHA256))
+        target = copy / ("common.py" + FROZEN_SUFFIX)
+        target.write_bytes(target.read_bytes() + b"#")
+        with self.assertRaises(FrozenFixtureError) as caught:
+            self.frozen_files(copy)
+        self.assertEqual(
+            str(caught.exception),
+            "frozen fixture common.py no longer matches its pinned sha256 (taken at %s)"
+            % FROZEN_AT_SHA)
+        target.unlink()
+        with self.assertRaises(FrozenFixtureError) as caught:
+            self.frozen_files(copy)
+        self.assertEqual(
+            str(caught.exception),
+            "frozen fixture common.py is missing from frozen_copy (taken at %s)" % FROZEN_AT_SHA)
 
     def test_the_frozen_pre_9263_decider_runs(self):
         """The decider taken at FROZEN_AT_SHA rejects `--stdin0`; the step ends as a RUN.
@@ -1111,13 +1294,13 @@ class CoverageJobWiring(unittest.TestCase):
 
 
 class CiClassifyReasonRuns(ClsHarness):
-    """The ci.yml cls block (same invariant on its cargo_skip_reason), run against git fixtures."""
+    """The ci.yml cls block, run against git fixtures with the shared REASON_ROWS."""
 
     @classmethod
     def setUpClass(cls):
         cls.body = run_body(find_step("classify", "- id: cls", CI_WORKFLOW))
 
-    def run_cls(self, base):
+    def run_cls(self, base, locale_env=None):
         script = self.work / "cls.sh"
         script.write_text(self.body)
         out = self.work / "gh_output"
@@ -1130,59 +1313,39 @@ class CiClassifyReasonRuns(ClsHarness):
             "PR_BASE_SHA": base, "PR_BASE_REF": PR_BASE_REF,
             "HOME": str(self.work), "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_SYSTEM": os.devnull})
-        res = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
-                             cwd=str(self.repo), env=env, capture_output=True, text=True,
-                             timeout=TIMEOUT_S)
-        values = {}
-        for line in out.read_text().splitlines():
-            key, _, value = line.partition("=")
-            values[key] = value
-        return values, res.stdout
+        env.update(locale_env or {})
+        return self.run_script(script, out, env)
 
-    def planted_run(self, label, docs_only, skip, reason):
-        planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
-        text = "docs_only=%s\ncargo_skip=%s\ncargo_skip_reason=%s\n" % (docs_only, skip, reason)
-        planted.write_text("import sys\nsys.stdout.write(%r)\n" % text)
-        self.commit("trusted decider " + label)
-        base = run_git(self.repo, "rev-parse", "HEAD")
-        self.write("docs/a.md", "# changed %s\n" % label)
-        self.commit()
-        return self.run_cls(base)
 
-    def test_a_bad_reason_never_yields_a_success_in_ci_yml(self):
-        """Same table as the coverage.yml step; the fail-closed reason carries the rules suffix."""
-        self.commit_base()
-        cap = "x" * REASON_MAX
-        fail = CI_FAIL_CLOSED
-        run = ("false", "false", fail)
+    FAIL_REASON = CI_FAIL_CLOSED
+    HEADER = re.compile(r"^--- Changed files vs classification base ([0-9a-f]{40}) "
+                        r"\(\s*1 files\) ---$")
 
-        def why(text):
-            return "::notice::cargo_skip reason rejected (%s), fail-closed RUN" % text
+    def expected_notices(self, row):
+        """Hand-written: the notice lines the ci.yml step prints for a row."""
+        if row.passed is None:
+            why = ["::notice::cargo_skip reason rejected (%s), fail-closed RUN" % row.why]
+            return (why if row.why else []) + [
+                "::notice::cargo_skip=false (%s) - running full pipeline" % CI_FAIL_CLOSED]
+        _docs, skip, reason = row.passed
+        if skip == "true":
+            return ["::notice::cargo_skip=true (%s) - cargo legs no-op" % reason]
+        return ["::notice::cargo_skip=false (%s) - running full pipeline" % reason]
 
-        run_notice = "::notice::cargo_skip=false (%s) - running full pipeline" % fail
-        rows = [
-            ("empty", "false", "true", "", run, [why("empty"), run_notice]),
-            ("one space", "false", "true", " ", run, [why("blank-only"), run_notice]),
-            ("three spaces", "false", "true", "   ", run, [why("blank-only"), run_notice]),
-            ("tab only", "false", "true", "\t", run, [why("control-character"), run_notice]),
-            ("space plus tab", "false", "true", " \t", run,
-             [why("control-character"), run_notice]),
-            ("NUL only", "false", "true", "\x00", run, [why("control-character"), run_notice]),
-            ("text with a control character", "false", "true", "ab\x01cd", run,
-             [why("control-character"), run_notice]),
-            ("cap plus one", "false", "true", cap + "x", run,
-             [why("over-cap-%d" % REASON_MAX), run_notice]),
-            ("cap", "false", "true", cap, ("false", "true", cap),
-             ["::notice::cargo_skip=true (%s) - cargo legs no-op" % cap]),
-        ]
-        for label, docs_only, skip, reason, expected, lines in rows:
-            with self.subTest(label):
-                values, stdout = self.planted_run(label, docs_only, skip, reason)
-                self.assertEqual(
-                    (values.get("docs_only"), values.get("cargo_skip"),
-                     values.get("cargo_skip_reason")), expected, label)
-                head = [ln for ln in stdout.splitlines() if ln.startswith("::notice::cargo_skip")]
-                self.assertEqual(head, lines, label)
+    def check_other_lines(self, label, others):
+        """The only other lines are the changed-file header and the one changed path."""
+        self.assertEqual(len(others), 2, "%s: other lines %r" % (label, others))
+        self.assertRegex(others[0], self.HEADER, label)
+        self.assertEqual(others[1], "docs/a.md", label)
+
+    def test_every_decider_answer_ends_as_a_run_or_a_well_formed_skip_in_ci_yml(self):
+        """The same REASON_ROWS list as the coverage.yml step, on every locale.
+
+        The fail-closed reason carries the rules suffix (CI_FAIL_CLOSED); the
+        rejection notice is `cargo_skip reason rejected (<token>), fail-closed RUN`.
+        The whole step output is checked: no line of any prefix carries the answer.
+        """
+        self.check_reason_rows()
 
 
 if __name__ == "__main__":
