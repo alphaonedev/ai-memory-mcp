@@ -65,8 +65,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 95
     env:
-      # The key env of ci.yml `check`: the workflow's CARGO_INCREMENTAL plus the job's
-      # profile overrides (the hosted leg exports nothing with a key prefix before its cache).
+      # The key env of ci.yml `check`: the workflow's CARGO_INCREMENTAL plus the workflow-level
+      # CARGO_PROFILE_DEV_DEBUG / CARGO_PROFILE_TEST_DEBUG pair of ci.yml (#8216: declared there
+      # for every job, `line-tables-only`) and the job's own entries that read it (the hosted leg
+      # exports nothing with a key prefix before its cache). The values here must equal the ci.yml
+      # hosted leg's; the 9681 key pin pins the pair. The macOS
+      # and linux-fed legs of `check` set both to 0, are self-hosted and skip rust-cache, so no
+      # warm job serves them and their value is not part of any cache key.
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only

@@ -1079,6 +1079,10 @@ WINDOWS = {SELECT_JOB: (SELECT_ALLOW, "Select jobs"),
 # The whole effective environment a pre-trust step may inherit: workflow env + job env + step env.
 WORKFLOW_ENV_VALUES = {"CARGO_TERM_COLOR": "always",
                        "SELF_HOSTED_TARGET_CAP_BYTES": "42949672960",
+                       # #8216: two inert cargo build knobs (debuginfo level); neither reaches a shell,
+                       # a loader or a path, so the pre-trust window stays an exact allow-list.
+                       "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+                       "CARGO_PROFILE_TEST_DEBUG": "line-tables-only",
                        "CARGO_INCREMENTAL": "0"}
 WORKFLOW_ENV_ALLOW = set(WORKFLOW_ENV_VALUES)
 JOB_ENV_VALUES = {SELECT_JOB: {"RUSTUP_TOOLCHAIN": "stable"}, GATE_JOB: {}}
