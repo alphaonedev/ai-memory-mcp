@@ -387,7 +387,7 @@ class ScriptBehaviour(CommandAssertions):
             with self.subTest(key):
                 started = time.monotonic()
                 rc, out, err = run_script(CI_DIR / "host_semaphore.py", [
-                    "--name", "sem", "--slots", "1", "--max-wait-secs", "0", "--label", value,
+                    "--name", "sem", "--slots", "1", "--max-wait-secs", "1", "--poll-secs", "1", "--label", value,
                     "--root", str(self.tmp / ("root-" + key)), "--", "true"])
                 self.assertEqual(rc, 0, err[-500:])
                 self.assert_commands(out + err, ["notice"])
@@ -397,7 +397,7 @@ class ScriptBehaviour(CommandAssertions):
         root = self.tmp / "busy"
         holder = subprocess.Popen([sys.executable, "-I", str(CI_DIR / "host_semaphore.py"), "--name", "sem",
                                    "--slots", "1", "--root", str(root), "--label", "holder", "--",
-                                   sys.executable, "-c", "import time; time.sleep(8)"],
+                                   sys.executable, "-c", "import time; time.sleep(60)"],
                                   stdout=subprocess.PIPE, text=True)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
@@ -405,9 +405,9 @@ class ScriptBehaviour(CommandAssertions):
         for key, value in self.hostile_values():
             with self.subTest(key):
                 rc, out, err = run_script(CI_DIR / "host_semaphore.py", [
-                    "--name", "sem", "--slots", "1", "--max-wait-secs", "0", "--label", value,
+                    "--name", "sem", "--slots", "1", "--max-wait-secs", "1", "--poll-secs", "1", "--label", value,
                     "--root", str(root), "--", "true"])
-                self.assertNotEqual(rc, 0, err[-300:])
+                self.assertEqual(rc, 82, err[-300:])  # infra-no-slot, not a refused wait (#9231: 0 is refused)
                 self.assert_commands(out + err, ["error"])
 
     def test_load_gate_cli_9365(self):
