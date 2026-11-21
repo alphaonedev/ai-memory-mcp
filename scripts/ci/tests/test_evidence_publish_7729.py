@@ -97,13 +97,19 @@ class Publish7729(ScratchCase):
 
     def test_stage_created_inside_private_parent_7729(self):
         real = self.bb.stage_write
+        staged = []
 
         def inspect(stage, *args, **kwargs):
-            self.assertEqual(stat.S_IMODE(stage.parent.stat().st_mode), 0o700)
-            self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
+            # Without the kernel no-replace rename (macOS) the portable path calls stage_write a second time
+            # for the new destination, which lives in the shared parent; only the stage is private (#9705).
+            if stage.name == self.bb.STAGE_NAME:
+                staged.append(stage)
+                self.assertEqual(stat.S_IMODE(stage.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
             return real(stage, *args, **kwargs)
         with mock.patch.object(self.bb, "stage_write", side_effect=inspect):
             self.publish()
+        self.assertEqual(len(staged), 1, "the stage is written exactly once, inside its private parent")
 
     def test_private_parent_swap_preserves_foreign_data_7729(self):
         replacement = []
