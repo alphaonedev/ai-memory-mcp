@@ -509,7 +509,7 @@ def rank_binaries(lines):
 
 def clean_lines(text):
     """Lines of a stored log with ANSI colour removed and trailing blanks stripped."""
-    return [ANSI_RE.sub("", ln).rstrip() for ln in text.splitlines()]
+    return [ANSI_RE.sub("", ln).rstrip() for ln in split_log_text(text)]
 
 
 def quote(text):

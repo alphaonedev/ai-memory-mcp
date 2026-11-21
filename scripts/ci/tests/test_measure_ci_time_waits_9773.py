@@ -705,6 +705,13 @@ class TableTests(unittest.TestCase):
                          "unmeasured: 5 cells in 3 of 3 rows (malformed-semaphore-wait=1, step-skipped=2, step-no-conclusion=2)")
 
 
+class StoredLogSplitTests(unittest.TestCase):
+    def test_stored_log_lines_end_on_newline_only(self):
+        forged = "a\x0bb\x0cc d\u0085e\rf"
+        self.assertEqual(mct.clean_lines(forged + "\nnext\n"), [forged, "next"])
+        self.assertEqual(mct.clean_lines("one\r\ntwo\r\n"), ["one", "two"])
+
+
 class DocstringTests(unittest.TestCase):
     def test_docstring_names_every_wait_reason_and_the_no_finished_decision(self):
         text = " ".join(mct.__doc__.split())
