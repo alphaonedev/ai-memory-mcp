@@ -37,6 +37,7 @@ under test.
 import os
 import re
 import contextlib
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -57,14 +58,35 @@ TIMEOUT_S = 120
 # Hand-written: a rules.json version bump must come with a reviewed table update.
 V = "cargo_skip-rules-v1"
 PR_BASE_REF = "chain/promo6-ssh-r2"
-# The chain tip tree that predates #9263 (its decider does not know --stdin0).
-CHAIN_TIP = "b5b1f8bbf3e8e867baa0bb36f901463c06d16a1f"
+# The sha the frozen decider rows were taken at: the tree that predates #9263 (its
+# decider does not know --stdin0). It is NOT the current chain tip and nothing
+# reads it from git: the four files live under FROZEN_DIR and are pinned below.
+FROZEN_AT_SHA = "b5b1f8bbf3e8e867baa0bb36f901463c06d16a1f"
+FROZEN_DIR = Path(__file__).resolve().parent / "fixtures" / "chain_tip_b5b1f8bb_impact"
+# Hand-written sha256 of each frozen file (taken once from `git show FROZEN_AT_SHA:...`).
+FROZEN_SHA256 = {
+    "__init__.py": "639ea34a77304d66e9bff28210587a4c6a3dc342222e79861d13b13205a67a2c",
+    "common.py": "9b9ee05d081bdf18b62efd6b54abe5aaae0db7a6a24018a86eb8fbac0eb36815",
+    "cargo_skip.py": "294dbaaafc87f94c384fb96a875ccfb3c5923e826fc0122273a1ad7c658b2465",
+    "rules.json": "86a9e788f37e50a8892c8cfe3135a80ce818a8381164f31660501c1a843df392",
+}
+FROZEN_SUFFIX = ".frozen"
 MAX_PATHS = 5000
 # Cost bound of the cap rows: two rows read the lists, and one path is matched
 # by at most this many passes (ci tree, docs, skip, each with its blocked check).
 LIST_READING_ROWS = 2
 LIST_PASSES = 3
 FAIL_CLOSED = "classifier-error-fail-closed"
+# Hand-written copy of the cap on the classify reason (reason_max in coverage.yml).
+REASON_MAX = 300
+RUN_NOTICE = "::notice::coverage RUN (%s) \u2014 full coverage pipeline" % FAIL_CLOSED
+
+
+def reject(why: str) -> str:
+    """The one line the classify step prints when it rejects the reason."""
+    return "::notice::coverage classify: reason rejected (%s), fail-closed RUN" % why
+
+
 # Fixture identity and canary values are assembled from parts so the diff holds no
 # literal that looks like a mailbox or a credential assignment.
 FIXTURE_MAIL = "fixture" + chr(64) + "fixture.test"
@@ -756,20 +778,59 @@ class CoverageClassifyRuns(unittest.TestCase):
                 values = self.planted_answer(label, docs_only, skip, reason)
                 self.expect(label, values, docs_only, skip, reason)
 
+    def planted_run(self, label, docs_only, skip, reason):
+        """Like planted_answer, and also return the stdout of the cls block."""
+        planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
+        text = "docs_only=%s\ncargo_skip=%s\ncargo_skip_reason=%s\n" % (docs_only, skip, reason)
+        planted.write_text("import sys\nsys.stdout.write(%r)\n" % text)
+        self.commit("trusted decider " + label)
+        base = run_git(self.repo, "rev-parse", "HEAD")
+        self.write("docs/a.md", "# changed %s\n" % label)
+        self.commit()
+        return self.run_cls(base)
+
     def test_an_empty_reason_never_yields_a_success_without_a_reason_line(self):
+        """A short-circuit success needs a reason with one non-blank printable character.
+
+        Invariant for all inputs: a reason that is empty, blanks only, holds a tab,
+        a NUL, any other control character, or is longer than REASON_MAX ends as a
+        RUN with the fail-closed reason and exactly one rejection line naming why;
+        a reason of at most REASON_MAX printable characters with one non-blank one
+        is reported unchanged. The expected column is written by hand.
+        """
         self.commit_base()
+        cap = "x" * REASON_MAX
         run = ("false", "false", FAIL_CLOSED)
+        ctl = reject("control-character")
         rows = [
-            ("run with an empty reason", "false", "false", ""),
-            ("skip with an empty reason", "false", "true", ""),
-            ("docs skip with an empty reason", "true", "true", ""),
-            ("skip with control characters only", "true", "true", "\x01\x02"),
-            ("skip with a bare DEL", "false", "true", "\x7f"),
+            # (label, docs_only, skip, reason, expected values, expected stdout lines)
+            ("run with an empty reason", "false", "false", "", run, [reject("empty"), RUN_NOTICE]),
+            ("skip with an empty reason", "false", "true", "", run, [reject("empty"), RUN_NOTICE]),
+            ("docs skip with an empty reason", "true", "true", "", run,
+             [reject("empty"), RUN_NOTICE]),
+            ("one space", "false", "true", " ", run, [reject("blank-only"), RUN_NOTICE]),
+            ("three spaces", "false", "true", "   ", run, [reject("blank-only"), RUN_NOTICE]),
+            ("tab only", "false", "true", "\t", run, [ctl, RUN_NOTICE]),
+            ("space plus tab", "false", "true", " \t", run, [ctl, RUN_NOTICE]),
+            ("NUL only", "false", "true", "\x00", run, [ctl, RUN_NOTICE]),
+            ("text with a NUL inside", "false", "true", "ab\x00cd", run, [ctl, RUN_NOTICE]),
+            ("skip with control characters only", "true", "true", "\x01\x02", run,
+             [ctl, RUN_NOTICE]),
+            ("text with a control character inside", "false", "true", "ab\x01cd", run,
+             [ctl, RUN_NOTICE]),
+            ("skip with a bare DEL", "false", "true", "\x7f", run, [ctl, RUN_NOTICE]),
+            ("cap plus one", "false", "true", cap + "x", run,
+             [reject("over-cap-%d" % REASON_MAX), RUN_NOTICE]),
+            ("cap", "false", "true", cap, ("false", "true", cap),
+             ["::notice::coverage short-circuit: %s \u2014 skipping heavy llvm-cov sweep" % cap]),
+            ("blanks around text", "false", "true", "  ok  ", ("false", "true", "  ok  "),
+             ["::notice::coverage short-circuit:   ok   \u2014 skipping heavy llvm-cov sweep"]),
         ]
-        for label, docs_only, skip, reason in rows:
+        for label, docs_only, skip, reason, expected, lines in rows:
             with self.subTest(label):
-                values = self.planted_answer(label, docs_only, skip, reason)
-                self.expect(label, values, *run)
+                values, stdout = self.planted_run(label, docs_only, skip, reason)
+                self.expect(label, values, *expected)
+                self.assertEqual(stdout.splitlines(), lines, label)
 
     def planted_files(self, files, label, rel_path):
         """Commit these files as the trusted impact tree, then edit `rel_path` in the PR."""
@@ -784,32 +845,14 @@ class CoverageClassifyRuns(unittest.TestCase):
         values, _ = self.run_cls(base)
         return values
 
-    @staticmethod
-    def chain_tip_files():
-        """The impact files of the chain tip, or None when the objects are not here."""
-        out = {}
-        for name in CoverageClassifyRuns.IMPACT_FILES:
-            res = subprocess.run(
-                ["git", "-C", str(REPO), "show", "%s:scripts/ci/impact/%s" % (CHAIN_TIP, name)],
-                capture_output=True, timeout=TIMEOUT_S, env=base_env())
-            if res.returncode != 0:
-                return None
-            out[name] = res.stdout
-        return out
-
     def test_a_decider_that_does_not_answer_in_the_new_shape_runs(self):
         """A PR whose merge-base predates #9263 runs the old decider with `--stdin0`.
 
-        Forms used. Stand-in rows (a) to (d) always run: they are the minimal
-        deciders that do not answer in the new shape and they do not depend on
-        the repository history. The REAL row reads the decider of the chain tip
-        (CHAIN_TIP) with `git show` from the repository this test runs in; it
-        runs when those objects are readable and its rows are left out
-        otherwise (the stand-ins still assert the same invariant), because a
-        shallow checkout cannot read them: the coverage.yml checkout fetches
-        with `fetch-depth: 2`. Measured on this clone: the tip
-        objects are readable and its decider rejects `--stdin0` with exit 2
-        (the same outcome as row (a)).
+        Forms used. Stand-in rows (a) to (d) are the minimal deciders that do not
+        answer in the new shape. The frozen decider of FROZEN_AT_SHA has its own
+        test (test_the_frozen_pre_9263_decider_runs): it reads a committed fixture
+        and never the repository history, because the CI checkout is shallow
+        (`fetch-depth: 2`) and the sha is not in it.
 
         Invariant: every such decider ends as a RUN with the exact reason
         `classifier-error-fail-closed`, never a skip, on a docs-only diff and on
@@ -836,9 +879,6 @@ class CoverageClassifyRuns(unittest.TestCase):
             ("(c) exit 0, old shape docs_only=true only", {"cargo_skip.py": old_shape}),
             ("(d) exit 1 after a full skip answer", {"cargo_skip.py": exit_one}),
         ]
-        tip = self.chain_tip_files()
-        if tip is not None:
-            deciders.append(("REAL chain tip decider", tip))
         diffs = [("docs only", "docs/a.md"), ("tests only", "scripts/ci/tests/x.py")]
         for dlabel, files in deciders:
             for flabel, rel in diffs:
@@ -846,6 +886,40 @@ class CoverageClassifyRuns(unittest.TestCase):
                 with self.subTest(label):
                     values = self.planted_files(files, label, rel)
                     self.expect(label, values, "false", "false", FAIL_CLOSED)
+
+    @staticmethod
+    def frozen_files():
+        """The committed bytes of the pre-#9263 impact files, each checked against its pin."""
+        out = {}
+        for name, digest in FROZEN_SHA256.items():
+            data = (FROZEN_DIR / (name + FROZEN_SUFFIX)).read_bytes()
+            assert hashlib.sha256(data).hexdigest() == digest, (
+                "frozen fixture %s no longer matches its pinned sha256 (taken at %s)"
+                % (name, FROZEN_AT_SHA))
+            out[name] = data
+        return out
+
+    def test_the_frozen_pre_9263_decider_runs(self):
+        """The decider taken at FROZEN_AT_SHA rejects `--stdin0`; the step ends as a RUN.
+
+        It always runs (no skip): the bytes are committed under FROZEN_DIR and
+        pinned by sha256 in FROZEN_SHA256. Expected column written by hand: the
+        exact fail-closed reason, on a docs-only diff and on a tests-only diff.
+        """
+        self.commit_base()
+        files = self.frozen_files()
+        self.assertEqual(sorted(files), sorted(FROZEN_SHA256))
+        for flabel, rel in [("docs only", "docs/a.md"), ("tests only", "scripts/ci/tests/x.py")]:
+            label = "frozen %s | %s" % (FROZEN_AT_SHA[:8], flabel)
+            with self.subTest(label):
+                values = self.planted_files(files, label, rel)
+                self.expect(label, values, "false", "false", FAIL_CLOSED)
+
+    def test_the_frozen_fixture_bytes_match_their_pins(self):
+        for name, digest in FROZEN_SHA256.items():
+            with self.subTest(name):
+                data = (FROZEN_DIR / (name + FROZEN_SUFFIX)).read_bytes()
+                self.assertEqual(hashlib.sha256(data).hexdigest(), digest)
 
     def test_a_pr_cannot_replace_its_own_classifier(self):
         base = self.commit_base()
