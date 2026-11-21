@@ -237,6 +237,14 @@ class LoadGateTests(unittest.TestCase):
         got = mct.split_job(issue_job(gate_steps=[nameless, step]), default_log())
         self.assertEqual(got["load_gate"], 1200.0)
 
+    def test_step_without_a_name_leaves_the_semaphore_absent_with_that_reason(self):
+        job = issue_job()
+        job["steps"].append({"name": None, "started_at": stamp("23:54:46"), "completed_at": stamp("23:54:46")})
+        got = mct.split_job(job, default_log())
+        self.assertIsNone(got["semaphore"])
+        self.assertEqual(got["wait_absent"]["semaphore"], "missing-step-name")
+        self.assertEqual(got["load_gate"], 1200.0)
+
     def test_job_without_a_combined_step_still_reports_the_gate(self):
         job = issue_job()
         job["steps"] = [s for s in job["steps"] if not s["name"].startswith("Run tests")]

@@ -21,6 +21,20 @@ Usage:
 
 `--rank-job` prints the test binaries with the longest `finished in` time from one job log.
 
+Wait figures (#9773). Two waits are reported apart from compile and test, each from the state it names:
+`load gate` is the wall time of the step `Load gate (#6795)` from the step list of the jobs API, and `semaphore` is the
+`<N>` of the line `[#7914 semaphore] ... acquired after <N>s` that scripts/ci/host_semaphore.py prints before it runs
+the cargo command. The four figures load gate, semaphore, compile and test never overlap: for a test step,
+test = step wall time - compile - semaphore. Only a semaphore line stamped inside the step and not later than the
+first cargo `Finished` line is read (a test that prints the marker runs after `Finished`); a step whose log holds no
+`Finished` line reads every stamped line inside the step, because nothing can be told apart there. A wait that cannot
+be read is `absent` with its own reason (a column cell `absent: <reason>`, never 0): no-load-gate-step,
+multiple-load-gate-steps, load-gate-missing-timestamp, load-gate-negative, no-log, empty-log, no-semaphore-line,
+multiple-semaphore-lines (two lines are refused, not summed), malformed-semaphore-wait,
+semaphore-wait-longer-than-step, compile-plus-wait-longer-than-step. The last three and multiple-semaphore-lines also
+leave `test` unmeasured with the same reason, because the wait cannot then be taken out of it. No line at all leaves
+`test` as step minus compile.
+
 Every duration is computed from two UTC timestamps that are both present and ordered, or the row is reported as
 `unmeasured` with a named reason (missing-timestamp, negative, compile-longer-than-step, missing-step-name) and left
 out of every median and range. The table is followed by a footer line that counts them. A value that could not be
@@ -102,13 +116,42 @@ EXIT_BENCH_PARTIAL = 7
 BENCH_LOG_MAX_BYTES = 64 * 1024 * 1024  # the stored logs are about 4.6 MB each; a log over the cap is not read
 RANK_TOP = 16
 STAGES = ("queue", "setup", "compile", "test", "post", "total")
+WAIT_STAGES = ("load_gate", "semaphore")
+WAIT_HEADERS = ("load gate s", "semaphore s")
+LOAD_GATE_STEP_NAME = "Load gate (#6795)"
+SEMAPHORE_MARKER = "[#7914 semaphore]"  # TAG of scripts/ci/host_semaphore.py
+SEMAPHORE_ACQUIRED_RE = re.compile(re.escape(SEMAPHORE_MARKER) + r" .*?\bacquired after (.*)$")
+SEMAPHORE_WAIT_RE = re.compile(r"([0-9]{1,9})s(?:\s|$)")  # host_semaphore.py prints an int with %d
 NOT_MEASURED = "not measured"
 REASON_MISSING_TS = "missing-timestamp"
 REASON_NEGATIVE = "negative"
 REASON_COMPILE_LONGER = "compile-longer-than-step"
 REASON_MISSING_NAME = "missing-step-name"
-REASONS = (REASON_MISSING_TS, REASON_NEGATIVE, REASON_COMPILE_LONGER, REASON_MISSING_NAME)
+REASON_NO_LOG = "no-log"
+REASON_EMPTY_LOG = "empty-log"
+REASON_NO_SEMAPHORE_LINE = "no-semaphore-line"
+REASON_MULTIPLE_SEMAPHORE = "multiple-semaphore-lines"
+REASON_MALFORMED_WAIT = "malformed-semaphore-wait"
+REASON_WAIT_LONGER = "semaphore-wait-longer-than-step"
+REASON_WAIT_COMPILE_OVERLAP = "compile-plus-wait-longer-than-step"
+REASON_NO_LOAD_GATE = "no-load-gate-step"
+REASON_MULTIPLE_LOAD_GATE = "multiple-load-gate-steps"
+REASON_LOAD_GATE_NO_TS = "load-gate-missing-timestamp"
+REASON_LOAD_GATE_NEGATIVE = "load-gate-negative"
+# reasons that leave the test figure unmeasured, because the wait cannot be taken out of it
+TEST_REFUSING_WAIT_REASONS = (REASON_MULTIPLE_SEMAPHORE, REASON_MALFORMED_WAIT, REASON_WAIT_LONGER,
+                              REASON_WAIT_COMPILE_OVERLAP)
+REASONS = (REASON_MISSING_TS, REASON_NEGATIVE, REASON_COMPILE_LONGER, REASON_MISSING_NAME, *TEST_REFUSING_WAIT_REASONS)
 UNMEASURED_KEY = "unmeasured"
+WAIT_ABSENT_KEY = "wait_absent"
+
+
+class WaitUnavailable(Exception):
+    """A wait figure that cannot be read; `reason` is its own exact reason text."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def parse_ts(text):
@@ -161,21 +204,73 @@ def sum_steps(steps):
     return (None, bad) if bad else (total, None)
 
 
+def log_line_time(line):
+    """UTC epoch of the timestamp a job-log line starts with, None when it has none."""
+    stamp = LOG_TS_RE.match(line)
+    if not stamp:
+        return None
+    return parse_ts(stamp.group(1) + ("." + stamp.group(2) if stamp.group(2) else "") + "Z")
+
+
+def in_window(when, win_start, win_end):
+    """True when the time is inside the window (one second of slack each side); an open end accepts everything."""
+    return not ((win_start is not None and when < win_start - 1) or (win_end is not None and when > win_end + 1))
+
+
 def first_finished(lines, win_start=None, win_end=None):
     """(timestamp, reported compile seconds) of the first cargo Finished line inside the window, else None."""
     for raw in lines:
         line = ANSI_RE.sub("", raw)
         hit = FINISHED_RE.search(line)
-        stamp = LOG_TS_RE.match(line)
-        if not hit or not stamp:
+        if not hit:
             continue
-        when = parse_ts(stamp.group(1) + ("." + stamp.group(2) if stamp.group(2) else "") + "Z")
-        if when is None:
-            continue
-        if (win_start is not None and when < win_start - 1) or (win_end is not None and when > win_end + 1):
+        when = log_line_time(line)
+        if when is None or not in_window(when, win_start, win_end):
             continue
         return when, int(hit.group(1) or 0) * 60 + float(hit.group(2))
     return None
+
+
+def parse_semaphore_wait(lines, win_start, win_end, cutoff):
+    """Seconds (int) of the one `acquired after <N>s` semaphore line inside the step window and not after cutoff.
+
+    cutoff is the time of the first cargo `Finished` line (None when the step has none). The semaphore wraps the
+    cargo command and prints before it, so a later line is a test's own output. Raises WaitUnavailable with the
+    reason: no line, two or more lines (refused, not summed), or a number that is not 1 to 9 ASCII digits then `s`.
+    """
+    found = []
+    for raw in lines:
+        line = ANSI_RE.sub("", raw)
+        hit = SEMAPHORE_ACQUIRED_RE.search(line)
+        if not hit:
+            continue
+        when = log_line_time(line)
+        if when is None or not in_window(when, win_start, win_end) or (cutoff is not None and when > cutoff):
+            continue
+        found.append(hit.group(1))
+    if not found:
+        raise WaitUnavailable(REASON_NO_SEMAPHORE_LINE)
+    if len(found) > 1:
+        raise WaitUnavailable(REASON_MULTIPLE_SEMAPHORE)
+    number = SEMAPHORE_WAIT_RE.match(found[0])
+    if not number:
+        raise WaitUnavailable(REASON_MALFORMED_WAIT)
+    return int(number.group(1))
+
+
+def load_gate_wait(steps):
+    """Wall seconds of the one step named LOAD_GATE_STEP_NAME; raises WaitUnavailable with the reason otherwise."""
+    gates = [s for s in steps if (s.get("name") or "") == LOAD_GATE_STEP_NAME]
+    if not gates:
+        raise WaitUnavailable(REASON_NO_LOAD_GATE)
+    if len(gates) > 1:
+        raise WaitUnavailable(REASON_MULTIPLE_LOAD_GATE)
+    secs, why = step_secs(gates[0])
+    if why == REASON_MISSING_TS:
+        raise WaitUnavailable(REASON_LOAD_GATE_NO_TS)
+    if why:
+        raise WaitUnavailable(REASON_LOAD_GATE_NEGATIVE)
+    return secs
 
 
 def split_job(job, log_lines=None):
@@ -188,12 +283,17 @@ def split_job(job, log_lines=None):
     A stage that cannot be derived because a timestamp is missing, a duration is negative, the compile time cargo
     reported is longer than its step or a step has no name is None, and `unmeasured` lists `stage:reason` for it.
     """
-    out = dict.fromkeys(STAGES)
+    out = dict.fromkeys((*STAGES, *WAIT_STAGES))
     out[UNMEASURED_KEY] = []
+    out[WAIT_ABSENT_KEY] = {}
 
     def flag(stage, reason):
         out[stage] = None
         out[UNMEASURED_KEY].append(f"{stage}:{reason}")
+
+    def wait_absent(stage, reason):
+        out[stage] = None
+        out[WAIT_ABSENT_KEY][stage] = reason
 
     total, why = duration(job.get("started_at"), job.get("completed_at"))
     out["total"] = total
@@ -205,12 +305,18 @@ def split_job(job, log_lines=None):
     elif started >= created:
         out["queue"] = started - created
     steps = job.get("steps") or []
+    try:
+        out["load_gate"] = load_gate_wait(steps)
+    except WaitUnavailable as exc:
+        wait_absent("load_gate", exc.reason)
     main = next((i for i, s in enumerate(steps) if COMBINED_STEP_RE.match(s.get("name") or "")), None)
     if main is None:
+        wait_absent("semaphore", REASON_NO_SEMAPHORE_LINE)
         return out
     if any(not s.get("name") for s in steps):
         for stage in ("setup", "compile", "test", "post"):
             flag(stage, REASON_MISSING_NAME)
+        wait_absent("semaphore", REASON_MISSING_NAME)
         out["combined_wall"] = None
         return out
 
@@ -233,16 +339,41 @@ def split_job(job, log_lines=None):
     if wall_why or extra_why:
         for stage in ("compile", "test"):
             flag(stage, wall_why or extra_why)
+        wait_absent("semaphore", wall_why or extra_why)
         return out
-    found = first_finished(log_lines, parse_ts(steps[main].get("started_at")), parse_ts(steps[main].get("completed_at"))) if log_lines else None
+    win_start, win_end = parse_ts(steps[main].get("started_at")), parse_ts(steps[main].get("completed_at"))
+    found = first_finished(log_lines, win_start, win_end) if log_lines else None
+    wait, wait_why = None, None
+    try:
+        if log_lines is None:
+            raise WaitUnavailable(REASON_NO_LOG)
+        if not log_lines:
+            raise WaitUnavailable(REASON_EMPTY_LOG)
+        wait = parse_semaphore_wait(log_lines, win_start, win_end, found[0] if found else None)
+        if wait > wall:
+            wait, wait_why = None, REASON_WAIT_LONGER
+        elif found and found[1] <= wall and found[1] + wait > wall:
+            wait, wait_why = None, REASON_WAIT_COMPILE_OVERLAP
+    except WaitUnavailable as exc:
+        wait_why = exc.reason
+    if wait_why:
+        wait_absent("semaphore", wait_why)
+    else:
+        out["semaphore"] = float(wait)
     if found and found[1] > wall:
         for stage in ("compile", "test"):
             flag(stage, REASON_COMPILE_LONGER)
     elif found:
         out["compile"] = found[1] + extra_compile
-        out["test"] = wall - found[1]
+        if wait_why in TEST_REFUSING_WAIT_REASONS:
+            flag("test", wait_why)
+        else:
+            # wait is None here only for no-log, empty-log or no-semaphore-line: there is nothing to take out
+            out["test"] = wall - found[1] if wait is None else wall - found[1] - wait
     else:
         out["compile"] = extra_compile or None
+        if wait_why in TEST_REFUSING_WAIT_REASONS:
+            flag("test", wait_why)
     return out
 
 
@@ -656,13 +787,39 @@ def collect(repo, branch, count, scratch, want_logs):
     return rows, errors
 
 
+def wait_cell(rows, stage):
+    """One wait cell of a group: the median and range, `absent: <reasons>` when no row has the figure."""
+    absent = [r[WAIT_ABSENT_KEY][stage] for r in rows if stage in r.get(WAIT_ABSENT_KEY, {})]
+    reasons = ", ".join(sorted(set(absent)))
+    stat = summarize([r.get(stage) for r in rows])
+    if stat is None:
+        return f"absent: {reasons}" if absent else NOT_MEASURED
+    return fmt(stat) + (f" (absent in {len(absent)} of {len(rows)} rows: {reasons})" if absent else "")
+
+
+def wait_footer(rows):
+    """One line counting the absent wait figures by stage and reason, or None when every wait was read."""
+    counts = defaultdict(int)
+    for row in rows:
+        for stage, reason in sorted(row.get(WAIT_ABSENT_KEY, {}).items()):
+            counts[(stage, reason)] += 1
+    if not counts:
+        return None
+    return "waits absent: " + ", ".join(f"{stage} {reason}={n}" for (stage, reason), n in sorted(counts.items()))
+
+
 def print_table(rows):
     groups = defaultdict(list)
     for row in rows:
         groups[(row["workflow"], row["job"], row["kind"])].append(row)
-    print("workflow | job | runner kind | " + " | ".join(f"{s} s" for s in STAGES))
+    print("workflow | job | runner kind | " + " | ".join(f"{s} s" for s in STAGES) + " | " + " | ".join(WAIT_HEADERS))
     for key in sorted(groups):
-        print(" | ".join(key) + " | " + " | ".join(fmt(summarize([r[s] for r in groups[key]])) for s in STAGES))
+        cells = [fmt(summarize([r[s] for r in groups[key]])) for s in STAGES]
+        cells += [wait_cell(groups[key], stage) for stage in WAIT_STAGES]
+        print(" | ".join(key) + " | " + " | ".join(cells))
+    footer = wait_footer(rows)
+    if footer:
+        print(footer)
     print(unmeasured_footer(rows))
 
 
