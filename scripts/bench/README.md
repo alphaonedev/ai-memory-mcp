@@ -18,7 +18,16 @@ instrument's own measured ceiling.
 | `ops_producer.py` | the §11.1 producer: concurrency ramps for `memory_store`, `memory_recall` (keyword tier) and `/sync/push`. Emits the results JSON `infra/pillar4-envelope/usl-fit.py` already consumes. `--self-test`. |
 | `run-ops-producers.sh` | runs all three producers end to end against freshly-started, self-contained daemons. Host processes, no Docker. |
 | `mesh_probe.py` | drives + measures one rung of the multi-node mesh ramp (`infra/bench-mesh/`). `--self-test`. |
-| `host-facts.sh` | CPU / RAM / storage capture; `--check` fails when a required fact is missing. |
+| `host-facts.py` | CPU / RAM / storage capture; `--check` fails when a required fact is missing. |
+
+## How a script finds `benchlib.py` (#9399)
+
+`ops_producer.py`, `mesh_probe.py`, `wake_latency.py` and `host-facts.py` do not import `benchlib` through the import
+search path. Each carries the loader block of `scripts/ci/sibling_load.py` (a test pins every copy byte for byte) and
+loads `benchlib.py` from the real folder of the script file, so a `benchlib` on `PYTHONPATH` or in the working
+directory is never read, and `python -I` and a symlinked start give the same result. When `benchlib.py` is absent,
+unreadable, not a regular file or a symlink that leaves the folder, the script prints one stderr line naming the path
+and exits 3 (`mesh_probe.py` also loads `ops_producer.py` the same way).
 
 ## What is NOT here, on purpose
 
@@ -52,7 +61,7 @@ Contract checks, no daemon needed:
 python3 scripts/bench/ops_producer.py --self-test
 python3 scripts/bench/mesh_probe.py --self-test
 python3 infra/bench-mesh/gen-mesh.py --self-test
-scripts/bench/host-facts.sh --check
+scripts/bench/host-facts.py --check
 ```
 
 ## Safety properties

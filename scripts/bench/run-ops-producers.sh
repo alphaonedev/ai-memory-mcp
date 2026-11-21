@@ -229,7 +229,7 @@ mint_pool() {
 }
 
 echo "[run-ops] binary: $("$BINARY" --version)"
-"${HERE}/host-facts.sh" >"${OUT_DIR}/host-facts.json"
+"${HERE}/host-facts.py" >"${OUT_DIR}/host-facts.json"
 
 # The one attested author every signed rung writes as.
 mkdir -p "${OUT_DIR}/author"

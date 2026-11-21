@@ -461,7 +461,7 @@ Contract checks that need no daemon and no Docker:
 python3 scripts/bench/ops_producer.py --self-test
 python3 scripts/bench/mesh_probe.py --self-test
 python3 infra/bench-mesh/gen-mesh.py --self-test
-scripts/bench/host-facts.sh --check
+scripts/bench/host-facts.py --check
 ```
 
 The producers are documented in

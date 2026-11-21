@@ -2173,6 +2173,7 @@ STREAM_PRELOAD_FUNCTIONS = {"scripts/ci/prune_runner_tmp.py": frozenset({"load_r
                             "scripts/ci/partition_test_binaries.py": frozenset({"require_workflow_annotation"}),
                             "scripts/ci/shared_cargo_target.py": frozenset({"require_workflow_annotation"})}
 STREAM_PRELOAD_GUARD_CALL = "python_refusal"  # a module-level ``if`` that calls it is the floor check
+SIBLING_REFUSAL_FUNCTION = "_sibling_refusal"  # the one print of the #9399 loader block (see StreamTracer)
 
 
 class StreamTracer:
@@ -2195,7 +2196,10 @@ class StreamTracer:
                 isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == STREAM_PRELOAD_GUARD_CALL
                 for sub in ast.walk(node.test))
             is_preload = isinstance(node, ast.FunctionDef) and node.name in preload
-            if _is_load_try(node) or is_floor or is_preload:
+            # The #9399 sibling loader block prints one refusal line; its text is pinned byte for byte to
+            # scripts/ci/sibling_load.py by test_sibling_load_9399, and the path in it has every control character escaped.
+            is_sibling_refusal = isinstance(node, ast.FunctionDef) and node.name == SIBLING_REFUSAL_FUNCTION
+            if _is_load_try(node) or is_floor or is_preload or is_sibling_refusal:
                 self.exempt.update(id(sub) for sub in ast.walk(node))
         # a bare name bound at module level to ``getattr(wa, "<shared function>", ...)`` is that shared function
         self.shared_aliases = set()

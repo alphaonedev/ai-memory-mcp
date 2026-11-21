@@ -76,9 +76,6 @@ SITES = (
     ("evidence/continuity-cycle.py", "continuity-cycle", 3, (("predicates.py", "predicates"),), ()),
 )
 SITE_FILES = frozenset(row[0] for row in SITES)
-# Files that load a module of their own tree through a by-path loader already; the census must not flag them, and a
-# new one is a decision, so each is listed with the file it loads. (Reasons: the READY `siblings:` line.)
-HELD_BY_OTHER_LOADERS = frozenset()
 CENSUS_EXCLUDED_PARTS = frozenset({"tests", "test", "__pycache__"})
 MIN_FILES_SCANNED = 50
 
@@ -394,6 +391,25 @@ class LoaderAlone(Scratch):
         self.assertEqual(captured.getvalue().count("\n"), 1)
         self.assertTrue(captured.getvalue().endswith("(BaseException)\n"))
 
+    def test_a_control_character_in_the_folder_name_cannot_start_a_second_line(self):
+        """The path in the line comes from the checkout: a newline or ESC in a folder name is printed as its escape."""
+        import io
+        from contextlib import redirect_stderr
+        for raw, shown in (("a\n::error::x", "a\\n::error::x"), ("b\r##[error]y", "b\\r##[error]y"),
+                           ("c\x1b[2Kz", "c\\x1b[2Kz"), ("d e", "d\\u2028e")):
+            with self.subTest(folder=shown):
+                folder = self.root / raw
+                folder.mkdir()
+                ns = {"__file__": str(folder / "tool.py"), "__name__": "tool_ctl_9399"}
+                exec(compile(block_of(canon_text()), str(CANON_FILE), "exec"), ns)
+                captured = io.StringIO()
+                with redirect_stderr(captured):
+                    ns["_sibling_refusal"]("tool", "helper.py", ns["SiblingLoadError"]("absent"))
+                line = captured.getvalue()
+                self.assertEqual(line.count("\n"), 1)
+                self.assertEqual(line, "tool: refused: sibling module helper.py at %s cannot be loaded (absent)\n"
+                                 % (os.path.join(os.path.realpath(self.root), shown, "helper.py")))
+
 
 class CopiesMatchTheLoader(unittest.TestCase):
     def test_every_site_holds_the_canonical_block_byte_for_byte(self):
@@ -406,7 +422,8 @@ class CopiesMatchTheLoader(unittest.TestCase):
                 self.assertEqual(block_of(path.read_text(encoding="utf-8")), canon)
 
     def test_no_other_script_holds_a_loader_block(self):
-        holders = {str(p.relative_to(SCRIPTS)) for p in SCRIPTS.rglob("*.py") if BLOCK_BEGIN in p.read_text(encoding="utf-8")}
+        holders = {str(p.relative_to(SCRIPTS)) for p in SCRIPTS.rglob("*.py")
+                   if any(line.startswith(BLOCK_BEGIN) for line in p.read_text(encoding="utf-8").splitlines())}
         self.assertEqual(holders - SITE_FILES, {"ci/sibling_load.py"})
 
     def test_every_site_calls_the_loader_once_per_sibling_with_its_own_exit_code(self):
@@ -433,7 +450,13 @@ def scripts_tree_names(path):
 
 def census_findings(path):
     """Findings of one file: sys.path changes, same-tree imports by name, relative imports, by-name dynamic imports."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    text = path.read_text(encoding="utf-8")
+    block = block_of(text)
+    if block is not None:
+        # The loader block restores sys.path by design; its text is pinned byte for byte to the canonical file by
+        # CopiesMatchTheLoader, so blank it (keeping the line numbers) instead of reading it as a violation.
+        text = text.replace(block, "\n" * block.count("\n"))
+    tree = ast.parse(text, filename=str(path))
     tree_names = scripts_tree_names(path)
     found = []
 
@@ -481,8 +504,6 @@ class Census(unittest.TestCase):
             scanned += 1
             findings = census_findings(path)
             if not findings:
-                continue
-            if str(rel) in HELD_BY_OTHER_LOADERS:
                 continue
             if str(rel) in SITE_FILES:
                 problems.append("%s still loads by name: %s" % (rel, findings))
