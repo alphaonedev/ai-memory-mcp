@@ -527,11 +527,15 @@ impl DottedRun {
             self.next_dot = 0;
         }
         // Forward-only cursor: each dot is stepped over at most once per run.
+        // The meter charges the steps the loop takes, not how far the cursor
+        // moved, so a cursor that restarted would be charged its real cost.
         let mut next = self.next_dot;
+        let mut steps = 0usize;
         while self.dots.get(next).is_some_and(|&d| d < pos) {
             next += 1;
+            steps += 1;
         }
-        charge_scan(next - self.next_dot);
+        charge_scan(steps);
         self.next_dot = next;
         self.from = pos;
         (self.end, &self.dots[self.next_dot..])
