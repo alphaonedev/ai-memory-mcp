@@ -542,7 +542,39 @@ echo "  --- Section B: #2500 test-invocation completeness ---"
 # Every `cargo test` that is wrapped by the #1492 watchdog runs a MULTI-binary
 # selection and must not fail fast. Single-target invocations (`--lib`,
 # `--test <one>`) are unaffected by the flag and are not required to carry it.
-watchdog_lines="$(grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo test' "$CI_YML" || true)"
+#
+# #9511: the build phase of the linux-fed leg bounds its compile-only prebuild
+# with its own timeout (BUILD_PHASE_TIMEOUT_SECS). That is not a test-run
+# watchdog: it runs no test (`--no-run`) and its ::error:: names the build
+# timeout. Exactly ONE form is classified as such (BUILD_TIMEOUT_RE: the
+# `"$build_t"` duration AND `--no-run`); every other wrapped `cargo test`,
+# a `--no-run` one with any other duration included, stays under B and D.
+BUILD_TIMEOUT_RE='"\$TIMEOUT_BIN" --signal=TERM --kill-after=60 "\$build_t" cargo test --no-run '
+# test_run_watchdogs <file> — the grep -n lines of every watchdog-wrapped
+# `cargo test` that is a test RUN (all of them except the build-timeout form).
+test_run_watchdogs() {
+    grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo test' "$1" | grep -vE "$BUILD_TIMEOUT_RE" || true
+}
+build_timeout_lines="$(grep -nE "$BUILD_TIMEOUT_RE" "$CI_YML" || true)"
+if [ -n "$build_timeout_lines" ]; then
+    n_bt="$(printf '%s\n' "$build_timeout_lines" | grep -c .)"
+    bt_fail=""
+    [ "$n_bt" -eq 1 ] || bt_fail="expected exactly 1 build-timeout invocation, found $n_bt"
+    grep -qE 'build_t="\$\(cap_to_job_left "\$BUILD_PHASE_TIMEOUT_SECS"\)"' "$CI_YML" \
+        || bt_fail="${bt_fail:+$bt_fail; }build_t is not cap_to_job_left \"\$BUILD_PHASE_TIMEOUT_SECS\""
+    case "$build_timeout_lines" in
+        *'> "$sd/build.jsonl" || build_rc=$?') ;;
+        *) bt_fail="${bt_fail:+$bt_fail; }the build-timeout invocation does not record its code in build_rc" ;;
+    esac
+    grep -qE '^\s+\[ "\$build_rc" -eq 0 \] \|\| return "\$build_rc"$' "$CI_YML" \
+        || bt_fail="${bt_fail:+$bt_fail; }no short-circuiting '[ \"\$build_rc\" -eq 0 ] || return \"\$build_rc\"' after the build timeout"
+    grep -qF '::error::[#9511] build phase exceeded the ${build_t}s build timeout (BUILD_PHASE_TIMEOUT_SECS)' "$CI_YML" \
+        || bt_fail="${bt_fail:+$bt_fail; }the build-timeout ::error:: does not name the build timeout"
+    [ -z "$bt_fail" ] \
+        && ok "B/D #9511: the one build-phase timeout is compile-only, capped by BUILD_PHASE_TIMEOUT_SECS, short-circuits and names itself" \
+        || bad "B/D #9511: build-phase timeout shape" "$bt_fail"
+fi
+watchdog_lines="$(test_run_watchdogs "$CI_YML")"
 if [ -z "$watchdog_lines" ]; then
     bad "B: found no watchdog-wrapped 'cargo test' invocation in $CI_YML" \
         "the #1492 watchdog wrapper was removed or renamed — this guard has gone blind"
@@ -844,7 +876,7 @@ d_scan() {
             printf '         no short-circuiting `cargo test --no-run "$@" || return "$?"` between the function opener (line %s) and the timed invocation (line %s)\n' \
                 "$opener" "$w" >&2
         fi
-    done <<< "$(grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo test' "$file" || true)"
+    done <<< "$(test_run_watchdogs "$file")"
     printf '%s/%s' "$bad" "$total"
 }
 
@@ -876,6 +908,22 @@ if [ "$d_total" -gt 0 ]; then
     else
         bad "D regression: the prebuild-stripped mutant did not fail the scan ($d_mut_result)" \
             "the scan has gone blind — every assertion above is vacuous"
+    fi
+fi
+
+# #9511 regression leg: the build-timeout classification is exact. The same
+# line with any other duration (here the test watchdog's) is a test-run
+# watchdog again, and B and D must both catch it.
+if [ -n "$build_timeout_lines" ]; then
+    BT_MUT="$SCRATCH/ci-9511-mutant.yml"
+    sed 's/"\$build_t" cargo test --no-run /"$WATCHDOG_SECS" cargo test --no-run /' "$CI_YML" > "$BT_MUT"
+    bt_mut_result="$(d_scan "$BT_MUT" 2>/dev/null)"
+    bt_mut_b="$(test_run_watchdogs "$BT_MUT" | grep -vc -- '--no-fail-fast' || true)"
+    if [ "$bt_mut_result" = "$((d_bad + 1))/$((d_total + 1))" ] && [ "$bt_mut_b" -eq "$((n_bad + 1))" ]; then
+        ok "B/D #9511 regression: a --no-run prebuild under any other duration is a test-run watchdog and fails both B and D"
+    else
+        bad "B/D #9511 regression: the duration-swapped mutant was not caught (D $bt_mut_result, B bad $bt_mut_b)" \
+            "the build-timeout exemption is wider than its one exact form"
     fi
 fi
 

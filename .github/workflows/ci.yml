@@ -1317,17 +1317,24 @@ jobs:
             # table: docs/ci/CARRIER-BRANCH-GATES.md.
             # #7914 - 300 on this leg only (self-hosted, no billing). The
             # host-local semaphore ("Run tests (impact-aware)" runs under
-            # scripts/ci/host_semaphore.py) admits 2 compile+test phases at
+            # scripts/ci/host_semaphore.py) admits 2 test-run phases at
             # once and its wait counts against this cap: run 39686450440
             # attempt 2 had the serial shard budget cut to 5239 s (160 min -
             # 4061 s elapsed - 300 s) and the #1492 watchdog killed it
             # (serial=124) with no test failing; the same leg alone took
-            # ~7980 s. Budget identity (pinned by test_ci_semaphore_wiring_7914):
-            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)
-            # The waits are kept, not shrunk, because they are what bound
-            # contention on a 4-runner host (#7928). The semaphore wait is the
-            # one named constant HOST_SEMAPHORE_MAX_WAIT_SECS below. The
-            # macos-fed and hosted caps are unchanged.
+            # ~7980 s. #9511: the compile runs BEFORE the test slot, under
+            # its own build semaphore (1 slot, BUILD_SEMAPHORE_MAX_WAIT_SECS),
+            # so a slot is never held while rustc compiles or links (job
+            # 136315786439 held its slot 12107 s, 6466 s of it compiling).
+            # #9733: the load gate only measures on this leg (wait 0, the
+            # build semaphore is its bound). Budget identity (pinned by
+            # test_ci_semaphore_wiring_7914):
+            #   cap 18000 s >= load-gate wait 0 + build-semaphore wait 600 + cold compile 4100 + semaphore wait 3600 + safety 300 + serial shard 7800 (= 16400 s)
+            # The semaphore waits are what bound contention on a 4-runner
+            # host (#7928); each is one named constant of the Run tests step
+            # (BUILD_SEMAPHORE_MAX_WAIT_SECS, HOST_SEMAPHORE_MAX_WAIT_SECS)
+            # and the load-gate wait is LOAD_GATE_MAX_WAIT_SECS of the gate
+            # step. The macos-fed and hosted caps are unchanged.
             timeout: 300
           - leg: macos-fed,sqlite
             runner: '["self-hosted","macos-fed"]'
@@ -1846,7 +1853,14 @@ jobs:
       # Self-hosted legs only: hosted runners are dedicated VMs.
       - name: Load gate (#6795)
         if: needs.classify.outputs.cargo_skip != 'true' && contains(matrix.runner, 'self-hosted')
-        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+        env:
+          # #9733 - the one place the gate wait is set (seconds). 0 on the
+          # linux-fed enterprise-fed leg: its build is bounded by the build
+          # semaphore of the next step, so the gate only measures and records
+          # (20 measured runs spent 9600 s of 12211 s gate wait in timeouts
+          # that then proceeded anyway). It is a term of the job cap identity.
+          LOAD_GATE_MAX_WAIT_SECS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' && '0' || '1200' }}
+        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}" --max-wait-secs "$LOAD_GATE_MAX_WAIT_SECS"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.cargo_skip != 'true'
@@ -1873,14 +1887,31 @@ jobs:
           # #7928 - the one place the semaphore wait is set (seconds); it is a
           # term of the job cap identity in the matrix timeout comment.
           HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'
+          # #9511 - the build phase runs before the test slot is taken, under
+          # its own per-host semaphore (linux-fed-build). decision: 1 slot over
+          # 2 because the host then carries at most one cold compile next to
+          # the two test-run phases. The wait is short; at the bound the build
+          # proceeds without a slot (recorded) rather than going red with no
+          # test run (#9231 class).
+          BUILD_SEMAPHORE_SLOTS: '1'
+          BUILD_SEMAPHORE_MAX_WAIT_SECS: '600'
+          # #9511 - the build phase's own timeout (seconds, also capped by the
+          # job time left): a hang bound above the 6466 s contended compile
+          # measured in job 136315786439, so a real build never trips it.
+          BUILD_PHASE_TIMEOUT_SECS: '7200'
         shell: bash
         run: |
           set -euo pipefail
-          # #7914 - bound how many legs compile and test at once on this host:
-          # re-run this very script under host_semaphore.py (the slot is held
-          # for the whole compile+test phase; the exit code is the script's).
-          if [ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ] && [ -z "${HOST_SEMAPHORE_HELD:-}" ]; then
-            export HOST_SEMAPHORE_HELD=1
+          # #7914 - bound how many legs test at once on this host: re-run this
+          # very script under host_semaphore.py (the exit code is the script's).
+          # #9511 - two passes: CI_SHARD_PHASE=build compiles every test binary
+          # (and runs the doc tests, which compile at run time) under the build
+          # semaphore and NO test slot; a red build ends the step here with the
+          # compiler output. Only then CI_SHARD_PHASE=run takes the test slot
+          # and runs the prebuilt binaries.
+          if [ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ] && [ -z "${HOST_SEMAPHORE_HELD:-}" ] && [ -z "${CI_SHARD_PHASE:-}" ]; then
+            CI_SHARD_PHASE=build python3 -I scripts/ci/host_semaphore.py --name linux-fed-build --slots "$BUILD_SEMAPHORE_SLOTS" --max-wait-secs "$BUILD_SEMAPHORE_MAX_WAIT_SECS" --on-timeout proceed --label "${CI_NODE}/${TIER} build" -- bash --noprofile --norc -eo pipefail "$0" || exit "$?"
+            export HOST_SEMAPHORE_HELD=1 CI_SHARD_PHASE=run
             exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots "$HOST_SEMAPHORE_SLOTS" --max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS" --label "${CI_NODE}/${TIER}" -- bash --noprofile --norc -eo pipefail "$0"
           fi
           # #6795 — JOB_T0 is written to $GITHUB_ENV by the first step of the job.
@@ -2425,12 +2456,48 @@ jobs:
             local label="$1" with_doc="$2"; shift 2
             local sd="${RUNNER_TEMP:-$PWD/.local-runs}/ci-shard"
             local job_now job_elapsed pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc=0 n
-            rm -rf "$sd"; mkdir -p "$sd"
-            echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
-            cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
-            python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
-            if [ "$PG_ISO_LANE" = "1" ]; then
-              python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
+            local phase="${CI_SHARD_PHASE:-}" fingerprint="$with_doc $FEAT $*" build_t build_rc=0 doc_rc=0
+            if [ "$phase" != "run" ]; then
+              rm -rf "$sd"; mkdir -p "$sd"
+              echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards (phase ${phase:-single})"
+              # #9511: the build phase has its own timeout, capped by the job time left.
+              if [ "$phase" = "build" ] && [ -n "$TIMEOUT_BIN" ]; then
+                build_t="$(cap_to_job_left "$BUILD_PHASE_TIMEOUT_SECS")"
+                "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$build_t" cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || build_rc=$?
+                if [ "$build_rc" -eq 124 ] || [ "$build_rc" -eq 137 ]; then
+                  echo "::error::[#9511] build phase exceeded the ${build_t}s build timeout (BUILD_PHASE_TIMEOUT_SECS) and was terminated; no test ran"
+                fi
+                [ "$build_rc" -eq 0 ] || return "$build_rc"
+              else
+                cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
+              fi
+              python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
+              if [ "$PG_ISO_LANE" = "1" ]; then
+                python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
+              fi
+              if [ "$phase" = "build" ]; then
+                # #9511: doc tests compile at run time (no prebuild on stable), so
+                # they run here, outside the test slot; their code is folded into
+                # the run phase's result so the shards still run (#2500).
+                if [ "$with_doc" = "1" ]; then
+                  run_doc_tests "[build] doc tests" $FEAT -- --test-threads=1 || doc_rc=$?
+                fi
+                echo "$doc_rc" > "$sd/doc.rc"
+                printf '%s\n' "$fingerprint" > "$sd/build.done"
+                echo "::notice::[#9511] '${label}': build phase done; the test slot is taken next for the run only"
+                return 0
+              fi
+            else
+              # #9511: the run phase never compiles; without the build phase's
+              # record for this exact selection it refuses (fail closed).
+              if [ ! -f "$sd/build.done" ] || [ "$(cat "$sd/build.done")" != "$fingerprint" ]; then
+                echo "::error::[#9511] run phase refused: no build record for '${label}' (the build phase must run first, outside the test slot)"
+                return 2
+              fi
+              doc_rc="$(cat "$sd/doc.rc" 2>/dev/null || echo 2)"
+              case "$doc_rc" in ''|*[!0-9]*) doc_rc=2 ;; esac
+              # the doc tests already ran in the build phase
+              with_doc=0
             fi
             # #6795: the serial shard cannot be split further, so it gets the
             # whole job time left (job cap - time since the job started, which
@@ -2501,12 +2568,12 @@ jobs:
               cat "$sd/$n.log"
               echo "::endgroup::"
             done
-            echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}"
-            for n in "$rc_s" "$rc_1" "$rc_2"; do
+            echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2} doc(build phase)=${doc_rc}"
+            for n in "$doc_rc" "$rc_s" "$rc_1" "$rc_2"; do
               if [ "$n" -ne 0 ]; then rc="$n"; fi
             done
             if [ "$rc" -ne 0 ]; then
-              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the shard output groups above"
+              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2} doc=${doc_rc}); see the shard output groups above"
             fi
             return "$rc"
           }
@@ -2612,7 +2679,12 @@ jobs:
           # failure, and the completed pipe flushes the log before the upload
           # step reads it. No `set +e`/PIPESTATUS dance — that would have
           # disabled the fail-fast the invariants depend on.
-          run_all 2>&1 | tee "$RESULT_LOG"
+          # #9511: the run phase appends to the log the build phase wrote.
+          if [ "${CI_SHARD_PHASE:-}" = "run" ]; then
+            run_all 2>&1 | tee -a "$RESULT_LOG"
+          else
+            run_all 2>&1 | tee "$RESULT_LOG"
+          fi
 
       # Durable audit-history artifact (#4). Uploaded on success AND failure so
       # a red leg's full output is retrievable long after the log view expires.

@@ -18,8 +18,15 @@ kernel drops a flock when its holder dies, so a crashed runner never leaks a slo
 SIGTERM/SIGINT/SIGHUP are forwarded to COMMAND's process group (then SIGKILL after
 a grace period) and the lock is released in ``finally``.
 
+``--on-timeout proceed`` (#9511, the build semaphore only): when no slot is free
+within the wait budget, print one ``::warning::`` record and run COMMAND without a
+slot, with ``HOST_SEMAPHORE_OVERFLOW=1`` in its environment. The default ``fail``
+keeps exit 3. Every acquire, overflow and refusal appends one row (name, label,
+waited seconds, outcome) to ``$GITHUB_STEP_SUMMARY`` when that variable is set
+(#9733); a summary write that fails is noted on stderr and never changes the result.
+
 Exit codes: the child's code; 2 bad arguments; 3 no slot free within the wait
-budget (COMMAND never ran); 4 the shared workflow_annotation.py next to this file
+budget and ``--on-timeout fail`` (COMMAND never ran); 4 the shared workflow_annotation.py next to this file
 cannot be loaded (COMMAND never ran, one ``::error`` line, #9365); 128+signal when
 COMMAND died from a signal.
 Python 3.9+, standard library only.
@@ -82,6 +89,11 @@ SEMAPHORE_POLL_SECS_DEFAULT = 30
 EXIT_NO_SLOT = 3
 KILL_GRACE_SECS = 20
 TAG = '[#7914 semaphore]'
+ON_TIMEOUT_FAIL = 'fail'
+ON_TIMEOUT_PROCEED = 'proceed'
+OVERFLOW_ENV = 'HOST_SEMAPHORE_OVERFLOW'
+SUMMARY_HEADER = '| semaphore | label | waited s | outcome |\n|---|---|---|---|\n'
+SUMMARY_LABEL_MAX = 80
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 
 
@@ -130,6 +142,28 @@ def _note(message):
     print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
 
 
+def summary_cell(text):
+    """One table cell: printable ASCII only, no pipe, at most SUMMARY_LABEL_MAX chars."""
+    return ''.join(c if ' ' <= c <= '~' and c != '|' else '?' for c in text)[:SUMMARY_LABEL_MAX]
+
+
+def record_summary(name, label, waited, outcome, environ=None):
+    """Append one row to $GITHUB_STEP_SUMMARY (#9733). Unset: nothing. A failed write is noted."""
+    path = (os.environ if environ is None else environ).get('GITHUB_STEP_SUMMARY', '')
+    if not path:
+        return
+    try:
+        with open(path, 'a+', encoding='utf-8') as fh:
+            fh.seek(0)
+            has_header = SUMMARY_HEADER.splitlines()[0] in fh.read()
+            fh.seek(0, os.SEEK_END)
+            if not has_header:
+                fh.write('\n' + SUMMARY_HEADER)
+            fh.write('| %s | %s | %d | %s |\n' % (summary_cell(name), summary_cell(label), waited, outcome))
+    except OSError as exc:
+        _note('job summary row not written (%s); the result is unchanged' % type(exc).__name__)
+
+
 def _signal_group(pgid, sig):
     try:
         os.killpg(pgid, sig)
@@ -139,14 +173,14 @@ def _signal_group(pgid, sig):
         _note('not permitted to signal process group %d with signal %d; leaving it to the kernel' % (pgid, sig))
 
 
-def run_child(command):
+def run_child(command, env=None):
     """Run COMMAND in its own process group; return its exit code.
 
     The slot lock fd stays in this wrapper only (#7927): Popen closes every fd above 2
     in the child (close_fds=True, the default), so a surviving descendant never keeps
     the host-wide slot after the wrapper prints ``released``.
     """
-    proc = subprocess.Popen(command, start_new_session=True)
+    proc = subprocess.Popen(command, start_new_session=True, env=env)
     got = []
 
     def forward(signum, _frame):
@@ -199,6 +233,8 @@ def main(argv=None):
     p.add_argument('--poll-secs', type=_positive_int, default=SEMAPHORE_POLL_SECS_DEFAULT)
     p.add_argument('--label', default='unlabelled')
     p.add_argument('--root', default=None, help='lock root (default ~/.cache/ai-memory-ci/semaphore)')
+    p.add_argument('--on-timeout', choices=(ON_TIMEOUT_FAIL, ON_TIMEOUT_PROCEED), default=ON_TIMEOUT_FAIL,
+                   help='at the wait bound: fail with exit 3 (default) or run COMMAND without a slot (#9511)')
     p.add_argument('command', nargs=argparse.REMAINDER)
     args = p.parse_args(argv)  # argparse exits 2 on bad arguments
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
@@ -210,15 +246,23 @@ def main(argv=None):
     slot_dir = root / args.name
     slot_dir.mkdir(parents=True, exist_ok=True)
     got = acquire(slot_dir, args.slots, args.label, args.max_wait_secs, args.poll_secs)
+    if got is None and args.on_timeout == ON_TIMEOUT_PROCEED:
+        print(wa.annotation("warning", "%s '%s': %s: no slot free after %ds (all %d slots busy); bound reached, "
+                            "running without a slot (%s=1)"
+                            % (TAG, args.label, args.name, args.max_wait_secs, args.slots, OVERFLOW_ENV)), flush=True)
+        record_summary(args.name, args.label, args.max_wait_secs, 'bound reached, ran without a slot')
+        return run_child(command, dict(os.environ, **{OVERFLOW_ENV: '1'}))
     if got is None:
         print(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
                             % (TAG, args.label, args.max_wait_secs, args.slots)), flush=True)
+        record_summary(args.name, args.label, args.max_wait_secs, 'no slot, exit %d' % EXIT_NO_SLOT)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:
         load, cores = load_and_cores()
         print(wa.annotation("notice", "%s '%s': slot %d of %d acquired after %ds (load=%.2f cores=%d)"
                             % (TAG, args.label, index, args.slots, waited, load, cores)), flush=True)
+        record_summary(args.name, args.label, waited, 'slot %d of %d' % (index, args.slots))
         return run_child(command)
     finally:
         os.close(fd)

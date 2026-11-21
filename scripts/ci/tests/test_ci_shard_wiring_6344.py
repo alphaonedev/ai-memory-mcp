@@ -124,7 +124,8 @@ class ShardWiringTests(unittest.TestCase):
         for v in ('s', '1', '2'):
             self.assertIn('wait "$pid_%s" || rc_%s=$?' % (v, v), self.body)
         self.assertNotRegex(self.body, r'^\s*wait\s*$', 'a bare wait discards exit codes')
-        self.assertIn('for n in "$rc_s" "$rc_1" "$rc_2"; do', self.body)
+        # #9511: the doc tests' code from the build phase is folded in with every shard's
+        self.assertIn('for n in "$doc_rc" "$rc_s" "$rc_1" "$rc_2"; do', self.body)
         self.assertIn('if [ "$n" -ne 0 ]; then rc="$n"; fi', self.body)
         self.assertTrue(self.body.rstrip().endswith('return "$rc"'))
 

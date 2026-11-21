@@ -25,7 +25,7 @@ that the named watchdog, not a nameless job-level cancel, is what fires (#6411).
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. On the sharded
 `enterprise-fed` legs the stricter rule applies: job `timeout-minutes` >=
 watchdog minutes + 28 (pre-watchdog compile and database setup) + 2 (teardown)
-= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 3600 s, counted against the cap; identity: cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)). All four rows meet both.
+= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 3600 s, counted against the cap. Since #9511 the leg compiles first, outside that slot, under its own build semaphore `linux-fed-build` (1 slot, wait up to `BUILD_SEMAPHORE_MAX_WAIT_SECS` 600 s, then it proceeds without a slot and says so, build timeout `BUILD_PHASE_TIMEOUT_SECS` 7200 s), and takes the test slot only for the run; since #9733 its load gate only measures (`LOAD_GATE_MAX_WAIT_SECS` 0; 1200 on the other self-hosted legs) and every gate and semaphore wait is a row of the job summary; identity: cap 18000 s >= load-gate wait 0 + build-semaphore wait 600 + cold compile 4100 + semaphore wait 3600 + safety 300 + serial shard 7800 (= 16400 s)). All four rows meet both.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
 
