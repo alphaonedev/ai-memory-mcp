@@ -2915,7 +2915,9 @@ class SessionPollFailsClosed9752(unittest.TestCase):
                 self.assertEqual(rc, pib.EXIT_SESSIONS, err)
                 self.assertIn(want, err)
                 self.assertIn(unittest.mock.call(unittest.mock.ANY, pib.signal.SIGKILL), calls)
-                self.assertEqual(state['waits'], UNREADABLE_MAX_9752 + 1, 'killed at the limit, not later')
+                # killed on the poll that reaches the limit, not later: 3 timed-out waits, 1 hold read + 3 polls
+                self.assertEqual(state['waits'], UNREADABLE_MAX_9752, 'killed at the limit, not later')
+                self.assertEqual(state['counts'], 1 + UNREADABLE_MAX_9752)
 
     def test_fewer_unreadable_polls_than_the_limit_pass(self):
         for label, bad in UNREADABLE_FORMS_9752:

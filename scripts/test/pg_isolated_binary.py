@@ -197,6 +197,14 @@ EXIT_TERM = 143
 EXIT_SESSIONS = 5  # SEC-L4: a binary opened more sessions than the budget assumes (#9592)
 # SEC-L4: how often a running isolated binary's sessions are counted against the per-binary bound.
 SESSION_POLL_SECS = 5.0
+# decision: three unreadable session polls in a row (15 s) fail the binary closed (EXIT_SESSIONS) over skipping
+# them without end, because a count that is never read is a bound that never holds; one bad poll still passes, so
+# a transient admin-session error does not turn a green binary red (#9752).
+SESSION_UNREADABLE_MAX = 3
+# #9752: the server caps each clone's sessions too, at the figure Admission reserves per clone. The cap binds the
+# lane's ordinary roles; a superuser session is exempt from CONNECTION LIMIT, so the poll bound above still holds
+# for that case.
+CLONE_CONNECTION_LIMIT = PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS
 
 # URL query keys and the libpq variable each maps to. Anything else fails
 # closed rather than being silently dropped.
@@ -887,7 +895,8 @@ def connection_budget(url: str) -> Tuple[int, int, int, int]:
 def mint(base_url: str, tpl: str, run_id: str, now: Optional[int] = None) -> Tuple[str, str]:
     """CREATE DATABASE ... TEMPLATE; retry while the template reports in-use."""
     name = isolated_db_name(run_id, now)
-    sql = 'CREATE DATABASE %s TEMPLATE %s' % (quote_ident(name), quote_ident(_checked_ident(tpl)))
+    sql = 'CREATE DATABASE %s TEMPLATE %s CONNECTION LIMIT %d' % (quote_ident(name), quote_ident(_checked_ident(tpl)),
+                                                                CLONE_CONNECTION_LIMIT)
     last = ''
     for attempt in range(1, MINT_ATTEMPTS + 1):
         try:
@@ -921,7 +930,9 @@ def drop(admin_url: str, name: str, run_id: Optional[str], attempts: int = DROP_
 def session_count(admin_url: str, name: str) -> int:
     raw = psql(admin_url, "SELECT count(*) FROM pg_stat_activity WHERE datname = '%s'"
                % _checked_ident(name), tuples=True).strip()
-    return int(raw) if raw.isdigit() else 0
+    if not raw.isdigit():  # #9752: an answer that is not a count is unreadable, never 0
+        raise WrapperError('could not read the sessions of %s (got %r)' % (name, raw[:40]))
+    return int(raw)
 
 
 def own_sessions(admin_url: str, run_id: str) -> int:
@@ -1244,12 +1255,12 @@ class Runner:
         """Wait for ``child``; on a clone, kill it when it holds more sessions than the budget assumes (SEC-L4).
 
         The bound is PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS, the figure Admission reserves per clone.
-        decision: a poll that cannot read the count is skipped (the next poll reads again) over failing the
-        binary, because a transient admin-session error must not turn a green binary red; the bound holds on
-        every poll that reads a count."""
+        A poll that cannot read the count is skipped, up to SESSION_UNREADABLE_MAX in a row; the poll that
+        reaches the limit fails the binary closed (#9752). A readable poll resets the run."""
         if minted is None:
             return child.wait()
         bound = PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS
+        unreadable = 0
         while True:
             try:
                 return child.wait(timeout=SESSION_POLL_SECS)
@@ -1258,15 +1269,25 @@ class Runner:
             try:
                 count = session_count(self.admin, minted)
             except WrapperError:
-                continue
+                unreadable += 1
+                if unreadable < SESSION_UNREADABLE_MAX:
+                    continue
+                log('FAIL %s: session count unreadable on %d consecutive polls (limit %d)'
+                    % (label, unreadable, SESSION_UNREADABLE_MAX))
+                return self._kill_bounded(child)
+            unreadable = 0
             if count > bound:
                 log('FAIL %s: session bound exceeded: %s opened %d sessions (bound %d)' % (label, minted, count, bound))
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # the group already exited
-                child.wait()
-                return EXIT_SESSIONS
+                return self._kill_bounded(child)
+
+    @staticmethod
+    def _kill_bounded(child: 'subprocess.Popen[str]') -> int:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # the group already exited
+        child.wait()
+        return EXIT_SESSIONS
 
     def run_one(self, target: List[str], isolate: bool = True) -> int:
         """One binary: mint + hold a clone, cargo test it, release, drop."""
