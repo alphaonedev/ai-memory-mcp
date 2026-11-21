@@ -42,6 +42,73 @@ CODE_SPAN_RE = re.compile(r"(`+)(.+?)\1")
 LINK_RE = re.compile(r"\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 TRAILING_SLASH_REASON = "trailing slash on a file target"
 EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "#", "tel:", "ftp://")
+# Fixture sizes are derived from the host (#9765). These two constants keep the
+# fixture this guard shipped with on a host with NAME_MAX 255 and PATH_MAX 4096
+# (Linux): names of 250 bytes, and a name 300 bytes long for the ENAMETOOLONG row.
+FIXTURE_NAME_MARGIN = 5
+OVERLONG_NAME_EXCESS = 45
+MIN_FIXTURE_NAME_WIDTH = 3
+# Upper bound of the symlink-hop probe; far above every kernel limit (Linux 40,
+# macOS 32) and below the interpreter recursion limit.
+SYMLINK_PROBE_CAP = 256
+
+
+def host_limit(directory, name, pathconf=os.pathconf):
+    """The host's ``os.pathconf`` limit ``name`` (``PC_NAME_MAX``, ``PC_PATH_MAX``) for ``directory``.
+
+    ``pathconf`` is a parameter so a test injects an answer or a failure. An
+    ``OSError`` from it propagates unchanged; an unlimited (-1) or zero answer is refused.
+    """
+    value = pathconf(str(directory), name)
+    if value <= 0:
+        raise ValueError("%s reports no usable limit: %d" % (name, value))
+    return value
+
+
+def kernel_symlink_limit(directory, stat=os.stat, cap=SYMLINK_PROBE_CAP):
+    """Longest chain of symlinks the kernel follows, found by building one in ``directory``.
+
+    Builds ``real.md``, ``c1 -> real.md``, ``c2 -> c1``, ... and calls ``stat`` on
+    each link as it is made. The first ``ELOOP`` ends the probe and the answer
+    is the length before it. Any other ``OSError`` propagates unchanged, and a
+    host that never answers ``ELOOP`` within ``cap`` links is refused.
+    ``stat`` is a parameter so a test injects a failure.
+    """
+    (directory / "real.md").write_text("# real\n", encoding="utf-8")
+    previous = "real.md"
+    for length in range(1, cap + 1):
+        name = "c%d" % length
+        (directory / name).symlink_to(previous)
+        try:
+            stat(str(directory / name))
+        except OSError as err:
+            if err.errno == errno.ELOOP:
+                return length - 1
+            raise
+        previous = name
+    raise ValueError("no ELOOP within %d links" % cap)
+
+
+def path_max_fixture_shape(name_max, path_max):
+    """``(width, count)`` for the PATH_MAX fixture: ``count`` names of ``width`` bytes.
+
+    One symlink target holds ``count`` names (``count * (width + 1) - 1`` bytes),
+    which is below ``path_max``; the prefix expanded twice (``L`` then ``M``) is
+    past it. NAME_MAX 255 and PATH_MAX 4096 give the original 250 x 9.
+    """
+    width = name_max - FIXTURE_NAME_MARGIN
+    if width < MIN_FIXTURE_NAME_WIDTH:
+        raise ValueError("NAME_MAX %d leaves no room for a fixture name" % name_max)
+    count = path_max // (2 * (width + 1)) + 1
+    target = count * (width + 1) - 1
+    if target >= path_max:
+        raise ValueError("NAME_MAX %d is too long for PATH_MAX %d" % (name_max, path_max))
+    return width, count
+
+
+def overlong_name(name_max):
+    """A ``.md`` file name 45 bytes past ``name_max`` (300 bytes on a NAME_MAX 255 host)."""
+    return "a" * (name_max + OVERLONG_NAME_EXCESS) + ".md"
 
 
 def has_symlink_component(root, path):
@@ -539,7 +606,7 @@ class HostLimitProbeTest(unittest.TestCase):
             name = os.path.basename(path)
             if name.startswith("c") and int(name[1:]) >= first_failing_length:
                 raise error
-            return os.stat(path, *args, **kwargs)
+            return None
 
         return fake
 
