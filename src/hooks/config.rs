@@ -273,7 +273,12 @@ impl HookConfig {
 /// (serde defaults can't see sibling fields). The compiled
 /// representation in [`HookConfig`] is unambiguous — the operator-
 /// facing relaxation lives in this struct only.
+///
+/// `deny_unknown_fields` (#9637): a key the schema does not know (a
+/// misspelt `fail_mode`, say) refuses the file instead of being
+/// dropped, so no file loads a weaker fail mode than its text asks for.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HookConfigRaw {
     event: HookEvent,
     command: PathBuf,
@@ -321,8 +326,11 @@ impl<'de> serde::Deserialize<'de> for HookConfig {
 }
 
 /// Top-level TOML shape: `[[hook]]` blocks collect into
-/// `hooks: Vec<HookConfig>`.
+/// `hooks: Vec<HookConfig>`. `deny_unknown_fields` (#9637): a table
+/// or key other than `hook` (a misspelt `[[hooks]]`, say) refuses the
+/// file instead of loading zero hooks.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HooksFile {
     #[serde(default, rename = "hook")]
     hooks: Vec<HookConfig>,
@@ -334,9 +342,19 @@ impl HookConfig {
     /// Returns the hook entries in their original on-disk order;
     /// G5's chain ordering pass is responsible for the
     /// priority-descending sort.
+    ///
+    /// Reads through [`Self::try_load_from_optional`], so the size cap,
+    /// the regular-file check and the FIFO-safe open hold here too; a
+    /// path with nothing at it is an [`HooksConfigError::Io`] `NotFound`.
     pub fn load_from_file(path: &Path) -> Result<Vec<HookConfig>, HooksConfigError> {
-        let contents = std::fs::read_to_string(path).map_err(HooksConfigError::Io)?;
-        Self::load_from_str(&contents)
+        match Self::try_load_from_optional(path) {
+            Ok(Some(hooks)) => Ok(hooks),
+            Ok(None) => Err(HooksConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no hooks file at the path",
+            ))),
+            Err(refused) => Err(refused.error),
+        }
     }
 
     /// Parse + validate from a TOML string. Split out from
@@ -351,10 +369,14 @@ impl HookConfig {
                 .span()
                 .map(|s| byte_offset_to_line_col(contents, s.start))
                 .unwrap_or((0, 0));
+            // `message()` is the parser reason alone; `to_string()`
+            // would quote the offending source lines into the
+            // operator-facing error (#9637). The reason is then
+            // stripped of echoed values, escaped and bounded.
             HooksConfigError::Toml {
                 line,
                 column: col,
-                message: e.to_string(),
+                message: sanitize_toml_message(e.message()),
             }
         })?;
 
@@ -369,6 +391,278 @@ impl HookConfig {
     /// platform-correct default location.
     pub fn default_path() -> Option<PathBuf> {
         dirs::config_dir().map(|p| p.join("ai-memory/hooks.toml"))
+    }
+
+    /// The one fail-closed door for loading a hooks file at a
+    /// startup or call site (#9637, ERRORS-02 / ERRORS-19).
+    ///
+    /// * `Ok(None)` — nothing exists at `path` (no file and no
+    ///   symlink). This is the ONLY "no hooks" outcome.
+    /// * `Ok(Some(hooks))` — a regular file that read, parsed and
+    ///   validated (an empty file is valid with zero hooks).
+    /// * `Err(_)` — anything else: a dangling symlink, a directory or
+    ///   other non-regular file, a read or permission error, a file
+    ///   over [`MAX_HOOKS_FILE_BYTES`], or a TOML / validation error.
+    ///   The error names the path and the reason.
+    ///
+    /// The file type and size are checked once, on the opened handle
+    /// (`fstat`), so the object checked is the object read. On unix the
+    /// open uses `O_NONBLOCK`: opening a FIFO for reading then returns
+    /// at once instead of waiting for a writer, and the handle check
+    /// refuses it as not a regular file. A regular file ignores the
+    /// flag.
+    ///
+    /// Named and shaped after the #3166 `AppConfig::try_load_from_optional`
+    /// (only "no entry" is absent), with the dangling-symlink arm added.
+    pub fn try_load_from_optional(path: &Path) -> Result<Option<Vec<HookConfig>>, HooksFileError> {
+        let refuse = |error: HooksConfigError| HooksFileError {
+            path: path.to_path_buf(),
+            error,
+        };
+        let file = match open_for_read_without_waiting(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // `open` follows links, so a dangling symlink is
+                // NotFound too; only a path with no entry is absent.
+                return match std::fs::symlink_metadata(path) {
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Ok(_) => Err(refuse(HooksConfigError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "dangling symlink (its target does not exist)",
+                    )))),
+                    Err(e2) => Err(refuse(HooksConfigError::Io(e2))),
+                };
+            }
+            Err(e) => return Err(refuse(HooksConfigError::Io(e))),
+        };
+        let opened = file
+            .metadata()
+            .map_err(|e| refuse(HooksConfigError::Io(e)))?;
+        if !opened.is_file() {
+            return Err(refuse(not_a_regular_file()));
+        }
+        if opened.len() > MAX_HOOKS_FILE_BYTES {
+            return Err(refuse(too_large()));
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_HOOKS_FILE_BYTES + 1),
+            &mut bytes,
+        )
+        .map_err(|e| refuse(HooksConfigError::Io(e)))?;
+        if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_HOOKS_FILE_BYTES) {
+            return Err(refuse(too_large()));
+        }
+        let contents = String::from_utf8(bytes).map_err(|_| refuse(not_utf8()))?;
+        Self::load_from_str(&contents).map(Some).map_err(refuse)
+    }
+
+    /// [`Self::try_load_from_optional`] on [`Self::default_path`], named
+    /// after the #3166 `AppConfig::load_for_boot`: zero hooks when no
+    /// config directory resolves (logged once) or nothing exists at the
+    /// path, an error for every file that exists but cannot be honoured.
+    /// Every startup site (serve, mcp, curator) uses this. There is no
+    /// environment variable or flag that turns the refusal off.
+    pub fn load_for_boot() -> Result<Vec<HookConfig>, HooksFileError> {
+        Self::resolve_for_boot(Self::default_path())
+    }
+
+    /// [`Self::load_for_boot`] with the default path passed in, so the
+    /// "no config directory" arm is testable.
+    pub(crate) fn resolve_for_boot(
+        path: Option<PathBuf>,
+    ) -> Result<Vec<HookConfig>, HooksFileError> {
+        match path {
+            Some(path) => Ok(Self::try_load_from_optional(&path)?.unwrap_or_default()),
+            None => {
+                note_no_config_dir();
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+static NO_CONFIG_DIR_NOTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Logs, once per process, that no config directory resolves so no
+/// hooks file can exist (#9637 V-6). Returns `true` on the call that
+/// logged.
+fn note_no_config_dir() -> bool {
+    let first = !NO_CONFIG_DIR_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first {
+        eprintln!("ai-memory: hooks: no config directory resolves; starting with no hooks");
+    }
+    first
+}
+
+/// Size ceiling for a hooks file. A hooks file is a few `[[hook]]`
+/// rows; anything larger is refused rather than read unbounded.
+pub const MAX_HOOKS_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Ceiling, in characters, on the parser message carried in a
+/// [`HooksConfigError::Toml`], so a refusal is bounded.
+const MAX_TOML_MESSAGE_CHARS: usize = 200;
+
+/// Open `path` for reading without waiting on a FIFO (#9637): with
+/// `O_NONBLOCK` a FIFO with no writer opens at once, so the caller's
+/// `fstat` check refuses it instead of the open blocking startup.
+#[cfg(unix)]
+fn open_for_read_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Non-unix platforms have no FIFO special files at a config path.
+#[cfg(not(unix))]
+fn open_for_read_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Prefixes of the serde data-model messages that quote a value or a
+/// key taken from the file (`unknown field `<key>``, `invalid type:
+/// string "<value>"`, ...). For these only the kind and the static
+/// `expected ...` text are kept (#9637).
+const VALUE_ECHOING_KINDS: &[(&str, &str)] = &[
+    ("unknown field ", "unknown field"),
+    ("unknown variant ", "unknown variant"),
+    ("invalid type: ", "invalid type"),
+    ("invalid value: ", "invalid value"),
+    ("invalid length ", "invalid length"),
+];
+
+/// The separator serde puts before its static description of what it
+/// expected.
+const EXPECTED_SEPARATOR: &str = ", expected ";
+
+/// The operator-facing form of a TOML / serde parse message (#9637):
+/// a message that quotes a file value is cut to its kind plus the
+/// static `expected ...` text; every other message is kept. Either is
+/// then escaped ([`push_escaped`]) and bounded to
+/// [`MAX_TOML_MESSAGE_CHARS`] characters, cut only between whole
+/// escape units.
+fn sanitize_toml_message(message: &str) -> String {
+    let mut out = String::new();
+    for (prefix, kind) in VALUE_ECHOING_KINDS {
+        if message.starts_with(prefix) {
+            out.push_str(kind);
+            // The LAST separator: a quoted key or value may itself
+            // contain the separator text, serde's static tail never does.
+            if let Some(at) = message.rfind(EXPECTED_SEPARATOR) {
+                push_escaped(&mut out, &message[at..], MAX_TOML_MESSAGE_CHARS);
+            }
+            return out;
+        }
+    }
+    push_escaped(&mut out, message, MAX_TOML_MESSAGE_CHARS);
+    out
+}
+
+/// Characters that are not control characters but still change how a
+/// terminal or log viewer shows the text around them: bidirectional
+/// overrides and isolates, zero-width characters, line and paragraph
+/// separators, the byte-order mark.
+fn is_display_altering(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Append `text` to `out` with every control character, every
+/// [`is_display_altering`] character and the backslash escaped, so a
+/// refusal line is one line and shows exactly what it says (#9637).
+/// Stops before the escape unit that would take `out` past
+/// `max_chars` characters, so a cut never splits a character or an
+/// escape.
+fn push_escaped(out: &mut String, text: &str, max_chars: usize) {
+    let mut len = out.chars().count();
+    for c in text.chars() {
+        let unit: String = if c == '\\' {
+            "\\\\".to_owned()
+        } else if c.is_control() {
+            c.escape_default().collect()
+        } else if is_display_altering(c) {
+            c.escape_unicode().collect()
+        } else {
+            let mut s = String::with_capacity(c.len_utf8());
+            s.push(c);
+            s
+        };
+        let unit_len = unit.chars().count();
+        if len.saturating_add(unit_len) > max_chars {
+            return;
+        }
+        out.push_str(&unit);
+        len += unit_len;
+    }
+}
+
+/// `path` for an operator-facing line, escaped like a parse message
+/// and not shortened.
+fn escaped_path(path: &Path) -> String {
+    let mut out = String::new();
+    push_escaped(&mut out, &path.display().to_string(), usize::MAX);
+    out
+}
+
+/// The reason a path that is not a regular file (a directory, FIFO,
+/// socket or device) is refused with (#9637).
+const NOT_A_REGULAR_FILE: &str = "not a regular file";
+
+fn not_a_regular_file() -> HooksConfigError {
+    HooksConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        NOT_A_REGULAR_FILE,
+    ))
+}
+
+fn not_utf8() -> HooksConfigError {
+    HooksConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "not valid UTF-8",
+    ))
+}
+
+fn too_large() -> HooksConfigError {
+    HooksConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("file is larger than {MAX_HOOKS_FILE_BYTES} bytes"),
+    ))
+}
+
+/// A hooks file that exists but cannot be loaded, with its path
+/// (#9637). Startup sites propagate this so the process refuses to
+/// start; `main` maps it to `EX_CONFIG`.
+#[derive(Debug)]
+pub struct HooksFileError {
+    /// The hooks file path that was refused.
+    pub path: PathBuf,
+    /// Why it was refused.
+    pub error: HooksConfigError,
+}
+
+impl fmt::Display for HooksFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hooks file {} cannot be loaded: {}",
+            escaped_path(&self.path),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for HooksFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -488,12 +782,14 @@ pub type HookConfigSnapshot = RwLock<Vec<HookConfig>>;
 /// Spawn a tokio task that listens for `SIGHUP` and reloads
 /// `path` into `snapshot` on every signal.
 ///
-/// G1 ships the signal-handler plumbing; the hooks loaded into
-/// the snapshot become live as soon as G3's executor starts
-/// reading from it. Until then this is a no-op observable only
-/// via a `tracing::info!` log line per reload — exactly what the
-/// G1 epic doc calls for ("for now just load + emit a tracing
-/// info on reload").
+/// Each reload goes through the same door as startup,
+/// [`HookConfig::try_load_from_optional`], on a blocking thread
+/// (CONCURRENCY-22). Only a file that loads in full replaces the
+/// snapshot; an absent file, a refused file or a failed load task
+/// keeps the previous snapshot and logs an error (#9637).
+///
+/// No shipped entry point spawns this task yet (issue #9779): a
+/// running daemon picks up a changed hooks file on restart.
 ///
 /// Returns the [`tokio::task::JoinHandle`] so the daemon main
 /// loop can shut the task down on graceful exit.
@@ -514,26 +810,40 @@ pub fn spawn_reload_task(
         };
 
         while sighup.recv().await.is_some() {
-            match HookConfig::load_from_file(&path) {
-                Ok(new_cfg) => {
+            let load_path = path.clone();
+            let loaded =
+                tokio::task::spawn_blocking(move || HookConfig::try_load_from_optional(&load_path))
+                    .await;
+            // Every arm but a full load leaves the previous snapshot in
+            // place: the running daemon keeps its last-known-good hooks.
+            match loaded {
+                Ok(Ok(Some(new_cfg))) => {
                     let count = new_cfg.len();
                     let mut guard = snapshot.write().await;
                     *guard = new_cfg;
                     tracing::info!(
-                        path = %path.display(),
+                        path = %escaped_path(&path),
                         hooks = count,
                         "hooks: reloaded config on SIGHUP"
                     );
                 }
-                Err(e) => {
-                    // Reload failure leaves the previous
-                    // snapshot in place — operators get a loud
-                    // error log but the running daemon keeps
-                    // serving with the last-known-good config.
+                Ok(Ok(None)) => {
                     tracing::error!(
-                        path = %path.display(),
+                        path = %escaped_path(&path),
+                        "hooks: SIGHUP reload found no hooks file; keeping previous config"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
                         error = %e,
                         "hooks: SIGHUP reload failed; keeping previous config"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        path = %escaped_path(&path),
+                        error = %e,
+                        "hooks: SIGHUP reload task failed; keeping previous config"
                     );
                 }
             }
@@ -1187,6 +1497,181 @@ namespace = "*"
         assert!(matches!(err, HooksConfigError::Io(_)));
     }
 
+    /// #9637 — a scratch directory under the repo's `.local-runs/`.
+    fn door_scratch() -> tempfile::TempDir {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs/hooks-door-9637");
+        std::fs::create_dir_all(&root).expect("create scratch root");
+        tempfile::Builder::new()
+            .prefix("door-")
+            .tempdir_in(&root)
+            .expect("scratch dir")
+    }
+
+    const DOOR_VALID: &str = r#"
+[[hook]]
+event = "post_store"
+command = "/bin/true"
+priority = 0
+timeout_ms = 1000
+mode = "exec"
+enabled = true
+namespace = "*"
+"#;
+
+    #[test]
+    fn door_absent_path_is_the_only_no_hooks_outcome_9637() {
+        let dir = door_scratch();
+        let got = HookConfig::try_load_from_optional(&dir.path().join("hooks.toml"))
+            .expect("absent is ok");
+        assert!(got.is_none(), "absent path must be Ok(None)");
+    }
+
+    #[test]
+    fn door_valid_and_empty_files_load_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        std::fs::write(&p, DOOR_VALID).expect("write");
+        let hooks = HookConfig::try_load_from_optional(&p)
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(hooks.len(), 1);
+        std::fs::write(&p, "").expect("write empty");
+        let hooks = HookConfig::try_load_from_optional(&p)
+            .expect("empty")
+            .expect("Some");
+        assert!(hooks.is_empty(), "an empty file is valid with zero hooks");
+    }
+
+    #[test]
+    fn door_refuses_parse_validation_directory_and_oversize_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+
+        std::fs::write(&p, "[[hook]]\nevent = \"post_store\"\ncommand = \n").expect("write");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("parse error refuses");
+        assert!(
+            matches!(err.error, HooksConfigError::Toml { .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.path, p);
+        assert!(err.to_string().contains(&p.display().to_string()), "{err}");
+
+        std::fs::write(&p, DOOR_VALID.replace("1000", "999999999")).expect("write");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("validation refuses");
+        assert!(
+            matches!(err.error, HooksConfigError::Validation { .. }),
+            "{err:?}"
+        );
+
+        let d = dir.path().join("as-dir");
+        std::fs::create_dir(&d).expect("mkdir");
+        let err = HookConfig::try_load_from_optional(&d).expect_err("directory refuses");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+
+        let big = vec![b'#'; usize::try_from(MAX_HOOKS_FILE_BYTES).expect("fits") + 1];
+        std::fs::write(&p, big).expect("write big");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("oversize refuses");
+        assert!(err.to_string().contains("larger than"), "{err}");
+    }
+
+    #[test]
+    fn door_toml_reason_is_bounded_and_echoes_no_source_line_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        let canary = "doorcanary9637";
+        std::fs::write(
+            &p,
+            format!("[[hook]]\nevent = \"post_store\"\ncommand = {canary} {canary}\n"),
+        )
+        .expect("write");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("parse error refuses");
+        let HooksConfigError::Toml { message, .. } = &err.error else {
+            panic!("expected Toml, got {err:?}");
+        };
+        assert!(message.chars().count() <= MAX_TOML_MESSAGE_CHARS);
+        assert!(
+            !err.to_string().contains(canary),
+            "source line echoed: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn door_refuses_a_dangling_symlink_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing-target.toml"), &p).expect("symlink");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("dangling symlink refuses");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "hooks file {} cannot be loaded: hooks.toml read error: dangling symlink (its target does not exist)",
+                p.display()
+            )
+        );
+    }
+
+    #[test]
+    fn door_refuses_a_non_utf8_file_with_a_named_error_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        std::fs::write(&p, [0x23, 0x20, 0xff, 0xfe, 0x0a]).expect("write non-UTF-8");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("non-UTF-8 refuses");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "hooks file {} cannot be loaded: hooks.toml read error: not valid UTF-8",
+                p.display()
+            )
+        );
+    }
+
+    #[test]
+    fn no_config_dir_is_absent_and_logged_once_9637() {
+        let hooks = HookConfig::resolve_for_boot(None).expect("no config dir is absent");
+        assert!(hooks.is_empty());
+        // `resolve_for_boot(None)` has logged (here or earlier in this
+        // process), so every later note stays quiet.
+        assert!(
+            !note_no_config_dir(),
+            "resolve_for_boot(None) logs the note"
+        );
+        assert!(
+            !note_no_config_dir(),
+            "the no-config-dir note is logged once"
+        );
+        assert!(
+            HookConfig::resolve_for_boot(None)
+                .expect("still absent")
+                .is_empty()
+        );
+    }
+
+    /// An unreadable path that no privilege can read: the parent of the
+    /// hooks file is a regular file, so the open fails with `ENOTDIR`
+    /// for root as well. No skip arm (#9637).
+    #[cfg(unix)]
+    #[test]
+    fn door_refuses_an_unreadable_path_9637() {
+        let dir = door_scratch();
+        let parent = dir.path().join("xdg-as-file");
+        std::fs::write(&parent, DOOR_VALID).expect("write the parent as a regular file");
+        let p = parent.join("hooks.toml");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("ENOTDIR refuses");
+        assert!(
+            matches!(&err.error, HooksConfigError::Io(e) if e.raw_os_error() == Some(libc::ENOTDIR)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "hooks file {} cannot be loaded: hooks.toml read error: Not a directory (os error 20)",
+                p.display()
+            )
+        );
+    }
+
     #[test]
     fn rejects_whitespace_only_namespace() {
         let toml_src = r#"
@@ -1222,3 +1707,7 @@ namespace = "   "
         assert!(line >= 3);
     }
 }
+
+#[cfg(test)]
+#[path = "config_door_9637_tests.rs"]
+mod door_9637_tests;

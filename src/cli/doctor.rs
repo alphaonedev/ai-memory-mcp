@@ -446,6 +446,10 @@ pub struct HooksReportArgs {
     pub json: bool,
 }
 
+/// `schema_version` of every `doctor --tokens --json` / `--raw-table`
+/// document, the hooks-refusal form (#9637) included.
+const TOKENS_SCHEMA_VERSION: &str = "v0.6.4-tokens-1";
+
 /// v0.6.4-004 — token-cost report.
 ///
 /// Walks `crate::sizes::tool_sizes()`, groups by family via
@@ -515,10 +519,25 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     family_totals.sort_by_key(|(_, _, sum)| std::cmp::Reverse(*sum));
 
     if args.json || args.raw_table {
+        // #9637: with `--hooks` the hooks file is loaded before any
+        // machine-readable output; a file that cannot be loaded is an
+        // error (exit 2) in this form too, with the reason in the JSON.
+        if args.hooks {
+            let path_opt = crate::hooks::config::HookConfig::default_path();
+            if let Err(e) = hooks_for_doctor(path_opt.as_deref()) {
+                writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
+                let payload = serde_json::json!({
+                    (field_names::SCHEMA_VERSION): TOKENS_SCHEMA_VERSION,
+                    "hooks_error": e.to_string(),
+                });
+                writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
+                return Ok(2);
+            }
+        }
         // Always include the full per-tool table when --raw-table is
         // set; --json gives the rolled-up view.
         let payload = serde_json::json!({
-            (field_names::SCHEMA_VERSION): "v0.6.4-tokens-1",
+            (field_names::SCHEMA_VERSION): TOKENS_SCHEMA_VERSION,
             "tokenizer": "cl100k_base",
             "active_profile": profile.families().iter().map(|f| f.name()).collect::<Vec<_>>(),
             "active_total_tokens": active_total,
@@ -621,7 +640,9 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     }
     if args.hooks {
         writeln!(out.stdout)?;
-        render_hooks_human(out)?;
+        if !render_hooks_human(out)? {
+            return Ok(2);
+        }
     }
     Ok(0)
 }
@@ -639,15 +660,9 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
     use crate::hooks::config::HookConfig;
 
     let path_opt = HookConfig::default_path();
-    let hooks: Vec<HookConfig> = match path_opt.as_ref() {
-        Some(p) if p.exists() => match HookConfig::load_from_file(p) {
-            Ok(h) => h,
-            Err(e) => {
-                writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
-                return Ok(2);
-            }
-        },
-        _ => Vec::new(),
+    // #9637: the fail-closed door; an existing file that cannot be loaded is an error (exit 2).
+    let Some(hooks) = load_hooks_for_doctor(path_opt.as_deref(), out)? else {
+        return Ok(2);
     };
 
     // #1734 PE-1 — resolve the mandatory-hook enforcement posture + the
@@ -720,14 +735,44 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
 
 /// Human-readable hooks block. Used by `--hooks` standalone *and*
 /// by the appended block when the operator combines `--tokens --hooks`.
-fn render_hooks_human(out: &mut CliOutput<'_>) -> Result<()> {
+/// Returns `false` when the hooks file exists but cannot be loaded
+/// (#9637); the error is on stderr and the caller exits 2.
+fn render_hooks_human(out: &mut CliOutput<'_>) -> Result<bool> {
     use crate::hooks::config::HookConfig;
     let path_opt = HookConfig::default_path();
-    let hooks: Vec<HookConfig> = match path_opt.as_ref() {
-        Some(p) if p.exists() => HookConfig::load_from_file(p).unwrap_or_default(),
-        _ => Vec::new(),
+    let Some(hooks) = load_hooks_for_doctor(path_opt.as_deref(), out)? else {
+        return Ok(false);
     };
-    render_hooks_human_with(out, path_opt.as_deref(), &hooks)
+    render_hooks_human_with(out, path_opt.as_deref(), &hooks)?;
+    Ok(true)
+}
+
+/// #9637 — doctor's use of the fail-closed door. `Ok(None)` means the
+/// file exists but cannot be loaded; the refusal (path and reason) is
+/// already on stderr.
+fn load_hooks_for_doctor(
+    path: Option<&Path>,
+    out: &mut CliOutput<'_>,
+) -> Result<Option<Vec<crate::hooks::config::HookConfig>>> {
+    match hooks_for_doctor(path) {
+        Ok(hooks) => Ok(Some(hooks)),
+        Err(e) => {
+            writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
+            Ok(None)
+        }
+    }
+}
+
+/// #9637 — the hooks doctor reports on: none without a config dir or
+/// a file, the file's hooks when it loads, its refusal otherwise.
+fn hooks_for_doctor(
+    path: Option<&Path>,
+) -> std::result::Result<Vec<crate::hooks::config::HookConfig>, crate::hooks::config::HooksFileError>
+{
+    let Some(p) = path else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::hooks::config::HookConfig::try_load_from_optional(p)?.unwrap_or_default())
 }
 
 fn render_hooks_human_with(

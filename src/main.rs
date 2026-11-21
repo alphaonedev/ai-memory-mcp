@@ -485,6 +485,17 @@ fn main() -> Result<()> {
     #[cfg(not(unix))]
     // The outcome is logged inside the hook.
     let _ = ai_memory::governance::audit::exit_drain_hook();
+    // #9637 — a hooks file that exists but cannot be honoured refused startup
+    // before anything was served: EX_CONFIG, the #3166 config-refusal code.
+    if let Some(refused) = result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<ai_memory::hooks::config::HooksFileError>())
+    {
+        eprintln!("ai-memory: boot refused — {refused}");
+        drop(log_guard);
+        std::process::exit(config::EX_CONFIG);
+    }
     if result.as_ref().err().is_some_and(|error| {
         error
             .downcast_ref::<daemon_runtime::FatalShutdownError>()
