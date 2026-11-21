@@ -575,6 +575,15 @@ class CapLengthLineTests(unittest.TestCase):
                 log_line("22:10:01", "test result: ok. 3 passed; 0 failed; finished in 4.50s")]
         self.assertEqual(mct.rank_binaries(rows), [(4.5, 3, "src/lib.rs")])
 
+    def test_the_anchor_is_the_whole_literal_not_its_first_word(self):
+        # a first "Finished" with no backtick, or a first "test result:" with no space, is not the anchor: the
+        # literal is "Finished `" and "test result: " (finding N4), so the real text after it is still read.
+        text = "Finished building; Finished `test` profile [unoptimized] target(s) in 5s"
+        self.assertEqual(mct.first_finished([log_line("22:39:43", text)])[1], 5.0)
+        rows = [log_line("22:10:00", "Running unittests src/lib.rs"),
+                log_line("22:10:01", "test result:ok test result: ok. 3 passed; 0 failed; finished in 2.50s")]
+        self.assertEqual(mct.rank_binaries(rows), [(2.5, 3, "src/lib.rs")])
+
 
 class BranchPinTests(unittest.TestCase):
     """Class D (finding N1): one row per remaining branch of step_secs, sum_steps, parse_ts, duration and first_finished."""
