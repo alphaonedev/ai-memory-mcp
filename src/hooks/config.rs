@@ -273,7 +273,12 @@ impl HookConfig {
 /// (serde defaults can't see sibling fields). The compiled
 /// representation in [`HookConfig`] is unambiguous — the operator-
 /// facing relaxation lives in this struct only.
+///
+/// `deny_unknown_fields` (#9637): a key the schema does not know (a
+/// misspelt `fail_mode`, say) refuses the file instead of being
+/// dropped, so no file loads a weaker fail mode than its text asks for.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HookConfigRaw {
     event: HookEvent,
     command: PathBuf,
@@ -321,8 +326,11 @@ impl<'de> serde::Deserialize<'de> for HookConfig {
 }
 
 /// Top-level TOML shape: `[[hook]]` blocks collect into
-/// `hooks: Vec<HookConfig>`.
+/// `hooks: Vec<HookConfig>`. `deny_unknown_fields` (#9637): a table
+/// or key other than `hook` (a misspelt `[[hooks]]`, say) refuses the
+/// file instead of loading zero hooks.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HooksFile {
     #[serde(default, rename = "hook")]
     hooks: Vec<HookConfig>,
@@ -334,9 +342,19 @@ impl HookConfig {
     /// Returns the hook entries in their original on-disk order;
     /// G5's chain ordering pass is responsible for the
     /// priority-descending sort.
+    ///
+    /// Reads through [`Self::try_load_from_optional`], so the size cap,
+    /// the regular-file check and the FIFO-safe open hold here too; a
+    /// path with nothing at it is an [`HooksConfigError::Io`] `NotFound`.
     pub fn load_from_file(path: &Path) -> Result<Vec<HookConfig>, HooksConfigError> {
-        let contents = std::fs::read_to_string(path).map_err(HooksConfigError::Io)?;
-        Self::load_from_str(&contents)
+        match Self::try_load_from_optional(path) {
+            Ok(Some(hooks)) => Ok(hooks),
+            Ok(None) => Err(HooksConfigError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no hooks file at the path",
+            ))),
+            Err(refused) => Err(refused.error),
+        }
     }
 
     /// Parse + validate from a TOML string. Split out from
@@ -353,12 +371,12 @@ impl HookConfig {
                 .unwrap_or((0, 0));
             // `message()` is the parser reason alone; `to_string()`
             // would quote the offending source lines into the
-            // operator-facing error (#9637). Bounded on a char
-            // boundary.
+            // operator-facing error (#9637). The reason is then
+            // stripped of echoed values, escaped and bounded.
             HooksConfigError::Toml {
                 line,
                 column: col,
-                message: e.message().chars().take(MAX_TOML_MESSAGE_CHARS).collect(),
+                message: sanitize_toml_message(e.message()),
             }
         })?;
 
@@ -387,9 +405,12 @@ impl HookConfig {
     ///   over [`MAX_HOOKS_FILE_BYTES`], or a TOML / validation error.
     ///   The error names the path and the reason.
     ///
-    /// The file type is checked twice: on the path before `open`
-    /// (so a FIFO is never opened and cannot block) and on the opened
-    /// handle (so a swap between the check and the open is caught).
+    /// The file type and size are checked once, on the opened handle
+    /// (`fstat`), so the object checked is the object read. On unix the
+    /// open uses `O_NONBLOCK`: opening a FIFO for reading then returns
+    /// at once instead of waiting for a writer, and the handle check
+    /// refuses it as not a regular file. A regular file ignores the
+    /// flag.
     ///
     /// Named and shaped after the #3166 `AppConfig::try_load_from_optional`
     /// (only "no entry" is absent), with the dangling-symlink arm added.
@@ -398,10 +419,10 @@ impl HookConfig {
             path: path.to_path_buf(),
             error,
         };
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
+        let file = match open_for_read_without_waiting(path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // `metadata` follows links, so a dangling symlink is
+                // `open` follows links, so a dangling symlink is
                 // NotFound too; only a path with no entry is absent.
                 return match std::fs::symlink_metadata(path) {
                     Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -414,10 +435,6 @@ impl HookConfig {
             }
             Err(e) => return Err(refuse(HooksConfigError::Io(e))),
         };
-        if !meta.is_file() {
-            return Err(refuse(not_a_regular_file()));
-        }
-        let file = std::fs::File::open(path).map_err(|e| refuse(HooksConfigError::Io(e)))?;
         let opened = file
             .metadata()
             .map_err(|e| refuse(HooksConfigError::Io(e)))?;
@@ -487,6 +504,115 @@ pub const MAX_HOOKS_FILE_BYTES: u64 = 1024 * 1024;
 /// [`HooksConfigError::Toml`], so a refusal is bounded.
 const MAX_TOML_MESSAGE_CHARS: usize = 200;
 
+/// Open `path` for reading without waiting on a FIFO (#9637): with
+/// `O_NONBLOCK` a FIFO with no writer opens at once, so the caller's
+/// `fstat` check refuses it instead of the open blocking startup.
+#[cfg(unix)]
+fn open_for_read_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Non-unix platforms have no FIFO special files at a config path.
+#[cfg(not(unix))]
+fn open_for_read_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Prefixes of the serde data-model messages that quote a value or a
+/// key taken from the file (`unknown field `<key>``, `invalid type:
+/// string "<value>"`, ...). For these only the kind and the static
+/// `expected ...` text are kept (#9637).
+const VALUE_ECHOING_KINDS: &[(&str, &str)] = &[
+    ("unknown field ", "unknown field"),
+    ("unknown variant ", "unknown variant"),
+    ("invalid type: ", "invalid type"),
+    ("invalid value: ", "invalid value"),
+    ("invalid length ", "invalid length"),
+];
+
+/// The separator serde puts before its static description of what it
+/// expected.
+const EXPECTED_SEPARATOR: &str = ", expected ";
+
+/// The operator-facing form of a TOML / serde parse message (#9637):
+/// a message that quotes a file value is cut to its kind plus the
+/// static `expected ...` text; every other message is kept. Either is
+/// then escaped ([`push_escaped`]) and bounded to
+/// [`MAX_TOML_MESSAGE_CHARS`] characters, cut only between whole
+/// escape units.
+fn sanitize_toml_message(message: &str) -> String {
+    let mut out = String::new();
+    for (prefix, kind) in VALUE_ECHOING_KINDS {
+        if message.starts_with(prefix) {
+            out.push_str(kind);
+            // The LAST separator: a quoted key or value may itself
+            // contain the separator text, serde's static tail never does.
+            if let Some(at) = message.rfind(EXPECTED_SEPARATOR) {
+                push_escaped(&mut out, &message[at..], MAX_TOML_MESSAGE_CHARS);
+            }
+            return out;
+        }
+    }
+    push_escaped(&mut out, message, MAX_TOML_MESSAGE_CHARS);
+    out
+}
+
+/// Characters that are not control characters but still change how a
+/// terminal or log viewer shows the text around them: bidirectional
+/// overrides and isolates, zero-width characters, line and paragraph
+/// separators, the byte-order mark.
+fn is_display_altering(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Append `text` to `out` with every control character, every
+/// [`is_display_altering`] character and the backslash escaped, so a
+/// refusal line is one line and shows exactly what it says (#9637).
+/// Stops before the escape unit that would take `out` past
+/// `max_chars` characters, so a cut never splits a character or an
+/// escape.
+fn push_escaped(out: &mut String, text: &str, max_chars: usize) {
+    let mut len = out.chars().count();
+    for c in text.chars() {
+        let unit: String = if c == '\\' {
+            "\\\\".to_owned()
+        } else if c.is_control() {
+            c.escape_default().collect()
+        } else if is_display_altering(c) {
+            c.escape_unicode().collect()
+        } else {
+            let mut s = String::with_capacity(c.len_utf8());
+            s.push(c);
+            s
+        };
+        let unit_len = unit.chars().count();
+        if len.saturating_add(unit_len) > max_chars {
+            return;
+        }
+        out.push_str(&unit);
+        len += unit_len;
+    }
+}
+
+/// `path` for an operator-facing line, escaped like a parse message
+/// and not shortened.
+fn escaped_path(path: &Path) -> String {
+    let mut out = String::new();
+    push_escaped(&mut out, &path.display().to_string(), usize::MAX);
+    out
+}
+
 fn not_a_regular_file() -> HooksConfigError {
     HooksConfigError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -524,7 +650,7 @@ impl fmt::Display for HooksFileError {
         write!(
             f,
             "hooks file {} cannot be loaded: {}",
-            self.path.display(),
+            escaped_path(&self.path),
             self.error
         )
     }
@@ -652,12 +778,14 @@ pub type HookConfigSnapshot = RwLock<Vec<HookConfig>>;
 /// Spawn a tokio task that listens for `SIGHUP` and reloads
 /// `path` into `snapshot` on every signal.
 ///
-/// G1 ships the signal-handler plumbing; the hooks loaded into
-/// the snapshot become live as soon as G3's executor starts
-/// reading from it. Until then this is a no-op observable only
-/// via a `tracing::info!` log line per reload — exactly what the
-/// G1 epic doc calls for ("for now just load + emit a tracing
-/// info on reload").
+/// Each reload goes through the same door as startup,
+/// [`HookConfig::try_load_from_optional`], on a blocking thread
+/// (CONCURRENCY-22). Only a file that loads in full replaces the
+/// snapshot; an absent file, a refused file or a failed load task
+/// keeps the previous snapshot and logs an error (#9637).
+///
+/// No shipped entry point spawns this task yet (issue #9779): a
+/// running daemon picks up a changed hooks file on restart.
 ///
 /// Returns the [`tokio::task::JoinHandle`] so the daemon main
 /// loop can shut the task down on graceful exit.
@@ -678,26 +806,40 @@ pub fn spawn_reload_task(
         };
 
         while sighup.recv().await.is_some() {
-            match HookConfig::load_from_file(&path) {
-                Ok(new_cfg) => {
+            let load_path = path.clone();
+            let loaded =
+                tokio::task::spawn_blocking(move || HookConfig::try_load_from_optional(&load_path))
+                    .await;
+            // Every arm but a full load leaves the previous snapshot in
+            // place: the running daemon keeps its last-known-good hooks.
+            match loaded {
+                Ok(Ok(Some(new_cfg))) => {
                     let count = new_cfg.len();
                     let mut guard = snapshot.write().await;
                     *guard = new_cfg;
                     tracing::info!(
-                        path = %path.display(),
+                        path = %escaped_path(&path),
                         hooks = count,
                         "hooks: reloaded config on SIGHUP"
                     );
                 }
-                Err(e) => {
-                    // Reload failure leaves the previous
-                    // snapshot in place — operators get a loud
-                    // error log but the running daemon keeps
-                    // serving with the last-known-good config.
+                Ok(Ok(None)) => {
                     tracing::error!(
-                        path = %path.display(),
+                        path = %escaped_path(&path),
+                        "hooks: SIGHUP reload found no hooks file; keeping previous config"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
                         error = %e,
                         "hooks: SIGHUP reload failed; keeping previous config"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        path = %escaped_path(&path),
+                        error = %e,
+                        "hooks: SIGHUP reload task failed; keeping previous config"
                     );
                 }
             }
