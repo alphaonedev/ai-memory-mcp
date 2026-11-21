@@ -360,13 +360,7 @@ class Step:
         return self.keys.get("uses", "").split("@", 1)[0]
 
     def mapping(self, key: str) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for line in self.blocks.get(key, []):
-            if _is_comment_or_blank(line) or _indent(line) != KEY_INDENT + 2:
-                continue
-            name, _, value = line.strip().partition(":")
-            out[name] = _scalar(value)
-        return out
+        return _mapping(self.blocks.get(key, []), KEY_INDENT + 2)
 
     def run(self) -> str:
         return "\n".join(line[KEY_INDENT + 2:] for line in self.blocks.get("run", [])).strip("\n")
@@ -444,13 +438,41 @@ class Job:
         return [_parse_step(item) for item in steps]
 
 
+class SourceStr(str):
+    """A mapping value as the lenient reader cut it, plus what the strict decoder needs: `source`
+    is the text after the colon (comment included) and `nested` is the first deeper line below
+    the key ("" when none). #9745 r1: an env value is decoded from `source`, never from the cut."""
+
+    source: str
+    nested: str
+
+    def __new__(cls, text: str, source: str = "", nested: str = "") -> SourceStr:
+        obj = super().__new__(cls, text)
+        obj.source = source
+        obj.nested = nested
+        return obj
+
+
+def _nested_line(lines: list[str], start: int, indent: int) -> str:
+    """The first non-blank, non-comment line at or after index `start` when it is deeper than
+    `indent`, else "". It looks ahead by index (no copy of the tail): the scan of one key stops at
+    the next significant line, so the scans of all keys together are linear (#9771 r1)."""
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if _is_comment_or_blank(line):
+            continue
+        return line.strip() if _indent(line) > indent else ""
+    return ""
+
+
 def _mapping(lines: list[str], indent: int) -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in lines:
+    for index, line in enumerate(lines):
         if _is_comment_or_blank(line) or _indent(line) != indent:
             continue
         name, _, value = line.strip().partition(":")
-        out[name] = _scalar(value)
+        nested = _nested_line(lines, index + 1, indent)
+        out[name] = SourceStr(_scalar(value), value.strip(), nested)
     return out
 
 
@@ -540,8 +562,147 @@ MATRIX_OR_LITERAL_RE = re.compile(
     r"^\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\|\|\s*'([^']*)'\s*\}\}$")
 
 
+class QuotedStr(str):
+    """A matrix value written in quotes: YAML types it as a string whatever its spelling."""
+
+
+# YAML 1.2 core schema (https://yaml.org/spec/1.2.2/#103-core-schema) spellings of a non-string.
+YAML_NULL_RE = re.compile(r"^(?:~|null|Null|NULL)$")
+YAML_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+YAML_INT_RE = re.compile(r"^(?:[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$")
+YAML_FLOAT_RE = re.compile(
+    r"^(?:[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?|[-+]?\.(?:inf|Inf|INF)"
+    r"|\.(?:nan|NaN|NAN))$")
+CANONICAL_INT_RE = re.compile(r"^-?[1-9][0-9]*$")
+
+
+def _yaml_typed_form(text: str) -> str:
+    """The YAML form an unquoted scalar takes when it is not a string, or "" when it is text or a
+    canonical non-zero integer (rendered back as the same text)."""
+    if CANONICAL_INT_RE.match(text):
+        return ""
+    for form, pattern in (("null", YAML_NULL_RE), ("boolean", YAML_BOOL_RE),
+                          ("integer", YAML_INT_RE), ("float", YAML_FLOAT_RE)):
+        if pattern.match(text):
+            return form
+    return ""
+
+
+# #9745 r1 (L2): ONE strict reader for every matrix leg value and env value. A value is decoded to
+# the exact string the runner uses, or the reader raises UnreadForm naming where it is and which
+# form it did not read. There is no default and no raw-text fallback: the forms below are a closed
+# list, and the refusal is the `else`.
+UNREAD_FLOW_MAPPING = "flow mapping"
+UNREAD_FLOW_SEQUENCE = "flow sequence"
+UNREAD_BLOCK_SCALAR = "block scalar"
+UNREAD_ALIAS = "alias"
+UNREAD_ANCHOR = "anchor"
+UNREAD_TAG = "tag"
+UNREAD_EXPRESSION = "expression"
+UNREAD_AFTER_QUOTE = "text after the closing quote"
+UNREAD_UNTERMINATED = "unterminated quote"
+UNREAD_ESCAPE = "escape in a double-quoted scalar"
+UNREAD_COLON = "colon in a plain scalar"
+UNREAD_RESERVED = "reserved indicator"
+UNREAD_FLOW_INDICATOR = "flow indicator at the start of a plain scalar"
+UNREAD_BLOCK_INDICATOR = "block collection indicator"
+UNREAD_CONTROL = "control character"
+UNREAD_NESTED = "nested or continued value"
+UNREAD_INDENT = "mis-indented line"
+UNREAD_DUPLICATE = "duplicate key"
+UNREAD_LINE = "line that is not key: value with a plain identifier key"
+UNREAD_BARE_DASH = "list entry that does not start with a key on the dash line"
+UNREAD_AXIS = "matrix axis"
+UNREAD_STRATEGY_BLOCK = "strategy is not a block mapping"
+UNREAD_STRATEGY_KEY = "strategy key other than fail-fast, max-parallel and matrix"
+UNREAD_MATRIX_BLOCK = "matrix is not a block mapping"
+UNREAD_INCLUDE_BLOCK = "include is not a block list"
+UNREAD_UNQUOTED_FORM = "unquoted YAML {form}"
+
+PLAIN_FIRST_CHAR_REASONS = {
+    "{": UNREAD_FLOW_MAPPING, "[": UNREAD_FLOW_SEQUENCE, ">": UNREAD_BLOCK_SCALAR,
+    "|": UNREAD_BLOCK_SCALAR, "*": UNREAD_ALIAS, "&": UNREAD_ANCHOR, "!": UNREAD_TAG,
+    "@": UNREAD_RESERVED, "`": UNREAD_RESERVED, "%": UNREAD_RESERVED,
+    ",": UNREAD_FLOW_INDICATOR, "]": UNREAD_FLOW_INDICATOR, "}": UNREAD_FLOW_INDICATOR,
+}
+CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+COMMENT_TAIL_RE = re.compile(r"^\s+#")
+PLAIN_COMMENT_RE = re.compile(r"\s#")
+PLAIN_COLON_RE = re.compile(r":(?:\s|$)")
+BLOCK_INDICATOR_RE = re.compile(r"^[-?](?:\s|$)")
+SINGLE_QUOTE, DOUBLE_QUOTE, BACKSLASH = "'", '"', "\\"
+
+
+class UnreadForm(AssertionError):
+    """A YAML form this reader does not model: it names `where`, the form (`reason`) and the text."""
+
+    def __init__(self, where: str, reason: str, text: str) -> None:
+        super().__init__(f"{where}: unread YAML form, {reason}: {text!r}")
+        self.reason = reason
+
+
+def _scan_quoted(text: str, where: str) -> tuple[str, str]:
+    """(the unescaped body, the text after the closing quote) of a fully quoted scalar. Single
+    quotes unescape `''`; a double-quoted scalar with a backslash escape is refused."""
+    quote = text[0]
+    out: list[str] = []
+    index = 1
+    while index < len(text):
+        char = text[index]
+        if quote == DOUBLE_QUOTE and char == BACKSLASH:
+            raise UnreadForm(where, UNREAD_ESCAPE, text)
+        if char == quote:
+            if quote == SINGLE_QUOTE and text[index + 1:index + 2] == SINGLE_QUOTE:
+                out.append(SINGLE_QUOTE)
+                index += 2
+                continue
+            return "".join(out), text[index + 1:]
+        out.append(char)
+        index += 1
+    raise UnreadForm(where, UNREAD_UNTERMINATED, text)
+
+
+def _decode_scalar(raw: str, where: str, allow_expression: bool) -> str:
+    """The string a runner reads from the text after `key:`: a QuotedStr for a quoted scalar, a plain
+    str for a plain scalar, "" for null. Every other form raises UnreadForm (never a default)."""
+    text = raw.strip()
+    if CONTROL_RE.search(text):
+        raise UnreadForm(where, UNREAD_CONTROL, text)
+    if not text or text.startswith("#"):
+        return ""
+    if text[0] in (SINGLE_QUOTE, DOUBLE_QUOTE):
+        body, tail = _scan_quoted(text, where)
+        if tail and not COMMENT_TAIL_RE.match(tail):
+            raise UnreadForm(where, UNREAD_AFTER_QUOTE, text)
+        if not allow_expression and EXPRESSION_OPEN in body:
+            raise UnreadForm(where, UNREAD_EXPRESSION, text)
+        return QuotedStr(body)
+    reason = PLAIN_FIRST_CHAR_REASONS.get(text[0])
+    if reason is None and BLOCK_INDICATOR_RE.match(text):
+        reason = UNREAD_BLOCK_INDICATOR
+    if reason is not None:
+        raise UnreadForm(where, reason, text)
+    plain = PLAIN_COMMENT_RE.split(text, 1)[0].rstrip()
+    if EXPRESSION_OPEN in plain:
+        if not allow_expression:
+            raise UnreadForm(where, UNREAD_EXPRESSION, text)
+    elif PLAIN_COLON_RE.search(plain):
+        raise UnreadForm(where, UNREAD_COLON, text)
+    return plain
+
+
 def _effective_env_value(name: str, raw: str, leg: dict[str, object]) -> str:
-    """The value env var `name` takes on one leg; an expression form other than one fails."""
+    """The value env var `name` takes on one leg; an expression form other than one fails. A value
+    read from a workflow (SourceStr) is decoded by the strict reader first (#9745 r1)."""
+    if isinstance(raw, SourceStr):
+        if raw.nested:
+            raise UnreadForm(name, UNREAD_NESTED, raw.nested)
+        decoded = _decode_scalar(raw.source, name, True)
+        if not isinstance(decoded, QuotedStr):
+            form = _yaml_typed_form(decoded)
+            if form and decoded != "0":
+                raise UnreadForm(name, UNREAD_UNQUOTED_FORM.format(form=form), raw.source.strip())
+        raw = str(decoded)
     if EXPRESSION_OPEN not in raw:
         return raw
     match = MATRIX_OR_LITERAL_RE.match(raw)
@@ -551,11 +712,20 @@ def _effective_env_value(name: str, raw: str, leg: dict[str, object]) -> str:
     value = leg.get(field_name)
     if value is None or value == "":
         return literal
-    # `||` takes the literal for a falsy matrix value (false, 0, ''). _scalar drops quoting, so a
-    # quoted '0' (a truthy string) and a bare 0 (falsy) read the same: refuse rather than guess.
+    # `||` takes the literal for a falsy matrix value (false, 0, ''). A quoted value is a string
+    # and is taken as written (QuotedStr, set by _matrix_include). An unquoted one is typed by
+    # YAML: a bare 0 is falsy and a bare 1.0 renders as 1, so only a canonical non-zero integer is
+    # read as its text; every other bare null, boolean or number spelling is refused (#9745).
+    if isinstance(value, QuotedStr):
+        return str(value)
     if isinstance(value, bool) or str(value).strip() in ("0", "0.0", "-0"):
         raise AssertionError(f"{name}: matrix.{field_name} = {value!r} is truthy when quoted and "
                              f"falsy when not, and this parser drops the quotes: {raw!r}")
+    form = _yaml_typed_form(str(value))
+    if form:
+        raise AssertionError(f"{name}: matrix.{field_name} = {value!r} is an unquoted YAML "
+                             f"{form}, which the runner reads as a typed value, not as this "
+                             f"text: {raw!r}")
     return str(value)
 
 
@@ -598,46 +768,99 @@ def _test_step_labels(job: Job) -> tuple[str, ...]:
     return tuple(s.label() for s in job.steps() if TEST_RUN_RE.search(s.run()))
 
 
+# #9745 r1 (L3): the checks below walk `_reachable_jobs`. The remaining `wf.jobs()` uses in this
+# module are kept on purpose, each commented where it stands: lookups by an explicit job id from
+# a hand table (PAIRS, JOBS, TEST_STEPS, CI_GATE_JOB, the warm workflow), where a missing id is a
+# KeyError and a called workflow is not meant; and the whole-file V-4 key walk, which visits
+# every workflow file and so every called workflow once under its own name.
+def _rust_cache_site_counts() -> tuple[dict[str, dict[str, int]], list[str]]:
+    """({workflow: {job: rust-cache step count}}, problems) over the PR-startable workflows
+    (#9747 r1: L3)."""
+    found: dict[str, dict[str, int]] = {}
+    problems: list[str] = []
+    for name in _all_workflow_names():
+        wf = Workflow.load(name)
+        if not PR_EVENTS & set(wf.events()):
+            continue
+        jobs, unread = _reachable_jobs(wf)
+        problems.extend(f"{name}: {problem}" for problem in unread)
+        for job_id, _job_wf, job in jobs:
+            count = sum(1 for s in job.steps() if s.uses_name() == RUST_CACHE)
+            if count:
+                found.setdefault(name, {})[job_id] = count
+    return found, problems
+
+
+def _rust_cache_step_failures(names: list[str]) -> list[str]:
+    """Every rust-cache step of `names` that is not the pinned sha, push-only save, no on-failure."""
+    failures: list[str] = []
+    for name in names:
+        jobs, unread = _reachable_jobs(Workflow.load(name))
+        failures.extend(f"{name}: {problem}" for problem in unread)
+        for job_id, _job_wf, job in jobs:
+            for step in job.steps():
+                if step.uses_name() != RUST_CACHE:
+                    continue
+                sha = step.keys["uses"].partition("@")[2]
+                if sha != RUST_CACHE_SHA:
+                    failures.append(f"{name}:{job_id}: rust-cache sha {sha!r} is not the pinned "
+                                    f"{RUST_CACHE_SHA}")
+                save_if = step.mapping("with").get("save-if")
+                if save_if != SAVE_IF_PUSH:
+                    failures.append(f"{name}:{job_id}: save-if is {save_if!r}, not the push gate")
+                if "cache-on-failure" in step.mapping("with"):
+                    failures.append(f"{name}:{job_id}: cache-on-failure is set")
+    return failures
+
+
+def _pr_cache_action_failures() -> list[str]:
+    """Every actions/cache step, and every unguarded cache save, of a PR-startable workflow."""
+    failures: list[str] = []
+    for name in _all_workflow_names():
+        wf = Workflow.load(name)
+        if not PR_EVENTS & set(wf.events()):
+            continue
+        jobs, unread = _reachable_jobs(wf)
+        failures.extend(f"{name}: {problem}" for problem in unread)
+        for job_id, _job_wf, job in jobs:
+            for step in job.steps():
+                where = f"{name}:{job_id}: {step.label()}"
+                if step.uses_name() == CACHE_COMBINED:
+                    failures.append(f"{where}: actions/cache saves in its post step on every event")
+                if step.uses_name() == CACHE_SAVE and not step.keys.get("if", "").startswith(PUSH_GATE):
+                    failures.append(f"{where}: cache save is not gated on a push: "
+                                    f"{step.keys.get('if')!r}")
+    return failures
+
+
+def _shared_key_owners(names: list[str]) -> dict[str, list[str]]:
+    """{shared-key: [workflow:job of every rust-cache step that sets it]} over `names`."""
+    shared_keys: dict[str, list[str]] = {}
+    for name in names:
+        jobs, unread = _reachable_jobs(Workflow.load(name))
+        if unread:
+            raise AssertionError("\n".join(f"{name}: {problem}" for problem in unread))
+        for job_id, _job_wf, job in jobs:
+            for step in job.steps():
+                if step.uses_name() == RUST_CACHE and "shared-key" in step.mapping("with"):
+                    shared_keys.setdefault(step.mapping("with")["shared-key"], []).append(
+                        f"{name}:{job_id}")
+    return shared_keys
+
+
 class RustCacheSaveScope9681(unittest.TestCase):
     """Every cache write in a PR-startable workflow comes from a push run (#9681)."""
 
     def test_rust_cache_sites_match_the_hand_table(self) -> None:
-        found: dict[str, dict[str, int]] = {}
-        for name in _all_workflow_names():
-            wf = Workflow.load(name)
-            if not PR_EVENTS & set(wf.events()):
-                continue
-            for job_id, job in wf.jobs().items():
-                count = sum(1 for s in job.steps() if s.uses_name() == RUST_CACHE)
-                if count:
-                    found.setdefault(name, {})[job_id] = count
-        self.assertEqual(found, RUST_CACHE_SITES)
+        counts, problems = _rust_cache_site_counts()
+        self.assertEqual(problems, [])
+        self.assertEqual(counts, RUST_CACHE_SITES)
 
     def test_every_rust_cache_step_saves_only_on_push(self) -> None:
-        for name in [*RUST_CACHE_SITES, WARM]:
-            wf = Workflow.load(name)
-            for job_id, job in wf.jobs().items():
-                for step in job.steps():
-                    if step.uses_name() != RUST_CACHE:
-                        continue
-                    with self.subTest(workflow=name, job=job_id):
-                        self.assertEqual(step.keys["uses"].split("@", 1)[1], RUST_CACHE_SHA)
-                        self.assertEqual(step.mapping("with").get("save-if"), SAVE_IF_PUSH)
-                        self.assertNotIn("cache-on-failure", step.mapping("with"))
+        self.assertEqual(_rust_cache_step_failures([*RUST_CACHE_SITES, WARM]), [])
 
     def test_no_pr_run_saves_an_actions_cache(self) -> None:
-        for name in _all_workflow_names():
-            wf = Workflow.load(name)
-            if not PR_EVENTS & set(wf.events()):
-                continue
-            for job_id, job in wf.jobs().items():
-                for step in job.steps():
-                    with self.subTest(workflow=name, job=job_id, step=step.label()):
-                        self.assertNotEqual(step.uses_name(), CACHE_COMBINED,
-                                            "actions/cache saves in its post step on every event")
-                        if step.uses_name() == CACHE_SAVE:
-                            self.assertTrue(step.keys.get("if", "").startswith(PUSH_GATE),
-                                            step.keys.get("if"))
+        self.assertEqual(_pr_cache_action_failures(), [])
 
     def test_hf_model_cache_restores_everywhere_and_saves_on_push(self) -> None:
         for (name, job_id), (restore_name, save_name) in HF_CACHE_SITES.items():
@@ -672,6 +895,8 @@ class RustCacheSaveScope9681(unittest.TestCase):
         self.assertEqual(concurrency.get("group"), "rust-cache-warm-${{ github.ref_name }}")
         self.assertEqual(concurrency.get("cancel-in-progress"), "false")
         self.assertNotIn("pull_request", "\n".join(wf.lines))
+        # wf.jobs() walk kept (#9745 r1 L3): the warm workflow is push-only and its jobs are
+        # checked by their own ids; a job-level `uses:` there would fail `runs-on` below.
         for job_id, job in wf.jobs().items():
             with self.subTest(job=job_id):
                 self.assertEqual(job.scalar("runs-on"), "ubuntu-latest")
@@ -716,13 +941,7 @@ class RustCacheSaveScope9681(unittest.TestCase):
     def test_warm_jobs_write_the_key_their_pr_jobs_restore(self) -> None:
         warm = Workflow.load(WARM)
         warm_jobs = warm.jobs()
-        shared_keys: dict[str, list[str]] = {}
-        for name in [*RUST_CACHE_SITES, WARM]:
-            for job_id, job in Workflow.load(name).jobs().items():
-                for step in job.steps():
-                    if step.uses_name() == RUST_CACHE and "shared-key" in step.mapping("with"):
-                        shared_keys.setdefault(step.mapping("with")["shared-key"], []).append(
-                            f"{name}:{job_id}")
+        shared_keys = _shared_key_owners([*RUST_CACHE_SITES, WARM])
         for pr_name, pr_job_id, warm_job_id, shared_key in PAIRS:
             pr_wf = Workflow.load(pr_name)
             pr_job, warm_job = pr_wf.jobs()[pr_job_id], warm_jobs[warm_job_id]
@@ -984,6 +1203,9 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                                          f"cache key {literal!r} is used outside the four paired "
                                          f"rust-cache steps (V-4)")
         for name in _all_workflow_names():
+            # wf.jobs() walk kept (#9745 r1 L3): this visits EVERY workflow file, and a called
+            # workflow is itself one of those files, so each rust-cache step is seen once, under
+            # its own file name; `_reachable_jobs` would see it a second time through its caller.
             for job_id, job in Workflow.load(name).jobs().items():
                 for step in job.steps():
                     if step.uses_name() != RUST_CACHE:
@@ -1271,6 +1493,33 @@ def _subcommand(command: str) -> str:
     return rest[0]
 
 
+def _gh_number(value: object) -> float:
+    """GitHub's number coercion (null 0, false 0, true 1, "" 0, a numeric string its value, any
+    other string NaN)."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (bool, int)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    try:
+        return float(int(text, 0)) if text[:2].lower() in ("0x", "0o") else float(text)
+    except ValueError:
+        return float("nan")
+
+
+def _gh_equal(left: object, right: object) -> bool:
+    """`==` of the workflow expression language: two strings compare case-insensitively, two values
+    of one type compare directly, any other pair compares as numbers (#9771 r1: a typed leg value
+    such as 1, true or null meets `matrix.x == 1` the way the runner reads it)."""
+    if isinstance(left, str) and isinstance(right, str):
+        return left.lower() == right.lower()
+    if type(left) is type(right):
+        return left == right
+    return _gh_number(left) == _gh_number(right)
+
+
 def _eval_if(expr: str, matrix: dict[str, object]) -> bool:
     """Evaluate a step `if:` for a hosted PR leg; an unknown name or form fails closed."""
     text = expr.strip()
@@ -1335,8 +1584,7 @@ def _eval_if(expr: str, matrix: dict[str, object]) -> bool:
         if peek() in ("==", "!="):
             op = take()
             right = atom()
-            same = (str(left).lower() == str(right).lower()
-                    if isinstance(left, str) and isinstance(right, str) else left == right)
+            same = _gh_equal(left, right)
             return same if op == "==" else not same
         return left
 
@@ -1368,32 +1616,159 @@ def _eval_if(expr: str, matrix: dict[str, object]) -> bool:
     return bool(result)
 
 
-def _matrix_include(job: Job) -> list[dict[str, object]]:
-    """The `strategy.matrix.include` entries of a job, scalar values only."""
-    entries: list[dict[str, object]] = []
-    include_indent = -1
-    item_indent = -1
-    for line in job.block("strategy"):
-        if _is_comment_or_blank(line):
-            continue
+STRATEGY_KEYS = ("fail-fast", "max-parallel", "matrix")
+MATRIX_INCLUDE_KEY = "include"
+KEY_LINE_RE = re.compile(r"^([A-Za-z_][\w-]*):(?:[ \t]+(.*))?$")
+DASH_LINE_RE = re.compile(r"^-( +)(\S.*)$")
+LegValue = str | bool | int | None
+
+
+def _leg_value(raw: str, where: str) -> LegValue:
+    """The value a plain or quoted matrix leg scalar has for the runner (#9771 r1, finding 1).
+
+    ONE typing for every consumer of a leg: a quoted scalar is a QuotedStr, a plain true/false in
+    any YAML 1.2 case is a bool, null/~/empty is None, a canonical integer (and 0) is an int, and a
+    plain yes/no/on/off or other text is a str (YAML 1.2 core schema). An unquoted hex, octal,
+    signed, zero-padded or float number has no single reading here, so it is refused by name
+    (UnreadForm), never returned as text that a consumer could read as a different type."""
+    decoded = _decode_scalar(raw, where, False)
+    if isinstance(decoded, QuotedStr):
+        return decoded
+    if decoded == "" or YAML_NULL_RE.match(decoded):
+        return None
+    if YAML_BOOL_RE.match(decoded):
+        return decoded.lower() == "true"
+    if decoded == "0" or CANONICAL_INT_RE.match(decoded):
+        return int(decoded)
+    form = _yaml_typed_form(decoded)
+    if form:
+        raise UnreadForm(where, UNREAD_UNQUOTED_FORM.format(form=form), decoded)
+    return decoded
+
+
+def _leg_text(value: object) -> str:
+    """A leg value as the runner renders it in a label or a command: true/false lowercase, a number
+    in decimal; None has no text and is refused by the caller."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _inline_value(job: Job, key: str) -> str:
+    """The text after `key:` on the job's own key line ("" when empty or only a comment)."""
+    for line in job.lines:
+        if _indent(line) == 4 and line.strip().startswith(key + ":"):
+            rest = line.strip()[len(key) + 1:].strip()
+            return "" if rest.startswith("#") else rest
+    return ""
+
+
+def _key_line(stripped: str, where: str) -> tuple[str, str]:
+    match = KEY_LINE_RE.match(stripped)
+    if not match:
+        raise UnreadForm(where, UNREAD_LINE, stripped)
+    return match.group(1), (match.group(2) or "").strip()
+
+
+def _inline_text(value: str) -> str:
+    """`value` unless it is empty or only a comment."""
+    return "" if value.startswith("#") else value
+
+
+def _key_sections(lines: list[str], indent: int, where: str
+                  ) -> list[tuple[str, str, list[str], str]]:
+    """Split block-mapping `lines` at `indent` into (key, inline text, deeper lines, key line)."""
+    sections: list[tuple[str, str, list[str], str]] = []
+    seen: set[str] = set()  # a set, not a scan of `sections` per key: linear in the keys (#9771 r1)
+    for line in lines:
         stripped = line.strip()
-        if stripped == "include:":
-            include_indent = _indent(line)
+        if _indent(line) < indent:
+            raise UnreadForm(where, UNREAD_INDENT, stripped)
+        if _indent(line) > indent:
+            sections[-1][2].append(line)
             continue
-        if include_indent < 0:
-            continue
-        if _indent(line) <= include_indent:
-            break
-        if stripped.startswith("- ") and (item_indent < 0 or _indent(line) == item_indent):
-            item_indent = _indent(line)
+        key, value = _key_line(stripped, where)
+        if key in seen:
+            raise UnreadForm(where, UNREAD_DUPLICATE, stripped)
+        seen.add(key)
+        sections.append((key, _inline_text(value), [], stripped))
+    return sections
+
+
+def _include_entries(children: list[str], where: str) -> list[dict[str, object]]:
+    """The legs of a block list of `key: scalar` mappings; any other line form is refused."""
+    if not children[0].strip().startswith("-"):
+        raise UnreadForm(where, UNREAD_INCLUDE_BLOCK, children[0].strip())
+    entries: list[dict[str, object]] = []
+    dash_indent = _indent(children[0])
+    key_indent = -1
+    last_key = ""
+    for line in children:
+        indent, stripped = _indent(line), line.strip()
+        item_where = f"{where}[{len(entries) - 1}]"
+        if indent == dash_indent:
+            item_where = f"{where}[{len(entries)}]"
+            if not stripped.startswith("-"):
+                raise UnreadForm(f"{where}[{len(entries) - 1}]", UNREAD_INDENT, stripped)
+            if stripped == "-":
+                raise UnreadForm(item_where, UNREAD_BARE_DASH, stripped)
+            dash = DASH_LINE_RE.match(stripped)
+            if not dash:
+                raise UnreadForm(item_where, UNREAD_LINE, stripped)
+            content = dash.group(2)
+            if content[0] in "{[":
+                raise UnreadForm(item_where, PLAIN_FIRST_CHAR_REASONS[content[0]], content)
+            key_indent = dash_indent + 1 + len(dash.group(1))
             entries.append({})
-            stripped = stripped[2:]
-        elif _indent(line) != item_indent + 2:
-            continue
-        name, _, value = stripped.partition(":")
-        scalar = _scalar(value)
-        entries[-1][name.strip()] = {"true": True, "false": False}.get(scalar, scalar)
+            last_key = ""
+        elif indent == key_indent:
+            content = stripped
+        elif indent > key_indent and last_key:
+            raise UnreadForm(f"{item_where}.{last_key}", UNREAD_NESTED, stripped)
+        else:
+            raise UnreadForm(item_where, UNREAD_INDENT, stripped)
+        key, value = _key_line(content, item_where)
+        if key in entries[-1]:
+            raise UnreadForm(f"{item_where}.{key}", UNREAD_DUPLICATE, value)
+        entries[-1][key] = _leg_value(value, f"{item_where}.{key}")
+        last_key = key
     return entries
+
+
+def _matrix_include(job: Job) -> list[dict[str, object]]:
+    """The `strategy.matrix.include` legs of a job, as the runner reads them (#9745 r1: a closed
+    list of forms; any other strategy, matrix, include or leg form raises UnreadForm)."""
+    where = f"{job.job_id}: strategy"
+    inline = _inline_value(job, "strategy")
+    if inline:
+        raise UnreadForm(where, UNREAD_STRATEGY_BLOCK, inline)
+    lines = [line for line in job.block("strategy") if not _is_comment_or_blank(line)]
+    if not lines:
+        return []
+    matrix: tuple[str, list[str]] | None = None
+    for key, value, children, line in _key_sections(lines, _indent(lines[0]), where):
+        if key not in STRATEGY_KEYS:
+            raise UnreadForm(where, UNREAD_STRATEGY_KEY, line)
+        if key == "matrix":
+            matrix = (value, children)
+        elif children:
+            raise UnreadForm(f"{where}.{key}", UNREAD_NESTED, children[0].strip())
+    if matrix is None:
+        return []
+    matrix_where = f"{where}.matrix"
+    value, children = matrix
+    if value or not children:
+        raise UnreadForm(matrix_where, UNREAD_MATRIX_BLOCK, value)
+    include: tuple[str, list[str]] | None = None
+    for key, value, deeper, line in _key_sections(children, _indent(children[0]), matrix_where):
+        if key != MATRIX_INCLUDE_KEY:
+            raise UnreadForm(matrix_where, UNREAD_AXIS, line)
+        include = (value, deeper)
+    assert include is not None  # children is not empty and holds no key but include
+    value, deeper = include
+    if value or not deeper:
+        raise UnreadForm(f"{matrix_where}.include", UNREAD_INCLUDE_BLOCK, value)
+    return _include_entries(deeper, f"{matrix_where}.include")
 
 
 def _hosted_legs(job: Job) -> list[dict[str, object]]:
@@ -1598,6 +1973,82 @@ def _event_gated(step: Step, how: str) -> bool:
     return value is None or value.startswith("${{ github.event_name == 'push' && ")
 
 
+# --- #9681 r3 (#9747): a job-level `uses:` reaches the called workflow's jobs -----------------------
+LOCAL_WORKFLOW_PREFIX = "./.github/workflows/"
+CALL_DEPTH_MAX = 8
+
+
+JOB_ID_RE = re.compile(r"[A-Za-z_][\w-]*")
+JOB_USES_RE = re.compile(r"""^(?:uses|'uses'|"uses"):(?:\s+(.*))?$""")
+
+
+def _job_uses(job: Job, where: str) -> str | None:
+    """The decoded job-level `uses` value, or None when the job has no `uses` key (#9771 r1).
+
+    The key is read at the indent of the job body's first significant line (a body indented deeper
+    than four spaces is still a call) and may be quoted; the value goes through the strict decoder,
+    so an anchor, tag, flow form or other unread spelling raises UnreadForm."""
+    body = [line for line in job.lines if not _is_comment_or_blank(line)]
+    if not body:
+        return None
+    indent = _indent(body[0])
+    for line in body:
+        match = JOB_USES_RE.match(line.strip()) if _indent(line) == indent else None
+        if match:
+            return str(_decode_scalar(match.group(1) or "", f"{where}.uses", True))
+    return None
+
+
+def _reachable_jobs(wf: Workflow, prefix: str = "", trail: tuple[str, ...] = ()
+                    ) -> tuple[list[tuple[str, Workflow, Job]], list[str]]:
+    """(every job a run of `wf` reaches as (job id, its workflow, job), the problems).
+
+    A job of `wf` is itself. A job with a job-level `uses: ./.github/workflows/<x>.yml` stands for
+    the jobs of that workflow, id `<caller job>/<called job>`, followed to CALL_DEPTH_MAX. Any
+    other job-level `uses` (a remote reusable workflow, a `@ref`, a path outside the tree, a
+    missing file, a cycle) is a problem: its jobs cannot be read, so the rule fails closed.
+
+    The caller job's own `if:` is ignored: a call that a push-only or otherwise gated condition
+    would skip still counts its inner jobs. That is the conservative side: it can over-report a
+    site (a false problem a reader resolves by naming the site), never hide one (fail-closed)."""
+    jobs: list[tuple[str, Workflow, Job]] = []
+    problems: list[str] = []
+    for job_id, job in wf.jobs().items():
+        where = f"{prefix}{job_id}"
+        try:
+            uses = _job_uses(job, where)
+        except UnreadForm as exc:
+            problems.append(str(exc))
+            continue
+        if uses is None:
+            if job.scalar("runs-on") is None:
+                problems.append(f"{where}: job has neither a readable runs-on nor a readable uses")
+                continue
+            jobs.append((prefix + job_id, wf, job))
+            continue
+        called = uses[len(LOCAL_WORKFLOW_PREFIX):]
+        if (not uses.startswith(LOCAL_WORKFLOW_PREFIX) or "@" in called or "/" in called
+                or not called.endswith((".yml", ".yaml"))):
+            problems.append(f"{where}: job-level uses of a reusable workflow that is not a "
+                            f"local {LOCAL_WORKFLOW_PREFIX}<name>.yml: {uses!r}")
+        elif called in (*trail, wf.name):
+            problems.append(f"{where}: reusable workflow call cycle: {uses!r}")
+        elif len(trail) >= CALL_DEPTH_MAX:
+            problems.append(f"{where}: reusable workflow call chain deeper than "
+                            f"{CALL_DEPTH_MAX}: {uses!r}")
+        elif called not in _all_workflow_names():
+            problems.append(f"{where}: reusable workflow {uses!r} is not a file")
+        else:
+            callee = Workflow.load(called)
+            if not any(JOB_ID_RE.fullmatch(inner_id) for inner_id in callee.jobs()):
+                problems.append(f"{where}: reusable workflow {uses!r} has no readable jobs")
+                continue
+            inner, found = _reachable_jobs(callee, f"{where}/", (*trail, wf.name))
+            jobs.extend(inner)
+            problems.extend(found)
+    return jobs, problems
+
+
 def _pr_cache_writers() -> tuple[list[tuple[str, str, str]], list[str]]:
     """(writers a PR run reaches, problems) across every PR-startable workflow and the warm one."""
     reached: list[tuple[str, str, str]] = []
@@ -1607,7 +2058,9 @@ def _pr_cache_writers() -> tuple[list[tuple[str, str, str]], list[str]]:
         pr_run = bool(PR_EVENTS & set(wf.events()))
         if not pr_run and name != WARM:
             continue
-        for job_id, job in wf.jobs().items():
+        jobs, found = _reachable_jobs(wf)
+        problems.extend(f"{name}: {problem}" for problem in found)
+        for job_id, _job_wf, job in jobs:
             for step in job.steps():
                 where = (name, job_id, step.label())
                 uses = step.uses_name()
@@ -1782,7 +2235,10 @@ def _runs_on(job: Job, leg: dict[str, object]) -> str:
     if field_name not in leg:
         raise AssertionError(f"{job.job_id}: runs-on reads matrix.{field_name}, which leg "
                              f"{_leg_id(leg)!r} does not set")
-    return str(leg[field_name])
+    if leg[field_name] is None:
+        raise AssertionError(f"{job.job_id}: runs-on reads matrix.{field_name}, which is null on "
+                             f"leg {_leg_id(leg)!r}")
+    return _leg_text(leg[field_name])
 
 
 def _maybe_reached(expr: str | None, leg: dict[str, object]) -> bool:
@@ -1796,10 +2252,13 @@ def _maybe_reached(expr: str | None, leg: dict[str, object]) -> bool:
 
 
 def _expand_matrix(command: str, leg: dict[str, object]) -> str:
-    """Replace `${{ matrix.<name> }}` with a string value the leg sets; anything else stays."""
+    """Replace `${{ matrix.<name> }}` with the text of a non-empty string, boolean or number value
+    the leg sets; a null, an empty value and anything else stays (and reads as a dynamic command)."""
     def sub(match: re.Match[str]) -> str:
         value = leg.get(match.group(1))
-        return value if isinstance(value, str) and value else match.group(0)
+        if value is None or value == "":
+            return match.group(0)
+        return _leg_text(value)
     return MATRIX_REF_RE.sub(sub, command)
 
 
@@ -1812,7 +2271,9 @@ def _hosted_pr_rust_cache_sites() -> tuple[dict[SiteKey, tuple[Workflow, Job, di
         wf = Workflow.load(name)
         if not PR_EVENTS & set(wf.events()):
             continue
-        for job_id, job in wf.jobs().items():
+        jobs, found = _reachable_jobs(wf)
+        problems.extend(f"{name}: {problem}" for problem in found)
+        for job_id, job_wf, job in jobs:
             caches = [s for s in job.steps() if s.uses_name() == RUST_CACHE]
             if not caches or not _maybe_reached(job.scalar("if"), {}):
                 continue
@@ -1830,8 +2291,19 @@ def _hosted_pr_rust_cache_sites() -> tuple[dict[SiteKey, tuple[Workflow, Job, di
                 if SELF_HOSTED in runner:
                     continue
                 if any(_maybe_reached(s.keys.get("if"), leg) for s in caches):
-                    sites[(name, job_id, _leg_id(leg))] = (wf, job, leg)
+                    _add_site(sites, problems, (name, job_id, _leg_id(leg)), (job_wf, job, leg))
     return sites, problems
+
+
+def _add_site(sites: dict[SiteKey, tuple[Workflow, Job, dict[str, object]]],
+              problems: list[str], key: SiteKey,
+              value: tuple[Workflow, Job, dict[str, object]]) -> None:
+    """Record one site; a second leg with the same key is a problem, never an overwrite (#9746)."""
+    if key in sites:
+        problems.append(f"two hosted legs of one job share the site key {_site_name(key)}: the "
+                        f"second would overwrite the first; give them different first keys")
+        return
+    sites[key] = value
 
 
 def _cold_commands(wf: Workflow, job: Job, leg: dict[str, object]) -> tuple[tuple[str, ...], list[str]]:
@@ -2033,9 +2505,10 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
     def test_hosted_legs_read_runs_on_and_fail_closed(self) -> None:
         """Sibling (#9681 r2): the PAIRS leg filter reads `runs-on`, not one matrix field's text."""
         def job(runs_on: str, *legs: str) -> Job:
-            lines = [f"    runs-on: {runs_on}", "    strategy:", "      matrix:", "        include:"]
-            for leg in legs:
-                lines.append(f"          - {leg}")
+            lines = [f"    runs-on: {runs_on}"]
+            if legs:  # an `include:` with no entries is a refused form (#9745 r1), so no strategy
+                lines += ["    strategy:", "      matrix:", "        include:"]
+                lines += [f"          - {leg}" for leg in legs]
             return Job("j", lines)
 
         by_os = job("${{ matrix.os }}", "os: ubuntu-latest", "os: '[self-hosted, linux-fed]'")
@@ -2046,6 +2519,890 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
             _hosted_legs(job("${{ inputs.runner }}", "runner: ubuntu-latest"))
         self.assertEqual(str(caught.exception),
                          "j: unrecognised runs-on form: '${{ inputs.runner }}'")
+
+
+# --- #9681 r3 (#9745, #9746, #9747) ----------------------------------------------------------------
+# Hand-written expected columns. Each unquoted spelling the YAML 1.2 core schema types as
+# something other than a string, with the form the refusal names.
+UNQUOTED_TYPED_FORMS: tuple[tuple[str, str], ...] = (
+    ("null", "null"), ("Null", "null"), ("NULL", "null"), ("~", "null"),
+    ("true", "boolean"), ("True", "boolean"), ("TRUE", "boolean"),
+    ("false", "boolean"), ("False", "boolean"), ("FALSE", "boolean"),
+    ("0x0", "integer"), ("0x1F", "integer"), ("0o7", "integer"), ("+1", "integer"),
+    ("01", "integer"), ("00", "integer"), ("-01", "integer"),
+    ("1.0", "float"), ("0.0e0", "float"), ("1e3", "float"), (".5", "float"), ("5.", "float"),
+    ("-0.0", "float"), (".nan", "float"), (".NaN", "float"), (".NAN", "float"),
+    (".inf", "float"), ("-.inf", "float"), ("+.INF", "float"),
+)
+# Unquoted text and canonical non-zero integers render as themselves: taken as written.
+UNQUOTED_TEXT_ROWS: tuple[str, ...] = ("1", "-5", "12", "debug", "line-tables-only", "1x", "0b1",
+                                       "nulls", "1_000", "0x", ".", "e3")
+# Quoted spellings are strings whatever they spell: taken as written.
+QUOTED_TEXT_ROWS: tuple[str, ...] = ("null", "~", "0", "0.0", "False", "0x0", "1.0", ".nan", "true")
+UNQUOTED_FORM_MESSAGE = ("K: matrix.cargo_debug = {value!r} is an unquoted YAML {form}, which the "
+                         "runner reads as a typed value, not as this text: "
+                         "\"${{{{ matrix.cargo_debug || 'line-tables-only' }}}}\"")
+
+STUB_SHA = "0" * 40
+STUB_CACHE_STEP = (f"      - name: Cache\n        uses: {RUST_CACHE}@{STUB_SHA}\n"
+                   "        with:\n          save-if: ${{ github.event_name == 'push' }}\n")
+
+
+def _stub_workflow(event: str, jobs: str) -> str:
+    return f"name: stub\non:\n  {event}:\njobs:\n{jobs}"
+
+
+def _stub_job(job_id: str, matrix: str = "", steps: str = STUB_CACHE_STEP) -> str:
+    return f"  {job_id}:\n    runs-on: ubuntu-latest\n{matrix}    steps:\n{steps}"
+
+
+def _stub_matrix(*legs: str) -> str:
+    body = "".join(f"          - {leg}\n" for leg in legs)
+    return f"    strategy:\n      matrix:\n        include:\n{body}"
+
+
+def _with_stub_workflows(texts: dict[str, str]):
+    """Patch the workflow tree seen by the enumerators to in-memory text (no file is written)."""
+    from unittest import mock
+    module = sys.modules[__name__]
+
+    def load(name: str) -> Workflow:
+        return Workflow(name, texts[name].splitlines())
+
+    stack = mock.patch.object(module, "_all_workflow_names", lambda: sorted(texts))
+    load_patch = mock.patch.object(Workflow, "load", staticmethod(load))
+    return stack, load_patch
+
+
+class ReachableWorkflowSites9681R3(unittest.TestCase):
+    """#9681 r3: the key-env evaluator reads typed YAML (#9745); the site enumerator names every
+    leg (#9746) and follows job-level `uses:` (#9747)."""
+
+    def _sites(self, texts: dict[str, str]):
+        names_patch, load_patch = _with_stub_workflows(texts)
+        with names_patch, load_patch:
+            return _hosted_pr_rust_cache_sites()
+
+    def _writers(self, texts: dict[str, str]):
+        names_patch, load_patch = _with_stub_workflows(texts)
+        with names_patch, load_patch:
+            return _pr_cache_writers()
+
+    def test_unquoted_typed_matrix_values_are_refused_naming_the_form(self) -> None:
+        for value, form in UNQUOTED_TYPED_FORMS:
+            with self.subTest(value=value):
+                with self.assertRaises(AssertionError) as caught:
+                    _effective_env_value("K", KEY_ENV_MATRIX_FORM, {"cargo_debug": value})
+                self.assertEqual(str(caught.exception),
+                                 UNQUOTED_FORM_MESSAGE.format(value=value, form=form))
+
+    def test_unquoted_text_and_quoted_values_are_taken_as_written(self) -> None:
+        for value in UNQUOTED_TEXT_ROWS:
+            with self.subTest(value=value, quoted=False):
+                self.assertEqual(
+                    _effective_env_value("K", KEY_ENV_MATRIX_FORM, {"cargo_debug": value}), value)
+        for value in QUOTED_TEXT_ROWS:
+            for quote in ("'", '"'):
+                with self.subTest(value=value, quote=quote):
+                    job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:",
+                                    "        include:",
+                                    f"          - cargo_debug: {quote}{value}{quote}"])
+                    (leg,) = _matrix_include(job)
+                    self.assertEqual(_effective_env_value("K", KEY_ENV_MATRIX_FORM, leg), value)
+
+    def test_unquoted_matrix_spelling_is_refused_end_to_end(self) -> None:
+        # #9771 r1: the reader refuses an unquoted hex or float at read time (one place, every
+        # consumer), and types a plain null as null (the env expression takes its literal)
+        for value, form in (("0x0", "integer"), ("1.0", "float")):
+            with self.subTest(value=value):
+                job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:",
+                                "        include:", f"          - cargo_debug: {value}"])
+                with self.assertRaises(AssertionError) as caught:
+                    _matrix_include(job)
+                self.assertEqual(str(caught.exception), _unread(
+                    "j: strategy.matrix.include[0].cargo_debug", f"unquoted YAML {form}", value))
+        job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:",
+                        "        include:", "          - cargo_debug: null"])
+        (leg,) = _matrix_include(job)
+        self.assertEqual(_effective_env_value("K", KEY_ENV_MATRIX_FORM, leg), EXPRESSION_DEFAULT)
+
+    def test_two_hosted_legs_with_one_first_key_are_a_problem(self) -> None:
+        legs = _stub_matrix("target: t", "target: t\n            os: other")
+        sites, problems = self._sites({"w.yml": _stub_workflow(
+            "pull_request", _stub_job("m", legs))})
+        self.assertEqual(sorted(sites), [("w.yml", "m", "target=t")])
+        self.assertEqual(problems, ["two hosted legs of one job share the site key "
+                                    "w.yml:m[target=t]: the second would overwrite the first; "
+                                    "give them different first keys"])
+        legs = _stub_matrix("target: t", "target: u")
+        sites, problems = self._sites({"w.yml": _stub_workflow(
+            "pull_request", _stub_job("m", legs))})
+        self.assertEqual((sorted(sites), problems),
+                         ([("w.yml", "m", "target=t"), ("w.yml", "m", "target=u")], []))
+
+    def test_called_workflow_jobs_are_sites_of_the_caller(self) -> None:
+        call = "  call:\n    uses: ./.github/workflows/called.yml\n"
+        texts = {"caller.yml": _stub_workflow("pull_request", call),
+                 "called.yml": _stub_workflow("workflow_call", _stub_job("inner"))}
+        sites, problems = self._sites(texts)
+        self.assertEqual((sorted(sites), problems), ([("caller.yml", "call/inner", "")], []))
+        # the same workflow behind a push-only caller is not reached by a pull request
+        texts["caller.yml"] = _stub_workflow("push", call)
+        self.assertEqual(self._sites(texts), ({}, []))
+        # two levels
+        texts = {"a.yml": _stub_workflow("pull_request", "  x:\n    uses: ./.github/workflows/b.yml\n"),
+                 "b.yml": _stub_workflow("workflow_call", "  y:\n    uses: ./.github/workflows/c.yml\n"),
+                 "c.yml": _stub_workflow("workflow_call", _stub_job("z"))}
+        sites, problems = self._sites(texts)
+        self.assertEqual((sorted(sites), problems), ([("a.yml", "x/y/z", "")], []))
+
+    def test_unreadable_reusable_workflow_calls_fail_closed(self) -> None:
+        forms = {
+            "remote": ("owner/repo/.github/workflows/r.yml@v1",
+                       "job-level uses of a reusable workflow that is not a local "
+                       "./.github/workflows/<name>.yml: 'owner/repo/.github/workflows/r.yml@v1'"),
+            "local-with-ref": ("./.github/workflows/called.yml@main",
+                               "job-level uses of a reusable workflow that is not a local "
+                               "./.github/workflows/<name>.yml: './.github/workflows/called.yml@main'"),
+            "outside-tree": ("./other/called.yml",
+                             "job-level uses of a reusable workflow that is not a local "
+                             "./.github/workflows/<name>.yml: './other/called.yml'"),
+            "subdirectory": ("./.github/workflows/sub/called.yml",
+                             "job-level uses of a reusable workflow that is not a local "
+                             "./.github/workflows/<name>.yml: './.github/workflows/sub/called.yml'"),
+            "missing": ("./.github/workflows/nothere.yml",
+                        "reusable workflow './.github/workflows/nothere.yml' is not a file"),
+        }
+        for label, (uses, reason) in forms.items():
+            with self.subTest(form=label):
+                texts = {"caller.yml": _stub_workflow("pull_request", f"  call:\n    uses: {uses}\n"),
+                         "called.yml": _stub_workflow("workflow_call", _stub_job("inner"))}
+                for fn in (self._sites, self._writers):
+                    result = fn(texts)
+                    self.assertEqual(result[1], [f"caller.yml: call: {reason}"])
+        cycle = {"a.yml": _stub_workflow("pull_request", "  x:\n    uses: ./.github/workflows/b.yml\n"),
+                 "b.yml": _stub_workflow("workflow_call", "  y:\n    uses: ./.github/workflows/b.yml\n")}
+        self.assertEqual(self._sites(cycle)[1], [
+            "a.yml: x/y: reusable workflow call cycle: './.github/workflows/b.yml'"])
+        self.assertEqual(self._writers(cycle)[1], [
+            "a.yml: x/y: reusable workflow call cycle: './.github/workflows/b.yml'"])
+
+    def _chain(self, last: int) -> dict[str, str]:
+        """w0 (a pull_request workflow) calls w1 ... calls w<last>, which holds the job `leaf`."""
+        names = [f"w{n}.yml" for n in range(last + 1)]
+        texts = {name: _stub_workflow(
+            "pull_request" if n == 0 else "workflow_call",
+            f"  c:\n    uses: ./.github/workflows/{names[n + 1]}\n")
+            for n, name in enumerate(names[:-1])}
+        texts[names[-1]] = _stub_workflow("workflow_call", _stub_job("leaf"))
+        return texts
+
+    def test_call_chain_one_deeper_than_the_limit_is_refused_as_too_deep(self) -> None:
+        # w0 .. w9: the call of w9 comes from w8, whose trail already holds eight workflows.
+        sites, problems = self._sites(self._chain(9))
+        self.assertEqual(sites, {})
+        self.assertEqual(problems, [
+            "w0.yml: c/c/c/c/c/c/c/c/c: reusable workflow call chain deeper than 8: "
+            "'./.github/workflows/w9.yml'"])
+        self.assertEqual(self._writers(self._chain(9))[1], problems)
+
+    def test_call_chain_at_the_limit_is_followed(self) -> None:
+        # w0 .. w8: eight calls, the last job is `leaf`.
+        sites, problems = self._sites(self._chain(8))
+        self.assertEqual((sorted(sites), problems), ([("w0.yml", "c/c/c/c/c/c/c/c/leaf", "")], []))
+        sites, problems = self._sites(self._chain(7))
+        self.assertEqual((sorted(sites), problems), ([("w0.yml", "c/c/c/c/c/c/c/leaf", "")], []))
+
+    def test_call_chain_messages_name_which_limit_fired(self) -> None:
+        cycle = {"a.yml": _stub_workflow("pull_request", "  x:\n    uses: ./.github/workflows/b.yml\n"),
+                 "b.yml": _stub_workflow("workflow_call", "  y:\n    uses: ./.github/workflows/a.yml\n")}
+        self.assertEqual(self._sites(cycle)[1], [
+            "a.yml: x/y: reusable workflow call cycle: './.github/workflows/a.yml'"])
+        self.assertNotIn("deeper", self._sites(cycle)[1][0])
+        self.assertNotIn("cycle", self._sites(self._chain(9))[1][0])
+
+    def test_cache_writer_in_a_called_workflow_is_reached(self) -> None:
+        writer = ("      - name: Docker layers\n        uses: actions/cache@" + STUB_SHA + "\n")
+        call = "  call:\n    uses: ./.github/workflows/called.yml\n"
+        texts = {"caller.yml": _stub_workflow("pull_request", call),
+                 "called.yml": _stub_workflow("workflow_call", _stub_job("inner", steps=writer))}
+        reached, problems = self._writers(texts)
+        self.assertEqual(problems, ["('caller.yml', 'call/inner', 'Docker layers'): actions/cache "
+                                    "saves in its post step on every event"])
+        texts["caller.yml"] = _stub_workflow("push", call)
+        self.assertEqual(self._writers(texts), ([], []))
+
+
+# --- #9745 r1 (L3): the three save-scope checks read the jobs a PR run reaches ------------------
+FOREIGN_SHA = "1" * 40
+CALLER_CALLS_INNER = "  call:\n    uses: ./.github/workflows/inner.yml\n"
+FOREIGN_RUST_CACHE_STEP = (
+    f"      - name: Cache\n        uses: {RUST_CACHE}@{FOREIGN_SHA}\n        with:\n"
+    "          save-if: ${{ github.event_name == 'push' }}\n          cache-on-failure: true\n")
+UNGATED_CACHE_STEPS = (
+    f"      - name: Docker layers\n        uses: actions/cache@{STUB_SHA}\n"
+    f"      - name: Save it\n        uses: actions/cache/save@{STUB_SHA}\n        if: always()\n")
+REMOTE_CALL = "owner/repo/.github/workflows/r.yml@v1"
+REMOTE_CALL_PROBLEM = ("caller.yml: call: job-level uses of a reusable workflow that is not a "
+                       "local ./.github/workflows/<name>.yml: 'owner/repo/.github/workflows/r.yml@v1'")
+
+
+def _caller_and_inner(steps: str, event: str = "pull_request", call: str = CALLER_CALLS_INNER
+                      ) -> dict[str, str]:
+    return {"caller.yml": _stub_workflow(event, call),
+            "inner.yml": _stub_workflow("workflow_call", _stub_job("inner", steps=steps))}
+
+
+def _under_stubs(texts: dict[str, str], fn: Callable, *args):
+    names_patch, load_patch = _with_stub_workflows(texts)
+    with names_patch, load_patch:
+        return fn(*args)
+
+
+class CalledWorkflowSaveScope9745R1(unittest.TestCase):
+    """#9745 r1 L3: the hand-table, pin and no-PR-cache checks follow a job-level `uses:` like the
+    site enumerator does (a foreign sha and cache-on-failure inside a called workflow are found)."""
+
+    def test_site_count_follows_a_called_workflow(self) -> None:
+        texts = _caller_and_inner(FOREIGN_RUST_CACHE_STEP)
+        self.assertEqual(_under_stubs(texts, _rust_cache_site_counts),
+                         ({"caller.yml": {"call/inner": 1}}, []))
+
+    def test_pin_and_on_failure_checks_follow_a_called_workflow(self) -> None:
+        texts = _caller_and_inner(FOREIGN_RUST_CACHE_STEP)
+        self.assertEqual(_under_stubs(texts, _rust_cache_step_failures, ["caller.yml"]), [
+            f"caller.yml:call/inner: rust-cache sha {FOREIGN_SHA!r} is not the pinned "
+            f"{RUST_CACHE_SHA}",
+            "caller.yml:call/inner: cache-on-failure is set"])
+
+    def test_pr_cache_action_check_follows_a_called_workflow(self) -> None:
+        texts = _caller_and_inner(UNGATED_CACHE_STEPS)
+        self.assertEqual(_under_stubs(texts, _pr_cache_action_failures), [
+            "caller.yml:call/inner: Docker layers: actions/cache saves in its post step on every "
+            "event",
+            "caller.yml:call/inner: Save it: cache save is not gated on a push: 'always()'"])
+        texts = _caller_and_inner(UNGATED_CACHE_STEPS, event="push")
+        self.assertEqual(_under_stubs(texts, _pr_cache_action_failures), [])
+
+    def test_an_unreadable_call_is_reported_by_each_check(self) -> None:
+        texts = _caller_and_inner(
+            FOREIGN_RUST_CACHE_STEP, call=f"  call:\n    uses: {REMOTE_CALL}\n")
+        self.assertEqual(_under_stubs(texts, _rust_cache_site_counts), ({}, [REMOTE_CALL_PROBLEM]))
+        self.assertEqual(_under_stubs(texts, _rust_cache_step_failures, ["caller.yml"]),
+                         [REMOTE_CALL_PROBLEM])
+        self.assertEqual(_under_stubs(texts, _pr_cache_action_failures), [REMOTE_CALL_PROBLEM])
+
+    def test_shared_key_owners_follow_a_called_workflow(self) -> None:
+        steps = (f"      - name: Cache\n        uses: {RUST_CACHE}@{STUB_SHA}\n        with:\n"
+                 "          shared-key: k\n")
+        texts = _caller_and_inner(steps)
+        self.assertEqual(_under_stubs(texts, _shared_key_owners, ["caller.yml"]),
+                         {"k": ["caller.yml:call/inner"]})
+
+    def test_shared_key_owners_refuse_an_unreadable_call(self) -> None:
+        texts = _caller_and_inner(
+            FOREIGN_RUST_CACHE_STEP, call=f"  call:\n    uses: {REMOTE_CALL}\n")
+        with self.assertRaises(AssertionError) as caught:
+            _under_stubs(texts, _shared_key_owners, ["caller.yml"])
+        self.assertEqual(str(caught.exception), REMOTE_CALL_PROBLEM)
+
+
+class StrategyStructureRefusals9745R1(unittest.TestCase):
+    """#9745 r1: strategy, matrix and include structure forms the first hand-mutant run found
+    unpinned (each case is red on a mutant that drops its branch)."""
+
+    @staticmethod
+    def _strategy_job(*lines: str) -> Job:
+        return Job("j", ["    runs-on: x", "    strategy:", *lines])
+
+    def test_structure_refusals(self) -> None:
+        include = ["        include:", "          - target: t"]
+        cases = (
+            (["      fail-fast: false", "        extra: 1", "      matrix:", *include],
+             "j: strategy.fail-fast", R_NESTED, "extra: 1"),
+            (["      matrix:", *include, "      matrix:", *include],
+             "j: strategy", R_DUPLICATE, "matrix:"),
+            (["      matrix:", *include, "        include:", "          - target: u"],
+             "j: strategy.matrix", R_DUPLICATE, "include:"),
+            (["        fail-fast: false", "      matrix:", *include],
+             "j: strategy", R_INDENT, "matrix:"),
+            (["      matrix:", "        include:", "          target: t"],
+             "j: strategy.matrix.include", R_INCLUDE_BLOCK, "target: t"),
+            (["      matrix:", "        include:", "          -x: 1"],
+             "j: strategy.matrix.include[0]", R_LINE, "-x: 1"),
+            (["      matrix:", *include, "          cargo_debug: 1"],
+             "j: strategy.matrix.include[0]", R_INDENT, "cargo_debug: 1"),
+        )
+        for lines, where, reason, text in cases:
+            with self.subTest(reason=reason, text=text):
+                with self.assertRaises(UnreadForm) as caught:
+                    _matrix_include(self._strategy_job(*lines))
+                self.assertEqual(str(caught.exception), _unread(where, reason, text))
+
+    def test_a_strategy_without_a_matrix_has_no_legs(self) -> None:
+        self.assertEqual(_matrix_include(self._strategy_job("      fail-fast: false")), [])
+        self.assertEqual(_matrix_include(Job("j", ["    runs-on: x"])), [])
+
+
+class AddSiteFirstWins9746R1(unittest.TestCase):
+    """#9745 r1 (surviving mutant M3): the first leg of a key stays recorded; the second is a
+    problem. Sentinel values make a dropped early `return` (second overwrites first) visible."""
+
+    def test_a_second_leg_with_the_same_key_never_replaces_the_first(self) -> None:
+        sites: dict = {}
+        problems: list[str] = []
+        key = ("w.yml", "m", "target=t")
+        first, second, third = ("wf-1", "job-1", {"n": 1}), ("wf-2", "job-2", {"n": 2}), \
+            ("wf-3", "job-3", {"n": 3})
+        _add_site(sites, problems, key, first)
+        self.assertEqual((sites, problems), ({key: first}, []))
+        _add_site(sites, problems, key, second)
+        self.assertIs(sites[key], first)
+        self.assertEqual(problems, ["two hosted legs of one job share the site key "
+                                    "w.yml:m[target=t]: the second would overwrite the first; "
+                                    "give them different first keys"])
+        other = ("w.yml", "m", "target=u")
+        _add_site(sites, problems, other, third)
+        self.assertEqual((sites, len(problems)), ({key: first, other: third}, 1))
+
+
+# --- #9745 r1 (L2): one closed-list decoder; an unread form is refused by name ------------------
+EXPRESSION_DEFAULT = "line-tables-only"
+LEG_HEAD = ["    runs-on: x", "    strategy:", "      matrix:", "        include:"]
+LEG_WHERE = "j: strategy.matrix.include[0].cargo_debug"
+TRUTHY_ZERO_MESSAGE = ("K: matrix.cargo_debug = 0 is truthy when quoted and falsy when not, and "
+                       "this parser drops the quotes: " + repr(KEY_ENV_MATRIX_FORM))
+# Reason strings, written out here (the code under test must produce exactly these).
+R_FLOW_MAPPING, R_FLOW_SEQUENCE = "flow mapping", "flow sequence"
+R_BLOCK_SCALAR, R_ALIAS, R_ANCHOR, R_TAG = "block scalar", "alias", "anchor", "tag"
+R_EXPRESSION = "expression"
+R_AFTER_QUOTE = "text after the closing quote"
+R_UNTERMINATED = "unterminated quote"
+R_ESCAPE = "escape in a double-quoted scalar"
+R_COLON = "colon in a plain scalar"
+R_RESERVED = "reserved indicator"
+R_FLOW_INDICATOR = "flow indicator at the start of a plain scalar"
+R_BLOCK_INDICATOR = "block collection indicator"
+R_CONTROL = "control character"
+R_NESTED = "nested or continued value"
+R_INDENT = "mis-indented line"
+R_DUPLICATE = "duplicate key"
+R_LINE = "line that is not key: value with a plain identifier key"
+R_BARE_DASH = "list entry that does not start with a key on the dash line"
+R_AXIS = "matrix axis"
+R_STRATEGY_BLOCK = "strategy is not a block mapping"
+R_STRATEGY_KEY = "strategy key other than fail-fast, max-parallel and matrix"
+R_MATRIX_BLOCK = "matrix is not a block mapping"
+R_INCLUDE_BLOCK = "include is not a block list"
+
+
+def _unread(where: str, reason: str, text: str) -> str:
+    return f"{where}: unread YAML form, {reason}: {text!r}"
+
+
+def _leg_job(*lines: str) -> Job:
+    return Job("j", [*LEG_HEAD, *lines])
+
+
+def _leg_outcome(written: str, after_colon: str = " ") -> tuple[str, object]:
+    """What the leg `cargo_debug:<after_colon><written>` gives the key env: ("value", text) or
+    ("refused", the refusal text)."""
+    job = _leg_job("          - target: t", f"            cargo_debug:{after_colon}{written}")
+    try:
+        (leg,) = _matrix_include(job)
+        return "value", _effective_env_value("K", KEY_ENV_MATRIX_FORM, leg)
+    except AssertionError as exc:
+        return "refused", str(exc)
+
+
+# (body, quoting, written, expected). expected is ("value", text), ("unread", reason) or
+# ("refused", the exact message). The comment and whitespace variants are generated below.
+CORPUS_ROWS: tuple[tuple[str, str, str, tuple[str, str]], ...] = (
+    ("abc", "none", "abc", ("value", "abc")),
+    ("abc", "single", "'abc'", ("value", "abc")),
+    ("abc", "double", '"abc"', ("value", "abc")),
+    ("it's", "none", "it's", ("value", "it's")),
+    ("it's", "single", "'it''s'", ("value", "it's")),
+    ("it's", "double", '"it\'s"', ("value", "it's")),
+    ("12", "none", "12", ("value", "12")),
+    ("12", "single", "'12'", ("value", "12")),
+    ("12", "double", '"12"', ("value", "12")),
+    ("zero", "none", "0", ("refused", TRUTHY_ZERO_MESSAGE)),
+    ("zero", "single", "'0'", ("value", "0")),
+    ("zero", "double", '"0"', ("value", "0")),
+    ("empty", "none", "", ("value", EXPRESSION_DEFAULT)),
+    ("empty", "single", "''", ("value", EXPRESSION_DEFAULT)),
+    ("empty", "double", '""', ("value", EXPRESSION_DEFAULT)),
+    ("hash", "none", "a#b", ("value", "a#b")),
+    ("hash", "single", "'a #b'", ("value", "a #b")),
+    ("hash", "double", '"a #b"', ("value", "a #b")),
+    ("json", "single", """'["ubuntu-latest"]'""", ("value", '["ubuntu-latest"]')),
+    ("comma", "none", "ubuntu-latest,sqlite", ("value", "ubuntu-latest,sqlite")),
+)
+AFTER_COLON_VARIANTS = (" ", "   ")
+TAIL_VARIANTS = ("", "  ")
+COMMENT_VARIANTS = ("", " # c", "   # it's a 'comment' \"here\"")
+# (written, reason): every form the evaluator cannot read as one string is refused by name.
+REFUSED_FORMS: tuple[tuple[str, str], ...] = (
+    ("{a: 1}", R_FLOW_MAPPING), ("{}", R_FLOW_MAPPING),
+    ("[0]", R_FLOW_SEQUENCE), ("[0, 1]", R_FLOW_SEQUENCE), ("[]", R_FLOW_SEQUENCE),
+    (">-", R_BLOCK_SCALAR), ("|", R_BLOCK_SCALAR), (">", R_BLOCK_SCALAR), ("|+", R_BLOCK_SCALAR),
+    ("*d", R_ALIAS), ("&d 0", R_ANCHOR), ("!!str 0", R_TAG), ("!x 0", R_TAG),
+    ("${{ inputs.d }}", R_EXPRESSION), ("'${{ inputs.d }}'", R_EXPRESSION),
+    ('"${{ inputs.d }}"', R_EXPRESSION), ("pre-${{ inputs.d }}", R_EXPRESSION),
+    ("'0'#c", R_AFTER_QUOTE), ("'a' b", R_AFTER_QUOTE), ('"a"b', R_AFTER_QUOTE),
+    ("'a", R_UNTERMINATED), ('"a', R_UNTERMINATED), ("'a''", R_UNTERMINATED),
+    ('"a\\n"', R_ESCAPE), ('"a\\"b"', R_ESCAPE),
+    ("a: b", R_COLON),
+    ("@x", R_RESERVED), ("`x", R_RESERVED), ("%x", R_RESERVED),
+    (",x", R_FLOW_INDICATOR), ("]x", R_FLOW_INDICATOR), ("}x", R_FLOW_INDICATOR),
+    ("- x", R_BLOCK_INDICATOR), ("-", R_BLOCK_INDICATOR), ("? x", R_BLOCK_INDICATOR),
+    ("a\x01b", R_CONTROL),
+)
+
+
+class UnreadFormRefusals9745R1(unittest.TestCase):
+    """#9745 r1 L2: a matrix leg value, an env value or a key part is evaluated to the exact string
+    the runner uses, or refused naming the unread form. No default and no raw text is returned for
+    a form the reader does not model."""
+
+    def test_generated_corpus_evaluates_exactly(self) -> None:
+        count = 0
+        for body, quoting, written, expected in CORPUS_ROWS:
+            for after in AFTER_COLON_VARIANTS:
+                for tail in TAIL_VARIANTS:
+                    for comment in COMMENT_VARIANTS:
+                        text = written + tail + comment
+                        with self.subTest(body=body, quoting=quoting, after=after, tail=tail,
+                                          comment=comment):
+                            count += 1
+                            kind, want = expected
+                            if kind == "value":
+                                self.assertEqual(_leg_outcome(text, after), ("value", want))
+                            elif kind == "unread":
+                                self.assertEqual(_leg_outcome(text, after), (
+                                    "refused", _unread(LEG_WHERE, want, text.strip())))
+                            else:
+                                self.assertEqual(_leg_outcome(text, after), ("refused", want))
+        self.assertEqual(count, len(CORPUS_ROWS) * len(AFTER_COLON_VARIANTS)
+                         * len(TAIL_VARIANTS) * len(COMMENT_VARIANTS))
+
+    def test_unreadable_leg_forms_are_refused_by_name(self) -> None:
+        for written, reason in REFUSED_FORMS:
+            for after in AFTER_COLON_VARIANTS:
+                with self.subTest(written=written, after=after):
+                    self.assertEqual(_leg_outcome(written, after), (
+                        "refused", _unread(LEG_WHERE, reason, written.strip())))
+
+    def test_the_comment_does_not_hide_an_unread_form(self) -> None:
+        for written, reason in (("*d", R_ALIAS), ("[0]", R_FLOW_SEQUENCE), ("!!str 0", R_TAG)):
+            with self.subTest(written=written):
+                text = f"{written} # c"
+                self.assertEqual(_leg_outcome(text), (
+                    "refused", _unread(LEG_WHERE, reason, text)))
+
+    def test_unquoted_typed_leg_values_keep_their_refusals(self) -> None:
+        # #9771 r1: the reader refuses a number it cannot type, and reads a plain null as null
+        # (the env expression then takes its literal, as the runner does)
+        self.assertEqual(_leg_outcome("1.5"), (
+            "refused", _unread(LEG_WHERE, "unquoted YAML float", "1.5")))
+        self.assertEqual(_leg_outcome("null"), ("value", EXPRESSION_DEFAULT))
+        # every YAML form of the refusal list is still read as itself when written quoted
+        self.assertEqual(_leg_outcome("'1.5'"), ("value", "1.5"))
+        self.assertEqual(_leg_outcome("pre-x"), ("value", "pre-x"))
+
+    def test_matrix_axes_are_refused(self) -> None:
+        for lines, text in (
+                (["      matrix:", "        cargo_debug: [0, 1]"], "cargo_debug: [0, 1]"),
+                (["      matrix:", "        cargo_debug:", "          - 0"], "cargo_debug:"),
+                (["      matrix:", "        exclude:", "          - os: a"], "exclude:"),
+                (["      matrix:", "        include:", "          - target: t",
+                  "        cargo_debug: [0, 1]"], "cargo_debug: [0, 1]"),
+                (["      matrix:", "        os: [a, b]", "        include:",
+                  "          - target: t"], "os: [a, b]")):
+            with self.subTest(text=text, lines=lines):
+                job = Job("j", ["    runs-on: x", "    strategy:", *lines])
+                with self.assertRaises(AssertionError) as caught:
+                    _matrix_include(job)
+                self.assertEqual(str(caught.exception),
+                                 _unread("j: strategy.matrix", R_AXIS, text))
+
+    def test_matrix_and_include_written_as_expressions_are_refused(self) -> None:
+        cases = (
+            (["    strategy: ${{ fromJSON(x) }}"], "j: strategy", R_STRATEGY_BLOCK,
+             "${{ fromJSON(x) }}"),
+            (["    strategy:", "      matrix: ${{ fromJSON(x) }}"], "j: strategy.matrix",
+             R_MATRIX_BLOCK, "${{ fromJSON(x) }}"),
+            (["    strategy:", "      matrix: {include: []}"], "j: strategy.matrix",
+             R_MATRIX_BLOCK, "{include: []}"),
+            (["    strategy:", "      matrix:", "        include: ${{ fromJSON(x) }}"],
+             "j: strategy.matrix.include", R_INCLUDE_BLOCK, "${{ fromJSON(x) }}"),
+            (["    strategy:", "      matrix:", "        include: [{a: 1}]"],
+             "j: strategy.matrix.include", R_INCLUDE_BLOCK, "[{a: 1}]"),
+            (["    strategy:", "      matrix:", "        include:"],
+             "j: strategy.matrix.include", R_INCLUDE_BLOCK, ""),
+            (["    strategy:", "      timeout: 3"], "j: strategy", R_STRATEGY_KEY, "timeout: 3"),
+            (["    strategy:", "      matrix:", "        include:", "          - {t: 1}"],
+             "j: strategy.matrix.include[0]", R_FLOW_MAPPING, "{t: 1}"),
+        )
+        for lines, where, reason, text in cases:
+            with self.subTest(reason=reason, text=text):
+                job = Job("j", ["    runs-on: x", *lines])
+                with self.assertRaises(AssertionError) as caught:
+                    _matrix_include(job)
+                self.assertEqual(str(caught.exception), _unread(where, reason, text))
+
+    def test_real_strategy_shapes_are_read_exactly(self) -> None:
+        job = Job("j", ["    runs-on: x", "    strategy:", "      fail-fast: false",
+                        "      max-parallel: 4", "      matrix:", "        include:",
+                        "          - leg: ubuntu-latest,sqlite", "            node: n  # note",
+                        "            shared_target: true", "            cargo_debug: '0'",
+                        "            timeout: 95", "          - target: t",
+                        "            runner: '[\"self-hosted\",\"linux-fed\"]'"])
+        legs = _matrix_include(job)
+        self.assertEqual(legs, [{"leg": "ubuntu-latest,sqlite", "node": "n",
+                                 "shared_target": True, "cargo_debug": "0", "timeout": 95},
+                                {"target": "t", "runner": '["self-hosted","linux-fed"]'}])
+        self.assertEqual([type(v) for v in legs[0].values()], [str, str, bool, QuotedStr, int])
+        self.assertEqual(_matrix_include(Job("j", ["    runs-on: x"])), [])
+
+    def test_leg_structure_refusals(self) -> None:
+        entry = "          - target: t"
+        cases = (
+            ([entry, "           cargo_debug: 1"], "j: strategy.matrix.include[0]", R_INDENT,
+             "cargo_debug: 1"),
+            ([entry, "            cargo_debug:", "              deep: 1"],
+             "j: strategy.matrix.include[0].cargo_debug", R_NESTED, "deep: 1"),
+            ([entry, "            cargo_debug: abc", "              def"],
+             "j: strategy.matrix.include[0].cargo_debug", R_NESTED, "def"),
+            ([entry, "            target: u"], "j: strategy.matrix.include[0].target", R_DUPLICATE,
+             "u"),
+            ([entry, "            'a': 1"], "j: strategy.matrix.include[0]", R_LINE, "'a': 1"),
+            ([entry, "            cargo_debug:1"], "j: strategy.matrix.include[0]", R_LINE,
+             "cargo_debug:1"),
+            ([entry, "            just text"], "j: strategy.matrix.include[0]", R_LINE,
+             "just text"),
+            (["          - 'a': 1"], "j: strategy.matrix.include[0]", R_LINE, "'a': 1"),
+            (["          -", "            target: t"], "j: strategy.matrix.include[0]",
+             R_BARE_DASH, "-"),
+            ([entry, "          - target: u", "            cargo_debug: *d"],
+             "j: strategy.matrix.include[1].cargo_debug", R_ALIAS, "*d"),
+        )
+        for lines, where, reason, text in cases:
+            with self.subTest(reason=reason, text=text):
+                with self.assertRaises(AssertionError) as caught:
+                    _matrix_include(_leg_job(*lines))
+                self.assertEqual(str(caught.exception), _unread(where, reason, text))
+
+    def test_every_refusal_is_reported_naming_workflow_and_job(self) -> None:
+        sites_of = ReachableWorkflowSites9681R3()._sites
+        cases = (
+            ("      matrix:\n        cargo_debug: [0, 1]\n", "w.yml: m: strategy.matrix: unread "
+             "YAML form, matrix axis: 'cargo_debug: [0, 1]'"),
+            ("      matrix:\n        include:\n          - {t: 1}\n", "w.yml: m: "
+             "strategy.matrix.include[0]: unread YAML form, flow mapping: '{t: 1}'"),
+            ("      matrix: ${{ fromJSON(x) }}\n", "w.yml: m: strategy.matrix: unread YAML form, "
+             "matrix is not a block mapping: '${{ fromJSON(x) }}'"),
+            ("      matrix:\n        include: ${{ fromJSON(x) }}\n", "w.yml: m: "
+             "strategy.matrix.include: unread YAML form, include is not a block list: "
+             "'${{ fromJSON(x) }}'"),
+            ("      matrix:\n        include:\n          - target: t\n"
+             "            cargo_debug: '0' # c\n            os: *d\n", "w.yml: m: "
+             "strategy.matrix.include[0].os: unread YAML form, alias: '*d'"),
+        )
+        for strategy, problem in cases:
+            with self.subTest(problem=problem):
+                job = f"  m:\n    runs-on: ubuntu-latest\n    strategy:\n{strategy}    steps:\n" \
+                      + STUB_CACHE_STEP
+                sites, problems = sites_of({"w.yml": _stub_workflow("pull_request", job)})
+                self.assertEqual((sites, problems), ({}, [problem]))
+
+
+# Env values: `CARGO_X: <text>` read through Job.env() and _effective_key_env.
+ENV_NAME = "CARGO_X"
+ENV_EXPRESSION = "${{ matrix.cargo_debug || 'x' }}"
+ENV_VALUE_ROWS: tuple[tuple[str, dict[str, object], dict[str, str]], ...] = (
+    ("abc", {}, {ENV_NAME: "abc"}),
+    ("'abc'", {}, {ENV_NAME: "abc"}),
+    ('"abc"', {}, {ENV_NAME: "abc"}),
+    ("abc # c", {}, {ENV_NAME: "abc"}),
+    ("'abc' # c", {}, {ENV_NAME: "abc"}),
+    ('"abc"   # c', {}, {ENV_NAME: "abc"}),
+    ("'it''s'", {}, {ENV_NAME: "it's"}),
+    ("-C link-arg=-fuse-ld=mold", {}, {ENV_NAME: "-C link-arg=-fuse-ld=mold"}),
+    ('"-C link-arg=-fuse-ld=mold"', {}, {ENV_NAME: "-C link-arg=-fuse-ld=mold"}),
+    ("0", {}, {ENV_NAME: "0"}),
+    ("'0'", {}, {ENV_NAME: "0"}),
+    ('"0"', {}, {ENV_NAME: "0"}),
+    ("10", {}, {ENV_NAME: "10"}),
+    ('"false"', {}, {ENV_NAME: "false"}),
+    ("", {}, {}),
+    ("''", {}, {}),
+    ("# only a comment", {}, {}),
+    (ENV_EXPRESSION, {}, {ENV_NAME: "x"}),
+    (ENV_EXPRESSION + " # c", {}, {ENV_NAME: "x"}),
+    ('"' + ENV_EXPRESSION + '"', {}, {ENV_NAME: "x"}),
+    ("'${{ matrix.cargo_debug || ''x'' }}'", {}, {ENV_NAME: "x"}),
+    (ENV_EXPRESSION, {"cargo_debug": QuotedStr("1")}, {ENV_NAME: "1"}),
+)
+ENV_REFUSED_ROWS: tuple[tuple[str, str], ...] = (
+    ("*d", R_ALIAS), ("&d 0", R_ANCHOR), ("!!str 0", R_TAG), ("[0]", R_FLOW_SEQUENCE),
+    ("{a: 1}", R_FLOW_MAPPING), (">-", R_BLOCK_SCALAR), ("|", R_BLOCK_SCALAR),
+    ("'a' b", R_AFTER_QUOTE), ("'a", R_UNTERMINATED), ('"a\\n"', R_ESCAPE),
+    ("a: b", R_COLON), ("@x", R_RESERVED), ("- x", R_BLOCK_INDICATOR),
+    ("1.5", "unquoted YAML float"), ("null", "unquoted YAML null"), ("~", "unquoted YAML null"),
+    ("true", "unquoted YAML boolean"), ("0x1F", "unquoted YAML integer"),
+    ("01", "unquoted YAML integer"),
+)
+
+
+def _env_outcome(text: str, leg: dict[str, object], *more: str) -> tuple[str, object]:
+    job = Job("j", ["    env:", f"      {ENV_NAME}: {text}", *more])
+    try:
+        return "value", _effective_key_env(job.env(), leg)
+    except AssertionError as exc:
+        return "refused", str(exc)
+
+
+class UnreadEnvForms9745R1(unittest.TestCase):
+    """#9745 r1 L2 (env side): an env value is its decoded text or an expression this module
+    evaluates; any other form is refused naming the env var and the form."""
+
+    def test_env_values_evaluate_exactly(self) -> None:
+        for text, leg, want in ENV_VALUE_ROWS:
+            with self.subTest(text=text, leg=leg):
+                self.assertEqual(_env_outcome(text, leg), ("value", want))
+
+    def test_unread_env_forms_are_refused_by_name(self) -> None:
+        for text, reason in ENV_REFUSED_ROWS:
+            with self.subTest(text=text):
+                self.assertEqual(_env_outcome(text, {}), (
+                    "refused", _unread(ENV_NAME, reason, text.strip())))
+
+    def test_other_expressions_keep_their_refusals(self) -> None:
+        for text in ("${{ inputs.d }}", "pre-" + ENV_EXPRESSION, "'${{ inputs.d }}'",
+                     "${{ matrix.a || 'x' }} tail"):
+            with self.subTest(text=text):
+                kind, message = _env_outcome(text, {})
+                self.assertEqual(kind, "refused")
+                self.assertTrue(message.startswith(
+                    f"{ENV_NAME}: unrecognised expression form in an env value: "), message)
+
+    def test_nested_and_continued_env_values_are_refused(self) -> None:
+        self.assertEqual(_env_outcome("", {}, "        a: 1"), (
+            "refused", _unread(ENV_NAME, R_NESTED, "a: 1")))
+        self.assertEqual(_env_outcome("abc", {}, "        def"), (
+            "refused", _unread(ENV_NAME, R_NESTED, "def")))
+        self.assertEqual(_env_outcome("abc", {}, "      OTHER: 1"), ("value", {ENV_NAME: "abc"}))
+
+    def test_a_matrix_read_by_an_env_must_be_exact_end_to_end(self) -> None:
+        # The leg a real job gives and the env text it reads, together.
+        job = _leg_job("          - target: t", "            cargo_debug: '0' # off")
+        (leg,) = _matrix_include(job)
+        self.assertEqual(_effective_key_env({ENV_NAME: ENV_EXPRESSION}, leg), {ENV_NAME: "0"})
+        job = _leg_job("          - target: t", "            cargo_debug: 'it''s'")
+        (leg,) = _matrix_include(job)
+        self.assertEqual(_effective_key_env({ENV_NAME: ENV_EXPRESSION}, leg), {ENV_NAME: "it's"})
+
+
+# --- #9771 r1 (finding 1): every plain leg scalar is typed or refused ------------------------------
+# The expected column is written out by hand from the YAML 1.2 core schema and the runner's rules
+# (a plain `false` is a boolean, `null`/`~`/empty is null, a canonical integer is a number).
+SKIP_IF_STEP = (f"      - name: Cache\n        uses: {RUST_CACHE}@{STUB_SHA}\n"
+                "        if: ${{ !matrix.skip }}\n"
+                "        with:\n          save-if: ${{ github.event_name == 'push' }}\n")
+EQ_ONE_IF_STEP = SKIP_IF_STEP.replace("${{ !matrix.skip }}", "${{ matrix.skip == 1 }}")
+SKIP_WHERE = "w.yml: j: strategy.matrix.include[0].skip: unread YAML form, "
+SITE_PREFIX = ("w.yml", "j")
+RAN = "ran"          # the step runs on the leg: the site is listed
+SKIPPED = "skipped"  # the step does not run on the leg: no site, no problem
+# (written after `skip:`, step `if:` form, outcome); outcome is RAN, SKIPPED or the exact problem.
+LEG_SCALAR_ROWS: tuple[tuple[str, str, str], ...] = (
+    ("False", "!", RAN), ("false", "!", RAN), ("FALSE", "!", RAN),
+    ("True", "!", SKIPPED), ("true", "!", SKIPPED), ("TRUE", "!", SKIPPED),
+    ("null", "!", RAN), ("Null", "!", RAN), ("NULL", "!", RAN), ("~", "!", RAN),
+    ("", "!", RAN),
+    ("0", "!", RAN), ("1", "!", SKIPPED), ("12", "!", SKIPPED),
+    ("1.0", "!", SKIP_WHERE + "unquoted YAML float: '1.0'"),
+    ("0x10", "!", SKIP_WHERE + "unquoted YAML integer: '0x10'"),
+    ("0o7", "!", SKIP_WHERE + "unquoted YAML integer: '0o7'"),
+    ("+1", "!", SKIP_WHERE + "unquoted YAML integer: '+1'"),
+    ("01", "!", SKIP_WHERE + "unquoted YAML integer: '01'"),
+    ("-0", "!", SKIP_WHERE + "unquoted YAML integer: '-0'"),
+    (".5", "!", SKIP_WHERE + "unquoted YAML float: '.5'"),
+    (".nan", "!", SKIP_WHERE + "unquoted YAML float: '.nan'"),
+    ("yes", "!", SKIPPED), ("no", "!", SKIPPED), ("on", "!", SKIPPED), ("off", "!", SKIPPED),
+    ("abc", "!", SKIPPED),
+    ("'false'", "!", SKIPPED), ('"false"', "!", SKIPPED), ("''", "!", RAN), ('""', "!", RAN),
+    ("'0'", "!", SKIPPED), ("'null'", "!", SKIPPED),
+    ("1", "== 1", RAN), ("0", "== 1", SKIPPED), ("'1'", "== 1", RAN), ("true", "== 1", RAN),
+    ("1.0", "== 1", SKIP_WHERE + "unquoted YAML float: '1.0'"),
+    ("0x10", "== 1", SKIP_WHERE + "unquoted YAML integer: '0x10'"),
+    ("null", "== 1", SKIPPED),
+)
+
+
+def _leg_scalar_sites(written: str, condition: str):
+    step = SKIP_IF_STEP if condition == "!" else EQ_ONE_IF_STEP
+    job = _stub_job("j", _stub_matrix(f"skip: {written}"), step)
+    names_patch, load_patch = _with_stub_workflows(
+        {"w.yml": _stub_workflow("pull_request", job)})
+    with names_patch, load_patch:
+        sites, problems = _hosted_pr_rust_cache_sites()
+    return sorted(sites), problems
+
+
+class LegScalarForms9771R1(unittest.TestCase):
+    """#9771 r1 finding 1: for every plain scalar a matrix leg can carry, a consumer of the leg
+    reader gets the typed value or the reader reports a problem; a running rust-cache site is never
+    returned as no site without a problem."""
+
+    def test_every_scalar_form_gives_the_exact_site_set_or_problem(self) -> None:
+        for written, condition, want in LEG_SCALAR_ROWS:
+            with self.subTest(written=written, condition=condition):
+                sites, problems = _leg_scalar_sites(written, condition)
+                if want == RAN:
+                    self.assertEqual((len(sites), problems), (1, []))
+                    self.assertEqual(sites[0][:2], SITE_PREFIX)
+                elif want == SKIPPED:
+                    self.assertEqual((sites, problems), ([], []))
+                else:
+                    self.assertEqual((sites, problems), ([], [want]))
+
+    def test_exact_site_keys_for_the_typed_rows(self) -> None:
+        self.assertEqual(_leg_scalar_sites("False", "!"), ([("w.yml", "j", "skip=False")], []))
+        self.assertEqual(_leg_scalar_sites("false", "!"), ([("w.yml", "j", "skip=False")], []))
+        self.assertEqual(_leg_scalar_sites("0", "!"), ([("w.yml", "j", "skip=0")], []))
+        self.assertEqual(_leg_scalar_sites("null", "!"), ([("w.yml", "j", "skip=None")], []))
+
+    def test_typed_values_reach_every_consumer(self) -> None:
+        def leg_of(written: str) -> dict[str, object]:
+            (leg,) = _matrix_include(_leg_job("          - skip: " + written))
+            return leg
+        self.assertEqual(leg_of("False"), {"skip": False})
+        self.assertEqual(leg_of("null"), {"skip": None})
+        self.assertEqual(leg_of("~"), {"skip": None})
+        self.assertEqual(leg_of(""), {"skip": None})
+        self.assertEqual(leg_of("0"), {"skip": 0})
+        self.assertEqual(leg_of("12"), {"skip": 12})
+        self.assertEqual(leg_of("no"), {"skip": "no"})
+        self.assertEqual(leg_of("'false'"), {"skip": "false"})
+        self.assertIsInstance(leg_of("'false'")["skip"], QuotedStr)
+        self.assertIs(_eval_if("!matrix.skip", {"skip": False}), True)
+        self.assertIs(_eval_if("matrix.skip == 1", {"skip": 1}), True)
+
+    def test_a_typed_value_in_runs_on_and_commands_renders_as_the_runner_text(self) -> None:
+        self.assertEqual(_runs_on(Job("j", ["    runs-on: ${{ matrix.os }}"]), {"os": 12}), "12")
+        self.assertEqual(_expand_matrix("cargo build -j ${{ matrix.n }}", {"n": 4}),
+                         "cargo build -j 4")
+        with self.assertRaises(AssertionError) as caught:
+            _runs_on(Job("j", ["    runs-on: ${{ matrix.os }}"]), {"os": None})
+        self.assertEqual(str(caught.exception),
+                         "j: runs-on reads matrix.os, which is null on leg 'os=None'")
+
+
+# --- #9771 r1 (finding 2): a called workflow that reads as nothing is a problem --------------------
+NO_JOBS_PROBLEM = ("caller.yml: call: reusable workflow './.github/workflows/inner.yml' has no "
+                   "readable jobs")
+NEITHER_PROBLEM = "caller.yml: call: job has neither a readable runs-on nor a readable uses"
+CALLEE_ROWS: tuple[tuple[str, str], ...] = (
+    ("", NO_JOBS_PROBLEM),
+    ("   \n\n", NO_JOBS_PROBLEM),
+    ("this is not a workflow\njust text\n", NO_JOBS_PROBLEM),
+    ("name: x\non:\n  workflow_call:\njobs: {}\n", NO_JOBS_PROBLEM),
+    ("name: x\non:\n  workflow_call:\njobs:\n", NO_JOBS_PROBLEM),
+    ("name: x\non:\n  workflow_call:\n", NO_JOBS_PROBLEM),
+)
+CALLER_FORMS: tuple[tuple[str, str], ...] = (
+    ("  call:\n    uses: ./.github/workflows/inner.yml\n", ""),
+    ("  call:\n    'uses': ./.github/workflows/inner.yml\n", ""),
+    ('  call:\n    "uses": ./.github/workflows/inner.yml\n', ""),
+    ("  call:\n    uses: './.github/workflows/inner.yml'\n", ""),
+    ("  call:\n    uses: ./.github/workflows/inner.yml # c\n", ""),
+    ("  call:\n      uses: ./.github/workflows/inner.yml\n", ""),
+    ("  call:\n      'uses': ./.github/workflows/inner.yml\n", ""),
+    ("  call:\n    name: x\n", NEITHER_PROBLEM),
+    ("  call:\n      name: x\n", NEITHER_PROBLEM),
+    ("  call:\n    'runs-on': ubuntu-latest\n", NEITHER_PROBLEM),
+)
+
+
+class UnreadableCallee9771R1(unittest.TestCase):
+    """#9771 r1 finding 2: a called workflow with zero readable jobs, or a job with neither a
+    readable runs-on nor a readable uses, is a problem with an exact reason, never a pass."""
+
+    def test_a_callee_with_no_readable_jobs_is_a_problem(self) -> None:
+        for text, problem in CALLEE_ROWS:
+            with self.subTest(callee=text):
+                texts = {"caller.yml": _stub_workflow("pull_request", CALLER_CALLS_INNER),
+                         "inner.yml": text}
+                self.assertEqual(_under_stubs(texts, _hosted_pr_rust_cache_sites), ({}, [problem]))
+
+    def test_every_caller_spelling_is_read_as_a_call_or_a_problem(self) -> None:
+        inner = _stub_workflow("workflow_call", _stub_job("inner"))
+        for call, problem in CALLER_FORMS:
+            with self.subTest(call=call):
+                texts = {"caller.yml": _stub_workflow("pull_request", call), "inner.yml": inner}
+                sites, problems = _under_stubs(texts, _hosted_pr_rust_cache_sites)
+                if problem:
+                    self.assertEqual((sorted(sites), problems), ([], [problem]))
+                else:
+                    self.assertEqual((sorted(sites), problems),
+                                     ([("caller.yml", "call/inner", "")], []))
+
+    def test_an_unreadable_uses_value_is_refused_by_name(self) -> None:
+        inner = _stub_workflow("workflow_call", _stub_job("inner"))
+        call = "  call:\n    uses: &a ./.github/workflows/inner.yml\n"
+        texts = {"caller.yml": _stub_workflow("pull_request", call), "inner.yml": inner}
+        self.assertEqual(_under_stubs(texts, _hosted_pr_rust_cache_sites), ({}, [
+            "caller.yml: call.uses: unread YAML form, anchor: '&a ./.github/workflows/inner.yml'"]))
+
+
+# --- #9771 r1 (finding 3): the line readers are linear ----------------------------------------------
+LINEAR_COST_CEILING_SECONDS = 2.0  # measured at the reviewed head: 21.50 s and 7.76 s
+ENV_KEYS_LARGE = 100_000
+AXIS_KEYS_LARGE = 20_000
+
+
+class LinearCost9771R1(unittest.TestCase):
+    """#9771 r1 finding 3: Job.env() and the matrix key reader take linear time in the number of
+    keys (an index look-ahead and a set of seen keys, no list copy or scan per key)."""
+
+    def test_job_env_with_100k_keys_is_linear(self) -> None:
+        lines = ["    env:", *(f"      K{i}: v{i}" for i in range(ENV_KEYS_LARGE))]
+        start = time.monotonic()
+        env = Job("j", lines).env()
+        elapsed = time.monotonic() - start
+        self.assertEqual((len(env), env["K0"], env[f"K{ENV_KEYS_LARGE - 1}"]),
+                         (ENV_KEYS_LARGE, "v0", f"v{ENV_KEYS_LARGE - 1}"))
+        self.assertLess(elapsed, LINEAR_COST_CEILING_SECONDS)
+
+    def test_job_env_nested_lookahead_is_exact(self) -> None:
+        lines = ["    env:", "      A: x", "        deeper", "      B:", "        c: 1", "      D: z"]
+        env = Job("j", lines).env()
+        self.assertEqual([(k, v.nested) for k, v in env.items()],
+                         [("A", "deeper"), ("B", "c: 1"), ("D", "")])
+
+    def test_matrix_with_20k_axis_keys_is_refused_fast_with_the_first_axis(self) -> None:
+        axes = [f"        axis{i}: x" for i in range(AXIS_KEYS_LARGE)]
+        job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:", *axes])
+        start = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            _matrix_include(job)
+        elapsed = time.monotonic() - start
+        self.assertEqual(str(caught.exception), _unread("j: strategy.matrix", R_AXIS, "axis0: x"))
+        self.assertLess(elapsed, LINEAR_COST_CEILING_SECONDS)
+
+    def test_a_duplicate_key_at_the_end_of_20k_keys_is_found_fast(self) -> None:
+        axes = [f"        axis{i}: x" for i in range(AXIS_KEYS_LARGE)] + ["        axis0: y"]
+        job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:", *axes])
+        start = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            _matrix_include(job)
+        elapsed = time.monotonic() - start
+        self.assertEqual(str(caught.exception),
+                         _unread("j: strategy.matrix", R_DUPLICATE, "axis0: y"))
+        self.assertLess(elapsed, LINEAR_COST_CEILING_SECONDS)
 
 
 if __name__ == "__main__":
