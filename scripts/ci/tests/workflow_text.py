@@ -3,10 +3,19 @@
 Standard library only (no YAML parser): it reads the two-space-indented job
 ids under `jobs:` and, per job, the four-space-indented `if:`, `needs:` and
 `outputs:` keys. That is all the ci.yml invariant tests need.
+
+`read_document` and `read_all_steps` (#9813) are the strict readers: they parse
+the whole file with the repository's own subset parser (scripts/ci/
+taint_boundary.py, standard library only) and raise `WorkflowReadError` on a
+file they cannot read or a form they do not parse, never returning a partial
+or guessed value. A guard that must fail rather than skip reads a workflow
+through them.
 """
+import importlib.util
 import re
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 JOB_ID_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 KEY_RE = re.compile(r"^    ([A-Za-z0-9_-]+):\s*(.*)$")
@@ -135,3 +144,81 @@ def read_steps(path: Path, job: str) -> List[dict]:
     if run_lines is not None:
         steps[-1]["run"] = "\n".join(run_lines).rstrip("\n") + "\n"
     return steps
+
+
+TAINT_BOUNDARY_NAME = "taint_boundary"
+TAINT_BOUNDARY_PATH = Path(__file__).resolve().parent.parent / "taint_boundary.py"
+
+
+class WorkflowReadError(Exception):
+    """A workflow file that cannot be read, decoded, parsed or shaped as a workflow (#9813)."""
+
+
+def load_taint_boundary():
+    """The repository's `taint_boundary` module (its subset YAML parser), loaded from its file.
+
+    It is registered once under its own name, because its dataclasses resolve their module through
+    `sys.modules`; a copy already imported by name (a test that put scripts/ci on `sys.path`) is reused.
+    """
+    loaded = sys.modules.get(TAINT_BOUNDARY_NAME)
+    if loaded is not None and hasattr(loaded, "parse_yaml"):
+        return loaded
+    spec = importlib.util.spec_from_file_location(TAINT_BOUNDARY_NAME, TAINT_BOUNDARY_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[TAINT_BOUNDARY_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(TAINT_BOUNDARY_NAME, None)
+        raise
+    return module
+
+
+def read_document(path: Path) -> object:
+    """The parsed YAML document of `path`, or WorkflowReadError naming the file (and the line of a parse refusal)."""
+    target = Path(path)
+    try:
+        raw = target.read_bytes()
+    except OSError as exc:
+        raise WorkflowReadError("%s: cannot read: %s" % (target, exc.strerror or type(exc).__name__)) from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkflowReadError("%s: not valid UTF-8: %s at byte %d" % (target, exc.reason, exc.start)) from exc
+    if not raw:
+        raise WorkflowReadError("%s: line 1: empty file" % target)
+    boundary = load_taint_boundary()
+    try:
+        return boundary.parse_yaml(text, str(target))
+    except boundary.YamlError as exc:
+        raise WorkflowReadError(str(exc)) from exc
+
+
+def read_all_steps(path: Path) -> List[Tuple[str, dict]]:
+    """Every `(job id, step)` of the workflow at `path`, in file order, from the strict reader.
+
+    A job without `steps` (a reusable-workflow call) has none. Any other shape raises WorkflowReadError:
+    a top level or `jobs` that is not a mapping, a job that is not a mapping, `steps` that is not a list,
+    a step that is not a mapping, a `run` that is not text.
+    """
+    target = Path(path)
+    document = read_document(target)
+    if not isinstance(document, dict):
+        raise WorkflowReadError("%s: top level is not a mapping" % target)
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        raise WorkflowReadError("%s: `jobs` is missing or not a mapping" % target)
+    found: List[Tuple[str, dict]] = []
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            raise WorkflowReadError("%s: job %r is not a mapping" % (target, job_id))
+        steps = job.get("steps", [])
+        if not isinstance(steps, list):
+            raise WorkflowReadError("%s: job %r: `steps` is not a list" % (target, job_id))
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise WorkflowReadError("%s: job %r: step %d is not a mapping" % (target, job_id, index))
+            if "run" in step and not isinstance(step["run"], str):
+                raise WorkflowReadError("%s: job %r: step %d: `run` is not text" % (target, job_id, index))
+            found.append((job_id, step))
+    return found

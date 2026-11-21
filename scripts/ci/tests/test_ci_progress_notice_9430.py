@@ -50,7 +50,8 @@ at 64 KiB                                                  final newline -> 9830
 ``test_9430_fix_no_host_text_tool_between_call_and_args`` holds that the step text from the ``python3 -I`` call to the
 end of its arguments names no host text tool; the 90-byte cut is the named constant CUT_BYTES inside the python call.
 
-The test parses ci.yml with PyYAML (required, as in test_pgbouncer_smoke_compose_4734.py), takes the
+The test reads ci.yml with the strict standard-library reader of workflow_text.py (#9813; it refuses what it
+cannot parse, naming the line, and needs no PyYAML), takes the
 ``run`` text of the one step that holds the ``[#6344] progress`` heartbeat, cuts the body of its
 ``( while true; do ... done ) &`` loop (without the ``sleep``) and runs that body with bash against synthetic
 logs in a scratch directory. Lines are split with ``str.splitlines`` (a superset of the runner's CR / LF /
@@ -93,9 +94,8 @@ import resource
 import signal
 import stat
 
-import yaml  # required: the guard fails, never skips, without it
-
 REPO = Path(__file__).resolve().parents[3]
+WORKFLOW_TEXT = Path(__file__).resolve().parent / "workflow_text.py"
 CI_YML = REPO / ".github" / "workflows" / "ci.yml"
 SCRATCH_PARENT = REPO / ".local-runs"
 WORKFLOW_ANNOTATION = REPO / "scripts" / "ci" / "workflow_annotation.py"
@@ -110,7 +110,16 @@ def load_workflow_annotation():
     return module
 
 
+def load_workflow_text():
+    """The shared strict workflow reader (#9813), loaded from its file (sys.path untouched)."""
+    spec = importlib.util.spec_from_file_location("workflow_text_9430_reader", WORKFLOW_TEXT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 wa = load_workflow_annotation()
+wt = load_workflow_text()
 
 HEARTBEAT_MARKER = "[#6344] progress"
 LOOP_OPEN = "( while true; do"
@@ -392,10 +401,11 @@ def heartbeat_body(run_text):
 
 
 def heartbeat_step():
-    """The one ci.yml step that holds the progress heartbeat, as parsed by PyYAML."""
-    workflow = yaml.safe_load(CI_YML.read_text())
-    steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])
-             if HEARTBEAT_MARKER in (step.get("run") or "")]
+    """The one ci.yml step that holds the progress heartbeat, as read by the strict stdlib reader.
+
+    An unreadable or oddly shaped ci.yml raises ``WorkflowReadError`` (a failure, never a skip).
+    """
+    steps = [step for _job, step in wt.read_all_steps(CI_YML) if HEARTBEAT_MARKER in (step.get("run") or "")]
     if len(steps) != 1:
         raise AssertionError("expected one ci.yml step with %r, found %d" % (HEARTBEAT_MARKER, len(steps)))
     return steps[0]

@@ -15,6 +15,7 @@ synthetic workflows are named constants below. No file is written.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import time
 import unittest
@@ -30,13 +31,7 @@ except ImportError as _import_error:  # red at the base: every cell fails on its
 else:
     IMPORT_ERROR = ""
 
-try:
-    import yaml as pyyaml  # parity oracle only; the classifier never imports it
-except ImportError as _pyyaml_error:  # the skip reason of the parity cell names the import failure
-    pyyaml = None
-    PYYAML_IMPORT_ERROR = repr(_pyyaml_error)
-else:
-    PYYAML_IMPORT_ERROR = ""
+WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 
 # Three row kinds, three pins (FINAL efb2b9e8, correction 0773f6ce); each pin only goes down.
 # Kind violation: the 13 rows before PR 9508 less the lifetime-tests R2 row (stage 1 of #9455), 4 class
@@ -982,6 +977,15 @@ def _real() -> tuple[dict[str, str], dict[str, str], frozenset[str]]:
     return _REAL["repo"]  # type: ignore[return-value]
 
 
+def _load_workflow_text():
+    """The shared workflow reader (#9813), loaded from its file (sys.path untouched)."""
+    path = Path(__file__).resolve().parent / "workflow_text.py"
+    spec = importlib.util.spec_from_file_location("workflow_text_9452_reader", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _real_job(workflow: str, job: str) -> dict[str, object]:
     workflows, _, _ = _real()
     doc = tb.parse_yaml(workflows[workflow], workflow)
@@ -1558,16 +1562,20 @@ class RealWorkflows(unittest.TestCase):
                           ("ci.yml", "select", "Select jobs"),
                           ("ci.yml", "select", "Select the full matrix (base selector unavailable)")})
 
-    @unittest.skipUnless(pyyaml is not None, f"PyYAML not importable ({PYYAML_IMPORT_ERROR}): parity oracle skipped")
-    def test_9452_subset_parser_matches_pyyaml_on_every_real_file(self) -> None:
+    def test_9452_subset_parser_reads_every_real_file_and_matches_the_line_reader(self) -> None:
+        """#9813: no PyYAML oracle (a fleet node has none). Every real file parses to a mapping, and the job ids
+        of every workflow equal the ids of the independent line-based reader (workflow_text.read_jobs)."""
         _need_module(self)
+        reader = _load_workflow_text()
         workflows, actions, _ = _real()
         for name, text in list(workflows.items()) + list(actions.items()):
             with self.subTest(file=name):
-                oracle = pyyaml.safe_load(text)
-                if isinstance(oracle, dict) and True in oracle:
-                    oracle["on"] = oracle.pop(True)
-                self.assertEqual(tb.parse_yaml(text, name), oracle)
+                document = tb.parse_yaml(text, name)
+                self.assertIsInstance(document, dict)
+        for name, text in workflows.items():
+            with self.subTest(jobs=name):
+                parsed = tb.parse_yaml(text, name)["jobs"]
+                self.assertEqual(list(parsed), list(reader.read_jobs(WORKFLOW_DIR / name)))
 
 
 if __name__ == "__main__":

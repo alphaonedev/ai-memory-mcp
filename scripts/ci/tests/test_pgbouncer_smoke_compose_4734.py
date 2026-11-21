@@ -1,6 +1,6 @@
 """Guard the pgbouncer smoke stack against #4734 / #4735 regressions.
 
-Compose is parsed (PyYAML when importable, otherwise a structured stdlib
+Compose is parsed (the standard-library subset reader of workflow_text, #9813: a structured
 parse of services -> ports / environment / network_mode; trailing comments are
 stripped either way): every published port of every service must bind
 127.0.0.1, only the pgbouncer service may publish, network_mode is forbidden,
@@ -52,7 +52,7 @@ extends/include/secrets/configs/env_file and any top-level key besides name and 
 a definition after then/do/else/elif/time/`!` is read as a definition; the group scan tracks do..done
 and case..esac and RAISES on a closer with no opener; a trailing comment holds no heredoc opener; both
 script headers are pinned to the exit codes the script uses (code 1 from its rc=1 site).
-r13: PyYAML is required (the guard fails without it) and the compose scalars are scanned AS DECODED,
+r13: the stdlib reader is required (#9813: the guard fails without it, PyYAML is not used) and the compose scalars are scanned AS DECODED,
 because compose interpolates after decoding; refused in the YAML: a backslash escape in a double-quoted
 scalar, block scalars, a scalar or flow collection over several lines, a `$` inside a quoted scalar
 (one pinned `user:` scalar excepted); every `docker compose` call passes the pinned `-f` and
@@ -102,12 +102,13 @@ import tempfile
 import time
 import types
 import unittest
-
-import yaml  # r13 S14: required (the guard FAILS, never skips, without it); compose is scanned decoded
+import importlib.util
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent.parent
 PGB = REPO / "infra" / "pgbouncer"
 COMPOSE = PGB / "docker-compose.yml"
+WORKFLOW_TEXT = pathlib.Path(__file__).resolve().parent / "workflow_text.py"
+COMPOSE_LABEL = "docker-compose.yml"
 INI = PGB / "pgbouncer.ini"
 SMOKE = PGB / "smoke-test.sh"
 ENVELOPE = REPO / "infra" / "pillar4-envelope" / "measure-envelope.sh"
@@ -439,8 +440,24 @@ def _fallback_parse(text):
     return services
 
 
+def _load_reader():
+    """#9813: the shared stdlib YAML subset reader (workflow_text -> taint_boundary), loaded from its
+    file; it refuses every form it does not parse with a named error and a line number."""
+    spec = importlib.util.spec_from_file_location("workflow_text_4734_reader", WORKFLOW_TEXT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_taint_boundary()
+
+
+_BOUNDARY = _load_reader()
+
+
+def _parse_document(text):
+    return _BOUNDARY.parse_yaml(text, COMPOSE_LABEL)
+
+
 def _yaml_parse(text):
-    doc = yaml.safe_load(text)
+    doc = _parse_document(text)
     out = {}
     for name, spec in (doc.get("services") or {}).items():
         env = spec.get("environment") or {}
@@ -564,43 +581,54 @@ def _interpolations(value):
     return names, problems
 
 
+BLOCK_SCALAR_HEADER = re.compile(r"(?:^|[:\-])\s+[|>][-+0-9]*\s*(?:#.*)?$")
+DOUBLE_QUOTED_SPAN = re.compile(r'"[^"\n]*"')
+SINGLE_QUOTED_SPAN = re.compile(r"'[^'\n]*'")
+EXPLICIT_TAG_MARK = "outside the subset: '!"
+
+
+def _decoded_strings(node):
+    """Every key and every string value of a decoded document, in order."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _decoded_strings(key)
+            yield from _decoded_strings(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _decoded_strings(item)
+    elif isinstance(node, str):
+        yield node
+
+
 def _decoded_scan(text):
-    """r13 K4+S14: (interpolated names, refusals) of the compose file as YAML DECODES it, because
-    compose interpolates the decoded scalar, not the raw text. Needs PyYAML. Every scalar value
-    (keys included) goes through the escape rule; and every construct in which the raw text and the
-    decoded scalar can differ is refused: a backslash escape in a double-quoted scalar, a block
-    scalar (`|`, `>`), a scalar continued over several lines (folded join, escaped line break,
-    comment-looking continuation), a flow collection over several lines, and a `$` inside a quoted
-    scalar except the one pinned `user:` scalar."""
-    names, problems, flow = set(), [], []
+    """r13 K4+S14, #9813: (interpolated names, refusals) of the compose file as the stdlib subset reader
+    decodes it, because compose interpolates the decoded scalar, not the raw text. Every scalar value
+    (keys included) goes through the escape rule; every construct in which the raw text and the decoded
+    scalar can differ is refused: a backslash escape in a double-quoted scalar, a block scalar (`|`, `>`),
+    an explicit tag, and text the reader does not parse (a scalar or flow collection over several lines
+    is one of those), and a `$` inside a quoted scalar except the one pinned `user:` scalar."""
+    names, problems = set(), []
     try:
-        events = list(yaml.parse(text))
-    except yaml.YAMLError as exc:
-        return names, ["the compose text does not parse: %s" % str(exc).splitlines()[0]]
-    for ev in events:
-        # r14 S18: compose decodes an explicit tag (`!!binary`, `!!str`, a verbatim tag) BEFORE it
-        # interpolates, so the raw text and the scalar the checks below see are not what it renders.
-        if isinstance(ev, (yaml.ScalarEvent, yaml.MappingStartEvent, yaml.SequenceStartEvent)) and ev.tag is not None:
-            problems.append("explicit YAML tag %r" % ev.tag)
-        if isinstance(ev, yaml.ScalarEvent):
-            raw = text[ev.start_mark.index : ev.end_mark.index]
-            if ev.start_mark.line != ev.end_mark.line:
-                problems.append("scalar over several lines: %r" % raw[:30])
-            if ev.style in ("|", ">"):
-                problems.append("block scalar")
-            if ev.style == '"' and "\\" in raw:
-                problems.append("backslash escape in a double-quoted scalar: %r" % raw[:30])
-            if ev.style in ('"', "'") and "$" in raw and raw not in COMPOSE_QUOTED_DOLLAR_OK:
-                problems.append("dollar inside a quoted scalar: %r" % raw[:30])
-            found, bad = _interpolations(ev.value)
-            names |= found
-            problems.extend(bad)
-        elif isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
-            flow.append((bool(ev.flow_style), ev.start_mark.line))
-        elif isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
-            is_flow, line = flow.pop()
-            if is_flow and ev.end_mark.line != line:
-                problems.append("flow collection over several lines")
+        document = _parse_document(text)
+    except _BOUNDARY.YamlError as exc:
+        message = str(exc).splitlines()[0]
+        if EXPLICIT_TAG_MARK in message:
+            return names, ["explicit YAML tag: %s" % message]
+        return names, ["the compose text does not parse: %s" % message]
+    for line in text.splitlines():
+        code = _strip_comment(line)
+        if BLOCK_SCALAR_HEADER.search(code):
+            problems.append("block scalar")
+        for span in DOUBLE_QUOTED_SPAN.findall(code):
+            if "\\" in span:
+                problems.append("backslash escape in a double-quoted scalar: %r" % span[:30])
+        for span in DOUBLE_QUOTED_SPAN.findall(code) + SINGLE_QUOTED_SPAN.findall(code):
+            if "$" in span and span not in COMPOSE_QUOTED_DOLLAR_OK:
+                problems.append("dollar inside a quoted scalar: %r" % span[:30])
+    for value in _decoded_strings(document):
+        found, bad = _interpolations(value)
+        names |= found
+        problems.extend(bad)
     return names, problems
 
 
@@ -2534,7 +2562,7 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
     def test_decoded_environment_and_labels_are_pinned_on_head(self):
         # r13 S14: the head environment keys, the absence of labels/command/entrypoint and the
         # decoded values are pinned, so an interpolation shows here as well as in the scan.
-        doc = yaml.safe_load(COMPOSE.read_text())
+        doc = _parse_document(COMPOSE.read_text())
         self.assertEqual(set(doc), {"name", "services"})
         env_keys = {name: sorted((spec.get("environment") or {})) for name, spec in doc["services"].items()}
         # A new environment key is allowed (its value is scanned below); the head keys must stay.
