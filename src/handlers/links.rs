@@ -207,6 +207,16 @@ pub async fn verify_link_handler(
 
     #[cfg(feature = "sal")]
     {
+        // #9616 — resolve the caller BEFORE the store is consulted, so an
+        // unusable `X-Agent-Id` is its named 400 on every path (no nonce, an
+        // unknown link, a store error), never a 404, a 200 or a store answer.
+        // #2032 LM3 — the replay cache below is partitioned by this caller;
+        // an ABSENT header is a fresh per-request `anonymous:req-<uuid8>`, so
+        // an anonymous partition can only ever evict itself.
+        let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+            Ok(caller) => caller,
+            Err(refusal) => return refusal,
+        };
         let filter = crate::store::VerifyFilter {
             source_id: body.source_id.clone(),
             target_id: body.target_id.clone(),
@@ -235,15 +245,8 @@ pub async fn verify_link_handler(
                     // 100k FIFO let any caller's 10k+ unique nonces flush
                     // another caller's fingerprints (the module doc's
                     // "eviction-flush attack"), re-opening the replay window
-                    // for the victim. Resolve the caller from `X-Agent-Id`
-                    // (like `create_link` / `get_links`); an ABSENT header is
-                    // a fresh per-request `anonymous:req-<uuid8>` — an
-                    // anonymous partition can only ever evict itself — and an
-                    // unusable one is the named 400 (#9616).
-                    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
-                        Ok(caller) => caller,
-                        Err(refusal) => return refusal,
-                    };
+                    // for the victim. The caller was resolved from
+                    // `X-Agent-Id` at the top of this arm (#9616).
                     // Empty bytes as the "signature" component —
                     // the resolved link's identity already binds the
                     // signature material via canonical_id.
