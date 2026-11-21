@@ -51,6 +51,14 @@ class Split(unittest.TestCase):
         self.assertEqual(sorted(residual), ['a2a_campaign_round1', 'port_pg'])
         self.assertEqual(other, ['--example demo'])
 
+    def test_bin_target_stays_in_the_serial_shard_9592(self):
+        plain = self.write('plain_pg', 'fn f(){}')
+        exes = split_mod.ptb.parse_build_json([artifact('plain_pg', plain), artifact('tool', plain, 'bin')])
+        targets, residual, other = split_mod.split(['--test plain_pg', '--bin tool'], exes, set())
+        self.assertEqual(targets, ['--test plain_pg'])
+        self.assertEqual(residual, [])
+        self.assertEqual(other, ['--bin tool'])
+
     def test_unknown_source_is_residual(self):
         exes = split_mod.ptb.parse_build_json([artifact('ghost', self.root / 'missing.rs')])
         _, residual, _ = split_mod.split(['--test ghost'], exes, set())
