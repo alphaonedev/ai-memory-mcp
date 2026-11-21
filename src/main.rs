@@ -154,7 +154,7 @@ fn main() -> Result<()> {
     };
     // #9620 — only a command that WRITES state seeds the default config, and
     // a refused write is reported by path (rust-1-98 ERRORS-19), never
-    // dropped. Read-only and diagnostic verbs create nothing.
+    // dropped. Read-only and diagnostic verbs do not write the config file.
     if writes_default_config(&cli.command)
         && let Err(e) = config::AppConfig::write_default_if_missing()
     {
@@ -546,7 +546,8 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
 /// #9620 — the commands that seed `<config dir>/ai-memory/config.toml` on a
 /// host that has none. An ALLOW-list of WRITING commands: a verb not listed
 /// here (every read-only and diagnostic verb, and any verb added later)
-/// creates no file at start. A new `Command` variant needs a verdict in
+/// does not write the default config file at start (other start-up writes:
+/// #9574, #9663, #9776). A new `Command` variant needs a verdict in
 /// `writes_default_config_has_a_verdict_for_every_command_9620`.
 fn writes_default_config(cmd: &daemon_runtime::Command) -> bool {
     matches!(

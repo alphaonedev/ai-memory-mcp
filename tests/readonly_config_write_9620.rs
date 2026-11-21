@@ -1,9 +1,12 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #9620 — a read-only or diagnostic invocation creates, changes and truncates
-//! no file; every filesystem write the binary makes at start either succeeds
-//! or is reported with a named error.
+//! #9620 — a read-only or diagnostic invocation does not create, change or
+//! truncate the default config file at start, and the default config write a
+//! writing verb makes has two outcomes: the complete file at the path as a
+//! regular file, or the path left as it was with one named error and the WARN.
+//! This covers the config file only; the other start-up writes are #9574 (key
+//! pair), #9663 (audit and forensic log directory) and #9776 (database file).
 //!
 //! Pre-fix, `src/main.rs` called `AppConfig::write_default_if_missing()` for
 //! EVERY subcommand, so `wake-hub --posture` (whose contract in
@@ -322,8 +325,7 @@ const OUTSIDE_BODY: &str = "# outside 9620 - must survive byte for byte\n";
 
 /// Exact line `config check` prints for a missing config at the resolved
 /// default path, after the path.
-const CHECK_NO_CONFIG_SUFFIX: &str =
-    "; the daemon starts on compiled defaults (nothing to check)";
+const CHECK_NO_CONFIG_SUFFIX: &str = "; the daemon starts on compiled defaults (nothing to check)";
 
 /// Run `argv` with `RLIMIT_FSIZE` set to `INJECTED_FSIZE_LIMIT_BYTES` in the
 /// child only (set between fork and exec), and SIGXFSZ ignored, so an
