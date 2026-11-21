@@ -52,6 +52,13 @@ def red_log(name):
     return '"${RUNNER_TEMP}/red-cause/%s"' % name
 
 
+# #9759 r1 L7: log capture is best effort, so a failing mkdir, touch or tee never turns a passing step red, and a
+# tee step takes its status from cargo alone. The exact lines around each tee writer, written out.
+BEST_EFFORT = " || true"
+TEE_BEFORE = ("set +e",)
+TEE_AFTER = ('status="${PIPESTATUS[0]}"', "set -e", 'exit "$status"')
+
+
 # The ONE wiring table (#9709 r1, C-M2): per test job, the paths its red-cause step reads and, per step that writes a
 # log, (step name, the --step log argument, the run line that writes the log, the mkdir argument run before it, a
 # run line that hands the log path to later steps). A step whose writer pipes into tee also needs ``shell: bash``
@@ -93,7 +100,7 @@ WIRING = {
         # Section E pins the llvm-cov command lines, so the step leaves a start marker (not a .log, so it is never
         # parsed as cargo output) that names it as the failing step.
         "steps": (("Generate coverage JSON", red_log("coverage-json.started"),
-                   "touch " + red_log("coverage-json.started"), LOG_DIR_ARG, None),),
+                   "touch " + red_log("coverage-json.started") + BEST_EFFORT, LOG_DIR_ARG, None),),
     },
 }
 
@@ -187,6 +194,13 @@ FIXTURE_A = (
     "\n"
     "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
 )
+SECTION_T = "     Running tests/t.rs (target/debug/deps/t-0123456789abcdef)\n"
+SECTION_T_ROW = "| t | " + RESULT_FAILED_LINE + " |\n"
+
+
+def failing_block(name):
+    """One whole cargo section with one failing test (#9759 r1 C: only a FAILED result line commits a name)."""
+    return (SECTION_T + "test " + name + " ... FAILED\n" + RESULT_FAILED_LINE + "\n").encode("utf-8")
 FIXTURE_A_SUMMARY = (
     TITLE_LINE + "\n"
     "\n"
@@ -194,17 +208,20 @@ FIXTURE_A_SUMMARY = (
     "\n"
     "| Binary | Reason |\n"
     "| --- | --- |\n"
-    "| ai_memory | " + RESULT_FAILED_LINE + " |\n"
+    "| ai&#95;memory | " + RESULT_FAILED_LINE + " |\n"
     "| crashy | ended without a test result line (crash, timeout or signal); process didn't exit successfully: "
-    "&#96;/x/crashy-fedcba9876543210&#96; (signal: 11, SIGSEGV: invalid memory reference) |\n"
+    "&#96;/x/crashy-f​edcba9876543210&#96; (signal: 11, SIGSEGV: invalid memory reference) |\n"
     "\n"
     "failing tests: 2\n"
     "\n"
     "| Binary | Test |\n"
     "| --- | --- |\n"
-    "| ai_memory | a\\x3a:bad |\n"
-    "| ai_memory | a\\x3a:worse |\n"
+    "| ai&#95;memory | a::bad |\n"
+    "| ai&#95;memory | a::worse |\n"
 )
+# #9759 r1: the summary is not a workflow command, so "::" and "%" stay as written there; "_" is escaped so a name is
+# never emphasis, and a zero-width space after the first hex digit of a 7+ digit run keeps GitHub from linking it as
+# a commit sha.
 FIXTURE_A_STDOUT = (
     "::error title=failing test binary::ai_memory: " + RESULT_FAILED_LINE + "\n"
     "::error title=failing test binary::crashy: ended without a test result line (crash, timeout or signal); "
@@ -307,12 +324,15 @@ class ParseAndRender(Scratch):
 
     def test_directory_input_reads_log_files_below_it_and_ignores_the_rest(self):
         self.write("logs/a.log", FIXTURE_A)
-        self.write("logs/sub/b.log", "test sub::only ... FAILED\n")
-        self.write("logs/c.txt", "test ignored::txt ... FAILED\n")
+        # #9759 r1 (C): no implicit section, so the nested log carries its own section and result lines.
+        self.write("logs/sub/b.log", "     Running tests/sub.rs (target/debug/deps/sub-0123456789abcdef)\n"
+                                     "test sub::only ... FAILED\n" + RESULT_FAILED_LINE + "\n")
+        self.write("logs/c.txt", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n"
+                                 "test ignored::txt ... FAILED\n" + RESULT_FAILED_LINE + "\n")
         rc, out, err, summary = self.run_script(["logs"])
         self.assertEqual(rc, 0)
-        self.assertIn("| ai_memory | a\\x3a:bad |\n", summary)
-        self.assertIn("| (unknown binary) | sub\\x3a:only |\n", summary)
+        self.assertIn("| ai&#95;memory | a::bad |\n", summary)
+        self.assertIn("| sub | sub::only |\n", summary)
         self.assertNotIn("ignored::txt", summary)
         self.assertNotIn("ignored\\x3a:txt", summary)
         self.assertIn("failing tests: 3\n", summary)
@@ -339,7 +359,7 @@ class ParseAndRender(Scratch):
                             "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| x | m\\x3a:one |\n| x | m\\x3a:two |\n", summary)
+        self.assertIn("| x | m::one |\n| x | m::two |\n", summary)
         self.assertIn("failing tests: 2\n", summary)
 
     def test_blank_lines_between_the_failures_header_and_the_names_are_skipped(self):
@@ -348,7 +368,7 @@ class ParseAndRender(Scratch):
                             "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| x | m\\x3a:one |\n| x | m\\x3a:two |\n", summary)
+        self.assertIn("| x | m::one |\n| x | m::two |\n", summary)
         self.assertNotIn("not_listed", summary)
         self.assertIn("failing tests: 2\n", summary)
 
@@ -357,16 +377,17 @@ class ParseAndRender(Scratch):
                             "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| doc-tests ai_memory | src/lib.rs - foo (line 3) |\n", summary)
+        self.assertIn("| doc-tests ai&#95;memory | src/lib.rs - foo (line 3) |\n", summary)
 
     def test_crlf_line_endings_and_invalid_utf8(self):
+        # #9759 r1 (C): a name is committed only by a FAILED result line, so the fixture ends with one (CRLF too).
         self.write("a.log", b"     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\r\n"
-                            b"test bad\xff\xfe ... FAILED\r\n")
+                            b"test bad\xff\xfe ... FAILED\r\n"
+                            b"test result: FAILED. 0 passed; 1 failed\r\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
         self.assertIn("| x | bad\ufffd\ufffd |\n", summary)
-        self.assertEqual(out.splitlines()[0],
-                         "::error title=failing test binary::x: ended without a test result line (crash, timeout or signal)")
+        self.assertEqual(out.splitlines()[0], "::error title=failing test binary::x: test result: FAILED. 0 passed; 1 failed")
 
     def test_no_failure_prints_one_notice_and_a_summary_line(self):
         self.write("a.log", "test a ... ok\n")
@@ -376,8 +397,10 @@ class ParseAndRender(Scratch):
 
 HOSTILE_CASES = (
     # (case, raw test name, summary cell, annotation text)
-    ("double colon", "x::y", "x\\x3a:y", "x\\x3a:y"),
-    ("percent-encoded newline", "a%0Ab", "a\\x250Ab", "a\\x250Ab"),
+    # #9759 r1: the summary file is markdown, not a workflow command: "::" and "%" stay as written there and "#" is an
+    # entity; the annotation text keeps the command escapes.
+    ("double colon", "x::y", "x::y", "x\\x3a:y"),
+    ("percent-encoded newline", "a%0Ab", "a%0Ab", "a\\x250Ab"),
     ("carriage return inside", "a\rb", "a\\x0db", "a\\x0db"),
     ("ansi colour", "\x1b[31mred\x1b[0m", "red", "red"),
     ("backtick", "a`b", "a&#96;b", "a`b"),
@@ -389,16 +412,16 @@ HOSTILE_CASES = (
     ("mention", "a@b", "a@​b", "a@b"),
     ("bare url", "x https://e.example", "x https:​//e.example", "x https://e.example"),
     ("www autolink", "WWW.e.example", "WWW​.e.example", "WWW.e.example"),
-    ("workflow command", "::error::boom", "\\x3a:error\\x3a:boom", "\\x3a:error\\x3a:boom"),
-    ("v1 command", "##[error]x", "\\x23#&#91;error]x", "\\x23\\x23\\x5berror]x"),
+    ("workflow command", "::error::boom", "::error::boom", "\\x3a:error\\x3a:boom"),
+    ("v1 command", "##[error]x", "&#35;&#35;&#91;error]x", "\\x23\\x23\\x5berror]x"),
     ("line separator", "a\u2028b", "a\\u2028b", "a\\u2028b"),
     ("token", "ghp_abcdefghijklmnop", "&lt;redacted>", "<redacted>"),
     ("backslash", "a\\b", "a\\\\b", "a\\\\b"),
     # #9709 r2 N2 (D2): a dash is not in the plain Rust path shape, so a 36-character dash segment goes through
     # clean() and is masked; a short dash segment is masked by nothing and stays readable.
-    ("dash segment of 36 characters", "m::abcdefghij-abcdefghij-abcdefghij-abc", "m\\x3a:&lt;redacted>",
+    ("dash segment of 36 characters", "m::abcdefghij-abcdefghij-abcdefghij-abc", "m::&lt;redacted>",
      "m\\x3a:<redacted>"),
-    ("dash segment of 7 characters", "m::abc-def", "m\\x3a:abc-def", "m\\x3a:abc-def"),
+    ("dash segment of 7 characters", "m::abc-def", "m::abc-def", "m\\x3a:abc-def"),
 )
 ALLOWED_STDOUT_LINE = re.compile(r"^::(?:error|notice) title=[a-z ]+::")
 
@@ -430,9 +453,9 @@ class Hostile(Scratch):
                               "::error title=failing test binary::d: ended without a test result line (crash, timeout or signal); "
                               "process didn't exit successfully: \\x3a:notice\\x3a:`x` \\x250A\n")
         self.assertEqual(summary, TITLE_LINE + "\n\nfailing test binaries: 2\n\n| Binary | Reason |\n| --- | --- |\n"
-                                  "| b\\x3a:c | test result: FAILED. 0 passed; \\x3a:error\\x3a:pwn &#124; &lt;i> |\n"
+                                  "| b::c | test result: FAILED. 0 passed; ::error::pwn &#124; &lt;i> |\n"
                                   "| d | ended without a test result line (crash, timeout or signal); process didn't exit successfully: "
-                                  "\\x3a:notice\\x3a:&#96;x&#96; \\x250A |\n")
+                                  "::notice::&#96;x&#96; %0A |\n")
 
     def test_no_stdout_line_can_start_a_second_command(self):
         lines = ["     Running tests/h.rs (target/debug/deps/h-0123456789abcdef)\n"]
@@ -463,13 +486,15 @@ class Bounds(Scratch):
                           BOUND_INPUT_FILES))
 
     def failing_tests(self, count):
-        return "".join("test t::n%03d ... FAILED\n" % index for index in range(count))
+        # #9759 r1 (C): one cargo section whose FAILED result line commits the names; that line is one more finding.
+        return (SECTION_T + "".join("test t::n%03d ... FAILED\n" % index for index in range(count))
+                + RESULT_FAILED_LINE + "\n")
 
     def test_failing_tests_at_the_bound_all_listed(self):
         self.write("a.log", self.failing_tests(50))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertEqual(summary.count("| (unknown binary) | t\\x3a:n"), 50)
+        self.assertEqual(summary.count("| t | t::n"), 50)
         self.assertIn("failing tests: 50\n", summary)
         self.assertNotIn("not listed", summary)
 
@@ -477,19 +502,20 @@ class Bounds(Scratch):
         self.write("a.log", self.failing_tests(51))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertEqual(summary.count("| (unknown binary) | t\\x3a:n"), 50)
+        self.assertEqual(summary.count("| t | t::n"), 50)
         self.assertIn("failing tests: 51\n", summary)
         self.assertNotIn("n050", summary)
         self.assertIn("\nfailing tests not listed: 1 (limit 50)\n", summary)
 
     def test_annotations_at_the_bound(self):
-        self.write("a.log", self.failing_tests(10))
+        # 9 failing tests and the FAILED binary row of their section: 10 findings (#9759 r1, the total counts both).
+        self.write("a.log", self.failing_tests(9))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(out.count("::error "), 10)
         self.assertNotIn("annotations:", out + summary)
 
     def test_annotations_one_above_the_bound(self):
-        self.write("a.log", self.failing_tests(11))
+        self.write("a.log", self.failing_tests(10))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(out.count("::error "), 10)
         self.assertEqual(out.splitlines()[-1], NOTICE + "annotations: 10 of 11 findings printed (limit 10), 1 omitted")
@@ -498,20 +524,20 @@ class Bounds(Scratch):
     def long_line(self, total):
         unit = "ab::"
         name = unit * 71 + "a" * (total - 5 - 11 - len(unit) * 71)
-        return "test " + name + " ... FAILED\n"
+        return SECTION_T + "test " + name + " ... FAILED\n" + RESULT_FAILED_LINE + "\n"
 
     def test_line_of_300_bytes_is_not_cut(self):
         self.write("a.log", self.long_line(300))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertEqual(summary.splitlines()[-1], "| (unknown binary) | " + "ab\\x3a:" * 71 + " |")
+        self.assertEqual(summary.splitlines()[-1], "| t | " + "ab::" * 71 + " |")
         self.assertNotIn("bytes cut", summary)
 
     def test_line_of_301_bytes_is_cut_and_counted(self):
         self.write("a.log", self.long_line(301))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| (unknown binary) | " + "ab\\x3a:" * 71 + " |\n", summary)
+        self.assertIn("| t | " + "ab::" * 71 + " |\n", summary)
         self.assertTrue(summary.endswith("\ninput lines over 300 bytes cut: 1\n"))
 
     def test_summary_bound_at_the_bound_and_one_above(self):
@@ -521,19 +547,29 @@ class Bounds(Scratch):
         self.assertEqual(module.fit_lines(at_bound, 32768), at_bound)
         above = ["x" * 99] * 327 + ["y" * 68]
         fitted = module.fit_lines(above, 32768)
-        self.assertEqual(fitted[:-1], above[:326])
-        self.assertEqual(fitted[-1], "summary over the limit: 2 lines omitted (limit 32768 bytes)")
+        # #9759 r1 (D): a blank line before the omission line, so it never joins a table row above it.
+        self.assertEqual(fitted[:-2], above[:326])
+        self.assertEqual(fitted[-2:], ["", "summary over the limit: 2 lines omitted (limit 32768 bytes)"])
         self.assertLessEqual(sum(len(line) + 1 for line in fitted), 32768)
 
     def test_a_huge_report_stays_under_the_summary_bound_and_says_how_much_was_omitted(self):
+        # #9759 r1: binary rows are capped at 50 too, so the rows are made wide (a "|" escapes to 6 bytes) to pass the
+        # byte bound with 50 binary rows and 50 test rows; the count notes are kept after the omission line (D).
+        wide = "w|" * 120  # each line stays under the 300-byte line bound
         rows = "".join("     Running tests/b%04d.rs (target/debug/deps/b%04d-0123456789abcdef)\n"
-                       "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n" % (i, i)
+                       "test %s%04d ... FAILED\n"
+                       "test result: FAILED. 0 passed; 1 failed; %s\n" % (i, i, wide, i, wide)
                        for i in range(2000))
         self.write("a.log", rows)
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
         self.assertLessEqual(len(summary.encode("utf-8")), 32768)
-        self.assertRegex(summary.splitlines()[-1], r"^summary over the limit: [1-9][0-9]* lines omitted \(limit 32768 bytes\)$")
+        tail = summary.splitlines()
+        self.assertEqual(tail[-5], "")
+        self.assertRegex(tail[-4], r"^summary over the limit: [1-9][0-9]* lines omitted \(limit 32768 bytes\)$")
+        self.assertEqual(tail[-3:], ["failing test binaries not listed: 1950 (limit 50)",
+                                     "failing tests not listed: 1950 (limit 50)",
+                                     "annotations: 10 of 4000 findings printed (limit 10), 3990 omitted"])
         self.assertEqual(out.count("::error "), 10)
 
     def filler_file(self, size, head):
@@ -542,19 +578,20 @@ class Bounds(Scratch):
         return head + body
 
     def test_file_of_exactly_the_byte_bound_is_read_whole(self):
-        self.write("a.log", self.filler_file(16777216, b"test early ... FAILED\n"))
+        # #9759 r1 (C): each failing block is a whole cargo section (section line, FAILED line, result line).
+        self.write("a.log", self.filler_file(16777216, failing_block("early")))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| (unknown binary) | early |\n", summary)
+        self.assertIn("| t | early |\n", summary)
         self.assertNotIn("input file over the limit", summary)
 
     def test_file_one_byte_over_the_bound_reads_the_tail_and_says_so(self):
         # cargo prints the verdict at the end: a log over the bound keeps its last 16 MiB (#9709 r1 LOW).
-        head = b"test early ... FAILED\n"
-        self.write("a.log", self.filler_file(16777217 - len(b"test late ... FAILED\n"), head) + b"\ntest late ... FAILED\n")
+        late = failing_block("late")
+        self.write("a.log", self.filler_file(16777217 - len(late), failing_block("early")) + b"\n" + late)
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| (unknown binary) | late |\n", summary)
+        self.assertIn("| t | late |\n", summary)
         self.assertNotIn("early", summary)
         self.assertTrue(summary.endswith("\ninput file over the limit: a.log has 16777218 bytes, last 16777216 read\n"))
 
@@ -562,14 +599,15 @@ class Bounds(Scratch):
         # M4: a sparse 4 GiB log whose FAILED block is at the tail; the child's address space is capped at 1.5 GiB
         # where the platform enforces RLIMIT_AS, so a whole-file read fails the test.
         path = self.dir / "a.log"
-        tail = b"\n     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\ntest m::late ... FAILED\n"
+        tail = (b"\n     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\ntest m::late ... FAILED\n"
+                + RESULT_FAILED_LINE.encode("ascii") + b"\n")
         with open(path, "wb") as handle:
             handle.truncate(4 * 1024 ** 3 - len(tail))
             handle.seek(0, os.SEEK_END)
             handle.write(tail)
         rc, out, err, summary = self.run_script(["a.log"], address_space=1536 * 1024 ** 2)
         self.assertEqual(rc, 0, err)
-        self.assertIn("| x | m\\x3a:late |\n", summary)
+        self.assertIn("| x | m::late |\n", summary)
         self.assertIn("input file over the limit: a.log has 4294967296 bytes, last 16777216 read\n", summary)
 
     def test_a_directory_walk_over_the_entry_bound_stops_and_says_so(self):
@@ -584,7 +622,7 @@ class Bounds(Scratch):
         block = (b"x" * 199 + b"\n") * (BOUND_FILE_BYTES // 200)
         for index in range(BOUND_TOTAL_BYTES // len(block) + 1):
             self.write("logs/f%02d.log" % index, block)
-        self.write("logs/zz.log", "test late ... FAILED\n")
+        self.write("logs/zz.log", failing_block("late"))
         rc, out, err, summary = self.run_script(["logs"])
         self.assertEqual(rc, 0)
         self.assertNotIn("late", summary)
@@ -593,14 +631,14 @@ class Bounds(Scratch):
 
     def numbered_files(self, count):
         for index in range(count):
-            body = "test late ... FAILED\n" if index == count - 1 else "test result: ok. 0 passed\n"
+            body = failing_block("late") if index == count - 1 else "test result: ok. 0 passed\n"
             self.write("logs/f%02d.log" % index, body)
 
     def test_input_files_at_the_bound_are_all_read(self):
         self.numbered_files(64)
         rc, out, err, summary = self.run_script(["logs"])
         self.assertEqual(rc, 0)
-        self.assertIn("| (unknown binary) | late |\n", summary)
+        self.assertIn("| t | late |\n", summary)
         self.assertNotIn("input files over the limit", summary)
 
     def test_input_files_one_above_the_bound_skip_the_last_and_say_so(self):
@@ -625,6 +663,8 @@ class LinearTime(Scratch):
             if index % 1000 == 0:
                 lines.append("     Running tests/t%d.rs (target/debug/deps/t%d-0123456789abcdef)" % (index, index))
             lines.append("test m::t%d ... %s" % (index, "FAILED" if index % 5000 == 0 else "ok"))
+            if index % 1000 == 999:  # #9759 r1 (C): every section ends with its result line, which commits the names
+                lines.append(RESULT_FAILED_LINE)
         self.write("a.log", "\n".join(lines) + "\n")
         elapsed, (rc, out, err, summary) = self.timed("a.log")
         self.assertEqual(rc, 0)
@@ -632,7 +672,8 @@ class LinearTime(Scratch):
         self.assertIn("failing tests: 20\n", summary)
 
     def test_100k_distinct_failures(self):
-        self.write("a.log", "".join("test m::t%d ... FAILED\n" % index for index in range(100000)))
+        self.write("a.log", SECTION_T + "".join("test m::t%d ... FAILED\n" % index for index in range(100000))
+                   + RESULT_FAILED_LINE + "\n")
         elapsed, (rc, out, err, summary) = self.timed("a.log")
         self.assertEqual(rc, 0)
         self.assertLess(elapsed, WALL_CLOCK_CEILING_SECONDS)
@@ -640,11 +681,12 @@ class LinearTime(Scratch):
         self.assertIn("\nfailing tests not listed: 99950 (limit 50)\n", summary)
 
     def test_a_single_10mb_line(self):
-        self.write("a.log", b"test " + b"a" * (10 * 1024 * 1024) + b" ... FAILED\n")
+        self.write("a.log", SECTION_T.encode("ascii") + b"test " + b"a" * (10 * 1024 * 1024) + b" ... FAILED\n"
+                   + RESULT_FAILED_LINE.encode("ascii") + b"\n")
         elapsed, (rc, out, err, summary) = self.timed("a.log")
         self.assertEqual(rc, 0)
         self.assertLess(elapsed, WALL_CLOCK_CEILING_SECONDS)
-        self.assertIn("| (unknown binary) | &lt;redacted> |\n", summary)
+        self.assertIn("| t | &lt;redacted> |\n", summary)
         self.assertTrue(summary.endswith("\ninput lines over 300 bytes cut: 1\n"))
 
     def test_a_10mb_line_of_colons_and_escapes(self):
@@ -723,15 +765,19 @@ class FailsOpen(Scratch):
         self.grow_after_fstat(path, b"test grown ... FAILED\n" * 4096)
         self.assertEqual(module.read_input(str(path), module.MAX_FILE_BYTES), (tail, size, True))
 
+    # #9759 r1 (C): the failing test sits in a whole cargo section, so its binary row is an annotation too.
+    ONE_FAILING_OUT = ("::error title=failing test binary::t: " + RESULT_FAILED_LINE + "\n"
+                       "::error title=failing test::t: one\n")
+
     def test_summary_variable_missing_still_prints_the_annotations(self):
-        self.write("a.log", "test one ... FAILED\n")
+        self.write("a.log", failing_block("one"))
         self.check(["a.log"], "GITHUB_STEP_SUMMARY is not set, summary not written", summary=None,
-                   expect_out_prefix="::error title=failing test::(unknown binary): one\n")
+                   expect_out_prefix=self.ONE_FAILING_OUT)
 
     def test_summary_file_not_writable(self):
-        self.write("a.log", "test one ... FAILED\n")
+        self.write("a.log", failing_block("one"))
         self.check(["a.log"], "cannot write summary nodir/x.md: No such file or directory", summary="nodir/x.md",
-                   expect_out_prefix="::error title=failing test::(unknown binary): one\n")
+                   expect_out_prefix=self.ONE_FAILING_OUT)
 
     def test_bad_option(self):
         self.check(["--bogus"], "usage error: unrecognized arguments: --bogus")
@@ -781,7 +827,9 @@ class ScriptShape(unittest.TestCase):
                 modules.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 modules.add(node.module)
-        self.assertEqual(modules, {"argparse", "hashlib", "importlib.util", "os", "re", "stat", "sys", "pathlib"})
+        # #9759 r1: unicodedata (standard library) classifies the characters visible() makes visible.
+        self.assertEqual(modules, {"argparse", "hashlib", "importlib.util", "os", "re", "stat", "sys", "pathlib",
+                                   "unicodedata"})
 
     def test_the_only_environment_variable_is_the_summary_file(self):
         text = SCRIPT.read_text(encoding="utf-8")
@@ -984,8 +1032,11 @@ def wiring_problems(text, workflow, job):
         if "| tee " in writer and "        shell: bash" not in item["active"]:
             problems.append("%s: tee without shell: bash (a red command is masked)" % name)
         if mkdir_arg is not None:
-            if "mkdir -p " + mkdir_arg not in run[:at]:
-                problems.append("%s: no mkdir -p %s before the writer" % (name, mkdir_arg))
+            if "mkdir -p " + mkdir_arg + BEST_EFFORT not in run[:at]:
+                problems.append("%s: no best-effort mkdir -p %s before the writer" % (name, mkdir_arg))
+            if "| tee " in writer and (tuple(run[max(at - len(TEE_BEFORE), 0):at]) != TEE_BEFORE
+                                       or tuple(run[at + 1:at + 1 + len(TEE_AFTER)]) != TEE_AFTER):
+                problems.append("%s: the step status is not cargo's own (set +e, PIPESTATUS[0], exit)" % name)
             if log_arg.rsplit("/", 1)[0] + '"' != mkdir_arg:
                 problems.append("%s: the log is not in the made directory" % name)
             if mkdir_arg not in wiring["reads"]:
@@ -1012,8 +1063,24 @@ PLANTED_EDITS = (
      "      - name: Run config-precedence under vectorlite (#2256 feature-gated pin)\n        shell: bash\n",
      "      - name: Run config-precedence under vectorlite (#2256 feature-gated pin)\n"),
     ("R15 sal lib tests lose mkdir", ("ci.yml", "sal-feature"),
-     '          mkdir -p "${RUNNER_TEMP}/red-cause"\n          cargo test --features sal --lib',
-     "          cargo test --features sal --lib"),
+     '          mkdir -p "${RUNNER_TEMP}/red-cause" || true\n          set +e\n          cargo test --features sal --lib',
+     "          set +e\n          cargo test --features sal --lib"),
+    # #9759 r1 L7: the best-effort capture and cargo's own status, one planted edit per line of the shape.
+    ("L7 sal build mkdir is not best effort", ("ci.yml", "sal-feature"),
+     '          mkdir -p "${RUNNER_TEMP}/red-cause" || true\n          set +e\n          cargo build --release',
+     '          mkdir -p "${RUNNER_TEMP}/red-cause"\n          set +e\n          cargo build --release'),
+    ("L7 vectorlite clippy keeps errexit", ("ci.yml", "vectorlite-feature"),
+     "          set +e\n          cargo clippy --all-targets --features vectorlite",
+     "          cargo clippy --all-targets --features vectorlite"),
+    ("L7 vectorlite 1860 status is the pipe's", ("ci.yml", "vectorlite-feature"),
+     red_log("vectorlite-1860.log") + '\n          status="${PIPESTATUS[0]}"\n',
+     red_log("vectorlite-1860.log") + '\n          status="$?"\n'),
+    ("L7 sal lib never exits with the status", ("ci.yml", "sal-feature"),
+     red_log("sal-lib.log") + '\n          status="${PIPESTATUS[0]}"\n          set -e\n          exit "$status"\n',
+     red_log("sal-lib.log") + '\n          status="${PIPESTATUS[0]}"\n          set -e\n'),
+    ("L7 coverage marker is not best effort", ("coverage.yml", "per-module-thresholds"),
+     'touch "${RUNNER_TEMP}/red-cause/coverage-json.started" || true\n',
+     'touch "${RUNNER_TEMP}/red-cause/coverage-json.started"\n'),
     ("R16 tee writes outside the read dir", ("ci.yml", "vectorlite-feature"),
      'tee "${RUNNER_TEMP}/red-cause/config-precedence.log"', 'tee "${RUNNER_TEMP}/config-precedence.log"'),
     ("check loses the fork guard", ("ci.yml", "check"),
@@ -1110,7 +1177,8 @@ class CleanedByConstruction(Scratch):
         self.write("a.log", running + "test m::a ... FAILED\n" + RESULT_FAILED_LINE + "\n"
                    + running + "failures:\n    m::b\n\n" + RESULT_FAILED_LINE + "\n"
                    + running + "running 1 test\n" + "  process didn't exit successfully: `x`\n"
-                   + "test " + canary_text + " ... FAILED\n")
+                   + "test " + canary_text + " ... FAILED\n"
+                   + RESULT_FAILED_LINE + "\n")  # #9759 r1 (C): the result line commits the token-shaped name
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
         for text in (out, err, summary):
@@ -1129,7 +1197,7 @@ class CleanedByConstruction(Scratch):
         self.assertEqual(rc, 0, err)
         self.assertIn("failing tests: 3\n", summary)
         for name in names:
-            self.assertIn("| ai_memory | %s |\n" % name.replace("::", "\\x3a:"), summary)
+            self.assertIn("| ai&#95;memory | %s |\n" % name.replace("_", "&#95;"), summary)  # #9759 r1 format
         self.assertEqual(out.count("::error title=failing test::"), 3)
 
     def test_every_canary_shape_is_masked(self):
@@ -1144,7 +1212,8 @@ class CleanedByConstruction(Scratch):
     def test_every_canary_is_masked_end_to_end(self):
         canaries = [canary_text for _shape, canary_text in canary_shapes()]
         self.write("a.log", "     Running tests/h.rs (target/debug/deps/h-0123456789abcdef)\n"
-                   + "".join("test tests::%s ... FAILED\n" % canary_text for canary_text in canaries))
+                   + "".join("test tests::%s ... FAILED\n" % canary_text for canary_text in canaries)
+                   + RESULT_FAILED_LINE + "\n")  # #9759 r1 (C): the result line commits the names
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
         self.assertIn("failing tests: %d\n" % len(canaries), summary)
@@ -1252,7 +1321,8 @@ class RequiredPinCount(unittest.TestCase):
 
 
 class Census(unittest.TestCase):
-    """At least 99% of the repository's real fn names print unmasked (fixture: gen_red_cause_census_9709.py)."""
+    """At least 99% of the repository's fn names print unmasked (fixture: a dated snapshot written by
+    gen_red_cause_census_9709.py, source sha in its docstring; #9759 r1 code finding 10)."""
 
     def test_real_fn_names_print_unmasked(self):
         module = load_module()
@@ -1278,8 +1348,8 @@ class SectionsAndLabels(Scratch):
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
         self.assertNotIn("fake", summary)
-        self.assertIn("| (unknown binary) | t |\n", summary)
-        self.assertNotIn("failing test binaries", summary)
+        # #9759 r1 (C): with no anchored section line there is no section at all, so the FAILED line is not read.
+        self.assertEqual(summary, TITLE_LINE + "\ncause not identified; no failing test or test binary found in 1 input file(s)\n")
 
     def test_lib_and_bin_unittests_are_distinct(self):
         block = ("     Running unittests %s (target/debug/deps/ai_memory-%s)\n\nrunning 2 tests\ntest tests::a ... FAILED\n\n"
@@ -1288,8 +1358,8 @@ class SectionsAndLabels(Scratch):
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
         self.assertIn("failing tests: 2\n", summary)
-        self.assertIn("| ai_memory | tests\\x3a:a |\n", summary)
-        self.assertIn("| ai_memory (src/main.rs) | tests\\x3a:a |\n", summary)
+        self.assertIn("| ai&#95;memory | tests::a |\n", summary)  # #9759 r1 summary format
+        self.assertIn("| ai&#95;memory (src/main.rs) | tests::a |\n", summary)
         self.assertIn("failing test binaries: 2\n", summary)
 
     def test_the_first_crash_detail_is_kept(self):
@@ -1303,10 +1373,11 @@ class SectionsAndLabels(Scratch):
         self.assertNotIn("second", summary)
 
     def test_a_note_after_a_table_has_a_blank_line_first(self):
-        self.write("a.log", "test t ... FAILED\n" + "x" * (BOUND_LINE_BYTES + 1) + "\n")
+        # #9759 r1 (C): a whole cargo section, so the name is committed by its result line.
+        self.write("a.log", failing_block("t") + b"x" * (BOUND_LINE_BYTES + 1) + b"\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
-        self.assertTrue(summary.endswith("| (unknown binary) | t |\n\ninput lines over 300 bytes cut: 1\n"), summary)
+        self.assertTrue(summary.endswith("| t | t |\n\ninput lines over 300 bytes cut: 1\n"), summary)
 
 
 class NamedCause(Scratch):
@@ -1321,8 +1392,10 @@ class NamedCause(Scratch):
         self.write("logs/sal-build.log", "   Compiling ai-memory v1.0.0 (/w)\n\x1b[31merror[E0308]\x1b[0m: mismatched types\n"
                                          " --> src/lib.rs:10:5\nerror: could not compile `ai-memory`\n")
         rc, out, err, summary = self.run_script(list(self.STEPS) + ["logs"])
-        self.assertEqual((rc, out), (0, CAUSE_TITLE + "Build release (sal feature): error[E0308]: mismatched types\n"))
-        self.assertEqual(summary, TITLE_LINE + "\ncause: Build release (sal feature): error&#91;E0308]: mismatched types\n")
+        # #9759 r1: the named line is the LAST error line of the failing step, and the summary calls it a candidate.
+        self.assertEqual((rc, out), (0, CAUSE_TITLE + "Build release (sal feature): error: could not compile `ai-memory`\n"))
+        self.assertEqual(summary, TITLE_LINE + "\nlast error line (a candidate cause): Build release (sal feature): "
+                         "error: could not compile &#96;ai-memory&#96;\n")
 
     def test_an_unknown_cause_names_the_last_step_whose_log_exists(self):
         self.write("logs/sal-clippy.log", "    Checking ai-memory v1.0.0 (/w)\n")
@@ -1398,17 +1471,21 @@ class NameKeyBytes(Scratch):
                          module.MAX_LINE_BYTES - len(module.TEST_PREFIX) - len(module.FAILED_SUFFIX))
 
     def test_both_forms_of_one_name_are_one_row_and_no_character_is_split(self):
-        for case, raw, shown_failed_first, shown_list_first, cuts in NAME_KEY_ROWS:
+        for case, raw, _shown_failed_first, shown_list_first, cuts in NAME_KEY_ROWS:
             for form, template in NAME_KEY_FORMS:
                 with self.subTest(case=case, form=form):
-                    first_shown = shown_failed_first if form == NAME_KEY_FORMS[0][0] else shown_list_first
+                    # #9759 r1 (C): names come from the failures list when the section has one, whichever line came
+                    # first, so both forms show the list form of the name (shown_failed_first is the FAILED-line
+                    # form, kept in the table for the key bound it documents).
+                    first_shown = shown_list_first
                     self.write("a.log", RUNNING_H + template % (raw, raw) + RESULT_FAILED_LINE + "\n")
                     (self.dir / "summary.md").unlink(missing_ok=True)
                     rc, out, err, summary = self.run_script(["a.log"])
                     self.assertEqual((rc, err), (0, ""))
                     self.assertIn("failing tests: 1\n", summary)
-                    self.assertEqual([line for line in summary.splitlines() if line.startswith("| h | t\\x3a:")],
-                                     ["| h | " + escaped_name(first_shown) + " |"])
+                    # #9759 r1: the summary file keeps `::` raw; only the annotation escapes it.
+                    self.assertEqual([line for line in summary.splitlines() if line.startswith("| h | t::")],
+                                     ["| h | " + first_shown + " |"])
                     self.assertEqual(out.splitlines()[-1], "::error title=failing test::h: " + escaped_name(first_shown))
                     self.assertEqual(len(out.splitlines()), 2)
                     self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
@@ -1449,22 +1526,23 @@ class NameKeyBytes(Scratch):
         self.assertEqual(len([line for line in summary.splitlines() if line.startswith("| h | m")]), 2)
 
     def test_an_error_line_over_the_bound_is_cut_on_a_character_boundary(self):
-        # sibling: first_error_line cuts a step log line in bytes: 7 + 146 x 2 = 299 bytes fit, a 147th would pass 300.
+        # sibling: the shown cause is cut in bytes (#9759 r1 A): "Build: error: " is 14 bytes and 14 + 141 x 2 = 296
+        # bytes fit under the 297-byte cut, a 142nd character would pass it; "..." marks the cut.
         self.write("logs/sal-build.log", "error: " + E2 * 200 + "\n")
         rc, out, err, summary = self.run_script(["--step", "logs/sal-build.log", "Build", "logs"])
         self.assertEqual((rc, err), (0, ""))
-        self.assertEqual(out, CAUSE_TITLE + "Build: error: " + E2 * 146 + "\n")
+        self.assertEqual(out, CAUSE_TITLE + "Build: error: " + E2 * 141 + "...\n")
         self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
 
     def test_a_crash_detail_over_the_bound_is_cut_on_a_character_boundary(self):
-        # sibling: the crash detail is a cut line too; with a 3-space indent 3 + 34 + 2 x 131 = 299 bytes fit, a 132nd
-        # character would pass 300.
+        # sibling: the shown reason is cut in bytes (#9759 r1 A): the reason text up to the detail is 61 + 34 = 95 bytes,
+        # 95 + 101 x 2 = 297 bytes fit the 297-byte cut, a 102nd character would pass it; "..." marks the cut.
         detail = "process didn't exit successfully: " + E2 * 200
         self.write("a.log", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n   " + detail + "\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual((rc, err), (0, ""))
         self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
-        self.assertIn("process didn't exit successfully: " + E2 * 131 + " |\n", summary)
+        self.assertIn("process didn't exit successfully: " + E2 * 101 + "... |\n", summary)
 
 
 class CrashRowKeys(Scratch):

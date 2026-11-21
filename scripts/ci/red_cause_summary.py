@@ -6,33 +6,49 @@
 A red test job used to leave its cause in a log nobody opens first.  This step runs after the test step of every
 test job (``if: failure() || cancelled()``, ``continue-on-error: true``, ``timeout-minutes``), reads the output the
 job already wrote and prints what a reader needs: the failing test binaries, the failing test names and the
-``test result: FAILED`` lines.  When no test failed it names the cause another way: the first ``error[``/``error:``
-line of the failing step, or ``cause not identified`` plus the failing step's name.  It is deterministic: no secret,
-no network, no LLM.  It never changes the job result.
+``test result: FAILED`` lines.  When no test failed it names the cause another way: the LAST ``error[``/``error:``
+line of the failing step, shown as ``last error line (a candidate cause): ``, or ``cause not identified`` plus the
+failing step's name.  It is deterministic: no secret, no network, no LLM.  It never changes the job result.
 
 Input: files, or directories (every ``*.log`` below them, sorted), given as arguments, plus one ``--step LOG NAME``
 per step of the job that writes a log, in step order.  The failing step is the last one whose log exists (a step
-that never started wrote no log).  The parser reads libtest output:
+that never started wrote no log); a failing step log that is not a regular file or cannot be read is a problem
+line.  The parser reads libtest output, one pass, linear in the input:
 
-* a line that starts exactly with cargo's ``     Running `` (five spaces) or ``   Doc-tests `` (three spaces) opens
-  a binary section.  The limit: a test that prints a line of exactly that shape on its own output also opens a
-  section; any other indent (a test's own ``Running ...`` text, indented or not) opens none;
-* ``test <name> ... FAILED`` and the indented names under ``failures:`` are failing tests;
-* ``test result: FAILED. ...`` is the result line of a failing binary;
-* a binary section that ends (next binary or end of input) without any ``test result:`` line is reported as its own
-  row with the reason ``ended without a test result line (crash, timeout or signal)`` and the first crash detail.
+* a binary section opens only on cargo's exact shapes, anchored on the whole line (trailing blanks aside):
+  ``     Running <source> (<path>)`` (five spaces, no backtick or parenthesis in either part) or
+  ``   Doc-tests <crate>`` (three spaces, one identifier).  Before the first such line nothing is read; there is no
+  implicit section.  Limit: a test that prints a line of exactly that shape on its own output opens a section;
+* failing test names come from their own section only: the last non-empty ``failures:`` list (four-space indent),
+  else the column-0 ``test <name> ... FAILED`` lines; libtest's mode suffixes (`` - should panic``,
+  `` - compile fail``, `` - compile``) and padding are removed; a name the token-safe line cut drops whole (one
+  long token run) is kept as ``<redacted>``, so its test still counts.  ``---- <name> stdout ----`` (or ``stderr``) starts
+  a captured-output block that is skipped up to the next ``failures:`` line;
+* the names are committed only by the section's column-0 ``test result: FAILED`` line, which is also a failing
+  binary row (every distinct such line is one row); ``test result: ok`` commits nothing;
+* a section that ends without any ``test result:`` line is a row with the reason ``ended without a test result line
+  (crash, timeout or signal)`` and the first crash detail; a crash detail after a passing result line is a row
+  ``crashed after a passing test result line; <detail>``.
 
-Every shown value is a ``Cleaned``, which only ``clean()`` (cut to the line bound, then the redaction of
-``scripts/cert_gate_evidence.py``) and ``render_name()`` make; ``Findings`` refuses anything else.  Counting and
-de-duplication run on the raw values, so N failing tests always print ``failing tests: N``: a test is keyed on its
-binary and the first NAME_KEY_BYTES UTF-8 bytes of its name, and every input line is cut in bytes on a character
-boundary (``cut_bytes``), so the FAILED line and the failures-list line of one name give one key and no cut line
-holds a half character.  ``render_name`` shows a
-name as written only when it has the plain Rust path shape and no token shape; every other name goes through
-``clean()``.  Output passes the shared escape of ``workflow_annotation.py``; Markdown cells also escape ``&``, ``<``,
-``|``, a backtick and ``[`` and break GFM autolinks and @mentions with a zero-width space.  Each bound is a named
-constant; over a bound the output carries an exact count line, never a silent cut.  A log over the file bound is read
-from its tail (cargo prints the verdict last).
+Every shown value is a ``Cleaned``, which only ``clean()`` and ``render_name()`` make; ``Findings`` refuses anything
+else.  ``clean()`` cuts first and redacts what is shown: a value over MAX_LINE_BYTES is cut on a character boundary,
+a token the cut went through is dropped whole, ``...`` marks the cut and every such cut is counted (``shown values
+cut: N``); then the redaction of ``scripts/cert_gate_evidence.py`` runs on at most MAX_LINE_BYTES (a raising
+redaction yields ``<redaction failed>``, never the raw text), and format characters (Unicode Cf, bidi controls
+among them) are shown as ``\\uXXXX``.  The redaction runs only for shown values, at most REDACTION_BUDGET_CALLS per
+run.  A crash detail whose path makes it too long loses leading path components behind ``.../`` first, so its
+signal stays.  Counting and de-duplication run on the raw values, so N failing tests always print ``failing tests:
+N``: a test is keyed on its binary and the first NAME_KEY_BYTES UTF-8 bytes of its name.  ``render_name`` shows a
+name as written only when it has the plain Rust path shape and no token shape.
+
+Output: annotations pass the shared escape of ``workflow_annotation.py``.  The summary file has its own escape
+(``\\`` doubled, control characters as ``\\xNN``, U+2028/U+2029 and surrogates as ``\\uXXXX``; ``::``, ``%`` and
+``#`` stay); Markdown cells also escape ``&``, ``#``, ``<``, ``|``, a backtick, ``[``, ``*``, ``_`` and ``~`` and
+break GFM autolinks, @mentions, ``GH-<n>`` and 7+ hex digit runs with a zero-width space.  Each bound is a named
+constant; over a bound the output carries an exact count line, never a silent cut, and the count lines stay after
+the omission line of a summary over MAX_SUMMARY_BYTES.  The annotation total counts every failing binary and test.
+A log over the file bound is read from its tail (cargo prints the verdict last); a tail without a complete line is
+reported as not parsed.
 
 Exit code: 0 on every internal error (missing or unreadable input, missing or unwritable summary file, a bad
 argument, any exception) after printing one ``::notice`` line with the exact reason.  The one exception is the
@@ -47,6 +63,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 
 
@@ -97,19 +114,23 @@ ISSUE = "#9709"
 
 # The bounds, each held from both sides by a test (at the bound, one above).
 MAX_FAILING_TESTS = 50  # failing tests listed in the summary
-MAX_LINE_BYTES = 300  # bytes of one input line that are read; the rest is cut and counted
+MAX_FAILING_BINARIES = 50  # failing test binary rows listed in the summary
+MAX_LINE_BYTES = 300  # bytes of one input line that are read, and of one shown value; the rest is cut and counted
 MAX_SUMMARY_BYTES = 32768  # bytes of the summary this step appends, escapes included
 MAX_ANNOTATIONS = 10  # ::error lines (GitHub shows 10 per step)
 MAX_FILE_BYTES = 16 * 1024 * 1024  # bytes read per input file: the whole file, or its last MAX_FILE_BYTES
 MAX_INPUT_FILES = 64  # input files read
 MAX_WALK_ENTRIES = 10000  # directory entries looked at per directory argument
 MAX_TOTAL_BYTES = 64 * 1024 * 1024  # bytes read over all input files
+REDACTION_BUDGET_CALLS = 256  # redaction calls per run: shown values only (2 x 50 rows, 2 x 50 tests, the rest)
 SUMMARY_OMIT_RESERVE = 160  # bytes kept free for the omission line of a summary over its bound
-ANNOTATION_MAX_CHARS = 4000  # an annotation line is never cut by the shared module: 2 x MAX_LINE_BYTES x 4 fits
+# An annotation line is never cut by the shared module: two shown values of MAX_LINE_BYTES, each byte at most
+# 7/3 characters after the Cf escape and the shared escape, plus the title, fit.
+ANNOTATION_MAX_CHARS = 4000
 DETAIL_MAX_CHARS = 200
 
-UNKNOWN_BINARY = "(unknown binary)"
 NO_RESULT_REASON = "ended without a test result line (crash, timeout or signal)"
+CRASH_AFTER_OK_REASON = "crashed after a passing test result line; "
 NO_PATHS_REASON = "no input paths given"
 EMPTY_PATH_REASON = "input path is empty"
 NO_SUMMARY_FILE_REASON = "GITHUB_STEP_SUMMARY is not set, summary not written"
@@ -117,10 +138,16 @@ NOT_IDENTIFIED = "cause not identified"
 NO_FINDINGS_NOTICE = NOT_IDENTIFIED + "; no failing test or test binary found in %d input file(s)"
 LAST_STEP_CAUSE = NOT_IDENTIFIED + "; failing step: %s (the last step whose log exists)"
 NO_STEP_CAUSE = NOT_IDENTIFIED + "; failing step: a step before %s (no step log exists)"
-CAUSE_PREFIX = "cause: "
+STEP_NOT_REGULAR = "step log %s is not a regular file (NotRegular)"
+STEP_UNREADABLE = "cannot read step log %s: %s (%s)"
+CAUSE_PREFIX = "last error line (a candidate cause): "
 REDACTION_FILE = "cert_gate_evidence.py"
 REDACTION_FAILED = "<redaction failed>"
+REDACTION_SPENT = "<redaction budget spent>"
 SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
+CUT_MARK = "..."
+CUT_MARK_BYTES = CUT_MARK.encode("ascii")
+PATH_CUT_MARK = ".../"
 
 NOTICE_TITLE = "red cause summary"
 TITLE_BINARY = "failing test binary"
@@ -130,6 +157,9 @@ TITLE_CAUSE = "red cause"
 TEST_PREFIX = "test "
 FAILED_SUFFIX = " ... FAILED"
 FAILED_SUFFIX_BYTES = FAILED_SUFFIX.encode("ascii")
+TEST_PREFIX_BYTES = TEST_PREFIX.encode("ascii")
+# The name shown when the line cut dropped a whole name (one token run): the run is never shown in part.
+DROPPED_NAME_BYTES = b"<redacted>"
 # A name is keyed on at most this many UTF-8 bytes, cut on a character boundary: the most a cut FAILED line keeps, so
 # the same long name in its FAILED line and in the failures list is one key (both lines are cut in bytes).
 NAME_KEY_BYTES = MAX_LINE_BYTES - len(TEST_PREFIX) - len(FAILED_SUFFIX)
@@ -137,24 +167,39 @@ NAME_KEY_BYTES = MAX_LINE_BYTES - len(TEST_PREFIX) - len(FAILED_SUFFIX)
 UTF8_CONTINUATION_MASK = 0xC0
 UTF8_CONTINUATION_TAG = 0x80
 UTF8_MAX_BACKUP = 3
+# The bytes a token is made of (the redaction masks such a run whole): a cut through a run drops the run.
+TOKEN_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-+/=.~")
 RESULT_PREFIX = "test result:"
 RESULT_FAILED_PREFIX = "test result: FAILED"
 FAILURES_HEADER = "failures:"
 LIST_INDENT = "    "
-RUNNING_OPEN = "     Running "  # cargo's exact column shape; see the module docstring for the limit
-DOC_TESTS_OPEN = "   Doc-tests "
+LIST_INDENT_BYTES = LIST_INDENT.encode("ascii")
+# cargo's exact section lines, matched on the whole line after its trailing blanks are removed.
+RUNNING_LINE = re.compile(r"     Running ([^`()\s][^`()]*?) \(([^`()\s]+)\)\Z")
+DOC_TESTS_LINE = re.compile(r"   Doc-tests ([A-Za-z_][A-Za-z0-9_-]*)\Z")
+CAPTURE_LINE = re.compile(r"---- .+ (?:stdout|stderr) ----\Z")
+MODE_SUFFIX = re.compile(r" - (?:should panic|compile fail|compile)\Z")
 DOC_TESTS_LABEL = "doc-tests "
 UNITTESTS_PREFIX = "unittests "
 LIB_SOURCE = "src/lib.rs"
 CRASH_MARKER = "process didn't exit successfully"
+CRASH_PATH = re.compile(r"`([^`]*)`")
 ERROR_LINE_PREFIXES = ("error[", "error:")
 HASH_SUFFIX = re.compile(r"-[0-9a-f]{8,}$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 INPUT_SUFFIX = ".log"
-MD_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), ("|", "&#124;"), ("`", "&#96;"), ("[", "&#91;"))
+FORMAT_CATEGORY = "Cf"
+BMP_LAST = 0xFFFF
+MD_ESCAPES = (("&", "&amp;"), ("#", "&#35;"), ("<", "&lt;"), ("|", "&#124;"), ("`", "&#96;"), ("[", "&#91;"),
+              ("*", "&#42;"), ("_", "&#95;"), ("~", "&#126;"))
 ZWSP = "​"
 MD_AUTOLINKS = ((re.compile(r"@"), "@" + ZWSP), (re.compile(r":(?=//)"), ":" + ZWSP),
-                (re.compile(r"(?i)(www)(?=\.)"), "\\1" + ZWSP))
+                (re.compile(r"(?i)(www)(?=\.)"), "\\1" + ZWSP),
+                (re.compile(r"\b([0-9a-fA-F])([0-9a-fA-F]{6,})\b"), "\\1" + ZWSP + "\\2"),
+                (re.compile(r"\b([Gg])([Hh]-[0-9])"), "\\1" + ZWSP + "\\2"))
+# The summary file escape: a backslash, C0, DEL and C1 controls, line and paragraph separators and surrogates.
+SUMMARY_ESCAPE = re.compile("[\\\\\x00-\x1f\x7f-\x9f  \ud800-\udfff]")
+C1_LAST = 0x9F
 
 # render_name: a name is shown as written only in the plain Rust path shape, with no token prefix, no JWT header and
 # no 32+ hex or base64 run inside one segment.
@@ -195,6 +240,10 @@ def build_parser():
 
 _redact_line = None
 _MINT = object()
+# Per-run counters, reset by run(): redaction calls made, shown values cut, shown values over the redaction budget.
+_redaction_calls = 0
+_shown_cuts = 0
+_budget_spent = 0
 
 
 class Cleaned:
@@ -218,6 +267,14 @@ def load_redaction():
     _redact_line = module.redact_line
 
 
+def reset_counters():
+    """The per-run counters at zero (one run of main() is one count)."""
+    global _redaction_calls, _shown_cuts, _budget_spent
+    _redaction_calls = 0
+    _shown_cuts = 0
+    _budget_spent = 0
+
+
 def cut_bytes(data, limit):
     """``data`` (UTF-8 bytes) cut to at most ``limit`` bytes without splitting a character: a cut that falls inside a
     multi-byte character backs up to that character's first byte, so nothing cut decodes to U+FFFD."""
@@ -230,21 +287,95 @@ def cut_bytes(data, limit):
     return data[:end]
 
 
-def clean(text):
-    """``text`` cut to the line bound (in characters, which never splits one) and redacted; a redaction that fails
-    yields a fixed marker, never the raw text."""
+def cut_token_safe(data, limit):
+    """``cut_bytes(data, limit)``, and when the cut goes through a run of token bytes the whole run is dropped, so no
+    shown text holds a fragment of a token the redaction would not recognise any more."""
+    head = cut_bytes(data, limit)
+    end = len(head)
+    if end == len(data) or end == 0 or data[end] not in TOKEN_BYTES or head[end - 1] not in TOKEN_BYTES:
+        return head
+    while end > 0 and head[end - 1] in TOKEN_BYTES:
+        end -= 1
+    return head[:end]
+
+
+def visible(text):
+    """``text`` with every format character (Unicode Cf: bidi controls, zero-width joiners) as a literal escape."""
+    if text.isascii():
+        return text
+    shown = []
+    for char in text:
+        if unicodedata.category(char) == FORMAT_CATEGORY:
+            shown.append(("\\u%04x" if ord(char) <= BMP_LAST else "\\U%08x") % ord(char))
+        else:
+            shown.append(char)
+    return "".join(shown)
+
+
+def _clean(text, count_cut):
+    """The one maker of a shown value from raw text: cut, then redact, then make format characters visible."""
+    global _redaction_calls, _shown_cuts, _budget_spent
     if _redact_line is None:
         return Cleaned(REDACTION_FAILED, _MINT)
-    shown = text if len(text) <= MAX_LINE_BYTES else text[:MAX_LINE_BYTES]
+    data = text.encode("utf-8", "replace")
+    if len(data) > MAX_LINE_BYTES:
+        data = cut_token_safe(data, MAX_LINE_BYTES - len(CUT_MARK_BYTES)) + CUT_MARK_BYTES
+        if count_cut:
+            _shown_cuts += 1
+    if _redaction_calls >= REDACTION_BUDGET_CALLS:
+        _budget_spent += 1
+        return Cleaned(REDACTION_SPENT, _MINT)
+    _redaction_calls += 1
     try:
-        return Cleaned(_redact_line(shown), _MINT)
+        shown = _redact_line(data.decode("utf-8", "replace"))
     except Exception:
         return Cleaned(REDACTION_FAILED, _MINT)
+    if not isinstance(shown, str):
+        return Cleaned(REDACTION_FAILED, _MINT)
+    data = shown.encode("utf-8", "replace")
+    if len(data) > MAX_LINE_BYTES:  # a redaction marker longer than what it masked
+        shown = (cut_token_safe(data, MAX_LINE_BYTES - len(CUT_MARK_BYTES)) + CUT_MARK_BYTES).decode("utf-8")
+    return Cleaned(visible(shown), _MINT)
+
+
+def clean(text):
+    """``text`` to show: cut to MAX_LINE_BYTES on a character boundary (a token the cut went through dropped whole, the
+    cut marked and counted), then redacted (a failing redaction yields a fixed marker, never the raw text)."""
+    return _clean(text, True)
+
+
+def shorter_path(reason):
+    """``reason`` with leading components of its backtick path replaced by ``.../`` until it fits MAX_LINE_BYTES, so a
+    crash detail keeps its signal; None when no such shortening makes it fit."""
+    match = CRASH_PATH.search(reason)
+    if match is None:
+        return None
+    path = match.group(1)
+    head, tail = reason[:match.start(1)], reason[match.end(1):]
+    at = path.find("/", 1)
+    while at >= 0:
+        shown = head + PATH_CUT_MARK + path[at + 1:] + tail
+        if len(shown.encode("utf-8", "replace")) <= MAX_LINE_BYTES:
+            return shown
+        at = path.find("/", at + 1)
+    return None
+
+
+def clean_reason(reason):
+    """A row reason to show: a crash path is shortened first, else the cut of clean(); either is one counted cut."""
+    global _shown_cuts
+    if len(reason.encode("utf-8", "replace")) <= MAX_LINE_BYTES:
+        return clean(reason)
+    shown = shorter_path(reason)
+    if shown is None:
+        return clean(reason)
+    _shown_cuts += 1
+    return _clean(shown, False)
 
 
 def render_name(raw):
-    """A test or binary name to show: as written when it has the plain Rust path shape and no token shape, else
-    ``clean(raw)``."""
+    """A test or binary name to show: as written when it has the plain Rust path shape and no token shape (no redaction
+    call), else ``clean(raw)``."""
     if (_redact_line is not None and len(raw) <= MAX_LINE_BYTES and NAME_GRAMMAR.fullmatch(raw)
             and not any(marker in raw for marker in NAME_TOKEN_MARKERS) and not NAME_SECRET_RUN.search(raw)):
         return Cleaned(raw, _MINT)
@@ -252,7 +383,9 @@ def render_name(raw):
 
 
 def md_cell(text):
-    """``text`` for a Markdown table cell: no HTML, no pipe, no backtick, no link bracket, no autolink or mention."""
+    """``text`` for a Markdown table cell: format characters visible, no HTML, no pipe, no emphasis, no backtick, no
+    link bracket, no heading or issue reference, no autolink, mention or commit link."""
+    text = visible(text)
     for raw, replacement in MD_ESCAPES:
         text = text.replace(raw, replacement)
     for pattern, replacement in MD_AUTOLINKS:
@@ -260,20 +393,45 @@ def md_cell(text):
     return text
 
 
-def binary_label(text):
-    """The binary of a ``Running`` line: the file name in its trailing parentheses without the hash, else the text;
-    a unittests binary of a source other than src/lib.rs (a bin target) carries its source."""
-    text = text.strip()
-    if text.endswith(")") and " (" in text:
-        at = text.rindex(" (")
-        inner = text[at + 2:-1]
-        name = inner.rsplit("/", 1)[-1]
-        label = HASH_SUFFIX.sub("", name) or text
-        source = text[:at]
-        if source.startswith(UNITTESTS_PREFIX) and source[len(UNITTESTS_PREFIX):] != LIB_SOURCE:
-            label = "%s (%s)" % (label, source[len(UNITTESTS_PREFIX):])
-        return label
-    return text
+def summary_char(match):
+    char = match.group(0)
+    if char == "\\":
+        return "\\\\"
+    if ord(char) <= C1_LAST:
+        return "\\x%02x" % ord(char)
+    return "\\u%04x" % ord(char)
+
+
+def summary_text(line):
+    """``line`` as written to the summary file: workflow commands cannot start there, so ``::``, ``%`` and ``#`` stay;
+    a backslash, controls, line separators and surrogates are escaped."""
+    return SUMMARY_ESCAPE.sub(summary_char, line)
+
+
+def binary_label(source, path):
+    """The binary of a ``Running`` line: the file name of its path without the hash; a unittests binary of a source
+    other than src/lib.rs (a bin target) carries its source."""
+    name = path.rsplit("/", 1)[-1]
+    label = HASH_SUFFIX.sub("", name) or path
+    if source.startswith(UNITTESTS_PREFIX) and source[len(UNITTESTS_PREFIX):] != LIB_SOURCE:
+        label = "%s (%s)" % (label, source[len(UNITTESTS_PREFIX):])
+    return label
+
+
+def section_label(line):
+    """The binary label when ``line`` (trailing blanks removed) is one of cargo's exact section lines, else None."""
+    match = RUNNING_LINE.match(line)
+    if match is not None:
+        return binary_label(match.group(1), match.group(2))
+    match = DOC_TESTS_LINE.match(line)
+    if match is not None:
+        return DOC_TESTS_LABEL + match.group(1)
+    return None
+
+
+def test_name(text):
+    """A libtest name without its padding and mode suffix (`` - should panic``, `` - compile fail``, ``- compile``)."""
+    return MODE_SUFFIX.sub("", text.strip()).rstrip()
 
 
 def require_cleaned(*values):
@@ -282,12 +440,17 @@ def require_cleaned(*values):
             raise TypeError("a shown value must be a Cleaned, not %s" % type(value).__name__)
 
 
+def raw_key(*parts):
+    return hashlib.blake2b(b"\x00".join(part.encode("utf-8", "replace") for part in parts), digest_size=16).digest()
+
+
 class Findings:
-    """What the parse found: failing binaries, failing tests, and the exact counts of every cut.  Keys are raw
-    values; only Cleaned values are stored for output."""
+    """What the parse found: failing binaries, failing tests, and the exact counts of every cut.  Keys and counts are
+    raw values; the shown values are made only for the rows listed, and only Cleaned values are stored."""
 
     def __init__(self):
-        self.binaries = []  # (shown binary, shown reason) in encounter order, unique by raw value
+        self.binaries = []  # (shown binary, shown reason): the first MAX_FAILING_BINARIES only
+        self.binary_count = 0  # every distinct failing binary row
         self.binary_keys = set()
         self.tests = []  # (shown binary, shown name): the first MAX_FAILING_TESTS only
         self.test_count = 0  # every distinct failing test
@@ -295,19 +458,25 @@ class Findings:
         self.files_read = 0
         self.cut_lines = 0
         self.truncated_files = []  # (shown name, size)
+        self.unparsed_files = []  # shown names of truncated files whose tail holds no complete line
         self.files_found = 0
         self.walks_over = []  # shown directory arguments whose walk hit MAX_WALK_ENTRIES
         self.files_over_budget = 0
 
-    def add_binary(self, raw_binary, raw_reason, shown_binary, shown_reason):
-        require_cleaned(shown_binary, shown_reason)
-        key = (raw_binary, raw_reason)
-        if key not in self.binary_keys:
-            self.binary_keys.add(key)
+    def note_binary(self, raw_binary, raw_reason, show):
+        """Count a failing binary row once; ``show()`` makes its (shown binary, shown reason) only when it is listed."""
+        key = raw_key(raw_binary, raw_reason)
+        if key in self.binary_keys:
+            return
+        self.binary_keys.add(key)
+        self.binary_count += 1
+        if len(self.binaries) < MAX_FAILING_BINARIES:
+            shown_binary, shown_reason = show()
+            require_cleaned(shown_binary, shown_reason)
             self.binaries.append((shown_binary.text, shown_reason.text))
 
-    def add_test(self, raw_binary, raw_name, shown_binary, shown_name):
-        require_cleaned(shown_binary, shown_name)
+    def note_test(self, raw_binary, raw_name, show):
+        """Count a failing test once (keyed on its first NAME_KEY_BYTES bytes); ``show()`` runs only when listed."""
         key = raw_binary.encode("utf-8", "replace") + b"\x00" + cut_bytes(raw_name.encode("utf-8", "replace"),
                                                                           NAME_KEY_BYTES)
         digest = hashlib.blake2b(key, digest_size=16).digest()
@@ -316,84 +485,146 @@ class Findings:
         self.test_keys.add(digest)
         self.test_count += 1
         if len(self.tests) < MAX_FAILING_TESTS:
+            shown_binary, shown_name = show()
+            require_cleaned(shown_binary, shown_name)
             self.tests.append((shown_binary.text, shown_name.text))
+
+    def add_binary(self, raw_binary, raw_reason, shown_binary, shown_reason):
+        require_cleaned(shown_binary, shown_reason)
+        self.note_binary(raw_binary, raw_reason, lambda: (shown_binary, shown_reason))
+
+    def add_test(self, raw_binary, raw_name, shown_binary, shown_name):
+        require_cleaned(shown_binary, shown_name)
+        self.note_test(raw_binary, raw_name, lambda: (shown_binary, shown_name))
 
 
 class Section:
     """One binary section of one file while it is parsed; every field holds the raw value."""
 
+    __slots__ = ("binary", "shown", "result", "detail", "after_ok", "names", "listed")
+
     def __init__(self, binary):
         self.binary = binary
-        self.has_result = False
-        self.detail = ""
+        self.shown = None  # render_name(binary), made once when a row of this section is listed
+        self.result = None  # None, or the kind of the first result line: "failed" or "ok"
+        self.detail = ""  # the first crash detail before any result line
+        self.after_ok = ""  # the first crash detail after a passing result line
+        self.names = []  # column-0 FAILED names since the last result line
+        self.listed = []  # the last non-empty failures list since the last result line
+
+    def shown_binary(self):
+        if self.shown is None:
+            self.shown = render_name(self.binary)
+        return self.shown
+
+
+def close_section(section, findings):
+    """The row of a section that ended without a result line, or that crashed after a passing one."""
+    if section is None:
+        return
+    if section.result is None:
+        reason = NO_RESULT_REASON + ("; " + section.detail if section.detail else "")
+    elif section.result == "ok" and section.after_ok:
+        reason = CRASH_AFTER_OK_REASON + section.after_ok
+    else:
+        return
+    findings.note_binary(section.binary, reason, lambda: (section.shown_binary(), clean_reason(reason)))
+
+
+def commit_result(section, line, findings):
+    """A column-0 result line: FAILED commits the section's names and is a row; ok commits nothing."""
+    names = section.listed or section.names
+    section.listed = []
+    section.names = []
+    if not line.startswith(RESULT_FAILED_PREFIX):
+        if section.result is None:
+            section.result = "ok"
+        return
+    section.result = "failed"
+    for name in names:
+        findings.note_test(section.binary, name, lambda: (section.shown_binary(), render_name(name)))
+    findings.note_binary(section.binary, line, lambda: (section.shown_binary(), clean(line)))
+
+
+def keep_dropped_name(raw, kept, prefix):
+    """``kept``, unless the token-safe cut dropped the whole name after ``prefix`` (a name that is one long token run):
+    then ``prefix`` and a fixed marker, so a failing test is never lost by the cut (#9759 r1, fail closed)."""
+    if raw.startswith(prefix) and not kept[len(prefix):].strip():
+        return prefix + DROPPED_NAME_BYTES
+    return kept
+
+
+def read_line(raw, findings):
+    """One input line as text: carriage return removed, cut to MAX_LINE_BYTES (a FAILED verdict kept, a token the cut
+    went through dropped whole, the cut counted), colour removed, trailing blanks removed."""
+    if raw.endswith(b"\r"):
+        raw = raw[:-1]
+    if len(raw) > MAX_LINE_BYTES:
+        findings.cut_lines += 1
+        if raw.endswith(FAILED_SUFFIX_BYTES):  # a long failing test name is cut, never its FAILED verdict
+            kept = cut_token_safe(raw[:-len(FAILED_SUFFIX_BYTES)], MAX_LINE_BYTES - len(FAILED_SUFFIX_BYTES))
+            raw = keep_dropped_name(raw, kept, TEST_PREFIX_BYTES) + FAILED_SUFFIX_BYTES
+        else:
+            raw = keep_dropped_name(raw, cut_token_safe(raw, MAX_LINE_BYTES), LIST_INDENT_BYTES)
+    return ANSI.sub("", raw.decode("utf-8", "replace")).rstrip()
 
 
 def parse_data(data, findings):
     """Parse the bytes of one input file into ``findings``: one pass, linear in the input size."""
-    section = Section(UNKNOWN_BINARY)
-    opened = False
+    section = None
     in_list = False
-    list_names = 0
-
-    def failing_test(raw_name):
-        findings.add_test(section.binary, raw_name, render_name(section.binary), render_name(raw_name))
-
-    def close_section():
-        if opened and not section.has_result:
-            reason = NO_RESULT_REASON
-            if section.detail:
-                reason = reason + "; " + section.detail
-            findings.add_binary(section.binary, reason, render_name(section.binary), clean(reason))
-
+    listing = []
+    skipping = False
     for raw in data.split(b"\n"):
-        if raw.endswith(b"\r"):
-            raw = raw[:-1]
-        if len(raw) > MAX_LINE_BYTES:
-            findings.cut_lines += 1
-            if raw.endswith(FAILED_SUFFIX_BYTES):  # a long failing test name is cut, never its FAILED verdict
-                raw = cut_bytes(raw, MAX_LINE_BYTES - len(FAILED_SUFFIX_BYTES)) + FAILED_SUFFIX_BYTES
-            else:
-                raw = cut_bytes(raw, MAX_LINE_BYTES)
-        line = ANSI.sub("", raw.decode("utf-8", "replace"))
-        stripped = line.strip()
+        line = read_line(raw, findings)
+        if skipping:  # a captured-output block: nothing in it is libtest's own output
+            if line == FAILURES_HEADER:
+                skipping = False
+                in_list = True
+                listing = []
+            continue
         if in_list:
-            if line.startswith(LIST_INDENT) and stripped:
-                failing_test(stripped)
-                list_names += 1
+            if line.startswith(LIST_INDENT) and line.strip():
+                listing.append(test_name(line))
                 continue
-            if not stripped and list_names == 0:
+            if not line and not listing:
                 continue
             in_list = False
-        if stripped == FAILURES_HEADER:
-            in_list = True
-            list_names = 0
-            continue
-        if line.startswith(RUNNING_OPEN) or line.startswith(DOC_TESTS_OPEN):
-            close_section()
-            if line.startswith(RUNNING_OPEN):
-                label = binary_label(line[len(RUNNING_OPEN):])
-            else:
-                label = DOC_TESTS_LABEL + line[len(DOC_TESTS_OPEN):].strip()
+            if listing:
+                section.listed = listing
+        label = section_label(line)
+        if label is not None:
+            close_section(section, findings)
             section = Section(label)
-            opened = True
             continue
-        if stripped.startswith(RESULT_PREFIX):
-            section.has_result = True
-            if stripped.startswith(RESULT_FAILED_PREFIX):
-                findings.add_binary(section.binary, stripped, render_name(section.binary), clean(stripped))
+        if section is None:  # no implicit section: nothing before cargo's first section line is read
             continue
-        if stripped.startswith(TEST_PREFIX) and stripped.endswith(FAILED_SUFFIX):
-            failing_test(stripped[len(TEST_PREFIX):-len(FAILED_SUFFIX)])
-            continue
-        if opened and CRASH_MARKER in stripped and not section.detail:
-            section.detail = stripped
-    close_section()
+        if line == FAILURES_HEADER:
+            in_list = True
+            listing = []
+        elif CAPTURE_LINE.match(line):
+            skipping = True
+        elif line.startswith(RESULT_PREFIX):
+            commit_result(section, line, findings)
+        elif line.startswith(TEST_PREFIX) and line.endswith(FAILED_SUFFIX):
+            name = test_name(line[len(TEST_PREFIX):-len(FAILED_SUFFIX)])
+            if name:
+                section.names.append(name)
+        elif CRASH_MARKER in line:
+            if section.result is None and not section.detail:
+                section.detail = line.strip()
+            elif section.result == "ok" and not section.after_ok:
+                section.after_ok = line.strip()
+    if in_list and listing and section is not None:
+        section.listed = listing
+    close_section(section, findings)
 
 
 def read_input(path, budget):
     """(bytes, size, truncated) of one regular file, read through one descriptor: no symlink is followed, a FIFO is
     refused after fstat.  A file over MAX_FILE_BYTES is read from its tail: its last MAX_FILE_BYTES without the
-    partial first line.  A file whose read would pass ``budget`` bytes raises OverBudget unread."""
+    partial first line (empty when the tail holds no line break).  A file whose read would pass ``budget`` bytes
+    raises OverBudget unread."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
     try:
@@ -494,24 +725,37 @@ def scan(paths, problems):
             continue
         budget -= len(data)
         findings.files_read += 1
+        if truncated and not data:
+            findings.unparsed_files.append(clean(os.path.basename(path)).text)
+            continue
         if truncated:
             findings.truncated_files.append((clean(os.path.basename(path)).text, size))
         parse_data(data, findings)
     return findings
 
 
-def first_error_line(data):
-    """The first ``error[``/``error:`` line of a step log (colour removed), or None."""
+def last_error_line(data):
+    """The last ``error[``/``error:`` line of a step log (cut like an input line, colour removed), or None."""
+    global _shown_cuts
+    found = None
     for chunk in data.split(b"\n"):
-        text = ANSI.sub("", cut_bytes(chunk, MAX_LINE_BYTES).decode("utf-8", "replace")).strip()
+        if chunk.endswith(b"\r"):
+            chunk = chunk[:-1]
+        head = cut_token_safe(chunk, MAX_LINE_BYTES)
+        text = ANSI.sub("", head.decode("utf-8", "replace")).strip()
         if text.startswith(ERROR_LINE_PREFIXES):
-            return text
-    return None
+            found = (text, len(head) < len(chunk))
+    if found is None:
+        return None
+    if found[1]:
+        _shown_cuts += 1
+    return found[0]
 
 
-def name_cause(steps):
-    """(Cleaned cause text, named) for a red job with no failing test: the first error line of the failing step (the
-    last whose log exists), else "cause not identified" with that step's name; None without ``--step``."""
+def name_cause(steps, problems):
+    """(Cleaned cause text, named) for a red job with no failing test: the last error line of the failing step (the
+    last whose log exists), else "cause not identified" with that step's name; a failing step log that is not a
+    regular file or cannot be read is a problem line.  None without ``--step``."""
     if not steps:
         return None
     failing = None
@@ -519,35 +763,43 @@ def name_cause(steps):
         if log == "":
             continue
         try:
-            if stat.S_ISREG(os.lstat(log).st_mode):
-                failing = (log, name)
+            mode = os.lstat(log).st_mode
         except OSError:
             continue
+        failing = (log, name, mode)
     if failing is None:
         return clean(NO_STEP_CAUSE % steps[0][1]), False
-    log, name = failing
+    log, name, mode = failing
+    unnamed = clean(LAST_STEP_CAUSE % name), False
+    if not stat.S_ISREG(mode):
+        problems.append(STEP_NOT_REGULAR % clean(log).text)
+        return unnamed
     try:
         data, _size, _truncated = read_input(log, MAX_FILE_BYTES)
-    except (OSError, NotRegular, OverBudget):
-        data = b""
-    error = first_error_line(data)
+    except NotRegular:
+        problems.append(STEP_NOT_REGULAR % clean(log).text)
+        return unnamed
+    except OSError as exc:
+        problems.append(STEP_UNREADABLE % (clean(log).text, exc.strerror or type(exc).__name__, type(exc).__name__))
+        return unnamed
+    error = last_error_line(data)
     if error is None:
-        return clean(LAST_STEP_CAUSE % name), False
+        return unnamed
     return clean("%s: %s" % (name, error)), True
 
 
 def summary_lines(findings, cause):
-    """The summary as raw lines (escaped when written); counts are exact, every bound has its own count line."""
+    """The summary as raw lines (escaped when written); counts are exact and come from the full lists."""
     lines = ["**Red cause (%s)**" % ISSUE]
-    if not findings.binaries and not findings.test_count:
+    if not findings.binary_count and not findings.test_count:
         if cause is None:
             lines.append(NO_FINDINGS_NOTICE % findings.files_read)
         else:
             shown, named = cause
             lines.append((CAUSE_PREFIX if named else "") + md_cell(shown.text))
-    if findings.binaries:
+    if findings.binary_count:
         lines.append("")
-        lines.append("failing test binaries: %d" % len(findings.binaries))
+        lines.append("failing test binaries: %d" % findings.binary_count)
         lines.append("")
         lines.append("| Binary | Reason |")
         lines.append("| --- | --- |")
@@ -561,23 +813,46 @@ def summary_lines(findings, cause):
         lines.append("| --- | --- |")
         for binary, name in findings.tests:
             lines.append("| %s | %s |" % (md_cell(binary), md_cell(name)))
-        if findings.test_count > len(findings.tests):
-            append_note(lines, "failing tests not listed: %d (limit %d)"
-                        % (findings.test_count - len(findings.tests), MAX_FAILING_TESTS))
-    if findings.files_found > MAX_INPUT_FILES:
-        append_note(lines, "input files over the limit: %d found, first %d read, %d skipped"
-                    % (findings.files_found, MAX_INPUT_FILES, findings.files_found - MAX_INPUT_FILES))
-    for name in findings.walks_over:
-        append_note(lines, "directory walk over the limit: %s has more than %d entries, rest skipped"
-                    % (md_cell(name), MAX_WALK_ENTRIES))
-    if findings.files_over_budget:
-        append_note(lines, "input bytes over the limit: %d file(s) not read (limit %d bytes)"
-                    % (findings.files_over_budget, MAX_TOTAL_BYTES))
-    for name, size in findings.truncated_files:
-        append_note(lines, "input file over the limit: %s has %d bytes, last %d read" % (md_cell(name), size, MAX_FILE_BYTES))
-    if findings.cut_lines:
-        append_note(lines, "input lines over %d bytes cut: %d" % (MAX_LINE_BYTES, findings.cut_lines))
     return lines
+
+
+def summary_notes(findings):
+    """The count lines of every bound the input reached; they are kept after an omission line too."""
+    notes = []
+    if findings.binary_count > len(findings.binaries):
+        notes.append("failing test binaries not listed: %d (limit %d)"
+                     % (findings.binary_count - len(findings.binaries), MAX_FAILING_BINARIES))
+    if findings.test_count > len(findings.tests):
+        notes.append("failing tests not listed: %d (limit %d)"
+                     % (findings.test_count - len(findings.tests), MAX_FAILING_TESTS))
+    if findings.files_found > MAX_INPUT_FILES:
+        notes.append("input files over the limit: %d found, first %d read, %d skipped"
+                     % (findings.files_found, MAX_INPUT_FILES, findings.files_found - MAX_INPUT_FILES))
+    for name in findings.walks_over:
+        notes.append("directory walk over the limit: %s has more than %d entries, rest skipped"
+                     % (md_cell(name), MAX_WALK_ENTRIES))
+    if findings.files_over_budget:
+        notes.append("input bytes over the limit: %d file(s) not read (limit %d bytes)"
+                     % (findings.files_over_budget, MAX_TOTAL_BYTES))
+    for name, size in findings.truncated_files:
+        notes.append("input file over the limit: %s has %d bytes, last %d read" % (md_cell(name), size, MAX_FILE_BYTES))
+    for name in findings.unparsed_files:
+        notes.append("input file %s: no complete line found in the last %d bytes, not parsed"
+                     % (md_cell(name), MAX_FILE_BYTES))
+    if findings.cut_lines:
+        notes.append("input lines over %d bytes cut: %d" % (MAX_LINE_BYTES, findings.cut_lines))
+    return notes
+
+
+def counter_notes():
+    """The count lines of the shown-value cuts and of the redaction budget of this run."""
+    notes = []
+    if _shown_cuts:
+        notes.append("shown values cut: %d (limit %d bytes)" % (_shown_cuts, MAX_LINE_BYTES))
+    if _budget_spent:
+        notes.append("redaction budget spent: %d shown values replaced by %s (limit %d calls)"
+                     % (_budget_spent, REDACTION_SPENT, REDACTION_BUDGET_CALLS))
+    return notes
 
 
 def append_note(lines, text):
@@ -588,7 +863,7 @@ def append_note(lines, text):
 
 
 def annotation_items(findings):
-    """(title, message) of every finding, failing binaries first: the annotation candidates."""
+    """(title, message) of every listed finding, failing binaries first: the annotation candidates."""
     items = [(TITLE_BINARY, "%s: %s" % (binary, reason)) for binary, reason in findings.binaries]
     items.extend((TITLE_TEST, "%s: %s" % (binary, name)) for binary, name in findings.tests)
     return items
@@ -596,24 +871,41 @@ def annotation_items(findings):
 
 def escaped_size(line):
     """Bytes the line takes in the summary file: escaped text plus its newline."""
-    return len(wa.safe_text(line).encode("utf-8")) + 1
+    return len(summary_text(line).encode("utf-8", "replace")) + 1
 
 
-def fit_lines(lines, limit):
-    """``lines`` that fit in ``limit`` escaped bytes; over the limit a prefix and one exact omission line."""
-    total = sum(escaped_size(line) for line in lines)
-    if total <= limit:
-        return list(lines)
+def fit_lines(lines, limit, notes=()):
+    """``lines`` and then ``notes`` when they fit in ``limit`` escaped bytes; over the limit a prefix of ``lines``, a
+    blank line, one exact omission line and the notes (the notes that fit, and a count of the rest)."""
+    notes = list(notes)
+    full = list(lines)
+    for note in notes:
+        append_note(full, note)
+    if sum(escaped_size(line) for line in full) <= limit:
+        return full
+    kept_notes = []
+    notes_size = 0
+    for note in notes:
+        size = escaped_size(note)
+        if notes_size + size > (limit - 2 * SUMMARY_OMIT_RESERVE) // 2:
+            break
+        kept_notes.append(note)
+        notes_size += size
+    if len(kept_notes) < len(notes):
+        kept_notes.append("notes over the limit: %d omitted" % (len(notes) - len(kept_notes)))
+        notes_size += SUMMARY_OMIT_RESERVE
     kept = []
     used = 0
     for line in lines:
         size = escaped_size(line)
-        if used + size > limit - SUMMARY_OMIT_RESERVE:
+        if used + size > limit - SUMMARY_OMIT_RESERVE - notes_size:
             break
         kept.append(line)
         used += size
-    kept.append("summary over the limit: %d lines omitted (limit %d bytes)" % (len(lines) - len(kept), limit))
-    return kept
+    omitted = len(lines) - len(kept)
+    kept.append("")
+    kept.append("summary over the limit: %d lines omitted (limit %d bytes)" % (omitted, limit))
+    return kept + kept_notes
 
 
 def notice(reason):
@@ -629,7 +921,7 @@ def describe(exc):
     return clean("%s: %s" % (name, str(exc)[:DETAIL_MAX_CHARS])).text
 
 
-def write_summary(lines, problems):
+def write_summary(lines, problems, notes=()):
     """Append the fitted summary to the file named by GITHUB_STEP_SUMMARY."""
     github_summary_path = os.environ.get(SUMMARY_ENV, "")
     if not github_summary_path:
@@ -637,8 +929,8 @@ def write_summary(lines, problems):
         return
     try:
         with open(github_summary_path, "a", encoding="utf-8") as handle:
-            for line in fit_lines(lines, MAX_SUMMARY_BYTES):
-                handle.write(wa.safe_text(line) + "\n")
+            for line in fit_lines(lines, MAX_SUMMARY_BYTES, notes):
+                handle.write(summary_text(line) + "\n")
     except OSError as exc:
         problems.append("cannot write summary %s: %s"
                         % (clean(github_summary_path).text, exc.strerror or type(exc).__name__))
@@ -646,6 +938,7 @@ def write_summary(lines, problems):
 
 def run(argv):
     args = build_parser().parse_args(argv)
+    reset_counters()
     try:
         load_redaction()
     except Exception as exc:
@@ -656,25 +949,28 @@ def run(argv):
         problems.append(NO_PATHS_REASON)
     findings = scan(args.paths, problems)
     items = annotation_items(findings)
-    cause = None if items else name_cause(args.step)
+    total = findings.binary_count + findings.test_count
+    cause = None if total else name_cause(args.step, problems)
     lines = summary_lines(findings, cause)
+    notes = summary_notes(findings)
     shown = items[:MAX_ANNOTATIONS]
-    if len(items) > len(shown):
-        append_note(lines, "annotations: %d of %d findings printed (limit %d), %d omitted"
-                    % (len(shown), len(items), MAX_ANNOTATIONS, len(items) - len(shown)))
-    write_summary(lines, problems)
+    omitted = None
+    if total > len(shown):
+        omitted = ("annotations: %d of %d findings printed (limit %d), %d omitted"
+                   % (len(shown), total, MAX_ANNOTATIONS, total - len(shown)))
+        notes.append(omitted)
+    write_summary(lines, problems, notes + counter_notes())
     for title, message in shown:
         print(wa.annotation("error", message, max_chars=ANNOTATION_MAX_CHARS, title=title), flush=True)
     if cause is not None and cause[1]:
         print(wa.annotation("error", cause[0].text, max_chars=ANNOTATION_MAX_CHARS, title=TITLE_CAUSE), flush=True)
-    if len(items) > len(shown):
-        notice("annotations: %d of %d findings printed (limit %d), %d omitted"
-               % (len(shown), len(items), MAX_ANNOTATIONS, len(items) - len(shown)))
+    if omitted is not None:
+        notice(omitted)
     if problems:
         notice(problems[0] if len(problems) == 1 else "%s (and %d more problems)" % (problems[0], len(problems) - 1))
-    elif not items and cause is None:
+    elif not total and cause is None:
         notice(NO_FINDINGS_NOTICE % findings.files_read)
-    elif not items and not cause[1]:
+    elif not total and not cause[1]:
         notice(cause[0].text)
     return EXIT_OK
 

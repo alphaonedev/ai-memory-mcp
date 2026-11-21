@@ -136,6 +136,17 @@ class RedactBeforeCut(Base):
             self.assertLessEqual(len(shown.encode("utf-8")), LINE_BYTES)
             self.assert_no_canary(shown, "clean() at offset %d" % offset)
 
+    def test_a_name_that_is_one_long_token_run_is_a_marked_row_in_both_forms(self):
+        # the token-safe line cut drops a run whole; a name that is ONE run is then the fixed marker, never lost.
+        run = "a" * (LINE_BYTES * 4)
+        for form in ("test %s ... FAILED\n\nfailures:\n    %s\n\n", "failures:\n    %s\n\ntest %s ... FAILED\n"):
+            with self.subTest(form=form[:8]):
+                out, summary = self.run_log(RUNNING_B + form % (run, run) + RESULT_FAILED_LINE + "\n")
+                self.assertIn("failing tests: 1\n", summary)
+                self.assertIn("| b | &lt;redacted> |\n", summary)
+                self.assertIn(TEST_TITLE + "b: <redacted>\n", out)
+                self.assertNotIn("a" * 32, out + summary)
+
     def test_names_that_differ_stay_distinct_after_redaction(self):
         names = ["t::k_%s" % (CANARY[:-1] + tail) for tail in "AB"]
         log = RUNNING_B + "".join("test %s ... FAILED\n" % name for name in names) + RESULT_FAILED_LINE + "\n"
@@ -144,7 +155,9 @@ class RedactBeforeCut(Base):
         self.assert_no_canary(out + summary, "two token names")
 
     def test_x1_a_long_crash_detail_keeps_its_signal_and_counts_the_cut(self):
-        path = "/" + "abcdefghi/" * 19 + "crashy"
+        # A dot in every component: the shared redaction masks a 32+ run of [A-Za-z0-9+/_-] whole, so a path without one
+        # would show as <redacted> and the components the shrink keeps could not be seen.
+        path = "/" + "abcd.fghi/" * 19 + "crashy"
         fixed = len("process didn't exit successfully: `") + len("` (signal: 11, SIGSEGV: invalid memory reference)")
         path += "z" * (298 - fixed - len(path))
         detail = "process didn't exit successfully: `%s` (signal: 11, SIGSEGV: invalid memory reference)" % path
@@ -153,7 +166,7 @@ class RedactBeforeCut(Base):
         line = [row for row in out.splitlines() if row.startswith(BINARY_TITLE)]
         self.assertEqual(len(line), 1, out)
         message = line[0][len(BINARY_TITLE + "crashy: "):]
-        self.assertTrue(message.startswith(NO_RESULT + "; process didn't exit successfully: `.../abcdefghi/"), message)
+        self.assertTrue(message.startswith(NO_RESULT + "; process didn't exit successfully: `.../abcd.fghi/"), message)
         self.assertTrue(message.endswith("crashy" + "z" * (298 - fixed - 1 - 190 - 6)
                                          + "` (signal: 11, SIGSEGV: invalid memory reference)"), message)
         self.assertLessEqual(len(message.encode("utf-8")), LINE_BYTES)
@@ -181,7 +194,8 @@ class WorkBeforeTheCap(Base):
     def test_100k_distinct_result_lines_redact_at_most_the_budget(self):
         module = load_script()
         calls = self.counting(module)
-        lines = ["test result: FAILED. %06d of the ones %s" % (index, "word " * 50) for index in range(100000)]
+        # 20 words keep the file under MAX_FILE_BYTES (16 MiB), so its section line is read and every line counts.
+        lines = ["test result: FAILED. %06d of the ones %s" % (index, "word " * 20) for index in range(100000)]
         log = self.write("many.log", RUNNING_B + "\n".join(lines) + "\n")
         started = time.monotonic()
         out, summary = self.run_inproc([str(log)], module)
@@ -444,7 +458,8 @@ ALLOWED_BUILTINS = {"AttributeError", "BaseException", "Exception", "OSError", "
                     "enumerate", "getattr", "isinstance", "len", "list", "max", "min", "object", "open", "ord", "print",
                     "range", "set", "sorted", "str", "sum", "super", "type", "ValueError", "any", "chr", "hasattr",
                     "tuple", "dict", "bytes", "int", "reversed", "zip", "UnicodeError", "property", "staticmethod",
-                    "bool", "iter", "next", "all", "frozenset", "map", "id", "repr", "divmod", "abs"}
+                    "bool", "iter", "next", "all", "frozenset", "map", "id", "repr", "divmod", "abs",
+                    "__name__"}  # the main guard reads the module's own __name__, also an attribute of builtins
 ENVIRON_SITES = 1
 
 

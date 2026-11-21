@@ -3067,26 +3067,39 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
 
-      # shell: bash = errexit + pipefail on every tee step below, so the tee (#9709) cannot mask a red cargo command.
+      # shell: bash on every tee step below: the step status is cargo's own (PIPESTATUS[0]), so the tee (#9709)
+      # can neither mask a red cargo command nor turn a green one red; the log directory is best effort.
       - name: Clippy (sal feature)
         shell: bash
         run: |
-          mkdir -p "${RUNNER_TEMP}/red-cause"
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          set +e
           cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic 2>&1 | tee "${RUNNER_TEMP}/red-cause/sal-clippy.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          exit "$status"
 
       - name: Build release (sal feature)
         shell: bash
         run: |
-          mkdir -p "${RUNNER_TEMP}/red-cause"
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          set +e
           cargo build --release --features sal 2>&1 | tee "${RUNNER_TEMP}/red-cause/sal-build.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          exit "$status"
 
       - name: Run lib tests (sal feature)
         shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
-          mkdir -p "${RUNNER_TEMP}/red-cause"
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          set +e
           cargo test --features sal --lib 2>&1 | tee "${RUNNER_TEMP}/red-cause/sal-lib.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          exit "$status"
 
       - name: Red cause summary (#9709)
         if: failure() || cancelled()
@@ -3140,28 +3153,41 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
 
-      # shell: bash = errexit + pipefail on every tee step below, so the tee (#9709) cannot mask a red cargo command.
+      # shell: bash on every tee step below: the step status is cargo's own (PIPESTATUS[0]), so the tee (#9709)
+      # can neither mask a red cargo command nor turn a green one red; the log directory is best effort.
       - name: Clippy (vectorlite feature, all targets)
         shell: bash
         run: |
-          mkdir -p "${RUNNER_TEMP}/red-cause"
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          set +e
           cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic 2>&1 | tee "${RUNNER_TEMP}/red-cause/vectorlite-clippy.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          exit "$status"
 
       - name: Run vectorlite no-native-lib seam tests (#1860)
         shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
-          mkdir -p "${RUNNER_TEMP}/red-cause"
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          set +e
           cargo test --features vectorlite --test vectorlite_1860 2>&1 | tee "${RUNNER_TEMP}/red-cause/vectorlite-1860.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          exit "$status"
 
       - name: Run config-precedence under vectorlite (#2256 feature-gated pin)
         shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
-          mkdir -p "${RUNNER_TEMP}/red-cause"
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          set +e
           cargo test --features vectorlite --test config_precedence 2>&1 | tee "${RUNNER_TEMP}/red-cause/config-precedence.log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          exit "$status"
 
       - name: Red cause summary (#9709)
         if: failure() || cancelled()

@@ -8,6 +8,11 @@ per line, sorted and unique, so a regenerated file diffs cleanly.
 
 Usage: ``python3 scripts/ci/tests/gen_red_cause_census_9709.py`` rewrites the fixture; ``--check`` exits 1 when the
 tracked fixture differs from a fresh walk (exit 0 when it matches).
+
+The fixture is a dated snapshot, not a live census (#9759 r1, code finding 10): it was regenerated on 2026-11-21 from
+the ``src/`` and ``tests/`` tree of f4bf8277d6fdda33c31a695f5f63499fa69f0ce2 (28574 names). ``--check`` is a manual
+tool and runs in no CI job, so a Rust PR never has to regenerate it; the 99% floor holds on any later tree because
+the names it samples are the repository's own naming style, and a regeneration is one command.
 """
 
 import argparse

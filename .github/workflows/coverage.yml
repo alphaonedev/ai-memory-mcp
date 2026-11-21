@@ -619,8 +619,8 @@ jobs:
         # it under the 7 GB runner ceiling.
         run: |
           # #9709: the start marker names this step as the failing one when the job goes red here.
-          mkdir -p "${RUNNER_TEMP}/red-cause"
-          touch "${RUNNER_TEMP}/red-cause/coverage-json.started"
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          touch "${RUNNER_TEMP}/red-cause/coverage-json.started" || true
           mkdir -p coverage
           cargo llvm-cov \
             --no-report \
