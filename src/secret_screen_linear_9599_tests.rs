@@ -162,6 +162,46 @@ fn screen_cost_doubling_is_linear_9599() {
     );
 }
 
+/// The worst case of the JWT dotted-run lookup: one token run in which every
+/// `eyJ` is a candidate and every candidate is followed by one dot, so the
+/// run holds `n / 4` dots and the detector makes `n / 4` lookups.
+const JWT_DOTTED_RUN_UNIT: &str = "eyJ.";
+/// The 64 KiB worst-case input for the dotted-run path (the content cap).
+const JWT_DOTTED_RUN_INPUT_BYTES: usize = 64 * 1024;
+/// Linear ceiling for one `redact_jwts` pass, in metered ops per input byte.
+/// A linear pass charges about 2.25 per byte on [`JWT_DOTTED_RUN_UNIT`]: the
+/// marker search (1), the one run scan (1) and the cursor steps (one per dot,
+/// 0.25). A lookup that searches the dots per candidate (binary search) adds
+/// about log2(n / 4) probes per candidate and passes 3 at 64 KiB.
+const JWT_DOTTED_RUN_COST_PER_BYTE_CEILING: u64 = 3;
+
+#[test]
+fn jwt_dotted_run_cost_is_linear_9599() {
+    let mut violations = Vec::new();
+    for len in [JWT_DOTTED_RUN_INPUT_BYTES, LARGE_INPUT_BYTES] {
+        let input = repeat_to(JWT_DOTTED_RUN_UNIT, len);
+        let n = u64::try_from(input.len()).unwrap_or(u64::MAX);
+        let ceiling = JWT_DOTTED_RUN_COST_PER_BYTE_CEILING.saturating_mul(n);
+        let mut kinds = Vec::new();
+        scan_meter::arm(u64::MAX);
+        let outcome = redact_jwts(&input, &mut kinds);
+        let ops = scan_meter::disarm();
+        // Detection is unchanged: a run of `eyJ.` holds no JWT.
+        assert_eq!(outcome, None, "#9599 `eyJ.` run must not redact");
+        assert!(kinds.is_empty(), "#9599 `eyJ.` run must not report a kind");
+        if ops > ceiling {
+            violations.push(format!(
+                "{JWT_DOTTED_RUN_UNIT:?} @ {n} bytes: ops {ops} > {JWT_DOTTED_RUN_COST_PER_BYTE_CEILING} * n = {ceiling}"
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "#9599 JWT dotted-run lookup is not linear (ops <= K * n):\n{}",
+        violations.join("\n")
+    );
+}
+
 /// xorshift64* — deterministic, dependency-free corpus generator.
 struct Rng(u64);
 

@@ -521,8 +521,13 @@ impl DottedRun {
             self.valid = true;
             self.next_dot = 0;
         }
-        let skipped = self.dots[self.next_dot..].partition_point(|&d| d < pos);
-        charge_scan(skipped);
+        let mut probes = 0usize;
+        let skipped = self.dots[self.next_dot..].partition_point(|&d| {
+            probes += 1;
+            d < pos
+        });
+        // Charge every probe of the search, not only the dots it skipped.
+        charge_scan(probes);
         self.next_dot += skipped;
         (self.end, &self.dots[self.next_dot..])
     }
