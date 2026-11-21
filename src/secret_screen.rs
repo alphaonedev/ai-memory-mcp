@@ -139,6 +139,8 @@ const MIN_PREFIXED_TOKEN_LEN: usize = 20;
 const MIN_TOKEN_ENTROPY_BITS: f64 = 3.5;
 /// AWS access-key id is exactly `AKIA` + 16 uppercase-alnum chars.
 const AWS_KEY_BODY_LEN: usize = 16;
+/// One histogram bin per byte value (the entropy confirmation's table).
+const BYTE_VALUE_BINS: usize = 256;
 
 /// Screen a content string for embedded credentials.
 ///
@@ -152,6 +154,8 @@ pub fn screen(content: &str) -> ScreenOutcome {
     let mut redacted = content.to_string();
 
     // 1. PEM private key block (any algorithm) — structural, no entropy gate.
+    // Two `contains` passes over the input (#9599 meter).
+    charge_scan(content.len().saturating_mul(2));
     if content.contains(PEM_BEGIN_MARKER) && content.contains(PEM_PRIVATE_KEY_MARKER) {
         kinds.push(KIND_PEM_PRIVATE_KEY);
         redacted = redact_pem_blocks(&redacted);
@@ -190,17 +194,80 @@ pub fn screen(content: &str) -> ScreenOutcome {
     }
 }
 
-/// Shannon entropy (bits/char) of a token's byte distribution.
+/// #9599 — test-only cost meter for the detectors. Every detector reports
+/// the bytes it examines through [`charge_scan`]; a lib test arms a budget
+/// and reads the total, which turns "no screened input takes more than
+/// linear time" into a deterministic op-count assertion. Release builds
+/// compile [`charge_scan`] to nothing.
+#[cfg(test)]
+pub(crate) mod scan_meter {
+    use std::cell::Cell;
+
+    /// The panic text the meter raises when an armed budget is exceeded.
+    pub(crate) const BUDGET_EXCEEDED: &str = "secret-screen scan budget exceeded (#9599)";
+
+    thread_local! {
+        static COST: Cell<u64> = const { Cell::new(0) };
+        static BUDGET: Cell<u64> = const { Cell::new(u64::MAX) };
+    }
+
+    /// Add `bytes` examined bytes; panics with [`BUDGET_EXCEEDED`] once the
+    /// armed budget is passed so a super-linear detector fails fast.
+    pub(crate) fn charge(bytes: usize) {
+        let add = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let total = COST.with(|c| {
+            let v = c.get().saturating_add(add);
+            c.set(v);
+            v
+        });
+        if total > BUDGET.with(Cell::get) {
+            panic!("{BUDGET_EXCEEDED}");
+        }
+    }
+
+    /// Reset the counter and arm `budget` for this thread.
+    pub(crate) fn arm(budget: u64) {
+        COST.with(|c| c.set(0));
+        BUDGET.with(|b| b.set(budget));
+    }
+
+    /// Disarm the budget and return the cost charged since [`arm`].
+    pub(crate) fn disarm() -> u64 {
+        BUDGET.with(|b| b.set(u64::MAX));
+        COST.with(Cell::get)
+    }
+}
+
+/// Report `bytes` examined bytes to the #9599 test meter (no-op outside
+/// tests).
+#[inline]
+fn charge_scan(bytes: usize) {
+    #[cfg(test)]
+    scan_meter::charge(bytes);
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
+/// `content[from..].find(pat)`, metered: charges the bytes up to the end of
+/// the match (or the whole remainder when there is none).
+fn find_from(content: &str, from: usize, pat: &str) -> Option<usize> {
+    let hay = &content[from..];
+    let found = hay.find(pat);
+    charge_scan(found.map_or(hay.len(), |rel| rel + pat.len()));
+    found
+}
+
+/// Shannon entropy (bits/char) of a byte histogram over `len` bytes. The
+/// bins are summed in index order, so one histogram always yields
+/// bit-identical bits however it was built (#9599: the prefix detectors
+/// maintain it incrementally instead of rebuilding it per candidate).
 #[must_use]
-fn shannon_entropy_bits(s: &str) -> f64 {
-    if s.is_empty() {
+fn entropy_from_counts(counts: &[usize; BYTE_VALUE_BINS], len: usize) -> f64 {
+    if len == 0 {
         return 0.0;
     }
-    let mut counts = [0usize; 256];
-    for b in s.bytes() {
-        counts[b as usize] += 1;
-    }
-    let len = s.len() as f64;
+    charge_scan(BYTE_VALUE_BINS);
+    let len = len as f64;
     let mut h = 0.0;
     for &c in counts.iter() {
         if c > 0 {
@@ -217,20 +284,93 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '.' | '=')
 }
 
-/// The contiguous token starting at byte offset `start` (over
-/// [`is_token_char`]).
-fn token_at(content: &str, start: usize) -> &str {
-    let bytes = content.as_bytes();
-    let mut end = start;
-    while end < bytes.len() && is_token_char(bytes[end] as char) {
-        end += 1;
+/// #9599 — the maximal [`is_token_char`] run, memoised for one content
+/// string. Bytes `[from, end)` are token chars and the byte at `end` is not
+/// (or `end` is the input length), so the run starting at ANY offset in
+/// `[from, end]` ends at `end`. Detector candidates only move right, so a
+/// pass scans each run once: O(len) instead of one rescan per candidate.
+#[derive(Debug, Default)]
+struct TokenRun {
+    from: usize,
+    end: usize,
+    valid: bool,
+}
+
+impl TokenRun {
+    /// End offset of the token run starting at byte offset `pos` (equal to
+    /// `pos` when the byte there is not a token char).
+    fn end_at(&mut self, content: &str, pos: usize) -> usize {
+        if !(self.valid && self.from <= pos && pos <= self.end) {
+            let bytes = content.as_bytes();
+            let mut end = pos;
+            while end < bytes.len() && is_token_char(bytes[end] as char) {
+                end += 1;
+            }
+            charge_scan(end - pos);
+            *self = Self {
+                from: pos,
+                end,
+                valid: true,
+            };
+        }
+        self.end
     }
-    &content[start..end]
+}
+
+/// #9599 — byte histogram of the suffix `content[pos..end]` of one token
+/// run. A later candidate in the same run (same `end`, larger `pos`) drops
+/// the bytes it skipped instead of recounting the whole suffix, so a pass
+/// counts each byte at most twice.
+#[derive(Debug)]
+struct SuffixCounts {
+    pos: usize,
+    end: usize,
+    counts: [usize; BYTE_VALUE_BINS],
+    valid: bool,
+}
+
+impl SuffixCounts {
+    fn new() -> Self {
+        Self {
+            pos: 0,
+            end: 0,
+            counts: [0; BYTE_VALUE_BINS],
+            valid: false,
+        }
+    }
+
+    /// Shannon entropy of `content[pos..end]` (`pos <= end`), bit-identical
+    /// to a fresh histogram of that slice.
+    fn entropy(&mut self, content: &str, pos: usize, end: usize) -> f64 {
+        let bytes = content.as_bytes();
+        if self.valid && self.end == end && self.pos <= pos {
+            // The histogram covers `[self.pos, end)` and `pos <= end`, so
+            // every byte dropped here was counted: no count goes below 0.
+            for &b in &bytes[self.pos..pos] {
+                self.counts[b as usize] -= 1;
+            }
+            charge_scan(pos - self.pos);
+        } else {
+            self.counts = [0; BYTE_VALUE_BINS];
+            for &b in &bytes[pos..end] {
+                self.counts[b as usize] += 1;
+            }
+            charge_scan(end - pos);
+            self.end = end;
+            self.valid = true;
+        }
+        self.pos = pos;
+        entropy_from_counts(&self.counts, end - pos)
+    }
 }
 
 /// Redact every `<prefix><token>` whose token clears the length + entropy
 /// floor. Returns the rewritten string when at least one was redacted (and
 /// pushes `kind`), else `None`.
+///
+/// #9599: every candidate is still judged on its own full token (the run
+/// from its token start), exactly as before; the run end and the suffix
+/// histogram are memoised per run, so the pass is linear in the input.
 fn redact_prefixed_tokens(
     content: &str,
     prefix: &str,
@@ -240,17 +380,19 @@ fn redact_prefixed_tokens(
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
     let mut hit = false;
-    while let Some(rel) = content[search_from..].find(prefix) {
+    let mut run = TokenRun::default();
+    let mut suffix = SuffixCounts::new();
+    while let Some(rel) = find_from(content, search_from, prefix) {
         let pfx_start = search_from + rel;
         let token_start = pfx_start + prefix.len();
-        let token = token_at(content, token_start);
+        let token_end = run.end_at(content, token_start);
         // Bearer's prefix includes the space; its token starts after it.
-        if token.len() >= MIN_PREFIXED_TOKEN_LEN
-            && shannon_entropy_bits(token) >= MIN_TOKEN_ENTROPY_BITS
+        if token_end - token_start >= MIN_PREFIXED_TOKEN_LEN
+            && suffix.entropy(content, token_start, token_end) >= MIN_TOKEN_ENTROPY_BITS
         {
             out.push_str(&content[search_from..pfx_start]);
             out.push_str(REDACTION_PLACEHOLDER);
-            search_from = token_start + token.len();
+            search_from = token_end;
             hit = true;
         } else {
             // Not a secret — keep the prefix, advance past it.
@@ -268,22 +410,31 @@ fn redact_prefixed_tokens(
 }
 
 /// Redact `AKIA` + 16 uppercase-alnum access-key ids.
+///
+/// #9599: the verdict reads only the 16-byte window after `AKIA` (uppercase
+/// and digits are token chars, so "the token there is at least 16 long and
+/// its first 16 bytes are uppercase-alnum" is exactly "the 16-byte window
+/// exists and is uppercase-alnum"); no run is scanned.
 fn redact_aws_keys(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
     let mut hit = false;
-    while let Some(rel) = content[search_from..].find(AWS_AKIA_PREFIX) {
+    while let Some(rel) = find_from(content, search_from, AWS_AKIA_PREFIX) {
         let start = search_from + rel;
         let body_start = start + AWS_AKIA_PREFIX.len();
-        let body = token_at(content, body_start);
-        let is_key = body.len() >= AWS_KEY_BODY_LEN
-            && body[..AWS_KEY_BODY_LEN]
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        let body_end = body_start.saturating_add(AWS_KEY_BODY_LEN);
+        charge_scan(AWS_KEY_BODY_LEN);
+        let is_key = content
+            .as_bytes()
+            .get(body_start..body_end)
+            .is_some_and(|body| {
+                body.iter()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            });
         if is_key {
             out.push_str(&content[search_from..start]);
             out.push_str(REDACTION_PLACEHOLDER);
-            search_from = body_start + AWS_KEY_BODY_LEN;
+            search_from = body_end;
             hit = true;
         } else {
             out.push_str(&content[search_from..body_start]);
@@ -299,18 +450,22 @@ fn redact_aws_keys(content: &str, kinds: &mut Vec<&'static str>) -> Option<Strin
     }
 }
 
+/// The JOSE header marker every compact JWS starts with (`{"` base64url).
+const JWT_HEADER_MARKER: &str = "eyJ";
+/// Minimum length of each of the three JWS segments.
+const JWT_MIN_SEGMENT_LEN: usize = 8;
+
 /// True when `token` is a compact JWS: `eyJ` header + three base64url
-/// segments each ≥ 8 chars. Shared by [`redact_jwts`] (detector) and
-/// [`receive_carveout_string_is_attestation_leaf`] (Wave-2 B1 preserve).
+/// segments each ≥ 8 chars. Shared by the receive carve-out
+/// ([`receive_carveout_string_is_attestation_leaf`], Wave-2 B1 preserve);
+/// [`redact_jwts`] applies the same rule through [`jwt_shape`].
 fn looks_like_jwt(token: &str) -> bool {
-    const JWT_HEADER_MARKER: &str = "eyJ";
-    const MIN_SEG_LEN: usize = 8;
     if !token.starts_with(JWT_HEADER_MARKER) {
         return false;
     }
     let mut n = 0usize;
     for seg in token.split('.') {
-        if seg.len() < MIN_SEG_LEN {
+        if seg.len() < JWT_MIN_SEGMENT_LEN {
             return false;
         }
         n += 1;
@@ -321,21 +476,92 @@ fn looks_like_jwt(token: &str) -> bool {
     n == 3
 }
 
+/// [`looks_like_jwt`] for the token `content[start..end]` that starts with
+/// [`JWT_HEADER_MARKER`], given the offsets of the dots inside it: exactly
+/// two dots and three segments of at least [`JWT_MIN_SEGMENT_LEN`] each.
+fn jwt_shape(start: usize, end: usize, dots: &[usize]) -> bool {
+    match dots {
+        [first, second] => {
+            first - start >= JWT_MIN_SEGMENT_LEN
+                && second - first - 1 >= JWT_MIN_SEGMENT_LEN
+                && end - second - 1 >= JWT_MIN_SEGMENT_LEN
+        }
+        _ => false,
+    }
+}
+
+/// #9599 — the token run under the JWT detector plus the offsets of its
+/// dots, memoised like [`TokenRun`]. The dots inside the token at a
+/// candidate are the suffix of `dots` from the first dot at or after it;
+/// `next_dot` is a cursor that only moves right to that dot, one dot per
+/// step, so all the lookups of one run cost at most its dot count and the
+/// pass stays linear. `from` is the last position served: a call at a
+/// smaller position rescans instead of reading a cursor already past it.
+#[derive(Debug, Default)]
+struct DottedRun {
+    /// The last position served (the cursor is valid for any `pos >= from`).
+    from: usize,
+    end: usize,
+    valid: bool,
+    dots: Vec<usize>,
+    next_dot: usize,
+}
+
+impl DottedRun {
+    /// `(end, dots in [pos, end))` of the token run starting at `pos`.
+    fn at(&mut self, content: &str, pos: usize) -> (usize, &[usize]) {
+        if !(self.valid && self.from <= pos && pos <= self.end) {
+            let bytes = content.as_bytes();
+            self.dots.clear();
+            let mut end = pos;
+            while end < bytes.len() && is_token_char(bytes[end] as char) {
+                if bytes[end] == b'.' {
+                    self.dots.push(end);
+                }
+                end += 1;
+            }
+            charge_scan(end - pos);
+            self.from = pos;
+            self.end = end;
+            self.valid = true;
+            self.next_dot = 0;
+        }
+        // Forward-only cursor: each dot is stepped over at most once per run.
+        // The meter charges the steps the loop takes, not how far the cursor
+        // moved, so a cursor that restarted would be charged its real cost.
+        let mut next = self.next_dot;
+        let mut steps = 0usize;
+        while self.dots.get(next).is_some_and(|&d| d < pos) {
+            next += 1;
+            steps += 1;
+        }
+        charge_scan(steps);
+        self.next_dot = next;
+        self.from = pos;
+        (self.end, &self.dots[self.next_dot..])
+    }
+}
+
 /// Redact JWTs: `<seg>.<seg>.<seg>` of base64url chars, each ≥ 8 long, the
 /// first segment starting with `eyJ` (the `{"` JOSE header marker) so we do
 /// not flag arbitrary dotted identifiers.
+///
+/// #9599: each candidate is judged on its own full token exactly as before;
+/// the run end and its dot offsets are memoised per run and the dot lookup
+/// is a forward-only cursor ([`DottedRun`]), so the pass is linear in the
+/// input (pinned by `jwt_dotted_run_cost_is_linear_9599`).
 fn redact_jwts(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
-    const JWT_HEADER_MARKER: &str = "eyJ";
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
     let mut hit = false;
-    while let Some(rel) = content[search_from..].find(JWT_HEADER_MARKER) {
+    let mut run = DottedRun::default();
+    while let Some(rel) = find_from(content, search_from, JWT_HEADER_MARKER) {
         let start = search_from + rel;
-        let token = token_at(content, start);
-        if looks_like_jwt(token) {
+        let (token_end, dots) = run.at(content, start);
+        if jwt_shape(start, token_end, dots) {
             out.push_str(&content[search_from..start]);
             out.push_str(REDACTION_PLACEHOLDER);
-            search_from = start + token.len();
+            search_from = token_end;
             hit = true;
         } else {
             out.push_str(&content[search_from..start + JWT_HEADER_MARKER.len()]);
@@ -370,7 +596,7 @@ fn redact_jwts(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
 fn redact_pem_blocks(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
-    while let Some(begin) = rest.find(PEM_BEGIN_MARKER) {
+    while let Some(begin) = find_from(rest, 0, PEM_BEGIN_MARKER) {
         out.push_str(&rest[..begin]);
         // The scan advances within `rest` — NOT re-sliced from the original
         // `content` (FBL-16: re-basing to `content` reproduced the same tail
@@ -379,10 +605,10 @@ fn redact_pem_blocks(content: &str) -> String {
         rest = &rest[begin..];
         // #2387 — bound this block's span at the NEXT `-----BEGIN` so a
         // later block (key or not) can never be folded into this one.
-        let region_end = rest[PEM_BEGIN_MARKER.len()..]
-            .find(PEM_BEGIN_MARKER)
+        let region_end = find_from(rest, PEM_BEGIN_MARKER.len(), PEM_BEGIN_MARKER)
             .map_or(rest.len(), |rel| PEM_BEGIN_MARKER.len() + rel);
         let region = &rest[..region_end];
+        charge_scan(region.len());
         // Within the bounded region the FIRST `PRIVATE KEY-----` closes a
         // key HEADER and the SECOND closes the FOOTER (the pre-#2387 scan
         // used the same first/second rule, just unbounded).
@@ -1130,6 +1356,10 @@ pub fn redact_pending_action_for_storage(
     out.payload = payload;
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "secret_screen_linear_9599_tests.rs"]
+mod linear_9599_tests;
 
 #[cfg(test)]
 mod tests {
