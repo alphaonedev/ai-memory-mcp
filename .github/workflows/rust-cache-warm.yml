@@ -398,8 +398,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # The key env of the android leg: the workflow's CARGO_INCREMENTAL (the job has no env).
+      # The key env of the android leg: the workflow's CARGO_INCREMENTAL and the job-level
+      # cargo-audit pin of the PR job (a job env enters the rust-cache key hash).
       CARGO_INCREMENTAL: "0"
+      # #3138: named pin for the cargo-audit version the PR job installs.
+      CARGO_AUDIT_VERSION: "0.22.2"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -463,15 +466,20 @@ jobs:
             --features sqlite-bundled \
             --lib
 
+      # The PR job's own setup-python step, at the same place (the audit gate reads TOML with
+      # it); it exports PKG_CONFIG_PATH and LD_LIBRARY_PATH into every later cargo step.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        with:
+          python-version: '3.12'
+
       # The cargo-audit binary, built from source at the #3138 pin with the PR job's own install
       # line. The PR job installs only when the pinned version is missing; here the install is
-      # unconditional (the cache is empty on a miss, and the warm job reads no version probe,
-      # which keeps nothing). The audit gate itself is not run here.
+      # unconditional with --force and reads no version probe, which keeps nothing. On a cache
+      # miss rust-cache can still restore a partial or stale cache through its restore-keys, so
+      # the step runs whenever the exact key missed. The audit gate itself is not run here.
       - name: Install the pinned cargo-audit (no audit run)
         if: steps.rust-cache.outputs.cache-hit != 'true'
-        env:
-          # #3138: named pin for the cargo-audit version the PR job installs.
-          CARGO_AUDIT_VERSION: "0.22.2"
         run: cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
 
       - name: Build release (release-profile smoke)

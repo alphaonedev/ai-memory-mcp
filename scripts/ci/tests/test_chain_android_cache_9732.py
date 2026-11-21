@@ -32,6 +32,7 @@ Run: python3 -I -m unittest discover -s scripts/ci/tests -p 'test_chain_android_
 
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 from dataclasses import dataclass
@@ -136,6 +137,7 @@ MIRRORS = (
     Row("nttld/setup-ndk", "nttld/setup-ndk", {"if": (NDK_GATE, CACHE_GATE)}),
     Row(NDK_STEPS[1], NDK_STEPS[1], {"if": (NDK_GATE, CACHE_GATE)}),
     Row(CARGO_CHECK_STEP, CARGO_CHECK_STEP, {"if": (SKIP_GATE, CACHE_GATE)}),
+    Row("actions/setup-python", "actions/setup-python", {"if": (ONCE_GATE, CACHE_GATE)}),
     Row(AUDIT_PR_STEP, AUDIT_WARM_STEP,
         {"name": (AUDIT_PR_STEP, AUDIT_WARM_STEP), "if": (ONCE_GATE, CACHE_GATE),
          "run": (ANY, AUDIT_WARM_RUN)}),
@@ -143,7 +145,35 @@ MIRRORS = (
         {"name": (BUILD_PR_STEP, BUILD_WARM_STEP), "if": (ONCE_GATE, CACHE_GATE)}),
 )
 # Steps of the PR job that have no warm counterpart (they run no cargo and write no cache input).
-PR_ONLY_STEPS = ("cargo_skip short-circuit", "actions/setup-python")
+PR_ONLY_STEPS = ("cargo_skip short-circuit",)
+
+# Literal 40-hex pins of every mirrored action (review r2 F7). Written by hand: a swap of the sha on
+# both sides at once, or a tag form, passes a side-to-side compare and fails this table.
+PINNED_USES = {
+    "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+    TOOLCHAIN_ACTION: "4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
+    base.RUST_CACHE: "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+    "nttld/setup-ndk": "ed92fe6cadad69be94a966a7ee3271275e62f779",
+    "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
+}
+# `with` inputs of a mirrored action pinned to one value on both sides (review r2 F2).
+PINNED_WITH = {("actions/setup-python", "python-version"): "3.12"}
+# Job-level env names pinned to one value on both sides: a job env enters the rust-cache key hash
+# and a step env does not, so the build-input version lives here (review r2 F4).
+JOB_ENV_PINNED = {"CARGO_AUDIT_VERSION": "0.22.2"}
+# The NDK version the cache holds and the prefix-key generation that goes with it: bump both
+# together, or the warm cache of the old NDK is restored for the new one (review r2 F4).
+NDK_GENERATION = (("r26d", "chain-cache-g1"),)
+# The contexts a `${{ }}` of a mirrored step may read (comment lines included); anything else, and
+# any expression the scan cannot read to its end, is a failure (review r2 F6).
+EXPRESSION_ALLOWED = tuple(re.compile(pattern) for pattern in (
+    r"matrix\.[A-Za-z0-9_-]+",
+    r"steps\.setup-ndk\.outputs\.[A-Za-z0-9_-]+",
+    r"needs\.classify\.outputs\.[A-Za-z0-9_-]+",
+    r"github\.event_name == 'push'",
+))
+EXPRESSION_OPEN = "${{"
+EXPRESSION_CLOSE = "}}"
 
 
 def _relative(lines: list[str], indent: int) -> str:
@@ -160,10 +190,24 @@ def _step_id(step: base.Step) -> str:
     return step.uses_name() or step.label()
 
 
+def _run_text(step: base.Step) -> str | None:
+    """The `run:` text with every comment kept: a block's comment lines, and the text of a
+    single-line `run:` up to the end of the line (the parser drops a trailing ` #` comment)."""
+    if "run" not in step.blocks:
+        return None
+    if "run" not in step.keys:
+        return step.run()
+    for index, line in enumerate(step.lines):
+        text = (" " * base.KEY_INDENT + line.strip()[2:]) if index == 0 else line
+        if base._indent(text) == base.KEY_INDENT and text.strip().startswith("run:"):
+            return text.strip()[len("run:"):].strip()
+    raise AssertionError(f"step {step.label()!r}: its single-line run is not on a step line")
+
+
 def _step_value(step: base.Step, key: str, leg: dict[str, object]) -> str | None:
     """The whole value of one step key (None when absent); the PR side expands `matrix.<name>`."""
     if key == "run":
-        value = step.run() if "run" in step.blocks else None
+        value = _run_text(step)
     elif key in step.keys:
         value = step.keys[key]
     elif key in step.blocks:
@@ -187,6 +231,88 @@ def _identities(wf: base.Workflow, job: base.Job,
         else:
             found[ident] = group[0]
     return found, duplicated
+
+
+def _order_problems(wf: base.Workflow, job: base.Job, steps: dict[str, base.Step],
+                    duplicated: set[str], ids: list[str]) -> list[str]:
+    """The mirrored steps run in the order of the hand table (every row present once)."""
+    want = [ident for ident in ids if ident in steps]
+    got = [_step_id(step) for step in job.steps()
+           if _step_id(step) in want and _step_id(step) not in duplicated]
+    if got == want:
+        return []
+    return [f"{wf.name}:{job.job_id}: mirrored steps run in the order {got!r}, the hand table "
+            f"says {want!r}"]
+
+
+def _expression_problems(wf: base.Workflow, job: base.Job, ident: str,
+                         step: base.Step) -> list[str]:
+    """Every `${{ }}` on every line of a mirrored step, comment lines included, reads an allowed
+    context; an expression the scan cannot read to its end is a failure, never a pass."""
+    problems: list[str] = []
+    for raw in step.lines:
+        if EXPRESSION_OPEN not in raw:
+            continue
+        line, at = raw.strip(), 0
+        while (start := raw.find(EXPRESSION_OPEN, at)) != -1:
+            end = raw.find(EXPRESSION_CLOSE, start + len(EXPRESSION_OPEN))
+            if end == -1:
+                problems.append(f"{wf.name}:{job.job_id} step {ident!r}: line {line!r} holds an "
+                                f"expression the scan cannot classify")
+                break
+            body = raw[start + len(EXPRESSION_OPEN):end].strip()
+            if not any(allowed.fullmatch(body) for allowed in EXPRESSION_ALLOWED):
+                problems.append(f"{wf.name}:{job.job_id} step {ident!r}: line {line!r} holds the "
+                                f"expression {body!r}, outside the allowlist")
+            at = end + len(EXPRESSION_CLOSE)
+    return problems
+
+
+def _row_pin_problems(row: Row, pr_wf: base.Workflow, pr_job: base.Job, pr_step: base.Step,
+                      warm_wf: base.Workflow, warm_job: base.Job, warm_step: base.Step,
+                      leg: dict[str, object]) -> list[str]:
+    """The literal pins of one mirrored step on each side: its action sha, its pinned `with`
+    inputs, a step env on both sides, and every expression of every line."""
+    problems: list[str] = []
+    for wf, job, ident, step, scope in ((pr_wf, pr_job, row.pr_id, pr_step, leg),
+                                        (warm_wf, warm_job, row.warm_id, warm_step, {})):
+        action = step.uses_name()
+        if action in PINNED_USES:
+            expected = f"{action}@{PINNED_USES[action]}"
+            actual = step.keys.get("uses")
+            if actual != expected:
+                problems.append(f"{wf.name}:{job.job_id} step {ident!r}: uses is {actual!r}, the "
+                                f"pinned form is {expected!r}")
+        for (pinned_action, key), expected_value in PINNED_WITH.items():
+            if action == pinned_action:
+                actual_value = _expanded(step, "with", scope).get(key)
+                if actual_value != expected_value:
+                    problems.append(f"{wf.name}:{job.job_id} step {ident!r}: with {key!r} is "
+                                    f"{actual_value!r}, the pinned value is {expected_value!r}")
+    pr_env = _step_value(pr_step, "env", leg)
+    if (pr_env is not None and pr_env == _step_value(warm_step, "env", {})
+            and "env" not in row.allowed):
+        for wf, job, ident in ((pr_wf, pr_job, row.pr_id), (warm_wf, warm_job, row.warm_id)):
+            problems.append(f"{wf.name}:{job.job_id} step {ident!r}: step env {pr_env!r} is on "
+                            f"both sides but the hand table names none (a step env is outside the "
+                            f"rust-cache key)")
+    for wf, job, ident, step in ((pr_wf, pr_job, row.pr_id, pr_step),
+                                 (warm_wf, warm_job, row.warm_id, warm_step)):
+        problems.extend(_expression_problems(wf, job, ident, step))
+    return problems
+
+
+def _generation_problems(wf: base.Workflow, job: base.Job) -> list[str]:
+    """The setup-ndk `ndk-version` and the rust-cache `prefix-key` of one side form a table pair."""
+    ndk = next((s.mapping("with").get("ndk-version") for s in job.steps()
+                if s.uses_name() == "nttld/setup-ndk"), None)
+    generation = next((s.mapping("with").get("prefix-key") for s in job.steps()
+                       if s.uses_name() == base.RUST_CACHE), None)
+    if (ndk, generation) in NDK_GENERATION:
+        return []
+    want_ndk, want_generation = NDK_GENERATION[0]
+    return [f"{wf.name}:{job.job_id}: NDK {ndk!r} is cached under generation {generation!r}; the "
+            f"hand table pairs {want_ndk!r} with {want_generation!r}"]
 
 
 def _step_problems(pr_wf: base.Workflow, pr_job: base.Job, warm_wf: base.Workflow,
@@ -226,6 +352,12 @@ def _step_problems(pr_wf: base.Workflow, pr_job: base.Job, warm_wf: base.Workflo
                                 f"{warm_wf.name}:{warm_job.job_id} step {row.warm_id!r}: key "
                                 f"{key!r} differs: {pr_wf.name} has {pr_val!r}, {warm_wf.name} "
                                 f"has {warm_val!r}")
+        problems.extend(_row_pin_problems(row, pr_wf, pr_job, pr_step, warm_wf, warm_job,
+                                          warm_step, leg))
+    for wf, job, dup, ids, steps in ((pr_wf, pr_job, pr_dup, [r.pr_id for r in MIRRORS], pr_steps),
+                                     (warm_wf, warm_job, warm_dup, [r.warm_id for r in MIRRORS],
+                                      warm_steps)):
+        problems.extend(_order_problems(wf, job, steps, dup, ids))
     mirrored_pr = {row.pr_id for row in MIRRORS} | set(PR_ONLY_STEPS)
     mirrored_warm = {row.warm_id for row in MIRRORS}
     for wf, job, steps, known in ((pr_wf, pr_job, pr_steps, mirrored_pr),
@@ -300,6 +432,13 @@ def _job_problems(pr_wf: base.Workflow, pr_job: base.Job, warm_wf: base.Workflow
         if pr_env.get(name) != warm_env.get(name):
             problems.append(f"{where}: env {name!r} differs: {pr_wf.name} has "
                             f"{pr_env.get(name)!r}, {warm_wf.name} has {warm_env.get(name)!r}")
+    for wf, job, env, failed in ((pr_wf, pr_job, pr_env, pr_failed),
+                                 (warm_wf, warm_job, warm_env, warm_failed)):
+        for name, expected in JOB_ENV_PINNED.items():
+            if name not in failed and env.get(name) != expected:
+                problems.append(f"{wf.name}:{job.job_id}: job env {name!r} is {env.get(name)!r}, "
+                                f"the pinned value is {expected!r}")
+        problems.extend(_generation_problems(wf, job))
     for key in WORKFLOW_KEYS_COMPARED:
         pr_val = _relative(pr_wf.top(key), 2) or None
         warm_val = _relative(warm_wf.top(key), 2) or None
@@ -590,8 +729,11 @@ class MirrorInputs9732(unittest.TestCase):
                 got = _on_side(side, (("sub", OLD_CHECKOUT_PIN, NEW_CHECKOUT_PIN),))
                 pr_val, warm_val = ((NEW_CHECKOUT_PIN, OLD_CHECKOUT_PIN) if side == "pr"
                                     else (OLD_CHECKOUT_PIN, NEW_CHECKOUT_PIN))
+                # The swapped side also misses the literal sha of the pin table (review r2 F7).
                 self.assertEqual(got, [_step_diff(CHECKOUT_ID, CHECKOUT_ID, "uses", pr_val,
-                                                  warm_val)])
+                                                  warm_val),
+                                       _pin_msg(side, CHECKOUT_ID, NEW_CHECKOUT_PIN,
+                                                OLD_CHECKOUT_PIN)])
             with self.subTest(key="with", side=side):
                 got = _on_side(side, (("sub", "persist-credentials: false",
                                        "persist-credentials: true"),))
@@ -785,6 +927,7 @@ class MirrorInputs9732(unittest.TestCase):
             ("Configure NDK toolchain for cargo", "Configure NDK toolchain for cargo"),
             ("cargo check (--lib --features sqlite-bundled)",
              "cargo check (--lib --features sqlite-bundled)"),
+            ("actions/setup-python", "actions/setup-python"),
             ("Security audit", "Install the pinned cargo-audit (no audit run)"),
             (BUILD_PR_LABEL, BUILD_WARM_LABEL)])
         for row in MIRRORS:
@@ -792,7 +935,11 @@ class MirrorInputs9732(unittest.TestCase):
             self.assertNotIn("uses", row.allowed, row.pr_id)
             self.assertNotIn("with", row.allowed, row.pr_id)
             self.assertNotIn("env", row.allowed, row.pr_id)
-        self.assertEqual(PR_ONLY_STEPS, ("cargo_skip short-circuit", "actions/setup-python"))
+        self.assertEqual(PR_ONLY_STEPS, ("cargo_skip short-circuit",))
+        self.assertEqual(PINNED_USES, LITERAL_SHAS)
+        self.assertEqual(PINNED_WITH, {("actions/setup-python", "python-version"): "3.12"})
+        self.assertEqual(JOB_ENV_PINNED, {"CARGO_AUDIT_VERSION": AUDIT_PIN})
+        self.assertEqual(NDK_GENERATION, ((NDK_VERSION_PIN, CACHE_GENERATION_PIN),))
         self.assertEqual(JOB_KEYS_MAY_DIFFER, ("name", "needs", "timeout-minutes", "strategy",
                                                "steps"))
         self.assertEqual(set(JOB_KEYS_COMPARED), {"defaults", "container", "services",
