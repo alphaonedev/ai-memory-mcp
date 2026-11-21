@@ -19,20 +19,28 @@ the same job-level `if:` the docs-only case used, with a reason line naming the
 case; no context is renamed (scripts/test/test-ci-workflow-invariants.sh holds
 the gate half).
 
-Invariant 3 (a time-limit end is named). The last step of the coverage job runs
-on `cancelled() || failure()` and writes one error annotation naming the sweep
-step, its outcome and its elapsed minutes. It prints no secret.
+Invariant 3 (the sweep end line is computed from the sweep state). The last
+step of the coverage job runs on `cancelled() || failure()` and writes ONE
+line chosen from the outcome of the sweep step: an error annotation for a
+failed, cancelled or unknown sweep, a notice for a sweep that succeeded (a
+later step ended the job) or was never run. `elapsed` is the sweep alone
+(start and end recorded around the sweep step). The 59 minute run of issue
+9792 lost its runner; a lost runner runs no later step, so no step can name
+that case. The step prints no secret.
+
+Invariant 4 (cost). The cost of the decider is bounded by operation counts
+(regex compilations and glob match calls), never by wall-clock time.
 
 The expected columns are hand-written literals; none is computed from the code
 under test.
 """
 import os
 import re
+import contextlib
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -46,11 +54,11 @@ IMPACT_DIR = REPO / "scripts" / "ci" / "impact"
 SCRATCH = REPO / ".local-runs"
 SCRIPT = IMPACT_DIR / "cargo_skip.py"
 TIMEOUT_S = 120
-TIME_CEILING_S = 5.0
 # Hand-written: a rules.json version bump must come with a reviewed table update.
 V = "cargo_skip-rules-v1"
 PR_BASE_REF = "chain/promo6-ssh-r2"
 MAX_PATHS = 5000
+FAIL_CLOSED = "classifier-error-fail-closed"
 # Fixture identity and canary values are assembled from parts so the diff holds no
 # literal that looks like a mailbox or a credential assignment.
 FIXTURE_MAIL = "fixture" + chr(64) + "fixture.test"
@@ -255,6 +263,70 @@ PR_9777 = [
 ]
 
 
+class CountingRe:
+    """Stand-in for the `re` module inside impact.common: counts compilations."""
+
+    def __init__(self):
+        self.compiles = 0
+
+    def compile(self, *args, **kwargs):
+        self.compiles += 1
+        return re.compile(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(re, name)
+
+
+class GlobOps:
+    """The named counters: COMPILES (regex compilations), MATCHES (glob match calls)."""
+
+    def __init__(self):
+        self.shim = CountingRe()
+        self.matches = 0
+
+    @property
+    def compiles(self):
+        return self.shim.compiles
+
+
+@contextlib.contextmanager
+def counted_glob_ops():
+    common = cargo_skip.common
+    ops = GlobOps()
+    real_re, real_match = common.re, common.match_glob
+    clear = getattr(common.glob_to_regex, "cache_clear", None)
+    if clear is not None:
+        clear()
+
+    def counting_match(glob, path):
+        ops.matches += 1
+        return real_match(glob, path)
+
+    common.re, common.match_glob = ops.shim, counting_match
+    try:
+        yield ops
+    finally:
+        common.re, common.match_glob = real_re, real_match
+
+
+def distinct_globs(section):
+    """Every string of the rules section: an upper bound on its distinct globs."""
+    found = set()
+
+    def walk(node):
+        if isinstance(node, str):
+            found.add(node)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value)
+
+    walk(section)
+    return found
+
+
 class DeciderTable(unittest.TestCase):
     """The decider verdict per path list: (docs_only, cargo_skip, exact reason)."""
 
@@ -314,24 +386,30 @@ class DeciderTable(unittest.TestCase):
 
     def test_the_cap_boundary(self):
         docs = ["docs/f%05d.md" % i for i in range(MAX_PATHS - 1)]
-        start = time.monotonic()
-        self.check("at the cap, rust last", docs + ["src/z.rs"], "false", "false",
-                   "rust-observable-path src/z.rs " + V)
-        self.check("one over the cap", docs + ["docs/x.md", "src/z.rs"], "false", "false",
-                   "path-count-over-cap-fail-closed %d>%d %s" % (MAX_PATHS + 1, MAX_PATHS, V))
-        self.check("at the cap, docs only", docs + ["docs/x.md"], "true", "true",
-                   "docs-only " + V)
-        self.assertLess(time.monotonic() - start, TIME_CEILING_S * 3)
+        globs = len(distinct_globs(self.section))
+        with counted_glob_ops() as ops:
+            self.check("at the cap, rust last", docs + ["src/z.rs"], "false", "false",
+                       "rust-observable-path src/z.rs " + V)
+            self.check("one over the cap", docs + ["docs/x.md", "src/z.rs"], "false", "false",
+                       "path-count-over-cap-fail-closed %d>%d %s" % (MAX_PATHS + 1, MAX_PATHS, V))
+            self.check("at the cap, docs only", docs + ["docs/x.md"], "true", "true",
+                       "docs-only " + V)
+        # Operation counts, not wall-clock: each glob is compiled once, and the
+        # match calls stay under paths x globs for the two list-reading rows.
+        self.assertGreater(ops.matches, 0)
+        self.assertLessEqual(ops.compiles, globs,
+                             "COMPILES %d over %d distinct globs" % (ops.compiles, globs))
+        self.assertLessEqual(ops.matches, 2 * MAX_PATHS * globs,
+                             "MATCHES %d over the bound" % ops.matches)
 
-    def test_ten_thousand_paths_with_one_rust_file_last_run_in_bounded_time(self):
+    def test_an_over_cap_list_costs_no_glob_operation(self):
         paths = ["docs/f%05d.md" % i for i in range(9999)] + ["src/z.rs"]
-        start = time.monotonic()
-        got = self.verdict(paths)
-        elapsed = time.monotonic() - start
+        with counted_glob_ops() as ops:
+            got = self.verdict(paths)
         self.assertEqual((got["docs_only"], got["cargo_skip"], got["cargo_skip_reason"]),
                          ("false", "false",
                           "path-count-over-cap-fail-closed 10000>%d %s" % (MAX_PATHS, V)))
-        self.assertLess(elapsed, TIME_CEILING_S)
+        self.assertEqual((ops.compiles, ops.matches), (0, 0))
 
 
 class DeciderCli(unittest.TestCase):
@@ -377,12 +455,10 @@ class DeciderCli(unittest.TestCase):
         self.check("rust path", b"docs/a.md\0src/x.rs\0", "false", "false",
                    "rust-observable-path src/x.rs " + V)
 
-    def test_a_hundred_fifty_thousand_paths_are_refused_fast(self):
+    def test_a_hundred_fifty_thousand_paths_are_refused(self):
         data = b"".join(b"docs/f%06d.md\0" % i for i in range(150000)) + b"src/z.rs\0"
-        start = time.monotonic()
         self.check("over the cap", data, "false", "false",
                    "path-count-over-cap-fail-closed 150001>%d %s" % (MAX_PATHS, V))
-        self.assertLess(time.monotonic() - start, TIME_CEILING_S * 2)
 
     def test_unreadable_base_fails_closed_with_the_bare_reason(self):
         res = subprocess.run(
@@ -618,20 +694,75 @@ class CoverageClassifyRuns(unittest.TestCase):
         self.expect("no trusted classifier", values, "false", "false",
                     "trusted-classifier-missing-in-base-fail-closed")
 
+    def planted_answer(self, label, docs_only, skip, reason):
+        """Commit a trusted decider that prints this exact answer; return a docs-edit result."""
+        planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
+        text = "docs_only=%s\ncargo_skip=%s\ncargo_skip_reason=%s\n" % (docs_only, skip, reason)
+        planted.write_text("import sys\nsys.stdout.write(%r)\n" % text)
+        self.commit("trusted decider " + label)
+        base = run_git(self.repo, "rev-parse", "HEAD")
+        self.write("docs/a.md", "# changed %s\n" % label)
+        self.commit()
+        values, _ = self.run_cls(base)
+        return values
+
     def test_a_decider_answer_of_the_wrong_shape_runs(self):
+        """Each of the two values is checked on its own against {true, false}."""
         self.commit_base()
-        for label, docs_only, skip in (("docs true, skip false", "true", "false"),
-                                       ("not a boolean", "maybe", "true"),
-                                       ("empty value", "", "true")):
-            planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
-            planted.write_text('print("docs_only=%s")\nprint("cargo_skip=%s")\n'
-                               'print("cargo_skip_reason=planted")\n' % (docs_only, skip))
-            self.commit("trusted decider " + label)
-            base = run_git(self.repo, "rev-parse", "HEAD")
-            self.write("docs/a.md", "# changed %s\n" % label)
-            self.commit()
-            values, _ = self.run_cls(base)
-            self.expect(label, values, "false", "false", "classifier-error-fail-closed")
+        run = ("false", "false", FAIL_CLOSED)
+        rows = [
+            ("docs true, skip false", "true", "false", "planted"),
+            ("docs valid, skip invalid", "true", "maybe", "planted"),
+            ("docs invalid, skip valid true", "maybe", "true", "planted"),
+            ("docs valid false, skip invalid", "false", "maybe", "planted"),
+            ("docs invalid, skip valid false", "maybe", "false", "planted"),
+            ("split values falset + rue", "falset", "rue", "planted"),
+            ("split values truet + rue", "truet", "rue", "planted"),
+            ("split values tru + efalse", "tru", "efalse", "planted"),
+            ("both empty", "", "", "planted"),
+            ("docs empty", "", "true", "planted"),
+            ("skip empty", "true", "", "planted"),
+            ("docs trailing blank", "true ", "true", "planted"),
+            ("docs leading blank", " true", "true", "planted"),
+            ("skip trailing blank", "true", "true ", "planted"),
+            ("skip tab", "false", "\t", "planted"),
+            ("docs carriage return", "true\r", "true", "planted"),
+            ("skip carriage return", "true", "true\r", "planted"),
+            ("newline inside docs", "tr\nue", "true", "planted"),
+            ("newline inside skip", "true", "tr\nue", "planted"),
+            ("upper case", "TRUE", "TRUE", "planted"),
+        ]
+        for label, docs_only, skip, reason in rows:
+            with self.subTest(label):
+                values = self.planted_answer(label, docs_only, skip, reason)
+                self.expect(label, values, *run)
+
+    def test_a_valid_decider_answer_passes_through_with_its_reason(self):
+        self.commit_base()
+        rows = [
+            ("false false", "false", "false", "planted-run"),
+            ("false true", "false", "true", "planted-skip"),
+            ("true true", "true", "true", "planted-docs"),
+        ]
+        for label, docs_only, skip, reason in rows:
+            with self.subTest(label):
+                values = self.planted_answer(label, docs_only, skip, reason)
+                self.expect(label, values, docs_only, skip, reason)
+
+    def test_an_empty_reason_never_yields_a_success_without_a_reason_line(self):
+        self.commit_base()
+        run = ("false", "false", FAIL_CLOSED)
+        rows = [
+            ("run with an empty reason", "false", "false", ""),
+            ("skip with an empty reason", "false", "true", ""),
+            ("docs skip with an empty reason", "true", "true", ""),
+            ("skip with control characters only", "true", "true", "\x01\x02"),
+            ("skip with a bare DEL", "false", "true", "\x7f"),
+        ]
+        for label, docs_only, skip, reason in rows:
+            with self.subTest(label):
+                values = self.planted_answer(label, docs_only, skip, reason)
+                self.expect(label, values, *run)
 
     def test_a_pr_cannot_replace_its_own_classifier(self):
         base = self.commit_base()
@@ -688,43 +819,130 @@ class CoverageJobWiring(unittest.TestCase):
                              capture_output=True, text=True, timeout=TIMEOUT_S, env=base_env(env))
         return res.returncode, res.stdout, res.stderr
 
-    def test_the_annotation_names_the_step_outcome_and_minutes(self):
+    def job_limit(self):
         limit = None
         for ln in job_lines("per-module-thresholds"):
             found = re.match(r"^    timeout-minutes:\s*(\d+)\s*$", ln)
             if found:
                 limit = found.group(1)
+        return limit
+
+    def check_line(self, label, env, expected):
+        env = dict(env)
+        env.update({"GITHUB_TOKEN": CANARY_A, "SECRET_CANARY": CANARY_B})
+        rc, stdout, stderr = self.final_step_run(env)
+        self.assertEqual(rc, 0, label)
+        self.assertEqual(stdout.splitlines(), [expected], label)
+        self.assertNotIn(CANARY_MARK, stdout + stderr, label)
+
+    def test_the_end_line_is_chosen_from_the_sweep_and_later_step_outcomes(self):
+        """One row per (sweep outcome, later-step outcome); hand-written lines."""
+        limit = self.job_limit()
         self.assertEqual(limit, "110")
-        header = '::error title=Coverage sweep ended::step "Generate coverage JSON" '
-        now = int(time.time())
+        head = 'step "Generate coverage JSON" '
+        err = "::error title=Coverage sweep ended::" + head
+        ended = "elapsed=3 min (job limit 110 min)"
+        sweep_lines = {
+            "success": {
+                "success": "::notice title=Coverage sweep finished::" + head + "outcome=success elapsed=3 min; Enforce per-module thresholds outcome=success",
+                "failure": "::notice title=Coverage sweep finished::" + head + "outcome=success elapsed=3 min; Enforce per-module thresholds outcome=failure",
+                "cancelled": "::notice title=Coverage sweep finished::" + head + "outcome=success elapsed=3 min; Enforce per-module thresholds outcome=cancelled",
+                "skipped": "::notice title=Coverage sweep finished::" + head + "outcome=success elapsed=3 min; Enforce per-module thresholds outcome=skipped",
+                "": "::notice title=Coverage sweep finished::" + head + "outcome=success elapsed=3 min; Enforce per-module thresholds outcome=unknown",
+                "x\n::error::forged": "::notice title=Coverage sweep finished::" + head + "outcome=success elapsed=3 min; Enforce per-module thresholds outcome=unknown",
+            },
+            "failure": {g: err + "outcome=failure " + ended for g in
+                        ("success", "failure", "cancelled", "skipped", "", "x\n::error::forged")},
+            "cancelled": {g: err + "outcome=cancelled " + ended for g in
+                          ("success", "failure", "cancelled", "skipped", "", "x\n::error::forged")},
+            "skipped": {g: "::notice title=Coverage sweep not run::" + head + "outcome=skipped (an earlier step ended the job)"
+                        for g in ("success", "failure", "cancelled", "skipped", "", "x\n::error::forged")},
+            "": {g: err + "outcome=unknown " + ended for g in
+                 ("success", "failure", "cancelled", "skipped", "", "x\n::error::forged")},
+            "x\n::error::forged": {g: err + "outcome=unknown " + ended for g in
+                                   ("success", "failure", "cancelled", "skipped", "", "x\n::error::forged")},
+        }
+        for sweep, by_gate in sweep_lines.items():
+            for gate, expected in by_gate.items():
+                with self.subTest(sweep=sweep, gate=gate):
+                    env = {"COV_SWEEP_START": "1000000", "COV_SWEEP_END": "1000185",
+                           "SWEEP_OUTCOME": sweep, "GATE_OUTCOME": gate,
+                           "COV_JOB_LIMIT_MIN": limit}
+                    self.check_line("%r/%r" % (sweep, gate), env, expected)
+
+    def test_a_threshold_failure_after_a_good_sweep_never_prints_the_ended_line(self):
+        env = {"COV_SWEEP_START": "1000000", "COV_SWEEP_END": "1003540",
+               "SWEEP_OUTCOME": "success", "GATE_OUTCOME": "failure",
+               "COV_JOB_LIMIT_MIN": self.job_limit()}
+        rc, stdout, _ = self.final_step_run(env)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("Coverage sweep ended", stdout)
+        self.assertNotIn("::error", stdout)
+
+    def test_elapsed_is_the_sweep_alone(self):
+        limit = self.job_limit()
+        head = '::error title=Coverage sweep ended::step "Generate coverage JSON" outcome=failure elapsed=%s (job limit 110 min)'
         rows = [
-            ("cancelled after three minutes",
-             {"COV_SWEEP_START": str(now - 185), "SWEEP_OUTCOME": "cancelled"},
-             header + "outcome=cancelled elapsed=3 min (job limit 110 min)"),
-            ("failure after 59 minutes",
-             {"COV_SWEEP_START": str(now - 59 * 60 - 5), "SWEEP_OUTCOME": "failure"},
-             header + "outcome=failure elapsed=59 min (job limit 110 min)"),
-            ("sweep never started",
-             {"COV_SWEEP_START": "", "SWEEP_OUTCOME": "skipped"},
-             header + "outcome=skipped elapsed=not-started (job limit 110 min)"),
-            ("start not a number",
-             {"COV_SWEEP_START": "abc", "SWEEP_OUTCOME": "cancelled"},
-             header + "outcome=cancelled elapsed=unknown (job limit 110 min)"),
-            ("start in the future",
-             {"COV_SWEEP_START": str(now + 9999), "SWEEP_OUTCOME": "cancelled"},
-             header + "outcome=cancelled elapsed=unknown (job limit 110 min)"),
-            ("outcome with odd characters",
-             {"COV_SWEEP_START": str(now - 65), "SWEEP_OUTCOME": "x\n::error::forged"},
-             header + "outcome=unknown elapsed=1 min (job limit 110 min)"),
+            ("59 minutes", "1000000", "1003545", "59 min"),
+            ("zero minutes", "1000000", "1000059", "0 min"),
+            ("never started", "", "1003545", "not-started"),
+            ("start not a number", "abc", "1003545", "unknown"),
+            ("end missing", "1000000", "", "unknown"),
+            ("end not a number", "1000000", "abc", "unknown"),
+            ("end before start", "1000000", "999999", "unknown"),
+            ("thirteen digit start", "1000000000000", "1000000000001", "unknown"),
         ]
-        for label, env, expected in rows:
+        for label, start, end, elapsed in rows:
             with self.subTest(label):
-                env = dict(env, COV_JOB_LIMIT_MIN=limit)
-                env.update({"GITHUB_TOKEN": CANARY_A, "SECRET_CANARY": CANARY_B})
-                rc, stdout, stderr = self.final_step_run(env)
-                self.assertEqual(rc, 0)
-                self.assertEqual(stdout.splitlines(), [expected])
-                self.assertNotIn(CANARY_MARK, stdout + stderr)
+                env = {"COV_SWEEP_START": start, "COV_SWEEP_END": end,
+                       "SWEEP_OUTCOME": "failure", "GATE_OUTCOME": "skipped",
+                       "COV_JOB_LIMIT_MIN": limit}
+                self.check_line(label, env, head % elapsed)
+
+    def test_the_job_limit_is_read_from_one_place(self):
+        """No fallback default; every COV_JOB_LIMIT_MIN equals timeout-minutes."""
+        limit = self.job_limit()
+        self.assertIsNotNone(limit)
+        text = "\n".join(job_lines("per-module-thresholds"))
+        self.assertNotIn("COV_JOB_LIMIT_MIN:-", text)
+        values = re.findall(r'COV_JOB_LIMIT_MIN:\s*"?(\d+)"?', text)
+        self.assertEqual(values, [limit])
+        self.assertEqual(re.findall(r"\b%s\b" % limit, run_body(steps_of("per-module-thresholds")[-1])), [])
+        header = '::error title=Coverage sweep ended::step "Generate coverage JSON" outcome=failure elapsed=1 min (job limit %s min)'
+        env = {"COV_SWEEP_START": "1000000", "COV_SWEEP_END": "1000060",
+               "SWEEP_OUTCOME": "failure", "GATE_OUTCOME": "skipped"}
+        self.check_line("limit unset", env, header % "unknown")
+
+    def test_the_sweep_end_is_recorded_right_after_the_sweep(self):
+        steps = steps_of("per-module-thresholds")
+        names = [step_first(s) for s in steps]
+        sweep = names.index("- name: Generate coverage JSON")
+        record = steps[sweep + 1]
+        self.assertEqual(step_first(record), "- name: Record the coverage sweep end (#9263)")
+        self.assertEqual(step_if(record), "always()")
+        self.assertIn('echo "COV_SWEEP_END=$(date +%s)" >> "$GITHUB_ENV"', run_body(record))
+
+    def test_the_end_step_reads_the_gate_outcome_and_the_sweep_outcome(self):
+        last = steps_of("per-module-thresholds")[-1]
+        text = "\n".join(last)
+        self.assertIn("SWEEP_OUTCOME: ${{ steps.sweep.outcome }}", text)
+        self.assertIn("GATE_OUTCOME: ${{ steps.thresholds.outcome }}", text)
+
+    def test_the_end_step_comment_states_the_runner_loss(self):
+        lines = WORKFLOW.read_text().splitlines()
+        at = lines.index("      - name: Name the coverage sweep end (#9263)")
+        block = []
+        for line in reversed(lines[:at]):
+            if not line.startswith("      #"):
+                break
+            block.append(line)
+        comment = " ".join(ln.strip().lstrip("#").strip() for ln in reversed(block))
+        comment = " ".join(comment.split())
+        self.assertIn("lost its runner", comment)
+        self.assertIn("#9792", comment)
+        self.assertIn("runs no later step", comment)
+        self.assertNotIn("ended on the job time limit", comment)
+        self.assertNotIn("time limit cancels it", comment)
 
 
 if __name__ == "__main__":
