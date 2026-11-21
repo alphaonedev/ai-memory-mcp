@@ -3471,6 +3471,42 @@ PAIR_STEP_NAMES_9770 = {
 UNPINNED_ABSENT_STEP_KEYS = ("working-directory", "continue-on-error", "timeout-minutes")
 UNPINNED_ABSENT_JOB_KEYS = ("services", "concurrency", "outputs", "environment", "continue-on-error")
 SIDES_9770 = ("pr", "warm")
+# Hand-written per PR workflow: the "<workflow>:<job>" label of its PR side and of its warm side.
+SIDE_LABELS_9770 = {
+    "ci.yml": ("ci.yml:check", "rust-cache-warm.yml:check-hosted-sqlite"),
+    "coverage.yml": ("coverage.yml:per-module-thresholds", "rust-cache-warm.yml:coverage"),
+}
+# Hand-written: what `_runs_on` says when a runs-on reads `matrix.zz` that the leg does not set.
+# PR side (job id, leg id) and warm side (job id, leg ''), per PR workflow.
+RUNS_ON_TAIL_9770 = {
+    ("ci.yml", "pr"): "check: runs-on reads matrix.zz, which leg 'leg=ubuntu-latest,sqlite' "
+                      "does not set",
+    ("ci.yml", "warm"): "check-hosted-sqlite: runs-on reads matrix.zz, which leg '' does not set",
+    ("coverage.yml", "pr"): "per-module-thresholds: runs-on reads matrix.zz, which leg '' "
+                            "does not set",
+    ("coverage.yml", "warm"): "coverage: runs-on reads matrix.zz, which leg '' does not set",
+}
+UNEVALUABLE_ENV_9770 = "FOO: ${{ weird }}"
+UNEVALUABLE_ENV_TAIL_9770 = ("env 'FOO' cannot be evaluated: FOO: unrecognised expression form "
+                             "in an env value: '${{ weird }}'")
+NODE_MARK_9770 = "@NODE@"
+# Hand-written: the real `env` block of the PR cargo step of ci.yml (CI_NODE is the one line the
+# test changes); the hand table pins it with CI_NODE taken as 'ubuntu-latest'.
+CI_CARGO_ENV_9770 = "\n".join((
+    'AI_MEMORY_NO_CONFIG: "1"',
+    "TIER: sqlite",
+    "CI_NODE: " + NODE_MARK_9770,
+    "TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}",
+    "DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}",
+    "TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}",
+    "TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}",
+    "TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}",
+    "JOB_TIMEOUT_MIN: 95",
+    "CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}",
+    "HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' "
+    "&& '2' || '0' }}",
+    "HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'",
+))
 
 
 def _job_range_9770(lines: list[str], job_id: str) -> tuple[int, int]:
@@ -3654,6 +3690,28 @@ def _cache_edit_9770(side: str, pair: tuple[str, str, str, str],
     return _mutated_9770(pair, side, lambda wf, job: _on_step_9770(wf, job, RUST_CACHE, edit))
 
 
+def _both_sides_9770(pair: tuple[str, str, str, str], pr_edit: Callable[[Workflow, str], Workflow],
+                     warm_edit: Callable[[Workflow, str], Workflow]) -> list[str]:
+    """The problems after one edit on the PR side and one on the warm side of `pair`."""
+    pr_name, pr_job_id, warm_job_id, _ = pair
+    return _pair_problems_9770(pair, pr_wf=pr_edit(Workflow.load(pr_name), pr_job_id),
+                               warm_wf=warm_edit(Workflow.load(WARM), warm_job_id))
+
+
+def _keep_9770(wf: Workflow, job_id: str) -> Workflow:
+    return wf
+
+
+def _runs_on_unread_9770(wf: Workflow, job_id: str) -> Workflow:
+    return _on_job_9770(wf, job_id, _set_job_line_9770("runs-on", "${{ matrix.zz }}"))
+
+
+def _env_edit_9770(entry: str) -> Callable[[Workflow, str], Workflow]:
+    def edit(wf: Workflow, job_id: str) -> Workflow:
+        return Workflow(wf.name, _top_env_9770(wf.lines, entry))
+    return edit
+
+
 class PairMirrorFixtures9770(unittest.TestCase):
     """#9770: every PAIRS row compares the whole rust-cache step and each mirrored cargo step."""
 
@@ -3692,13 +3750,10 @@ class PairMirrorFixtures9770(unittest.TestCase):
                     problems = _mutated_9770(pair, "pr", lambda wf, job: _on_step_9770(
                         wf, job, pr_cargo, _sub_in_lines_9770("CI_NODE: ${{ matrix.node }}",
                                                               "CI_NODE: other")))
-                    self.assertEqual(len(problems), 1)
-                    self.assertTrue(problems[0].startswith(
-                        f"{pair[0]}:{pair[1]} step {pr_cargo!r}: key 'env' is "), problems)
-                    self.assertIn("CI_NODE: other", problems[0])
-                    self.assertTrue(problems[0].endswith(
-                        "the hand table says " + repr(PAIR_TABLES[(pair[0], pair[1])]
-                                                      .row_for(pr_cargo).allowed["env"][0])))
+                    self.assertEqual(problems, [
+                        f"{pair[0]}:{pair[1]} step {pr_cargo!r}: key 'env' is "
+                        f"{CI_CARGO_ENV_9770.replace(NODE_MARK_9770, 'other')!r}, the hand table "
+                        f"says {CI_CARGO_ENV_9770.replace(NODE_MARK_9770, 'ubuntu-latest')!r}"])
 
     def test_every_added_step_key_on_either_side_of_the_rust_cache_step(self) -> None:
         added = (("env", [FIXTURE_ENV_BLOCK], FIXTURE_ENV_BLOCK), ("run", "echo x", "echo x"),
@@ -3775,8 +3830,8 @@ class PairMirrorFixtures9770(unittest.TestCase):
                 wf_name, job_id = _side_ids_9770(pair, side)
                 with self.subTest(pair=pair[2], side=side):
                     problems = _cache_edit_9770(side, pair, _add_step_key_9770("bogus-key", "1"))
-                    self.assertIn(f"{wf_name}:{job_id} step {RUST_CACHE!r}: step key "
-                                  "'bogus-key' is not a known step key", problems)
+                    self.assertEqual(problems, [f"{wf_name}:{job_id} step {RUST_CACHE!r}: step key "
+                                                "'bogus-key' is not a known step key"])
 
     def test_an_unmapped_missing_or_duplicated_step_is_a_problem(self) -> None:
         for pair in PAIRS:
@@ -3795,7 +3850,8 @@ class PairMirrorFixtures9770(unittest.TestCase):
                 with self.subTest(pair=pair[2], side=side, case="duplicate"):
                     problems = _mutated_9770(pair, side, lambda wf, job: _duplicate_step_9770(
                         wf, job, disk))
-                    self.assertIn(f"{wf_name}:{job_id}: step {disk!r} appears 2 times", problems)
+                    self.assertEqual(problems, [f"{wf_name}:{job_id}: step {disk!r} "
+                                                "appears 2 times"])
 
     def test_the_hand_table_pins_the_allowed_differences(self) -> None:
         ci_if_hosted = "needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'"
@@ -3855,8 +3911,8 @@ class PairMirrorFixtures9770(unittest.TestCase):
                 with self.subTest(pair=pair[2], side=side, key="bogus"):
                     problems = _mutated_9770(pair, side, lambda wf, job: _on_job_9770(
                         wf, job, _add_job_key_9770("bogus-job-key", "1")))
-                    self.assertIn(f"{wf_name}:{job_id}: job key 'bogus-job-key' is not a known "
-                                  "job key", problems)
+                    self.assertEqual(problems, [f"{wf_name}:{job_id}: job key 'bogus-job-key' is "
+                                                "not a known job key"])
 
     def test_a_changed_runs_on_on_either_side(self) -> None:
         expected = {
@@ -3903,7 +3959,7 @@ class PairMirrorFixtures9770(unittest.TestCase):
                 problems = _mutated_9770(PAIRS[1], side, lambda wf, job: _on_job_9770(
                     wf, job, _add_job_key_9770("permissions", "write-all") if side == "warm"
                     else _set_perm_9770))
-                actual = "write-all" if side == "warm" else "write-all"
+                actual = "write-all"
                 expected = None if side == "warm" else "contents: read\npull-requests: write"
                 self.assertEqual(problems, [f"{wf_name}:{job_id}: job key 'permissions' is "
                                             f"{actual!r}, the hand table says {expected!r}"])
@@ -3937,11 +3993,45 @@ class PairMirrorFixtures9770(unittest.TestCase):
 
     def test_an_unevaluable_env_value_is_a_problem_naming_the_variable(self) -> None:
         pair = PAIRS[0]
-        problems = _mutated_9770(pair, "pr", lambda wf, job: Workflow(
-            wf.name, _top_env_9770(wf.lines, "FOO: ${{ weird }}")))
-        self.assertEqual(problems, [
-            f"{pair[0]}:{pair[1]}: env 'FOO' cannot be evaluated: FOO: unrecognised expression "
-            "form in an env value: '${{ weird }}'"])
+        problems = _mutated_9770(pair, "pr", _env_edit_9770(UNEVALUABLE_ENV_9770))
+        self.assertEqual(problems, [f"{SIDE_LABELS_9770[pair[0]][0]}: {UNEVALUABLE_ENV_TAIL_9770}"])
+
+    def test_the_env_check_reports_every_side_that_failed_and_invents_no_value(self) -> None:
+        bad = _env_edit_9770(UNEVALUABLE_ENV_9770)
+        plain = _env_edit_9770("FOO: a")
+        for pair in PAIRS:
+            pr_label, warm_label = SIDE_LABELS_9770[pair[0]]
+            pr_line = f"{pr_label}: {UNEVALUABLE_ENV_TAIL_9770}"
+            warm_line = f"{warm_label}: {UNEVALUABLE_ENV_TAIL_9770}"
+            # (case, PR edit, warm edit, exact problems)
+            cases = (
+                ("both fail", bad, bad, [pr_line, warm_line]),
+                ("only the PR side fails, the warm side lacks the variable", bad, _keep_9770,
+                 [pr_line]),
+                ("only the warm side fails, the PR side lacks the variable", _keep_9770, bad,
+                 [warm_line]),
+                ("the PR side fails, the warm side reads a value", bad, plain, [pr_line]),
+                ("the warm side fails, the PR side reads a value", plain, bad, [warm_line]),
+            )
+            for case, pr_edit, warm_edit, expected in cases:
+                with self.subTest(pair=pair[2], case=case):
+                    self.assertEqual(_both_sides_9770(pair, pr_edit, warm_edit), expected)
+
+    def test_a_runs_on_that_cannot_be_read_names_the_side_that_failed(self) -> None:
+        for pair in PAIRS:
+            pr_label, warm_label = SIDE_LABELS_9770[pair[0]]
+            pr_line = f"{pr_label}: runs-on cannot be read: {RUNS_ON_TAIL_9770[(pair[0], 'pr')]}"
+            warm_line = (f"{warm_label}: runs-on cannot be read: "
+                         f"{RUNS_ON_TAIL_9770[(pair[0], 'warm')]}")
+            # (case, PR edit, warm edit, exact problems); a side that failed is never compared.
+            cases = (
+                ("PR side", _runs_on_unread_9770, _keep_9770, [pr_line]),
+                ("warm side", _keep_9770, _runs_on_unread_9770, [warm_line]),
+                ("both sides", _runs_on_unread_9770, _runs_on_unread_9770, [pr_line, warm_line]),
+            )
+            for case, pr_edit, warm_edit, expected in cases:
+                with self.subTest(pair=pair[2], case=case):
+                    self.assertEqual(_both_sides_9770(pair, pr_edit, warm_edit), expected)
 
     def test_a_workflow_level_defaults_on_either_side(self) -> None:
         for pair in PAIRS:
