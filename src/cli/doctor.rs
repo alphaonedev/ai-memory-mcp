@@ -515,6 +515,21 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     family_totals.sort_by_key(|(_, _, sum)| std::cmp::Reverse(*sum));
 
     if args.json || args.raw_table {
+        // #9637: with `--hooks` the hooks file is loaded before any
+        // machine-readable output; a file that cannot be loaded is an
+        // error (exit 2) in this form too, with the reason in the JSON.
+        if args.hooks {
+            let path_opt = crate::hooks::config::HookConfig::default_path();
+            if let Err(e) = hooks_for_doctor(path_opt.as_deref()) {
+                writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
+                let payload = serde_json::json!({
+                    (field_names::SCHEMA_VERSION): "v0.6.4-tokens-1",
+                    "hooks_error": e.to_string(),
+                });
+                writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
+                return Ok(2);
+            }
+        }
         // Always include the full per-tool table when --raw-table is
         // set; --json gives the rolled-up view.
         let payload = serde_json::json!({
@@ -735,16 +750,25 @@ fn load_hooks_for_doctor(
     path: Option<&Path>,
     out: &mut CliOutput<'_>,
 ) -> Result<Option<Vec<crate::hooks::config::HookConfig>>> {
-    let Some(p) = path else {
-        return Ok(Some(Vec::new()));
-    };
-    match crate::hooks::config::HookConfig::try_load_from_optional(p) {
-        Ok(hooks) => Ok(Some(hooks.unwrap_or_default())),
+    match hooks_for_doctor(path) {
+        Ok(hooks) => Ok(Some(hooks)),
         Err(e) => {
             writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
             Ok(None)
         }
     }
+}
+
+/// #9637 — the hooks doctor reports on: none without a config dir or
+/// a file, the file's hooks when it loads, its refusal otherwise.
+fn hooks_for_doctor(
+    path: Option<&Path>,
+) -> std::result::Result<Vec<crate::hooks::config::HookConfig>, crate::hooks::config::HooksFileError>
+{
+    let Some(p) = path else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::hooks::config::HookConfig::try_load_from_optional(p)?.unwrap_or_default())
 }
 
 fn render_hooks_human_with(
