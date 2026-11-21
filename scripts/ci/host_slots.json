@@ -1,0 +1,10 @@
+{
+  "_comment": "Host semaphore gates (#9231). slots = the HOST_SEMAPHORE_SLOTS of the gated leg in .github/workflows/ci.yml; serving_runners = the self-hosted runners that carry the leg's label and can run it. Rule (scripts/ci/host_slots_check.py, pinned by scripts/ci/tests/test_slot_wait_outcome_9231.py): len(serving_runners) <= slots, so a job that holds a runner always finds a slot. Adding a runner with the label needs a slot first. The runner list is a declaration of the host, kept by hand to match the host; the test cannot enumerate live runners.",
+  "gates": {
+    "linux-fed-tests": {
+      "slots": 2,
+      "label": "linux-fed",
+      "serving_runners": ["f2-linux-fed", "f2-linux-fed-2"]
+    }
+  }
+}

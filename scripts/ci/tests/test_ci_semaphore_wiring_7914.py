@@ -85,8 +85,8 @@ class SemaphoreWiring(unittest.TestCase):
             slack, SERIAL_SHARD_SECS,
             'cap %d - gate %d - semaphore %d - compile %d - safety %d = %d < serial shard %d'
             % (cap_secs, gate_wait, semaphore_wait, COLD_COMPILE_SECS, safety_secs, slack, SERIAL_SHARD_SECS))
-        self.assertIn('cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 '
-                      '+ safety 300 + serial shard 7800 (= 17000 s)', CI)
+        self.assertIn('cap 18000 s >= load-gate wait 1200 + semaphore wait 600 + cold compile 4100 '
+                      '+ safety 300 + serial shard 7800 (= 14000 s)', CI)
 
     def test_only_the_linux_fed_enterprise_leg_has_300(self):
         rows = re.findall(r'- leg: (\S+)\n(?:(?!\n          - leg:).)*?timeout: (\d+)\n', CI, re.S)

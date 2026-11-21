@@ -1099,6 +1099,13 @@ jobs:
   check:
     name: Check (${{ matrix.leg }})
     needs: classify
+    # #9231 - one output per leg: scripts/ci/host_semaphore.py writes
+    # no_slot=true to the step output when no host slot was free and no test
+    # ran; ci-gate (scripts/ci/impact/gate.py) folds a failed check with such an
+    # output as the named outcome "infra: no slot", never as a test failure. The
+    # key carries the leg index so matrix legs never overwrite each other.
+    outputs:
+      slot_starved_${{ strategy.job-index }}: ${{ steps.tests.outputs.no_slot }}
     # RUNNER PLACEMENT — PER-LEG (rule at the head of this file). Only the leg
     # that needs the native pg tier is self-hosted on Linux; the Linux sqlite
     # leg is GitHub-hosted. `runs-on` therefore cannot be a fixed shape, so it
@@ -1323,9 +1330,11 @@ jobs:
             # 4061 s elapsed - 300 s) and the #1492 watchdog killed it
             # (serial=124) with no test failing; the same leg alone took
             # ~7980 s. Budget identity (pinned by test_ci_semaphore_wiring_7914):
-            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)
-            # The waits are kept, not shrunk, because they are what bound
-            # contention on a 4-runner host (#7928). The semaphore wait is the
+            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 600 + cold compile 4100 + safety 300 + serial shard 7800 (= 14000 s)
+            # The semaphore wait was 3600 s (#7928) and is 600 s since #9231: the
+            # runners that serve this leg are tied to the 2 slots by
+            # scripts/ci/host_slots.json, so no job queues inside the semaphore.
+            # The semaphore wait is the
             # one named constant HOST_SEMAPHORE_MAX_WAIT_SECS below. The
             # macos-fed and hosted caps are unchanged.
             timeout: 300
@@ -1849,6 +1858,7 @@ jobs:
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
       - name: Run tests (impact-aware)
+        id: tests
         if: needs.classify.outputs.cargo_skip != 'true'
         env:
           AI_MEMORY_NO_CONFIG: "1"
@@ -1871,8 +1881,13 @@ jobs:
           # linux-fed enterprise-fed leg; 0 = no semaphore (every other leg).
           HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' && '2' || '0' }}
           # #7928 - the one place the semaphore wait is set (seconds); it is a
-          # term of the job cap identity in the matrix timeout comment.
-          HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'
+          # term of the job cap identity in the matrix timeout comment. #9231:
+          # 600 s (was 3600 s): the serving runners equal the slots
+          # (scripts/ci/host_slots.json), so a wait only bridges a handover; a
+          # slot hold lasts about 2 h, so a longer wait never ended in a slot and
+          # only held a runner idle. No slot ends as the named outcome
+          # "infra: no slot" (step output no_slot, step summary, ci-gate bucket).
+          HOST_SEMAPHORE_MAX_WAIT_SECS: '600'
         shell: bash
         run: |
           set -euo pipefail

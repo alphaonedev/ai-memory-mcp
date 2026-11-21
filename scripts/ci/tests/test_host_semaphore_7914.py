@@ -60,7 +60,7 @@ class Semaphore(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertEqual(hs.SEMAPHORE_SLOTS_DEFAULT, 2)
-        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 3600)
+        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 600)
         self.assertEqual(hs.SEMAPHORE_POLL_SECS_DEFAULT, 30)
 
     def test_extra_waiter_times_out_with_exit_3(self):

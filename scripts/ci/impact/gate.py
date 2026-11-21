@@ -41,6 +41,17 @@ DOCS_ONLY_KEY = "docs_only"
 DOCS_ONLY_TRUE = "true"
 TAG_REF_PREFIX = "refs/tags/v"
 MISSING_REASON = "missing-needed-job"
+# #9231: the `check` matrix job exports one output per leg, `slot_starved_<index>`,
+# set to 'true' by scripts/ci/host_semaphore.py when no host slot was free and no
+# test ran. A failed `check` with such an output is the named outcome below; it
+# is still NOT a pass (a required check must never pass on a job that judged
+# nothing) and it exits with its own code so the verdict says "not a test failure".
+INFRA_JOB = "check"
+INFRA_OUTPUT_PREFIX = "slot_starved"
+INFRA_OUTPUT_TRUE = "true"
+INFRA_RESULT = "infra: no slot"
+RESULT_FAILURE = "failure"
+EXIT_INFRA = 4
 # The `needs:` list of the ci-gate job in .github/workflows/ci.yml; a test
 # keeps the two in step.
 REQUIRED_NEEDS = ("select", "classify", "build-script-vetting", "check",
@@ -72,6 +83,14 @@ def skip_allowed(needs: dict, job: str, key: Optional[str], github_ref: str,
             and outputs_of(needs, SELECT_JOB).get(key) == DOMAIN_FALSE)
 
 
+def no_slot_outcome(needs: dict, job: str) -> bool:
+    """True when `job` is the check job, failed, and a leg recorded that no host slot was free."""
+    if job != INFRA_JOB or result_of(needs, job) != RESULT_FAILURE:
+        return False
+    return any(key.startswith(INFRA_OUTPUT_PREFIX + "_") and value == INFRA_OUTPUT_TRUE
+               for key, value in outputs_of(needs, job).items())
+
+
 def evaluate(needs: dict, job_map: Dict[str, str], github_ref: str = "",
              tag_skip_jobs: Iterable[str] = (),
              required: Iterable[str] = ()) -> Tuple[bool, List[dict]]:
@@ -94,20 +113,28 @@ def evaluate(needs: dict, job_map: Dict[str, str], github_ref: str = "",
         else:
             passed = False
         ok = ok and passed
-        rows.append({"job": job, "result": result, "selected": not excused,
-                     "ok": passed})
+        infra = (not passed) and no_slot_outcome(needs, job)
+        rows.append({"job": job, "result": INFRA_RESULT if infra else result,
+                     "selected": not excused, "ok": passed, "infra": infra})
     return ok, rows
 
 
 def render(rows: List[dict]) -> str:
     """Render the verdict table."""
     width = max([len(r["job"]) for r in rows] + [3])
-    lines = ["%-*s  %-10s  %-8s  %s" % (width, "job", "result", "selected", "ok")]
+    rwidth = max([len(str(r["result"])) for r in rows] + [10])
+    lines = ["%-*s  %-*s  %-8s  %s" % (width, "job", rwidth, "result", "selected", "ok")]
     for row in rows:
-        lines.append("%-*s  %-10s  %-8s  %s" % (
-            width, row["job"], row["result"], "yes" if row["selected"] else "no",
+        lines.append("%-*s  %-*s  %-8s  %s" % (
+            width, row["job"], rwidth, row["result"], "yes" if row["selected"] else "no",
             "pass" if row["ok"] else "FAIL"))
     return "\n".join(lines)
+
+
+def only_infra_failures(rows: List[dict]) -> bool:
+    """True when at least one row failed and every failed row is the no-slot outcome."""
+    failed = [r for r in rows if not r["ok"]]
+    return bool(failed) and all(r.get("infra") for r in failed)
 
 
 def read_needs(arg: str) -> dict:
@@ -139,6 +166,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     for row in rows:
         if row["result"] == MISSING_REASON:
             print("ci-gate: %s: %s" % (MISSING_REASON, row["job"]))
+    if not ok and only_infra_failures(rows):
+        print("ci-gate: INFRA (%s): not a test failure, no test ran; the gate stays red, re-run the job"
+              % INFRA_RESULT)
+        return EXIT_INFRA
     print("ci-gate: %s" % ("pass" if ok else "FAIL"))
     return common.EXIT_OK if ok else common.EXIT_FAIL
 

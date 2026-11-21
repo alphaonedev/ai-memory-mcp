@@ -77,9 +77,17 @@ except (Exception, SystemExit) as exc:  # any failed load: one fixed line built 
     sys.exit(WA_EXIT_LOAD_REFUSED)
 
 SEMAPHORE_SLOTS_DEFAULT = 2
-SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 3600
+# decision: 600 s over 3600 s because a waiter holds a runner seat idle for the whole wait
+# and, with the serving runners tied to the slots (scripts/ci/host_slots.json), a wait only
+# bridges a slot handover or a non-CI holder; a hold lasts about 2 h, so a longer wait never
+# ends in a slot and only costs a runner an hour (#9231).
+SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 600
 SEMAPHORE_POLL_SECS_DEFAULT = 30
 EXIT_NO_SLOT = 3
+NO_SLOT_OUTPUT_LINE = 'no_slot=true'  # step output the job output and ci-gate read (#9231)
+NO_SLOT_SUMMARY_TEXT = 'infra: no slot'
+ENV_GITHUB_OUTPUT = 'GITHUB_OUTPUT'
+ENV_GITHUB_STEP_SUMMARY = 'GITHUB_STEP_SUMMARY'
 KILL_GRACE_SECS = 20
 TAG = '[#7914 semaphore]'
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
@@ -128,6 +136,31 @@ def acquire(slot_dir, slots, label, max_wait, poll, sleep_fn=time.sleep):
 def _note(message):
     """Record a tolerated condition on stderr (#7929), never silently."""
     print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
+
+
+def _append_env_file(env_name, text):
+    """Append TEXT to the file named by env var ENV_NAME; a missing or unwritable file is noted, never fatal."""
+    path = os.environ.get(env_name)
+    if not path:
+        return
+    try:
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(text)
+    except OSError as exc:
+        _note('cannot append to %s (%s)' % (env_name, type(exc).__name__))
+
+
+def record_no_slot(label, max_wait, slots):
+    """Name the outcome: a step output for ci-gate and a step summary line (#9231).
+
+    The step still exits non-zero (fail closed); the record only lets ci-gate
+    tell "no test ran, infra" from a failed test.
+    """
+    _append_env_file(ENV_GITHUB_OUTPUT, NO_SLOT_OUTPUT_LINE + '\n')
+    _append_env_file(ENV_GITHUB_STEP_SUMMARY,
+                     '### %s\n\nNo test ran for `%s`: no host slot was free after %ds (all %d slots busy). '
+                     'This is not a test failure; re-run the job.\n'
+                     % (NO_SLOT_SUMMARY_TEXT, label.replace('`', "'"), max_wait, slots))
 
 
 def _signal_group(pgid, sig):
@@ -213,6 +246,7 @@ def main(argv=None):
     if got is None:
         print(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
                             % (TAG, args.label, args.max_wait_secs, args.slots)), flush=True)
+        record_no_slot(args.label, args.max_wait_secs, args.slots)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:
