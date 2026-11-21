@@ -453,9 +453,12 @@ class SourceStr(str):
         return obj
 
 
-def _nested_line(rest: list[str], indent: int) -> str:
-    """The first non-blank, non-comment line of `rest` when it is deeper than `indent`, else ""."""
-    for line in rest:
+def _nested_line(lines: list[str], start: int, indent: int) -> str:
+    """The first non-blank, non-comment line at or after index `start` when it is deeper than
+    `indent`, else "". It looks ahead by index (no copy of the tail): the scan of one key stops at
+    the next significant line, so the scans of all keys together are linear (#9771 r1)."""
+    for index in range(start, len(lines)):
+        line = lines[index]
         if _is_comment_or_blank(line):
             continue
         return line.strip() if _indent(line) > indent else ""
@@ -468,7 +471,8 @@ def _mapping(lines: list[str], indent: int) -> dict[str, str]:
         if _is_comment_or_blank(line) or _indent(line) != indent:
             continue
         name, _, value = line.strip().partition(":")
-        out[name] = SourceStr(_scalar(value), value.strip(), _nested_line(lines[index + 1:], indent))
+        nested = _nested_line(lines, index + 1, indent)
+        out[name] = SourceStr(_scalar(value), value.strip(), nested)
     return out
 
 
@@ -1489,6 +1493,33 @@ def _subcommand(command: str) -> str:
     return rest[0]
 
 
+def _gh_number(value: object) -> float:
+    """GitHub's number coercion (null 0, false 0, true 1, "" 0, a numeric string its value, any
+    other string NaN)."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (bool, int)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    try:
+        return float(int(text, 0)) if text[:2].lower() in ("0x", "0o") else float(text)
+    except ValueError:
+        return float("nan")
+
+
+def _gh_equal(left: object, right: object) -> bool:
+    """`==` of the workflow expression language: two strings compare case-insensitively, two values
+    of one type compare directly, any other pair compares as numbers (#9771 r1: a typed leg value
+    such as 1, true or null meets `matrix.x == 1` the way the runner reads it)."""
+    if isinstance(left, str) and isinstance(right, str):
+        return left.lower() == right.lower()
+    if type(left) is type(right):
+        return left == right
+    return _gh_number(left) == _gh_number(right)
+
+
 def _eval_if(expr: str, matrix: dict[str, object]) -> bool:
     """Evaluate a step `if:` for a hosted PR leg; an unknown name or form fails closed."""
     text = expr.strip()
@@ -1553,8 +1584,7 @@ def _eval_if(expr: str, matrix: dict[str, object]) -> bool:
         if peek() in ("==", "!="):
             op = take()
             right = atom()
-            same = (str(left).lower() == str(right).lower()
-                    if isinstance(left, str) and isinstance(right, str) else left == right)
+            same = _gh_equal(left, right)
             return same if op == "==" else not same
         return left
 
@@ -1590,7 +1620,38 @@ STRATEGY_KEYS = ("fail-fast", "max-parallel", "matrix")
 MATRIX_INCLUDE_KEY = "include"
 KEY_LINE_RE = re.compile(r"^([A-Za-z_][\w-]*):(?:[ \t]+(.*))?$")
 DASH_LINE_RE = re.compile(r"^-( +)(\S.*)$")
-PLAIN_BOOLEANS = {"true": True, "false": False}
+LegValue = str | bool | int | None
+
+
+def _leg_value(raw: str, where: str) -> LegValue:
+    """The value a plain or quoted matrix leg scalar has for the runner (#9771 r1, finding 1).
+
+    ONE typing for every consumer of a leg: a quoted scalar is a QuotedStr, a plain true/false in
+    any YAML 1.2 case is a bool, null/~/empty is None, a canonical integer (and 0) is an int, and a
+    plain yes/no/on/off or other text is a str (YAML 1.2 core schema). An unquoted hex, octal,
+    signed, zero-padded or float number has no single reading here, so it is refused by name
+    (UnreadForm), never returned as text that a consumer could read as a different type."""
+    decoded = _decode_scalar(raw, where, False)
+    if isinstance(decoded, QuotedStr):
+        return decoded
+    if decoded == "" or YAML_NULL_RE.match(decoded):
+        return None
+    if YAML_BOOL_RE.match(decoded):
+        return decoded.lower() == "true"
+    if decoded == "0" or CANONICAL_INT_RE.match(decoded):
+        return int(decoded)
+    form = _yaml_typed_form(decoded)
+    if form:
+        raise UnreadForm(where, UNREAD_UNQUOTED_FORM.format(form=form), decoded)
+    return decoded
+
+
+def _leg_text(value: object) -> str:
+    """A leg value as the runner renders it in a label or a command: true/false lowercase, a number
+    in decimal; None has no text and is refused by the caller."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _inline_value(job: Job, key: str) -> str:
@@ -1618,6 +1679,7 @@ def _key_sections(lines: list[str], indent: int, where: str
                   ) -> list[tuple[str, str, list[str], str]]:
     """Split block-mapping `lines` at `indent` into (key, inline text, deeper lines, key line)."""
     sections: list[tuple[str, str, list[str], str]] = []
+    seen: set[str] = set()  # a set, not a scan of `sections` per key: linear in the keys (#9771 r1)
     for line in lines:
         stripped = line.strip()
         if _indent(line) < indent:
@@ -1626,8 +1688,9 @@ def _key_sections(lines: list[str], indent: int, where: str
             sections[-1][2].append(line)
             continue
         key, value = _key_line(stripped, where)
-        if any(key == seen[0] for seen in sections):
+        if key in seen:
             raise UnreadForm(where, UNREAD_DUPLICATE, stripped)
+        seen.add(key)
         sections.append((key, _inline_text(value), [], stripped))
     return sections
 
@@ -1667,9 +1730,7 @@ def _include_entries(children: list[str], where: str) -> list[dict[str, object]]
         key, value = _key_line(content, item_where)
         if key in entries[-1]:
             raise UnreadForm(f"{item_where}.{key}", UNREAD_DUPLICATE, value)
-        decoded = _decode_scalar(value, f"{item_where}.{key}", False)
-        entries[-1][key] = decoded if isinstance(decoded, QuotedStr) \
-            else PLAIN_BOOLEANS.get(decoded, decoded)
+        entries[-1][key] = _leg_value(value, f"{item_where}.{key}")
         last_key = key
     return entries
 
@@ -1917,6 +1978,27 @@ LOCAL_WORKFLOW_PREFIX = "./.github/workflows/"
 CALL_DEPTH_MAX = 8
 
 
+JOB_ID_RE = re.compile(r"[A-Za-z_][\w-]*")
+JOB_USES_RE = re.compile(r"""^(?:uses|'uses'|"uses"):(?:\s+(.*))?$""")
+
+
+def _job_uses(job: Job, where: str) -> str | None:
+    """The decoded job-level `uses` value, or None when the job has no `uses` key (#9771 r1).
+
+    The key is read at the indent of the job body's first significant line (a body indented deeper
+    than four spaces is still a call) and may be quoted; the value goes through the strict decoder,
+    so an anchor, tag, flow form or other unread spelling raises UnreadForm."""
+    body = [line for line in job.lines if not _is_comment_or_blank(line)]
+    if not body:
+        return None
+    indent = _indent(body[0])
+    for line in body:
+        match = JOB_USES_RE.match(line.strip()) if _indent(line) == indent else None
+        if match:
+            return str(_decode_scalar(match.group(1) or "", f"{where}.uses", True))
+    return None
+
+
 def _reachable_jobs(wf: Workflow, prefix: str = "", trail: tuple[str, ...] = ()
                     ) -> tuple[list[tuple[str, Workflow, Job]], list[str]]:
     """(every job a run of `wf` reaches as (job id, its workflow, job), the problems).
@@ -1932,12 +2014,19 @@ def _reachable_jobs(wf: Workflow, prefix: str = "", trail: tuple[str, ...] = ()
     jobs: list[tuple[str, Workflow, Job]] = []
     problems: list[str] = []
     for job_id, job in wf.jobs().items():
-        uses = job.scalar("uses")
+        where = f"{prefix}{job_id}"
+        try:
+            uses = _job_uses(job, where)
+        except UnreadForm as exc:
+            problems.append(str(exc))
+            continue
         if uses is None:
+            if job.scalar("runs-on") is None:
+                problems.append(f"{where}: job has neither a readable runs-on nor a readable uses")
+                continue
             jobs.append((prefix + job_id, wf, job))
             continue
         called = uses[len(LOCAL_WORKFLOW_PREFIX):]
-        where = f"{prefix}{job_id}"
         if (not uses.startswith(LOCAL_WORKFLOW_PREFIX) or "@" in called or "/" in called
                 or not called.endswith((".yml", ".yaml"))):
             problems.append(f"{where}: job-level uses of a reusable workflow that is not a "
@@ -1950,7 +2039,11 @@ def _reachable_jobs(wf: Workflow, prefix: str = "", trail: tuple[str, ...] = ()
         elif called not in _all_workflow_names():
             problems.append(f"{where}: reusable workflow {uses!r} is not a file")
         else:
-            inner, found = _reachable_jobs(Workflow.load(called), f"{where}/", (*trail, wf.name))
+            callee = Workflow.load(called)
+            if not any(JOB_ID_RE.fullmatch(inner_id) for inner_id in callee.jobs()):
+                problems.append(f"{where}: reusable workflow {uses!r} has no readable jobs")
+                continue
+            inner, found = _reachable_jobs(callee, f"{where}/", (*trail, wf.name))
             jobs.extend(inner)
             problems.extend(found)
     return jobs, problems
@@ -2142,7 +2235,10 @@ def _runs_on(job: Job, leg: dict[str, object]) -> str:
     if field_name not in leg:
         raise AssertionError(f"{job.job_id}: runs-on reads matrix.{field_name}, which leg "
                              f"{_leg_id(leg)!r} does not set")
-    return str(leg[field_name])
+    if leg[field_name] is None:
+        raise AssertionError(f"{job.job_id}: runs-on reads matrix.{field_name}, which is null on "
+                             f"leg {_leg_id(leg)!r}")
+    return _leg_text(leg[field_name])
 
 
 def _maybe_reached(expr: str | None, leg: dict[str, object]) -> bool:
@@ -2156,10 +2252,13 @@ def _maybe_reached(expr: str | None, leg: dict[str, object]) -> bool:
 
 
 def _expand_matrix(command: str, leg: dict[str, object]) -> str:
-    """Replace `${{ matrix.<name> }}` with a string value the leg sets; anything else stays."""
+    """Replace `${{ matrix.<name> }}` with the text of a non-empty string, boolean or number value
+    the leg sets; a null, an empty value and anything else stays (and reads as a dynamic command)."""
     def sub(match: re.Match[str]) -> str:
         value = leg.get(match.group(1))
-        return value if isinstance(value, str) and value else match.group(0)
+        if value is None or value == "":
+            return match.group(0)
+        return _leg_text(value)
     return MATRIX_REF_RE.sub(sub, command)
 
 
@@ -2512,15 +2611,20 @@ class ReachableWorkflowSites9681R3(unittest.TestCase):
                     self.assertEqual(_effective_env_value("K", KEY_ENV_MATRIX_FORM, leg), value)
 
     def test_unquoted_matrix_spelling_is_refused_end_to_end(self) -> None:
-        for value, form in (("null", "null"), ("0x0", "integer"), ("1.0", "float")):
+        # #9771 r1: the reader refuses an unquoted hex or float at read time (one place, every
+        # consumer), and types a plain null as null (the env expression takes its literal)
+        for value, form in (("0x0", "integer"), ("1.0", "float")):
             with self.subTest(value=value):
                 job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:",
                                 "        include:", f"          - cargo_debug: {value}"])
-                (leg,) = _matrix_include(job)
                 with self.assertRaises(AssertionError) as caught:
-                    _effective_env_value("K", KEY_ENV_MATRIX_FORM, leg)
-                self.assertEqual(str(caught.exception),
-                                 UNQUOTED_FORM_MESSAGE.format(value=value, form=form))
+                    _matrix_include(job)
+                self.assertEqual(str(caught.exception), _unread(
+                    "j: strategy.matrix.include[0].cargo_debug", f"unquoted YAML {form}", value))
+        job = Job("j", ["    runs-on: x", "    strategy:", "      matrix:",
+                        "        include:", "          - cargo_debug: null"])
+        (leg,) = _matrix_include(job)
+        self.assertEqual(_effective_env_value("K", KEY_ENV_MATRIX_FORM, leg), EXPRESSION_DEFAULT)
 
     def test_two_hosted_legs_with_one_first_key_are_a_problem(self) -> None:
         legs = _stub_matrix("target: t", "target: t\n            os: other")
@@ -2766,7 +2870,7 @@ class AddSiteFirstWins9746R1(unittest.TestCase):
 EXPRESSION_DEFAULT = "line-tables-only"
 LEG_HEAD = ["    runs-on: x", "    strategy:", "      matrix:", "        include:"]
 LEG_WHERE = "j: strategy.matrix.include[0].cargo_debug"
-TRUTHY_ZERO_MESSAGE = ("K: matrix.cargo_debug = '0' is truthy when quoted and falsy when not, and "
+TRUTHY_ZERO_MESSAGE = ("K: matrix.cargo_debug = 0 is truthy when quoted and falsy when not, and "
                        "this parser drops the quotes: " + repr(KEY_ENV_MATRIX_FORM))
 # Reason strings, written out here (the code under test must produce exactly these).
 R_FLOW_MAPPING, R_FLOW_SEQUENCE = "flow mapping", "flow sequence"
@@ -2898,10 +3002,11 @@ class UnreadFormRefusals9745R1(unittest.TestCase):
                     "refused", _unread(LEG_WHERE, reason, text)))
 
     def test_unquoted_typed_leg_values_keep_their_refusals(self) -> None:
-        self.assertEqual(_leg_outcome("1.5"), ("refused", UNQUOTED_FORM_MESSAGE.format(
-            value="1.5", form="float")))
-        self.assertEqual(_leg_outcome("null"), ("refused", UNQUOTED_FORM_MESSAGE.format(
-            value="null", form="null")))
+        # #9771 r1: the reader refuses a number it cannot type, and reads a plain null as null
+        # (the env expression then takes its literal, as the runner does)
+        self.assertEqual(_leg_outcome("1.5"), (
+            "refused", _unread(LEG_WHERE, "unquoted YAML float", "1.5")))
+        self.assertEqual(_leg_outcome("null"), ("value", EXPRESSION_DEFAULT))
         # every YAML form of the refusal list is still read as itself when written quoted
         self.assertEqual(_leg_outcome("'1.5'"), ("value", "1.5"))
         self.assertEqual(_leg_outcome("pre-x"), ("value", "pre-x"))
@@ -2956,9 +3061,9 @@ class UnreadFormRefusals9745R1(unittest.TestCase):
                         "            runner: '[\"self-hosted\",\"linux-fed\"]'"])
         legs = _matrix_include(job)
         self.assertEqual(legs, [{"leg": "ubuntu-latest,sqlite", "node": "n",
-                                 "shared_target": True, "cargo_debug": "0", "timeout": "95"},
+                                 "shared_target": True, "cargo_debug": "0", "timeout": 95},
                                 {"target": "t", "runner": '["self-hosted","linux-fed"]'}])
-        self.assertEqual([type(v) for v in legs[0].values()], [str, str, bool, QuotedStr, str])
+        self.assertEqual([type(v) for v in legs[0].values()], [str, str, bool, QuotedStr, int])
         self.assertEqual(_matrix_include(Job("j", ["    runs-on: x"])), [])
 
     def test_leg_structure_refusals(self) -> None:
