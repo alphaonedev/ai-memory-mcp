@@ -30,7 +30,9 @@ reported apart from compile and test (#9773): `Load gate` is the wall time of th
 command. The four figures never overlap: Test is the step wall time minus compile minus the semaphore wait, so for the
 linux-fed enterprise-fed leg it is run time only (any later cargo invocation is still inside it). A wait the script
 cannot read is `absent: <reason>`, never 0: the legs that have no semaphore wrapper print no such line
-(`no-semaphore-line`), and `coverage.yml` has no `Load gate (#6795)` step (`no-load-gate-step`). A compile of 1 s is a
+(`no-semaphore-line`), `coverage.yml` has no `Load gate (#6795)` step (`no-load-gate-step`), and a step whose
+conclusion is not `success` gives no figure (`load-gate-skipped`). The semaphore line is read only in the exact form
+the wrapper prints, on one physical line. A compile of 1 s is a
 warm cache or a cargo skip.
 
 | Job | Runner kind | Queue | Setup/cache | Compile | Test | Post | Total | Load gate | Semaphore |
@@ -38,12 +40,15 @@ warm cache or a cargo skip.
 | ci.yml Check (linux-fed,enterprise-fed) | self-hosted Linux | 189 (1-2438) n=9 | 66 (21-959) | 2975 (1-6442) | 3775 (996-6565) | 8 (4-56) | 7318 (1059-10739) | 45 (0-930) n=10 | 0 (0-1410) n=10 |
 | ci.yml Check (macos-fed,enterprise-fed) | macos-fed | 1990 (598-2433) n=8 | 20 (18-25) | 512 (181-832) | 2070 (319-2440) | 4 (2-4) | 2624 (553-3301) | 0 (0-1) n=10 | absent: no-semaphore-line |
 | ci.yml Check (macos-fed,sqlite) | macos-fed | 1 (1-3) n=8 | 8 (5-73) | 368 (155-549) | 1564 (421-1939) | 2 (1-4) | 1988 (597-2430) | 0 (0-60) n=10 | absent: no-semaphore-line |
-| ci.yml Check (ubuntu-latest,sqlite) | hosted | 2 (1-2) n=9 | 160 (115-188) | 1952 (1190-2572) | 1529 (309-2020) | 356 (12-449) | 3774 (1942-5188) | 0 (0-0) n=10 | absent: no-semaphore-line |
+| ci.yml Check (ubuntu-latest,sqlite) | hosted | 2 (1-2) n=9 | 160 (115-188) | 1952 (1190-2572) | 1529 (309-2020) | 356 (12-449) | 3774 (1942-5188) | absent: load-gate-skipped | absent: no-semaphore-line |
 | coverage.yml Per-Module Coverage Thresholds | hosted | 3 (1-7) n=10 | 192 (148-237) | 999 (835-1073) | 3924 (2631-4277) | 26 (18-77) | 5164 (3695-5580) | absent: no-load-gate-step | absent: no-semaphore-line |
 
 The Load gate and Semaphore columns, and the linux-fed Test cell (its range was 1008-7285 before the semaphore wait
-was taken out), were measured on 2026-11-21 by the fixed script over the same runs; the command and its output are
-quoted in the PR body of #9773. Footer of that run: `waits absent: load_gate no-load-gate-step=10, semaphore
+was taken out), were measured on 2026-11-21 by the script as fixed in PR #9799 (issue #9773), over the same runs:
+`python3.12 -I scripts/ci/measure_ci_time.py --repo alphaonedev/ai-memory-mcp --branch chain/promo6-ssh-r2 --runs 10`.
+The `Load gate (#6795)` step of the ubuntu-latest leg has the jobs-API conclusion `skipped` in all 10 runs, so its cell
+is `absent: load-gate-skipped`, not the `0 (0-0)` that the timestamps of a step that did not run gave in an earlier
+version. Footer of that run: `waits absent: load_gate load-gate-skipped=10, load_gate no-load-gate-step=10, semaphore
 no-semaphore-line=40` and `unmeasured: 0 cells in 0 of 50 rows`.
 
 The job of issue #9773 (run 44813346880, job 136556334572, `Check (linux-fed,enterprise-fed)`), measured by the same
