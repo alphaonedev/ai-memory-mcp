@@ -4,7 +4,7 @@
 //! #9661 source ratchet: no plain (non-test) `fn` registers a production
 //! handler on a router.
 //!
-//! Why: CodeQL's `rust/unsafe-deserialization` query treats the extractor
+//! Why: `CodeQL`'s `rust/unsafe-deserialization` query treats the extractor
 //! parameters of a handler as remote sources once the handler is registered
 //! with `.route(...)` in a plain helper `fn` of a test file. The typed and
 //! bounded `from_slice` / `from_value` lines inside the handlers, unchanged

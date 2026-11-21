@@ -368,58 +368,66 @@ fn full_router_layer(uri: &str) -> Layer {
 /// The census routes registered on their production handlers with NO
 /// authority layer, no transport auth and no postgres gate: a request reaches
 /// the handler with the header exactly as sent.
-fn handler_router(app: AppState) -> axum::Router {
-    use ai_memory::handlers as h;
-    use axum::routing::{delete, get, post};
-    axum::Router::new()
-        .route(
-            "/api/v1/memories/{id}",
-            get(h::get_memory).delete(h::delete_memory),
-        )
-        .route(
-            "/api/v1/memories",
-            get(h::list_memories).post(h::create_memory),
-        )
-        .route("/api/v1/search", get(h::search_memories))
-        .route("/api/v1/contradictions", get(h::detect_contradictions))
-        .route("/api/v1/links", delete(h::delete_link))
-        .route("/api/v1/links/{id}", get(h::get_links))
-        .route("/api/v1/memories/{id}/lineage", get(h::get_lineage))
-        .route(
-            "/api/v1/namespaces",
-            post(h::set_namespace_standard_qs).delete(h::clear_namespace_standard_qs),
-        )
-        .route("/api/v1/check_duplicate", post(h::check_duplicate))
-        .route("/api/v1/entities/by_alias", get(h::entity_get_by_alias))
-        .route("/api/v1/links/verify", post(h::verify_link_handler))
-        .route(
-            "/api/v1/archive",
-            post(h::archive_by_ids).delete(h::purge_archive),
-        )
-        .route("/api/v1/archive/{id}/restore", post(h::restore_archive))
-        .route("/api/v1/agents", post(h::register_agent))
-        .route("/api/v1/pending", get(h::list_pending))
-        .route("/api/v1/pending/{id}/approve", post(h::approve_pending))
-        .route("/api/v1/pending/{id}/reject", post(h::reject_pending))
-        .route("/api/v1/share", post(h::share_memory))
-        .route(
-            h::routes::MEMORY_REFLECTION_ORIGIN,
-            post(h::route_1111::handle_reflection_origin_http),
-        )
-        .route(
-            h::routes::MEMORY_DEPENDENTS_OF_INVALIDATED,
-            post(h::route_1111::handle_dependents_of_invalidated_http),
-        )
-        .route(
-            h::routes::MEMORY_VERIFY,
-            post(h::route_1111::handle_verify_http),
-        )
-        .route(
-            h::routes::MEMORY_SMART_LOAD,
-            post(h::route_1111::handle_smart_load_http),
-        )
-        .route(SYNC_SINCE, get(h::sync_since))
-        .with_state(app)
+///
+/// A macro, expanded inside the two handler-only test bodies and nowhere
+/// else: a plain helper fn that registers production handlers makes `CodeQL`
+/// treat their extractor parameters as remote sources and turns unchanged,
+/// typed and bounded deserialisation lines into alerts (#9661). The ratchet
+/// `plain_router_9661` holds this.
+macro_rules! handler_router {
+    ($app:expr) => {{
+        use ai_memory::handlers as h;
+        use axum::routing::{delete, get, post};
+        axum::Router::new()
+            .route(
+                "/api/v1/memories/{id}",
+                get(h::get_memory).delete(h::delete_memory),
+            )
+            .route(
+                "/api/v1/memories",
+                get(h::list_memories).post(h::create_memory),
+            )
+            .route("/api/v1/search", get(h::search_memories))
+            .route("/api/v1/contradictions", get(h::detect_contradictions))
+            .route("/api/v1/links", delete(h::delete_link))
+            .route("/api/v1/links/{id}", get(h::get_links))
+            .route("/api/v1/memories/{id}/lineage", get(h::get_lineage))
+            .route(
+                "/api/v1/namespaces",
+                post(h::set_namespace_standard_qs).delete(h::clear_namespace_standard_qs),
+            )
+            .route("/api/v1/check_duplicate", post(h::check_duplicate))
+            .route("/api/v1/entities/by_alias", get(h::entity_get_by_alias))
+            .route("/api/v1/links/verify", post(h::verify_link_handler))
+            .route(
+                "/api/v1/archive",
+                post(h::archive_by_ids).delete(h::purge_archive),
+            )
+            .route("/api/v1/archive/{id}/restore", post(h::restore_archive))
+            .route("/api/v1/agents", post(h::register_agent))
+            .route("/api/v1/pending", get(h::list_pending))
+            .route("/api/v1/pending/{id}/approve", post(h::approve_pending))
+            .route("/api/v1/pending/{id}/reject", post(h::reject_pending))
+            .route("/api/v1/share", post(h::share_memory))
+            .route(
+                h::routes::MEMORY_REFLECTION_ORIGIN,
+                post(h::route_1111::handle_reflection_origin_http),
+            )
+            .route(
+                h::routes::MEMORY_DEPENDENTS_OF_INVALIDATED,
+                post(h::route_1111::handle_dependents_of_invalidated_http),
+            )
+            .route(
+                h::routes::MEMORY_VERIFY,
+                post(h::route_1111::handle_verify_http),
+            )
+            .route(
+                h::routes::MEMORY_SMART_LOAD,
+                post(h::route_1111::handle_smart_load_http),
+            )
+            .route(SYNC_SINCE, get(h::sync_since))
+            .with_state($app)
+    }};
 }
 
 /// Which router a census leg drives.
@@ -605,11 +613,7 @@ async fn create_fixture(router: &axum::Router) -> String {
 /// one run reports EVERY broken cell, not only the first. A destructive cell
 /// that removed the fixture is reported and the fixture is recreated, so one
 /// removal never cascades into the cells after it.
-async fn census(app: AppState, backend: &str, leg: Leg) -> (Vec<String>, Vec<String>) {
-    let router = match leg {
-        Leg::Full => router(app),
-        Leg::HandlerOnly => handler_router(app),
-    };
+async fn census(router: axum::Router, backend: &str, leg: Leg) -> (Vec<String>, Vec<String>) {
     let mut id = create_fixture(&router).await;
 
     let mut table = Vec::new();
@@ -728,13 +732,13 @@ fn unsigned_sync_since_for_tests() {
     });
 }
 
-async fn sqlite_census(leg: Leg) {
+async fn sqlite_census(leg: Leg, build: impl FnOnce(AppState) -> axum::Router) {
     common::permissive_attestation_for_tests();
     unsigned_sync_since_for_tests();
     std::fs::create_dir_all(".local-runs").unwrap();
     let dir = tempfile::tempdir_in(".local-runs").unwrap();
     let (table, broken) = census(
-        sqlite_app_state(&dir.path().join("memories.db")),
+        build(sqlite_app_state(&dir.path().join("memories.db"))),
         "sqlite",
         leg,
     )
@@ -744,39 +748,39 @@ async fn sqlite_census(leg: Leg) {
 }
 
 #[cfg(feature = "sal-postgres")]
-async fn postgres_census(leg: Leg) {
+async fn postgres_census(leg: Leg, build: impl FnOnce(AppState) -> axum::Router) {
     let Some(url) = common::postgres_url() else {
         return;
     };
     common::permissive_attestation_for_tests();
     unsigned_sync_since_for_tests();
-    let (table, broken) = census(postgres_app_state(&url).await, "postgres", leg).await;
+    let (table, broken) = census(build(postgres_app_state(&url).await), "postgres", leg).await;
     report(&table, &broken);
     assert_full_table(&table);
 }
 
 #[tokio::test]
 async fn sqlite_invalid_agent_id_is_one_named_400_on_every_route_9616() {
-    sqlite_census(Leg::Full).await;
+    sqlite_census(Leg::Full, router).await;
 }
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_invalid_agent_id_is_one_named_400_on_every_route_9616() {
-    postgres_census(Leg::Full).await;
+    postgres_census(Leg::Full, router).await;
 }
 
 /// The handler's own refusal, with no authority layer in front of it.
 #[tokio::test]
 async fn sqlite_handler_refuses_every_form_without_the_authority_layer_9616() {
-    sqlite_census(Leg::HandlerOnly).await;
+    sqlite_census(Leg::HandlerOnly, |app| handler_router!(app)).await;
 }
 
 /// The handler's own refusal, with no authority layer in front of it.
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_handler_refuses_every_form_without_the_authority_layer_9616() {
-    postgres_census(Leg::HandlerOnly).await;
+    postgres_census(Leg::HandlerOnly, |app| handler_router!(app)).await;
 }
 
 /// The reflect body refusal a request past the caller step meets, written by
