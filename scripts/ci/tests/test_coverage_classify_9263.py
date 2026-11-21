@@ -612,6 +612,21 @@ class CoverageClassifyRuns(unittest.TestCase):
         self.expect("no trusted classifier", values, "false", "false",
                     "trusted-classifier-missing-in-base-fail-closed")
 
+    def test_a_decider_answer_of_the_wrong_shape_runs(self):
+        self.commit_base()
+        for label, docs_only, skip in (("docs true, skip false", "true", "false"),
+                                       ("not a boolean", "maybe", "true"),
+                                       ("empty value", "", "true")):
+            planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
+            planted.write_text('print("docs_only=%s")\nprint("cargo_skip=%s")\n'
+                               'print("cargo_skip_reason=planted")\n' % (docs_only, skip))
+            self.commit("trusted decider " + label)
+            base = run_git(self.repo, "rev-parse", "HEAD")
+            self.write("docs/a.md", "# changed %s\n" % label)
+            self.commit()
+            values, _ = self.run_cls(base)
+            self.expect(label, values, "false", "false", "classifier-error-fail-closed")
+
     def test_a_pr_cannot_replace_its_own_classifier(self):
         base = self.commit_base()
         planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
