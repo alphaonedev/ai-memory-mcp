@@ -118,7 +118,7 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   goes whole, whatever its children's mtimes. A symlink is unlinked and never
   followed, so a sibling `runner-N` directory is never touched.
 - On the macOS node TMPDIR is `<runner folder>/_tmp` under `/Users/Shared` or
-  `/Volumes/f1dev/rt`; it is proven by identity the same way (the folder's name
+  the volume runner root named by `F1_VOLUME_RUNNER_ROOT`; it is proven by identity the same way (the folder's name
   must match the layout and its parent must be that root).
 - TMPDIR is proven, by file identity (device and inode of the opened
   directory, never by path text), to be `<runner root>/runner-<digits>`: the

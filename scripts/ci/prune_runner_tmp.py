@@ -218,7 +218,7 @@ F2_RUNNER_ROOT = "/ai-scratch/runner-tmp"  # confirmed: runs 43768137071, 437681
 ALLOWED_ROOTS = (F2_RUNNER_ROOT,)
 # macOS node (f1) layouts: TMPDIR is ``<root>/<runner folder>/_tmp``. Confirmed 2026-11-21 from the runner ``.env``
 # TMPDIR= lines (read only) of the two running f1 runners: /Users/Shared/actions-runner/_tmp and
-# /Volumes/f1dev/rt/fed3/_tmp; the stopped runners use /Users/Shared/actions-runner-2/_tmp and
+# <F1_VOLUME_RUNNER_ROOT>/fed3/_tmp; the stopped runners use /Users/Shared/actions-runner-2/_tmp and
 # /Users/Shared/f1-macos-fed-N/_tmp. No prune-facts line of an f1 run is quoted yet.
 F1_SHARED_RUNNER_ROOT = "/Users/Shared"
 F1_VOLUME_RUNNER_ROOT = "/Volumes/f1dev/rt"
