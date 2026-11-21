@@ -253,6 +253,14 @@ pub(crate) const ACTION_GET_FAILED: &str = "action_get failed";
 pub(crate) const ACTION_TRANSITION_FAILED: &str = "action_transition failed";
 pub(crate) const ATTESTATION_FAILED_MSG: &str = "attestation failed";
 pub(crate) const CHECKPOINT_RESOLVE_FAILED: &str = "checkpoint resolve failed";
+/// The `error` of the transport-auth `401` (`api_key_auth`): no key, or a key
+/// that is neither the shared key nor an enrolled per-agent key. The MCP
+/// forwarder matches it to name a refused per-agent key (#9367 K-5).
+pub(crate) const API_KEY_REFUSED_ERROR: &str = "missing or invalid API key";
+/// The `error` of the per-agent key binding `403` (`api_key_auth`, #2044):
+/// the `X-Agent-Id` differs from the agent the key is bound to. Matched by the
+/// MCP forwarder alongside [`API_KEY_REFUSED_ERROR`] (#9367 K-5).
+pub(crate) const IDENTITY_BINDING_MISMATCH_ERROR: &str = "identity_binding_mismatch";
 
 pub(crate) fn quota_exceeded_response(qe: &crate::quotas::QuotaError) -> axum::response::Response {
     (

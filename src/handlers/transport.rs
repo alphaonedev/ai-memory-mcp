@@ -1014,7 +1014,7 @@ fn record_auth_failure(auth: &ApiKeyState, source: Option<IpAddr>, now: Instant)
     }
     (
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "missing or invalid API key"})),
+        Json(json!({"error": super::errors::API_KEY_REFUSED_ERROR})),
     )
         .into_response()
 }
@@ -1226,7 +1226,7 @@ pub async fn api_key_auth(
                     return (
                         StatusCode::FORBIDDEN,
                         Json(json!({
-                            "error": "identity_binding_mismatch",
+                            "error": super::errors::IDENTITY_BINDING_MISMATCH_ERROR,
                             "message": "X-Agent-Id must match the agent bound to the \
                                         presented per-agent api-key",
                         })),

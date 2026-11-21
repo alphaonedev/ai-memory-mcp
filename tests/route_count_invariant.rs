@@ -20,10 +20,14 @@
 
 use std::fs;
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 #[test]
 fn arch_14_route_count_invariant() {
     // Normalize CRLF → LF at read time. The static-text scan below
-    // uses literal `\n` anchors (e.g. `"\n#[cfg(test)]\nmod "`); on
+    // reads whole lines (the resolver matches `mod NAME {` line ends); on
     // Windows the runner checkout converts `\n` → `\r\n` via
     // `core.autocrlf=true`, so the literal `\n` patterns never match
     // and `.find(...)` returns None. Issue #1374 documents the
@@ -34,36 +38,31 @@ fn arch_14_route_count_invariant() {
         .replace("\r\n", "\n");
 
     // Locate the build_router_with_timeout fn — its body contains
-    // every production route. Then locate the `#[cfg(test)]\nmod
-    // tests {` inline test module sentinel that demarcates the
-    // production block from the test-only routes (e.g. `/slow`).
+    // every production route.
     let fn_start = src
         .find("pub fn build_router_with_timeout(")
         .expect("locate build_router_with_timeout");
 
-    // The first `#[cfg(test)]` attribute that follows the fn
-    // body marks the boundary between production routes (above)
-    // and test-only routes (below). The inline test module name
-    // is `h7_timeout_tests` at v0.7.0; using the cfg-attribute
-    // sentinel rather than the mod name keeps the test stable if
-    // the inline test module gets renamed.
-    let test_mod_start = src[fn_start..]
-        .find("\n#[cfg(test)]\nmod ")
-        .expect("locate inline #[cfg(test)] mod sentinel after build_router_with_timeout");
-
-    let production_block = &src[fn_start..fn_start + test_mod_start];
-    let test_block_end = src.len();
-    let test_block = &src[fn_start + test_mod_start..test_block_end];
+    // The production block is every line from the fn on outside the
+    // `cfg(test)` modules (the ONE resolver, #9367): a `#[cfg(test)]` item
+    // inside production code does not end it, and production after a test
+    // module still counts. Test routes are the `.route(` lines the resolver
+    // removed (e.g. `/slow` in the inline `h7_timeout_tests` module).
+    let from_fn = &src[fn_start..];
+    let production_block = cfg_test_modules::strip_cfg_test_inline_mods(from_fn);
+    let all_routes = from_fn
+        .lines()
+        .filter(|line| line.trim_start().starts_with(".route("))
+        .count();
 
     let production_routes = production_block
         .lines()
         .filter(|line| line.trim_start().starts_with(".route("))
         .count();
 
-    let test_routes = test_block
-        .lines()
-        .filter(|line| line.trim_start().starts_with(".route("))
-        .count();
+    let test_routes = all_routes
+        .checked_sub(production_routes)
+        .expect("the resolver only removes lines, so production routes never exceed all routes");
 
     assert_eq!(
         production_routes,

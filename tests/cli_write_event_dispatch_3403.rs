@@ -55,6 +55,10 @@ use tempfile::TempDir;
 mod common;
 use common::tls_receiver::{Respond, TlsReceiver};
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 // ---------------------------------------------------------------------------
 // harness (mirrors tests/webhook_coverage.rs)
 // ---------------------------------------------------------------------------
@@ -432,15 +436,11 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// Strip the `#[cfg(test)]` module so a fixture never counts as a
-/// production site. Same boundary heuristic as
-/// `tests/atomise_funnel_ceiling_2984.rs`.
-fn production_prefix(src: &str) -> String {
-    let cut = src
-        .find("\n#[cfg(test)]\nmod tests")
-        .or_else(|| src.find("\n#[cfg(test)]\n#[path"))
-        .unwrap_or(src.len());
-    src[..cut]
+/// Every line outside the file's `cfg(test)` modules (the ONE resolver,
+/// `tests/common/cfg_test_modules.rs`, #9367), minus comment lines, so a
+/// fixture never counts as a production site.
+fn production_text(src: &str) -> String {
+    cfg_test_modules::strip_cfg_test_inline_mods(src)
         .lines()
         .filter(|l| {
             let t = l.trim_start();
@@ -454,7 +454,7 @@ fn production_prefix(src: &str) -> String {
 fn every_cli_write_verb_routes_through_the_shared_event_funnel_3403() {
     let mut missing = Vec::new();
     for (file, emitter) in CLI_WRITE_VERBS {
-        if !production_prefix(&read(file)).contains(emitter) {
+        if !production_text(&read(file)).contains(emitter) {
             missing.push(format!(
                 "{file} no longer calls `{emitter}` — a CLI write verb that dispatches \
                  nothing is invisible to every subscriber while its MCP twin is not (#3403)."
@@ -478,7 +478,7 @@ fn no_cli_file_re_pairs_an_event_name_with_a_details_struct_3403() {
             .unwrap_or(&entry)
             .display()
             .to_string();
-        let src = production_prefix(&std::fs::read_to_string(&entry).unwrap_or_default());
+        let src = production_text(&std::fs::read_to_string(&entry).unwrap_or_default());
         if src.contains("subscriptions::dispatch_event") {
             offenders.push(rel);
         }
@@ -496,7 +496,7 @@ fn no_cli_file_re_pairs_an_event_name_with_a_details_struct_3403() {
 fn the_one_shot_epilogue_drains_the_webhook_fan_out_3403() {
     // Delivery is fire-and-forget: without this the CLI would dispatch
     // events that reliably die with the process.
-    let src = production_prefix(&read("src/daemon_runtime.rs"));
+    let src = production_text(&read("src/daemon_runtime.rs"));
     assert!(
         src.contains("subscriptions::drain_dispatches_with_report("),
         "#3403: `daemon_runtime::run` must drain the webhook fan-out before a one-shot \

@@ -25,6 +25,10 @@
 
 use std::path::PathBuf;
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -33,15 +37,11 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// Strip the `#[cfg(test)]` module and comment lines so a fixture or a
-/// doc reference never counts as a production site. Same boundary
-/// heuristic as `tests/atomise_funnel_ceiling_2984.rs`.
-fn production_prefix(src: &str) -> String {
-    let cut = src
-        .find("\n#[cfg(test)]\nmod tests")
-        .or_else(|| src.find("\n#[cfg(test)]\n#[path"))
-        .unwrap_or(src.len());
-    src[..cut]
+/// Every line outside the file's `cfg(test)` modules (the ONE resolver,
+/// `tests/common/cfg_test_modules.rs`, #9367), minus comment lines, so a
+/// fixture or a doc reference never counts as a production site.
+fn production_text(src: &str) -> String {
+    cfg_test_modules::strip_cfg_test_inline_mods(src)
         .lines()
         .filter(|l| {
             let t = l.trim_start();
@@ -72,7 +72,7 @@ const CONSOLE_SUBSCRIBER_SURFACES: &[(&str, &str)] = &[
 fn no_production_file_builds_its_own_console_subscriber_3436() {
     let mut offenders = Vec::new();
     for (file, why) in CONSOLE_SUBSCRIBER_SURFACES {
-        let src = production_prefix(&read(file));
+        let src = production_text(&read(file));
         if src.contains("tracing_subscriber::fmt()") {
             offenders.push(format!(
                 "{file} ({why}) still builds its own `tracing_subscriber::fmt()`. The \
@@ -96,7 +96,7 @@ fn no_production_file_builds_its_own_console_subscriber_3436() {
 fn every_long_running_verb_routes_through_the_console_funnel_3436() {
     let mut missing = Vec::new();
     for (file, why) in CONSOLE_SUBSCRIBER_SURFACES {
-        let src = production_prefix(&read(file));
+        let src = production_text(&read(file));
         if !src.contains("init_console_tracing(") {
             missing.push(format!(
                 "{file} ({why}) no longer calls init_console_tracing"
@@ -110,7 +110,7 @@ fn every_long_running_verb_routes_through_the_console_funnel_3436() {
 /// property of the funnel, not of its callers.
 #[test]
 fn the_console_funnel_pins_stderr_3436() {
-    let src = production_prefix(&read("src/logging.rs"));
+    let src = production_text(&read("src/logging.rs"));
     let funnel = src
         .split("pub fn init_console_tracing")
         .nth(1)
@@ -177,7 +177,7 @@ fn json_ignoring_verbs_are_classified_unsupported_3436() {
 /// for it, instead of inheriting the flag by accident.
 #[test]
 fn the_json_classification_has_no_catch_all_arm_3436() {
-    let src = production_prefix(&read("src/cli/json_contract.rs"));
+    let src = production_text(&read("src/cli/json_contract.rs"));
     let body = src
         .split("pub fn json_support")
         .nth(1)
@@ -193,7 +193,7 @@ fn the_json_classification_has_no_catch_all_arm_3436() {
 /// any work — the refusal claims NOTHING WAS EXECUTED.
 #[test]
 fn the_dispatcher_refuses_unsupported_json_before_any_work_3436() {
-    let src = production_prefix(&read("src/daemon_runtime.rs"));
+    let src = production_text(&read("src/daemon_runtime.rs"));
     assert!(
         src.contains("json_contract::json_support(&cli.command)"),
         "the dispatcher must consult the --json classification"
@@ -213,7 +213,7 @@ fn the_dispatcher_refuses_unsupported_json_before_any_work_3436() {
 /// its JSON envelope. It must route through the `--json` contract helper.
 #[test]
 fn rules_keygen_status_line_honours_the_json_contract_3436() {
-    let src = production_prefix(&read("src/cli/rules.rs"));
+    let src = production_text(&read("src/cli/rules.rs"));
     let keygen = src
         .split("fn keygen_operator")
         .nth(1)
@@ -238,7 +238,7 @@ fn rules_keygen_status_line_honours_the_json_contract_3436() {
 /// built, instead of being certified by a vacuously-true empty walk.
 #[test]
 fn verify_reflection_chain_refuses_an_unknown_root_3436() {
-    let src = production_prefix(&read("src/cli/verify.rs"));
+    let src = production_text(&read("src/cli/verify.rs"));
     let run = src.split("pub fn run(").nth(1).expect("run must exist");
     let gate = run
         .find("is_none()")

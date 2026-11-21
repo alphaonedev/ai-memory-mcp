@@ -841,31 +841,6 @@ jobs:
         run: python3 scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)
         run: python3 scripts/test/test_workflow_concurrency_6340.py
-      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
-      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
-      - name: Resolve the corpus ratchet base (#7987)
-        env:
-          PR_BASE_REF: ${{ github.base_ref }}
-        run: |
-          if [ -n "$PR_BASE_REF" ]; then
-            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
-              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
-              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-              git fetch --no-tags --deepen=200 origin HEAD || true
-            fi
-            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
-          else
-            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
-          fi
-      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
-      - name: Fetch the corpus replay objects (#7988)
-        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
-      # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
-      - name: Fetch the amendment ledger replay objects (#9303)
-        run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
-      - name: Shard partition and wiring unit tests (#6344)
-        run: python3 -m unittest discover -s scripts/ci/tests
       - name: AGE self-heal helper unit test (#6161)
         run: python3 scripts/test/test_ensure_age_extension_6161.py
       # #7160 - scripts/test/ is outside the discovery root above; run the
@@ -964,11 +939,16 @@ jobs:
     # it nothing. `Swatinem/rust-cache` restores the registry on hosted exactly
     # as it did before #3109.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # #9593 - 15 -> 40: the job now also runs the scripts/ci unit tests (11.7 min
+    # measured in `classify`), after its own ~0.5 min of gate work.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # #9593 - fetch-depth 2 as in `classify`, where the unit tests below
+          # ran before: a push anchors the corpus ratchet on its first parent.
+          fetch-depth: 2
       - name: Install Rust 1.99.1 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
@@ -989,6 +969,36 @@ jobs:
         # pre-#2635 ledger-only algorithm over a planted unvetted package and
         # requires it to MISS — so the leg cannot pass tautologically.
         run: python3 scripts/check-build-script-vetting.py --self-test
+      # #9593 - moved here from `classify`, where this 11.7 min step held every
+      # `needs: classify` job (the four Check legs and seven others) back.
+      # This job has no `needs:`, is no ancestor of any Check leg, runs on every
+      # push and pull request and is a required context, so the same tests still
+      # run and still gate the merge. Same steps, same command, same order.
+      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
+      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
+      - name: Resolve the corpus ratchet base (#7987)
+        env:
+          PR_BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$PR_BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
+              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
+              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+              git fetch --no-tags --deepen=200 origin HEAD || true
+            fi
+            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
+          else
+            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
+          fi
+      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
+      - name: Fetch the corpus replay objects (#7988)
+        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
+      - name: Fetch the amendment ledger replay objects (#9303)
+        run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      - name: Shard partition and wiring unit tests (#6344)
+        run: python3 -m unittest discover -s scripts/ci/tests
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an
@@ -1107,7 +1117,9 @@ jobs:
     #                                 passed (`Check (ubuntu-latest)`), so 45 is
     #                                 a MEASURED hosted value, not an f2 value.
     #                                 The 2x2 rewrite added the release build +
-    #                                 `cargo audit` steps to the leg, so +10.
+    #                                 `cargo audit` steps to the leg, so +10;
+    #                                 #9680 moved both to the android
+    #                                 Cross-compile leg and the cap is kept.
     #                                 The 1500s (25 min) sqlite watchdog stays
     #                                 well inside it.
     #   linux-fed,enterprise-fed 300  (was 160, 80 before: raised in #6411/#6344 and #7914, see the matrix entry.) Compile ~12 min (hoisted
@@ -1159,10 +1171,11 @@ jobs:
       # `target/debug/deps` across two runners, until rust-lld died with
       # `ld terminated with signal 7 [Bus error]` on a full disk (#3453) — and
       # (b) charged the link time to the macOS full-suite job that then blew
-      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in every
-      # backtrace and panic location (the only debuginfo CI actually reads;
-      # nothing here runs a debugger) at roughly a third of the size and link
-      # cost. DECLARED HERE, in the workflow, deliberately: a runner-side
+      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in
+      # backtraces on the legs that keep it (panic locations come from the
+      # compiler, not debuginfo, and stay on every leg; nothing here runs a
+      # debugger or sets RUST_BACKTRACE) at roughly a third of the size and
+      # link cost. DECLARED HERE, in the workflow, deliberately: a runner-side
       # `.env` is per-node operator state that no repo change can preserve or
       # audit, so a re-imaged or added runner would silently regress.
       #
@@ -1171,21 +1184,41 @@ jobs:
       # CARGO_PROFILE_DEV_DEBUG (the hosted low-mem step below) would otherwise
       # leave the test profile at this value. Both are stated at every point
       # they are set, so the pair can never drift apart.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      #
+      # #9593 - the self-hosted linux-fed enterprise-fed leg links ~1,057 test
+      # executables (55 min median; the macos-fed leg does the same set in
+      # 7-11 min). Its matrix entry sets `cargo_debug: '0'`, which turns
+      # debuginfo off for BOTH profiles on that one leg (the test binaries use
+      # the test profile, the package library they link against the dev
+      # profile; cert-postgres-age.yml and postgres-ignored.yml already do
+      # this), so backtraces on that leg carry no file:line. No other leg has
+      # a `cargo_debug` key: the two macOS legs keep line-tables-only, and the
+      # hosted sqlite leg sets 0 in its own low-mem step below. Environment
+      # only: no Cargo.toml or .cargo change, and no release-shaped or
+      # coverage build reads this key.
+      CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
+      CARGO_PROFILE_TEST_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
     strategy:
       fail-fast: false
-      # #7188 - concurrency cap: at most 3 of this job's 4 legs run at once per
-      # workflow run, so the self-hosted linux-fed leg and the two macOS legs
-      # never wait on each other while a fourth leg cannot pile on. N = 3 and
-      # not lower because a lower cap would serialise the macOS legs behind the
-      # hosted sqlite leg (~75 min) with no benefit to the f2 disk. The host-level
-      # bound lives elsewhere: every linux-fed enterprise-fed job builds into the
-      # PER-RUNNER CARGO_TARGET_DIR of the runner it runs on (below), so a target
-      # has exactly one writer and compiles once across that runner's jobs.
+      # #7188/#9682 - concurrency cap: N = 4 = the number of legs. The cap of 3
+      # held the fourth leg back until one of the other three finished; 4 lets
+      # every leg queue for its runner as soon as `classify` is done, and its
+      # start time then depends on a free runner. Measured on run 44716882423
+      # (PR 9579, 2 macos-fed runners online): macos-fed,sqlite, inside the cap
+      # of 3, started 73 minutes after creation and macos-fed,enterprise-fed
+      # 102 minutes, so most of that wait was the macos-fed runner pool and not
+      # the cap. 4 is safe because only
+      # ONE leg runs on the Linux host (linux-fed,enterprise-fed), where the
+      # host semaphore (2 slots, "Run tests (impact-aware)") bounds the compile
+      # +test phases, and the fourth leg runs on the macOS host, which has its
+      # own runner pool. The host-level bound lives elsewhere: every linux-fed
+      # enterprise-fed job builds into the PER-RUNNER CARGO_TARGET_DIR of the
+      # runner it runs on (below), so a target has exactly one writer and
+      # compiles once across that runner's jobs. Keep N >= the leg count
+      # (pinned by test_ci_check_matrix_max_parallel_9682).
       # A cross-run `concurrency` group is deliberately NOT used: GitHub replaces
       # a PENDING run in a group, which would silently cancel a required check.
-      max-parallel: 3
+      max-parallel: 4
       matrix:
         # 2x2 via `include:` so the single name variable `leg` co-varies with
         # `runner` (runs-on labels), `node` (a descriptive tag used by the
@@ -1218,6 +1251,9 @@ jobs:
             # f32c18dad) took release smoke to 1225 s when the maximum
             # recorded below was 787 s, and passed with 4 min 4 s of margin —
             # inside the "re-derive when within 20 %" rule this comment set.
+            # (History: `Security audit` and `Build release` ran on this leg
+            # then; since #9680 they run on the android entry of
+            # mobile-cross-compile, see the note above `timeout: 95`.)
             #
             # Measured today (UTC 18:17–19:32, the cancelled run): free-disk
             # 160 s + impact-aware tests 2708 s (a full-impact diff — the
@@ -1247,17 +1283,13 @@ jobs:
             # completed run of 3271 s and a step-max sum of 3865 s
             # (free-disk 187 + tests 2441 + cold cargo-audit 413 + release
             # smoke 787 + setup ~37); both maxima have since moved (tests
-            # 2708, release smoke 1225).
+            # 2708, release smoke 1225). The measurements above were taken
+            # while this leg still ran cargo-audit and the release smoke.
+            # #9680 moved both to the android (`once`) entry of
+            # mobile-cross-compile, bounded there by that job's own
+            # timeout-minutes (#9699); this leg now runs neither, and its cap
+            # stays at 95 until the post-move maxima of this leg are measured.
             timeout: 95
-            # `once` marks the ONE leg that carries the 2x2-invariant extras
-            # (cargo-audit, the release-profile smoke build) so they do not
-            # multiply across four legs. It is an explicit flag rather than a
-            # `matrix.node == '<label>'` comparison ON PURPOSE: those
-            # comparisons silently stopped matching when this leg was renamed
-            # from `linux-fed` to `ubuntu-latest`, which would have switched
-            # `cargo audit` — a supply-chain control — off with no signal at
-            # all. A named flag cannot drift out of a rename.
-            once: true
           - leg: linux-fed,enterprise-fed
             runner: '["self-hosted","linux-fed"]'
             node: linux-fed
@@ -1268,6 +1300,8 @@ jobs:
             # the hosted and macOS legs do not set it and keep their default
             # workspace `target/`.
             shared_target: true
+            # #9593 - debuginfo off on this leg only (see the job env above).
+            cargo_debug: '0'
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
             # inside this outer bound. 160 = 130 min watchdog + 28 min of
@@ -1410,7 +1444,8 @@ jobs:
       # before the reclaim was widened (#2960/#1810), and #1407 added the 8 GB
       # swapfile because the lib-test LINK step hit `ld … signal 7 [Bus error]`
       # against the hosted ~7 GB RAM ceiling. This is the heaviest job in CI —
-      # full integration compile at DEV_DEBUG=1 plus a release build.
+      # full integration compile at DEV_DEBUG=1 (the release build moved to
+      # the android Cross-compile leg in #9680).
       #
       # The `if:` is keyed on `runner.environment == 'github-hosted'`, NOT on a
       # matrix value: this step deletes SYSTEM PATHS, and on an ephemeral hosted
@@ -1886,7 +1921,8 @@ jobs:
           # `CI_NODE = ubuntu-latest` comparison ON PURPOSE: this leg has
           # already been renamed once (linux-fed,sqlite -> ubuntu-latest,sqlite)
           # and a node-name comparison silently stops matching on a rename —
-          # the exact drift the `once:` flag above exists to avoid. Every
+          # the exact drift the `once:` matrix flag (now on the android
+          # Cross-compile entry, #9680) exists to avoid. Every
           # non-macos sqlite node therefore gets the larger hang budget by
           # default, which delays hang DETECTION and never weakens it.
           # The `enterprise-fed` legs run
@@ -2607,47 +2643,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      # cargo-audit runs once (the advisory DB is platform-independent) — on
-      # the `once` leg so it does not multiply across the 2x2.
-      - name: Security audit
-        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
-        env:
-          # #3138: named pin for the cargo-audit version this job installs.
-          CARGO_AUDIT_VERSION: "0.22.2"
-        run: |
-          # #3138: install when cargo-audit is missing OR its version differs
-          # from the pin (a stale preinstalled one on a warm self-hosted runner
-          # must not run). A matching install is left alone. The job fails when
-          # the pinned version is still not what runs; the audit is never skipped.
-          if ! command -v cargo-audit >/dev/null 2>&1 \
-             || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
-            cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
-          fi
-          if ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
-            echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the installed version"
-            exit 1
-          fi
-          python3 -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py
-          # Cross-check .cargo/audit.toml with .cargo/audit-exceptions.toml.
-          # The gate prints its summary and every public identity diagnostic;
-          # cargo-audit JSON and external stderr remain captured inside it.
-          python3 scripts/ci/check_cargo_audit.py
-
-      # CI-speed: the release build here is only a release-PROFILE compile
-      # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
-      # produced by release.yml on tag, and a release-profile-only break that
-      # the debug `cargo test` build wouldn't already catch is vanishingly rare
-      # for this pure-Rust + bundled-sqlite crate. Run it on the `once` leg
-      # so it does not multiply across the 2x2.
-      # RESTORED with the hosted move (see the free-disk step above). The
-      # release build follows a full debug test compile; pre-#3109 this leg
-      # needed the debug artifacts dropped first to fit. Tradeoff, stated: when
-      # this job saves the rust-cache (trunk `push` only — `save-if` above), the
-      # saved `target/` no longer carries debug artifacts, so PR restores are
-      # cooler. That is the pre-#3109 behaviour exactly, and it degrades speed,
-      # never correctness. `cargo clean --profile dev` touches only the
+      # #9680: `Security audit` and the release-profile smoke build moved to
+      # the `once` entry of the mobile-cross-compile matrix (the required
+      # context `Cross-compile (aarch64-linux-android)`), where they run in
+      # parallel with this leg's tests instead of after them.
+      #
+      # The trim below is kept: it was added so the release build fitted after
+      # the debug test compile (pre-#3109), and it still keeps the saved
+      # rust-cache (trunk `push` only — `save-if` above) at the size it has
+      # had since then, so the cache does not grow by the debug artifacts.
+      # Tradeoff, stated: PR restores carry no debug artifacts, which degrades
+      # speed, never correctness. `cargo clean --profile dev` touches only the
       # workspace `target/`, never a system path.
-      - name: Trim target/debug before release build (hosted)
+      - name: Trim target/debug before the cache save (hosted)
         if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'
         run: |
           set -eu
@@ -2660,18 +2668,6 @@ jobs:
           df -h /
           du -sh target 2>/dev/null || true
           echo "::endgroup::"
-
-      # CI-speed: the release build here is only a release-PROFILE compile
-      # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
-      # produced by release.yml on tag, and a release-profile-only break that
-      # the debug `cargo test` build on ubuntu wouldn't already catch is
-      # vanishingly rare for this pure-Rust + bundled-sqlite crate. Running it
-      # on ubuntu ONLY takes it off the macos critical path (-~400s) — the
-      # prep `cargo clean` step above is already ubuntu-only.
-
-      - name: Build release (once leg — release-profile smoke)
-        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
-        run: cargo build --release
 
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
       # tier" above). always() so a failed/cancelled test run still reclaims
@@ -2855,6 +2851,16 @@ jobs:
   # the heavy matrix. CI cost: ~5-8 min per target on a cold cache, ~1
   # min on a warm cache; well under the $5/mo budget the issue projected.
   #
+  # #9680: the android entry also carries the once-per-run extras that used
+  # to sit at the end of `Check (ubuntu-latest,sqlite)` — `Security audit`
+  # (cargo-audit built with `cargo install --locked` at the #3138 pin) and
+  # the release-profile smoke
+  # build. This job is a required context with no `needs` on `check`, so
+  # the extras run in parallel with the test legs and a red in either still
+  # reds a required context and `ci-gate`. The flag is `once`, not a
+  # `matrix.target == ...` comparison, for the rename-drift reason the
+  # `check` matrix documented when it held the flag.
+  #
   # #2494 UN-WEDGE — DO NOT ADD A JOB-LEVEL `if:` TO THIS JOB.
   # `Cross-compile (aarch64-apple-ios)` and
   # `Cross-compile (aarch64-linux-android)` are REQUIRED contexts on
@@ -2878,6 +2884,14 @@ jobs:
     name: Cross-compile (${{ matrix.target }})
     needs: classify
     runs-on: ${{ matrix.os }}
+    # #9699 - the outer cap on honest work, re-derived for the work this job
+    # holds since #9680 (measured maxima, push runs on release/v1.0.0): android
+    # leg 177 s (run 43809244411) + cold cargo-audit install 459 s + cold
+    # release smoke 1319 s (run 43715405044, both on the check leg before the
+    # move) = 1955 s = 32.6 min; 45 min is 1.38x that sum (the iOS leg's
+    # longest is 276 s). Re-derive when a measured run comes within 20 % of it.
+    # The #9680 release-split module bounds it on both sides.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -2892,6 +2906,10 @@ jobs:
           # rusqlite-sys's build.rs invokes for the bundled SQLite C code.
           - target: aarch64-linux-android
             os: ubuntu-latest
+            # `once` marks the ONE matrix entry of this workflow that runs the
+            # once-per-run extras (cargo-audit, the release-profile smoke).
+            # A named flag cannot drift out of a rename of the entry.
+            once: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -2913,7 +2931,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: needs.classify.outputs.cargo_skip != 'true'
         with:
-          key: mobile-${{ matrix.target }}
+          # #9700 - the key was rotated once when this entry began to hold
+          # cargo-audit and target/release (#9680): the old exact-match entry
+          # held neither and, on a full match, rust-cache never re-saves. Saved
+          # only on trunk `push` (#3089, the form of the check job's cache), so
+          # a pull_request run restores and never writes a PR-scoped entry.
+          key: mobile-${{ matrix.target }}-audit-release
+          save-if: ${{ github.event_name == 'push' }}
 
       # Android NDK r26d — provides the clang toolchain we point at via
       # CC_aarch64_linux_android / AR_aarch64_linux_android below so the
@@ -2962,6 +2986,55 @@ jobs:
             --no-default-features \
             --features sqlite-bundled \
             --lib
+
+      # The audit gate (scripts/ci/check_cargo_audit.py) reads TOML with
+      # tomllib, so it gets the same pinned Python as the `check` job.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
+        with:
+          python-version: '3.12'
+
+      # cargo-audit runs once (the advisory DB is platform-independent) — on
+      # the android `once` entry so it does not multiply across the targets.
+      # #9680 (ruling 7fd3cd38): it is still built from source with
+      # `cargo install --locked` at the #3138 pin; the step runs beside the
+      # test legs, off the critical path, so no prebuilt is downloaded.
+      - name: Security audit
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
+        env:
+          # #3138: named pin for the cargo-audit version this job installs.
+          CARGO_AUDIT_VERSION: "0.22.2"
+        run: |
+          # #3138: install when cargo-audit is missing OR its version differs
+          # from the pin (a stale preinstalled one on a warm self-hosted runner
+          # must not run). A matching install is left alone. The job fails when
+          # the pinned version is still not what runs; the audit is never skipped.
+          if ! command -v cargo-audit >/dev/null 2>&1 \
+             || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
+            cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
+          fi
+          if ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
+            echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the installed version"
+            exit 1
+          fi
+          python3 -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py
+          # Cross-check .cargo/audit.toml with .cargo/audit-exceptions.toml.
+          # The gate prints its summary and every public identity diagnostic;
+          # cargo-audit JSON and external stderr remain captured inside it.
+          python3 scripts/ci/check_cargo_audit.py
+
+      # The release build is a release-PROFILE compile smoke (opt-level 3,
+      # fat LTO). The distributable per-OS artifacts are produced by
+      # release.yml on tag. It builds the host (x86_64) target with the
+      # default features: the NDK variables above are scoped to the android
+      # target only. #9680: it runs here at full parallelism, in parallel
+      # with the Check legs, instead of serialised behind the sqlite leg's
+      # low-memory link settings. No swapfile: the crate links one binary
+      # (ai-memory), the same fat-LTO link bench.yml, token-budget.yml and
+      # batman-mode-acceptance.yml run on ubuntu-latest without swap.
+      - name: Build release (once leg — release-profile smoke)
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
+        run: cargo build --release
 
   # v0.7.0 Phase D regression closeout — `sal`-only feature gate. The
   # `check` matrix above builds the default (sqlite-bundled only) and
