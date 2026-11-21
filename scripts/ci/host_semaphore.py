@@ -18,14 +18,15 @@ kernel drops a flock when its holder dies, so a crashed runner never leaks a slo
 SIGTERM/SIGINT/SIGHUP are forwarded to COMMAND's process group (then SIGKILL after
 a grace period) and the lock is released in ``finally``.
 
-Exit codes: the child's code; 2 bad arguments; 3 no slot free within the wait
-budget (COMMAND never ran); 4 the shared workflow_annotation.py next to this file
+Exit codes: the child's code; 2 bad arguments; 75 no slot free within the wait
+budget (COMMAND never ran; one ``::error title=infra: no slot::`` line, #9231); 4 the shared workflow_annotation.py next to this file
 cannot be loaded (COMMAND never ran, one ``::error`` line, #9365); 128+signal when
 COMMAND died from a signal.
 Python 3.9+, standard library only.
 """
 import argparse
 import fcntl
+import json
 import os
 import re
 import signal
@@ -56,7 +57,7 @@ def _load_workflow_annotation():
     return module
 
 
-EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 3 = no slot, else the child's)
+EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 75 = no slot, else the child's)
 
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "host_semaphore"
@@ -77,9 +78,33 @@ except (Exception, SystemExit) as exc:  # any failed load: one fixed line built 
     sys.exit(WA_EXIT_LOAD_REFUSED)
 
 SEMAPHORE_SLOTS_DEFAULT = 2
-SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 3600
+# decision: 600 s over 3600 s because a waiter holds a runner seat idle for the whole wait
+# and, with the serving runners tied to the slots (scripts/ci/host_slots.json), a wait only
+# bridges a slot handover or a non-CI holder; a hold lasts about 2 h, so a longer wait never
+# ends in a slot and only costs a runner an hour (#9231).
+SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 600
 SEMAPHORE_POLL_SECS_DEFAULT = 30
-EXIT_NO_SLOT = 3
+# decision: a distinct exit code and the token infra-no-slot in the annotation message over a job
+# output, because a job output is set after pull-request code ran (taint boundary class iii) and
+# the gate is red either way (#9231). A job log line carries no title, so the message names the outcome.
+# decision: reserved codes 82, 83 and 84 over sharing 75, because the product binary exits 75
+# (src/main.rs) and a child's own code passes through this wrapper unchanged. 82-84 are none of
+# 0-4 (this wrapper, load_gate.py), 64-78 (sysexits, the product binary), 86-87 (a test stub),
+# 90-109 (nextest, cargo 101), 124-127 (timeout, shell), 128+signal; the table that pins this is
+# scripts/ci/tests/test_slot_wait_outcome_9231.py.
+EXIT_NO_SLOT = 82
+EXIT_UNKNOWN_RUNNER = 83
+EXIT_CHILD_RESERVED = 84  # the child itself ended with 82, 83 or 84; the wrapper never passes those through
+RESERVED_EXIT_CODES = frozenset((EXIT_NO_SLOT, EXIT_UNKNOWN_RUNNER, EXIT_CHILD_RESERVED))
+OUTCOME_NO_SLOT = 'infra-no-slot'  # token in the annotation message; a CI failure class for it is tracked in #9833
+OUTCOME_UNKNOWN_RUNNER = 'infra-unknown-runner'
+OUTCOME_RESERVED_CODE = 'infra-reserved-code'
+SLOT_ACQUIRED_MARKER = 'slot-acquired'  # printed as its own line when the slot is held, before the child starts
+TITLE_NO_SLOT = 'infra no-slot'  # titles carry no colon or comma, so no property escape reaches the UI
+TITLE_UNKNOWN_RUNNER = 'infra unknown-runner'
+TITLE_RESERVED_CODE = 'infra reserved-code'
+HOST_SLOTS_CONFIG = 'host_slots.json'
+ENV_RUNNER_NAME = 'RUNNER_NAME'  # set by the GitHub runner for every step
 KILL_GRACE_SECS = 20
 TAG = '[#7914 semaphore]'
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
@@ -128,6 +153,52 @@ def acquire(slot_dir, slots, label, max_wait, poll, sleep_fn=time.sleep):
 def _note(message):
     """Record a tolerated condition on stderr (#7929), never silently."""
     print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
+
+
+def serving_runners(name, config_path=None):
+    """The runner names declared to serve gate NAME in host_slots.json, or None when unknown."""
+    path = Path(config_path) if config_path else Path(__file__).resolve().parent / HOST_SLOTS_CONFIG
+    try:
+        names = json.loads(path.read_text(encoding='utf-8'))['gates'][name]['serving_runners']
+        if isinstance(names, list) and all(isinstance(n, str) for n in names):
+            return names
+        raise TypeError('serving_runners is not a list of strings')
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        _note('serving runners of %r unavailable (%s)' % (name, type(exc).__name__))
+        return None
+
+
+def no_slot_annotation(label, max_wait, slots, runners):
+    """The one error annotation of the named outcome infra-no-slot (#9231); no test ran, the job stays red.
+
+    RUNNERS is the serving-runner list of the gate, or None when unknown. The message carries the token
+    infra-no-slot because a job log shows the message only (`##[error]<message>`, no title).
+    """
+    return wa.annotation(
+        'error',
+        "%s '%s': %s: no slot free after %ds (all %d slots busy on this host, %s serving runners); "
+        "no test ran, this is an infrastructure outcome, not a test failure; exit %d"
+        % (TAG, label, OUTCOME_NO_SLOT, max_wait, slots, 'unknown' if runners is None else len(runners),
+           EXIT_NO_SLOT),
+        title=TITLE_NO_SLOT)
+
+
+def unknown_runner_annotation(label, gate, runner):
+    """Error annotation: the live runner is not a serving runner of GATE, so the slot count does not cover it."""
+    return wa.annotation(
+        'error',
+        "%s '%s': %s: runner '%s' is not a serving runner of gate '%s' in %s; no test ran; exit %d"
+        % (TAG, label, OUTCOME_UNKNOWN_RUNNER, runner, gate, HOST_SLOTS_CONFIG, EXIT_UNKNOWN_RUNNER),
+        title=TITLE_UNKNOWN_RUNNER)
+
+
+def reserved_code_annotation(label, child_rc):
+    """Error annotation: the child ended with a code this wrapper reserves for its own outcomes."""
+    return wa.annotation(
+        'error',
+        "%s '%s': %s: the command exited with %d, a code reserved for wrapper outcomes; reported as %d"
+        % (TAG, label, OUTCOME_RESERVED_CODE, child_rc, EXIT_CHILD_RESERVED),
+        title=TITLE_RESERVED_CODE)
 
 
 def _signal_group(pgid, sig):
@@ -199,6 +270,7 @@ def main(argv=None):
     p.add_argument('--poll-secs', type=_positive_int, default=SEMAPHORE_POLL_SECS_DEFAULT)
     p.add_argument('--label', default='unlabelled')
     p.add_argument('--root', default=None, help='lock root (default ~/.cache/ai-memory-ci/semaphore)')
+    p.add_argument('--config', default=None, help='slot configuration (default host_slots.json next to this file)')
     p.add_argument('command', nargs=argparse.REMAINDER)
     args = p.parse_args(argv)  # argparse exits 2 on bad arguments
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
@@ -206,20 +278,32 @@ def main(argv=None):
         p.error('a command is required after --')
     if not NAME_RE.fullmatch(args.name):
         p.error('--name must match %s' % NAME_RE.pattern)
+    runners = serving_runners(args.name, args.config)
+    runner = os.environ.get(ENV_RUNNER_NAME)
+    if runner and runners is not None and runner not in runners:
+        # decision: refuse an unlisted runner over a hand-kept list nothing reads, because the list is the
+        # slot count's only source: a runner outside it is not covered by the slots (#9231).
+        print(unknown_runner_annotation(args.label, args.name, runner), flush=True)
+        return EXIT_UNKNOWN_RUNNER
     root = Path(args.root) if args.root else default_root()
     slot_dir = root / args.name
     slot_dir.mkdir(parents=True, exist_ok=True)
     got = acquire(slot_dir, args.slots, args.label, args.max_wait_secs, args.poll_secs)
     if got is None:
-        print(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
-                            % (TAG, args.label, args.max_wait_secs, args.slots)), flush=True)
+        print(no_slot_annotation(args.label, args.max_wait_secs, args.slots, runners), flush=True)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:
         load, cores = load_and_cores()
         print(wa.annotation("notice", "%s '%s': slot %d of %d acquired after %ds (load=%.2f cores=%d)"
                             % (TAG, args.label, index, args.slots, waited, load, cores)), flush=True)
-        return run_child(command)
+        # One fixed line before the child starts: a log with the no-slot line and this line is not a no-slot job.
+        print(wa.log_line("%s '%s': %s" % (TAG, args.label, SLOT_ACQUIRED_MARKER)), flush=True)
+        child_rc = run_child(command)
+        if child_rc in RESERVED_EXIT_CODES:
+            print(reserved_code_annotation(args.label, child_rc), flush=True)
+            return EXIT_CHILD_RESERVED
+        return child_rc
     finally:
         os.close(fd)
         print(wa.log_line("%s '%s': slot %d of %d released" % (TAG, args.label, index, args.slots)), flush=True)

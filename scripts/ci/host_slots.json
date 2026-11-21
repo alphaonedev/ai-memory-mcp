@@ -1,0 +1,21 @@
+{
+  "_comment": "Host semaphore gates (#9231). registered_runners = every self-hosted runner registered for this repository on both nodes (names from the runners API). A gate's slots = the HOST_SEMAPHORE_SLOTS of the gated leg in .github/workflows/ci.yml; serving_runners = the registered runners that carry the leg's label and can run it. Rules (scripts/ci/host_slots_check.py, run by CI in the shard-partition unit test step and pinned by scripts/ci/tests/test_slot_wait_outcome_9231.py): serving_runners is a subset of registered_runners and len(serving_runners) <= slots, so a job that holds a runner always finds a slot. scripts/ci/host_semaphore.py reads serving_runners at run time and ends with the named outcome infra-unknown-runner when RUNNER_NAME is not listed there. Adding a runner with the label needs a slot first.",
+  "registered_runners": [
+    "f1-macos-fed",
+    "f1-macos-fed-2",
+    "f1-macos-fed-3",
+    "f1-macos-fed-4",
+    "f1-macos-fed-5",
+    "f2-linux-fed",
+    "f2-linux-fed-2",
+    "f2-linux-fed-3",
+    "f2-linux-fed-4"
+  ],
+  "gates": {
+    "linux-fed-tests": {
+      "slots": 2,
+      "label": "linux-fed",
+      "serving_runners": ["f2-linux-fed", "f2-linux-fed-2"]
+    }
+  }
+}

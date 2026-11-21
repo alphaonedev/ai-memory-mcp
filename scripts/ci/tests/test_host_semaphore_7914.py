@@ -60,10 +60,10 @@ class Semaphore(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertEqual(hs.SEMAPHORE_SLOTS_DEFAULT, 2)
-        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 3600)
+        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 600)
         self.assertEqual(hs.SEMAPHORE_POLL_SECS_DEFAULT, 30)
 
-    def test_extra_waiter_times_out_with_exit_3(self):
+    def test_extra_waiter_times_out_with_the_no_slot_code_82(self):
         a = start(self.root, ['--name', 'n', '--slots', '1'], SLEEPER)
         b = None
         try:
@@ -71,8 +71,8 @@ class Semaphore(unittest.TestCase):
             b = start(self.root, ['--name', 'n', '--slots', '1', '--max-wait-secs', '1', '--poll-secs', '1'],
                       [sys.executable, '-c', 'print("must not run")'])
             out, _ = b.communicate(timeout=30)
-            self.assertEqual(b.returncode, 3, out)
-            self.assertIn("[#7914 semaphore] 'T': no slot free after 1s", out)
+            self.assertEqual(b.returncode, 82, out)
+            self.assertIn("[#7914 semaphore] 'T': infra-no-slot: no slot free after 1s", out)
             self.assertNotIn('must not run', out)
         finally:
             a.terminate()
