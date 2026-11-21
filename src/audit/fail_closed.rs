@@ -275,9 +275,10 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
-    /// The latch is process-global and the end-to-end cells in
-    /// `fail_closed_4400_tests` also set and reset it, so every cell holds the
-    /// ONE audit sink lock (a private lock here raced them).
+    /// The latch is process-global and read by every write path, so each cell
+    /// runs in an isolated child process (#7321) and, inside it, holds the ONE
+    /// audit sink lock (a private lock here raced the end-to-end cells in
+    /// `fail_closed_4400_tests`).
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         super::super::sink_test_lock()
     }
@@ -285,6 +286,11 @@ mod tests {
     /// Unlatched: allowed, and the retry never runs.
     #[test]
     fn an_unlatched_gate_allows_without_a_retry_4400() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "audit::fail_closed::tests::an_unlatched_gate_allows_without_a_retry_4400",
+        ) {
+            return;
+        }
         let _g = lock();
         reset_for_test();
         assert!(gate_with(true, 5, || panic!("no retry when not latched")).is_ok());
@@ -294,6 +300,11 @@ mod tests {
     /// rate-limited to one per interval; a successful retry clears the latch.
     #[test]
     fn a_latched_gate_retries_at_most_once_per_interval_4400() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "audit::fail_closed::tests::a_latched_gate_retries_at_most_once_per_interval_4400",
+        ) {
+            return;
+        }
         let _g = lock();
         reset_for_test();
         LATCHED.store(true, Ordering::SeqCst);
@@ -337,6 +348,11 @@ mod tests {
     /// load) and let the push through. Red before the fix: it stamped "now".
     #[test]
     fn latch_for_test_stays_refusing_past_the_probe_interval_6150() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "audit::fail_closed::tests::latch_for_test_stays_refusing_past_the_probe_interval_6150",
+        ) {
+            return;
+        }
         let _g = lock();
         let _latch = latch_for_test();
         let later = super::super::now_unix_ms().saturating_add(PROBE_INTERVAL_MS + 100);
@@ -352,6 +368,11 @@ mod tests {
     /// Red before the fix: the clear was unconditional.
     #[test]
     fn a_failure_during_a_successful_retry_keeps_the_latch_4464() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "audit::fail_closed::tests::a_failure_during_a_successful_retry_keeps_the_latch_4464",
+        ) {
+            return;
+        }
         let _g = lock();
         force_on_for_test(true);
         LATCHED.store(true, Ordering::SeqCst);
@@ -368,6 +389,11 @@ mod tests {
     /// Latched but the mode was turned off: allowed, latch cleared, no retry.
     #[test]
     fn turning_the_mode_off_clears_the_latch_4400() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "audit::fail_closed::tests::turning_the_mode_off_clears_the_latch_4400",
+        ) {
+            return;
+        }
         let _g = lock();
         reset_for_test();
         LATCHED.store(true, Ordering::SeqCst);
