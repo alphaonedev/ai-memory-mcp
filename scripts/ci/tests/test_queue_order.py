@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import random
+import sys
 import tempfile
 import time
 import unittest
@@ -37,6 +38,7 @@ def load_tool():
     if spec is None or spec.loader is None:
         raise ImportError("cannot load %s" % TOOL)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses resolve string annotations through sys.modules
     spec.loader.exec_module(module)
     return module
 
@@ -79,7 +81,8 @@ class FakeGh:
         self._maybe_fail("list_runs")
         if self.raw_override is not None:
             return self.raw_override
-        queued = [r for r in sorted(self.runs.values(), key=lambda r: r["id"]) if r["status"] == "queued"]
+        # the API filter is status=queued; the double leaks every unfinished run so the tool's own scope check is what is tested
+        queued = [r for r in sorted(self.runs.values(), key=lambda r: r["id"]) if r["status"] != "completed"]
         chunk = queued[(page - 1) * qo.PAGE_SIZE:page * qo.PAGE_SIZE]
         total = self.total_override if self.total_override is not None else len(queued)
         return {"total_count": total, "workflow_runs": chunk}
