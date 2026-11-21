@@ -1279,6 +1279,19 @@ fn forward_url_posture(url: Option<&str>) -> (String, bool) {
     }
 }
 
+/// #9367 V-5 — whether the MCP forwarder's per-agent key variable
+/// (`AI_MEMORY_AGENT_API_KEY_FILE`) is set, reported only when a forward URL is
+/// configured: `set` or `unset`, never the path and never the file content.
+/// An empty value is `unset`, as the forwarder and `bind-api-key` read it.
+fn forward_agent_key_file_fact(
+    forward_url: Option<&str>,
+    env_value: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    forward_url?;
+    let set = env_value.is_some_and(|v| !v.is_empty());
+    Some(if set { "set" } else { "unset" }.to_string())
+}
+
 /// v1.0.0 #3705 — every transit surface versus the mandate.
 ///
 /// Read-only. The daemon's own listener is argv-only (`--tls-cert` /
@@ -1522,7 +1535,13 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
     } else {
         Severity::Info
     };
-    let facts = vec![
+    // #9367 V-5 — with a forward URL configured, whether the forwarder will
+    // send a per-agent key: set / unset only (never the path or the key).
+    let forward_key_file = forward_agent_key_file_fact(
+        app_config.mcp_federation_forward_url.as_deref(),
+        std::env::var_os(crate::agent_key_file::AGENT_API_KEY_FILE_ENV).as_deref(),
+    );
+    let mut facts = vec![
         ("mandate".into(), MANDATE.to_string()),
         ("listener_tls".into(), listener_tls),
         ("local_tls_material".into(), local_tls_material),
@@ -1532,11 +1551,16 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
             crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.into(),
             forward_url,
         ),
+    ];
+    if let Some(fact) = forward_key_file {
+        facts.push(("mcp_forward_agent_key_file".into(), fact));
+    }
+    facts.extend([
         ("store_url_sslmode".into(), store_url_sslmode),
         ("webhook_plaintext_targets".into(), webhook_targets),
         ("llm_egress_plaintext".into(), llm_egress),
         ("boot_verdict".into(), verdict),
-    ];
+    ]);
     let note = (severity != Severity::Info).then(|| {
         format!(
             "{ISSUE_TAG}: {MANDATE} — a plaintext listener, peer, webhook target, MCP forward \
@@ -5977,6 +6001,48 @@ mod tests {
         );
         assert!(!refuses);
         assert_eq!(forward_url_posture(None), ("unset".to_string(), false));
+    }
+
+    /// #9367 V-5 — with a forward URL configured, doctor says whether
+    /// `AI_MEMORY_AGENT_API_KEY_FILE` is set: `set` or `unset` only, never the
+    /// path or the file content; with no forward URL there is no such fact.
+    /// The transit section builds the fact from this one function.
+    #[test]
+    fn doctor_reports_the_forward_key_variable_set_or_unset_only_9367() {
+        use std::ffi::OsStr;
+        const URL: &str = "https://peer:9077";
+        const PATH: &str = "/srv/agent-9367/agent.token";
+        assert_eq!(forward_agent_key_file_fact(None, None), None);
+        assert_eq!(
+            forward_agent_key_file_fact(None, Some(OsStr::new(PATH))),
+            None
+        );
+        assert_eq!(
+            forward_agent_key_file_fact(Some(URL), None).as_deref(),
+            Some("unset")
+        );
+        assert_eq!(
+            forward_agent_key_file_fact(Some(URL), Some(OsStr::new(""))).as_deref(),
+            Some("unset"),
+            "an empty value is unset, as the forwarder and bind-api-key read it"
+        );
+        let set = forward_agent_key_file_fact(Some(URL), Some(OsStr::new(PATH)));
+        assert_eq!(set.as_deref(), Some("set"));
+        // The production text is every line outside the file's test modules
+        // (the ONE resolver, #9367): a production fn may carry a test-only
+        // seam statement, and production after a test module still counts.
+        let production = crate::test_resolver::cfg_test_modules::strip_cfg_test_inline_mods(
+            include_str!("doctor.rs"),
+        );
+        assert_eq!(
+            production.matches("forward_agent_key_file_fact(").count(),
+            2,
+            "the definition plus the one transit-section call"
+        );
+        assert!(
+            production.contains("\"mcp_forward_agent_key_file\""),
+            "the transit section names the fact"
+        );
     }
 
     /// v1.0.0 #3700 — the detector section renders right after Configuration
