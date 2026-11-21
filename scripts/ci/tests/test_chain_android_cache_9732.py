@@ -333,11 +333,32 @@ ENV_STEP = ["        env:", "          FOO: bar"]
 SIDES = ("pr", "warm")
 
 
+def _step_span(lines: list[str], anchor: str) -> tuple[int, int]:
+    """The line span of the one step whose `- ` line holds `anchor` (it ends at the next step)."""
+    starts = [i for i, line in enumerate(lines)
+              if anchor in line and base._indent(line) == base.STEP_INDENT
+              and line.lstrip().startswith("- ")]
+    if len(starts) != 1:
+        raise AssertionError(f"fixture step anchor {anchor!r} matched {len(starts)} steps")
+    end = next((i for i in range(starts[0] + 1, len(lines))
+                if base._indent(lines[i]) == base.STEP_INDENT and lines[i].lstrip().startswith("- ")),
+               len(lines))
+    return starts[0], end
+
+
 def _apply(lines: list[str], ops: tuple[tuple, ...]) -> list[str]:
     out = list(lines)
     for op in ops:
         if op[0] == "end":
             out.extend(op[1])
+            continue
+        if op[0] == "move_before":
+            # ("move_before", moved step anchor, step anchor it moves in front of)
+            start, end = _step_span(out, op[1])
+            moved = out[start:end]
+            del out[start:end]
+            target, _ = _step_span(out, op[2])
+            out[target:target] = moved
             continue
         anchor = op[1]
         hits = [i for i, line in enumerate(out) if anchor in line]
@@ -780,6 +801,193 @@ class MirrorInputs9732(unittest.TestCase):
         self.assertEqual(ENV_ONE_SIDED, {"ci.yml": ("SELF_HOSTED_TARGET_CAP_BYTES",),
                                          "rust-cache-warm.yml": ()})
         self.assertEqual(WORKFLOW_KEYS_COMPARED, ("defaults",))
+
+
+# --- review r2: the class is "a change the pin module does not refuse" -------------------------
+# Written by hand, independent of the reader. Each builder spells the exact refusal text.
+LITERAL_SHAS = {
+    "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+    "dtolnay/rust-toolchain": "4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
+    "Swatinem/rust-cache": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+    "nttld/setup-ndk": "ed92fe6cadad69be94a966a7ee3271275e62f779",
+    "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
+}
+FOREIGN_SHA = "a" * 40
+NDK_VERSION_PIN = "r26d"
+CACHE_GENERATION_PIN = "chain-cache-g1"
+AUDIT_PIN = "0.22.2"
+EVENT_EXPR = "${{ github.event.head_commit.message }}"
+EVENT_BODY = "github.event.head_commit.message"
+SIDE_WF = {"pr": (PR_NAME, PR_JOB_ID), "warm": (base.WARM, WARM_JOB_ID)}
+NDK_CONFIGURE = NDK_STEPS[1]
+LS_ANCHOR = 'ls "$TC" | head -40'
+BUILD_RUN_ANCHOR = "run: cargo build --release"
+BUILD_WARM_ANCHOR = "- name: Build release (release-profile smoke)"
+BUILD_PR_ANCHOR = "- name: Build release (once leg"
+CHECK_STEP_ANCHOR = "- name: cargo check (--lib --features sqlite-bundled)"
+
+
+def _pin_msg(side: str, ident: str, actual: object, expected: object) -> str:
+    wf_name, job_id = SIDE_WF[side]
+    return f"{wf_name}:{job_id} step {ident!r}: uses is {actual!r}, the pinned form is {expected!r}"
+
+
+def _expr_msg(side: str, ident: str, line: str, expr: str) -> str:
+    wf_name, job_id = SIDE_WF[side]
+    return (f"{wf_name}:{job_id} step {ident!r}: line {line!r} holds the expression {expr!r}, "
+            f"outside the allowlist")
+
+
+def _unterminated_msg(side: str, ident: str, line: str) -> str:
+    wf_name, job_id = SIDE_WF[side]
+    return (f"{wf_name}:{job_id} step {ident!r}: line {line!r} holds an expression the scan "
+            f"cannot classify")
+
+
+def _order_msg(side: str, got: list[str], want: list[str]) -> str:
+    wf_name, job_id = SIDE_WF[side]
+    return f"{wf_name}:{job_id}: mirrored steps run in the order {got!r}, the hand table says {want!r}"
+
+
+def _jobenv_msg(side: str, name: str, actual: object, expected: object) -> str:
+    wf_name, job_id = SIDE_WF[side]
+    return f"{wf_name}:{job_id}: job env {name!r} is {actual!r}, the pinned value is {expected!r}"
+
+
+def _gen_msg(side: str, ndk: object, generation: object) -> str:
+    wf_name, job_id = SIDE_WF[side]
+    return (f"{wf_name}:{job_id}: NDK {ndk!r} is cached under generation {generation!r}; the hand "
+            f"table pairs {NDK_VERSION_PIN!r} with {CACHE_GENERATION_PIN!r}")
+
+
+def _step_env_msg(side: str, ident: str, value: str) -> str:
+    wf_name, job_id = SIDE_WF[side]
+    return (f"{wf_name}:{job_id} step {ident!r}: step env {value!r} is on both sides but the hand "
+            f"table names none (a step env is outside the rust-cache key)")
+
+
+class ClassInvariants9732(unittest.TestCase):
+    """Review r2 (F2, F3, F4, F6, F7): a change to `uses`, `with`, `env`, `run` text (comment lines
+    included), step order or a build-input version is refused unless a hand table names it."""
+
+    # F2: setup-python exports PKG_CONFIG_PATH and LD_LIBRARY_PATH into the cargo steps of the PR
+    # leg; the warm job mirrors it.
+    def test_setup_python_is_a_mirrored_step_of_the_warm_job(self) -> None:
+        _, pr_job, _ = _android_leg()
+        _, warm_job = _warm_job()
+        pr_steps = [s for s in pr_job.steps() if s.uses_name() == "actions/setup-python"]
+        warm_steps = [s for s in warm_job.steps() if s.uses_name() == "actions/setup-python"]
+        self.assertEqual(len(pr_steps), 1)
+        self.assertEqual(len(warm_steps), 1, f"{WARM_JOB_ID}: no actions/setup-python step")
+        self.assertEqual(warm_steps[0].keys.get("uses"), pr_steps[0].keys.get("uses"))
+        self.assertEqual(warm_steps[0].mapping("with"), pr_steps[0].mapping("with"))
+        self.assertNotIn("actions/setup-python", PR_ONLY_STEPS)
+        self.assertIn("actions/setup-python", [row.pr_id for row in MIRRORS])
+
+    # F4: a step-level env is outside the rust-cache key hash; a job-level env is inside it.
+    def test_the_audit_pin_is_a_job_level_env_on_both_sides(self) -> None:
+        _, pr_job, _ = _android_leg()
+        _, warm_job = _warm_job()
+        for job in (pr_job, warm_job):
+            with self.subTest(job=job.job_id):
+                self.assertEqual(job.env().get("CARGO_AUDIT_VERSION"), AUDIT_PIN)
+                self.assertEqual([s.label() for s in job.steps()
+                                  if "CARGO_AUDIT_VERSION" in s.mapping("env")], [])
+
+    # F3: the order of the mirrored warm steps is the PR order (07e).
+    def test_a_mirrored_warm_step_moved_out_of_order_is_refused(self) -> None:
+        got = _problems(warm_job_ops=(("move_before", BUILD_WARM_ANCHOR, CHECK_STEP_ANCHOR),))
+        want = [row.warm_id for row in MIRRORS]
+        moved = [i for i in want if i != BUILD_WARM_LABEL]
+        moved.insert(moved.index(CARGO_CHECK_STEP), BUILD_WARM_LABEL)
+        self.assertEqual(got, [_order_msg("warm", moved, want)])
+
+    def test_the_same_reorder_on_the_pr_side_is_refused(self) -> None:
+        got = _problems(pr_job_ops=(("move_before", BUILD_PR_ANCHOR, CHECK_STEP_ANCHOR),))
+        want = [row.pr_id for row in MIRRORS]
+        moved = [i for i in want if i != BUILD_PR_LABEL]
+        moved.insert(moved.index(CARGO_CHECK_STEP), BUILD_PR_LABEL)
+        self.assertEqual(got, [_order_msg("pr", moved, want)])
+
+    # F4: P1 (audit pin changed on both sides) is refused for the right reason.
+    def test_p1_the_audit_pin_changed_on_both_sides_is_refused(self) -> None:
+        ops = (("sub", f'CARGO_AUDIT_VERSION: "{AUDIT_PIN}"', 'CARGO_AUDIT_VERSION: "0.22.3"'),)
+        self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
+                         [_jobenv_msg("pr", "CARGO_AUDIT_VERSION", "0.22.3", AUDIT_PIN),
+                          _jobenv_msg("warm", "CARGO_AUDIT_VERSION", "0.22.3", AUDIT_PIN)])
+
+    # F4: P2 (NDK r27 on both sides) and a generation bump without the NDK are refused.
+    def test_p2_the_ndk_version_changed_without_the_cache_generation_is_refused(self) -> None:
+        ops = (("sub", f"ndk-version: {NDK_VERSION_PIN}", "ndk-version: r27"),)
+        self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
+                         [_gen_msg("pr", "r27", CACHE_GENERATION_PIN),
+                          _gen_msg("warm", "r27", CACHE_GENERATION_PIN)])
+
+    def test_a_cache_generation_bump_without_the_ndk_version_is_refused(self) -> None:
+        ops = (("sub", f"prefix-key: {CACHE_GENERATION_PIN}", "prefix-key: chain-cache-g2"),)
+        self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
+                         [_gen_msg("pr", NDK_VERSION_PIN, "chain-cache-g2"),
+                          _gen_msg("warm", NDK_VERSION_PIN, "chain-cache-g2")])
+
+    # F6: comment text of a `run:` is compared (G04) and an expression anywhere is classified (H08).
+    def test_g04_a_comment_after_a_single_line_run_is_refused_on_either_side(self) -> None:
+        for side in SIDES:
+            with self.subTest(side=side):
+                got = _on_side(side, (("sub", BUILD_RUN_ANCHOR, f"{BUILD_RUN_ANCHOR} # keep"),))
+                bare, kept = "cargo build --release", "cargo build --release # keep"
+                pr_val, warm_val = (kept, bare) if side == "pr" else (bare, kept)
+                self.assertEqual(got, [_step_diff(BUILD_PR_LABEL, BUILD_WARM_LABEL, "run", pr_val,
+                                                  warm_val)])
+
+    def test_g04_a_comment_holding_an_event_expression_is_refused_twice(self) -> None:
+        line = f"{BUILD_RUN_ANCHOR} # {EVENT_EXPR}"
+        got = _on_side("warm", (("sub", BUILD_RUN_ANCHOR, line),))
+        self.assertEqual(got, [
+            _step_diff(BUILD_PR_LABEL, BUILD_WARM_LABEL, "run", "cargo build --release",
+                       f"cargo build --release # {EVENT_EXPR}"),
+            _expr_msg("warm", BUILD_WARM_LABEL, line, EVENT_BODY)])
+
+    def test_h08_the_same_expression_comment_in_both_ndk_blocks_is_refused(self) -> None:
+        comment = f"# {EVENT_EXPR}"
+        ops = (("after", LS_ANCHOR, [f"          {comment}"]),)
+        self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
+                         [_expr_msg("pr", NDK_CONFIGURE, comment, EVENT_BODY),
+                          _expr_msg("warm", NDK_CONFIGURE, comment, EVENT_BODY)])
+
+    def test_an_expression_the_scan_cannot_classify_is_refused(self) -> None:
+        for side in SIDES:
+            with self.subTest(side=side):
+                comment = "# ${{ matrix.target"
+                got = _on_side(side, (("after", LS_ANCHOR, [f"          {comment}"]),))
+                self.assertEqual(got[-1], _unterminated_msg(side, NDK_CONFIGURE, comment))
+
+    # F7: every mirrored action is pinned to its literal 40-hex sha, not only side to side.
+    def test_h07_h10_e04_h05_a_sha_swapped_on_both_sides_is_refused(self) -> None:
+        for action in ("nttld/setup-ndk", "dtolnay/rust-toolchain", "actions/checkout"):
+            with self.subTest(action=action):
+                old = f"{action}@{LITERAL_SHAS[action]}"
+                new = f"{action}@{FOREIGN_SHA}"
+                ops = (("sub", old, new),)
+                self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
+                                 [_pin_msg("pr", action, new, old),
+                                  _pin_msg("warm", action, new, old)])
+
+    def test_a_tag_form_of_a_pinned_action_is_refused_on_both_sides(self) -> None:
+        for action in ("nttld/setup-ndk", "dtolnay/rust-toolchain", "actions/checkout"):
+            with self.subTest(action=action):
+                old = f"{action}@{LITERAL_SHAS[action]}"
+                new = f"{action}@v4"
+                ops = (("sub", old, new),)
+                self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
+                                 [_pin_msg("pr", action, new, old),
+                                  _pin_msg("warm", action, new, old)])
+
+    # A step env named on both sides is outside the key hash and outside every pin: refused.
+    def test_a_step_env_on_both_sides_of_a_pair_is_refused(self) -> None:
+        ops = (("after", "name: Build release", ENV_STEP),)
+        self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
+                         [_step_env_msg("pr", BUILD_PR_LABEL, "FOO: bar"),
+                          _step_env_msg("warm", BUILD_WARM_LABEL, "FOO: bar")])
 
 
 if __name__ == "__main__":
