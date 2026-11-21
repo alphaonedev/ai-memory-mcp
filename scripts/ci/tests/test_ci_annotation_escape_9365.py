@@ -33,6 +33,7 @@ Run: python3 -m unittest scripts/ci/tests/test_ci_annotation_escape_9365.py
 
 import ast
 import contextlib
+import errno
 import importlib.util
 import io
 import os
@@ -45,6 +46,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 CI_DIR = REPO / "scripts" / "ci"
@@ -86,6 +88,26 @@ NON_UTF8_NAME_BYTES = b"bad\xff\xfe::x"
 NON_UTF8_NAME_ESCAPED = "bad\\udcff\\udcfe\\x3a:x"
 INTERPRETER_PLACEHOLDER = "<interpreter>"
 PRUNE_WARNING_FLOOR_GIB = 100000000
+# #9705 (review r1, L1): the whole warning line of every row, written out by hand. The prefix and suffix are the fixed
+# text of the warning in ``prune_runner_artifacts.py`` with the floor above; the middle is the escaped root name.
+PRUNE_WARNING_PREFIX = "::warning::free space under "
+PRUNE_WARNING_SUFFIX = " is below the 100000000 GiB floor and no idle sibling target is left to evict"
+PRUNE_WARNING_ROOT_ESCAPED = {
+    "command": "home-\\x3a:error\\x3a:x",
+    "raw_newline": "home-a\\x0a\\x3a:error\\x3a:injected",
+    "raw_cr": "home-a\\x0d\\x3a:error\\x3a:injected",
+    "colons": "home-a\\x3a:b",
+    "percent": "home-100\\x2525",
+    "non_utf8": "home-" + NON_UTF8_NAME_ESCAPED,
+}
+# #9705 (review r1, L2): the three spellings of an interpreter and the text a hand-written table masks (see
+# ``HostProbePins9705``); all invented paths, so the table does not depend on the host.
+FAKE_EXECUTABLE = "/opt/h/bin/python3.12"
+FAKE_REAL_EXECUTABLE = "/opt/h/Cellar/3.12.16/bin/python3.12.16"
+FAKE_REAL_DIRECTORY = "/opt/h/Cellar/3.12.16/bin"
+FAKE_DIRECTORY_SPELLING = "/opt/h/Cellar/3.12.16/bin/python3.12"
+FAKE_COLON_EXECUTABLE = "/opt/a\\x3a:b/bin/python3.12"
+FAKE_SPELLINGS = frozenset({FAKE_EXECUTABLE, FAKE_REAL_EXECUTABLE, FAKE_DIRECTORY_SPELLING, FAKE_COLON_EXECUTABLE})
 
 
 def oracle_escape(text):
@@ -511,6 +533,42 @@ class ScriptBehaviour(CommandAssertions):
             with self.subTest(key):
                 self.assert_prune_warning_row(key, on_disk=True)
 
+    def test_prune_warning_expected_table_is_the_oracle_text_9705(self):
+        """The hand-written whole-line table agrees with the oracle for every row (two independent sources)."""
+        self.assertEqual(sorted(PRUNE_WARNING_ROOT_ESCAPED), sorted(FILE_NAME_CORPUS))
+        for key in FILE_NAME_CORPUS:
+            with self.subTest(key):
+                self.assertEqual(PRUNE_WARNING_ROOT_ESCAPED[key], oracle_escape("home-" + HOSTILE[key]))
+
+    def test_prune_warning_row_check_compares_the_whole_line_9705(self):
+        """The check every row goes through is red for a line that is not exactly the expected one (L1)."""
+        expected = PRUNE_WARNING_PREFIX + PRUNE_WARNING_ROOT_ESCAPED["colons"] + PRUNE_WARNING_SUFFIX
+        self.assertEqual(expected, "::warning::free space under home-a\\x3a:b is below the 100000000 GiB floor and no "
+                                   "idle sibling target is left to evict")
+        near_misses = (
+            [],
+            ["::warning::skipped"],
+            [expected + "x"],
+            ["x" + expected],
+            [expected[:-1]],
+            [expected.replace("warning", "error", 1)],
+            [expected, expected],
+            [expected, "::notice::extra"],
+        )
+        for lines in near_misses:
+            with self.subTest(lines=lines):
+                with mock.patch.object(self, "prune_warning_row", return_value=(lines, expected)):
+                    with self.assertRaises(AssertionError):
+                        self.assert_prune_warning_row("colons", on_disk=False)
+        with mock.patch.object(self, "prune_warning_row", return_value=([expected], expected)):
+            self.assert_prune_warning_row("colons", on_disk=False)
+
+    def test_prune_warning_row_forms_choose_the_on_disk_form_when_the_probe_accepts_9705(self):
+        every_row_on_disk = {"command": True, "raw_newline": True, "raw_cr": True, "colons": True, "percent": True,
+                             "non_utf8": True}
+        self.assertEqual(row_forms(True), every_row_on_disk)
+        self.assertEqual(row_forms(False), {**every_row_on_disk, "non_utf8": False})
+
     def test_tier_cred_preflight_error_9365(self):
         for key, value in self.hostile_values(FILE_NAME_CORPUS):
             with self.subTest(key):
@@ -587,6 +645,119 @@ class ScriptBehaviour(CommandAssertions):
                 self.assertEqual(rc, 0, err[-500:])
                 lines = env_file.read_text(errors="surrogateescape").splitlines()
                 self.assertEqual(len(lines), 2, lines)
+
+
+class HostProbePins9705(unittest.TestCase):
+    """The host-dependent helpers of #9705 (the non-UTF-8 probe, the interpreter mask), pinned by hand-written rows."""
+
+    PROBE_DIRECTORY = "/probe-dir"
+    PROBE_PATH = b"/probe-dir/bad\xff\xfe::x"
+
+    def test_probe_reports_refused_for_eilseq_and_leaves_nothing_9705(self):
+        """APFS raises errno 92 (``errno.EILSEQ`` on darwin) for the name: the one errno the probe was built for."""
+        removed = []
+
+        def refuse(path):
+            raise OSError(errno.EILSEQ, "Illegal byte sequence")
+
+        self.assertIs(fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=refuse, rmdir=removed.append), False)
+        self.assertEqual(removed, [])
+
+    def test_probe_accepts_when_the_directory_is_made_and_removes_it_9705(self):
+        made, removed = [], []
+        self.assertIs(fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=made.append, rmdir=removed.append), True)
+        self.assertEqual(made, [self.PROBE_PATH])
+        self.assertEqual(removed, [self.PROBE_PATH])
+
+    def test_probe_raises_every_other_oserror_with_its_type_and_errno_9705(self):
+        rows = ((errno.EACCES, PermissionError), (errno.ENOSPC, OSError), (errno.EROFS, OSError),
+                (errno.EEXIST, FileExistsError), (errno.ENOENT, FileNotFoundError), (errno.EIO, OSError),
+                (errno.EILSEQ + 1, OSError))
+        for code, error_type in rows:
+            with self.subTest(errno=code):
+                removed = []
+
+                def fail(path, code=code):
+                    raise OSError(code, "injected")
+
+                with self.assertRaises(OSError) as caught:
+                    fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=fail, rmdir=removed.append)
+                self.assertIs(type(caught.exception), error_type)
+                self.assertEqual(caught.exception.errno, code)
+                self.assertEqual(removed, [])
+
+    def test_probe_raises_an_oserror_without_an_errno_9705(self):
+        def fail(path):
+            raise OSError("no errno")
+
+        with self.assertRaises(OSError) as caught:
+            fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=fail, rmdir=lambda path: None)
+        self.assertIsNone(caught.exception.errno)
+
+    def test_probe_raises_when_the_directory_cannot_be_removed_9705(self):
+        def fail(path):
+            raise PermissionError(errno.EACCES, "injected")
+
+        with self.assertRaises(PermissionError):
+            fs_accepts_non_utf8_names(self.PROBE_DIRECTORY, mkdir=lambda path: None, rmdir=fail)
+
+    def test_probe_on_this_host_leaves_the_directory_as_it_found_it_9705(self):
+        directory = scratch_dir("probe")
+        self.addCleanup(shutil.rmtree, str(directory), True)
+        before = sorted(os.listdir(directory))
+        self.assertIn(fs_accepts_non_utf8_names(directory), (True, False))
+        self.assertEqual(sorted(os.listdir(directory)), before)
+
+    def test_interpreter_spellings_are_exactly_the_three_and_their_escapes_9705(self):
+        """``sys.executable``, its realpath and its directory's realpath with the file name kept; nothing else."""
+        real = {FAKE_EXECUTABLE: FAKE_REAL_EXECUTABLE, "/opt/h/bin": FAKE_REAL_DIRECTORY}
+        self.assertEqual(interpreter_spellings(FAKE_EXECUTABLE, realpath=real.__getitem__),
+                         {FAKE_EXECUTABLE, FAKE_REAL_EXECUTABLE, FAKE_DIRECTORY_SPELLING})
+        colon_real = {"/opt/a::b/bin/python3.12": "/opt/a::b/bin/python3.12", "/opt/a::b/bin": "/opt/a::b/bin"}
+        self.assertEqual(interpreter_spellings("/opt/a::b/bin/python3.12", realpath=colon_real.__getitem__),
+                         {"/opt/a::b/bin/python3.12", FAKE_COLON_EXECUTABLE})
+
+    def test_mask_replaces_only_a_whole_executable_field_9705(self):
+        rows = (
+            ("executable=" + FAKE_EXECUTABLE, "executable=<interpreter>"),
+            ("executable=" + FAKE_REAL_EXECUTABLE, "executable=<interpreter>"),
+            ("executable=" + FAKE_DIRECTORY_SPELLING, "executable=<interpreter>"),
+            ("executable=" + FAKE_COLON_EXECUTABLE, "executable=<interpreter>"),
+            ("tmpdir=/x python=3.12 executable=" + FAKE_EXECUTABLE, "tmpdir=/x python=3.12 executable=<interpreter>"),
+            ("a\nexecutable=" + FAKE_EXECUTABLE + "\nb\nexecutable=" + FAKE_REAL_EXECUTABLE + "\n",
+             "a\nexecutable=<interpreter>\nb\nexecutable=<interpreter>\n"),
+            # the directory alone is not a spelling
+            ("executable=" + FAKE_REAL_DIRECTORY, "executable=" + FAKE_REAL_DIRECTORY),
+            ("executable=/opt/h/bin", "executable=/opt/h/bin"),
+            # the bare file name is not a spelling, in the field or elsewhere
+            ("python=python3.12 executable=python3.12", "python=python3.12 executable=python3.12"),
+            ("tmpdir=/x/python3.12 executable=/x/python3.12", "tmpdir=/x/python3.12 executable=/x/python3.12"),
+            # a spelling in another field is not replaced
+            ("tmpdir=" + FAKE_EXECUTABLE + " resolved=" + FAKE_REAL_EXECUTABLE,
+             "tmpdir=" + FAKE_EXECUTABLE + " resolved=" + FAKE_REAL_EXECUTABLE),
+            ("tmpdir=" + FAKE_EXECUTABLE + " executable=" + FAKE_EXECUTABLE,
+             "tmpdir=" + FAKE_EXECUTABLE + " executable=<interpreter>"),
+            # only a complete value counts
+            ("executable=" + FAKE_EXECUTABLE + "-extra", "executable=" + FAKE_EXECUTABLE + "-extra"),
+            ("executable=" + FAKE_EXECUTABLE + " ", "executable=" + FAKE_EXECUTABLE + " "),
+            ("executable=x" + FAKE_EXECUTABLE, "executable=x" + FAKE_EXECUTABLE),
+            ("notexecutable=" + FAKE_EXECUTABLE, "notexecutable=" + FAKE_EXECUTABLE),
+            # no path at all
+            ("::notice::nothing to mask here", "::notice::nothing to mask here"),
+            ("executable=", "executable="),
+            ("", ""),
+        )
+        for text, expected in rows:
+            with self.subTest(text=text):
+                self.assertEqual(mask_interpreter(text, FAKE_SPELLINGS), expected)
+
+    def test_mask_default_spellings_are_this_interpreters_9705(self):
+        spellings = interpreter_spellings()
+        self.assertIn(sys.executable, spellings)
+        self.assertIn(os.path.realpath(sys.executable), spellings)
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                self.assertEqual(mask_interpreter("python=3 executable=" + spelling), "python=3 executable=<interpreter>")
 
 
 class TemplateRendering(unittest.TestCase):
