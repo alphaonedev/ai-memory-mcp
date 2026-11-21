@@ -698,6 +698,9 @@ jobs:
           docs_only=false
           cargo_skip=false
           cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
+          # #9263: cap on the reason length (rejected, never cut) and the why of a rejection.
+          reason_max=300
+          reason_why=""
           trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
           trust_impact="$trust_dir/scripts/ci/impact"
           trust_ref=$(git merge-base HEAD "$cls_base" 2>/dev/null || echo "$cls_base")
@@ -717,7 +720,34 @@ jobs:
               docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
               cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
               cargo_skip_reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
+              # #9263: any non-printable character in the answer (a tab, a NUL, a
+              # carriage return, another control character) is a rejection. The
+              # file is read directly because a shell variable drops NUL.
+              nonprint=$(tr -d '[:print:]\n' < "$skip_out" | wc -c)
+              if [ "$nonprint" -ne 0 ]; then
+                reason_why="control-character"
+              fi
             fi
+          fi
+          # #9263: a success needs a reason of at most reason_max printable
+          # characters with one non-blank one; otherwise a RUN, with one line.
+          if [ -z "$reason_why" ]; then
+            if [ -z "$cargo_skip_reason" ]; then
+              reason_why="empty"
+            elif [ "${#cargo_skip_reason}" -gt "$reason_max" ]; then
+              reason_why="over-cap-$reason_max"
+            else
+              case "$cargo_skip_reason" in
+                *[![:space:]]*) ;;
+                *) reason_why="blank-only" ;;
+              esac
+            fi
+          fi
+          if [ -n "$reason_why" ]; then
+            echo "::notice::cargo_skip reason rejected ($reason_why), fail-closed RUN"
+            docs_only=false
+            cargo_skip=false
+            cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
           fi
           case "$docs_only$cargo_skip" in
             truetrue|falsetrue|falsefalse) ;;
