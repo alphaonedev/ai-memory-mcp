@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
+THIS_FILE = "scripts/ci/tests/test_script_callform_9592.py"
 GATE = REPO / "scripts" / "test" / "test-ci-workflow-invariants.sh"
 PYTHON = "python3"
 TIMEOUT_S = 600
@@ -36,6 +37,7 @@ GATE_ISOLATED_TARGETS = (
 # The scripts/ci/tests modules that import the sibling module workflow_text and load in isolated mode,
 # written out by hand: the gate target plus every other importer this PR edits.
 WORKFLOW_TEXT_IMPORTERS = (
+    "scripts/ci/tests/test_ci_release_split_9680.py",
     "scripts/ci/tests/test_ci_test_step_exec_6795.py",
     CONSUMER_FILE,
     "scripts/ci/tests/test_step_env_9769.py",
@@ -72,6 +74,20 @@ def isolated_load(rel):
     return run([PYTHON, "-I", "-c", LOAD_PROBE, str(REPO / rel)])
 
 
+def importer_list_problem(found, expected):
+    """One line that names each file missing from, or stale in, the importer lists; "" when they agree."""
+    missing = sorted(set(found) - set(expected))
+    stale = sorted(set(expected) - set(found))
+    parts = []
+    if missing:
+        parts.append("add " + ", ".join(missing) + " to WORKFLOW_TEXT_IMPORTERS (loads in isolated mode) "
+                     "or DISCOVER_ONLY_IMPORTERS (discover only, with the reason) in " + THIS_FILE)
+    if stale:
+        parts.append("remove " + ", ".join(stale) + " from WORKFLOW_TEXT_IMPORTERS or DISCOVER_ONLY_IMPORTERS in "
+                     + THIS_FILE + ": it no longer imports workflow_text")
+    return "; ".join(parts)
+
+
 class GateCallForm(unittest.TestCase):
     def test_gate_names_exactly_these_isolated_targets(self):
         found = sorted(set(GATE_CALL_RE.findall(GATE.read_text(encoding="utf-8"))))
@@ -103,7 +119,22 @@ class SiblingImportersLoadIsolated(unittest.TestCase):
         importer_re = re.compile(r"^\s*(?:import workflow_text\b|from workflow_text import\b)", re.M)
         found = sorted("scripts/ci/tests/" + p.name for p in tests_dir.glob("*.py")
                        if importer_re.search(p.read_text(encoding="utf-8")))
-        self.assertEqual(found, sorted(WORKFLOW_TEXT_IMPORTERS + tuple(DISCOVER_ONLY_IMPORTERS)))
+        expected = sorted(WORKFLOW_TEXT_IMPORTERS + tuple(DISCOVER_ONLY_IMPORTERS))
+        self.assertEqual(importer_list_problem(found, expected), "")
+        self.assertEqual(found, expected)
+
+    def test_the_importer_list_failure_message_is_one_line_naming_file_and_list(self):
+        new = "scripts/ci/tests/test_new_importer_9592.py"
+        self.assertEqual(
+            importer_list_problem([new, "a.py"], ["a.py"]),
+            "add " + new + " to WORKFLOW_TEXT_IMPORTERS (loads in isolated mode) or DISCOVER_ONLY_IMPORTERS "
+            "(discover only, with the reason) in scripts/ci/tests/test_script_callform_9592.py")
+        self.assertEqual(
+            importer_list_problem(["a.py"], ["a.py", "gone.py"]),
+            "remove gone.py from WORKFLOW_TEXT_IMPORTERS or DISCOVER_ONLY_IMPORTERS in "
+            "scripts/ci/tests/test_script_callform_9592.py: it no longer imports workflow_text")
+        self.assertEqual(importer_list_problem(["a.py"], ["a.py"]), "")
+        self.assertNotIn("\n", importer_list_problem(["x.py", "y.py"], ["z.py"]))
 
     def test_no_discover_only_importer_has_a_script_caller(self):
         caller_files = [GATE, *sorted((REPO / ".github" / "workflows").glob("*.yml"))]
