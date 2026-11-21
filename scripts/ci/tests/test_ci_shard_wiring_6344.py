@@ -92,17 +92,18 @@ class ShardBudgetTests(unittest.TestCase):
     def test_shards_share_one_budget_each(self):
         body = function_body(ci_text(), 'run_shard')
         self.assertIn('remaining=$(shard_left "$t0")', body)
-        # Three shard runs (lib, binaries, doc tests) plus the opt-in isolated
-        # lane of #6386, which draws on the same shard budget.
-        self.assertEqual(body.count('WATCHDOG_SECS="$remaining"'), 4)
-        self.assertIn('WATCHDOG_SECS="$remaining" run_isolated_lane', body)
+        # Three shard runs (lib, binaries, doc tests). The isolated binaries
+        # left the shard for their own step in #9592 (3-agent vote (71472661)),
+        # which takes its own watchdog from the job time left.
+        self.assertEqual(body.count('WATCHDOG_SECS="$remaining"'), 3)
+        self.assertNotIn('run_isolated_lane', ci_text())
 
     def test_7000_exhaustion_diagnostics_report_the_actual_shard_budget(self):
         body = function_body(ci_text(), 'run_shard')
         messages = re.findall(
             r'echo "::error::\[#[0-9]+ shard\] \$\{name\}: '
             r'\$\{([^}]+)\}s shard budget exhausted before ([^"\n]+)"', body)
-        stages = ('the lib run', 'the binaries run', 'the isolated binaries', 'the doc tests')
+        stages = ('the lib run', 'the binaries run', 'the doc tests')
         self.assertEqual(messages, [('SHARD_BUDGET', stage) for stage in stages])
 
 

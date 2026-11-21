@@ -29,7 +29,8 @@ import time
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# `python3 -I FILE` leaves the script's own folder off sys.path; append it (never insert at 0) (#9592).
+sys.path.append(str(Path(__file__).resolve().parent))
 
 import workflow_text  # noqa: E402
 

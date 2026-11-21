@@ -3,3 +3,36 @@
 # Cross-process state a per-binary database cannot isolate belongs here.
 # Ceilings only fall: remove a name when its binary no longer needs it.
 a2a_campaign_round1
+
+# #9592 (3-agent vote (71472661) I-7): every binary below has a hit of
+# scripts/ci/pg_isolate_cluster_audit.py (a wall-time assert, the load-sensitive
+# class of PR 8230 defect 2 / issue 6796, directly or through tests/common/mcp_wait.rs).
+# The audit is red when a hit binary is missing here.
+agent_projection_write_sites_8341
+as_agent_read_visibility_3499
+auto_atomise
+capture_turn_identity_3393
+child_stdin_write_report_8734
+cov_federation_sync_quorum_arms
+envelope_column_type_fail_closed_4133
+fed_push_fanout_8741
+inference_egress_proxy_redirect_4193
+issue_1317_cli_reflect_wire_layer_preserves_caller_metadata
+issue_1590_default_namespace_write_paths
+mcp_format_refusal_3803
+mcp_governance_pre_action_1685
+mcp_governance_pre_write_hook_1583
+mcp_initialize_server_signing
+mcp_integration
+mcp_stdio_oversize_drain_4064
+mcp_update_expected_version_type_4061
+migration_guard_trigger_rebuild_8341
+routine_run_authorization_3506
+secret_screen_g29
+serve_integration
+skill_compositional_context_visibility_4059
+skill_export_yaml_round_trip_4065
+skill_promote_test
+toon_meta_budget_3802
+transit_encryption_3705
+wake_client_3470
