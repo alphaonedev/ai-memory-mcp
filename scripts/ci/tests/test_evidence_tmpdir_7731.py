@@ -11,6 +11,8 @@ import sys
 import unittest
 import unittest.mock as mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
 CALLER_CWD = Path.cwd()

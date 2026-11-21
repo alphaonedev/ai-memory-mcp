@@ -3,22 +3,37 @@
 # SPDX-License-Identifier: Apache-2.0
 """LOW7871: a failing cleanup step never leaves a held directory descriptor open in publish_bundle."""
 import errno
+import fcntl
 import os
 import unittest
 from pathlib import Path
 import unittest.mock as mock
 
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
+MACOS_PATH_BUFFER = 1024  # MAXPATHLEN: the F_GETPATH result buffer
 FILES = {"proof.txt": b"approved\n"}
 PUBLISHED = "published"
 
 
 def descriptor_target(fd):
+    """The path an open descriptor names: /proc on Linux, F_GETPATH on macOS (no /proc there, #9705)."""
     try:
         return Path(os.readlink(f"/proc/self/fd/{fd}"))
     except OSError:
+        pass
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is None:
         return None
+    try:
+        raw = fcntl.fcntl(fd, getpath, bytes(MACOS_PATH_BUFFER))
+    except OSError:
+        return None
+    return Path(os.fsdecode(raw.split(b"\0", 1)[0]))
 
 
 class CleanupClose7871(ScratchCase):

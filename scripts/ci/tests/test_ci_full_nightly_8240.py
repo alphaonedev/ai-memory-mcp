@@ -8,6 +8,11 @@ import json
 import re
 import unittest
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 import impact_fixture as fx
 import workflow_text
 import ci_full_nightly as nightly

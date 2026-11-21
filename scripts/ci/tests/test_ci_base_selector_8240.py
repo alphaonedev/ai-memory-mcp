@@ -33,6 +33,8 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 import gha_expr
 import impact_fixture as fx
 import workflow_text

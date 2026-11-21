@@ -519,6 +519,23 @@ RUST_LITERAL = re.compile(
 LEX_START = re.compile(r"[\"'/*rbc]")
 
 
+def memoized(func):
+    """Cache a pure parser by its arguments; a list result is copied out so no caller can change the cache (#9705).
+
+    Every Census() of the 179 cells re-reads the same few source texts through the same regexes, which took
+    minutes on a slow host. An exception is never cached, and the key is the full text, so a mutated source
+    always gets its own parse.
+    """
+    cached = functools.lru_cache(maxsize=None)(func)
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = cached(*args, **kwargs)
+        return list(result) if isinstance(result, list) else result
+    return wrapper
+
+
+@memoized
 def strip_comments(text, where=RUST_SRC):
     """Remove `//` and `/* */` comments (block comments nest); literals stay intact.
 
@@ -608,6 +625,7 @@ GENERIC_OWNER = re.compile(r"(?<![\w'#])(?:(?:fn|struct|enum|union|type|trait)\s
 IDENT = re.compile(r"(?<!\w)[A-Za-z_]\w*")
 
 
+@memoized
 def generic_names(masked, where=RUST_SRC):
     """Return [("generic", name, position)] for the generic parameters of fn, struct, enum, union, type, trait, impl."""
     found = []
@@ -633,6 +651,7 @@ def generic_names(masked, where=RUST_SRC):
     return found
 
 
+@memoized
 def declared_names(masked, where=RUST_SRC):
     """Return [(kind, name, position)] for every name an item of ANY kind introduces in the masked source.
 
@@ -650,6 +669,7 @@ def declaration(name):
     return r"\b(?:const|static|let)\s+(?:mut\s+)?%s\b" % re.escape(name)
 
 
+@memoized
 def declared_once(masked, pattern, what):
     """Raise unless `pattern` occurs exactly once in the literal-masked, comment-stripped source."""
     count = len(re.findall(pattern, masked))
@@ -702,6 +722,7 @@ def use_tree(tokens, pos, prefix, where=RUST_SRC):
             return [(path + [tok], path[-1] if tok == "self" and path else tok)], pos + 1
 
 
+@memoized
 def use_bindings(masked, name, where=RUST_SRC, reexport_ok=True):
     """Return the compact `use` statements of the literal-masked source that bind `name`.
 
@@ -722,6 +743,7 @@ def use_bindings(masked, name, where=RUST_SRC, reexport_ok=True):
     return hits
 
 
+@memoized
 def declared_name_once(masked, name, what, where=RUST_SRC):
     """Raise unless `name` has exactly one declaration (ANY item kind) or `use` binding in the masked, stripped source."""
     declared = len([found for found in declared_names(masked) if found[1] == name])
@@ -752,6 +774,7 @@ def unescape(literal):
     return ESCAPE.sub(decode, literal)
 
 
+@memoized
 def strings(body):
     """Return the string literals (plain and raw) of a Rust fragment, in order, comments excluded.
 
@@ -1446,6 +1469,7 @@ def pin_modules(clean):
                                  % (RUST_SRC, item[0], item[3], header))
 
 
+@memoized
 def use_statements(masked):
     """Return [(match, at module level)] for every `use` statement; module level is the file root and `mod` bodies."""
     stack, found, last = [], [], 0
@@ -2882,6 +2906,7 @@ def local_import_targets(lib_clean, overrides):
     return targets
 
 
+@memoized
 def top_level(masked):
     """Return `masked` with every character at brace depth > 0 blanked: the items a module path can name.
 
@@ -3178,6 +3203,7 @@ def external_roots(masked, rel):
     return roots
 
 
+@memoized
 def crate_name_bindings(masked, name, rel):
     """Return what declares or binds `name` in the type namespace of the masked source (an empty list: nothing).
 
@@ -5907,9 +5933,17 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
             pick += 1
         return list(dict.fromkeys(found))
 
+    @staticmethod
+    def walk_once(tree):
+        """The nodes of `tree` in `ast.walk` order, walked once per tree: the scan runs once per pick of the names (#9705)."""
+        nodes = getattr(tree, "walked_8346", None)
+        if nodes is None:
+            nodes = tree.walked_8346 = list(ast.walk(tree))
+        return nodes
+
     def scan_nodes(self, tree, values, chars, latin_names, operator_names, cache_sizes, skip, found):
         """r27: append to `found` the label of every spelling of the check in `tree` under one reading of the names."""
-        for node in ast.walk(tree):
+        for node in self.walk_once(tree):
             if isinstance(node, ast.Name) and node.id in ("ord", "ascii"):
                 found.append(node.id)
             elif isinstance(node, ast.ImportFrom) and node.module == "re" and any(

@@ -8,6 +8,11 @@ import unittest
 from contextlib import redirect_stderr
 import unittest.mock as mock
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from test_evidence_generator_5040_5042 import EVIDENCE, load
 
 EXIT_STATUS = 3

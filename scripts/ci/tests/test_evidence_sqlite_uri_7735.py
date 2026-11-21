@@ -4,6 +4,11 @@ import sqlite3
 import unittest
 from urllib.parse import quote
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 import tmp_runtime_guard_7393 as guard
 from test_evidence_generator_5040_5042 import ScratchCase
 

@@ -19,6 +19,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from tmp_runtime_guard_7393 import GuardedCase
 
 REPO = Path(__file__).resolve().parents[3]
@@ -26,6 +28,8 @@ EVIDENCE = REPO / "scripts" / "evidence"
 SCRATCH = REPO / ".local-runs"
 SCRIPTS = ("run_cert.py", "build_bundle.py", "prep.py")
 TIP = "a" * 40
+NATIVE_RENAME_SKIP_REASON = "atomic no-replace rename (renameat2) is not available on this platform"
+NATIVE_RENAME_MISSING_ON_LINUX = "build_bundle.rename_noreplace_native must exist on Linux"
 
 # A chain section as run_cert.py writes it, then the gates rows that used to share the file (#5042).
 CHAIN_SECTION = (
@@ -64,6 +68,23 @@ class ScratchCase(GuardedCase):
     def legs(self, text):
         (self.dir / "legs.log").write_text(text)
         return self.dir
+
+    def native_legs(self, bundle):
+        """Yield (label, rename function): the kernel no-replace rename, then the portable path (#9705).
+
+        Linux must have the kernel path, so its absence there fails; any other platform skips that
+        leg with NATIVE_RENAME_SKIP_REASON and still runs the portable one. Labels name the
+        destination directories, so no two legs of one test share a path.
+        """
+        native = bundle.rename_noreplace_native
+        if native is not None:
+            yield "native", native
+        elif sys.platform.startswith("linux"):
+            self.fail(NATIVE_RENAME_MISSING_ON_LINUX)
+        else:
+            with self.subTest(leg="native"):
+                self.skipTest(NATIVE_RENAME_SKIP_REASON)
+        yield "portable", None
 
 
 class CheckRun5042(ScratchCase):

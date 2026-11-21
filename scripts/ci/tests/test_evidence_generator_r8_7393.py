@@ -38,8 +38,10 @@ import unittest
 import unittest.mock as mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 import tmp_runtime_guard_7393 as guard
-from test_evidence_generator_5040_5042 import ScratchCase, load
+from test_evidence_generator_5040_5042 import NATIVE_RENAME_SKIP_REASON, ScratchCase, load
 from test_evidence_generator_r2_7393 import GIT, make_repo
 from test_evidence_generator_r5_7393 import BundleFixture, GatesRun
 from test_evidence_generator_r7_7393 import GATE_FILE, PLANTED, REAL_GATE, RECAPTURE_SH, write_empty
@@ -56,7 +58,7 @@ GATE_SCRIPTS = (
 # environment stops it.
 PROBE_GATE = (
     "#!/usr/bin/env bash\n"
-    'echo "START $(pwd -P) COUNT $(ls -A | wc -l) MODE $(stat -c %a .)"\n'
+    'echo "START $(pwd -P) COUNT $(ls -A | wc -l | tr -d " ") MODE $(stat -c %a . 2>/dev/null || stat -f %Lp .)"\n'
     'echo "ENV PP=${PYTHONPATH-unset} HOME=${PYTHONHOME-unset} STARTUP=${PYTHONSTARTUP-unset} '
     'UB=${PYTHONUSERBASE-unset} SAFE=${PYTHONSAFEPATH-unset} NOUSER=${PYTHONNOUSERSITE-unset}"\n'
     'cd "$(dirname "$0")/.." || exit 2\n'
@@ -382,7 +384,7 @@ class PublishNoReplace7667(BundleFixture):
 
     def test_a_destination_created_after_the_exists_check_is_refused_by_the_kernel_7667(self):
         if self.bb.rename_noreplace_native is None:
-            self.skipTest("renameat2 is not available on this platform")
+            self.skipTest(NATIVE_RENAME_SKIP_REASON)
         self.assert_refused()
 
     def test_a_destination_created_after_the_exists_check_is_refused_without_renameat2_7667(self):
@@ -390,9 +392,9 @@ class PublishNoReplace7667(BundleFixture):
             self.assert_refused()
 
     def test_the_bundle_is_published_with_either_path_7667(self):
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
-                dest = self.dest.parent / f"cert-{native is None}"
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                dest = self.dest.parent / f"cert-{leg}"
                 listing = self.bb.publish_bundle(self.wt, dest, self.files, self.manifest)
                 self.assertEqual(listing, ["MANIFEST.sha256", "a.txt", "b.txt"])
                 self.assertEqual((dest / "a.txt").read_bytes(), b"one\n")

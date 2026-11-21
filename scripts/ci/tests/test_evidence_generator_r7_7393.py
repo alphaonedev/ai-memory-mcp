@@ -30,6 +30,8 @@ import unittest
 import unittest.mock as mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 import tmp_runtime_guard_7393 as guard
 from test_evidence_generator_5040_5042 import ScratchCase, load
 from test_evidence_generator_r2_7393 import make_repo

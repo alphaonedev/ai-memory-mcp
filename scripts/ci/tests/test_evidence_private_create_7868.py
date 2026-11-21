@@ -7,7 +7,12 @@ import stat
 import unittest
 import unittest.mock as mock
 
-from test_evidence_generator_5040_5042 import ScratchCase, load
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
+from test_evidence_generator_5040_5042 import NATIVE_RENAME_MISSING_ON_LINUX, NATIVE_RENAME_SKIP_REASON, ScratchCase, load
 
 PRIVATE_FILE_CREATE_MODE = 0o600
 PUBLISHED_DATA_MODE = 0o644
@@ -42,6 +47,9 @@ class PrivateCreate7868(ScratchCase):
         return dest, created
 
     def test_creation_mode_is_private_native_7868(self):
+        if load("build_bundle").rename_noreplace_native is None:
+            self.assertFalse(sys.platform.startswith("linux"), NATIVE_RENAME_MISSING_ON_LINUX)
+            self.skipTest(NATIVE_RENAME_SKIP_REASON)
         _, created = self.publish("native")
         self.assertEqual(len(created), len(FILES) + 1)
         for path, mode in created:

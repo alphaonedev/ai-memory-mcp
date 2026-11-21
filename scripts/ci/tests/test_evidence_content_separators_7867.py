@@ -5,6 +5,11 @@
 import subprocess
 import unittest
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from test_evidence_generator_5040_5042 import ScratchCase, load
 from test_evidence_generator_r2_7393 import GIT
 
