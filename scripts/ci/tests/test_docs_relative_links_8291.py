@@ -697,6 +697,7 @@ class HostLimitProbeTest(unittest.TestCase):
         cases = (
             ((7, 4096), "NAME_MAX 7 leaves no room for a fixture name"),
             ((255, 200), "NAME_MAX 255 is too long for PATH_MAX 200"),
+            ((255, 250), "NAME_MAX 255 is too long for PATH_MAX 250"),  # target == PATH_MAX
         )
         for args, message in cases:
             with self.assertRaises(ValueError) as caught:
