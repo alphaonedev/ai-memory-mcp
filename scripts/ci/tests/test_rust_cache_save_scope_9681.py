@@ -3251,13 +3251,16 @@ PAIR_TABLES: dict[tuple[str, str], PairTable] = {
             Row("Generate coverage JSON",
                 "Build the instrumented coverage targets (no test runs)", {
                     "name": (ANY, ANY), "run": (ANY, ANY), "if": (None, WARM_IF_CACHE_MISS),
-                    "env": (None, None)}),
+                    "env": (None, None), "id": ("sweep", None)}),
         ),
         pr_only=(
             "Install jq + postgresql-client (bounded+retry",
             "Start TLS PostgreSQL + AGE (#3705)",
             "Install pgvector + provision AGE/vector extensions",
             "PostgreSQL package repair + preflight (#9235)",
+            "Record the coverage sweep start (#9263)",
+            "Record the coverage sweep end (#9263)",
+            "Name the coverage sweep end (#9263)",
             "Enforce per-module thresholds",
             "Render coverage comment body (#1993)",
             "Post coverage to PR (sticky) (#1993)",
@@ -3265,7 +3268,7 @@ PAIR_TABLES: dict[tuple[str, str], PairTable] = {
         ),
         job_allowed={
             "name": (ANY, ANY), "needs": ("classify", None),
-            "if": ("needs.classify.outputs.docs_only != 'true'", None),
+            "if": ("needs.classify.outputs.cargo_skip != 'true'", None),
             "permissions": ("contents: read\npull-requests: write", None),
         },
         env_one_sided={},
@@ -3783,12 +3786,25 @@ class PairMirrorFixtures9770(unittest.TestCase):
             for side in SIDES_9770:
                 ident = pr_cargo if side == "pr" else warm_cargo
                 for key, value, seen in added:
+                    if key == "id" and pair[0] == "coverage.yml":
+                        continue  # pinned by the hand table (id: sweep, #9263); see the test below
                     with self.subTest(pair=pair[2], side=side, key=key):
                         problems = _mutated_9770(pair, side, lambda wf, job: _on_step_9770(
                             wf, job, ident, _add_step_key_9770(key, value)))
                         pr_value, warm_value = (seen, None) if side == "pr" else (None, seen)
                         self.assertEqual(problems, [_differs_9770(
                             pair, pr_cargo, warm_cargo, key, pr_value, warm_value)])
+
+    def test_the_coverage_sweep_id_is_pinned_on_the_pr_cargo_step_9263(self) -> None:
+        """#9263 gave `Generate coverage JSON` the id `sweep` that its end-of-sweep step reads."""
+        pair = PAIRS[1]
+        pr_cargo, warm_cargo = PAIR_STEP_NAMES_9770[pair[0]][:2]
+        renamed = _mutated_9770(pair, "pr", lambda wf, job: _on_step_9770(
+            wf, job, pr_cargo, _sub_in_lines_9770("id: sweep", "id: zz")))
+        self.assertEqual(renamed, [_table_9770(pair, "pr", pr_cargo, "id", "zz", "sweep")])
+        warm_added = _mutated_9770(pair, "warm", lambda wf, job: _on_step_9770(
+            wf, job, warm_cargo, _add_step_key_9770("id", "sweep")))
+        self.assertEqual(warm_added, [_table_9770(pair, "warm", warm_cargo, "id", "sweep", None)])
 
     def test_a_changed_uses_or_with_on_a_mirrored_step_on_either_side(self) -> None:
         for pair in PAIRS:
@@ -3883,7 +3899,8 @@ class PairMirrorFixtures9770(unittest.TestCase):
         self.assertEqual(cov.row_for("Install cargo-llvm-cov").allowed["if"],
                          (None, "steps.rust-cache.outputs.cache-hit != 'true'"))
         self.assertEqual(cov.row_for("Generate coverage JSON").allowed["env"], (None, None))
-        self.assertEqual(cov.job_allowed["if"], ("needs.classify.outputs.docs_only != 'true'", None))
+        self.assertEqual(cov.job_allowed["if"], ("needs.classify.outputs.cargo_skip != 'true'", None))
+        self.assertEqual(cov.row_for("Generate coverage JSON").allowed["id"], ("sweep", None))
         self.assertEqual(cov.job_allowed["permissions"],
                          ("contents: read\npull-requests: write", None))
         self.assertEqual(cov.env_one_sided, {})
@@ -3963,7 +3980,7 @@ class PairMirrorFixtures9770(unittest.TestCase):
                 problems = _mutated_9770(PAIRS[1], side, lambda wf, job: _on_job_9770(
                     wf, job, _set_job_line_9770("if", "true") if side == "pr"
                     else _add_job_key_9770("if", "true")))
-                expected = "needs.classify.outputs.docs_only != 'true'" if side == "pr" else None
+                expected = "needs.classify.outputs.cargo_skip != 'true'" if side == "pr" else None
                 self.assertEqual(problems, [f"{wf_name}:{job_id}: job key 'if' is 'true', "
                                             f"the hand table says {expected!r}"])
             with self.subTest(pair="coverage", side=side, key="permissions"):
