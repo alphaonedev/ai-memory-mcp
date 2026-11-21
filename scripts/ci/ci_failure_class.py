@@ -9,6 +9,9 @@ the hosted-runner PostgreSQL preflight annotation emitted by
 
     ::error::[coverage-pg] PG-ENV <reason>   ->   ci-env
 
+The host-slot wait annotation of `scripts/ci/host_semaphore.py` (#9231),
+`::error title=infra\x3a no slot::...`, maps to infra-no-slot.
+
 Anything else (a warning, a missing `::error::`, another label, a glued-on
 suffix such as `PG-ENVX`) is NOT classified here and yields `None`.
 
@@ -33,10 +36,20 @@ PG_ENV_LINE = re.compile(
 )
 
 
+CLASS_INFRA_NO_SLOT = "infra-no-slot"
+
+# #9231: scripts/ci/host_semaphore.py ends a wait without a slot with one annotation
+#   ::error title=infra%3A no slot::<message>      (workflow_annotation writes the colon as \x3a; %3A and a bare colon also match)
+# and exit code 75; no test ran, the class is infrastructure, never a test failure.
+NO_SLOT_LINE = re.compile(r"(?m)(?:^|\s)::error title=infra(?:%3[Aa]|\\x3[Aa]|:) no slot::[^\s]")
+
+
 def classify(log_text: str) -> str | None:
     """Return the CI class for the log text, or None when no rule matches."""
     if PG_ENV_LINE.search(log_text):
         return CLASS_CI_ENV
+    if NO_SLOT_LINE.search(log_text):
+        return CLASS_INFRA_NO_SLOT
     return None
 
 

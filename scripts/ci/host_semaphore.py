@@ -18,14 +18,15 @@ kernel drops a flock when its holder dies, so a crashed runner never leaks a slo
 SIGTERM/SIGINT/SIGHUP are forwarded to COMMAND's process group (then SIGKILL after
 a grace period) and the lock is released in ``finally``.
 
-Exit codes: the child's code; 2 bad arguments; 3 no slot free within the wait
-budget (COMMAND never ran); 4 the shared workflow_annotation.py next to this file
+Exit codes: the child's code; 2 bad arguments; 75 no slot free within the wait
+budget (COMMAND never ran; one ``::error title=infra: no slot::`` line, #9231); 4 the shared workflow_annotation.py next to this file
 cannot be loaded (COMMAND never ran, one ``::error`` line, #9365); 128+signal when
 COMMAND died from a signal.
 Python 3.9+, standard library only.
 """
 import argparse
 import fcntl
+import json
 import os
 import re
 import signal
@@ -56,7 +57,7 @@ def _load_workflow_annotation():
     return module
 
 
-EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 3 = no slot, else the child's)
+EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 75 = no slot, else the child's)
 
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "host_semaphore"
@@ -83,11 +84,13 @@ SEMAPHORE_SLOTS_DEFAULT = 2
 # ends in a slot and only costs a runner an hour (#9231).
 SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 600
 SEMAPHORE_POLL_SECS_DEFAULT = 30
-EXIT_NO_SLOT = 3
-NO_SLOT_OUTPUT_LINE = 'no_slot=true'  # step output the job output and ci-gate read (#9231)
-NO_SLOT_SUMMARY_TEXT = 'infra: no slot'
-ENV_GITHUB_OUTPUT = 'GITHUB_OUTPUT'
-ENV_GITHUB_STEP_SUMMARY = 'GITHUB_STEP_SUMMARY'
+# decision: a distinct exit code over a job output because a job output is set after
+# pull-request code ran (taint boundary class iii) and the gate is red either way (#9231).
+# 75 is EX_TEMPFAIL of sysexits.h: not 0, 1, 2, 3, 4 (this wrapper and load_gate.py), not 101
+# (cargo test), not 124-127 (timeout, shell) and not 128+signal, so no test failure produces it.
+EXIT_NO_SLOT = 75
+NO_SLOT_TITLE = 'infra: no slot'  # annotation title; scripts/ci/ci_failure_class.py classifies on it
+HOST_SLOTS_CONFIG = 'host_slots.json'
 KILL_GRACE_SECS = 20
 TAG = '[#7914 semaphore]'
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
@@ -138,29 +141,25 @@ def _note(message):
     print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
 
 
-def _append_env_file(env_name, text):
-    """Append TEXT to the file named by env var ENV_NAME; a missing or unwritable file is noted, never fatal."""
-    path = os.environ.get(env_name)
-    if not path:
-        return
+def serving_runner_count(name):
+    """Runners declared to serve gate NAME in host_slots.json next to this file, or None when unknown."""
     try:
-        with open(path, 'a', encoding='utf-8') as handle:
-            handle.write(text)
-    except OSError as exc:
-        _note('cannot append to %s (%s)' % (env_name, type(exc).__name__))
+        cfg = json.loads((Path(__file__).resolve().parent / HOST_SLOTS_CONFIG).read_text(encoding='utf-8'))
+        return len(cfg['gates'][name]['serving_runners'])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        _note('serving runner count unavailable (%s)' % type(exc).__name__)
+        return None
 
 
-def record_no_slot(label, max_wait, slots):
-    """Name the outcome: a step output for ci-gate and a step summary line (#9231).
-
-    The step still exits non-zero (fail closed); the record only lets ci-gate
-    tell "no test ran, infra" from a failed test.
-    """
-    _append_env_file(ENV_GITHUB_OUTPUT, NO_SLOT_OUTPUT_LINE + '\n')
-    _append_env_file(ENV_GITHUB_STEP_SUMMARY,
-                     '### %s\n\nNo test ran for `%s`: no host slot was free after %ds (all %d slots busy). '
-                     'This is not a test failure; re-run the job.\n'
-                     % (NO_SLOT_SUMMARY_TEXT, label.replace('`', "'"), max_wait, slots))
+def no_slot_annotation(name, label, max_wait, slots):
+    """The one error annotation of the named outcome `infra: no slot` (#9231); no test ran, the job stays red."""
+    runners = serving_runner_count(name)
+    return wa.annotation(
+        'error',
+        "%s '%s': no slot free after %ds (all %d slots busy on this host, %s serving runners); "
+        "no test ran, this is an infrastructure outcome, not a test failure; exit %d"
+        % (TAG, label, max_wait, slots, 'unknown' if runners is None else runners, EXIT_NO_SLOT),
+        title=NO_SLOT_TITLE)
 
 
 def _signal_group(pgid, sig):
@@ -244,9 +243,7 @@ def main(argv=None):
     slot_dir.mkdir(parents=True, exist_ok=True)
     got = acquire(slot_dir, args.slots, args.label, args.max_wait_secs, args.poll_secs)
     if got is None:
-        print(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
-                            % (TAG, args.label, args.max_wait_secs, args.slots)), flush=True)
-        record_no_slot(args.label, args.max_wait_secs, args.slots)
+        print(no_slot_annotation(args.name, args.label, args.max_wait_secs, args.slots), flush=True)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:

@@ -71,7 +71,7 @@ class Semaphore(unittest.TestCase):
             b = start(self.root, ['--name', 'n', '--slots', '1', '--max-wait-secs', '1', '--poll-secs', '1'],
                       [sys.executable, '-c', 'print("must not run")'])
             out, _ = b.communicate(timeout=30)
-            self.assertEqual(b.returncode, 3, out)
+            self.assertEqual(b.returncode, 75, out)
             self.assertIn("[#7914 semaphore] 'T': no slot free after 1s", out)
             self.assertNotIn('must not run', out)
         finally:

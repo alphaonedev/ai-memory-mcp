@@ -1099,13 +1099,6 @@ jobs:
   check:
     name: Check (${{ matrix.leg }})
     needs: classify
-    # #9231 - one output per leg: scripts/ci/host_semaphore.py writes
-    # no_slot=true to the step output when no host slot was free and no test
-    # ran; ci-gate (scripts/ci/impact/gate.py) folds a failed check with such an
-    # output as the named outcome "infra: no slot", never as a test failure. The
-    # key carries the leg index so matrix legs never overwrite each other.
-    outputs:
-      slot_starved_${{ strategy.job-index }}: ${{ steps.tests.outputs.no_slot }}
     # RUNNER PLACEMENT — PER-LEG (rule at the head of this file). Only the leg
     # that needs the native pg tier is self-hosted on Linux; the Linux sqlite
     # leg is GitHub-hosted. `runs-on` therefore cannot be a fixed shape, so it
@@ -1858,7 +1851,6 @@ jobs:
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
       - name: Run tests (impact-aware)
-        id: tests
         if: needs.classify.outputs.cargo_skip != 'true'
         env:
           AI_MEMORY_NO_CONFIG: "1"
@@ -1885,8 +1877,9 @@ jobs:
           # 600 s (was 3600 s): the serving runners equal the slots
           # (scripts/ci/host_slots.json), so a wait only bridges a handover; a
           # slot hold lasts about 2 h, so a longer wait never ended in a slot and
-          # only held a runner idle. No slot ends as the named outcome
-          # "infra: no slot" (step output no_slot, step summary, ci-gate bucket).
+          # only held a runner idle. No slot ends as the named outcome: one
+          # ::error title=infra: no slot:: annotation and exit code 75, which no
+          # test failure produces (the gate stays red, no job output is set).
           HOST_SEMAPHORE_MAX_WAIT_SECS: '600'
         shell: bash
         run: |
