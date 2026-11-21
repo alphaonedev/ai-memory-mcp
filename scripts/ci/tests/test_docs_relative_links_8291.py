@@ -635,6 +635,27 @@ class HostLimitProbeTest(unittest.TestCase):
                 str(caught.exception), "PC_NAME_MAX reports no usable limit: %d" % answer
             )
 
+    def test_host_limit_is_bounded_on_both_sides_for_both_limits_9781(self):
+        # Independent of the module constant: the ceiling is written out here.
+        ceiling = 65536
+        for name in ("PC_NAME_MAX", "PC_PATH_MAX"):
+            self.assertEqual(host_limit(self.base, name, lambda d, n: ceiling), ceiling)
+            self.assertEqual(host_limit(self.base, name, lambda d, n: 1), 1)
+            for answer in (ceiling + 1, 2**31):
+                with self.assertRaises(ValueError) as caught:
+                    host_limit(self.base, name, lambda d, n, a=answer: a)
+                self.assertEqual(
+                    str(caught.exception),
+                    "%s reports a limit above the ceiling %d: %d" % (name, ceiling, answer),
+                )
+            for answer in (None, "255", 255.0, True):
+                with self.assertRaises(ValueError) as caught:
+                    host_limit(self.base, name, lambda d, n, a=answer: a)
+                self.assertEqual(
+                    str(caught.exception),
+                    "%s reports a non-integer limit: %r" % (name, answer),
+                )
+
     def test_host_limit_lets_an_os_error_through_with_its_type_and_errno(self):
         def fake(directory, name):
             raise OSError(errno.EIO, "boom")
