@@ -18,7 +18,16 @@ database, so the class (a) binaries (Postgres, `#[serial]`, `federat*`) ran one
 after another. With the lane on (flag `1`, kill switch not `1`, tier
 `enterprise-fed`):
 
-1. **Configure** runs `pg_isolated_binary.py setup --emit-env`. It checks the
+1. **Configure** creates the job's ephemeral base `CI_FED_DB`
+   (`ai_memory_test_ci_<run>_<attempt>_<leg>`), then runs
+   `pg_isolated_binary.py setup --db "$CI_FED_DB" --emit-env`. Setup refuses
+   (exit 2) any base that is not of that ephemeral form, including the URL
+   database when `--db` is absent and the shared `ai_memory_test`, unless
+   `--allow-shared-base "<reason>"` gives a reason; it never creates a base
+   (#7031). It then refuses a base whose `lineage_integrity_watermark` records a
+   higher `agent_lineage` mark than `count(*)` of `agent_lineage` in any schema
+   (the #6983 REGRESSED diagnostic); a row it cannot read is a refusal, never a
+   skip (#7157). It checks the
    live connection budget: `max_connections` minus the reserved slots minus the
    sessions open right now (`pg_stat_activity`) must cover
    `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. It builds
@@ -46,8 +55,30 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    readable source (`scripts/ci/pg_isolate_split.py`) run last, one at a time,
    on the shared database. The flag is stripped from their environment, so the
    Rust helper does not mint for them.
-3. **Cleanup** runs `pg_isolated_binary.py teardown --run-id <this run>`, which
-   drops this run's leftover clones and the template.
+3. **Cleanup** runs `pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id <this run>`,
+   which drops this run's leftover clones and the template. The `--db` is
+   classified as in setup, and the teardown is refused unless
+   `AI_MEMORY_TEST_PG_TEMPLATE` is set to the template this job's setup emitted
+   for that `--db` (#7180; unset or empty is refused, #7031). A signal or an
+   error does not stop the drops: a name not dropped, or a clone listing that
+   failed, is printed on an `unreleased:` line.
+
+Setup and teardown run under one ownership guard (#7114, #7179, #7200, #7212).
+A database is owned only after its `CREATE DATABASE` succeeded in this run, and
+only owned names are ever dropped, with a plain `DROP DATABASE` (never
+`WITH (FORCE)`). SIGTERM, SIGINT and SIGHUP only set a flag, checked between
+statements, so a signal can never fall between the server's commit of a CREATE
+and the ownership record. On any exception or signal the owned names are
+dropped. Exit codes of setup and teardown:
+
+| Exit | Meaning |
+|---|---|
+| 0 | done: setup leaves only the template it handed to the job; teardown leaves nothing of this run |
+| 2 | refused or failed: nothing this invocation created is left; a teardown refused before its first statement dropped nothing |
+| 128 + signal | interrupted (143 for SIGTERM): nothing this invocation created is left, and a teardown still ran every drop |
+| 5 | a database of this run is, or may be, still on the server; every such name, or the query that lists them, is on its own `unreleased:` line |
+
+Exit 5 wins over a signal, and a signal wins over an error.
 
 On SIGTERM (the watchdog) or SIGINT, the wrapper stops dispatching, sends TERM
 to every running `cargo` process group and KILL 5 s later, drops the clones in
@@ -85,6 +116,9 @@ unset.
   touch clones of their own run.
 * **No FORCE drops.** A database with a live session cannot be dropped, so a
   race with another binary fails the drop instead of terminating that binary.
+* **Ephemeral base only, never minted.** Setup builds a template only beside an
+  ephemeral CI base, and creates no base of its own; a shared base needs
+  `--allow-shared-base "<reason>"`, which is logged (#7031).
 * **Admin-only cross-run sweep.**
   `pg_isolated_binary.py sweep --older-than N` (N at least 600 s) drops idle
   clones of any run. CI never calls it (invariant `G2-no-ci-sweep`).
