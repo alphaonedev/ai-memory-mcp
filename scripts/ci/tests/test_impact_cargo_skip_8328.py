@@ -85,7 +85,7 @@ DISPATCH_CASE = 'case "${TEST_IMPACT:-__ALL__}" in'
 DISPATCH_ARM = re.compile(r"^ {12}([^ #][^)\n]*\))", re.M)
 DISPATCH_ARMS = ('__ALL__|"")', "*)")
 STEP_IF = re.compile(r"^        if:\s*(.*)$")
-CONSUMER_IF = "needs.classify.outputs.cargo_skip != 'true'"
+CONSUMER_IF = "needs.classify.outputs.cargo_skip != 'true' && env.LEG_SKIP != 'true'"  # LEG_SKIP: #9821
 EXPECTED_READER = ("ci.yml", "TEST_IMPACT: ${{ needs.classify.outputs.test_impact }}")
 REJECTED = "impact-selection-rejected-at-consumer"
 WHOLE_STEP_NAMES = ("alpha_test", "beta_test")

@@ -61,6 +61,7 @@ PINNED_JOBS = (
     ("build-script-vetting", "Build-script custom-build ledger gate (#2635)"),
     ("actionlint", "actionlint (workflow-injection guard)"),
     ("msrv", "MSRV (Rust 1.98)"),
+    ("draft-admission", "Draft admission re-check"),  # #9821, after the base list
     ("check", "Check (${{ matrix.leg }})"),
     ("postgres-feature", "Postgres feature gate"),
     ("mobile-cross-compile", "Cross-compile (${{ matrix.target }})"),

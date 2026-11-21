@@ -97,6 +97,7 @@ JOBS: dict[str, dict[str, str]] = {
         "build-script-vetting": "Build-script custom-build ledger gate (#2635)",
         "actionlint": "actionlint (workflow-injection guard)",
         "msrv": "MSRV (Rust 1.98)",
+        "draft-admission": "Draft admission re-check",
         "check": "Check (${{ matrix.leg }})",
         "postgres-feature": "Postgres feature gate",
         "mobile-cross-compile": "Cross-compile (${{ matrix.target }})",
@@ -139,7 +140,7 @@ JOBS: dict[str, dict[str, str]] = {
 
 # ci-gate folds these jobs (the others are required contexts by their own names); a step moved
 # into a job outside this list and outside the required contexts stops failing a required context.
-CI_GATE_NEEDS = ("select", "classify", "build-script-vetting", "check", "mobile-cross-compile")
+CI_GATE_NEEDS = ("select", "classify", "build-script-vetting", "draft-admission", "check", "mobile-cross-compile")
 
 # Job -> ordered labels of its test and gate steps (run text matching TEST_RUN_RE). A plain YAML
 # step name ends at ` #`, so some labels below stop mid-parenthesis exactly as GitHub shows them.
@@ -1158,6 +1159,8 @@ HOSTED_PR_CONTEXT: dict[str, object] = {
     "needs.classify.outputs.cargo_skip": "false",
     "runner.environment": "github-hosted",
     "runner.os": "Linux",
+    # #9821 (I5): the hosted leg is never skipped (the skip condition needs a self-hosted runner).
+    "env.LEG_SKIP": "false",
     "github.event_name": "pull_request",
     "github.repository": REPO_SLUG,
     "github.event.pull_request.head.repo.full_name": REPO_SLUG,
@@ -1758,6 +1761,8 @@ UNPAIRED_RUST_CACHE_SITES: dict[tuple[str, str, str], UnpairedSite] = {
 
 RUNS_ON_MATRIX_RE = re.compile(
     r"^\$\{\{\s*(?:fromJSON\(\s*matrix\.([A-Za-z_][\w-]*)\s*\)|matrix\.([A-Za-z_][\w-]*))\s*\}\}$")
+RUNS_ON_DRAFT_FLIP_RE = re.compile(
+    r"""^\$\{\{\s*fromJSON\((.+) && '\["ubuntu-latest"\]' \|\| matrix\.(runner)\)\s*\}\}$""")
 MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][\w-]*)\s*\}\}")
 SELF_HOSTED = "self-hosted"
 SiteKey = tuple[str, str, str]
@@ -1776,9 +1781,18 @@ def _runs_on(job: Job, leg: dict[str, object]) -> str:
     if EXPRESSION_OPEN not in raw:
         return raw
     match = RUNS_ON_MATRIX_RE.match(raw.strip())
+    is_flip = False
+    if not match:
+        # #9821 (I5): a draft PR flips a SELF-HOSTED leg to a hosted runner. The flip is
+        # accepted only when its condition names `contains(matrix.runner, 'self-hosted')`, so
+        # a hosted leg never changes; the leg's own runner is the else branch.
+        flip = RUNS_ON_DRAFT_FLIP_RE.match(raw.strip())
+        if flip and "contains(matrix.runner, 'self-hosted')" in flip.group(1):
+            match = flip
+            is_flip = True
     if not match:
         raise AssertionError(f"{job.job_id}: unrecognised runs-on form: {raw!r}")
-    field_name = match.group(1) or match.group(2)
+    field_name = match.group(2) if is_flip else match.group(1) or match.group(2)
     if field_name not in leg:
         raise AssertionError(f"{job.job_id}: runs-on reads matrix.{field_name}, which leg "
                              f"{_leg_id(leg)!r} does not set")

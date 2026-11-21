@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import random
 import sys
 import tempfile
@@ -20,7 +21,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-TOOL = Path(__file__).resolve().parent.parent / "queue_order.py"
+TOOL = Path(os.environ.get("QUEUE_ORDER_UNDER_TEST") or Path(__file__).resolve().parent.parent / "queue_order.py")
 SCRATCH = Path(__file__).resolve().parents[3] / ".local-runs"
 
 SEED = 9821

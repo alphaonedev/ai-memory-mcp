@@ -51,6 +51,7 @@ EXPECTED_JOB_NAMES = {
     "build-script-vetting": "Build-script custom-build ledger gate (#2635)",
     "actionlint": "actionlint (workflow-injection guard)",
     "msrv": "MSRV (Rust 1.98)",
+    "draft-admission": "Draft admission re-check",
     "check": "Check (${{ matrix.leg }})",
     "postgres-feature": "Postgres feature gate",
     "mobile-cross-compile": "Cross-compile (${{ matrix.target }})",
@@ -68,17 +69,21 @@ EXPECTED_NEEDS = {
     "build-script-vetting": (),
     "actionlint": CLASSIFY_SELECT,
     "msrv": CLASSIFY_SELECT,
-    "check": ("classify",),
+    "draft-admission": (),
+    "check": ("classify", "draft-admission"),
     "postgres-feature": CLASSIFY_SELECT,
     "mobile-cross-compile": ("classify",),
     "sal-feature": CLASSIFY_SELECT,
     "vectorlite-feature": CLASSIFY_SELECT,
     "dockerfile-validate": CLASSIFY_SELECT,
-    "ci-gate": ("select", "classify", "build-script-vetting", "check", "mobile-cross-compile"),
+    "ci-gate": ("select", "classify", "build-script-vetting", "draft-admission", "check",
+                "mobile-cross-compile"),
 }
 
 # Jobs whose check-runs are required contexts, and the jobs that are not.
-REQUIRED_JOBS = frozenset(EXPECTED_JOB_NAMES) - {"select", "ci-gate"}
+# draft-admission (#9821) is deliberately unrequired: the ledger line in
+# scripts/qc-allowlists/required-contexts-not-required.txt names it.
+REQUIRED_JOBS = frozenset(EXPECTED_JOB_NAMES) - {"select", "ci-gate", "draft-admission"}
 # Matrix jobs: a job-level `if:` is evaluated before expansion and would hide
 # the expanded required names (#2494), so these two never carry one.
 MATRIX_JOBS = {"check": "leg", "mobile-cross-compile": "target"}
@@ -103,6 +108,7 @@ EXPECTED_CI_CONTEXTS = frozenset({
     "Build-script custom-build ledger gate (#2635)",
     "actionlint (workflow-injection guard)",
     "MSRV (Rust 1.98)",
+    "Draft admission re-check",
     "Check (ubuntu-latest,sqlite)",
     "Check (linux-fed,enterprise-fed)",
     "Check (macos-fed,sqlite)",
@@ -116,7 +122,7 @@ EXPECTED_CI_CONTEXTS = frozenset({
     "ci-gate",
 })
 # Contexts of this workflow that branch protection requires (live pin).
-EXPECTED_REQUIRED_CI_CONTEXTS = EXPECTED_CI_CONTEXTS - {"Impact selection", "ci-gate"}
+EXPECTED_REQUIRED_CI_CONTEXTS = EXPECTED_CI_CONTEXTS - {"Impact selection", "ci-gate", "Draft admission re-check"}
 
 # 2./3. Gate steps: name -> the job that must hold it.
 SECURITY_AUDIT = "Security audit"
@@ -159,7 +165,8 @@ EXPECTED_GATE_STEPS = {
 }
 # Exact guards of the steps this change moves or depends on.
 EXPECTED_STEP_IFS = {
-    ("check", RUN_TESTS): CARGO_SKIP_GUARD,
+    # #9821 (I5): a skipped self-hosted draft leg also runs no tests.
+    ("check", RUN_TESTS): CARGO_SKIP_GUARD + " && env.LEG_SKIP != 'true'",
     ("mobile-cross-compile", "cargo check (--lib --features sqlite-bundled)"): CARGO_SKIP_GUARD,
     ("mobile-cross-compile", SECURITY_AUDIT): ONCE_GUARD,
     ("mobile-cross-compile", RELEASE_SMOKE): ONCE_GUARD,

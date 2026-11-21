@@ -43,7 +43,7 @@ TAG_REF_PREFIX = "refs/tags/v"
 MISSING_REASON = "missing-needed-job"
 # The `needs:` list of the ci-gate job in .github/workflows/ci.yml; a test
 # keeps the two in step.
-REQUIRED_NEEDS = ("select", "classify", "build-script-vetting", "check",
+REQUIRED_NEEDS = ("select", "classify", "build-script-vetting", "draft-admission", "check",
                   "mobile-cross-compile")
 
 
