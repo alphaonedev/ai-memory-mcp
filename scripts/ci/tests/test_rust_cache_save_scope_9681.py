@@ -3391,16 +3391,18 @@ def _job_problems(pr_wf: Workflow, pr_job_id: str, warm_wf: Workflow, warm_job_i
     differs = (f"{pr_wf.name}:{pr_job_id} vs {warm_wf.name}:{warm_job_id}: job key {{key!r}} "
                f"differs: {pr_wf.name} has {{pv!r}}, {warm_wf.name} has {{wv!r}}")
     for key in KNOWN_JOB_KEYS:
-        try:
-            if key == "runs-on":
-                pr_value, warm_value = _runs_on(pr_job, leg), _runs_on(warm_job, {})
-            else:
-                pr_value, warm_value = _job_value(pr_job, key, leg), _job_value(warm_job, key, {})
-        except AssertionError as exc:
-            problems.append(f"{pr_wf.name}:{pr_job_id}: runs-on cannot be read: {exc}")
-            continue
-        _compare_key(key, pr_value, warm_value, table.job_allowed, f"{pr_wf.name}:{pr_job_id}",
-                     f"{warm_wf.name}:{warm_job_id}", "job key", differs, problems)
+        values: list[str | None] = []
+        for wf_name, job_id, job, side_leg in ((pr_wf.name, pr_job_id, pr_job, leg),
+                                               (warm_wf.name, warm_job_id, warm_job, {})):
+            try:
+                values.append(_runs_on(job, side_leg) if key == "runs-on"
+                              else _job_value(job, key, side_leg))
+            except AssertionError as exc:
+                problems.append(f"{wf_name}:{job_id}: {key} cannot be read: {exc}")
+        if len(values) == 2:  # a side that could not be read is reported, never compared
+            _compare_key(key, values[0], values[1], table.job_allowed,
+                         f"{pr_wf.name}:{pr_job_id}", f"{warm_wf.name}:{warm_job_id}", "job key",
+                         differs, problems)
     return problems
 
 
@@ -3426,9 +3428,7 @@ def _env_problems(pr_wf: Workflow, pr_job_id: str, warm_wf: Workflow, warm_job_i
                               if name in env else None)
             except AssertionError as exc:
                 problems.append(f"{wf_name}:{job_id}: env {name!r} cannot be evaluated: {exc}")
-                values.append(None)
-                break
-        if len(values) == 2 and values[0] != values[1]:
+        if len(values) == 2 and values[0] != values[1]:  # a failed side is never compared
             problems.append(f"{pr_wf.name}:{pr_job_id} vs {warm_wf.name}:{warm_job_id}: env "
                             f"{name!r} differs: {pr_wf.name} has {values[0]!r}, "
                             f"{warm_wf.name} has {values[1]!r}")
@@ -3646,6 +3646,12 @@ def _duplicate_step_9770(wf: Workflow, job_id: str, ident: str) -> Workflow:
     return Workflow(wf.name, lines[:stop] + lines[first:stop] + lines[stop:])
 
 
+def _triplicate_step_9770(wf: Workflow, job_id: str, ident: str) -> Workflow:
+    lines = list(wf.lines)
+    first, stop = _step_range_9770(lines, job_id, ident)
+    return Workflow(wf.name, lines[:stop] + lines[first:stop] * 2 + lines[stop:])
+
+
 def _pair_problems_9770(pair: tuple[str, str, str, str], pr_wf: Workflow | None = None,
                         warm_wf: Workflow | None = None) -> list[str]:
     pr_name, pr_job_id, warm_job_id, _ = pair
@@ -3852,6 +3858,11 @@ class PairMirrorFixtures9770(unittest.TestCase):
                         wf, job, disk))
                     self.assertEqual(problems, [f"{wf_name}:{job_id}: step {disk!r} "
                                                 "appears 2 times"])
+                with self.subTest(pair=pair[2], side=side, case="triplicate"):
+                    problems = _mutated_9770(pair, side, lambda wf, job: _triplicate_step_9770(
+                        wf, job, disk))
+                    self.assertEqual(problems, [f"{wf_name}:{job_id}: step {disk!r} "
+                                                "appears 3 times"])
 
     def test_the_hand_table_pins_the_allowed_differences(self) -> None:
         ci_if_hosted = "needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'"
