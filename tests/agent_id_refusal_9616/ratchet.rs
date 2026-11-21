@@ -438,68 +438,68 @@ fn is_ident_char(c: char) -> bool {
 }
 
 fn lex(src: &str) -> Vec<Tok> {
-    let b: Vec<char> = src.chars().collect();
-    let n = b.len();
+    let chars: Vec<char> = src.chars().collect();
+    let len = chars.len();
     let mut out = Vec::new();
     let mut i = 0;
-    while i < n {
-        let c = b[i];
-        if c.is_whitespace() {
+    while i < len {
+        let ch = chars[i];
+        if ch.is_whitespace() {
             i += 1;
-        } else if c == '/' && b.get(i + 1) == Some(&'/') {
-            while i < n && b[i] != '\n' {
+        } else if ch == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < len && chars[i] != '\n' {
                 i += 1;
             }
-        } else if c == '/' && b.get(i + 1) == Some(&'*') {
+        } else if ch == '/' && chars.get(i + 1) == Some(&'*') {
             let mut depth = 1;
             i += 2;
-            while i < n && depth > 0 {
-                if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+            while i < len && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
                     depth += 1;
                     i += 2;
-                } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
                     depth -= 1;
                     i += 2;
                 } else {
                     i += 1;
                 }
             }
-        } else if c == '"' {
-            let (s, j) = cooked_string(&b, i + 1);
-            out.push(Tok::Str(s));
+        } else if ch == '"' {
+            let (text, j) = cooked_string(&chars, i + 1);
+            out.push(Tok::Str(text));
             i = j;
-        } else if c == '\'' {
-            i = char_literal_end(&b, i).unwrap_or(i + 1);
-        } else if c.is_alphabetic() || c == '_' {
+        } else if ch == '\'' {
+            i = char_literal_end(&chars, i).unwrap_or(i + 1);
+        } else if ch.is_alphabetic() || ch == '_' {
             let start = i;
-            while i < n && is_ident_char(b[i]) {
+            while i < len && is_ident_char(chars[i]) {
                 i += 1;
             }
-            let word: String = b[start..i].iter().collect();
-            let next = b.get(i).copied();
+            let word: String = chars[start..i].iter().collect();
+            let next = chars.get(i).copied();
             match (word.as_str(), next) {
                 ("b" | "c", Some('"')) => {
-                    let (s, j) = cooked_string(&b, i + 1);
-                    out.push(Tok::Str(s));
+                    let (text, j) = cooked_string(&chars, i + 1);
+                    out.push(Tok::Str(text));
                     i = j;
                 }
-                ("b", Some('\'')) => i = char_literal_end(&b, i).unwrap_or(i + 1),
+                ("b", Some('\'')) => i = char_literal_end(&chars, i).unwrap_or(i + 1),
                 ("r" | "br" | "cr", Some('"' | '#')) => {
                     let mut j = i;
-                    while j < n && b[j] == '#' {
+                    while j < len && chars[j] == '#' {
                         j += 1;
                     }
                     let hashes = j - i;
-                    if b.get(j) == Some(&'"') {
-                        let (s, k) = raw_string(&b, j + 1, hashes);
-                        out.push(Tok::Str(s));
+                    if chars.get(j) == Some(&'"') {
+                        let (text, k) = raw_string(&chars, j + 1, hashes);
+                        out.push(Tok::Str(text));
                         i = k;
                     } else if word == "r" && hashes == 1 {
                         let start = j;
-                        while j < n && is_ident_char(b[j]) {
+                        while j < len && is_ident_char(chars[j]) {
                             j += 1;
                         }
-                        out.push(Tok::Ident(b[start..j].iter().collect()));
+                        out.push(Tok::Ident(chars[start..j].iter().collect()));
                         i = j;
                     } else {
                         out.push(Tok::Ident(word));
@@ -507,12 +507,12 @@ fn lex(src: &str) -> Vec<Tok> {
                 }
                 _ => out.push(Tok::Ident(word)),
             }
-        } else if c.is_ascii_digit() {
-            while i < n && is_ident_char(b[i]) {
+        } else if ch.is_ascii_digit() {
+            while i < len && is_ident_char(chars[i]) {
                 i += 1;
             }
         } else {
-            out.push(Tok::Punct(c));
+            out.push(Tok::Punct(ch));
             i += 1;
         }
     }
