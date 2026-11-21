@@ -387,7 +387,7 @@ fn injected_write_failure_leaves_no_partial_config_9620() {
             !sb.config_path().exists(),
             "#9620 attempt {attempt}: a failed default config write left a file at the path \
              ({} bytes); stderr={stderr}",
-            fs::metadata(sb.config_path()).map(|m| m.len()).unwrap_or(0)
+            fs::metadata(sb.config_path()).map_or(0, |m| m.len())
         );
         assert_eq!(
             tree(&sb.config_dir()),
