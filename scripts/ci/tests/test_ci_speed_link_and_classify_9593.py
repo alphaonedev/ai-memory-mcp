@@ -3,11 +3,17 @@
 
 Class: the changes that must leave the set of tests and the set of reported check names
 unchanged (invariant for every push):
-  (a) debuginfo (#8216, widening the #9593 pin): every job in every workflow that runs cargo
-      on a SELF-HOSTED runner declares CARGO_PROFILE_DEV_DEBUG and CARGO_PROFILE_TEST_DEBUG,
-      they are equal, and both are 0 on every self-hosted leg (a job with no declaration is a
-      finding, never a default). The domain is read from the workflow files; the expected
-      runner kind and values per job and leg are the hand table EXPECTED_CARGO_DEBUG;
+  (a) debuginfo (#8216, widening the #9593 pin): for EVERY cargo job on a SELF-HOSTED runner, in
+      every workflow, the effective CARGO_PROFILE_DEV_DEBUG and CARGO_PROFILE_TEST_DEBUG are
+      declared, equal and 0 on every leg, whatever the form that sets them (workflow env, job env,
+      step env, a write to GITHUB_ENV by echo quoted or unquoted, printf, tee, here-document, a
+      composed variable name, RUSTFLAGS, a cargo --config). This is fail closed BY CONSTRUCTION:
+      ALLOWED_SETTING_SITES is an allowlist of the exact lines (workflow, job, indent, text) that
+      may mention a debuginfo setting, and every write to GITHUB_ENV is either a literal
+      `echo "NAME=value"` (alone or in a `{ ...; } >> "$GITHUB_ENV"` group) or listed in
+      ALLOWED_DYNAMIC_ENV_WRITERS; a line the test cannot classify is a problem, never a pass.
+      The domain is read from the workflow files; the expected runner kind and values per job and
+      leg are the hand table EXPECTED_CARGO_DEBUG;
   (c) the scripts/ci unit-test step lives in exactly one job that is no `needs` ancestor of any
       Check leg, runs on every push and carries no path filter or job-level `if:`.
   (d) the job ids and names of ci.yml equal the list pinned from the base (6c67b17b7).
@@ -24,6 +30,7 @@ Python 3.12+, standard library only (the workflows are read as text).
 """
 import re
 import unittest
+from collections import Counter
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -89,6 +96,57 @@ EXPECTED_CARGO_DEBUG: dict = {
     ("token-budget.yml", "budget", ""): (_H, "", ""),
     ("yank.yml", "yank", ""): (_H, "", ""),
 }
+# Allowlist (written from the workflow files at 90a4df1b2, never derived): every live line of a
+# workflow file that mentions a debuginfo setting, as (workflow, job, indent, text); job "" = before
+# `jobs:` (workflow level). A line of this shape anywhere else is a finding, so a step-level env,
+# an unquoted echo, a printf, a here-document, a cargo --config or a RUSTFLAGS edit all go red.
+_DD, _DT = "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"
+_MATRIX_EXPR = "${{ matrix.cargo_debug || 'line-tables-only' }}"
+_LOWMEM = "- name: Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)"
+ALLOWED_SETTING_SITES = (
+    ("cert-postgres-age.yml", "", 2, _DD + ': "0"'),
+    ("cert-postgres-age.yml", "", 2, _DT + ': "0"'),
+    ("ci.yml", "", 2, _DD + ": line-tables-only"),
+    ("ci.yml", "", 2, _DT + ": line-tables-only"),
+    ("ci.yml", "check", 6, _DD + ": " + _MATRIX_EXPR),
+    ("ci.yml", "check", 6, _DT + ": " + _MATRIX_EXPR),
+    ("ci.yml", "check", 6, _LOWMEM),
+    ("ci.yml", "check", 12, 'echo "%s=0"' % _DD),
+    ("ci.yml", "check", 12, 'echo "%s=0"' % _DT),
+    ("ci.yml", "check", 12, 'echo "RUSTFLAGS=-C debuginfo=0"'),
+    ("coverage.yml", "per-module-thresholds", 6, 'RUSTFLAGS: "-C link-arg=-fuse-ld=mold"'),
+    ("coverage.yml", "per-module-thresholds", 6, _DD + ': "0"'),
+    ("postgres-ignored.yml", "", 2, _DD + ': "0"'),
+    ("postgres-ignored.yml", "", 2, _DT + ': "0"'),
+    ("rust-cache-warm.yml", "check-hosted-sqlite", 6, _DD + ": line-tables-only"),
+    ("rust-cache-warm.yml", "check-hosted-sqlite", 6, _DT + ": line-tables-only"),
+    ("rust-cache-warm.yml", "check-hosted-sqlite", 6, _LOWMEM),
+    ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "%s=0"' % _DD),
+    ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "%s=0"' % _DT),
+    ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "RUSTFLAGS=-C debuginfo=0"'),
+    ("rust-cache-warm.yml", "coverage", 6, 'RUSTFLAGS: "-C link-arg=-fuse-ld=mold"'),
+    ("rust-cache-warm.yml", "coverage", 6, _DD + ': "0"'),
+)
+# The writes to GITHUB_ENV that are not a literal `echo "NAME=value"`: (workflow, job, text). Each
+# one writes names the test cannot read from the line (a loop variable, a helper script's output);
+# none can name a debuginfo variable: the loop is over the two passphrase names, and the helpers
+# are scripts/ci/shared_cargo_target.py, scripts/ci/sccache_env.py and
+# scripts/test/pg_isolated_binary.py, none of which mentions debuginfo.
+ALLOWED_DYNAMIC_ENV_WRITERS = frozenset({
+    ("ci.yml", "check", "printf '%s=\\n' \"$name\" >> \"$GITHUB_ENV\""),
+    ("ci.yml", "check", 'run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" '
+                        '--runner-name "$RUNNER_NAME_ARG"'),
+    ("ci.yml", "check", 'run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"'),
+    ("ci.yml", "check", 'AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py '
+                        'setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"'),
+})
+# What can set a debuginfo level: the cargo profile variables, rustc's -C debuginfo, RUSTFLAGS in any
+# spelling, a cargo --config profile key.
+SETTING_RE = re.compile(
+    r"CARGO_PROFILE_\w*DEBUG\w*|debuginfo|RUSTFLAGS|CARGO_ENCODED_\w+|profile\.\w+\.debug|-C\s*debug", re.I)
+ENV_ECHO_RE = re.compile(r'^(?:run: )?echo "[A-Za-z_][A-Za-z0-9_]*=[^"]*" >> "\$GITHUB_ENV"$')
+GROUP_ECHO_RE = re.compile(r'^echo "[A-Za-z_][A-Za-z0-9_]*=[^"]*"$')
+GROUP_CLOSE = '} >> "$GITHUB_ENV"'
 UNIT_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
 UNIT_JOB = "build-script-vetting"
 UNIT_STEP = "Shard partition and wiring unit tests (#6344)"
@@ -371,6 +429,50 @@ def cargo_debug_rows(workflows: dict) -> tuple:
     return rows, problems
 
 
+def problems_setting_sites(workflows: dict) -> list:
+    """Fail-closed allowlist over every workflow: (1) a write to GITHUB_ENV is a literal
+    `echo "NAME=value"`, a `{ echo "NAME=value"; ... } >> "$GITHUB_ENV"` group of literal echoes, or an
+    ALLOWED_DYNAMIC_ENV_WRITERS line; (2) every line that mentions a debuginfo setting is one of
+    ALLOWED_SETTING_SITES, the same number of times."""
+    out: list = []
+    want = Counter(ALLOWED_SETTING_SITES)
+    found: Counter = Counter()
+    for name in sorted(workflows):
+        lines = workflows[name].split("\n")
+        job = ""
+        in_jobs = False
+        for index, line in enumerate(lines):
+            if line == "jobs:":
+                in_jobs = True
+            match = JOB_RE.match(line) if in_jobs else None
+            if match:
+                job = match.group(1)
+            if not _live(line):
+                continue
+            text = line.strip()
+            if SETTING_RE.search(line):
+                found[(name, job, _indent(line), text)] += 1
+            if "GITHUB_ENV" not in line and "--github-env" not in line:
+                continue
+            if text == GROUP_CLOSE:
+                start = index - 1
+                while start >= 0 and lines[start].strip() != "{":
+                    start -= 1
+                if start < 0:
+                    out.append("%s %s: a write to GITHUB_ENV in a form the test cannot classify: %s" % (name, job, text))
+                for body in lines[max(start, 0) + 1:index]:
+                    if _live(body) and not GROUP_ECHO_RE.match(body.strip()):
+                        out.append("%s %s: a line of a GITHUB_ENV group the test cannot classify: %s"
+                                   % (name, job, body.strip()))
+            elif not ENV_ECHO_RE.match(text) and (name, job, text) not in ALLOWED_DYNAMIC_ENV_WRITERS:
+                out.append("%s %s: a write to GITHUB_ENV in a form the test cannot classify: %s" % (name, job, text))
+    for key in sorted(set(want) | set(found)):
+        if found[key] != want[key]:
+            out.append("%s %s: debuginfo setting site (indent %d) %r occurs %d times, the allowlist has %d"
+                       % (key + (found[key], want[key])))
+    return out
+
+
 def problems_debuginfo(workflows: dict) -> list:
     rows, out = cargo_debug_rows(workflows)
     for var in DEBUG_VARS:
@@ -413,7 +515,7 @@ def problems_debuginfo(workflows: dict) -> list:
             found = True
         if not found and (kind, dev, test) != EXPECTED_CARGO_DEBUG[key]:
             out.append("%s: reads %r, the hand table says %r" % (label, (kind, dev, test), EXPECTED_CARGO_DEBUG[key]))
-    return out
+    return out + problems_setting_sites(workflows)
 
 
 # ---------------------------------------------------------------------------------------
@@ -530,7 +632,7 @@ def real_workflows() -> dict:
 
 
 class RealFiles(unittest.TestCase):
-    def test_9593_debuginfo_off_on_the_linux_fed_leg_only(self):
+    def test_8216_debuginfo_pair_declared_and_0_on_every_self_hosted_leg(self):
         self.assertEqual(problems_debuginfo(real_workflows()), [])
 
     def test_9593_unit_test_step_is_in_one_job_with_no_path_to_a_check_leg(self):
@@ -591,6 +693,93 @@ class NeedsBrokenCopies(unittest.TestCase):
                 self.assertEqual(problems_unit_needs(self._broken_job(old, new)), want)
 
 
+# (a) Broken copies of the debuginfo setting sites, one per form a workflow can set the pair (or
+# RUSTFLAGS debuginfo): (cell, workflow, old text or None = append to the file, new text, exact
+# problems written by hand). `old` occurs once in the real file. Forms: step env (M12, M14), unquoted
+# echo (M13), printf (M15), here-document, tee, a composed variable name, a group line with a dynamic
+# name, RUSTFLAGS in a workflow env, a cargo --config, a flow-style job env, a changed value at an
+# allowed site, a duplicated allowed line, a literal echo in another workflow.
+CERT = "cert-postgres-age.yml"
+CERT_STEP = "      - name: Run #[ignore]-gated pg + AGE cells against the certified stack\n        run: |\n"
+CERT_STEP_SET = CERT_STEP + "          set -euo pipefail\n"
+RCW_DEV_ECHO = '            echo "CARGO_PROFILE_DEV_DEBUG=0"\n'
+RCW_TEST_ECHO = '            echo "CARGO_PROFILE_TEST_DEBUG=0"\n'
+_BAD_WRITE = "%s %s: a write to GITHUB_ENV in a form the test cannot classify: %s"
+_BAD_SITE = "%s %s: debuginfo setting site (indent %d) %r occurs %d times, the allowlist has %d"
+CERT_JOB = "cert-postgres-age"
+UNQUOTED_ECHO = 'echo CARGO_PROFILE_DEV_DEBUG=2 >> "$GITHUB_ENV"'
+PRINTF = "printf 'CARGO_PROFILE_TEST_DEBUG=line-tables-only\\n' >> \"$GITHUB_ENV\""
+HEREDOC_OPEN = 'cat >> "$GITHUB_ENV" <<EOF'
+TEE = 'echo "CARGO_PROFILE_DEV_DEBUG=2" | tee -a "$GITHUB_ENV"'
+COMPOSED = 'k=CARGO_PROFILE_DEV; echo "${k}_DEBUG=2" >> "$GITHUB_ENV"'
+CARGO_CONFIG = "cargo build --config profile.dev.debug=2 --features sal-postgres --bin ai-memory"
+FLOW_ENV = 'env: {CARGO_PROFILE_DEV_DEBUG: "2"}'
+RUSTFLAGS_STEP = 'run: echo "RUSTFLAGS=-C debuginfo=2" >> "$GITHUB_ENV"'
+SITE_MUTANTS = (
+    ("M12_step_env_on_the_check_job",
+     CI,
+     "      - name: Run tests (impact-aware)\n        if: needs.classify.outputs.cargo_skip != 'true'\n        env:\n",
+     "      - name: Run tests (impact-aware)\n        if: needs.classify.outputs.cargo_skip != 'true'\n        env:\n"
+     "          CARGO_PROFILE_DEV_DEBUG: line-tables-only\n          CARGO_PROFILE_TEST_DEBUG: line-tables-only\n",
+     [_BAD_SITE % (CI, "check", 10, "CARGO_PROFILE_DEV_DEBUG: line-tables-only", 1, 0),
+      _BAD_SITE % (CI, "check", 10, "CARGO_PROFILE_TEST_DEBUG: line-tables-only", 1, 0)]),
+    ("M13_unquoted_echo_to_github_env",
+     CERT, CERT_STEP_SET, CERT_STEP_SET + "          " + UNQUOTED_ECHO + "\n",
+     [_BAD_WRITE % (CERT, CERT_JOB, UNQUOTED_ECHO),
+      _BAD_SITE % (CERT, CERT_JOB, 10, UNQUOTED_ECHO, 1, 0)]),
+    ("M14_step_env_on_another_self_hosted_job",
+     CERT, CERT_STEP,
+     CERT_STEP.replace("        run: |\n", '        env:\n          CARGO_PROFILE_TEST_DEBUG: "2"\n        run: |\n'),
+     [_BAD_SITE % (CERT, CERT_JOB, 10, 'CARGO_PROFILE_TEST_DEBUG: "2"', 1, 0)]),
+    ("M15_printf_to_github_env",
+     CERT, CERT_STEP_SET, CERT_STEP_SET + "          " + PRINTF + "\n",
+     [_BAD_WRITE % (CERT, CERT_JOB, PRINTF),
+      _BAD_SITE % (CERT, CERT_JOB, 10, PRINTF, 1, 0)]),
+    ("M16_here_document_to_github_env",
+     CERT, CERT_STEP_SET,
+     CERT_STEP_SET + "          " + HEREDOC_OPEN + "\n          CARGO_PROFILE_TEST_DEBUG=2\n          EOF\n",
+     [_BAD_WRITE % (CERT, CERT_JOB, HEREDOC_OPEN),
+      _BAD_SITE % (CERT, CERT_JOB, 10, "CARGO_PROFILE_TEST_DEBUG=2", 1, 0)]),
+    ("M17_tee_to_github_env",
+     CERT, CERT_STEP_SET, CERT_STEP_SET + "          " + TEE + "\n",
+     ["cert-postgres-age.yml cert-postgres-age leg '': self-hosted job sets CARGO_PROFILE_DEV_DEBUG to '2', "
+      "must be 0",
+      "cert-postgres-age.yml cert-postgres-age leg '': CARGO_PROFILE_DEV_DEBUG '2' differs from "
+      "CARGO_PROFILE_TEST_DEBUG '0'",
+      _BAD_WRITE % (CERT, CERT_JOB, TEE),
+      _BAD_SITE % (CERT, CERT_JOB, 10, TEE, 1, 0)]),
+    ("M18_composed_variable_name",
+     CERT, CERT_STEP_SET, CERT_STEP_SET + "          " + COMPOSED + "\n",
+     [_BAD_WRITE % (CERT, CERT_JOB, COMPOSED)]),
+    ("M19_dynamic_name_in_an_env_group",
+     "rust-cache-warm.yml", '            echo "CARGO_BUILD_JOBS=1"\n', '            echo "${k}=2"\n',
+     ['rust-cache-warm.yml check-hosted-sqlite: a line of a GITHUB_ENV group the test cannot classify: '
+      'echo "${k}=2"']),
+    ("M20_rustflags_debuginfo_in_the_workflow_env",
+     "postgres-ignored.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n',
+     '  CARGO_PROFILE_TEST_DEBUG: "0"\n  RUSTFLAGS: "-C debuginfo=2"\n',
+     [_BAD_SITE % ("postgres-ignored.yml", "", 2, 'RUSTFLAGS: "-C debuginfo=2"', 1, 0)]),
+    ("M21_cargo_config_profile_key",
+     CERT, "          cargo build --features sal-postgres --bin ai-memory\n", "          " + CARGO_CONFIG + "\n",
+     [_BAD_SITE % (CERT, CERT_JOB, 10, CARGO_CONFIG, 1, 0)]),
+    ("M22_flow_style_job_env",
+     CERT, "    steps:\n", "    " + FLOW_ENV + "\n    steps:\n",
+     [_BAD_SITE % (CERT, CERT_JOB, 4, FLOW_ENV, 1, 0)]),
+    ("M23_value_changed_at_an_allowed_echo",
+     "rust-cache-warm.yml", RCW_TEST_ECHO, RCW_TEST_ECHO.replace("=0", "=2"),
+     ["rust-cache-warm.yml check-hosted-sqlite leg '': CARGO_PROFILE_DEV_DEBUG '0' differs from "
+      "CARGO_PROFILE_TEST_DEBUG '2'",
+      _BAD_SITE % ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "CARGO_PROFILE_TEST_DEBUG=0"', 0, 1),
+      _BAD_SITE % ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "CARGO_PROFILE_TEST_DEBUG=2"', 1, 0)]),
+    ("M24_allowed_echo_duplicated",
+     "rust-cache-warm.yml", RCW_DEV_ECHO, RCW_DEV_ECHO + RCW_DEV_ECHO,
+     [_BAD_SITE % ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "CARGO_PROFILE_DEV_DEBUG=0"', 2, 1)]),
+    ("M25_literal_rustflags_echo_in_another_workflow",
+     "yank.yml", None, "        " + RUSTFLAGS_STEP + "\n",
+     [_BAD_SITE % ("yank.yml", "yank", 8, RUSTFLAGS_STEP, 1, 0)]),
+)
+
+
 class BrokenCopies(unittest.TestCase):
     """Each check is red, with its exact message, on a deliberately broken copy."""
 
@@ -599,6 +788,16 @@ class BrokenCopies(unittest.TestCase):
         self.assertEqual(workflows[name].count(old), 1, old)
         workflows[name] = workflows[name].replace(old, new)
         return workflows
+
+    def test_each_debuginfo_setting_form_is_red_on_its_broken_copy(self):
+        for cell, name, old, new, want in SITE_MUTANTS:
+            with self.subTest(cell=cell):
+                if old is None:
+                    workflows = real_workflows()
+                    workflows[name] = workflows[name].rstrip("\n") + "\n" + new
+                else:
+                    workflows = self._broken(name, old, new)
+                self.assertEqual(problems_debuginfo(workflows), want)
 
     def test_debuginfo_key_on_a_hosted_leg(self):
         leg = "ubuntu-latest,sqlite"
@@ -638,7 +837,9 @@ class BrokenCopies(unittest.TestCase):
     def test_self_hosted_cargo_job_with_no_declaration(self):
         workflows = self._broken("cert-postgres-age.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n', "")
         self.assertEqual(problems_debuginfo(workflows), [
-            "cert-postgres-age.yml cert-postgres-age leg '': self-hosted job leaves CARGO_PROFILE_TEST_DEBUG undeclared"])
+            "cert-postgres-age.yml cert-postgres-age leg '': self-hosted job leaves CARGO_PROFILE_TEST_DEBUG undeclared",
+            "cert-postgres-age.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"0\"' occurs 0 "
+            "times, the allowlist has 1"])
 
     def test_self_hosted_dev_and_test_differ(self):
         workflows = self._broken("postgres-ignored.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n',
@@ -646,7 +847,11 @@ class BrokenCopies(unittest.TestCase):
         self.assertEqual(problems_debuginfo(workflows), [
             "postgres-ignored.yml postgres-ignored leg '': self-hosted job sets CARGO_PROFILE_TEST_DEBUG to '1', must be 0",
             "postgres-ignored.yml postgres-ignored leg '': CARGO_PROFILE_DEV_DEBUG '0' differs from "
-            "CARGO_PROFILE_TEST_DEBUG '1'"])
+            "CARGO_PROFILE_TEST_DEBUG '1'",
+            "postgres-ignored.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"0\"' occurs 0 "
+            "times, the allowlist has 1",
+            "postgres-ignored.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"1\"' occurs 1 "
+            "times, the allowlist has 0"])
 
     def test_hosted_ci_job_dev_and_test_differ(self):
         workflows = self._broken(CI, "\n  CARGO_PROFILE_TEST_DEBUG: line-tables-only\n",
