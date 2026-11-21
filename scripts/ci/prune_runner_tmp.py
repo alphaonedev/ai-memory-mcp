@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Prune stale entries of a self-hosted runner's own TMPDIR at job start (#8634).
+"""Clear a self-hosted runner's own TMPDIR at the job boundary (#8634, #9820).
 
-Removes ONLY direct entries of one directory whose own mtime (lstat, never a
-symlink target) is older than MAX_AGE_SECS. An old directory goes whole,
-whatever its children's mtimes. Symlinks are unlinked, never followed. Nothing
-outside that directory is touched, so a sibling ``runner-N`` directory is safe.
+Removes ONLY direct entries of one directory. ``--mode job-end`` (the last step of a job, ``if: always()``)
+removes every entry; ``--mode job-start`` (first step after checkout, for a job whose end step never ran) keeps
+an entry whose own mtime (lstat, never a symlink target) is within JOB_START_GRACE_SECS, presumed owned by a
+live writer. The clear is bound to the job boundary, never to polling for an idle runner. An entry that
+carries an append-only or immutable flag has the flag cleared (descriptor-relative) and is removed. A removed
+directory goes whole, whatever its children's mtimes. Symlinks are unlinked, never followed. Nothing
+outside that directory is touched, so a sibling ``runner-N`` directory is safe. The directory is either
+``<runner root>/runner-<digits>`` (Linux node) or ``<layout root>/<runner folder>/_tmp`` (macOS node).
 
 The directory is PROVEN, by file identity and not by path text, to be this
 runner's own ``<runner root>/runner-<digits>``: TMPDIR is opened once
@@ -184,13 +188,26 @@ def refusal_annotation(reason):
 
 import argparse  # noqa: E402  (the floor check above must run before anything newer is needed)
 import errno  # noqa: E402
+import fcntl  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import stat  # noqa: E402
+import struct  # noqa: E402
 import time  # noqa: E402
 
-SECS_PER_DAY = 86400
-MAX_AGE_SECS = SECS_PER_DAY
+# #9820: the clear is bound to the JOB BOUNDARY, never to polling for an idle runner (f1 runners go from one job
+# to the next in 2 seconds, a 3-second poll never fired). Two modes, both run by a step of the job itself:
+#   job-end   (``if: always()`` last step): nothing is kept, every entry of the runner's own TMPDIR goes.
+#   job-start (first step after checkout, covers a cancelled or lost job whose end step never ran): an entry
+#             touched within JOB_START_GRACE_SECS is presumed owned by a live writer and kept; the next
+#             boundary removes it.
+# decision: job-start plus job-end steps over polling an idle runner or a one-day age cut, because the runner
+# has no event a poll can see in 2 seconds, and a one-day cut left up to 60 GiB a day in place.
+MODE_JOB_START = "job-start"
+MODE_JOB_END = "job-end"
+MODES = (MODE_JOB_START, MODE_JOB_END)
+JOB_START_GRACE_SECS = 30
+GRACE_SECS_BY_MODE = {MODE_JOB_START: JOB_START_GRACE_SECS, MODE_JOB_END: 0}
 
 # Confirmed runner roots (ruling f23a9ae4). A root is added only with the run
 # whose prune-facts line shows a real runner TMPDIR under it; a guessed root was
@@ -199,6 +216,17 @@ MAX_AGE_SECS = SECS_PER_DAY
 # refuses visibly and the job continues.
 F2_RUNNER_ROOT = "/ai-scratch/runner-tmp"  # confirmed: runs 43768137071, 43768136935, 43768136967 (runner-1, -3, -4)
 ALLOWED_ROOTS = (F2_RUNNER_ROOT,)
+# macOS node (f1) layouts: TMPDIR is ``<root>/<runner folder>/_tmp``. Confirmed 2026-11-21 from the runner ``.env``
+# TMPDIR= lines (read only) of the two running f1 runners: /Users/Shared/actions-runner/_tmp and
+# /Volumes/f1dev/rt/fed3/_tmp; the stopped runners use /Users/Shared/actions-runner-2/_tmp and
+# /Users/Shared/f1-macos-fed-N/_tmp. No prune-facts line of an f1 run is quoted yet.
+F1_SHARED_RUNNER_ROOT = "/Users/Shared"
+F1_VOLUME_RUNNER_ROOT = "/Volumes/f1dev/rt"
+RUNNER_FOLDER_LEAF = "_tmp"
+RUNNER_FOLDER_LAYOUTS = (
+    (F1_SHARED_RUNNER_ROOT, re.compile(r"(actions-runner|f1-macos-fed)(-[0-9]+)?")),
+    (F1_VOLUME_RUNNER_ROOT, re.compile(r"fed[0-9]+")),
+)
 MAX_TREE_DEPTH = 10000  # directory levels below a top-level entry; deeper = one counted failure
 MAX_TREE_ENTRIES = 5_000_000  # entries under one top-level entry; more = one counted failure
 RUNNER_DIR_PATTERN = re.compile(r"runner-[0-9]+")
@@ -254,6 +282,7 @@ REFUSAL_REASONS = {
     "forbidden": "TMPDIR is a forbidden path: {path}",
     "not_owner": "TMPDIR is not owned by the current user: {path}",
     "not_runner_dir": "TMPDIR is not named runner-<digits>: {name}",
+    "not_runner_folder": "TMPDIR is not <root>/<runner folder>/_tmp of an allowed layout: {path}",
     "outside_roots": "TMPDIR is outside the allowed roots {roots}: {path}",
     "contains": "TMPDIR contains the home directory or the workspace: {path}",
 }
@@ -461,22 +490,53 @@ def prove_runner_dir(dir_fd, info, path, known_roots, roots, environ):
     if info.st_uid != os.geteuid():
         raise refuse("not_owner", path=path)
     name = os.path.basename(path)
-    if RUNNER_DIR_PATTERN.fullmatch(name) is None:
-        raise refuse("not_runner_dir", name=name)
-    try:
-        parent_fd = os.open("..", DIR_FLAGS, dir_fd=dir_fd)
-    except (NotImplementedError, TypeError) as exc:
-        raise PlatformMissing("os.open", exc) from exc
-    try:
-        parent = os.fstat(parent_fd)
-        if file_id(parent) not in known_roots:
-            raise refuse("outside_roots", roots=list(roots), path=os.path.realpath(path))
-        same_mount_as_root(parent_fd, parent, dir_fd, info, path)
-    finally:
-        os.close(parent_fd)
+    if name == RUNNER_FOLDER_LEAF:
+        prove_runner_folder_leaf(dir_fd, info, path)
+    else:
+        if RUNNER_DIR_PATTERN.fullmatch(name) is None:
+            raise refuse("not_runner_dir", name=name)
+        try:
+            parent_fd = os.open("..", DIR_FLAGS, dir_fd=dir_fd)
+        except (NotImplementedError, TypeError) as exc:
+            raise PlatformMissing("os.open", exc) from exc
+        try:
+            parent = os.fstat(parent_fd)
+            if file_id(parent) not in known_roots:
+                raise refuse("outside_roots", roots=list(roots), path=os.path.realpath(path))
+            same_mount_as_root(parent_fd, parent, dir_fd, info, path)
+        finally:
+            os.close(parent_fd)
     for name_ in guarded_paths(environ):
         if file_id(info) in ancestor_ids(name_):
             raise refuse("contains", path=path)
+
+
+def prove_runner_folder_leaf(dir_fd, info, path):
+    """#9820: prove TMPDIR is ``<layout root>/<runner folder>/_tmp`` by identity (the macOS node's form).
+
+    The folder is TMPDIR's own ``..`` and the root is the folder's ``..`` (both opened without following a
+    link); the root must be the same file as a RUNNER_FOLDER_LAYOUTS root whose pattern matches the folder's
+    real name, and TMPDIR must be on that root's mount. Anything else is the refusal ``not_runner_folder``.
+    """
+    folder_name = os.path.basename(os.path.dirname(os.path.realpath(path)))
+    try:
+        folder_fd = os.open("..", DIR_FLAGS, dir_fd=dir_fd)
+    except (NotImplementedError, TypeError) as exc:
+        raise PlatformMissing("os.open", exc) from exc
+    try:
+        root_fd = os.open("..", DIR_FLAGS, dir_fd=folder_fd)
+        try:
+            root = os.fstat(root_fd)
+            for layout_root, pattern in RUNNER_FOLDER_LAYOUTS:
+                layout = stat_or_none(layout_root)
+                if layout is not None and file_id(layout) == file_id(root) and pattern.fullmatch(folder_name):
+                    same_mount_as_root(root_fd, root, dir_fd, info, path)
+                    return
+            raise refuse("not_runner_folder", path=os.path.realpath(path))
+        finally:
+            os.close(root_fd)
+    finally:
+        os.close(folder_fd)
 
 
 def same_mount_as_root(parent_fd, parent, dir_fd, info, path):
@@ -694,6 +754,113 @@ def write_job_summary(line, environ, err):
         print(f"{PROG}: job summary not written: {safe_text(exc.strerror or exc)}", file=err)
 
 
+# Protected-entry flags (#9820): a test that leaves an append-only or immutable entry behind makes every
+# unlink and rmdir below it fail with EPERM, so the clear drops the flag of the entry and of its directory
+# (through the open descriptor, never a path) and retries once.
+FS_IOC_GETFLAGS = 0x80086601  # linux, _IOR('f', 1, long)
+FS_IOC_SETFLAGS = 0x40086602  # linux, _IOW('f', 2, long)
+FS_APPEND_FL = 0x00000020
+FS_IMMUTABLE_FL = 0x00000010
+LINUX_PROTECT_FLAGS = FS_APPEND_FL | FS_IMMUTABLE_FL
+DARWIN_PROTECT_FLAGS = getattr(stat, "UF_APPEND", 0x4) | getattr(stat, "UF_IMMUTABLE", 0x2)
+ENTRY_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+PROTECT_ERRNOS = frozenset({errno.EPERM, errno.EACCES})
+
+
+def linux_flags(fd):
+    """The ext-style inode flags of an open descriptor, or None when the file system has none."""
+    try:
+        return struct.unpack("l", fcntl.ioctl(fd, FS_IOC_GETFLAGS, struct.pack("l", 0)))[0]
+    except OSError:
+        return None
+
+
+def linux_set_flags(fd, value):
+    fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack("l", value))
+
+
+def linux_clear_flags(dir_fd, name):
+    """Clear append-only and immutable on the directory ``dir_fd`` and on its entry ``name``; True when one was cleared."""
+    cleared = False
+    for target, relative in ((".", True), (name, False)):
+        try:
+            fd = os.open(target, ENTRY_OPEN_FLAGS, dir_fd=dir_fd)
+        except OSError:
+            continue  # a symlink (O_NOFOLLOW), a vanished entry or an unopenable one has no flags to clear
+        try:
+            value = linux_flags(fd)
+            if value is not None and value & LINUX_PROTECT_FLAGS:
+                linux_set_flags(fd, value & ~LINUX_PROTECT_FLAGS)
+                cleared = True
+        except OSError:
+            pass  # no capability to change the flag: the original removal error stands
+        finally:
+            os.close(fd)
+    return cleared
+
+
+def darwin_flags(target):
+    """The BSD file flags (``st_flags``) of ``target`` (relative to the current directory), no link followed."""
+    return getattr(os.lstat(target), "st_flags", 0)
+
+
+def darwin_set_flags(target, value):
+    os.chflags(target, value, follow_symlinks=False)
+
+
+def darwin_clear_flags(dir_fd, name):
+    """Clear user append-only and immutable on ``dir_fd`` and on its entry ``name``; True when one was cleared.
+
+    ``chflags`` has no descriptor-relative form, so the process enters ``dir_fd`` (fchdir) for the call and goes
+    back to where it was; the entry is named relative to that open directory, never by a path from TMPDIR.
+    """
+    cleared = False
+    here = os.open(".", DIR_FLAGS)
+    try:
+        os.fchdir(dir_fd)
+        for target in (".", name):
+            try:
+                value = darwin_flags(target)
+                if value & DARWIN_PROTECT_FLAGS:
+                    darwin_set_flags(target, value & ~DARWIN_PROTECT_FLAGS)
+                    cleared = True
+            except OSError:
+                continue
+    finally:
+        os.fchdir(here)
+        os.close(here)
+    return cleared
+
+
+FLAG_CLEARERS = {PLATFORM_LINUX: linux_clear_flags, PLATFORM_DARWIN: darwin_clear_flags}
+
+
+def clear_flags(dir_fd, name):
+    """Drop the protect flags for ``name`` in ``dir_fd`` on this platform; False when none was cleared."""
+    clearer = FLAG_CLEARERS.get(sys.platform)
+    return bool(clearer and clearer(dir_fd, name))
+
+
+def unlink_entry(dir_fd, name):
+    """``os.unlink`` that, on EPERM or EACCES, clears the protect flags once and retries."""
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno not in PROTECT_ERRNOS or not clear_flags(dir_fd, name):
+            raise
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def rmdir_entry(dir_fd, name):
+    """``os.rmdir`` with the same one clear-and-retry."""
+    try:
+        os.rmdir(name, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno not in PROTECT_ERRNOS or not clear_flags(dir_fd, name):
+            raise
+        os.rmdir(name, dir_fd=dir_fd)
+
+
 class Tally:
     """Counters and the failure and skip lines (capped) of one run."""
 
@@ -783,7 +950,7 @@ def list_level(dir_fd, root_dev, tally, errors, remove=True, dry_run=False):
             elif stat.S_ISDIR(info.st_mode):
                 pending.append((entry.name, info))
             elif remove and not dry_run:
-                os.unlink(entry.name, dir_fd=dir_fd)
+                unlink_entry(dir_fd, entry.name)
                 tally.freed += info.st_blocks * DISK_BLOCK_BYTES
         except OSError as exc:
             errors.append(exc)
@@ -866,7 +1033,7 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None, dry_ru
             if dry_run:
                 continue
             try:
-                os.rmdir(level.name, dir_fd=dir_fd)
+                rmdir_entry(dir_fd, level.name)
                 tally.freed += level.blocks * DISK_BLOCK_BYTES
             except OSError as exc:
                 errors.append(exc)
@@ -874,7 +1041,7 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None, dry_ru
         dir_fd = None
         if not dry_run:
             try:
-                os.rmdir(name, dir_fd=parent_fd)
+                rmdir_entry(parent_fd, name)
                 tally.freed += level.blocks * DISK_BLOCK_BYTES
             except OSError as exc:
                 errors.append(exc)
@@ -898,20 +1065,24 @@ def remove_entry(dir_fd, name, scanned, root_dev, tally, root_mnt=None, dry_run=
         return
     if dry_run:
         return
-    os.unlink(name, dir_fd=dir_fd)
+    unlink_entry(dir_fd, name)
     tally.freed += now_info.st_blocks * DISK_BLOCK_BYTES
 
 
-def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None):
-    """Prune old direct entries of the proven directory ``dir_fd`` into ``tally``."""
+def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None, grace_secs=JOB_START_GRACE_SECS):
+    """Prune the direct entries of the proven directory ``dir_fd`` into ``tally``.
+
+    An entry whose own mtime is within ``grace_secs`` of ``now`` is kept as owned by a live writer;
+    ``grace_secs`` 0 (the job-end mode) keeps nothing.
+    """
     if root_mnt is None:
         root_mnt = mount_id(dir_fd)
-    cutoff = now - MAX_AGE_SECS
+    cutoff = now - grace_secs
     with os.scandir(dir_fd) as scan:
         for entry in scan:
             try:
                 info = entry.stat(follow_symlinks=False)
-                if info.st_mtime >= cutoff:
+                if grace_secs > 0 and info.st_mtime >= cutoff:
                     tally.kept += 1
                     continue
                 if info.st_dev != root_dev:
@@ -951,6 +1122,9 @@ def main(argv=None, environ=None, out=None, err=None):
         return load_refused(out, err)
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0])
     parser.add_argument("--dry-run", action="store_true", help="print what would go, delete nothing")
+    parser.add_argument("--mode", choices=MODES, default=MODE_JOB_START,
+                        help="job-start keeps entries touched in the last %d s; job-end removes every entry"
+                        % JOB_START_GRACE_SECS)
     args = parser.parse_args(argv)
     raw = environ.get("TMPDIR")
     write_job_summary(print_runner_facts(raw, ALLOWED_ROOTS, out), environ, err)
@@ -970,7 +1144,7 @@ def main(argv=None, environ=None, out=None, err=None):
             return refused(exc.refusal(), out, err)
         except Refusal as exc:
             return refused(exc, out, err)
-        prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt)
+        prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt, GRACE_SECS_BY_MODE[args.mode])
     except Exception as exc:  # internal error: named, no traceback, the job goes red (exit 1)
         tally.internal_error = True
         print(wa.log_line(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}"), file=err)

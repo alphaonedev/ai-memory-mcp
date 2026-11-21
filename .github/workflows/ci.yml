@@ -2781,6 +2781,14 @@ jobs:
         if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
+      # #9820 - job-boundary clear: the runner's TMPDIR holds nothing this job
+      # made once it ends (pass, fail or cancel). LAST step, never an idle poll.
+      - name: Clear runner TMPDIR at job end (#9820)
+        if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted'
+        uses: ./.github/actions/prune-runner-tmp
+        with:
+          mode: job-end
+
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #
   # v1.0.0 self-hosted rewrite. Under the old GitHub-hosted topology this job

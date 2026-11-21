@@ -106,10 +106,20 @@ therefore runs the composite action `.github/actions/prune-runner-tmp` as the
 step right after checkout (guarded by `runner.environment == 'self-hosted'`),
 which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 
-- Only DIRECT entries of the resolved `TMPDIR` whose own mtime (lstat, never a
-  symlink target) is older than one day (`MAX_AGE_SECS`) are removed. An old
-  directory goes whole, whatever its children's mtimes. A symlink is unlinked
-  and never followed, so a sibling `runner-N` directory is never touched.
+- Only DIRECT entries of the resolved `TMPDIR` are removed (#9820). The clear is
+  bound to the job boundary, never to polling for an idle runner (f1 runners go
+  from one job to the next in 2 s): the action runs a second time as the last
+  step of every self-hosted job (`mode: job-end`, `if: always()`), which removes
+  every entry, and at job start (`mode: job-start`, covers a job whose end step
+  never ran: runner lost, hard cancel), which keeps an entry whose own mtime
+  (lstat, never a symlink target) is within `JOB_START_GRACE_SECS` (30) as owned
+  by a live writer. An entry with an append-only or immutable flag has the flag
+  cleared through its open descriptor and is then removed. A removed directory
+  goes whole, whatever its children's mtimes. A symlink is unlinked and never
+  followed, so a sibling `runner-N` directory is never touched.
+- On the macOS node TMPDIR is `<runner folder>/_tmp` under `/Users/Shared` or
+  `/Volumes/f1dev/rt`; it is proven by identity the same way (the folder's name
+  must match the layout and its parent must be that root).
 - TMPDIR is proven, by file identity (device and inode of the opened
   directory, never by path text), to be `<runner root>/runner-<digits>`: the
   last component must match `runner-<digits>` and the directory's parent must be
@@ -184,6 +194,7 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 - refusal: `TMPDIR is a forbidden path: <path>`
 - refusal: `TMPDIR is not owned by the current user: <path>`
 - refusal: `TMPDIR is not named runner-<digits>: <name>`
+- refusal: `TMPDIR is not <root>/<runner folder>/_tmp of an allowed layout: <path>`
 - refusal: `TMPDIR is outside the allowed roots <roots>: <path>`
 - refusal: `TMPDIR contains the home directory or the workspace: <path>`
 

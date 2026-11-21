@@ -165,3 +165,10 @@ jobs:
       - name: Sweep target/debug to the size cap (self-hosted)
         if: always() && runner.environment == 'self-hosted'
         run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+
+      # #9820 - job-boundary clear: LAST step, runs on pass, fail and cancel.
+      - name: Clear runner TMPDIR at job end (#9820)
+        if: always() && runner.environment == 'self-hosted'
+        uses: ./.github/actions/prune-runner-tmp
+        with:
+          mode: job-end

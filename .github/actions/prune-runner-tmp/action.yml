@@ -1,11 +1,14 @@
-name: Prune runner TMPDIR (#8634)
+name: Prune runner TMPDIR (#8634, #9820)
 description: >-
   Self-hosted runners only (the caller gates it with runner.environment ==
-  'self-hosted'). Removes direct entries of this runner's own TMPDIR whose mtime
-  is older than one day (scripts/ci/prune_runner_tmp.py); never follows a
+  'self-hosted'). Clears direct entries of this runner's own TMPDIR at the job
+  boundary (scripts/ci/prune_runner_tmp.py, #9820): mode job-end (last step,
+  if: always()) removes every entry, mode job-start keeps an entry touched in the
+  last 30 s as a live writer's; never follows a
   symlink and never touches another runner's directory. A refusal (TMPDIR
-  unset, relative, a symlink, not owned by the user, not named runner-<digits>,
-  outside the confirmed runner roots) prints a ::warning annotation with the
+  unset, relative, a symlink, not owned by the user, not named runner-<digits>
+  or <runner folder>/_tmp, outside the confirmed runner roots) prints a
+  ::warning annotation with the
   reason, deletes nothing and does not fail the job or skip the steps after it
   (ruling f23a9ae4). A per-entry removal failure does not fail the job: the step
   exits 0, prints pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n> and
@@ -16,9 +19,16 @@ description: >-
   descriptor-relative call of each needed function in a probe directory it
   removes again. The prune-facts line also goes to the job summary. An
   unexpected error fails the job.
+inputs:
+  mode:
+    description: job-start (keep entries touched in the last 30 s) or job-end (remove every entry)
+    required: false
+    default: job-start
 runs:
   using: composite
   steps:
     - name: Prune stale TMPDIR entries
       shell: bash
-      run: python3 -I "${GITHUB_ACTION_PATH}/../../../scripts/ci/prune_runner_tmp.py"
+      env:
+        PRUNE_MODE: ${{ inputs.mode }}
+      run: python3 -I "${GITHUB_ACTION_PATH}/../../../scripts/ci/prune_runner_tmp.py" --mode "${PRUNE_MODE}"
