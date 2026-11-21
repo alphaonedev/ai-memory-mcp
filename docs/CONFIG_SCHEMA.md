@@ -972,7 +972,7 @@ this is the single documented location. Resolution differs by OS:
 | unset | `~/.config/ai-memory/config.toml` (unchanged) |
 | set, and it carries `ai-memory/config.toml` | `$XDG_CONFIG_HOME/ai-memory/config.toml` |
 | set, empty, but `~/.config/ai-memory/config.toml` exists | **the legacy `~/.config` file, plus a one-shot stderr WARN** |
-| set, and neither file exists | `$XDG_CONFIG_HOME/ai-memory/config.toml` (where a default is written) |
+| set, and neither file exists | `$XDG_CONFIG_HOME/ai-memory/config.toml` (where a default is written by a writing command, see "When the default config is written" below) |
 
 **macOS [#3329].** `dirs::config_dir()` on macOS is
 `~/Library/Application Support`, which is where the identity **keys** and hooks
@@ -986,7 +986,39 @@ never silently ignored:
 |---|---|
 | `~/.config/ai-memory/config.toml` exists | **`~/.config/…` (documented) wins.** If a `~/Library/Application Support/ai-memory/config.toml` also exists it is SHADOWED with a loud stderr WARN — delete or merge it. |
 | only `~/Library/Application Support/ai-memory/config.toml` exists | It is HONOURED (a config is never dropped) with a one-shot WARN asking you to move it to `~/.config`. |
-| neither exists | `~/.config/ai-memory/config.toml` — new installs and `write_default_if_missing` land here. |
+| neither exists | `~/.config/ai-memory/config.toml` — the default config a writing command seeds (`write_default_if_missing`) lands here. |
+
+**When the default config is written [#9620].** Only a command that writes
+state seeds the default `config.toml` on a host that has none: `serve`, `mcp`,
+`sync-daemon`, `boot`, `install`, `wrap`, `store`, `capture-turn`, `import`,
+`restore` and `mine`. Every other verb — the read-only and diagnostic ones
+(`wake-hub --posture` and `--health`, `doctor`, `config check` and `show`, the
+`verify-*` family, `stats`, `list`, `get`, `recall`, `search`, `completions`,
+`man`) and any verb added later — does not create, change or truncate the
+config file at start. This statement covers the config file only: other
+start-up writes are tracked separately (the key pair, #9574; the audit and
+forensic log directory, #9663; the database file, #9776).
+
+The write has two outcomes. Either the complete default file exists at the
+path as a regular file, or the path is left exactly as it was and the command
+reports one error. A regular file already at the path is kept byte for byte.
+Any other entry there (a symbolic link, dangling or not, a directory, a FIFO,
+a socket or a device) is refused with
+`config path exists and is a <kind>, not a regular file; it was left unchanged`
+and is never followed or opened by the write (the config loader, which runs
+before it, waiting on a FIFO at the path is tracked as #9784). A missing path is filled through a temp file
+in the same directory, created exclusive, written and synced, then published
+with a hard link that refuses an existing path, so the config file appears
+atomically and complete or not at all; the temp file is removed on every
+outcome. On a filesystem without hard links the write fails, and the command
+runs on compiled defaults. A refused or failed write is reported on stderr as
+`ai-memory: WARN could not write the default config <path>: <error>` while the
+command still runs.
+
+`ai-memory config check` with no `--file` on a host with no config file exits
+`0` and prints
+`OK: no config file at <path>; the daemon starts on compiled defaults (nothing to check)`;
+a missing `--file` path still exits `2`.
 
 With a truthy `AI_MEMORY_NO_CONFIG` no config file is read, so none of the
 config-path WARNs in either table (legacy `~/.config`, shadowed Library file,

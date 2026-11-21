@@ -81,7 +81,9 @@ pub enum ConfigAction {
     /// failure refuses `exec` (EX_CONFIG) instead of
     /// `AppConfig::load_from` fail-opening to a keyless daemon.
     ///
-    /// Exit 0 = valid TOML with no unknown keys; 2 = file missing; 3 =
+    /// Exit 0 = valid TOML with no unknown keys, or no `--file` and no
+    /// file at the default path (the daemon starts on compiled defaults,
+    /// #9620); 2 = the `--file` path is missing; 3 =
     /// not valid TOML; 4 = unreadable; 5 = valid TOML carrying keys the
     /// daemon refuses to boot on (#3715 — run this BEFORE upgrading; it
     /// never refuses, it reports). The toml crate's `Display` is deliberately
@@ -404,6 +406,18 @@ fn check_toml(file: Option<&Path>, out: &mut CliOutput) -> Result<i32> {
         &resolved
     };
     if !path.exists() {
+        // #9620: a missing file at the resolved default path is the state
+        // the daemon boots from (compiled defaults), so there is nothing
+        // wrong to report: exit 0, as before read-only verbs stopped
+        // seeding the file. A missing explicit `--file` stays exit 2.
+        if file.is_none() {
+            let _ = writeln!(
+                out.stderr,
+                "OK: no config file at {}; the daemon starts on compiled defaults (nothing to check)",
+                path.display()
+            );
+            return Ok(0);
+        }
         let _ = writeln!(
             out.stderr,
             "ERROR: no config file at {} — nothing to check.",

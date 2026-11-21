@@ -138,6 +138,9 @@ pub use shape::{
 /// #3808 + #3819 — the `[llm.auto_tag]` reality gap (ignored endpoint keys +
 /// the live model override). Child module so config.rs stays under its ceiling.
 mod auto_tag_endpoint;
+/// #9620 — the default config write. Child module so config.rs stays under
+/// its ceiling.
+mod default_config_write;
 /// v1.0.0 #3715 item 3 — the key deprecation lifecycle, as data.
 pub mod deprecated_keys;
 /// #3823 — refuse a non-loopback plaintext inference endpoint at config
@@ -10388,157 +10391,37 @@ impl AppConfig {
         }
     }
 
-    /// Write a default config file if one doesn't exist yet.
-    pub fn write_default_if_missing() {
-        let Some(path) = Self::config_path() else {
-            return;
-        };
-        if path.exists() {
-            return;
+    /// Write a default config file if one doesn't exist yet (#9620).
+    ///
+    /// No config path resolvable is `Ok(())`. A regular file already present
+    /// is left byte for byte alone; a non-regular entry is refused (see
+    /// [`Self::write_default_at`]). Any other failure is returned so the caller can
+    /// name the path (rust-1-98 ERRORS-19); the caller decides which commands
+    /// write at all (`writes_default_config` in `src/main.rs`).
+    ///
+    /// # Errors
+    /// The I/O error from creating the config directory or the file.
+    pub fn write_default_if_missing() -> std::io::Result<()> {
+        match Self::config_path() {
+            Some(path) => Self::write_default_at(&path),
+            None => Ok(()),
         }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let default_toml = r#"# ai-memory configuration
-# See: https://github.com/alphaonedev/ai-memory-mcp
+    }
 
-# Feature tier: keyword, semantic, smart, autonomous
-# tier = "semantic"
-
-# Path to SQLite database
-# db = "~/.claude/ai-memory.db"
-
-# App-level ChaCha20-Poly1305 content encryption (NOT SQLCipher whole-DB).
-# Either this or AI_MEMORY_ENCRYPT_AT_REST=1 engages at-rest content sealing.
-# Default off. Whole-DB SQLCipher still needs --features sqlcipher + a passphrase.
-# [encryption]
-# at_rest = false
-
-# Ollama base URL (for smart/autonomous tiers)
-# ollama_url = "http://localhost:11434"
-
-# Embedding model: mini_lm_l6_v2 (384-dim) or nomic_embed_v15 (768-dim)
-# embedding_model = "mini_lm_l6_v2"
-
-# LLM model tag for Ollama
-# llm_model = "gemma4:e2b"
-
-# Dedicated model for auto_tag (short structured output).
-# Defaults to gemma3:4b. Reasoning-heavy features still use llm_model.
-# auto_tag_model = "gemma3:4b"
-
-# Enable neural cross-encoder reranking (autonomous tier)
-# cross_encoder = true
-
-# Default namespace for new memories
-# default_namespace = "global"
-
-# Archive expired memories before GC deletion (default: true)
-# archive_on_gc = true
-
-# Postgres connection-pool sizing (postgres store only; sqlite ignores).
-# Precedence per field: AI_MEMORY_PG_POOL_MAX / _MIN /
-# _ACQUIRE_TIMEOUT_SECS env > these fields > compiled default.
-# Non-positive / unparseable values fall through to the default.
-# postgres_pool_max_connections = 16        # hard ceiling on open connections
-# postgres_pool_min_connections = 2         # always-open warm-connection floor
-# postgres_acquire_timeout_secs = 30        # acquire() wait before erroring (secs)
-
-# Per-tier TTL overrides (uncomment to customize)
-# [ttl]
-# short_ttl_secs = 21600        # 6 hours (default)
-# mid_ttl_secs = 604800         # 7 days (default)
-# long_ttl_secs = 0             # 0 = never expires (default)
-# short_extend_secs = 3600      # +1h on access (default)
-# mid_extend_secs = 86400       # +1d on access (default)
-
-# v0.6.3.1 (PR-5 / issue #487) — operational logging facility.
-# Default-OFF. Uncomment + set enabled = true to capture every
-# `tracing::*` call site to a rotating on-disk log file. See
-# `docs/security/audit-trail.md` §SIEM ingestion guide for Splunk /
-# Datadog / Elastic / Loki recipes.
-# [logging]
-# enabled = false
-# path = "~/.local/state/ai-memory/logs/"
-# max_size_mb = 100
-# max_files = 30
-# retention_days = 90
-# structured = false              # true = emit JSON lines for SIEM ingest
-# level = "info"                  # tracing EnvFilter directive
-# rotation = "daily"              # minutely | hourly | daily | never
-
-# v0.6.3.1 (PR-5 / issue #487) — security audit trail. Default-OFF.
-# When enabled, every memory mutation emits one hash-chained JSON
-# line per event suitable for SOC2 / HIPAA / GDPR / FedRAMP evidence.
-# `ai-memory audit verify` walks the chain; `ai-memory logs tail`
-# streams events. The forensic log (integrity rows and screened governance
-# decision rows: keyed commitments, never request content) is written
-# regardless. redact_content=false is unsupported and ignored with a warning.
-# [audit]
-# enabled = false
-# path = "~/.local/state/ai-memory/audit/"
-# schema_version = 1
-# redact_content = true            # v1 schema never emits content; reserved
-# hash_chain = true
-# attestation_cadence_minutes = 60
-# append_only = true               # best-effort chflags(2) / FS_IOC_SETFLAGS
-
-# Compliance presets. Set `applied = true` and the documented retention
-# / cadence values override the defaults above. See
-# `docs/security/audit-trail.md` §Compliance.
-# [audit.compliance.soc2]
-# applied = false
-# retention_days = 730
-# redact_content = true
-# attestation_cadence_minutes = 60
-#
-# [audit.compliance.hipaa]
-# applied = false
-# retention_days = 2190
-# redact_content = true
-# # encrypt_at_rest is an ENFORCEMENT-GATED CLAIM, not a switch (#2401): it does
-# # NOT turn on at-rest encryption. That requires AI_MEMORY_ENCRYPT_AT_REST=1
-# # (env #37) or [encryption].at_rest = true; an applied preset asserting it
-# # without the gate REFUSES to boot (a compliance defaults-lie is a hard error)
-# # rather than silently storing content in PLAINTEXT. Whole-DB SQLCipher is a
-# # separate control (--features sqlcipher + passphrase).
-# # encrypt_at_rest = true
-#
-# [audit.compliance.gdpr]
-# applied = false
-# retention_days = 1095
-# redact_content = true
-# # pseudonymize_actors is RESERVED / NOT IMPLEMENTED at v1.0.0 (#2401): the knob
-# # has no consumer, actor ids are recorded verbatim, and an applied preset
-# # asserting it REFUSES to boot (unsatisfiable). Do not set it; retired from the
-# # shipped presets.
-# # pseudonymize_actors = true
-#
-# [audit.compliance.fedramp]
-# applied = false
-# retention_days = 1095
-# redact_content = true
-# attestation_cadence_minutes = 30
-
-# v0.6.3.1 (PR-9h / issue #487 PR #497 req #73) — boot privacy controls.
-# Default-ON (omit the section entirely for the historical pre-v0.6.3.1
-# behavior). Two knobs:
-#
-# - `enabled = false` silences `ai-memory boot` entirely: empty stdout,
-#   empty stderr, exit 0. The SessionStart hook injects nothing. Use on
-#   privacy-sensitive hosts where memory titles must never enter CI
-#   logs. The env var `AI_MEMORY_BOOT_ENABLED=0` takes precedence over
-#   this config (same precedence pattern as PR-5's log-dir resolution).
-#
-# - `redact_titles = true` keeps the manifest header but replaces row
-#   `title` fields with `<redacted>` — useful for compliance contexts
-#   that need the audit-trail signal of "boot ran with N memories"
-#   without exposing memory subjects.
-# [boot]
-# enabled = true
-# redact_titles = false
-"#;
-        let _ = std::fs::write(&path, default_toml);
+    /// Create `path` with the default template, or leave it as it was
+    /// (#9620). A regular file already there is kept byte for byte; any other
+    /// entry (symlink, directory, FIFO, ...) is refused with one named
+    /// `AlreadyExists` error and left unchanged. A missing path is filled
+    /// through a synced temp file in the same directory published with
+    /// `hard_link`, so the path never holds a partial file. Detail:
+    /// `src/config/default_config_write.rs`.
+    ///
+    /// # Errors
+    /// The I/O error from creating the parent directory, examining the path,
+    /// creating, filling or publishing the temp file, or removing it; the
+    /// named refusal for a non-regular entry at the path.
+    pub fn write_default_at(path: &std::path::Path) -> std::io::Result<()> {
+        default_config_write::write_default_at(path)
     }
 }
 
@@ -11684,16 +11567,63 @@ legacy_scoring = false
         // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::set_var("HOME", tmp.path()) };
         // First call writes the file.
-        AppConfig::write_default_if_missing();
+        AppConfig::write_default_if_missing().expect("first call writes the default config");
         let expected = AppConfig::config_path().unwrap();
         assert!(expected.exists(), "config not written at {expected:?}");
         let original = std::fs::read_to_string(&expected).unwrap();
         assert!(original.contains("ai-memory configuration"));
         // Second call must NOT overwrite (idempotent).
         std::fs::write(&expected, "# user-edited\n").unwrap();
-        AppConfig::write_default_if_missing();
+        AppConfig::write_default_if_missing().expect("second call is a no-op");
         let after = std::fs::read_to_string(&expected).unwrap();
         assert_eq!(after, "# user-edited\n");
+    }
+
+    /// #9620 — an existing file is left byte for byte alone and reported Ok.
+    #[test]
+    fn write_default_at_leaves_an_existing_file_alone_9620() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-memory").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::io::Write::write_all(&mut std::fs::File::create_new(&path).unwrap(), b"# mine\n")
+            .unwrap();
+        AppConfig::write_default_at(&path).expect("AlreadyExists is Ok");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\n");
+    }
+
+    /// #9620 — a missing file is created with the template, parents included.
+    #[test]
+    fn write_default_at_creates_parents_and_template_9620() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a").join("b").join("config.toml");
+        AppConfig::write_default_at(&path).expect("creates");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with("# ai-memory configuration"), "{body:.40}");
+    }
+
+    /// Kind `create_dir_all` reports when the parent path is a regular file
+    /// (measured on Linux: the std fallback maps a non-directory that already
+    /// exists to `AlreadyExists`).
+    const REFUSED_PARENT_KIND_9620: std::io::ErrorKind = std::io::ErrorKind::AlreadyExists;
+
+    /// #9620 — a refused write is an Err, never dropped: here the parent
+    /// path is a regular file, so the directory cannot be created.
+    #[test]
+    fn write_default_at_reports_a_refused_parent_9620() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::io::Write::write_all(&mut std::fs::File::create_new(&blocker).unwrap(), b"x").unwrap();
+        let path = blocker.join("config.toml");
+        let err = AppConfig::write_default_at(&path).expect_err("parent is a file");
+        // `create_dir_all` reports a non-directory in the way as an error;
+        // it must reach the caller instead of being read as "already there".
+        assert_eq!(
+            err.kind(),
+            REFUSED_PARENT_KIND_9620,
+            "a file in the way of the parent directory must give exactly this kind: {err}"
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "x");
     }
 
     #[test]
@@ -12677,7 +12607,7 @@ legacy_scoring = false
         let tmp = tempfile::tempdir().expect("tempdir");
         // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::set_var("HOME", tmp.path()) };
-        AppConfig::write_default_if_missing();
+        AppConfig::write_default_if_missing().expect("default config written");
         let written = AppConfig::config_path().expect("config_path resolves");
         let contents = std::fs::read_to_string(&written).expect("default toml written");
         assert!(
