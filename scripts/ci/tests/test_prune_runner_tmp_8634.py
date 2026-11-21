@@ -56,7 +56,7 @@ SCRATCH_BASE = Path(os.environ.get("TMPDIR") or ROOT / ".local-runs")
 
 SECS_PER_DAY = 86400
 OLD_AGE_SECS = 2 * SECS_PER_DAY
-YOUNG_AGE_SECS = 60
+YOUNG_AGE_SECS = 5  # inside JOB_START_GRACE_SECS (30), so a job-start run keeps it as a live writer's entry
 EXIT_OK = 0
 EXIT_REFUSED = EXIT_OK  # ruling f23a9ae4: a refusal ends the step green, with a ::warning annotation
 EXIT_ERROR = 1
@@ -2417,8 +2417,8 @@ class RoundOneFixes(Base):
         self.assertEqual(snapshot(top), before, "no file on the way down is removed")
 
     def test_entry_exactly_at_the_cutoff_is_kept(self):
-        """F5 :724: mtime == now - MAX_AGE_SECS is kept; one second older goes."""
-        cutoff = CUTOFF_NOW - PRUNE.MAX_AGE_SECS
+        """F5 :724: mtime == now - JOB_START_GRACE_SECS is kept; one second older goes."""
+        cutoff = CUTOFF_NOW - PRUNE.JOB_START_GRACE_SECS
         at = self.runner / "at-cutoff.db"
         older = self.runner / "older.db"
         for path, mtime in ((at, cutoff), (older, cutoff - 1)):
@@ -2637,6 +2637,217 @@ class SocketPathLimit9460(unittest.TestCase):
         self.assert_cell_green(self.run_socket_cell(tests_dir, None))
 
 
+LIVE_WRITER_AGE_SECS = 3  # an entry touched seconds ago: owned by a job that is still running
+FUTURE_SKEW_SECS = -1000  # an mtime 1000 s ahead of the clock (age() subtracts)
+F1_FOLDER_NAMES = ("actions-runner", "actions-runner-2", "f1-macos-fed-3", "f1-macos-fed-5", "fed3")
+F1_LAYOUT_REFUSAL = "TMPDIR is not <root>/<runner folder>/_tmp of an allowed layout: {path}"
+FLAG_PLATFORMS = ("linux", "darwin")
+
+
+class FlagWorld:
+    """A fake protect-flag store keyed by file identity, plus an unlink and rmdir that honour it.
+
+    A flagged entry cannot be removed, and nothing inside a flagged directory can be removed or made: the
+    EPERM a real append-only or immutable flag gives. Clearing needs CAP_LINUX_IMMUTABLE (linux) or ownership
+    (darwin), neither of which a test may assume, so the platform primitives (the ioctl pair and the
+    chflags pair) are replaced by dict accessors and every other line of the clear path runs for real.
+    """
+
+    def __init__(self):
+        self.flags = {}
+
+    @staticmethod
+    def key(info):
+        return (info.st_dev, info.st_ino)
+
+    def set(self, path, value):
+        self.flags[self.key(os.lstat(path))] = value
+
+    def get(self, path):
+        return self.flags.get(self.key(os.lstat(path)), 0)
+
+    def guarded(self, real):
+        def remover(name, *args, dir_fd=None, **kwargs):
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)  # ENOENT passes through, as for the real call
+            parent = os.fstat(dir_fd) if dir_fd is not None else os.stat(os.path.dirname(os.fspath(name)) or ".")
+            if self.flags.get(self.key(info)) or self.flags.get(self.key(parent)):
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            return real(name, *args, dir_fd=dir_fd, **kwargs)
+
+        return remover
+
+
+class JobBoundaryClear9820(Base):
+    """#9820: the runner's TMPDIR holds nothing a job made once the job ends; a live job's entry survives."""
+
+    def make_scratch(self):
+        """A left-behind file, a tree and a folder that carries the protect flag; returns the flagged folder."""
+        self.make_file("left.db", 0)
+        self.make_tree("left-dir", 0)
+        flagged = self.runner / "append-only-dir"
+        (flagged / "inner").mkdir(parents=True)
+        (flagged / "inner" / "events.log").write_bytes(b"e" * 50)
+        (flagged / "top.log").write_bytes(b"t" * 50)
+        return flagged
+
+    def flag_world(self, platform, flagged):
+        """Patch the platform's flag primitives onto a FlagWorld and make ``flagged`` and its file protected."""
+        world = FlagWorld()
+        protect = PRUNE.LINUX_PROTECT_FLAGS if platform == "linux" else PRUNE.DARWIN_PROTECT_FLAGS
+        world.set(flagged, protect)
+        world.set(flagged / "top.log", protect)
+        patches = [
+            mock.patch.object(PRUNE.os, "unlink", world.guarded(os.unlink)),
+            mock.patch.object(PRUNE.os, "rmdir", world.guarded(os.rmdir)),
+        ]
+        if platform == "linux":
+            clearer = PRUNE.linux_clear_flags
+            patches += [
+                mock.patch.object(PRUNE, "linux_flags", lambda fd: world.flags.get(world.key(os.fstat(fd)), 0)),
+                mock.patch.object(PRUNE, "linux_set_flags",
+                                  lambda fd, value: world.flags.__setitem__(world.key(os.fstat(fd)), value)),
+            ]
+        else:
+            clearer = PRUNE.darwin_clear_flags
+            patches += [
+                mock.patch.object(PRUNE, "darwin_flags", lambda target: world.get(target)),
+                mock.patch.object(PRUNE, "darwin_set_flags",
+                                  lambda target, value: world.flags.__setitem__(world.key(os.lstat(target)), value)),
+            ]
+        patches.append(mock.patch.object(PRUNE, "FLAG_CLEARERS", {sys.platform: clearer}))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        return world
+
+    def check_left_scratch_is_cleared(self, platform):
+        flagged = self.make_scratch()
+        world = self.flag_world(platform, flagged)
+        rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertRegex(out, r"^pruned=3 kept=0 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), [], "nothing the job made is left")
+        self.assertTrue(world.flags, "the fake flag store was in play")
+
+    def test_job_end_removes_a_left_file_and_an_append_only_folder_on_the_linux_path(self):
+        self.check_left_scratch_is_cleared("linux")
+
+    def test_job_end_removes_a_left_file_and_an_append_only_folder_on_the_darwin_path(self):
+        self.check_left_scratch_is_cleared("darwin")
+
+    def test_without_the_flag_clearing_the_protected_folder_is_a_counted_failure(self):
+        """The guard of the fake store is real: with no clearer the same scratch cannot be removed."""
+        flagged = self.make_scratch()
+        self.flag_world("linux", flagged)
+        with mock.patch.object(PRUNE, "FLAG_CLEARERS", {}):
+            rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(err, "prune_runner_tmp: failed to remove append-only-dir: [Errno 1] Operation not permitted\n")
+        self.assertRegex(out, r"^pruned=2 kept=0 failed=1 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), ["append-only-dir"])
+
+    def test_job_end_removes_an_entry_touched_a_moment_ago_and_one_dated_in_the_future(self):
+        self.make_file("fresh.db", LIVE_WRITER_AGE_SECS)
+        self.make_file("skewed.db", FUTURE_SKEW_SECS)
+        self.make_tree("fresh-dir", 0)
+        rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertRegex(out, r"^pruned=3 kept=0 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), [])
+
+    def test_job_start_keeps_the_entry_of_a_live_job_and_removes_what_an_ended_job_left(self):
+        live_file = self.make_file("live.db", LIVE_WRITER_AGE_SECS)
+        live_tree = self.make_tree("live-dir", LIVE_WRITER_AGE_SECS)
+        self.make_file("left.db", PRUNE.JOB_START_GRACE_SECS + OLD_AGE_SECS)
+        self.make_tree("left-dir", PRUNE.JOB_START_GRACE_SECS + OLD_AGE_SECS)
+        rc, out, err = self.run_prune(self.runner, "--mode", "job-start")
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertRegex(out, r"^pruned=2 kept=2 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), ["live-dir", "live.db"])
+        self.assertTrue(live_file.exists() and (live_tree / "sub" / "f.db").exists())
+
+    def test_the_default_mode_is_job_start_and_an_unknown_mode_is_a_usage_error(self):
+        live = self.make_file("live.db", LIVE_WRITER_AGE_SECS)
+        rc, out, err = self.run_prune(self.runner)
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertIn("pruned=0 kept=1 failed=0", out)
+        self.assertTrue(live.exists())
+        with self.assertRaises(SystemExit) as raised:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.run_prune(self.runner, "--mode", "idle")
+        self.assertEqual(raised.exception.code, 2)
+        self.assertTrue(live.exists())
+
+    def test_the_grace_belongs_to_job_start_only(self):
+        self.assertEqual(PRUNE.GRACE_SECS_BY_MODE, {PRUNE.MODE_JOB_START: PRUNE.JOB_START_GRACE_SECS, PRUNE.MODE_JOB_END: 0})
+        self.assertEqual(PRUNE.MODES, ("job-start", "job-end"))
+        self.assertGreater(PRUNE.JOB_START_GRACE_SECS, 0)
+
+    def test_the_clear_is_bound_to_the_job_boundary_and_never_polls_for_an_idle_runner(self):
+        """f1 runners go from one job to the next in 2 s: nothing may wait for idleness, sleep or look at processes."""
+        source = (ROOT / "scripts/ci/prune_runner_tmp.py").read_text()
+        tree = ast.parse(source)
+        called = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        for forbidden in ("time.sleep", "sleep", "subprocess.run", "subprocess.Popen", "os.system", "os.popen", "pgrep"):
+            self.assertNotIn(forbidden, called)
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        self.assertFalse(imported & {"subprocess", "psutil", "signal", "sched", "threading"}, imported)
+        for text in (source, (ROOT / ACTION_PATH).read_text()):
+            self.assertNotRegex(text, r"(?i)\bsleep\b|pgrep|Runner\.Worker|\bidle poll")
+
+    def test_f1_runner_folder_tmp_is_cleared_and_every_other_form_is_refused(self):
+        with mock.patch.object(PRUNE, "RUNNER_FOLDER_LAYOUTS", ((str(self.root), PRUNE.RUNNER_FOLDER_LAYOUTS[0][1]),)):
+            for folder in F1_FOLDER_NAMES:
+                with self.subTest(folder=folder):
+                    leaf = self.root / folder / PRUNE.RUNNER_FOLDER_LEAF
+                    leaf.mkdir(parents=True)
+                    self.make_file("old.db", 0, leaf)
+                    rc, out, err = self.run_prune(leaf, "--mode", "job-end")
+                    if folder == "fed3":  # the volume layout's folder name does not match the shared layout
+                        self.assertEqual(rc, EXIT_REFUSED, err)
+                        self.assertEqual(err.rstrip("\n"),
+                                         "prune_runner_tmp: refused: " + F1_LAYOUT_REFUSAL.format(path=leaf))
+                        self.assertEqual(self.names(leaf), ["old.db"])
+                        continue
+                    self.assertEqual((rc, err), (EXIT_OK, ""))
+                    self.assertIn("pruned=1 kept=0 failed=0", out)
+                    self.assertEqual(self.names(leaf), [])
+            for bad in ("evil", "actions-runner-x", "f1-macos-fed-", "tmp"):
+                with self.subTest(refused=bad):
+                    leaf = self.root / bad / PRUNE.RUNNER_FOLDER_LEAF
+                    leaf.mkdir(parents=True)
+                    victim = self.make_file("old.db", 0, leaf)
+                    rc, out, err = self.run_prune(leaf, "--mode", "job-end")
+                    self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+                    self.assertEqual(err.rstrip("\n"), "prune_runner_tmp: refused: " + F1_LAYOUT_REFUSAL.format(path=leaf))
+                    self.assertTrue(victim.exists(), "a refusal deletes nothing")
+
+    def test_a_tmp_folder_under_a_root_that_is_not_a_layout_root_is_refused(self):
+        elsewhere = self.base / "elsewhere" / "actions-runner" / PRUNE.RUNNER_FOLDER_LEAF
+        elsewhere.mkdir(parents=True)
+        victim = self.make_file("old.db", 0, elsewhere)
+        with mock.patch.object(PRUNE, "RUNNER_FOLDER_LAYOUTS", ((str(self.root), PRUNE.RUNNER_FOLDER_LAYOUTS[0][1]),)):
+            rc, out, err = self.run_prune(elsewhere, "--mode", "job-end")
+        self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+        self.assertEqual(err.rstrip("\n"), "prune_runner_tmp: refused: " + F1_LAYOUT_REFUSAL.format(path=elsewhere))
+        self.assertTrue(victim.exists())
+
+    def test_the_f1_layouts_are_the_ones_read_from_the_runner_env_files(self):
+        shared, volume = PRUNE.RUNNER_FOLDER_LAYOUTS
+        self.assertEqual((shared[0], volume[0]), ("/Users/Shared", "/Volumes/f1dev/rt"))
+        for name in ("actions-runner", "actions-runner-2", "f1-macos-fed-3", "f1-macos-fed-4", "f1-macos-fed-5"):
+            self.assertTrue(shared[1].fullmatch(name), name)
+        for name in ("fed3", "fed12"):
+            self.assertTrue(volume[1].fullmatch(name), name)
+        for name in ("", "fed", "fedx", "actions-runner-", "actions-runner-2x", "../actions-runner", "f1-macos-fed-3/x"):
+            self.assertFalse(shared[1].fullmatch(name) or volume[1].fullmatch(name), name)
+
+    def test_docs_state_the_job_boundary_clear(self):
+        text = (ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text()
+        for needle in ("mode: job-end", "JOB_START_GRACE_SECS", "never to polling for an idle runner", "append-only"):
+            self.assertIn(needle, text)
+
+
 class WorkflowWiring(unittest.TestCase):
     """Every self-hosted job calls the prune action first (right after its checkout)."""
 
@@ -2659,12 +2870,31 @@ class WorkflowWiring(unittest.TestCase):
                 checkout = [i for i, s in enumerate(steps) if "uses: actions/checkout@" in "\n".join(s.code_lines())]
                 self.assertEqual(len(checkout), 1, key)
                 prune_idx = [i for i, s in enumerate(steps) if ACTION_USES in "\n".join(s.code_lines())]
-                self.assertEqual(prune_idx, [checkout[0] + 1], f"{key}: prune must be the step right after checkout")
+                self.assertEqual(prune_idx[:1], [checkout[0] + 1], f"{key}: prune must be the step right after checkout")
+                self.assertNotIn("mode: job-end", "\n".join(steps[prune_idx[0]].code_lines()), "the start step is job-start")
                 before = "\n".join("\n".join(s.code_lines()) for s in steps[: checkout[0]])
                 self.assertNotRegex(before, r"\bcargo\b|\brustup\b|uses: [a-z]", f"{key}: nothing builds before the prune")
                 text = "\n".join(steps[prune_idx[0]].code_lines())
                 self.assertIn("runner.environment == 'self-hosted'", text)
                 self.assertNotIn("continue-on-error", text)
+
+    def test_every_self_hosted_job_clears_at_job_end_as_its_last_step_whatever_the_outcome(self):
+        """#9820: the end step is the last step, runs on pass, fail and cancel, and never continues on error."""
+        for key, steps in self.self_hosted_jobs().items():
+            with self.subTest(job=key):
+                ends = [i for i, s in enumerate(steps)
+                        if ACTION_USES in "\n".join(s.code_lines()) and "mode: job-end" in "\n".join(s.code_lines())]
+                self.assertEqual(ends, [len(steps) - 1], f"{key}: exactly one job-end clear, as the last step")
+                text = "\n".join(steps[-1].code_lines())
+                self.assertRegex(text, r"if: always\(\)")
+                self.assertIn("runner.environment == 'self-hosted'", text)
+                self.assertNotRegex(text, r"continue-on-error|!cancelled\(\)|success\(\)|failure\(\)")
+
+    def test_action_passes_the_mode_input_to_the_script_and_defaults_to_job_start(self):
+        text = (ROOT / ACTION_PATH).read_text()
+        self.assertRegex(text, r"(?s)inputs:\s+mode:.*default: job-start")
+        self.assertIn('--mode "${PRUNE_MODE}"', text)
+        self.assertIn("PRUNE_MODE: ${{ inputs.mode }}", text)
 
     def test_action_describes_both_failure_modes_and_runs_the_script(self):
         text = (ROOT / ACTION_PATH).read_text()
