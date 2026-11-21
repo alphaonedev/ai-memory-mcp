@@ -708,6 +708,26 @@ class HostLimitProbeTest(unittest.TestCase):
         self.assertEqual(overlong_name(255), "a" * 300 + ".md")
         self.assertEqual(overlong_name(143), "a" * 188 + ".md")
 
+    def test_overlong_name_lengths_are_pinned_whole_and_stem_9765(self):
+        # (name_max, stem bytes, whole-name bytes); written by hand, not computed.
+        table = ((255, 300, 303), (143, 188, 191))
+        for name_max, stem, whole in table:
+            name = overlong_name(name_max)
+            self.assertEqual(len(name.encode()), whole, name_max)
+            self.assertEqual(len(name[: -len(".md")].encode()), stem, name_max)
+            self.assertTrue(name.endswith(".md"), name_max)
+            self.assertGreater(len(name.encode()), name_max, name_max)
+
+    def test_overlong_name_docstring_states_the_whole_length_9765(self):
+        doc = overlong_name.__doc__
+        whole = len(overlong_name(255).encode())
+        stem = whole - len(".md")
+        excess = whole - 255
+        self.assertEqual((stem, whole, excess), (300, 303, 48))
+        for number in (stem, whole, excess):
+            self.assertIn("%d" % number, doc)
+        self.assertNotIn("45 bytes", doc)
+
     def test_overlong_name_is_refused_by_the_host_it_was_sized_for(self):
         name = overlong_name(host_limit(self.base, "PC_NAME_MAX"))
         with self.assertRaises(OSError) as caught:
