@@ -10393,8 +10393,9 @@ impl AppConfig {
 
     /// Write a default config file if one doesn't exist yet (#9620).
     ///
-    /// No config path resolvable is `Ok(())`. A file already present is left
-    /// byte for byte alone. Any other failure is returned so the caller can
+    /// No config path resolvable is `Ok(())`. A regular file already present
+    /// is left byte for byte alone; a non-regular entry is refused (see
+    /// [`Self::write_default_at`]). Any other failure is returned so the caller can
     /// name the path (rust-1-98 ERRORS-19); the caller decides which commands
     /// write at all (`writes_default_config` in `src/main.rs`).
     ///
@@ -10407,167 +10408,20 @@ impl AppConfig {
         }
     }
 
-    /// Create `path` with the default template, atomically: `create_new`
-    /// fails with `AlreadyExists` rather than truncating a file that appeared
-    /// since any earlier check, so there is no check-then-write race (#9620).
+    /// Create `path` with the default template, or leave it as it was
+    /// (#9620). A regular file already there is kept byte for byte; any other
+    /// entry (symlink, directory, FIFO, ...) is refused with one named
+    /// `AlreadyExists` error and left unchanged. A missing path is filled
+    /// through a synced temp file in the same directory published with
+    /// `hard_link`, so the path never holds a partial file. Detail:
+    /// `src/config/default_config_write.rs`.
     ///
     /// # Errors
-    /// The I/O error from creating the parent directory, opening the file
-    /// (other than `AlreadyExists`, which is `Ok(())`) or writing it.
+    /// The I/O error from creating the parent directory, examining the path,
+    /// creating, filling or publishing the temp file, or removing it; the
+    /// named refusal for a non-regular entry at the path.
     pub fn write_default_at(path: &std::path::Path) -> std::io::Result<()> {
-        use std::io::Write;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        let default_toml = r#"# ai-memory configuration
-# See: https://github.com/alphaonedev/ai-memory-mcp
-
-# Feature tier: keyword, semantic, smart, autonomous
-# tier = "semantic"
-
-# Path to SQLite database
-# db = "~/.claude/ai-memory.db"
-
-# App-level ChaCha20-Poly1305 content encryption (NOT SQLCipher whole-DB).
-# Either this or AI_MEMORY_ENCRYPT_AT_REST=1 engages at-rest content sealing.
-# Default off. Whole-DB SQLCipher still needs --features sqlcipher + a passphrase.
-# [encryption]
-# at_rest = false
-
-# Ollama base URL (for smart/autonomous tiers)
-# ollama_url = "http://localhost:11434"
-
-# Embedding model: mini_lm_l6_v2 (384-dim) or nomic_embed_v15 (768-dim)
-# embedding_model = "mini_lm_l6_v2"
-
-# LLM model tag for Ollama
-# llm_model = "gemma4:e2b"
-
-# Dedicated model for auto_tag (short structured output).
-# Defaults to gemma3:4b. Reasoning-heavy features still use llm_model.
-# auto_tag_model = "gemma3:4b"
-
-# Enable neural cross-encoder reranking (autonomous tier)
-# cross_encoder = true
-
-# Default namespace for new memories
-# default_namespace = "global"
-
-# Archive expired memories before GC deletion (default: true)
-# archive_on_gc = true
-
-# Postgres connection-pool sizing (postgres store only; sqlite ignores).
-# Precedence per field: AI_MEMORY_PG_POOL_MAX / _MIN /
-# _ACQUIRE_TIMEOUT_SECS env > these fields > compiled default.
-# Non-positive / unparseable values fall through to the default.
-# postgres_pool_max_connections = 16        # hard ceiling on open connections
-# postgres_pool_min_connections = 2         # always-open warm-connection floor
-# postgres_acquire_timeout_secs = 30        # acquire() wait before erroring (secs)
-
-# Per-tier TTL overrides (uncomment to customize)
-# [ttl]
-# short_ttl_secs = 21600        # 6 hours (default)
-# mid_ttl_secs = 604800         # 7 days (default)
-# long_ttl_secs = 0             # 0 = never expires (default)
-# short_extend_secs = 3600      # +1h on access (default)
-# mid_extend_secs = 86400       # +1d on access (default)
-
-# v0.6.3.1 (PR-5 / issue #487) — operational logging facility.
-# Default-OFF. Uncomment + set enabled = true to capture every
-# `tracing::*` call site to a rotating on-disk log file. See
-# `docs/security/audit-trail.md` §SIEM ingestion guide for Splunk /
-# Datadog / Elastic / Loki recipes.
-# [logging]
-# enabled = false
-# path = "~/.local/state/ai-memory/logs/"
-# max_size_mb = 100
-# max_files = 30
-# retention_days = 90
-# structured = false              # true = emit JSON lines for SIEM ingest
-# level = "info"                  # tracing EnvFilter directive
-# rotation = "daily"              # minutely | hourly | daily | never
-
-# v0.6.3.1 (PR-5 / issue #487) — security audit trail. Default-OFF.
-# When enabled, every memory mutation emits one hash-chained JSON
-# line per event suitable for SOC2 / HIPAA / GDPR / FedRAMP evidence.
-# `ai-memory audit verify` walks the chain; `ai-memory logs tail`
-# streams events. The forensic log (integrity rows and screened governance
-# decision rows: keyed commitments, never request content) is written
-# regardless. redact_content=false is unsupported and ignored with a warning.
-# [audit]
-# enabled = false
-# path = "~/.local/state/ai-memory/audit/"
-# schema_version = 1
-# redact_content = true            # v1 schema never emits content; reserved
-# hash_chain = true
-# attestation_cadence_minutes = 60
-# append_only = true               # best-effort chflags(2) / FS_IOC_SETFLAGS
-
-# Compliance presets. Set `applied = true` and the documented retention
-# / cadence values override the defaults above. See
-# `docs/security/audit-trail.md` §Compliance.
-# [audit.compliance.soc2]
-# applied = false
-# retention_days = 730
-# redact_content = true
-# attestation_cadence_minutes = 60
-#
-# [audit.compliance.hipaa]
-# applied = false
-# retention_days = 2190
-# redact_content = true
-# # encrypt_at_rest is an ENFORCEMENT-GATED CLAIM, not a switch (#2401): it does
-# # NOT turn on at-rest encryption. That requires AI_MEMORY_ENCRYPT_AT_REST=1
-# # (env #37) or [encryption].at_rest = true; an applied preset asserting it
-# # without the gate REFUSES to boot (a compliance defaults-lie is a hard error)
-# # rather than silently storing content in PLAINTEXT. Whole-DB SQLCipher is a
-# # separate control (--features sqlcipher + passphrase).
-# # encrypt_at_rest = true
-#
-# [audit.compliance.gdpr]
-# applied = false
-# retention_days = 1095
-# redact_content = true
-# # pseudonymize_actors is RESERVED / NOT IMPLEMENTED at v1.0.0 (#2401): the knob
-# # has no consumer, actor ids are recorded verbatim, and an applied preset
-# # asserting it REFUSES to boot (unsatisfiable). Do not set it; retired from the
-# # shipped presets.
-# # pseudonymize_actors = true
-#
-# [audit.compliance.fedramp]
-# applied = false
-# retention_days = 1095
-# redact_content = true
-# attestation_cadence_minutes = 30
-
-# v0.6.3.1 (PR-9h / issue #487 PR #497 req #73) — boot privacy controls.
-# Default-ON (omit the section entirely for the historical pre-v0.6.3.1
-# behavior). Two knobs:
-#
-# - `enabled = false` silences `ai-memory boot` entirely: empty stdout,
-#   empty stderr, exit 0. The SessionStart hook injects nothing. Use on
-#   privacy-sensitive hosts where memory titles must never enter CI
-#   logs. The env var `AI_MEMORY_BOOT_ENABLED=0` takes precedence over
-#   this config (same precedence pattern as PR-5's log-dir resolution).
-#
-# - `redact_titles = true` keeps the manifest header but replaces row
-#   `title` fields with `<redacted>` — useful for compliance contexts
-#   that need the audit-trail signal of "boot ran with N memories"
-#   without exposing memory subjects.
-# [boot]
-# enabled = true
-# redact_titles = false
-"#;
-        file.write_all(default_toml.as_bytes())
+        default_config_write::write_default_at(path)
     }
 }
 
