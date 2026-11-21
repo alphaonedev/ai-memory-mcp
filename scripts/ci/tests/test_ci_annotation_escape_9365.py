@@ -79,6 +79,13 @@ HOSTILE = {
     "separators": "a\u2028::error::b\x85::error::c",
 }
 FILE_NAME_CORPUS = ("command", "raw_newline", "raw_cr", "colons", "percent", "non_utf8")
+# #9705: a file system may refuse a name that is not UTF-8 (APFS: errno 92). The bytes of the row, and its escaped text
+# written out by hand (``\udcff``/``\udcfe`` are the surrogate-escaped bytes 0xff/0xfe, ``::`` keeps its first colon
+# as ``\x3a``), never computed from the code under test.
+NON_UTF8_NAME_BYTES = b"bad\xff\xfe::x"
+NON_UTF8_NAME_ESCAPED = "bad\\udcff\\udcfe\\x3a:x"
+INTERPRETER_PLACEHOLDER = "<interpreter>"
+PRUNE_WARNING_FLOOR_GIB = 100000000
 
 
 def oracle_escape(text):
@@ -117,6 +124,30 @@ def oracle_escape(text):
 def scratch_dir(label):
     SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=label + "-", dir=str(SCRATCH_ROOT)))
+
+
+def fs_accepts_non_utf8_names(directory):
+    """Probe once whether ``directory`` takes a directory name that is not UTF-8 (#9705); the probe leaves nothing."""
+    probe = os.path.join(os.fsencode(str(directory)), NON_UTF8_NAME_BYTES)
+    try:
+        os.mkdir(probe)
+    except OSError:
+        return False
+    os.rmdir(probe)
+    return True
+
+
+def mask_interpreter(text):
+    """``text`` with each spelling of the interpreter path (``sys.executable``, its realpath and its directory's
+    realpath with the file name kept, which a ``-S`` child reports under Homebrew; raw and escaped by the oracle)
+    replaced by one placeholder, longest spelling first; every other byte is untouched (#9705)."""
+    directory, file_name = os.path.split(sys.executable)
+    spellings = {sys.executable, os.path.realpath(sys.executable),
+                 os.path.join(os.path.realpath(directory), file_name)}
+    spellings |= {oracle_escape(spelling) for spelling in spellings}
+    for spelling in sorted(spellings, key=len, reverse=True):
+        text = text.replace(spelling, INTERPRETER_PLACEHOLDER)
+    return text
 
 
 def load_module(path, name):
@@ -410,21 +441,75 @@ class ScriptBehaviour(CommandAssertions):
                 self.assertEqual(rc, 2, (out + err)[-500:])
                 self.assert_commands(out + err, ["error"])
 
+    def prune_warning_row(self, key, on_disk):
+        """One row of the prune warning. ``on_disk``: the fixture directory is made and the script is run (the only
+        form before #9705); otherwise the warning of ``evict_idle_targets`` is made for a root named by the row's
+        bytes without a directory, so the row asserts on a file system that refuses the name."""
+        value = HOSTILE[key]
+        if on_disk:
+            home = self.tmp / ("home-" + value)
+            base = home / ".cache" / "ai-memory-ci" / "cargo-target"
+            base.mkdir(parents=True)
+            work = home / "work"
+            work.mkdir(exist_ok=True)
+            rc, out, err = run_script(CI_DIR / "prune_runner_artifacts.py", [
+                "--work-root", str(work), "--workspace", str(work / "ws"), "--protected-root", str(base),
+                "--evict-root", str(base), "--runner-name", "me", "--home", str(home),
+                "--free-floor-gib", str(PRUNE_WARNING_FLOOR_GIB)], isolated=False)
+            self.assertEqual(rc, 0, (out + err)[-800:])
+            self.assert_commands(out + err, ["warning"], oracle_escape(str(base))[:200])
+            return self.command_lines(out + err)[0]
+        name = os.fsdecode(b"home-" + NON_UTF8_NAME_BYTES) if key == "non_utf8" else "home-" + value
+
+        class RootNamedByBytes:
+            """Stands for the eviction root: a directory with no entries whose text is ``name``."""
+
+            def is_dir(self):
+                return True
+
+            def iterdir(self):
+                return iter(())
+
+            def __str__(self):
+                return name
+
+        module = load_module(CI_DIR / "prune_runner_artifacts.py", "prune_runner_artifacts_9705_" + key)
+        module.eviction_problem = lambda *_args: None
+        module.resolve = lambda _path: RootNamedByBytes()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            module.evict_idle_targets("unused", "me", "unused", 1, PRUNE_WARNING_FLOOR_GIB, time.time(),
+                                      free_bytes=lambda _path: 0)
+        self.assert_commands(buf.getvalue(), ["warning"], oracle_escape(name)[:200])
+        if key == "non_utf8":
+            self.assertIn("home-" + NON_UTF8_NAME_ESCAPED, buf.getvalue())
+        return self.command_lines(buf.getvalue())[0]
+
+    def assert_prune_warning_row(self, key, on_disk):
+        """The row's warning line comes back from the helper, so a branch that returned without asserting is red."""
+        line = self.prune_warning_row(key, on_disk)
+        self.assertIsNotNone(line, f"{key}: the row asserted nothing")
+        self.assertTrue(line.startswith("::warning"), line[:300])
+
     def test_prune_runner_artifacts_warning_9365(self):
+        accepts = fs_accepts_non_utf8_names(self.tmp)
         for key in FILE_NAME_CORPUS:
-            value = HOSTILE[key]
             with self.subTest(key):
-                home = self.tmp / ("home-" + value)
-                base = home / ".cache" / "ai-memory-ci" / "cargo-target"
-                base.mkdir(parents=True)
-                work = home / "work"
-                work.mkdir(exist_ok=True)
-                rc, out, err = run_script(CI_DIR / "prune_runner_artifacts.py", [
-                    "--work-root", str(work), "--workspace", str(work / "ws"), "--protected-root", str(base),
-                    "--evict-root", str(base), "--runner-name", "me", "--home", str(home),
-                    "--free-floor-gib", "100000000"], isolated=False)
-                self.assertEqual(rc, 0, (out + err)[-800:])
-                self.assert_commands(out + err, ["warning"], oracle_escape(str(base))[:200])
+                self.assert_prune_warning_row(key, on_disk=accepts or key != "non_utf8")
+
+    def test_prune_warning_without_a_directory_asserts_every_row_9705(self):
+        """The probe-false branch, on every host: the same escaping of every row of the corpus, no directory made."""
+        for key in FILE_NAME_CORPUS:
+            with self.subTest(key):
+                self.assert_prune_warning_row(key, on_disk=False)
+
+    def test_prune_warning_with_a_directory_asserts_every_utf8_row_9705(self):
+        """The probe-true branch, on every host: every row the file system takes runs the script on a made directory."""
+        for key in FILE_NAME_CORPUS:
+            if key == "non_utf8":
+                continue
+            with self.subTest(key):
+                self.assert_prune_warning_row(key, on_disk=True)
 
     def test_tier_cred_preflight_error_9365(self):
         for key, value in self.hostile_values(FILE_NAME_CORPUS):
@@ -720,9 +805,12 @@ class PruneLoadInvariant(unittest.TestCase):
             rc, out, err = fix.run(args=(), flags=flags)  # a real prune of the fixture runner dir
             self.assertFalse(fix.marker.exists(), f"{label}: the planted module ran")
             left = sorted(path.relative_to(fix.root).as_posix() for path in fix.root.rglob("*"))
-            results[label] = (rc, out.replace(str(fix.base), "<base>").splitlines(), left)
+            # #9705: sys.executable and its realpath differ under Homebrew; both spellings become one placeholder
+            results[label] = (rc, mask_interpreter(out.replace(str(fix.base), "<base>")).splitlines(), left)
         self.assertEqual(results["plain"][0], EXIT_OK_CODE, results["plain"])
         self.assertEqual(results["plain"][2], sorted([FIXTURE_RUNNER_NAME, "outside-canary"]), "the old entries are pruned")
+        self.assertTrue(any(line.endswith("executable=" + INTERPRETER_PLACEHOLDER) for line in results["plain"][1]),
+                        results["plain"])  # the mask found the interpreter path; it did not match nothing
         self.assertEqual(results["-I"], results["plain"])
         self.assertEqual(results["-S"], results["plain"])
 
