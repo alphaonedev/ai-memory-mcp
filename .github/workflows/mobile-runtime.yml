@@ -19,20 +19,22 @@ name: Mobile runtime (iOS Simulator + Android emulator)
 #
 # Trigger matrix (cost-conscious):
 #   - `push` to `release/**`     → run both arms
-#   - `pull_request` to `main` or `rehearsal/**` (#5447; path-filtered)
-#                                → run iOS Simulator only (Android
+#   - `pull_request` to `main`, `rehearsal/**` or `chain/**` (#5447;
+#     path-filtered)             → run iOS Simulator only (Android
 #                                  is too expensive per-PR; its job
 #                                  condition admits only push and
 #                                  workflow_dispatch)
 #   - `workflow_dispatch`        → run both arms on demand
 #
-# Estimated cost: ~$0.40 / iOS run + ~$0.04 / Android run when both
-# arms execute. With release/** push frequency of ~5 / month + a
-# weekly manual dispatch, the total stays small. That figure counts push and
-# dispatch runs ONLY. Pull-request runs (iOS arm only, ~$0.40 each on
-# macos-latest, 45 min timeout) are additional: one per push to a PR
-# branch whose base is main or rehearsal/** and whose diff touches the
-# path list below; the monthly total grows with that PR-push count.
+# Cost, in runner minutes (the job timeouts below are the caps): the iOS arm
+# is capped at 45 minutes and the Android arm at 60 minutes per run, and the
+# iOS arm runs on a macOS runner, the costlier runner class. With a
+# `release/**` push frequency of about 5 per month plus a weekly manual
+# dispatch, the monthly runner-minute total for those runs is small. That
+# total counts push and dispatch runs ONLY. Pull-request runs (iOS arm only,
+# up to 45 minutes each on macos-latest) are additional: one per push to a PR
+# branch whose base is main, rehearsal/** or chain/** and whose diff touches
+# the path list below; the monthly total grows with that PR-push count.
 
 on:
   push:
@@ -58,7 +60,8 @@ on:
 
 # Cancel in-flight runs on the same branch/PR if a new push lands.
 # Mobile-runtime is the slowest workflow we have; superseded runs
-# burn $0.30+ on average if we let them complete.
+# would otherwise spend up to their full timeout of runner minutes
+# (45 for the iOS arm) if we let them complete.
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
 # PR events; isolates fork PRs by PR number. See ci.yml for full
 # rationale.
