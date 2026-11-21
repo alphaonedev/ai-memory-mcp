@@ -572,8 +572,12 @@ fn alice() -> Vec<HeaderValue> {
     vec![HeaderValue::from_static(ALICE)]
 }
 
-/// Create the memory every cell targets, owned by ALICE.
+/// Create the memory every cell targets, owned by ALICE. The title is fresh
+/// per call: the full-router and handler legs of one backend share the run
+/// namespace and, on postgres, one database, where a repeated title in a
+/// namespace is a 409.
 async fn create_fixture(router: &axum::Router) -> String {
+    let title = format!("fixture 9616 {}", uuid::Uuid::new_v4().simple());
     let (status, created) = call(
         router,
         "POST",
@@ -581,7 +585,7 @@ async fn create_fixture(router: &axum::Router) -> String {
         &alice(),
         Some(json!({
             "namespace": namespace(),
-            "title": "fixture 9616",
+            "title": title,
             "content": "alice owns this row",
             "tier": "long",
             "tags": [],
