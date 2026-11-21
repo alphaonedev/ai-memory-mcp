@@ -406,7 +406,13 @@ fn cooked_string(b: &[char], mut i: usize) -> (String, usize) {
 fn raw_string(b: &[char], mut i: usize, hashes: usize) -> (String, usize) {
     let start = i;
     while i < b.len() {
-        if b[i] == '"' && b[i + 1..].iter().take(hashes).filter(|&&c| c == '#').count() == hashes
+        if b[i] == '"'
+            && b[i + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|&&c| c == '#')
+                .count()
+                == hashes
         {
             return (b[start..i].iter().collect(), i + 1 + hashes);
         }
@@ -606,10 +612,7 @@ fn offenders(files: &[(String, String)]) -> Vec<String> {
                     Some(Exactly(k)) => k.to_string(),
                     Some(AnyNonZero) => "1 or more".to_owned(),
                 };
-                found.push(format!(
-                    "{path}: {} {n} (allowed {granted})",
-                    class.label()
-                ));
+                found.push(format!("{path}: {} {n} (allowed {granted})", class.label()));
             }
         }
     }
@@ -657,14 +660,19 @@ fn every_agent_id_site_in_the_tree_is_allow_listed_9616() {
             continue;
         }
         if !SCANNED_ROOTS.contains(&top) {
-            problems.push(format!("{path}: tracked root {top} is neither scanned nor left out"));
+            problems.push(format!(
+                "{path}: tracked root {top} is neither scanned nor left out"
+            ));
             continue;
         }
         let src = std::fs::read_to_string(root.join(&path)).expect("read tracked source");
         files.push((path, src));
     }
     for (left, reason) in LEFT_OUT {
-        assert!(root.join(left).is_dir(), "left-out root {left} is gone ({reason})");
+        assert!(
+            root.join(left).is_dir(),
+            "left-out root {left} is gone ({reason})"
+        );
     }
     problems.extend(offenders(&files));
     assert_eq!(problems, Vec::<String>::new());
@@ -681,13 +689,12 @@ const VERDICT_GET_LITERAL: &str =
 const VERDICT_GET_ALL_FIRST: &str =
     "fn f(h: &HeaderMap) { let _ = h.get_all(crate::HEADER_AGENT_ID).iter().next(); }";
 const VERDICT_GET_REF: &str = "fn f(h: &HeaderMap) { let _ = h.get(&crate::HEADER_AGENT_ID); }";
-const VERDICT_RENAMED_FALLBACK: &str =
-    r#"fn f(claimed: Option<&str>) -> String { resolve_http_agent_id(None, claimed).unwrap_or_else(|_| "ai:http".into()) }"#;
+const VERDICT_RENAMED_FALLBACK: &str = r#"fn f(claimed: Option<&str>) -> String { resolve_http_agent_id(None, claimed).unwrap_or_else(|_| "ai:http".into()) }"#;
 // Spelling variants.
 const UPPER_CASE: &str = r#"fn f(h: &HeaderMap) { let _ = h.get("X-AGENT-ID"); }"#;
-const LINE_SPLIT_STRING: &str = "fn f(h: &HeaderMap) { let _ = h.get(\"x-agent-\\\n        id\"); }";
-const LINE_SPLIT_CALL: &str =
-    "fn f(h: &HeaderMap) {\n    let _ = h\n        .get(\n            crate::HEADER_AGENT_ID,\n        );\n}";
+const LINE_SPLIT_STRING: &str =
+    "fn f(h: &HeaderMap) { let _ = h.get(\"x-agent-\\\n        id\"); }";
+const LINE_SPLIT_CALL: &str = "fn f(h: &HeaderMap) {\n    let _ = h\n        .get(\n            crate::HEADER_AGENT_ID,\n        );\n}";
 const ALIASED: &str =
     "use crate::HEADER_AGENT_ID as WHO;\nfn f(h: &HeaderMap) { let _ = h.get(WHO); }";
 const ESCAPED: &str = r#"fn f(h: &HeaderMap) { let _ = h.get("x\x2dagent\u{2d}id"); }"#;
@@ -699,7 +706,8 @@ const MATCH_ARM: &str = r#"fn f(n: &str) -> bool { match n { "x-agent-id" => tru
 const RAW_IDENT_RESOLVER: &str =
     "fn f(h: Option<&str>) { let _ = r#resolve_http_agent_id(None, h); }";
 const SENTINEL_LITERAL: &str = r#"fn f(h: &HeaderMap) -> String { resolve_caller(h, None).unwrap_or_else(|_| "anonymous:invalid".to_string()) }"#;
-const SENTINEL_CONST: &str = "fn f() -> &'static str { crate::identity::sentinels::ANONYMOUS_INVALID }";
+const SENTINEL_CONST: &str =
+    "fn f() -> &'static str { crate::identity::sentinels::ANONYMOUS_INVALID }";
 const FOLD_THROUGH_MAP: &str =
     "fn f(h: &HeaderMap) -> Option<String> { resolve_caller(h, None).map(|c| c).ok() }";
 const FOLD_HEADER_READ: &str =
@@ -729,8 +737,16 @@ fn deny_corpus_is_refused_with_the_exact_offender_9616() {
     let sentinel = |p: &str| format!("{p}: anonymous-invalid 1 (allowed 0)");
     let fold = |p: &str| format!("{p}: refusal-folded 1 (allowed 0)");
     let rows: &[(&str, &str, Vec<String>)] = &[
-        ("verdict get literal", VERDICT_GET_LITERAL, vec![header(PROBE)]),
-        ("verdict get_all first", VERDICT_GET_ALL_FIRST, vec![header(PROBE)]),
+        (
+            "verdict get literal",
+            VERDICT_GET_LITERAL,
+            vec![header(PROBE)],
+        ),
+        (
+            "verdict get_all first",
+            VERDICT_GET_ALL_FIRST,
+            vec![header(PROBE)],
+        ),
         ("verdict get &const", VERDICT_GET_REF, vec![header(PROBE)]),
         (
             "verdict renamed fallback",
@@ -747,7 +763,11 @@ fn deny_corpus_is_refused_with_the_exact_offender_9616() {
         ("fragments", FRAGMENTS, vec![header(PROBE)]),
         ("const table", CONST_TABLE, vec![header(PROBE)]),
         ("match arm", MATCH_ARM, vec![header(PROBE)]),
-        ("raw ident resolver", RAW_IDENT_RESOLVER, vec![resolver(PROBE)]),
+        (
+            "raw ident resolver",
+            RAW_IDENT_RESOLVER,
+            vec![resolver(PROBE)],
+        ),
         (
             "sentinel literal",
             SENTINEL_LITERAL,
@@ -775,10 +795,10 @@ fn deny_corpus_is_refused_with_the_exact_offender_9616() {
     );
 }
 
-const COMMENT_ONLY: &str = "// reads X-Agent-Id via h.get(\"x-agent-id\") and HEADER_AGENT_ID\nfn f() {}";
+const COMMENT_ONLY: &str =
+    "// reads X-Agent-Id via h.get(\"x-agent-id\") and HEADER_AGENT_ID\nfn f() {}";
 const DOC_AND_NESTED_BLOCK: &str = "/// the X-Agent-Id header\n/* HEADER_AGENT_ID /* nested x-agent-id */ resolve_http_agent_id(None, h).ok() */\nfn f() {}";
-const CHAR_AND_LIFETIME: &str =
-    "fn f<'a>(x: &'a str) -> char { let _ = x; '\"' } // x-agent-id\nfn g() -> char { '\\'' } // ANONYMOUS_INVALID";
+const CHAR_AND_LIFETIME: &str = "fn f<'a>(x: &'a str) -> char { let _ = x; '\"' } // x-agent-id\nfn g() -> char { '\\'' } // ANONYMOUS_INVALID";
 const FUNNEL_USE: &str = "fn f(headers: &HeaderMap) -> Response {\n    let caller = match crate::handlers::caller_identity::header_agent_id(headers) {\n        Err(r) => return r.into_response(),\n        Ok(v) => v,\n    };\n    let _ = http_caller(headers)?;\n    let _ = resolve_caller(headers, caller).map_err(IntoResponse::into_response)?;\n    todo!()\n}";
 
 /// Allowed forms raise no offender.

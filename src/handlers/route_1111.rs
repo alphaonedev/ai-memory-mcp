@@ -519,8 +519,7 @@ pub async fn handle_reflect_http(
             Ok(None) => None,
             Ok(Some(_)) => {
                 let body_agent = body.get("agent_id").and_then(Value::as_str);
-                match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
-                {
+                match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
                     Ok(id) => Some(id),
                     Err(e) => return err_response(e),
                 }

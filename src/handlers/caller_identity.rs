@@ -347,10 +347,13 @@ mod tests {
     #[test]
     fn body_claim_must_match_the_header_9616() {
         assert_eq!(
-            resolve_caller(&with(&[b"ai:alice"]), Some("ai:bob")).map_err(|r| r.message().to_owned()),
-            Err("invalid agent_id: agent_id_body_header_mismatch: body-supplied agent_id \
+            resolve_caller(&with(&[b"ai:alice"]), Some("ai:bob"))
+                .map_err(|r| r.message().to_owned()),
+            Err(
+                "invalid agent_id: agent_id_body_header_mismatch: body-supplied agent_id \
                  \"ai:bob\" disagrees with authenticated header-resolved id \"ai:alice\""
-                .to_owned())
+                    .to_owned()
+            )
         );
         assert_eq!(
             resolve_caller(&with(&[b"ai:alice"]), Some("ai:alice")).as_deref(),
