@@ -45,6 +45,7 @@ Round 5 (REVIEW-8328-code-r4 F1/F2/F3, REVIEW-8328-security-r4 F1/F2/INFO):
     before the boundary, and exactly two dispatch arms.
 14. The cls verdict-shape guard forces false/false on a malformed verdict.
 """
+import errno
 import json
 import os
 import re
@@ -175,6 +176,188 @@ def scratch_dir() -> Path:
     return Path(tempfile.mkdtemp(prefix="cs8328-", dir=str(SCRATCH)))
 
 
+SED_GNU = "gnu"
+SED_BSD = "bsd"
+SED_ABSENT = "absent"
+ABSENT_SED_REASON_TEXT = "host has no sed on PATH: the impact step cannot run"
+
+# The host shim (#9744). The workflow step uses the GNU form `{...;p}`; BSD sed needs `p;}`.
+# The shim repairs only that one form, only inside the sed program argument (the value of
+# `-e`, else the first non-option argument), never inside an `s`, `y` or address pattern or
+# replacement. A program or option it cannot classify is passed through unchanged, so the host
+# sed then fails loudly. Every other argument (file operands included) is passed as given.
+SED_SHIM_BODY = r'''
+import os
+import sys
+
+SIMPLE_COMMANDS = "pdDnNgGhHxP="
+S_FLAGS = "gpiImMeE0123456789"
+PLAIN_FLAGS = "nErsu"
+SKIP_BLANKS = " \t"
+
+
+def _skip_parts(prog, pos, parts):
+    """Return the index after `parts` delimited parts that follow the delimiter at `pos`, or -1."""
+    if pos >= len(prog):
+        return -1
+    delim = prog[pos]
+    if delim.isalnum() or delim in "\\\n[]":
+        return -1
+    pos += 1
+    for _ in range(parts):
+        while pos < len(prog) and prog[pos] != delim:
+            if prog[pos] == "[":
+                return -1
+            pos += 2 if prog[pos] == "\\" else 1
+        if pos >= len(prog):
+            return -1
+        pos += 1
+    return pos
+
+
+def _closes_block(prog, pos):
+    """True when the next non-blank character at or after `pos` is the closing brace."""
+    while pos < len(prog) and prog[pos] in SKIP_BLANKS:
+        pos += 1
+    return pos < len(prog) and prog[pos] == "}"
+
+
+def repair_program(prog):
+    """Return `prog` with `;` inserted between a `p` and its closing brace, or `prog` unchanged."""
+    inserts = []
+    pos = 0
+    while pos < len(prog):
+        char = prog[pos]
+        if char in " \t\n;{}!,$" or char.isdigit():
+            pos += 1
+        elif char == "/":
+            pos = _skip_parts(prog, pos, 1)
+        elif char == "s":
+            pos = _skip_parts(prog, pos + 1, 2)
+            while pos >= 0 and pos < len(prog) and prog[pos] in S_FLAGS:
+                if prog[pos] == "p" and _closes_block(prog, pos + 1):
+                    inserts.append(pos + 1)
+                pos += 1
+        elif char == "y":
+            pos = _skip_parts(prog, pos + 1, 2)
+        elif char in SIMPLE_COMMANDS:
+            if char == "p" and _closes_block(prog, pos + 1):
+                inserts.append(pos + 1)
+            pos += 1
+        else:
+            return prog
+        if pos < 0:
+            return prog
+    for index in reversed(inserts):
+        prog = prog[:index] + ";" + prog[index:]
+    return prog
+
+
+def rewrite_argv(argv):
+    """Return argv with only the sed program argument repaired."""
+    out = list(argv)
+    have_script = False
+    pos = 0
+    while pos < len(out):
+        arg = out[pos]
+        if arg == "--":
+            if not have_script and pos + 1 < len(out):
+                out[pos + 1] = repair_program(out[pos + 1])
+            return out
+        if arg == "-e":
+            if pos + 1 >= len(out):
+                return list(argv)
+            out[pos + 1] = repair_program(out[pos + 1])
+            have_script = True
+            pos += 2
+        elif len(arg) > 1 and arg[0] == "-" and all(c in PLAIN_FLAGS for c in arg[1:]):
+            pos += 1
+        elif arg.startswith("-") and arg != "-":
+            return list(argv)
+        else:
+            if not have_script:
+                out[pos] = repair_program(arg)
+            return out
+    return out
+
+
+if __name__ == "__main__":
+    os.execv(REAL_SED, [REAL_SED] + rewrite_argv(sys.argv[1:]))
+'''
+
+
+def shim_namespace():
+    """Return the shim source executed as a library (its `__main__` block does not run)."""
+    namespace = {"__name__": "sed_shim_under_test", "REAL_SED": "sed"}
+    exec(compile(SED_SHIM_BODY, "<sed-shim>", "exec"), namespace)
+    return namespace
+
+
+def shim_rewrite_argv(argv):
+    """Return what the shim hands the host sed for `argv`."""
+    return shim_namespace()["rewrite_argv"](list(argv))
+
+
+SED_PROBE_GNU_RC = 0
+SED_PROBE_BSD_RC = 1  # BSD sed rejects `--version` with a usage error and exit 1
+PROBE_FAILED_TEXT = "host sed %s is present but its probe failed: %s"
+
+
+class HostSedProbeError(AssertionError):
+    """A sed that resolves on PATH gave no GNU or BSD answer; a cell that hits it fails."""
+
+
+def probe_host_sed(search_path=None, which=shutil.which, run=subprocess.run):
+    """Return (state, path): SED_GNU, SED_BSD or SED_ABSENT; raises HostSedProbeError.
+
+    GNU sed answers `--version` with exit 0, BSD sed rejects the option with exit 1. The
+    absent state means only that no sed resolves on PATH (or the resolved path vanished
+    before the exec: FileNotFoundError). A sed that resolves but whose probe raises another
+    OSError, times out or exits with any other code is broken: it raises, never skips.
+    """
+    real = which("sed", path=search_path)
+    if real is None:
+        return SED_ABSENT, None
+    try:
+        res = run([real, "--version"], capture_output=True, text=True, timeout=TIMEOUT_S)
+    except FileNotFoundError:
+        return SED_ABSENT, None
+    except subprocess.TimeoutExpired:
+        raise HostSedProbeError(PROBE_FAILED_TEXT % (real, "timeout after %s s" % TIMEOUT_S))
+    except OSError as exc:
+        name = errno.errorcode.get(exc.errno, "unknown")
+        raise HostSedProbeError(PROBE_FAILED_TEXT % (real, "errno %s (%s)" % (exc.errno, name)))
+    if res.returncode == SED_PROBE_GNU_RC:
+        return SED_GNU, real
+    if res.returncode == SED_PROBE_BSD_RC:
+        return SED_BSD, real
+    raise HostSedProbeError(PROBE_FAILED_TEXT % (
+        real, "exit %d is neither GNU (%d) nor BSD (%d)"
+        % (res.returncode, SED_PROBE_GNU_RC, SED_PROBE_BSD_RC)))
+
+
+def bsd_sed_shim_dir(work: Path, search_path=None, force: bool = False, probe=probe_host_sed):
+    """Return a directory holding a `sed` shim for a BSD-userland host, else None.
+
+    The step text lives in ci.yml (its form is pinned there), so the test adapts
+    the host instead: the shim repairs only the `p}` brace-close of the sed program
+    to `p;}` and runs the host's own sed. On a GNU host nothing is installed (unless
+    `force`) and the step runs byte for byte as on the hosted runner. A host with no
+    sed on PATH skips with a named reason; a sed that is there but broken fails.
+    """
+    state, real = probe(search_path)
+    if state == SED_ABSENT:
+        raise unittest.SkipTest(ABSENT_SED_REASON_TEXT)
+    if state == SED_GNU and not force:
+        return None
+    shim_dir = work / "bin-sed-shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "sed"
+    shim.write_text("#!%s -I\nREAL_SED = %r\n%s" % (sys.executable, real, SED_SHIM_BODY))
+    shim.chmod(0o755)
+    return shim_dir
+
+
 def run_cli(rules_text: str, args, stdin_text: str = "x.md\n"):
     """Run cargo_skip.py -I against a rules text; return (rc, stdout, stderr)."""
     work = scratch_dir()
@@ -183,7 +366,8 @@ def run_cli(rules_text: str, args, stdin_text: str = "x.md\n"):
         rules.write_text(rules_text)
         res = subprocess.run(
             [sys.executable, "-I", str(SCRIPT), "--stdin", "--rules", str(rules)] + list(args),
-            input=stdin_text, capture_output=True, text=True, timeout=TIMEOUT_S)
+            input=stdin_text, capture_output=True, text=True, timeout=TIMEOUT_S,
+            cwd=str(REPO))
         return res.returncode, res.stdout, res.stderr
     finally:
         shutil.rmtree(str(work), ignore_errors=True)
@@ -336,6 +520,9 @@ class ImpactStepOutputAllowList(unittest.TestCase):
             env = dict(os.environ, GITHUB_OUTPUT=str(out), RUNNER_TEMP=str(work),
                        CLS_BASE="base", IMPACT_BASE="base", DOCS_ONLY=docs_only,
                        IMPACT_FORCED_REASON=forced)
+            shim_dir = bsd_sed_shim_dir(work)
+            if shim_dir is not None:
+                env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
             res = subprocess.run(RUNNER_BASH + [step_by_id(CI_YML, "impact")[2]],
                                  cwd=str(work), env=env, capture_output=True, text=True,
                                  timeout=TIMEOUT_S)
@@ -428,6 +615,199 @@ class ImpactStepOutputAllowList(unittest.TestCase):
             self.assertEqual(values["test_impact"], "alpha_test beta_test", count)
             self.assertIn("selector noise line 200", stdout)
             self.assertNotIn("selector noise line 201", stdout)
+
+
+CI_SED_PROGRAM = "1,200{s/::/: :/g;p}"
+CI_SED_REPAIRED = "1,200{s/::/: :/g;p;}"
+ABSENT_SED_REASON = "host has no sed on PATH: the impact step cannot run"
+# (label, argv the test passes, argv the host sed must receive). Written out by hand.
+SHIM_ARGV_ROWS = (
+    ("ci-program", ["-n", CI_SED_PROGRAM, "log"], ["-n", CI_SED_REPAIRED, "log"]),
+    ("replacement-text", ["-n", "s/a/p}/p"], ["-n", "s/a/p}/p"]),
+    ("pattern-text", ["-n", "/p}/p"], ["-n", "/p}/p"]),
+    ("file-operand", ["-n", "p", "filep}"], ["-n", "p", "filep}"]),
+    ("file-operand-after-repaired-program", ["-n", "{p}", "filep}"], ["-n", "{p;}", "filep}"]),
+    ("dash-e-program", ["-n", "-e", "{p}", "filep}"], ["-n", "-e", "{p;}", "filep}"]),
+    ("two-dash-e-programs", ["-e", "{p}", "-e", "{p}"], ["-e", "{p;}", "-e", "{p;}"]),
+    ("end-of-options", ["-n", "--", "{p}", "f"], ["-n", "--", "{p;}", "f"]),
+    ("space-before-brace", ["{p }"], ["{p; }"]),
+    ("s-flag-p-before-brace", ["{s/a/b/p}"], ["{s/a/b/p;}"]),
+    ("already-repaired", ["{p;}"], ["{p;}"]),
+    ("y-command-text", ["y/p}/ab/"], ["y/p}/ab/"]),
+    ("unclassifiable-step-address", ["-n", "2~3{p}"], ["-n", "2~3{p}"]),
+    ("unclassifiable-text-command", ["-n", "a hello p}"], ["-n", "a hello p}"]),
+    ("unclassifiable-bracket-pattern", ["-n", "/[/]/{p}"], ["-n", "/[/]/{p}"]),
+    ("unclassifiable-option", ["-i", "bak", "{p}"], ["-i", "bak", "{p}"]),
+    ("no-arguments", [], []),
+)
+
+
+def run_shim(work: Path, args, stdin_text: str = ""):
+    """Run the host-sed shim (forced, also on a GNU host) in `work`; return (rc, out, err)."""
+    shim_dir = bsd_sed_shim_dir(work, force=True)
+    res = subprocess.run([str(shim_dir / "sed")] + list(args), input=stdin_text,
+                         capture_output=True, text=True, cwd=str(work), timeout=TIMEOUT_S)
+    return res.returncode, res.stdout, res.stderr
+
+
+class HostSedProbe(unittest.TestCase):
+    """F1: the host sed probe ends in gnu, bsd or absent (see HostSedProbeStates for the rest)."""
+
+    def test_no_sed_on_path_is_the_absent_state(self):
+        empty = scratch_dir()
+        try:
+            self.assertEqual(probe_host_sed(search_path=str(empty)), (SED_ABSENT, None))
+        finally:
+            shutil.rmtree(str(empty), ignore_errors=True)
+
+    def test_absent_sed_skips_with_the_exact_reason(self):
+        empty = scratch_dir()
+        work = scratch_dir()
+        try:
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                bsd_sed_shim_dir(work, search_path=str(empty))
+            self.assertEqual(str(ctx.exception), ABSENT_SED_REASON)
+        finally:
+            shutil.rmtree(str(empty), ignore_errors=True)
+            shutil.rmtree(str(work), ignore_errors=True)
+
+    def test_present_sed_is_gnu_or_bsd(self):
+        state, real = probe_host_sed()
+        self.assertIn(state, (SED_GNU, SED_BSD))
+        self.assertTrue(real)
+        gnu = subprocess.run(["sed", "--version"], capture_output=True, text=True).returncode == 0
+        self.assertEqual(state, SED_GNU if gnu else SED_BSD)
+
+
+FAKE_SED = "/x/sed"
+PROBE_ARGV = [FAKE_SED, "--version"]
+
+
+def fake_run_returning(code):
+    """Return a stand-in for subprocess.run that answers with exit code `code`."""
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, code, "", "")
+    return fake_run
+
+
+def fake_run_raising(exc):
+    """Return a stand-in for subprocess.run that raises `exc`."""
+    def fake_run(argv, **kwargs):
+        raise exc
+    return fake_run
+
+
+# (label, which() answer, run stand-in, expected). Written out by hand: a (state, path) tuple,
+# or (exception type, exact message) for a sed that resolves but whose probe is not an answer.
+PROBE_ROWS = (
+    ("which-none", None, fake_run_raising(AssertionError("run must not be called")),
+     (("absent", None))),
+    ("exec-file-not-found", FAKE_SED, fake_run_raising(FileNotFoundError(errno.ENOENT, "gone")),
+     (("absent", None))),
+    ("permission-error", FAKE_SED, fake_run_raising(PermissionError(errno.EACCES, "denied")),
+     ("raises", "host sed /x/sed is present but its probe failed: errno 13 (EACCES)")),
+    ("oserror-eio", FAKE_SED, fake_run_raising(OSError(errno.EIO, "io")),
+     ("raises", "host sed /x/sed is present but its probe failed: errno 5 (EIO)")),
+    ("oserror-without-errno", FAKE_SED, fake_run_raising(OSError("odd")),
+     ("raises", "host sed /x/sed is present but its probe failed: errno None (unknown)")),
+    ("timeout", FAKE_SED, fake_run_raising(subprocess.TimeoutExpired(PROBE_ARGV, 120)),
+     ("raises", "host sed /x/sed is present but its probe failed: timeout after 120 s")),
+    ("gnu-answer", FAKE_SED, fake_run_returning(0), ("gnu", FAKE_SED)),
+    ("bsd-answer", FAKE_SED, fake_run_returning(1), ("bsd", FAKE_SED)),
+    ("unknown-exit-2", FAKE_SED, fake_run_returning(2),
+     ("raises", "host sed /x/sed is present but its probe failed: exit 2 is neither GNU (0) nor BSD (1)")),
+    ("unknown-exit-127", FAKE_SED, fake_run_returning(127),
+     ("raises", "host sed /x/sed is present but its probe failed: exit 127 is neither GNU (0) nor BSD (1)")),
+    ("killed-by-signal", FAKE_SED, fake_run_returning(-9),
+     ("raises", "host sed /x/sed is present but its probe failed: exit -9 is neither GNU (0) nor BSD (1)")),
+)
+
+
+class HostSedProbeStates(unittest.TestCase):
+    """#9744 r2: only 'no sed resolves on PATH' is absent; a sed that resolves and misbehaves fails."""
+
+    def test_probe_table(self):
+        for label, found, run, expected in PROBE_ROWS:
+            with self.subTest(row=label):
+                if expected[0] == "raises":
+                    with self.assertRaises(HostSedProbeError) as ctx:
+                        probe_host_sed(which=lambda name, path=None: found, run=run)
+                    self.assertEqual(str(ctx.exception), expected[1])
+                else:
+                    got = probe_host_sed(which=lambda name, path=None: found, run=run)
+                    self.assertEqual(got, expected)
+
+    def test_probe_runs_the_resolved_path_with_version(self):
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        probe_host_sed(which=lambda name, path=None: FAKE_SED, run=fake_run)
+        self.assertEqual(seen, [PROBE_ARGV])
+
+    def test_a_failing_probe_fails_a_dependent_cell_and_does_not_skip_it(self):
+        broken = fake_run_raising(OSError(errno.EIO, "io"))
+
+        class Dependent(unittest.TestCase):
+            def test_cell(self):
+                work = scratch_dir()
+                try:
+                    bsd_sed_shim_dir(
+                        work, probe=lambda sp: probe_host_sed(sp, which=lambda n, path=None: FAKE_SED,
+                                                              run=broken))
+                finally:
+                    shutil.rmtree(str(work), ignore_errors=True)
+
+        result = unittest.TestResult()
+        unittest.defaultTestLoader.loadTestsFromTestCase(Dependent).run(result)
+        self.assertEqual((result.testsRun, len(result.skipped), len(result.errors)), (1, 0, 0))
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("errno 5 (EIO)", result.failures[0][1])
+
+    def test_absent_state_alone_prints_the_skip_reason(self):
+        work = scratch_dir()
+        try:
+            with self.assertRaises(unittest.SkipTest) as ctx:
+                bsd_sed_shim_dir(work, probe=lambda sp: ("absent", None))
+            self.assertEqual(str(ctx.exception), ABSENT_SED_REASON)
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
+
+
+class SedShimOnlyRepairsTheProgram(unittest.TestCase):
+    """F2: the host sed gets the test's arguments, except the one sed program's closing brace."""
+
+    def test_argv_table(self):
+        for label, argv, expected in SHIM_ARGV_ROWS:
+            with self.subTest(row=label):
+                self.assertEqual(shim_rewrite_argv(argv), expected)
+
+    def test_replacement_text_reaches_sed_unchanged(self):
+        work = scratch_dir()
+        try:
+            rc, out, err = run_shim(work, ["-n", "s/a/p}/p"], "ab\n")
+            self.assertEqual((rc, out), (0, "p}b\n"), err)
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
+
+    def test_file_operand_is_opened_under_its_own_name(self):
+        work = scratch_dir()
+        try:
+            (work / "filep}").write_text("x\n")
+            rc, out, err = run_shim(work, ["-n", "p", "filep}"])
+            self.assertEqual((rc, out), (0, "x\n"), err)
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
+
+    def test_ci_workflow_program_still_works(self):
+        work = scratch_dir()
+        try:
+            rc, out, err = run_shim(work, ["-n", CI_SED_PROGRAM], "a::b\nc\n")
+            self.assertEqual((rc, out), (0, "a: :b\nc\n"), err)
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
 
 
 def test_step_lines():
@@ -777,7 +1157,8 @@ class NoWorkspaceFirstOnSysPath(unittest.TestCase):
             res = subprocess.run(
                 [sys.executable, "-I", str(tree / "impact" / "cargo_skip.py"), "--stdin",
                  "--rules", str(tree / "impact" / "rules.json")],
-                input="src/lib.rs\n", capture_output=True, text=True, timeout=TIMEOUT_S)
+                input="src/lib.rs\n", capture_output=True, text=True, timeout=TIMEOUT_S,
+                cwd=str(work))
         finally:
             shutil.rmtree(str(work), ignore_errors=True)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -977,6 +1358,20 @@ class ForcedFullRuns(unittest.TestCase):
         rc, out, _ = run_cli(rules, ["--event-name", "pull_request", "--base-ref", "chain/promo6-ssh-r2"],
                              "scripts/ci/tests/test_x.py\n")
         self.assertIn("cargo_skip=true", out)
+
+    def test_run_cli_ignores_the_callers_cwd(self):
+        """#9744-P1: run_cli does not depend on the caller's working directory."""
+        empty = scratch_dir()
+        try:
+            subprocess.run(["git", "init", "-q", "."], cwd=str(empty), check=True, timeout=TIMEOUT_S)
+            res = subprocess.run(
+                [sys.executable, "-I", "-m", "unittest", "discover", "-s", str(Path(__file__).parent),
+                 "-p", Path(__file__).name, "-k", "test_cli_event_and_base_flags"],
+                cwd=str(empty), capture_output=True, text=True, timeout=TIMEOUT_S)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("Ran 1 test", res.stderr)
+        finally:
+            shutil.rmtree(str(empty), ignore_errors=True)
 
     def test_full_ci_keys_match_the_selector_force_all_keys(self):
         data = json.loads(RULES.read_text())

@@ -118,6 +118,17 @@ MOUNT_UNREADABLE_REASON = "the mount id of TMPDIR cannot be read: {why}"
 RESOLVES_ELSEWHERE_REASON = "TMPDIR resolves elsewhere than its normalized path: {path}"
 SUMMARY_UNWRITABLE_LINE = "prune_runner_tmp: job summary not written: {why}"
 BIND_HELPER_TIMEOUT_SECS = 120
+SOCKET_PATH_LIMIT = 104  # sun_path is 108 bytes on Linux and 104 on macOS (unix(7), sys/un.h); the smaller bounds both
+LONG_TMPDIR_SEGMENT = "t" * 40
+LONG_TMPDIR_SEGMENTS = 5  # 5 * 41 bytes below the scratch directory: a TMPDIR of at least 200 bytes (#9460)
+LONG_TMPDIR_BYTES = 200
+LONG_CHECKOUT_SEGMENT = "d" * 60
+LONG_CHECKOUT_SEGMENTS = 3  # 3 * 61 bytes of path, past SOCKET_PATH_LIMIT before the file name
+SOCKET_CELL_TIMEOUT_SECS = 300
+SOCKET_CELL_CLASS = "EntryKinds"
+SOCKET_CELL_MODULE = "test_prune_runner_tmp_8634"
+SOCKET_CELL_SIBLINGS = ("scripts/ci/prune_runner_tmp.py", "scripts/ci/workflow_annotation.py",
+                        "scripts/ci/check_pg_preflight_workflows.py")
 LEFTOVER_LINE_RE = r"^prune_runner_tmp: probe directory left in place: " + PROBE_NAME_RE + "$"
 # D-M1: skip reasons and the counted failure text of a directory the walk does not enter.
 SKIP_MOUNT_POINT = "a mount point, not entered"
@@ -190,6 +201,26 @@ def remove_scratch(top, base):
 def age(path, secs):
     stamp = time.time() - secs
     os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+def bind_unix_socket(parent, name):
+    """Bind an AF_UNIX socket called ``name`` inside ``parent`` whatever the length of ``parent`` (#9460).
+
+    The kernel limits the bound path to SOCKET_PATH_LIMIT bytes, so the bind uses the bare name from a working
+    directory of ``parent``; the previous directory is restored also when the bind fails. decision: relative name
+    over a short directory plus rename because the socket must be a child of ``parent`` (the prune cell scans it)
+    and a rename cannot cross filesystems, so a short directory elsewhere could not hold it.
+    """
+    if len(name.encode()) >= SOCKET_PATH_LIMIT:
+        raise ValueError(f"socket name is {len(name.encode())} bytes, limit {SOCKET_PATH_LIMIT}: {name}")
+    previous = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.chdir(parent)
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.bind(name)
+    finally:
+        os.fchdir(previous)
+        os.close(previous)
 
 
 def snapshot(top):
@@ -456,9 +487,7 @@ class EntryKinds(Base):
         made["symlink"] = parent / "k-link"
         os.mkfifo(parent / "k-fifo")
         made["fifo"] = parent / "k-fifo"
-        sock = socket.socket(socket.AF_UNIX)
-        sock.bind(str(parent / "k-sock"))
-        sock.close()
+        bind_unix_socket(parent, "k-sock")
         made["socket"] = parent / "k-sock"
         for path in (parent / "k-dir" / "inner" / "f", parent / "k-dir" / "inner", *made.values()):
             age(path, OLD_AGE_SECS)
@@ -2384,6 +2413,71 @@ class RootsAndFloor(unittest.TestCase):
         self.assertNotIn("--root", self.doc_section)
         for token in ("runner-<digits>", "another device", "internal error"):
             self.assertIn(token, self.doc_section)
+
+
+class SocketPathLimit9460(unittest.TestCase):
+    """The socket cell binds whatever the length of TMPDIR or of the checkout path (#9460).
+
+    Each cell runs the real ``EntryKinds`` class (the one that binds an AF_UNIX socket) in a child interpreter whose
+    TMPDIR or checkout path is longer than SOCKET_PATH_LIMIT, and asserts it ends ``OK`` with no OSError.
+    """
+
+    def setUp(self):
+        SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
+        holder = tempfile.TemporaryDirectory(dir=SCRATCH_BASE, prefix="sock9460-")
+        self.addCleanup(holder.cleanup)
+        self.scratch = Path(holder.name).resolve()
+
+    def run_socket_cell(self, tests_dir, tmpdir):
+        env = {key: value for key, value in os.environ.items() if key not in ("TMPDIR", "PRUNE_SCRIPT_UNDER_TEST")}
+        if tmpdir is not None:
+            env["TMPDIR"] = str(tmpdir)
+        return subprocess.run(
+            [sys.executable, "-m", "unittest", f"{SOCKET_CELL_MODULE}.{SOCKET_CELL_CLASS}"],
+            cwd=tests_dir, env=env, capture_output=True, text=True, check=False, timeout=SOCKET_CELL_TIMEOUT_SECS)
+
+    def assert_cell_green(self, done):
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("OSError", done.stderr)
+        self.assertNotIn("AF_UNIX path too long", done.stderr)
+        self.assertRegex(done.stderr, r"(?m)^Ran [1-9][0-9]* tests? in ")
+        self.assertRegex(done.stderr, r"(?m)^OK$")
+
+    def test_socket_cell_with_a_200_byte_tmpdir(self):
+        long_tmp = self.scratch
+        for _ in range(LONG_TMPDIR_SEGMENTS):
+            long_tmp = long_tmp / LONG_TMPDIR_SEGMENT
+        long_tmp.mkdir(parents=True)
+        self.assertGreaterEqual(len(str(long_tmp)), LONG_TMPDIR_BYTES)
+        self.assert_cell_green(self.run_socket_cell(ROOT / "scripts/ci/tests", long_tmp))
+
+    def test_bind_helper_restores_the_working_directory_on_success_and_on_failure(self):
+        parent = self.scratch / "bind-parent"
+        parent.mkdir()
+        before = os.getcwd()
+        bind_unix_socket(parent, "ok-sock")
+        self.assertEqual(os.getcwd(), before)
+        self.assertTrue(stat.S_ISSOCK(os.lstat(parent / "ok-sock").st_mode))
+        with self.assertRaises(OSError) as raised:  # the name is taken: bind raises after the chdir
+            bind_unix_socket(parent, "ok-sock")
+        self.assertEqual(raised.exception.errno, errno.EADDRINUSE)
+        self.assertEqual(os.getcwd(), before)
+        too_long = "n" * SOCKET_PATH_LIMIT
+        with self.assertRaises(ValueError):
+            bind_unix_socket(parent, too_long)
+        self.assertEqual(os.getcwd(), before)
+
+    def test_socket_cell_from_a_checkout_path_past_the_socket_limit(self):
+        checkout = self.scratch
+        for _ in range(LONG_CHECKOUT_SEGMENTS):
+            checkout = checkout / LONG_CHECKOUT_SEGMENT
+        tests_dir = checkout / "scripts/ci/tests"
+        tests_dir.mkdir(parents=True)
+        shutil.copy2(Path(__file__), tests_dir / f"{SOCKET_CELL_MODULE}.py")
+        for rel in SOCKET_CELL_SIBLINGS:
+            shutil.copy2(ROOT / rel, checkout / rel)
+        self.assertGreater(len(str(tests_dir / "k-sock")), SOCKET_PATH_LIMIT)
+        self.assert_cell_green(self.run_socket_cell(tests_dir, None))
 
 
 class WorkflowWiring(unittest.TestCase):
