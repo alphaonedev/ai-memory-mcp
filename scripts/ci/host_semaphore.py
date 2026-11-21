@@ -18,11 +18,23 @@ kernel drops a flock when its holder dies, so a crashed runner never leaks a slo
 SIGTERM/SIGINT/SIGHUP are forwarded to COMMAND's process group (then SIGKILL after
 a grace period) and the lock is released in ``finally``.
 
-Exit codes: the child's code; 2 bad arguments; 75 no slot free within the wait
-budget (COMMAND never ran; one ``::error title=infra: no slot::`` line, #9231); 4 the shared workflow_annotation.py next to this file
-cannot be loaded (COMMAND never ran, one ``::error`` line, #9365); 128+signal when
-COMMAND died from a signal.
-Python 3.9+, standard library only.
+The wait is the one value of ``--max-wait-secs`` or of the HOST_SEMAPHORE_MAX_WAIT_SECS environment
+key (both must agree when both are given), else 600 s. It is refused, before any slot or command, when
+it is empty, not a plain decimal integer, 0, negative, above the IDLE_SEAT_CEILING_SECS ceiling of
+host_slot_limits.py, or when the flag is given more than once (#9231).
+
+Exit codes: the child's code, passed through unchanged (75 of the product binary included);
+2 bad arguments (argparse, one usage line on stderr; a child's own 2 also passes through);
+4 the shared workflow_annotation.py or host_slot_limits.py next to this file cannot be loaded
+(COMMAND never ran, one ``::error`` line, #9365);
+82 infra-no-slot, no slot free within the wait (COMMAND never ran, one
+``::error title=infra no-slot::`` line, #9231);
+83 infra-unknown-runner, the runner is not a serving runner of the gate in host_slots.json;
+84 the child itself ended with 82, 83, 84 or 85 (one ``::error title=infra reserved-code::`` line);
+85 infra-wait-refused, the wait is refused as above (COMMAND never ran, no slot taken, one
+``::error title=infra wait-refused::`` line);
+128+signal when COMMAND died from a signal.
+Python 3.12+, standard library only.
 """
 import argparse
 import fcntl
@@ -57,7 +69,7 @@ def _load_workflow_annotation():
     return module
 
 
-EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 75 = no slot, else the child's)
+EXIT_LOAD_REFUSED = 4  # a shared module cannot be loaded (2 = bad arguments, 82-85 = wrapper outcomes, else the child's)
 
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "host_semaphore"
@@ -77,6 +89,70 @@ except (Exception, SystemExit) as exc:  # any failed load: one fixed line built 
           file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
     sys.exit(WA_EXIT_LOAD_REFUSED)
 
+# decision: one module host_slot_limits.py that this wrapper and host_slots_check.py both read over a
+# literal in each, because the run-time refusal and the source scan must move together (#9231 R2-C).
+LIMITS_RELATIVE_PATH = "host_slot_limits.py"
+
+
+def _load_host_slot_limits():
+    """host_slot_limits.py from this file's real directory, by path only; its IDLE_SEAT_CEILING_SECS is a positive int."""
+    import importlib.util
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), LIMITS_RELATIVE_PATH))
+    loaded = sys.modules.get("host_slot_limits")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("host_slot_limits", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    value = module.IDLE_SEAT_CEILING_SECS  # absent: AttributeError
+    if type(value) is not int:  # a bool, a float or a string is not a ceiling
+        raise TypeError("IDLE_SEAT_CEILING_SECS is not an int")
+    if value <= 0:
+        raise ValueError("IDLE_SEAT_CEILING_SECS is not positive")
+    return module
+
+
+def _limits_load_cause(exc):
+    """The cause named on stderr for a failed limits load: a fixed literal per class, never text from the module."""
+    # decision: a literal per known class over type(exc).__name__ because the #9365 stream ratchet admits only
+    # traceable text on a stream, and a broken module can raise a class of any name.
+    kind = type(exc)
+    if kind is FileNotFoundError:
+        return "FileNotFoundError"
+    if kind is PermissionError:
+        return "PermissionError"
+    if kind is IsADirectoryError:
+        return "IsADirectoryError"
+    if kind is SyntaxError:
+        return "SyntaxError"
+    if kind is AttributeError:
+        return "AttributeError"
+    if kind is TypeError:
+        return "TypeError"
+    if kind is ValueError:
+        return "ValueError"
+    if kind is ImportError:
+        return "ImportError"
+    if kind is RuntimeError:
+        return "RuntimeError"
+    if kind is SystemExit:
+        return "SystemExit"
+    if isinstance(exc, OSError):
+        return "OSError"
+    return "Exception"
+
+
+try:
+    _limits = _load_host_slot_limits()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line, then exit before any slot or command
+    print("host_semaphore: refused: host_slot_limits.py next to the script cannot be loaded (%s)"
+          % _limits_load_cause(exc), file=sys.stderr, flush=True)
+    print("::error title=host_semaphore refused::host_semaphore: refused: host_slot_limits.py next to the script"
+          " cannot be loaded", file=sys.stdout, flush=True)
+    sys.exit(EXIT_LOAD_REFUSED)
+
+IDLE_SEAT_CEILING_SECS = _limits.IDLE_SEAT_CEILING_SECS  # the longest wait the wrapper accepts, from any source
 SEMAPHORE_SLOTS_DEFAULT = 2
 # decision: 600 s over 3600 s because a waiter holds a runner seat idle for the whole wait
 # and, with the serving runners tied to the slots (scripts/ci/host_slots.json), a wait only
@@ -87,15 +163,24 @@ SEMAPHORE_POLL_SECS_DEFAULT = 30
 # decision: a distinct exit code and the token infra-no-slot in the annotation message over a job
 # output, because a job output is set after pull-request code ran (taint boundary class iii) and
 # the gate is red either way (#9231). A job log line carries no title, so the message names the outcome.
-# decision: reserved codes 82, 83 and 84 over sharing 75, because the product binary exits 75
-# (src/main.rs) and a child's own code passes through this wrapper unchanged. 82-84 are none of
+# decision: reserved codes 82, 83, 84 and 85 over sharing 75, because the product binary exits 75
+# (src/main.rs) and a child's own code passes through this wrapper unchanged. 82-85 are none of
 # 0-4 (this wrapper, load_gate.py), 64-78 (sysexits, the product binary), 86-87 (a test stub),
 # 90-109 (nextest, cargo 101), 124-127 (timeout, shell), 128+signal; the table that pins this is
 # scripts/ci/tests/test_slot_wait_outcome_9231.py.
+# decision: a refused wait exits 85 over argparse's 2, because a child's own 2 passes through, so a 2
+# could be either; 85 is reserved, so a child's 85 is reported as 84 and 85 is only ever a refusal.
 EXIT_NO_SLOT = 82
 EXIT_UNKNOWN_RUNNER = 83
-EXIT_CHILD_RESERVED = 84  # the child itself ended with 82, 83 or 84; the wrapper never passes those through
-RESERVED_EXIT_CODES = frozenset((EXIT_NO_SLOT, EXIT_UNKNOWN_RUNNER, EXIT_CHILD_RESERVED))
+EXIT_CHILD_RESERVED = 84  # the child itself ended with 82, 83, 84 or 85; the wrapper never passes those through
+EXIT_WAIT_REFUSED = 85
+RESERVED_EXIT_CODES = frozenset((EXIT_NO_SLOT, EXIT_UNKNOWN_RUNNER, EXIT_CHILD_RESERVED, EXIT_WAIT_REFUSED))
+OUTCOME_WAIT_REFUSED = 'infra-wait-refused'
+TITLE_WAIT_REFUSED = 'infra wait-refused'
+FLAG_MAX_WAIT = '--max-wait-secs'
+ENV_MAX_WAIT = 'HOST_SEMAPHORE_MAX_WAIT_SECS'  # the workflow's one env mapping key for the wait
+PLAIN_DECIMAL_RE = re.compile(r'0|[1-9][0-9]*')  # ASCII digits only: int() would also take " 9", "+9", "٩"
+NEGATIVE_RE = re.compile(r'-[0-9]+')
 OUTCOME_NO_SLOT = 'infra-no-slot'  # token in the annotation message; a CI failure class for it is tracked in #9833
 OUTCOME_UNKNOWN_RUNNER = 'infra-unknown-runner'
 OUTCOME_RESERVED_CODE = 'infra-reserved-code'
@@ -201,6 +286,62 @@ def reserved_code_annotation(label, child_rc):
         title=TITLE_RESERVED_CODE)
 
 
+def wait_refused_annotation(label, reason):
+    """Error annotation of the named outcome infra-wait-refused: no slot was taken and no command ran."""
+    return wa.annotation(
+        'error',
+        "%s '%s': %s: %s; no slot taken, no command ran; exit %d"
+        % (TAG, label, OUTCOME_WAIT_REFUSED, reason, EXIT_WAIT_REFUSED),
+        title=TITLE_WAIT_REFUSED)
+
+
+def wait_value_problem(source, text):
+    """Why TEXT (from SOURCE) is not an accepted wait, or None. A rejected value is never echoed."""
+    if text == '':
+        return '%s is empty' % source
+    if NEGATIVE_RE.fullmatch(text):
+        return '%s is negative' % source
+    if not PLAIN_DECIMAL_RE.fullmatch(text):
+        return '%s is not a plain decimal integer' % source
+    if text == '0':
+        return '%s is 0; the wait is at least 1 s' % source
+    # the length first: a huge digit string is above the ceiling without converting it
+    if len(text) > len(str(IDLE_SEAT_CEILING_SECS)) or int(text) > IDLE_SEAT_CEILING_SECS:
+        return '%s is above the %d s idle seat ceiling' % (source, IDLE_SEAT_CEILING_SECS)
+    return None
+
+
+def effective_wait(flag_values, environ):
+    """(seconds, None) for the one accepted wait, or (None, reason) for a refused one.
+
+    decision: refuse a repeated --max-wait-secs (even with equal values) over last-wins, because last-wins
+    hides from a reader of the workflow which value the wrapper uses (#9231 R2-C).
+    """
+    flags = flag_values or []
+    if len(flags) > 1:
+        return None, '%s is given %d times; give it once' % (FLAG_MAX_WAIT, len(flags))
+    flag = flags[0] if flags else None
+    env_text = environ.get(ENV_MAX_WAIT)
+    if flag is not None:
+        problem = wait_value_problem(FLAG_MAX_WAIT, flag)
+        if problem:
+            return None, problem
+    if env_text is not None:
+        problem = wait_value_problem(ENV_MAX_WAIT, env_text)
+        if problem:
+            return None, problem
+    if flag is not None and env_text is not None and flag != env_text:
+        # both values are accepted plain integers at this point, so naming them leaks nothing
+        return None, '%s %s differs from %s %s' % (FLAG_MAX_WAIT, flag, ENV_MAX_WAIT, env_text)
+    text = flag if flag is not None else env_text
+    if text is None:
+        text = str(SEMAPHORE_MAX_WAIT_SECS_DEFAULT)
+        problem = wait_value_problem('the default wait', text)
+        if problem:
+            return None, problem
+    return int(text), None
+
+
 def _signal_group(pgid, sig):
     try:
         os.killpg(pgid, sig)
@@ -255,24 +396,24 @@ def _positive_int(text):
     return value
 
 
-def _non_negative_int(text):
-    value = int(text)
-    if value < 0:
-        raise argparse.ArgumentTypeError('must be >= 0')
-    return value
-
-
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # allow_abbrev=False: an abbreviation such as --max-wait is a bad argument, never a second spelling of the flag
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     p.add_argument('--name', required=True)
     p.add_argument('--slots', type=_positive_int, default=SEMAPHORE_SLOTS_DEFAULT)
-    p.add_argument('--max-wait-secs', type=_non_negative_int, default=SEMAPHORE_MAX_WAIT_SECS_DEFAULT)
+    p.add_argument(FLAG_MAX_WAIT, action='append', default=None, metavar='SECS',
+                   help='the wait for a slot, 1 to IDLE_SEAT_CEILING_SECS of host_slot_limits.py; give it once')
     p.add_argument('--poll-secs', type=_positive_int, default=SEMAPHORE_POLL_SECS_DEFAULT)
     p.add_argument('--label', default='unlabelled')
     p.add_argument('--root', default=None, help='lock root (default ~/.cache/ai-memory-ci/semaphore)')
     p.add_argument('--config', default=None, help='slot configuration (default host_slots.json next to this file)')
     p.add_argument('command', nargs=argparse.REMAINDER)
     args = p.parse_args(argv)  # argparse exits 2 on bad arguments
+    # The wait is refused before the command check, the runner check, the slot directory and any wait.
+    max_wait, refusal = effective_wait(args.max_wait_secs, os.environ)
+    if refusal is not None:
+        print(wait_refused_annotation(args.label, refusal), flush=True)
+        return EXIT_WAIT_REFUSED
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         p.error('a command is required after --')
@@ -288,9 +429,9 @@ def main(argv=None):
     root = Path(args.root) if args.root else default_root()
     slot_dir = root / args.name
     slot_dir.mkdir(parents=True, exist_ok=True)
-    got = acquire(slot_dir, args.slots, args.label, args.max_wait_secs, args.poll_secs)
+    got = acquire(slot_dir, args.slots, args.label, max_wait, args.poll_secs)
     if got is None:
-        print(no_slot_annotation(args.label, args.max_wait_secs, args.slots, runners), flush=True)
+        print(no_slot_annotation(args.label, max_wait, args.slots, runners), flush=True)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:

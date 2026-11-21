@@ -1098,7 +1098,7 @@ class PruneLoadInvariant(unittest.TestCase):
 SIBLING_SCRIPTS = {
     "scripts/ci-sweep-target.py": (),
     "scripts/ci/ci_full_nightly.py": (),
-    "scripts/ci/host_semaphore.py": (),
+    "scripts/ci/host_semaphore.py": ("scripts/ci/host_slot_limits.py",),  # #9231 wait ceiling
     "scripts/ci/impact/base_sha.py": (),
     "scripts/ci/load_gate.py": (),
     "scripts/ci/partition_test_binaries.py": (),
@@ -1406,7 +1406,7 @@ GATE_LOAD_EXIT_CODES = {
     "scripts/ci/load_gate.py": 3,  # EXIT_LOAD_REFUSED (0 = proceed, 2 = bad arguments)
     "scripts/ci/pg_env_preflight.py": 3,  # EXIT_PG_ENV
     "scripts/ci/tier_cred_preflight.py": 1,  # EXIT_UNAVAILABLE
-    "scripts/ci/host_semaphore.py": 4,  # EXIT_LOAD_REFUSED (82 = no slot, 83 = unknown runner, 84 = a child that exited with a reserved code; any other code is the child's)
+    "scripts/ci/host_semaphore.py": 4,  # EXIT_LOAD_REFUSED (82 = no slot, 83 = unknown runner, 84 = a child that exited with a reserved code, 85 = a refused wait; any other code is the child's)
     "scripts/ci/partition_test_binaries.py": 2,  # EXIT_FAIL_CLOSED
     "scripts/ci/suite_budget.py": 4,  # EXIT_LOAD_REFUSED (2 = malformed input, 3 = margin lost) #9229
 }

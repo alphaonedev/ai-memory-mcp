@@ -1880,9 +1880,13 @@ jobs:
           # only held a runner idle. No slot ends as the named outcome
           # infra-no-slot: one error annotation whose message carries that token
           # (a job log shows the message only) and exit code 82. The codes 82 to
-          # 84 are reserved: a command that exits with one of them is reported as
+          # 85 are reserved: a command that exits with one of them is reported as
           # 84, and a runner outside scripts/ci/host_slots.json ends as
           # infra-unknown-runner (83). The gate stays red, no job output is set.
+          # The wrapper refuses, before any slot or command, a wait above the
+          # 900 s ceiling of scripts/ci/host_slot_limits.py, a repeated flag, or
+          # a flag that differs from this key: infra-wait-refused, exit code 85.
+          # Set the wait only here; run text reads it as a plain $ read.
           HOST_SEMAPHORE_MAX_WAIT_SECS: '600'
         shell: bash
         run: |

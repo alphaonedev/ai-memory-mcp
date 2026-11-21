@@ -766,6 +766,7 @@ class OneConstant(unittest.TestCase):
         ('OTHER = 900\n', 'AttributeError'),
         ('raise RuntimeError("boom")\n', 'RuntimeError'),
         ('IDLE_SEAT_CEILING_SECS = (\n', 'SyntaxError'),
+        ('class OddLoadError(Exception):\n    pass\nraise OddLoadError()\n', 'Exception'),  # an unlisted class
     ]
 
     def test_an_unloadable_limits_module_refuses_with_exit_4_before_any_command(self):

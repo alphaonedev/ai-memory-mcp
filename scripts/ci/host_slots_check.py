@@ -9,10 +9,15 @@ gated by it. Rules:
 * serving runners are registered runners, none listed twice, and never exceed the slot count,
   so a job that holds a runner always finds a slot and never idles in the semaphore wait;
 * every `host_semaphore.py` call in a workflow or composite action under .github (`.yml` and
-  `.yaml`) names a literal configured gate with `--name` in any position, and every
-  configured gate is called;
-* HOST_SEMAPHORE_MAX_WAIT_SECS has exactly one definition across the workflows, parsed with
-  the YAML subset parser of scripts/ci/taint_boundary.py, and is at most IDLE_SEAT_CEILING_SECS;
+  `.yaml`) names a literal configured gate with `--name` in any position, gives `--max-wait-secs`
+  exactly once before the ` -- ` of the wrapped command, and every configured gate is called;
+* HOST_SEMAPHORE_MAX_WAIT_SECS has exactly one definition across the workflows and composite
+  actions, parsed with the YAML subset parser of scripts/ci/taint_boundary.py, and is at most
+  IDLE_SEAT_CEILING_SECS (scripts/ci/host_slot_limits.py, the value host_semaphore.py also refuses
+  above at run time);
+* in the run text of those files HOST_SEMAPHORE_MAX_WAIT_SECS appears only as its env mapping key or as
+  a plain `$KEY` / `${KEY}` read: any other use (an assignment, export, declare, read, `${KEY:=v}`, an env
+  prefix, an expression read) is refused, so the one parsed definition is the only value;
 * the slot count of the gated leg in ci.yml equals the configured slots.
 
 CI runs it inside the existing "Shard partition and wiring unit tests (#6344)" step: unittest discover
@@ -29,17 +34,23 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import taint_boundary  # noqa: E402  (the repository's own YAML subset parser)
+from host_slot_limits import IDLE_SEAT_CEILING_SECS  # noqa: E402  (the one ceiling, shared with host_semaphore.py)
 
 REPO = HERE.parents[1]
 CONFIG_PATH = HERE / 'host_slots.json'
 GITHUB_DIR = REPO / '.github'
 WAIT_KEY = 'HOST_SEMAPHORE_MAX_WAIT_SECS'
 SLOTS_KEY = 'HOST_SEMAPHORE_SLOTS'
-IDLE_SEAT_CEILING_SECS = 900  # nothing may hold a runner seat idle longer than this
 MAX_SLOTS = 64
 GATE_NAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 CALL_RE = re.compile(r'python3?\s+(?:-\S+\s+)*\S*host_semaphore\.py\b')
 NAME_FLAG_RE = re.compile(r'(?:^|\s)--name(?:=|\s+)(\S+)')
+MAX_WAIT_FLAG_RE = re.compile(r'(?:^|\s)--max-wait-secs(?:=|\s|$)')
+# decision: an allowlist of the env mapping key and a plain $ / ${} read over a list of forbidden assignment
+# forms, because shell has open-ended ways to write a variable (export, declare, readonly, local, read,
+# printf -v, ${:=}, eval, env X=) and an allowlist fails closed on each (#9231 R2-C).
+WAIT_KEY_USE_RE = re.compile(r'(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])' % WAIT_KEY)
+WAIT_KEY_MAPPING_RE = re.compile(r'\s*%s\s*:' % WAIT_KEY)
 SLOTS_EXPR_RE = re.compile(r"&& '(\d+)' \|\| '0'")
 EXIT_OK = 0
 EXIT_VIOLATION = 1
@@ -129,8 +140,31 @@ def call_site_violations(cfg, workflow_texts):
             called.add(names[0])
             if names[0] not in cfg['gates']:
                 found.append('%s: calls the unconfigured gate %s' % (wf, names[0]))
+            if len(MAX_WAIT_FLAG_RE.findall(segment)) != 1:
+                found.append('%s: a host_semaphore.py call without exactly one --max-wait-secs' % wf)
     for name in sorted(set(cfg['gates']) - called):
         found.append('%s: configured but no workflow calls it' % name)
+    return found
+
+
+def _allowed_wait_key_use(line, start, end):
+    """True when the key at LINE[START:END] is the env mapping key or a plain $KEY / ${KEY} read."""
+    if start == len(line) - len(line.lstrip()) and WAIT_KEY_MAPPING_RE.match(line):
+        return True
+    if line[start - 1:start] == '$' and (start < 2 or line[start - 2] != '$'):
+        return True
+    return line[max(0, start - 2):start] == '${' and line[end:end + 1] == '}'
+
+
+def wait_key_violations(texts):
+    """One line per use of the wait key in run text that is neither its env mapping key nor a plain read."""
+    found = []
+    for rel, text in sorted(texts.items()):
+        for line in _code_lines(text):
+            for use in WAIT_KEY_USE_RE.finditer(line):
+                if not _allowed_wait_key_use(line, use.start(), use.end()):
+                    found.append('%s: %s is used other than as its env mapping key or a plain $ read; '
+                                 'set it only in the one env mapping' % (rel, WAIT_KEY))
     return found
 
 
@@ -192,9 +226,9 @@ def main():
     try:
         cfg = load_config()
         texts = github_texts()
-        workflows = {k: v for k, v in texts.items() if k.startswith('workflows/')}
+        # every .github text, composite actions included: a definition there counts and is bounded too
         problems = (config_violations(cfg) + call_site_violations(cfg, texts)
-                    + bound_violations(cfg, workflows))
+                    + bound_violations(cfg, texts) + wait_key_violations(texts))
     except (ConfigError, taint_boundary.YamlError) as exc:
         print('host_slots_check: malformed: %s' % exc)
         return EXIT_MALFORMED
