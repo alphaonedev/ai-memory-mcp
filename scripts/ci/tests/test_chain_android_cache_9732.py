@@ -32,6 +32,7 @@ Run: python3 -I -m unittest discover -s scripts/ci/tests -p 'test_chain_android_
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 import unittest
@@ -174,6 +175,15 @@ EXPRESSION_ALLOWED = tuple(re.compile(pattern) for pattern in (
 ))
 EXPRESSION_OPEN = "${{"
 EXPRESSION_CLOSE = "}}"
+# sha256 of the whole `run:` text (comment lines kept) of every mirrored step whose text is the same
+# on both sides: an edit made on both sides at once, comment lines included, is red until this
+# hand table is edited too (review r2 F6; the audit rows differ by design and are pinned above).
+RUN_DIGESTS = {
+    NDK_STEPS[1]: "00650e036555d79d37b5bbfff4ef135b02a338704da1cd0ac7f6198e2ea08d5a",
+    CARGO_CHECK_STEP: "e1a8f32dfdab13b237924fcd22429686dd6e20e16d0bd530f4587cc8b354d4ca",
+    BUILD_PR_STEP: "41b46c923a09a351323dedf1a264a76c88fe9659886a061e6688e4b2aec4b8fb",
+    BUILD_WARM_STEP: "41b46c923a09a351323dedf1a264a76c88fe9659886a061e6688e4b2aec4b8fb",
+}
 
 
 def _relative(lines: list[str], indent: int) -> str:
@@ -296,9 +306,18 @@ def _row_pin_problems(row: Row, pr_wf: base.Workflow, pr_job: base.Job, pr_step:
             problems.append(f"{wf.name}:{job.job_id} step {ident!r}: step env {pr_env!r} is on "
                             f"both sides but the hand table names none (a step env is outside the "
                             f"rust-cache key)")
-    for wf, job, ident, step in ((pr_wf, pr_job, row.pr_id, pr_step),
-                                 (warm_wf, warm_job, row.warm_id, warm_step)):
+    for wf, job, ident, step, scope in ((pr_wf, pr_job, row.pr_id, pr_step, leg),
+                                        (warm_wf, warm_job, row.warm_id, warm_step, {})):
         problems.extend(_expression_problems(wf, job, ident, step))
+    # A run text the two sides share is pinned by digest; sides that differ are refused above.
+    if _step_value(pr_step, "run", leg) == _step_value(warm_step, "run", {}):
+        for wf, job, ident, step, scope in ((pr_wf, pr_job, row.pr_id, pr_step, leg),
+                                            (warm_wf, warm_job, row.warm_id, warm_step, {})):
+            pinned = RUN_DIGESTS.get(ident)
+            actual = hashlib.sha256((_step_value(step, "run", scope) or "").encode()).hexdigest()
+            if pinned is not None and actual != pinned:
+                problems.append(f"{wf.name}:{job.job_id} step {ident!r}: run text digest is "
+                                f"{actual}, the pinned digest is {pinned}")
     return problems
 
 
@@ -940,6 +959,12 @@ class MirrorInputs9732(unittest.TestCase):
         self.assertEqual(PINNED_WITH, {("actions/setup-python", "python-version"): "3.12"})
         self.assertEqual(JOB_ENV_PINNED, {"CARGO_AUDIT_VERSION": AUDIT_PIN})
         self.assertEqual(NDK_GENERATION, ((NDK_VERSION_PIN, CACHE_GENERATION_PIN),))
+        self.assertEqual(RUN_DIGESTS, {
+            NDK_CONFIGURE: "00650e036555d79d37b5bbfff4ef135b02a338704da1cd0ac7f6198e2ea08d5a",
+            "cargo check (--lib --features sqlite-bundled)":
+                "e1a8f32dfdab13b237924fcd22429686dd6e20e16d0bd530f4587cc8b354d4ca",
+            BUILD_PR_LABEL: "41b46c923a09a351323dedf1a264a76c88fe9659886a061e6688e4b2aec4b8fb",
+            BUILD_WARM_LABEL: "41b46c923a09a351323dedf1a264a76c88fe9659886a061e6688e4b2aec4b8fb"})
         self.assertEqual(JOB_KEYS_MAY_DIFFER, ("name", "needs", "timeout-minutes", "strategy",
                                                "steps"))
         self.assertEqual(set(JOB_KEYS_COMPARED), {"defaults", "container", "services",
@@ -1011,6 +1036,15 @@ def _step_env_msg(side: str, ident: str, value: str) -> str:
     wf_name, job_id = SIDE_WF[side]
     return (f"{wf_name}:{job_id} step {ident!r}: step env {value!r} is on both sides but the hand "
             f"table names none (a step env is outside the rust-cache key)")
+
+
+def _is_digest_msg(side: str, ident: str, message: str) -> bool:
+    wf_name, job_id = SIDE_WF[side]
+    head = f"{wf_name}:{job_id} step {ident!r}: run text digest is "
+    tail = f", the pinned digest is {RUN_DIGESTS[ident]}"
+    middle = message[len(head):-len(tail)]
+    return (message.startswith(head) and message.endswith(tail) and len(middle) == 64
+            and middle != RUN_DIGESTS[ident])
 
 
 class ClassInvariants9732(unittest.TestCase):
@@ -1097,9 +1131,30 @@ class ClassInvariants9732(unittest.TestCase):
     def test_h08_the_same_expression_comment_in_both_ndk_blocks_is_refused(self) -> None:
         comment = f"# {EVENT_EXPR}"
         ops = (("after", LS_ANCHOR, [f"          {comment}"]),)
-        self.assertEqual(_problems(pr_job_ops=ops, warm_job_ops=ops),
-                         [_expr_msg("pr", NDK_CONFIGURE, comment, EVENT_BODY),
-                          _expr_msg("warm", NDK_CONFIGURE, comment, EVENT_BODY)])
+        got = _problems(pr_job_ops=ops, warm_job_ops=ops)
+        self.assertEqual(got[:2], [_expr_msg("pr", NDK_CONFIGURE, comment, EVENT_BODY),
+                                   _expr_msg("warm", NDK_CONFIGURE, comment, EVENT_BODY)])
+        self.assertEqual(len(got), 4)
+        for side, message in zip(SIDES, got[2:]):
+            self.assertTrue(_is_digest_msg(side, NDK_CONFIGURE, message), message)
+
+    # F6: a comment line edited on BOTH sides at once changes no side-to-side compare; the digest
+    # table refuses it (H08 both-sides form), and so does an allowed expression added to both.
+    def test_h08_a_run_comment_edited_on_both_sides_is_refused_by_the_digest(self) -> None:
+        for text in ("# a note both jobs carry", "# ${{ steps.setup-ndk.outputs.ndk-path }}"):
+            with self.subTest(text=text):
+                ops = (("after", LS_ANCHOR, [f"          {text}"]),)
+                got = _problems(pr_job_ops=ops, warm_job_ops=ops)
+                self.assertEqual(len(got), 2, got)
+                for side, message in zip(SIDES, got):
+                    self.assertTrue(_is_digest_msg(side, NDK_CONFIGURE, message), message)
+
+    def test_a_run_comment_edited_on_one_side_is_one_run_difference_and_no_digest(self) -> None:
+        for side in SIDES:
+            with self.subTest(side=side):
+                got = _on_side(side, (("after", LS_ANCHOR, ["          # one side only"]),))
+                self.assertEqual(len(got), 1, got)
+                self.assertIn("key 'run' differs", got[0])
 
     def test_an_expression_the_scan_cannot_classify_is_refused(self) -> None:
         for side in SIDES:
