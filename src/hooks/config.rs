@@ -613,10 +613,14 @@ fn escaped_path(path: &Path) -> String {
     out
 }
 
+/// The reason a path that is not a regular file (a directory, FIFO,
+/// socket or device) is refused with (#9637).
+const NOT_A_REGULAR_FILE: &str = "not a regular file";
+
 fn not_a_regular_file() -> HooksConfigError {
     HooksConfigError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        "not a regular file",
+        NOT_A_REGULAR_FILE,
     ))
 }
 

@@ -446,6 +446,10 @@ pub struct HooksReportArgs {
     pub json: bool,
 }
 
+/// `schema_version` of every `doctor --tokens --json` / `--raw-table`
+/// document, the hooks-refusal form (#9637) included.
+const TOKENS_SCHEMA_VERSION: &str = "v0.6.4-tokens-1";
+
 /// v0.6.4-004 — token-cost report.
 ///
 /// Walks `crate::sizes::tool_sizes()`, groups by family via
@@ -523,7 +527,7 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
             if let Err(e) = hooks_for_doctor(path_opt.as_deref()) {
                 writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;
                 let payload = serde_json::json!({
-                    (field_names::SCHEMA_VERSION): "v0.6.4-tokens-1",
+                    (field_names::SCHEMA_VERSION): TOKENS_SCHEMA_VERSION,
                     "hooks_error": e.to_string(),
                 });
                 writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
@@ -533,7 +537,7 @@ pub fn run_tokens(args: TokensArgs, out: &mut CliOutput<'_>) -> Result<i32> {
         // Always include the full per-tool table when --raw-table is
         // set; --json gives the rolled-up view.
         let payload = serde_json::json!({
-            (field_names::SCHEMA_VERSION): "v0.6.4-tokens-1",
+            (field_names::SCHEMA_VERSION): TOKENS_SCHEMA_VERSION,
             "tokenizer": "cl100k_base",
             "active_profile": profile.families().iter().map(|f| f.name()).collect::<Vec<_>>(),
             "active_total_tokens": active_total,
