@@ -11,13 +11,16 @@ Python 3.9+, standard library only; the step script is bash 3.2 compatible.
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path
 
-import workflow_text
+# `python3 -I FILE` leaves the script's own folder off sys.path; append it (never insert at 0) (#9592).
+sys.path.append(str(Path(__file__).resolve().parent))
+import workflow_text  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 CI = (REPO / '.github' / 'workflows' / 'ci.yml').read_text()

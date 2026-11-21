@@ -28,7 +28,9 @@ import unittest
 import unittest.mock as mock
 from pathlib import Path
 
-import workflow_text
+# `python3 -I FILE` leaves the script's own folder off sys.path; append it (never insert at 0) (#9592).
+sys.path.append(str(Path(__file__).resolve().parent))
+import workflow_text  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "ci" / "suite_budget.py"

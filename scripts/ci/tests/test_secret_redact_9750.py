@@ -72,6 +72,10 @@ FORMS = (
     ("sql e-string lower doubled", "password e'fa''%s' x" % FAKE, "password %s x" % VAL),
     ("sql unclosed literal", "PASSWORD '%s" % FAKE, "PASSWORD %s" % VAL),
     ("sql empty literal", "PASSWORD '' x", "PASSWORD %s x" % VAL),
+    ("sql no blank", "PASSWORD'%s' x" % FAKE, "PASSWORD%s x" % VAL),
+    ("sql unicode escape string", "PASSWORD U&'%s' x" % FAKE, "PASSWORD %s x" % VAL),
+    ("sql dollar quote", "PASSWORD $$%s$$;" % FAKE, "PASSWORD %s" % VAL),
+    ("sql tagged dollar quote", "PASSWORD $q$%s$q$ x" % FAKE, "PASSWORD %s" % VAL),
     # Must NOT be redacted: the word password with no quoted literal right after it.
     ("sql password word then text", 'FATAL:  password authentication failed for user "u"',
      'FATAL:  password authentication failed for user "u"'),
@@ -79,6 +83,8 @@ FORMS = (
     ("sql password at line end", "set a password", "set a password"),
     ("sql password then double quote", 'password "u" x', 'password "u" x'),
     ("sql other keyword literal", "VALID UNTIL 'infinity'", "VALID UNTIL 'infinity'"),
+    ("sql password then shell variable", "password $HOME x", "password $HOME x"),
+    ("sql other keyword dollar quote", "DO $$ BEGIN END $$", "DO $$ BEGIN END $$"),
 )
 BIG_SQL_CHARS = 200_000
 
@@ -159,6 +165,25 @@ class EveryFormEverySink(unittest.TestCase):
                 self.assertNotIn(FAKE, out, label)
 
 
+class SqlLiteralLineEnd(unittest.TestCase):
+    """D3-L1: an unclosed or dollar-quoted SQL literal is redacted to its line end and no further."""
+
+    ROWS = (
+        ("dollar quote stops at the line end", "PASSWORD $q$%s$q$\nnext 'x'" % FAKE,
+         "PASSWORD %s\nnext 'x'" % VAL),
+        ("unclosed quote stops at the line end", "PASSWORD '%s\nnext 'x'" % FAKE,
+         "PASSWORD %s\nnext 'x'" % VAL),
+        ("non-secret literal then secret", "a 'b' PASSWORD '%s'" % FAKE, "a 'b' PASSWORD %s" % VAL),
+        ("secret keyword inside a non-secret literal", "a 'x PASSWORD '%s'" % FAKE,
+         "a 'x PASSWORD %s" % VAL),
+    )
+
+    def test_rows(self):
+        for label, text, expected in self.ROWS:
+            with self.subTest(row=label):
+                self.assertEqual(STEP_MOD.redact(text), expected)
+
+
 class FunnelMissingFailsClosed(unittest.TestCase):
     """Without the funnel no sink prints raw text: the preflight withholds the detail, the wrapper and the
     serial step refuse at import."""
@@ -237,6 +262,7 @@ class LinearBound(unittest.TestCase):
                  "a '" + "b ''" * (n // 4) + " PASSWORD '" + FAKE + "'",
                  "x '" * (n // 3) + " PASSWORD '" + FAKE + "'",
                  "w '''" * (n // 5) + " PASSWORD E'" + FAKE + "'",
+                 "a $$" * (n // 4) + " PASSWORD $$" + FAKE,
                  "PASSWORD E'" + "\\" * n + FAKE)
         for line in lines:
             with self.subTest(prefix=line[:12]):

@@ -57,9 +57,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.append(str(REPO / "scripts" / "ci"))
+# The s19 gate runs this file as `python3 -I FILE consumer-check`; isolated mode leaves the
+# script's own folder off sys.path, so append it (never insert at 0) for workflow_text (#9592).
+sys.path.append(str(Path(__file__).resolve().parent))
 
 from impact import cargo_skip, read_set  # noqa: E402
-import workflow_text  # noqa: E402  (scripts/ci/tests, the discover start directory)
+import workflow_text  # noqa: E402  (scripts/ci/tests, appended above)
 
 CI_YML = REPO / ".github" / "workflows" / "ci.yml"
 COVERAGE_YML = REPO / ".github" / "workflows" / "coverage.yml"
