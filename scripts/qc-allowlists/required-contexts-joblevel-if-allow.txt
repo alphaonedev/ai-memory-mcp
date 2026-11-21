@@ -48,7 +48,10 @@ Dockerfile build (no push)
 # coverage.yml's `per-module-thresholds`. Its classifier already used the PR
 # base (the correct shape ci.yml now matches), so its fail-open window was
 # narrower than the ci.yml seven — but the empty-diff arm was still open until
-# #2494/#2496, and it is still `skipped`-on-docs-only today.
+# #2494/#2496. Since #9263 its job-level `if:` reads
+# `needs.classify.outputs.cargo_skip != 'true'` (the decider's superset verdict:
+# docs and scripts/ci/tests only), so it is `skipped` on those diffs and RUNS on
+# every other, an unreadable, empty or over-cap path list included.
 Per-Module Coverage Thresholds
 #
 # ---------------------------------------------------------------------------

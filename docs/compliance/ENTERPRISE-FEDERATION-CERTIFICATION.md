@@ -2216,3 +2216,7 @@ ruling, ratified under adversarial review.
 ### Amendment 2026-11-20
 
 - path: src/handlers/federation_receive.rs
+
+### Amendment 2026-11-21
+
+- path: src/federation/mod.rs

@@ -86,6 +86,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: token-budget
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
       - name: per-tool ceiling (1500 tokens cl100k_base)
         env:
           AI_MEMORY_NO_CONFIG: "1"

@@ -50,14 +50,18 @@ fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Pa
     use std::sync::OnceLock;
     static ISOLATED: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
     let (home, keys) = ISOLATED.get_or_init(|| {
-        let root =
-            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("integration-isolated");
+        // #9719 — one root PER PROCESS. Under nextest every test is its own
+        // process; a shared root let two processes' `keypair::save` (two
+        // separate renames: `.priv`, then `.pub`) interleave into a torn pair
+        // that `load` rejects, and every spawned child then refused (#3354).
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("integration-isolated-{}", std::process::id()));
         let home = root.join("home");
         let keys = root.join("keys");
         key_dir_sandbox::mkdir_0700(&home);
         key_dir_sandbox::mkdir_0700(&keys);
-        // RACE-FREE first boot — mint the daemon signing key ONCE, in-process,
-        // before any parallel test spawns concurrent `serve` daemons. On a cold
+        // RACE-FREE first boot — mint the daemon signing key ONCE per process,
+        // in-process, before any parallel test spawns concurrent `serve` daemons. On a cold
         // shared key dir, multiple daemons would otherwise race to generate the
         // same `host:<hostname>` id; whichever writes the on-disk pair LAST then
         // disagrees with the in-memory key an earlier daemon already booted
@@ -13918,4 +13922,163 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
     }
 
     let _ = std::fs::remove_file(&db);
+}
+
+// ---------------------------------------------------------------------------
+// #9719 — the fixture key directory must be private to ONE test process.
+//
+// Under `cargo nextest` every test is its own process, so every process runs
+// `isolated_home_and_keys` once. With a single fixed directory, the saves of
+// different processes interleave between the `.priv` and `.pub` renames of
+// `keypair::save` and leave a torn pair that `load` rejects (the #3354
+// "no key was loadable" refusal in every spawned child). The probe below runs
+// the real fixture in several processes at the same time, the shape nextest
+// produces.
+// ---------------------------------------------------------------------------
+
+/// Number of fixture processes started together by the #9719 test.
+const FIXTURE_PROCESS_COUNT_9719: usize = 12;
+/// Env var that turns the probe test into a fixture-running child.
+const FIXTURE_PROBE_ENV_9719: &str = "AI_MEMORY_FIXTURE_PROBE_9719";
+/// Env var carrying the epoch-millisecond instant every child waits for, so
+/// all children enter the fixture together.
+const FIXTURE_PROBE_START_ENV_9719: &str = "AI_MEMORY_FIXTURE_PROBE_START_MS_9719";
+/// Prefix of the single result line a child prints.
+const FIXTURE_PROBE_LINE_9719: &str = "FIXTURE_PROBE_9719";
+/// How far ahead of the spawn loop the common start instant is set.
+const FIXTURE_PROBE_LEAD_MS_9719: u128 = 3000;
+
+/// Field separator of the child result line.
+/// A tab: a space is legal inside a target directory path, a tab is not
+/// produced by any path the fixture builds (the writer asserts it).
+const FIXTURE_PROBE_SEP_9719: char = '\t';
+
+/// Number of fields in the child result line: prefix, HOME, keys dir, loaded.
+const FIXTURE_PROBE_FIELDS_9719: usize = 4;
+
+/// Writer half of the child-to-parent result line.
+fn format_probe_line_9719(home: &std::path::Path, keys: &std::path::Path, loaded: bool) -> String {
+    let sep = FIXTURE_PROBE_SEP_9719;
+    assert!(
+        !home.to_string_lossy().contains(sep) && !keys.to_string_lossy().contains(sep),
+        "fixture path carries the probe separator: {} {}",
+        home.display(),
+        keys.display()
+    );
+    format!(
+        "{FIXTURE_PROBE_LINE_9719}{sep}{}{sep}{}{sep}{loaded}",
+        home.display(),
+        keys.display()
+    )
+}
+
+/// Parser half: the line split into its fields (prefix, HOME, keys, loaded).
+fn parse_probe_line_9719(line: &str) -> Vec<&str> {
+    line.split(FIXTURE_PROBE_SEP_9719).collect()
+}
+
+/// The result line must round-trip paths that carry a space (a target
+/// directory such as `/x/target dir/tmp`): exactly four fields, each exact.
+#[test]
+fn probe_line_round_trips_paths_with_spaces_9719() {
+    let home = std::path::Path::new("/x/target dir/tmp/integration-isolated-1/home");
+    let keys = std::path::Path::new("/x/target dir/tmp/integration-isolated-1/keys");
+    let line = format_probe_line_9719(home, keys, true);
+    let fields = parse_probe_line_9719(&line);
+    assert_eq!(fields.len(), FIXTURE_PROBE_FIELDS_9719, "line: {line}");
+    assert_eq!(fields[0], FIXTURE_PROBE_LINE_9719);
+    assert_eq!(fields[1], "/x/target dir/tmp/integration-isolated-1/home");
+    assert_eq!(fields[2], "/x/target dir/tmp/integration-isolated-1/keys");
+    assert_eq!(fields[3], "true");
+}
+
+/// Child half: a no-op unless the parent test set `FIXTURE_PROBE_ENV_9719`.
+#[test]
+fn fixture_probe_child_9719() {
+    if std::env::var_os(FIXTURE_PROBE_ENV_9719).is_none() {
+        return;
+    }
+    let start_ms: u128 = std::env::var(FIXTURE_PROBE_START_ENV_9719)
+        .expect("start instant")
+        .parse()
+        .expect("start instant is a number");
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        if now >= start_ms {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (home, keys) = isolated_home_and_keys();
+    let id = ai_memory::identity::resolve_agent_id(None, None).expect("agent id");
+    let loaded = ai_memory::identity::keypair::load(&id, keys).is_ok();
+    println!("{}", format_probe_line_9719(home, keys, loaded));
+}
+
+#[test]
+fn fixture_processes_get_distinct_loadable_key_dirs_9719() {
+    let exe = std::env::current_exe().expect("current exe");
+    let start_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis()
+        + FIXTURE_PROBE_LEAD_MS_9719;
+    let children: Vec<std::process::Child> = (0..FIXTURE_PROCESS_COUNT_9719)
+        .map(|_| {
+            std::process::Command::new(&exe)
+                .args(["--exact", "fixture_probe_child_9719", "--nocapture"])
+                .env(FIXTURE_PROBE_ENV_9719, "1")
+                .env(FIXTURE_PROBE_START_ENV_9719, start_ms.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fixture probe child")
+        })
+        .collect();
+    let mut homes = std::collections::BTreeSet::new();
+    let mut keys_dirs = std::collections::BTreeSet::new();
+    let id = ai_memory::identity::resolve_agent_id(None, None).expect("agent id");
+    for child in children {
+        let out = child.wait_with_output().expect("wait for probe child");
+        assert!(
+            out.status.success(),
+            "probe child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(FIXTURE_PROBE_LINE_9719))
+            .unwrap_or_else(|| panic!("no probe line in child output: {stdout}"));
+        let fields = parse_probe_line_9719(line);
+        assert_eq!(
+            fields.len(),
+            FIXTURE_PROBE_FIELDS_9719,
+            "probe line shape: {line}"
+        );
+        assert_eq!(
+            fields[3], "true",
+            "child saw an unloadable key pair: {line}"
+        );
+        homes.insert(fields[1].to_string());
+        keys_dirs.insert(fields[2].to_string());
+    }
+    assert_eq!(
+        keys_dirs.len(),
+        FIXTURE_PROCESS_COUNT_9719,
+        "every fixture process needs its own keys dir: {keys_dirs:?}"
+    );
+    assert_eq!(
+        homes.len(),
+        FIXTURE_PROCESS_COUNT_9719,
+        "every fixture process needs its own HOME: {homes:?}"
+    );
+    for dir in &keys_dirs {
+        let kp = ai_memory::identity::keypair::load(&id, std::path::Path::new(dir))
+            .unwrap_or_else(|e| panic!("key pair in {dir} not loadable: {e}"));
+        assert_eq!(kp.agent_id, id, "pair in {dir} belongs to the daemon id");
+    }
 }
