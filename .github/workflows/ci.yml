@@ -695,6 +695,11 @@ jobs:
           # .github/ or scripts/ci/ (outside scripts/ci/tests/) is a full run.
           # This step runs no workspace command at all (round 3): the selector
           # that executes PR-tree code is the separate `impact` step below.
+          # #9263 / #9815: one locale for every byte test below. BSD and GNU tr
+          # and bash 3.2 and 5 disagree on [:print:] and ${#var} above 0x7f in
+          # any other locale; the answer check is made byte-wise whatever the
+          # caller exports. Same line in coverage.yml.
+          export LC_ALL=C
           docs_only=false
           cargo_skip=false
           cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
@@ -716,16 +721,27 @@ jobs:
           elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
             cargo_skip_reason="classifier-or-workflow-edited-fail-closed cargo_skip-rules"
           elif echo "$changed" | python3 -I "$trust_impact/cargo_skip.py" --stdin --rules "$trust_impact/rules.json" --event-name "$EVENT_NAME" --base-ref "$PR_BASE_REF" > "$skip_out"; then
-            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ] && [ "$(grep -c '^cargo_skip=' "$skip_out")" = "1" ] && [ "$(grep -c '^cargo_skip_reason=' "$skip_out")" = "1" ]; then
-              docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
-              cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
-              cargo_skip_reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
-              # #9263: any non-printable character in the answer (a tab, a NUL, a
-              # carriage return, another control character) is a rejection. The
-              # file is read directly because a shell variable drops NUL.
+            # #9263: the answer is exactly three lines, one per key, and nothing
+            # else (a fourth or empty line, a second or missing key, a line
+            # break inside a value, no answer) or it is rejected.
+            answer_lines=$(grep -c '' "$skip_out" || true)
+            if [ "$answer_lines" != "3" ] \
+              || [ "$(grep -c '^docs_only=' "$skip_out" || true)" != "1" ] \
+              || [ "$(grep -c '^cargo_skip=' "$skip_out" || true)" != "1" ] \
+              || [ "$(grep -c '^cargo_skip_reason=' "$skip_out" || true)" != "1" ]; then
+              reason_why="extra-line"
+            else
+              # Any byte that is not printable ASCII (a tab, a NUL, a carriage
+              # return, DEL, ESC, any byte above 0x7e) anywhere in the answer is
+              # a rejection. The file is read directly because a shell variable
+              # drops NUL; nothing is parsed before it passes.
               nonprint=$(tr -d '[:print:]\n' < "$skip_out" | wc -c)
               if [ "$nonprint" -ne 0 ]; then
-                reason_why="control-character"
+                reason_why="not-printable-ascii"
+              else
+                docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
+                cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
+                cargo_skip_reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
               fi
             fi
           fi
@@ -749,6 +765,12 @@ jobs:
             cargo_skip=false
             cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
           fi
+          # #9263: each value is checked on its own first. The pair case below
+          # reads the two values joined, so a split value ("falset" + "rue"
+          # reads as falsetrue) would pass it; the pair case then only decides
+          # the combination (docs_only=true needs cargo_skip=true).
+          case "$docs_only" in true|false) ;; *) cargo_skip=invalid ;; esac
+          case "$cargo_skip" in true|false) ;; *) docs_only=invalid ;; esac
           case "$docs_only$cargo_skip" in
             truetrue|falsetrue|falsefalse) ;;
             *) docs_only=false; cargo_skip=false; cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules" ;;

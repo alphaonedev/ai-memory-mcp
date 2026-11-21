@@ -218,6 +218,11 @@ jobs:
           # MERGE-BASE tree (git merge-base HEAD "$base", the whole PR) and run
           # with -I from outside the workspace, so a PR cannot edit its own
           # judgement. Anything unexpected is false.
+          # #9263 / #9815: one locale for every byte test below. BSD tr and
+          # bash 3.2 (macOS) and GNU tr and bash 5 (ubuntu) otherwise disagree
+          # on [:print:] and ${#var} for bytes above 0x7f, so the answer check
+          # is made byte-wise, here, whatever locale the caller exports.
+          export LC_ALL=C
           docs_only=false
           cargo_skip=false
           reason="classifier-error-fail-closed"
@@ -242,19 +247,28 @@ jobs:
           elif [ -n "$ci_edit" ]; then
             reason="classifier-or-workflow-edited-fail-closed"
           elif python3 -I "$trust_impact/cargo_skip.py" --stdin0 --rules "$trust_impact/rules.json" --event-name "$COV_EVENT_NAME" --base-ref "$COV_BASE_REF" < "$paths_z" > "$skip_out"; then
-            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ] \
-              && [ "$(grep -c '^cargo_skip=' "$skip_out")" = "1" ] \
-              && [ "$(grep -c '^cargo_skip_reason=' "$skip_out")" = "1" ]; then
-              docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
-              cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
-              reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
-              # Any character that is not printable (a tab, a NUL, a carriage
-              # return or another control character) anywhere in the answer is
-              # a rejection: the reason is never cleaned up and then trusted.
-              # The file is read directly because a shell variable drops NUL.
+            # The answer is exactly three lines, one per key, and nothing
+            # else: a fourth line, an empty line, a second or a missing key, a
+            # line break inside a value or no answer at all is a rejection.
+            answer_lines=$(grep -c '' "$skip_out" || true)
+            if [ "$answer_lines" != "3" ] \
+              || [ "$(grep -c '^docs_only=' "$skip_out" || true)" != "1" ] \
+              || [ "$(grep -c '^cargo_skip=' "$skip_out" || true)" != "1" ] \
+              || [ "$(grep -c '^cargo_skip_reason=' "$skip_out" || true)" != "1" ]; then
+              reason_why="extra-line"
+            else
+              # Any byte that is not printable ASCII (a tab, a NUL, a carriage
+              # return, DEL, ESC, any byte above 0x7e) anywhere in the answer
+              # is a rejection: the reason is never cleaned up and then
+              # trusted. The file is read directly (a shell variable drops
+              # NUL) and nothing is parsed before it passes.
               nonprint=$(tr -d '[:print:]\n' < "$skip_out" | wc -c)
               if [ "$nonprint" -ne 0 ]; then
-                reason_why="control-character"
+                reason_why="not-printable-ascii"
+              else
+                docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
+                cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
+                reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
               fi
             fi
           fi
@@ -263,9 +277,10 @@ jobs:
           # (so a split value such as `falset` + `rue`, an empty, blank, CR or
           # newline-carrying value is refused), docs_only=true needs
           # cargo_skip=true, and the reason must hold at least one non-blank
-          # printable character, no control character and at most reason_max
-          # characters. Anything else is a RUN with the fail-closed reason,
-          # never a skip, and one line names why.
+          # printable ASCII character, no control character and at most
+          # reason_max bytes. Anything else is a RUN with the fail-closed
+          # reason, never a skip, and one line holding one fixed token names
+          # why; the answer text itself is never printed.
           shape_ok=1
           case "$docs_only" in true|false) ;; *) shape_ok=0 ;; esac
           case "$cargo_skip" in true|false) ;; *) shape_ok=0 ;; esac

@@ -306,6 +306,14 @@ REASON_ROWS = [
         answer=b"cargo_skip=true\ncargo_skip_reason=" + OK_REASON + LF),
     rej("cargo_skip missing", WHY_EXTRA, canary=ZQ,
         answer=b"docs_only=false\ncargo_skip_reason=" + OK_REASON + LF),
+    # exactly three lines where one key is replaced by a look-alike: only the
+    # per-key count (not the line count) refuses these
+    rej("three lines, docs_only a look-alike", WHY_EXTRA, canary=ZQ,
+        answer=b"docs_onlyX=" + ZQ + b"\ncargo_skip=true\ncargo_skip_reason=" + OK_REASON + LF),
+    rej("three lines, cargo_skip a look-alike", WHY_EXTRA, canary=ZQ,
+        answer=b"docs_only=false\ncargo_skipX=" + ZQ + b"\ncargo_skip_reason=" + OK_REASON + LF),
+    rej("three lines, reason a look-alike", WHY_EXTRA, canary=ZQ,
+        answer=b"docs_only=false\ncargo_skip=true\ncargo_skip_reasonX=" + ZQ + LF),
     rej("no answer at all", WHY_EXTRA, answer=b""),
     rej("a reason that carries a key line", WHY_EXTRA, ZQ + b"\ncargo_skip=true", canary=ZQ),
     rej("an extra line and a control character", WHY_EXTRA, ZQ + b"\n\x01", canary=ZQ),
