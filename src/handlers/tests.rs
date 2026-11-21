@@ -76,14 +76,51 @@ fn install_security_bypass_for_legacy_tests() {
     });
 }
 
+/// #1751 / #9730 — the one site of this file that pins the lib-test binary to
+/// the explicit permissive attestation opt-out, so the unsigned HTTP create
+/// fixtures keep exercising their actual subject matter (required-default
+/// rejection is covered by `tests/agent_attestation_integrity.rs`). Both
+/// `test_state` and `test_app_state` go through it: one helper-routed
+/// environment mutation in this file, not one per caller
+/// (`scripts/check-test-env-lock.sh` arm (e), #3523).
+fn pin_permissive_attestation() {
+    crate::identity::attest::permissive_attestation_for_lib_tests();
+}
+
 fn test_state() -> Db {
     install_security_bypass_for_legacy_tests();
     // #3498 battery: isolated handler slices must install the network gate
     // before fanout, just as the federation test fixtures do (#3515).
     crate::governance::wire_check::ensure_installed_for_test();
+    // #9730 — a hand-built `AppState` (no `test_app_state`) over this handle
+    // reaches the HTTP-direct attestation gate, whose default is "required"
+    // (403). `test_app_state` pins the permissive posture for the process;
+    // pin it here too so a test that skips it does not depend on a sibling
+    // having run first (nextest runs each test in its own process).
+    pin_permissive_attestation();
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)))
+}
+
+/// #9730 — class guard: every handler test obtains its handle through
+/// `test_state`, so the wire-action hook and the permissive attestation pin
+/// must both be in place afterwards, in a fresh process (nextest) as well as
+/// in the shared `cargo test` process.
+#[test]
+fn test_state_seeds_process_wide_state_9730() {
+    let _db = test_state();
+    assert!(
+        crate::governance::wire_check::GOVERNANCE_PRE_ACTION
+            .get()
+            .is_some(),
+        "test_state must install the wire-action hook (#9730)"
+    );
+    assert_eq!(
+        std::env::var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION").as_deref(),
+        Ok("0"),
+        "test_state must pin the permissive attestation posture (#9730)"
+    );
 }
 
 /// S5-C1 fix campaign (2026-05-13): tests that hit
@@ -393,7 +430,7 @@ pub(super) fn test_app_state(db: Db) -> AppState {
     // attestation opt-out so the unsigned HTTP create fixtures below
     // keep exercising their actual subject matter (required-default
     // rejection is covered by `tests/agent_attestation_integrity.rs`).
-    crate::identity::attest::permissive_attestation_for_lib_tests();
+    pin_permissive_attestation();
     // v0.7.0 Wave-3 — test helper. Test fixtures use `:memory:`
     // SQLite for the legacy `db` field (no on-disk path) so the
     // trait-routed `store` field is set to a separate SqliteStore
