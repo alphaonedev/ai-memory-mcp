@@ -92,6 +92,19 @@ pub fn require_audit_trail_enabled() -> bool {
     std::env::var(REQUIRE_AUDIT_TRAIL_ENV).is_ok_and(|v| crate::security_profile::is_truthy(&v))
 }
 
+/// Test-only: the refusal every latch mutator gives outside an isolated child
+/// test process (#7321). One message, naming the function that was reached.
+#[cfg(test)]
+fn require_isolated_child(function: &str) {
+    let isolated = std::env::var(crate::test_support::TEST_ENV_ISOLATION_ROLE_ENV)
+        .is_ok_and(|role| role == "child");
+    assert!(
+        isolated,
+        "{function} mutates the process-global audit latch and may only run in an isolated \
+         child test process (#7321); wrap the test in run_env_isolated_child_or_spawn"
+    );
+}
+
 /// Test-only: turn the mode on without touching the process environment.
 #[cfg(test)]
 static FORCE_ON_FOR_TEST: AtomicBool = AtomicBool::new(false);
@@ -100,6 +113,7 @@ static FORCE_ON_FOR_TEST: AtomicBool = AtomicBool::new(false);
 /// latch and retry clock. Callers hold `audit::sink_test_lock`.
 #[cfg(test)]
 pub(crate) fn force_on_for_test(on: bool) {
+    require_isolated_child("force_on_for_test");
     FORCE_ON_FOR_TEST.store(on, Ordering::SeqCst);
     reset_for_test();
 }
@@ -239,6 +253,7 @@ fn probe_trail() -> bool {
 /// behind for the rest of the process.
 #[cfg(test)]
 pub(crate) fn latch_for_test() -> LatchGuard {
+    require_isolated_child("latch_for_test");
     FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
     LATCHED.store(true, Ordering::SeqCst);
     LAST_PROBE_MS.store(u64::MAX, Ordering::SeqCst);
@@ -261,14 +276,24 @@ impl Drop for LatchGuard {
 /// Test-only: let the next latched gate retry at once.
 #[cfg(test)]
 pub(crate) fn reset_probe_clock_for_test() {
+    require_isolated_child("reset_probe_clock_for_test");
     LAST_PROBE_MS.store(0, Ordering::SeqCst);
 }
 
 /// Test-only: reset the process-global latch state.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
+    require_isolated_child("reset_for_test");
     LATCHED.store(false, Ordering::SeqCst);
     LAST_PROBE_MS.store(0, Ordering::SeqCst);
+}
+
+/// Test-only: set the latch itself, for a cell that needs it set without a
+/// failing append. The only way a test names the latch static (#7321).
+#[cfg(test)]
+pub(crate) fn set_latched_for_test(latched: bool) {
+    require_isolated_child("set_latched_for_test");
+    LATCHED.store(latched, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -307,7 +332,7 @@ mod tests {
         }
         let _g = lock();
         reset_for_test();
-        LATCHED.store(true, Ordering::SeqCst);
+        set_latched_for_test(true);
         let mut probes = 0;
         let refused = gate_with(true, 10_000, || {
             probes += 1;
@@ -375,7 +400,7 @@ mod tests {
         }
         let _g = lock();
         force_on_for_test(true);
-        LATCHED.store(true, Ordering::SeqCst);
+        set_latched_for_test(true);
         let r = gate_with(true, 50_000, || {
             // A concurrent emit failure, landing while the retry appends.
             note_failure_for_latch();
@@ -396,7 +421,7 @@ mod tests {
         }
         let _g = lock();
         reset_for_test();
-        LATCHED.store(true, Ordering::SeqCst);
+        set_latched_for_test(true);
         assert!(gate_with(false, 1, || panic!("no retry when the mode is off")).is_ok());
         assert!(!audit_trail_latched());
         reset_for_test();

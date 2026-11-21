@@ -80,6 +80,7 @@ const ALLOWLIST: [Permit; 7] = [
             "latch_for_test",
             "reset_probe_clock_for_test",
             "reset_for_test",
+            "set_latched_for_test",
             "LatchGuard",
         ],
         reason: "defines the statics, the production gate and the asserting test setters",
@@ -417,6 +418,7 @@ pub(super) fn assert_shared_process() {
 
 use super::fail_closed::{
     force_on_for_test, latch_for_test, reset_for_test, reset_probe_clock_for_test,
+    set_latched_for_test,
 };
 
 fn direct_force_on() {
@@ -425,6 +427,10 @@ fn direct_force_on() {
 
 fn direct_reset() {
     reset_for_test();
+}
+
+fn direct_set_latched() {
+    set_latched_for_test(true);
 }
 
 fn direct_latch() {
@@ -494,9 +500,14 @@ fn through_another_drop_impl() {
 #[test]
 fn every_way_of_reaching_the_latch_refuses_in_the_shared_process_7321() {
     assert_shared_process();
-    let table: [(&str, &str, fn()); 12] = [
+    let table: [(&str, &str, fn()); 13] = [
         ("force_on_for_test", "force_on_for_test", direct_force_on),
         ("reset_for_test", "reset_for_test", direct_reset),
+        (
+            "set_latched_for_test",
+            "set_latched_for_test",
+            direct_set_latched,
+        ),
         ("latch_for_test", "latch_for_test", direct_latch),
         (
             "reset_probe_clock_for_test",
@@ -545,4 +556,42 @@ fn every_way_of_reaching_the_latch_refuses_in_the_shared_process_7321() {
         })
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #7321, the issue's victim (`mcp::tests::chunkc_archive_gc_dry_run_returns_count`)
+/// and every other write-path test that does not isolate reads the latch in the
+/// shared process; the owner's 2026-11-19 comment on #7321 says that test "must
+/// not depend on that state". This pins why it cannot: nothing in the shared
+/// process can set the latch or force the mode on. Every test-only mutator
+/// refuses there (the table above), the mode comes only from the environment,
+/// and a gate that never sees the mode on never latches
+/// (`note_failure_for_latch`). After driving every mutator, the shared
+/// process's latch is clear and its mode equals the environment's.
+#[test]
+fn the_shared_process_latch_stays_clear_for_unisolated_readers_7321() {
+    assert_shared_process();
+    let mutators: [fn(); 5] = [
+        direct_force_on,
+        direct_reset,
+        direct_latch,
+        direct_probe_clock,
+        direct_set_latched,
+    ];
+    for mutator in mutators {
+        assert!(
+            panic_message(mutator).is_some(),
+            "a mutator ran in the shared process"
+        );
+    }
+    assert!(
+        !crate::audit::audit_trail_latched(),
+        "no test in the shared process may leave the latch set"
+    );
+    let from_environment = std::env::var(crate::audit::REQUIRE_AUDIT_TRAIL_ENV)
+        .is_ok_and(|v| crate::security_profile::is_truthy(&v));
+    assert_eq!(
+        crate::audit::require_audit_trail_enabled(),
+        from_environment,
+        "the shared process's mode is the environment's, never forced"
+    );
 }
