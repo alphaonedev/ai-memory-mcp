@@ -223,8 +223,8 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
         "release-shape": ("Release feature declaration guard",
                           "Build release binary (exactly as release.yml)",
                           "No OpenSSL / libpq / native-tls in the shipped dependency graph",
-                          "Prove the shipped binary reports sal-postgres and uses the tier over "
-                          "verify-full"),
+                          ("Prove the shipped binary reports sal-postgres and uses the tier over "
+                          "verify-full")),
     },
     "token-budget.yml": {
         "budget": ("per-tool ceiling (1500 tokens cl100k_base)",
@@ -1399,9 +1399,9 @@ NON_PRODUCING_SUBCOMMANDS: dict[str, str] = {
 RESOLVED_PR_COMMANDS: dict[tuple[str, str, str], tuple[str | None, str]] = {
     ("ci.yml", "check", 'cargo test --no-run "$@"'): (
         "cargo test --no-run",
-        "run_tests / run_doc_tests prebuild: on the hosted sqlite leg FEAT and TAIL are empty, the "
+        ("run_tests / run_doc_tests prebuild: on the hosted sqlite leg FEAT and TAIL are empty, the "
         "full suite passes no argument and the impact path passes --lib / --test names, a subset "
-        "of the same build"),
+        "of the same build")),
     ("ci.yml", "check", 'cargo test --no-fail-fast "$@"'): (
         "cargo test --no-run",
         "runs the binaries the prebuild line above it built, with the same arguments"),
@@ -1413,13 +1413,13 @@ RESOLVED_PR_COMMANDS: dict[tuple[str, str, str], tuple[str | None, str]] = {
     ("ci.yml", "check", 'cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@"'): (
         None, "run_sharded: enterprise-fed tier only, never the hosted sqlite leg"),
     ("coverage.yml", "per-module-thresholds",
-     "cargo llvm-cov --no-clean --features sal,sal-postgres --lib --workspace --json --output-path "
+     ("cargo llvm-cov --no-clean --features sal,sal-postgres --lib --workspace --json --output-path "
      "coverage/current.json -- schema_init_postgres_embedding_dim_conversion --ignored "
-     "--test-threads=1"): (
-        "cargo llvm-cov --no-report --features sal,sal-postgres --lib --tests --workspace -- "
-        "--test-threads=1",
-        "report call: --no-clean reuses the first call's instrumented build, and --lib with the "
-        "same features is a subset of --lib --tests"),
+     "--test-threads=1")): (
+        ("cargo llvm-cov --no-report --features sal,sal-postgres --lib --tests --workspace -- "
+        "--test-threads=1"),
+        ("report call: --no-clean reuses the first call's instrumented build, and --lib with the "
+        "same features is a subset of --lib --tests")),
 }
 # Test-runner arguments (after `--`) a warm command may append: they reach the test binary, not
 # the compiler, so the build is the PR command's build.
@@ -2156,11 +2156,11 @@ KEY_ENV_EVAL_FAIL: tuple[tuple[str, str, dict[str, object], str], ...] = (
     ("two-defaults", "${{ matrix.a || matrix.b || 'c' }}", {},
      "K: unrecognised expression form in an env value: \"${{ matrix.a || matrix.b || 'c' }}\""),
     ("zero-is-ambiguous", KEY_ENV_MATRIX_FORM, {"cargo_debug": "0"},
-     "K: matrix.cargo_debug = '0' is truthy when quoted and falsy when not, and this parser "
-     "drops the quotes: \"${{ matrix.cargo_debug || 'line-tables-only' }}\""),
+     ("K: matrix.cargo_debug = '0' is truthy when quoted and falsy when not, and this parser "
+     "drops the quotes: \"${{ matrix.cargo_debug || 'line-tables-only' }}\"")),
     ("boolean-is-ambiguous", KEY_ENV_MATRIX_FORM, {"cargo_debug": False},
-     "K: matrix.cargo_debug = False is truthy when quoted and falsy when not, and this parser "
-     "drops the quotes: \"${{ matrix.cargo_debug || 'line-tables-only' }}\""),
+     ("K: matrix.cargo_debug = False is truthy when quoted and falsy when not, and this parser "
+     "drops the quotes: \"${{ matrix.cargo_debug || 'line-tables-only' }}\"")),
 )
 
 
@@ -2195,8 +2195,8 @@ UNPAIRED_RUST_CACHE_SITES: dict[tuple[str, str, str], UnpairedSite] = {
         "the `once` leg runs the cargo-audit install and the release smoke that #9680 moved off "
         "`check`, under its own key `mobile-<target>-audit-release`; no chain push warms it (#9732)",
         ("cargo build --release",
-         "cargo check --target aarch64-linux-android --no-default-features --features "
-         "sqlite-bundled --lib",
+         ("cargo check --target aarch64-linux-android --no-default-features --features "
+         "sqlite-bundled --lib"),
          "cargo install cargo-audit --locked --force --version 0.22.2")),
     ("ci.yml", "sal-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
     ("ci.yml", "vectorlite-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
@@ -2421,8 +2421,8 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
             ("site-in-both", frozenset({site_p}), {site_p: cold},
              ["rust-cache site in both PAIRS and UNPAIRED_RUST_CACHE_SITES: w.yml:p"]),
             ("stale-row", frozenset({site_p}), {site_a: cold},
-             ["stale UNPAIRED_RUST_CACHE_SITES row (no hosted pull_request rust-cache site): "
-              "w.yml:a"]),
+             [("stale UNPAIRED_RUST_CACHE_SITES row (no hosted pull_request rust-cache site): "
+              "w.yml:a")]),
             ("row-without-issue", frozenset({site_a, site_p}), {site_a: UnpairedSite((), "r")},
              ["UNPAIRED_RUST_CACHE_SITES row without an issue number: w.yml:a"]),
             ("row-with-zero-issue", frozenset({site_a, site_p}), {site_a: UnpairedSite((0,), "r")},
@@ -2443,15 +2443,15 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
                 self.assertEqual(
                     _unpaired_site_problems(frozenset({site_b, site_p}), paired,
                                             {site_b: pinned}, commands_of),
-                    [f"cold cargo commands of w.yml:b[target=t] differ from its row: only on the "
-                     f"site {only_site}, only in the row {only_row}"])
+                    [(f"cold cargo commands of w.yml:b[target=t] differ from its row: only on the "
+                     f"site {only_site}, only in the row {only_row}")])
         cmds[site_b] = ((), ["s: unnamed dynamic cargo command: cargo build $X"])
         self.assertEqual(
             _unpaired_site_problems(frozenset({site_b, site_p}), paired, {site_b: pinned},
                                     commands_of),
             ["w.yml:b[target=t]: s: unnamed dynamic cargo command: cargo build $X",
-             "cold cargo commands of w.yml:b[target=t] differ from its row: only on the site [], "
-             "only in the row ['cargo build --release']"])
+             ("cold cargo commands of w.yml:b[target=t] differ from its row: only on the site [], "
+             "only in the row ['cargo build --release']")])
 
     def test_runs_on_reader_table_and_fail_closed(self) -> None:
         def job(runs_on: str) -> Job:
@@ -2631,9 +2631,9 @@ class ReachableWorkflowSites9681R3(unittest.TestCase):
         sites, problems = self._sites({"w.yml": _stub_workflow(
             "pull_request", _stub_job("m", legs))})
         self.assertEqual(sorted(sites), [("w.yml", "m", "target=t")])
-        self.assertEqual(problems, ["two hosted legs of one job share the site key "
+        self.assertEqual(problems, [("two hosted legs of one job share the site key "
                                     "w.yml:m[target=t]: the second would overwrite the first; "
-                                    "give them different first keys"])
+                                    "give them different first keys")])
         legs = _stub_matrix("target: t", "target: u")
         sites, problems = self._sites({"w.yml": _stub_workflow(
             "pull_request", _stub_job("m", legs))})
@@ -2659,17 +2659,17 @@ class ReachableWorkflowSites9681R3(unittest.TestCase):
     def test_unreadable_reusable_workflow_calls_fail_closed(self) -> None:
         forms = {
             "remote": ("owner/repo/.github/workflows/r.yml@v1",
-                       "job-level uses of a reusable workflow that is not a local "
-                       "./.github/workflows/<name>.yml: 'owner/repo/.github/workflows/r.yml@v1'"),
+                       ("job-level uses of a reusable workflow that is not a local "
+                       "./.github/workflows/<name>.yml: 'owner/repo/.github/workflows/r.yml@v1'")),
             "local-with-ref": ("./.github/workflows/called.yml@main",
-                               "job-level uses of a reusable workflow that is not a local "
-                               "./.github/workflows/<name>.yml: './.github/workflows/called.yml@main'"),
+                               ("job-level uses of a reusable workflow that is not a local "
+                               "./.github/workflows/<name>.yml: './.github/workflows/called.yml@main'")),
             "outside-tree": ("./other/called.yml",
-                             "job-level uses of a reusable workflow that is not a local "
-                             "./.github/workflows/<name>.yml: './other/called.yml'"),
+                             ("job-level uses of a reusable workflow that is not a local "
+                             "./.github/workflows/<name>.yml: './other/called.yml'")),
             "subdirectory": ("./.github/workflows/sub/called.yml",
-                             "job-level uses of a reusable workflow that is not a local "
-                             "./.github/workflows/<name>.yml: './.github/workflows/sub/called.yml'"),
+                             ("job-level uses of a reusable workflow that is not a local "
+                             "./.github/workflows/<name>.yml: './.github/workflows/sub/called.yml'")),
             "missing": ("./.github/workflows/nothere.yml",
                         "reusable workflow './.github/workflows/nothere.yml' is not a file"),
         }
@@ -2702,8 +2702,8 @@ class ReachableWorkflowSites9681R3(unittest.TestCase):
         sites, problems = self._sites(self._chain(9))
         self.assertEqual(sites, {})
         self.assertEqual(problems, [
-            "w0.yml: c/c/c/c/c/c/c/c/c: reusable workflow call chain deeper than 8: "
-            "'./.github/workflows/w9.yml'"])
+            ("w0.yml: c/c/c/c/c/c/c/c/c: reusable workflow call chain deeper than 8: "
+            "'./.github/workflows/w9.yml'")])
         self.assertEqual(self._writers(self._chain(9))[1], problems)
 
     def test_call_chain_at_the_limit_is_followed(self) -> None:
@@ -2727,8 +2727,8 @@ class ReachableWorkflowSites9681R3(unittest.TestCase):
         texts = {"caller.yml": _stub_workflow("pull_request", call),
                  "called.yml": _stub_workflow("workflow_call", _stub_job("inner", steps=writer))}
         reached, problems = self._writers(texts)
-        self.assertEqual(problems, ["('caller.yml', 'call/inner', 'Docker layers'): actions/cache "
-                                    "saves in its post step on every event"])
+        self.assertEqual(problems, [("('caller.yml', 'call/inner', 'Docker layers'): actions/cache "
+                                    "saves in its post step on every event")])
         texts["caller.yml"] = _stub_workflow("push", call)
         self.assertEqual(self._writers(texts), ([], []))
 
@@ -2771,15 +2771,15 @@ class CalledWorkflowSaveScope9745R1(unittest.TestCase):
     def test_pin_and_on_failure_checks_follow_a_called_workflow(self) -> None:
         texts = _caller_and_inner(FOREIGN_RUST_CACHE_STEP)
         self.assertEqual(_under_stubs(texts, _rust_cache_step_failures, ["caller.yml"]), [
-            f"caller.yml:call/inner: rust-cache sha {FOREIGN_SHA!r} is not the pinned "
-            f"{RUST_CACHE_SHA}",
+            (f"caller.yml:call/inner: rust-cache sha {FOREIGN_SHA!r} is not the pinned "
+            f"{RUST_CACHE_SHA}"),
             "caller.yml:call/inner: cache-on-failure is set"])
 
     def test_pr_cache_action_check_follows_a_called_workflow(self) -> None:
         texts = _caller_and_inner(UNGATED_CACHE_STEPS)
         self.assertEqual(_under_stubs(texts, _pr_cache_action_failures), [
-            "caller.yml:call/inner: Docker layers: actions/cache saves in its post step on every "
-            "event",
+            ("caller.yml:call/inner: Docker layers: actions/cache saves in its post step on every "
+            "event"),
             "caller.yml:call/inner: Save it: cache save is not gated on a push: 'always()'"])
         texts = _caller_and_inner(UNGATED_CACHE_STEPS, event="push")
         self.assertEqual(_under_stubs(texts, _pr_cache_action_failures), [])
@@ -2858,9 +2858,9 @@ class AddSiteFirstWins9746R1(unittest.TestCase):
         self.assertEqual((sites, problems), ({key: first}, []))
         _add_site(sites, problems, key, second)
         self.assertIs(sites[key], first)
-        self.assertEqual(problems, ["two hosted legs of one job share the site key "
+        self.assertEqual(problems, [("two hosted legs of one job share the site key "
                                     "w.yml:m[target=t]: the second would overwrite the first; "
-                                    "give them different first keys"])
+                                    "give them different first keys")])
         other = ("w.yml", "m", "target=u")
         _add_site(sites, problems, other, third)
         self.assertEqual((sites, len(problems)), ({key: first, other: third}, 1))
@@ -3097,18 +3097,18 @@ class UnreadFormRefusals9745R1(unittest.TestCase):
     def test_every_refusal_is_reported_naming_workflow_and_job(self) -> None:
         sites_of = ReachableWorkflowSites9681R3()._sites
         cases = (
-            ("      matrix:\n        cargo_debug: [0, 1]\n", "w.yml: m: strategy.matrix: unread "
-             "YAML form, matrix axis: 'cargo_debug: [0, 1]'"),
-            ("      matrix:\n        include:\n          - {t: 1}\n", "w.yml: m: "
-             "strategy.matrix.include[0]: unread YAML form, flow mapping: '{t: 1}'"),
-            ("      matrix: ${{ fromJSON(x) }}\n", "w.yml: m: strategy.matrix: unread YAML form, "
-             "matrix is not a block mapping: '${{ fromJSON(x) }}'"),
-            ("      matrix:\n        include: ${{ fromJSON(x) }}\n", "w.yml: m: "
+            ("      matrix:\n        cargo_debug: [0, 1]\n", ("w.yml: m: strategy.matrix: unread "
+             "YAML form, matrix axis: 'cargo_debug: [0, 1]'")),
+            ("      matrix:\n        include:\n          - {t: 1}\n", ("w.yml: m: "
+             "strategy.matrix.include[0]: unread YAML form, flow mapping: '{t: 1}'")),
+            ("      matrix: ${{ fromJSON(x) }}\n", ("w.yml: m: strategy.matrix: unread YAML form, "
+             "matrix is not a block mapping: '${{ fromJSON(x) }}'")),
+            ("      matrix:\n        include: ${{ fromJSON(x) }}\n", ("w.yml: m: "
              "strategy.matrix.include: unread YAML form, include is not a block list: "
-             "'${{ fromJSON(x) }}'"),
-            ("      matrix:\n        include:\n          - target: t\n"
-             "            cargo_debug: '0' # c\n            os: *d\n", "w.yml: m: "
-             "strategy.matrix.include[0].os: unread YAML form, alias: '*d'"),
+             "'${{ fromJSON(x) }}'")),
+            (("      matrix:\n        include:\n          - target: t\n"
+             "            cargo_debug: '0' # c\n            os: *d\n"), ("w.yml: m: "
+             "strategy.matrix.include[0].os: unread YAML form, alias: '*d'")),
         )
         for strategy, problem in cases:
             with self.subTest(problem=problem):
