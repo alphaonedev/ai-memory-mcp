@@ -261,6 +261,45 @@ def serving_runners(name, config_path=None):
         return None
 
 
+def gate_runners(names, config_path=None):
+    """(serving runners, None) when NAMES is exactly one gate of the slot configuration, else (None, the reason).
+
+    decision: refuse an unknown gate, an unreadable configuration and a repeated --name over running with
+    "runners unknown", because a gate no configuration holds has no host-wide slot count (#9846). The file is
+    read once here, so the runner check uses the same text that proved the gate. The reasons are fixed text:
+    the gate name has passed NAME_RE and the path and the file contents are never echoed.
+    """
+    if len(names) > 1:
+        return None, '--name is given %d times; give it once' % len(names)
+    name = names[0]
+    path = Path(config_path) if config_path else Path(__file__).resolve().parent / HOST_SLOTS_CONFIG
+    try:
+        config = json.loads(path.read_text(encoding='utf-8'))
+    except OSError as exc:
+        return None, 'the slot configuration cannot be read (%s)' % type(exc).__name__
+    # UnicodeDecodeError is a ValueError; nesting past the recursion limit is RecursionError
+    except (ValueError, RecursionError):
+        return None, 'the slot configuration is not valid UTF-8 JSON'
+    gates = config.get('gates') if isinstance(config, dict) else None
+    if not isinstance(gates, dict):
+        return None, 'the slot configuration has no gates object'
+    if name not in gates:
+        return None, "'%s' is not a gate of the slot configuration" % name
+    runners = gates[name].get('serving_runners') if isinstance(gates[name], dict) else None
+    if not (isinstance(runners, list) and all(isinstance(r, str) for r in runners)):
+        return None, "gate '%s' has no serving_runners list of strings in the slot configuration" % name
+    return runners, None
+
+
+def unknown_gate_annotation(label, reason):
+    """Error annotation of infra-unknown-runner for a --name the configuration does not hold (#9846)."""
+    return wa.annotation(
+        'error',
+        "%s '%s': %s: %s; no slot taken, no command ran; exit %d"
+        % (TAG, label, OUTCOME_UNKNOWN_RUNNER, reason, EXIT_UNKNOWN_RUNNER),
+        title=TITLE_UNKNOWN_RUNNER)
+
+
 def no_slot_annotation(label, max_wait, slots, runners):
     """The one error annotation of the named outcome infra-no-slot (#9231); no test ran, the job stays red.
 
@@ -407,7 +446,7 @@ def _positive_int(text):
 def main(argv=None):
     # allow_abbrev=False: an abbreviation such as --max-wait is a bad argument, never a second spelling of the flag
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
-    p.add_argument('--name', required=True)
+    p.add_argument('--name', action='append', required=True, help='one gate of the slot configuration; give it once')
     p.add_argument('--slots', type=_positive_int, default=SEMAPHORE_SLOTS_DEFAULT)
     p.add_argument(FLAG_MAX_WAIT, action='append', default=None, metavar='SECS',
                    help='the wait for a slot, 1 to IDLE_SEAT_CEILING_SECS of host_slot_limits.py; give it once')
@@ -425,17 +464,22 @@ def main(argv=None):
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         p.error('a command is required after --')
-    if not NAME_RE.fullmatch(args.name):
+    if not all(NAME_RE.fullmatch(name) for name in args.name):
         p.error('--name must match %s' % NAME_RE.pattern)
-    runners = serving_runners(args.name, args.config)
+    # The gate is refused after the wait and before the runner check, the slot directory and any wait (#9846).
+    runners, problem = gate_runners(args.name, args.config)
+    if problem is not None:
+        print(unknown_gate_annotation(args.label, problem), flush=True)
+        return EXIT_UNKNOWN_RUNNER
+    name = args.name[0]
     runner = os.environ.get(ENV_RUNNER_NAME)
-    if runner and runners is not None and runner not in runners:
+    if runner and runner not in runners:
         # decision: refuse an unlisted runner over a hand-kept list nothing reads, because the list is the
         # slot count's only source: a runner outside it is not covered by the slots (#9231).
-        print(unknown_runner_annotation(args.label, args.name, runner), flush=True)
+        print(unknown_runner_annotation(args.label, name, runner), flush=True)
         return EXIT_UNKNOWN_RUNNER
     root = Path(args.root) if args.root else default_root()
-    slot_dir = root / args.name
+    slot_dir = root / name
     slot_dir.mkdir(parents=True, exist_ok=True)
     got = acquire(slot_dir, args.slots, args.label, max_wait, args.poll_secs)
     if got is None:
