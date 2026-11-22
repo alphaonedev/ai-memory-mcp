@@ -1916,6 +1916,8 @@ NON_WRITER_ACTIONS: dict[str, str] = {
     "docker://rhysd/actionlint:1.7.1": "a container step running actionlint",
     "./.github/actions/prune-runner-tmp": "local composite action; it uses no action and no cache "
                                           "(read by test_local_actions_hold_no_cache_writer)",
+    "./.github/actions/docs-only-gate": "local composite action (#9683); it uses no action and no cache "
+                                        "(read by test_local_actions_hold_no_cache_writer)",
 }
 # Named exceptions: a cache writer that a pull_request run can reach today, with its tracker.
 PR_CACHE_WRITER_EXCEPTIONS: dict[tuple[str, str, str], str] = {

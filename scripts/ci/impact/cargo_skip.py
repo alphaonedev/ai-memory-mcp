@@ -329,7 +329,8 @@ def odd_path(path: str) -> bool:
 
 def classify(section: dict, paths: List[str], event_name: str = "",
              base_ref: str = "", repo: Optional[Path] = None,
-             truncated: bool = False) -> Dict[str, str]:
+             truncated: bool = False,
+             max_paths: int = MAX_PATHS) -> Dict[str, str]:
     """Return the three output values for the changed `paths`.
 
     With `repo` set, any tracked symlink, any tracked gitlink or a symlinked
@@ -338,7 +339,8 @@ def classify(section: dict, paths: List[str], event_name: str = "",
     RUN by default (#9263): a list that was cut short (`truncated`), is empty,
     is over MAX_PATHS, or holds an odd path never short-circuits. After the
     forced full runs the order is truncated, empty, over-cap, odd path, symlink
-    scan, CI tree, then the allow-list verdicts.
+    scan, CI tree, then the allow-list verdicts. `max_paths` defaults to
+    MAX_PATHS; the docs-only gate (#9683) passes its own, larger, bound.
     """
     version = "cargo_skip-rules-v%s" % section["version"]
     forced = full_ci_reason(section, event_name, base_ref)
@@ -348,9 +350,9 @@ def classify(section: dict, paths: List[str], event_name: str = "",
         return verdict(FALSE, FALSE, "%s %s" % (REASON_TRUNCATED, version))
     if not paths:
         return verdict(FALSE, FALSE, "%s %s" % (REASON_EMPTY, version))
-    if len(paths) > MAX_PATHS:
+    if len(paths) > max_paths:
         return verdict(FALSE, FALSE, "%s %d>%d %s" % (
-            REASON_OVER_CAP, len(paths), MAX_PATHS, version))
+            REASON_OVER_CAP, len(paths), max_paths, version))
     for path in paths:
         if odd_path(path):
             return verdict(FALSE, FALSE, "%s %s %s" % (
