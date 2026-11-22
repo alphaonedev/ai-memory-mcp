@@ -36,9 +36,11 @@ sys.path.insert(0, str(HERE))
 import taint_boundary  # noqa: E402  (the repository's own YAML subset parser)
 # the one ceiling and the one wait grammar, shared with host_semaphore.py
 from host_slot_limits import IDLE_SEAT_CEILING_SECS, PLAIN_DECIMAL_PATTERN  # noqa: E402
+from host_slot_limits import SLOT_CONFIG_NESTING_MAX, nesting_exceeds  # noqa: E402  (the one nesting bound, #9883)
 
 REPO = HERE.parents[1]
 CONFIG_PATH = HERE / 'host_slots.json'
+NESTING_REFUSED_REASON = '%s nests deeper than %d levels' % (CONFIG_PATH.name, SLOT_CONFIG_NESTING_MAX)
 GITHUB_DIR = REPO / '.github'
 WAIT_KEY = 'HOST_SEMAPHORE_MAX_WAIT_SECS'
 SLOTS_KEY = 'HOST_SEMAPHORE_SLOTS'
@@ -77,8 +79,17 @@ def _string_list(value, where):
 def load_config(path=CONFIG_PATH):
     """The parsed, type and range checked configuration; ConfigError with one line otherwise."""
     try:
-        cfg = json.loads(Path(path).read_text(encoding='utf-8'))
+        text = Path(path).read_text(encoding='utf-8')
     except (OSError, ValueError) as exc:
+        raise ConfigError('%s is unreadable or not JSON (%s)' % (Path(path).name, type(exc).__name__))
+    # the shared bound decides, never the interpreter's recursion limit (#9883, as host_semaphore.py does)
+    if nesting_exceeds(text, SLOT_CONFIG_NESTING_MAX):
+        raise ConfigError(NESTING_REFUSED_REASON)
+    try:
+        cfg = json.loads(text)
+    except RecursionError:  # second line of defence below the bound: the same reason
+        raise ConfigError(NESTING_REFUSED_REASON) from None
+    except ValueError as exc:
         raise ConfigError('%s is unreadable or not JSON (%s)' % (Path(path).name, type(exc).__name__))
     if not isinstance(cfg, dict):
         raise ConfigError('top level must be an object')

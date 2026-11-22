@@ -32,7 +32,8 @@ Exit codes: the child's code, passed through unchanged (75 of the product binary
 83 infra-unknown-runner, the runner is not a serving runner of the gate in host_slots.json, or the gate is
 refused before any slot: a ``--name`` that fails NAME_RE, is given more than once or is not a gate of the
 configuration, a gate without a serving_runners list of strings, or a configuration that is missing,
-unreadable, not UTF-8 JSON, without a gates object or with a duplicate key (#9846, #9851);
+unreadable, not UTF-8 JSON, nested deeper than SLOT_CONFIG_NESTING_MAX of host_slot_limits.py, without a
+gates object or with a duplicate key (#9846, #9851, #9883);
 84 the child itself ended with 82, 83, 84 or 85 (one ``::error title=infra reserved-code::`` line);
 85 infra-wait-refused, the wait is refused as above (COMMAND never ran, no slot taken, one
 ``::error title=infra wait-refused::`` line);
@@ -125,6 +126,13 @@ def _load_host_slot_limits():
         raise TypeError("no_duplicate_keys is not callable")
     if not (isinstance(module.DuplicateKeyError, type) and issubclass(module.DuplicateKeyError, ValueError)):
         raise TypeError("DuplicateKeyError is not a ValueError class")
+    bound = module.SLOT_CONFIG_NESTING_MAX  # absent: AttributeError (the one nesting bound, #9883)
+    if type(bound) is not int:
+        raise TypeError("SLOT_CONFIG_NESTING_MAX is not an int")
+    if bound <= 0:
+        raise ValueError("SLOT_CONFIG_NESTING_MAX is not positive")
+    if not callable(module.nesting_exceeds):  # absent: AttributeError
+        raise TypeError("nesting_exceeds is not callable")
     return module
 
 
@@ -195,6 +203,8 @@ TITLE_WAIT_REFUSED = 'infra wait-refused'
 FLAG_MAX_WAIT = '--max-wait-secs'
 ENV_MAX_WAIT = 'HOST_SEMAPHORE_MAX_WAIT_SECS'  # the workflow's one env mapping key for the wait
 PLAIN_DECIMAL_RE = re.compile(_limits.PLAIN_DECIMAL_PATTERN)  # the one grammar, shared with host_slots_check.py
+CONFIG_NOT_JSON_REASON = 'the slot configuration is not valid UTF-8 JSON'
+NESTING_REFUSED_REASON = 'the slot configuration nests deeper than %d levels' % _limits.SLOT_CONFIG_NESTING_MAX
 NEGATIVE_RE = re.compile(r'-[0-9]+')
 OUTCOME_NO_SLOT = 'infra-no-slot'  # token in the annotation message; a CI failure class for it is tracked in #9833
 OUTCOME_UNKNOWN_RUNNER = 'infra-unknown-runner'
@@ -269,15 +279,25 @@ def gate_runners(names, config_path=None):
     name = names[0]
     path = Path(config_path) if config_path else Path(__file__).resolve().parent / HOST_SLOTS_CONFIG
     try:
-        config = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=_limits.no_duplicate_keys)
+        text = path.read_text(encoding='utf-8')
     except OSError as exc:
         return None, 'the slot configuration cannot be read (%s)' % type(exc).__name__
+    except UnicodeDecodeError:
+        return None, CONFIG_NOT_JSON_REASON
+    # decision (#9883): a named bound checked by a linear scan before the read, over relying on RecursionError,
+    # because whether json.loads raises it depends on the interpreter; the bound gives one reason on every Python.
+    if _limits.nesting_exceeds(text, _limits.SLOT_CONFIG_NESTING_MAX):
+        return None, NESTING_REFUSED_REASON
+    try:
+        config = json.loads(text, object_pairs_hook=_limits.no_duplicate_keys)
     # before ValueError (DuplicateKeyError is one): a repeated key is a refusal, never "the last one wins" (#9851 L3)
     except _limits.DuplicateKeyError:
         return None, 'the slot configuration has a duplicate key'
-    # UnicodeDecodeError is a ValueError; nesting past the recursion limit is RecursionError
-    except (ValueError, RecursionError):
-        return None, 'the slot configuration is not valid UTF-8 JSON'
+    # second line of defence below the bound: the same reason
+    except RecursionError:
+        return None, NESTING_REFUSED_REASON
+    except ValueError:
+        return None, CONFIG_NOT_JSON_REASON
     gates = config.get('gates') if isinstance(config, dict) else None
     if not isinstance(gates, dict):
         return None, 'the slot configuration has no gates object'
