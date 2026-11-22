@@ -441,19 +441,20 @@ def _fallback_parse(text):
 
 
 def _load_reader():
-    """#9813: the shared stdlib YAML subset reader (workflow_text -> taint_boundary), loaded from its
-    file; it refuses every form it does not parse with a named error and a line number."""
+    """#9813, #9817: the shared strict stdlib YAML reader (workflow_text.parse_text: the closed grammar, the
+    subset parser and the independent line reader compared in full), loaded from its file. It refuses every
+    form it does not read with WorkflowReadError (file, line, one reason constant, no document text)."""
     spec = importlib.util.spec_from_file_location("workflow_text_4734_reader", WORKFLOW_TEXT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.load_taint_boundary()
+    return module
 
 
-_BOUNDARY = _load_reader()
+_READER = _load_reader()
 
 
 def _parse_document(text):
-    return _BOUNDARY.parse_yaml(text, COMPOSE_LABEL)
+    return _READER.parse_text(text, COMPOSE_LABEL)
 
 
 def _yaml_parse(text):
@@ -546,21 +547,21 @@ def _compose_scan(text):
     extends/include/secrets/configs/env_file and any top-level key besides name and services."""
     names, problems = _interpolations(text)
     if YAML_ANCHOR_ALIAS.search(text):
-        problems.append("YAML anchor or alias")
+        problems.append(COMPOSE_ANCHOR_ALIAS)
     if YAML_MERGE_KEY.search(text):
-        problems.append("YAML merge key")
+        problems.append(COMPOSE_MERGE_KEY)
     for m in COMPOSE_BANNED_KEYS.finditer(text):
-        problems.append("banned key %s" % m.group(0).strip("\"' :"))
+        problems.append(COMPOSE_BANNED_KEY % m.group(0).strip("\"' :"))
     tops = set()
-    for ln in text.splitlines():
+    for number, ln in enumerate(text.splitlines(), 1):
         if ln.strip() and not ln[0].isspace():
             key = COMPOSE_TOP_KEY.match(ln)
             if key is None:
-                problems.append("top-level line that is not a key: %r" % ln[:20])
+                problems.append(COMPOSE_TOP_NOT_KEY % number)  # #9817 L2: the line number, never its text
             else:
                 tops.add(key.group(1))
-    if tops != {"name", "services"}:
-        problems.append("top-level keys %s differ from name, services" % sorted(tops))
+    if tops != COMPOSE_TOP_KEYS:
+        problems.append(COMPOSE_TOP_KEYS_DIFFER % sorted(tops))
     return names, problems
 
 
@@ -596,7 +597,7 @@ def _interpolations(value):
     names, problems = set(), []
     for m in DOLLAR_RUN.finditer(value):
         if len(m.group(1)) >= 3:
-            problems.append("a run of %d dollars (escape plus interpolation)" % len(m.group(1)))
+            problems.append(DOLLAR_RUN_REFUSED % len(m.group(1)))
         if len(m.group(1)) % 2 == 1 and m.group(2):
             names.add(m.group(2))
     return names, problems
@@ -620,34 +621,34 @@ def _decoded_strings(node):
         yield node
 
 
-EXPLICIT_TAG_MARK = "outside the subset: '!"
-
-
 def _decoded_scan(text):
     """r13 K4+S14, #9813: (interpolated names, refusals) of the compose file as the stdlib subset reader
     decodes it, because compose interpolates the decoded scalar, not the raw text. Every scalar value
     (keys included) goes through the escape rule; every construct in which the raw text and the decoded
     scalar can differ is refused: a backslash escape in a double-quoted scalar, a block scalar (`|`, `>`),
     an explicit tag, and text the reader does not parse (a scalar or flow collection over several lines
-    is one of those), and a `$` inside a quoted scalar except the one pinned `user:` scalar."""
+    is one of those), and a `$` inside a quoted scalar except the one pinned `user:` scalar.
+
+    #9817: the reader is workflow_text.parse_text, so a refusal carries `<label>: line N: <reason constant>`
+    and no document text (L2); each refusal text is a named constant pinned row by row in
+    test_decoded_scan_selftest (L4)."""
     names, problems = set(), []
     try:
         document = _parse_document(text)
-    except _BOUNDARY.YamlError as exc:
-        message = str(exc).splitlines()[0]
-        if EXPLICIT_TAG_MARK in message:
-            return names, ["explicit YAML tag: %s" % message]
-        return names, ["the compose text does not parse: %s" % message]
-    for line in text.splitlines():
+    except _READER.WorkflowReadError as exc:
+        if exc.reason == _READER.TAG:
+            return names, [DECODED_TAG % exc]
+        return names, [DECODED_UNPARSED % exc]
+    for number, line in enumerate(text.splitlines(), 1):
         code = _strip_comment(line)
         if BLOCK_SCALAR_HEADER.search(code):
-            problems.append("block scalar")
+            problems.append(DECODED_BLOCK_SCALAR % number)
         for span in DOUBLE_QUOTED_SPAN.findall(code):
             if "\\" in span:
-                problems.append("backslash escape in a double-quoted scalar: %r" % span[:30])
+                problems.append(DECODED_BACKSLASH % number)
         for span in DOUBLE_QUOTED_SPAN.findall(code) + SINGLE_QUOTED_SPAN.findall(code):
             if "$" in span and span not in COMPOSE_QUOTED_DOLLAR_OK:
-                problems.append("dollar inside a quoted scalar: %r" % span[:30])
+                problems.append(DECODED_QUOTED_DOLLAR % number)
     for value in _decoded_strings(document):
         found, bad = _interpolations(value)
         names |= found
