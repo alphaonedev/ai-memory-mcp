@@ -224,10 +224,24 @@ if __name__ == "__main__" and wa is None:
     sys.exit(load_refused(sys.stdout, sys.stderr, requested_mode(sys.argv[1:]) == MODE_JOB_END))
 
 
-def refusal_annotation(reason, level=LEVEL_WARNING):
-    """The workflow annotation for a refusal; ``reason`` is the raw text (a ``Refusal`` gives its ``raw``)."""
+def refusal_annotation(reason, level=LEVEL_WARNING, context=None):
+    """The workflow annotation for a refusal; ``reason`` is the raw text (a ``Refusal`` gives its ``raw``).
+
+    ``context`` (``refusal_context``, #9876 N1) follows the reason. When the line would pass the annotation cap,
+    the reason is cut, never the context, so the layout, owner and entry stay in every refusal line.
+    """
     raw = getattr(reason, "raw", reason)
-    return wa.annotation(level, wa.render("{prog}: refused: {reason}", prog=PROG, reason=raw), title=f"{PROG} refused")
+    if context is None:
+        return wa.annotation(level, wa.render("{prog}: refused: {reason}", prog=PROG, reason=raw),
+                             title=f"{PROG} refused")
+    reason_text = wa.render("{reason}", reason=raw)
+    head = wa.annotation(level, wa.render("{prog}: refused: ", prog=PROG), title=f"{PROG} refused")
+    room = MAX_ANNOTATION_CHARS - len(head) - len(context)
+    if len(reason_text) > room:
+        reason_text = wa.render("{reason}" + ANNOTATION_CUT_MARK,
+                                reason=wa.SafeText(reason_text[:max(room - len(ANNOTATION_CUT_MARK), 0)]))
+    return wa.annotation(level, wa.render("{prog}: refused: {reason}{context}", prog=PROG, reason=reason_text,
+                                          context=context), max_chars=MAX_ANNOTATION_CHARS, title=f"{PROG} refused")
 
 
 import argparse  # noqa: E402  (the floor check above must run before anything newer is needed)
@@ -285,6 +299,17 @@ MAX_ANNOTATION_NAMES = 5  # names listed in the counted-failures annotation
 MAX_ANNOTATION_NAME_CHARS = 120  # raw characters of one name before it is cut
 MAX_ANNOTATION_CHARS = 1000  # the whole annotation line, escapes included
 ANNOTATION_CUT_MARK = "..."
+# #9876 N1: the context every refusal and failed annotation carries (layout row, owner, entry). Each word below
+# stands for a state that has no path, uid or errno to print.
+LAYOUT_NONE = "none"  # TMPDIR names no allowed layout
+RUNNER_UNSET = "unset"  # RUNNER_NAME unset or empty in a macOS layout row
+OWNER_UNSET = "unset"  # TMPDIR unset or empty: nothing to lstat
+OWNER_RELATIVE = "relative"  # TMPDIR not absolute: never looked up
+OWNER_INVALID = "invalid"  # TMPDIR holds a NUL byte: no path the kernel can look up
+ENTRY_UNSET = "unset"
+ENTRY_EMPTY = "empty"
+NO_ERRNO = "none"  # a failure that carries no errno (a place not entered, a tree too large)
+UNKNOWN_ERRNO = "EUNKNOWN"  # an errno number the errno module does not name
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 FACTS_PREFIX = "prune-facts:"
 SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
@@ -408,20 +433,97 @@ def refuse(key, **fields):
     return refusal
 
 
-def failed_annotation(count, names, level=LEVEL_WARNING):
+class FailedEntry:
+    """One failed entry as the annotation names it (#9876 N1): its name, its owner and the errno of its failure.
+
+    ``owner`` is the entry's lstat uid as text, or the errno name when that lstat fails; ``errno_name`` is the
+    errno name of the failure, or NO_ERRNO for a failure that carries none (a place not entered, a tree too large).
+    """
+
+    __slots__ = ("name", "owner", "errno_name")
+
+    def __init__(self, name, owner, errno_name):
+        self.name = name
+        self.owner = owner
+        self.errno_name = errno_name
+
+
+def errno_token(code):
+    """The errno name of ``code`` (``EACCES``); NO_ERRNO for None, UNKNOWN_ERRNO for a number errno does not name."""
+    if code is None:
+        return NO_ERRNO
+    return errno.errorcode[code] if code in errno.errorcode else UNKNOWN_ERRNO
+
+
+def cut_value(text):
+    """``text`` cut at MAX_ANNOTATION_NAME_CHARS raw characters (the cut marked), escaped, as ``SafeText``."""
+    text = str(text)
+    cut = len(text) > MAX_ANNOTATION_NAME_CHARS
+    return wa.render("{text}" + (ANNOTATION_CUT_MARK if cut else ""), text=text[:MAX_ANNOTATION_NAME_CHARS])
+
+
+def owner_token(path, dir_fd=None):
+    """The owner of ``path`` (not followed) as text: its uid, the errno name when lstat fails, or OWNER_INVALID."""
+    try:
+        return str(os.lstat(path, dir_fd=dir_fd).st_uid)
+    except OSError as exc:
+        return errno_token(exc.errno)
+    except ValueError:  # an embedded NUL: no path the kernel can look up
+        return OWNER_INVALID
+
+
+def layout_row(raw, environ):
+    """The layout row ``raw`` (TMPDIR as given) names, read from the path alone (#9876 N1).
+
+    ``linux:<root>/runner-<n>`` for a runner directory directly under an allowed root,
+    ``macos:<root>/<folder>/_tmp runner=<RUNNER_NAME>`` for the leaf of an allowed runner-folder layout
+    (``runner=unset`` when RUNNER_NAME is unset or empty), and LAYOUT_NONE for every other value.
+    """
+    if not raw or not os.path.isabs(raw):
+        return LAYOUT_NONE
+    path = os.path.normpath(raw)
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    if parent in ALLOWED_ROOTS and RUNNER_DIR_PATTERN.fullmatch(name):
+        return wa.render("linux:{path}", path=cut_value(path))
+    if name == RUNNER_FOLDER_LEAF:
+        folder_root, folder = os.path.dirname(parent), os.path.basename(parent)
+        for root, folder_pattern in RUNNER_FOLDER_LAYOUTS:
+            if folder_root == root and folder_pattern.fullmatch(folder):
+                runner = environ.get(RUNNER_NAME_ENV) or RUNNER_UNSET
+                return wa.render("macos:{path} runner={runner}", path=cut_value(path), runner=cut_value(runner))
+    return LAYOUT_NONE
+
+
+def refusal_context(raw, environ):
+    """The ``(layout=... owner=... entry=...)`` suffix of a refusal, computed from TMPDIR as given (#9876 N1)."""
+    if raw is None:
+        owner, entry = OWNER_UNSET, ENTRY_UNSET
+    elif raw == "":
+        owner, entry = OWNER_UNSET, ENTRY_EMPTY
+    elif not os.path.isabs(raw):
+        owner, entry = OWNER_RELATIVE, cut_value(raw)
+    else:
+        owner, entry = owner_token(raw), cut_value(raw)
+    return wa.render(" (layout={layout} owner={owner} entry={entry})", layout=layout_row(raw, environ),
+                     owner=owner, entry=entry)
+
+
+def failed_annotation(count, entries, level=LEVEL_WARNING, layout=LAYOUT_NONE):
     """The one ``::warning`` line (``::error`` at job end) for ``count`` entries that could not be removed;
     None when ``count`` is 0.
 
-    ``names`` are the first MAX_ANNOTATION_NAMES failed names in sorted order. Every name goes
+    ``entries`` are the first MAX_ANNOTATION_NAMES ``FailedEntry`` rows in name order; each is named with its owner
+    and errno, and ``layout`` (``layout_row``) names the layout of the TMPDIR (#9876 N1). Every name goes
     through ``safe_text`` (findings L4, D-L1), so the only ``::`` in the line is the command's own.
     """
     if count <= 0:
         return None
     shown = []
-    for name in list(names)[:MAX_ANNOTATION_NAMES]:
-        cut = len(name) > MAX_ANNOTATION_NAME_CHARS
-        shown.append(wa.render("{name}" + (ANNOTATION_CUT_MARK if cut else ""), name=name[:MAX_ANNOTATION_NAME_CHARS]))
-    message = wa.render("{prog}: failed={count} not removed: {names}", prog=PROG, count=count, names=wa.join(", ", shown))
+    for entry in list(entries)[:MAX_ANNOTATION_NAMES]:
+        shown.append(wa.render("{name} (owner={owner} errno={errno_name})", name=cut_value(entry.name),
+                               owner=entry.owner, errno_name=entry.errno_name))
+    message = wa.render("{prog}: failed={count} layout={layout} not removed: {names}", prog=PROG, count=count,
+                        layout=layout, names=wa.join(", ", shown))
     if count > MAX_ANNOTATION_NAMES:
         message = wa.render("{message} (list cut at {limit} of {count})", message=message, limit=MAX_ANNOTATION_NAMES, count=count)
     return wa.annotation(level, message, max_chars=MAX_ANNOTATION_CHARS, title=f"{PROG} failed")
@@ -994,13 +1096,15 @@ class Tally:
     def __init__(self, err):
         self.pruned = self.kept = self.failed = self.skipped = self.freed = 0
         self.tree_entries = 0
-        self.first_failed = []  # the MAX_ANNOTATION_NAMES smallest failed names, sorted
+        self.first_failed = []  # FailedEntry rows of the MAX_ANNOTATION_NAMES smallest failed names, by name
         self.internal_error = False
         self.err = err
 
-    def fail(self, name, exc):
+    def fail(self, name, exc, owner):
+        """Count one failed entry; ``owner`` is ``owner_token`` of the entry, taken when it failed (#9876 N1)."""
         self.failed += 1
-        self.first_failed = sorted([*self.first_failed, name])[:MAX_ANNOTATION_NAMES]
+        row = FailedEntry(name, owner, errno_token(exc.errno))  # every failure is an OSError (prune catches those)
+        self.first_failed = sorted([*self.first_failed, row], key=lambda kept: kept.name)[:MAX_ANNOTATION_NAMES]
         if self.failed <= MAX_FAILURE_LINES:
             # CODE F6: a top-level entry not entered is named once; its text is the constant reason alone
             text = exc.reason if isinstance(exc, NotEntered) and not exc.nested and exc.name == name else error_text(exc)
@@ -1249,13 +1353,15 @@ def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None, grace_secs=
             except NotEntered as exc:  # decision 2: every place not entered is one skip line and one counted failure
                 if not exc.nested:  # the top-level entry itself is not entered; its nested skip is printed already
                     tally.skip(entry.name, exc.reason)
-                tally.fail(entry.name, exc)
+                tally.fail(entry.name, exc, owner_token(entry.name, dir_fd))
             except OSError as exc:  # one failed entry, counted
-                tally.fail(entry.name, exc)
+                tally.fail(entry.name, exc, owner_token(entry.name, dir_fd))
 
 
-def refused(reason, out, err, job_end=False):
+def refused(reason, out, err, job_end=False, context=None):
     """Print one refusal (stderr line and one annotation); a refusal deletes nothing.
+
+    ``context`` (``refusal_context``) names the layout row, the owner and the entry in the annotation (#9876 N1).
 
     At job start it is a warning with exit 0 (ruling f23a9ae4: the end step of the same job still clears).
     At job end it is an error with exit 3 (PR 9822 r1, HIGH-1): the TMPDIR stays uncleared and the job says so.
@@ -1269,7 +1375,7 @@ def refused(reason, out, err, job_end=False):
         tally = Tally(err)
         tally.failed = 1
         print(wa.log_line(tally.summary()), file=out)
-    print(refusal_annotation(reason, level), file=out)
+    print(refusal_annotation(reason, level, context), file=out)
     out.flush()
     return code
 
@@ -1279,7 +1385,8 @@ def main(argv=None, environ=None, out=None, err=None):
     out, err = out or sys.stdout, err or sys.stderr
     if wa is None:  # an in-process caller of a copy whose sibling did not load: the same refusal, nothing pruned
         return load_refused(out, err, requested_mode(sys.argv[1:] if argv is None else argv) == MODE_JOB_END)
-    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0])
+    # #9876 N2: no abbreviation, so the mode argparse parses is the mode requested_mode reads before it
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0], allow_abbrev=False)
     parser.add_argument("--dry-run", action="store_true", help="print what would go, delete nothing")
     parser.add_argument("--mode", choices=MODES, default=MODE_JOB_START,
                         help="job-start keeps entries touched in the last %d s; job-end removes every entry"
@@ -1301,9 +1408,9 @@ def main(argv=None, environ=None, out=None, err=None):
             root_mnt = root_mount_id(dir_fd)
             probe_platform(dir_fd, err, os.path.normpath(raw))
         except PlatformMissing as exc:
-            return refused(exc.refusal(), out, err, job_end)
+            return refused(exc.refusal(), out, err, job_end, refusal_context(raw, environ))
         except Refusal as exc:
-            return refused(exc, out, err, job_end)
+            return refused(exc, out, err, job_end, refusal_context(raw, environ))
         prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt, GRACE_SECS_BY_MODE[args.mode])
     except Exception as exc:  # internal error: named, no traceback, the job goes red (exit 1)
         tally.internal_error = True
@@ -1313,7 +1420,8 @@ def main(argv=None, environ=None, out=None, err=None):
             os.close(dir_fd)
     print(wa.log_line(tally.summary()), file=out)
     if not tally.internal_error:
-        annotation = failed_annotation(tally.failed, tally.first_failed, LEVEL_ERROR if job_end else LEVEL_WARNING)
+        annotation = failed_annotation(tally.failed, tally.first_failed, LEVEL_ERROR if job_end else LEVEL_WARNING,
+                                       layout_row(raw, environ))
         if annotation:
             print(annotation, file=out)
     out.flush()
