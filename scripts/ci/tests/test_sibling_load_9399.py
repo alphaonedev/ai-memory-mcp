@@ -20,6 +20,7 @@ import ast
 import fnmatch
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -48,6 +49,7 @@ REASON_LEAVES = "symlink leaves the script folder"
 REASON_EMPTY = "empty"
 REASON_TAKEN = "module name taken"
 EXIT_REFUSED_DEFAULT = 3
+EXIT_REFUSED_DOCS_GATE = 5  # docs_only_gate.py spends 0, 2, 3 (docs only: skips work) and 4 itself
 EXIT_REFUSED_SCCACHE = 5  # sccache_env.py already spends 2, 3 and 4 on its own outcomes
 MARKER_ENV = "DECOY_MARKER_9399"
 DECOY_SOURCE = (
@@ -70,6 +72,9 @@ DRIVER_SOURCE = (
 SITES = (
     ("ci/impact/build_index.py", "build_index", 3, (("common.py", "impact.common"),), ("-I",)),
     ("ci/impact/cargo_skip.py", "cargo_skip", 3, (("common.py", "impact.common"),), ("-I",)),
+    # A refused load must never end with EXIT_DOCS_ONLY (3), the one exit code that lets a job skip its work (#9683).
+    ("ci/impact/docs_only_gate.py", "docs_only_gate", EXIT_REFUSED_DOCS_GATE,
+     (("common.py", "impact.common"), ("cargo_skip.py", "impact.cargo_skip")), ("-I",)),
     ("ci/impact/gate.py", "gate", 3, (("common.py", "impact.common"),), ("-I",)),
     ("ci/impact/read_set.py", "read_set", 3, (("common.py", "impact.common"),), ("-I",)),
     ("ci/impact/select.py", "select", 3, (("common.py", "impact.common"),), ("-I",)),
@@ -764,6 +769,17 @@ class LoaderAlone(Scratch):
                 self.assertEqual(line.count("\n"), 1)
                 self.assertEqual(line, "tool: refused: sibling module helper.py at %s cannot be loaded (absent)\n"
                                  % (os.path.join(os.path.realpath(self.root), shown, "helper.py")))
+
+
+class DocsGateRefusalNeverSkips(unittest.TestCase):
+    def test_the_refusal_exit_is_not_the_docs_only_exit(self):
+        """#9683: only exit 3 of docs_only_gate.py lets a heavy job skip, so a refused sibling load ends otherwise."""
+        text = (SCRIPTS / "ci" / "impact" / "docs_only_gate.py").read_text(encoding="utf-8")
+        docs_only = int(re.search(r"^EXIT_DOCS_ONLY = ([0-9]+)$", text, re.M).group(1))
+        refused = int(re.search(r"^SIBLING_EXIT_LOAD_REFUSED = ([0-9]+)$", text, re.M).group(1))
+        self.assertEqual(docs_only, 3)
+        self.assertNotIn(refused, (0, docs_only))
+        self.assertEqual(refused, EXIT_REFUSED_DOCS_GATE)
 
 
 class CopiesMatchTheLoader(unittest.TestCase):
