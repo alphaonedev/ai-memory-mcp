@@ -62,7 +62,7 @@ class OpenLegRow(NamedTuple):
 
 # The legs that still break the invariant; each is a later stage of #9455 (stage 0,
 # issuecomment-7017025012): ci.yml check needs a hosted-aware shared cargo target, the two
-# postgres jobs need a PG 18 + AGE + pgvector tier a hosted run reaches.
+# postgres jobs need a PG 19 + AGE + pgvector tier a hosted run reaches.
 OPEN_RUNNER_LEG_ROWS = (
     OpenLegRow("cert-postgres-age.yml", "cert-postgres-age", '["self-hosted","linux-fed"]', RUNNER_ISSUE),
     OpenLegRow("ci.yml", "check", '["self-hosted","linux-fed"]', RUNNER_ISSUE),

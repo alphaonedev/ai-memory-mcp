@@ -7,7 +7,7 @@
 -- as the superuser, against the audit database (POSTGRES_DB). It creates ONLY
 -- the two server extensions the ai-memory sal-postgres adapter needs:
 --
---   * age    — Apache AGE 1.8.0 (property-graph over PostgreSQL).
+--   * age    — Apache AGE (the certified version, EXPECTED_AGE_VERSION; property-graph over PostgreSQL).
 --   * vector — pgvector 0.8.7 (the server-side `vector` column type the
 --              sal-postgres adapter maps Rust embedding vectors to).
 --

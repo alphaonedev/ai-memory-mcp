@@ -739,7 +739,7 @@ class FakePg:
     """A tiny stateful server behind psql: databases, template flag, sessions.
 
     Understands exactly the statements setup/teardown issue. ``fail`` maps a
-    SQL prefix to an error text (rc 1: PostgreSQL 18.6 psql returns 1 for a SQL
+    SQL prefix to an error text (rc 1: psql returns 1 for a SQL
     error and reserves 2 for a lost connection). ``lost`` lists SQL prefixes
     that commit on the server but whose psql then reports rc 2.
     Every statement is logged in ``log``.

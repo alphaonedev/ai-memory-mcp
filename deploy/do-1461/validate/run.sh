@@ -140,13 +140,13 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
                      || record "$host" "single_instance" 1 "${nproc:-0}" FAIL
 done
 
-# ---- pg nodes: pinned upstream stack (PG 18.6 + AGE 1.8.0 + pgvector 0.8.7) --
+# ---- pg nodes: pinned upstream stack (PG 19.0 + AGE 1.7.0 + pgvector 0.8.7) --
 # ONE regional PG droplet per region runs the pinned NATIVE stack (no container
 # anywhere on the DO fleet). Every published result must be peer-verifiable
 # against the EXACT upstream stack, so assert the LIVE server reports those
 # versions on EVERY region's pg. `current_setting('server_version')` returns the
-# bare minor + distro build suffix ("18.4 (Ubuntu 18.4-1.pgdg24.04+1)"); split on
-# the first space to recover the bare upstream minor (18.4). AGE + pgvector
+# bare minor + distro build suffix ("19.0 (Ubuntu 19.0-2.pgdg24.04+1)"); split on
+# the first space to recover the bare upstream minor (19.0). AGE + pgvector
 # versions come from pg_extension.extversion. Probed over SSH via the local
 # `postgres` peer (sudo -u postgres psql, unix-socket — no TLS needed for the
 # probe itself; the daemon->PG TLS leg is asserted separately below). bash-3.2:

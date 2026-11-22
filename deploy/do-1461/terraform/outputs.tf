@@ -24,7 +24,7 @@ output "peers" {
 }
 
 output "pg" {
-  description = "Shared PG18.4/AGE1.7.0 substrate: hostname -> {public_ip, private_ip}. Peers reach it on the private VPC IP over TLS."
+  description = "Shared PG19.0/AGE1.7.0 substrate: hostname -> {public_ip, private_ip}. Peers reach it on the private VPC IP over TLS."
   value = {
     for name, d in digitalocean_droplet.node : name => {
       public_ip  = d.ipv4_address

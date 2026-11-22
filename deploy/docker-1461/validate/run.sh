@@ -117,13 +117,13 @@ done
 
 # --------------------------------------------------------------------------
 # Fleet: store-stack version anchors. The operator directive requires the
-# campaign run on PostgreSQL EXACTLY 18.4 + Apache AGE EXACTLY 1.7.0; assert
+# campaign run on PostgreSQL EXACTLY 19.0 + Apache AGE EXACTLY 1.7.0; assert
 # the LIVE server reports those upstream versions so every published result
 # is peer-verifiable against the pinned stack (lib.sh EXPECTED_PG_VERSION /
 # EXPECTED_AGE_VERSION). `current_setting('server_version')` returns the
 # bare minor followed by the distro build suffix (e.g.
-# "18.4 (Debian 18.4-1.pgdg13+1)"), so split on the first space to recover
-# the bare upstream minor (18.4) for an exact peer-verifiable match.
+# "19.0 (Debian 19.0-2.pgdg13+1)"), so split on the first space to recover
+# the bare upstream minor (19.0) for an exact peer-verifiable match.
 # AGE's installed version comes from pg_extension.extversion.
 # --------------------------------------------------------------------------
 pg_ver="$(node_exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "select split_part(current_setting('server_version'),' ',1)" 2>/dev/null | tr -d '[:space:]' || true)"

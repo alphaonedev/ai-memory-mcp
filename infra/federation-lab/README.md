@@ -452,22 +452,14 @@ hive node), the locked stack is:
 
 | Component | Pinned version |
 | --- | --- |
-| PostgreSQL | **18.6** |
-| Apache AGE | **1.8.0** |
+| PostgreSQL | **19.0** |
+| Apache AGE | **1.7.0** |
 | pgvector | **0.8.7** |
 
-**On the AGE version, both surfaces, stated together** — because they disagree
-and the disagreement confuses people:
-
-- `github.com/apache/age/releases` carries **PG18 / v1.8.0-rc0 (2026-07-09)**,
-  which is the newest released AGE for PostgreSQL 18.
-- Apache tags **every** release `X.Y.Z-rc0` — that is the ASF release-vote
-  convention, not a pre-release marker. Consequently pgdg reads the package as
-  `1.8.0~rc0-…` while `extversion` reports plain `1.8.0`.
-- The download page `age.apache.org/download` **lags**, still showing 1.7.0.
-
-The `~rc0` suffix is **not** a Debian packaging revision. That claim is false
-and was purged from PR #2940; do not reintroduce it.
+**On the AGE build:** Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). pgdg ships no AGE package for PostgreSQL
+19, so every provisioner fetches AGE at the full commit
+`c6b043d1c8f4909331b9080d6640b487782fc958`, builds it unmodified, and fails when
+`git rev-parse HEAD` differs. `CREATE EXTENSION age` reports `extversion = 1.7.0`.
 
 ---
 

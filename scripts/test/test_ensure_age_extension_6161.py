@@ -3,9 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pin scripts/ci/ensure-age-extension.py (#6161).
 
-The macos-fed runner keeps Apache AGE in the Homebrew-managed postgresql@18
-trees; a ``brew upgrade`` relinks them and drops the AGE files.  The helper
-restores exactly five sha256-pinned files from a node-local directory.
+The macos-fed runner keeps Apache AGE inside the PostgreSQL share/lib trees of
+the tier its CI leg connects to; a rebuild or relink of that tree drops the AGE
+files.  The helper restores exactly five sha256-pinned files from a node-local
+directory.  It names no PostgreSQL major and no AGE version of its own: the
+``--pg-config`` it is given must report the SSOT ``EXPECTED_PG_VERSION`` and the
+probe asks for the SSOT ``EXPECTED_AGE_VERSION`` (#9927, ``SsotBoundTests``).
 
 These tests drive the script as a subprocess against a fake sharedir/pkglibdir
 and a fake psql/pg_config (Python stubs), so no live Postgres is needed.  The
@@ -45,16 +48,19 @@ PREFIX = "ensure-age-extension: "
 SHARE_FILES = ("age--1.6.0--1.7.0.sql", "age--1.7.0--1.8.0.sql", "age--1.8.0.sql", "age.control")
 DYLIB = b"\x7fAGE-dylib-6161" * 64
 
+# The certified PostgreSQL the fake pg_config reports, written out (not read from the SSOT or the helper).
+CERTIFIED_PG_VERSION_LINE = "PostgreSQL 19.0"
 FAKE_PG_CONFIG = """#!{py}
 import sys
 base = {base!r}
-print({{"--sharedir": base + "/share", "--pkglibdir": base + "/lib"}}[sys.argv[1]])
+print({{"--sharedir": base + "/share", "--pkglibdir": base + "/lib", "--bindir": base,
+        "--version": {version!r}}}[sys.argv[1]])
 """
 
 # Fake psql with real-view semantics: only the control file decides the row.
 # It records its argv and whether PGPASSWORD carried the marker value, and refuses (exit 3) any SQL other than
 # the reviewed read-only probe (#6896).
-PROBE_SQL_6896 = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
+PROBE_SQL_6896 = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age' AND default_version = '1.7.0'"
 FAKE_PSQL = """#!{py}
 import json, os, sys
 base = {base!r}
@@ -161,6 +167,9 @@ spec.loader.exec_module(mod)
 with open(sys.argv[2]) as fh:
     cfg = json.load(fh)
 mod.MANIFEST = tuple(tuple(row) for row in cfg["manifest"])
+mod.MANIFEST_SOURCE_COMMIT = mod.certified_pins()["AGE_SOURCE_COMMIT"]  # #9927: the fixtures pin a certified build
+if cfg.get("source_commit") is not None:
+    mod.MANIFEST_SOURCE_COMMIT = cfg["source_commit"]
 if cfg.get("refused") is not None:
     mod.REFUSED_SHAS = frozenset(cfg["refused"])
 if cfg.get("uid") is not None:
@@ -177,6 +186,8 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 mod.installed_ok = lambda dests: True
 mod.dest_dirs = lambda pg_config: {}
+mod.require_certified_pg = lambda pg_config, pins: None  # the first Popen must stay psql's
+mod.MANIFEST_SOURCE_COMMIT = mod.certified_pins()["AGE_SOURCE_COMMIT"]  # #9927: the fixtures pin a certified build
 signum, pid_file = int(sys.argv[2]), sys.argv[3]
 real_popen = subprocess.Popen
 
@@ -202,6 +213,7 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 with open(sys.argv[2]) as fh:
     mod.MANIFEST = tuple(tuple(row) for row in json.load(fh)["manifest"])
+mod.MANIFEST_SOURCE_COMMIT = mod.certified_pins()["AGE_SOURCE_COMMIT"]  # #9927: the fixtures pin a certified build
 record = sys.argv[3]
 real_popen = subprocess.Popen
 
@@ -298,7 +310,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             p.chmod(0o755 if sub == "lib" else 0o644)
         self.pg_config = self.base / "pg_config"
         self.psql = self.base / "psql"
-        write_exe(self.pg_config, FAKE_PG_CONFIG.format(py=sys.executable, base=str(self.base)))
+        write_exe(self.pg_config, FAKE_PG_CONFIG.format(py=sys.executable, base=str(self.base),
+                                                        version=CERTIFIED_PG_VERSION_LINE))
         write_exe(self.psql, FAKE_PSQL.format(py=sys.executable, base=str(self.base), marker=PW_MARKER))
         self.url_file = self.base / "url"
         self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr\n")
@@ -306,22 +319,24 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.harness.write_text(HARNESS)
         self.uid = None
         self.refused = None
+        self.source_commit = None  # None: the harness pins the fixtures as a build of the SSOT commit
 
     # ---- helpers -------------------------------------------------------
     def manifest(self):
         order = [("lib", "age.dylib")] + [("share", n) for n in SHARE_FILES]
         return [[sub, name, sha(self.src[(sub, name)])] for sub, name in order]
 
-    def cmd(self, age_dir=None):
+    def cmd(self, age_dir=None, psql=True):
         cfg = self.base / "cfg.json"
-        cfg.write_text(json.dumps({"manifest": self.manifest(), "uid": self.uid, "refused": self.refused}))
-        return [
+        cfg.write_text(json.dumps({"manifest": self.manifest(), "uid": self.uid, "refused": self.refused,
+                                   "source_commit": self.source_commit}))
+        argv = [
             sys.executable, "-I", str(self.harness), str(SCRIPT), str(cfg),
             "--url-file", str(self.url_file),
             "--age-dir", str(age_dir if age_dir is not None else self.age),
             "--pg-config", str(self.pg_config),
-            "--psql", str(self.psql),
         ]
+        return argv + (["--psql", str(self.psql)] if psql else [])
 
     def run_script(self, age_dir=None, env=None):
         return subprocess.run(self.cmd(age_dir), capture_output=True, text=True, check=False, env=env)
@@ -478,12 +493,13 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for call in calls:
             self.assertEqual(call["argv"][1:], [
                 "postgres://ciuser@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
-                "-c", "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"])
+                "-c", PROBE_SQL_6896])
 
     def test_the_probe_sql_is_the_reviewed_catalog_read_6896(self):
         # #6896: the probe is the helper's only SQL, a read of pg_available_extensions under the tier role.
-        self.assertEqual(load_module().PROBE_SQL, PROBE_SQL_6896)
-        self.assertEqual(PROBE_SQL_6896, "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'")
+        self.assertEqual(load_module().probe_sql(), PROBE_SQL_6896)
+        self.assertEqual(PROBE_SQL_6896,
+                         "SELECT count(*) FROM pg_available_extensions WHERE name = 'age' AND default_version = '1.7.0'")
 
     def test_psql_stderr_is_never_relayed_6897(self):
         # #6897: real psql error text names the host, address, user and database; the helper keeps all of it
@@ -1795,6 +1811,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         def load():
             mod = load_module()
             mod.MANIFEST = manifest
+            mod.MANIFEST_SOURCE_COMMIT = mod.certified_pins()["AGE_SOURCE_COMMIT"]  # #9927: the fixtures pin a certified build
             mod.dest_dirs = lambda pg_config: dests
             mod.read_url = lambda url_file: "postgres://u@h/db"
             mod.probe_lists_age = lambda psql, url: (self.ext / "age.control").is_file()
@@ -1845,16 +1862,208 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
 
     def test_real_script_rejects_unpinned_source(self):
         r = self.real_script()
-        self.assert_fails(r, 2, "age source rejected: ")
-        self.assertIn("pinned sha256", r.stderr)
+        if load_module().manifest_is_certified():
+            self.assert_fails(r, 2, "age source rejected: ")
+            self.assertIn("pinned sha256", r.stderr)
+        else:  # #9927: until #9929 re-pins MANIFEST, the real script refuses before reading a source byte
+            self.assert_fails(r, 2, "age source refused: MANIFEST pins a build of apache/age ")
+            self.assertIn("re-pin MANIFEST to the node build (issue 9929)", r.stderr)
         self.assert_nothing_installed()
+
+    # ---- #9927: the PG tree and the AGE build come from the tier and the SSOT ---------------------------------
+    # Written out, not read from the helper: the SSOT defaults of deploy/docker-1461/provision/lib.sh.
+    CERTIFIED_PINS_9927 = {"EXPECTED_PG_VERSION": "19.0", "EXPECTED_AGE_VERSION": "1.7.0",
+                           "AGE_SOURCE_COMMIT": "c6b043d1c8f4909331b9080d6640b487782fc958"}
+    # Path and version forms the helper source must never carry (F4: it hardcoded a Homebrew postgresql@18 tree
+    # and an AGE 1.8.0 build directory).  Each form is one regex; any hit outside the allowlist is a finding.
+    NODE_TREE_FORMS_9927 = (
+        r"postgresql@", r"/opt/homebrew/opt/", r"/usr/lib/postgresql/[0-9]", r"/opt/aimem/pg[0-9]",
+        r"pg-age-stack\W+age-[0-9]", r"age-[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{6}",
+        r"\bPostgreSQL 1[0-9]\b", r"\bpsql 1[0-9]", r"\bPG ?1[0-9]\b", r"release/PG1[0-9]",
+    )
+    # AGE version literals the helper may carry, each with the exact count: the share file names of the MANIFEST
+    # build (they name the files on disk, re-pinned with MANIFEST in #9929) and the #8282 refusal of a stock build.
+    AGE_VERSION_ALLOW_9927 = {
+        '("share", "age--1.6.0--1.7.0.sql"': 1, '("share", "age--1.7.0--1.8.0.sql"': 1,
+        '("share", "age--1.8.0.sql"': 1, "stock apache/age 1.8.0 carries issue 2580 (issue 8282)": 1,
+        "# stock age.dylib 1.8.0, apache/age#2580": 1,
+        "#2581: no catalog read in is_age_extension_exists() outside a live transaction).  Stock 1.8.0": 1,
+    }
+
+    def scan_helper_source_9927(self, text):
+        """Return the F4 findings of a helper source text: (line number, form or version literal)."""
+        found = []
+        allow = dict(self.AGE_VERSION_ALLOW_9927)
+        for no, line in enumerate(text.splitlines(), 1):
+            found += [(no, form) for form in self.NODE_TREE_FORMS_9927 if re.search(form, line)]
+            if re.search(r"(?<![0-9.])[0-9]+\.[0-9]+\.[0-9]+(?![0-9])", line):
+                hit = next((key for key in allow if key in line and allow[key] > 0), None)
+                if hit is None:
+                    found.append((no, "age version literal"))
+                else:
+                    allow[hit] -= 1
+        return found
+
+    def test_helper_names_no_pg_tree_or_age_build_of_its_own_9927(self):
+        # F4 ratchet: red on the hardcoded postgresql@18 pg_config/psql and the age-1.8.0-06ce678d default.
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(self.scan_helper_source_9927(text), [])
+        mod = load_module()
+        for gone in ("DEFAULT_PG_CONFIG", "DEFAULT_PSQL", "DEFAULT_AGE_DIR", "PROBE_SQL"):
+            self.assertFalse(hasattr(mod, gone), gone)
+
+    def test_helper_scan_finds_every_f4_form_9927(self):
+        # Mutation table: one line per form the hardcode can take; each must be a finding, the clean twin none.
+        mutants = (
+            'DEFAULT_PG_CONFIG = "/opt/homebrew/opt/postgresql@18/bin/pg_config"',
+            'PSQL = "/opt/homebrew/opt/postgresql@19/bin/psql"',
+            'BIN = "/usr/lib/postgresql/19/bin"',
+            'BIN = Path("/opt/aimem/pg19") / "bin"',
+            'DIR = Path.home() / "pg-age-stack" / "age-1.8.0-06ce678d"',
+            'DIR = HOME + "/age-1.7.0-c6b043d1"',
+            'WANT = "PostgreSQL 19"',
+            '# psql 19 catches SIGALRM',
+            'TIER = "PG19"',
+            '# release/PG18/1.8.0',
+            'AGE = "1.7.0"',
+            "SQL = \"... default_version = '1.8.0'\"",
+            '("share", "age--1.9.0.sql", "00")',
+        )
+        for line in mutants:
+            with self.subTest(line=line):
+                self.assertNotEqual(self.scan_helper_source_9927(line + "\n"), [], line)
+        clean = 'args.age_dir = Path.home() / AGE_DIR_PARENT / f"age-{pins[\'EXPECTED_AGE_VERSION\']}-{commit}"\n'
+        self.assertEqual(self.scan_helper_source_9927(clean), [])
+        # an allowlisted line counts once: a second copy is a finding
+        twice = '("share", "age--1.8.0.sql", "a")\n("share", "age--1.8.0.sql", "a")\n'
+        self.assertEqual(self.scan_helper_source_9927(twice), [(2, "age version literal")])
+
+    def test_helper_scan_is_linear_on_a_100k_line_input_9927(self):
+        text = "x = 'abc' + PATH + '0.2'  # 128+N %2F\n" * 100_000
+        start = time.monotonic()
+        self.assertEqual(self.scan_helper_source_9927(text), [])
+        self.assertLess(time.monotonic() - start, 20.0)
+
+    def test_certified_pins_are_the_ssot_defaults_9927(self):
+        mod = load_module()
+        self.assertEqual(mod.certified_pins(), self.CERTIFIED_PINS_9927)
+        self.assertEqual(mod.SSOT_FILE, ROOT / "deploy/docker-1461/provision/lib.sh")
+
+    def test_certified_pins_refuse_a_missing_repeated_or_malformed_key_9927(self):
+        mod = load_module()
+        good = ('EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-19.0}"\n'
+                'EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.7.0}"\n'
+                'AGE_SOURCE_COMMIT="${DOCKER_1461_AGE_SOURCE_COMMIT:-c6b043d1c8f4909331b9080d6640b487782fc958}"\n')
+        ssot = self.base / "lib.sh"
+        ssot.write_text(good)
+        self.assertEqual(mod.certified_pins(ssot), self.CERTIFIED_PINS_9927)
+        broken = {
+            "EXPECTED_PG_VERSION": good.replace("EXPECTED_PG_VERSION=", "# EXPECTED_PG_VERSION=", 1),
+            "EXPECTED_AGE_VERSION": good + 'EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.8.0}"\n',
+            "AGE_SOURCE_COMMIT": good.replace("c6b043d1c8f4909331b9080d6640b487782fc958", "c6b043d"),
+        }
+        broken_shapes = {
+            "EXPECTED_PG_VERSION": good.replace(":-19.0}", ":-19.0' OR '1}"),
+            "EXPECTED_AGE_VERSION": good.replace(":-1.7.0}", ":-1.7.0'; DROP}"),
+        }
+        for key, text in list(broken.items()) + list(broken_shapes.items()):
+            with self.subTest(key=key, text=text):
+                ssot.write_text(text)
+                with self.assertRaises(mod.HelperError) as ctx:
+                    mod.certified_pins(ssot)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertEqual(str(ctx.exception), f"certified pin {key} is not set exactly once in {ssot}")
+        missing = self.base / "absent.sh"
+        with self.assertRaises(mod.HelperError) as ctx:
+            mod.certified_pins(missing)
+        self.assertEqual((ctx.exception.code, str(ctx.exception)), (2, f"certified pin file {missing} is unreadable"))
+
+    def test_pg_config_is_required_9927(self):
+        argv = [sys.executable, "-I", str(SCRIPT), "--url-file", str(self.url_file), "--psql", str(self.psql),
+                "--age-dir", str(self.age)]
+        r = subprocess.run(argv, capture_output=True, text=True, check=False)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("the following arguments are required: --pg-config", r.stderr)
+        self.assertFalse((self.base / "psql.log").exists(), "psql ran without a pg_config")
+        self.assert_nothing_installed()
+
+    def test_pg_config_that_cannot_run_is_refused_9927(self):
+        self.pg_config = self.base / "no-such-pg_config"
+        r = self.run_script()
+        self.assert_fails(r, 2, "pg_config --version could not run (FileNotFoundError)")
+        self.assertFalse((self.base / "psql.log").exists())
+        self.assert_nothing_installed()
+
+    def test_pg_config_of_another_postgresql_is_refused_before_any_write_9927(self):
+        # The heal never writes into a tree of another major (F4).  Accepted: the certified version, optionally
+        # followed by a space and a packager suffix.  Everything else is exit 2 before the probe and any write.
+        accepted = ("PostgreSQL 19.0", "PostgreSQL 19.0 (Debian 19.0-2.pgdg24.04+1)", "PostgreSQL 19.0 (Homebrew)")
+        refused = ("PostgreSQL 18.6", "PostgreSQL 16.10", "PostgreSQL 19.1", "PostgreSQL 19.01", "PostgreSQL 119.0",
+                   "PostgreSQL 19.0beta1", "PostgreSQL 19", "postgresql 19.0", "", "19.0", "PostgreSQL 19.0\tx")
+        self.install_good()
+        for line in accepted:
+            with self.subTest(accepted=line):
+                write_exe(self.pg_config, FAKE_PG_CONFIG.format(py=sys.executable, base=str(self.base), version=line))
+                r = self.run_script()
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("no restore needed", r.stdout)
+        shutil.rmtree(self.lib)
+        shutil.rmtree(self.ext)
+        self.lib.mkdir()
+        self.ext.mkdir(parents=True)
+        log = self.base / "psql.log"
+        log.unlink(missing_ok=True)
+        for line in refused:
+            with self.subTest(refused=line):
+                write_exe(self.pg_config, FAKE_PG_CONFIG.format(py=sys.executable, base=str(self.base), version=line))
+                r = self.run_script()
+                shown = line.strip() if "\t" not in line else "an unprintable answer"
+                self.assert_fails(r, 2, f"pg_config {self.pg_config} reports {shown or 'nothing'} (exit 0); "
+                                        "the certified tier is PostgreSQL 19.0")
+                self.assertFalse(log.exists(), "the probe ran against a refused tree")
+                self.assert_nothing_installed()
+
+    def test_psql_defaults_to_the_pg_config_bindir_9927(self):
+        self.install_good()
+        r = subprocess.run(self.cmd(psql=False), capture_output=True, text=True, check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertEqual([call["argv"][0] for call in calls], [str(self.base / "psql")])
+
+    def test_non_certified_manifest_never_writes_9927(self):
+        # MANIFEST pins a build of another AGE commit than the SSOT: no restore, ever.
+        self.source_commit = "deadbeef" + "0" * 32
+        refusal = ("age source refused: MANIFEST pins a build of apache/age deadbeef, the certified "
+                   "AGE_SOURCE_COMMIT is c6b043d1; re-pin MANIFEST to the node build (issue 9929)")
+        r = self.run_script()
+        self.assert_fails(r, 2, refusal)
+        self.assert_nothing_installed()
+        # the tier already offers the certified AGE version from a safe library: nothing to do, nothing written
+        lib = self.lib / "age.dylib"
+        lib.write_bytes(b"\x7fAGE-node-build-of-the-ssot-commit")
+        lib.chmod(0o755)
+        (self.ext / "age.control").write_text("default_version = '1.7.0'\n")
+        before = {p.name: p.read_bytes() for d in (self.lib, self.ext) for p in d.iterdir()}
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.strip(), "age extension available (no restore needed)")
+        self.assertEqual({p.name: p.read_bytes() for d in (self.lib, self.ext) for p in d.iterdir()}, before)
+        # a writable or refused library is not healthy, and the helper still refuses to write
+        for mode, data in ((0o775, lib.read_bytes()), (0o755, b"stock")):
+            with self.subTest(mode=oct(mode), refused=data == b"stock"):
+                lib.write_bytes(data)
+                lib.chmod(mode)
+                self.refused = [sha(b"stock")]
+                r = self.run_script()
+                self.assert_fails(r, 2, refusal)
+                self.assertEqual(lib.read_bytes(), data)
 
     def test_real_script_ignores_env_source_override(self):
         home = self.base / "home"
         home.mkdir()
         r = self.real_script({"HOME": str(home), "AI_MEMORY_CI_AGE_DIR": str(self.age)}, age_dir=False)
         self.assert_fails(r, 2, "age source incomplete: ")
-        self.assertIn(str(home / "pg-age-stack" / "age-1.8.0-06ce678d"), r.stderr)
+        self.assertIn(str(home / "pg-age-stack" / "age-1.7.0-c6b043d1"), r.stderr)
         self.assert_nothing_installed()
 
     # ---- #8282: refused builds ------------------------------------------
@@ -1968,7 +2177,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
 # ---- #6347: the libpq oracle behind the docstring claim "a URL the helper accepts is read the same way by libpq" --
 LIBPQ_CANDIDATES = (
     "/opt/homebrew/opt/libpq/lib/libpq.5.dylib",
-    "/opt/homebrew/opt/postgresql@18/lib/postgresql/libpq.5.dylib",
+    "/opt/aimem/pg19/lib/libpq.5.dylib",  # f1's PG 19 source build (#9929)
     "/usr/local/opt/libpq/lib/libpq.5.dylib",
     "/usr/lib/x86_64-linux-gnu/libpq.so.5",
     "/usr/lib/aarch64-linux-gnu/libpq.so.5",

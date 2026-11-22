@@ -106,21 +106,16 @@ CA and per-peer keys are minted once and reused on re-runs for stable trust.
 ## What "reproducible" means here
 
 - **Pinned artifacts** (`provision/lib.sh`): version `0.7.0`, schema `v57`,
-  `EMBED_DIM=768`, `apache/age:release_PG18_1.7.0` bumped to PostgreSQL `18.6`
-  (pinned `PG_APT_VERSION`) + Apache AGE `1.8.0` (pinned `AGE_APT_VERSION`)
-  + pgvector (pinned `PGVECTOR_APT_VERSION`),
+  `EMBED_DIM=768`, the official `postgres` image (`PG_BASE_IMAGE`) at PostgreSQL
+  `19.0` (pinned `PG_APT_VERSION`) + Apache AGE `1.7.0` built from source at the
+  pinned `AGE_SOURCE_COMMIT` + pgvector `0.8.7` (pinned `PGVECTOR_APT_VERSION`),
   embedder/LLM model ids,
   every port/name/path — all single-source constants, env-overridable for forks,
   with **no hostname/region/vendor literal baked into any variable name**.
-  PostgreSQL 18.6 and pgvector 0.8.7 are current-stable; **Apache AGE 1.8.0 is
-  the newest released AGE for PostgreSQL 18** per
-  [github.com/apache/age/releases](https://github.com/apache/age/releases)
-  (`PG18/v1.8.0-rc0`, 2026-07-09). Apache AGE tags every release `X.Y.Z-rc0` on
-  GitHub (its release-vote convention), which is why the pgdg package version
-  reads `1.8.0~rc0-…`; `CREATE EXTENSION age` reports `extversion = 1.8.0`.
-  NOTE: the project download page (age.apache.org/download) still lists 1.7.0 as
-  "current stable" and lags the releases page — this lane tracks the newest
-  released AGE for PG18.
+  pgdg ships no AGE package and apache/age publishes no image for PostgreSQL
+  19, so the image build fetches AGE at the one pinned commit, unmodified, and
+  fails when `git rev-parse HEAD` differs: Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+  `CREATE EXTENSION age` reports `extversion = 1.7.0`.
 - **Deterministic topology.** Peer name/port/schema/federation-id are pure
   functions of a 1-based peer index; nothing is hand-enumerated.
 - **Idempotent.** Every step is safe to re-run; CA + per-peer keys are minted
@@ -192,7 +187,7 @@ deploy/docker-1461/
 ├── Makefile                    single entrypoint (seed/build/tls/zerotouch/up/validate/test/report/down/clean)
 ├── README.md                   this runbook
 ├── docker-compose.yml          2 peers + PG/AGE/pgvector on a private bridge
-├── Dockerfile.pg-age-vector    PG18.6 + Apache AGE 1.8.0 + pgvector image
+├── Dockerfile.pg-age-vector    PG19.0 + Apache AGE 1.7.0 + pgvector image
 ├── provision/                  idempotent 0→60 toolkit (00/10/40/45/50 + lib.sh SSOT)
 ├── validate/                   verification harness (run.sh) — baseline gate
 ├── test/                       full-spectrum suite (run.sh) — regression/crypto/federation/zerotouch/a2a/ai_nhi
