@@ -151,6 +151,9 @@ ALWAYS_RUN_PARITY_TESTS=(
     # Wave-2 B3 — at-rest content-encryption E2E is a release gate (default
     # build RED when S1 refused ChaCha). Not millisecond-cheap; required.
     encryption_at_rest
+    # #9730 / #9803 — the key-dir bind guard scans every tracked file, so a
+    # change anywhere can make it red; run it on every PR, not only by impact.
+    key_dir_bind_guard_9730
 )
 
 # --------------------------------------------------------------------
