@@ -248,28 +248,42 @@ fn probe_trail() -> bool {
 /// come due after [`PROBE_INTERVAL_MS`] of wall clock, and a sink-less child
 /// then cleared the latch. A test that needs an immediate retry calls
 /// [`reset_probe_clock_for_test`]. Callers hold `audit::sink_test_lock` and
-/// keep the returned guard alive for the span of the latch: its `Drop` calls
-/// [`force_on_for_test`]`(false)`, so a panic cannot leave a never-due latch
-/// behind for the rest of the process.
+/// keep the returned guard alive for the span of the latch: its `Drop` puts
+/// back the forced mode, the latch and the retry clock the gate had when the
+/// guard was taken, so a panic cannot leave a never-due latch behind for the
+/// rest of the process and an inner guard never un-latches an outer one
+/// (#9840). Guards drop innermost first, which scope order guarantees.
 #[cfg(test)]
 pub(crate) fn latch_for_test() -> LatchGuard {
     require_isolated_child("latch_for_test");
+    let prior = LatchGuard {
+        forced: FORCE_ON_FOR_TEST.load(Ordering::SeqCst),
+        latched: LATCHED.load(Ordering::SeqCst),
+        probe_ms: LAST_PROBE_MS.load(Ordering::SeqCst),
+    };
     FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
     LATCHED.store(true, Ordering::SeqCst);
     LAST_PROBE_MS.store(u64::MAX, Ordering::SeqCst);
-    LatchGuard(())
+    prior
 }
 
-/// Test-only RAII guard from [`latch_for_test`]: dropping it restores the mode
-/// to the environment and clears the latch and retry clock (idempotent).
+/// Test-only RAII guard from [`latch_for_test`]. It holds the gate state from
+/// before the guard was taken (forced mode, latched flag, retry clock) and
+/// dropping it puts exactly that back, at any nesting depth (#9840).
 #[cfg(test)]
-#[must_use = "dropping the guard immediately un-latches the audit trail"]
-pub(crate) struct LatchGuard(());
+#[must_use = "dropping the guard immediately restores the prior audit trail state"]
+pub(crate) struct LatchGuard {
+    forced: bool,
+    latched: bool,
+    probe_ms: u64,
+}
 
 #[cfg(test)]
 impl Drop for LatchGuard {
     fn drop(&mut self) {
-        force_on_for_test(false);
+        FORCE_ON_FOR_TEST.store(self.forced, Ordering::SeqCst);
+        LATCHED.store(self.latched, Ordering::SeqCst);
+        LAST_PROBE_MS.store(self.probe_ms, Ordering::SeqCst);
     }
 }
 
