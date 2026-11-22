@@ -159,7 +159,8 @@ EXPECTED_GATE_STEPS = {
 }
 # Exact guards of the steps this change moves or depends on.
 EXPECTED_STEP_IFS = {
-    ("check", RUN_TESTS): CARGO_SKIP_GUARD,
+    # #9821 (I5): a skipped self-hosted draft leg also runs no tests (decided behaviour).
+    ("check", RUN_TESTS): CARGO_SKIP_GUARD + " && env.LEG_SKIP != 'true'",
     ("mobile-cross-compile", "cargo check (--lib --features sqlite-bundled)"): CARGO_SKIP_GUARD,
     ("mobile-cross-compile", SECURITY_AUDIT): ONCE_GUARD,
     ("mobile-cross-compile", RELEASE_SMOKE): ONCE_GUARD,

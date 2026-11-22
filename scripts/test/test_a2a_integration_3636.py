@@ -37,7 +37,8 @@ class Integration3636(unittest.TestCase):
             '1. The model in one page', '2. Choose your receive pattern',
             '3. Enrolment, end to end', '4. Sending',
             '5. Drive an agent loop from wakes', '6. Multi-host',
-            '7. Security model', '8. Degraded modes', '9. Troubleshooting'])
+            '7. Security model', '8. Degraded modes', '9. Troubleshooting',
+            '10. Agent2Agent (A2A) standard binding'])
         for required in ['--daemon-producer', '--agent-type', '--include-agent',
                          'allowed_sender_agent_ids', 'peer_not_enrolled',
                          'deferred-audit spool ancestor permits untrusted rename',

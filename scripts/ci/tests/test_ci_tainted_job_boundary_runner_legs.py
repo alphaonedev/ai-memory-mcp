@@ -205,6 +205,22 @@ FORM_CASES = (
      "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
      "          - runner: '[\"macos-latest\"]'\n    runs-on: ${{ fromJSON(matrix.runner) }}\n",
      set(), []),
+    # PR 9838 (#9821): the flip form `fromJSON(<cond> && '<json>' || matrix.<axis>)` yields every
+    # axis value AND the literal arm, so a new self-hosted matrix label is a new row.
+    ("flip form, hosted literal arm",
+     "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
+     "          - runner: '[\"self-hosted\",\"macos-fed\"]'\n          - runner: '[\"self-hosted\",\"new-fed\"]'\n"
+     "    runs-on: ${{ fromJSON(github.event.pull_request.draft == true && '[\"ubuntu-latest\"]' || matrix.runner) }}\n",
+     {(SYNTH, JOB, '["self-hosted","macos-fed"]'), (SYNTH, JOB, '["self-hosted","new-fed"]')}, []),
+    ("flip form, self-hosted literal arm",
+     "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
+     "    runs-on: ${{ fromJSON(inputs.x == 'a' && '[\"self-hosted\",\"arm-fed\"]' || matrix.runner) }}\n",
+     {(SYNTH, JOB, '["self-hosted","arm-fed"]')}, []),
+    ("flip form with || in the condition is opaque",
+     "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
+     "    runs-on: ${{ fromJSON(inputs.x || inputs.y && '[\"ubuntu-latest\"]' || matrix.runner) }}\n",
+     {(SYNTH, JOB, leg_text(("${{ fromJSON(inputs.x || inputs.y && '[\"ubuntu-latest\"]' || matrix.runner) }}",)))},
+     []),
     ("opaque expression", "    runs-on: ${{ inputs.runner }}\n", {(SYNTH, JOB, '["${{ inputs.runner }}"]')}, []),
     ("unclassifiable: number", "    runs-on: 42\n", set(),
      [f"{SYNTH}/{JOB}: runs-on value 42 outside the known forms"]),

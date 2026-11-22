@@ -214,7 +214,8 @@ def configure_step(text):
 PREFLIGHT_CALL = 'if ! python3 -I scripts/ci/tier_cred_preflight.py --url-file "$url_file"; then'
 CREATE_DB = 'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then'
 URL_FILE_LINE = 'url_file="$HOME/.ai-memory-ci-fed-url"'
-STEP_IF = "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'"
+# The trailing guard is the #9821 draft skip: a skipped leg runs nothing, so it has nothing to pre-flight.
+STEP_IF = "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed' && env.LEG_SKIP != 'true'"
 
 # shell compound commands: a command word that opens one, and the word that closes it
 _START = r"(?:^|[;&|(]\s*|\bthen\s+|\bdo\s+|\belse\s+|\belif\s+[^;]*;\s*then\s+)"
@@ -573,9 +574,10 @@ class TestWiring(unittest.TestCase):
             "return-above": text.replace(call_block, '          if [ "$LEG" = "x" ]; then\n            return 0\n'
                                          "          fi\n" + call_block),
             "step-if-narrowed": text.replace(
-                "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'\n        shell: bash",
                 "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed' && "
-                "matrix.node != 'macos-fed'\n        shell: bash"),
+                "env.LEG_SKIP != 'true'\n        shell: bash",
+                "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed' && "
+                "env.LEG_SKIP != 'true' && matrix.node != 'macos-fed'\n        shell: bash"),
             "continue-on-error": text.replace("        shell: bash\n        env:\n          # matrix.leg via env",
                                               "        shell: bash\n        continue-on-error: true\n        env:\n"
                                               "          # matrix.leg via env"),

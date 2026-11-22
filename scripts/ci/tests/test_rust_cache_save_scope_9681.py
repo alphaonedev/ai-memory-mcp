@@ -1403,6 +1403,8 @@ HOSTED_PR_CONTEXT: dict[str, object] = {
     "needs.classify.outputs.cargo_skip": "false",
     "runner.environment": "github-hosted",
     "runner.os": "Linux",
+    # #9821 (I5): the hosted leg is never skipped (the skip condition needs a self-hosted runner).
+    "env.LEG_SKIP": "false",
     "github.event_name": "pull_request",
     "github.repository": REPO_SLUG,
     "github.event.pull_request.head.repo.full_name": REPO_SLUG,
@@ -2138,6 +2140,14 @@ UNPAIRED_RUST_CACHE_SITES: dict[tuple[str, str, str], UnpairedSite] = {
 
 RUNS_ON_MATRIX_RE = re.compile(
     r"^\$\{\{\s*(?:fromJSON\(\s*matrix\.([A-Za-z_][\w-]*)\s*\)|matrix\.([A-Za-z_][\w-]*))\s*\}\}$")
+# #9821 (I5): the one flip condition `runs-on` may carry, written out by hand (the same text as
+# LEG_SKIP in ci.yml); a changed or looser condition is an unrecognised runs-on form.
+DRAFT_FLIP_CONDITION = (
+    "github.event_name == 'pull_request' && github.event.pull_request.draft == true "
+    "&& contains(matrix.runner, 'self-hosted') "
+    "&& !contains(github.event.pull_request.labels.*.name, 'ci-fix')")
+RUNS_ON_DRAFT_FLIP_RE = re.compile(
+    r"""^\$\{\{\s*fromJSON\((.+) && '\["ubuntu-latest"\]' \|\| matrix\.(runner)\)\s*\}\}$""")
 MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][\w-]*)\s*\}\}")
 SELF_HOSTED = "self-hosted"
 SiteKey = tuple[str, str, str]
@@ -2156,9 +2166,19 @@ def _runs_on(job: Job, leg: dict[str, object]) -> str:
     if EXPRESSION_OPEN not in raw:
         return raw
     match = RUNS_ON_MATRIX_RE.match(raw.strip())
+    is_flip = False
+    if not match:
+        # #9821 (I5): a draft PR flips a SELF-HOSTED leg to a hosted runner. The flip is
+        # accepted only when its condition is exactly DRAFT_FLIP_CONDITION (which names
+        # `contains(matrix.runner, 'self-hosted')`), so a hosted leg never changes; the leg's
+        # own runner is the else branch.
+        flip = RUNS_ON_DRAFT_FLIP_RE.match(raw.strip())
+        if flip and flip.group(1) == DRAFT_FLIP_CONDITION:
+            match = flip
+            is_flip = True
     if not match:
         raise AssertionError(f"{job.job_id}: unrecognised runs-on form: {raw!r}")
-    field_name = match.group(1) or match.group(2)
+    field_name = match.group(2) if is_flip else match.group(1) or match.group(2)
     if field_name not in leg:
         raise AssertionError(f"{job.job_id}: runs-on reads matrix.{field_name}, which leg "
                              f"{_leg_id(leg)!r} does not set")
@@ -2382,11 +2402,14 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
             return Job("j", [f"    runs-on: {runs_on}"])
 
         leg = {"os": "ubuntu-latest", "runner": '["self-hosted","linux-fed"]'}
+        flip_text = "${{ fromJSON(%s && '[\"ubuntu-latest\"]' || matrix.runner) }}"
+        draft_flip_form = flip_text % DRAFT_FLIP_CONDITION
         cases = {
             "ubuntu-latest": "ubuntu-latest",
             "[self-hosted, linux-fed]": "[self-hosted, linux-fed]",
             "${{ matrix.os }}": "ubuntu-latest",
             "${{ fromJSON(matrix.runner) }}": '["self-hosted","linux-fed"]',
+            draft_flip_form: '["self-hosted","linux-fed"]',
         }
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
@@ -2396,6 +2419,18 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
             "${{ matrix.missing }}": "j: runs-on reads matrix.missing, which leg "
                                      "'os=ubuntu-latest' does not set",
         }
+        # A flip whose condition is not exactly the pinned one is refused: a dropped
+        # self-hosted test, a dropped ci-fix exemption, an `||` tail, or a changed event.
+        for changed in (
+            DRAFT_FLIP_CONDITION.replace(" && contains(matrix.runner, 'self-hosted')", ""),
+            DRAFT_FLIP_CONDITION.replace(
+                " && !contains(github.event.pull_request.labels.*.name, 'ci-fix')", ""),
+            DRAFT_FLIP_CONDITION + " || true",
+            DRAFT_FLIP_CONDITION.replace("'pull_request'", "'push'"),
+            "contains(matrix.runner, 'self-hosted')",
+        ):
+            failures[flip_text % changed] = (
+                "j: unrecognised runs-on form: " + repr(flip_text % changed))
         for raw, reason in failures.items():
             with self.subTest(raw=raw), self.assertRaises(AssertionError) as caught:
                 _runs_on(job(raw), leg)
@@ -3174,9 +3209,12 @@ class PairTable:
         raise KeyError(pr_id)
 
 
-CI_IF_NOT_SKIPPED = "needs.classify.outputs.cargo_skip != 'true'"
-CI_IF_HOSTED = CI_IF_NOT_SKIPPED + " && runner.environment == 'github-hosted'"
-CI_IF_LOW_MEM = CI_IF_NOT_SKIPPED + " && matrix.leg == 'ubuntu-latest,sqlite'"
+# #9821 (I5): every PR-side work step also carries the LEG_SKIP guard; the rows are written out.
+CI_IF_RUNS = "needs.classify.outputs.cargo_skip != 'true' && env.LEG_SKIP != 'true'"
+CI_IF_HOSTED = ("needs.classify.outputs.cargo_skip != 'true' && runner.environment == "
+                "'github-hosted' && env.LEG_SKIP != 'true'")
+CI_IF_LOW_MEM = ("needs.classify.outputs.cargo_skip != 'true' && matrix.leg == "
+                 "'ubuntu-latest,sqlite' && env.LEG_SKIP != 'true'")
 WARM_IF_CACHE_MISS = "steps.rust-cache.outputs.cache-hit != 'true'"
 WARM_CACHE_ID = "rust-cache"
 WARM_CACHE_NAME = "Rust cache (write the key the PR job restores)"
@@ -3209,18 +3247,19 @@ PAIR_TABLES: dict[tuple[str, str], PairTable] = {
             Row("actions/setup-node", "actions/setup-node", {"if": (CI_IF_HOSTED, None)}),
             Row("Install Rust 1.99.1 (matches rust-toolchain.toml pin)",
                 "Install Rust 1.99.1 (matches rust-toolchain.toml pin)",
-                {"if": (CI_IF_NOT_SKIPPED, None)}),
+                {"if": (CI_IF_RUNS, None)}),
             Row(RUST_CACHE, RUST_CACHE, CI_RUST_CACHE_ALLOWED),
             Row("Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)",
                 "Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)",
                 {"if": (CI_IF_LOW_MEM, None)}),
             Row("Run tests (impact-aware)", "Build the test targets (no run)", {
                 "name": (ANY, ANY), "run": (ANY, ANY), "shell": ("bash", None),
-                "if": (CI_IF_NOT_SKIPPED, WARM_IF_CACHE_MISS), "env": (CI_CARGO_ENV, None)}),
+                "if": (CI_IF_RUNS, WARM_IF_CACHE_MISS), "env": (CI_CARGO_ENV, None)}),
         ),
         pr_only=(
             "Record job start (#6795)",
             "Fork-PR refusal (self-hosted legs never run fork code)",
+            "Draft skip (#9821)",
             "Prune stale runner TMPDIR (#8634)",
             "cargo_skip short-circuit",
             "Per-runner cargo target (#7188)",
@@ -3247,7 +3286,8 @@ PAIR_TABLES: dict[tuple[str, str], PairTable] = {
             "name": (ANY, ANY), "needs": ("classify", None), "strategy": (ANY, None),
             "runs-on": ('["ubuntu-latest"]', "ubuntu-latest"),
         },
-        env_one_sided={"SELF_HOSTED_TARGET_CAP_BYTES": ONE_SIDED_PR},
+        env_one_sided={"SELF_HOSTED_TARGET_CAP_BYTES": ONE_SIDED_PR,
+                       "LEG_SKIP": ONE_SIDED_PR},
     ),
     ("coverage.yml", "per-module-thresholds"): PairTable(
         rows=(
@@ -3899,20 +3939,27 @@ class PairMirrorFixtures9770(unittest.TestCase):
                                                 "appears 3 times"])
 
     def test_the_hand_table_pins_the_allowed_differences(self) -> None:
-        ci_if_hosted = "needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'github-hosted'"
+        ci_if_hosted = ("needs.classify.outputs.cargo_skip != 'true' && runner.environment == "
+                        "'github-hosted' && env.LEG_SKIP != 'true'")
+        ci_if_runs = "needs.classify.outputs.cargo_skip != 'true' && env.LEG_SKIP != 'true'"
         ci = PAIR_TABLES[("ci.yml", "check")]
         self.assertEqual(ci.row_for(RUST_CACHE).allowed["if"], (ci_if_hosted, None))
         self.assertEqual(ci.row_for(RUST_CACHE).allowed["id"], (None, "rust-cache"))
         self.assertEqual(ci.row_for("Install Rust 1.99.1 (matches rust-toolchain.toml pin)")
-                         .allowed["if"], ("needs.classify.outputs.cargo_skip != 'true'", None))
+                         .allowed["if"], (ci_if_runs, None))
         self.assertEqual(ci.row_for("Run tests (impact-aware)").allowed["shell"], ("bash", None))
         self.assertEqual(ci.row_for("Run tests (impact-aware)").allowed["if"],
-                         ("needs.classify.outputs.cargo_skip != 'true'",
-                          "steps.rust-cache.outputs.cache-hit != 'true'"))
+                         (ci_if_runs, "steps.rust-cache.outputs.cache-hit != 'true'"))
         self.assertEqual(ci.row_for("Run tests (impact-aware)").allowed["env"][1], None)
         self.assertEqual(ci.job_allowed["needs"], ("classify", None))
         self.assertEqual(ci.job_allowed["runs-on"], ('["ubuntu-latest"]', "ubuntu-latest"))
-        self.assertEqual(ci.env_one_sided, {"SELF_HOSTED_TARGET_CAP_BYTES": "pr"})
+        self.assertEqual(ci.row_for("Low-mem hosted sqlite link (debuginfo=0, system ld "
+                                    "— mold isolation)").allowed["if"],
+                         ("needs.classify.outputs.cargo_skip != 'true' && matrix.leg == "
+                          "'ubuntu-latest,sqlite' && env.LEG_SKIP != 'true'", None))
+        self.assertIn("Draft skip (#9821)", ci.pr_only)
+        self.assertEqual(ci.env_one_sided,
+                         {"SELF_HOSTED_TARGET_CAP_BYTES": "pr", "LEG_SKIP": "pr"})
         cov = PAIR_TABLES[("coverage.yml", "per-module-thresholds")]
         self.assertEqual(cov.row_for("Install cargo-llvm-cov").allowed["if"],
                          (None, "steps.rust-cache.outputs.cache-hit != 'true'"))
