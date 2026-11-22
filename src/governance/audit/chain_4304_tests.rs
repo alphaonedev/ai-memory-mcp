@@ -86,6 +86,9 @@ fn writer_for(dir: &Path) -> ChainWriter {
         },
         file: None,
         lock_contended_until: None,
+        sync_tracked: false,
+        unsynced: false,
+        retired: Vec::new(),
     }
 }
 
@@ -148,8 +151,14 @@ fn two_appenders_alternating_keep_one_chain_4304() {
     let mut a = writer_for(tmp.path());
     let mut b = writer_for(tmp.path());
     for i in 0..4 {
-        a.append(pending(&format!("ai:a-{i}"))).expect("a");
-        b.append(pending(&format!("ai:b-{i}"))).expect("b");
+        assert_eq!(
+            a.append(pending(&format!("ai:a-{i}"))).expect("a"),
+            RowOutcome::Written
+        );
+        assert_eq!(
+            b.append(pending(&format!("ai:b-{i}"))).expect("b"),
+            RowOutcome::Written
+        );
     }
     let recs = rows(tmp.path());
     assert_eq!(recs.len(), 8);
@@ -163,7 +172,10 @@ fn a_same_length_rewrite_forces_a_tail_reread_4304() {
     let _g = lock();
     let tmp = TempDir::new().unwrap();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("first");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("first"),
+        RowOutcome::Written
+    );
     let original = rows(tmp.path()).remove(0);
     let mut swapped = original.clone();
     swapped.actor = "ai:row-z".to_string();
@@ -182,7 +194,10 @@ fn a_same_length_rewrite_forces_a_tail_reread_4304() {
     f.write_all(body.as_bytes()).unwrap();
     drop(f);
 
-    w.append(pending("ai:row-b")).expect("second");
+    assert_eq!(
+        w.append(pending("ai:row-b")).expect("second"),
+        RowOutcome::Written
+    );
     let recs = rows(tmp.path());
     assert_eq!(recs[0].actor, "ai:row-z");
     assert_eq!(
@@ -199,13 +214,19 @@ fn an_unknown_cursor_resyncs_from_the_file_4304() {
     let _g = lock();
     let tmp = TempDir::new().unwrap();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("first");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("first"),
+        RowOutcome::Written
+    );
     // What a failed write leaves behind: no cursor, a head that is not the
     // file's tail.
     w.cursor.at = None;
     w.cursor.last_hash = "f".repeat(64);
     w.file = None;
-    w.append(pending("ai:row-b")).expect("second");
+    assert_eq!(
+        w.append(pending("ai:row-b")).expect("second"),
+        RowOutcome::Written
+    );
     let recs = rows(tmp.path());
     assert_eq!(recs.len(), 2);
     assert_one_chain(&recs);
@@ -220,12 +241,18 @@ fn an_unusable_lock_file_degrades_to_rereading_and_is_counted_4304() {
     std::fs::create_dir(tmp.path().join(FORENSIC_LOCK_FILE)).unwrap();
     let before = crate::metrics::forensic_lock_unavailable_count();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("first");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("first"),
+        RowOutcome::Written
+    );
     append_foreign(
         tmp.path(),
         &foreign_row("ai:other", &rows(tmp.path())[0].self_hash()),
     );
-    w.append(pending("ai:row-b")).expect("second");
+    assert_eq!(
+        w.append(pending("ai:row-b")).expect("second"),
+        RowOutcome::Written
+    );
     let recs = rows(tmp.path());
     assert_eq!(recs.len(), 3);
     assert_one_chain(&recs);
@@ -238,7 +265,10 @@ fn the_lock_file_is_not_a_forensic_log_file_4304() {
     let _g = lock();
     let tmp = TempDir::new().unwrap();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("append");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("append"),
+        RowOutcome::Written
+    );
     assert!(tmp.path().join(FORENSIC_LOCK_FILE).exists());
     assert_eq!(list_forensic_files(tmp.path()).unwrap().len(), 1);
 }
@@ -250,8 +280,14 @@ fn a_truncated_file_keeps_the_break_visible_4304() {
     let _g = lock();
     let tmp = TempDir::new().unwrap();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("a");
-    w.append(pending("ai:row-b")).expect("b");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("a"),
+        RowOutcome::Written
+    );
+    assert_eq!(
+        w.append(pending("ai:row-b")).expect("b"),
+        RowOutcome::Written
+    );
     let before = rows(tmp.path());
     let first_line_len = serde_json::to_string(&before[0]).unwrap().len() + 1;
     let f = OpenOptions::new()
@@ -261,7 +297,10 @@ fn a_truncated_file_keeps_the_break_visible_4304() {
     f.set_len(first_line_len as u64).unwrap();
     drop(f);
 
-    w.append(pending("ai:row-c")).expect("c");
+    assert_eq!(
+        w.append(pending("ai:row-c")).expect("c"),
+        RowOutcome::Written
+    );
     let recs = rows(tmp.path());
     assert_eq!(recs.len(), 2, "row b is gone");
     assert_eq!(
@@ -288,7 +327,10 @@ fn a_held_lock_costs_at_most_the_budget_and_is_counted_4304() {
     let before = crate::metrics::forensic_lock_unavailable_count();
     let mut w = writer_for(tmp.path());
     let t0 = std::time::Instant::now();
-    w.append(pending("ai:row-a")).expect("append");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("append"),
+        RowOutcome::Written
+    );
     let took = t0.elapsed();
     assert!(
         took >= FORENSIC_LOCK_BUDGET,
@@ -333,7 +375,10 @@ fn the_lock_file_is_created_owner_only_4304() {
     let _g = lock();
     let tmp = TempDir::new().unwrap();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("append");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("append"),
+        RowOutcome::Written
+    );
     let mode = std::fs::metadata(tmp.path().join(FORENSIC_LOCK_FILE))
         .unwrap()
         .permissions()
@@ -352,7 +397,10 @@ fn a_planted_symlink_lock_file_is_not_followed_4304() {
     std::os::unix::fs::symlink(&target, tmp.path().join(FORENSIC_LOCK_FILE)).unwrap();
     let before = crate::metrics::forensic_lock_unavailable_count();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("append");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("append"),
+        RowOutcome::Written
+    );
     assert!(!target.exists(), "the link target was not created");
     assert!(crate::metrics::forensic_lock_unavailable_count() > before);
     assert_eq!(rows(tmp.path()).len(), 1);
@@ -375,7 +423,10 @@ fn a_planted_fifo_lock_file_does_not_hang_4304() {
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     let before = crate::metrics::forensic_lock_unavailable_count();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("append");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("append"),
+        RowOutcome::Written
+    );
     assert!(crate::metrics::forensic_lock_unavailable_count() > before);
     assert_eq!(rows(tmp.path()).len(), 1);
 }
@@ -392,7 +443,10 @@ fn an_existing_wide_lock_file_is_made_owner_only_4352() {
     std::fs::write(&path, b"").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let mut w = writer_for(tmp.path());
-    w.append(pending("ai:row-a")).expect("append");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("append"),
+        RowOutcome::Written
+    );
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
     assert_eq!(rows(tmp.path()).len(), 1);
@@ -419,7 +473,10 @@ fn a_persistently_held_lock_costs_later_rows_only_the_breaker_wait_4353() {
     let before = crate::metrics::forensic_lock_unavailable_count();
     let mut w = writer_for(tmp.path());
     let t0 = std::time::Instant::now();
-    w.append(pending("ai:row-a")).expect("a");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("a"),
+        RowOutcome::Written
+    );
     assert!(
         t0.elapsed() >= FORENSIC_LOCK_BUDGET,
         "first row waits the budget"
@@ -427,7 +484,10 @@ fn a_persistently_held_lock_costs_later_rows_only_the_breaker_wait_4353() {
     assert!(w.lock_contended_until.is_some(), "the breaker opened");
     let t1 = std::time::Instant::now();
     for i in 0..3 {
-        w.append(pending(&format!("ai:row-{i}"))).expect("later");
+        assert_eq!(
+            w.append(pending(&format!("ai:row-{i}"))).expect("later"),
+            RowOutcome::Written
+        );
     }
     let later = t1.elapsed();
     assert!(
@@ -454,12 +514,18 @@ fn a_released_lock_closes_the_breaker_4353() {
     let holder = hold_lock(tmp.path());
     let mut w = writer_for(tmp.path());
     w.lock_contended_until = std::time::Instant::now().checked_add(LOCK_BREAKER_WINDOW);
-    w.append(pending("ai:row-a")).expect("a");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("a"),
+        RowOutcome::Written
+    );
     assert!(w.lock_contended_until.is_some(), "still held: still open");
     holder.unlock().unwrap();
     drop(holder);
     let before = crate::metrics::forensic_lock_unavailable_count();
-    w.append(pending("ai:row-b")).expect("b");
+    assert_eq!(
+        w.append(pending("ai:row-b")).expect("b"),
+        RowOutcome::Written
+    );
     assert!(
         w.lock_contended_until.is_none(),
         "the lock was taken: closed"
@@ -476,7 +542,10 @@ fn an_expired_breaker_window_waits_the_full_budget_4353() {
     let mut w = writer_for(tmp.path());
     w.lock_contended_until = std::time::Instant::now().checked_sub(LOCK_BREAKER_WAIT);
     let t0 = std::time::Instant::now();
-    w.append(pending("ai:row-a")).expect("a");
+    assert_eq!(
+        w.append(pending("ai:row-a")).expect("a"),
+        RowOutcome::Written
+    );
     assert!(t0.elapsed() >= FORENSIC_LOCK_BUDGET);
     holder.unlock().unwrap();
 }

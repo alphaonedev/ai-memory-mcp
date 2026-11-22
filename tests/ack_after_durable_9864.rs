@@ -44,9 +44,24 @@ use serde_json::{Value, json};
 /// wall time).
 const ACK_BARRIER_DEADLINE_ENV: &str = "AI_MEMORY_TEST_ACK_BARRIER_DEADLINE_MS";
 
-/// The JSON-RPC code and reason prefix of the named error, written by hand.
+/// The JSON-RPC code of the named error, written by hand.
 const AUDIT_NOT_DURABLE_CODE: i64 = -32_010;
-const AUDIT_NOT_DURABLE_REASON: &str = "audit row not durable";
+
+/// The whole refusal text at the 0 ms deadline seam, written by hand. Every
+/// write cell compares the message to it exactly.
+const NOT_DURABLE_AT_ZERO_TEXT: &str = "audit row not durable: the forensic audit writer did not \
+    confirm the audit row within 0 ms, so this request is not acknowledged; the mutation may \
+    have been applied and its audit row stays queued until the writer recovers (#9864)";
+
+/// The deadline of the K-2 cell: long enough for a healthy writer to settle
+/// every row, short enough that the three held refusals cost little.
+const RETRY_CELL_DEADLINE_MS: &str = "1000";
+
+/// The whole refusal text at [`RETRY_CELL_DEADLINE_MS`], written by hand.
+const NOT_DURABLE_AT_RETRY_CELL_TEXT: &str = "audit row not durable: the forensic audit writer \
+    did not confirm the audit row within 1000 ms, so this request is not acknowledged; the \
+    mutation may have been applied and its audit row stays queued until the writer recovers \
+    (#9864)";
 
 /// The HTTP status of the named error in `serve`, written by hand.
 const SERVE_NOT_DURABLE_STATUS: u16 = 503;
@@ -301,6 +316,38 @@ fn forensic_dir(home: &Path) -> PathBuf {
     home.join("audit")
 }
 
+fn db_path(home: &Path) -> PathBuf {
+    home.join("ack9864.db")
+}
+
+fn count_title(home: &Path, title: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path(home)).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE title = ?1",
+        [title],
+        |row| row.get(0),
+    )
+    .expect("count memories")
+}
+
+fn memory_id(home: &Path, title: &str) -> String {
+    let conn = rusqlite::Connection::open(db_path(home)).expect("open db");
+    conn.query_row("SELECT id FROM memories WHERE title = ?1", [title], |row| {
+        row.get(0)
+    })
+    .expect("memory id")
+}
+
+fn link_count(home: &Path, source: &str, target: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path(home)).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+        [source, target],
+        |row| row.get(0),
+    )
+    .expect("count links")
+}
+
 fn hold_dir(home: &Path) -> PathBuf {
     let dir = home.join("writer-hold");
     std::fs::create_dir_all(&dir).expect("create writer hold dir");
@@ -341,6 +388,18 @@ fn kind_rows(home: &Path, kind: &str) -> usize {
 /// config (forensic dir here), key dir and db; the writer delay off, the hold
 /// directory and the barrier deadline seam set.
 fn spawn_child(home: &Path, mode_args: &[String], hold: &Path, piped_stdio: bool) -> Child {
+    spawn_child_with(home, mode_args, hold, piped_stdio, Some("0"))
+}
+
+/// [`spawn_child`] with the deadline seam chosen: `None` keeps the
+/// production deadline.
+fn spawn_child_with(
+    home: &Path,
+    mode_args: &[String],
+    hold: &Path,
+    piped_stdio: bool,
+    deadline_ms: Option<&str>,
+) -> Child {
     let config_root = home.join(".config").join("ai-memory");
     std::fs::create_dir_all(&config_root).expect("create config root");
     std::fs::write(
@@ -363,12 +422,14 @@ fn spawn_child(home: &Path, mode_args: &[String], hold: &Path, piped_stdio: bool
         .env("AI_MEMORY_EMBED_OFFLINE", "1")
         .env(TEST_FORENSIC_WRITER_DELAY_ENV, "0")
         .env(TEST_FORENSIC_WRITER_HOLD_DIR_ENV, hold)
-        .env(ACK_BARRIER_DEADLINE_ENV, "0")
         .current_dir(home)
         .arg("--db")
-        .arg(home.join("ack9864.db"))
+        .arg(db_path(home))
         .args(mode_args)
         .stderr(Stdio::null());
+    if let Some(ms) = deadline_ms {
+        cmd.env(ACK_BARRIER_DEADLINE_ENV, ms);
+    }
     if piped_stdio {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
     } else {
@@ -440,12 +501,13 @@ fn tool_call(id: u64, name: &str, arguments: &Value) -> Value {
 }
 
 fn is_not_durable(resp: &Value) -> bool {
+    is_refusal_with(resp, NOT_DURABLE_AT_ZERO_TEXT)
+}
+
+fn is_refusal_with(resp: &Value, text: &str) -> bool {
     let err = resp.get("error");
     err.and_then(|e| e.get("code")).and_then(Value::as_i64) == Some(AUDIT_NOT_DURABLE_CODE)
-        && err
-            .and_then(|e| e.get("message"))
-            .and_then(Value::as_str)
-            .is_some_and(|m| m.starts_with(AUDIT_NOT_DURABLE_REASON))
+        && err.and_then(|e| e.get("message")).and_then(Value::as_str) == Some(text)
 }
 
 /// MCP mode, every registry tool: with the writer held and a row queued, every
@@ -567,7 +629,9 @@ fn http(client: &reqwest::blocking::Client, port: u16, method: &str, path: &str)
 }
 
 fn http_not_durable(status: u16, text: &str) -> bool {
-    status == SERVE_NOT_DURABLE_STATUS && text.contains(AUDIT_NOT_DURABLE_REASON)
+    status == SERVE_NOT_DURABLE_STATUS
+        && serde_json::from_str::<Value>(text)
+            .is_ok_and(|v| v == json!({ "error": NOT_DURABLE_AT_ZERO_TEXT }))
 }
 
 /// `serve` mode, every production route: with the writer held and a row
@@ -598,6 +662,7 @@ fn serve_every_write_route_waits_for_a_durable_audit_row_9864() {
     wait_for(&mut reaper, "the first delete row on disk", || {
         kind_rows(&home_path, "memory_delete") == 1
     });
+    let refusals_before = sink_unavailable_total(&client, port);
     engage_hold(&hold);
     let (status, text) = http(&client, port, "DELETE", r::MEMORIES_ID);
     wait_for(&mut reaper, "the writer to hold the queued row", || {
@@ -610,12 +675,16 @@ fn serve_every_write_route_waits_for_a_durable_audit_row_9864() {
     );
 
     let mut wrong = Vec::new();
-    if !http_not_durable(status, &text) {
+    let mut refused = 0_u64;
+    if http_not_durable(status, &text) {
+        refused += 1;
+    } else {
         wrong.push(format!("DELETE {} (held): {status}", r::MEMORIES_ID));
     }
     for (method, path, want) in HTTP_CELLS {
         let (status, text) = http(&client, port, method, path);
         let got = if http_not_durable(status, &text) {
+            refused += 1;
             NotDurable
         } else {
             Answers
@@ -634,4 +703,254 @@ fn serve_every_write_route_waits_for_a_durable_audit_row_9864() {
         HTTP_CELLS.len() + 1,
         wrong.join("\n")
     );
+    // K-1: one count of the outage metric per refusal, no more, no less.
+    assert_eq!(
+        sink_unavailable_total(&client, port) - refusals_before,
+        refused,
+        "ai_memory_forensic_sink_unavailable_total must rise by one per refusal"
+    );
+}
+
+const SINK_UNAVAILABLE_METRIC: &str = "ai_memory_forensic_sink_unavailable_total";
+
+/// The outage counter as `serve` exposes it (a read-only route, so it never
+/// waits on the barrier).
+fn sink_unavailable_total(client: &reqwest::blocking::Client, port: u16) -> u64 {
+    let (status, text) = http(client, port, "GET", r::METRICS_BARE);
+    assert_eq!(status, 200, "metrics: {text}");
+    text.lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            (parts.next() == Some(SINK_UNAVAILABLE_METRIC))
+                .then(|| parts.next())
+                .flatten()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .map_or_else(
+            || panic!("{SINK_UNAVAILABLE_METRIC} missing from {}", r::METRICS_BARE),
+            |v| {
+                assert!(v >= 0.0 && v.fract() == 0.0, "counter {v}");
+                // A counter value is a whole number well under 2^53.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let n = v as u64;
+                n
+            },
+        )
+}
+
+fn mcp_session(home: &Path, hold: &Path, deadline_ms: &str) -> (Reaper, Mcp) {
+    let mode = [
+        "mcp".to_string(),
+        "--profile".to_string(),
+        "full".to_string(),
+    ];
+    let mut child = spawn_child_with(home, &mode, hold, true, Some(deadline_ms));
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut mcp = Mcp { stdin, stdout };
+    let init = mcp.request(
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2024-11-05","capabilities":{},
+        "clientInfo":{"name":"probe9864","version":"1"}}}),
+    );
+    assert!(init.get("error").is_none(), "initialize: {init}");
+    (Reaper(child), mcp)
+}
+
+fn tool_succeeded(resp: &Value) -> bool {
+    resp.get("error").is_none() && resp["result"]["isError"].as_bool() != Some(true)
+}
+
+const RETRY_TITLE: &str = "retried-after-refusal-9864";
+const SOURCE_TITLE: &str = "link-source-9864";
+const TARGET_TITLE: &str = "link-target-9864";
+
+fn store_args(title: &str) -> Value {
+    json!({"title":title,"content":"k-2","namespace":"t9864","tier":"long"})
+}
+
+/// K-2 and K-4. With the writer held, a store and a link are refused with the
+/// exact text although both mutations committed ("may have been applied").
+/// The held row stays queued: once the hold is lifted it is written (K-4),
+/// and the retried store and link answer success and create no second
+/// memory and no second link (K-2: memories upsert on (title, namespace),
+/// links insert-or-ignore).
+#[test]
+fn a_refused_store_and_link_retried_after_recovery_create_nothing_twice_9864() {
+    let home = sandbox();
+    let hold = hold_dir(home.path());
+    let (mut reaper, mut mcp) = mcp_session(home.path(), &hold, RETRY_CELL_DEADLINE_MS);
+    let home_path = home.path().to_path_buf();
+    for (id, title) in [(2, SOURCE_TITLE), (3, TARGET_TITLE)] {
+        let resp = mcp.request(&tool_call(id, "memory_store", &store_args(title)));
+        assert!(tool_succeeded(&resp), "seed {title}: {resp}");
+    }
+    let source = memory_id(home.path(), SOURCE_TITLE);
+    let target = memory_id(home.path(), TARGET_TITLE);
+    let link_args = json!({"source_id":source,"target_id":target,"relation":"related_to"});
+    let first = mcp.request(&tool_call(4, "memory_delete", &json!({"id": DUMMY_ID})));
+    assert!(
+        !is_refusal_with(&first, NOT_DURABLE_AT_RETRY_CELL_TEXT),
+        "first delete: {first}"
+    );
+    wait_for(&mut reaper, "the first delete row on disk", || {
+        kind_rows(&home_path, "memory_delete") == 1
+    });
+    engage_hold(&hold);
+    let held_delete = mcp.request(&tool_call(5, "memory_delete", &json!({"id": DUMMY_ID})));
+    wait_for(&mut reaper, "the writer to hold the queued row", || {
+        held(&hold)
+    });
+    let refused_store = mcp.request(&tool_call(6, "memory_store", &store_args(RETRY_TITLE)));
+    let refused_link = mcp.request(&tool_call(7, "memory_link", &link_args));
+    for (what, resp) in [
+        ("held delete", &held_delete),
+        ("store", &refused_store),
+        ("link", &refused_link),
+    ] {
+        assert!(
+            is_refusal_with(resp, NOT_DURABLE_AT_RETRY_CELL_TEXT),
+            "{what} must be refused: {resp}"
+        );
+    }
+    // The refusal says the mutation may have been applied: here it was.
+    assert_eq!(
+        count_title(home.path(), RETRY_TITLE),
+        1,
+        "the refused store committed"
+    );
+    assert_eq!(
+        link_count(home.path(), &source, &target),
+        1,
+        "the refused link committed"
+    );
+    assert_eq!(
+        kind_rows(&home_path, "memory_delete"),
+        1,
+        "the held row is still queued"
+    );
+
+    std::fs::remove_file(hold.join(TEST_FORENSIC_WRITER_HOLD_FILE)).expect("lift the hold");
+    // K-4: the row that timed out is written once the writer recovers.
+    wait_for(&mut reaper, "the held row on disk", || {
+        kind_rows(&home_path, "memory_delete") == 2
+    });
+    // K-2: the retries succeed and create nothing twice.
+    let store = mcp.request(&tool_call(8, "memory_store", &store_args(RETRY_TITLE)));
+    assert!(tool_succeeded(&store), "retried store: {store}");
+    let link = mcp.request(&tool_call(9, "memory_link", &link_args));
+    assert!(tool_succeeded(&link), "retried link: {link}");
+    assert_eq!(
+        count_title(home.path(), RETRY_TITLE),
+        1,
+        "a retried store made a second memory"
+    );
+    assert_eq!(
+        link_count(home.path(), &source, &target),
+        1,
+        "a retried link made a second link"
+    );
+}
+
+/// Rounds of the `serve` SIGKILL cell.
+const SERVE_KILL_ROUNDS: u64 = 10;
+/// The kill instants cycle through this many milliseconds.
+const SERVE_KILL_SPAN_MS: u64 = 900;
+
+fn http_json(
+    client: &reqwest::blocking::Client,
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+    body: &Value,
+) -> u16 {
+    let url = format!("{}{path}", common::tls::TestTls::base_url(port));
+    client
+        .request(method, url)
+        .json(body)
+        .send()
+        .map_or(0, |resp| resp.status().as_u16())
+}
+
+/// K-3 in `serve`, production deadline: deletes and stores are sent one after
+/// another while the process is killed with SIGKILL at a different instant
+/// each round. Every delete answered with anything but the refusal has its
+/// forensic row on disk afterwards, and every store answered with success
+/// has its memory.
+#[test]
+fn serve_rows_on_disk_cover_every_acknowledged_write_after_sigkill_9864() {
+    for round in 0..SERVE_KILL_ROUNDS {
+        let home = sandbox();
+        let hold = hold_dir(home.path());
+        let port = free_port();
+        let tls = common::tls::TestTls::generate(&home.path().join("tls"));
+        let mut mode = vec![
+            "serve".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+        ];
+        mode.extend(tls.serve_args());
+        let mut reaper = Reaper(spawn_child_with(home.path(), &mode, &hold, false, None));
+        let client = https_client(&tls);
+        wait_for(&mut reaper, "/health", || {
+            http(&client, port, "GET", r::HEALTH).0 == 200
+        });
+        let worker_client = client.clone();
+        let sender = std::thread::spawn(move || {
+            let (mut acked_deletes, mut acked_stores) = (0_usize, Vec::new());
+            for k in 0_u64.. {
+                let status = if k % 2 == 0 {
+                    let path = r::MEMORIES_ID.replace("{id}", DUMMY_ID);
+                    http_json(
+                        &worker_client,
+                        port,
+                        reqwest::Method::DELETE,
+                        &path,
+                        &json!({}),
+                    )
+                } else {
+                    let title = format!("killed-{round}-{k}");
+                    let status = http_json(
+                        &worker_client,
+                        port,
+                        reqwest::Method::POST,
+                        r::MEMORIES,
+                        &store_args(&title),
+                    );
+                    if (200..300).contains(&status) {
+                        acked_stores.push(title);
+                    }
+                    status
+                };
+                match status {
+                    0 => break,
+                    SERVE_NOT_DURABLE_STATUS => {}
+                    _ if k % 2 == 0 => acked_deletes += 1,
+                    _ => {}
+                }
+            }
+            (acked_deletes, acked_stores)
+        });
+        std::thread::sleep(Duration::from_millis(
+            100 + (round * 89) % SERVE_KILL_SPAN_MS,
+        ));
+        let _ = reaper.0.kill();
+        let _ = reaper.0.wait();
+        let (acked_deletes, acked_stores) = sender.join().expect("sender thread");
+        let on_disk = kind_rows(home.path(), "memory_delete");
+        assert!(
+            on_disk >= acked_deletes,
+            "round {round}: {on_disk} forensic delete rows on disk, {acked_deletes} deletes \
+             acknowledged before SIGKILL"
+        );
+        for title in &acked_stores {
+            assert_eq!(
+                count_title(home.path(), title),
+                1,
+                "round {round}: store {title} lost"
+            );
+        }
+    }
 }

@@ -37,6 +37,13 @@ pub const INVALID_PARAMS: i64 = -32602;
 /// record-stop write fence on `tools/call`.
 pub const INTERNAL_ERROR: i64 = -32603;
 
+/// #9864 — the request may have run, but its forensic audit row was not
+/// confirmed durable in time (or could not be written), so it is not
+/// acknowledged. An implementation-defined server error (the spec reserves
+/// `-32000..=-32099` for those); the message starts with
+/// `crate::governance::audit::AUDIT_NOT_DURABLE_REASON`.
+pub const AUDIT_NOT_DURABLE: i64 = -32010;
+
 /// MCP protocol revision advertised in the `initialize` result's
 /// `protocolVersion` field.
 pub const PROTOCOL_REVISION: &str = "2024-11-05";
