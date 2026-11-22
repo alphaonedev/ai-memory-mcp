@@ -816,6 +816,11 @@ def judge_call_deciders():
                      judge(code, THREE_JUDGE_LINES), EXIT_THREE_LINES_EXPECT[code]))
         rows.append(("(l) judge exits %d and prints an unknown token" % code,
                      judge(code, ("bogus-token",)), EXIT_UNKNOWN_EXPECT[code]))
+        # Empty output and a missing line (two of the three lines): a RUN for every code,
+        # exit 0 included. Written by hand, one row each.
+        rows.append(("(l) judge exits %d and prints nothing" % code, judge(code, ()), CE))
+        rows.append(("(l) judge exits %d and prints two of the three lines" % code,
+                     judge(code, THREE_JUDGE_LINES[:2]), CE))
     return [(label, {"cargo_skip.py": data}, expected) for label, data, expected in rows]
 
 
