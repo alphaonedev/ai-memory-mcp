@@ -17,6 +17,7 @@ The expected values are written out below by hand: SITES (script, prog, exit cod
 Run: python3 -m unittest discover -s scripts/ci/tests -p test_sibling_load_9399.py
 """
 import ast
+import fnmatch
 import json
 import os
 import shutil
@@ -790,9 +791,13 @@ REASON_TEST_MODULE = (
 REASON_TEST_HELPER = (
     "shared unittest helper of scripts/ci/tests: puts scripts/ci on sys.path for the tests that import it; never run "
     "as a CI decision step")
-REASON_THIS_TEST = (
-    "this test: execs the canonical loader block text read from scripts/ci/sibling_load.py, which "
-    "CopiesMatchTheLoader pins byte for byte")
+# The ONE written rule over test modules (#8213 N1): a file directly in scripts/ci/tests/ whose name matches the
+# pattern is a unittest module, and its findings are allowed by this rule instead of one row each, so a new chain
+# test cannot turn the census red. Everything else stays a row: a helper in that folder, a test module in another
+# folder, a file in a folder below it.
+CENSUS_TEST_MODULE_FOLDER = "ci/tests"
+CENSUS_TEST_MODULE_NAME = "test_*.py"
+CENSUS_TEST_MODULE_RULE = (CENSUS_TEST_MODULE_FOLDER + "/" + CENSUS_TEST_MODULE_NAME, REASON_TEST_MODULE)
 # One row per construct form, written out by hand: (source of a probe file beside peer.py and select.py, its exact
 # finding labels in walk order). Each is one way to load a module other than through the one checked loader.
 CENSUS_FORMS = (
@@ -849,314 +854,6 @@ CENSUS_ALLOWLIST = {
     'ci/shared_cargo_target.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
     'ci/suite_budget.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
     'ci/tests/impact_fixture.py': (('from impact import', 'sys.path.insert'), REASON_TEST_HELPER),
-    'ci/tests/test_cert_amendment_ledger_6124.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_cargo_audit_8615.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_cert_expiry_corpus.py': (('exec', 'spec_from_file_location'), REASON_TEST_MODULE),
-    'ci/tests/test_check_codeql_alerts_7337.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_codeql_alerts_7833.py': (('import test_check_codeql_alerts_7337',), REASON_TEST_MODULE),
-    'ci/tests/test_check_docs_private_paths_8493.py': (
-        (
-            'from docs_private_path_shapes_8493 import',
-            'spec_from_file_location',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_check_no_cn_ai_vendor.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_npm_audit_8615.py': (('import check_npm_audit', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_check_pg_isolate_invariants.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_pg_preflight_workflows_9235.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_pr_body_ids.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_ci_annotation_escape_9365.py': (
-        (
-            'load_module',
-            'spec_from_file_location',
-            'sys.path.insert',
-            'sys.path.pop',
-            'sys.path.remove',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_base_selector_8240.py': (
-        (
-            'exec',
-            'import gha_expr',
-            'import impact_fixture',
-            'import workflow_text',
-            'import_module(non-constant)',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_failure_class_9235.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_ci_full_nightly_8240.py': (
-        (
-            'import ci_full_nightly',
-            'import impact_fixture',
-            'import workflow_text',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_progress_notice_9430.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_ci_release_split_9680.py': (
-        (
-            'import workflow_text',
-            'spec_from_file_location',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_select_gating_8240.py': (
-        (
-            'import gha_expr',
-            'import impact_fixture',
-            'import workflow_text',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_semaphore_wiring_7914.py': (('import host_semaphore', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary.py': (('import taint_boundary', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_closed.py': (
-        (
-            'import taint_boundary',
-            'import test_ci_tainted_job_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_open_rows.py': (
-        (
-            'from test_ci_tainted_job_boundary import',
-            'import taint_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_prescan_uses.py': (
-        (
-            'exec',
-            'import taint_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_runner_legs.py': (
-        (
-            'from impact import',
-            'import taint_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_codeql_6163.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_coverage_classify_9263.py': (('from impact import', 'sys.path.append'), REASON_TEST_MODULE),
-    'ci/tests/test_evict_r5_7219.py': (
-        (
-            'import prune_runner_artifacts',
-            'import shared_cargo_target',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_child_isolation_7728.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_cleanup_close_7871.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_content_separators_7867.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_diff_hunks_7733.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_entry_7730.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r5_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_5040_5042.py': (
-        (
-            'from tmp_runtime_guard_7393 import',
-            'import_module(non-constant)',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r2_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r3_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r4_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r3_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r5_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r3_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r6_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r3_7393 import',
-            'from test_evidence_generator_r5_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r7_7393.py': (
-        (
-            'exec',
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r5_7393 import',
-            'from test_evidence_generator_r6_7393 import',
-            'import tmp_runtime_guard_7393',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r8_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r5_7393 import',
-            'from test_evidence_generator_r6_7393 import',
-            'from test_evidence_generator_r7_7393 import',
-            'import tmp_runtime_guard_7393',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_pathspecs_7732.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_post_mkdir_cleanup_8211.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_private_create_7868.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_publish_7729.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_report_escaping_7734.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_run_cert_close_all_7876.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_run_git_exit_7869.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_scratch_fd_7870.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_sqlite_uri_7735.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'import tmp_runtime_guard_7393',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_tmpdir_7731.py': (('from test_evidence_generator_5040_5042 import',), REASON_TEST_MODULE),
-    'ci/tests/test_host_semaphore_7914.py': (
-        (
-            'import host_semaphore',
-            'sys.path.insert',
-            'sys.path.pop',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_8322.py': (('from impact import', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_8328.py': (
-        (
-            'exec',
-            'from impact import',
-            'sys.path.append',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_cwd_top_8493.py': (
-        (
-            'from impact_fixture import',
-            'from test_impact_cargo_skip_symlink_tracked_8493 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_env_gitlink_8493.py': (
-        (
-            'from impact import',
-            'from impact_fixture import',
-            'sys.path.append',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_symlink_8493.py': (('from impact_fixture import',), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_symlink_toplevel_8493.py': (
-        (
-            'from impact_fixture import',
-            'from test_impact_cargo_skip_symlink_tracked_8493 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_symlink_tracked_8493.py': (('from impact_fixture import',), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_worktree_cfg_8493.py': (
-        (
-            'from impact import',
-            'from impact_fixture import',
-            'from test_impact_cargo_skip_symlink_tracked_8493 import',
-            'sys.path.append',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_gate.py': (
-        (
-            'from impact import',
-            'import impact_fixture',
-            'import workflow_text',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_rules_8240.py': (('from impact import', 'import impact_fixture'), REASON_TEST_MODULE),
-    'ci/tests/test_impact_select.py': (('from impact import', 'import impact_fixture'), REASON_TEST_MODULE),
-    'ci/tests/test_linux_fed_footprint_7188.py': (
-        (
-            'import shared_cargo_target',
-            'import test_ci_check_matrix_max_parallel_9682',
-            'sys.path.insert',
-            'sys.path.pop',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_load_gate_6795.py': (('import load_gate', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_measure_ci_time_9710.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_measure_ci_time_bench_9710.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_partition_test_binaries.py': (
-        (
-            'import partition_test_binaries',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_partition_union_6412.py': (
-        (
-            'import partition_test_binaries',
-            'import test_partition_test_binaries',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_pg_env_preflight_9235.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_pg_isolate_split.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_pg_isolated_binary.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_prune_runner_artifacts_7188.py': (
-        (
-            'import prune_runner_artifacts',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_prune_runner_tmp_8634.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_recapture_cert_3607_5038.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_rust_cache_save_scope_9681.py': (
-        (
-            'import taint_boundary',
-            'sys.path.insert',
-            'sys.path.pop',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_sccache_and_eviction_7199.py': (
-        (
-            'import prune_runner_artifacts',
-            'import sccache_env',
-            'import shared_cargo_target',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_sccache_r3_7199.py': (
-        (
-            'from test_sccache_and_eviction_7199 import',
-            'import sccache_env',
-            'import shared_cargo_target',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_sibling_load_9399.py': (('exec',), REASON_THIS_TEST),
-    'ci/tests/test_suite_budget_9229.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_suite_budget_9229_integrity.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_sync_r4_7219.py': (('import prune_runner_artifacts', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_test_env_lock_isolation_7913.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_tier_cred_preflight_8686.py': (('spec_from_file_location',), REASON_TEST_MODULE),
     'ci/tests/tmp_runtime_guard_7393.py': (('sys.path.insert',), REASON_TEST_HELPER),
     'ci/tier_cred_preflight.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
     'claude-md-rule-compare.py': (('exec', 'spec_from_file_location'), REASON_OUTSIDE_FILE_9857),
@@ -1316,11 +1013,19 @@ def census_table():
     return table, len(files), skipped
 
 
+def census_rule_covers(rel):
+    """True only for a scripts-relative path directly in CENSUS_TEST_MODULE_FOLDER whose name matches
+    CENSUS_TEST_MODULE_NAME (case-sensitive, whatever the file system does)."""
+    folder, _sep, name = rel.rpartition("/")
+    return folder == CENSUS_TEST_MODULE_FOLDER and fnmatch.fnmatchcase(name, CENSUS_TEST_MODULE_NAME)
+
+
 def census_verdict(table):
-    """(unexpected, stale) of a census table against the written allowlist: every file whose findings are not
-    exactly its row, and every row that names a file without findings."""
+    """(unexpected, stale) of a census table against the written allowlist: every file outside the test-module rule
+    whose findings are not exactly its row, and every row that names a file without findings."""
     expected = {rel: tuple(sorted(labels)) for rel, (labels, _reason) in CENSUS_ALLOWLIST.items()}
-    unexpected = {rel: labels for rel, labels in table.items() if expected.get(rel) != labels}
+    unexpected = {rel: labels for rel, labels in table.items()
+                  if not census_rule_covers(rel) and expected.get(rel) != labels}
     stale = sorted(rel for rel in expected if rel not in table)
     return unexpected, stale
 
@@ -1378,8 +1083,10 @@ class Census(unittest.TestCase):
                 self.assertEqual(rel in unexpected, finding)
 
     def test_every_allowlist_row_and_skip_rule_has_a_reason(self):
+        self.assertGreaterEqual(len(CENSUS_TEST_MODULE_RULE[1].strip()), MIN_REASON_CHARS)
         for rel, (labels, reason) in CENSUS_ALLOWLIST.items():
             with self.subTest(rel=rel):
+                self.assertFalse(census_rule_covers(rel), rel + " is covered by the test-module rule; a row is dead")
                 self.assertTrue(labels, rel + " has no labels")
                 self.assertGreaterEqual(len(reason.strip()), MIN_REASON_CHARS, rel + " has no written reason")
                 if rel in SITE_FILES:
