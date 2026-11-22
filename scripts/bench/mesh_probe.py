@@ -80,22 +80,34 @@ def _load_sibling(filename, module_name):
         if os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
             return loaded
         raise SiblingLoadError("module name taken")
+    # The checked path is opened by descriptor, one component at a time from the script folder, never following a
+    # symlink: the object read is the object checked, even when a folder is swapped after the check.
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    parts = os.path.relpath(path, here).split(os.sep)
+    fds = []
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        raise SiblingLoadError("absent") from None
-    except OSError:
-        raise SiblingLoadError("unreadable") from None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SiblingLoadError("not a regular file")
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            source = handle.read()
-    except OSError:
-        raise SiblingLoadError("unreadable") from None
+        try:
+            fds.append(os.open(here, dir_flags))
+            for part in parts[:-1]:
+                fds.append(os.open(part, dir_flags, dir_fd=fds[-1]))
+            fds.append(os.open(parts[-1], os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0), dir_fd=fds[-1]))
+        except FileNotFoundError:
+            raise SiblingLoadError("absent") from None
+        except OSError:
+            raise SiblingLoadError("unreadable") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fds[-1]).st_mode):
+                raise SiblingLoadError("not a regular file")
+            with os.fdopen(fds[-1], "rb", closefd=False) as handle:
+                source = handle.read()
+        except OSError:
+            raise SiblingLoadError("unreadable") from None
     finally:
-        os.close(fd)
+        for fd in fds:
+            os.close(fd)
+    if not source:
+        raise SiblingLoadError("empty")
     module = types.ModuleType(module_name)
     module.__file__ = path
     saved_path = list(sys.path)

@@ -24,45 +24,6 @@ import sys
 from pathlib import Path
 
 
-def _load_workflow_annotation():
-    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
-    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
-    import importlib.util
-    import os
-    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
-    loaded = sys.modules.get("workflow_annotation")
-    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
-        module = loaded
-    else:
-        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
-    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
-    if missing:
-        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
-    if loaded is None:
-        sys.modules["workflow_annotation"] = module
-    return module
-
-
-# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
-WA_PROG = "pg_isolate_split"
-WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation",)
-WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
-WA_ERROR_TO_STDERR = False
-
-try:
-    wa = _load_workflow_annotation()
-except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
-    wa_cause = type(exc).__name__
-    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
-          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
-    print("::error title=pg_isolate_split refused::pg_isolate_split: refused: shared module workflow_annotation.py"
-          " next to the script cannot be loaded",
-          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
-    sys.exit(WA_EXIT_LOAD_REFUSED)
-
 # >>> sibling-load 9399 (canonical text; scripts/ci/sibling_load.py; test_sibling_load_9399 pins every copy)
 class SiblingLoadError(ImportError):
     """A refused sibling load; ``reason`` is one of the fixed words the refusal line prints."""
@@ -91,22 +52,34 @@ def _load_sibling(filename, module_name):
         if os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
             return loaded
         raise SiblingLoadError("module name taken")
+    # The checked path is opened by descriptor, one component at a time from the script folder, never following a
+    # symlink: the object read is the object checked, even when a folder is swapped after the check.
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    parts = os.path.relpath(path, here).split(os.sep)
+    fds = []
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        raise SiblingLoadError("absent") from None
-    except OSError:
-        raise SiblingLoadError("unreadable") from None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SiblingLoadError("not a regular file")
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            source = handle.read()
-    except OSError:
-        raise SiblingLoadError("unreadable") from None
+        try:
+            fds.append(os.open(here, dir_flags))
+            for part in parts[:-1]:
+                fds.append(os.open(part, dir_flags, dir_fd=fds[-1]))
+            fds.append(os.open(parts[-1], os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0), dir_fd=fds[-1]))
+        except FileNotFoundError:
+            raise SiblingLoadError("absent") from None
+        except OSError:
+            raise SiblingLoadError("unreadable") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fds[-1]).st_mode):
+                raise SiblingLoadError("not a regular file")
+            with os.fdopen(fds[-1], "rb", closefd=False) as handle:
+                source = handle.read()
+        except OSError:
+            raise SiblingLoadError("unreadable") from None
     finally:
-        os.close(fd)
+        for fd in fds:
+            os.close(fd)
+    if not source:
+        raise SiblingLoadError("empty")
     module = types.ModuleType(module_name)
     module.__file__ = path
     saved_path = list(sys.path)
@@ -136,6 +109,17 @@ def _sibling_refusal(prog, filename, exc):
 
 SIBLING_PROG = "pg_isolate_split"
 SIBLING_EXIT_LOAD_REFUSED = 3
+
+WA_REQUIRED = ("annotation",)  # each must be a callable of workflow_annotation.py (#9365)
+
+try:
+    wa = _load_sibling("workflow_annotation.py", "workflow_annotation")
+    for wa_name in WA_REQUIRED:
+        if not callable(getattr(wa, wa_name, None)):
+            raise AttributeError("workflow_annotation.py lacks " + wa_name)
+except (Exception, SystemExit) as exc:  # any failed load ends here with one fixed line (#9399)
+    _sibling_refusal(SIBLING_PROG, "workflow_annotation.py", exc)
+    sys.exit(SIBLING_EXIT_LOAD_REFUSED)
 
 try:
     ptb = _load_sibling("partition_test_binaries.py", "partition_test_binaries")
