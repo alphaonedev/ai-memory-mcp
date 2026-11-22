@@ -543,9 +543,15 @@ pub fn handle_reflect_caller(
     if let Some(obj) = input.metadata.as_object_mut() {
         obj.remove(crate::models::field_names::ATTEST_LEVEL);
     }
-    let mut attest_sink = serde_json::Value::Object(serde_json::Map::new());
-    crate::identity::attest::gate_unsigned_surface_attestation(&mut attest_sink)
-        .map_err(|e| e.to_string())?;
+    // #9926 — a reflection of the stdio session agent is sealed (signed and
+    // verified) at the reflect write funnel, so it is not an unsigned write
+    // and the strict unsigned-surface refusal does not apply to it; a seal
+    // failure there refuses the reflection.
+    if !crate::identity::session_signer::covers(&input.agent_id) {
+        let mut attest_sink = serde_json::Value::Object(serde_json::Map::new());
+        crate::identity::attest::gate_unsigned_surface_attestation(&mut attest_sink)
+            .map_err(|e| e.to_string())?;
+    }
 
     // ─── #1325: caller-asserted depth mismatch refusal ──────────────
     // When the caller passed `depth: N`, verify it matches the

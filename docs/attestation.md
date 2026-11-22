@@ -475,6 +475,33 @@ You want every MCP write cryptographically attributed:
 > gate applies to caller-originated `memory_store`, not the substrate's
 > internal maintenance writes.
 
+### Recipe 3 — Server-side signing for a stdio MCP session (#9926)
+
+Your MCP host does not sign, but you want `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`
+and attributed rows. The stdio `ai-memory mcp` process can sign for its own
+session agent:
+
+1. Do **Option B** steps 1–3 for the session agent (`AI_MEMORY_AGENT_ID`).
+   Step 1 writes `<agent>.priv` (32 raw bytes, mode `0600`).
+2. In the server's `env` map set `AI_MEMORY_AGENT_ID` and
+   `AI_MEMORY_MCP_SIGNING_KEY_FILE` to the path of that `.priv` file.
+
+At boot the server opens the file without following a symlink and refuses to
+start, with an exact reason, unless it is a regular file owned by the
+effective user, mode `0600` or stricter, exactly 32 bytes, and its public half
+equals the public key bound to the session agent. A missing agent id, an
+unbound agent and a configured MCP federation forward URL also refuse to start.
+
+Once started, `memory_store` calls without a `signature`, `memory_reflect`,
+`memory_consolidate` and `memory_entity_register` by the session agent are
+signed in the server over the `SignableWrite` envelope, verified against the
+bound key, admitted once through the replay ledger, and land
+`attest_level=agent_attested`. If signing or verification fails the write is
+refused; it never lands `claimed` instead. A `signature` the caller supplies on
+`memory_store` takes precedence. Writes that name another agent id are handled
+exactly as before. With the variable unset nothing changes. The key is held
+only by the server process and is never logged.
+
 ---
 
 ## Verify it worked

@@ -10405,7 +10405,15 @@ pub fn consolidate_with_expected_versions(
     // REFUSED (before any write). Substrate / curator consolidates
     // (`substrate_authored`, the SAL `for_admin` ConsolidationPass) are exempt,
     // exactly like the SAL `store()` surface (env #48).
-    if !substrate_authored && crate::identity::attest::global_strict_attestation_enabled() {
+    // #9926 — a consolidate by the stdio session agent is sealed (signed and
+    // verified) below, so it is not unsigned and is admitted here; a seal
+    // failure refuses it inside the write transaction.
+    let session_sealed =
+        !substrate_authored && crate::identity::session_signer::covers(consolidator_agent_id);
+    if !substrate_authored
+        && !session_sealed
+        && crate::identity::attest::global_strict_attestation_enabled()
+    {
         return Err(anyhow::anyhow!(
             "{}",
             crate::identity::attest::ATTESTATION_REFUSED_UNSIGNED_SURFACE
@@ -10668,16 +10676,46 @@ pub fn consolidate_with_expected_versions(
         consult_why_trace_gate(&candidate)?;
         // #8341 - the ledger projection, inside this write txn.
         let projected = agent_projection::projected(conn, &candidate)?;
-        let (summary, metadata_json) = match &projected {
-            Some(p) => (p.content.as_str(), serde_json::to_string(&p.metadata)?),
-            None => (summary, metadata_json),
+        // #9926 — seal the row exactly as it will be persisted (after the
+        // ledger projection), so the signed title and content are the
+        // inserted ones. The replay-ledger admission runs inside this write
+        // transaction and rolls back with it.
+        let session_row = if session_sealed {
+            use crate::identity::session_signer::{SealOutcome, seal_sync};
+            let mut row = projected.clone().unwrap_or_else(|| candidate.clone());
+            // The unsigned gate was skipped because the signer covers this
+            // agent, so anything but `Signed` refuses (fail closed).
+            match seal_sync(conn, &mut row, consolidator_agent_id) {
+                SealOutcome::Signed => {}
+                SealOutcome::UnsignedOtherAgent => {
+                    return Err(crate::errors::refusal(
+                        crate::identity::session_signer::SEAL_REFUSAL_PREFIX,
+                    ));
+                }
+                SealOutcome::Refused(reason) => {
+                    return Err(crate::errors::refusal(reason));
+                }
+            }
+            crate::validate::validate_metadata(&row.metadata)
+                .context("merged metadata exceeds size limit")?;
+            Some(row)
+        } else {
+            None
+        };
+        let title = session_row.as_ref().map_or(title, |row| row.title.as_str());
+        let (summary, metadata_json) = match (&session_row, &projected) {
+            (Some(row), _) => (row.content.as_str(), serde_json::to_string(&row.metadata)?),
+            (None, Some(p)) => (p.content.as_str(), serde_json::to_string(&p.metadata)?),
+            (None, None) => (summary, metadata_json),
         };
         // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
         // it mints its own content-id from the (plaintext) summary + the
         // candidate's genesis identity. Minted BEFORE the #228 seal swap
         // below so the cid always hashes the plaintext summary, never the
         // ciphertext placeholder (mirrors the `db::insert` ordering).
-        let cid_stamp = crate::identity::cid::stamp_memory_cid(&candidate);
+        // #9926 — a sealed row hashes the bytes it signed and persists.
+        let cid_stamp =
+            crate::identity::cid::stamp_memory_cid(session_row.as_ref().unwrap_or(&candidate));
         // #228/#2301 Commit B — at-rest content encryption on the consolidate
         // funnel. This raw INSERT bypasses the `db::insert` chokepoint (where
         // the SQLite seal normally lands), so without this call a curator
@@ -12191,10 +12229,19 @@ pub fn entity_register(
         // stamped `attest_level="claimed"` so an attestation census is truthful.
         // Refuses BEFORE the insert below, so no partial row is written.
         let mut metadata = serde_json::Value::Object(meta_map);
-        crate::identity::attest::gate_unsigned_surface_attestation(&mut metadata)?;
+        // #9926 — an entity registered by the stdio session agent is sealed
+        // (signed and verified) below instead of crossing the unsigned gate.
+        let session_agent = agent_id.filter(|a| crate::identity::session_signer::covers(a));
+        if session_agent.is_none() {
+            crate::identity::attest::gate_unsigned_surface_attestation(&mut metadata)?;
+        }
 
-        let now = Utc::now().to_rfc3339();
-        let mem = Memory {
+        let now = if session_agent.is_some() {
+            crate::identity::attest::now_attestable_rfc3339()
+        } else {
+            Utc::now().to_rfc3339()
+        };
+        let mut mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
             valid_from: None,
             valid_until: None,
@@ -12226,6 +12273,20 @@ pub fn entity_register(
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
         };
+        if let Some(agent) = session_agent {
+            use crate::identity::session_signer::{SealOutcome, seal_sync};
+            // The unsigned gate was skipped because the signer covers this
+            // agent, so anything but `Signed` refuses (fail closed).
+            match seal_sync(conn, &mut mem, agent) {
+                SealOutcome::Signed => {}
+                SealOutcome::UnsignedOtherAgent => {
+                    return Err(crate::errors::refusal(
+                        crate::identity::session_signer::SEAL_REFUSAL_PREFIX,
+                    ));
+                }
+                SealOutcome::Refused(reason) => return Err(crate::errors::refusal(reason)),
+            }
+        }
         let id = insert(conn, &mem).context("insert entity memory")?;
         (id, true)
     };

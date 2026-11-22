@@ -538,23 +538,37 @@ fn handle_store_inner(
             // signature so it propagates verbatim across federation relay hops.
             crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
         } else {
-            // #3018 — stamp `attest_level` UNCONDITIONALLY on the unsigned
-            // path (not only under strict), so the permissive MCP surface
-            // lands an explicit `attest_level="claimed"` and an attestation
-            // census (`metadata.attest_level='claimed'`) is truthful.
-            // `stamp_attestation_sync` resolves the require flag internally:
-            // the #1985 surface-scoped default leaves MCP permissive, so an
-            // unsigned MCP write lands `claimed`; only an explicit
-            // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`/`=true` forces the
-            // strict reject-unsigned posture.
-            crate::identity::attest::stamp_attestation_sync(
-                conn,
-                &mut mem,
-                &agent_id,
-                None,
-                crate::identity::attest::WriteSurface::Mcp,
-            )
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_STORE_INNER, e))?;
+            // #9926 — the session signer seals an unsigned write of the
+            // session agent: signed over the canonical envelope, verified
+            // against the bound key, stamped `agent_attested`, admitted to
+            // the replay ledger. A refusal refuses the write; there is no
+            // fallback to `claimed`. Any other agent runs the path below.
+            use crate::identity::session_signer::{SealOutcome, seal_sync};
+            match seal_sync(conn, &mut mem, &agent_id) {
+                SealOutcome::Signed => {}
+                SealOutcome::Refused(reason) => return Err(reason),
+                SealOutcome::UnsignedOtherAgent => {
+                    // #3018 — stamp `attest_level` UNCONDITIONALLY on the unsigned
+                    // path (not only under strict), so the permissive MCP surface
+                    // lands an explicit `attest_level="claimed"` and an attestation
+                    // census (`metadata.attest_level='claimed'`) is truthful.
+                    // `stamp_attestation_sync` resolves the require flag internally:
+                    // the #1985 surface-scoped default leaves MCP permissive, so an
+                    // unsigned MCP write lands `claimed`; only an explicit
+                    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`/`=true` forces the
+                    // strict reject-unsigned posture.
+                    crate::identity::attest::stamp_attestation_sync(
+                        conn,
+                        &mut mem,
+                        &agent_id,
+                        None,
+                        crate::identity::attest::WriteSurface::Mcp,
+                    )
+                    .map_err(|e| {
+                        crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_STORE_INNER, e)
+                    })?;
+                }
+            }
         }
     }
 

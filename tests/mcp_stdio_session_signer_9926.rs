@@ -139,7 +139,14 @@ impl Sandbox {
         assert!(!pubkey.is_empty(), "export-pub printed a key");
         let out = self.cli(
             agent,
-            &["agents", "bind-key", "--agent-id", agent, "--pubkey", &pubkey],
+            &[
+                "agents",
+                "bind-key",
+                "--agent-id",
+                agent,
+                "--pubkey",
+                &pubkey,
+            ],
         );
         assert!(
             out.status.success(),
@@ -281,10 +288,7 @@ impl Mcp {
 
     /// `(is_error, text)` of one tool call.
     fn call_raw(&mut self, tool: &str, arguments: &Value) -> (bool, String) {
-        let response = self.request(
-            "tools/call",
-            &json!({"name": tool, "arguments": arguments}),
-        );
+        let response = self.request("tools/call", &json!({"name": tool, "arguments": arguments}));
         assert!(response.get("error").is_none(), "rpc error: {response}");
         let text = response["result"]["content"][0]["text"]
             .as_str()
@@ -357,7 +361,10 @@ fn assert_attested_and_verifies(sb: &Sandbox, id: &str, what: &str) {
     )
     .unwrap_or_else(|e| panic!("{what}: signature must verify against the bound key: {e}"));
     assert!(
-        matches!(level, ai_memory::identity::verify::AttestLevel::AgentAttested),
+        matches!(
+            level,
+            ai_memory::identity::verify::AttestLevel::AgentAttested
+        ),
         "{what}: verified level"
     );
 }
@@ -515,7 +522,11 @@ fn boot_refuses_key_that_is_not_the_bound_key_9926() {
     let wrong = sb.key_file_bytes(&[0x5a_u8; 32], "wrong.key", 0o600);
     for require in POSTURES {
         let out = sb.boot_with_env(AGENT, require, wrong.as_os_str());
-        assert_boot_refused(&out, REFUSE_MISMATCH, &format!("wrong key REQUIRE={require}"));
+        assert_boot_refused(
+            &out,
+            REFUSE_MISMATCH,
+            &format!("wrong key REQUIRE={require}"),
+        );
     }
 }
 
@@ -537,7 +548,7 @@ fn boot_refuses_unbound_session_agent_9926() {
 }
 
 /// A caller-supplied valid signature takes precedence: the row carries the
-/// CALLER's signature and created_at, not a server re-sign.
+/// CALLER's signature and `created_at`, not a server re-sign.
 #[test]
 fn caller_signature_takes_precedence_over_session_signer_9926() {
     let sb = Sandbox::new();
@@ -573,7 +584,10 @@ fn caller_signature_takes_precedence_over_session_signer_9926() {
         out["id"].as_str().expect("id").to_string()
     };
     let mem = get_memory(&sb, &id);
-    assert_eq!(mem.created_at, created_at, "caller's signed created_at kept");
+    assert_eq!(
+        mem.created_at, created_at,
+        "caller's signed created_at kept"
+    );
     assert_eq!(
         mem.metadata["write_signature"], sig_b64,
         "caller's signature persisted, not a server re-sign"
@@ -634,7 +648,97 @@ fn other_session_without_key_is_unchanged_9926() {
     let mem = get_memory(&sb, &plain_id);
     assert_eq!(attest_level(&mem), CLAIMED, "unkeyed session lands claimed");
     assert_eq!(mem.metadata["agent_id"], OTHER_AGENT);
-    assert!(mem.metadata.get("write_signature").is_none(), "no signature");
+    assert!(
+        mem.metadata.get("write_signature").is_none(),
+        "no signature"
+    );
+}
+
+/// Per-session key isolation inside ONE keyed process: a write that names a
+/// different agent id is never signed with the session key. It either runs
+/// today's unsigned path (lands `claimed`, no signature) or is refused by the
+/// identity layer; it never lands `agent_attested`. End to end the identity
+/// layer refuses first; the `covers` guard itself is pinned by the unit test
+/// `signer_covers_only_its_session_agent_9926`.
+#[test]
+fn keyed_session_never_signs_for_another_agent_9926() {
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(AGENT, "0", Some(&key));
+    let (is_error, text) = mcp.call_raw(
+        "memory_store",
+        &json!({
+            "title": "isolation other agent 9926",
+            "content": "A body attributed to another agent, long enough to read as prose.",
+            "namespace": NAMESPACE,
+            "kind": "observation",
+            "agent_id": OTHER_AGENT,
+        }),
+    );
+    drop(mcp);
+    if is_error {
+        assert!(
+            text.contains("agent_id mismatch"),
+            "a foreign-agent write is refused by the identity layer: {text}"
+        );
+        return;
+    }
+    let out: Value = serde_json::from_str(&text).expect("tool JSON");
+    let id = out["id"].as_str().expect("store id");
+    let mem = get_memory(&sb, id);
+    assert_eq!(mem.metadata["agent_id"], OTHER_AGENT, "attributed as named");
+    assert_eq!(
+        attest_level(&mem),
+        CLAIMED,
+        "another agent's write is not session-signed"
+    );
+    assert!(
+        mem.metadata.get("write_signature").is_none(),
+        "no session signature on another agent's write"
+    );
+}
+
+/// No silent downgrade at write time: when the bound key is revoked after
+/// boot (the seal verifies against the key bound NOW), the session-signed
+/// write does not verify and is REFUSED with the seal reason; it never lands
+/// `claimed`, even under the permissive posture.
+#[test]
+fn write_time_seal_failure_refuses_not_downgrades_9926() {
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(AGENT, "0", Some(&key));
+    let before = mcp.store("before revoke 9926");
+    assert_attested_and_verifies(&sb, &before, "write before the revoke");
+    let out = sb.cli(AGENT, &["agents", "revoke-key", "--agent-id", AGENT]);
+    assert!(
+        out.status.success(),
+        "agents revoke-key: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (is_error, text) = mcp.call_raw(
+        "memory_store",
+        &json!({
+            "title": "downgrade 9926",
+            "content": "A body whose session seal cannot verify, long enough to read as prose.",
+            "namespace": NAMESPACE,
+            "kind": "observation",
+        }),
+    );
+    drop(mcp);
+    assert!(is_error, "write-time seal failure refuses: {text}");
+    assert!(
+        text.contains(ai_memory::identity::session_signer::SEAL_REFUSAL_PREFIX),
+        "exact seal refusal: {text}"
+    );
+    let n: i64 = sb
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE title = 'downgrade 9926'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(n, 0, "nothing stored, no claimed fallback");
 }
 
 /// Unset key: today's behaviour. Permissive lands `claimed` with no

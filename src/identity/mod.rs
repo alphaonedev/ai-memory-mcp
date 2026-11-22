@@ -113,6 +113,9 @@ pub mod attest;
 /// v1.0.0 #3549 — the ONE caller-authority resolver beneath every handler
 /// (MCP `tools/call` dispatch + HTTP `authority_layer`).
 pub mod authority;
+/// #9926 — the stdio MCP session signer: a process-global key, installed
+/// only by the `mcp` boot, that signs covered stdio writes server-side.
+pub mod session_signer;
 // v1.0.0 crypto-core stage 3 (#1942/#1941) — live v2 write-attestation
 // path: composes the stage-1 cbor_array encoder + stage-2 SubkeyCert chain
 // + suite binding into the store-path `write_v2` presentation gate. Additive
