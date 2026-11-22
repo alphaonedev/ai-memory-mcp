@@ -85,6 +85,11 @@ PROBE = ("probe", 5445, 60)
 BOOTOUT = ("/bin/launchctl", "bootout", SERVICE)
 REMOVE = ("remove", PLIST)
 WAIT = ("wait", 4242, 300)
+PORT_CALL = ("port", 5445)
+AGENT_LABEL = "com.example.pg-tier-agent"
+AGENT_TARGET = "gui/501/com.example.pg-tier-agent"
+PRINT_DISABLED = ("/bin/launchctl", "print-disabled", "user/501")
+STARTED_PID = 5151
 READ_ONLY_CALLS = {PRINT, PS, PS_NEW}
 
 # The plist the tool must write for the placeholder arguments, written out by hand.
@@ -111,6 +116,10 @@ PLIST_LINES = [
     "\t</array>",
     "\t<key>RunAtLoad</key>",
     "\t<true/>",
+    "\t<key>StandardErrorPath</key>",
+    "\t<string>/opt/tier/pgdata/com.example.pg-tier.log</string>",
+    "\t<key>StandardOutPath</key>",
+    "\t<string>/opt/tier/pgdata/com.example.pg-tier.log</string>",
     "\t<key>UserName</key>",
     "\t<string>pgtier</string>",
     "\t<key>WorkingDirectory</key>",
@@ -128,6 +137,8 @@ EXPECTED_DICT = {
     "RunAtLoad": True,
     "KeepAlive": True,
     "ExitTimeOut": 60,
+    "StandardOutPath": "/opt/tier/pgdata/com.example.pg-tier.log",
+    "StandardErrorPath": "/opt/tier/pgdata/com.example.pg-tier.log",
 }
 FOREIGN_BYTES = b"<plist>someone else's daemon</plist>\n"
 PIDFILE_BYTES = b"4242\n/opt/tier/pgdata\n1763768852\n5445\n"
@@ -139,7 +150,7 @@ def _sha16(data: bytes) -> str:
 
 DIFF_SUMMARY = (
     f"found {len(FOREIGN_BYTES)} bytes sha256 {_sha16(FOREIGN_BYTES)}, "
-    f"expected {len(PLIST_BYTES)} bytes sha256 {_sha16(PLIST_BYTES)}, 28 lines differ"
+    f"expected {len(PLIST_BYTES)} bytes sha256 {_sha16(PLIST_BYTES)}, 32 lines differ"
 )
 
 
@@ -159,6 +170,11 @@ class FakeRunner(tdi.HostRunner):
         }
         self.groups = {GROUP_GID: GROUP, 0: "wheel"}
         self.facts = {
+            "/": tdi.Facts(tdi.Kind.DIR, 0, 0o755),
+            "/Library": tdi.Facts(tdi.Kind.DIR, 0, 0o755),
+            "/opt": tdi.Facts(tdi.Kind.DIR, 0, 0o755),
+            "/opt/tier": tdi.Facts(tdi.Kind.DIR, 0, 0o755),
+            "/opt/tier/bin": tdi.Facts(tdi.Kind.DIR, 0, 0o755),
             LAUNCH_DIR: tdi.Facts(tdi.Kind.DIR, 0, 0o755),
             BIN: tdi.Facts(tdi.Kind.FILE, 0, 0o755),
             DATA: tdi.Facts(tdi.Kind.DIR, ACCOUNT_UID, 0o700),
@@ -174,6 +190,11 @@ class FakeRunner(tdi.HostRunner):
         self.probe_result = True
         self.publish_error: OSError | None = None
         self.remove_error: OSError | None = None
+        self.port_taken = False
+        self.agent_state = "disabled"
+        self.launchd_pid_value: int | None = None
+        self.started_pid: int | None = STARTED_PID
+        self.pidfile_pid: int | None = STARTED_PID
         self.calls: list[tuple[object, ...]] = []
 
     def platform(self) -> str:
@@ -199,15 +220,32 @@ class FakeRunner(tdi.HostRunner):
         data = self.files.get(path)
         return None if data is None else data[: limit + 1]
 
+    def read_data_dir(self, path: str, name: str, limit: int):
+        facts = self.lstat(path)
+        if facts.kind is not tdi.Kind.DIR:
+            return facts, None
+        return facts, self.read_file(f"{path}/{name}", limit)
+
+    def port_in_use(self, port: int) -> bool:
+        self.calls.append(("port", port))
+        return self.port_taken
+
     def _run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(tuple(argv))
         if argv[:2] == [tdi.LAUNCHCTL, "print"]:
             rc = self.print_rc if self.print_rc is not None else (0 if self.loaded else 113)
-            return subprocess.CompletedProcess(argv, rc, "", "")
+            pid_line = f"\tpid = {self.launchd_pid_value}\n" if self.loaded and self.launchd_pid_value else ""
+            return subprocess.CompletedProcess(argv, rc, "system = {\n" + pid_line + "}\n", "")
+        if argv[:2] == [tdi.LAUNCHCTL, "print-disabled"]:
+            return subprocess.CompletedProcess(argv, 0, f'disabled services = {{\n\t"{AGENT_LABEL}" => {self.agent_state}\n}}\n', "")
         if argv[0] == tdi.LAUNCHCTL:
             rc = self.launchctl_rc.get(argv[1], 0)
             if rc == 0:
                 self.loaded = argv[1] == "bootstrap"
+                if self.loaded:
+                    self.launchd_pid_value = self.started_pid
+                    if self.pidfile_pid is not None:
+                        self.files[PIDFILE] = f"{self.pidfile_pid}\n/opt/tier/pgdata\n1763768852\n5445\n".encode()
             return subprocess.CompletedProcess(argv, rc, "", "")
         if argv[0] == tdi.PS:
             pid = int(argv[2])
@@ -265,7 +303,7 @@ def argv_for(mode: str, handover: bool = False, overrides: dict[str, str | None]
             argv.append(f"{flag}={value}")
     argv.extend(MODE_FLAGS[mode])
     if handover:
-        argv.append("--handover")
+        argv.extend(["--handover", f"--agent-label={AGENT_LABEL}"])
     return argv
 
 
@@ -307,13 +345,16 @@ PM_LINES = {
     "STALE": "postmaster: stale pid file, pid 4242 is not running",
 }
 READ_CALLS = {"NONE": [PRINT], "ALIVE": [PRINT, PS], "STALE": [PRINT, PS]}
+PROCEED_WORDS = "port check, write, bootstrap, probe, verify"
+BOOTSTRAP_WORDS = "port check, bootstrap, probe, verify"
+HANDOVER_WORDS = "wait up to 300 s for pid 4242 to exit, then agent check, port check, write, bootstrap, probe, verify"
 INSTALL_VERDICTS = {
-    "write": "install verdict: proceed: write, bootstrap, probe",
+    "write": "install verdict: proceed: " + PROCEED_WORDS,
     "pm": (
         "install verdict: refuse: postmaster pid 4242 holds /opt/tier/pgdata; nothing changed; "
         "stop its supervisor, then pass --handover"
     ),
-    "handover": "install verdict: hand-over: wait up to 300 s for pid 4242 to exit, then write, bootstrap, probe",
+    "handover": "install verdict: hand-over: " + HANDOVER_WORDS,
     "noop": f"install verdict: no-op: {PLIST} holds identical bytes and {SERVICE} is loaded",
     "different": f"install verdict: refuse: plist target {PLIST} holds different bytes ({DIFF_SUMMARY}); nothing changed",
 }
@@ -322,9 +363,16 @@ REMOVE_VERDICTS = {
     "bootout_remove": "remove verdict: proceed: bootout, remove plist",
     "notours": f"remove verdict: refuse: plist target {PLIST} is not ours ({DIFF_SUMMARY}); nothing changed",
 }
+PROBE_LINE = "probe 127.0.0.1:5445, deadline 60 s"
+VERIFY_LINE = f"verify that the pid launchd reports for {SERVICE} is the first line of {PIDFILE}; only then print installed"
+WRITE_LINE = f"write {PLIST} atomically, mode 0644, owner root:wheel, never over an existing file"
+PORT_LINE = "refuse if anything already answers on 127.0.0.1:5445"
 
 
-def dry_lines(target: str, loaded: bool, postmaster: str, euid: int, install: str, remove: str) -> list[str]:
+def dry_lines(
+    target: str, loaded: bool, postmaster: str, euid: int, install: str, remove: str, handover: bool = False
+) -> list[str]:
+    agent = AGENT_LABEL if handover else "AGENT_LABEL"
     return [
         OUT + "dry run, nothing is changed",
         "account: pgtier uid 501 group staff gid 20",
@@ -336,18 +384,25 @@ def dry_lines(target: str, loaded: bool, postmaster: str, euid: int, install: st
         *PLIST_LINES,
         "--- plist end ---",
         f"install, in order (as root: sudo {CMD} --install):",
-        f"  1. write {PLIST} atomically, mode 0644, owner root:wheel",
-        f"  2. launchctl bootstrap system {PLIST}",
-        "  3. probe 127.0.0.1:5445, deadline 60 s",
-        f"hand-over when a postmaster holds the data directory (as root: sudo {CMD} --install --handover):",
-        "  1. stop the interim supervisor of the running postmaster",
-        "  2. stop the running postmaster cleanly as pgtier: /opt/tier/bin/pg_ctl -D /opt/tier/pgdata stop -m fast",
-        "  3. the tool waits up to 300 s for that pid to exit and refuses if a new postmaster holds the data directory",
-        f"  4. write {PLIST} as in install step 1 when it is absent",
-        f"  5. launchctl bootstrap system {PLIST}",
-        "  6. probe 127.0.0.1:5445, deadline 60 s",
+        f"  1. {PORT_LINE}",
+        f"  2. {WRITE_LINE}",
+        f"  3. /bin/launchctl bootstrap system {PLIST}",
+        f"  4. {PROBE_LINE}",
+        f"  5. {VERIFY_LINE}",
+        "hand-over when a postmaster holds the data directory, first by hand:",
+        f"  a. disable the interim login agent persistently: /bin/launchctl disable gui/501/{agent}",
+        f"  b. stop it: /bin/launchctl bootout gui/501/{agent}",
+        "  c. if the postmaster still runs, stop it cleanly as pgtier: /opt/tier/bin/pg_ctl -D /opt/tier/pgdata stop -m fast",
+        f"then as root: sudo {CMD} --install --handover --agent-label {agent}",
+        "  1. wait up to 300 s for the running postmaster to exit; refuse if a new postmaster holds the data directory",
+        f"  2. refuse unless /bin/launchctl print-disabled user/501 shows gui/501/{agent} disabled",
+        f"  3. {PORT_LINE}",
+        f"  4. {WRITE_LINE}",
+        f"  5. /bin/launchctl bootstrap system {PLIST}",
+        f"  6. {PROBE_LINE}",
+        f"  7. {VERIFY_LINE}",
         f"removal, in order (as root: sudo {CMD} --remove):",
-        f"  1. launchctl bootout {SERVICE}",
+        f"  1. /bin/launchctl bootout {SERVICE}",
         f"  2. rm {PLIST}",
         INSTALL_VERDICTS[install],
         REMOVE_VERDICTS[remove],
@@ -355,10 +410,17 @@ def dry_lines(target: str, loaded: bool, postmaster: str, euid: int, install: st
 
 
 LOADED_NO_PLIST = f"{SERVICE} is loaded but {PLIST} is absent; nothing changed; inspect: launchctl print {SERVICE}"
+FREE = "127.0.0.1:5445 is free"
 WROTE = f"wrote {PLIST} (mode 0644, owner root:wheel)"
 BOOTSTRAPPED = f"bootstrapped {SERVICE}"
-ANSWERS = "127.0.0.1:5445 answers; installed"
-REMOVAL_ERR = ["removal, in order:", f"  1. launchctl bootout {SERVICE}", f"  2. rm {PLIST}"]
+ANSWERS = "127.0.0.1:5445 answers"
+INSTALLED = f"launchd pid 5151 of {SERVICE} owns /opt/tier/pgdata and 127.0.0.1:5445; installed"
+STATE_PRESENT_LOADED = f"state: plist {PLIST} present; service {SERVICE} loaded"
+STATE_PRESENT_NOT_LOADED = f"state: plist {PLIST} present; service {SERVICE} not loaded"
+STATE_ABSENT_NOT_LOADED = f"state: plist {PLIST} absent; service {SERVICE} not loaded"
+STATE_ABSENT_LOADED = f"state: plist {PLIST} absent; service {SERVICE} loaded"
+UNDO_REMOVE = f"undo: sudo {CMD} --remove"
+FINISH_REMOVAL = f"to finish the removal: sudo {CMD} --remove"
 
 # key -> (exit code, stdout lines, stderr lines, commands after the state reads, state is read)
 OUTCOMES: dict[str, tuple[int, list[str], list[str], list[tuple[object, ...]], bool]] = {
@@ -374,7 +436,8 @@ OUTCOMES: dict[str, tuple[int, list[str], list[str], list[tuple[object, ...]], b
         [],
         [
             REFUSED
-            + f"--install needs root (effective uid 501); this tool never calls sudo; run: sudo {CMD} --install --handover"
+            + f"--install needs root (effective uid 501); this tool never calls sudo; run: sudo {CMD} --install"
+            + f" --handover --agent-label {AGENT_LABEL}"
         ],
         [],
         False,
@@ -386,7 +449,13 @@ OUTCOMES: dict[str, tuple[int, list[str], list[str], list[tuple[object, ...]], b
         [],
         False,
     ),
-    "USAGE_RH": (2, [], [REFUSED + "--handover goes with --install only"], [], False),
+    "USAGE_RH": (
+        2,
+        [],
+        [REFUSED + "--handover goes with --install or the dry run; --remove never waits for a postmaster"],
+        [],
+        False,
+    ),
     "I_DIFFERENT": (
         4,
         [],
@@ -404,25 +473,34 @@ OUTCOMES: dict[str, tuple[int, list[str], list[str], list[tuple[object, ...]], b
     ),
     "I_WRITE": (
         0,
-        [OUT + "--install: proceed: write, bootstrap, probe", WROTE, BOOTSTRAPPED, ANSWERS],
+        [OUT + "--install: proceed: " + PROCEED_WORDS, FREE, WROTE, BOOTSTRAPPED, ANSWERS, INSTALLED],
         [],
-        [PUBLISH, BOOTSTRAP, PROBE],
+        [PORT_CALL, PUBLISH, BOOTSTRAP, PROBE, PRINT],
         True,
     ),
     "I_HANDOVER": (
         0,
         [
-            OUT + "--install: hand-over: wait up to 300 s for pid 4242 to exit, then write, bootstrap, probe",
+            OUT + "--install: hand-over: " + HANDOVER_WORDS,
             "postmaster pid 4242 exited",
+            f"login agent {AGENT_TARGET} is disabled",
+            FREE,
             WROTE,
             BOOTSTRAPPED,
             ANSWERS,
+            INSTALLED,
         ],
         [],
-        [WAIT, PS, PUBLISH, BOOTSTRAP, PROBE],
+        [WAIT, PS, PRINT_DISABLED, PORT_CALL, PUBLISH, BOOTSTRAP, PROBE, PRINT],
         True,
     ),
-    "I_BOOTSTRAP": (0, [OUT + "--install: proceed: bootstrap, probe", BOOTSTRAPPED, ANSWERS], [], [BOOTSTRAP, PROBE], True),
+    "I_BOOTSTRAP": (
+        0,
+        [OUT + "--install: proceed: " + BOOTSTRAP_WORDS, FREE, BOOTSTRAPPED, ANSWERS, INSTALLED],
+        [],
+        [PORT_CALL, BOOTSTRAP, PROBE, PRINT],
+        True,
+    ),
     "LOADED_NO_PLIST": (4, [], [REFUSED + LOADED_NO_PLIST], [], True),
     "R_NOTOURS": (4, [], [REFUSED + f"plist target {PLIST} is not ours ({DIFF_SUMMARY}); nothing changed"], [], True),
     "R_NOOP": (0, [OUT + f"--remove: no-op: {PLIST} is absent and {SERVICE} is not loaded"], [], [], True),
@@ -562,16 +640,16 @@ LOADED_TABLE = [
     ("DRY_RUN", "DIFFERENT", False, "D:different:notours"),
 ]
 INSTALL_VERDICTS["refuse_loaded"] = "install verdict: refuse: " + LOADED_NO_PLIST
-INSTALL_VERDICTS["bootstrap"] = "install verdict: proceed: bootstrap, probe"
+INSTALL_VERDICTS["bootstrap"] = "install verdict: proceed: " + BOOTSTRAP_WORDS
 REMOVE_VERDICTS["refuse_loaded"] = "remove verdict: refuse: " + LOADED_NO_PLIST
 REMOVE_VERDICTS["remove"] = "remove verdict: proceed: remove plist"
 
 
-def expected(key: str, target: str, loaded: bool, postmaster: str, euid: int):
+def expected(key: str, target: str, loaded: bool, postmaster: str, euid: int, handover: bool = False):
     """The hand-written outcome for one key: (code, out, err, calls)."""
     if key.startswith("D:"):
         _, install, remove = key.split(":")
-        return 0, dry_lines(target, loaded, postmaster, euid, install, remove), [], READ_CALLS[postmaster]
+        return 0, dry_lines(target, loaded, postmaster, euid, install, remove, handover), [], READ_CALLS[postmaster]
     code, out, err, actions, reads = OUTCOMES[key]
     return code, out, err, (READ_CALLS[postmaster] if reads else []) + actions
 
@@ -602,7 +680,7 @@ class ExhaustiveTableTests(unittest.TestCase):
                 fake = fake_for(mode, euid, target, postmaster)
                 loaded = fake.loaded
                 got = run_fake(fake, argv_for(mode, handover))
-                self.assertEqual(got, expected(key, target, loaded, postmaster, euid))
+                self.assertEqual(got, expected(key, target, loaded, postmaster, euid, handover))
 
     def test_loaded_rows(self) -> None:
         for mode, target, loaded, key in LOADED_TABLE:
@@ -625,8 +703,18 @@ class ExhaustiveTableTests(unittest.TestCase):
                 self.assertTrue(set(fake.calls) <= READ_ONLY_CALLS, fake.calls)
 
 
+INSTALL_PROCEED = OUT + "--install: proceed: " + PROCEED_WORDS
+INSTALL_HANDOVER = OUT + "--install: hand-over: " + HANDOVER_WORDS
+REMOVE_PROCEED = OUT + "--remove: proceed: bootout, remove plist"
+UNDO_BOOTSTRAP = f"undo: sudo /bin/launchctl bootstrap system {PLIST}"
+AGENT_ENABLED = (
+    REFUSED + f"login agent {AGENT_LABEL} of uid 501 is not disabled and could start a second postmaster; "
+    f"nothing changed; disable it first: /bin/launchctl disable {AGENT_TARGET}"
+)
+
+
 class FailureAfterChangeTests(unittest.TestCase):
-    """A failure after the write reports the re-read state and the removal path; nothing is undone silently."""
+    """A failure after the first change names what changed, the state re-read now and the undo true for that state."""
 
     def test_bootstrap_fails(self) -> None:
         fake = fake_for("INSTALL", 0, "ABSENT", "NONE")
@@ -635,13 +723,14 @@ class FailureAfterChangeTests(unittest.TestCase):
             run_fake(fake, argv_for("INSTALL")),
             (
                 6,
-                [OUT + "--install: proceed: write, bootstrap, probe", WROTE],
+                [INSTALL_PROCEED, FREE, WROTE],
                 [
-                    FAILED + f"launchctl bootstrap system {PLIST} exited 5",
-                    f"state: plist {PLIST} present; service {SERVICE} not loaded",
-                    *REMOVAL_ERR,
+                    FAILED + f"/bin/launchctl bootstrap system {PLIST} exited 5",
+                    f"changed: wrote {PLIST}",
+                    STATE_PRESENT_NOT_LOADED,
+                    UNDO_REMOVE,
                 ],
-                [PRINT, PUBLISH, BOOTSTRAP, PRINT],
+                [PRINT, PORT_CALL, PUBLISH, BOOTSTRAP, PRINT],
             ),
         )
         self.assertEqual(fake.files[PLIST], PLIST_BYTES)
@@ -653,30 +742,64 @@ class FailureAfterChangeTests(unittest.TestCase):
             run_fake(fake, argv_for("INSTALL")),
             (
                 7,
-                [OUT + "--install: proceed: write, bootstrap, probe", WROTE, BOOTSTRAPPED],
+                [INSTALL_PROCEED, FREE, WROTE, BOOTSTRAPPED],
                 [
                     FAILED + "127.0.0.1:5445 did not answer within 60 s",
-                    f"state: plist {PLIST} present; service {SERVICE} loaded",
-                    *REMOVAL_ERR,
+                    f"changed: wrote {PLIST}; bootstrapped {SERVICE}",
+                    STATE_PRESENT_LOADED,
+                    UNDO_REMOVE,
                 ],
-                [PRINT, PUBLISH, BOOTSTRAP, PROBE, PRINT],
+                [PRINT, PORT_CALL, PUBLISH, BOOTSTRAP, PROBE, PRINT],
             ),
         )
 
-    def test_write_loses_a_race(self) -> None:
+    def test_write_loses_a_race_refuses_without_touching_the_other_file(self) -> None:
         fake = fake_for("INSTALL", 0, "ABSENT", "NONE")
         fake.publish_error = FileExistsError(errno.EEXIST, "exists")
         self.assertEqual(
             run_fake(fake, argv_for("INSTALL")),
             (
+                4,
+                [INSTALL_PROCEED, FREE],
+                [REFUSED + f"plist target {PLIST} appeared during the install; nothing changed"],
+                [PRINT, PORT_CALL, PUBLISH],
+            ),
+        )
+
+    def test_write_fails_before_the_link_changes_nothing(self) -> None:
+        fake = fake_for("INSTALL", 0, "ABSENT", "NONE")
+        fake.publish_error = OSError(errno.EIO, "io")
+        self.assertEqual(
+            run_fake(fake, argv_for("INSTALL")),
+            (
                 6,
-                [OUT + "--install: proceed: write, bootstrap, probe"],
+                [INSTALL_PROCEED, FREE],
+                [FAILED + f"writing {PLIST}: EIO; nothing changed", STATE_ABSENT_NOT_LOADED],
+                [PRINT, PORT_CALL, PUBLISH, PRINT],
+            ),
+        )
+
+    def test_write_fails_after_the_link_reports_the_written_plist(self) -> None:
+        fake = fake_for("INSTALL", 0, "ABSENT", "NONE")
+
+        def publish_then_fail(path: str, data: bytes) -> None:
+            fake.calls.append(("publish", path))
+            fake.files[path] = data
+            raise tdi.PartialWrite(errno.EIO, "dir fsync")
+
+        fake.publish_file = publish_then_fail
+        self.assertEqual(
+            run_fake(fake, argv_for("INSTALL")),
+            (
+                6,
+                [INSTALL_PROCEED, FREE],
                 [
-                    FAILED + f"writing {PLIST}: EEXIST",
-                    f"state: plist {PLIST} absent; service {SERVICE} not loaded",
-                    *REMOVAL_ERR,
+                    FAILED + f"writing {PLIST}: EIO after the plist was linked in place",
+                    f"changed: wrote {PLIST}",
+                    STATE_PRESENT_NOT_LOADED,
+                    UNDO_REMOVE,
                 ],
-                [PRINT, PUBLISH, PRINT],
+                [PRINT, PORT_CALL, PUBLISH, PRINT],
             ),
         )
 
@@ -687,7 +810,7 @@ class FailureAfterChangeTests(unittest.TestCase):
             run_fake(fake, argv_for("INSTALL", handover=True)),
             (
                 8,
-                [OUT + "--install: hand-over: wait up to 300 s for pid 4242 to exit, then write, bootstrap, probe"],
+                [INSTALL_HANDOVER],
                 [REFUSED + "postmaster pid 4242 did not exit within 300 s; nothing changed"],
                 [PRINT, PS, WAIT],
             ),
@@ -701,7 +824,7 @@ class FailureAfterChangeTests(unittest.TestCase):
             run_fake(fake, argv_for("INSTALL", handover=True)),
             (
                 5,
-                [OUT + "--install: hand-over: wait up to 300 s for pid 4242 to exit, then write, bootstrap, probe"],
+                [INSTALL_HANDOVER],
                 [
                     REFUSED
                     + "postmaster pid 5151 started on /opt/tier/pgdata during the hand-over; nothing changed; "
@@ -712,6 +835,17 @@ class FailureAfterChangeTests(unittest.TestCase):
         )
         self.assertNotIn(PLIST, fake.files)
 
+    def test_handover_with_an_enabled_agent_refuses(self) -> None:
+        for agent_state in ("enabled", "false", "missing"):
+            with self.subTest(agent_state=agent_state):
+                fake = fake_for("INSTALL", 0, "ABSENT", "ALIVE")
+                fake.agent_state = agent_state
+                self.assertEqual(
+                    run_fake(fake, argv_for("INSTALL", handover=True)),
+                    (12, [INSTALL_HANDOVER, "postmaster pid 4242 exited"], [AGENT_ENABLED], [PRINT, PS, WAIT, PS, PRINT_DISABLED]),
+                )
+                self.assertNotIn(PLIST, fake.files)
+
     def test_bootout_fails_keeps_the_plist(self) -> None:
         fake = fake_for("REMOVE", 0, "IDENTICAL", "NONE")
         fake.launchctl_rc["bootout"] = 3
@@ -719,11 +853,12 @@ class FailureAfterChangeTests(unittest.TestCase):
             run_fake(fake, argv_for("REMOVE")),
             (
                 6,
-                [OUT + "--remove: proceed: bootout, remove plist"],
+                [REMOVE_PROCEED],
                 [
-                    FAILED + f"launchctl bootout {SERVICE} exited 3",
-                    f"state: plist {PLIST} present; service {SERVICE} loaded",
-                    *REMOVAL_ERR,
+                    FAILED + f"/bin/launchctl bootout {SERVICE} exited 3",
+                    "changed: nothing",
+                    STATE_PRESENT_LOADED,
+                    FINISH_REMOVAL,
                 ],
                 [PRINT, BOOTOUT, PRINT],
             ),
@@ -737,11 +872,13 @@ class FailureAfterChangeTests(unittest.TestCase):
             run_fake(fake, argv_for("REMOVE")),
             (
                 6,
-                [OUT + "--remove: proceed: bootout, remove plist", f"booted out {SERVICE}"],
+                [REMOVE_PROCEED, f"booted out {SERVICE}"],
                 [
                     FAILED + f"removing {PLIST}: EPERM",
-                    f"state: plist {PLIST} present; service {SERVICE} not loaded",
-                    *REMOVAL_ERR,
+                    f"changed: booted out {SERVICE}",
+                    STATE_PRESENT_NOT_LOADED,
+                    UNDO_BOOTSTRAP,
+                    FINISH_REMOVAL,
                 ],
                 [PRINT, BOOTOUT, REMOVE, PRINT],
             ),
@@ -752,7 +889,10 @@ class FailureAfterChangeTests(unittest.TestCase):
         self.assertEqual(run_fake(fake, argv_for("INSTALL"))[0], 0)
         self.assertEqual(fake.files[PLIST], PLIST_BYTES)
         fake.calls.clear()
-        self.assertEqual(run_fake(fake, argv_for("INSTALL")), expected("I_NOOP", "IDENTICAL", True, "NONE", 0))
+        code, out, err, _ = expected("I_NOOP", "IDENTICAL", True, "NONE", 0)
+        # The started postmaster left its pid file; the fake does not keep pid 5151 alive, so it reads as stale.
+        self.assertEqual(run_fake(fake, argv_for("INSTALL")), (code, out, err, [PRINT, PS_NEW]))
+        fake.files.pop(PIDFILE)
         fake.calls.clear()
         self.assertEqual(run_fake(fake, argv_for("REMOVE")), expected("R_BOOTOUT_REMOVE", "IDENTICAL", True, "NONE", 0))
         self.assertNotIn(PLIST, fake.files)
@@ -903,8 +1043,20 @@ DEGENERATE = [
     ("pidfile pid over", {}, _set_file(PIDFILE, b"99999999999\n"), 9, f"{PIDFILE} does not start with a process id"),
     ("pidfile blank first", {}, _set_file(PIDFILE, b" 4242\n"), 9, f"{PIDFILE} does not start with a process id"),
     ("pidfile over cap", {}, _set_file(PIDFILE, b"4242\n" + b"x" * 4092), 9, f"{PIDFILE} is larger than 4096 bytes"),
-    ("launchctl print fails", {}, _set_attr("print_rc", 5), 9, f"host probe failed: launchctl print {SERVICE} exited 5"),
-    ("ps fails", {}, _set_file(PIDFILE, PIDFILE_BYTES, alive=True), 9, "host probe failed: ps -p 4242 exited 2"),
+    (
+        "launchctl print fails",
+        {},
+        _set_attr("print_rc", 5),
+        9,
+        f"host probe failed: /bin/launchctl print {SERVICE} exited 5; nothing changed",
+    ),
+    (
+        "ps fails",
+        {},
+        _set_file(PIDFILE, PIDFILE_BYTES, alive=True),
+        9,
+        "host probe failed: /bin/ps -p 4242 exited 2; nothing changed",
+    ),
 ]
 DEGENERATE_EXTRA = {"ps fails": _set_attr("ps_rc", 2)}
 
