@@ -1317,7 +1317,7 @@ jobs:
             # table: docs/ci/CARRIER-BRANCH-GATES.md.
             # #7914 - 300 on this leg only (self-hosted, no billing). The
             # host-local semaphore ("Run tests (impact-aware)" runs under
-            # scripts/ci/host_semaphore.py) admits 2 compile+test phases at
+            # the host semaphore wrapper of scripts/ci) admits 2 compile+test phases at
             # once and its wait counts against this cap: run 39686450440
             # attempt 2 had the serial shard budget cut to 5239 s (160 min -
             # 4061 s elapsed - 300 s) and the #1492 watchdog killed it
@@ -1886,17 +1886,25 @@ jobs:
           # The wrapper refuses, before any slot or command, a wait above the
           # 900 s ceiling of scripts/ci/host_slot_limits.py, a repeated flag, or
           # a flag that differs from this key: infra-wait-refused, exit code 85.
-          # Set the wait only here; run text reads it as a plain $ read.
+          # Set the wait only here; run text reads it as a plain $ read. #9851:
+          # the wrapper call below gives the same value as a literal (its line
+          # is canonical: no quote or expansion), and the wrapper refuses a
+          # flag that differs from this key with exit code 85.
           HOST_SEMAPHORE_MAX_WAIT_SECS: '600'
         shell: bash
         run: |
           set -euo pipefail
           # #7914 - bound how many legs compile and test at once on this host:
-          # re-run this very script under host_semaphore.py (the slot is held
-          # for the whole compile+test phase; the exit code is the script's).
+          # re-run this very script under the host semaphore wrapper (the slot
+          # is held for the whole compile+test phase; the exit code is the
+          # script's). #9851: the wrapper call is one canonical line (letters,
+          # digits, space and _ . / = : , - only), so the script is first copied
+          # to a fixed path and the slot count, wait and label are literals.
           if [ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ] && [ -z "${HOST_SEMAPHORE_HELD:-}" ]; then
             export HOST_SEMAPHORE_HELD=1
-            exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots "$HOST_SEMAPHORE_SLOTS" --max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS" --label "${CI_NODE}/${TIER}" -- bash --noprofile --norc -eo pipefail "$0"
+            mkdir -p .local-runs
+            cp -- "$0" .local-runs/semaphore-step
+            exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 --max-wait-secs 600 --label linux-fed/enterprise-fed -- bash --noprofile --norc -eo pipefail .local-runs/semaphore-step
           fi
           # #6795 — JOB_T0 is written to $GITHUB_ENV by the first step of the job.
           # Invalid or missing: warn and keep the flat watchdog values (fail

@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""Check the host-slot configuration against itself and the workflow files (#9231).
+"""Check the host-slot configuration against itself and the workflow files (#9231, #9851).
 
 The slot configuration (scripts/ci/host_slots.json) lists every registered self-hosted
 runner, names every host semaphore gate, its slot count and the runners that serve a leg
 gated by it. Rules:
 
-* the configuration is well typed (one error line, never a traceback, on a malformed file);
+* the configuration is well typed and gives no key twice in one object (one error line, never a
+  traceback, on a malformed file);
 * serving runners are registered runners, none listed twice, and never exceed the slot count,
   so a job that holds a runner always finds a slot and never idles in the semaphore wait;
-* every occurrence of the token host_semaphore (any case) in every file under .github is either a
-  fully classified call or a finding with its reason (an allowlist, fail closed by construction).
-  A fully classified call is `python3 [no-argument flags] scripts/ci/host_semaphore.py` with the
-  literal path, exactly one literal configured `--name` in any position and exactly one
-  `--max-wait-secs` before the ` -- ` of the wrapped command, whose value is a plain decimal within
-  the ceiling or the plain read of HOST_SEMAPHORE_MAX_WAIT_SECS. Each call on a line is checked on
-  its own; comments are stripped before the flags are parsed. The only other admitted sites are the
-  HOST_SEMAPHORE_* environment names in ENV_NAMES and the prose comment lines in COMMENT_SITES, each
-  with its reason. Every configured gate is called;
+* every occurrence of the token host_semaphore (any case) in every file under .github is a canonical
+  call or a finding with its reason (an allowlist, fail closed by construction; #9851). Outside the
+  HOST_SEMAPHORE_* environment names of ENV_NAMES the token may appear only on a content line of a
+  `run: |` literal block of a .yml or .yaml file (any other YAML style, a key, a comment line, another
+  file type: a finding). That line is made only of letters, digits, space and `_ . / = : , -` (any other
+  character, named by its code point, is a finding: no quote, expansion, escape, glob, comment, operator,
+  tab or non-ASCII character reaches the grammar). Its words, split on spaces only, are
+  `[exec] python3 [no-argument flags] scripts/ci/host_semaphore.py`, then only the five wrapper flags
+  --name, --max-wait-secs, --slots, --label and --poll-secs, each with one word as its value, then ` -- `
+  and a command. Exactly one configured --name; exactly one --max-wait-secs, a plain decimal within the
+  ceiling; --slots is required and equals the configured slot count; --label and --poll-secs at most
+  once, --poll-secs a plain decimal. The parsed YAML document is a cross-check: the token lines of its
+  decoded `run` values equal the block lines this scan read, else a finding. Every configured gate is
+  called;
 * HOST_SEMAPHORE_MAX_WAIT_SECS has exactly one definition across the workflows and composite
   actions, parsed with the YAML subset parser of scripts/ci/taint_boundary.py, and is a plain
   decimal (PLAIN_DECIMAL_PATTERN of scripts/ci/host_slot_limits.py) from 1 to IDLE_SEAT_CEILING_SECS,
@@ -34,58 +40,57 @@ Exit 0 when everything holds, 1 with one line per violation, 2 on a malformed co
 """
 import json
 import re
+import string
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import taint_boundary  # noqa: E402  (the repository's own YAML subset parser)
-# the one ceiling and the one wait grammar, shared with host_semaphore.py
-from host_slot_limits import IDLE_SEAT_CEILING_SECS, PLAIN_DECIMAL_PATTERN  # noqa: E402
+# the one ceiling, the one wait grammar and the one duplicate-key hook, shared with host_semaphore.py
+from host_slot_limits import (  # noqa: E402
+    IDLE_SEAT_CEILING_SECS, PLAIN_DECIMAL_PATTERN, DuplicateKeyError, no_duplicate_keys)
 
 REPO = HERE.parents[1]
 CONFIG_PATH = HERE / 'host_slots.json'
 GITHUB_DIR = REPO / '.github'
+YAML_SUFFIXES = ('.yml', '.yaml')
 WAIT_KEY = 'HOST_SEMAPHORE_MAX_WAIT_SECS'
 SLOTS_KEY = 'HOST_SEMAPHORE_SLOTS'
 MAX_SLOTS = 64
 GATE_NAME_RE = re.compile(r'[A-Za-z0-9_-]+')  # used with fullmatch: no trailing newline slips through
 PLAIN_DECIMAL_RE = re.compile(PLAIN_DECIMAL_PATTERN)  # used with fullmatch, exactly as the wrapper does
 SHOWN_VALUE_MAX = 64  # a refused value is shown cut to this many characters
-# decision: an allowlist of token sites over a list of forbidden call spellings, because a list of forbidden
-# forms is never complete (`-m`, a variable or split path, a glob, a second call after `;`); every site that is
-# not a fully classified call is a finding by construction (#9231 F1).
+# decision: a canonical-form allowlist over a better bash and YAML emulation, because a checker that only admits
+# text it can read with no interpretation cannot disagree with bash (#9851, the parser differential class). A
+# workflow may name the wrapper only on a line of a `run: |` literal block (the one YAML style whose lines are the
+# lines the shell runs), the line is made only of CANONICAL_CHARS (no quote, expansion, glob, comment, operator,
+# escape, tab or non-ASCII character: nothing the shell interprets), and its words, split on spaces only, follow
+# the one call grammar of _call_findings. Every other site of the token is a finding by construction.
 TOKEN_RE = re.compile(r'host_semaphore', re.IGNORECASE)  # IGNORECASE: a macOS runner opens HOST_SEMAPHORE.PY too
-# The environment names of the gated leg: each holds the token but names no script.
+# The environment names of the gated leg: each holds the token but names no script; they are outside this rule.
 ENV_NAMES = ('HOST_SEMAPHORE_SLOTS', 'HOST_SEMAPHORE_MAX_WAIT_SECS', 'HOST_SEMAPHORE_HELD')
 ENV_NAME_RE = re.compile(r'(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_])' % '|'.join(ENV_NAMES))
 ENV_LIKE_RE = re.compile(r'HOST_SEMAPHORE_[A-Za-z0-9_]*', re.IGNORECASE)
-# {(file under .github, comment line stripped): reason} - prose comments that hold the token and run nothing.
-COMMENT_SITES = {
-    ('workflows/ci.yml', '# scripts/ci/host_semaphore.py) admits 2 compile+test phases at'):
-        'prose: the slot budget comment of the linux-fed leg (#7914)',
-    ('workflows/ci.yml', '# re-run this very script under host_semaphore.py (the slot is held'):
-        'prose: the comment above the one call of the linux-fed leg (#7914)',
-}
+CANONICAL_CHARS = frozenset(string.ascii_letters + string.digits + ' _./=:,-')
+NON_CANONICAL_RE = re.compile(r'[^A-Za-z0-9 _./=:,-]')  # the complement of CANONICAL_CHARS, one linear search
+# `run: |` with an optional `- ` sequence entry, chomping and indentation indicators and a trailing YAML comment
+RUN_BLOCK_RE = re.compile(r'( *)(- +)?run: *\|[1-9+-]{0,2}(?: +#.*)?')
 SCRIPT_PATH = 'scripts/ci/host_semaphore.py'
+SCRIPT_WORDS = (SCRIPT_PATH, './' + SCRIPT_PATH)
+PYTHON_WORD = 'python3'
+EXEC_WORD = 'exec'
+SEPARATOR = '--'
 # Python options that take no argument; -c, -m, -W and -X take one, so a call with them is not classified.
-CALL_RE = re.compile(r'(?<![^\s;&|(])python3(?:\s+-[bBdEiIOPqRsSuvx]+)*\s+(?:\./)?'
-                     + re.escape(SCRIPT_PATH) + r'(?=[\s;&|)]|$)')
-# The wrapper's own arguments end at its ` -- `, at a shell separator or at the next call on the line.
-SEGMENT_END_RE = re.compile(r'\s--(?=\s|$)|[;&|)`]')
-NAME_FLAG_RE = re.compile(r'(?:^|\s)--name(?:=|\s+)(\S+)')
-MAX_WAIT_FLAG_RE = re.compile(r'(?:^|\s)--max-wait-secs(?:=|\s+|$)(\S*)')
+PYTHON_FLAG_RE = re.compile(r'-[bBdEiIOPqRsSuvx]+')
 # #9847: the only flags a workflow call of the wrapper may give (--config and --root steer it off the checked
-# configuration and lock root); --slots must be the one bounded read of SLOTS_KEY
+# configuration and lock root)
 FLAG_NAME = '--name'
 FLAG_MAX_WAIT = '--max-wait-secs'
 FLAG_SLOTS = '--slots'
 FLAG_LABEL = '--label'
 FLAG_POLL = '--poll-secs'
 CALL_FLAGS = (FLAG_NAME, FLAG_MAX_WAIT, FLAG_SLOTS, FLAG_LABEL, FLAG_POLL)
-SLOTS_READ = '"$%s"' % SLOTS_KEY
-WAIT_KEY_READS = ('$%s' % WAIT_KEY, '${%s}' % WAIT_KEY, '"$%s"' % WAIT_KEY, '"${%s}"' % WAIT_KEY)
-QUOTE_CHARS = '\'"\\'
 # decision: an allowlist of the env mapping key and a plain $ / ${} read over a list of forbidden assignment
 # forms, because shell has open-ended ways to write a variable (export, declare, readonly, local, read,
 # printf -v, ${:=}, eval, env X=) and an allowlist fails closed on each (#9231 R2-C).
@@ -98,27 +103,28 @@ EXIT_MALFORMED = 2
 
 # Findings of the token scan, one exact reason per form (the file is the first %s).
 F_NOT_A_CALL = '%s: a host_semaphore.py reference that is not a python3 call'
-F_MODULE = '%s: host_semaphore run as a module (-m); call the literal path scripts/ci/host_semaphore.py'
-F_VARIABLE = '%s: a host_semaphore path built from a variable or a substitution'
-F_GLOB = '%s: a host_semaphore path with a glob character'
-F_SPLIT = '%s: a host_semaphore path split by a quote or a backslash'
 F_ENV_NAME = '%s: %s is not a listed HOST_SEMAPHORE_ environment name'
-F_COMMENT = '%s: a host_semaphore reference in a comment that is not a listed comment site'
 F_NOT_TEXT = '%s: not UTF-8 text, so the host_semaphore token scan cannot read it'
-F_NO_NAME = '%s: a host_semaphore.py call without exactly one literal --name'
+F_NOT_YAML = '%s: a host_semaphore reference in a file that is not a .yml or .yaml workflow'
+F_OUTSIDE_BLOCK = '%s: a host_semaphore reference outside a run: | literal block'
+F_CHAR = ('%s: a host_semaphore line with the character %s, outside the canonical call characters '
+          '(letters, digits, space and _ . / = : , -)')
+F_YAML_UNREADABLE = '%s: the YAML subset parser cannot read this file, so its host_semaphore lines are not checked'
+F_DECODED_DIFFERS = '%s: the host_semaphore lines of the parsed run values differ from its run: | block lines'
+F_TOKEN_AGAIN = '%s: a host_semaphore.py call line that names host_semaphore again'
+F_NO_NAME = '%s: a host_semaphore.py call without exactly one plain --name'
 F_UNCONFIGURED = '%s: calls the unconfigured gate %s'
 F_NO_WAIT = '%s: a host_semaphore.py call without exactly one --max-wait-secs'
-F_WAIT_NOT_LITERAL = ('%s: a host_semaphore.py call whose --max-wait-secs is neither a literal nor a plain read of '
-                      + WAIT_KEY)
 F_WAIT_VALUE = '%s: a host_semaphore.py call whose --max-wait-secs %s'
 F_NEVER_CALLED = '%s: configured but no workflow calls it'
 F_UNKNOWN_FLAG = '%s: a host_semaphore.py call with the flag %s, which is not one of ' + ', '.join(CALL_FLAGS)
-F_FLAG_QUOTED = '%s: a host_semaphore.py call with a flag spelled with a quote or a backslash'
-F_SLOTS_VALUE = '%s: a host_semaphore.py call whose --slots is not ' + SLOTS_READ
+F_SLOTS_VALUE = '%s: a host_semaphore.py call whose --slots is not the configured slot count'
 F_POLL_VALUE = '%s: a host_semaphore.py call whose --poll-secs is not a plain decimal integer'
 F_FLAG_NO_VALUE = '%s: a host_semaphore.py call whose %s has no value'
+F_REPEATED = '%s: a host_semaphore.py call that gives %s more than once'
 F_POSITIONAL = ('%s: a host_semaphore.py call with a word before its -- that is neither a wrapper flag nor its '
                 'value (the wrapper would run it as the command)')
+F_NO_COMMAND = '%s: a host_semaphore.py call without a -- followed by a command'
 
 
 class ConfigError(Exception):
@@ -138,7 +144,10 @@ def _string_list(value, where):
 def load_config(path=CONFIG_PATH):
     """The parsed, type and range checked configuration; ConfigError with one line otherwise."""
     try:
-        cfg = json.loads(Path(path).read_text(encoding='utf-8'))
+        cfg = json.loads(Path(path).read_text(encoding='utf-8'), object_pairs_hook=no_duplicate_keys)
+    # before ValueError (DuplicateKeyError is one): a repeated key is malformed, never "the last one wins" (#9851)
+    except DuplicateKeyError:
+        raise ConfigError('%s has a duplicate key' % Path(path).name)
     except (OSError, ValueError) as exc:
         raise ConfigError('%s is unreadable or not JSON (%s)' % (Path(path).name, type(exc).__name__))
     if not isinstance(cfg, dict):
@@ -202,225 +211,198 @@ def _code_lines(text):
     return re.sub(r'\\\n', ' ', '\n'.join(lines)).splitlines()
 
 
-def _comment_start(line):
-    """The index where the shell or YAML comment of LINE starts (an unquoted # at a word start), or len(LINE)."""
-    quote = None
-    escaped = False
-    for index, char in enumerate(line):
-        if escaped:
-            escaped = False
-        elif quote == "'":
-            if char == "'":
-                quote = None
-        elif char == '\\':
-            escaped = True
-        elif quote == '"':
-            if char == '"':
-                quote = None
-        elif char in '\'"':
-            quote = char
-        elif char == '#' and (index == 0 or line[index - 1].isspace()):
-            return index
-    return len(line)
+def _token_text(line):
+    """LINE with every character outside CANONICAL_CHARS deleted, the text the token is searched in.
+
+    decision: search the token with the non-canonical characters deleted over searching the raw line, because the
+    shell joins `host_sema\\phore`, `host_"sema"phore` and `host_sema''phore` into the token, so a line that spells
+    it split by a quote or an escape still holds it (and is then an F_CHAR finding). Known limit, stated in
+    docs/ci/CARRIER-BRANCH-GATES.md: a path the shell computes (an expansion that yields part of the name) is not
+    text, so no text scan reads it; review is the defence there, as for public_scan.py."""
+    return NON_CANONICAL_RE.sub('', line)
 
 
-def _quoted_mask(text):
-    """For each index of TEXT: True when that character lies inside a quoted span or follows a backslash.
-
-    One linear pass, so checking every flag of a segment stays linear in its length."""
-    mask = []
-    quote = None
-    escaped = False
-    for char in text:
-        mask.append(quote is not None or escaped)
-        if escaped:
-            escaped = False
-        elif quote == "'":
-            if char == "'":
-                quote = None
-        elif char == '\\':
-            escaped = True
-        elif quote == '"':
-            if char == '"':
-                quote = None
-        elif char in '\'"':
-            quote = char
-    return mask
+def _holds_token(line):
+    """True when LINE names the token outside the listed environment names."""
+    return TOKEN_RE.search(ENV_NAME_RE.sub(' ', _token_text(line))) is not None
 
 
-def _dequoted(word):
-    return ''.join(char for char in word if char not in QUOTE_CHARS)
-
-
-def _token_count(word):
-    """Occurrences of the token in WORD once quotes and backslashes are removed, the listed env names left out."""
-    plain = _dequoted(word)
-    return len(TOKEN_RE.findall(plain)) - len(ENV_NAME_RE.findall(plain))
-
-
-def _site_reason(wf, word, previous, in_comment):
-    """The exact finding for a token site in WORD that is not a classified call."""
-    if in_comment:
-        return F_COMMENT % wf
-    if previous == '-m' or word.startswith('-m'):
-        return F_MODULE % wf
-    # #9844 D3: a word whose only token sites are unlisted HOST_SEMAPHORE_ names (a `$HOST_SEMAPHORE_X` read) is
-    # named as such; a word that also holds the token outside those names keeps the path reasons below
-    plain = _dequoted(word)
-    unlisted = [env_like.group(0) for env_like in ENV_LIKE_RE.finditer(plain) if env_like.group(0) not in ENV_NAMES]
+def _env_name_finding(wf, line):
+    """F_ENV_NAME when the only token sites of LINE are unlisted HOST_SEMAPHORE_ names (#9844 D3), else None."""
+    plain = ENV_NAME_RE.sub(' ', _token_text(line))
+    unlisted = ENV_LIKE_RE.search(plain)
     if unlisted and not TOKEN_RE.search(ENV_LIKE_RE.sub(' ', plain)):
-        return F_ENV_NAME % (wf, unlisted[0][:SHOWN_VALUE_MAX])
-    if '$' in word or '`' in word:
-        return F_VARIABLE % wf
-    if any(char in word for char in '*?['):
-        return F_GLOB % wf
-    if any(char in word for char in QUOTE_CHARS):
-        return F_SPLIT % wf
-    for env_like in ENV_LIKE_RE.finditer(_dequoted(word)):
-        if env_like.group(0) not in ENV_NAMES:
-            return F_ENV_NAME % (wf, env_like.group(0)[:SHOWN_VALUE_MAX])
-    return F_NOT_A_CALL % wf
+        return F_ENV_NAME % (wf, unlisted.group(0)[:SHOWN_VALUE_MAX])
+    return None
 
 
-def _shell_words(segment, quoted):
-    """(start, word) for each word of SEGMENT: a run of characters that holds no unquoted, unescaped blank."""
-    words = []
-    start = None
-    for index, char in enumerate(segment):
-        if char.isspace() and not quoted[index]:
-            if start is not None:
-                words.append((start, segment[start:index]))
-                start = None
-        elif start is None:
-            start = index
-    if start is not None:
-        words.append((start, segment[start:]))
-    return words
+def _is_call_line(line):
+    """True when LINE holds the token and is not only unlisted environment names: it must be a classified call."""
+    return _holds_token(line) and _env_name_finding('', line) is None
 
 
-def _flag_findings(wf, segment, quoted):
-    """#9847: every word of SEGMENT is one of the five wrapper flags, its value, or a finding.
+def _placed_lines(text):
+    """(line, True when it is a content line of a `run: |` literal block) for each line of TEXT.
 
-    decision: an allowlist of the flags a workflow call may give over a list of the dangerous ones (--config,
-    --root), because every other flag or word steers the wrapper outside what this checker proves: an unknown flag
-    or one argparse refuses, a --slots other than the one bounded read, or a stray word that argparse takes as the
-    start of the wrapped command, which would swallow every flag after it."""
-    found = []
-    words = _shell_words(segment, quoted)
-    index = 0
-    while index < len(words):
-        start, word = words[index]
+    The lines are split on a newline only (a carriage return stays in the line and is not a canonical
+    character). A block holds the blank lines and the lines indented deeper than its key after the header."""
+    key_indent = None
+    for line in text.split('\n'):
+        if key_indent is not None:
+            if not line.strip() or len(line) - len(line.lstrip(' ')) > key_indent:
+                yield line, True
+                continue
+            key_indent = None
+        yield line, False
+        header = RUN_BLOCK_RE.fullmatch(line)
+        if header:
+            key_indent = len(header.group(1)) + len(header.group(2) or '')
+
+
+def _decoded_call_lines(node, out):
+    """The stripped call lines of every `run` string value of the parsed YAML document NODE."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == 'run' and isinstance(value, str):
+                out.extend(line.strip() for line in value.split('\n') if _is_call_line(line))
+            else:
+                _decoded_call_lines(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _decoded_call_lines(item, out)
+
+
+def _call_words(wf, words):
+    """(index after the script word, None) when WORDS start a classified call, else (None, the finding)."""
+    index = 1 if words[:1] == [EXEC_WORD] else 0
+    if words[index:index + 1] != [PYTHON_WORD]:
+        return None, F_NOT_A_CALL % wf
+    index += 1
+    while index < len(words) and PYTHON_FLAG_RE.fullmatch(words[index]):
         index += 1
-        if quoted[start] or not word.startswith('-'):
+    if index >= len(words) or words[index] not in SCRIPT_WORDS:
+        return None, F_NOT_A_CALL % wf
+    return index + 1, None
+
+
+def _flag_values(wf, words, index, found):
+    """{flag: [value, ...]} of the wrapper words from INDEX to the first --, and the index of that --.
+
+    #9847: every word before the -- is one of the five wrapper flags, its value, or a finding. decision: an
+    allowlist of the flags a workflow call may give over a list of the dangerous ones (--config, --root), because
+    every other flag or word steers the wrapper outside what this checker proves. A value is one canonical word,
+    the next word when it does not start with - or the text after =. decision: a next word that starts with - is
+    never a value over taking a one-dash word as one, because argparse reads `--label -x` as a missing value (and
+    `-5` as a number), so the checker could otherwise admit a call the wrapper parses differently."""
+    values = {flag: [] for flag in CALL_FLAGS}
+    while index < len(words) and words[index] != SEPARATOR:
+        word = words[index]
+        index += 1
+        if not word.startswith('--'):
             found.append(F_POSITIONAL % wf)
             continue
         flag, joined, value = word.partition('=')
-        if any(char in flag for char in QUOTE_CHARS):
-            found.append(F_FLAG_QUOTED % wf)
-        elif flag not in CALL_FLAGS:
-            found.append(F_UNKNOWN_FLAG % (wf, flag[:SHOWN_VALUE_MAX]))
         if not joined:
             value = None
-            if index < len(words) and not _word_is_flag(words[index], quoted):
-                value = words[index][1]
+            if index < len(words) and not words[index].startswith('-'):
+                value = words[index]
                 index += 1
-        if flag in (FLAG_NAME, FLAG_MAX_WAIT) or flag not in CALL_FLAGS:
-            continue  # --name and --max-wait-secs have their own findings; an unknown flag is already one
-        if value is None:
+        if flag not in CALL_FLAGS:
+            found.append(F_UNKNOWN_FLAG % (wf, flag[:SHOWN_VALUE_MAX]))
+        elif value or flag in (FLAG_NAME, FLAG_MAX_WAIT):
+            values[flag].append(value or None)  # --name and --max-wait-secs: an empty one fails "exactly one"
+        else:
             found.append(F_FLAG_NO_VALUE % (wf, flag))
-        elif flag == FLAG_SLOTS:
-            if value != SLOTS_READ:
-                found.append(F_SLOTS_VALUE % wf)
-        elif flag == FLAG_POLL:
-            if not PLAIN_DECIMAL_RE.fullmatch(value):
-                found.append(F_POLL_VALUE % wf)
-    return found
+    return values, index
 
 
-def _word_is_flag(item, quoted):
-    """True when the word ITEM = (start, word) starts with an unquoted --, so it is never taken as a value.
-
-    decision: only -- marks a flag here over any leading -, because a value such as -5 is one argparse takes as
-    the value (and the wait check names it), while a --word after a flag is the next flag."""
-    start, word = item
-    return not quoted[start] and word.startswith('--')
-
-
-def _call_findings(wf, cfg, segment, called):
-    """The findings of one classified call whose own arguments are SEGMENT."""
-    # a flag spelled inside a quoted argument (`--label "--name x"`) is text the shell passes as one word, not a flag
-    quoted = _quoted_mask(segment)
-    return _name_wait_findings(wf, cfg, segment, called, quoted) + _flag_findings(wf, segment, quoted)
-
-
-def _name_wait_findings(wf, cfg, segment, called, quoted):
-    """The --name and --max-wait-secs findings of one classified call."""
-    names = [match.group(1) for match in NAME_FLAG_RE.finditer(segment) if not quoted[match.start(1) - 1]]
-    if len(names) != 1 or not GATE_NAME_RE.fullmatch(names[0]):
-        return [F_NO_NAME % wf]
+def _call_findings(wf, cfg, line, called):
+    """The findings of one call line of a `run: |` block: the charset first, then the one call grammar."""
+    bad = NON_CANONICAL_RE.search(line)
+    if bad:
+        # the character is named by its code point, so no control or bidi character reaches the output
+        return [F_CHAR % (wf, 'U+%04X' % ord(bad.group(0)))]
+    words = [word for word in line.split(' ') if word]
+    index, finding = _call_words(wf, words)
+    if finding:
+        return [finding]
+    if _holds_token(' '.join(words[index:])):
+        return [F_TOKEN_AGAIN % wf]
     found = []
-    called.add(names[0])
-    if names[0] not in cfg['gates']:
-        found.append(F_UNCONFIGURED % (wf, names[0]))
-    waits = [match for match in MAX_WAIT_FLAG_RE.finditer(segment) if not quoted[match.start(1) - 1]]
-    if len(waits) != 1:
-        found.append(F_NO_WAIT % wf)
-        return found
-    value = waits[0].group(1)
-    if value in WAIT_KEY_READS:
-        return found  # the one parsed definition, bounded by bound_violations
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in '\'"':
-        value = value[1:-1]
-    if any(char in value for char in '$`*?[\'"\\'):
-        found.append(F_WAIT_NOT_LITERAL % wf)
+    values, index = _flag_values(wf, words, index, found)
+    if index + 1 >= len(words):
+        found.append(F_NO_COMMAND % wf)
+    names = values[FLAG_NAME]
+    gate = None
+    if len(names) != 1 or names[0] is None or not GATE_NAME_RE.fullmatch(names[0]):
+        found.append(F_NO_NAME % wf)
     else:
-        problem = wait_value_finding(value)
+        called.add(names[0])
+        gate = cfg['gates'].get(names[0])
+        if gate is None:
+            found.append(F_UNCONFIGURED % (wf, names[0][:SHOWN_VALUE_MAX]))
+    waits = values[FLAG_MAX_WAIT]
+    if len(waits) != 1 or waits[0] is None:
+        found.append(F_NO_WAIT % wf)
+    else:
+        problem = wait_value_finding(waits[0])
         if problem:
             found.append(F_WAIT_VALUE % (wf, problem))
+    for flag in (FLAG_SLOTS, FLAG_LABEL, FLAG_POLL):
+        if len(values[flag]) > 1:
+            found.append(F_REPEATED % (wf, flag))
+    slots = values[FLAG_SLOTS]
+    # decision: --slots is required and equal to the configured count over the wrapper default, because the
+    # default is a second slot count the configuration does not hold
+    if not slots or (gate is not None and slots[0] != str(gate['slots'])):
+        found.append(F_SLOTS_VALUE % wf)
+    polls = values[FLAG_POLL]
+    if polls and not PLAIN_DECIMAL_RE.fullmatch(polls[0]):
+        found.append(F_POLL_VALUE % wf)
     return found
 
 
-def _line_findings(wf, cfg, line, called):
-    """The findings of one logical line: each call checked on its own, each other token site a finding."""
-    code_end = 0 if line.lstrip().startswith('#') else _comment_start(line)
-    code = line[:code_end]
-    calls = list(CALL_RE.finditer(code))
-    found = []
-    path_starts = set()
-    for number, call in enumerate(calls):
-        path_starts.add(code.index('scripts/', call.start()) - (2 if code[:call.end()].endswith(
-            './' + SCRIPT_PATH) else 0))
-        stop = calls[number + 1].start() if number + 1 < len(calls) else len(code)
-        rest = code[call.end():stop]
-        # #9844 D1: a ;, --, ) or backtick inside quotes or after a backslash is text of one word, not the end
-        rest_quoted = _quoted_mask(rest)
-        end = next((match for match in SEGMENT_END_RE.finditer(rest) if not rest_quoted[match.start()]), None)
-        found.extend(_call_findings(wf, cfg, rest[:end.start()] if end else rest, called))
-    listed = (wf, line.strip()) in COMMENT_SITES and code_end == 0
-    previous = ''
-    for match in re.finditer(r'\S+', line):
-        word = match.group(0)
-        count = _token_count(word)
-        if match.start() in path_starts:
-            count -= 1
-        if count > 0 and not listed:
-            found.extend([_site_reason(wf, word, previous, match.start() >= code_end)] * count)
-        previous = word
-    return found
+def _decoded_findings(wf, text, block_lines):
+    """F_YAML_UNREADABLE or F_DECODED_DIFFERS when the parsed run values do not hold exactly BLOCK_LINES."""
+    try:
+        decoded = []
+        _decoded_call_lines(taint_boundary.parse_yaml(text, wf), decoded)
+    except (taint_boundary.Unclassifiable, RecursionError, ValueError):
+        return [F_YAML_UNREADABLE % wf]
+    return [] if sorted(decoded) == sorted(block_lines) else [F_DECODED_DIFFERS % wf]
 
 
 def call_site_violations(cfg, workflow_texts):
-    """Every token site that is not a classified call, every finding of a call, and every gate never called."""
+    """Every token site that is not a classified call, every finding of a call, and every gate never called.
+
+    One pass per line; the parsed document is a cross-check, so a line this scan places in a `run: |` block
+    that YAML reads otherwise (or a folded, quoted or escaped run value) is a finding, never clean."""
     called = set()
     found = []
     for wf, text in sorted(workflow_texts.items()):
         if text is None:
             found.append(F_NOT_TEXT % wf)
             continue
-        # a backslash-newline joins two lines into one shell line; comments stay, so a token there still counts
-        for line in re.sub(r'\\\n', '', text).splitlines():
-            if TOKEN_RE.search(_dequoted(line)):
-                found.extend(_line_findings(wf, cfg, line, called))
+        if not wf.endswith(YAML_SUFFIXES):
+            if any(_holds_token(line) for line in text.split('\n')):
+                found.append(F_NOT_YAML % wf)
+            continue
+        block_lines = []
+        holds_token = False
+        for line, in_block in _placed_lines(text):
+            if not _holds_token(line):
+                continue
+            holds_token = True
+            reason = _env_name_finding(wf, line)
+            if reason is None and not in_block:
+                reason = F_OUTSIDE_BLOCK % wf
+            if reason is not None:
+                found.append(reason)
+                continue
+            block_lines.append(line.strip())
+            found.extend(_call_findings(wf, cfg, line, called))
+        if holds_token:
+            found.extend(_decoded_findings(wf, text, block_lines))
     for name in sorted(set(cfg['gates']) - called):
         found.append(F_NEVER_CALLED % name)
     return found
