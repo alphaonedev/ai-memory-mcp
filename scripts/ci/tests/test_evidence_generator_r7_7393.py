@@ -26,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock as mock
 from pathlib import Path
@@ -40,6 +41,8 @@ from test_evidence_generator_r6_7393 import tmp_root_findings
 
 TESTS = Path(__file__).resolve().parent
 EVIDENCE_DIR = TESTS.parent.parent / "evidence"
+DEEP_TREE_DEPTH = 2 * sys.getrecursionlimit() + 1  # just past the "deeper than twice the recursion limit" claim (#9705)
+DEEP_SWEEP_CEILING_S = 50.0  # the sweep re-walks its name chain, so cost is quadratic in depth: 5000 levels took 138 s on macOS
 T = "".join(map(chr, (116, 109, 112)))  # the name of the system scratch root, spelled from character codes
 
 REAL_GATE = (
@@ -267,11 +270,13 @@ class IterativeSweep7620(GatesRun):
 
     def test_a_stale_directory_nested_deeper_than_the_recursion_limit_is_removed_7620(self):
         rc, r, wt, tip = self.prepare()
-        depth = 5000
+        depth = DEEP_TREE_DEPTH
         self.assertGreater(depth, sys.getrecursionlimit() * 2)
         name = f".expiry-{dead_pid()}-deep"
         make_deep(wt / ".local-runs", name, depth)
+        started = time.monotonic()
         code, out, log = self.drive(wt, tip)
+        self.assertLess(time.monotonic() - started, DEEP_SWEEP_CEILING_S, "the sweep of the deep tree took too long")
         self.assertFalse((wt / ".local-runs" / name).exists(), "the stale tree is gone")
         self.assertNotIn("RecursionError", out + log)
         self.assertNotIn("Traceback", out)
