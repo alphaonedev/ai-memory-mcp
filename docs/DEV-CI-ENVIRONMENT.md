@@ -478,7 +478,7 @@ normal form, exist and not be a symlink. The binary must be an executable regula
 The data directory must be owned by `--account` and not group or world writable. The account must not be `root`, uid 0
 or primary gid 0. Each refusal prints one `tier-daemon-installer: refused: ...` line and exits non-zero. The plist runs
 the binary as an argument list (`postgres -D <data dir> -p <port>`, no shell) under `UserName`/`GroupName` of that
-account, with `RunAtLoad`, `KeepAlive` and `ExitTimeOut` 60.
+account, with `WorkingDirectory` set to the data directory, `RunAtLoad`, `KeepAlive` and `ExitTimeOut` 60.
 
 **Dry run (the default).** With no `--install` and no `--remove`, the tool changes nothing. The only commands it runs
 are the read-only `launchctl print system/<label>` and `ps -p <pid>` for the pid in `postmaster.pid`. It prints:
