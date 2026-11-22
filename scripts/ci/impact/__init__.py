@@ -11,5 +11,8 @@ Modules:
     gate         aggregates `toJSON(needs)` into one pass/fail verdict
 
 Scripts are run as files (`python3 -I scripts/ci/impact/select.py ...`) and
-import this package by putting `scripts/ci` on `sys.path`.
+load their siblings by path through the one checked loader of #9399
+(scripts/ci/sibling_load.py, embedded in each script). No script puts
+`scripts/ci` on `sys.path` or imports this folder as a package by name; only
+the unittest helper scripts/ci/tests/impact_fixture.py does, for the tests.
 """

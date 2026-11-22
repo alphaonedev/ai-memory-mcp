@@ -14,11 +14,17 @@ travels INSIDE each script. ``test_sibling_load_9399`` pins every copy equal to 
 What ``_load_sibling(filename, module_name)`` does, for every way the script was started (by path from another working
 directory, through a symlink, under ``python3 -I``, with decoys of the same name on PYTHONPATH and in the cwd):
 
-* the file is ``realpath(__file__)``'s folder plus ``filename``, resolved; a result outside that folder raises
-  ``SiblingLoadError`` ("symlink leaves the script folder"); a symlink that stays inside is followed;
-* the resolved path is opened ONCE (``O_NOFOLLOW`` on the final component), ``fstat`` must say regular file, and the
-  bytes read from that descriptor are what gets compiled and run: no second open, no check on one object and use of
-  another. Absent raises "absent", any other open failure "unreadable", a directory or device "not a regular file";
+* the trust anchor is the script's own folder, ``realpath(__file__)``'s folder: the file is that folder plus
+  ``filename``, resolved; a result outside that folder raises ``SiblingLoadError`` ("symlink leaves the script
+  folder"); a symlink that stays inside is resolved before the open;
+* the resolved path is opened by descriptor, one component at a time: the script folder, then each folder below it
+  with ``dir_fd`` on the folder before it, every one ``O_DIRECTORY | O_NOFOLLOW``, and the file ``O_NOFOLLOW |
+  O_NONBLOCK`` (a FIFO open never blocks). A folder or the file swapped for a symlink after the resolve is refused.
+  ``fstat`` on the file descriptor must say regular file, and the bytes read from that descriptor are what gets
+  compiled and run: no second open, no check on one object and use of another. Absent raises "absent", any other
+  open or read failure "unreadable", a directory, FIFO or device "not a regular file", a file of zero bytes "empty".
+  Every descriptor is non-inheritable (PEP 446: ``os.open`` sets it so), so no child started meanwhile holds one, and
+  every descriptor is closed on every outcome;
 * the module runs registered in ``sys.modules`` under ``module_name`` (a dataclass needs that during its own exec) and
   stays registered: a second script loading the same file in the same process gets the same object. A name already
   taken by a different file raises "module name taken", it is never reused;
