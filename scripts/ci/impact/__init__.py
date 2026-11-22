@@ -14,5 +14,6 @@ Scripts are run as files (`python3 -I scripts/ci/impact/select.py ...`) and
 load their siblings by path through the one checked loader of #9399
 (scripts/ci/sibling_load.py, embedded in each script). No script puts
 `scripts/ci` on `sys.path` or imports this folder as a package by name; only
-the unittest helper scripts/ci/tests/impact_fixture.py does, for the tests.
+the unittest helper impact_fixture, which sits beside the tests, does, for
+the tests.
 """
