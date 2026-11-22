@@ -461,6 +461,24 @@ class BaseCase(unittest.TestCase):
                            dict(derived_env(base, head), IMPACT_FILES=files))
 
 
+class BoundNamesCache9705(unittest.TestCase):
+    """The per-node cache of _bound_names must never hand out a stale or a shared result."""
+
+    def test_the_cache_returns_a_fresh_list_and_does_not_follow_a_copy_9705(self):
+        tree = ast.parse("def f(a):\n    b = 1\n")
+        first = _bound_names(tree)
+        self.assertEqual([(n, k) for n, k, _ in first], [("f", "def"), ("a", "arg"), ("b", "store")])
+        second = _bound_names(tree)  # served from the cache
+        second.clear()
+        self.assertEqual(len(_bound_names(tree)), 3, "a caller emptied the cached list")
+        fn = tree.body[0]
+        self.assertEqual(len(_bound_names(fn)), 3)  # fn now carries a cache of its own
+        clone = copy.copy(fn)
+        clone.body = [ast.Pass()]
+        self.assertEqual([n for n, _, _ in _bound_names(clone)], ["f", "a"], "a copy reused its original's bindings")
+        self.assertEqual(len(_bound_names(tree)), 3)
+
+
 class WorkflowShape(unittest.TestCase):
     def test_select_job_materialises_before_it_builds_and_selects(self):
         names = [s["name"] for s in workflow_text.read_steps(CI_YML, SELECT_JOB)]
@@ -1615,7 +1633,19 @@ def _chain(node):
 
 
 def _bound_names(tree):
-    """(name, kind, statement) for every binding in the tree; kind is store, def, arg, import."""
+    """(name, kind, statement) for every binding in the tree; kind is store, def, arg, import.
+
+    Every caller asks about the same few trees again and again (38k calls, 18M ast.walk steps for one test), so
+    the result is kept on the node, tagged with the node's id so a copy.copy of it never reuses a stale one (#9705)."""
+    cached = tree.__dict__.get("bound_names_9705")
+    if cached is not None and cached[0] == id(tree):
+        return list(cached[1])
+    found = _bound_names_walk(tree)
+    tree.bound_names_9705 = (id(tree), found)
+    return list(found)
+
+
+def _bound_names_walk(tree):
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
