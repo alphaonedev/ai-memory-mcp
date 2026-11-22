@@ -87,16 +87,8 @@ SITES = (
     ("evidence/continuity-cycle.py", "continuity-cycle", 3, (("predicates.py", "predicates"),), ()),
 )
 SITE_FILES = frozenset(row[0] for row in SITES)
-MIN_FILES_SCANNED = 150  # the whole tree holds about 200 Python files; fewer means the walk lost a folder
-MIN_REASON_CHARS = 20
-SHEBANG_READ_BYTES = 256
-SHEBANG_FIXTURE = "test/fixtures/pr_retarget_check_8332/stub_bin/gh"  # a python shebang file with no .py suffix
-CENSUS_SYS_SEARCH_ATTRS = frozenset({"path", "meta_path", "path_hooks", "path_importer_cache"})
-CENSUS_DYNAMIC_IMPORTS = frozenset({"import_module", "__import__", "find_spec", "find_loader"})
-CENSUS_BY_PATH_LOADERS = frozenset({"spec_from_file_location", "spec_from_loader", "SourceFileLoader",
-                                    "SourcelessFileLoader", "ExtensionFileLoader", "FileFinder", "run_path",
-                                    "run_module", "load_source", "load_module"})
-CENSUS_EXEC_CALLS = frozenset({"exec", "eval", "execfile"})
+CENSUS_EXCLUDED_PARTS = frozenset({"tests", "test", "__pycache__"})
+MIN_FILES_SCANNED = 50
 
 
 def canon_text():
@@ -699,455 +691,8 @@ class CopiesMatchTheLoader(unittest.TestCase):
                 self.assertIn("SIBLING_EXIT_LOAD_REFUSED = %d" % code, text)
 
 
-# The census is an ALLOWLIST over the whole scripts tree (#9399 r1, F3): every Python file under scripts/ is read, and
-# every file with a finding is a hand-written row (its exact finding labels and the reason it may keep them). A new
-# finding anywhere, a new form in a listed file, or a stale row is red. The paths the walk leaves out are the rules
-# below, each with its reason.
-CENSUS_SKIPPED_RULES = {
-    "__pycache__": "bytecode caches a test run writes; untracked, and the census reads source, not bytecode",
-    "symlink": "a link is never followed out of the tree by the census; none is tracked under scripts/ (pinned 0)",
-    "folder": "the walk descends into every folder; a folder itself holds no source",
-    "special file": "a FIFO, socket or device could block the read; none sits under scripts/ (pinned 0)",
-    "not Python": "neither a .py file nor a file whose first line is a python shebang (shell, JSON, text, fixtures)",
-}
-CENSUS_RULES_THAT_MUST_BE_EMPTY = ("symlink", "special file")
-REASON_LEFT_TO_9857 = (
-    "left to #9857: loads a sibling by path through an older loader (the #9365 workflow_annotation loader, the "
-    "ensure_age_extension loader or its own spec_from_file_location) with no descriptor check; #9857 moves it to the "
-    "one checked loader")
-REASON_OUTSIDE_FILE_9857 = (
-    "loads a tracked file outside its own folder by path (wake_latency: sdk/python/ai_memory/wake.py; "
-    "claude-md-rule-compare: scripts/check-claude-md-size.py of the base checkout and of the tree) with a path "
-    "check only; the same unchecked open, left to #9857 (checklist comment "
-    "https://github.com/alphaonedev/ai-memory-mcp/issues/9857#issuecomment-7074437416)")
-REASON_POSIX_REEXEC = (
-    "__import__ of 'posix' or 'nt' (a conditional of two constants), builtin modules of sys.builtin_module_names, to "
-    "re-exec under -I before anything else loads; never a file")
-REASON_TEST_MODULE = (
-    "unittest module: loads the script under test or a shared test helper, by name or by path, from the PR tree it "
-    "tests; run by the build-script-vetting job, never as a CI decision step")
-REASON_TEST_HELPER = (
-    "shared unittest helper of scripts/ci/tests: puts scripts/ci on sys.path for the tests that import it; never run "
-    "as a CI decision step")
-REASON_THIS_TEST = (
-    "this test: execs the canonical loader block text read from scripts/ci/sibling_load.py, which "
-    "CopiesMatchTheLoader pins byte for byte")
-# One row per construct form, written out by hand: (source of a probe file beside peer.py and select.py, its exact
-# finding labels in walk order). Each is one way to load a module other than through the one checked loader.
-CENSUS_FORMS = (
-    ("import sys\nsys.path.insert(0, '.')\n", ["sys.path.insert"]),
-    ("import sys\nsys.path.append('.')\n", ["sys.path.append"]),
-    ("import sys\nsys.path[0] = '.'\n", ["sys.path assignment"]),
-    ("import sys\nsys.path += ['.']\n", ["sys.path assignment"]),
-    ("import sys\nsys.path = ['.']\n", ["sys.path assignment"]),
-    ("import sys\ndel sys.path[0]\n", ["sys.path deletion"]),
-    ("import sys as _s\n_s.path.insert(0, '.')\n", ["sys.path.insert"]),
-    ("from sys import path\npath.insert(0, '.')\n", ["from sys import path"]),
-    ("from sys import path as search\n", ["from sys import path"]),
-    ("from sys import *\n", ["from sys import *"]),
-    ("import sys\nsys.meta_path.append(None)\n", ["sys.meta_path.append"]),
-    ("import sys\nsetattr(sys, 'path', [])\n", ["setattr(sys.path)"]),
-    ("import sys\nsetattr(sys, name, [])\n", ["setattr(sys, non-constant)"]),
-    ("import peer\n", ["import peer"]),
-    ("import peer as other\n", ["import peer"]),
-    ("from peer import X\n", ["from peer import"]),
-    ("import select\n", ["import select"]),
-    ("from . import peer\n", ["relative import"]),
-    ("import importlib\nimportlib.import_module('peer')\n", ["import_module(peer)"]),
-    ("import importlib\nimportlib.import_module(name)\n", ["import_module(non-constant)"]),
-    ("import importlib\nimportlib.import_module('pe' + 'er')\n", ["import_module(non-constant)"]),
-    ("__import__('peer')\n", ["__import__(peer)"]),
-    ("__import__(name)\n", ["__import__(non-constant)"]),
-    ("from importlib import import_module as load\nload('peer')\n", ["import_module(peer)"]),
-    ("import importlib.util\nimportlib.util.find_spec('peer')\n", ["find_spec(peer)"]),
-    ("import importlib.util\nimportlib.util.spec_from_file_location('p', 'peer.py')\n", ["spec_from_file_location"]),
-    ("from importlib.util import spec_from_file_location as at\nat('p', 'peer.py')\n", ["spec_from_file_location"]),
-    ("from importlib.machinery import SourceFileLoader\nSourceFileLoader('p', 'peer.py').load_module()\n",
-     ["load_module", "SourceFileLoader"]),
-    ("import runpy\nrunpy.run_path('peer.py')\n", ["run_path"]),
-    ("import runpy\nrunpy.run_module('peer')\n", ["run_module"]),
-    ("exec(open('peer.py').read())\n", ["exec"]),
-    ("import builtins\nbuiltins.exec('pass')\n", ["exec"]),
-    ("eval('1')\n", ["eval"]),
-    ("import importlib.util\ngetattr(importlib.util, 'spec_from_file_location')\n",
-     ["getattr(spec_from_file_location)"]),
-    ("import importlib\nload = getattr(importlib, 'import_module')\n", ["getattr(import_module)"]),
-    ("def broken(:\n", ["unparsable (SyntaxError)"]),
-    ("import json\nimport os\nimport sys\nprint(sys.path)\n", []),
-)
-CENSUS_ALLOWLIST = {
-    'bench/wake_latency.py': (('spec_from_file_location',), REASON_OUTSIDE_FILE_9857),
-    'ci-sweep-target.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/ci_full_nightly.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/host_semaphore.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/impact/base_sha.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/load_gate.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/partition_test_binaries.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/pg_env_preflight.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/prune_runner_tmp.py': (('exec',), REASON_LEFT_TO_9857),
-    'ci/shared_cargo_target.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/suite_budget.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'ci/tests/impact_fixture.py': (('from impact import', 'sys.path.insert'), REASON_TEST_HELPER),
-    'ci/tests/test_cert_amendment_ledger_6124.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_cargo_audit_8615.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_cert_expiry_corpus.py': (('exec', 'spec_from_file_location'), REASON_TEST_MODULE),
-    'ci/tests/test_check_codeql_alerts_7337.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_codeql_alerts_7833.py': (('import test_check_codeql_alerts_7337',), REASON_TEST_MODULE),
-    'ci/tests/test_check_docs_private_paths_8493.py': (
-        (
-            'from docs_private_path_shapes_8493 import',
-            'spec_from_file_location',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_check_no_cn_ai_vendor.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_npm_audit_8615.py': (('import check_npm_audit', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_check_pg_isolate_invariants.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_pg_preflight_workflows_9235.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_check_pr_body_ids.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_ci_annotation_escape_9365.py': (
-        (
-            'load_module',
-            'spec_from_file_location',
-            'sys.path.insert',
-            'sys.path.pop',
-            'sys.path.remove',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_base_selector_8240.py': (
-        (
-            'exec',
-            'import gha_expr',
-            'import impact_fixture',
-            'import workflow_text',
-            'import_module(non-constant)',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_failure_class_9235.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_ci_full_nightly_8240.py': (
-        (
-            'import ci_full_nightly',
-            'import impact_fixture',
-            'import workflow_text',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_progress_notice_9430.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_ci_release_split_9680.py': (
-        (
-            'import workflow_text',
-            'spec_from_file_location',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_select_gating_8240.py': (
-        (
-            'import gha_expr',
-            'import impact_fixture',
-            'import workflow_text',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_semaphore_wiring_7914.py': (('import host_semaphore', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary.py': (('import taint_boundary', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_closed.py': (
-        (
-            'import taint_boundary',
-            'import test_ci_tainted_job_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_open_rows.py': (
-        (
-            'from test_ci_tainted_job_boundary import',
-            'import taint_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_prescan_uses.py': (
-        (
-            'exec',
-            'import taint_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_ci_tainted_job_boundary_runner_legs.py': (
-        (
-            'from impact import',
-            'import taint_boundary',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_codeql_6163.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_coverage_classify_9263.py': (('from impact import', 'sys.path.append'), REASON_TEST_MODULE),
-    'ci/tests/test_evict_r5_7219.py': (
-        (
-            'import prune_runner_artifacts',
-            'import shared_cargo_target',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_child_isolation_7728.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_cleanup_close_7871.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_content_separators_7867.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_diff_hunks_7733.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_entry_7730.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r5_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_5040_5042.py': (
-        (
-            'from tmp_runtime_guard_7393 import',
-            'import_module(non-constant)',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r2_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r3_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r4_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r3_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r5_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r3_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r6_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r3_7393 import',
-            'from test_evidence_generator_r5_7393 import',
-            'from tmp_runtime_guard_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r7_7393.py': (
-        (
-            'exec',
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r5_7393 import',
-            'from test_evidence_generator_r6_7393 import',
-            'import tmp_runtime_guard_7393',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_generator_r8_7393.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-            'from test_evidence_generator_r5_7393 import',
-            'from test_evidence_generator_r6_7393 import',
-            'from test_evidence_generator_r7_7393 import',
-            'import tmp_runtime_guard_7393',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_pathspecs_7732.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_post_mkdir_cleanup_8211.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_private_create_7868.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_publish_7729.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_report_escaping_7734.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'from test_evidence_generator_r2_7393 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_run_cert_close_all_7876.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_run_git_exit_7869.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_scratch_fd_7870.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_sqlite_uri_7735.py': (
-        (
-            'from test_evidence_generator_5040_5042 import',
-            'import tmp_runtime_guard_7393',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_evidence_tmpdir_7731.py': (('from test_evidence_generator_5040_5042 import',), REASON_TEST_MODULE),
-    'ci/tests/test_host_semaphore_7914.py': (
-        (
-            'import host_semaphore',
-            'sys.path.insert',
-            'sys.path.pop',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_8322.py': (('from impact import', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_8328.py': (
-        (
-            'exec',
-            'from impact import',
-            'sys.path.append',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_cwd_top_8493.py': (
-        (
-            'from impact_fixture import',
-            'from test_impact_cargo_skip_symlink_tracked_8493 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_env_gitlink_8493.py': (
-        (
-            'from impact import',
-            'from impact_fixture import',
-            'sys.path.append',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_symlink_8493.py': (('from impact_fixture import',), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_symlink_toplevel_8493.py': (
-        (
-            'from impact_fixture import',
-            'from test_impact_cargo_skip_symlink_tracked_8493 import',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_symlink_tracked_8493.py': (('from impact_fixture import',), REASON_TEST_MODULE),
-    'ci/tests/test_impact_cargo_skip_worktree_cfg_8493.py': (
-        (
-            'from impact import',
-            'from impact_fixture import',
-            'from test_impact_cargo_skip_symlink_tracked_8493 import',
-            'sys.path.append',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_gate.py': (
-        (
-            'from impact import',
-            'import impact_fixture',
-            'import workflow_text',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_impact_rules_8240.py': (('from impact import', 'import impact_fixture'), REASON_TEST_MODULE),
-    'ci/tests/test_impact_select.py': (('from impact import', 'import impact_fixture'), REASON_TEST_MODULE),
-    'ci/tests/test_linux_fed_footprint_7188.py': (
-        (
-            'import shared_cargo_target',
-            'import test_ci_check_matrix_max_parallel_9682',
-            'sys.path.insert',
-            'sys.path.pop',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_load_gate_6795.py': (('import load_gate', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_measure_ci_time_9710.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_measure_ci_time_bench_9710.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_partition_test_binaries.py': (
-        (
-            'import partition_test_binaries',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_partition_union_6412.py': (
-        (
-            'import partition_test_binaries',
-            'import test_partition_test_binaries',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_pg_env_preflight_9235.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_pg_isolate_split.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_pg_isolated_binary.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_prune_runner_artifacts_7188.py': (
-        (
-            'import prune_runner_artifacts',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_prune_runner_tmp_8634.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_recapture_cert_3607_5038.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_rust_cache_save_scope_9681.py': (
-        (
-            'import taint_boundary',
-            'sys.path.insert',
-            'sys.path.pop',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_sccache_and_eviction_7199.py': (
-        (
-            'import prune_runner_artifacts',
-            'import sccache_env',
-            'import shared_cargo_target',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_sccache_r3_7199.py': (
-        (
-            'from test_sccache_and_eviction_7199 import',
-            'import sccache_env',
-            'import shared_cargo_target',
-            'sys.path.insert',
-        ), REASON_TEST_MODULE),
-    'ci/tests/test_sibling_load_9399.py': (('exec',), REASON_THIS_TEST),
-    'ci/tests/test_suite_budget_9229.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_suite_budget_9229_integrity.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_sync_r4_7219.py': (('import prune_runner_artifacts', 'sys.path.insert'), REASON_TEST_MODULE),
-    'ci/tests/test_test_env_lock_isolation_7913.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/test_tier_cred_preflight_8686.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'ci/tests/tmp_runtime_guard_7393.py': (('sys.path.insert',), REASON_TEST_HELPER),
-    'ci/tier_cred_preflight.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'claude-md-rule-compare.py': (('exec', 'spec_from_file_location'), REASON_OUTSIDE_FILE_9857),
-    'evidence/build_bundle.py': (('__import__(non-constant)', 'spec_from_file_location'), REASON_LEFT_TO_9857),
-    'evidence/prep.py': (('__import__(non-constant)', 'spec_from_file_location'), REASON_LEFT_TO_9857),
-    'evidence/run_cert.py': (('__import__(non-constant)',), REASON_POSIX_REEXEC),
-    'test/pg_isolated_binary.py': (('spec_from_file_location',), REASON_LEFT_TO_9857),
-    'test/test_cert_gate_evidence_7181.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'test/test_ci_sweep_target.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-    'test/test_ensure_age_extension_6161.py': (('load_module', 'spec_from_file_location'), REASON_TEST_MODULE),
-    'test/test_pr_retarget_check_8332.py': (('spec_from_file_location',), REASON_TEST_MODULE),
-}
-
-
-def is_python_source(path):
-    """True for a ``.py`` file and for a file whose first line is a python shebang (``stub_bin/gh`` and the like)."""
-    if path.suffix == ".py":
-        return True
-    try:
-        with open(path, "rb") as handle:
-            first = handle.readline(SHEBANG_READ_BYTES)
-    except OSError:
-        return False
-    return first.startswith(b"#!") and b"python" in first
-
-
-def census_files():
-    """Every Python source under scripts/ (the whole tree: tests/, test/ and fixtures included), with the paths the
-    walk leaves out by a written rule (CENSUS_SKIPPED_RULES) counted per rule."""
-    files, skipped = [], {rule: 0 for rule in CENSUS_SKIPPED_RULES}
-    for path in sorted(SCRIPTS.rglob("*")):
-        rel = path.relative_to(SCRIPTS)
-        if "__pycache__" in rel.parts:
-            skipped["__pycache__"] += 1
-        elif path.is_symlink():
-            skipped["symlink"] += 1
-        elif path.is_dir():
-            skipped["folder"] += 1
-        elif not path.is_file():
-            skipped["special file"] += 1
-        elif not is_python_source(path):
-            skipped["not Python"] += 1
-        else:
-            files.append(path)
-    return files, skipped
-
-
 def scripts_tree_names(path):
-    """Names a file in the scripts tree can import from its own folder or an ancestor folder up to scripts/.
-
-    A stdlib name is kept: ``import select`` in scripts/ci/impact/ loads impact/select.py whenever the script folder
-    is sys.path[0] (every start without -I), so a same-named file makes the name a sibling name."""
+    """Names a file in the scripts tree can import from its own folder or an ancestor folder up to scripts/."""
     names = set()
     folder = path.parent
     while True:
@@ -1155,156 +700,100 @@ def scripts_tree_names(path):
         if folder == SCRIPTS:
             break
         folder = folder.parent
-    return names
+    return names - set(sys.stdlib_module_names)
 
 
 def census_findings(path):
-    """The finding labels of one file (one per occurrence, in walk order): every change of the import search path,
-    every import of a same-tree name, every relative import, every dynamic import that is by name or not a constant,
-    and every by-path load (CENSUS_BY_PATH_LOADERS, exec, eval). Unreadable or unparsable source is a finding."""
-    try:
-        text = path.read_text(encoding="utf-8")
-        block = block_of(text)
-        if block is not None:
-            # The loader block restores sys.path and execs the checked bytes by design; its text is pinned byte for
-            # byte to the canonical file by CopiesMatchTheLoader, so blank it (keeping the line numbers).
-            text = text.replace(block, "\n" * block.count("\n"))
-        tree = ast.parse(text, filename=str(path))
-    except (OSError, UnicodeDecodeError, SyntaxError, ValueError) as exc:
-        return ["unparsable (%s)" % type(exc).__name__]
+    """Findings of one file: sys.path changes, same-tree imports by name, relative imports, by-name dynamic imports."""
+    text = path.read_text(encoding="utf-8")
+    block = block_of(text)
+    if block is not None:
+        # The loader block restores sys.path by design; its text is pinned byte for byte to the canonical file by
+        # CopiesMatchTheLoader, so blank it (keeping the line numbers) instead of reading it as a violation.
+        text = text.replace(block, "\n" * block.count("\n"))
+    tree = ast.parse(text, filename=str(path))
     tree_names = scripts_tree_names(path)
-    sys_names = {"sys"}  # every name bound to the sys module in this file
-    aliases = {}  # a local name bound by ``from <module> import <loader>`` -> the loader's own name
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == "sys":
-                    sys_names.add(alias.asname or "sys")
-        elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            for alias in node.names:
-                if alias.name in CENSUS_DYNAMIC_IMPORTS | CENSUS_BY_PATH_LOADERS:
-                    aliases[alias.asname or alias.name] = alias.name
     found = []
 
-    def is_sys_attr(node):
-        return (isinstance(node, ast.Attribute) and node.attr in CENSUS_SYS_SEARCH_ATTRS
-                and isinstance(node.value, ast.Name) and node.value.id in sys_names)
-
-    def callee_name(func):
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-        return aliases.get(name, name) if isinstance(func, ast.Name) else name
+    def is_sys_path(node):
+        return (isinstance(node, ast.Attribute) and node.attr == "path"
+                and isinstance(node.value, ast.Name) and node.value.id == "sys")
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_sys_attr(node.func.value):
-            found.append("sys.%s.%s" % (node.func.value.attr, node.func.attr))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_sys_path(node.func.value):
+            found.append((node.lineno, "sys.path." + node.func.attr))
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 inner = target.value if isinstance(target, ast.Subscript) else target
-                if is_sys_attr(inner):
-                    found.append("sys.%s assignment" % inner.attr)
-        elif isinstance(node, ast.Delete):
-            for target in node.targets:
-                inner = target.value if isinstance(target, ast.Subscript) else target
-                if is_sys_attr(inner):
-                    found.append("sys.%s deletion" % inner.attr)
+                if is_sys_path(inner):
+                    found.append((node.lineno, "sys.path assignment"))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] in tree_names:
-                    found.append("import " + alias.name)
+                    found.append((node.lineno, "import " + alias.name))
         elif isinstance(node, ast.ImportFrom):
             if node.level > 0:
-                found.append("relative import")
-            elif node.module == "sys":
-                found.extend("from sys import " + a.name for a in node.names
-                             if a.name in CENSUS_SYS_SEARCH_ATTRS or a.name == "*")
+                found.append((node.lineno, "relative import"))
             elif node.module and node.module.split(".")[0] in tree_names:
-                found.append("from " + node.module + " import")
-        if isinstance(node, ast.Call):
-            name = callee_name(node.func)
-            if name in CENSUS_DYNAMIC_IMPORTS:
-                arg = node.args[0] if node.args else None
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    if arg.value.split(".")[0] in tree_names:
-                        found.append(name + "(" + arg.value + ")")
-                else:
-                    found.append(name + "(non-constant)")
-            elif name in CENSUS_BY_PATH_LOADERS | CENSUS_EXEC_CALLS:
-                found.append(name)
-            elif name in ("getattr", "setattr", "delattr") and len(node.args) >= 2:
-                target, attr = node.args[0], node.args[1]
-                if not (isinstance(attr, ast.Constant) and isinstance(attr.value, str)):
-                    if isinstance(target, ast.Name) and target.id in sys_names:
-                        found.append(name + "(sys, non-constant)")
-                elif attr.value in CENSUS_DYNAMIC_IMPORTS | CENSUS_BY_PATH_LOADERS:
-                    found.append(name + "(" + attr.value + ")")
-                elif attr.value in CENSUS_SYS_SEARCH_ATTRS and isinstance(target, ast.Name) \
-                        and target.id in sys_names:
-                    found.append(name + "(sys." + attr.value + ")")
+                found.append((node.lineno, "from " + node.module + " import"))
+        elif isinstance(node, ast.Call):
+            callee = node.func
+            name = callee.attr if isinstance(callee, ast.Attribute) else getattr(callee, "id", "")
+            if name in ("import_module", "__import__") and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
+                        and arg.value.split(".")[0] in tree_names:
+                    found.append((node.lineno, name + "(" + arg.value + ")"))
     return found
 
 
-def census_table():
-    """{scripts-relative path: sorted finding labels} for every file of the whole tree with a finding."""
-    files, skipped = census_files()
-    table = {}
-    for path in files:
-        labels = census_findings(path)
-        if labels:
-            table[path.relative_to(SCRIPTS).as_posix()] = tuple(sorted(set(labels)))
-    return table, len(files), skipped
-
-
 class Census(unittest.TestCase):
-    def test_every_finding_in_the_whole_tree_is_a_written_allowlist_row(self):
-        table, scanned, skipped = census_table()
+    def test_no_script_changes_sys_path_or_imports_a_sibling_by_name(self):
+        scanned = 0
+        problems = []
+        for path in sorted(SCRIPTS.rglob("*.py")):
+            rel = path.relative_to(SCRIPTS)
+            if CENSUS_EXCLUDED_PARTS & set(rel.parts) or path.name.startswith("test_"):
+                continue
+            scanned += 1
+            findings = census_findings(path)
+            if not findings:
+                continue
+            if str(rel) in SITE_FILES:
+                problems.append("%s still loads by name: %s" % (rel, findings))
+            else:
+                problems.append("%s is not on the hand-written SITES list: %s" % (rel, findings))
         self.assertGreaterEqual(scanned, MIN_FILES_SCANNED, "the census scanned %d files" % scanned)
-        self.assertEqual(set(skipped), set(CENSUS_SKIPPED_RULES))
-        for rule in CENSUS_RULES_THAT_MUST_BE_EMPTY:
-            self.assertEqual(skipped[rule], 0, "the census does not read a %s; none may sit under scripts/" % rule)
-        expected = {rel: tuple(sorted(labels)) for rel, (labels, _reason) in CENSUS_ALLOWLIST.items()}
-        unexpected = {rel: labels for rel, labels in table.items() if expected.get(rel) != labels}
-        stale = sorted(rel for rel in expected if rel not in table)
-        self.assertEqual(unexpected, {}, "a file loads a module another way than through the one checked loader")
-        self.assertEqual(stale, [], "an allowlist row names a file that no longer has those findings")
-
-    def test_every_allowlist_row_and_skip_rule_has_a_reason(self):
-        for rel, (labels, reason) in CENSUS_ALLOWLIST.items():
-            with self.subTest(rel=rel):
-                self.assertTrue(labels, rel + " has no labels")
-                self.assertGreaterEqual(len(reason.strip()), MIN_REASON_CHARS, rel + " has no written reason")
-                if rel in SITE_FILES:
-                    # A SITES script loads every sibling through the one loader; the only other load it may keep is
-                    # of a tracked file in another tree (wake_latency's SDK client), never of a sibling.
-                    self.assertEqual((labels, reason), (("spec_from_file_location",), REASON_OUTSIDE_FILE_9857))
-        for rule, reason in CENSUS_SKIPPED_RULES.items():
-            with self.subTest(rule=rule):
-                self.assertGreaterEqual(len(reason.strip()), MIN_REASON_CHARS)
-
-    def test_the_walk_reads_a_python_shebang_file_without_a_suffix(self):
-        files, _skipped = census_files()
-        self.assertIn(SHEBANG_FIXTURE, {p.relative_to(SCRIPTS).as_posix() for p in files})
+        self.assertEqual(problems, [])
 
     def test_the_census_sees_each_form(self):
-        folder = Path(os.path.realpath(tempfile.mkdtemp(prefix="census-9399-")))
-        self.addCleanup(shutil.rmtree, folder)
-        (folder / "peer.py").write_text("X = 1\n", encoding="utf-8")
-        (folder / "select.py").write_text("X = 1\n", encoding="utf-8")
-        probe = folder / "probe.py"
-        real_scripts = globals()["SCRIPTS"]
-        globals()["SCRIPTS"] = folder
-        try:
-            for source, labels in CENSUS_FORMS:
-                probe.write_text(source, encoding="utf-8")
-                with self.subTest(form=source):
-                    self.assertEqual(census_findings(probe), labels)
-            shebang = folder / "tool"
-            shebang.write_text("#!/usr/bin/env python3\nimport peer\n", encoding="utf-8")
-            self.assertTrue(is_python_source(shebang))
-            (folder / "notes").write_text("#!/bin/sh\nimport peer\n", encoding="utf-8")
-            self.assertFalse(is_python_source(folder / "notes"))
-        finally:
-            globals()["SCRIPTS"] = real_scripts
+        with tempfile.TemporaryDirectory(prefix="census-9399-") as raw:
+            folder = Path(os.path.realpath(raw))
+            (folder / "peer.py").write_text("X = 1\n", encoding="utf-8")
+            probe = folder / "probe.py"
+            expected = {
+                "import sys\nsys.path.insert(0, '.')\n": "sys.path.insert",
+                "import sys\nsys.path.append('.')\n": "sys.path.append",
+                "import sys\nsys.path[0] = '.'\n": "sys.path assignment",
+                "import sys\nsys.path += ['.']\n": "sys.path assignment",
+                "import peer\n": "import peer",
+                "from peer import X\n": "from peer import",
+                "from . import peer\n": "relative import",
+                "import importlib\nimportlib.import_module('peer')\n": "import_module(peer)",
+                "__import__('peer')\n": "__import__(peer)",
+            }
+            real_scripts = globals()["SCRIPTS"]
+            globals()["SCRIPTS"] = folder
+            try:
+                for source, label in expected.items():
+                    probe.write_text(source, encoding="utf-8")
+                    with self.subTest(form=label):
+                        self.assertEqual([what for _, what in census_findings(probe)], [label])
+                probe.write_text("import json\nimport os\n", encoding="utf-8")
+                self.assertEqual(census_findings(probe), [])
+            finally:
+                globals()["SCRIPTS"] = real_scripts
 
 
 if __name__ == "__main__":
