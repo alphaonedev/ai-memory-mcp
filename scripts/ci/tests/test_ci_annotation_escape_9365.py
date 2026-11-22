@@ -36,6 +36,7 @@ import contextlib
 import errno
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -382,31 +383,41 @@ class ScriptBehaviour(CommandAssertions):
     def hostile_values(self, names=None):
         return [(key, HOSTILE[key]) for key in (names or HOSTILE)]
 
+    def sem_config(self):
+        """A slot configuration holding the gate sem: the wrapper refuses a gate it does not hold (#9846)."""
+        path = self.tmp / "sem-slots.json"
+        path.write_text(json.dumps({"registered_runners": [], "gates": {
+            "sem": {"slots": 1, "label": "x", "serving_runners": []}}}))
+        return str(path)
+
     def test_host_semaphore_notice_9365(self):
+        config = self.sem_config()
         for key, value in self.hostile_values():
             with self.subTest(key):
                 started = time.monotonic()
                 rc, out, err = run_script(CI_DIR / "host_semaphore.py", [
-                    "--name", "sem", "--slots", "1", "--max-wait-secs", "1", "--poll-secs", "1", "--label", value,
-                    "--root", str(self.tmp / ("root-" + key)), "--", "true"])
+                    "--name", "sem", "--config", config, "--slots", "1", "--max-wait-secs", "1", "--poll-secs", "1",
+                    "--label", value, "--root", str(self.tmp / ("root-" + key)), "--", "true"])
                 self.assertEqual(rc, 0, err[-500:])
                 self.assert_commands(out + err, ["notice"])
                 self.assertLess(time.monotonic() - started, HUGE_WALL_CLOCK_SECS)
 
     def test_host_semaphore_no_slot_error_9365(self):
         root = self.tmp / "busy"
+        config = self.sem_config()
         holder = subprocess.Popen([sys.executable, "-I", str(CI_DIR / "host_semaphore.py"), "--name", "sem",
-                                   "--slots", "1", "--root", str(root), "--label", "holder", "--",
+                                   "--config", config, "--slots", "1", "--root", str(root), "--label", "holder", "--",
                                    sys.executable, "-c", "import time; time.sleep(60)"],
-                                  stdout=subprocess.PIPE, text=True)
+                                  stdout=subprocess.PIPE, text=True,
+                                  env={k: v for k, v in os.environ.items() if k != "RUNNER_NAME"})
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
         self.assertTrue(holder.stdout.readline().startswith("::notice::"))  # the holder owns the only slot
         for key, value in self.hostile_values():
             with self.subTest(key):
                 rc, out, err = run_script(CI_DIR / "host_semaphore.py", [
-                    "--name", "sem", "--slots", "1", "--max-wait-secs", "1", "--poll-secs", "1", "--label", value,
-                    "--root", str(root), "--", "true"])
+                    "--name", "sem", "--config", config, "--slots", "1", "--max-wait-secs", "1", "--poll-secs", "1",
+                    "--label", value, "--root", str(root), "--", "true"])
                 self.assertEqual(rc, 82, err[-300:])  # infra-no-slot, not a refused wait (#9231: 0 is refused)
                 self.assert_commands(out + err, ["error"])
 

@@ -178,6 +178,12 @@ def error_lines(out):
     return [ln for ln in out.splitlines() if ln.startswith('::error')]
 
 
+# #9846: the one refusal of a --name that names no gate of the loaded slot configuration, written out by hand
+U_REFUSED = ("::error title=infra unknown-runner::[#7914 semaphore] 'T': infra-unknown-runner: %s; "
+             "no slot taken, no command ran; exit 83")
+U_GATE = U_REFUSED % "'%s' is not a gate of the slot configuration"
+
+
 class WrapperOutcome(unittest.TestCase):
     # (slots held and asked for, serving runners listed, expected "N serving runners" text)
     NO_SLOT_TABLE = [(1, ['a'], 1), (2, ['a', 'b'], 2), (3, ['a', 'b'], 2), (4, ['a', 'b'], 2), (2, ['a', 'b', 'c', 'd'], 4)]
@@ -205,13 +211,14 @@ class WrapperOutcome(unittest.TestCase):
         self.assertNotIn('\\x3a', out.split('::', 2)[1])
         self.assertNotIn('%3A', out)
 
-    def test_unconfigured_gate_says_unknown_serving_runners(self):
+    def test_unconfigured_gate_is_refused_before_the_wait(self):
+        # #9846: was exit 82 after a wait with "unknown serving runners"; an unknown gate never waits for a slot
         w = wrapper(self, ['a'], slots_in_file=1)
         w.gate = 'not-in-the-config'
         w.hold(1)
         rc, out = w.run(1, CHILD_OK)
-        self.assertEqual(rc, 82, out)
-        self.assertIn('all 1 slots busy on this host, unknown serving runners)', out)
+        self.assertEqual(rc, 83, out)
+        self.assertEqual(error_lines(out), [U_GATE % 'not-in-the-config'])
 
     def test_a_free_slot_runs_the_command_after_one_marker_line(self):
         for slots, held in ((1, 0), (2, 1), (3, 2), (4, 3)):
@@ -272,16 +279,165 @@ class WrapperOutcome(unittest.TestCase):
                 self.assertEqual(rc, 0, out)
                 self.assertIn('CHILD-RAN', out)
 
-    def test_runner_check_is_skipped_for_an_unconfigured_gate(self):
-        w = wrapper(self, ['a'], slots_in_file=1)
-        w.gate = 'not-in-the-config'
-        rc, out = w.run(1, CHILD_OK, runner='anything')
-        self.assertEqual(rc, 0, out)
+    def test_an_unconfigured_gate_is_refused_whatever_the_runner(self):
+        # #9846: was exit 0 (the runner check was skipped and the command ran under a gate no config holds)
+        for runner in ('anything', 'a', None):
+            with self.subTest(runner=runner):
+                w = wrapper(self, ['a'], slots_in_file=1)
+                w.gate = 'not-in-the-config'
+                rc, out = w.run(1, CHILD_OK, runner=runner)
+                self.assertEqual(rc, 83, out)
+                self.assertNotIn('CHILD-RAN', out)
+                self.assertFalse((w.root / 'not-in-the-config').exists())
 
     def test_the_shipped_config_lists_the_runner_seen_in_the_real_no_slot_job(self):
         cfg = json.loads(CONFIG.read_text())
         self.assertIn('f2-linux-fed-4', cfg['registered_runners'])  # run 44292743356 job 134771214198
-        self.assertEqual(hs.serving_runners('linux-fed-tests'), ['f2-linux-fed', 'f2-linux-fed-2'])
+        # #9846: gate_runners is the one loader of the configuration; it refuses, never reports "unknown"
+        self.assertEqual(hs.gate_runners(['linux-fed-tests']), (['f2-linux-fed', 'f2-linux-fed-2'], None))
+        self.assertFalse(hasattr(hs, 'serving_runners'))
+
+
+class UnknownGateRefused(unittest.TestCase):
+    """#9846: --name must be one gate of the loaded host_slots.json; otherwise exit 83 before any slot or command.
+
+    Every row asserts the exact one error line, exit 83, no lock root created, no command run and no traceback.
+    """
+    GOOD = {'registered_runners': ['a'], 'gates': {'g': {'slots': 1, 'label': 'x', 'serving_runners': ['a']}}}
+    DEEP_NESTING = 100_000  # deeper than any recursion limit: json.loads raises RecursionError
+    # (row id, config bytes or None for no file, a directory, the --name values, expected reason): by hand
+    ROWS = [
+        ('absent name', GOOD, ['bogus'], "'bogus' is not a gate of the slot configuration"),
+        ('absent name, case differs', GOOD, ['G'], "'G' is not a gate of the slot configuration"),
+        ('missing config', None, ['g'], 'the slot configuration cannot be read (FileNotFoundError)'),
+        ('config is a directory', 'DIR', ['g'], 'the slot configuration cannot be read (IsADirectoryError)'),
+        ('not json', b'{"gates": ', ['g'], 'the slot configuration is not valid UTF-8 JSON'),
+        ('not utf-8', b'\xff\xfe{}', ['g'], 'the slot configuration is not valid UTF-8 JSON'),
+        ('nesting past the recursion limit', b'[' * DEEP_NESTING + b']' * DEEP_NESTING, ['g'],
+         'the slot configuration is not valid UTF-8 JSON'),
+        ('top level is a list', b'[]', ['g'], 'the slot configuration has no gates object'),
+        ('no gates key', b'{"registered_runners": []}', ['g'], 'the slot configuration has no gates object'),
+        ('gates is a list', b'{"gates": ["g"]}', ['g'], 'the slot configuration has no gates object'),
+        ('gate is not an object', b'{"gates": {"g": 1}}', ['g'],
+         "gate 'g' has no serving_runners list of strings in the slot configuration"),
+        ('serving_runners is a string', b'{"gates": {"g": {"serving_runners": "a"}}}', ['g'],
+         "gate 'g' has no serving_runners list of strings in the slot configuration"),
+        ('serving_runners missing', b'{"gates": {"g": {"slots": 1}}}', ['g'],
+         "gate 'g' has no serving_runners list of strings in the slot configuration"),
+        ('repeated --name, last unknown', GOOD, ['g', 'bogus'], '--name is given 2 times; give it once'),
+        ('repeated --name, first unknown', GOOD, ['bogus', 'g'], '--name is given 2 times; give it once'),
+        ('repeated --name, equal values', GOOD, ['g', 'g'], '--name is given 2 times; give it once'),
+        ('three --name', GOOD, ['g', 'g', 'g'], '--name is given 3 times; give it once'),
+        # #9851 L3: a repeated key is a refusal, never "the last one wins"
+        ('duplicate gate key', b'{"gates": {"g": {"serving_runners": []}, "g": {"serving_runners": ["a"]}}}', ['g'],
+         'the slot configuration has a duplicate key'),
+        ('duplicate top-level key', b'{"gates": {}, "gates": {"g": {"serving_runners": ["a"]}}}', ['g'],
+         'the slot configuration has a duplicate key'),
+        ('duplicate nested key', b'{"gates": {"g": {"serving_runners": [], "serving_runners": ["a"]}}}', ['g'],
+         'the slot configuration has a duplicate key'),
+        # #9851 L4: a malformed --name is an unknown gate too (exit 83, fixed reason, the name never echoed)
+        ('name with a path', GOOD, ['../x'], '--name is not a plain gate name'),
+        ('second name malformed', GOOD, ['g', '../x'], '--name is not a plain gate name'),
+        ('name with a newline', GOOD, ['x\n'], '--name is not a plain gate name'),
+    ]
+
+    def run_wrapper(self, td, config, names, runner=None, script=None):
+        cfg = Path(td) / 'cfg.json'
+        if config == 'DIR':
+            cfg.mkdir()
+        elif isinstance(config, dict):
+            cfg.write_text(json.dumps(config))
+        elif config is not None:
+            cfg.write_bytes(config)
+        root = Path(td) / 'locks'
+        marker = Path(td) / 'child-started'
+        env = {k: v for k, v in os.environ.items() if k not in ('RUNNER_NAME', WAIT_ENV_KEY)}
+        if runner is not None:
+            env['RUNNER_NAME'] = runner
+        name_args = [arg for name in names for arg in ('--name', name)]
+        done = subprocess.run([sys.executable, '-I', str(script or CI_DIR / 'host_semaphore.py'), *name_args,
+                               '--max-wait-secs', '1', '--poll-secs', '1', '--root', str(root), '--label', 'T',
+                               '--config', str(cfg), '--', sys.executable, '-c', MARKER_CHILD, str(marker)],
+                              capture_output=True, text=True, env=env, timeout=60)
+        return done, root, marker
+
+    def assert_refused(self, done, root, marker, reason):
+        self.assertEqual((done.returncode, error_lines(done.stdout)), (83, [U_REFUSED % reason]),
+                         done.stdout + done.stderr)
+        self.assertNotIn('Traceback', done.stdout + done.stderr)
+        self.assertFalse(root.exists(), 'a lock root was created')
+        self.assertFalse(marker.exists(), 'the command ran')
+
+    def test_every_row_is_refused_with_its_exact_reason(self):
+        for row, config, names, reason in self.ROWS:
+            for runner in (None, 'a'):
+                with self.subTest(row=row, runner=runner), scratch() as td:
+                    self.assert_refused(*self.run_wrapper(td, config, names, runner), reason)
+
+    def test_a_configured_gate_still_runs_the_command(self):
+        for runner in (None, 'a'):
+            with self.subTest(runner=runner), scratch() as td:
+                done, root, marker = self.run_wrapper(td, self.GOOD, ['g'], runner)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(error_lines(done.stdout), [])
+                self.assertTrue(marker.exists())
+
+    def test_the_refusal_comes_after_the_wait_check(self):
+        # a refused wait is still exit 85 for an unknown gate: the wait is the first check (#9231 R2-C)
+        with scratch() as td:
+            done, root, marker = self.run_wrapper(td, None, ['bogus'])
+            self.assertEqual(done.returncode, 83)
+            env = {k: v for k, v in os.environ.items() if k not in ('RUNNER_NAME', WAIT_ENV_KEY)}
+            env[WAIT_ENV_KEY] = '3600'
+            done = subprocess.run([sys.executable, '-I', str(CI_DIR / 'host_semaphore.py'), '--name', 'bogus',
+                                   '--root', str(root), '--label', 'T', '--config', str(Path(td) / 'none.json'),
+                                   '--', 'true'], capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual((done.returncode, done.stdout.splitlines()),
+                             (85, [refused('HOST_SEMAPHORE_MAX_WAIT_SECS is above the 900 s idle seat ceiling')]))
+
+    def test_a_bad_name_is_refused_with_83_and_never_echoed(self):
+        for names in (['../x'], ['g', '../x'], ['x\n']):
+            with self.subTest(names=names), scratch() as td:
+                done, root, marker = self.run_wrapper(td, self.GOOD, names)
+                self.assertEqual(done.returncode, EXIT_UNKNOWN_RUNNER, done.stdout + done.stderr)
+                self.assertNotIn('../x', done.stdout + done.stderr)
+                self.assertFalse(root.exists())
+
+    # (mutant id, (old text, new text) in host_semaphore.py, a row id that goes red): each breaks one check
+    MUTANTS = [
+        ('name-in-gates check dropped', ('    if name not in gates:\n', '    if False:\n'), 'absent name'),
+        ('OSError tolerated', ('    except OSError as exc:\n        return',
+                               '    except OSError as exc:\n        return [], None\n        return'), 'missing config'),
+        ('ValueError tolerated', ('    except (ValueError, RecursionError):\n        return',
+                                  '    except (ValueError, RecursionError):\n        return [], None\n        return'),
+         'not json'),
+        ('first --name checked', ('    runners, problem = gate_runners(args.name, args.config)\n',
+                                  '    runners, problem = gate_runners(args.name[:1], args.config)\n'),
+         'repeated --name, last unknown'),
+        ('RecursionError not caught', ('    except (ValueError, RecursionError):\n',
+                                       '    except ValueError:\n'), 'nesting past the recursion limit'),
+        ('gates type not checked', ('    if not isinstance(gates, dict):\n', '    if gates is None:\n'),
+         'gates is a list'),
+        ('repeat check dropped', ('    if len(names) > 1:\n', '    if False:\n'), 'repeated --name, last unknown'),
+        ('runner list not checked', ('    if not (isinstance(runners, list)',
+                                     '    if not (True or isinstance(runners, list)'), 'serving_runners is a string'),
+        ('duplicate keys tolerated', ("object_pairs_hook=_limits.no_duplicate_keys)", ')'), 'duplicate gate key'),
+        ('a malformed name is a bad argument', ('        return EXIT_UNKNOWN_RUNNER\n    # The gate is refused',
+                                                 '        return 2\n    # The gate is refused'), 'name with a path'),
+    ]
+
+    def test_each_mutant_of_the_check_goes_red(self):
+        source = (CI_DIR / 'host_semaphore.py').read_text()
+        rows = {row: (config, names, reason) for row, config, names, reason in self.ROWS}
+        for mutant, (old, new), row in self.MUTANTS:
+            with self.subTest(mutant=mutant), scratch() as td:
+                self.assertEqual(source.count(old), 1, 'mutant anchor %r' % old)
+                repo = copy_repo(td, replace={'host_semaphore.py': source.replace(old, new)})
+                config, names, reason = rows[row]
+                done, root, marker = self.run_wrapper(td, config, names,
+                                                      script=repo / 'scripts' / 'ci' / 'host_semaphore.py')
+                self.assertNotEqual((done.returncode, error_lines(done.stdout)), (83, [U_REFUSED % reason]),
+                                    'mutant %s survived' % mutant)
 
 
 class ExitCodeCollisionTable(unittest.TestCase):
@@ -772,6 +928,14 @@ class OneConstant(unittest.TestCase):
         ('IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = 7\n', 'TypeError'),
         ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = b'0|[1-9][0-9]*'\n", 'TypeError'),
         ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '[0-9'\n", 'ValueError'),
+        # #9851 L3: the one duplicate-key hook is loaded from the same module and checked the same way
+        ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '0'\n", 'AttributeError'),
+        ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '0'\nno_duplicate_keys = 1\n", 'TypeError'),
+        ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '0'\nno_duplicate_keys = dict\n", 'AttributeError'),
+        ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '0'\nno_duplicate_keys = dict\n"
+         "DuplicateKeyError = KeyError\n", 'TypeError'),
+        ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '0'\nno_duplicate_keys = dict\n"
+         "DuplicateKeyError = 'x'\n", 'TypeError'),
     ]
 
     def test_an_unloadable_limits_module_refuses_with_exit_4_before_any_command(self):

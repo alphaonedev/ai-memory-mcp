@@ -4,6 +4,7 @@ Real subprocesses against a scratch lock root; nothing here touches the
 operator's ~/.cache. Python 3.9+, standard library only.
 """
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -19,10 +20,19 @@ SCRATCH = os.environ.get('TMPDIR') or None
 SLEEPER = [sys.executable, '-c', 'import time; time.sleep(60)']
 
 
+GATE_CONFIG_NAME = 'gate-n.json'  # the wrapper refuses a gate its configuration does not hold (#9846)
+GATE_CONFIG = {'registered_runners': [], 'gates': {'n': {'slots': 2, 'label': 'x', 'serving_runners': []}}}
+
+
 def start(root, args, child, **kw):
-    cmd = [sys.executable, '-I', str(SCRIPT), '--root', str(root), '--label', 'T'] + args + ['--'] + child
-    # the wait key is part of the wrapper's input (#9231): a value inherited from the caller must not steer these tests
-    kw.setdefault('env', {k: v for k, v in os.environ.items() if k != 'HOST_SEMAPHORE_MAX_WAIT_SECS'})
+    config = Path(root).parent / GATE_CONFIG_NAME  # next to the lock root, inside the test's scratch directory
+    if not config.exists():
+        config.write_text(json.dumps(GATE_CONFIG))
+    cmd = [sys.executable, '-I', str(SCRIPT), '--root', str(root), '--label', 'T', '--config', str(config)] + args
+    cmd += ['--'] + child
+    # the wait key and the runner name are wrapper input (#9231): values inherited from the caller (a CI runner
+    # sets RUNNER_NAME) must not steer these tests
+    kw.setdefault('env', {k: v for k, v in os.environ.items() if k not in ('HOST_SEMAPHORE_MAX_WAIT_SECS', 'RUNNER_NAME')})
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
 
 
@@ -42,7 +52,8 @@ def wait_for_line(proc, needle, limit=15.0):
 class Semaphore(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory(dir=SCRATCH)
-        self.root = Path(self._td.name)
+        self.root = Path(self._td.name) / 'locks'
+        self.root.mkdir()
 
     def tearDown(self):
         self._td.cleanup()
@@ -180,17 +191,20 @@ class Semaphore(unittest.TestCase):
         p = start(self.root, ['--name', 'n', '--slots', '0'], ['true'])
         p.communicate(timeout=30)
         self.assertEqual(p.returncode, 2)
+        # #9851: a --name that is not a plain gate name is refused as an unknown gate (83), not a usage error
         p = start(self.root, ['--name', '../x', '--slots', '1'], ['true'])
-        p.communicate(timeout=30)
-        self.assertEqual(p.returncode, 2)
+        out, _ = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 83, out)
+        self.assertIn('--name is not a plain gate name', out)
 
     def test_name_with_newline_rejected_7914(self):
         """A trailing or embedded newline is not a valid name and creates nothing (fullmatch, not match)."""
         for bad in ('x\n', 'x\ny'):
             before = sorted(q.name for q in self.root.iterdir())
             p = start(self.root, ['--name', bad, '--slots', '1'], ['true'])
-            p.communicate(timeout=30)
-            self.assertEqual(p.returncode, 2, repr(bad))
+            out, _ = p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 83, repr(bad))  # #9851: refused as an unknown gate
+            self.assertIn('--name is not a plain gate name', out, repr(bad))
             self.assertEqual(sorted(q.name for q in self.root.iterdir()), before, repr(bad))
 
 
