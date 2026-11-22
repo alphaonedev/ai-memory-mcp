@@ -22,8 +22,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from test_slot_wait_outcome_9231 import (  # noqa: E402
-    CALL_HEAD, CI_DIR, S_DECODED, S_NEVER, S_NOT_YAML, S_OUTSIDE, S_POSITIONAL, S_TOKEN_AGAIN, SCAN_GOOD, SCAN_W,
-    TokenScanFailsClosed, hsc, load_checker, run_block, s_char)
+    CALL_HEAD, CI_DIR, S_DECODED, S_NEVER, S_NOT_CALL, S_NOT_YAML, S_OUTSIDE, S_POSITIONAL, S_TOKEN_AGAIN, SCAN_GOOD,
+    SCAN_W, TokenScanFailsClosed, hsc, load_checker, run_block, s_char)
 
 CFG = TokenScanFailsClosed.CFG
 # Written out by hand (not taken from the checker): the characters a canonical call line may hold.
@@ -47,6 +47,15 @@ S_UNREADABLE = ('workflows/w.yml: the YAML subset parser cannot read this file, 
                 'are not checked')
 LINE_CEILING_SECS = 5.0
 BLOCK_CEILING_SECS = 10.0
+# #9847 r2 findings A and B: the reasons of the decoded-script scan, written out by hand.
+S_JOINED = ('workflows/w.yml: a host_semaphore line joined from two or more lines by a backslash-newline '
+            'continuation (the shell runs the joined line, which is never a canonical call)')
+S_ESCAPED = ('workflows/w.yml: a parsed YAML key or value outside the run values holds host_semaphore where no raw '
+             'line does (an escaped spelling)')
+S_KEY_USE = ('workflows/w.yml: HOST_SEMAPHORE_MAX_WAIT_SECS is used other than as its env mapping key or a plain $ '
+             'read; set it only in the one env mapping')
+GOOD_TAIL = ' --name g --slots 1 --max-wait-secs 600 -- bash'
+EVIL_TAIL = ' --name g --slots 1 --max-wait-secs 600 --root /evil -- bash x'
 
 
 def positions(char):
@@ -122,6 +131,12 @@ class ReviewerRepros(unittest.TestCase):
          [S_OUTSIDE, S_UNREADABLE, S_NEVER]),
         ('security-M2 double-quoted escape', 'run: "%s"\n' % SCAN_GOOD.replace(' -- bash', '\\x20--config\\x20/e -- b'),
          [S_OUTSIDE, S_DECODED, S_NEVER]),
+        # delta r2 finding D: the interpreter word is exactly python3, never a word that starts with it
+        ('r2-D python3x', run_block('exec python3x -I scripts/ci/host_semaphore.py' + GOOD_TAIL), [S_NOT_CALL, S_NEVER]),
+        ('r2-D python3.12', run_block('exec python3.12 -I scripts/ci/host_semaphore.py' + GOOD_TAIL),
+         [S_NOT_CALL, S_NEVER]),
+        ('r2-D python3-evil', run_block('exec python3-evil -I scripts/ci/host_semaphore.py' + GOOD_TAIL),
+         [S_NOT_CALL, S_NEVER]),
     ]
 
     def test_each_repro_is_its_exact_finding(self):
@@ -201,6 +216,91 @@ class LinearBounds(unittest.TestCase):
         text = run_block(*[SCAN_GOOD] * BIG)
         self.assertGreater(len(text), YAML_CAP_BYTES)
         self.assertEqual(self.timed(text, BLOCK_CEILING_SECS), [S_UNREADABLE])
+
+
+class DecodedScriptInvariant(unittest.TestCase):
+    """#9847, delta r2 findings A and B: the checker judges what the runner will execute.
+
+    For every way YAML and the shell can spell a host semaphore call (backslash-newline continuation, the YAML
+    escapes \\x5f, \\u005f and \\U0000005f of the underscore, folded and literal block scalars, quoting, line joins),
+    the call is either found and checked against the canonical form or reported as a finding with a named reason.
+    Zero findings is never the result of a spelling. Every expected row is written out by hand."""
+
+    TABLE = [
+        # finding A: a backslash-newline continuation, which the shell removes before it splits words
+        ('continuation inside the token', run_block('exec python3 -I scripts/ci/host_\\', 'semaphore.py' + EVIL_TAIL),
+         [S_JOINED, S_NEVER]),
+        ('continuation inside the upper-case token', run_block('exec python3 -I scripts/ci/HOST_\\',
+                                                               'SEMAPHORE.PY' + EVIL_TAIL), [S_JOINED, S_NEVER]),
+        ('continuation inside the token of a canonical call',
+         run_block('python3 scripts/ci/host_sema\\', 'phore.py' + GOOD_TAIL), [S_JOINED, S_NEVER]),
+        ('continuation before a canonical call line', run_block('env X=1 \\', 'python3 scripts/ci/host_semaphore.py'
+                                                                 + GOOD_TAIL), [S_JOINED]),
+        ('continuation after a call line', run_block(SCAN_GOOD + ' \\', '--root /x'),
+         [s_char('U+005C'), S_JOINED, S_NEVER]),
+        ('continuation in a comment line (over-approximated: a finding)', run_block('# host_\\', 'semaphore'),
+         [S_JOINED, S_NEVER]),
+        ('CRLF line ends with the continuation inside the token',
+         'run: |\r\n  exec python3 scripts/ci/host_\\\r\n  semaphore.py%s\r\n' % EVIL_TAIL, [S_JOINED, S_NEVER]),
+        ('folded > with a blank line under the continuation',
+         'run: >\n  exec python3 scripts/ci/host_\\\n\n  semaphore.py%s\n' % EVIL_TAIL, [S_JOINED, S_NEVER]),
+        ('folded > joins with a space: bash runs no host_semaphore',
+         'run: >\n  exec python3 scripts/ci/host_\\\n  semaphore.py%s\n' % EVIL_TAIL, [S_NEVER]),
+        ('double-quoted \\n line join', 'run: "exec \\\\\\npython3 scripts/ci/host_semaphore.py%s"\n' % GOOD_TAIL,
+         [S_OUTSIDE, S_DECODED, S_JOINED, S_NEVER]),
+        # finding B: a YAML escape of the underscore, decoded before the runner sees the script
+        ('double-quoted \\x5f', 'run: "exec python3 scripts/ci/host\\x5fsemaphore.py%s"\n' % EVIL_TAIL,
+         [S_DECODED, S_NEVER]),
+        ('double-quoted \\u005f', 'run: "exec python3 scripts/ci/host\\u005fsemaphore.py%s"\n' % EVIL_TAIL,
+         [S_DECODED, S_NEVER]),
+        ('double-quoted \\U0000005f', 'run: "exec python3 scripts/ci/host\\U0000005fsemaphore.py%s"\n' % EVIL_TAIL,
+         [S_DECODED, S_NEVER]),
+        ('\\x5f beside a canonical call', run_block(SCAN_GOOD) + 'env:\n  X: "host\\x5fsemaphore"\n', [S_ESCAPED]),
+        ('\\u005f in a key beside a canonical call', '"host\\u005fsemaphore": 1\n' + run_block(SCAN_GOOD),
+         [S_ESCAPED]),
+        ('\\x5f in a run value beside a canonical call',
+         'jobs:\n  a:\n    steps:\n      - run: |\n          %s\n      - run: "python3 scripts/ci/host\\x5fsemaphore.py'
+         ' --root /e -- b"\n' % SCAN_GOOD, [S_DECODED]),
+        # quoting the shell undoes: still the token, and a finding
+        ('single-quoted with a doubled quote', "run: 'python3 scripts/ci/host_semaphore.py --label ''x''%s'\n"
+         % GOOD_TAIL, [S_OUTSIDE, S_DECODED, S_NEVER]),
+    ]
+
+    def test_every_spelling_is_its_exact_finding(self):
+        for row, text, expected in self.TABLE:
+            with self.subTest(row):
+                self.assertEqual(scan(text), expected)
+
+    def test_a_continuation_in_a_file_that_is_not_yaml(self):
+        texts = {'scripts.sh': 'python3 scripts/ci/host_\\\nsemaphore.py x\n', SCAN_W: run_block(SCAN_GOOD)}
+        self.assertEqual(hsc.call_site_violations(CFG, texts), [S_NOT_YAML % 'scripts.sh'])
+
+    def test_the_wait_key_sibling(self):
+        """wait_key_violations scans the same decoded run text: a joined or escaped key use is refused."""
+        rows = [
+            ('continuation inside the key', 'run: |\n  export HOST_SEMAPHORE_MAX_\\\n  WAIT_SECS=3600\n', [S_KEY_USE]),
+            ('\\x5f in the key', 'run: "export HOST\\x5fSEMAPHORE_MAX_WAIT_SECS=3600"\n', [S_KEY_USE]),
+            ('a plain read stays admitted', 'run: |\n  echo "$HOST_SEMAPHORE_MAX_WAIT_SECS"\n', []),
+        ]
+        for row, text, expected in rows:
+            with self.subTest(row):
+                self.assertEqual(hsc.wait_key_violations({SCAN_W: text}), expected)
+
+    def test_a_100k_block_with_a_continuation_is_linear(self):
+        text = run_block(*['echo x'] * BIG + ['exec python3 -I scripts/ci/host_\\', 'semaphore.py' + EVIL_TAIL])
+        self.assertGreater(len(text), BIG)
+        start = time.monotonic()
+        got = scan(text)
+        self.assertLess(time.monotonic() - start, BLOCK_CEILING_SECS)
+        self.assertEqual(got, [S_JOINED, S_NEVER])
+
+    def test_a_100k_escaped_line_is_linear(self):
+        text = 'run: "%s exec python3 scripts/ci/host\\x5fsemaphore.py%s"\n' % ('x ' * BIG, EVIL_TAIL)
+        self.assertGreater(len(text), BIG)
+        start = time.monotonic()
+        got = scan(text)
+        self.assertLess(time.monotonic() - start, LINE_CEILING_SECS)
+        self.assertEqual(got, [S_DECODED, S_NEVER])
 
 
 class RuleMutants(unittest.TestCase):
