@@ -10,14 +10,17 @@
 //! re-reads the tail when the file changed since this process last wrote
 //! (vote acba9602).
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use ai_memory::governance::audit::{CHAIN_HEAD_PREV_HASH, ForensicDecision};
 use serde_json::{Value, json};
-#[path = "common/child_stdin_report.rs"]
-mod child_stdin_report;
+// #9906 F1: the one guard of every spawned child, shared by the three drain
+// test files.
+#[path = "common/mcp_child_guard.rs"]
+mod mcp_child_guard;
+use mcp_child_guard::{ChildGuard, TIER_LINE, requested_tiers, spawn_line_reader};
 
 /// The namespace every probe purges (the forensic row is written before the
 /// storage call, so an empty archive is fine).
@@ -121,6 +124,28 @@ fn assert_one_unbroken_chain(recs: &[ForensicDecision]) {
     }
 }
 
+/// How long a child may take to answer one request line (start-up included:
+/// scheduler-bound on a loaded host, so generous, but a bound).
+const RESPONSE_BOUND: Duration = Duration::from_secs(300);
+
+/// How long a child may take to exit after stdin EOF.
+const EXIT_BOUND: Duration = Duration::from_secs(60);
+
+/// The one spawn site of an `mcp` child in this file: the guard owns it, so
+/// every failed wait kills and reaps it and reports its stderr (#9906 F1).
+fn spawn_mcp(home: &Path) -> ChildGuard {
+    let child = command(home, &[])
+        // #9906 — the tier on the command line: `mcp --tier` has a clap
+        // default that shadows the config file's tier (#9913).
+        .args(["mcp", "--profile", "full", "--tier", CHILD_TIER])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    ChildGuard::new(child)
+}
+
 /// `mcp` starts (reading row 0 as its tail), a CLI command appends row 1,
 /// then `mcp` records a row: it must chain from row 1. Red on the base (it
 /// chained from its stale row 0, forking the chain).
@@ -130,27 +155,14 @@ fn mcp_chains_from_a_row_another_process_wrote_while_it_ran_4304() {
     purge(home.path(), &[]);
     assert_eq!(rows(home.path()).len(), 1, "seed row");
 
-    let mut child = command(home.path(), &[])
-        // #9906 — the tier on the command line: `mcp --tier` has a clap
-        // default that shadows the config file's tier (#9913).
-        .args(["mcp", "--profile", "full", "--tier", CHILD_TIER])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn mcp");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut guard = spawn_mcp(home.path());
+    let mut stdin = guard.take_stdin().expect("stdin");
+    let lines = spawn_line_reader(guard.take_stdout().expect("stdout"));
     let mut request = |req: &Value| -> Value {
-        child_stdin_report::write_line_or_report(
-            &mut stdin,
-            &mut child,
-            None,
-            "request",
-            &req.to_string(),
-        );
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("read response");
+        guard.write_line(&mut stdin, "request", &req.to_string());
+        let Some(line) = guard.recv_line(&lines, RESPONSE_BOUND, "a response line") else {
+            guard.fail("a response line (stdout closed)", None)
+        };
         serde_json::from_str(&line).expect("json response")
     };
     // The answer to `initialize` proves `mcp` is up, so its sink (and the
@@ -175,7 +187,7 @@ fn mcp_chains_from_a_row_another_process_wrote_while_it_ran_4304() {
         "name":"memory_delete","arguments":{"id":"00000000-0000-4000-8000-000000004304"}}}),
     );
     drop(stdin);
-    let status = child.wait().expect("mcp exit");
+    let status = guard.wait_exit_bounded(EXIT_BOUND, "mcp to exit after stdin EOF");
     assert!(status.success(), "mcp exit status: {status}");
 
     let recs = rows(home.path());
@@ -189,4 +201,26 @@ fn mcp_chains_from_a_row_another_process_wrote_while_it_ran_4304() {
     );
     assert_eq!(recs.len(), 3);
     assert_one_unbroken_chain(&recs);
+}
+
+/// #9906 — the `mcp` child of this file serves the keyword tier. The config
+/// file's `tier = "keyword"` alone does not reach `mcp` (#9913), so the spawn
+/// pins it on the command line; this cell is red when it does not.
+#[test]
+fn the_mcp_child_serves_the_keyword_tier_9906() {
+    let home = sandbox();
+    let mut guard = spawn_mcp(home.path());
+    guard.wait_stderr_contains(TIER_LINE, RESPONSE_BOUND);
+    drop(guard.take_stdin());
+    let status = guard.wait_exit_bounded(EXIT_BOUND, "mcp to exit after stdin EOF");
+    let err = guard.stderr_final();
+    assert_eq!(
+        requested_tiers(&err),
+        [CHILD_TIER],
+        "requested tier lines; stderr:\n{err}"
+    );
+    assert!(
+        status.success(),
+        "mcp exit status: {status}; stderr:\n{err}"
+    );
 }

@@ -23,7 +23,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,8 +32,11 @@ use ai_memory::governance::audit::{
     CHAIN_HEAD_PREV_HASH, EXIT_DRAIN_BUDGET, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
 };
 use serde_json::{Value, json};
-#[path = "common/child_stdin_report.rs"]
-mod child_stdin_report;
+// #9906 F1: every spawned child is owned by one guard (kill + reap + stderr on
+// every failure path), shared by the three drain test files.
+#[path = "common/mcp_child_guard.rs"]
+mod mcp_child_guard;
+use mcp_child_guard::{ChildGuard, TIER_LINE, pid_exists, requested_tiers, spawn_line_reader};
 
 /// Writer delay that makes a queued row certainly outlive a signalled process.
 const WRITER_DELAY_MS: &str = "600";
@@ -127,22 +131,18 @@ fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int])
     cmd.spawn().expect("spawn mcp")
 }
 
-/// The child's stderr so far, for a write-failure report: waits (bounded) for
-/// the reader thread, then reads the shared buffer.
-fn collect_stderr(thread: &mut Option<std::thread::JoinHandle<()>>, buf: &Mutex<String>) -> String {
-    if let Some(t) = thread.take() {
-        child_stdin_report::finish_reader(t);
-    }
-    buf.lock().map(|b| b.clone()).unwrap_or_default()
-}
+/// How long a serving child may take to answer one request line. Steady-state
+/// work on a loaded host, so it is generous; still a bound (a hung child must
+/// fail the cell with its stderr, never block it forever, #9906 F1).
+const REQUEST_BOUND: Duration = Duration::from_secs(120);
 
 struct Session {
-    child: Child,
+    /// Owns the child and its stderr reader: killed and reaped on every
+    /// failure path and on drop.
+    guard: ChildGuard,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
-    /// Everything the child wrote to stderr so far (a reader thread fills it).
-    stderr_buf: Arc<Mutex<String>>,
-    stderr_thread: Option<std::thread::JoinHandle<()>>,
+    /// Stdout lines, read on a thread so every read is bounded.
+    lines: Receiver<String>,
 }
 
 impl Session {
@@ -161,30 +161,15 @@ impl Session {
         s
     }
 
-    /// Wrap a spawned child: capture its stderr on a reader thread.
-    fn attach(mut child: Child) -> Self {
-        let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
-        let mut child_stderr = child.stderr.take().expect("stderr");
-        let sink = Arc::clone(&stderr_buf);
-        let stderr_thread = std::thread::spawn(move || {
-            let mut chunk = [0_u8; 1024];
-            while let Ok(n) = child_stderr.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                if let Ok(mut buf) = sink.lock() {
-                    buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                }
-            }
-        });
+    /// Wrap a spawned child: the guard captures its stderr on a reader thread.
+    fn attach(child: Child) -> Self {
+        let mut guard = ChildGuard::new(child);
+        let stdin = guard.take_stdin().expect("stdin");
+        let lines = spawn_line_reader(guard.take_stdout().expect("stdout"));
         Self {
-            child,
+            guard,
             stdin: Some(stdin),
-            stdout,
-            stderr_buf,
-            stderr_thread: Some(stderr_thread),
+            lines,
         }
     }
 
@@ -212,106 +197,58 @@ impl Session {
         );
     }
 
-    /// Send one request line without waiting for its response.
+    /// Send one request line without waiting for its response; a failed
+    /// write kills and reaps the child and fails with its stderr.
     fn send(&mut self, req: &Value) {
         let stdin = self.stdin.as_mut().expect("stdin open");
-        let (thread, buf) = (&mut self.stderr_thread, &self.stderr_buf);
-        child_stdin_report::write_line_or_report_with(
-            stdin,
-            &mut self.child,
-            || collect_stderr(thread, buf),
-            "request",
-            &req.to_string(),
-        );
+        self.guard.write_line(stdin, "request", &req.to_string());
     }
 
-    /// Read one response line (blocks; the cells' children are bounded).
+    /// Read one response line, bounded by `REQUEST_BOUND`; `None` at end of
+    /// stream or when the line is not JSON.
     fn read_response(&mut self) -> Option<Value> {
-        let mut line = String::new();
-        match self.stdout.read_line(&mut line) {
-            Ok(n) if n > 0 => serde_json::from_str(&line).ok(),
-            _ => None,
-        }
+        let line = self
+            .guard
+            .recv_line(&self.lines, REQUEST_BOUND, "a response line")?;
+        serde_json::from_str(&line).ok()
     }
 
     fn request(&mut self, req: &Value) -> Value {
-        let stdin = self.stdin.as_mut().expect("stdin open");
-        let (thread, buf) = (&mut self.stderr_thread, &self.stderr_buf);
-        child_stdin_report::write_line_or_report_with(
-            stdin,
-            &mut self.child,
-            || collect_stderr(thread, buf),
-            "request",
-            &req.to_string(),
-        );
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read response");
+        self.send(req);
+        let Some(line) = self
+            .guard
+            .recv_line(&self.lines, REQUEST_BOUND, "a response line")
+        else {
+            self.guard.fail("a response line (stdout closed)", None)
+        };
         serde_json::from_str(&line).expect("json response")
     }
 
     fn signal(&self, name: &str) {
         let status = Command::new("kill")
-            .args(["-s", name, &self.child.id().to_string()])
+            .args(["-s", name, &self.guard.id().to_string()])
             .status()
             .expect("run kill");
         assert!(status.success(), "kill -s {name} failed");
     }
 
-    /// Wait for exit, bounded; kill by pid and fail when it does not exit.
+    /// Wait for exit, bounded; the guard kills the child and fails with its
+    /// stderr and `EXIT_BOUND` when it does not exit.
     fn wait_bounded(&mut self) -> std::process::ExitStatus {
-        let deadline = Instant::now() + EXIT_BOUND;
-        loop {
-            if let Some(status) = self.child.try_wait().expect("try_wait") {
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!("mcp did not exit within {EXIT_BOUND:?} of the signal");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        self.guard
+            .wait_exit_bounded(EXIT_BOUND, "mcp to exit after the signal")
     }
 
     /// All of the child's stderr (call after it exited: joins the reader).
     fn stderr_text(&mut self) -> String {
-        if let Some(t) = self.stderr_thread.take() {
-            let _ = t.join();
-        }
-        self.stderr_buf
-            .lock()
-            .map(|b| b.clone())
-            .unwrap_or_default()
-    }
-
-    /// Fail at once, with the exit status and all captured stderr, when the
-    /// child has already exited while a start-up wait is still polling: a
-    /// child that crashed at start-up must not cost the full `STARTUP_BOUND`
-    /// (#4347 L-2, TEST-02).
-    fn fail_if_exited(&mut self, waiting_for: &str) {
-        if let Some(status) = self.child.try_wait().expect("try_wait") {
-            let stderr = self.stderr_text();
-            panic!(
-                "the child exited ({status:?}) while waiting for {waiting_for}; stderr:\n{stderr}"
-            );
-        }
+        self.guard.stderr_final()
     }
 
     /// Wait (bounded) until the child has written `needle` to stderr; fails
-    /// fast if the child exits first.
+    /// fast, with its exit status and stderr, if the child exits first
+    /// (#4347 L-2, TEST-02).
     fn wait_stderr_contains(&mut self, needle: &str) {
-        let deadline = Instant::now() + STARTUP_BOUND;
-        loop {
-            if self.stderr_buf.lock().is_ok_and(|b| b.contains(needle)) {
-                return;
-            }
-            self.fail_if_exited(&format!("{needle:?} on stderr"));
-            assert!(
-                Instant::now() < deadline,
-                "the child never wrote {needle:?} to stderr"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        self.guard.wait_stderr_contains(needle, STARTUP_BOUND);
     }
 
     /// Wait (bounded) for the child to reach the held point; fails fast if
@@ -319,11 +256,12 @@ impl Session {
     fn wait_entered(&mut self, dir: &Path) {
         let deadline = Instant::now() + STARTUP_BOUND;
         while !dir.join("entered").exists() {
-            self.fail_if_exited("the held request");
-            assert!(
-                Instant::now() < deadline,
-                "the child never reached the held request"
-            );
+            if !self.guard.is_running() {
+                self.guard.fail("the held request", None);
+            }
+            if Instant::now() >= deadline {
+                self.guard.fail("the held request", Some(STARTUP_BOUND));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -653,17 +591,17 @@ fn a_fenced_request_released_mid_drain_is_never_acknowledged_4347() {
 fn an_unavailable_stop_handler_refuses_to_start_4347() {
     for failing in ["SIGTERM", "SIGINT", "SIGHUP"] {
         let home = sandbox();
-        let mut child = spawn_mcp(
+        let mut guard = ChildGuard::new(spawn_mcp(
             home.path(),
             &[(
                 "AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL",
                 failing.to_string(),
             )],
             &[],
-        );
+        ));
         // Offer work; a server that started would acknowledge it. A write to
         // an already-exited child may fail: that is the refusal too.
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = guard.take_stdin() {
             let _ = writeln!(
                 stdin,
                 "{}",
@@ -672,26 +610,15 @@ fn an_unavailable_stop_handler_refuses_to_start_4347() {
                     "clientInfo":{"name":"probe4347","version":"1"}}})
             );
         }
-        let deadline = Instant::now() + STARTUP_BOUND;
-        let status = loop {
-            if let Some(st) = child.try_wait().expect("try_wait") {
-                break st;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("mcp kept running with the {failing} handler unavailable");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let status = guard.wait_exit_bounded(
+            STARTUP_BOUND,
+            &format!("mcp to refuse to start with the {failing} handler unavailable"),
+        );
         let mut out = String::new();
-        if let Some(mut o) = child.stdout.take() {
+        if let Some(mut o) = guard.take_stdout() {
             let _ = o.read_to_string(&mut out);
         }
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
-        }
+        let err = guard.stderr_final();
         assert!(
             matches!(status.code(), Some(c) if c != 0),
             "{failing}: must exit non-zero, got {status:?}; stderr: {err}"
@@ -718,7 +645,7 @@ fn an_inherited_ignored_hup_and_int_are_honoured_but_term_still_drains_4347() {
     let alive = s.request(&store_request(4000, "served-after-ignored-signals-4347"));
     assert!(alive.get("error").is_none(), "{alive}");
     assert!(
-        s.child.try_wait().expect("try_wait").is_none(),
+        s.guard.is_running(),
         "an ignored SIGHUP/SIGINT must not stop the server"
     );
     s.signal("TERM");
@@ -738,10 +665,15 @@ fn an_inherited_ignored_hup_and_int_are_honoured_but_term_still_drains_4347() {
 /// Request id for the `i`-th request of a pipelined burst.
 const BURST_BASE_ID: u64 = 100;
 
+/// The memory id a burst request `id` deletes: the one definition of the id
+/// layout, used to build the request and the expected id set (#9906 F3).
+fn burst_memory_id(id: u64) -> String {
+    format!("00000000-0000-4000-8000-{id:012}")
+}
+
 fn burst_delete(id: u64) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
-        "name":"memory_delete","arguments":{
-            "id":format!("00000000-0000-4000-8000-{id:012}")}}})
+        "name":"memory_delete","arguments":{"id":burst_memory_id(id)}}})
 }
 
 /// Requests of one pipelined burst after its leading `memory_delete` (id 2);
@@ -799,11 +731,13 @@ fn tool_acks(map: &HashMap<u64, Value>) -> usize {
     map.keys().filter(|id| **id != 1).count()
 }
 
-/// Wait on the reader's condvar until `done` holds, bounded by `bound`; fail
-/// at once, with the exit status, when the child exits first.
+/// Wait on the reader's condvar until `done` holds, bounded by `bound`. When
+/// the child exits first, or the bound passes, the guard kills and reaps the
+/// child and the panic carries its stderr, the exit or the named deadline
+/// (#9906 F1).
 fn wait_responses(
     responses: &Responses,
-    child: &mut Child,
+    guard: &mut ChildGuard,
     bound: Duration,
     what: &str,
     done: impl Fn(&HashMap<u64, Value>) -> bool,
@@ -812,18 +746,14 @@ fn wait_responses(
     let (lock, cvar) = &**responses;
     let mut map = lock.lock().expect("responses lock");
     while !done(&map) {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            panic!(
-                "the child exited ({status:?}) while waiting for {what}; {} tool calls acknowledged",
-                tool_acks(&map)
-            );
+        let timed_out = Instant::now() >= deadline;
+        if timed_out || !guard.is_running() {
+            // Release the map first: the stdout reader thread needs it to end.
+            drop(map);
+            let bound_named = timed_out.then_some(bound);
+            guard.fail(what, bound_named);
         }
         let now = Instant::now();
-        assert!(
-            now < deadline,
-            "no {what} within {bound:?}; {} tool calls acknowledged",
-            tool_acks(&map)
-        );
         map = cvar
             .wait_timeout(map, RESPONSE_WAKE_SLICE.min(deadline - now))
             .expect("responses lock")
@@ -853,27 +783,16 @@ fn exit_drain_outcome(stderr: &str) -> Vec<&str> {
 /// `memory_delete` rows naming exactly the acknowledged deletes.
 fn burst_round(label: &str, cut: usize) {
     let home = sandbox();
-    let mut child = spawn_mcp(
+    let mut guard = ChildGuard::new(spawn_mcp(
         home.path(),
         &[(
             TEST_FORENSIC_WRITER_DELAY_ENV,
             BURST_WRITER_DELAY_MS.to_string(),
         )],
         &[],
-    );
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut child_stderr = child.stderr.take().expect("stderr");
-    let stderr_buf = Arc::new(Mutex::new(String::new()));
-    let stderr_sink = Arc::clone(&stderr_buf);
-    // Drain stderr while the child runs, so a full pipe can never stall it.
-    let stderr_reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = child_stderr.read_to_string(&mut text);
-        if let Ok(mut buf) = stderr_sink.lock() {
-            buf.push_str(&text);
-        }
-    });
+    ));
+    let mut stdin = guard.take_stdin().expect("stdin");
+    let stdout = BufReader::new(guard.take_stdout().expect("stdout"));
     let responses: Responses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
     let sink = Arc::clone(&responses);
     let reader = std::thread::spawn(move || {
@@ -893,10 +812,8 @@ fn burst_round(label: &str, cut: usize) {
     // Initialize first and wait for the answer: the stop handlers are
     // installed before the loop serves, so from here a signal is a graceful
     // stop (a signal before that has nothing queued to lose).
-    child_stdin_report::write_line_or_report(
+    guard.write_line(
         &mut stdin,
-        &mut child,
-        None,
         "initialize",
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2024-11-05","capabilities":{},
@@ -905,7 +822,7 @@ fn burst_round(label: &str, cut: usize) {
     );
     wait_responses(
         &responses,
-        &mut child,
+        &mut guard,
         STARTUP_BOUND,
         &format!("{label}: the initialize response"),
         |m| m.contains_key(&1),
@@ -930,33 +847,21 @@ fn burst_round(label: &str, cut: usize) {
     });
     wait_responses(
         &responses,
-        &mut child,
+        &mut guard,
         BURST_ACK_BOUND,
         &format!("{label}: {cut} acknowledged tool calls"),
         |m| tool_acks(m) >= cut,
     );
     let acked_at_signal = tool_acks(&responses.0.lock().expect("responses lock"));
     let status = Command::new("kill")
-        .args(["-s", "TERM", &child.id().to_string()])
+        .args(["-s", "TERM", &guard.id().to_string()])
         .status()
         .expect("run kill");
     assert!(status.success(), "kill -s TERM failed");
-    let deadline = Instant::now() + EXIT_BOUND;
-    let exit = loop {
-        if let Some(st) = child.try_wait().expect("try_wait") {
-            break st;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("{label}: mcp did not exit within {EXIT_BOUND:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let exit = guard.wait_exit_bounded(EXIT_BOUND, &format!("{label}: mcp to exit after SIGTERM"));
     let _stdin = writer.join().expect("writer thread");
     reader.join().expect("reader thread");
-    stderr_reader.join().expect("stderr thread");
-    let err = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    let err = guard.stderr_final();
     // The cut is where it says: the signal followed `cut` acknowledgements.
     assert!(
         acked_at_signal >= cut,
@@ -1036,11 +941,6 @@ fn burst_round(label: &str, cut: usize) {
     );
 }
 
-/// The memory id a burst `memory_delete` with request id `id` targets.
-fn burst_memory_id(id: u64) -> String {
-    format!("00000000-0000-4000-8000-{id:012}")
-}
-
 /// B2 (pipelined form) — 120 requests are queued on stdin and SIGTERM lands
 /// at a different point of the burst on every round (after `burst_cut(r)`
 /// acknowledgements), so some request is in flight at the signal. Whatever
@@ -1066,10 +966,6 @@ fn a_late_burst_cut_drains_every_acknowledged_row_within_the_budget_9906() {
     }
 }
 
-/// Prefix of the line `ai-memory mcp` writes with the tier it serves
-/// (`src/mcp/mod.rs::run_mcp_server`).
-const TIER_LINE: &str = "ai-memory: requested tier = ";
-
 /// The tier every child of this file must serve: keyword needs no model, so
 /// start-up never waits on an embedder download (#9906).
 const CHILD_TIER: &str = "keyword";
@@ -1077,7 +973,8 @@ const CHILD_TIER: &str = "keyword";
 /// #9906 — every MCP child of this file serves the keyword tier. The config
 /// file's `tier = "keyword"` alone does not reach `mcp` (its `--tier` has a
 /// clap default that shadows the file, #9913), so the spawn pins the tier on
-/// the command line; this cell is red when it does not.
+/// the command line; this cell is red when it does not. Every cell spawns
+/// through `spawn_mcp`, the one spawn site of this file.
 #[test]
 fn every_mcp_child_of_the_drain_cells_serves_the_keyword_tier_9906() {
     let home = sandbox();
@@ -1086,12 +983,11 @@ fn every_mcp_child_of_the_drain_cells_serves_the_keyword_tier_9906() {
     drop(s.stdin.take());
     let exit = s.wait_bounded();
     let err = s.stderr_text();
-    let tiers: Vec<&str> = err
-        .lines()
-        .filter_map(|l| l.strip_prefix(TIER_LINE))
-        .map(str::trim)
-        .collect();
-    assert_eq!(tiers, [CHILD_TIER], "requested tier lines; stderr:\n{err}");
+    assert_eq!(
+        requested_tiers(&err),
+        [CHILD_TIER],
+        "requested tier lines; stderr:\n{err}"
+    );
     assert_eq!(exit.code(), Some(0), "stdin EOF exit; stderr:\n{err}");
 }
 
@@ -1113,26 +1009,22 @@ fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
         ));
         let dir = barrier_dir(home.path());
         let started = Instant::now();
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let msg = panic_text(|| {
             if wait == "stderr" {
                 s.wait_stderr_contains("never-written-needle-4347");
             } else {
                 s.wait_entered(&dir);
             }
-        }));
+        });
         let elapsed = started.elapsed();
-        let msg = match caught {
-            Ok(()) => panic!("{wait}: the wait returned although the child exited"),
-            Err(p) => p
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_string()))
-                .unwrap_or_default(),
-        };
         println!("L-2 negative check ({wait}): failed after {elapsed:?}: {msg}");
         assert!(
             msg.contains("the child exited"),
             "{wait}: must name the exit, not a timeout: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to start"),
+            "{wait}: must carry the child's stderr: {msg}"
         );
         assert!(
             elapsed < Duration::from_secs(30),
@@ -1141,69 +1033,41 @@ fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
     }
 }
 
-/// #9906 F1 - the short deadline of the failure-path cells below (those cells
-/// only; the real waits keep their long bounds).
-const FAILURE_CELL_DEADLINE: Duration = Duration::from_secs(2);
-
-/// Whether `pid` still names a process (a reaped child does not).
-fn pid_exists(pid: u32) -> bool {
-    let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
-    // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-/// Drive `wait_responses` to a failure against a child that never gets a
-/// request: returns the exact panic text and whether the pid still existed
-/// right after the panic (before the cell's own cleanup).
-fn burst_wait_failure(extra_env: &[(&str, String)], marker: &str) -> (String, bool) {
-    let home = sandbox();
-    let mut child = spawn_mcp(home.path(), extra_env, &[]);
-    let pid = child.id();
-    let seen = Arc::new(Mutex::new(String::new()));
-    let mut pipe = child.stderr.take().expect("stderr pipe");
-    let sink = Arc::clone(&seen);
-    std::thread::spawn(move || {
-        let mut chunk = [0_u8; 1024];
-        while let Ok(n) = pipe.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            sink.lock()
-                .expect("stderr sink")
-                .push_str(&String::from_utf8_lossy(&chunk[..n]));
-        }
-    });
-    let started = Instant::now();
-    while !seen.lock().expect("stderr sink").contains(marker) {
-        assert!(
-            started.elapsed() < STARTUP_BOUND,
-            "the child never wrote {marker:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let responses: Responses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wait_responses(
-            &responses,
-            &mut child,
-            FAILURE_CELL_DEADLINE,
-            "a response that is never sent",
-            |_| false,
-        );
-    }));
-    let alive = pid_exists(pid);
-    let _ = child.kill();
-    let _ = child.wait();
-    let text = match caught {
-        Ok(()) => panic!("the wait returned although nothing was ever answered"),
+/// The panic text of `f`, which must panic.
+fn panic_text(f: impl FnOnce()) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => panic!("the wait returned although it had to fail"),
         Err(p) => p
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_string()))
             .unwrap_or_default(),
-    };
-    (text, alive)
+    }
+}
+
+/// #9906 F1 - the short deadline of the failure-path cells below (those cells
+/// only; the real waits keep their long bounds).
+const FAILURE_CELL_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Drive `wait_responses` to a failure against a child that never gets a
+/// request: returns the exact panic text and whether the pid still existed
+/// right after the panic (before the guard is dropped).
+fn burst_wait_failure(extra_env: &[(&str, String)], marker: &str) -> (String, bool) {
+    let home = sandbox();
+    let mut guard = ChildGuard::new(spawn_mcp(home.path(), extra_env, &[]));
+    let pid = guard.id();
+    guard.wait_stderr_contains(marker, STARTUP_BOUND);
+    let responses: Responses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    let text = panic_text(|| {
+        wait_responses(
+            &responses,
+            &mut guard,
+            FAILURE_CELL_DEADLINE,
+            "a response that is never sent",
+            |_| false,
+        );
+    });
+    (text, pid_exists(pid))
 }
 
 /// #9906 F1 - a burst wait that hits its deadline kills and reaps the child
@@ -1242,4 +1106,40 @@ fn a_burst_wait_whose_child_exited_reports_its_stderr_9906() {
         "the panic must carry the child's stderr: {text}"
     );
     assert!(!alive, "the child must be reaped: {text}");
+}
+
+/// #9906 F1 - the guard reaps by construction: a guard dropped while its child
+/// runs (the path of any panic, including ones added later) kills and reaps it.
+#[test]
+fn dropping_the_guard_kills_and_reaps_a_running_child_9906() {
+    let home = sandbox();
+    let mut guard = ChildGuard::new(spawn_mcp(home.path(), &[], &[]));
+    let pid = guard.id();
+    assert!(guard.is_running(), "the child runs before the drop");
+    assert!(pid_exists(pid), "the pid exists before the drop");
+    drop(guard);
+    assert!(!pid_exists(pid), "the dropped guard must reap its child");
+}
+
+/// #9906 F1 - a request that is never answered fails the request wait with
+/// the child's stderr and the named bound, never a hang.
+#[test]
+fn a_bounded_line_read_that_hits_its_deadline_reports_stderr_and_kills_9906() {
+    let home = sandbox();
+    let mut s = Session::attach(spawn_mcp(home.path(), &[], &[]));
+    let pid = s.guard.id();
+    s.wait_stderr_contains(TIER_LINE);
+    let text = panic_text(|| {
+        let _ = s.guard.recv_line(
+            &s.lines,
+            FAILURE_CELL_DEADLINE,
+            "a response that is never sent",
+        );
+    });
+    assert!(
+        text.contains("no a response that is never sent within 2s")
+            && text.contains("requested tier = keyword"),
+        "bound and stderr named: {text}"
+    );
+    assert!(!pid_exists(pid), "the child must be reaped: {text}");
 }
