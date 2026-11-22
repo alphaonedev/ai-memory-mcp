@@ -2129,12 +2129,11 @@ mod tests {
             let started = std::time::Instant::now();
             let got = loader_verdict(&case.path);
             let elapsed = started.elapsed();
-            let want = match &case.expect {
-                Expect::Accept { .. } => Ok(()),
-                Expect::Refuse(reason) => Err(reason.clone()),
-            };
-            if got != want {
-                wrong.push(format!("{}: got {got:?}, want {want:?}", case.name));
+            if got != case.expect {
+                wrong.push(format!(
+                    "{}: got {got:?}, want {:?}",
+                    case.name, case.expect
+                ));
             }
             if case.name == "100K+ input" && elapsed > OVERSIZE_REFUSAL_CEILING {
                 wrong.push(format!(

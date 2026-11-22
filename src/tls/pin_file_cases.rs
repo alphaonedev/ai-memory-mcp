@@ -76,16 +76,20 @@ pub(crate) fn with_deadline<T: Send + 'static>(
     rx.recv_timeout(ROW_DEADLINE).ok()
 }
 
-/// The runtime loader's verdict on `path` as `Ok(())` or the `{e:#}` text,
-/// bounded by [`ROW_DEADLINE`].
-pub(crate) fn loader_verdict(path: &Path) -> Result<(), String> {
+/// The runtime loader's observed verdict on `path`, in the table's own
+/// shape: `Accept` with the loaded host and pin counts, or `Refuse` with the
+/// `{e:#}` text. A loader that does not return within [`ROW_DEADLINE`] is
+/// `Refuse(DEADLINE_MISS)`.
+pub(crate) fn loader_verdict(path: &Path) -> Expect {
     let path = path.to_path_buf();
-    with_deadline(move || {
-        super::load_peer_fingerprint_map(&path)
-            .map(|_| ())
-            .map_err(|e| format!("{e:#}"))
+    with_deadline(move || match super::load_peer_fingerprint_map(&path) {
+        Ok(pins) => Expect::Accept {
+            hosts: pins.host_count(),
+            pins: pins.pin_count(),
+        },
+        Err(e) => Expect::Refuse(format!("{e:#}")),
     })
-    .unwrap_or_else(|| Err(DEADLINE_MISS.to_string()))
+    .unwrap_or_else(|| Expect::Refuse(DEADLINE_MISS.to_string()))
 }
 
 fn no_entries(p: &Path) -> Expect {

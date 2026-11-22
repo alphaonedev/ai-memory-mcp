@@ -210,7 +210,8 @@ mod tests {
             let runtime = runtime_accepts();
             let loader = loader_verdict(std::path::Path::new(&value));
             let runtime_pass = runtime == Ok(true);
-            if doctor_pass != runtime_pass || doctor_pass != loader.is_ok() {
+            let loader_pass = matches!(loader, Expect::Accept { .. });
+            if doctor_pass != runtime_pass || doctor_pass != loader_pass {
                 disagree.push(format!(
                     "{name}: doctor ({doctor_pass}, {actual:?}) runtime {runtime:?} loader {loader:?}"
                 ));
@@ -239,7 +240,10 @@ mod tests {
         }
         let _cleanup = EnvGuard;
         let fp_file = set_fully_hardened_env();
-        assert_eq!(loader_verdict(fp_file.path()), Ok(()));
+        assert_eq!(
+            loader_verdict(fp_file.path()),
+            Expect::Accept { hosts: 1, pins: 1 }
+        );
         let got = doctor_row_current();
         assert_eq!(
             got,
