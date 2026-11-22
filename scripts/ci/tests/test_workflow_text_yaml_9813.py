@@ -431,6 +431,23 @@ class FileChecks(ReaderCase):
         self.assertEqual(over.stat().st_size, cap + 1)
         self.assert_refusal(self.refused(wt.read_document, over), str(over), None, REASON_TEXTS["OVER_CAP"])
 
+    def test_9817_the_read_cap_is_checked_before_the_bytes_are_decoded(self) -> None:
+        over = self.write(b"\xff" * (wt.MAX_DOCUMENT_BYTES + 1), "over-binary.yml")
+        self.assert_refusal(self.refused(wt.read_document, over), str(over), None, REASON_TEXTS["OVER_CAP"])
+
+    def test_9817_parse_text_caps_the_text_in_utf8_bytes_before_any_other_check(self) -> None:
+        """The cap counts UTF-8 bytes, not characters, and comes first: the over-cap text also holds a tab."""
+        cap = wt.MAX_DOCUMENT_BYTES
+        head = "a: 1\n#"
+        at_cap = head + "x" * (cap - len(head) - 1) + "\n"
+        self.assertEqual(wt.parse_text(at_cap, LABEL), {"a": 1})
+        prefix = "\ta: 1\n#"
+        body_bytes = cap + 1 - len(prefix) - 1
+        wide = prefix + "é" * (body_bytes // 2) + "x" * (body_bytes % 2) + "\n"
+        self.assertEqual(len(wide.encode("utf-8")), cap + 1)
+        self.assertLess(len(wide), cap)
+        self.assert_refusal(self.refused(wt.parse_text, wide, LABEL), LABEL, None, REASON_TEXTS["OVER_CAP"])
+
     def test_9817_invalid_utf8_is_refused_with_its_line(self) -> None:
         path = self.write(b"a: 1\nb: \xff\n")
         self.assert_refusal(self.refused(wt.read_document, path), str(path), 2, REASON_TEXTS["UTF8"])
