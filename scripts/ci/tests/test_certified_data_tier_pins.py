@@ -907,5 +907,209 @@ class TreeMutantTest(unittest.TestCase):
         self.assertEqual(self.scan_tree(), ["y.md:1: history-region-in-unlisted-file"])
 
 
+def expected_line_key(line):
+    """The allowlist key of one full line, spelled out independently of the
+    module: the first 24 hex digits of its sha256, each digit moved onto the
+    letters g..v so the allowlist file holds no digit (#9951 r2)."""
+    return hashlib.sha256(line.encode("utf-8")).hexdigest()[:24].translate(
+        str.maketrans("0123456789abcdef", "ghijklmnopqrstuv"))
+
+
+class FailClosedMutantTest(unittest.TestCase):
+    """Round-2 design call on #9951: both ratchets fail closed by construction.
+    On a line that names the tier (any tier word) every numeric token must be
+    a certified token derived from lib.sh, or the exact full line is listed
+    with a reason; an AGE build is found by what is executed, never by text.
+    Each case is a mutant that survived round 1 or a new mutant per form; the
+    expected findings are written out by hand."""
+
+    def setUp(self):
+        base = os.environ.get("TMPDIR") or str(ROOT / ".local-runs")
+        os.makedirs(base, exist_ok=True)
+        self.tree = Path(tempfile.mkdtemp(prefix="cert-tier-fc-", dir=base))
+        (self.tree / "aaa").mkdir()
+        (self.tree / "aaa" / "ok.md").write_text("PostgreSQL 19.0 + Apache AGE 1.7.0\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tree, ignore_errors=True)
+
+    def plant(self, rel, text):
+        path = self.tree / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(text, bytes):
+            path.write_bytes(text)
+        else:
+            path.write_text(text)
+
+    def scan_tree(self, allowlist=None):
+        return scan(self.tree, SSOT_FIXTURE, allowlist={"lines": {}, "unreadable": {}} if allowlist is None else allowlist)[0]
+
+    # --- the four round-1 survivors --------------------------------------
+    def test_survivor_server_version_num_comparison_9951(self):
+        self.plant("scripts/probe.py", "if server_version_num >= 180000:\n    ok()\n")
+        self.assertEqual(self.scan_tree(), [
+            "scripts/probe.py:1: uncertified-token:180000: if server_version_num >= 180000:"])
+
+    def test_survivor_makefile_conditional_assignment_9951(self):
+        self.plant("deploy/x/Makefile", "PG_MAJOR ?= 18\n")
+        self.assertEqual(self.scan_tree(), ["deploy/x/Makefile:1: uncertified-token:18: PG_MAJOR ?= 18"])
+
+    def test_survivor_stale_line_in_a_formerly_exempt_test_file_9951(self):
+        self.plant("scripts/test/test_ensure_age_extension_6161.py", 'WANT = "PostgreSQL 18.6"\n')
+        self.assertEqual(self.scan_tree(), [
+            'scripts/test/test_ensure_age_extension_6161.py:1: postgres-18,uncertified-token:18.6: WANT = "PostgreSQL 18.6"'])
+
+    def test_survivor_applier_named_only_in_a_comment_9951(self):
+        self.plant("deploy/y/Dockerfile", "\n".join([
+            "FROM scratch",
+            "RUN git clone https://github.com/apache/age.git /src/age \\",
+            " && git -C /src/age checkout c6b043d1c8f4909331b9080d6640b487782fc958 \\",
+            " # python3 /p/apply_age_patch.py --ssot /p/lib.sh --src /src/age",
+            " && make -C /src/age install",
+            "",
+        ]))
+        self.assertEqual(self.scan_tree(), ["deploy/y/Dockerfile:5: age-build-without-patch"])
+
+    # --- one mutant per form of the pin -----------------------------------
+    def test_every_form_of_an_uncertified_pin_is_a_finding_9951(self):
+        forms = {
+            # literal
+            "f/literal.md": ("Runs on PostgreSQL 20 only.\n", ["uncertified-token:20"]),
+            # typed constant whose name carries a non-neutral word
+            "f/typed.rs": ("const PG_FLOOR: u32 = 17;\n", ["uncertified-token:17"]),
+            # alias name
+            "f/alias.py": ("pg_tier_alias = 20\n", ["uncertified-token:20"]),
+            # YAML flow list under a non-version key
+            "f/list.yml": ("  pg_supported: [17, 20]\n", ["uncertified-token:17", "uncertified-token:20"]),
+            # match arm with the value first
+            "f/arm.rs": ('    20 => "postgres",\n', ["uncertified-token:20"]),
+            # a file outside the first directory scanned
+            "zzz/deep/q.toml": ("postgres = 17\n", ["uncertified-token:17"]),
+        }
+        for rel, (text, _) in forms.items():
+            self.plant(rel, text)
+        want = sorted(f"{rel}:1: {','.join(reasons)}: {text.strip()}" for rel, (text, reasons) in forms.items())
+        self.assertEqual(sorted(self.scan_tree()), want)
+
+    def test_certified_tokens_and_untiered_lines_are_clean_9951(self):
+        self.plant("g/clean.md", "\n".join([
+            "PostgreSQL 19 (server_version_num 190000), AGE 1.7.0, pgvector 0.8.7.",
+            "postgresql-19=19.0-2.pgdg13+1 postgresql-19-pgvector=0.8.7-1.pgdg13+2",
+            "AGE commit c6b043d plus 06ce678d74210539705c77e2dc7c9fa861e2a331",
+            "The cache holds 512 entries for 30 seconds.",
+            "",
+        ]))
+        self.assertEqual(self.scan_tree(), [])
+
+    # --- the allowlist ---------------------------------------------------
+    def test_listed_line_passes_once_per_entry_9951(self):
+        line = "Runs on PostgreSQL 20 only."
+        self.plant("h/doc.md", f"{line}\n{line}\n")
+        one = {"lines": {"h/doc.md": [[expected_line_key(line), "DOC"]]}, "unreadable": {}}
+        self.assertEqual(self.scan_tree(one), [f"h/doc.md:2: uncertified-token:20: {line}"])
+        two = {"lines": {"h/doc.md": [[expected_line_key(line), "DOC"]] * 2}, "unreadable": {}}
+        self.assertEqual(self.scan_tree(two), [])
+
+    def test_dead_allowlist_entries_are_findings_9951(self):
+        gone, stale = expected_line_key("no such line"), expected_line_key("PostgreSQL 19.0 + Apache AGE 1.7.0")
+        allow = {
+            "lines": {"aaa/ok.md": [[stale, "DOC"]], "gone.md": [[gone, "DOC"]]},
+            "unreadable": {"aaa/ok.md": "not binary at all"},
+        }
+        self.assertEqual(self.scan_tree(allow), [
+            "aaa/ok.md: unreadable-entry-is-utf8",
+            f"aaa/ok.md: dead-allowlist-entry:{stale}",
+            f"gone.md: dead-allowlist-entry:{gone}",
+        ])
+
+    def test_unknown_reason_is_a_finding_9951(self):
+        line = "Runs on PostgreSQL 20 only."
+        self.plant("h/doc.md", f"{line}\n")
+        allow = {"lines": {"h/doc.md": [[expected_line_key(line), "BECAUSE"]]}, "unreadable": {}}
+        self.assertEqual(self.scan_tree(allow), [f"h/doc.md: allowlist-entry-bad-reason:{expected_line_key(line)}"])
+
+    def test_listed_binary_still_has_its_lines_scanned_9951(self):
+        self.plant("docs/logo.jpg", b"\xff\xd8\xffPostgreSQL 18.6\n")
+        allow = {"lines": {}, "unreadable": {"docs/logo.jpg": "logo image (JPEG)"}}
+        self.assertEqual(self.scan_tree(allow), ["docs/logo.jpg:1: postgres-18,uncertified-token:18.6: \xff\xd8\xffPostgreSQL 18.6"])
+
+    def test_allowlist_type_has_no_whole_file_field_9951(self):
+        self.assertEqual(set(load_allowlist()), {"lines", "unreadable"})
+        for rel, entries in load_allowlist()["lines"].items():
+            self.assertIsInstance(entries, list, rel)
+            for entry in entries:
+                self.assertEqual(len(entry), 2, rel)
+                self.assertRegex(entry[0], r"^[g-v]{24}$", rel)
+                self.assertIn(entry[1], ALLOW_REASONS, rel)
+
+    # --- the ledger: an AGE build is what is executed ---------------------
+    def test_sixth_builder_without_the_applier_9951(self):
+        self.plant("infra/x/build.sh", "\n".join([
+            "#!/bin/sh",
+            "git clone https://github.com/apache/age.git /opt/age",
+            "cd /opt/age",
+            "make PG_CONFIG=/usr/bin/pg_config install",
+            "",
+        ]))
+        self.assertEqual(self.scan_tree(), ["infra/x/build.sh:4: age-build-without-patch"])
+
+    def test_short_sha_checkout_then_bare_make_9951(self):
+        self.plant("b/n5.sh", "#!/bin/bash\nset -e\ngit -C /opt/src checkout c6b043d1\nmake -j4\n")
+        self.assertEqual(self.scan_tree(), ["b/n5.sh:4: age-build-without-patch"])
+
+    def test_applier_in_an_echo_string_does_not_patch_9951(self):
+        self.plant("b/echo.sh", "#!/bin/sh\necho python3 apply_age_patch.py\nmake -C /src/age install\n")
+        self.assertEqual(self.scan_tree(), ["b/echo.sh:3: age-build-without-patch"])
+
+    def test_workflow_run_block_builder_9951(self):
+        self.plant(".github/workflows/w.yml", "\n".join([
+            "jobs:",
+            "  b:",
+            "    steps:",
+            "      - run: |",
+            "          git clone https://github.com/apache/age.git age-src",
+            "          make -C age-src install",
+            "",
+        ]))
+        self.assertEqual(self.scan_tree(), [".github/workflows/w.yml:6: age-build-without-patch"])
+
+    def test_python_subprocess_builder_9951(self):
+        self.plant("tools/b.py", "\n".join([
+            "import subprocess",
+            "# apply_age_patch.py is named only here",
+            'subprocess.run(["make", "-C", "/src/age", "install"], check=True)',
+            "",
+        ]))
+        self.assertEqual(self.scan_tree(), ["tools/b.py:3: age-build-without-patch"])
+
+    def test_patched_builders_of_every_kind_are_clean_9951(self):
+        apply = "python3 /p/apply_age_patch.py --ssot /p/lib.sh --src /src/age"
+        self.plant("k/Dockerfile", f"FROM scratch\nRUN git clone https://github.com/apache/age.git /src/age \\\n && {apply} \\\n && make -C /src/age install\n")
+        self.plant("k/b.sh", f"#!/bin/sh\nset -e\ncd /src/age\n{apply}\nmake PG_CONFIG=/usr/bin/pg_config install\n")
+        self.plant("k/w.yml", f"steps:\n  - run: |\n      {apply}\n      make -C /src/age install\n")
+        self.plant("k/b.py", "\n".join([
+            "import subprocess",
+            'subprocess.run(["python3", "/p/apply_age_patch.py", "--ssot", "/p/lib.sh", "--src", "/src/age"], check=True)',
+            'subprocess.run(["make", "-C", "/src/age", "install"], check=True)',
+            "",
+        ]))
+        self.assertEqual(self.scan_tree(), [])
+
+    def test_applier_and_its_tests_are_not_builders_9951(self):
+        # Prose, docstrings and argv that never run make: the text names the
+        # AGE commit and a make line, but nothing executes a build (#9981).
+        self.plant("deploy/docker-1461/provision/apply_age_patch.py", "\n".join([
+            '"""Run between the checkout of AGE_SOURCE_COMMIT and make PG_CONFIG=/x install."""',
+            "import subprocess",
+            'subprocess.run(["git", "apply", "-"], check=True)',
+            "",
+        ]))
+        self.plant("scripts/test/test_x.py", "\n".join([
+            "BUILD = 'git checkout c6b043d1c8f4909331b9080d6640b487782fc958 && make -j4 install'",
+            "",
+        ]))
+        self.assertEqual(self.scan_tree(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
