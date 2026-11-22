@@ -715,6 +715,8 @@ jobs:
           done
           skip_out="${RUNNER_TEMP:-.}/cargo-skip.out"
           : > "$skip_out"
+          judge_out="${RUNNER_TEMP:-.}/answer-judge.out"
+          : > "$judge_out"
           if [ "$trusted" != "true" ]; then
             cargo_skip_reason="trusted-classifier-missing-in-base-fail-closed cargo_skip-rules"
           elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
@@ -724,15 +726,25 @@ jobs:
             # the reason (answer_shape.py, loaded from the merge-base tree with
             # the decider). No grep, tr, sed or wc computes a reason here: their
             # byte handling differs between BSD (macOS) and GNU (hosted Linux)
-            # userland. Exit 0 prints the three normalised lines, exit 1 prints
-            # one fixed token, any other exit is a checker-error RUN.
+            # userland. Exit 0 prints the three normalised lines and nothing else, exit 1
+            # prints one fixed token and nothing else, every other exit code (2 included,
+            # whatever it prints) is a checker-error RUN.
             shape_rc=0
-            shape_out=$(python3 -I "$trust_impact/cargo_skip.py" --judge-answer "$skip_out") || shape_rc=$?
-            if [ "$shape_rc" = "0" ]; then
-              shape_docs=""; shape_skip=""; shape_reason=""
-              { IFS= read -r shape_docs || :; IFS= read -r shape_skip || :; IFS= read -r shape_reason || :; } <<< "$shape_out"
-              # An accept must hold the three keys in order and a non-empty reason; a checker
-              # that exits 0 with anything else is a checker-error RUN, never a skip.
+            python3 -I "$trust_impact/cargo_skip.py" --judge-answer "$skip_out" > "$judge_out" || shape_rc=$?
+            # The answer is read from a file, line by line, and the lines are counted: a
+            # command substitution would drop trailing blank lines and hide an extra one.
+            shape_lines=0; shape_docs=""; shape_skip=""; shape_reason=""
+            while IFS= read -r shape_line || [ -n "$shape_line" ]; do
+              shape_lines=$((shape_lines + 1))
+              case "$shape_lines" in
+                1) shape_docs=$shape_line ;;
+                2) shape_skip=$shape_line ;;
+                3) shape_reason=$shape_line ;;
+              esac
+            done < "$judge_out"
+            if [ "$shape_rc" = "0" ] && [ "$shape_lines" = "3" ]; then
+              # An accept is exit 0 with exactly three lines: the three keys in order and a
+              # non-empty reason. Anything else is a checker-error RUN, never a skip.
               if [ "${shape_docs#docs_only=}" != "$shape_docs" ] \
                 && [ "${shape_skip#cargo_skip=}" != "$shape_skip" ] \
                 && [ -n "${shape_reason#cargo_skip_reason=}" ] \
@@ -743,9 +755,9 @@ jobs:
               else
                 reason_why="checker-error"
               fi
-            elif [ "$shape_rc" = "1" ]; then
-              case "$shape_out" in
-                extra-line|not-printable-ascii|empty|over-cap-300|blank-only) reason_why="$shape_out" ;;
+            elif [ "$shape_rc" = "1" ] && [ "$shape_lines" = "1" ]; then
+              case "$shape_docs" in
+                extra-line|not-printable-ascii|empty|over-cap-300|blank-only) reason_why="$shape_docs" ;;
                 *) reason_why="checker-error" ;;
               esac
             else

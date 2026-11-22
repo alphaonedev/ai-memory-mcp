@@ -1503,6 +1503,37 @@ class CiClassifyReasonRuns(ClsHarness):
         self.check_judge_rows()
 
 
+JUDGED_START = "# #9263 / #9815: ONE byte test in Python judges the answer"
+JUDGED_END_PREV = 'reason_why="checker-error"'
+# The one line of the judged part that names a step's own output variable.
+JUDGED_OUT_CI = "cargo_skip_reason=${shape_reason#cargo_skip_reason=}"
+JUDGED_OUT_COV = "reason=${shape_reason#cargo_skip_reason=}"
+
+
+class JudgedPartsEqual(unittest.TestCase):
+    """The judged part of the two classify steps is the same text (message-not-from-state)."""
+
+    @staticmethod
+    def judged_part(body: str):
+        lines = body.splitlines()
+        first = next(i for i, ln in enumerate(lines) if ln.strip().startswith(JUDGED_START))
+        start_indent = len(lines[first]) - len(lines[first].lstrip())
+        for i in range(first + 1, len(lines)):
+            indent = len(lines[i]) - len(lines[i].lstrip())
+            if (lines[i].strip() == "fi" and indent == start_indent
+                    and lines[i - 1].strip() == JUDGED_END_PREV):
+                return [ln.strip() for ln in lines[first:i + 1]]
+        raise AssertionError("the judged part has no end")
+
+    def test_the_judged_parts_are_byte_equal_apart_from_the_output_variable(self):
+        ci = self.judged_part(run_body(find_step("classify", "- id: cls", CI_WORKFLOW)))
+        cov = self.judged_part(run_body(find_step("classify", "- id: cls")))
+        self.assertEqual(cov.count(JUDGED_OUT_COV), 1, "the coverage step names its variable once")
+        self.assertEqual(ci.count(JUDGED_OUT_CI), 1, "the ci step names its variable once")
+        mapped = [JUDGED_OUT_CI if ln == JUDGED_OUT_COV else ln for ln in cov]
+        self.assertEqual(ci, mapped)
+
+
 # The byte test answer_shape.py, called as the steps call it. Hand-written columns:
 # (label, answer bytes, exit code, stdout). Exit 0 prints the three normalised lines,
 # exit 1 prints the one fixed reason token.
