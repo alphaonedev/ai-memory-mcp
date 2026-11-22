@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Prune stale entries of a self-hosted runner's own TMPDIR at job start (#8634).
+"""Clear a self-hosted runner's own TMPDIR at the job boundary (#8634, #9820).
 
-Removes ONLY direct entries of one directory whose own mtime (lstat, never a
-symlink target) is older than MAX_AGE_SECS. An old directory goes whole,
-whatever its children's mtimes. Symlinks are unlinked, never followed. Nothing
-outside that directory is touched, so a sibling ``runner-N`` directory is safe.
+Removes ONLY direct entries of one directory. ``--mode job-end`` (the last step of a job, ``if: always()``)
+removes every entry; ``--mode job-start`` (first step after checkout, for a job whose end step never ran) keeps
+an entry whose own mtime (lstat, never a symlink target) is within JOB_START_GRACE_SECS, presumed owned by a
+live writer. The clear is bound to the job boundary, never to polling for an idle runner. An entry whose
+removal fails with EPERM or EACCES and that carries an append-only or immutable flag has the flag cleared
+(descriptor-relative, never through a symlink, never on a non-directory with more than one link) and the
+removal is retried once; an owned directory without owner rwx is given owner rwx once and the removal retried.
+An entry named ``dotnet-diagnostic-<pid>-...`` or ``clr-debug-pipe-<pid>-...`` that is a socket or a FIFO
+and whose pid is a live process is kept in both modes (the runner's own .NET diagnostic endpoint). A removed
+directory goes whole, whatever its children's mtimes. Symlinks are unlinked, never followed. Nothing
+outside that directory is touched, so a sibling ``runner-N`` directory is safe. The directory is either
+``<runner root>/runner-<digits>`` (Linux node) or ``<layout root>/<runner folder>/_tmp`` (macOS node), and in
+the second form the runner folder must be the one RUNNER_FOLDER_BY_NAME names for this job's RUNNER_NAME.
+
+Exit codes: 0 cleared (or, at job start, a refusal or a counted failure with its ``::warning``); 3
+(EXIT_NOT_CLEARED) at job end when the TMPDIR is not cleared: every refusal and every counted failure there
+prints one ``::error`` annotation with the reason and fails the step, so the job says why; 1 an internal error.
 
 The directory is PROVEN, by file identity and not by path text, to be this
 runner's own ``<runner root>/runner-<digits>``: TMPDIR is opened once
@@ -15,13 +28,16 @@ runner's own ``<runner root>/runner-<digits>``: TMPDIR is opened once
 named constant with the run that confirmed it), the last component must match
 RUNNER_DIR_PATTERN, and every later check and every deletion goes through that
 one descriptor. Anything it cannot prove ends in a named refusal (nothing
-deleted; the reason goes to stderr and to a ``::warning`` annotation on stdout,
-and the step still exits 0 so the rest of the job runs): TMPDIR unset, empty, relative, missing, a
+deleted; the reason goes to stderr and to one annotation on stdout: at job start a
+``::warning`` and exit 0 so the rest of the job runs, at job end an ``::error`` and exit 3): TMPDIR unset,
+empty, relative, missing, a
 symlink, not a directory, changed while opened, a forbidden path (``/``,
 ``/tmp``, the home directory, the workspace, the working directory), not owned
 by the current user, not named runner-<digits>, outside the allowed roots,
 containing the home directory or the workspace, resolving (by the kernel)
-elsewhere than its normalized path; an allowed root that is relative or ``/``;
+elsewhere than its normalized path; a ``_tmp`` whose runner folder matches no
+layout, was renamed while it was opened, or is not the folder of RUNNER_NAME (or RUNNER_NAME is unset);
+a TMPDIR that carries an immutable or append-only flag; an allowed root that is relative or ``/``;
 an interpreter older than MIN_PYTHON; a mount id of TMPDIR that cannot be read
 (Linux); a platform where one of the descriptor-relative calls does not work.
 
@@ -34,8 +50,9 @@ os.scandir, os.unlink, os.rmdir); the refusal names the first call that fails.
 The probe removes what it made, also under ``--dry-run``; a probe it cannot
 remove is named on stderr (``probe directory left in place``).
 
-A per-entry failure is reported and counted, never fatal: exit 0 with
-``pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>``. A directory
+A per-entry failure is reported and counted and never stops the other entries:
+``pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>`` and one annotation with the count (job start:
+``::warning``, exit 0; job end: ``::error``, exit 3). A directory
 on another device, or (Linux) on another mount than TMPDIR (the ``mnt_id`` of
 ``/proc/self/fdinfo/<fd>``, so a same-device bind mount is caught too), is
 skipped and reported, never entered; a mount id that cannot be read is a skip
@@ -61,6 +78,12 @@ import sys
 MIN_PYTHON = (3, 12)
 EXIT_OK = 0
 EXIT_ERROR = 1
+EXIT_NOT_CLEARED = 3  # PR 9822 r1: job end that is not cleared fails the step and says why (one ::error)
+MODE_OPTION = "--mode"
+MODE_JOB_START = "job-start"
+MODE_JOB_END = "job-end"
+LEVEL_WARNING = "warning"
+LEVEL_ERROR = "error"
 PROG = "prune_runner_tmp"
 VERSION_REFUSAL_MAX_CHARS = 1000  # workflow_annotation.MAX_ANNOTATION_CHARS: the whole line, escapes included
 VERSION_REFUSAL_CUT_MARK = "..."  # workflow_annotation.ANNOTATION_CUT_MARK
@@ -103,21 +126,45 @@ def version_text(text):
     return "".join(pieces)
 
 
-def version_refusal_annotation(reason):
+def version_refusal_annotation(reason, level=LEVEL_WARNING):
     """The version refusal's annotation, byte-equal to the shared module's ``annotation``/``render`` line, built without it."""
-    # the fixed text is annotation("warning", render("{prog}: refused: {reason}", ...), title=f"{PROG} refused")
-    line = "::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: " + version_text(reason)
+    # the fixed text is annotation(level, render("{prog}: refused: {reason}", ...), title=f"{PROG} refused")
+    line = "::" + level + " title=prune_runner_tmp refused::prune_runner_tmp: refused: " + version_text(reason)
     if len(line) > VERSION_REFUSAL_MAX_CHARS:
         line = line[: VERSION_REFUSAL_MAX_CHARS - len(VERSION_REFUSAL_CUT_MARK)] + VERSION_REFUSAL_CUT_MARK
     return line
 
 
+def requested_mode(argv):
+    """The ``--mode`` value of ``argv`` as argparse takes it (the last one wins), read before argparse runs.
+
+    The version and load refusals run before the parser can; they need the mode for their level and exit code.
+    Anything but an exact ``job-end`` is job start (the default), so a refusal there stays a warning.
+    """
+    mode = MODE_JOB_START
+    argv = list(argv)
+    for index, arg in enumerate(argv):
+        if arg == "--":
+            break
+        if arg == MODE_OPTION and index + 1 < len(argv):
+            mode = argv[index + 1]
+        elif arg.startswith(MODE_OPTION + "="):
+            mode = arg[len(MODE_OPTION) + 1:]
+    return mode
+
+
+def refusal_outcome(job_end):
+    """(annotation level, exit code) of a refusal: job end fails the step with an error, job start warns."""
+    return (LEVEL_ERROR, EXIT_NOT_CLEARED) if job_end else (LEVEL_WARNING, EXIT_OK)
+
+
 # The floor check runs before the shared module is loaded and before any name lookup but sys (ruling 598d069e):
 # below MIN_PYTHON nothing else of this file runs.
 if __name__ == "__main__" and python_refusal(sys.version_info) is not None:
+    LEVEL, CODE = refusal_outcome(requested_mode(sys.argv[1:]) == MODE_JOB_END)
     sys.stderr.write(f"{PROG}: refused: {python_refusal(sys.version_info)}\n")
-    sys.stdout.write(version_refusal_annotation(python_refusal(sys.version_info)) + "\n")
-    sys.exit(EXIT_OK)
+    sys.stdout.write(version_refusal_annotation(python_refusal(sys.version_info), LEVEL) + "\n")
+    sys.exit(CODE)
 
 SHARED_MODULE_FILE = "workflow_annotation.py"
 SHARED_MODULE_USED = ("safe_value", "render", "join", "annotation", "log_line")  # every name this script takes from it
@@ -158,39 +205,66 @@ wa, LOAD_FAILURE = load_shared_module(globals().get("__file__"))
 safe_text = getattr(wa, "safe_value", None)  # the tests and the call sites below use it as a module attribute
 
 
-def load_refused(out, err):
+def load_refused(out, err, job_end=False):
     """The load refusal: one fixed stderr line and one fixed annotation, both built without the shared module.
 
-    It mirrors the version refusal (exit 0, not counted, nothing pruned): a sibling that cannot be loaded is a
-    broken checkout, not a runner that could not be proven safe.
+    It mirrors the version refusal (not counted, nothing pruned): a warning with exit 0 at job start, an error
+    with exit 3 at job end, where the TMPDIR stays uncleared and the job must say so.
     """
+    level, code = refusal_outcome(job_end)
     print(f"{PROG}: refused: shared module {SHARED_MODULE_FILE} next to the script cannot be loaded ({LOAD_FAILURE})",
           file=err)
-    print("::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: shared module workflow_annotation.py"
-          " next to the script cannot be loaded", file=out)
+    print("::" + level + " title=prune_runner_tmp refused::prune_runner_tmp: refused: shared module"
+          " workflow_annotation.py next to the script cannot be loaded", file=out)
     out.flush()
-    return EXIT_OK
+    return code
 
 
 if __name__ == "__main__" and wa is None:
-    sys.exit(load_refused(sys.stdout, sys.stderr))
+    sys.exit(load_refused(sys.stdout, sys.stderr, requested_mode(sys.argv[1:]) == MODE_JOB_END))
 
 
-def refusal_annotation(reason):
-    """The workflow annotation for a refusal; ``reason`` is the raw text (a ``Refusal`` gives its ``raw``)."""
+def refusal_annotation(reason, level=LEVEL_WARNING, context=None):
+    """The workflow annotation for a refusal; ``reason`` is the raw text (a ``Refusal`` gives its ``raw``).
+
+    ``context`` (``refusal_context``, #9876 N1) follows the reason. When the line would pass the annotation cap,
+    the reason is cut, never the context, so the layout, owner and entry stay in every refusal line.
+    """
     raw = getattr(reason, "raw", reason)
-    return wa.annotation("warning", wa.render("{prog}: refused: {reason}", prog=PROG, reason=raw), title=f"{PROG} refused")
+    if context is None:
+        return wa.annotation(level, wa.render("{prog}: refused: {reason}", prog=PROG, reason=raw),
+                             title=f"{PROG} refused")
+    reason_text = wa.render("{reason}", reason=raw)
+    head = wa.annotation(level, wa.render("{prog}: refused: ", prog=PROG), title=f"{PROG} refused")
+    room = MAX_ANNOTATION_CHARS - len(head) - len(context)
+    if len(reason_text) > room:
+        reason_text = wa.render("{reason}" + ANNOTATION_CUT_MARK,
+                                reason=wa.SafeText(reason_text[:max(room - len(ANNOTATION_CUT_MARK), 0)]))
+    return wa.annotation(level, wa.render("{prog}: refused: {reason}{context}", prog=PROG, reason=reason_text,
+                                          context=context), max_chars=MAX_ANNOTATION_CHARS, title=f"{PROG} refused")
 
 
 import argparse  # noqa: E402  (the floor check above must run before anything newer is needed)
 import errno  # noqa: E402
+import fcntl  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import stat  # noqa: E402
+import struct  # noqa: E402
 import time  # noqa: E402
 
-SECS_PER_DAY = 86400
-MAX_AGE_SECS = SECS_PER_DAY
+# #9820: the clear is bound to the JOB BOUNDARY, never to polling for an idle runner (f1 runners go from one job
+# to the next in 2 seconds, a 3-second poll never fired). Two modes, both run by a step of the job itself:
+#   job-end   (``if: always()`` last step): nothing is kept, every entry of the runner's own TMPDIR goes.
+#   job-start (first step after checkout, covers a cancelled or lost job whose end step never ran): an entry
+#             touched within JOB_START_GRACE_SECS is presumed owned by a live writer and kept; the next
+#             boundary removes it.
+# decision: job-start plus job-end steps over polling an idle runner or a one-day age cut, because the runner
+# has no event a poll can see in 2 seconds, and a one-day cut left up to 60 GiB a day in place.
+# MODE_JOB_START and MODE_JOB_END are defined above the version floor check, which needs them for its exit code.
+MODES = (MODE_JOB_START, MODE_JOB_END)
+JOB_START_GRACE_SECS = 30
+GRACE_SECS_BY_MODE = {MODE_JOB_START: JOB_START_GRACE_SECS, MODE_JOB_END: 0}
 
 # Confirmed runner roots (ruling f23a9ae4). A root is added only with the run
 # whose prune-facts line shows a real runner TMPDIR under it; a guessed root was
@@ -199,6 +273,22 @@ MAX_AGE_SECS = SECS_PER_DAY
 # refuses visibly and the job continues.
 F2_RUNNER_ROOT = "/ai-scratch/runner-tmp"  # confirmed: runs 43768137071, 43768136935, 43768136967 (runner-1, -3, -4)
 ALLOWED_ROOTS = (F2_RUNNER_ROOT,)
+# macOS node (f1) layout: TMPDIR is ``<F1_VOLUME_RUNNER_ROOT>/<runner folder>/_tmp``. Written out 2026-11-22 from
+# the TMPDIR= line (read only) of each of the three live f1 runner .env files: runner f1-macos-fed uses folder fed,
+# f1-macos-fed-2 uses fed2 and f1-macos-fed-3 uses fed3 (PR 9822 r1, code HIGH-3, security M1). No other f1
+# layout is live; a TMPDIR under any other root is the refusal not_runner_folder (exit 3 at job end).
+F1_VOLUME_RUNNER_ROOT = "/Volumes/f1dev/rt"
+RUNNER_FOLDER_LEAF = "_tmp"
+RUNNER_FOLDER_LAYOUTS = (
+    (F1_VOLUME_RUNNER_ROOT, re.compile(r"fed[0-9]*", re.ASCII)),
+)
+# Security M3: the runner folder is bound to the job's own runner. RUNNER_NAME (set by the runner for every step)
+# must name the folder TMPDIR is in, so a job of one runner never clears a sibling runner's _tmp.
+RUNNER_NAME_ENV = "RUNNER_NAME"
+RUNNER_FOLDER_BY_NAME = {"f1-macos-fed": "fed", "f1-macos-fed-2": "fed2", "f1-macos-fed-3": "fed3"}
+# LOW-2: a .NET runner endpoint of a live process (the runner's own diagnostic socket or debug pipe) is kept.
+RUNNER_ENDPOINT_PATTERN = re.compile(r"(?:dotnet-diagnostic|clr-debug-pipe)-([0-9]{1,10})-.*", re.ASCII | re.DOTALL)
+MIN_ENDPOINT_PID = 2  # pid 0 names the process group and pid 1 is init: never a runner endpoint owner
 MAX_TREE_DEPTH = 10000  # directory levels below a top-level entry; deeper = one counted failure
 MAX_TREE_ENTRIES = 5_000_000  # entries under one top-level entry; more = one counted failure
 RUNNER_DIR_PATTERN = re.compile(r"runner-[0-9]+")
@@ -209,6 +299,17 @@ MAX_ANNOTATION_NAMES = 5  # names listed in the counted-failures annotation
 MAX_ANNOTATION_NAME_CHARS = 120  # raw characters of one name before it is cut
 MAX_ANNOTATION_CHARS = 1000  # the whole annotation line, escapes included
 ANNOTATION_CUT_MARK = "..."
+# #9876 N1: the context every refusal and failed annotation carries (layout row, owner, entry). Each word below
+# stands for a state that has no path, uid or errno to print.
+LAYOUT_NONE = "none"  # TMPDIR names no allowed layout
+RUNNER_UNSET = "unset"  # RUNNER_NAME unset or empty in a macOS layout row
+OWNER_UNSET = "unset"  # TMPDIR unset or empty: nothing to lstat
+OWNER_RELATIVE = "relative"  # TMPDIR not absolute: never looked up
+OWNER_INVALID = "invalid"  # TMPDIR holds a NUL byte: no path the kernel can look up
+ENTRY_UNSET = "unset"
+ENTRY_EMPTY = "empty"
+NO_ERRNO = "none"  # a failure that carries no errno (a place not entered, a tree too large)
+UNKNOWN_ERRNO = "EUNKNOWN"  # an errno number the errno module does not name
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 FACTS_PREFIX = "prune-facts:"
 SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
@@ -254,6 +355,10 @@ REFUSAL_REASONS = {
     "forbidden": "TMPDIR is a forbidden path: {path}",
     "not_owner": "TMPDIR is not owned by the current user: {path}",
     "not_runner_dir": "TMPDIR is not named runner-<digits>: {name}",
+    "not_runner_folder": "TMPDIR is not <root>/<runner folder>/_tmp of an allowed layout: {path}",
+    "runner_unset": "RUNNER_NAME is unset or empty; the runner folder cannot be bound: {path}",
+    "runner_unbound": "TMPDIR folder {folder} is not the folder of runner {runner}: {path}",
+    "tmpdir_flagged": "TMPDIR carries an immutable or append-only flag: {path}",
     "outside_roots": "TMPDIR is outside the allowed roots {roots}: {path}",
     "contains": "TMPDIR contains the home directory or the workspace: {path}",
 }
@@ -328,22 +433,100 @@ def refuse(key, **fields):
     return refusal
 
 
-def failed_annotation(count, names):
-    """The one ``::warning`` line for ``count`` entries that could not be removed; None when ``count`` is 0.
+class FailedEntry:
+    """One failed entry as the annotation names it (#9876 N1): its name, its owner and the errno of its failure.
 
-    ``names`` are the first MAX_ANNOTATION_NAMES failed names in sorted order. Every name goes
+    ``owner`` is the entry's lstat uid as text, or the errno name when that lstat fails; ``errno_name`` is the
+    errno name of the failure, or NO_ERRNO for a failure that carries none (a place not entered, a tree too large).
+    """
+
+    __slots__ = ("name", "owner", "errno_name")
+
+    def __init__(self, name, owner, errno_name):
+        self.name = name
+        self.owner = owner
+        self.errno_name = errno_name
+
+
+def errno_token(code):
+    """The errno name of ``code`` (``EACCES``); NO_ERRNO for None, UNKNOWN_ERRNO for a number errno does not name."""
+    if code is None:
+        return NO_ERRNO
+    return errno.errorcode[code] if code in errno.errorcode else UNKNOWN_ERRNO
+
+
+def cut_value(text):
+    """``text`` cut at MAX_ANNOTATION_NAME_CHARS raw characters (the cut marked), escaped, as ``SafeText``."""
+    text = str(text)
+    cut = len(text) > MAX_ANNOTATION_NAME_CHARS
+    return wa.render("{text}" + (ANNOTATION_CUT_MARK if cut else ""), text=text[:MAX_ANNOTATION_NAME_CHARS])
+
+
+def owner_token(path, dir_fd=None):
+    """The owner of ``path`` (not followed) as text: its uid, the errno name when lstat fails, or OWNER_INVALID."""
+    try:
+        return str(os.lstat(path, dir_fd=dir_fd).st_uid)
+    except OSError as exc:
+        return errno_token(exc.errno)
+    except ValueError:  # an embedded NUL: no path the kernel can look up
+        return OWNER_INVALID
+
+
+def layout_row(raw, environ):
+    """The layout row ``raw`` (TMPDIR as given) names, read from the path alone (#9876 N1).
+
+    ``linux:<root>/runner-<n>`` for a runner directory directly under an allowed root,
+    ``macos:<root>/<folder>/_tmp runner=<RUNNER_NAME>`` for the leaf of an allowed runner-folder layout
+    (``runner=unset`` when RUNNER_NAME is unset or empty), and LAYOUT_NONE for every other value.
+    """
+    if not raw or not os.path.isabs(raw):
+        return LAYOUT_NONE
+    path = os.path.normpath(raw)
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    if parent in ALLOWED_ROOTS and RUNNER_DIR_PATTERN.fullmatch(name):
+        return wa.render("linux:{path}", path=cut_value(path))
+    if name == RUNNER_FOLDER_LEAF:
+        folder_root, folder = os.path.dirname(parent), os.path.basename(parent)
+        for root, folder_pattern in RUNNER_FOLDER_LAYOUTS:
+            if folder_root == root and folder_pattern.fullmatch(folder):
+                runner = environ.get(RUNNER_NAME_ENV) or RUNNER_UNSET
+                return wa.render("macos:{path} runner={runner}", path=cut_value(path), runner=cut_value(runner))
+    return LAYOUT_NONE
+
+
+def refusal_context(raw, environ):
+    """The ``(layout=... owner=... entry=...)`` suffix of a refusal, computed from TMPDIR as given (#9876 N1)."""
+    if raw is None:
+        owner, entry = OWNER_UNSET, ENTRY_UNSET
+    elif raw == "":
+        owner, entry = OWNER_UNSET, ENTRY_EMPTY
+    elif not os.path.isabs(raw):
+        owner, entry = OWNER_RELATIVE, cut_value(raw)
+    else:
+        owner, entry = owner_token(raw), cut_value(raw)
+    return wa.render(" (layout={layout} owner={owner} entry={entry})", layout=layout_row(raw, environ),
+                     owner=owner, entry=entry)
+
+
+def failed_annotation(count, entries, level=LEVEL_WARNING, layout=LAYOUT_NONE):
+    """The one ``::warning`` line (``::error`` at job end) for ``count`` entries that could not be removed;
+    None when ``count`` is 0.
+
+    ``entries`` are the first MAX_ANNOTATION_NAMES ``FailedEntry`` rows in name order; each is named with its owner
+    and errno, and ``layout`` (``layout_row``) names the layout of the TMPDIR (#9876 N1). Every name goes
     through ``safe_text`` (findings L4, D-L1), so the only ``::`` in the line is the command's own.
     """
     if count <= 0:
         return None
     shown = []
-    for name in list(names)[:MAX_ANNOTATION_NAMES]:
-        cut = len(name) > MAX_ANNOTATION_NAME_CHARS
-        shown.append(wa.render("{name}" + (ANNOTATION_CUT_MARK if cut else ""), name=name[:MAX_ANNOTATION_NAME_CHARS]))
-    message = wa.render("{prog}: failed={count} not removed: {names}", prog=PROG, count=count, names=wa.join(", ", shown))
+    for entry in list(entries)[:MAX_ANNOTATION_NAMES]:
+        shown.append(wa.render("{name} (owner={owner} errno={errno_name})", name=cut_value(entry.name),
+                               owner=entry.owner, errno_name=entry.errno_name))
+    message = wa.render("{prog}: failed={count} layout={layout} not removed: {names}", prog=PROG, count=count,
+                        layout=layout, names=wa.join(", ", shown))
     if count > MAX_ANNOTATION_NAMES:
         message = wa.render("{message} (list cut at {limit} of {count})", message=message, limit=MAX_ANNOTATION_NAMES, count=count)
-    return wa.annotation("warning", message, max_chars=MAX_ANNOTATION_CHARS, title=f"{PROG} failed")
+    return wa.annotation(level, message, max_chars=MAX_ANNOTATION_CHARS, title=f"{PROG} failed")
 
 
 def file_id(info):
@@ -461,22 +644,70 @@ def prove_runner_dir(dir_fd, info, path, known_roots, roots, environ):
     if info.st_uid != os.geteuid():
         raise refuse("not_owner", path=path)
     name = os.path.basename(path)
-    if RUNNER_DIR_PATTERN.fullmatch(name) is None:
-        raise refuse("not_runner_dir", name=name)
-    try:
-        parent_fd = os.open("..", DIR_FLAGS, dir_fd=dir_fd)
-    except (NotImplementedError, TypeError) as exc:
-        raise PlatformMissing("os.open", exc) from exc
-    try:
-        parent = os.fstat(parent_fd)
-        if file_id(parent) not in known_roots:
-            raise refuse("outside_roots", roots=list(roots), path=os.path.realpath(path))
-        same_mount_as_root(parent_fd, parent, dir_fd, info, path)
-    finally:
-        os.close(parent_fd)
+    if name == RUNNER_FOLDER_LEAF:
+        prove_runner_folder_leaf(dir_fd, info, path, environ)
+    else:
+        if RUNNER_DIR_PATTERN.fullmatch(name) is None:
+            raise refuse("not_runner_dir", name=name)
+        try:
+            parent_fd = os.open("..", DIR_FLAGS, dir_fd=dir_fd)
+        except (NotImplementedError, TypeError) as exc:
+            raise PlatformMissing("os.open", exc) from exc
+        try:
+            parent = os.fstat(parent_fd)
+            if file_id(parent) not in known_roots:
+                raise refuse("outside_roots", roots=list(roots), path=os.path.realpath(path))
+            same_mount_as_root(parent_fd, parent, dir_fd, info, path)
+        finally:
+            os.close(parent_fd)
     for name_ in guarded_paths(environ):
         if file_id(info) in ancestor_ids(name_):
             raise refuse("contains", path=path)
+
+
+def prove_runner_folder_leaf(dir_fd, info, path, environ):
+    """#9820: prove TMPDIR is ``<layout root>/<runner folder>/_tmp`` by identity (the macOS node's form).
+
+    The folder is TMPDIR's own ``..`` and the root is the folder's ``..`` (both opened without following a
+    link). The folder's name is read from the root itself (LOW-1): the entry of that name in the open root fd
+    must be the open folder fd, so a rename between the path's resolution and the opens is caught. The root
+    must be the same file as a RUNNER_FOLDER_LAYOUTS root whose pattern matches that name (else the refusal
+    ``not_runner_folder``), RUNNER_NAME must be set (``runner_unset``) and must be the runner of that folder
+    (``runner_unbound``, security M3), and TMPDIR must be on the root's mount.
+    """
+    try:
+        folder_fd = os.open("..", DIR_FLAGS, dir_fd=dir_fd)
+    except (NotImplementedError, TypeError) as exc:
+        raise PlatformMissing("os.open", exc) from exc
+    try:
+        root_fd = os.open("..", DIR_FLAGS, dir_fd=folder_fd)
+        try:
+            root = os.fstat(root_fd)
+            folder_name = os.path.basename(os.path.dirname(os.path.realpath(path)))
+            layout_pattern = None
+            for layout_root, pattern in RUNNER_FOLDER_LAYOUTS:
+                layout = stat_or_none(layout_root)
+                if layout is not None and file_id(layout) == file_id(root):
+                    layout_pattern = pattern
+                    break
+            if layout_pattern is None or layout_pattern.fullmatch(folder_name) is None:
+                raise refuse("not_runner_folder", path=path)
+            try:
+                named = os.lstat(folder_name, dir_fd=root_fd)
+            except OSError as exc:
+                raise refuse("not_runner_folder", path=path) from exc
+            if not stat.S_ISDIR(named.st_mode) or file_id(named) != file_id(os.fstat(folder_fd)):
+                raise refuse("not_runner_folder", path=path)
+            runner = environ.get(RUNNER_NAME_ENV)
+            if not runner:
+                raise refuse("runner_unset", path=path)
+            if RUNNER_FOLDER_BY_NAME.get(runner) != folder_name:
+                raise refuse("runner_unbound", folder=folder_name, runner=runner, path=path)
+            same_mount_as_root(root_fd, root, dir_fd, info, path)
+        finally:
+            os.close(root_fd)
+    finally:
+        os.close(folder_fd)
 
 
 def same_mount_as_root(parent_fd, parent, dir_fd, info, path):
@@ -500,13 +731,14 @@ class ProbeMismatch(OSError):
     """A probed call returned, but not what the call must return."""
 
 
-def probe_platform(dir_fd, err):
+def probe_platform(dir_fd, err, path=None):
     """D-H1: make one real descriptor-relative call of each needed function inside the proven directory.
 
     Creates ``.prune-probe-<pid>-<hex>`` and a file in it, then lstat, scandir, unlink and rmdir by dir_fd.
     Every call is looked up on ``os`` at call time, so the probe tests exactly the functions the walk uses.
     Raises PlatformMissing naming the first call that fails; a probe directory it cannot remove is named
-    on ``err`` (before the refusal) and never touched again.
+    on ``err`` (before the refusal) and never touched again. A mkdir refused (EPERM or EACCES) in a TMPDIR
+    that carries a protect flag is the refusal ``tmpdir_flagged`` for ``path`` (L4), never cleared here.
     """
     name = f"{PROBE_PREFIX}{os.getpid()}-{os.urandom(PROBE_RANDOM_BYTES).hex()}"
     call = "os.mkdir"
@@ -541,6 +773,8 @@ def probe_platform(dir_fd, err):
         os.rmdir(name, dir_fd=dir_fd)
         made_dir = False
     except OSError as exc:
+        if call == "os.mkdir" and exc.errno in PROTECT_ERRNOS and fd_flags(dir_fd) & protect_mask():
+            raise refuse("tmpdir_flagged", path=path) from exc  # L4: the TMPDIR itself is protected
         if not (creating and exc.errno in CANNOT_WRITE_ERRNOS):
             raise PlatformMissing(call, exc) from exc
         cannot_write = exc
@@ -663,6 +897,13 @@ def print_runner_facts(raw, roots, out):
                 if parent is not None and info is not None and file_id(info) == file_id(parent):
                     allowed = root
                     break
+            if allowed == "none" and os.path.basename(real) == RUNNER_FOLDER_LEAF:  # L2: <layout root>/<folder>/_tmp
+                grandparent = stat_or_none(os.path.dirname(os.path.dirname(real)))
+                for layout_root, _pattern in RUNNER_FOLDER_LAYOUTS:
+                    info = stat_or_none(layout_root)
+                    if grandparent is not None and info is not None and file_id(info) == file_id(grandparent):
+                        allowed = layout_root
+                        break
         version = sys.version.splitlines()[0]
         line = (
             f"{FACTS_PREFIX} tmpdir={safe_text(raw)} resolved={safe_text(resolved)} symlink={symlink} "
@@ -694,19 +935,176 @@ def write_job_summary(line, environ, err):
         print(f"{PROG}: job summary not written: {safe_text(exc.strerror or exc)}", file=err)
 
 
+# Protected-entry flags (#9820): a test that leaves an append-only or immutable entry behind makes every
+# unlink and rmdir below it fail with EPERM, so the clear drops the flag of the entry and of its directory
+# (through the open descriptor, never a path) and retries once.
+FS_IOC_GETFLAGS = 0x80086601  # linux, _IOR('f', 1, long)
+FS_IOC_SETFLAGS = 0x40086602  # linux, _IOW('f', 2, long)
+FS_APPEND_FL = 0x00000020
+FS_IMMUTABLE_FL = 0x00000010
+LINUX_PROTECT_FLAGS = FS_APPEND_FL | FS_IMMUTABLE_FL
+DARWIN_PROTECT_FLAGS = getattr(stat, "UF_APPEND", 0x4) | getattr(stat, "UF_IMMUTABLE", 0x2)
+ENTRY_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+PROTECT_ERRNOS = frozenset({errno.EPERM, errno.EACCES})
+
+
+def linux_flags(fd):
+    """The ext-style inode flags of an open descriptor, or None when the file system has none."""
+    try:
+        return struct.unpack("l", fcntl.ioctl(fd, FS_IOC_GETFLAGS, struct.pack("l", 0)))[0]
+    except OSError:
+        return None
+
+
+def linux_set_flags(fd, value):
+    fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack("l", value))
+
+
+def linux_clear_flags(dir_fd, name):
+    """Clear append-only and immutable on the directory ``dir_fd`` and on its entry ``name``; True when one was cleared."""
+    cleared = False
+    for target, relative in ((".", True), (name, False)):
+        try:
+            fd = os.open(target, ENTRY_OPEN_FLAGS, dir_fd=dir_fd)
+        except OSError:
+            continue  # a symlink (O_NOFOLLOW), a vanished entry or an unopenable one has no flags to clear
+        try:
+            value = linux_flags(fd)
+            if value is not None and value & LINUX_PROTECT_FLAGS:
+                linux_set_flags(fd, value & ~LINUX_PROTECT_FLAGS)
+                cleared = True
+        except OSError:
+            pass  # no capability to change the flag: the original removal error stands
+        finally:
+            os.close(fd)
+    return cleared
+
+
+def darwin_flags(target):
+    """The BSD file flags (``st_flags``) of ``target`` (relative to the current directory), no link followed."""
+    return getattr(os.lstat(target), "st_flags", 0)
+
+
+def darwin_set_flags(target, value):
+    os.chflags(target, value, follow_symlinks=False)
+
+
+def darwin_clear_flags(dir_fd, name):
+    """Clear user append-only and immutable on ``dir_fd`` and on its entry ``name``; True when one was cleared.
+
+    ``chflags`` has no descriptor-relative form, so the process enters ``dir_fd`` (fchdir) for the call and goes
+    back to where it was; the entry is named relative to that open directory, never by a path from TMPDIR.
+    """
+    cleared = False
+    here = os.open(".", DIR_FLAGS)
+    try:
+        os.fchdir(dir_fd)
+        for target in (".", name):
+            try:
+                value = darwin_flags(target)
+                if value & DARWIN_PROTECT_FLAGS:
+                    darwin_set_flags(target, value & ~DARWIN_PROTECT_FLAGS)
+                    cleared = True
+            except OSError:
+                continue
+    finally:
+        os.fchdir(here)
+        os.close(here)
+    return cleared
+
+
+FLAG_CLEARERS = {PLATFORM_LINUX: linux_clear_flags, PLATFORM_DARWIN: darwin_clear_flags}
+
+
+def clear_flags(dir_fd, name):
+    """Drop the protect flags for ``name`` in ``dir_fd`` on this platform; False when none was cleared."""
+    clearer = FLAG_CLEARERS.get(sys.platform)
+    return bool(clearer and clearer(dir_fd, name))
+
+
+def protect_mask():
+    """The protect-flag bits of this platform (L4); 0 where the platform has none."""
+    if sys.platform == PLATFORM_LINUX:
+        return LINUX_PROTECT_FLAGS
+    if sys.platform == PLATFORM_DARWIN:
+        return DARWIN_PROTECT_FLAGS
+    return 0
+
+
+def fd_flags(fd):
+    """The protect-relevant flags of open ``fd`` (L4): the inode flags on Linux, st_flags on Darwin, else 0."""
+    if sys.platform == PLATFORM_LINUX:
+        return linux_flags(fd) or 0
+    if sys.platform == PLATFORM_DARWIN:
+        return getattr(os.fstat(fd), "st_flags", 0)
+    return 0
+
+
+def unprotect(dir_fd, name, exc):
+    """Make one retry of a removal of ``name`` in ``dir_fd`` possible; True when something was changed.
+
+    Only for EPERM or EACCES. A non-directory with more than one link (L1, security LOW-1) shares its inode,
+    and so its flags, with a file that may be outside TMPDIR: nothing is changed and the error stands. Else
+    the protect flags of the entry and of ``dir_fd`` are dropped (never through a symlink), and when that
+    changed nothing, or the error was EACCES, an owned directory ``dir_fd`` that lacks owner rwx is given
+    owner rwx through its descriptor (MEDIUM-5).
+    """
+    if exc.errno not in PROTECT_ERRNOS:
+        return False
+    try:
+        entry = os.lstat(name, dir_fd=dir_fd)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(entry.st_mode) and entry.st_nlink > 1:
+        return False
+    changed = clear_flags(dir_fd, name)
+    if exc.errno == errno.EACCES or not changed:
+        here = os.fstat(dir_fd)
+        mode = stat.S_IMODE(here.st_mode)
+        if here.st_uid == os.geteuid() and mode & stat.S_IRWXU != stat.S_IRWXU:
+            try:
+                os.fchmod(dir_fd, mode | stat.S_IRWXU)
+                changed = True
+            except OSError:
+                pass  # the original removal error stands
+    return changed
+
+
+def unlink_entry(dir_fd, name):
+    """``os.unlink`` that, on EPERM or EACCES, unprotects once (``unprotect``) and retries."""
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except OSError as exc:
+        if not unprotect(dir_fd, name, exc):
+            raise
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def rmdir_entry(dir_fd, name):
+    """``os.rmdir`` with the same one unprotect-and-retry."""
+    try:
+        os.rmdir(name, dir_fd=dir_fd)
+    except OSError as exc:
+        if not unprotect(dir_fd, name, exc):
+            raise
+        os.rmdir(name, dir_fd=dir_fd)
+
+
 class Tally:
     """Counters and the failure and skip lines (capped) of one run."""
 
     def __init__(self, err):
         self.pruned = self.kept = self.failed = self.skipped = self.freed = 0
         self.tree_entries = 0
-        self.first_failed = []  # the MAX_ANNOTATION_NAMES smallest failed names, sorted
+        self.first_failed = []  # FailedEntry rows of the MAX_ANNOTATION_NAMES smallest failed names, by name
         self.internal_error = False
         self.err = err
 
-    def fail(self, name, exc):
+    def fail(self, name, exc, owner):
+        """Count one failed entry; ``owner`` is ``owner_token`` of the entry, taken when it failed (#9876 N1)."""
         self.failed += 1
-        self.first_failed = sorted([*self.first_failed, name])[:MAX_ANNOTATION_NAMES]
+        row = FailedEntry(name, owner, errno_token(exc.errno))  # every failure is an OSError (prune catches those)
+        self.first_failed = sorted([*self.first_failed, row], key=lambda kept: kept.name)[:MAX_ANNOTATION_NAMES]
         if self.failed <= MAX_FAILURE_LINES:
             # CODE F6: a top-level entry not entered is named once; its text is the constant reason alone
             text = exc.reason if isinstance(exc, NotEntered) and not exc.nested and exc.name == name else error_text(exc)
@@ -783,7 +1181,7 @@ def list_level(dir_fd, root_dev, tally, errors, remove=True, dry_run=False):
             elif stat.S_ISDIR(info.st_mode):
                 pending.append((entry.name, info))
             elif remove and not dry_run:
-                os.unlink(entry.name, dir_fd=dir_fd)
+                unlink_entry(dir_fd, entry.name)
                 tally.freed += info.st_blocks * DISK_BLOCK_BYTES
         except OSError as exc:
             errors.append(exc)
@@ -866,7 +1264,7 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None, dry_ru
             if dry_run:
                 continue
             try:
-                os.rmdir(level.name, dir_fd=dir_fd)
+                rmdir_entry(dir_fd, level.name)
                 tally.freed += level.blocks * DISK_BLOCK_BYTES
             except OSError as exc:
                 errors.append(exc)
@@ -874,7 +1272,7 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None, dry_ru
         dir_fd = None
         if not dry_run:
             try:
-                os.rmdir(name, dir_fd=parent_fd)
+                rmdir_entry(parent_fd, name)
                 tally.freed += level.blocks * DISK_BLOCK_BYTES
             except OSError as exc:
                 errors.append(exc)
@@ -898,20 +1296,52 @@ def remove_entry(dir_fd, name, scanned, root_dev, tally, root_mnt=None, dry_run=
         return
     if dry_run:
         return
-    os.unlink(name, dir_fd=dir_fd)
+    unlink_entry(dir_fd, name)
     tally.freed += now_info.st_blocks * DISK_BLOCK_BYTES
 
 
-def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None):
-    """Prune old direct entries of the proven directory ``dir_fd`` into ``tally``."""
+def live_runner_endpoint(name, info):
+    """LOW-2: True for a socket or FIFO named as a .NET runner endpoint whose pid is a live process.
+
+    The runner's own diagnostic socket and debug pipes sit in its TMPDIR for the runner's whole life; removing
+    them breaks the runner's diagnostics. A regular file of that name, a pid below MIN_ENDPOINT_PID and the
+    endpoint of a process that no longer exists (ESRCH) are removed as any other entry. A pid that exists but
+    is not ours (EPERM) is live. Any other answer of kill(pid, 0) removes the entry (the clear is not held back).
+    """
+    if not (stat.S_ISSOCK(info.st_mode) or stat.S_ISFIFO(info.st_mode)):
+        return False
+    match = RUNNER_ENDPOINT_PATTERN.fullmatch(name)
+    if match is None:
+        return False
+    pid = int(match.group(1))
+    if pid < MIN_ENDPOINT_PID:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None, grace_secs=JOB_START_GRACE_SECS):
+    """Prune the direct entries of the proven directory ``dir_fd`` into ``tally``.
+
+    An entry whose own mtime is within ``grace_secs`` of ``now`` is kept as owned by a live writer;
+    ``grace_secs`` 0 (the job-end mode) keeps nothing.
+    """
     if root_mnt is None:
         root_mnt = mount_id(dir_fd)
-    cutoff = now - MAX_AGE_SECS
+    cutoff = now - grace_secs
     with os.scandir(dir_fd) as scan:
         for entry in scan:
             try:
                 info = entry.stat(follow_symlinks=False)
-                if info.st_mtime >= cutoff:
+                if live_runner_endpoint(entry.name, info):
+                    tally.kept += 1
+                    continue
+                if grace_secs > 0 and info.st_mtime >= cutoff:
                     tally.kept += 1
                     continue
                 if info.st_dev != root_dev:
@@ -923,35 +1353,46 @@ def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None):
             except NotEntered as exc:  # decision 2: every place not entered is one skip line and one counted failure
                 if not exc.nested:  # the top-level entry itself is not entered; its nested skip is printed already
                     tally.skip(entry.name, exc.reason)
-                tally.fail(entry.name, exc)
+                tally.fail(entry.name, exc, owner_token(entry.name, dir_fd))
             except OSError as exc:  # one failed entry, counted
-                tally.fail(entry.name, exc)
+                tally.fail(entry.name, exc, owner_token(entry.name, dir_fd))
 
 
-def refused(reason, out, err):
-    """Print one refusal (stderr line and warning annotation); a refusal exits 0 and deletes nothing.
+def refused(reason, out, err, job_end=False, context=None):
+    """Print one refusal (stderr line and one annotation); a refusal deletes nothing.
 
+    ``context`` (``refusal_context``) names the layout row, the owner and the entry in the annotation (#9876 N1).
+
+    At job start it is a warning with exit 0 (ruling f23a9ae4: the end step of the same job still clears).
+    At job end it is an error with exit 3 (PR 9822 r1, HIGH-1): the TMPDIR stays uncleared and the job says so.
+    decision: job-end non-zero over warning because the class invariant says the job says why with a non-zero exit.
     A counted refusal (COUNTED_REFUSALS) also prints the summary with failed=1, so the runner that could
     not be proven safe shows as a counted failure next to its one annotation.
     """
+    level, code = refusal_outcome(job_end)
     print(wa.log_line(f"{PROG}: refused: {reason}"), file=err)
     if getattr(reason, "counted", False):
         tally = Tally(err)
         tally.failed = 1
         print(wa.log_line(tally.summary()), file=out)
-    print(refusal_annotation(reason), file=out)
+    print(refusal_annotation(reason, level, context), file=out)
     out.flush()
-    return EXIT_OK  # ruling f23a9ae4: a refusal is green with its warning; only an internal error is red
+    return code
 
 
 def main(argv=None, environ=None, out=None, err=None):
     environ = os.environ if environ is None else environ
     out, err = out or sys.stdout, err or sys.stderr
     if wa is None:  # an in-process caller of a copy whose sibling did not load: the same refusal, nothing pruned
-        return load_refused(out, err)
-    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0])
+        return load_refused(out, err, requested_mode(sys.argv[1:] if argv is None else argv) == MODE_JOB_END)
+    # #9876 N2: no abbreviation, so the mode argparse parses is the mode requested_mode reads before it
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0], allow_abbrev=False)
     parser.add_argument("--dry-run", action="store_true", help="print what would go, delete nothing")
+    parser.add_argument("--mode", choices=MODES, default=MODE_JOB_START,
+                        help="job-start keeps entries touched in the last %d s; job-end removes every entry"
+                        % JOB_START_GRACE_SECS)
     args = parser.parse_args(argv)
+    job_end = args.mode == MODE_JOB_END
     raw = environ.get("TMPDIR")
     write_job_summary(print_runner_facts(raw, ALLOWED_ROOTS, out), environ, err)
     tally = Tally(err)
@@ -965,12 +1406,12 @@ def main(argv=None, environ=None, out=None, err=None):
                 raise refuse("platform_unverifiable", platform=sys.platform)
             dir_fd, info = open_runner_dir(raw, ALLOWED_ROOTS, environ)
             root_mnt = root_mount_id(dir_fd)
-            probe_platform(dir_fd, err)
+            probe_platform(dir_fd, err, os.path.normpath(raw))
         except PlatformMissing as exc:
-            return refused(exc.refusal(), out, err)
+            return refused(exc.refusal(), out, err, job_end, refusal_context(raw, environ))
         except Refusal as exc:
-            return refused(exc, out, err)
-        prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt)
+            return refused(exc, out, err, job_end, refusal_context(raw, environ))
+        prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt, GRACE_SECS_BY_MODE[args.mode])
     except Exception as exc:  # internal error: named, no traceback, the job goes red (exit 1)
         tally.internal_error = True
         print(wa.log_line(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}"), file=err)
@@ -979,11 +1420,15 @@ def main(argv=None, environ=None, out=None, err=None):
             os.close(dir_fd)
     print(wa.log_line(tally.summary()), file=out)
     if not tally.internal_error:
-        annotation = failed_annotation(tally.failed, tally.first_failed)
+        annotation = failed_annotation(tally.failed, tally.first_failed, LEVEL_ERROR if job_end else LEVEL_WARNING,
+                                       layout_row(raw, environ))
         if annotation:
             print(annotation, file=out)
     out.flush()
-    return EXIT_ERROR if tally.internal_error else EXIT_OK
+    if tally.internal_error:
+        return EXIT_ERROR
+    # decision: job-start stays a warning over failing because the end step of the same job fails it with one ::error
+    return EXIT_NOT_CLEARED if job_end and tally.failed > 0 else EXIT_OK
 
 
 if __name__ == "__main__":
