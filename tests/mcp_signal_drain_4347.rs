@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use ai_memory::governance::audit::{
     CHAIN_HEAD_PREV_HASH, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
+    TEST_FORENSIC_WRITER_HOLD_DIR_ENV, TEST_FORENSIC_WRITER_HOLD_FILE,
 };
 use serde_json::{Value, json};
 #[path = "common/child_stdin_report.rs"]
@@ -928,37 +929,66 @@ fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
     }
 }
 
-/// #9864 — how many times longer than the bounded exit drain each queued row
-/// takes the writer, so the drain cannot finish whatever the scheduler does.
-const WRITER_DELAY_DRAIN_MULTIPLE: u32 = 3;
+/// #9864 — the directory of the writer hold for one cell.
+fn hold_dir(home: &Path) -> PathBuf {
+    let dir = home.join("writer-hold");
+    std::fs::create_dir_all(&dir).expect("create writer hold dir");
+    dir
+}
 
-/// #9864 — the deletes this cell has acknowledged before the signal: the one
-/// the handshake makes plus this many more.
-const EXTRA_ACKED_DELETES: usize = 1;
+/// #9864 — wait (bounded, on a condition) until `n` forensic delete rows are
+/// on disk, so a hold created next cannot catch a handshake row.
+fn wait_delete_rows(s: &mut Session, home: &Path, n: usize) {
+    let deadline = Instant::now() + STARTUP_BOUND;
+    while delete_rows(&rows(home)) < n {
+        s.fail_if_exited("the handshake rows");
+        assert!(
+            Instant::now() < deadline,
+            "the handshake rows never reached disk"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
-/// #9864 — an acknowledgement is written only after the write AND its
-/// forensic row are durable. The writer is slowed past the exit drain bound
-/// (`EXIT_DRAIN_BUDGET`); every delete the child acknowledged before SIGTERM
-/// must still have its forensic row on disk after exit. The carrier
-/// acknowledges once the row is QUEUED, the drain times out and the
-/// acknowledged rows are dropped (CI run 44973448614: left 6, right 31).
+/// #9864 — the JSON-RPC code of the not-durable reply, written by hand.
+const AUDIT_NOT_DURABLE_CODE: i64 = -32_010;
+
+/// #9864 — a reply acknowledges its request unless it is the named
+/// not-durable error (`-32010`, the only reply that says "not acknowledged").
+fn acknowledged(resp: &Value) -> bool {
+    resp.get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_i64)
+        != Some(AUDIT_NOT_DURABLE_CODE)
+}
+
+/// #9864 — an acknowledgement is written only after the forensic row is
+/// durable. The writer is held (a hold file, not a sleep) with the delete's
+/// row queued and nothing on disk; SIGTERM then runs the exit drain, which
+/// times out on the held writer. Every delete the child acknowledged must
+/// still have its forensic row on disk after exit. The carrier acknowledges
+/// once the row is QUEUED, so the held row is acknowledged and lost (CI run
+/// 44973448614: left 6, right 31).
 #[test]
 fn an_acknowledged_delete_keeps_its_forensic_row_past_the_exit_drain_9864() {
     let home = sandbox();
-    let delay = ai_memory::governance::audit::EXIT_DRAIN_BUDGET * WRITER_DELAY_DRAIN_MULTIPLE;
-    let delay_ms = delay.as_millis().to_string();
-    let mut s = Session::start_with(home.path(), &[(TEST_FORENSIC_WRITER_DELAY_ENV, delay_ms)]);
-    // The handshake made one acknowledged delete; make the extra ones.
+    let dir = hold_dir(home.path());
+    let mut s = Session::start_with(
+        home.path(),
+        &[
+            (TEST_FORENSIC_WRITER_DELAY_ENV, "0".to_string()),
+            (TEST_FORENSIC_WRITER_HOLD_DIR_ENV, dir.display().to_string()),
+        ],
+    );
+    wait_delete_rows(&mut s, home.path(), 1);
+    std::fs::write(dir.join(TEST_FORENSIC_WRITER_HOLD_FILE), b"hold\n").expect("create hold");
+    // The handshake's delete is acknowledged and on disk.
     let mut acked_deletes = 1_usize;
-    for k in 0..EXTRA_ACKED_DELETES {
-        let resp = s.request(&json!({"jsonrpc":"2.0","id":100 + k,"method":"tools/call",
-            "params":{"name":"memory_delete","arguments":{
-                "id":"00000000-0000-4000-8000-000000009864"}}}));
-        assert_eq!(
-            resp.get("id"),
-            Some(&json!(100 + k)),
-            "delete {k}: no acknowledgement: {resp}"
-        );
+    let resp = s.request(&json!({"jsonrpc":"2.0","id":100,"method":"tools/call",
+        "params":{"name":"memory_delete","arguments":{
+            "id":"00000000-0000-4000-8000-000000009864"}}}));
+    assert_eq!(resp.get("id"), Some(&json!(100)), "no reply: {resp}");
+    if acknowledged(&resp) {
         acked_deletes += 1;
     }
     s.signal("TERM");
@@ -973,7 +1003,8 @@ fn an_acknowledged_delete_keeps_its_forensic_row_past_the_exit_drain_9864() {
     assert_eq!(
         delete_rows(&recs),
         acked_deletes,
-        "every acknowledged delete must have its forensic row after SIGTERM; stderr: {err}"
+        "every acknowledged delete must have its forensic row after SIGTERM \
+         (reply: {resp}); stderr: {err}"
     );
     assert_one_unbroken_chain(&recs);
     assert_acked_write_durable(home.path());

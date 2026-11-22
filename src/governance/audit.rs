@@ -371,6 +371,14 @@ fn run_writer(rx: Receiver<WriteOp>) {
     let mut pending_barriers: Vec<Sender<()>> = Vec::new();
 
     while let Ok(first) = rx.recv() {
+        // #9864 — test seam: a batch that starts with a row can be held
+        // before any of it is written (the losing interleaving: the row is
+        // queued, nothing is on disk). Barrier-only batches (the boot flush,
+        // the exit drain) are never held.
+        #[cfg(any(test, debug_assertions))]
+        if matches!(first, WriteOp::Row(_)) {
+            hold_writer_for_test();
+        }
         let mut batch = vec![first];
         while let Ok(next) = rx.try_recv() {
             batch.push(next);
@@ -679,6 +687,46 @@ fn test_writer_delay() -> Option<std::time::Duration> {
             .filter(|ms| *ms > 0)
             .map(std::time::Duration::from_millis)
     })
+}
+
+/// #9864 — test seam: the directory of the writer hold. While the file
+/// [`TEST_FORENSIC_WRITER_HOLD_FILE`] exists in it, the background writer
+/// does not start a batch that begins with a row, and it creates
+/// [`TEST_FORENSIC_WRITER_HELD_FILE`] there to say it is holding. Removing
+/// the hold file releases the writer. Read in debug and test builds only.
+pub const TEST_FORENSIC_WRITER_HOLD_DIR_ENV: &str = "AI_MEMORY_TEST_FORENSIC_WRITER_HOLD_DIR";
+
+/// #9864 — the file whose presence holds the background writer.
+pub const TEST_FORENSIC_WRITER_HOLD_FILE: &str = "hold";
+
+/// #9864 — the file the held writer creates.
+pub const TEST_FORENSIC_WRITER_HELD_FILE: &str = "held";
+
+/// #9864 — how often the held writer re-checks the hold file.
+#[cfg(any(test, debug_assertions))]
+const TEST_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+#[cfg(any(test, debug_assertions))]
+fn hold_writer_for_test() {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        std::env::var_os(TEST_FORENSIC_WRITER_HOLD_DIR_ENV)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
+    let Some(dir) = dir else {
+        return;
+    };
+    let hold = dir.join(TEST_FORENSIC_WRITER_HOLD_FILE);
+    if !hold.exists() {
+        return;
+    }
+    // A test seam: a failure to create the marker only makes the test that
+    // waits for it time out, it never changes what the writer does.
+    let _ = std::fs::write(dir.join(TEST_FORENSIC_WRITER_HELD_FILE), b"held\n");
+    while hold.exists() {
+        std::thread::sleep(TEST_HOLD_POLL);
+    }
 }
 
 /// Test-only: enqueue a raw append directly to the background writer,
