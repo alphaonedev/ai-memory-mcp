@@ -20,6 +20,9 @@ Invariants, each a table with expected values written out by hand (none computed
      wrapper refuses a value above IDLE_SEAT_CEILING_SECS (900 s, one literal in host_slot_limits.py, read
      by both scripts), 0, negative, empty or not a plain decimal integer with exit 85, before any slot or
      command; 85 is reserved, so a refusal is never a child's exit code.
+  5. #9883: both readers of host_slots.json refuse a text that nests deeper than SLOT_CONFIG_NESTING_MAX (32,
+     one literal in host_slot_limits.py) with one fixed reason, by a linear scan before the JSON read, so the
+     reason and the exit code are the same on Python 3.12, 3.13 and 3.14; a RecursionError maps to that reason.
 
 Run: python3 -m unittest discover -s scripts/ci/tests
 """
@@ -53,6 +56,12 @@ EXIT_BAD_ARGUMENTS = 2
 EXPECTED_WAIT_SECS = 600
 IDLE_SEAT_CEILING_SECS = 900
 WAIT_ENV_KEY = 'HOST_SEMAPHORE_MAX_WAIT_SECS'
+# #9883: the one nesting bound of host_slots.json, decided by the readers and never by an interpreter limit
+SLOT_CONFIG_NESTING_MAX = 32
+NESTING_REASON = 'the slot configuration nests deeper than 32 levels'
+DEEP_NESTING = 100_000  # deeper than any recursion limit; 3.12 raises RecursionError on it, 3.14 does not
+SCAN_CHARS = 2_000_000  # the linear-time input of the nesting scan
+SCAN_CEILING_SECS = 5.0  # wall-clock ceiling for one scan of SCAN_CHARS (about 0.3 s measured on f2)
 LIMITS_MODULE = CI_DIR / 'host_slot_limits.py'
 # Every producer of an exit code this wrapper's callers can see. None may use 82, 83, 84 or 85.
 EXIT_CODE_PRODUCERS = {
@@ -304,7 +313,6 @@ class UnknownGateRefused(unittest.TestCase):
     Every row asserts the exact one error line, exit 83, no lock root created, no command run and no traceback.
     """
     GOOD = {'registered_runners': ['a'], 'gates': {'g': {'slots': 1, 'label': 'x', 'serving_runners': ['a']}}}
-    DEEP_NESTING = 100_000  # deeper than any recursion limit: json.loads raises RecursionError
     # (row id, config bytes or None for no file, a directory, the --name values, expected reason): by hand
     ROWS = [
         ('absent name', GOOD, ['bogus'], "'bogus' is not a gate of the slot configuration"),
@@ -313,8 +321,21 @@ class UnknownGateRefused(unittest.TestCase):
         ('config is a directory', 'DIR', ['g'], 'the slot configuration cannot be read (IsADirectoryError)'),
         ('not json', b'{"gates": ', ['g'], 'the slot configuration is not valid UTF-8 JSON'),
         ('not utf-8', b'\xff\xfe{}', ['g'], 'the slot configuration is not valid UTF-8 JSON'),
-        ('nesting past the recursion limit', b'[' * DEEP_NESTING + b']' * DEEP_NESTING, ['g'],
-         'the slot configuration is not valid UTF-8 JSON'),
+        # #9883: the nesting bound decides, the same on 3.12, 3.13 and 3.14 (no RecursionError is relied on)
+        ('nesting at the bound', b'[' * 32 + b']' * 32, ['g'], 'the slot configuration has no gates object'),
+        ('nesting one past the bound', b'[' * 33 + b']' * 33, ['g'], NESTING_REASON),
+        ('object nesting one past the bound', b'{"a": ' * 33 + b'1' + b'}' * 33, ['g'], NESTING_REASON),
+        ('mixed nesting one past the bound', b'{"gates": ' + b'[' * 32 + b']' * 32 + b'}', ['g'], NESTING_REASON),
+        ('nesting 100000 levels', b'[' * DEEP_NESTING + b']' * DEEP_NESTING, ['g'], NESTING_REASON),
+        ('nesting 100000 levels, never closed', b'[' * DEEP_NESTING, ['g'], NESTING_REASON),
+        ('brackets inside a string do not nest', b'{"gates": "' + b'[' * 100 + b'"}', ['g'],
+         'the slot configuration has no gates object'),
+        ('an escaped quote does not end the string', b'{"gates": "\\"' + b'[' * 100 + b'"}', ['g'],
+         'the slot configuration has no gates object'),
+        ('an escaped backslash ends before the quote', b'{"gates": "\\\\", "x": ' + b'[' * 33 + b']' * 33 + b'}',
+         ['g'], NESTING_REASON),
+        ('not utf-8 and deep', b'\xff' + b'[' * 33, ['g'], 'the slot configuration is not valid UTF-8 JSON'),
+        ('siblings do not add depth', b'[' + b','.join([b'[]'] * 40) + b']', ['g'], 'the slot configuration has no gates object'),
         ('top level is a list', b'[]', ['g'], 'the slot configuration has no gates object'),
         ('no gates key', b'{"registered_runners": []}', ['g'], 'the slot configuration has no gates object'),
         ('gates is a list', b'{"gates": ["g"]}', ['g'], 'the slot configuration has no gates object'),
@@ -403,41 +424,146 @@ class UnknownGateRefused(unittest.TestCase):
                 self.assertNotIn('../x', done.stdout + done.stderr)
                 self.assertFalse(root.exists())
 
-    # (mutant id, (old text, new text) in host_semaphore.py, a row id that goes red): each breaks one check
+    HS, LIM = 'host_semaphore.py', 'host_slot_limits.py'
+    BOUND_REMOVED = (HS, '    if _limits.nesting_exceeds(text, _limits.SLOT_CONFIG_NESTING_MAX):\n', '    if False:\n')
+    # (mutant id, ((file, old text, new text), ...), a row id that goes red on 3.12, 3.13 and 3.14): each breaks one check
     MUTANTS = [
-        ('name-in-gates check dropped', ('    if name not in gates:\n', '    if False:\n'), 'absent name'),
-        ('OSError tolerated', ('    except OSError as exc:\n        return',
-                               '    except OSError as exc:\n        return [], None\n        return'), 'missing config'),
-        ('ValueError tolerated', ('    except (ValueError, RecursionError):\n        return',
-                                  '    except (ValueError, RecursionError):\n        return [], None\n        return'),
-         'not json'),
-        ('first --name checked', ('    runners, problem = gate_runners(args.name, args.config)\n',
-                                  '    runners, problem = gate_runners(args.name[:1], args.config)\n'),
+        ('name-in-gates check dropped', ((HS, '    if name not in gates:\n', '    if False:\n'),), 'absent name'),
+        ('OSError tolerated', ((HS, '    except OSError as exc:\n        return',
+                                '    except OSError as exc:\n        return [], None\n        return'),), 'missing config'),
+        ('undecodable tolerated', ((HS, '    except UnicodeDecodeError:\n        return',
+                                    '    except UnicodeDecodeError:\n        return [], None\n        return'),),
+         'not utf-8'),
+        ('ValueError tolerated', ((HS, '    except ValueError:\n        return',
+                                   '    except ValueError:\n        return [], None\n        return'),), 'not json'),
+        ('first --name checked', ((HS, '    runners, problem = gate_runners(args.name, args.config)\n',
+                                   '    runners, problem = gate_runners(args.name[:1], args.config)\n'),),
          'repeated --name, last unknown'),
-        ('RecursionError not caught', ('    except (ValueError, RecursionError):\n',
-                                       '    except ValueError:\n'), 'nesting past the recursion limit'),
-        ('gates type not checked', ('    if not isinstance(gates, dict):\n', '    if gates is None:\n'),
+        # #9883: the bound decides on every interpreter; RecursionError is only the second line of defence
+        ('nesting bound removed', (BOUND_REMOVED,), 'nesting one past the bound'),
+        ('bound removed and RecursionError not caught',
+         (BOUND_REMOVED, (HS, '    except RecursionError:\n', '    except ZeroDivisionError:\n')), 'nesting 100000 levels'),
+        ('bound removed and RecursionError mapped to another reason',
+         (BOUND_REMOVED, (HS, '    except RecursionError:\n        return None, NESTING_REFUSED_REASON\n',
+                          '    except RecursionError:\n        return None, CONFIG_NOT_JSON_REASON\n')),
+         'nesting 100000 levels'),
+        ('bound raised by one', ((LIM, 'SLOT_CONFIG_NESTING_MAX = 32\n', 'SLOT_CONFIG_NESTING_MAX = 33\n'),),
+         'nesting one past the bound'),
+        ('bound lowered by one', ((LIM, 'SLOT_CONFIG_NESTING_MAX = 32\n', 'SLOT_CONFIG_NESTING_MAX = 31\n'),),
+         'nesting at the bound'),
+        ('scan off by one', ((LIM, '            if depth > bound:\n', '            if depth > bound + 1:\n'),),
+         'nesting one past the bound'),
+        ('objects not counted', ((LIM, "        elif ch in '[{':\n", "        elif ch in '[':\n"),),
+         'object nesting one past the bound'),
+        ('closers not counted', ((LIM, '            depth -= 1\n', '            depth -= 0\n'),),
+         'siblings do not add depth'),
+        ('strings not skipped', ((LIM, "        elif ch == '\"':\n            in_string = True\n",
+                                  "        elif False:\n            in_string = True\n"),),
+         'brackets inside a string do not nest'),
+        ('escape not honoured', ((LIM, "            elif ch == '\\\\':\n                escaped = True\n",
+                                  "            elif False:\n                escaped = True\n"),),
+         'an escaped quote does not end the string'),
+        ('escape never cleared', ((LIM, '            if escaped:\n                escaped = False\n',
+                                   '            if escaped:\n                pass\n'),),
+         'an escaped backslash ends before the quote'),
+        ('gates type not checked', ((HS, '    if not isinstance(gates, dict):\n', '    if gates is None:\n'),),
          'gates is a list'),
-        ('repeat check dropped', ('    if len(names) > 1:\n', '    if False:\n'), 'repeated --name, last unknown'),
-        ('runner list not checked', ('    if not (isinstance(runners, list)',
-                                     '    if not (True or isinstance(runners, list)'), 'serving_runners is a string'),
-        ('duplicate keys tolerated', ("object_pairs_hook=_limits.no_duplicate_keys)", ')'), 'duplicate gate key'),
-        ('a malformed name is a bad argument', ('        return EXIT_UNKNOWN_RUNNER\n    # The gate is refused',
-                                                 '        return 2\n    # The gate is refused'), 'name with a path'),
+        ('repeat check dropped', ((HS, '    if len(names) > 1:\n', '    if False:\n'),), 'repeated --name, last unknown'),
+        ('runner list not checked', ((HS, '    if not (isinstance(runners, list)',
+                                      '    if not (True or isinstance(runners, list)'),), 'serving_runners is a string'),
+        ('duplicate keys tolerated', ((HS, "object_pairs_hook=_limits.no_duplicate_keys)", ')'),), 'duplicate gate key'),
+        ('a malformed name is a bad argument', ((HS, '        return EXIT_UNKNOWN_RUNNER\n    # The gate is refused',
+                                                  '        return 2\n    # The gate is refused'),), 'name with a path'),
     ]
 
     def test_each_mutant_of_the_check_goes_red(self):
-        source = (CI_DIR / 'host_semaphore.py').read_text()
         rows = {row: (config, names, reason) for row, config, names, reason in self.ROWS}
-        for mutant, (old, new), row in self.MUTANTS:
+        for mutant, edits, row in self.MUTANTS:
             with self.subTest(mutant=mutant), scratch() as td:
-                self.assertEqual(source.count(old), 1, 'mutant anchor %r' % old)
-                repo = copy_repo(td, replace={'host_semaphore.py': source.replace(old, new)})
+                texts = {}
+                for name, old, new in edits:
+                    text = texts.get(name, (CI_DIR / name).read_text())
+                    self.assertEqual(text.count(old), 1, 'mutant anchor %r' % old)
+                    texts[name] = text.replace(old, new)
+                repo = copy_repo(td, replace=texts)
                 config, names, reason = rows[row]
                 done, root, marker = self.run_wrapper(td, config, names,
                                                       script=repo / 'scripts' / 'ci' / 'host_semaphore.py')
                 self.assertNotEqual((done.returncode, error_lines(done.stdout)), (83, [U_REFUSED % reason]),
                                     'mutant %s survived' % mutant)
+
+
+class NestingBound(unittest.TestCase):
+    """#9883: one named nesting bound of host_slots.json decides, never an interpreter's recursion limit.
+
+    The invariant: for every input the refusal reason and the exit code are the same on Python 3.12, 3.13 and 3.14.
+    """
+    # (input text, expected nesting_exceeds at bound 32): written by hand
+    TABLE = [
+        ('', False),
+        ('{}', False),
+        ('[' * 32 + ']' * 32, False),
+        ('[' * 33 + ']' * 33, True),
+        ('[' * 33, True),  # never closed: the scan still stops at the opener past the bound
+        ('{"a": ' * 32 + '1' + '}' * 32, False),
+        ('{"a": ' * 33 + '1' + '}' * 33, True),
+        ('[{' * 16 + '}]' * 16, False),
+        ('[{' * 16 + '[' + ']' + '}]' * 16, True),
+        ('[' + '[]' * 1000 + ']', False),
+        ('"' + '[' * 100 + '"', False),
+        ('"\\"' + '[' * 100 + '"', False),  # the escaped quote keeps the string open
+        ('"\\\\"' + '[' * 33, True),  # an escaped backslash: the next quote ends the string
+        ('"\\u005b' + '[' * 40 + '"', False),
+        (']' * 10 + '[' * 33, False),  # a closer before an opener: the reader refuses this text as not JSON
+        ('é[' * 33, True),  # non-ASCII text between the brackets
+    ]
+
+    def test_the_bound_and_the_reason_are_the_written_values(self):
+        self.assertEqual(need(self, hs._limits, 'SLOT_CONFIG_NESTING_MAX'), SLOT_CONFIG_NESTING_MAX)
+        self.assertEqual(need(self, hs, 'NESTING_REFUSED_REASON'), NESTING_REASON)
+        self.assertEqual(need(self, hsc, 'NESTING_REFUSED_REASON'), 'host_slots.json nests deeper than 32 levels')
+
+    def test_every_table_input_has_its_written_result(self):
+        scan = need(self, hs._limits, 'nesting_exceeds')
+        for text, expected in self.TABLE:
+            with self.subTest(text=text[:40]):
+                self.assertIs(scan(text, SLOT_CONFIG_NESTING_MAX), expected)
+
+    def test_the_scan_is_linear_on_inputs_of_two_million_characters(self):
+        scan = need(self, hs._limits, 'nesting_exceeds')
+        # (shape, text of SCAN_CHARS characters, expected): the first three are scanned to the end
+        shapes = [
+            ('flat siblings', '[]' * (SCAN_CHARS // 2), False),
+            ('one long string', '"' + 'x' * (SCAN_CHARS - 2) + '"', False),
+            ('escapes in a string', '"' + '\\"' * ((SCAN_CHARS - 2) // 2) + '"', False),
+            ('openers only', '[' * SCAN_CHARS, True),
+        ]
+        for shape, text, expected in shapes:
+            with self.subTest(shape=shape):
+                self.assertGreaterEqual(len(text), SCAN_CHARS - 2)
+                start = time.monotonic()
+                self.assertIs(scan(text, SLOT_CONFIG_NESTING_MAX), expected)
+                self.assertLess(time.monotonic() - start, SCAN_CEILING_SECS)
+
+    def test_a_recursion_error_of_the_reader_maps_to_the_bound_reason(self):
+        from unittest import mock
+        with scratch() as td:
+            path = Path(td) / 'host_slots.json'
+            path.write_text('{"gates": {}}')
+            with mock.patch.object(hs.json, 'loads', side_effect=RecursionError('deep')):
+                self.assertEqual(hs.gate_runners(['g'], str(path)), (None, NESTING_REASON))
+                with self.assertRaises(hsc.ConfigError) as ctx:
+                    hsc.load_config(path)
+            self.assertEqual(str(ctx.exception), 'host_slots.json nests deeper than 32 levels')
+
+    def test_a_configured_gate_nested_at_the_bound_still_runs_the_command(self):
+        gate = b'{"slots": 1, "label": "x", "serving_runners": ["a"], "deep": ' + b'[' * 29 + b']' * 29 + b'}'
+        config = b'{"registered_runners": ["a"], "gates": {"g": ' + gate + b'}}'
+        for runner in (None, 'a'):
+            with self.subTest(runner=runner), scratch() as td:
+                done, root, marker = UnknownGateRefused.run_wrapper(self, td, config, ['g'], runner)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertTrue(marker.exists())
 
 
 class ExitCodeCollisionTable(unittest.TestCase):
@@ -646,6 +772,10 @@ class MalformedConfig(unittest.TestCase):
         ('serving not list', '{"registered_runners": ["a"], "gates": {"g": {"slots": 1, "label": "x", "serving_runners": "a"}}}',
          'gate g: serving_runners must be a list of non-empty strings'),
         ('bad gate name', '{"registered_runners": ["a"], "gates": {"g h": {}}}', "gate name 'g h' is not a plain name"),
+        # #9883: the shared nesting bound decides; 3.12 raised an uncaught RecursionError here, 3.14 parsed the list
+        ('nesting at the bound', '[' * 32 + ']' * 32, 'top level must be an object'),
+        ('nesting one past the bound', '[' * 33 + ']' * 33, 'host_slots.json nests deeper than 32 levels'),
+        ('nesting 100000 levels', '[' * DEEP_NESTING + ']' * DEEP_NESTING, 'host_slots.json nests deeper than 32 levels'),
     ]
 
     def test_each_malformed_file_is_one_named_violation_never_a_traceback(self):
@@ -911,6 +1041,9 @@ class OneConstant(unittest.TestCase):
             self.assertEqual((done.returncode, done.stdout.splitlines()), (1, [
                 'host_slots_check: workflows/ci.yml: HOST_SEMAPHORE_MAX_WAIT_SECS 600 is above the 300 s idle seat ceiling']))
 
+    # every name the loader checked before #9883, valid
+    BASE_LIMITS = ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '0'\nno_duplicate_keys = dict\n"
+                   "DuplicateKeyError = ValueError\n")
     # (host_slot_limits.py text or None for absent, the cause named on stderr): by hand
     BAD_LIMITS = [
         (None, 'FileNotFoundError'),
@@ -936,6 +1069,13 @@ class OneConstant(unittest.TestCase):
          "DuplicateKeyError = KeyError\n", 'TypeError'),
         ("IDLE_SEAT_CEILING_SECS = 900\nPLAIN_DECIMAL_PATTERN = '0'\nno_duplicate_keys = dict\n"
          "DuplicateKeyError = 'x'\n", 'TypeError'),
+        # #9883: the one nesting bound and its scan are loaded from the same module and checked the same way
+        (BASE_LIMITS, 'AttributeError'),
+        (BASE_LIMITS + 'SLOT_CONFIG_NESTING_MAX = True\n', 'TypeError'),
+        (BASE_LIMITS + 'SLOT_CONFIG_NESTING_MAX = 32.0\n', 'TypeError'),
+        (BASE_LIMITS + 'SLOT_CONFIG_NESTING_MAX = 0\n', 'ValueError'),
+        (BASE_LIMITS + 'SLOT_CONFIG_NESTING_MAX = 32\n', 'AttributeError'),
+        (BASE_LIMITS + 'SLOT_CONFIG_NESTING_MAX = 32\nnesting_exceeds = 1\n', 'TypeError'),
     ]
 
     def test_an_unloadable_limits_module_refuses_with_exit_4_before_any_command(self):
