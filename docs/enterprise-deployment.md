@@ -464,7 +464,7 @@ production Dockerfile. Quick summary:
 | Component | Pinned version |
 |---|---|
 | PostgreSQL | **19.0** (canonical; SSOT `deploy/docker-1461/provision/lib.sh` `EXPECTED_PG_VERSION`). PG 16 + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
-| Apache AGE | **1.7.0** (canonical extversion; SSOT `EXPECTED_AGE_VERSION`) — Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). SSOT `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`; the first stage of the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` builds that commit unmodified on `postgres:19-trixie` and checks `git rev-parse HEAD`, so `CREATE EXTENSION age` reports extversion 1.7.0 |
+| Apache AGE | **1.7.0** (canonical extversion; SSOT `EXPECTED_AGE_VERSION`) — Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). SSOT `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`; the first stage of the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` builds that commit plus the one pinned upstream fix (applied by `provision/apply_age_patch.py`, #9965) on the official PostgreSQL 19 base image pinned by digest (`PG_BASE_IMAGE`) and checks `git rev-parse HEAD`, so `CREATE EXTENSION age` reports extversion 1.7.0 |
 | pgvector | **0.8.7** (`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`; Rust binding crate `pgvector = "0.4"`) |
 | ai-memory build | `cargo build --release --features sal-postgres` |
 
@@ -1496,9 +1496,11 @@ build time and `hnsw.ef_search=80` at query time
 See [`postgres-age-guide.md §"Install — Ubuntu 24.04 example"`](postgres-age-guide.html)
 for the AGE from-source recipe. The bundled
 `deploy/docker-1461/Dockerfile.pg-age-vector` (#1065, #9927) is a two-stage
-build on `postgres:19-trixie`: the first stage builds AGE 1.7.0 from upstream
-PG19 branch commit c6b043d (`AGE_SOURCE_COMMIT`, not a tagged Apache release)
-unmodified and checks `git rev-parse HEAD`; the final stage installs the pinned
+build on the official PostgreSQL 19 base image pinned by digest (`PG_BASE_IMAGE`):
+the first stage builds AGE 1.7.0 from upstream PG19 branch commit c6b043d
+(`AGE_SOURCE_COMMIT`, not a tagged Apache release), checks `git rev-parse HEAD`,
+and applies the one pinned upstream fix 06ce678d through
+`deploy/docker-1461/provision/apply_age_patch.py` (#9965); the final stage installs the pinned
 pgdg PostgreSQL 19.0 and pgvector 0.8.7 packages and copies the AGE files in —
 so K8s / ECS / Cloud Run users don't have to build AGE themselves.
 
@@ -1552,10 +1554,10 @@ Retention sizing reference:
 
 **Pin AGE to a specific source commit.** The v1.0.0 reference pins AGE to
 **1.7.0** (extversion) and pgvector to **0.8.7** on PostgreSQL 19.0 (SSOT
-`provision/lib.sh` `AGE_SOURCE_COMMIT` / `PGVECTOR_APT_VERSION`). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+`provision/lib.sh` `AGE_SOURCE_COMMIT` / `PGVECTOR_APT_VERSION`). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
 Do not let a host rebuild or package update move AGE off that commit — the
 Cypher binding semantics have changed between AGE versions historically, and the
-v1.0.0 canonical substrate targets AGE 1.7.0 at commit c6b043d.
+v1.0.0 canonical substrate targets AGE 1.7.0 at commit c6b043d plus upstream fix commit 06ce678d (#9965).
 
 Upgrade procedure:
 
@@ -1563,8 +1565,10 @@ Upgrade procedure:
 2. Stop the ai-memory daemons.
 3. Stop Postgres (`systemctl stop postgresql@19-main`).
 4. Install AGE built from the pinned `AGE_SOURCE_COMMIT` (`git fetch` the full
-   sha, check `git rev-parse HEAD`, `make install` with the PostgreSQL 19
-   `PG_CONFIG`; recipe in `postgres-age-guide.md`) — operator-paced.
+   sha, check `git rev-parse HEAD`, run
+   `deploy/docker-1461/provision/apply_age_patch.py --ssot deploy/docker-1461/provision/lib.sh --src <age checkout>`,
+   `make install` with the PostgreSQL 19 `PG_CONFIG`, then the same applier with
+   `--verify`; recipe in `postgres-age-guide.md`) — operator-paced.
 5. Start Postgres; verify `SELECT extversion FROM pg_extension WHERE
    extname='age';` reports the new version (expect `1.7.0`).
 6. Start the ai-memory daemons.
@@ -2023,7 +2027,7 @@ it, and flip it back.
 ### 14.8 Backup + tooling discipline
 
 - [ ] Backup cadence per §13.1; quarterly restore drill against a scratch host (§13.2).
-- [ ] Daemon binary version pinned per-host (no auto-update); AGE pinned to its source commit (v1.0.0 reference: 1.7.0 extversion at commit c6b043d; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
+- [ ] Daemon binary version pinned per-host (no auto-update); AGE pinned to its source commit (v1.0.0 reference: 1.7.0 extversion at commit c6b043d plus the pinned upstream fix 06ce678d; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
 
 ### 14.9 One-command hardened posture + the certified-posture gate
 

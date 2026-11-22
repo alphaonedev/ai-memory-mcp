@@ -222,15 +222,15 @@ to certify a stack whose probed versions drift from the pins below).
 
 | Component | Canonical version | SSOT pin (`deploy/docker-1461/provision/lib.sh`) |
 |---|---|---|
-| PostgreSQL | **19.0** | `PG_BASE_IMAGE=postgres:19-trixie`, `PG_MAJOR=19`, `PG_APT_VERSION=19.0-2.pgdg13+1`, `EXPECTED_PG_VERSION=19.0` |
-| Apache AGE | **1.7.0** | Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19): `AGE_SOURCE_REPO=https://github.com/apache/age.git`, `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958` (the build checks `git rev-parse HEAD`; `CREATE EXTENSION age` reports extversion 1.7.0), `EXPECTED_AGE_VERSION=1.7.0` |
+| PostgreSQL | **19.0** | `PG_BASE_IMAGE=postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60`, `PG_MAJOR=19`, `PG_APT_VERSION=19.0-2.pgdg13+1`, `EXPECTED_PG_VERSION=19.0` |
+| Apache AGE | **1.7.0** | Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19): `AGE_SOURCE_REPO=https://github.com/apache/age.git`, `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`, `AGE_PATCH_UPSTREAM_COMMIT=06ce678d74210539705c77e2dc7c9fa861e2a331`, `AGE_PATCH_SHA256=4d30cd91884756f281ec11dc5efd7ae2d32bcbeb9f90b44740dfec1fd2d25cc0` (the build checks `git rev-parse HEAD` and applies the patch with `apply_age_patch.py`, #9965; `CREATE EXTENSION age` reports extversion 1.7.0), `EXPECTED_AGE_VERSION=1.7.0` |
 | pgvector (server extension) | **0.8.7** | `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
 | ai-memory postgres schema | **v102** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 102` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 102`). A deployment-validation anchor at the current schema would be a separate config. |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
-(`ARG PG_BASE_IMAGE=postgres:19-trixie`, `ARG PG_MAJOR=19`, `ARG AGE_SOURCE_COMMIT`)
+(`ARG PG_BASE_IMAGE`, `ARG PG_MAJOR`, `ARG AGE_SOURCE_COMMIT`, each passed from the SSOT; the base image is pinned by digest)
 builds AGE at the pinned commit in its first stage and layers pgvector 0.8.7
 in the final stage, so K8s / ECS / Cloud Run operators do not build AGE by hand. See
 [`postgres-age-guide.md`](postgres-age-guide.md) for the from-source

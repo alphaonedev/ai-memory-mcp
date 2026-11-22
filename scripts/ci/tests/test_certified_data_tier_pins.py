@@ -58,7 +58,7 @@ APPLIER = "apply_age_patch.py"
 # AGE source pin and the #9965 patch decision (independent of the code under
 # test). The digest is the one postgres:19-trixie had at certification
 # (#9969); the patch sha256 is of the repo file, the patched sha256 is of
-# src/backend/utils/ag_catalog.c after the patch on AGE_SOURCE_COMMIT.
+# src/backend/catalog/ag_catalog.c after the patch on AGE_SOURCE_COMMIT.
 BASE_DIGEST = "sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60"
 EXPECTED_SSOT = {
     "PG_BASE_IMAGE": "postgres:19-trixie@" + BASE_DIGEST,
@@ -280,6 +280,9 @@ LINE_ALLOW = {
     ('changelog.d/3297.docs.md',
      'both backends (not AGE Cypher). Re-verified on AGE **1.8.0**:'):
         'fragment of an earlier change, history',
+    ('changelog.d/9927.changed.md',
+     'Certified data tier (#9927): the v1.0.0 enterprise-federation tier moves to PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7 (operator directives c4f4d408 and 111f59db). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19), is pinned by its full commit sha as `AGE_SOURCE_COMMIT` in `deploy/docker-1461/provision/lib.sh`; `Dockerfile.pg-age-vector` builds that commit plus the one pinned upstream fix (#9965) on the official PostgreSQL 19 base image pinned by digest (`PG_BASE_IMAGE`) and checks `git rev-parse HEAD`. `AGE_VERSION_CANONICAL` is now `1.7.0` (1.8.0 reports as a tested non-canonical version), the CI cert jobs require PostgreSQL 19, and every current doc states the triple with the exact provenance sentence. The PG 16 + AGE 1.6.0 alternate matrix is unchanged. The ratchet `scripts/ci/tests/test_certified_data_tier_pins.py` fails CI on any tracked file that states an earlier tier outside a marked history region or a named allowlist entry.'):
+        'the PG 19 move names AGE 1.8.0 as the tested non-canonical version',
     ('scripts/ci/tests/data/certification_scope_8262_pins.json',
      '{"file": "CHANGELOG.md", "text": "- **Measured end-to-end** (two `--release --features sal-postgres` daemons, same host, same live PG 18.4 instance, interleaved to bracket drift, HTTP keep-alive, n=300): `memory_load_family` p50 **53.84 ms -> 2.59 ms (20.8x)**, p99 78.26 -> 4.17 ms. The pre-fix figure independently reproduces the 54.27 ms p50 recorded in #2580."},'):
         'pins a released CHANGELOG line, history',

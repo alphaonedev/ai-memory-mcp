@@ -26,7 +26,7 @@ MAXIMUM-SECURE posture**.
 > packages (`$PG_APT_VERSION`, `$PGVECTOR_APT_VERSION`). pgdg ships no AGE
 > package for PostgreSQL 19, so the installer builds AGE from source at the one
 > pinned commit `$AGE_SOURCE_COMMIT`, unmodified, and fails when
-> `git rev-parse HEAD` differs: Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+> `git rev-parse HEAD` differs: Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
 > `CREATE EXTENSION age` reports `extversion = 1.7.0`.
 
 ```

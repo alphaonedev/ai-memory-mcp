@@ -4,7 +4,7 @@ layout: doc
 
 # `find_paths` executed engine (#3297 re-verify, 2026-09-11)
 
-The certified tier is now PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7 (Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19); `deploy/docker-1461/provision/lib.sh`, #9927). The capture below is dated and was taken on the
+The certified tier is now PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7 (Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19); `deploy/docker-1461/provision/lib.sh`, #9927). The capture below is dated and was taken on the
 AGE pin of that time. The `find_paths` dispatcher is the relational CTE on both `KgBackend`
 values and does not depend on the list-predicate results on any AGE version.
 

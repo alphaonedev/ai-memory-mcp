@@ -315,15 +315,19 @@ separately by `.github/workflows/cert-postgres-age.yml` (next paragraph).
 **CI-asserted in-PR on `release/**` (SSOT-pinned): PostgreSQL 19.0 + Apache
 AGE 1.7.0 + pgvector 0.8.7.** These are the pins
 the deployment SSOT carries — `deploy/docker-1461/provision/lib.sh`
-(`PG_BASE_IMAGE=postgres:19-trixie`, `EXPECTED_PG_VERSION=19.0`,
+(`PG_BASE_IMAGE=postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60`, `EXPECTED_PG_VERSION=19.0`,
 `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`,
+`AGE_PATCH_UPSTREAM_COMMIT=06ce678d74210539705c77e2dc7c9fa861e2a331`,
+`AGE_PATCH_SHA256=4d30cd91884756f281ec11dc5efd7ae2d32bcbeb9f90b44740dfec1fd2d25cc0`,
 `EXPECTED_AGE_VERSION=1.7.0`, `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`; the
 pgvector Rust binding is the `pgvector` crate `0.4`, `features = ["sqlx"]`)
 — set by operator directives c4f4d408 and 111f59db ([#9927](https://github.com/alphaonedev/ai-memory-mcp/issues/9927)).
-**Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release;
-upstream has no 1.7.0 release for PostgreSQL 19).** The image build checks `git rev-parse HEAD` against the pin,
-builds the commit unmodified, and `CREATE EXTENSION age` reports extversion
-1.7.0. As of
+**Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit
+06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for
+PostgreSQL 19).** The image build checks `git rev-parse HEAD` against the pin, applies that one
+fix through `deploy/docker-1461/provision/apply_age_patch.py` (which refuses any other patch
+bytes or patched result and checks the `IsTransactionState()` guard after the build, #9965),
+and `CREATE EXTENSION age` reports extversion 1.7.0. As of
 [#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548) /
 [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) the
 AGE/KG + recall-purity suites run against this exact stack in-PR: the
@@ -343,7 +347,7 @@ artifact itself. The PG 16 / AGE 1.6.0 combination in
 
 > **PostgreSQL 19.0 + Apache AGE 1.7.0 (2026-11-22, [#9927](https://github.com/alphaonedev/ai-memory-mcp/issues/9927)).**
 > v1.0.0 GA is certified on PostgreSQL 19.0 · Apache AGE 1.7.0 · pgvector 0.8.7
-> (operator directives c4f4d408 and 111f59db). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release;
+> (operator directives c4f4d408 and 111f59db). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release;
 > upstream has no 1.7.0 release for PostgreSQL 19).
 > Both fleet nodes carry this one triple (operator 618908f7); the macos-fed rebuild
 > is [#9929](https://github.com/alphaonedev/ai-memory-mcp/issues/9929). The

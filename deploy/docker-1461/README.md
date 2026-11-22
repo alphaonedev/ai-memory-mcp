@@ -114,7 +114,7 @@ CA and per-peer keys are minted once and reused on re-runs for stable trust.
   with **no hostname/region/vendor literal baked into any variable name**.
   pgdg ships no AGE package and apache/age publishes no image for PostgreSQL
   19, so the image build fetches AGE at the one pinned commit, unmodified, and
-  fails when `git rev-parse HEAD` differs: Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+  fails when `git rev-parse HEAD` differs: Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
   `CREATE EXTENSION age` reports `extversion = 1.7.0`.
 - **Deterministic topology.** Peer name/port/schema/federation-id are pure
   functions of a 1-based peer index; nothing is hand-enumerated.

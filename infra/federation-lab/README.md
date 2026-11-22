@@ -456,7 +456,7 @@ hive node), the locked stack is:
 | Apache AGE | **1.7.0** |
 | pgvector | **0.8.7** |
 
-**On the AGE build:** Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). pgdg ships no AGE package for PostgreSQL
+**On the AGE build:** Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). pgdg ships no AGE package for PostgreSQL
 19, so every provisioner fetches AGE at the full commit
 `c6b043d1c8f4909331b9080d6640b487782fc958`, builds it unmodified, and fails when
 `git rev-parse HEAD` differs. `CREATE EXTENSION age` reports `extversion = 1.7.0`.

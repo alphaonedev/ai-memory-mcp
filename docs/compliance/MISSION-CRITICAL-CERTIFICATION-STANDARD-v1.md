@@ -16,9 +16,10 @@ Edits to the standard's text go through a new revision of the reviews/ source, n
 **Author:** Claude Fable 5.1 (Conductor, sole merger of `release/v1.0.0`)
 **Date:** 2026-09-09 (revision 4.4: PostgreSQL 19.0 + Apache AGE 1.7.0 in §0.1, 2026-11-22; revision 4.3: pgvector 0.8.7 in §0.1, 2026-10-23; revision 4.2: freeze line recorded in §6 and §7)
 **Revision 4.4 (2026-11-22):** the certified backend is PostgreSQL 19.0 + Apache AGE 1.7.0 +
-pgvector 0.8.7. Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a
-tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19), is pinned as
-`AGE_SOURCE_COMMIT` in `deploy/docker-1461/provision/lib.sh`. Reason: operator directives
+pgvector 0.8.7. Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus
+upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no
+1.7.0 release for PostgreSQL 19), is pinned as `AGE_SOURCE_COMMIT` plus `AGE_PATCH_SHA256` in
+`deploy/docker-1461/provision/lib.sh` (#9965). Reason: operator directives
 c4f4d408 and 111f59db (tracked in #9927). The PG 19 move revises no acceptance target, so the
 declaration is not re-registered.
 <!-- tier-history: begin (revision 4.3 and 4.2 notes, superseded by revision 4.4) -->
@@ -62,7 +63,7 @@ A certificate is void outside its envelope. The envelope enumerates:
 
 | Axis | Declared values (v1.0.0 candidate) |
 |---|---|
-| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` ([`DEFAULT_DB_SYNCHRONOUS`](../../src/storage/connection.rs), the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` ([`ENV_DB_SYNCHRONOUS`](../../src/storage/connection.rs)) or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 19.0 + Apache AGE 1.7.0 (built from upstream PG19 branch commit c6b043d, `AGE_SOURCE_COMMIT`; not a tagged Apache release; extension version 1.7.0) + pgvector 0.8.7; pins are the AGE source commit and the package SHA-256s mirrored in the bundle, the apt strings are informational |
+| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` ([`DEFAULT_DB_SYNCHRONOUS`](../../src/storage/connection.rs), the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` ([`ENV_DB_SYNCHRONOUS`](../../src/storage/connection.rs)) or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 19.0 + Apache AGE 1.7.0 (built from upstream PG19 branch commit c6b043d, `AGE_SOURCE_COMMIT`, plus upstream fix commit 06ce678d, `AGE_PATCH_SHA256`; not a tagged Apache release; extension version 1.7.0) + pgvector 0.8.7; pins are the AGE source commit, the AGE patch SHA-256 and the package SHA-256s mirrored in the bundle, the apt strings are informational |
 | Feature builds | exactly the Cargo feature sets certified: `default` (sqlite-bundled) · `sal` · `sal-postgres` (implies `sal`) · `vectorlite`. The CI lane named `enterprise-fed` is `sal-postgres` run against the certified PG/AGE/pgvector pins; it is not a Cargo feature |
 | Transports and principals | HTTP with per-agent enrolled keys is the only **multi-principal** transport. MCP over stdio resolves its caller from the launcher's `AI_MEMORY_AGENT_ID` environment ([`resolve_read_visibility_caller`](../../src/identity/mod.rs); absent → single-tenant trust-all) and is certified as a **single trust domain**: one launcher, one principal. A swarm of N agents is certifiable only over HTTP, or over stdio when an orchestrator provably controls each child's environment and is itself the certified principal |
 | Hosts / adapters | an adapter contract with a tested version **range** per host, recorded in the N4 matrix; `ai-memory doctor --host <name>` (new, item 21) runs the wrapper self-test on the installed node; a node outside the range is NOT CERTIFIED for that host |

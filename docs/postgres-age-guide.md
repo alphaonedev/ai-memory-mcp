@@ -71,7 +71,7 @@ inventory, which is frozen against regression by
 | Component | Version | Notes |
 |---|---|---|
 | PostgreSQL | **19.0** (certified) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=19.0`, `PG_MAJOR=19`, `PG_APT_VERSION=19.0-2.pgdg13+1`). PG 16.x + AGE 1.6.0 remains the tested alternate matrix (`infra/lan-parity-test/`). |
-| Apache AGE | **1.7.0** (certified extversion) | Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). SSOT `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`, `EXPECTED_AGE_VERSION=1.7.0`. Built unmodified from that commit (checked with `git rev-parse HEAD`); `CREATE EXTENSION age` reports extversion 1.7.0. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` or the source build below. |
+| Apache AGE | **1.7.0** (certified extversion) | Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). SSOT `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`, `EXPECTED_AGE_VERSION=1.7.0`. Built unmodified from that commit (checked with `git rev-parse HEAD`); `CREATE EXTENSION age` reports extversion 1.7.0. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` or the source build below. |
 | pgvector | **0.8.7** (certified) | Faster HNSW, with the upstream fix for HNSW-vacuuming index corruption. SSOT: `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
 | ai-memory | v0.9.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
@@ -98,9 +98,11 @@ ships pgvector. Because the ai-memory SAL postgres adapter REQUIRES pgvector
 to Postgres `vector` columns), the repo ships a ready-made stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
 (#1065). Its first stage builds Apache AGE from `AGE_SOURCE_COMMIT` on the
-official `postgres:19-trixie` base (pinned `postgresql-19` and
-`postgresql-server-dev-19` `.deb`s), refusing the build unless
-`git rev-parse HEAD` equals the pinned commit; the final stage installs the
+official PostgreSQL 19 base image, pinned by digest (`PG_BASE_IMAGE`; pinned
+`postgresql-19` and `postgresql-server-dev-19` `.deb`s), refusing the build unless
+`git rev-parse HEAD` equals the pinned commit and
+`deploy/docker-1461/provision/apply_age_patch.py` accepts the one pinned upstream
+fix (#9965); the final stage installs the
 pinned pgdg `postgresql-19-pgvector` package and copies the AGE build in. Use
 this image for any deployment that backs ai-memory onto Postgres+AGE. (The
 `infra/lan-parity-test/` image — PG 16 + AGE 1.6.0 + pgvector 0.8.2 — remains
@@ -137,17 +139,21 @@ cd pgvector
 sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config install
 cd ..
 
-# 3. Apache AGE 1.7.0, built unmodified from upstream PG19 branch commit
-#    c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for
-#    PostgreSQL 19). The bundled Dockerfile and the do-1461 native lane build
-#    the same commit; `CREATE EXTENSION age` reports extversion 1.7.0.
+# 3. Apache AGE 1.7.0: upstream PG19 branch commit c6b043d plus upstream fix
+#    06ce678d (apache/age#2581), applied by apply_age_patch.py from a checkout
+#    of this repository at REPO (#9965). The bundled Dockerfile and the do-1461
+#    native lane build the same tree; extversion is 1.7.0.
 git init age && cd age
 git remote add origin https://github.com/apache/age.git
 git fetch --depth 1 origin c6b043d1c8f4909331b9080d6640b487782fc958
 git checkout --detach FETCH_HEAD
 test "$(git rev-parse HEAD)" = c6b043d1c8f4909331b9080d6640b487782fc958
+python3 "$REPO/deploy/docker-1461/provision/apply_age_patch.py" \
+  --ssot "$REPO/deploy/docker-1461/provision/lib.sh" --src .
 make PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
 sudo make PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config install
+python3 "$REPO/deploy/docker-1461/provision/apply_age_patch.py" \
+  --ssot "$REPO/deploy/docker-1461/provision/lib.sh" --src . --verify
 cd ..
 
 # 4. Restart postgres to pick up the shared libraries.
@@ -168,13 +174,14 @@ restarting the daemon container indefinitely on Plan C and any
 Compose / K8s deploy.
 
 The fix is the bundled two-stage Dockerfile, which builds AGE at the pinned
-commit and layers pgvector on the official PostgreSQL 19 image. Build it with
-the SSOT pins as build arguments (`deploy/docker-1461/provision/10_build.sh`
-and `.github/workflows/publish-ci-image.yml` pass them from `lib.sh`):
+commit plus the one pinned upstream fix and layers pgvector on the official
+PostgreSQL 19 image, pinned by digest. Build it with the SSOT pins as build
+arguments (`deploy/docker-1461/provision/10_build.sh` and
+`.github/workflows/publish-ci-image.yml` pass them from `lib.sh`):
 
 ```bash
 docker build -f deploy/docker-1461/Dockerfile.pg-age-vector \
-  --build-arg PG_BASE_IMAGE=postgres:19-trixie \
+  --build-arg PG_BASE_IMAGE=postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60 \
   --build-arg PG_MAJOR=19 \
   --build-arg PG_APT_VERSION=19.0-2.pgdg13+1 \
   --build-arg AGE_SOURCE_REPO=https://github.com/apache/age.git \

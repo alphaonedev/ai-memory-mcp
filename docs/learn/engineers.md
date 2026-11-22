@@ -142,9 +142,10 @@ ceiling — [certification §1 and §6](../compliance/ENTERPRISE-FEDERATION-CERT
 
 ### 9.2 The data tier: PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7
 
-Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release;
-upstream has no 1.7.0 release for PostgreSQL 19). The pins live in
-`deploy/docker-1461/provision/lib.sh` (#9927).
+Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit
+06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for
+PostgreSQL 19). The pins, the patch's SHA-256 included, live in
+`deploy/docker-1461/provision/lib.sh` (#9927, #9965).
 
 - **Why this triple:** multi-writer durability and strong consistency
   (Postgres), native graph traversal of `memory_links` via Cypher (AGE) with

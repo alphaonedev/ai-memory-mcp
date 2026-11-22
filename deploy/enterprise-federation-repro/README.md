@@ -17,7 +17,7 @@ This README is the operator quick-reference.
 
 ## What it stands up
 
-- **Data tier** — PostgreSQL **19.0** + Apache AGE **1.7.0** + pgvector **0.8.7**. Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19)
+- **Data tier** — PostgreSQL **19.0** + Apache AGE **1.7.0** + pgvector **0.8.7**. Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19)
   (the pins are SOURCED from `deploy/docker-1461/provision/lib.sh`; the image is
   built from the canonical `deploy/docker-1461/Dockerfile.pg-age-vector`). TLS
   1.3, **hostssl-only** (cleartext refused pre-auth), **client-cert mTLS** to

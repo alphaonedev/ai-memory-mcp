@@ -37,7 +37,7 @@ Every enterprise-fed test tier runs the identical certified stack:
 | Apache AGE | **1.7.0** |
 | pgvector | **0.8.7** |
 
-Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). The pins live in `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION`, `AGE_SOURCE_COMMIT`, `EXPECTED_AGE_VERSION`, `PGVECTOR_APT_VERSION`; #9927, operator directives c4f4d408 and 111f59db). Both nodes carry this one triple (operator 618908f7); the macos-fed rebuild is #9929. PG 16 + AGE 1.6.0 remains the tested alternate (`infra/lan-parity-test/`).
+Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). The pins live in `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION`, `AGE_SOURCE_COMMIT`, `EXPECTED_AGE_VERSION`, `PGVECTOR_APT_VERSION`; #9927, operator directives c4f4d408 and 111f59db). Both nodes carry this one triple (operator 618908f7); the macos-fed rebuild is #9929. PG 16 + AGE 1.6.0 remains the tested alternate (`infra/lan-parity-test/`).
 
 **TLS is mandatory on every tier, both nodes** — no customer permits unencrypted
 traffic to/from PostgreSQL. Each tier enforces:
@@ -66,7 +66,7 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 
 - **OS:** Linux x86_64 (Ubuntu/Pop!_OS noble-class)
 - **Data tier:** **native** (pgdg apt PostgreSQL 19.0 + pgvector 0.8.7; **AGE 1.7.0 built
-  unmodified from upstream PG19 branch commit c6b043d** — not a tagged Apache release, and AGE is
+  from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d** (#9965) — not a tagged Apache release, and AGE is
   not packaged in pgdg apt)
   - Cluster listens on `127.0.0.1:5445`
   - TLS certs operator-local (postgres-owned; CA reused from `pg-age-stack/certs`)
@@ -497,10 +497,13 @@ The command lists runner status (names and ids are not published here). Service 
 ## 9. Build gotchas (recorded for future rebuilds)
 
 **Apache AGE from source (both OSes):** the certified build is upstream PG19 branch
-commit c6b043d, built unmodified (no Makefile patch), checked with `git rev-parse HEAD`
-exactly as `deploy/docker-1461/Dockerfile.pg-age-vector` does. Older AGE branches failed
-under bison ≥ 3.8 (the deprecated `%pure-parser` directive is fatal under AGE's
-`-Werror`); that Makefile patch is never applied to the certified commit.
+commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581), checked with
+`git rev-parse HEAD` and patched by `deploy/docker-1461/provision/apply_age_patch.py`
+(run with `--ssot deploy/docker-1461/provision/lib.sh --src <age checkout>` before `make`
+and again with `--verify` after it), exactly as `deploy/docker-1461/Dockerfile.pg-age-vector`
+does (#9965). The applier refuses any other source commit, patch bytes or patched result.
+Older AGE branches failed under bison ≥ 3.8 (the deprecated `%pure-parser` directive is fatal
+under AGE's `-Werror`); that Makefile patch is never applied to the certified commit.
 
 **macOS Homebrew `postgresql@N` is keg-only** (N is the major, `PG_MAJOR`): `pg_config`
 reports `@N`-suffixed paths (`/opt/homebrew/{share,include,lib}/postgresql@N`) that are
@@ -511,7 +514,8 @@ incomplete stubs. Fix by symlinking each to the keg subdir
 `bison`+`flex` (Apple's bison 2.3 is too old).
 
 **Linux:** pgdg apt provides PostgreSQL 19.0 + pgvector 0.8.7; AGE is built from
-source at `AGE_SOURCE_COMMIT` (upstream PG19 branch commit c6b043d), unmodified.
+source at `AGE_SOURCE_COMMIT` (upstream PG19 branch commit c6b043d) plus the one pinned
+upstream fix, applied by `apply_age_patch.py` as above.
 
 **Rust on a CI node must be rustup-managed, never Homebrew (2026-08-22):**
 Homebrew's `rustup` formula installs proxies in `~/.cargo/bin` (`cargo -> rustup`,

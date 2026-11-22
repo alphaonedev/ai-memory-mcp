@@ -138,12 +138,12 @@ deploy/enterprise-federation-repro/verify.sh     <span class="cm"># prove the in
   <div class="container">
     <span class="section-eyebrow">1 · Provisioning the data tier</span>
     <h2>PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7</h2>
-    <p class="lede">The tier image is built from the canonical in-repo two-stage Dockerfile on <code>postgres:19-trixie</code>. Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19): the first stage fetches <code>AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958</code>, checks <code>git rev-parse HEAD</code> against it and builds it unmodified; the final stage installs the pinned pgdg <code>postgresql-19-pgvector</code> package. <code>CREATE EXTENSION age</code> then reports extversion 1.7.0. Every version literal lives once, in <code>deploy/docker-1461/provision/lib.sh</code>, and arrives at the build as a <code>--build-arg</code>. <code>repro.sh</code> reads those same pins.</p>
+    <p class="lede">The tier image is built from the canonical in-repo two-stage Dockerfile on the official PostgreSQL 19 base image, pinned by digest (<code>PG_BASE_IMAGE</code>). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19): the first stage fetches <code>AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958</code>, checks <code>git rev-parse HEAD</code> against it, applies the one pinned upstream fix with <code>provision/apply_age_patch.py</code> (#9965) and builds it; the final stage installs the pinned pgdg <code>postgresql-19-pgvector</code> package. <code>CREATE EXTENSION age</code> then reports extversion 1.7.0. Every version literal lives once, in <code>deploy/docker-1461/provision/lib.sh</code>, and arrives at the build as a <code>--build-arg</code>. <code>repro.sh</code> reads those same pins.</p>
 
     <h3>Image build</h3>
     <pre class="codeblock"><span class="cm"># repro.sh builds this automatically; pins come from provision/lib.sh.</span>
 docker build \
-  --build-arg PG_BASE_IMAGE=postgres:19-trixie \
+  --build-arg PG_BASE_IMAGE=postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60 \
   --build-arg PG_MAJOR=19 \
   --build-arg PG_APT_VERSION=19.0-2.pgdg13+1 \
   --build-arg AGE_SOURCE_REPO=https://github.com/apache/age.git \
