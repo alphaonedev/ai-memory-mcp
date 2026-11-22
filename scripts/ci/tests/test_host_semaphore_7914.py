@@ -191,17 +191,20 @@ class Semaphore(unittest.TestCase):
         p = start(self.root, ['--name', 'n', '--slots', '0'], ['true'])
         p.communicate(timeout=30)
         self.assertEqual(p.returncode, 2)
+        # #9851: a --name that is not a plain gate name is refused as an unknown gate (83), not a usage error
         p = start(self.root, ['--name', '../x', '--slots', '1'], ['true'])
-        p.communicate(timeout=30)
-        self.assertEqual(p.returncode, 2)
+        out, _ = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 83, out)
+        self.assertIn('--name is not a plain gate name', out)
 
     def test_name_with_newline_rejected_7914(self):
         """A trailing or embedded newline is not a valid name and creates nothing (fullmatch, not match)."""
         for bad in ('x\n', 'x\ny'):
             before = sorted(q.name for q in self.root.iterdir())
             p = start(self.root, ['--name', bad, '--slots', '1'], ['true'])
-            p.communicate(timeout=30)
-            self.assertEqual(p.returncode, 2, repr(bad))
+            out, _ = p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 83, repr(bad))  # #9851: refused as an unknown gate
+            self.assertIn('--name is not a plain gate name', out, repr(bad))
             self.assertEqual(sorted(q.name for q in self.root.iterdir()), before, repr(bad))
 
 

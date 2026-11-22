@@ -50,9 +50,15 @@ class SemaphoreWiring(unittest.TestCase):
         self.assertIn('[ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ]', step)
         self.assertIn('[ -z "${HOST_SEMAPHORE_HELD:-}" ]', step)
         self.assertIn('export HOST_SEMAPHORE_HELD=1', step)
-        self.assertIn('exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests '
-                      '--slots "$HOST_SEMAPHORE_SLOTS"', step)
-        self.assertIn('-- bash --noprofile --norc -eo pipefail "$0"', step)
+        # #9851: the call line is canonical (no quote or expansion), so the script is copied to a fixed path
+        self.assertIn('cp -- "$0" .local-runs/semaphore-step', step)
+        self.assertIn('exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 '
+                      '--max-wait-secs 600 --label linux-fed/enterprise-fed '
+                      '-- bash --noprofile --norc -eo pipefail .local-runs/semaphore-step', step)
+        self.assertLess(step.index('cp -- "$0" .local-runs/semaphore-step'),
+                        step.index('exec python3 -I scripts/ci/host_semaphore.py'))
+        # the literal slot count is the one the env expression gives this leg
+        self.assertIn("matrix.tier == 'enterprise-fed' && '2' || '0'", step)
         # the guard runs before JOB_T0 handling and before any cargo call
         guard = step.index('exec python3 -I scripts/ci/host_semaphore.py')
         self.assertLess(guard, step.index('JOB_T0_VALID=0'))
@@ -82,7 +88,8 @@ class SemaphoreWiring(unittest.TestCase):
         semaphore_wait = int(defs[0][1])
         self.assertLessEqual(semaphore_wait, host_slots_check.IDLE_SEAT_CEILING_SECS,
                              'the wait bound must stay within the idle seat ceiling (#9231)')
-        self.assertIn('--max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS"', CI)
+        # #9851: the call gives the env constant's value as a literal
+        self.assertIn('--max-wait-secs %d --label' % semaphore_wait, CI)
         safety = re.search(r'JOB_T0\) - (\d+) \)\)', CI)
         self.assertIsNotNone(safety)
         safety_secs = int(safety.group(1))
