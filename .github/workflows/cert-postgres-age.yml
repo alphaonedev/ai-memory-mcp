@@ -157,10 +157,21 @@ jobs:
         if: runner.environment == 'self-hosted'
         uses: ./.github/actions/prune-runner-tmp
 
+      # Docs-only short-circuit (#9683): every later step except the
+      # always()/failure() housekeeping is guarded on docs_only != 'true';
+      # any doubt is docs_only=false, a full run.
+      - name: Docs-only short-circuit (#9683)
+        id: docs
+        uses: ./.github/actions/docs-only-gate
+        with:
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          event-name: ${{ github.event_name }}
+          base-ref: ${{ github.base_ref }}
+
       # FAIL CLOSED if rustup is missing on a self-hosted node — see the
       # `lint` job in ci.yml for the full rationale (#3128 / restore #3293).
       - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
-        if: runner.environment != 'github-hosted'
+        if: runner.environment != 'github-hosted' && steps.docs.outputs.docs_only != 'true'
         shell: bash
         run: |
           test -x "$HOME/.cargo/bin/rustup" || {
@@ -168,6 +179,7 @@ jobs:
             exit 1
           }
       - name: Install Rust 1.99.1 (matches rust-toolchain.toml pin)
+        if: steps.docs.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.99.1
@@ -184,6 +196,7 @@ jobs:
       # connection to issue CREATE/DROP DATABASE. Fail-closed: a missing URL
       # file or a failed CREATE reds the job.
       - name: Point at the native enterprise-fed tier (per-job ephemeral db)
+        if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           # psql for the native tier lives under a versioned prefix. Prepend it
@@ -251,12 +264,13 @@ jobs:
       # so nothing is lost. CARGO_INCREMENTAL=0 — which this action used to
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && steps.docs.outputs.docs_only != 'true'
         with:
           # #9681: a pull_request or merge_group run restores, never writes.
           save-if: ${{ github.event_name == 'push' }}
 
       - name: Resolve certified stack pins from deploy SSOT
+        if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           # ONE declaration source (#B1): every version literal this job
@@ -279,6 +293,7 @@ jobs:
       # (no per-PR docker build/pull/run). Wait for it to answer, then assert
       # its versions against the SSOT below.
       - name: Wait for native tier readiness
+        if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           attempt=1
@@ -294,6 +309,7 @@ jobs:
           exit 1
 
       - name: Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)
+        if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           # The native cert tier is provisioned with the pinned extensions +
@@ -308,6 +324,7 @@ jobs:
           $PSQL -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists / no priv / AGE init handled by ladder"
 
       - name: Assert certified stack versions (cert evidence, hard-fail on drift)
+        if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           PSQL="psql $AI_MEMORY_TEST_POSTGRES_URL -tAX"
@@ -354,6 +371,7 @@ jobs:
           esac
 
       - name: Run #[ignore]-gated pg + AGE cells against the certified stack
+        if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           # The pg-parity binaries are the cross-backend parity cells (they do
@@ -404,6 +422,7 @@ jobs:
           exit "$rc"
 
       - name: Cluster-A cert-posture armability gate (#3061 #3016 #3067)
+        if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
           # Load-bearing end-to-end proof (sibling to

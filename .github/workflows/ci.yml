@@ -2890,8 +2890,9 @@ jobs:
   # to consume the v0.7.x release artifacts. The job is `--lib` only —
   # we never build a CLI binary for mobile; the consumer is FFI from an
   # iOS / Android app. No-ops on docs-only PRs alongside the rest of
-  # the heavy matrix. CI cost: ~5-8 min per target on a cold cache, ~1
-  # min on a warm cache; well under the $5/mo budget the issue projected.
+  # the heavy matrix. CI cost of the cross-compile step itself: ~5-8 min per
+  # target on a cold cache, ~1 min on a warm cache; the android entry's
+  # once-per-run extras (below) are costed at `timeout-minutes` on the job.
   #
   # #9680: the android entry also carries the once-per-run extras that used
   # to sit at the end of `Check (ubuntu-latest,sqlite)` — `Security audit`
@@ -2934,6 +2935,10 @@ jobs:
     # longest is 276 s). Re-derive when a measured run comes within 20 % of it.
     # The #9680 release-split module bounds it on both sides.
     timeout-minutes: 45
+    env:
+      # #3138: named pin for the cargo-audit version this job installs. It is a job-level env
+      # (not a step env) so it enters the rust-cache key hash, like the warm job's (#9732).
+      CARGO_AUDIT_VERSION: "0.22.2"
     strategy:
       fail-fast: false
       matrix:
@@ -2976,9 +2981,15 @@ jobs:
           # #9700 - the key was rotated once when this entry began to hold
           # cargo-audit and target/release (#9680): the old exact-match entry
           # held neither and, on a full match, rust-cache never re-saves. Saved
-          # only on trunk `push` (#3089, the form of the check job's cache), so
-          # a pull_request run restores and never writes a PR-scoped entry.
-          key: mobile-${{ matrix.target }}-audit-release
+          # only on a `push` (#3089), so a pull_request run restores and never
+          # writes a PR-scoped entry. #9732: a chain PR reads chain/<name>, which
+          # only rust-cache-warm.yml writes (job mobile-android-audit-release),
+          # under this shared-key (the android leg resolves it to the literal the
+          # warm job spells; a `key:` input would add the job id and never match)
+          # and the chain generation prefix-key. The iOS leg shares this step
+          # and stays unpaired (#9681 V-12).
+          prefix-key: chain-cache-g1
+          shared-key: mobile-${{ matrix.target }}-audit-release
           save-if: ${{ github.event_name == 'push' }}
 
       # Android NDK r26d — provides the clang toolchain we point at via
@@ -3043,9 +3054,6 @@ jobs:
       # test legs, off the critical path, so no prebuilt is downloaded.
       - name: Security audit
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
-        env:
-          # #3138: named pin for the cargo-audit version this job installs.
-          CARGO_AUDIT_VERSION: "0.22.2"
         run: |
           # #3138: install when cargo-audit is missing OR its version differs
           # from the pin (a stale preinstalled one on a warm self-hosted runner

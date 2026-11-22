@@ -30,6 +30,7 @@ Python 3.12+, standard library only.
 import ast
 import contextlib
 import errno
+import functools
 import importlib.util
 import io
 import json
@@ -142,8 +143,8 @@ COUNTED_REFUSAL_SUMMARY = "pruned=0 kept=0 failed=1 freed_bytes=0 skipped=0"
 VERIFIABLE_PLATFORMS = ("linux", "darwin")
 UNVERIFIABLE_PLATFORMS = ("freebsd14", "sunos5", "cygwin", "aix7", "win32", "linux-gnu", "darwin2")
 # errno -> strerror of a probe that cannot write (decision 3): the prune goes on after a read-only probe.
-CANNOT_WRITE_ERRNOS = {errno.ENOSPC: "No space left on device", errno.EDQUOT: "Disk quota exceeded",
-                       errno.EROFS: "Read-only file system"}
+# The strerror text is libc's (glibc "Disk quota exceeded", macOS "Disc quota exceeded"): read from the host, never a literal.
+CANNOT_WRITE_ERRNOS = {code: os.strerror(code) for code in (errno.ENOSPC, errno.EDQUOT, errno.EROFS)}
 CREATING_CALLS = ("mkdir", "file-create")
 NON_CREATING_PROBE_CALLS = ("open", "lstat")  # probe calls that make nothing: a full-disk errno there is a broken call
 READ_ONLY_PROBE_LINE = "prune_runner_tmp: probe cannot write ({why}); the read-only probe passed, pruning goes on"
@@ -179,6 +180,68 @@ def setUpModule():
     CHK = _load("check_pg_preflight_workflows", CHECKER)
     if SCRIPT.exists():
         PRUNE = _load("prune_runner_tmp", SCRIPT)
+
+
+def _fresh_probe_dir():
+    SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(dir=SCRATCH_BASE, prefix="prune8634-probe-")).resolve()
+
+
+def probe_byte_ff_refusal(create):
+    """None when ``create`` makes a file named with byte 0xff, "EILSEQ" when the file system refuses that name.
+
+    The one errno that names the missing facility is EILSEQ (APFS). Every other error (ENOSPC, EIO, EACCES, ...)
+    says nothing about the name, so it propagates and the cell fails instead of silently dropping a security cell.
+    """
+    top = _fresh_probe_dir()
+    try:
+        fd = create(os.path.join(os.fsencode(top), b"probe\xff"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError as exc:
+        if exc.errno != errno.EILSEQ:
+            raise
+        return errno.errorcode[errno.EILSEQ]
+    else:
+        os.close(fd)
+        return None
+    finally:
+        remove_scratch(top, SCRATCH_BASE)
+
+
+@functools.cache
+def host_refuses_byte_ff_names():
+    """None when the scratch file system accepts a file name holding byte 0xff (Linux), else "EILSEQ" (APFS)."""
+    return probe_byte_ff_refusal(os.open)
+
+
+@functools.cache
+def host_folds_case():
+    """True when the scratch file system treats ``Probe-case`` and ``probe-case`` as one name (APFS default)."""
+    top = _fresh_probe_dir()
+    try:
+        (top / "Probe-case").write_bytes(b"x")
+        return (top / "probe-case").exists()
+    finally:
+        remove_scratch(top, SCRATCH_BASE)
+
+
+def byte_ff_reason(errno_name):
+    """The exact skip reason for a row that needs a 0xff file name, or None when the host runs it."""
+    if errno_name is None:
+        return None
+    return f"this file system refuses a file name holding byte 0xff ({errno_name}, platform {sys.platform})"
+
+
+def byte_ff_skip_reason():
+    """The skip reason of this host for a 0xff-name row, or None when the host runs it."""
+    return byte_ff_reason(host_refuses_byte_ff_names())
+
+
+def split_hostile_names(names, refusal):
+    """(kept, dropped): drop only the names holding a lone surrogate (byte 0xff) on a host that refuses them."""
+    if refusal is None:
+        return list(names), []
+    kept = [name for name in names if "\udcff" not in name]
+    return kept, [name for name in names if "\udcff" in name]
 
 
 def remove_scratch(top, base):
@@ -604,9 +667,15 @@ class PathForms(Base):
     def test_not_a_runner_directory_below_a_root(self):
         for name in ("skills", "god-zsg", "runner-", "runner-1x", "Runner-1", "runner-1 ", "xrunner-1", "runner--1", "runner-١"):
             with self.subTest(name=name):
-                lane = self.root / name
+                root = self.root
+                if host_folds_case() and name.casefold() == self.runner.name:
+                    # `Runner-1` is `runner-1` here: put the row in a sibling allowed root that holds no `runner-1`.
+                    root = self.base / "root-case-fold"
+                    root.mkdir(exist_ok=True)
+                lane = root / name
                 lane.mkdir()
-                self.refused(lane, f"TMPDIR is not named runner-<digits>: {name}", victim_dir=lane)
+                with mock.patch.object(PRUNE, "ALLOWED_ROOTS", (str(self.root), str(root))):
+                    self.refused(lane, f"TMPDIR is not named runner-<digits>: {name}", victim_dir=lane)
         nested = self.runner / "nested" / "x"
         nested.mkdir(parents=True)
         self.refused(nested, "TMPDIR is not named runner-<digits>: x")
@@ -651,7 +720,9 @@ class PathForms(Base):
 
     def test_forbidden_by_file_identity_not_by_spelling(self):
         self.refused("/", "TMPDIR is a forbidden path: /")
-        self.refused("/tmp", "TMPDIR is a forbidden path: /tmp")
+        # macOS: /tmp is a symlink to private/tmp, and the tool names a symlink before it tests the forbidden list.
+        tmp_reason = "TMPDIR is a symlink: /tmp" if os.path.islink("/tmp") else "TMPDIR is a forbidden path: /tmp"
+        self.refused("/tmp", tmp_reason)
         self.refused(self.home, f"TMPDIR is a forbidden path: {self.home}", victim_dir=self.home)
         via_alias = self.base / "alias"
         os.symlink(self.base, via_alias)
@@ -839,6 +910,21 @@ class PlatformProbe(Base):
         env["TMPDIR"] = str(self.runner)
         for interpreter in interpreters:
             with self.subTest(interpreter=interpreter):
+                version = subprocess.run(
+                    [interpreter, "-I", "-c", "import sys; print(*sys.version_info[:3])"],
+                    capture_output=True, text=True, check=True,
+                ).stdout.split()
+                refusal = PRUNE.python_refusal(tuple(int(part) for part in version))
+                if refusal is not None:
+                    # An interpreter below the floor (macOS /usr/bin/python3 is 3.9.6) refuses by design, deleting nothing.
+                    victim = self.make_file("old.db", OLD_AGE_SECS)
+                    rc, out, err = self.run_cli(self.runner, interpreter=interpreter)
+                    self.assertEqual((rc, err), (EXIT_OK, f"prune_runner_tmp: refused: {refusal}\n"))
+                    self.assertIn(ANNOTATION_PREFIX + refusal, out.splitlines())
+                    self.assertTrue(victim.exists())
+                    self.assertEqual(self.probe_dirs(), [])
+                    victim.unlink()
+                    continue
                 self.make_file("old.db", OLD_AGE_SECS)
                 rc, out, err = self.run_cli(self.runner, interpreter=interpreter)
                 self.assertEqual((rc, err), (EXIT_OK, ""))
@@ -1080,28 +1166,38 @@ class HostileNames(Base):
             os.utime(raw, (time.time() - OLD_AGE_SECS,) * 2)
         return raw
 
+    def host_names(self):
+        """The hostile names this host can create; each dropped 0xff name is a skipped subTest with the exact reason."""
+        kept, dropped = split_hostile_names(HOSTILE_NAMES, host_refuses_byte_ff_names())
+        for name in dropped:
+            with self.subTest(name=name):
+                self.skipTest(byte_ff_skip_reason())
+        return kept
+
     def test_dry_run_lines_carry_no_injection(self):
-        for index, name in enumerate(HOSTILE_NAMES):
+        names = self.host_names()
+        for index, name in enumerate(names):
             self.make_named(f"{index}-{name}", as_dir=False)
         rc, out, err = self.run_prune(self.runner, "--dry-run")
         self.assertEqual((rc, err), (EXIT_OK, ""))
         self.lines_ok(out)
-        self.assertEqual(len(out.splitlines()), len(HOSTILE_NAMES) + 1)
-        self.assertIn(f"pruned={len(HOSTILE_NAMES)} ", out)
+        self.assertEqual(len(out.splitlines()), len(names) + 1)
+        self.assertIn(f"pruned={len(names)} ", out)
 
     @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
     def test_failure_lines_carry_no_injection(self):
+        names = self.host_names()
         locked = []
-        for index, name in enumerate(HOSTILE_NAMES):
+        for index, name in enumerate(names):
             raw = self.make_named(f"{index}-{name}", as_dir=True)
             os.chmod(os.path.join(raw, b"sub"), 0o500)
             locked.append(raw)
         self.addCleanup(lambda: [os.chmod(os.path.join(raw, b"sub"), 0o700) for raw in locked])
         rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
-        self.assertIn(f"failed={len(HOSTILE_NAMES)} ", out)
+        self.assertIn(f"failed={len(names)} ", out)
         self.lines_ok(err)
-        self.assertEqual(len(err.splitlines()), len(HOSTILE_NAMES))
+        self.assertEqual(len(err.splitlines()), len(names))
 
     def test_safe_text_forms(self):
         cases = {
@@ -1635,6 +1731,8 @@ class FailureAnnotation(Base):
     def test_hostile_names_reach_the_runner_as_exact_escaped_text(self):
         for raw, escaped in ANNOTATION_ESCAPES.items():
             with self.subTest(raw=raw):
+                if "\udcff" in raw and (reason := byte_ff_skip_reason()) is not None:
+                    self.skipTest(reason)
                 path = os.path.join(os.fsencode(self.runner), os.fsencode(raw))
                 Path(os.fsdecode(path)).write_bytes(b"x")
                 os.utime(path, (time.time() - OLD_AGE_SECS,) * 2)
@@ -2333,6 +2431,57 @@ class RoundOneFixes(Base):
         self.assertEqual(self.names(), ["at-cutoff.db"])
 
 
+SUN_PATH_OVERFLOW_BYTES = 200  # above both AF_UNIX limits (104 macOS, 108 Linux), so no TMPDIR length matters
+BYTE_FF_REFUSED_NAME = "EILSEQ"
+UNRELATED_PROBE_ERRNOS = (errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES)
+
+
+class HostProbes(unittest.TestCase):
+    """Fix round 1 of #9674: a host probe skips only on the one errno that names the missing facility."""
+
+    @staticmethod
+    def failing_create(code):
+        def create(path, flags, mode=0o777):
+            raise OSError(code, os.strerror(code))
+        return create
+
+    def test_byte_ff_probe_skips_only_on_eilseq(self):
+        got = probe_byte_ff_refusal(self.failing_create(errno.EILSEQ))
+        self.assertEqual(got, BYTE_FF_REFUSED_NAME)
+        self.assertEqual(
+            byte_ff_reason(got),
+            f"this file system refuses a file name holding byte 0xff (EILSEQ, platform {sys.platform})",
+        )
+
+    def test_byte_ff_probe_propagates_every_other_errno(self):
+        for code in UNRELATED_PROBE_ERRNOS:
+            with self.subTest(errno=errno.errorcode[code]):
+                with self.assertRaises(OSError) as caught:
+                    probe_byte_ff_refusal(self.failing_create(code))
+                self.assertEqual(caught.exception.errno, code)
+
+    def test_byte_ff_probe_propagates_a_non_oserror(self):
+        def create(path, flags, mode=0o777):
+            raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            probe_byte_ff_refusal(create)
+
+    def test_byte_ff_probe_accepting_host_returns_none(self):
+        def accepting_create(path, flags, mode=0o777):
+            return os.open(os.devnull, os.O_RDONLY)
+        self.assertIsNone(probe_byte_ff_refusal(accepting_create))
+
+    def test_hostile_names_drop_only_the_0xff_row_on_a_refusing_host(self):
+        kept, dropped = split_hostile_names(HOSTILE_NAMES, BYTE_FF_REFUSED_NAME)
+        self.assertEqual(dropped, ["bad\udcff\nname"])
+        self.assertEqual(kept, [name for name in HOSTILE_NAMES if "\udcff" not in name])
+        self.assertEqual(len(kept), len(HOSTILE_NAMES) - 1)
+
+    def test_hostile_names_keep_every_row_on_an_accepting_host(self):
+        kept, dropped = split_hostile_names(HOSTILE_NAMES, None)
+        self.assertEqual((kept, dropped), (list(HOSTILE_NAMES), []))
+
+
 class RootsAndFloor(unittest.TestCase):
     """The roots are named constants with evidence, the floor check runs before newer code, docs match the code."""
 
@@ -2442,6 +2591,14 @@ class SocketPathLimit9460(unittest.TestCase):
         self.assertNotIn("AF_UNIX path too long", done.stderr)
         self.assertRegex(done.stderr, r"(?m)^Ran [1-9][0-9]* tests? in ")
         self.assertRegex(done.stderr, r"(?m)^OK$")
+
+    def test_socket_is_made_in_a_directory_deeper_than_sun_path_whatever_tmpdir_is(self):
+        """Folded from #9674 round 1: the directory depth alone (not TMPDIR) is past both AF_UNIX limits."""
+        deep = self.scratch.joinpath("d" * 60, "e" * 60, "f" * 60)
+        deep.mkdir(parents=True)
+        self.assertGreater(len(str(deep)), SUN_PATH_OVERFLOW_BYTES - 20)
+        bind_unix_socket(deep, "k-sock")
+        self.assertTrue(stat.S_ISSOCK(os.lstat(deep / "k-sock").st_mode))
 
     def test_socket_cell_with_a_200_byte_tmpdir(self):
         long_tmp = self.scratch
