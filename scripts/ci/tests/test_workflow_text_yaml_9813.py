@@ -398,6 +398,21 @@ class FileChecks(ReaderCase):
                 exc = self.refused(wt.read_document, Path(device))
                 self.assert_refusal(exc, device, None, REASON_TEXTS["DEVICE"])
 
+    def test_9817_each_other_file_type_seen_by_fstat_is_refused(self) -> None:
+        """A socket or a block device cannot be opened here as a file to read, so fstat is given its mode."""
+        path = self.write("a: 1\n")
+        real_fstat = os.fstat
+        for kind, (mode, constant) in {"socket": (stat.S_IFSOCK, "NOT_REGULAR"),
+                                       "block_device": (stat.S_IFBLK, "DEVICE")}.items():
+            with self.subTest(kind=kind):
+                def fake_fstat(fd, mode=mode):
+                    real = real_fstat(fd)
+                    return os.stat_result((mode | 0o600,) + tuple(real)[1:])
+
+                with unittest.mock.patch.object(wt.os, "fstat", fake_fstat):
+                    exc = self.refused(wt.read_document, path)
+                self.assert_refusal(exc, str(path), None, REASON_TEXTS[constant])
+
     def test_9817_an_unreadable_file_is_refused(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("root reads a mode-000 file; the row needs an unprivileged user")
