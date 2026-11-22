@@ -3191,7 +3191,7 @@ CI_CARGO_ENV = "\n".join((
     "TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}",
     "TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}",
     "TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}",
-    "JOB_TIMEOUT_MIN: 95",
+    "TEST_STEP_DEADLINE_MIN: ${{ steps.test_step_bound.outputs.deadline_min }}",
     "CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}",
     "HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' "
     "&& '2' || '0' }}",
@@ -3218,7 +3218,8 @@ PAIR_TABLES: dict[tuple[str, str], PairTable] = {
                 {"if": (CI_IF_LOW_MEM, None)}),
             Row("Run tests (impact-aware)", "Build the test targets (no run)", {
                 "name": (ANY, ANY), "run": (ANY, ANY), "shell": ("bash", None),
-                "if": (CI_IF_NOT_SKIPPED, WARM_IF_CACHE_MISS), "env": (CI_CARGO_ENV, None)}),
+                "if": (CI_IF_NOT_SKIPPED, WARM_IF_CACHE_MISS), "env": (CI_CARGO_ENV, None),
+                "timeout-minutes": ("${{ fromJSON(steps.test_step_bound.outputs.minutes) }}", None)}),
         ),
         pr_only=(
             "Record job start (#6795)",
@@ -3234,6 +3235,7 @@ PAIR_TABLES: dict[tuple[str, str], PairTable] = {
             "Run the pg_isolated_binary live cells (enterprise-fed legs only)",
             "Scrub inherited passphrase env (self-hosted only, issue 3539 hygiene)",
             "Load gate (#6795)",
+            "Test step bound (#9852)",
             "Upload test results (durable audit history)",
             "Upload shard logs (#6344)",
             "Upload isolated-lane per-binary logs (#6383)",
@@ -3491,7 +3493,12 @@ PAIR_STEP_NAMES_9770 = {
                      "Free disk + add swap (#1148 belt-and-suspenders, aggressive)",
                      "Install Rust 1.99.1"),
 }
+# Keys that neither cargo step of a pair may carry. ci.yml's PR cargo step carries
+# `timeout-minutes` since #9852 (pinned by its Row), so that one pair is exempt for that key
+# only; `test_the_ci_test_step_timeout_is_pinned_9852` proves the pin and the warm-side absence.
 UNPINNED_ABSENT_STEP_KEYS = ("working-directory", "continue-on-error", "timeout-minutes")
+PINNED_PR_STEP_KEY_9852 = {"ci.yml": "timeout-minutes"}
+CI_TEST_STEP_TIMEOUT_9852 = "${{ fromJSON(steps.test_step_bound.outputs.minutes) }}"
 UNPINNED_ABSENT_JOB_KEYS = ("services", "concurrency", "outputs", "environment", "continue-on-error")
 SIDES_9770 = ("pr", "warm")
 # Hand-written per PR workflow: the "<workflow>:<job>" label of its PR side and of its warm side.
@@ -3524,7 +3531,7 @@ CI_CARGO_ENV_9770 = "\n".join((
     "TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}",
     "TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}",
     "TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}",
-    "JOB_TIMEOUT_MIN: 95",
+    "TEST_STEP_DEADLINE_MIN: ${{ steps.test_step_bound.outputs.deadline_min }}",
     "CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}",
     "HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' "
     "&& '2' || '0' }}",
@@ -3808,12 +3815,30 @@ class PairMirrorFixtures9770(unittest.TestCase):
                 for key, value, seen in added:
                     if key == "id" and pair[0] == "coverage.yml":
                         continue  # pinned by the hand table (id: sweep, #9263); see the test below
+                    if PINNED_PR_STEP_KEY_9852.get(pair[0]) == key:
+                        continue  # pinned on the PR cargo step (#9852); see the test below
                     with self.subTest(pair=pair[2], side=side, key=key):
                         problems = _mutated_9770(pair, side, lambda wf, job: _on_step_9770(
                             wf, job, ident, _add_step_key_9770(key, value)))
                         pr_value, warm_value = (seen, None) if side == "pr" else (None, seen)
                         self.assertEqual(problems, [_differs_9770(
                             pair, pr_cargo, warm_cargo, key, pr_value, warm_value)])
+
+    def test_the_ci_test_step_timeout_is_pinned_9852(self) -> None:
+        """#9852 gave `Run tests (impact-aware)` a computed `timeout-minutes`; the warm step has none."""
+        pair = PAIRS[0]
+        pr_cargo, warm_cargo = PAIR_STEP_NAMES_9770[pair[0]][:2]
+        changed = _mutated_9770(pair, "pr", lambda wf, job: _on_step_9770(
+            wf, job, pr_cargo, _sub_in_lines_9770(
+                f"timeout-minutes: {CI_TEST_STEP_TIMEOUT_9852}", "timeout-minutes: x")))
+        self.assertEqual(changed, [_table_9770(
+            pair, "pr", pr_cargo, "timeout-minutes", "x", CI_TEST_STEP_TIMEOUT_9852)])
+        for added in ("x", CI_TEST_STEP_TIMEOUT_9852):
+            with self.subTest(added=added):
+                warm_added = _mutated_9770(pair, "warm", lambda wf, job: _on_step_9770(
+                    wf, job, warm_cargo, _add_step_key_9770("timeout-minutes", added)))
+                self.assertEqual(warm_added, [_table_9770(
+                    pair, "warm", warm_cargo, "timeout-minutes", added, None)])
 
     def test_the_coverage_sweep_id_is_pinned_on_the_pr_cargo_step_9263(self) -> None:
         """#9263 gave `Generate coverage JSON` the id `sweep` that its end-of-sweep step reads."""

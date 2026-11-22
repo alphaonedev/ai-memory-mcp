@@ -32,8 +32,8 @@ Test step deadline (#9852): the step `Test step bound (#9852)` runs `suite_budge
 the leg `timeout` minus `POST_STEP_MARGIN_MIN` (12) counted from `JOB_T0`, so the upload and cleanup steps after it
 keep that margin however late the step starts. `suite_budget.test_step_deadline_secs` is the one source: the bound,
 `TEST_STEP_DEADLINE_MIN` (read by `job_left`, the serial shard budget and its notice), the whole-suite plan and the
-#7914 identity all read it. Fewer than 10 minutes left, or a `JOB_T0` that is not an epoch second, is a named red
-(exit 2) of the bound step, so the test step never runs unbounded. The macos-fed sqlite leg is 87 so its 75-minute
+#7914 identity all read it. Fewer than 10 minutes left is a named red (exit 3; a `JOB_T0` that is not an epoch second
+is exit 2) of the bound step, so the test step never runs unbounded. The macos-fed sqlite leg is 87 so its 75-minute
 deadline keeps the whole-suite ceiling below with its 20 percent margin.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
