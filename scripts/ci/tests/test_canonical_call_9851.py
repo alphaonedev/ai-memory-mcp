@@ -480,8 +480,8 @@ SPELLINGS = [
 class GatedStepTemplate(unittest.TestCase):
     """#9879 invariant B (rules B1 to B3), each row with its reason by hand."""
 
-    def gsv(self, texts, module=None, cfg=CFG):
-        return need(self, module or hsc, 'gated_step_violations')(cfg, texts)
+    def gsv(self, texts, module=None):
+        return need(self, module or hsc, 'gated_step_violations')(texts)
 
     # (row, text of G_W, expected findings)
     PROBES = [
@@ -548,7 +548,7 @@ class GatedStepTemplate(unittest.TestCase):
         self.assertEqual(got, [S_B2])
 
     def test_the_real_tree_has_no_finding(self):
-        self.assertEqual(self.gsv(hsc.github_all_texts(), cfg=hsc.load_config()), [])
+        self.assertEqual(self.gsv(hsc.github_all_texts()), [])
 
     # (mutant id, (old text, new text) in host_slots_check.py, texts, expected findings)
     MUTANTS = [

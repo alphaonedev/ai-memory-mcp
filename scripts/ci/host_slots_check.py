@@ -148,7 +148,6 @@ F_POSITIONAL = ('%s: a host_semaphore.py call with a word before its -- that is 
                 'value (the wrapper would run it as the command)')
 F_NO_COMMAND = '%s: a host_semaphore.py call without a -- followed by a command'
 
-ENV_LEVELS = ('step', 'job', 'workflow')
 # #9879 invariant B: the wrapper's path fragments. A run value that names one of them names the wrapper.
 WRAPPER_FRAGMENT_RE = re.compile(r'ci/host|host_sem|semaphore\.py', re.IGNORECASE)
 PATH_FRAGMENT_RE = re.compile(r'ci/host', re.IGNORECASE)
@@ -158,7 +157,6 @@ FRAGMENT_OPENER_RE = re.compile(r'\$\{\{|[*?\[]|\$\'|\$"')
 EXPR_OPENER = '${{'
 QUOTES = ('"', "'")
 WORKFLOW_DIR = 'workflows/'
-F_ENV_FORM = '%s: job %s: the %s env is not a plain mapping, so its keys cannot be checked'
 F_GATED_EXPR = ('%s: job %s: a run line of a gated job holds an expression ${{ (the runner substitutes it into the '
                 'script before bash reads it)')
 F_PATH_CHAR = ('%s: a run line names ci/host and, with quotes removed, holds a character outside the canonical call '
@@ -563,18 +561,13 @@ def _shown_name(name):
     return name if isinstance(name, str) and GATE_NAME_RE.fullmatch(name) else _shown(name)
 
 
-def _env_mapping(found, where, level, holder):
-    """The env mapping of HOLDER (a step, job or workflow), {} when absent; F_ENV_FORM and {} when not a mapping."""
+def _env_mapping(holder):
+    """The env mapping of HOLDER (a step, job or workflow), {} when absent or not a mapping."""
     env = holder.get('env') if isinstance(holder, dict) else None
-    if env is None:
-        return {}
-    if not isinstance(env, dict):
-        found.append(F_ENV_FORM % (where + (level,)))
-        return {}
-    return env
+    return env if isinstance(env, dict) else {}
 
 
-def _gated_job_findings(cfg, wf, doc, job_id, job):
+def _gated_job_findings(wf, doc, job_id, job):
     """The expression rule of invariant B (B2) for one job of the workflow document DOC.
 
     A job is gated when a step run value names the wrapper or the job or a step env sets HOST_SEMAPHORE_SLOTS; the
@@ -584,10 +577,7 @@ def _gated_job_findings(cfg, wf, doc, job_id, job):
     steps = [step for step in steps if isinstance(step, dict)] if isinstance(steps, list) else []
     runs = [step for step in steps if isinstance(step.get('run'), str)]
     wrapper_steps = [step for step in runs if any(_names_wrapper(line) for line in _logical_lines(step['run']))]
-    scratch = []
-    slot_envs = [_env_mapping(scratch, where, level, holder)
-                 for level, holder in (('job', job), ('workflow', doc))] + [
-        _env_mapping(scratch, where, ENV_LEVELS[0], step) for step in steps]
+    slot_envs = [_env_mapping(holder) for holder in [job, doc] + steps]
     if not wrapper_steps and not any(SLOTS_KEY in env for env in slot_envs):
         return []
     found = []
@@ -600,13 +590,14 @@ def _line_rule_count(lines, rule):
     return sum(1 for line in lines if rule(line))
 
 
-def gated_step_violations(cfg, workflow_texts):
+def gated_step_violations(workflow_texts):
     """Invariant B of #9879: every spelling of the wrapper path that the runner or the shell resolves before the
     wrapper runs is a finding.
 
     Per file: the jobs of a workflow (the gated-job expression rule), then F_PATH_CHAR and F_FRAGMENT_FORM (each
-    counted on the raw lines and on the decoded run lines, the larger count). Known limit
-    (docs/ci/CARRIER-BRANCH-GATES.md): a line with no literal fragment, the path taken wholly from a variable."""
+    counted on the raw lines and on the decoded run lines, the larger count). Known limits
+    (docs/ci/CARRIER-BRANCH-GATES.md): a line with no literal fragment, the path taken wholly from a variable; a
+    composite action's run text is checked by B1 and B3 only, B2 applies to workflow jobs (#9893)."""
     found = []
     for wf, text in sorted(workflow_texts.items()):
         if text is None:
@@ -627,7 +618,7 @@ def gated_step_violations(cfg, workflow_texts):
         run_lines = [line for value in _run_values(doc) for line in _logical_lines(value)]
         jobs = doc.get('jobs') if isinstance(doc, dict) and wf.startswith(WORKFLOW_DIR) else None
         for job_id, job in (jobs.items() if isinstance(jobs, dict) else ()):
-            found.extend(_gated_job_findings(cfg, wf, doc, job_id, job))
+            found.extend(_gated_job_findings(wf, doc, job_id, job))
         found.extend([F_PATH_CHAR % wf] * _line_rule_count(run_lines, _path_char))
         found.extend([F_FRAGMENT_FORM % wf] * max(fragments, _line_rule_count(run_lines, _fragment_form)))
     return found
@@ -765,7 +756,7 @@ def main():
         # every .github text, composite actions included: a definition there counts and is bounded too
         all_texts = github_all_texts()
         problems = (config_violations(cfg) + call_site_violations(cfg, all_texts)
-                    + gated_step_violations(cfg, all_texts)
+                    + gated_step_violations(all_texts)
                     + bound_violations(cfg, texts) + wait_key_violations(texts))
     except (ConfigError, taint_boundary.YamlError) as exc:
         print('host_slots_check: malformed: %s' % exc)
