@@ -2706,14 +2706,6 @@ PERMITTED_BARE_MODULE_USES = frozenset({
 PERMITTED_IMPORTS = frozenset({"argparse", "errno", "fcntl", "os", "re", "stat", "struct", "sys", "time"})
 CALL_ROOTS = ("os", "time", "fcntl", "struct", "sys", "stat", "errno", "re", "argparse", "subprocess", "sp",
               "signal", "shutil", "socket", "threading", "psutil")
-SWEEP_7160_STEPS = frozenset({
-    "Sweep target/debug to the size cap (self-hosted)",
-    "Sweep per-runner cargo target to the size cap (self-hosted, #7160)",
-})
-FORK_CLAUSE = ("(github.event_name != 'pull_request' || "
-               "github.event.pull_request.head.repo.full_name == github.repository)")
-CHECKOUT_GUARD = "steps.checkout.outcome == 'success'"
-CHECKOUT_ID_OUTSIDE_SCOPE = {"ci.yml"}  # ci.yml checkout carries no id; coordinator b29: no edit outside the clear
 
 
 def module_calls(tree):
@@ -3207,8 +3199,9 @@ class JobBoundaryClear9820(Base):
 
     def test_high2_docs_state_the_job_boundary_clear_without_a_home_prefix(self):
         text = (ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text()
-        for needle in ("mode: job-end", "JOB_START_GRACE_SECS", "never to polling for an idle runner", "append-only",
-                       "F1_VOLUME_RUNNER_ROOT", "RUNNER_FOLDER_BY_NAME", "exits 3"):
+        for needle in ("--mode job-end", "JOB_START_GRACE_SECS", "never to polling for an idle runner", "append-only",
+                       "F1_VOLUME_RUNNER_ROOT", "RUNNER_FOLDER_BY_NAME", "exits 3",
+                       "No workflow invokes `--mode job-end` yet", "#9876", "#9875"):
             self.assertIn(needle, text)
         self.assertNotIn("/Users/", text)
 
@@ -3240,40 +3233,29 @@ class WorkflowWiring(unittest.TestCase):
                 checkout = [i for i, s in enumerate(steps) if "uses: actions/checkout@" in "\n".join(s.code_lines())]
                 self.assertEqual(len(checkout), 1, key)
                 prune_idx = [i for i, s in enumerate(steps) if ACTION_USES in "\n".join(s.code_lines())]
-                self.assertEqual(prune_idx[:1], [checkout[0] + 1], f"{key}: prune must be the step right after checkout")
-                self.assertNotIn("mode: job-end", "\n".join(steps[prune_idx[0]].code_lines()), "the start step is job-start")
+                self.assertEqual(prune_idx, [checkout[0] + 1], f"{key}: prune must be the step right after checkout")
                 before = "\n".join("\n".join(s.code_lines()) for s in steps[: checkout[0]])
                 self.assertNotRegex(before, r"\bcargo\b|\brustup\b|uses: [a-z]", f"{key}: nothing builds before the prune")
                 text = "\n".join(steps[prune_idx[0]].code_lines())
                 self.assertIn("runner.environment == 'self-hosted'", text)
                 self.assertNotIn("continue-on-error", text)
 
-    def test_high1_the_job_end_clear_follows_every_build_and_test_step_and_only_the_7160_sweeps_follow_it(self):
-        """#9820 / PR 9822 r1: the clear runs after every build and test step; the #7160 sweeps stay last."""
-        for key, steps in self.self_hosted_jobs().items():
-            with self.subTest(job=key):
-                ends = [i for i, s in enumerate(steps)
-                        if ACTION_USES in "\n".join(s.code_lines()) and "mode: job-end" in "\n".join(s.code_lines())]
-                self.assertEqual(len(ends), 1, f"{key}: exactly one job-end clear")
-                after = [s.name for s in steps[ends[0] + 1:]]
-                self.assertLessEqual(set(after), SWEEP_7160_STEPS, f"{key}: only the #7160 sweeps follow the clear")
-                text = "\n".join(steps[ends[0]].code_lines())
-                self.assertRegex(text, r"if: always\(\)")
-                self.assertIn("runner.environment == 'self-hosted'", text)
-                self.assertIn(FORK_CLAUSE, text, f"{key}: low-3 fork clause")
-                if key[0] not in CHECKOUT_ID_OUTSIDE_SCOPE:
-                    self.assertIn(CHECKOUT_GUARD, text, f"{key}: low-3 checkout outcome guard")
-                self.assertNotRegex(text, r"continue-on-error|!cancelled\(\)|success\(\)|failure\(\)")
-
-    def test_action_passes_the_mode_input_to_the_script_and_defaults_to_job_start(self):
+    def test_action_describes_both_failure_modes_and_runs_the_script(self):
         text = (ROOT / ACTION_PATH).read_text()
-        self.assertRegex(text, r"(?s)inputs:\s+mode:.*default: job-start")
-        self.assertIn('--mode "${PRUNE_MODE}"', text)
-        self.assertIn("PRUNE_MODE: ${{ inputs.mode }}", text)
+        self.assertIn("using: composite", text)
+        self.assertIn("scripts/ci/prune_runner_tmp.py", text)
+        self.assertRegex(text, r"(?is)refus\w+ .*::warning.*does not fail")
+        self.assertRegex(text, r"(?is)per-entry .*does not fail")
+        self.assertRegex(text, r"(?is)unexpected error .*fails? the job")
         self.assertIsNone(re.search(r"continue-on-error", text))
 
-    def test_medium6_the_action_run_line_fails_job_end_and_warns_at_job_start(self):
-        """Run the action's own run: line under bash, as the runner does, on a TMPDIR that must be refused."""
+    def test_the_wired_step_runs_job_start_and_a_refusal_does_not_fail_the_job(self):
+        """PR 9822 lands the job-end mode unwired (#9876, #9875): the one wired step passes no --mode.
+
+        Its own run: line runs under bash, as the runner does, on a TMPDIR that must be refused: the default
+        mode is job-start, so the refusal is a ::warning with exit 0 and nothing is deleted.
+        """
+        self.assertNotIn("--mode", action_run_line())
         base = Path(tempfile.mkdtemp(dir=SCRATCH_BASE))
         self.addCleanup(shutil.rmtree, base)
         bindir = base / "bin"
@@ -3282,15 +3264,14 @@ class WorkflowWiring(unittest.TestCase):
         scratch = base / "not-a-runner"
         scratch.mkdir()
         (scratch / "keep.db").write_bytes(b"k")
-        for mode, rc_wanted, level in (("job-end", EXIT_NOT_CLEARED, "::error"), ("job-start", EXIT_OK, "::warning")):
-            with self.subTest(mode=mode):
-                env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(base), "TMPDIR": str(scratch),
-                       "PRUNE_MODE": mode, "GITHUB_ACTION_PATH": str(ROOT / ".github/actions/prune-runner-tmp")}
-                done = subprocess.run(["bash", "-c", action_run_line()], env=env, capture_output=True, text=True,
-                                      timeout=60, check=False)
-                self.assertEqual(done.returncode, rc_wanted, done.stderr)
-                self.assertIn(f"{level} title=prune_runner_tmp refused::", done.stdout)
-                self.assertTrue((scratch / "keep.db").exists())
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(base), "TMPDIR": str(scratch),
+               "GITHUB_ACTION_PATH": str(ROOT / ".github/actions/prune-runner-tmp")}
+        done = subprocess.run(["bash", "-c", action_run_line()], env=env, capture_output=True, text=True,
+                              timeout=60, check=False)
+        self.assertEqual(done.returncode, EXIT_OK, done.stderr)
+        self.assertIn("::warning title=prune_runner_tmp refused::", done.stdout)
+        self.assertNotIn("::error", done.stdout)
+        self.assertTrue((scratch / "keep.db").exists())
 
 
 if __name__ == "__main__":

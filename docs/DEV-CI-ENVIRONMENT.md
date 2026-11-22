@@ -106,20 +106,21 @@ therefore runs the composite action `.github/actions/prune-runner-tmp` as the
 step right after checkout (guarded by `runner.environment == 'self-hosted'`),
 which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 
-- Only DIRECT entries of the resolved `TMPDIR` are removed (#9820). The clear is
-  bound to the job boundary, never to polling for an idle runner (f1 runners go
-  from one job to the next in 2 s): the action runs a second time near the end
-  of every self-hosted job (`mode: job-end`, `if: always()`, after every build
-  and test step; only the two #7160 sweep steps come after it, and it needs the
-  job's checkout step to have succeeded), which removes every entry, and at job
-  start (`mode: job-start`, covers a job whose end step never ran: runner lost,
-  hard cancel), which keeps an entry whose own mtime (lstat, never a symlink
-  target) is within `JOB_START_GRACE_SECS` (30) as owned by a live writer.
-- At job end a TMPDIR that is not cleared fails the step: a refusal or any
-  entry it could not remove prints one `::error` annotation and the step
-  exits 3 (`EXIT_NOT_CLEARED`). At job start the same outcome is a `::warning`
-  with exit 0, because the end step of the same job clears it or fails the job.
-  An internal error exits 1 in both modes.
+- Only DIRECT entries of the resolved `TMPDIR` are removed (#9820). The script
+  has two modes. `--mode job-start` is the default and the only mode a workflow
+  runs today (the step right after checkout passes no `--mode`): it keeps an
+  entry whose own mtime (lstat, never a symlink target) is within
+  `JOB_START_GRACE_SECS` (30) as owned by a live writer and removes the rest.
+  `--mode job-end` removes every entry; it is bound to the job boundary,
+  never to polling for an idle runner (f1 runners go from one job to the next
+  in 2 s). No workflow invokes `--mode job-end` yet: the job-end step in the
+  workflows, the action input that passes the mode and the checkout guard of
+  the `ci.yml` check job land with issues #9876 and #9875. Until then the
+  action's own description still states the one-day age of #8634.
+- In mode job-end a TMPDIR that is not cleared fails the step: a refusal or any
+  entry it could not remove prints one `::error` annotation and the script
+  exits 3 (`EXIT_NOT_CLEARED`). In mode job-start the same outcome is a
+  `::warning` with exit 0. An internal error exits 1 in both modes.
 - An entry with an append-only or immutable flag (EPERM or EACCES) has the flag
   cleared through its open descriptor, never through a symlink, and is then
   removed; a file with more than one hard link is never unflagged (its inode is
@@ -190,10 +191,8 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   stderr and changes no exit code.
 - Every input it cannot prove ends in a named refusal with nothing deleted. A
   refusal prints one annotation with the escaped reason (and the same line on
-  stderr): at job start a `::warning` and exit 0, at job end an `::error` and
-  the step exits 3. The job-end step runs after every build and test step, so
-  its failure skips nothing but the #7160 sweeps, which run on `always()`. The
-  reasons, each pinned by a test against the code:
+  stderr): in mode job-start a `::warning` and exit 0, in mode job-end an
+  `::error` and exit 3. The reasons, each pinned by a test against the code:
 
 - refusal: `python <found> is older than <wanted>`
 - refusal: `this platform lacks a working descriptor-relative call: <call> raised <error> (<why>)`

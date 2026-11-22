@@ -2761,16 +2761,6 @@ jobs:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
 
-      # #9820 - job-boundary clear: the runner's TMPDIR holds nothing this job
-      # made once it ends (pass, fail or cancel). After every build and test
-      # step, before only the #7160 sweeps; never an idle poll. A TMPDIR it
-      # cannot clear fails the job with one ::error (exit 3).
-      - name: Clear runner TMPDIR at job end (#9820)
-        if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: ./.github/actions/prune-runner-tmp
-        with:
-          mode: job-end
-
       # #7160 - cap the persistent self-hosted target/debug (oldest-mtime
       # first). Last steps so they never race a running build. Two shapes,
       # exactly one runs per self-hosted leg: legs that build in the workspace

@@ -146,7 +146,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        id: checkout
         with:
           persist-credentials: false
       - name: Prune stale runner TMPDIR (#8634)
@@ -470,15 +469,6 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
-
-      # #9820 - job-boundary clear: after every build and test step, before only
-      # the #7160 sweep; runs on pass, fail and cancel once checkout succeeded.
-      # A TMPDIR it cannot clear fails the job with one ::error (exit 3).
-      - name: Clear runner TMPDIR at job end (#9820)
-        if: always() && runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && steps.checkout.outcome == 'success'
-        uses: ./.github/actions/prune-runner-tmp
-        with:
-          mode: job-end
 
       # #7160 - cap the persistent self-hosted target/debug (workspace-local,
       # oldest-mtime first). Last step so it never races a running build.
