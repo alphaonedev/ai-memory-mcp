@@ -5,9 +5,11 @@
 Invariant, for every input: the prune deletes only stale top-level entries of a
 directory PROVEN, by file identity, to be this runner's own
 ``<confirmed runner root>/runner-<digits>``; any input it cannot prove ends in a
-named refusal (exact reason, nothing deleted); a per-entry failure or a
-refusal never fails or skips the rest of the job (a ``::warning`` annotation, exit 0); an
-unexpected internal error stays red (exit 1); a per-entry failure is counted (exit 0); no output
+named refusal (exact reason, nothing deleted); in mode job-start a per-entry
+failure or a refusal never fails or skips the rest of the job (a ``::warning``
+annotation, exit 0), in mode job-end (#9820) a TMPDIR that is not cleared says
+why with one ``::error`` annotation and exit 3; an unexpected internal error
+stays red (exit 1); a per-entry failure is counted; no output
 line can carry a workflow command; removal never recurses in Python frames and
 never enters another device or another mount; the platform check is a functional
 probe and gives the same answer under every interpreter a runner uses.
@@ -2639,22 +2641,130 @@ class SocketPathLimit9460(unittest.TestCase):
 
 LIVE_WRITER_AGE_SECS = 3  # an entry touched seconds ago: owned by a job that is still running
 FUTURE_SKEW_SECS = -1000  # an mtime 1000 s ahead of the clock (age() subtracts)
-F1_FOLDER_NAMES = ("actions-runner", "actions-runner-2", "f1-macos-fed-3", "f1-macos-fed-5", "fed3")
 F1_LAYOUT_REFUSAL = "TMPDIR is not <root>/<runner folder>/_tmp of an allowed layout: {path}"
 FLAG_PLATFORMS = ("linux", "darwin")
+# PR 9822 r1: job end that is not cleared says why with a non-zero exit and one ::error annotation.
+EXIT_NOT_CLEARED = 3
+ERROR_REFUSED = "::error title=prune_runner_tmp refused::prune_runner_tmp: refused: "
+WARNING_REFUSED = "::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: "
+ERROR_FAILED = "::error title=prune_runner_tmp failed::prune_runner_tmp: "
+# Written out from the TMPDIR= line of each live runner .env on f1 (2026-11-22) and the runner's agentName;
+# never computed from the script (code HIGH-3, security M1/M3).
+LIVE_RUNNER_TABLE = (
+    ("f1-macos-fed", "/Volumes/f1dev/rt/fed/_tmp"),
+    ("f1-macos-fed-2", "/Volumes/f1dev/rt/fed2/_tmp"),
+    ("f1-macos-fed-3", "/Volumes/f1dev/rt/fed3/_tmp"),
+)
+NOT_A_RUNNER_FOLDER = ("evil", "fedx", "fed-2", "fed2x", "Fed2", "actions-runner", "actions-runner-2",
+                       "f1-macos-fed-3", "tmp", "fed٢")
+RUNNER_UNSET_REFUSAL = "RUNNER_NAME is unset or empty; the runner folder cannot be bound: {path}"
+RUNNER_UNBOUND_REFUSAL = "TMPDIR folder {folder} is not the folder of runner {runner}: {path}"
+TMPDIR_FLAGGED_REFUSAL = "TMPDIR carries an immutable or append-only flag: {path}"
+CONTAINS_REFUSAL = "TMPDIR contains the home directory or the workspace: {path}"
+JOB_START_GRACE_SECS_PINNED = 30
+FS_IOC_PINNED = (0x80086601, 0x40086602)  # _IOR('f', 1, long) and _IOW('f', 2, long) on a 64-bit kernel
+# Every module call the script may make (code MEDIUM-6): an allowlist, never a list of forbidden spellings.
+PERMITTED_CALLS = frozenset({
+    "argparse.ArgumentParser", "fcntl.ioctl", "os.chflags", "os.close", "os.fchdir", "os.fchmod", "os.fstat",
+    "os.getcwd", "os.geteuid", "os.getpid", "os.kill", "os.lstat", "os.mkdir", "os.open", "os.path.basename",
+    "os.path.dirname", "os.path.expanduser", "os.path.isabs", "os.path.normpath", "os.path.realpath", "os.read",
+    "os.rmdir", "os.scandir", "os.stat", "os.unlink", "os.urandom", "os.urandom(PROBE_RANDOM_BYTES).hex",
+    "os.write", "re.compile", "stat.S_IMODE", "stat.S_ISDIR", "stat.S_ISFIFO", "stat.S_ISLNK", "stat.S_ISREG",
+    "stat.S_ISSOCK", "struct.pack", "struct.unpack", "sys.exit", "sys.modules.get", "sys.stderr.write",
+    "sys.stdout.write", "sys.version.splitlines", "time.time",
+})
+REFLECTIVE_NAMES = ("__import__", "exec", "eval", "compile", "getattr", "globals", "vars", "setattr")
+PERMITTED_REFLECTIVE_CALLS = frozenset({
+    "__import__('os')", "compile(source, path, 'exec', dont_inherit=True)",
+    "exec(compile(source, path, 'exec', dont_inherit=True), module.__dict__)", "getattr(exc, 'escaped', None)",
+    "getattr(module, name, None)", "getattr(os, 'O_CLOEXEC', 0)", "getattr(os, 'O_NONBLOCK', 0)",
+    "getattr(os.lstat(target), 'st_flags', 0)", "getattr(os.fstat(fd), 'st_flags', 0)",
+    "getattr(reason, 'counted', False)", "getattr(reason, 'raw', reason)", "getattr(stat, 'UF_APPEND', 4)",
+    "getattr(stat, 'UF_IMMUTABLE', 2)", "getattr(wa, 'safe_value', None)", "globals()",
+})
+# A module name used other than as ``module.attr``: the only permitted uses (an alias would hide a call).
+PERMITTED_BARE_MODULE_USES = frozenset({
+    "getattr(os, 'O_CLOEXEC', 0)", "getattr(os, 'O_NONBLOCK', 0)", "getattr(stat, 'UF_APPEND', 4)",
+    "getattr(stat, 'UF_IMMUTABLE', 2)", "type(sys)",
+})
+PERMITTED_IMPORTS = frozenset({"argparse", "errno", "fcntl", "os", "re", "stat", "struct", "sys", "time"})
+CALL_ROOTS = ("os", "time", "fcntl", "struct", "sys", "stat", "errno", "re", "argparse", "subprocess", "sp",
+              "signal", "shutil", "socket", "threading", "psutil")
+SWEEP_7160_STEPS = frozenset({
+    "Sweep target/debug to the size cap (self-hosted)",
+    "Sweep per-runner cargo target to the size cap (self-hosted, #7160)",
+})
+FORK_CLAUSE = ("(github.event_name != 'pull_request' || "
+               "github.event.pull_request.head.repo.full_name == github.repository)")
+CHECKOUT_GUARD = "steps.checkout.outcome == 'success'"
+CHECKOUT_ID_OUTSIDE_SCOPE = {"ci.yml"}  # ci.yml checkout carries no id; coordinator b29: no edit outside the clear
+
+
+def module_calls(tree):
+    """Every call whose callee is rooted at a module name, as source text."""
+    return {ast.unparse(node.func) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and ast.unparse(node.func).split(".")[0] in CALL_ROOTS}
+
+
+def attribute_root(node):
+    """The Name at the base of an ``a.b.c`` chain, or None when the chain starts at anything else."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node if isinstance(node, ast.Name) else None
+
+
+def resolve_reference(text):
+    """The object ``text`` (``module.attr...``) names, or None when it does not resolve here (fail closed)."""
+    root, *parts = text.split(".")
+    try:
+        value = importlib.import_module(root)
+        for part in parts:
+            value = getattr(value, part)
+    except (ImportError, AttributeError):
+        return None
+    return value
+
+
+def callable_references(tree, parents):
+    """Every module attribute named other than as a call's callee that is (or may be) a function.
+
+    ``run = os.system`` or ``TABLE = (os.system,)`` hides a call from module_calls; such a reference counts as
+    the call itself. A reference that does not resolve here, or that is written to, is reported as well.
+    """
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or isinstance(parents.get(node), ast.Attribute):
+            continue
+        root = attribute_root(node)
+        if root is None or root.id not in CALL_ROOTS:
+            continue
+        parent = parents.get(node)
+        if isinstance(parent, ast.Call) and parent.func is node:
+            continue
+        text = ast.unparse(node)
+        if not isinstance(node.ctx, ast.Load):
+            found.add(f"write {text}")
+            continue
+        value = resolve_reference(text)
+        if value is None or callable(value):
+            found.add(text)
+    return found
 
 
 class FlagWorld:
-    """A fake protect-flag store keyed by file identity, plus an unlink and rmdir that honour it.
+    """A fake protect-flag store keyed by file identity, plus an unlink, rmdir and mkdir that honour it.
 
     A flagged entry cannot be removed, and nothing inside a flagged directory can be removed or made: the
     EPERM a real append-only or immutable flag gives. Clearing needs CAP_LINUX_IMMUTABLE (linux) or ownership
     (darwin), neither of which a test may assume, so the platform primitives (the ioctl pair and the
     chflags pair) are replaced by dict accessors and every other line of the clear path runs for real.
+    Keys come from lstat (never a symlink target), as the real flag calls use O_NOFOLLOW / follow_symlinks=False.
     """
 
-    def __init__(self):
+    def __init__(self, error=errno.EPERM):
         self.flags = {}
+        self.error = error
 
     @staticmethod
     def key(info):
@@ -2671,10 +2781,19 @@ class FlagWorld:
             info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)  # ENOENT passes through, as for the real call
             parent = os.fstat(dir_fd) if dir_fd is not None else os.stat(os.path.dirname(os.fspath(name)) or ".")
             if self.flags.get(self.key(info)) or self.flags.get(self.key(parent)):
-                raise PermissionError(errno.EPERM, "Operation not permitted")
+                raise PermissionError(self.error, os.strerror(self.error))
             return real(name, *args, dir_fd=dir_fd, **kwargs)
 
         return remover
+
+    def guarded_mkdir(self, real):
+        def maker(name, *args, dir_fd=None, **kwargs):
+            parent = os.fstat(dir_fd) if dir_fd is not None else os.stat(os.path.dirname(os.fspath(name)) or ".")
+            if self.flags.get(self.key(parent)):
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            return real(name, *args, dir_fd=dir_fd, **kwargs)
+
+        return maker
 
 
 class JobBoundaryClear9820(Base):
@@ -2690,15 +2809,20 @@ class JobBoundaryClear9820(Base):
         (flagged / "top.log").write_bytes(b"t" * 50)
         return flagged
 
-    def flag_world(self, platform, flagged):
+    def flag_world(self, platform, flagged=None, protect=None, error=errno.EPERM):
         """Patch the platform's flag primitives onto a FlagWorld and make ``flagged`` and its file protected."""
-        world = FlagWorld()
-        protect = PRUNE.LINUX_PROTECT_FLAGS if platform == "linux" else PRUNE.DARWIN_PROTECT_FLAGS
-        world.set(flagged, protect)
-        world.set(flagged / "top.log", protect)
+        world = FlagWorld(error)
+        if protect is None:
+            protect = PRUNE.LINUX_PROTECT_FLAGS if platform == "linux" else PRUNE.DARWIN_PROTECT_FLAGS
+        self.protect = protect
+        if flagged is not None:
+            world.set(flagged, protect)
+            world.set(flagged / "top.log", protect)
         patches = [
             mock.patch.object(PRUNE.os, "unlink", world.guarded(os.unlink)),
             mock.patch.object(PRUNE.os, "rmdir", world.guarded(os.rmdir)),
+            mock.patch.object(PRUNE.os, "mkdir", world.guarded_mkdir(os.mkdir)),
+            mock.patch.object(PRUNE, "fd_flags", lambda fd: world.flags.get(world.key(os.fstat(fd)), 0)),
         ]
         if platform == "linux":
             clearer = PRUNE.linux_clear_flags
@@ -2720,9 +2844,18 @@ class JobBoundaryClear9820(Base):
             self.addCleanup(patch.stop)
         return world
 
-    def check_left_scratch_is_cleared(self, platform):
+    def errors(self):
+        return [line for line in self.annotations if line.startswith("::error")]
+
+    def assert_not_cleared(self, rc, err, reason):
+        """Job end refused: exit 3, the reason on stderr and exactly one ::error annotation with it."""
+        self.assertEqual(rc, EXIT_NOT_CLEARED, err)
+        self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+        self.assertEqual(self.errors(), [ERROR_REFUSED + reason])
+
+    def check_left_scratch_is_cleared(self, platform, protect=None, error=errno.EPERM):
         flagged = self.make_scratch()
-        world = self.flag_world(platform, flagged)
+        world = self.flag_world(platform, flagged, protect, error)
         rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
         self.assertEqual((rc, err), (EXIT_OK, ""))
         self.assertRegex(out, r"^pruned=3 kept=0 failed=0 freed_bytes=\d+ skipped=0\n$")
@@ -2735,16 +2868,107 @@ class JobBoundaryClear9820(Base):
     def test_job_end_removes_a_left_file_and_an_append_only_folder_on_the_darwin_path(self):
         self.check_left_scratch_is_cleared("darwin")
 
-    def test_without_the_flag_clearing_the_protected_folder_is_a_counted_failure(self):
+    def test_medium3_eacces_from_a_protect_flag_is_cleared_too(self):
+        for platform in FLAG_PLATFORMS:
+            with self.subTest(platform=platform):
+                self.check_left_scratch_is_cleared(platform, error=errno.EACCES)
+
+    def test_medium3_an_immutable_only_flag_is_cleared_on_both_paths(self):
+        cases = (("linux", 0x10), ("darwin", 0x2))  # FS_IMMUTABLE_FL, UF_IMMUTABLE
+        for platform, protect in cases:
+            with self.subTest(platform=platform):
+                self.check_left_scratch_is_cleared(platform, protect=protect)
+        self.assertEqual(PRUNE.FS_IMMUTABLE_FL & PRUNE.LINUX_PROTECT_FLAGS, 0x10)
+        self.assertEqual(PRUNE.DARWIN_PROTECT_FLAGS & 0x2, 0x2)
+
+    def test_medium3_the_flag_ioctl_numbers_are_the_kernel_ones(self):
+        self.assertEqual((PRUNE.FS_IOC_GETFLAGS, PRUNE.FS_IOC_SETFLAGS), FS_IOC_PINNED)
+
+    def test_high1_without_the_flag_clearing_job_end_is_not_cleared_and_exits_non_zero(self):
         """The guard of the fake store is real: with no clearer the same scratch cannot be removed."""
         flagged = self.make_scratch()
         self.flag_world("linux", flagged)
         with mock.patch.object(PRUNE, "FLAG_CLEARERS", {}):
             rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
-        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(rc, EXIT_NOT_CLEARED)
         self.assertEqual(err, "prune_runner_tmp: failed to remove append-only-dir: [Errno 1] Operation not permitted\n")
         self.assertRegex(out, r"^pruned=2 kept=0 failed=1 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.errors(), [ERROR_FAILED + "failed=1 not removed: append-only-dir"])
         self.assertEqual(self.names(), ["append-only-dir"])
+
+    def test_high1_the_same_failure_at_job_start_is_a_warning_with_exit_0(self):
+        flagged = self.make_scratch()
+        self.flag_world("linux", flagged)
+        with mock.patch.object(PRUNE, "FLAG_CLEARERS", {}):
+            rc, out, err = self.run_prune(self.runner, "--mode", "job-start")
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(self.errors(), [])
+        self.assertEqual(self.annotations, [FAILED_TITLE + "failed=1 not removed: append-only-dir"])
+
+    def test_medium2_a_symlink_to_a_flagged_outside_target_is_unlinked_and_the_target_keeps_its_flag(self):
+        """The link sits in a flagged folder, so its unlink fails first and the flag clearing runs on the link."""
+        outside = self.base / "outside.db"
+        outside.write_bytes(b"o")
+        for platform in FLAG_PLATFORMS:
+            with self.subTest(platform=platform):
+                box = self.runner / "box"
+                box.mkdir()
+                (box / "link").symlink_to(outside)
+                world = self.flag_world(platform)
+                world.set(outside, self.protect)
+                world.set(box, self.protect)
+                rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+                self.assertEqual((rc, err), (EXIT_OK, ""))
+                self.assertEqual(self.names(), [])
+                self.assertEqual(world.get(outside), self.protect, "the outside target's flag is untouched")
+                self.assertTrue(outside.exists())
+
+    def test_low1_a_hard_link_to_a_flagged_outside_file_is_a_failure_and_its_flag_is_untouched(self):
+        outside = self.base / "outside-hard.db"
+        outside.write_bytes(b"o")
+        os.link(outside, self.runner / "hard.db")
+        for platform in FLAG_PLATFORMS:
+            with self.subTest(platform=platform):
+                world = self.flag_world(platform)
+                world.set(outside, self.protect)
+                rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+                self.assertEqual(rc, EXIT_NOT_CLEARED)
+                self.assertEqual(err, "prune_runner_tmp: failed to remove hard.db: [Errno 1] Operation not permitted\n")
+                self.assertEqual(self.errors(), [ERROR_FAILED + "failed=1 not removed: hard.db"])
+                self.assertEqual(world.get(outside), self.protect, "a shared inode never has its flag cleared")
+
+    def test_medium5_an_owned_read_only_directory_is_made_writable_once_and_removed(self):
+        locked = self.runner / "locked"
+        (locked / "deep").mkdir(parents=True)
+        (locked / "deep" / "f.db").write_bytes(b"x")
+        (locked / "g.db").write_bytes(b"y")
+        os.chmod(locked / "deep", 0o500)
+        os.chmod(locked, 0o500)
+        self.addCleanup(lambda: [os.chmod(p, 0o700) for p in (locked, locked / "deep") if p.exists()])
+        rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertRegex(out, r"^pruned=1 kept=0 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), [])
+
+    def test_l4_a_flagged_tmpdir_is_a_named_refusal(self):
+        world = self.flag_world(PRUNE.PLATFORM_LINUX if sys.platform == PRUNE.PLATFORM_LINUX else PRUNE.PLATFORM_DARWIN)
+        world.set(self.runner, self.protect)
+        victim = self.make_file("old.db", 0)
+        rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+        self.assert_not_cleared(rc, err, TMPDIR_FLAGGED_REFUSAL.format(path=self.runner))
+        self.assertTrue(victim.exists())
+
+    def test_low2_a_live_runner_diagnostic_pipe_is_kept_and_a_dead_ones_removed(self):
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        live_name = f"clr-debug-pipe-{os.getpid()}-1-in"
+        os.mkfifo(self.runner / live_name)
+        os.mkfifo(self.runner / f"dotnet-diagnostic-{dead.pid}-2-socket")
+        self.make_file(f"dotnet-diagnostic-{os.getpid()}-3-socket", 0)  # a regular file is never kept
+        rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertRegex(out, r"^pruned=2 kept=1 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), [live_name])
 
     def test_job_end_removes_an_entry_touched_a_moment_ago_and_one_dated_in_the_future(self):
         self.make_file("fresh.db", LIVE_WRITER_AGE_SECS)
@@ -2766,6 +2990,15 @@ class JobBoundaryClear9820(Base):
         self.assertEqual(self.names(), ["live-dir", "live.db"])
         self.assertTrue(live_file.exists() and (live_tree / "sub" / "f.db").exists())
 
+    def test_medium1_the_grace_is_30_s_an_entry_of_29_s_is_kept_and_one_of_31_s_removed(self):
+        self.assertEqual(PRUNE.JOB_START_GRACE_SECS, JOB_START_GRACE_SECS_PINNED)
+        self.make_file("young.db", JOB_START_GRACE_SECS_PINNED - 1)
+        self.make_file("old.db", JOB_START_GRACE_SECS_PINNED + 1)
+        rc, out, err = self.run_prune(self.runner, "--mode", "job-start")
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertRegex(out, r"^pruned=1 kept=1 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), ["young.db"])
+
     def test_the_default_mode_is_job_start_and_an_unknown_mode_is_a_usage_error(self):
         live = self.make_file("live.db", LIVE_WRITER_AGE_SECS)
         rc, out, err = self.run_prune(self.runner)
@@ -2779,73 +3012,169 @@ class JobBoundaryClear9820(Base):
         self.assertTrue(live.exists())
 
     def test_the_grace_belongs_to_job_start_only(self):
-        self.assertEqual(PRUNE.GRACE_SECS_BY_MODE, {PRUNE.MODE_JOB_START: PRUNE.JOB_START_GRACE_SECS, PRUNE.MODE_JOB_END: 0})
+        self.assertEqual(PRUNE.GRACE_SECS_BY_MODE, {"job-start": JOB_START_GRACE_SECS_PINNED, "job-end": 0})
         self.assertEqual(PRUNE.MODES, ("job-start", "job-end"))
-        self.assertGreater(PRUNE.JOB_START_GRACE_SECS, 0)
 
-    def test_the_clear_is_bound_to_the_job_boundary_and_never_polls_for_an_idle_runner(self):
+    def test_medium6_the_script_makes_only_permitted_calls_and_imports(self):
         """f1 runners go from one job to the next in 2 s: nothing may wait for idleness, sleep or look at processes."""
         source = (ROOT / "scripts/ci/prune_runner_tmp.py").read_text()
-        tree = ast.parse(source)
-        called = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
-        for forbidden in ("time.sleep", "sleep", "subprocess.run", "subprocess.Popen", "os.system", "os.popen", "pgrep"):
-            self.assertNotIn(forbidden, called)
-        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
-        self.assertFalse(imported & {"subprocess", "psutil", "signal", "sched", "threading"}, imported)
+        self.check_ratchet(source)
         for text in (source, (ROOT / ACTION_PATH).read_text()):
             self.assertNotRegex(text, r"(?i)\bsleep\b|pgrep|Runner\.Worker|\bidle poll")
 
-    def test_f1_runner_folder_tmp_is_cleared_and_every_other_form_is_refused(self):
-        with mock.patch.object(PRUNE, "RUNNER_FOLDER_LAYOUTS", ((str(self.root), PRUNE.RUNNER_FOLDER_LAYOUTS[0][1]),)):
-            for folder in F1_FOLDER_NAMES:
-                with self.subTest(folder=folder):
-                    leaf = self.root / folder / PRUNE.RUNNER_FOLDER_LEAF
-                    leaf.mkdir(parents=True)
-                    self.make_file("old.db", 0, leaf)
-                    rc, out, err = self.run_prune(leaf, "--mode", "job-end")
-                    if folder == "fed3":  # the volume layout's folder name does not match the shared layout
-                        self.assertEqual(rc, EXIT_REFUSED, err)
-                        self.assertEqual(err.rstrip("\n"),
-                                         "prune_runner_tmp: refused: " + F1_LAYOUT_REFUSAL.format(path=leaf))
-                        self.assertEqual(self.names(leaf), ["old.db"])
-                        continue
-                    self.assertEqual((rc, err), (EXIT_OK, ""))
-                    self.assertIn("pruned=1 kept=0 failed=0", out)
-                    self.assertEqual(self.names(leaf), [])
-            for bad in ("evil", "actions-runner-x", "f1-macos-fed-", "tmp"):
-                with self.subTest(refused=bad):
-                    leaf = self.root / bad / PRUNE.RUNNER_FOLDER_LEAF
-                    leaf.mkdir(parents=True)
-                    victim = self.make_file("old.db", 0, leaf)
-                    rc, out, err = self.run_prune(leaf, "--mode", "job-end")
-                    self.assertEqual((rc, out), (EXIT_REFUSED, ""))
-                    self.assertEqual(err.rstrip("\n"), "prune_runner_tmp: refused: " + F1_LAYOUT_REFUSAL.format(path=leaf))
-                    self.assertTrue(victim.exists(), "a refusal deletes nothing")
+    def check_ratchet(self, source):
+        tree = ast.parse(source)
+        self.assertLessEqual(module_calls(tree), PERMITTED_CALLS)
+        imported = {alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+                    for alias in node.names}
+        self.assertEqual(imported, PERMITTED_IMPORTS)
+        self.assertEqual([node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)], [])
+        reflective = {ast.unparse(node) for node in ast.walk(tree) if isinstance(node, ast.Call)
+                      and isinstance(node.func, ast.Name) and node.func.id in REFLECTIVE_NAMES}
+        self.assertLessEqual(reflective, PERMITTED_REFLECTIVE_CALLS)
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        bare = {ast.unparse(parents[node]) for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and node.id in CALL_ROOTS
+                and not (isinstance(parents.get(node), ast.Attribute) and parents[node].value is node)}
+        self.assertLessEqual(bare, PERMITTED_BARE_MODULE_USES)
+        self.assertLessEqual(callable_references(tree, parents), PERMITTED_CALLS)
+
+    def test_medium6_each_ratchet_form_is_red(self):
+        source = (ROOT / "scripts/ci/prune_runner_tmp.py").read_text()
+        for mutant in ("import subprocess as sp\n", "from time import sleep\n", "os.system('true')\n",
+                       "sp.run(['x'])\n", "__import__('subprocess')\n", "import signal\n", "run = os.system\n",
+                       "getattr(os, 'system')('true')\n", "time.sleep(1)\n", "os.execv('/bin/true', ['true'])\n",
+                       "eval('1')\n", "TABLE = {'x': os}\n"):
+            with self.subTest(mutant=mutant):
+                with self.assertRaises(AssertionError):
+                    self.check_ratchet(source + mutant)
+
+    def leaf(self, folder):
+        leaf = self.root / folder / PRUNE.RUNNER_FOLDER_LEAF
+        leaf.mkdir(parents=True, exist_ok=True)
+        return leaf
+
+    def layouts_here(self):
+        patch = mock.patch.object(PRUNE, "RUNNER_FOLDER_LAYOUTS", ((str(self.root), PRUNE.RUNNER_FOLDER_LAYOUTS[0][1]),))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_high3_every_live_runner_tmpdir_is_cleared_at_job_end(self):
+        self.layouts_here()
+        for runner, tmpdir in LIVE_RUNNER_TABLE:
+            with self.subTest(runner=runner):
+                leaf = self.leaf(Path(tmpdir).parent.name)
+                self.make_file("old.db", 0, leaf)
+                rc, out, err = self.run_prune(leaf, "--mode", "job-end", env_extra={"RUNNER_NAME": runner})
+                self.assertEqual((rc, err), (EXIT_OK, ""))
+                self.assertIn("pruned=1 kept=0 failed=0", out)
+                self.assertEqual(self.names(leaf), [])
+
+    def test_high3_the_layout_table_is_the_live_one(self):
+        self.assertEqual([root for root, _ in PRUNE.RUNNER_FOLDER_LAYOUTS],
+                         sorted({str(Path(tmpdir).parent.parent) for _, tmpdir in LIVE_RUNNER_TABLE}))
+        self.assertEqual(PRUNE.F1_VOLUME_RUNNER_ROOT, str(Path(LIVE_RUNNER_TABLE[0][1]).parent.parent))
+        self.assertEqual(PRUNE.RUNNER_FOLDER_BY_NAME,
+                         {runner: Path(tmpdir).parent.name for runner, tmpdir in LIVE_RUNNER_TABLE})
+        self.assertEqual(PRUNE.RUNNER_NAME_ENV, "RUNNER_NAME")
+
+    def test_high3_a_folder_that_matches_no_layout_is_not_cleared_and_exits_non_zero(self):
+        self.layouts_here()
+        for folder in NOT_A_RUNNER_FOLDER:
+            with self.subTest(folder=folder):
+                leaf = self.leaf(folder)
+                victim = self.make_file("old.db", 0, leaf)
+                rc, out, err = self.run_prune(leaf, "--mode", "job-end", env_extra={"RUNNER_NAME": "f1-macos-fed"})
+                self.assert_not_cleared(rc, err, F1_LAYOUT_REFUSAL.format(path=leaf))
+                self.assertEqual(out, "")
+                self.assertTrue(victim.exists(), "a refusal deletes nothing")
+
+    def test_m3_the_runner_name_binds_the_folder(self):
+        self.layouts_here()
+        leaf = self.leaf("fed3")
+        victim = self.make_file("old.db", 0, leaf)
+        rows = (({}, RUNNER_UNSET_REFUSAL.format(path=leaf)),
+                ({"RUNNER_NAME": ""}, RUNNER_UNSET_REFUSAL.format(path=leaf)),
+                ({"RUNNER_NAME": "f1-macos-fed-2"},
+                 RUNNER_UNBOUND_REFUSAL.format(folder="fed3", runner="f1-macos-fed-2", path=leaf)),
+                ({"RUNNER_NAME": "runner-x"}, RUNNER_UNBOUND_REFUSAL.format(folder="fed3", runner="runner-x", path=leaf)))
+        for env, reason in rows:
+            with self.subTest(env=env):
+                rc, out, err = self.run_prune(leaf, "--mode", "job-end", env_extra=env)
+                self.assert_not_cleared(rc, err, reason)
+                self.assertTrue(victim.exists())
+
+    def test_high3_a_refusal_at_job_start_stays_a_warning_with_exit_0(self):
+        self.layouts_here()
+        leaf = self.leaf("evil")
+        rc, out, err = self.run_prune(leaf, "--mode", "job-start", env_extra={"RUNNER_NAME": "f1-macos-fed"})
+        reason = F1_LAYOUT_REFUSAL.format(path=leaf)
+        self.assertEqual((rc, err), (EXIT_OK, f"prune_runner_tmp: refused: {reason}\n"))
+        self.assertEqual(self.annotations, [WARNING_REFUSED + reason])
+
+    def test_high1_a_missing_shared_module_at_job_end_exits_non_zero(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(PRUNE, "wa", None):
+            rc = PRUNE.main(["--mode", "job-end"], environ={}, out=out, err=err)
+            rc_start = PRUNE.main([], environ={}, out=io.StringIO(), err=io.StringIO())
+        self.assertEqual((rc, rc_start), (EXIT_NOT_CLEARED, EXIT_OK))
+        self.assertTrue(out.getvalue().startswith("::error title=prune_runner_tmp refused::"), out.getvalue())
+
+    def test_low1_a_folder_renamed_between_resolve_and_open_is_refused(self):
+        self.layouts_here()
+        leaf = self.leaf("fed")
+        victim = self.make_file("old.db", 0, leaf)
+        self.leaf("other")
+        real_open, swapped = os.open, []
+
+        def swapping_open(name, *args, **kwargs):
+            if name == ".." and not swapped:
+                swapped.append(True)
+                os.rename(self.root / "fed", self.root / "moved")
+                os.rename(self.root / "other", self.root / "fed")
+            return real_open(name, *args, **kwargs)
+
+        with mock.patch.object(PRUNE.os, "open", swapping_open):
+            rc, out, err = self.run_prune(leaf, "--mode", "job-end", env_extra={"RUNNER_NAME": "f1-macos-fed"})
+        self.assert_not_cleared(rc, err, F1_LAYOUT_REFUSAL.format(path=leaf))
+        self.assertTrue((self.root / "moved" / "_tmp" / victim.name).exists())
+
+    def test_medium4_a_runner_folder_tmp_that_holds_the_workspace_is_refused(self):
+        self.layouts_here()
+        leaf = self.leaf("fed")
+        workspace = leaf / "ws"
+        workspace.mkdir()
+        rc, out, err = self.run_prune(leaf, "--mode", "job-end",
+                                      env_extra={"RUNNER_NAME": "f1-macos-fed", "GITHUB_WORKSPACE": str(workspace)})
+        self.assert_not_cleared(rc, err, CONTAINS_REFUSAL.format(path=leaf))
+        self.assertTrue(workspace.exists())
 
     def test_a_tmp_folder_under_a_root_that_is_not_a_layout_root_is_refused(self):
-        elsewhere = self.base / "elsewhere" / "actions-runner" / PRUNE.RUNNER_FOLDER_LEAF
+        elsewhere = self.base / "elsewhere" / "fed" / PRUNE.RUNNER_FOLDER_LEAF
         elsewhere.mkdir(parents=True)
         victim = self.make_file("old.db", 0, elsewhere)
-        with mock.patch.object(PRUNE, "RUNNER_FOLDER_LAYOUTS", ((str(self.root), PRUNE.RUNNER_FOLDER_LAYOUTS[0][1]),)):
-            rc, out, err = self.run_prune(elsewhere, "--mode", "job-end")
-        self.assertEqual((rc, out), (EXIT_REFUSED, ""))
-        self.assertEqual(err.rstrip("\n"), "prune_runner_tmp: refused: " + F1_LAYOUT_REFUSAL.format(path=elsewhere))
+        self.layouts_here()
+        rc, out, err = self.run_prune(elsewhere, "--mode", "job-end", env_extra={"RUNNER_NAME": "f1-macos-fed"})
+        self.assert_not_cleared(rc, err, F1_LAYOUT_REFUSAL.format(path=elsewhere))
         self.assertTrue(victim.exists())
 
-    def test_the_f1_layouts_are_the_ones_read_from_the_runner_env_files(self):
-        shared, volume = PRUNE.RUNNER_FOLDER_LAYOUTS
-        self.assertEqual((shared[0], volume[0]), ("/Users/Shared", "/Volumes/f1dev/rt"))
-        for name in ("actions-runner", "actions-runner-2", "f1-macos-fed-3", "f1-macos-fed-4", "f1-macos-fed-5"):
-            self.assertTrue(shared[1].fullmatch(name), name)
-        for name in ("fed3", "fed12"):
-            self.assertTrue(volume[1].fullmatch(name), name)
-        for name in ("", "fed", "fedx", "actions-runner-", "actions-runner-2x", "../actions-runner", "f1-macos-fed-3/x"):
-            self.assertFalse(shared[1].fullmatch(name) or volume[1].fullmatch(name), name)
+    def test_l2_the_facts_line_names_the_layout_root_of_a_runner_folder_tmp(self):
+        self.layouts_here()
+        leaf = self.leaf("fed2")
+        line = PRUNE.print_runner_facts(str(leaf), (), io.StringIO())
+        self.assertIn(f" allowed_root={self.root} ", line)
 
-    def test_docs_state_the_job_boundary_clear(self):
+    def test_high2_docs_state_the_job_boundary_clear_without_a_home_prefix(self):
         text = (ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text()
-        for needle in ("mode: job-end", "JOB_START_GRACE_SECS", "never to polling for an idle runner", "append-only"):
+        for needle in ("mode: job-end", "JOB_START_GRACE_SECS", "never to polling for an idle runner", "append-only",
+                       "F1_VOLUME_RUNNER_ROOT", "RUNNER_FOLDER_BY_NAME", "exits 3"):
             self.assertIn(needle, text)
+        self.assertNotIn("/Users/", text)
+
+
+def action_run_line():
+    match = re.search(r"(?m)^\s+run: (.+)$", (ROOT / ACTION_PATH).read_text())
+    return match.group(1)
 
 
 class WorkflowWiring(unittest.TestCase):
@@ -2878,16 +3207,21 @@ class WorkflowWiring(unittest.TestCase):
                 self.assertIn("runner.environment == 'self-hosted'", text)
                 self.assertNotIn("continue-on-error", text)
 
-    def test_every_self_hosted_job_clears_at_job_end_as_its_last_step_whatever_the_outcome(self):
-        """#9820: the end step is the last step, runs on pass, fail and cancel, and never continues on error."""
+    def test_high1_the_job_end_clear_follows_every_build_and_test_step_and_only_the_7160_sweeps_follow_it(self):
+        """#9820 / PR 9822 r1: the clear runs after every build and test step; the #7160 sweeps stay last."""
         for key, steps in self.self_hosted_jobs().items():
             with self.subTest(job=key):
                 ends = [i for i, s in enumerate(steps)
                         if ACTION_USES in "\n".join(s.code_lines()) and "mode: job-end" in "\n".join(s.code_lines())]
-                self.assertEqual(ends, [len(steps) - 1], f"{key}: exactly one job-end clear, as the last step")
-                text = "\n".join(steps[-1].code_lines())
+                self.assertEqual(len(ends), 1, f"{key}: exactly one job-end clear")
+                after = [s.name for s in steps[ends[0] + 1:]]
+                self.assertLessEqual(set(after), SWEEP_7160_STEPS, f"{key}: only the #7160 sweeps follow the clear")
+                text = "\n".join(steps[ends[0]].code_lines())
                 self.assertRegex(text, r"if: always\(\)")
                 self.assertIn("runner.environment == 'self-hosted'", text)
+                self.assertIn(FORK_CLAUSE, text, f"{key}: low-3 fork clause")
+                if key[0] not in CHECKOUT_ID_OUTSIDE_SCOPE:
+                    self.assertIn(CHECKOUT_GUARD, text, f"{key}: low-3 checkout outcome guard")
                 self.assertNotRegex(text, r"continue-on-error|!cancelled\(\)|success\(\)|failure\(\)")
 
     def test_action_passes_the_mode_input_to_the_script_and_defaults_to_job_start(self):
@@ -2895,15 +3229,27 @@ class WorkflowWiring(unittest.TestCase):
         self.assertRegex(text, r"(?s)inputs:\s+mode:.*default: job-start")
         self.assertIn('--mode "${PRUNE_MODE}"', text)
         self.assertIn("PRUNE_MODE: ${{ inputs.mode }}", text)
-
-    def test_action_describes_both_failure_modes_and_runs_the_script(self):
-        text = (ROOT / ACTION_PATH).read_text()
-        self.assertIn("using: composite", text)
-        self.assertIn("scripts/ci/prune_runner_tmp.py", text)
-        self.assertRegex(text, r"(?is)refus\w+ .*::warning.*does not fail")
-        self.assertRegex(text, r"(?is)per-entry .*does not fail")
-        self.assertRegex(text, r"(?is)unexpected error .*fails? the job")
         self.assertIsNone(re.search(r"continue-on-error", text))
+
+    def test_medium6_the_action_run_line_fails_job_end_and_warns_at_job_start(self):
+        """Run the action's own run: line under bash, as the runner does, on a TMPDIR that must be refused."""
+        base = Path(tempfile.mkdtemp(dir=SCRATCH_BASE))
+        self.addCleanup(shutil.rmtree, base)
+        bindir = base / "bin"
+        bindir.mkdir()
+        (bindir / "python3").symlink_to(sys.executable)
+        scratch = base / "not-a-runner"
+        scratch.mkdir()
+        (scratch / "keep.db").write_bytes(b"k")
+        for mode, rc_wanted, level in (("job-end", EXIT_NOT_CLEARED, "::error"), ("job-start", EXIT_OK, "::warning")):
+            with self.subTest(mode=mode):
+                env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(base), "TMPDIR": str(scratch),
+                       "PRUNE_MODE": mode, "GITHUB_ACTION_PATH": str(ROOT / ".github/actions/prune-runner-tmp")}
+                done = subprocess.run(["bash", "-c", action_run_line()], env=env, capture_output=True, text=True,
+                                      timeout=60, check=False)
+                self.assertEqual(done.returncode, rc_wanted, done.stderr)
+                self.assertIn(f"{level} title=prune_runner_tmp refused::", done.stdout)
+                self.assertTrue((scratch / "keep.db").exists())
 
 
 if __name__ == "__main__":
