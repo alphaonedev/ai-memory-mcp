@@ -36,7 +36,8 @@ BLOCK_BEGIN = "# >>> sibling-load 9399"
 BLOCK_END = "# <<< sibling-load 9399"
 PYTHON = sys.executable
 SUBPROCESS_TIMEOUT_S = 120
-FIFO_TIMEOUT_S = 20  # a FIFO open that blocks (O_NONBLOCK dropped) fails the row at this ceiling instead of hanging
+FD_FOLDER = "/dev/fd"  # the open descriptors of this process, on Linux and macOS alike
+FIFO_TIMEOUT_S = 20  #a FIFO open that blocks (O_NONBLOCK dropped) fails the row at this ceiling instead of hanging
 DEGENERATE_TIMEOUT_S = 20  # wall-clock ceiling of one site run against one degenerate or broken sibling
 # The reason words of the refusal line, written out by hand (never read from the loader under test).
 REASON_ABSENT = "absent"
@@ -447,6 +448,64 @@ class LoaderAlone(Scratch):
     def test_an_empty_file_is_refused(self):
         self.write("blank.py", b"")
         self.refused("blank.py", "blank_9399", REASON_EMPTY)
+
+    def test_a_read_error_on_the_checked_descriptor_is_unreadable(self):
+        """An OSError from the read (an EIO on a failing disk) is the refusal "unreadable", never a traceback (M08)."""
+        self.write("eio.py", "VALUE = 1\n")
+
+        class FailingRead:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self):
+                raise OSError(5, "Input/output error")
+
+        with mock.patch("os.fdopen", FailingRead):
+            self.refused("eio.py", "eio_9399", REASON_UNREADABLE)
+
+    def open_fds(self):
+        return set(os.listdir(FD_FOLDER))
+
+    def test_every_descriptor_is_closed_on_every_outcome(self):
+        """The folder and file descriptors are closed whether the load succeeds or is refused after the open (M21)."""
+        (self.folder / "sub").mkdir()
+        (self.folder / "sub" / "deep.py").write_text("VALUE = 3\n", encoding="utf-8")
+        (self.folder / "adir2.py").mkdir()
+        self.write("eio2.py", "VALUE = 1\n")
+        before = self.open_fds()
+        self.assertEqual(self.load("sub/deep.py", "deep_9399").VALUE, 3)
+        self.refused("adir2.py", "adir2_9399", REASON_NOT_REGULAR)
+        with mock.patch("os.fdopen", side_effect=OSError(5, "Input/output error")):
+            self.refused("eio2.py", "eio2_9399", REASON_UNREADABLE)
+        self.assertEqual(self.open_fds(), before, "a descriptor stayed open")
+
+    def test_no_descriptor_is_inheritable_while_open(self):
+        """Every descriptor the loader opens is non-inheritable (PEP 446): a child started while the load runs holds
+        none of them (M10). Each is checked just before the loader closes it."""
+        (self.folder / "sub2").mkdir()
+        (self.folder / "sub2" / "deep.py").write_text("VALUE = 4\n", encoding="utf-8")
+        seen = []
+        real_close = os.close
+
+        def checking_close(fd):
+            seen.append(os.get_inheritable(fd))
+            real_close(fd)
+
+        with mock.patch("os.close", checking_close):
+            self.assertEqual(self.load("sub2/deep.py", "deep2_9399").VALUE, 4)
+        self.assertEqual(seen, [False, False, False], "folder, sub2 and deep.py descriptors")
+
+    def test_the_module_is_registered_before_its_code_runs(self):
+        """The sibling finds itself in sys.modules while it runs (a dataclass, pickle and typing need that) (M14)."""
+        self.write("selfref.py", "import sys\nSELF = sys.modules[__name__]\n")
+        module = self.load("selfref.py", "selfref_9399")
+        self.assertIs(module.SELF, module)
 
     def test_a_folder_swapped_for_a_symlink_after_the_check_is_refused(self):
         """F2: the containment check resolves the path, the open walks the same folders by descriptor. A folder
