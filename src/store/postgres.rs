@@ -147,6 +147,10 @@ use super::{
     StoreResult, UpdatePatch, VerifyFilter, VerifyLinkReport, VerifyReport,
 };
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
+pub use crate::store::embedding_dim_policy::EmbeddingDimIntent;
+use crate::store::embedding_dim_policy::{
+    AutoMigrateDecision, EmbeddingDimMismatch, decide_auto_migrate,
+};
 
 /// Tracing target for postgres-SAL events. Pre-#1562 these were
 /// emitted as a FIELD (`target = `), which RUST_LOG target filtering
@@ -2510,6 +2514,42 @@ pub fn render_schema_sql(template: &str, dim: u32) -> String {
 /// chain) keep resolving.
 pub use crate::store::PoolConfig;
 
+/// #9933 — `memories.embedding` declared dim read on `conn` (a transaction
+/// holding the conversion lock, or a pooled connection).
+/// [`PostgresStore::current_embedding_dim`] delegates here.
+async fn current_embedding_dim_on(conn: &mut sqlx::PgConnection) -> StoreResult<Option<i32>> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT atttypmod FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         JOIN pg_namespace n ON c.relnamespace = n.oid
+         WHERE c.relname = 'memories' AND a.attname = 'embedding'
+         AND n.nspname = 'public'",
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| to_store_err("read memories.embedding atttypmod", e))?;
+    Ok(row.map(|(t,)| t))
+}
+
+/// #9933 — stored embeddings (live plus archived) on `conn`. Checked add:
+/// two row counts cannot overflow `i64` in practice, but a wrap would turn a
+/// refusal into a conversion.
+async fn count_embeddings_at_risk_on(conn: &mut sqlx::PgConnection) -> StoreResult<i64> {
+    let live: i64 = sqlx::query_scalar(crate::SQL_COUNT_EMBEDDED_MEMORIES)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| to_store_err("count memories.embedding non-null", e))?;
+    let archived: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories WHERE embedding IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| to_store_err("count archived_memories.embedding non-null", e))?;
+    live.checked_add(archived)
+        .ok_or_else(|| StoreError::InvalidInput {
+            detail: format!("stored embedding count overflows i64 ({live} + {archived})"),
+        })
+}
+
 /// v0.7.0 M4 — default connection-level `statement_timeout` (seconds)
 /// applied to every postgres connection in the pool. 30s bounds the
 /// outer envelope of any single query so a pathological `pg_sleep(60)`,
@@ -3366,127 +3406,102 @@ impl PostgresStore {
         bootstrap_result
     }
 
-    /// Issue #877 (HIGH-SEV): Connect with an explicit embedding dim and
-    /// auto-migrate the live `memories.embedding` (+ archive) column to
-    /// `vector(<dim>)` when the existing schema disagrees.
+    /// Issue #877 / #9933: connect with a requested embedding dim and
+    /// reconcile the live `memories.embedding` (+ archive) column with it
+    /// WITHOUT ever NULLing a stored vector.
     ///
-    /// This is the daemon-bootstrap entry point. The plain
-    /// [`Self::connect_with_dim`] would WARN and continue if the schema
-    /// was created with a different dim (e.g. a fresh container picked up
-    /// `DEFAULT_EMBEDDING_DIM` = 384 from a no-flag boot, then the
-    /// operator switched the configured embedder to `nomic_embed_v15`
-    /// (768)). The result was every HTTP POST `/api/v1/memories` rejected
-    /// at pgvector with `expected 384 dimensions, not 768` — a hard
-    /// production outage Plan-C retest surfaced.
+    /// This is the daemon-bootstrap entry point. #877 added it because a
+    /// column created at one dim (e.g. `DEFAULT_EMBEDDING_DIM` = 384) and an
+    /// embedder at another (768) rejected every write at pgvector. #9933:
+    /// the #877 fix converted a POPULATED column too, NULLing every stored
+    /// embedding whenever the requested dim (often only a tier preset or the
+    /// compiled default) disagreed with the live column.
     ///
-    /// Behaviour:
+    /// Behaviour (the table is [`decide_auto_migrate`], unit-tested there):
     /// - Connect + bootstrap exactly like [`Self::connect_with_dim_and_timeout`].
-    /// - Probe `current_embedding_dim()`. If it equals `dim`, return Ok.
-    /// - If it differs (or is missing) **AND `embedder_available` is
-    ///   `true`**, invoke [`Self::migrate_embedding_dim`] which is
-    ///   destructive on the embedding column (existing vectors are NULLed;
-    ///   rows themselves survive). Regeneration then backfills them from
-    ///   the durable text under the live embedder.
-    /// - If it differs **AND `embedder_available` is `false`** (keyword
-    ///   tier / egress-denied / the embedder failed to construct), the
-    ///   destructive migrate is SKIPPED: the stored embeddings are
-    ///   PRESERVED and a loud WARN names the mismatch. This is the #2567
-    ///   fix — NULLing every vector when no embedder can regenerate them is
-    ///   irreversible loss of derived state, leaving each row strictly
-    ///   worse. Recall degrades safely (the #2167 `embedding_space`
-    ///   predicate + the #114 dim-match gate already exclude a stored
-    ///   vector of a different dim/space from scoring, so the worst case is
-    ///   fewer semantic hits, never a wrong result), and no-embedder writes
-    ///   bind `embedding = NULL` so the stale column dim is never
-    ///   exercised. The state self-heals the next boot that DOES construct
-    ///   an embedder (which takes the normal migrate-then-backfill path).
-    /// - The migration is gated to the supported dim set (384, 768); any
-    ///   other value bubbles `StoreError::InvalidInput` from the
-    ///   sub-call.
-    ///
-    /// Existing callers ([`Self::connect`], CLI `schema-init`) keep the
-    /// non-auto-migrate semantics so a one-shot CLI tool can't silently
-    /// destroy embeddings.
+    /// - The live column already has `intent.dim()`: Ok.
+    /// - Mismatch and `embedder_available` is `false` (keyword tier /
+    ///   egress-denied / the embedder failed to construct): nothing changes,
+    ///   a WARN names both dims (#2567). Recall skips cross-dim vectors
+    ///   (#2167 `embedding_space` predicate + #114 dim-match) and
+    ///   no-embedder writes bind `embedding = NULL`.
+    /// - Mismatch on a column with no stored embeddings: converted in place
+    ///   (#877; nothing is lost). The conversion runs WITHOUT the force flag,
+    ///   so a vector written after the count makes it refuse instead.
+    /// - Mismatch on a populated column with an embedder: the boot REFUSES
+    ///   with [`EmbeddingDimMismatch`] (`StoreError::InvalidInput`), naming
+    ///   the live dim, the requested dim and its source, the number of
+    ///   embeddings at risk and the explicit opt-in
+    ///   (`ai-memory schema-init --embedding-dim <N> --force-reembed`).
+    ///   Booting an embedder whose dim the column cannot hold would fail every
+    ///   write, so a refusal is the only state that loses nothing.
     ///
     /// `embedder_available` MUST be the caller's TRUTHFUL runtime
     /// embedder-constructibility signal (in `serve` it is
-    /// `build_embedder(...).is_some()`), NOT a config-derived "a dim was
-    /// configured" proxy — the two diverge exactly under egress-deny /
-    /// model-load-failure, which is the #2567 defect class. It is the
-    /// destructive funnel's own defense-in-depth gate: no present or future
-    /// caller can NULL the stored embeddings without proving a regeneration
-    /// path.
+    /// `build_embedder(...).is_some()`), NOT a config-derived proxy (#2567).
     ///
     /// # Errors
     ///
-    /// Same as [`Self::connect_with_dim_and_timeout`], plus any error
-    /// from the in-place conversion.
+    /// Same as [`Self::connect_with_dim_and_timeout`]; the
+    /// [`EmbeddingDimMismatch`] refusal above; any error from reading the
+    /// column dim, counting the stored embeddings or the empty-column
+    /// conversion.
     pub async fn connect_with_dim_and_timeout_auto_migrate(
         url: &str,
-        dim: u32,
+        intent: EmbeddingDimIntent,
         statement_timeout_secs: u64,
         pool_config: PoolConfig,
         embedder_available: bool,
     ) -> StoreResult<Self> {
-        let store =
-            Self::connect_with_dim_and_timeout(url, dim, statement_timeout_secs, pool_config)
-                .await?;
+        let store = Self::connect_with_dim_and_timeout(
+            url,
+            intent.dim(),
+            statement_timeout_secs,
+            pool_config,
+        )
+        .await?;
 
         let current = store.current_embedding_dim().await?;
-        let target_i32 = i32::try_from(dim).unwrap_or(384);
-        match current {
-            Some(cur) if cur == target_i32 => Ok(store),
-            _ => {
-                if !embedder_available {
-                    // #2567 (5-agent vote 4d3ea1c5) — DEGRADE, never
-                    // destroy. No embedder is constructible (keyword tier /
-                    // egress-denied / the embedder failed to build), so
-                    // NULLing every stored vector would destroy derived
-                    // state that is regenerable ONLY with an embedder —
-                    // irreversible loss, `updated_at` untouched so invisible
-                    // to staleness checks. Preserve the vectors, refuse the
-                    // migrate, and WARN loudly with the REAL stored dim +
-                    // configured target. The durable vectors stay recoverable
-                    // the moment a matching embedder returns (the next boot
-                    // that constructs one takes the migrate-then-backfill
-                    // path). Recall meanwhile skips cross-dim/cross-space
-                    // vectors (#2167 embedding_space predicate + #114
-                    // dim-match), so it degrades to keyword / fewer results,
-                    // never a wrong result.
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        current = ?current,
-                        target = target_i32,
-                        "issue #2567: stored memories.embedding column dim ({current:?}) disagrees \
-                         with the configured dim ({target_i32}) but NO embedder is constructible \
-                         (keyword tier / inference-egress denied / embedder build failed). \
-                         PRESERVING stored embeddings — the destructive auto-migrate is SKIPPED \
-                         because NULLing vectors that cannot be regenerated is unrecoverable data \
-                         loss. Semantic recall will skip cross-space vectors (degrading to keyword) \
-                         until a matching embedder is configured; the schema self-heals on the next \
-                         boot that constructs an embedder."
-                    );
-                    return Ok(store);
-                }
+        let at_risk = if intent.matches_live(current) {
+            0
+        } else {
+            store.count_embeddings_at_risk().await?
+        };
+        let requested = intent.dim();
+        match decide_auto_migrate(current, intent, at_risk, embedder_available) {
+            AutoMigrateDecision::Keep => Ok(store),
+            AutoMigrateDecision::PreserveNoEmbedder => {
+                // #2567 (5-agent vote 4d3ea1c5) — DEGRADE, never destroy.
                 tracing::warn!(
                     target: TRACE_TARGET,
                     current = ?current,
-                    target = target_i32,
-                    "issue #877 auto-migrate: existing memories.embedding column dim disagrees \
-                     with configured embedder dim ({target_i32}); converting in place. \
-                     Existing embeddings will be NULLed — re-embed required after this completes."
+                    target = requested,
+                    "issue #2567: stored memories.embedding column dim ({current:?}) disagrees \
+                     with the requested dim ({requested}) but NO embedder is constructible \
+                     (keyword tier / inference-egress denied / embedder build failed). \
+                     PRESERVING stored embeddings — the destructive auto-migrate is SKIPPED \
+                     because NULLing vectors that cannot be regenerated is unrecoverable data \
+                     loss. Semantic recall will skip cross-space vectors (degrading to keyword) \
+                     until an embedder whose dimension matches the column is configured."
                 );
-                // #1781 — force = true here: the #877 daemon auto-migrate
-                // is the operator's explicit opt-in (they configured the
-                // mismatched embedder dim + chose the auto-migrate boot
-                // path), so it must NOT refuse like the CLI default does.
-                // The CLI `schema-init` path defaults to refuse (force =
-                // args.force_reembed); auto-migrate preserves #877.
-                // #2567 — reached ONLY when `embedder_available` proves a
-                // regeneration path exists, so the NULL is recoverable.
-                store.migrate_embedding_dim(dim, true).await?;
                 Ok(store)
             }
+            AutoMigrateDecision::ConvertEmpty => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    current = ?current,
+                    target = requested,
+                    "issue #877 auto-migrate: memories.embedding column dim ({current:?}) \
+                     disagrees with the requested dim ({requested}) and holds no embeddings; \
+                     converting the empty column in place."
+                );
+                // #9933 — force = false: the count above saw no vector, and
+                // the conversion re-counts under its table lock, so a row
+                // embedded in between makes it refuse rather than NULL it.
+                store.migrate_embedding_dim_for(intent, false).await?;
+                Ok(store)
+            }
+            AutoMigrateDecision::Refuse(mismatch) => Err(mismatch.into()),
         }
     }
 
@@ -10509,17 +10524,40 @@ impl PostgresStore {
     /// Returns `StoreError::BackendUnavailable` if the catalog probe
     /// fails (connection issue, etc.).
     pub async fn current_embedding_dim(&self) -> StoreResult<Option<i32>> {
-        let row: Option<(i32,)> = sqlx::query_as(
-            "SELECT atttypmod FROM pg_attribute a
-             JOIN pg_class c ON c.oid = a.attrelid
-             JOIN pg_namespace n ON c.relnamespace = n.oid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'
-             AND n.nspname = 'public'",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| to_store_err("read memories.embedding atttypmod", e))?;
-        Ok(row.map(|(t,)| t))
+        let mut conn =
+            self.pool.acquire().await.map_err(|e| {
+                to_store_err("acquire connection to read memories.embedding dim", e)
+            })?;
+        current_embedding_dim_on(&mut conn).await
+    }
+
+    /// Stored embeddings (live plus archived) a `vector(N)` conversion
+    /// would NULL. Read on the pool: callers use it to decide, and the
+    /// conversion itself re-counts under its table lock
+    /// ([`Self::migrate_embedding_dim_for`]).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::BackendUnavailable` when either count fails.
+    pub async fn count_embeddings_at_risk(&self) -> StoreResult<i64> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| to_store_err("acquire connection to count stored embeddings", e))?;
+        count_embeddings_at_risk_on(&mut conn).await
+    }
+
+    /// Operator-initiated `vector(N)` conversion with an explicitly chosen
+    /// dimension. Equivalent to [`Self::migrate_embedding_dim_for`] with
+    /// [`EmbeddingDimIntent::Explicit`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::migrate_embedding_dim_for`].
+    pub async fn migrate_embedding_dim(&self, target_dim: u32, force: bool) -> StoreResult<bool> {
+        self.migrate_embedding_dim_for(EmbeddingDimIntent::Explicit(target_dim), force)
+            .await
     }
 
     /// Operator-initiated `vector(N)` conversion. Destructive on the
@@ -10537,28 +10575,36 @@ impl PostgresStore {
     /// The whole operation runs in a single transaction so a mid-way
     /// failure leaves the schema untouched.
     ///
-    /// # Refuse-destructive-by-default (#1781)
+    /// # Refuse-destructive-by-default (#1781, #9933)
     ///
     /// When the conversion is real (the live column dim differs from
-    /// `target_dim`) AND the corpus already holds stored embeddings,
-    /// the call REFUSES with `StoreError::InvalidInput` unless `force`
-    /// is set — re-running `ai-memory schema-init --embedding-dim` with
-    /// the wrong/default dim against a populated corpus would otherwise
-    /// silently NULL every embedding (semantic recall degrades to
-    /// keyword until a full re-embed). `force = true` is the explicit
-    /// `--force-reembed` escape hatch (CLI) or the operator-opted-in
-    /// #877 daemon auto-migrate path. Precedent: #1785 DROP-confirm.
+    /// the requested dim) AND the corpus holds stored embeddings, the call
+    /// REFUSES with [`EmbeddingDimMismatch`] (`StoreError::InvalidInput`,
+    /// naming both dims, the source of the requested one, the count and the
+    /// opt-in) unless `force` is set. `force = true` is ONLY the explicit
+    /// `ai-memory schema-init --embedding-dim <N> --force-reembed` opt-in;
+    /// no boot path passes it (#9933).
+    ///
+    /// #9933 — the dim check and the count run INSIDE the conversion
+    /// transaction after `LOCK TABLE memories, archived_memories IN ACCESS
+    /// EXCLUSIVE MODE`, so a row embedded between a caller's decision and
+    /// the conversion is counted and refused, never NULLed unseen.
     ///
     /// # Errors
     ///
-    /// - `StoreError::InvalidInput` when `target_dim` is not one of the
-    ///   supported values (`SUPPORTED_EMBEDDING_DIMS`).
-    /// - `StoreError::InvalidInput` when stored embeddings exist and
-    ///   `force` is `false` (#1781 destructive-conversion refusal).
+    /// - `StoreError::InvalidInput` when the requested dim is not one of
+    ///   the supported values (`SUPPORTED_EMBEDDING_DIMS`).
+    /// - `StoreError::InvalidInput` (the [`EmbeddingDimMismatch`] text)
+    ///   when stored embeddings exist and `force` is `false`.
     /// - `StoreError::BackendUnavailable` on any SQL failure during
     ///   the conversion.
-    pub async fn migrate_embedding_dim(&self, target_dim: u32, force: bool) -> StoreResult<bool> {
+    pub async fn migrate_embedding_dim_for(
+        &self,
+        intent: EmbeddingDimIntent,
+        force: bool,
+    ) -> StoreResult<bool> {
         self.gate_record_stop().await?;
+        let target_dim = intent.dim();
         let target_i32 = i32::try_from(target_dim).map_err(|_| StoreError::InvalidInput {
             detail: format!("target_dim {target_dim} out of i32 range"),
         })?;
@@ -10570,10 +10616,23 @@ impl PostgresStore {
             });
         }
 
-        let current = self.current_embedding_dim().await?;
-        if let Some(cur) = current
-            && cur == target_i32
-        {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v29 conversion tx", e))?;
+
+        // #9933 — check and use on the same object: take the lock the ALTER
+        // below needs anyway BEFORE reading the dim and counting, so no
+        // writer can embed a row between the refusal decision and the NULL.
+        // Dropping `tx` on any early return rolls the lock back.
+        sqlx::query("LOCK TABLE memories, archived_memories IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("lock memories + archived_memories for v29 conversion", e))?;
+
+        let current = current_embedding_dim_on(&mut tx).await?;
+        if intent.matches_live(current) {
             tracing::info!(
                 target: TRACE_TARGET,
                 dim = target_i32,
@@ -10582,31 +10641,10 @@ impl PostgresStore {
             return Ok(false);
         }
 
-        // #1781 — refuse-destructive-by-default. The conversion below
-        // NULLs every stored embedding (cross-dim reprojection isn't
-        // well-defined). Probe how many rows would lose their vector
-        // BEFORE touching anything; if any exist and the caller didn't
-        // opt in via `force`, refuse without mutating a single row.
-        let embeddings_at_risk: i64 = {
-            let live: i64 = sqlx::query_scalar(crate::SQL_COUNT_EMBEDDED_MEMORIES)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| to_store_err("count memories.embedding non-null", e))?;
-            let archived: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM archived_memories WHERE embedding IS NOT NULL",
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| to_store_err("count archived_memories.embedding non-null", e))?;
-            live + archived
-        };
-
+        // #1781 — refuse-destructive-by-default, counted under the lock.
+        let embeddings_at_risk = count_embeddings_at_risk_on(&mut tx).await?;
         if embeddings_at_risk > 0 && !force {
-            return Err(StoreError::InvalidInput {
-                detail: format!(
-                    "refusing destructive embedding-dim conversion vector({current:?})→vector({target_dim}): {embeddings_at_risk} stored embeddings would be NULLed (semantic recall degrades to keyword until a full re-embed). Re-run `ai-memory schema-init --embedding-dim {target_dim} --force-reembed` to proceed."
-                ),
-            });
+            return Err(EmbeddingDimMismatch::new(current, intent, embeddings_at_risk).into());
         }
 
         tracing::warn!(
@@ -10616,12 +10654,6 @@ impl PostgresStore {
             embeddings_nulled = embeddings_at_risk,
             "{embeddings_at_risk} embeddings NULLed by vector({target_i32}) conversion — re-embed required (v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; operators MUST re-run embeddings after this conversion completes)"
         );
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin v29 conversion tx", e))?;
 
         // Drop the HNSW indexes that pin the column type. ALTER COLUMN
         // TYPE on a vector column fails while the HNSW index references

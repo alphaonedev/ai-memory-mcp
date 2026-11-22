@@ -7,7 +7,7 @@
 //!
 //! Observed: under `AI_MEMORY_NO_CONFIG=1` with no `AI_MEMORY_EMBED_DIM`, the
 //! daemon resolved the embedding dimension from the tier preset (384) and the
-//! #877 boot auto-migrate NULLed every stored 768-dim vector. The invariant
+//! #877 boot auto-migrate set to NULL every stored 768-dim vector. The invariant
 //! pinned here, for every row of the table below:
 //!
 //! 1. A dimension mismatch over a populated column is a REFUSAL with the exact
@@ -29,7 +29,9 @@
 #![cfg(feature = "sal-postgres")]
 
 use ai_memory::models::Memory;
-use ai_memory::store::postgres::{DEFAULT_EMBEDDING_DIM, PoolConfig, PostgresStore};
+use ai_memory::store::postgres::{
+    DEFAULT_EMBEDDING_DIM, EmbeddingDimIntent, PoolConfig, PostgresStore,
+};
 use ai_memory::store::{CallerContext, MemoryStore};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -40,7 +42,7 @@ use common::postgres_url;
 
 /// The live column dimension the corpus is seeded at (nomic-embed-text-v1.5).
 const LIVE_DIM: u32 = 768;
-/// The dimension the issue's NO_CONFIG boot resolved to (MiniLM tier preset,
+/// The dimension the issue's `NO_CONFIG` boot resolved to (`MiniLM` tier preset,
 /// also the compiled default).
 const OTHER_DIM: u32 = 384;
 /// Distinct seeded rows; each carries a different vector so a rewrite of any
@@ -75,7 +77,7 @@ enum Source {
     /// An operator pin: `[embeddings].model`, the legacy model field, an
     /// `AI_MEMORY_EMBED_DIM` / `[embeddings].dim` pin.
     Configured,
-    /// A tier preset or the compiled default (the issue's NO_CONFIG case).
+    /// A tier preset or the compiled default (the issue's `NO_CONFIG` case).
     Defaulted,
     /// No dimension resolved at all (keyword tier): the plain connect.
     Absent,
@@ -243,7 +245,11 @@ async fn assert_intact(pool: &PgPool, seeded: &[(String, Vec<f32>)], dim: u32, r
         "{row}: the live column must keep vector({dim})"
     );
     let got = read_vectors(pool).await;
-    assert_eq!(got.len(), seeded.len(), "{row}: every seeded row must remain");
+    assert_eq!(
+        got.len(),
+        seeded.len(),
+        "{row}: every seeded row must remain"
+    );
     for ((want_id, want_vec), (got_id, got_vec)) in seeded.iter().zip(got.iter()) {
         assert_eq!(want_id, got_id, "{row}: row order");
         assert_eq!(
@@ -256,21 +262,26 @@ async fn assert_intact(pool: &PgPool, seeded: &[(String, Vec<f32>)], dim: u32, r
 
 /// Boot the daemon store the way `serve` does for `source` at `dim`.
 ///
-/// The ONLY function in this file that names the boot entry points, so the
-/// red commit and the fix commit differ in this body alone.
+/// The ONLY function in this file that names the boot entry points: the red
+/// commit and the fix commit differ in this body, `schema_init_config` and
+/// the `EmbeddingDimIntent` import alone.
 async fn boot(
     url: &str,
     source: Source,
     dim: u32,
     embedder_available: bool,
 ) -> Result<PostgresStore, String> {
-    let res = match source {
-        // Pre-#9933 the funnel took a bare u32: a configured and a defaulted
-        // dimension were indistinguishable at the destructive decision.
-        Source::Configured | Source::Defaulted => {
+    let intent = match source {
+        Source::Configured => Some(EmbeddingDimIntent::Explicit(dim)),
+        Source::Defaulted => Some(EmbeddingDimIntent::Defaulted(dim)),
+        Source::Absent => None,
+    };
+    let res = match intent {
+        // #9933 — the funnel takes the dim WITH its source.
+        Some(intent) => {
             PostgresStore::connect_with_dim_and_timeout_auto_migrate(
                 url,
-                dim,
+                intent,
                 TIMEOUT_SECS,
                 PoolConfig::default(),
                 embedder_available,
@@ -279,8 +290,7 @@ async fn boot(
         }
         // `build_store_handle` with no resolved dim: the plain connect at the
         // compiled default, which never converts.
-        Source::Absent => {
-            let _ = dim;
+        None => {
             PostgresStore::connect_with_dim_and_timeout(
                 url,
                 DEFAULT_EMBEDDING_DIM,
@@ -428,9 +438,9 @@ async fn run_schema_init(
 }
 
 /// The config-resolved default schema-init receives from the daemon
-/// dispatch, as a DEFAULTED dimension (tier preset under NO_CONFIG).
-fn schema_init_config(dim: Option<u32>) -> Option<u32> {
-    dim
+/// dispatch, as a DEFAULTED dimension (tier preset under `NO_CONFIG`).
+fn schema_init_config(dim: Option<u32>) -> Option<EmbeddingDimIntent> {
+    dim.map(EmbeddingDimIntent::Defaulted)
 }
 
 /// schema-init with no `--embedding-dim`, with and without `--force-reembed`:
@@ -461,7 +471,10 @@ async fn schema_init_defaulted_dim_adopts_live_column_9933() {
     let err = run_schema_init(&url, None, true, Some(OTHER_DIM))
         .await
         .expect_err("--force-reembed with a defaulted dim must refuse");
-    assert_eq!(err, EXPECTED_DEFAULTED_REFUSAL, "schema-init/defaulted+force");
+    assert_eq!(
+        err, EXPECTED_DEFAULTED_REFUSAL,
+        "schema-init/defaulted+force"
+    );
     assert_intact(&inspect, &seeded, LIVE_DIM, "schema-init/defaulted+force").await;
 }
 

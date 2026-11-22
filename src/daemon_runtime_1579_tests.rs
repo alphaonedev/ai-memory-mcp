@@ -66,7 +66,7 @@ async fn issue_1579_a3_boot_log_redacts_store_url_password() {
         Some(&url),
         &db_path,
         None,
-        Some(384),
+        Some(crate::store::embedding_dim_policy::EmbeddingDimIntent::Defaulted(384)),
         false,
         crate::store::PoolConfig::default(),
     )
