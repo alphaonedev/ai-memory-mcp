@@ -387,7 +387,8 @@ fn finish_reader_returns_within_its_bound_when_the_pipe_stays_open_8734() {
 //
 // A source scan over every `.rs` file under `tests/` and `benches/`. It fails,
 // naming `file:line`, on a child-stdin handle access (`<x>.stdin.take()`,
-// `.stdin.as_mut()`, `.stdin.as_ref()` and every other `.stdin` field form;
+// `.stdin.as_mut()`, `.stdin.as_ref()` and every other `.stdin` field form, and
+// the child guard's `<guard>.take_stdin()`;
 // the `.stdin(Stdio::piped())` builder call is not an access) whose handle is
 // written to directly, in the same statement or through the name the access is
 // bound to, outside the helper modules. A handle that is handed to
@@ -429,14 +430,14 @@ struct AllowEntry {
 const STDIN_WRITE_ALLOWLIST: &[AllowEntry] = &[
     AllowEntry {
         file: "tests/mcp_signal_drain_4347.rs",
-        anchor: "if let Some(mut stdin) = child.stdin.take()",
+        anchor: "if let Some(mut stdin) = guard.take_stdin()",
         sites: 1,
         reason: "deliberate `let _ = writeln!` to a child that is expected to have exited \
                  (a failed write is the refusal the test asserts)",
     },
     AllowEntry {
         file: "tests/mcp_signal_drain_4347.rs",
-        anchor: "let mut stdin = child.stdin.take().expect(\"stdin\");",
+        anchor: "let mut stdin = guard.take_stdin().expect(\"stdin\");",
         sites: 1,
         reason: "burst writer thread whose write results are discarded with `let _` on \
                  purpose: the child is cut by SIGTERM mid-burst",
@@ -516,11 +517,20 @@ fn statement_boundaries(source: &str) -> Vec<usize> {
     out
 }
 
-/// Byte offsets of every child-stdin field access in `source`: `.stdin`
-/// followed by neither an identifier character nor `(`.
+/// The child-guard accessor that hands out the child's stdin handle
+/// (`tests/common/mcp_child_guard.rs`): a handle taken through it is a
+/// child-stdin handle exactly like `<x>.stdin.take()`.
+const GUARD_TAKE_STDIN: &str = ".take_stdin(";
+
+/// Byte offsets of every child-stdin access in `source`: a `.stdin` field
+/// followed by neither an identifier character nor `(`, and every
+/// [`GUARD_TAKE_STDIN`] call.
 fn stdin_accesses(source: &str) -> Vec<usize> {
     const NEEDLE: &str = ".stdin";
-    let mut out = Vec::new();
+    let mut out: Vec<usize> = source
+        .match_indices(GUARD_TAKE_STDIN)
+        .map(|(at, _)| at)
+        .collect();
     let mut from = 0;
     while let Some(found) = source[from..].find(NEEDLE) {
         let at = from + found;
@@ -530,6 +540,7 @@ fn stdin_accesses(source: &str) -> Vec<usize> {
         }
         from = at + NEEDLE.len();
     }
+    out.sort_unstable();
     out
 }
 
@@ -729,6 +740,15 @@ const AS_MUT_SOURCE: &str = "fn drive(&mut self) {\n    let stdin = self.stdin.a
 const NON_WRITE_SOURCE: &str = "fn drive() {\n    let child = Command::new(\"x\").stdin(Stdio::piped()).spawn();\n    \
     drop(child.stdin.take());\n    // child.stdin.take() in a comment: ignored\n}\n";
 
+/// The child-guard forms: bound then written, and written in one statement.
+const GUARD_BOUND_SOURCE: &str = "fn drive() {\n    let mut stdin = guard.take_stdin().expect(\"stdin\");\n    \
+    let _ = stdin.write_all(b\"x\");\n}\n";
+const GUARD_DIRECT_SOURCE: &str = "fn drive() {\n    \
+    let _ = writeln!(guard.take_stdin().expect(\"stdin\"), \"x\");\n}\n";
+/// The guard forms that are not raw writes: the helper write and a close.
+const GUARD_HELPER_SOURCE: &str = "fn drive() {\n    let mut stdin = guard.take_stdin().expect(\"stdin\");\n    \
+    guard.write_line(&mut stdin, \"request\", \"x\");\n    drop(guard.take_stdin());\n}\n";
+
 // Row (g1): an unconverted write is flagged with its line.
 
 #[test]
@@ -742,13 +762,19 @@ fn guard_flags_an_unconverted_write_with_its_line_8734() {
     let (violations, stale) = unallowed_and_stale(&sites, &[]);
     assert_eq!(violations, sites, "no allowlist entry: it is a violation");
     assert!(stale.is_empty());
-    for (name, source) in [("bound", BOUND_SOURCE), ("as_mut", AS_MUT_SOURCE)] {
+    for (name, source) in [
+        ("bound", BOUND_SOURCE),
+        ("as_mut", AS_MUT_SOURCE),
+        ("guard bound", GUARD_BOUND_SOURCE),
+        ("guard direct", GUARD_DIRECT_SOURCE),
+    ] {
         let found = scan_source("tests/scratch_8734.rs", source);
         assert_eq!(found.len(), 1, "{name} form: {found:?}");
         assert_eq!(found[0].line, 2, "{name} form reports the access line");
     }
     for (name, source) in [
         ("converted", CONVERTED_SOURCE),
+        ("guard helper write and close", GUARD_HELPER_SOURCE),
         ("close and builder", NON_WRITE_SOURCE),
     ] {
         assert!(
