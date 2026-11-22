@@ -1164,6 +1164,20 @@ experiment behind it.
   operator with an existing OTLP collector has no standard export and must scrape the Prometheus surface
   instead.
 
+**Enterprise-federation hardening (research checkpoint, issue #4404)**
+
+- [#4404](https://github.com/alphaonedev/ai-memory-mcp/issues/4404#issuecomment-7080826506) research checkpoint
+  (2026-11-22): its APPLICABLE items and top-5 actions are workstream **w9** in
+  [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md), rows H1–H18 — caller binding on every route, role checks on
+  governance writes, tenancy leaks, audit-tamper detection, PostgreSQL parity of shipped surfaces, no lost
+  writes under concurrency, provenance through reflection and consolidation, poisoning and erasure proofs,
+  enterprise-scale measurement, and positioning on federation, attested identity, audit and security. Every row
+  is first-party hardening, a fix, a test or docs for an existing capability; none adds a new feature, and most
+  carriers sit on the v1.0.0 GA milestone, so a row still open at the GA tag is a v1.1.0 entry condition.
+  *Cost until done:* the multi-tenant federation posture cannot be called production-ready while a caller can
+  claim another agent's identity, a tenant can read another tenant's pending rows, or the PostgreSQL tier
+  behaves differently from SQLite on a shipped surface.
+
 ---
 
 ## 12. Recovered commitments from prior phased roadmap
