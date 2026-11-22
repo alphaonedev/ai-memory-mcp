@@ -134,11 +134,11 @@ ALLOWED_SETTING_SITES = (
 # scripts/test/pg_isolated_binary.py, none of which mentions debuginfo.
 ALLOWED_DYNAMIC_ENV_WRITERS = frozenset({
     ("ci.yml", "check", "printf '%s=\\n' \"$name\" >> \"$GITHUB_ENV\""),
-    ("ci.yml", "check", 'run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" '
-                        '--runner-name "$RUNNER_NAME_ARG"'),
+    ("ci.yml", "check", ('run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" '
+                         '--runner-name "$RUNNER_NAME_ARG"')),
     ("ci.yml", "check", 'run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"'),
-    ("ci.yml", "check", 'AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py '
-                        'setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"'),
+    ("ci.yml", "check", ('AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py '
+                         'setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"')),
 })
 # What can set a debuginfo level: the cargo profile variables, rustc's -C debuginfo, RUSTFLAGS in any
 # spelling, a cargo --config profile key.
@@ -719,8 +719,8 @@ SITE_MUTANTS = (
     ("M12_step_env_on_the_check_job",
      CI,
      "      - name: Run tests (impact-aware)\n        if: needs.classify.outputs.cargo_skip != 'true'\n        env:\n",
-     "      - name: Run tests (impact-aware)\n        if: needs.classify.outputs.cargo_skip != 'true'\n        env:\n"
-     "          CARGO_PROFILE_DEV_DEBUG: line-tables-only\n          CARGO_PROFILE_TEST_DEBUG: line-tables-only\n",
+     ("      - name: Run tests (impact-aware)\n        if: needs.classify.outputs.cargo_skip != 'true'\n        env:\n"
+      "          CARGO_PROFILE_DEV_DEBUG: line-tables-only\n          CARGO_PROFILE_TEST_DEBUG: line-tables-only\n"),
      [_BAD_SITE % (CI, "check", 10, "CARGO_PROFILE_DEV_DEBUG: line-tables-only", 1, 0),
       _BAD_SITE % (CI, "check", 10, "CARGO_PROFILE_TEST_DEBUG: line-tables-only", 1, 0)]),
     ("M13_unquoted_echo_to_github_env",
@@ -742,10 +742,10 @@ SITE_MUTANTS = (
       _BAD_SITE % (CERT, CERT_JOB, 10, "CARGO_PROFILE_TEST_DEBUG=2", 1, 0)]),
     ("M17_tee_to_github_env",
      CERT, CERT_STEP_SET, CERT_STEP_SET + "          " + TEE + "\n",
-     ["cert-postgres-age.yml cert-postgres-age leg '': self-hosted job sets CARGO_PROFILE_DEV_DEBUG to '2', "
-      "must be 0",
-      "cert-postgres-age.yml cert-postgres-age leg '': CARGO_PROFILE_DEV_DEBUG '2' differs from "
-      "CARGO_PROFILE_TEST_DEBUG '0'",
+     [("cert-postgres-age.yml cert-postgres-age leg '': self-hosted job sets CARGO_PROFILE_DEV_DEBUG to '2', "
+       "must be 0"),
+      ("cert-postgres-age.yml cert-postgres-age leg '': CARGO_PROFILE_DEV_DEBUG '2' differs from "
+       "CARGO_PROFILE_TEST_DEBUG '0'"),
       _BAD_WRITE % (CERT, CERT_JOB, TEE),
       _BAD_SITE % (CERT, CERT_JOB, 10, TEE, 1, 0)]),
     ("M18_composed_variable_name",
@@ -753,8 +753,8 @@ SITE_MUTANTS = (
      [_BAD_WRITE % (CERT, CERT_JOB, COMPOSED)]),
     ("M19_dynamic_name_in_an_env_group",
      "rust-cache-warm.yml", '            echo "CARGO_BUILD_JOBS=1"\n', '            echo "${k}=2"\n',
-     ['rust-cache-warm.yml check-hosted-sqlite: a line of a GITHUB_ENV group the test cannot classify: '
-      'echo "${k}=2"']),
+     [('rust-cache-warm.yml check-hosted-sqlite: a line of a GITHUB_ENV group the test cannot classify: '
+       'echo "${k}=2"')]),
     ("M20_rustflags_debuginfo_in_the_workflow_env",
      "postgres-ignored.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n',
      '  CARGO_PROFILE_TEST_DEBUG: "0"\n  RUSTFLAGS: "-C debuginfo=2"\n',
@@ -767,8 +767,8 @@ SITE_MUTANTS = (
      [_BAD_SITE % (CERT, CERT_JOB, 4, FLOW_ENV, 1, 0)]),
     ("M23_value_changed_at_an_allowed_echo",
      "rust-cache-warm.yml", RCW_TEST_ECHO, RCW_TEST_ECHO.replace("=0", "=2"),
-     ["rust-cache-warm.yml check-hosted-sqlite leg '': CARGO_PROFILE_DEV_DEBUG '0' differs from "
-      "CARGO_PROFILE_TEST_DEBUG '2'",
+     [("rust-cache-warm.yml check-hosted-sqlite leg '': CARGO_PROFILE_DEV_DEBUG '0' differs from "
+       "CARGO_PROFILE_TEST_DEBUG '2'"),
       _BAD_SITE % ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "CARGO_PROFILE_TEST_DEBUG=0"', 0, 1),
       _BAD_SITE % ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "CARGO_PROFILE_TEST_DEBUG=2"', 1, 0)]),
     ("M24_allowed_echo_duplicated",
@@ -838,20 +838,20 @@ class BrokenCopies(unittest.TestCase):
         workflows = self._broken("cert-postgres-age.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n', "")
         self.assertEqual(problems_debuginfo(workflows), [
             "cert-postgres-age.yml cert-postgres-age leg '': self-hosted job leaves CARGO_PROFILE_TEST_DEBUG undeclared",
-            "cert-postgres-age.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"0\"' occurs 0 "
-            "times, the allowlist has 1"])
+            ("cert-postgres-age.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"0\"' occurs 0 "
+             "times, the allowlist has 1")])
 
     def test_self_hosted_dev_and_test_differ(self):
         workflows = self._broken("postgres-ignored.yml", '  CARGO_PROFILE_TEST_DEBUG: "0"\n',
                                  '  CARGO_PROFILE_TEST_DEBUG: "1"\n')
         self.assertEqual(problems_debuginfo(workflows), [
             "postgres-ignored.yml postgres-ignored leg '': self-hosted job sets CARGO_PROFILE_TEST_DEBUG to '1', must be 0",
-            "postgres-ignored.yml postgres-ignored leg '': CARGO_PROFILE_DEV_DEBUG '0' differs from "
-            "CARGO_PROFILE_TEST_DEBUG '1'",
-            "postgres-ignored.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"0\"' occurs 0 "
-            "times, the allowlist has 1",
-            "postgres-ignored.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"1\"' occurs 1 "
-            "times, the allowlist has 0"])
+            ("postgres-ignored.yml postgres-ignored leg '': CARGO_PROFILE_DEV_DEBUG '0' differs from "
+             "CARGO_PROFILE_TEST_DEBUG '1'"),
+            ("postgres-ignored.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"0\"' occurs 0 "
+             "times, the allowlist has 1"),
+            ("postgres-ignored.yml : debuginfo setting site (indent 2) 'CARGO_PROFILE_TEST_DEBUG: \"1\"' occurs 1 "
+             "times, the allowlist has 0")])
 
     def test_hosted_ci_job_dev_and_test_differ(self):
         workflows = self._broken(CI, "\n  CARGO_PROFILE_TEST_DEBUG: line-tables-only\n",
