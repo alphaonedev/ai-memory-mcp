@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,9 @@ GUARDED_DOCS_SUBDIRS = ("docs/security",)
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 CODE_SPAN_RE = re.compile(r"(`+)(.+?)\1")
 LINK_RE = re.compile(r"\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+LINUX_SYMLOOP_LIMIT = 40  # the Linux symlink hop limit; macOS stops at 32 (#9705)
+SYMLOOP_PROBE_CAP = 128
+LONG_NAME_LEN = 250  # below NAME_MAX (255) on both kernels
 TRAILING_SLASH_REASON = "trailing slash on a file target"
 EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "#", "tel:", "ftp://")
 
@@ -386,8 +390,32 @@ class LinkContainmentTest(unittest.TestCase):
             previous = name
         return previous
 
+    def kernel_symloop_limit(self):
+        """The longest symlink chain this kernel follows: 40 on Linux, 32 on macOS (#9705).
+
+        Probed by stat-ing ever longer chains in a scratch directory; Linux must report exactly
+        LINUX_SYMLOOP_LIMIT, so the probe can never hide a regression there.
+        """
+        probe = self.base / "symloop-probe"
+        probe.mkdir()
+        (probe / "real").write_text("x", encoding="utf-8")
+        previous, limit = "real", 0
+        for index in range(1, SYMLOOP_PROBE_CAP + 1):
+            name = "p%d" % index
+            (probe / name).symlink_to(previous)
+            try:
+                os.stat(str(probe / name))
+            except OSError as error:
+                self.assertEqual(error.errno, errno.ELOOP)
+                break
+            previous, limit = name, index
+        self.assertLess(limit, SYMLOOP_PROBE_CAP, "no kernel limit found")
+        if sys.platform.startswith("linux"):
+            self.assertEqual(limit, LINUX_SYMLOOP_LIMIT)
+        return limit
+
     def test_symlink_chain_past_kernel_limit_is_unresolvable_8291_r6(self):
-        last = self.chain(41)
+        last = self.chain(self.kernel_symloop_limit() + 1)
         self.write("a.md", "[a](%s)\n" % last)
         self.assertEqual(
             broken_links(self.root),
@@ -395,7 +423,7 @@ class LinkContainmentTest(unittest.TestCase):
         )
 
     def test_symlink_chain_at_kernel_limit_resolves_8291_r6(self):
-        last = self.chain(40)
+        last = self.chain(self.kernel_symloop_limit())
         self.write("a.md", "[a](%s)\n" % last)
         self.assertEqual(broken_links(self.root), [])
 
@@ -480,7 +508,11 @@ class LinkContainmentTest(unittest.TestCase):
         The raw target ``L/M/out`` is short, but user-space resolution expands it past
         PATH_MAX, while the kernel follows ``out`` and ``outd`` to the outside directory.
         """
-        names = [("%d" % n).ljust(250, "n") for n in range(9)]
+        # Two levels of ``count`` long names must pass PATH_MAX while one symlink target stays
+        # below it: 9 names on Linux (4096), 3 on macOS (1024, which also caps a target) (#9705).
+        path_max = os.pathconf(str(self.root), "PC_PATH_MAX")
+        count = path_max // (2 * (LONG_NAME_LEN + 1)) + 1
+        names = [("%d" % n).ljust(LONG_NAME_LEN, "n") for n in range(count)]
         (self.root / "L").symlink_to(os.path.join(*names))
         root_fd = os.open(str(self.root), os.O_RDONLY)
         try:

@@ -14,6 +14,10 @@ Every case builds throwaway repositories under the repository's `.local-runs/`
 import unittest
 from pathlib import Path
 
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from impact_fixture import git, make_scratch, write_files
 from test_impact_cargo_skip_symlink_tracked_8493 import (
     DOCS_FALSE, DOCS_TRUE, REASON_ERROR, REASON_TRACKED, SKIP_FALSE,

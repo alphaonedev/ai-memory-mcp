@@ -15,6 +15,8 @@ import unittest
 from pathlib import Path
 from typing import Dict, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from impact_fixture import IMPACT_DIR, RULES_JSON, git, make_scratch, write_files
 
 sys.path.append(str(IMPACT_DIR.parent))

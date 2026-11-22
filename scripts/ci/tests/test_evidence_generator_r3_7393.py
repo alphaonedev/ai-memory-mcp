@@ -24,6 +24,8 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from tmp_runtime_guard_7393 import GuardedCase
 import unittest.mock as mock
 

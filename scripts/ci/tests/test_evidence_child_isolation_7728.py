@@ -13,7 +13,10 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from unittest import mock
+import unittest
+import unittest.mock as mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
 
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
@@ -173,3 +176,6 @@ class ChildIsolation7728(ScratchCase):
                                 env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('PLANTED-MODULE-7728', result.stderr)
+
+if __name__ == "__main__":
+    unittest.main()

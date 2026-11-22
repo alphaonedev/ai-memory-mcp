@@ -5,9 +5,15 @@
 import os
 import errno
 import stat
+import unittest
 import unittest.mock as mock
 
-from test_evidence_generator_5040_5042 import ScratchCase, load
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
+from test_evidence_generator_5040_5042 import NATIVE_RENAME_SKIP_REASON, ScratchCase, load
 
 MANIFEST = "MANIFEST.sha256"
 ORIGINAL = {"a.txt": b"builder bytes\n"}
@@ -49,9 +55,9 @@ class Publish7729(ScratchCase):
                 self.publish()
 
     def test_stage_swap_after_verify_refuses_both_paths_7729(self):
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
-                self.dest = self.dest.with_name("swap-" + str(native is None))
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("swap-" + leg)
                 replaced = []
 
                 def swap(stage):
@@ -64,25 +70,25 @@ class Publish7729(ScratchCase):
                 self.assertEqual((replaced[0] / "a.txt").read_bytes(), FORGED["a.txt"])
 
     def test_matching_forged_manifest_refuses_both_paths_7729(self):
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
-                self.dest = self.dest.with_name("content-" + str(native is None))
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("content-" + leg)
                 self.attack(self.forge)
                 self.assertFalse(self.dest.exists())
 
     def test_normal_publish_preserves_shared_scratch_mode_7729(self):
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
-                self.dest = self.dest.with_name("cert-" + str(native is None))
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("cert-" + leg)
                 self.assertEqual(self.publish(), [MANIFEST, "a.txt"])
                 self.assertEqual((self.dest / "a.txt").read_bytes(), ORIGINAL["a.txt"])
                 self.assertEqual((self.dest / MANIFEST).read_text(), self.manifest)
                 self.assertEqual(stat.S_IMODE(self.scratch.stat().st_mode), 0o775)
 
     def test_destination_appears_preserved_both_paths_7729(self):
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
-                self.dest = self.dest.with_name("race-" + str(native is None))
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("race-" + leg)
 
                 def appear(_stage):
                     self.dest.mkdir(parents=True)
@@ -92,13 +98,19 @@ class Publish7729(ScratchCase):
 
     def test_stage_created_inside_private_parent_7729(self):
         real = self.bb.stage_write
+        staged = []
 
         def inspect(stage, *args, **kwargs):
-            self.assertEqual(stat.S_IMODE(stage.parent.stat().st_mode), 0o700)
-            self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
+            # Without the kernel no-replace rename (macOS) the portable path calls stage_write a second time
+            # for the new destination, which lives in the shared parent; only the stage is private (#9705).
+            if stage.name == self.bb.STAGE_NAME:
+                staged.append(stage)
+                self.assertEqual(stat.S_IMODE(stage.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
             return real(stage, *args, **kwargs)
         with mock.patch.object(self.bb, "stage_write", side_effect=inspect):
             self.publish()
+        self.assertEqual(len(staged), 1, "the stage is written exactly once, inside its private parent")
 
     def test_private_parent_swap_preserves_foreign_data_7729(self):
         replacement = []
@@ -151,8 +163,8 @@ class Publish7729(ScratchCase):
 
     def test_postpublication_mutation_is_removed_both_paths_7729(self):
         real = self.bb.rename_noreplace
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
 
                 def tamper(*args, **kwargs):
                     real(*args, **kwargs)
@@ -195,8 +207,8 @@ class Publish7729(ScratchCase):
     def test_destination_exists_preserved_both_paths_7729(self):
         self.dest.mkdir(parents=True)
         self.forge(self.dest)
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
                 with self.assertRaises(self.bb.Fatal):
                     self.publish()
                 self.assertEqual((self.dest / "a.txt").read_bytes(), FORGED["a.txt"])
@@ -257,7 +269,7 @@ class Publish7729(ScratchCase):
 
     def test_shared_output_parent_native_preserves_mode_7729(self):
         if self.bb.rename_noreplace_native is None:
-            self.skipTest("atomic no-replace rename unavailable")
+            self.skipTest(NATIVE_RENAME_SKIP_REASON)
         self.dest.parent.mkdir()
         self.dest.parent.chmod(0o775)
         self.publish()
@@ -335,9 +347,9 @@ class Publish7729(ScratchCase):
     def test_executable_modes_and_manifest_bytes_both_paths_7729(self):
         files = {**ORIGINAL, "recapture.py": b"# fixture only\n"}
         manifest = self.bb.manifest_text(files)
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
-                self.dest = self.dest.with_name("mode-" + str(native is None))
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("mode-" + leg)
                 self.bb.publish_bundle(self.wt, self.dest, files, manifest)
                 self.assertEqual((self.dest / MANIFEST).read_bytes(), manifest.encode())
                 self.assertEqual((self.dest / "recapture.py").read_bytes(), files["recapture.py"])
@@ -348,9 +360,9 @@ class Publish7729(ScratchCase):
         self.dest.parent.mkdir()
         self.dest.parent.chmod(0o775)
         real = self.bb.rename_noreplace
-        for native in (self.bb.rename_noreplace_native, None):
-            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
-                self.dest = self.dest.with_name("rejected-" + str(native is None))
+        for leg, native in self.native_legs(self.bb):
+            with self.subTest(leg=leg), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("rejected-" + leg)
 
                 def tamper(*args, **kwargs):
                     real(*args, **kwargs)
@@ -394,3 +406,6 @@ class Publish7729(ScratchCase):
         self.assertEqual(swapped, [True])
         self.assertEqual((self.dest / "a.txt").read_bytes(), FORGED["a.txt"])
         self.assertEqual(list(self.dest.with_name("cleaned-owned").iterdir()), [])
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,6 +5,11 @@ import copy
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 import test_check_codeql_alerts_7337 as original
 
 

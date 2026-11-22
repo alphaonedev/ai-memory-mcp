@@ -13,6 +13,8 @@ import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # by-path runs: siblings import by bare name (#9705)
+
 from impact_fixture import IMPACT_DIR, git, make_scratch, write_files
 from test_impact_cargo_skip_symlink_tracked_8493 import (
     DOCS_FALSE, DOCS_TRUE, REASON_TRACKED, SKIP_FALSE, SKIP_TRUE, run_cli)
