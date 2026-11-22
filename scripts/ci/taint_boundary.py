@@ -3446,21 +3446,57 @@ def _check_job_form(job: dict[str, object], label: str) -> None:
     _check_matrix(job, label)
 
 
-def _matrix_axis(raw: str) -> tuple[str, bool] | None:
-    """`${{ matrix.<axis> }}` or `${{ fromJSON(matrix.<axis>) }}`: the axis and the fromJSON flag."""
+FLIP_AND = "&&"
+FLIP_OR = "||"
+
+
+def _flip_literal(body: str) -> tuple[str, str] | None:
+    """`<cond> && '<json>' || matrix.<axis>` (PR 9838): (axis, literal arm text), else None.
+
+    The condition holds no `||` (otherwise the grouping is not the flip and the whole
+    expression stays one opaque leg); the literal is one single-quoted string.
+    """
+    head, sep, tail = body.rpartition(FLIP_OR)
+    if not sep:
+        return None
+    tail = tail.strip()
+    if not tail.startswith("matrix."):
+        return None
+    cond, sep, literal = head.rpartition(FLIP_AND)
+    literal = literal.strip()
+    if not sep or not cond.strip() or FLIP_OR in cond:
+        return None
+    if len(literal) < 2 or not (literal.startswith("'") and literal.endswith("'")):
+        return None
+    inner = literal[1:-1]
+    if "'" in inner.replace("''", ""):
+        return None
+    return tail[len("matrix."):], inner.replace("''", "'")
+
+
+def _matrix_axis(raw: str) -> tuple[str, bool, str | None] | None:
+    """`${{ matrix.<axis> }}`, `${{ fromJSON(matrix.<axis>) }}` or the flip form
+    `${{ fromJSON(<cond> && '<json>' || matrix.<axis>) }}`: the axis, the fromJSON flag
+    and the literal arm of the flip form (None for the first two forms)."""
     text = raw.strip()
     if not (text.startswith(EXPR_OPEN) and text.endswith(EXPR_CLOSE)) or text.count(EXPR_OPEN) != 1:
         return None
     body = text[len(EXPR_OPEN):-len(EXPR_CLOSE)].strip()
     from_json = body.startswith("fromJSON(") and body.endswith(")")
+    literal: str | None = None
     if from_json:
         body = body[len("fromJSON("):-1].strip()
+        if not body.startswith("matrix."):
+            flip = _flip_literal(body)
+            if flip is None:
+                return None
+            body, literal = "matrix." + flip[0], flip[1]
     if not body.startswith("matrix."):
         return None
     axis = body[len("matrix."):]
     if not axis or not all(_is_ident_char(ch) for ch in axis):
         return None
-    return axis, from_json
+    return axis, from_json, literal
 
 
 def _runs_on_legs(job: dict[str, object], label: str) -> list[tuple[str, ...]]:
@@ -3496,7 +3532,7 @@ def _runs_on_legs(job: dict[str, object], label: str) -> list[tuple[str, ...]]:
     if isinstance(raw, str):
         found = _matrix_axis(raw)
         if found is not None:
-            axis, from_json = found
+            axis, from_json, literal = found
             if not isinstance(matrix, dict):
                 raise Unclassifiable(f"{label}: runs-on names a matrix axis but the matrix is not a mapping")
             values: list[object] = []
@@ -3517,6 +3553,12 @@ def _runs_on_legs(job: dict[str, object], label: str) -> list[tuple[str, ...]]:
                     except ValueError as exc:
                         raise Unclassifiable(f"{label}: fromJSON matrix value is not JSON") from exc
                 legs.append(as_labels(v))
+            if literal is not None:
+                # the flip form's literal arm is one more leg beside every axis value
+                try:
+                    legs.append(as_labels(json.loads(literal)))
+                except ValueError as exc:
+                    raise Unclassifiable(f"{label}: fromJSON literal arm is not JSON") from exc
             return legs
         # Any other expression (an input, a variable, an event field) can name any runner:
         # it is one opaque leg, never hosted, so R2 treats it as persistent.

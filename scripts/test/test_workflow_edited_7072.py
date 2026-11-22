@@ -11,6 +11,10 @@ longer list ``edited``; a base retarget is landed only after a new head push (an
 ordinary ``pull_request`` run classifies against the new base), enforced at landing by
 scripts/ci/pr_retarget_check.py.
 
+#9821 (PR 9838): ci.yml also lists ``ready_for_review``, so a draft whose self-hosted
+legs ended red ("Draft skip") runs them in full the moment it is marked ready; it never
+lists ``edited`` or ``labeled``. coverage.yml keeps the three default types.
+
 Stdlib only. Run: ``python3 -I scripts/test/test_workflow_edited_7072.py``
 or ``python3 -I -m unittest`` with the file path loaded by the repo runner.
 """
@@ -22,6 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WF = ROOT / ".github" / "workflows"
 REQUIRED_TYPES = {"opened", "synchronize", "reopened"}
+CI_YML_TYPES = REQUIRED_TYPES | {"ready_for_review"}
+FORBIDDEN_TYPES = {"edited", "labeled"}
 
 
 def _read(name: str) -> str:
@@ -41,7 +47,9 @@ def _pr_types(text: str) -> set:
 
 class PullRequestEdited7072(unittest.TestCase):
     def test_ci_yml_types_exclude_edited(self):
-        self.assertEqual(_pr_types(_read("ci.yml")), REQUIRED_TYPES)
+        types = _pr_types(_read("ci.yml"))
+        self.assertEqual(types, CI_YML_TYPES)
+        self.assertEqual(types & FORBIDDEN_TYPES, set())
 
     def test_coverage_yml_types_exclude_edited(self):
         self.assertEqual(_pr_types(_read("coverage.yml")), REQUIRED_TYPES)

@@ -68,6 +68,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRATCH = ROOT / ".local-runs"
 WF = ROOT / ".github" / "workflows"
 NO_EDITED = ("ci.yml", "coverage.yml")
+# The first inline `types: [...]` list under the `pull_request:` trigger (group 2 = its members).
+PR_TYPES_LIST = re.compile(r"(^  pull_request:\n(?:    [^\n]*\n)*?    types: \[)([^\]\n]*)\]", re.M)
 EDITED_ALLOW = {"claude-md-rule-compare.yml"}
 TARGET_ALLOW = {"claude-md-rule-compare.yml"}
 ACCEPTED_GUARDS = (
@@ -764,8 +766,9 @@ class BodyOnlyEditNeverCancels8332(unittest.TestCase):
         for name in NO_EDITED:
             text = (WF / name).read_text(encoding="utf-8")
             self.assertEqual(edited_listed(name, text), [])
-            mutated = text.replace("types: [opened, synchronize, reopened]",
-                                   "types: [opened, synchronize, reopened, edited]", 1)
+            # PR 9838 (M1): insert `edited` into the parsed list, whatever its members, so a
+            # new activity type on the trigger never turns this mutation into a no-op.
+            mutated = PR_TYPES_LIST.sub(lambda m: m.group(1) + m.group(2).rstrip() + ", edited]", text, count=1)
             self.assertNotEqual(mutated, text, name)
             self.assertEqual(len(edited_listed(name, mutated)), 1, name)
 
