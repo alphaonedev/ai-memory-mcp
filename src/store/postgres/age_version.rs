@@ -31,8 +31,10 @@
 use std::fmt;
 
 /// The certified Apache AGE `extversion` — mirrors `EXPECTED_AGE_VERSION`
-/// (`deploy/docker-1461/provision/lib.sh`).
-pub const AGE_VERSION_CANONICAL: &str = "1.8.0";
+/// (`deploy/docker-1461/provision/lib.sh`): Apache AGE 1.7.0, built from
+/// upstream PG19 branch commit c6b043d (not a tagged Apache release;
+/// upstream has no 1.7.0 release for PostgreSQL 19), on PostgreSQL 19 (#9927).
+pub const AGE_VERSION_CANONICAL: &str = "1.7.0";
 
 /// The tested floor — the alternate matrix's AGE (`infra/lan-parity-test`,
 /// PG 16 + AGE 1.6.0). Anything below it is an unsupported substrate.
@@ -199,22 +201,25 @@ mod tests {
     }
 
     /// The comparator table the ruling names: 1.5.0 → BelowFloor, 1.6.0 →
-    /// TestedAlternate, 1.8.0 → Canonical, garbage → Unparseable.
+    /// TestedAlternate, 1.7.0 → Canonical, garbage → Unparseable. 1.8.0 is
+    /// the previous pin (#9927): above the floor, not certified, so YELLOW.
     #[test]
     fn comparator_table_3756() {
-        let table: [(&str, AgeVersionVerdict); 12] = [
+        let table: [(&str, AgeVersionVerdict); 14] = [
             ("1.5.0", AgeVersionVerdict::BelowFloor),
             ("1.0.0", AgeVersionVerdict::BelowFloor),
             ("0.9.9", AgeVersionVerdict::BelowFloor),
             ("1.6.0", AgeVersionVerdict::TestedAlternate),
-            ("1.7.0", AgeVersionVerdict::TestedAlternate),
+            ("1.6.1", AgeVersionVerdict::TestedAlternate),
+            ("1.8.0", AgeVersionVerdict::TestedAlternate),
             ("1.9.0", AgeVersionVerdict::TestedAlternate),
             ("2.0.0", AgeVersionVerdict::TestedAlternate),
-            ("1.8.0", AgeVersionVerdict::Canonical),
-            (" 1.8.0\n", AgeVersionVerdict::Canonical),
+            ("1.7.0", AgeVersionVerdict::Canonical),
+            (" 1.7.0\n", AgeVersionVerdict::Canonical),
             ("garbage", AgeVersionVerdict::Unparseable),
-            ("1.8", AgeVersionVerdict::Unparseable),
-            ("1.8.0~rc0", AgeVersionVerdict::Unparseable),
+            ("1.7", AgeVersionVerdict::Unparseable),
+            ("1.7.0~rc0", AgeVersionVerdict::Unparseable),
+            ("1.7.0-c6b043d", AgeVersionVerdict::Unparseable),
         ];
         for (raw, want) in table {
             assert_eq!(age_version_verdict(raw), want, "extversion {raw:?}");
@@ -225,7 +230,7 @@ mod tests {
             "empty"
         );
         assert_eq!(
-            age_version_verdict("1.8.0.1"),
+            age_version_verdict("1.7.0.1"),
             AgeVersionVerdict::Unparseable,
             "a fourth component is not a version we vouch for"
         );
@@ -276,7 +281,7 @@ mod tests {
     #[test]
     fn canonical_has_no_note_and_alternate_explains_3756() {
         assert_eq!(
-            age_version_remedy("1.8.0", AgeVersionVerdict::Canonical),
+            age_version_remedy("1.7.0", AgeVersionVerdict::Canonical),
             None
         );
         let note = age_version_remedy("1.6.0", AgeVersionVerdict::TestedAlternate)

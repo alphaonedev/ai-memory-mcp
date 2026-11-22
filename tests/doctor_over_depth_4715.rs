@@ -8,7 +8,7 @@
 //! NEW bind from making one, but pre-#4477 data and imports can still hold one;
 //! the doctor printed only a depth histogram, so the chain failed closed
 //! silently. The cells plant raw `namespace_meta` rows (the bind path refuses
-//! them) and run the real `ai-memory doctor --json` on SQLite and PG 18.6:
+//! them) and run the real `ai-memory doctor --json` on SQLite and PG 19.0:
 //!
 //! - a 9-hop chain is Critical and the offending root is named, with the
 //!   shortening hint and exit code 2;

@@ -12,7 +12,7 @@
 //! `v/proj`, hangs a 9-link same-owner chain above it, and every governed
 //! operation in A's subtree returns 500.
 //!
-//! Cells, sqlite and PG 18.6, outcome compared across backends:
+//! Cells, sqlite and PG 19.0, outcome compared across backends:
 //! - (a) the cross-principal shape, chain built bottom-up: B's root link that
 //!   crosses the bound is refused, no row, A's writes under `v/proj` stay 201;
 //! - (b) the same chain built top-down (a link added at the TOP) is refused at

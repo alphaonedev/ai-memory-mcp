@@ -13172,14 +13172,16 @@ impl PostgresStore {
         // `build_find_paths_current_view_cypher` (DELETED, #2613) emitted
         // an `ALL(e IN relationships(p) WHERE …)` guard. On AGE **1.7.0**
         // that was a PARSE rejection (`syntax error at or near "("`).
-        // The certified pin is now AGE **1.8.0** (`EXPECTED_AGE_VERSION`;
-        // `deploy/docker-1461/provision/lib.sh`). Re-verified #3297 on a
+        // #3297 re-verified this on the pin of that time, a
         // live 1.8.0 extversion: `ALL(x IN [1,2,3] WHERE …)` and
         // `ANY(…)` now PARSE and return; `filter(…)` still parse-rejects;
         // the find_paths `ALL(e IN relationships(p) WHERE e.valid_until
         // IS NULL)` still does NOT succeed — it fails at RUNTIME
         // (`ERROR: no relation entry for relid 2`) on a seeded
         // two-vertex graph. Capture: `docs/kg-find-paths-engine.md`.
+        // The certified pin is `EXPECTED_AGE_VERSION`
+        // (`deploy/docker-1461/provision/lib.sh`, #9927); the traversal
+        // below never relies on either list predicate, on any version.
         // Restoring an AGE `find_paths` reader is follow-up #3609, not
         // this path: the dispatcher stays the relational CTE on BOTH
         // `KgBackend` values because even a PARSEABLE AGE walk is a

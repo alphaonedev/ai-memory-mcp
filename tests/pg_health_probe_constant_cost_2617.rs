@@ -119,8 +119,9 @@ mod pg {
     /// Largest `rows=N` reported by any ACTUAL (executed) plan node — i.e. how
     /// many rows the statement really touched.
     ///
-    /// `PostgreSQL` **18** renders actual row counts with two decimal places
-    /// (`rows=1317.00`); 17 and earlier render a bare integer (`rows=1317`).
+    /// `PostgreSQL` 19 (the certified tier) renders actual row counts with two
+    /// decimal places (`rows=1317.00`), as 18 did; 17 and earlier render a
+    /// bare integer (`rows=1317`).
     /// The integral part is taken TEXTUALLY so both render forms parse on the
     /// same path with no float arithmetic and no lossy cast (PERF-07/09). A
     /// token that parses as neither would silently vanish from the `max()` and
@@ -135,7 +136,7 @@ mod pg {
             let Some(token) = after.split_whitespace().next() else {
                 continue;
             };
-            // `1317` (pg <= 17) and `1317.00` (pg 18) both yield `1317`.
+            // `1317` (17 and earlier) and `1317.00` (18 and later) both yield `1317`.
             let integral = token.split('.').next().unwrap_or(token);
             let n: u64 = integral.parse().unwrap_or_else(|e| {
                 panic!(

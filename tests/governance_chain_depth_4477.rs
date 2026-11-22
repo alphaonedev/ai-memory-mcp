@@ -10,7 +10,7 @@
 //! governed nothing there, and both backends silently dropped explicit
 //! parents beyond their hop budget (pg 5, sqlite 8).
 //!
-//! Cells, each on sqlite and PG 18.6 over the public HTTP surface, with the
+//! Cells, each on sqlite and PG 19.0 over the public HTTP surface, with the
 //! cross-backend outcome compared:
 //! - a stranger's FIRST bind on a child 6, 7 and 8 levels below a governed
 //!   root is refused with the not-owner kind, over HTTP and the SAL trait

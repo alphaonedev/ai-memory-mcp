@@ -58,7 +58,8 @@
 //! `#![cfg(feature = "sal-postgres")]` + `#[ignore]` on the live tests, run by
 //! the `postgres-age` job in `.github/workflows/postgres-parity-nightly.yml`
 //! (`-- --include-ignored`, the #1799 lane convention) against the certified
-//! PG 18.4 + AGE 1.7.0 + pgvector 0.8.6 stack. They also skip cleanly with a
+//! PG 19.0 + AGE 1.7.0 + pgvector 0.8.7 stack (`deploy/docker-1461/provision/lib.sh`,
+//! #9927). They also skip cleanly with a
 //! printed reason when `AI_MEMORY_TEST_AGE_URL` / `AI_MEMORY_TEST_POSTGRES_URL`
 //! is unset or the connected database has no AGE extension.
 //!
