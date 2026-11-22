@@ -732,37 +732,91 @@ class DeciderCli(unittest.TestCase):
         self.assertEqual(sorted(got), ["docs/a.md", "src/a.rs"])
 
 
-def judge_call_deciders():
-    """Planted deciders that answer in the new shape but whose judge call is broken.
+# The five reject tokens answer_shape.py prints on exit 1, written out by hand.
+JUDGE_TOKENS = ("extra-line", "not-printable-ascii", "empty", "over-cap-300", "blank-only")
+# Exit codes of the judge call: accept, reject, error, an unlisted code, "found but not
+# executable", "not found", and the top of the byte.
+JUDGE_EXITS = (0, 1, 2, 3, 126, 127, 255)
+CE = JUDGE_BROKEN_WHY
+# Hand-written expected column of the exit-code table: per exit code, what a judge that
+# prints exactly one token line (each of JUDGE_TOKENS in order) must produce. Only
+# exit 1 names the token; every other exit code, exit 0 included, is a checker-error RUN.
+EXIT_TOKEN_EXPECT = {
+    0: (CE, CE, CE, CE, CE),
+    1: ("extra-line", "not-printable-ascii", "empty", "over-cap-300", "blank-only"),
+    2: (CE, CE, CE, CE, CE),
+    3: (CE, CE, CE, CE, CE),
+    126: (CE, CE, CE, CE, CE),
+    127: (CE, CE, CE, CE, CE),
+    255: (CE, CE, CE, CE, CE),
+}
+# Hand-written: a judge that prints the three valid lines. Only exit 0 is a skip (None);
+# the token branch of exit 1 never matches three lines, and every other code is a RUN.
+EXIT_THREE_LINES_EXPECT = {0: None, 1: CE, 2: CE, 3: CE, 126: CE, 127: CE, 255: CE}
+# Hand-written: a judge that prints an unknown token. A RUN for every exit code.
+EXIT_UNKNOWN_EXPECT = {0: CE, 1: CE, 2: CE, 3: CE, 126: CE, 127: CE, 255: CE}
+THREE_JUDGE_LINES = ("docs_only=true", "cargo_skip=true", "cargo_skip_reason=old-skip")
 
+
+def judge_call_deciders():
+    """Planted deciders whose judge call (--judge-answer) answers as written.
+
+    Rows are (label, files, expected): expected is the reason token the step prints for a
+    RUN, or None when the answer is the one accepted shape and the skip is honoured.
     Rows (e) to (g) break the call itself (exit 2, junk on exit 0, an unknown token on
     exit 1). Rows (h) to (k) exit 0 with exactly one wrong line out of three, so each key
-    and the reason check of a step is the only thing that refuses the answer.
+    and the reason check of a step is the only thing that refuses the answer. Rows (l)
+    are the exit-code dimension (every code of JUDGE_EXITS against every token, the
+    three valid lines and an unknown token). Rows (m) are the extra-line forms of exit 0
+    and exit 1 (a fourth line of text, a blank fourth line, a repeated key line, five
+    lines, a blank line after a token).
     """
     answer = (b"print('docs_only=true')\nprint('cargo_skip=true')\n"
               b"print('cargo_skip_reason=old-skip')\n")
     head = b"import sys\nif '--judge-answer' in sys.argv:\n"
 
+    def judge(code, lines):
+        printed = "".join("    print(%r)\n" % line for line in lines)
+        return head + printed.encode() + (b"    sys.exit(%d)\n" % code) + answer
+
     def says(docs, skip, reason):
-        lines = "".join("    print(%r)\n" % text for text in (docs, skip, reason))
-        return head + lines.encode() + b"    sys.exit(0)\n" + answer
+        return judge(0, (docs, skip, reason))
 
     rows = [
-        ("(e) valid answer, judge exits 2", head + b"    sys.exit(2)\n" + answer),
-        ("(f) valid answer, judge exits 0 with junk",
-         head + b"    print('hello')\n    sys.exit(0)\n" + answer),
-        ("(g) valid answer, judge exits 1 with an unknown token",
-         head + b"    print('bogus-token')\n    sys.exit(1)\n" + answer),
+        ("(e) valid answer, judge exits 2", head + b"    sys.exit(2)\n" + answer, CE),
+        ("(f) valid answer, judge exits 0 with junk", judge(0, ("hello",)), CE),
+        ("(g) valid answer, judge exits 1 with an unknown token", judge(1, ("bogus-token",)), CE),
         ("(h) judge exits 0, docs key wrong",
-         says("docs_onlyX=true", "cargo_skip=true", "cargo_skip_reason=old-skip")),
+         says("docs_onlyX=true", "cargo_skip=true", "cargo_skip_reason=old-skip"), CE),
         ("(i) judge exits 0, skip key wrong",
-         says("docs_only=true", "cargo_skipX=true", "cargo_skip_reason=old-skip")),
+         says("docs_only=true", "cargo_skipX=true", "cargo_skip_reason=old-skip"), CE),
         ("(j) judge exits 0, reason key wrong",
-         says("docs_only=true", "cargo_skip=true", "cargo_skip_reasonX=old-skip")),
+         says("docs_only=true", "cargo_skip=true", "cargo_skip_reasonX=old-skip"), CE),
         ("(k) judge exits 0, reason empty",
-         says("docs_only=true", "cargo_skip=true", "cargo_skip_reason=")),
+         says("docs_only=true", "cargo_skip=true", "cargo_skip_reason="), CE),
+        ("(m1) judge exits 0, the three lines and a fourth line of text",
+         judge(0, THREE_JUDGE_LINES + ("junk",)), CE),
+        ("(m2) judge exits 0, the three lines and a blank fourth line",
+         judge(0, THREE_JUDGE_LINES + ("",)), CE),
+        ("(m3) judge exits 0, the three lines and a repeated key line",
+         judge(0, THREE_JUDGE_LINES + ("cargo_skip_reason=old-skip",)), CE),
+        ("(m4) judge exits 0, the three lines and two more lines",
+         judge(0, THREE_JUDGE_LINES + ("a", "b")), CE),
+        ("(m5) judge exits 1, a known token and a blank second line",
+         judge(1, ("empty", "")), CE),
+        ("(m6) judge exits 1, a known token and a second line of text",
+         judge(1, ("empty", "junk")), CE),
+        ("(m7) judge exits 1, a blank first line", judge(1, ("",)), CE),
     ]
-    return [(label, {"cargo_skip.py": data}) for label, data in rows]
+    for code in JUDGE_EXITS:
+        for token, expected in zip(JUDGE_TOKENS, EXIT_TOKEN_EXPECT[code]):
+            rows.append(("(l) judge exits %d and prints %s" % (code, token),
+                         judge(code, (token,)), expected))
+        rows.append(("(l) judge exits %d and prints the three valid lines" % code,
+                     judge(code, THREE_JUDGE_LINES), EXIT_THREE_LINES_EXPECT[code]))
+        rows.append(("(l) judge exits %d and prints an unknown token" % code,
+                     judge(code, ("bogus-token",)), EXIT_UNKNOWN_EXPECT[code]))
+    return [(label, {"cargo_skip.py": data}, expected) for label, data, expected in rows]
 
 
 class ClsHarness(unittest.TestCase):
@@ -829,19 +883,23 @@ class ClsHarness(unittest.TestCase):
         return values
 
     def check_judge_rows(self):
-        """Every broken judge call ends as a RUN with this step's fail-closed reason."""
+        """Every judge answer of judge_call_deciders() ends as its written RUN or skip."""
         self.commit_base()
         diffs = [("docs only", "docs/a.md"), ("tests only", "scripts/ci/tests/x.py")]
-        for dlabel, files in judge_call_deciders():
+        for dlabel, files, expected in judge_call_deciders():
             for flabel, rel in diffs:
                 label = "%s | %s" % (dlabel, flabel)
                 with self.subTest(label):
                     values = self.planted_files(files, label, rel)
-                    self.expect(label, values, "false", "false", self.FAIL_REASON)
+                    if expected is None:
+                        self.expect(label, values, "true", "true", "old-skip")
+                        shown = SimpleNamespace(passed=("true", "true", "old-skip"), why=None)
+                    else:
+                        self.expect(label, values, "false", "false", self.FAIL_REASON)
+                        shown = SimpleNamespace(passed=None, why=expected)
                     notices = [ln for ln in self.last_stdout.decode("utf-8", "replace").splitlines()
                                if ln.startswith("::notice::")]
-                    rejected = SimpleNamespace(passed=None, why=JUDGE_BROKEN_WHY)
-                    self.assertEqual(notices, self.expected_notices(rejected), label)
+                    self.assertEqual(notices, self.expected_notices(shown), label)
 
     # Set by each step class: the fail-closed reason and the notice lines of a row.
     FAIL_REASON = FAIL_CLOSED
