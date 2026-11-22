@@ -723,13 +723,16 @@ class CancelWindow(TestBase):
         self.assertEqual((gh.cancels, gh.reruns), ([3], [3]))
 
     def test_re_read_after_the_cancel_fails(self) -> None:
-        gh = self.queue(3)
+        gh = self.queue(4)  # cancels 4 first, then 3
         gh.fail_after_cancel["get_run"] = gh_error(500)
         code, lines, err = call(gh, self.state, "--execute")
         self.assertEqual(code, qo.EXIT_GH)
-        self.assertIn("cancelled run 3: cancel not confirmed", lines)
-        self.assertIn("queue_order: refused: gh call failed: run 3: HTTP 500 (server error)", err)
-        self.assertIs(recorded(self.state)[3].phase, qo.Phase.CANCELLING)
+        self.assertIn("cancelled run 4: cancel not confirmed", lines)
+        self.assertIn("queue_order: refused: gh call failed: run 4: HTTP 500 (server error)", err)
+        self.assertEqual(gh.cancels, [4])
+        state = recorded(self.state)
+        self.assertEqual(sorted(state), [4])  # run 3 was never cancelled, so it has no record
+        self.assertIs(state[4].phase, qo.Phase.CANCELLING)
 
     def test_judge_rows_of_an_unconfirmed_cancel(self) -> None:
         open_pr = qo.PrFacts(True, SHA_A, False, False)

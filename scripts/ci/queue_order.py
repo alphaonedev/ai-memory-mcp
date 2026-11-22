@@ -22,8 +22,12 @@ Invariants (held for all inputs):
                BEFORE it is cancelled.  A recorded run is started again exactly
                once, into a free slot, or dropped with a printed reason (PR
                closed, newer head, newer run of the PR, finished, gone, the
-               record does not match the live run).  A cancel that has not
-               landed yet keeps its record.  A record waits at most
+               record does not match the live run, or a run that started
+               although its cancel was seen to land).  A cancel that has not
+               been seen to land keeps its record (phase cancelling), and so
+               does a run whose job started inside the window before the
+               cancel call (`cancel raced a start`): restarted once after the
+               cancel lands, or dropped when it finishes.  A record waits at most
                MAX_WAIT_CYCLES calls behind newer arrivals.
   I3 fail      an unreadable, partial or unstable run list, an unknown status,
      closed    conclusion, label or draft state, a gh failure (classified from
@@ -36,8 +40,12 @@ Invariants (held for all inputs):
                head branch is not protected.  Every cancel and every restart
                goes through one function each (cancel_checked, restart_checked)
                that re-reads the run just before the action and acts only when
-               it is still bound to what was planned: never a run with a job
-               started, never a push run, never another workflow, never a fork.
+               it is still bound to what was planned: never a push run, never
+               another workflow, never a fork.  No cancel is sent unless every
+               job was queued at the re-read made immediately before the call;
+               GitHub has no conditional cancel, so a start inside that window
+               is possible and is handled: the run and its jobs are read again
+               after the call and such a run is recorded for restart (I2).
   I5 skip      a run in the listing with no PR, with more than one PR, from a
                fork or with an unknown head repository is skipped and named;
                the other runs are still planned.
@@ -140,6 +148,8 @@ REASON_JOB_STARTED = "a job has started"
 REASON_NO_SELF_HOSTED = "does not wait on a self-hosted runner"
 REASON_CANCEL_PENDING = "cancel pending"
 REASON_STARTED_AGAIN = "started again (status %s, attempt %d)"
+REASON_CANCEL_RACED = "cancel raced a start"
+REASON_CANCEL_UNCONFIRMED = "cancel not confirmed"
 REASON_RESTART_PENDING = "restart pending"
 
 
@@ -232,7 +242,8 @@ def parse_gh_response(returncode: int, stdout: str, stderr: str) -> Any:
 
 
 class Phase(enum.Enum):
-    CANCELLED = "cancelled"  # recorded before the cancel; waits to be started again
+    CANCELLING = "cancelling"  # recorded before the cancel; the cancel has not been seen to land
+    CANCELLED = "cancelled"  # the re-read after the cancel saw it land; waits to be started again
     RESTARTED = "restarted"  # started again once; attempt is the new attempt
 
 
@@ -534,8 +545,11 @@ def judge(entry: BoundEntry, run: Any, scope: Scope, pr_facts_fn: Callable[[int]
     if status in QUEUE_STATUSES:
         # the cancel was accepted and has not landed
         return Judgment(Disposition.PENDING, REASON_CANCEL_PENDING)
+    if status != COMPLETED and entry.phase is Phase.CANCELLING:
+        # a job started inside the window before the cancel call; the cancel still lands on it (I4)
+        return Judgment(Disposition.PENDING, REASON_CANCEL_RACED)
     if status != COMPLETED:
-        # a run that started is never cancelled (I4), so it has nothing to restart: dropped with its reason
+        # CANCELLED is written only once the cancel was seen to land, so a run that runs now has nothing to restart
         return Judgment(Disposition.DROP, REASON_STARTED_AGAIN % (status, attempt))
     if conclusion != CANCELLED:
         return Judgment(Disposition.DROP, "finished (conclusion %s)" % conclusion)
@@ -680,8 +694,46 @@ class Facts:
 # ----------------------------------------------------- the two mutations ----
 
 
-def cancel_checked(gh: Any, listed: QueuedRun) -> str:
-    """The only caller of the cancel API.  Re-reads the run and its jobs; '' when cancelled, else why not."""
+class CancelOutcome(NamedTuple):
+    """What cancel_checked did.  sent: the cancel call was made; reason: why not, or what the re-read after it saw
+    ('' when the cancel landed); phase: the record's phase from here on; error: a failed re-read after the cancel."""
+
+    sent: bool
+    reason: str
+    phase: Phase | None = None
+    error: Refusal | None = None
+
+
+def cancel_checked(gh: Any, listed: QueuedRun) -> CancelOutcome:
+    """The only caller of the cancel API.  Re-reads the run and its jobs and cancels only a bound run whose jobs are
+    all queued; then reads the run and its jobs again, because GitHub has no conditional cancel (a job can start
+    between the re-read and the call)."""
+    why = cancel_refusal(gh, listed)
+    if why:
+        return CancelOutcome(False, why)
+    try:
+        gh.cancel(listed.run_id)
+    except GhError as exc:
+        raise Refusal(EXIT_GH, "%s: cancel run %d: %s" % (REASON_GH_FAILED, listed.run_id, exc)) from None
+    try:
+        run = read_run(gh, listed.run_id)
+        if run is None:
+            return CancelOutcome(True, "", Phase.CANCELLED)  # gone after the cancel: the next call drops the record
+        if not isinstance(run, dict):
+            raise Refusal(EXIT_REFUSED, "%s: run %d payload" % (REASON_UNCLASSIFIABLE, listed.run_id))
+        status, _ = check_status(run)
+        if status == COMPLETED:
+            return CancelOutcome(True, "", Phase.CANCELLED)
+        _waits, started = job_facts(gh_call(REASON_JOBS_UNREADABLE, gh.run_jobs, listed.run_id), listed.run_id)
+    except Refusal as exc:
+        return CancelOutcome(True, REASON_CANCEL_UNCONFIRMED, Phase.CANCELLING, exc)
+    if status not in QUEUE_STATUSES or started:
+        return CancelOutcome(True, REASON_CANCEL_RACED, Phase.CANCELLING)
+    return CancelOutcome(True, REASON_CANCEL_PENDING, Phase.CANCELLING)
+
+
+def cancel_refusal(gh: Any, listed: QueuedRun) -> str:
+    """Why the run is not cancelled ('' when it may be): the re-read immediately before the cancel call."""
     run = read_run(gh, listed.run_id)
     if run is None:
         return REASON_GONE
@@ -704,10 +756,6 @@ def cancel_checked(gh: Any, listed: QueuedRun) -> str:
     _waits, started = job_facts(gh_call(REASON_JOBS_UNREADABLE, gh.run_jobs, listed.run_id), listed.run_id)
     if started:
         return REASON_JOB_STARTED
-    try:
-        gh.cancel(listed.run_id)
-    except GhError as exc:
-        raise Refusal(EXIT_GH, "%s: cancel run %d: %s" % (REASON_GH_FAILED, listed.run_id, exc)) from None
     return ""
 
 
@@ -985,20 +1033,30 @@ def run_once(gh: Any, store: StateStore, keep: int, scope: Scope, execute: bool,
         entry = kept[run.run_id]
         kept[run.run_id] = replace(entry, waited=min(MAX_WAIT_CYCLES, entry.waited + 1))
     for run in cancel_runs:
-        kept[run.run_id] = BoundEntry(run.run_id, run.pr, run.head_sha, run.attempt, Phase.CANCELLED, 0)
+        kept[run.run_id] = BoundEntry(run.run_id, run.pr, run.head_sha, run.attempt, Phase.CANCELLING, 0)
     store.write(list(kept.values()))  # I2: durable before the first cancel (also proves the file is writable)
-    refused: list[int] = []
+    sent: set[int] = set()
+    unconfirmed: Refusal | None = None
     for run in reversed(cancel_runs):
-        why = cancel_checked(gh, run)
-        if why:
-            refused.append(run.run_id)
-            out("left alone run %d: %s" % (run.run_id, why))
-        else:
-            out("cancelled run %d" % run.run_id)
-    if refused:
-        for run_id in refused:
+        outcome = cancel_checked(gh, run)
+        if not outcome.sent:
+            out("left alone run %d: %s" % (run.run_id, outcome.reason))
+            continue
+        sent.add(run.run_id)
+        if outcome.phase is Phase.CANCELLED:
+            kept[run.run_id] = replace(kept[run.run_id], phase=Phase.CANCELLED)
+            store.write(list(kept.values()))
+        out("cancelled run %d%s" % (run.run_id, ": " + outcome.reason if outcome.reason else ""))
+        if outcome.error is not None:
+            unconfirmed = outcome.error  # the record stays CANCELLING: the next call judges the run again
+            break
+    unsent = [run.run_id for run in cancel_runs if run.run_id not in sent]  # left alone, or not reached after a failure
+    if unsent:
+        for run_id in unsent:
             del kept[run_id]
         store.write(list(kept.values()))
+    if unconfirmed is not None:
+        raise unconfirmed
     for run in start_runs:
         entry = kept[run.run_id]
         verdict = restart_checked(gh, entry, scope)
