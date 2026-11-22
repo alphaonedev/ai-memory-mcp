@@ -128,7 +128,6 @@ MAX_HISTORY_REGION_LINES = 160
 REQUIRED_CERT_CONTEXT = "Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)"
 # (path, exact substring of the line): reason.
 LINE_ALLOW = {
-    (".github/workflows/mobile-runtime.yml", "(iOS 18.5/18.6)"): "iOS simulator versions, not the data tier",
     ("tests/qual_10_module_size_ceiling.rs", "after the AGE-1.8.0 comment rewrite"): "dated ceiling-bump history (#3297)",
     ("changelog.d/3297.docs.md", "Re-verified on AGE **1.8.0**"): "records the tier #3297 was verified on",
     # The required status-check context is byte-identical to branch protection;
@@ -154,6 +153,12 @@ LINE_ALLOW = {
     ("scripts/ci/ensure-age-extension.py", '("share", "age--1.8.0.sql", "f6c2d353'): "MANIFEST row of the node build (#9929)",
     ("scripts/ci/ensure-age-extension.py", "# stock age.dylib 1.8.0, apache/age#2580"): "refused stock build (#8282)",
     ("scripts/ci/ensure-age-extension.py", 'REFUSED_REASON = "refused: stock apache/age 1.8.0'): "refused stock build (#8282)",
+    # Markdown table rows cannot hold a region marker line; these rows are frozen dated records.
+    ("docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md", "| F9 — campaign docs on PG16/AGE1.6.0/pgvector0.8.4 vs certified PG18.4"):
+        "2026-08-13 finding register row, a frozen record",
+    ("docs/compliance/v1.0.0-DECLARATION.md",
+     "| `memory_recall` hot, keyword (depth 1) | PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.6 |"):
+        "hash-pinned pre-registered v1.0.0 declaration (scripts/check-declaration-hash.sh D1); revised only after a miss",
 }
 
 
@@ -305,7 +310,9 @@ class WholeTreeTest(unittest.TestCase):
             text = read_text(ROOT, rel)
             if not text or not re.search(r"(?i)apache\s+age\W{0,4}1\.7\.0", text):
                 continue
-            flat = re.sub(r"<[^>]+>", "", text)
+            # A tag opens with a letter, "/" or "!"; a bare "<16 GB" or "<=" in prose is not a tag
+            # and must not swallow the text up to the next ">".
+            flat = re.sub(r"<[A-Za-z/!][^<>]*>", "", text)
             flat = re.sub(r"[*`]", "", re.sub(r"\s+", " ", flat))
             if AGE_PROVENANCE not in flat:
                 missing.append(rel)

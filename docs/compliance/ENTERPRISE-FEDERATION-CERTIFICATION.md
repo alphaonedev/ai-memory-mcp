@@ -242,11 +242,13 @@ $ git diff --stat e22bc93c 580d8427
 > the tracked tree was byte-identical after the run. Full log
 > `cert-eba96b307/removal-proof-full.log`.
 >
+> <!-- tier-history: begin (CI evidence of PR #3931, run 36253489794, on the PG 18.6 tier of that time) -->
 > **§5.4(3)** pg+AGE and the self-hosted federation lanes are cited from CI on
 > PR #3931 (the standing promotion-4 carrier), whose merge commit carries this
 > exact tree (the merge-base with `release/v1.0.0` is the release tip
 > `a1403c742`): `Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector
 > 0.8.6)` run [`36253489794`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/36253489794) (success);
+> <!-- tier-history: end -->
 > `Check (macos-fed,enterprise-fed)` in run [`36253489960`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/36253489960) (success);
 > `Postgres ignored tests (sal-postgres --ignored)` run [`36253489868`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/36253489868) (success).
 > `Check (linux-fed,enterprise-fed)` runs on the SAME self-hosted node that
@@ -1132,27 +1134,25 @@ release binary is deliberately NOT enterprise-federation-compliant.
 
 ---
 
-## 3. §5.4(3) — Postgres + AGE + pgvector evidence (18.6 / 1.8.0 / pgvector at 0.8.6, then current, executed GREEN — run 33182767671; current pin 0.8.7)
+## 3. §5.4(3) — Postgres + AGE + pgvector evidence (certified: PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7; earlier rounds dated below)
 
 The certified stack is **executed in-PR** by `.github/workflows/cert-postgres-age.yml`
 (#2548), which BUILDS and runs the exact certified triple and hard-fails on any
 version drift (the `Assert certified stack versions` step in
 `.github/workflows/cert-postgres-age.yml`):
 
-- **PostgreSQL 18.6** (`EXPECTED_PG_VERSION=18.6`, `PG_APT_VERSION=18.6-1.pgdg13+2`)
-- **Apache AGE 1.8.0** — the newest released AGE for PostgreSQL 18 per
-  [github.com/apache/age/releases](https://github.com/apache/age/releases)
-  (`PG18/v1.8.0-rc0`, 2026-07-09) (`EXPECTED_AGE_VERSION=1.8.0`,
-  `AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1`, base image
-  `apache/age:release_PG18_1.7.0` with AGE upgraded to 1.8.0 via pgdg apt).
-  NOTE: the project download page (age.apache.org/download) still lists 1.7.0
-  as "current stable" and lags the releases page; this cert tracks the newest
-  RELEASED AGE for PG18. Apache AGE tags every release `X.Y.Z-rc0` on GitHub
-  (its release-vote convention), which is why the pgdg package version reads
-  `1.8.0~rc0-…`; `CREATE EXTENSION age` reports `extversion = 1.8.0`.
-- **pgvector 0.8.7** (`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`; advanced from the
-  0.8.6 patch on 2026-10-23, see the dated note below — the executed-GREEN runs
-  cited in this section ran on the prior 0.8.6 patch)
+- **PostgreSQL 19.0** (`EXPECTED_PG_VERSION=19.0`, `PG_MAJOR=19`,
+  `PG_APT_VERSION=19.0-2.pgdg13+1`, base image `postgres:19-trixie`)
+- **Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19)**. The build checks out `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`
+  from `AGE_SOURCE_REPO`, verifies it with `git rev-parse HEAD`, and builds it
+  unmodified; `CREATE EXTENSION age` reports `extversion = 1.7.0`
+  (`EXPECTED_AGE_VERSION=1.7.0`).
+- **pgvector 0.8.7** (`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`)
+
+The tested alternate stays PostgreSQL 16 + Apache AGE 1.6.0 (the PG16 matrix,
+labelled as the alternate wherever it appears). The certified triple moved to
+PostgreSQL 19 on 2026-11-22 (#9927); the executed-GREEN runs cited below ran on
+the earlier 18.x rounds and are kept as the dated record of those rounds.
 
 **Executed GREEN on the cert SHA:** run
 `https://github.com/alphaonedev/ai-memory-mcp/actions/runs/31601974424`
@@ -1161,11 +1161,25 @@ and run `31601912912` (head `90c2a265`). The same certified-stack job
 is also SUCCESS on PR #2910 (the squash that produced `580d8427`).
 This answers the ruling's "executed, at certified versions, not
 CI-on-16-while-certifying-18" — the workflow refuses to certify a mismatched
-stack. (Those specific dated runs executed the historical **18.4 / 1.7.0 /
-0.8.5** round; the CURRENT standard tier — **PG 18.6 / AGE 1.8.0 / pgvector
-0.8.7** — is the tier this same workflow asserts in-PR on `release/**` from
-the SSOT pins, per the STANDARD data-tier note below.)
+stack. (Those dated runs executed an earlier round, recorded below; the
+certified tier — **PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7** — is the
+tier this same workflow asserts in-PR on `release/**` from the SSOT pins.)
 
+> **Certified data tier (2026-11-22, #9927; operator directives c4f4d408,
+> 111f59db).** **PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7** is the
+> certified enterprise-federation data tier. AGE is Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+> The pins are the SSOT defaults in `deploy/docker-1461/provision/lib.sh`
+> (`EXPECTED_PG_VERSION=19.0`, `EXPECTED_AGE_VERSION=1.7.0`,
+> `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`,
+> `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`), asserted in-PR by the
+> `Assert certified stack versions` step of
+> `.github/workflows/cert-postgres-age.yml`, which hard-fails on any drift; the
+> ratchet `scripts/ci/tests/test_certified_data_tier_pins.py` fails CI when a
+> tracked file states another triple. The first GREEN run of that job on the
+> change that carries this pin is the PG 19 build+assert evidence
+> (fail-closed). The notes below are the dated record of the earlier rounds.
+
+<!-- tier-history: begin (dated rounds on PG 18.4 and 18.6, 2026-08 to 2026-10, superseded by PG 19 #9927) -->
 > **Evidence status, stated plainly (2026-08-28 Wave-1 C3).** The
 > then-current triple **PG 18.6 / AGE 1.8.0 / pgvector at 0.8.6** is executed GREEN:
 > run [`33182767671`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33182767671)
@@ -1259,6 +1273,7 @@ the SSOT pins, per the STANDARD data-tier note below.)
 > pins above). A future federation-wire change still trips the §7 re-cert
 > trigger and requires re-running §5.4(2)–(5) at the new SHA regardless of the
 > data-tier minor.
+<!-- tier-history: end -->
 
 > **Stack-evidence note (two disjoint corpora).** The certified triple
 > above is **single-node CI evidence**. The only real multi-node mesh
@@ -1573,14 +1588,13 @@ is observed:**
 4. **`cert-postgres-age.yml` certifying a stack that is NOT the pins the
    `Assert certified stack versions` step reads from
    `deploy/docker-1461/provision/lib.sh`** (a drift that step should have
-   caught) voids it. The current standard pins are
-   **PG 18.6 / AGE 1.8.0 / pgvector 0.8.7** (`EXPECTED_PG_VERSION=18.6`,
-   `EXPECTED_AGE_VERSION=1.8.0`, `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`),
-   standardized 2026-08-18 (pgvector advanced to 0.8.7 on 2026-10-23) and asserted in-PR on `release/**` by that step;
-   the 2026-08-12 ratification round was against the prior, now-superseded
-   **PG 18.4 / AGE 1.7.0 / pgvector at 0.8.6** minor (recorded as history in the
-   §3 STANDARD data-tier note). The disconfirmation trigger tracks the pins
-   the step actually asserts — currently 18.6 / 1.8.0 / 0.8.7.
+   caught) voids it. The certified pins are
+   **PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7** (`EXPECTED_PG_VERSION=19.0`,
+   `EXPECTED_AGE_VERSION=1.7.0`, `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`,
+   `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`; 2026-11-22, #9927), asserted in-PR
+   on `release/**` by that step; the earlier rounds are recorded as dated
+   history in §3. The disconfirmation trigger tracks the pins the step
+   actually asserts — currently 19.0 / 1.7.0 / 0.8.7.
    *Observable:* that step (the `Assert certified stack versions` step in
    `.github/workflows/cert-postgres-age.yml`) hard-fails the job on any
    mismatch against those pins.
@@ -1664,10 +1678,12 @@ invocations, one filter each. A single invocation with three positional
 filters is REFUSED by cargo (`error: unexpected argument`) before any test
 runs — a vacuous leg that certifies nothing and must never be cited.
 
+<!-- tier-history: begin (CI evidence on f32c18dad, run 35544846676, on the PG 18.6 tier of that time) -->
 *§5.4(3) Postgres + AGE + pgvector, and the live-pg §5.4(4) negative lanes:
 executed GREEN in CI on `f32c18dad`.* `Certified pg+AGE cells (live PG 18.6 +
 AGE 1.8.0 + pgvector
 0.8.6)` — run
+<!-- tier-history: end -->
 [`35544846676`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/35544846676)
 (success). `Check (linux-fed,enterprise-fed)` + `Check (macos-fed,enterprise-fed)`
 — the federation namespace-scope negative lanes on both backends — run

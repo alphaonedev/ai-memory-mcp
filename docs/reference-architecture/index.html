@@ -11,7 +11,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Grand Slam Reference Architecture — 3-region Batman-mode AI Agent Hive</title>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
 <meta name="description" content="ai-memory v0.9.0 Secure Enterprise Federated Reference Architecture (do-1461): a 3-region (nyc3 / fra1 / sgp1) Batman-active AI Agent Hive. 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one W=2-synchronous-quorum mesh with eventual cross-region convergence, three distinct encryption legs (API mTLS, federation/quorum mTLS, daemon→Postgres verify-full TLS), each proven with a positive and a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.">
+<!-- tier-history: end -->
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -205,7 +207,9 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
 <section class="hero" id="main">
   <h1>The Grand Slam.</h1>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
   <p class="tagline">The <strong style="color:var(--gold)">Secure Enterprise Federated Reference Architecture</strong> — a 3-region, Batman-active AI Agent Hive. Three geographic regions (<strong style="color:var(--rg-nyc)">nyc3</strong> · <strong style="color:var(--rg-fra)">fra1</strong> · <strong style="color:var(--rg-sgp)">sgp1</strong>), 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one <strong style="color:var(--good)">W=2 synchronous quorum + eventual cross-region convergence</strong> mesh, three distinct encryption legs — each proven with a positive <em>and</em> a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.</p>
+<!-- tier-history: end -->
   <div class="pills">
     <span class="pill">3 regions</span>
     <span class="pill">15 nodes · 9 peers + 3 PG + 3 agents</span>
@@ -221,8 +225,10 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
   <div class="container">
     <div style="border:1px solid var(--gold);border-left:4px solid var(--gold);border-radius:12px;background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 6%,transparent),color-mix(in srgb,var(--accent) 2%,transparent));padding:1.25rem 1.4rem">
       <p style="color:var(--gold);font-family:var(--font-mono);font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.5rem">Version currency</p>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
       <p style="color:var(--text-muted);margin-bottom:.7rem">Every result cell on this page is preserved verbatim from the <strong style="color:var(--text)">v0.9.0 <code>do-1461</code> reference run</strong> — a measured 0&rarr;60 clean-room fleet (<strong>PostgreSQL 18.4 · Apache AGE 1.7.0 · pgvector 0.8.2 · schema v78 · ai-memory 0.9.0</strong>). Those cells are the run record and are <em>not</em> rewritten; changing a measured version would falsify the run.</p>
-      <p style="color:var(--text-muted);margin-bottom:.7rem"><strong style="color:var(--text)">Build a fresh hive against the current pins.</strong> The <code>do-1461</code> provisioning SSOT on <code>release/v1.0.0</code> (<code>deploy/docker-1461/provision/lib.sh</code>) now targets <strong style="color:var(--gold)">PostgreSQL 18.6 + Apache AGE 1.8.0 (extversion) + pgvector 0.8.7</strong>; the current binary migrates to <strong style="color:var(--gold)">schema v102</strong> (<code>src/storage/migrations.rs</code>). AGE 1.8.0 is overlaid via pinned pgdg apt on the <code>apache/age:release_PG18_1.7.0</code> base image.</p>
+<!-- tier-history: end -->
+      <p style="color:var(--text-muted);margin-bottom:.7rem"><strong style="color:var(--text)">Build a fresh hive against the current pins.</strong> The <code>do-1461</code> provisioning SSOT on <code>release/v1.0.0</code> (<code>deploy/docker-1461/provision/lib.sh</code>) now targets <strong style="color:var(--gold)">PostgreSQL 19.0 + Apache AGE 1.7.0 (extversion) + pgvector 0.8.7</strong>; the current binary migrates to <strong style="color:var(--gold)">schema v102</strong> (<code>src/storage/migrations.rs</code>). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19), pinned as <code>AGE_SOURCE_COMMIT</code> and built unmodified by the first stage of <code>deploy/docker-1461/Dockerfile.pg-age-vector</code> on <code>postgres:19-trixie</code>.</p>
       <p style="color:var(--text-muted);margin-bottom:0">Several v1.0.0 fail-closed defaults have <strong style="color:var(--text)">hardened past what the v0.9.0 run measured</strong>: per-write and per-signal federation-receive attestation now default <strong style="color:var(--good)">ON</strong> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a> / #1801&rarr;#1954), closing the &ldquo;claimed-by-default&rdquo; limitation noted in the <em>Honest limitations</em> section below, and the certified enterprise-federation posture (asi-hard + 22 checks) is evaluated by <code>ai-memory doctor --posture enterprise-federation</code> and its boot gate <code>AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1</code> (its PostgreSQL at-rest storage check records an operator attestation; it does not itself probe disk encryption, <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/4250">#4250</a>). The certified envelope is a <strong>500&ndash;1000-agent cluster composed of &le; 50-peer federation blocks</strong> (certification doc line 538&ndash;539) (a derived topology ceiling, not a measured million-agent capacity). Canonical: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v1.0.0/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md">compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md</a>.</p>
     </div>
   </div>
@@ -233,7 +239,9 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
   <div class="container">
     <span class="eyebrow">At a glance</span>
     <h2 class="sans">One hive, three regions, three encrypted legs.</h2>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
     <p class="lede">Each region is a self-contained substrate cluster in its own private VPC of <strong>five nodes</strong>: one regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2 node, three <code>ai-memory</code> daemon peers, and one NHI agent (an xAI grok-4.3 client) — 5 × 3 regions = <strong>15 nodes</strong> total (9 peers + 3 PG + 3 agents). A region's peers bind to <em>their</em> regional Postgres over the private VPC under <code>sslmode=verify-full</code>. All nine peers — across all three regions — federate into <strong>one</strong> cross-region write-quorum mesh over public IPs, secured by mTLS, per-message Ed25519 signing, nonce anti-replay, and CA-rooted zero-touch peer enrollment. The synchronous write quorum is <strong>W=2</strong> (local commit + one cross-region remote ack) and the federation is <strong>primarily eventual</strong>: a write commits locally, attests, returns OK after one remote ack, then async catch-up converges it to every peer in every region (the harness asserts full cross-region convergence). The three NHI agents are pure mTLS clients (not federation-mesh members) exercising the <code>a2a</code> + <code>ai_nhi</code> test groups over Leg-1. Every node runs the Batman-active MAXIMUM-SECURE posture. This topology was verified <strong>identically</strong> across both independent clean-room reproducibility rounds (same 100% GREEN results on fresh fleets).</p>
+<!-- tier-history: end -->
     <div class="stats">
       <div class="stat"><div class="n">3</div><div class="l">Regions</div></div>
       <div class="stat"><div class="n">15</div><div class="l">Nodes (9 peers + 3 PG + 3 agents)</div></div>
@@ -255,7 +263,9 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <div class="diagram-wrap">
       <svg viewBox="0 0 1200 720" role="img" aria-labelledby="hive-title hive-desc" preserveAspectRatio="xMidYMid meet">
         <title id="hive-title">3-region federated AI Agent Hive topology diagram</title>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
         <desc id="hive-desc">Three region clusters — nyc3 (US-East), fra1 (EU-Central), and sgp1 (Asia-SE) — arranged in a triangle. Each cluster is a 5-node unit containing one regional PostgreSQL 18.4 / Apache AGE / pgvector node, three ai-memory peer daemons, and one NHI agent (an xAI grok-4.3 client), for 15 nodes total (9 peers + 3 PG + 3 agents). Within each region, the three peers connect to their regional Postgres over private-VPC TLS verify-full (leg 3, slate blue). All nine peers across the three regions are interconnected by a cross-region quorum mesh using a W=2 synchronous write quorum (local commit plus one cross-region remote ack) with eventual async convergence to every peer in every region (leg 2, teal). The NHI agent in each region is a pure mTLS client that connects to its regional peer over API mutual-TLS on port 9077 (leg 1, gold) — a client link, not a member of the quorum mesh. Every peer node displays a Batman shield-lock glyph indicating the MAXIMUM-SECURE posture.</desc>
+<!-- tier-history: end -->
 
         <defs>
           <radialGradient id="rgGlow" cx="50%" cy="50%" r="50%">
@@ -303,9 +313,11 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <!-- regional postgres -->
           <g transform="translate(60,140)">
             <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
             <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--slate)">PostgreSQL 18.4</text>
             <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
             <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
+<!-- tier-history: end -->
             <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 hostssl verify-full</text>
           </g>
 
@@ -344,9 +356,11 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <text x="760" y="110" class="svg-label" font-size="10">private VPC · regional substrate</text>
           <g transform="translate(990,140)">
             <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
             <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--slate)">PostgreSQL 18.4</text>
             <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
             <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
+<!-- tier-history: end -->
             <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 hostssl verify-full</text>
           </g>
           <g transform="translate(760,132)">
@@ -382,9 +396,11 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <text x="410" y="460" class="svg-label" font-size="10">private VPC · regional substrate</text>
           <g transform="translate(410,492)">
             <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
             <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--slate)">PostgreSQL 18.4</text>
             <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
             <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
+<!-- tier-history: end -->
             <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 hostssl verify-full</text>
           </g>
           <g transform="translate(595,484)">
@@ -486,8 +502,10 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <!-- regional pg -->
         <g transform="translate(1000,98)">
           <rect width="170" height="84" rx="10" fill="url(#pgGrad2)" stroke-width="1.5" style="stroke:var(--slate)"/>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
           <text x="85" y="30" text-anchor="middle" class="svg-title" font-size="11" font-weight="700" style="fill:var(--slate)">Regional PG 18.4</text>
           <text x="85" y="47" text-anchor="middle" class="svg-label" font-size="8.5">AGE 1.7.0 · pgvector 0.8.2</text>
+<!-- tier-history: end -->
           <text x="85" y="64" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 scram-sha-256</text>
         </g>
 
@@ -541,7 +559,9 @@ footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         </div>
       </div>
     </div>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
     <p style="font-size:.85rem">Source: <code>test/encrypted_legs.sh</code> + the <code>crypto</code> / <code>federation</code> / <code>zerotouch</code> test groups in <code>deploy/do-1461/test/run.sh</code>. The canonical green reports (JSON + TSV) are regenerated under <code>.local-runs/do-1461/reports/</code> from a clean 0→60 run of this 3-region PG18.4 fleet.</p>
+<!-- tier-history: end -->
   </div>
 </section>
 
@@ -737,7 +757,9 @@ make down                              <span class="cm"># tear it all down</span
       <div class="card">
         <div class="lbl">Pinned stack</div>
         <h3 style="font-family:var(--font-mono)">single-source constants</h3>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
         <p>PostgreSQL <code>18.4-1.pgdg24.04+1</code> · Apache AGE <code>1.7.0</code> · pgvector <code>0.8.2</code> · schema <code>v78</code> · golden binary <code>sha256</code>-asserted · <code>nomic-embed-text</code> 768-dim CPU embedder. Installed natively — no Docker anywhere on the fleet.</p>
+<!-- tier-history: end -->
       </div>
     </div>
 
@@ -789,6 +811,7 @@ make down                              <span class="cm"># tear it all down</span
       <thead><tr><th>Host</th><th>Role</th><th>Region</th><th>Runs</th></tr></thead>
       <tbody>
         <tr><td><code>do-1461-peer-nyc3-01..03</code></td><td>peer ×3</td><td style="color:var(--rg-nyc)">nyc3</td><td>federated <code>ai-memory serve</code> + CPU Ollama embedder sidecar</td></tr>
+<!-- tier-history: begin (v0.9.0 do-1461 reference run, preserved verbatim) -->
         <tr><td><code>do-1461-pg-nyc3-01</code></td><td>pg</td><td style="color:var(--rg-nyc)">nyc3</td><td>regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2</td></tr>
         <tr><td><code>do-1461-agent-nyc3-01</code></td><td>agent</td><td style="color:var(--rg-nyc)">nyc3</td><td>NHI agent — xAI grok-4.3 mTLS client (Leg-1); exercises <code>a2a</code> + <code>ai_nhi</code>; not a federation member</td></tr>
         <tr><td><code>do-1461-peer-fra1-01..03</code></td><td>peer ×3</td><td style="color:var(--rg-fra)">fra1</td><td>federated <code>ai-memory serve</code> + CPU Ollama embedder sidecar</td></tr>
@@ -796,6 +819,7 @@ make down                              <span class="cm"># tear it all down</span
         <tr><td><code>do-1461-agent-fra1-01</code></td><td>agent</td><td style="color:var(--rg-fra)">fra1</td><td>NHI agent — xAI grok-4.3 mTLS client (Leg-1); exercises <code>a2a</code> + <code>ai_nhi</code>; not a federation member</td></tr>
         <tr><td><code>do-1461-peer-sgp1-01..03</code></td><td>peer ×3</td><td style="color:var(--rg-sgp)">sgp1</td><td>federated <code>ai-memory serve</code> + CPU Ollama embedder sidecar</td></tr>
         <tr><td><code>do-1461-pg-sgp1-01</code></td><td>pg</td><td style="color:var(--rg-sgp)">sgp1</td><td>regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2</td></tr>
+<!-- tier-history: end -->
         <tr><td><code>do-1461-agent-sgp1-01</code></td><td>agent</td><td style="color:var(--rg-sgp)">sgp1</td><td>NHI agent — xAI grok-4.3 mTLS client (Leg-1); exercises <code>a2a</code> + <code>ai_nhi</code>; not a federation member</td></tr>
       </tbody>
     </table>
@@ -812,7 +836,7 @@ make down                              <span class="cm"># tear it all down</span
       <li>• <a href="../batman-active-mode.html" style="color:var(--text)">Batman Mode atlas</a> — single-node activation recipe + the 7 forms</li>
       <li>• <a href="../compliance/nsa-csi-mcp.html" style="color:var(--text)">NSA CSI MCP mapping</a> — full concern/recommendation matrix with provenance</li>
       <li>• <a href="../compliance/honest-limitations.html" style="color:var(--text)">honest-limitations.md</a> — what the substrate does not defend against</li>
-      <li>• <a href="../compliance/enterprise-federation-repro.html" style="color:var(--text)">Enterprise-federation reproduction</a> — reproduce the audit env (PG 18.6 / AGE 1.8.0 / pgvector 0.8.7, TLS+mTLS) + the 3&times;7 scheme</li>
+      <li>• <a href="../compliance/enterprise-federation-repro.html" style="color:var(--text)">Enterprise-federation reproduction</a> — reproduce the audit env (PG 19.0 / AGE 1.7.0 / pgvector 0.8.7, TLS+mTLS) + the 3&times;7 scheme</li>
       <li>• <a href="../encryption.html" style="color:var(--text)">Encryption atlas</a> — SQLCipher / mTLS / HMAC-mandatory webhooks</li>
       <li>• <a href="../zero-touch-trust.html" style="color:var(--text)">Zero-touch trust</a> — CA-rooted O(1) peer enrollment</li>
       <li>• <a href="../architectures-t5.html" style="color:var(--text)">T5 — Global Hive</a> — the architecture tier this fleet realises</li>

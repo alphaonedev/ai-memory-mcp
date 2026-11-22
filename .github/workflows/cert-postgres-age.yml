@@ -2,8 +2,8 @@
 #
 # v1.0.0 SELF-HOSTED REWRITE (chore/ci-self-hosted-2x2). This job now runs on
 # `[self-hosted, linux-fed]` and points AI_MEMORY_TEST_POSTGRES_URL /
-# AI_MEMORY_TEST_AGE_URL at the node's ALWAYS-UP native cert tier (PostgreSQL
-# 19.0 + AGE 1.7.0 + pgvector 0.8.7, TLS verify-full, port 5445), read from
+# AI_MEMORY_TEST_AGE_URL at the node's ALWAYS-UP native cert tier
+# (PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7, TLS verify-full, port 5445), read from
 # $HOME/.ai-memory-ci-fed-url. The former per-PR `docker build`/pull of
 # deploy/docker-1461/Dockerfile.pg-age-vector + `docker run` is REMOVED (the
 # tier it constructed now exists continuously). The cert EVIDENCE is
