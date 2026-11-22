@@ -730,9 +730,11 @@ def git(repo, *args):
 GATE_REL = "scripts/ci/impact/docs_only_gate.py"
 RULES_REL = "scripts/ci/impact/rules.json"
 ACTION_REL = ".github/actions/docs-only-gate/action.yml"
-# Where a base-commit copy of the gate gets a stand-in decider: right after the gate's own imports, so
+# Where a base-commit copy of the gate gets a stand-in decider: right after the gate's own sibling loads, so
 # the `step` mode stays the real code and only `decide` is replaced.
-DECIDE_SHIM_ANCHOR = "from impact import common  # noqa: E402\n"
+DECIDE_SHIM_ANCHOR = (
+    '    _sibling_refusal(SIBLING_PROG, "cargo_skip.py", exc)\n'
+    "    sys.exit(SIBLING_EXIT_LOAD_REFUSED)\n")
 DECIDE_SHIM = "\nif sys.argv[1:2] == ['decide']:\n%s\n"
 UNKNOWN_EXITS = (1, 2, 4, 5, 7, 125, 255)
 OWNER_READ_EXEC_ONLY = 0o500  # a directory the owner cannot write into
@@ -745,7 +747,7 @@ ALL_DOCS_SECTION = {
     "test_read_globs": [], "ci_tree_globs": [], "ci_tree_exempt_globs": [], "full_ci_events": [],
     "full_ci_base_names": [], "full_ci_base_prefixes": []}
 FULL_RUN_LITERAL = "docs_only stays empty and the job runs in full"
-# Standard-library modules the gate's helpers import after the gate extends sys.path; a file of the
+# Standard-library modules the gate's helpers import; the gate never extends sys.path (#9399); a file of the
 # same name beside impact/ must never be the one imported.
 PLANTED_STDLIB_NAMES = ("json.py", "sqlite3.py")
 # A sitecustomize a job could reach through PYTHONPATH: it claims docs-only and exits before the
@@ -1046,7 +1048,7 @@ class StepDoubt(GateRepo):
                 self.assertIn("is not a pull request", out)
 
     def test_planted_stdlib_name_beside_impact_is_not_imported_9683(self):
-        """The gate appends its parent to sys.path, so a json.py or sqlite3.py planted beside impact/
+        """The gate loads its siblings by path (#9399), so a json.py or sqlite3.py planted beside impact/
         never shadows the standard library (REVIEW-9696 L2); the copy still decides a full run."""
         tree = self.top / "planted" / "ci"
         (tree / "impact").mkdir(parents=True)

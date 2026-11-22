@@ -49,6 +49,11 @@ class SelectorChangesSelectAll(ImpactCase):
                     modules.update(alias.name for alias in node.names)
                 elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("impact."):
                     modules.add(node.module.split(".", 1)[1])
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_load_sibling"
+                      and len(node.args) == 2 and all(isinstance(arg, ast.Constant) for arg in node.args)
+                      and str(node.args[1].value).startswith("impact.")):
+                    # #9399: a sibling is loaded by file through the shared loader, under the name ``impact.<stem>``
+                    modules.add(str(node.args[1].value).split(".", 1)[1])
         self.assertIn("common", modules)
         for module in sorted(modules):
             path = "scripts/ci/impact/%s.py" % module
