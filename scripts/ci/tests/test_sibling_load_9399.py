@@ -610,13 +610,43 @@ class LoaderAlone(Scratch):
         here = os.path.realpath(self.folder)
         real_stat = os.stat
 
+        real_open = os.open
+        opened = []
+
         def failing_stat(path, *args, **kwargs):
             if os.fspath(path) == here:
                 raise PermissionError(13, "Permission denied", path)
             return real_stat(path, *args, **kwargs)
 
-        with mock.patch.object(os, "stat", failing_stat):
+        def recording_open(path, flags, *args, **kwargs):
+            opened.append(path)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(os, "stat", failing_stat), mock.patch.object(os, "open", recording_open):
             self.refused("mod.py", "statfail_9399", REASON_UNREADABLE)
+        self.assertEqual(opened, [], "the loader opened a path without the identity record of the script folder")
+
+    def test_a_script_folder_on_another_device_with_the_same_inode_is_refused(self):
+        """#9888: the identity is the pair (device, inode); a folder opened with the recorded inode number on another
+        device is another folder, refused as unreadable."""
+        marker = self.root / "evil-ran"
+        self.write("mod.py", EVIL_SOURCE % str(marker))
+        real_fstat = os.fstat
+        first = []
+
+        def other_device_fstat(fd, *args, **kwargs):
+            result = real_fstat(fd, *args, **kwargs)
+            if first or not stat.S_ISDIR(result.st_mode):
+                return result
+            first.append(fd)
+            fields = list(result)
+            fields[stat.ST_DEV] = result.st_dev + 1
+            return os.stat_result(fields)
+
+        with mock.patch.object(os, "fstat", other_device_fstat):
+            self.refused("mod.py", "otherdev_9399", REASON_UNREADABLE)
+        self.assertEqual(len(first), 1)
+        self.assertFalse(marker.exists(), "the file in the folder of the other device ran")
 
     def test_a_symlink_inside_the_folder_is_followed(self):
         self.write("real_target.py", "VALUE = 3\n")
