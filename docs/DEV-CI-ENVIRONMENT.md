@@ -511,11 +511,18 @@ are the read-only `launchctl print system/<label>` and `ps -p <pid>` for the pid
 - 127.0.0.1:`<port>` must not answer before the bootstrap; if it does, another process holds the port and the tool
   refuses (exit 11) before any change;
 - it writes the plist atomically (temp file in the same directory, fchown, fchmod, fsync, then a link that fails if the
-  target appeared, then a directory fsync), mode 0644, owner root:wheel. No temp file survives a failed step. If the
-  target appears during the install the tool refuses (exit 4) and leaves that file alone. Then it runs
-  `launchctl bootstrap system <plist>` and checks that 127.0.0.1:`<port>` answers within 60 s;
-- it prints `installed` only when the pid launchd reports for the service equals the first line of `postmaster.pid`;
-  a missing launchd pid, a missing pid file or a mismatch is a failure (exit 7);
+  target appeared, then a directory fsync), mode 0644, owner root:wheel. A failed step removes the temp file, trying
+  the unlink twice; a temp file is left only when both unlinks fail, and the report then names it by its full path
+  with a `changed: left temp file <path>` line and an `undo: sudo rm <path>` line. A failure after the link (temp
+  unlink, directory fsync or directory close) reports `changed: wrote <plist>`, the state line and the
+  `--remove` undo. If the target appears during the install the tool stops (exit 4) and leaves that file alone.
+  Then it runs `launchctl bootstrap system <plist>` and checks that 127.0.0.1:`<port>` answers within 60 s;
+- it prints `installed` only when, after the port answered, `postmaster.pid` has exactly 8 lines, line 1 is the pid
+  launchd reports for the service, line 2 is the data directory, line 4 is the port, line 8 with blanks stripped is
+  exactly `ready`, and launchd still reports the same pid when asked again after the read. Every other state (no
+  launchd pid, an unreadable, missing, oversized, short or long pid file, a pid, data directory or port mismatch, a
+  non-numeric port, a status other than `ready`, a pid that changed or went away during the read) is its own
+  failure line with exit 7; a pid-file line in a report is cut to 64 characters and escaped;
 - a failure after the first change prints what changed, the state it re-read and the undo step true for that state.
   It undoes nothing on its own. A failure before any change says `nothing changed`.
 

@@ -24,9 +24,11 @@ Modes (all three take the same required arguments, so ``--remove`` can prove the
   signals a process.  It then refuses while that login agent is not disabled (``launchctl print-disabled``), so only
   one supervisor can start the tier.  Every install then checks that nothing answers on ``127.0.0.1:<port>``,
   publishes the plist (temp file in the same directory, fsync, mode 0644, owner root:wheel, ``link`` so a target
-  that appeared after the check is never replaced, directory fsync; the temp file never survives a failure), runs
-  ``launchctl bootstrap system <plist>``, proves the port answers within a deadline and proves that the pid launchd
-  reports for the service is the first line of ``postmaster.pid``.  Only then does it print ``installed``.  A failure
+  that appeared after the check is never replaced, directory fsync; a failed step unlinks the temp file with one retry, and a temp file left after both tries is
+  named in the report with its ``rm`` undo), runs ``launchctl bootstrap system <plist>``, proves the port answers
+  within a deadline and proves that ``postmaster.pid`` has 8 lines naming the pid launchd reports, the data
+  directory, the port and status ``ready``, and that launchd reports the same pid after the read.  Only then does
+  it print ``installed``.  A failure
   after the first change prints what was changed, the state it re-reads and the undo step for that state; it does
   not undo anything silently.
 * ``--remove``: needs effective uid 0.  The exact inverse: ``launchctl bootout system/<label>`` when loaded (launchd
@@ -184,17 +186,45 @@ REFUSE_AGENT_ENABLED = (
 )
 REFUSE_PORT_IN_USE = "{host}:{port} already answers before bootstrap; another process holds the port; nothing changed"
 REFUSE_RACE = "plist target {path} appeared during the install; nothing changed"
+FAIL_RACE_TEMP_LEFT = "plist target {path} appeared during the install; temp file {temp} left in place"
 REFUSE_HOST = "host probe failed: {why}; nothing changed"
 
 FAIL_RC = "{command} exited {rc}"
 FAIL_WRITE = "writing {path}: {name}"
 FAIL_WRITE_LINKED = "writing {path}: {name} after the plist was linked in place"
+TEMP_LEFT_SUFFIX = "; temp file {temp} left in place"
 FAIL_REMOVE = "removing {path}: {name}"
+FAIL_REMOVE_UNLINKED = "removing {path}: {name} after the plist was unlinked"
 FAIL_PROBE = "{host}:{port} did not answer within {seconds} s"
 FAIL_NO_LAUNCHD_PID = "launchd reports no pid for {service}"
 FAIL_NO_POSTMASTER_PID = "{path} names no postmaster pid ({why})"
 FAIL_PID_MISMATCH = "launchd pid {launchd_pid} of {service} is not the postmaster pid {pid} in {path}"
 FAIL_DATA_DIR = "{why}"
+FAIL_PIDFILE_UNREADABLE = "{path} is unreadable ({why})"
+FAIL_PIDFILE_SHORT = "{path} has {lines} lines, not the {want} a started postmaster writes"
+FAIL_PIDFILE_LONG = "{path} has text after line {want}"
+FAIL_PIDFILE_DATA_DIR = "{path} names data directory {shown}, not {data_dir}"
+FAIL_PIDFILE_PORT_EMPTY = "{path} has an empty port line"
+FAIL_PIDFILE_PORT_NAN = "{path} port line {shown} is not a number"
+FAIL_PIDFILE_PORT = "{path} names port {shown}, not {port}"
+FAIL_PIDFILE_STATUS_EMPTY = "{path} has an empty status line"
+FAIL_PIDFILE_STATUS = "{path} status is {shown}, not ready"
+FAIL_REREAD_GONE = "launchd reports no pid for {service} after {path} was read"
+FAIL_REREAD_CHANGED = "launchd pid of {service} changed from {before} to {after} while {path} was read"
+
+# postmaster.pid as PostgreSQL writes it once the server accepts connections (pidfile.h): line 1 pid, line 2 data
+# directory, line 4 port, line 8 the status padded with blanks.  Lines are counted from 1.
+PIDFILE_LINES = 8
+PIDFILE_DATA_DIR_LINE = 2
+PIDFILE_PORT_LINE = 4
+PIDFILE_STATUS_LINE = 8
+PIDFILE_READY = b"ready"
+PIDFILE_STATUS_PAD = b" "
+PORT_LINE_RE = re.compile(rb"[0-9]+")
+SHOWN_MAX_CHARS = 64
+SHOWN_CUT = "..."
+TEMP_LEFT_WORD = "left temp file "
+UNLINK_TRIES = 2
 
 PIDFILE_ABSENT = "absent"
 PIDFILE_EMPTY = "is empty"
@@ -276,7 +306,16 @@ class ChangesNotAllowed(Exception):
 
 
 class PartialWrite(OSError):
-    """The plist was linked in place, then a later part of the publish (temp unlink, directory fsync) failed."""
+    """The plist was linked in place, then a later part of the publish (temp unlink, directory fsync, close) failed.
+
+    ``strerror`` names what changed; ``left_temp`` is the full path of a temp file left behind, or None.
+    """
+
+    left_temp: str | None = None
+
+
+class PartialRemove(OSError):
+    """The plist was unlinked, then the directory fsync or close failed: the removal happened."""
 
 
 class TempFileExists(OSError):
@@ -385,6 +424,47 @@ def _errno_name(exc: OSError) -> str:
     return errno.errorcode.get(exc.errno or 0, type(exc).__name__)
 
 
+def _close_quietly(fd: int) -> None:
+    """Close ``fd`` while another error is already on its way out: a close error must not replace that error."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _close_reporting(fd: int, path: str) -> None:
+    """Close ``fd`` on the success path: a close error there is the error."""
+    try:
+        os.close(fd)
+    except OSError as exc:
+        raise HostError(f"close {path}: {_errno_name(exc)}") from exc
+
+
+def _unlink_retrying(name: str, dir_fd: int) -> None:
+    """Unlink ``name`` in ``dir_fd``, trying UNLINK_TRIES times; a name already gone counts as removed."""
+    last: OSError | None = None
+    for _ in range(UNLINK_TRIES):
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last = exc
+        else:
+            return
+    assert last is not None
+    raise last
+
+
+def _drop_temp(dir_fd: int, temp_name: str, temp_path: str, error: BaseException) -> None:
+    """Remove the temp file while ``error`` propagates.  When both unlinks fail the error keeps its kind and
+    carries ``left_temp``, the full path of the file left behind, so the report can name it."""
+    try:
+        _unlink_retrying(temp_name, dir_fd)
+    except OSError:
+        error.left_temp = temp_path  # type: ignore[attr-defined]
+
+
 def _kind_of(mode: int) -> Kind:
     if stat.S_ISLNK(mode):
         return Kind.SYMLINK
@@ -455,7 +535,11 @@ class HostRunner:
 
     @staticmethod
     def _read_fd(fd: int, path: str, limit: int) -> bytes:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        try:
+            mode = os.fstat(fd).st_mode
+        except OSError as exc:
+            raise HostError(f"fstat {path}: {_errno_name(exc)}") from exc
+        if not stat.S_ISREG(mode):
             raise HostError(f"open {path}: not a regular file")
         chunks: list[bytes] = []
         remaining = limit + 1
@@ -479,9 +563,12 @@ class HostRunner:
         except OSError as exc:
             raise HostError(f"open {path}: {_errno_name(exc)}") from exc
         try:
-            return self._read_fd(fd, path, limit)
-        finally:
-            os.close(fd)
+            data = self._read_fd(fd, path, limit)
+        except BaseException:
+            _close_quietly(fd)
+            raise
+        _close_reporting(fd, path)
+        return data
 
     def read_data_dir(self, path: str, name: str, limit: int) -> tuple[Facts, bytes | None]:
         """Open the directory without following a symlink, ``fstat`` it, then read ``name`` through that open fd.
@@ -499,21 +586,30 @@ class HostRunner:
                 return self.lstat(path), None
             raise HostError(f"open {path}: {_errno_name(exc)}") from exc
         try:
-            st = os.fstat(dir_fd)
+            try:
+                st = os.fstat(dir_fd)
+            except OSError as exc:
+                raise HostError(f"fstat {path}: {_errno_name(exc)}") from exc
             facts = Facts(_kind_of(st.st_mode), st.st_uid, stat.S_IMODE(st.st_mode))
             file_path = f"{path}/{name}"
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
             except FileNotFoundError:
-                return facts, None
+                data = None
             except OSError as exc:
                 raise HostError(f"open {file_path}: {_errno_name(exc)}") from exc
-            try:
-                return facts, self._read_fd(fd, file_path, limit)
-            finally:
-                os.close(fd)
-        finally:
-            os.close(dir_fd)
+            else:
+                try:
+                    data = self._read_fd(fd, file_path, limit)
+                except BaseException:
+                    _close_quietly(fd)
+                    raise
+                _close_reporting(fd, file_path)
+        except BaseException:
+            _close_quietly(dir_fd)
+            raise
+        _close_reporting(dir_fd, path)
+        return facts, data
 
     def _run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         try:
@@ -589,22 +685,61 @@ class HostRunner:
     def publish_file(self, path: str, data: bytes) -> None:
         """Write ``data`` to a new file at ``path``: same-directory temp file, fsync, mode, owner, link, dir fsync.
 
-        Raises FileExistsError when the target exists (nothing changed), PartialWrite when a step after the link
-        failed (the plist is in place), any other OSError when nothing was linked.  The temp file is removed on
-        every path.
+        Raises FileExistsError when the target exists and any other OSError when a step before the link failed:
+        the plist was not written, the error keeps its kind, and the temp file is removed (two tries).  Once the
+        plist is linked the only exception is PartialWrite, whose text names the plist and every later step that
+        failed (temp unlink, directory fsync, directory close).  A temp file survives only when both of its unlinks
+        fail; the error then carries its full path as ``left_temp`` and the text names it.
         """
         self._require_changes()
         target = PurePosixPath(path)
         dir_fd = os.open(str(target.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         temp_name = f".{target.name}.tmp-{os.getpid()}"
-        temp_exists = False
-        linked = False
+        temp_path = f"{target.parent}/{temp_name}"
         try:
+            self._write_temp(dir_fd, temp_name, temp_path, data)
             try:
-                fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, TEMP_MODE, dir_fd=dir_fd)
-            except FileExistsError as exc:
-                raise TempFileExists(errno.EEXIST, f"temp file {temp_name} exists") from exc
-            temp_exists = True
+                os.link(temp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+            except BaseException as exc:
+                _drop_temp(dir_fd, temp_name, temp_path, exc)
+                raise
+        except BaseException:
+            _close_quietly(dir_fd)
+            raise
+        # The plist is linked in place: from here every failure is a PartialWrite naming what changed.
+        problems: list[str] = []
+        first: OSError | None = None
+        left_temp: str | None = None
+        try:
+            _unlink_retrying(temp_name, dir_fd)
+        except OSError as exc:
+            first, left_temp = exc, temp_path
+            problems.append(f"removing temp file {temp_path} failed ({_errno_name(exc)})")
+        try:
+            self._fsync(dir_fd)
+        except OSError as exc:
+            first = first or exc
+            problems.append(f"the directory fsync failed ({_errno_name(exc)})")
+        try:
+            os.close(dir_fd)
+        except OSError as exc:
+            first = first or exc
+            problems.append(f"closing the directory failed ({_errno_name(exc)})")
+        if first is not None:
+            text = f"{path} linked in place, then " + ", then ".join(problems)
+            if left_temp is not None:
+                text += TEMP_LEFT_SUFFIX.format(temp=left_temp)
+            partial = PartialWrite(first.errno, text)
+            partial.left_temp = left_temp
+            raise partial from first
+
+    def _write_temp(self, dir_fd: int, temp_name: str, temp_path: str, data: bytes) -> None:
+        """Create the temp file exclusively and write, chown, chmod, fsync and close it; on any failure remove it."""
+        try:
+            fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, TEMP_MODE, dir_fd=dir_fd)
+        except FileExistsError as exc:
+            raise TempFileExists(errno.EEXIST, f"temp file {temp_name} exists") from exc
+        try:
             try:
                 view = memoryview(data)
                 while view:
@@ -612,33 +747,34 @@ class HostRunner:
                 self._fchown(fd, ROOT_UID, WHEEL_GID)
                 os.fchmod(fd, PLIST_MODE)
                 self._fsync(fd)
-            finally:
-                os.close(fd)
-            os.link(temp_name, target.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
-            linked = True
-            os.unlink(temp_name, dir_fd=dir_fd)
-            temp_exists = False
-            self._fsync(dir_fd)
-        except OSError as exc:
-            if linked:
-                raise PartialWrite(exc.errno, exc.strerror) from exc
+            except BaseException:
+                _close_quietly(fd)
+                raise
+            os.close(fd)
+        except BaseException as exc:
+            _drop_temp(dir_fd, temp_name, temp_path, exc)
             raise
-        finally:
-            try:
-                if temp_exists:
-                    os.unlink(temp_name, dir_fd=dir_fd)
-            finally:
-                os.close(dir_fd)
 
     def remove_file(self, path: str) -> None:
+        """Unlink ``path`` through its opened parent.  An error before the unlink is the plain OSError (nothing
+        changed); an fsync or close failure after it is PartialRemove (the plist is gone)."""
         self._require_changes()
         target = PurePosixPath(path)
         dir_fd = os.open(str(target.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.unlink(target.name, dir_fd=dir_fd)
+        except BaseException:
+            _close_quietly(dir_fd)
+            raise
+        try:
             self._fsync(dir_fd)
-        finally:
+        except OSError as exc:
+            _close_quietly(dir_fd)
+            raise PartialRemove(exc.errno, f"{path} unlinked, then the directory fsync failed ({_errno_name(exc)})") from exc
+        try:
             os.close(dir_fd)
+        except OSError as exc:
+            raise PartialRemove(exc.errno, f"{path} unlinked, then closing the directory failed ({_errno_name(exc)})") from exc
 
     def launchctl(self, args: tuple[str, ...]) -> int:
         self._require_changes()
@@ -1095,8 +1231,10 @@ def step_line(config: Config, step: Step) -> str:
             return f"probe {PROBE_HOST}:{config.port}, deadline {PROBE_DEADLINE_SECONDS} s"
         case Step.VERIFY:
             return (
-                f"verify that the pid launchd reports for {config.service} is the first line of "
-                f"{shlex.quote(config.pidfile)}; only then print installed"
+                f"verify that {shlex.quote(config.pidfile)} has {PIDFILE_LINES} lines naming the pid launchd reports "
+                f"for {config.service}, data directory {shlex.quote(config.data_dir)}, port {config.port} and status "
+                f"{PIDFILE_READY.decode('ascii')}, and that launchd reports the same pid after the read; "
+                "only then print installed"
             )
         case Step.BOOTOUT:
             return shlex.join([LAUNCHCTL, *bootout_args(config)])
@@ -1204,10 +1342,12 @@ def _after_failure(
                 outcome.err.extend([failed + NOTHING_CHANGED_SUFFIX, state_line])
             else:
                 outcome.err.extend([failed, f"changed: {changed_words}", state_line])
+                left_temps = [word[len(TEMP_LEFT_WORD) :] for word in changed if word.startswith(TEMP_LEFT_WORD)]
                 if any(word.startswith("wrote ") for word in changed):
                     outcome.err.append(f"undo: sudo {command} {Mode.REMOVE.value}")
-                elif service_loaded is not False:
+                elif service_loaded is not False and len(left_temps) < len(changed):
                     outcome.err.append(f"undo: sudo {shlex.join([LAUNCHCTL, *bootout_args(config)])}")
+                outcome.err.extend(f"undo: sudo {shlex.join(['rm', temp])}" for temp in left_temps)
         case Mode.REMOVE:
             outcome.err.extend([failed, f"changed: {changed_words}", state_line])
             if any(word.startswith("booted out ") for word in changed) and plist_present:
@@ -1240,23 +1380,77 @@ class _StepRefused(Exception):
 
 
 def _verify(runner: HostRunner, config: Config) -> str:
-    """Prove the daemon launchd started owns the data directory; return the installed line or raise _StepFailed."""
+    """Prove the daemon launchd started owns the data directory and the port and is ready; return the installed
+    line or raise _StepFailed.
+
+    Installed only when all hold at once: launchd reports a pid; the data directory passes its check on the opened
+    object; postmaster.pid has exactly PIDFILE_LINES lines; line 1 is that pid; line 2 is the configured data
+    directory; line 4 is the configured port; line 8, blanks stripped, is exactly ``ready``; and launchd reports
+    the same pid when asked again after the read.  The probe step ran before this one.  Every other state is its
+    own reason with EXIT_PROBE_FAILED.
+    """
+    path = config.pidfile
     launchd_pid = runner.launchd_pid(config.service)
     if launchd_pid is None:
         raise _StepFailed(EXIT_PROBE_FAILED, FAIL_NO_LAUNCHD_PID.format(service=config.service))
-    facts, data = runner.read_data_dir(config.data_dir, PIDFILE_NAME, MAX_PIDFILE_BYTES)
+    try:
+        facts, data = runner.read_data_dir(config.data_dir, PIDFILE_NAME, MAX_PIDFILE_BYTES)
+    except HostError as exc:
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_UNREADABLE.format(path=path, why=exc)) from exc
     refusal = _data_dir_refusal(config.data_dir, config.account, facts)
     if refusal is not None:
         raise _StepFailed(EXIT_PROBE_FAILED, FAIL_DATA_DIR.format(why=refusal.message))
     pid, why = _parse_pidfile(data)
+    if data is None or (why and why != PIDFILE_BAD_PID):
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_NO_POSTMASTER_PID.format(path=path, why=why))
+    lines = data.split(b"\n")
+    if lines[-1] == b"":
+        lines.pop()
+    if len(lines) < PIDFILE_LINES:
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_SHORT.format(path=path, lines=len(lines), want=PIDFILE_LINES))
+    if len(lines) > PIDFILE_LINES:
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_LONG.format(path=path, want=PIDFILE_LINES))
     if why:
-        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_NO_POSTMASTER_PID.format(path=config.pidfile, why=why))
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_NO_POSTMASTER_PID.format(path=path, why=why))
     if pid != launchd_pid:
         raise _StepFailed(
             EXIT_PROBE_FAILED,
-            FAIL_PID_MISMATCH.format(launchd_pid=launchd_pid, service=config.service, pid=pid, path=config.pidfile),
+            FAIL_PID_MISMATCH.format(launchd_pid=launchd_pid, service=config.service, pid=pid, path=path),
+        )
+    data_line = lines[PIDFILE_DATA_DIR_LINE - 1]
+    if data_line != os.fsencode(config.data_dir):
+        raise _StepFailed(
+            EXIT_PROBE_FAILED, FAIL_PIDFILE_DATA_DIR.format(path=path, shown=_shown(data_line), data_dir=config.data_dir)
+        )
+    port_line = lines[PIDFILE_PORT_LINE - 1]
+    if not port_line:
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_PORT_EMPTY.format(path=path))
+    if not PORT_LINE_RE.fullmatch(port_line):
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_PORT_NAN.format(path=path, shown=_shown(port_line)))
+    if port_line != str(config.port).encode("ascii"):
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_PORT.format(path=path, shown=_shown(port_line), port=config.port))
+    status = lines[PIDFILE_STATUS_LINE - 1].strip(PIDFILE_STATUS_PAD)
+    if not status:
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_STATUS_EMPTY.format(path=path))
+    if status != PIDFILE_READY:
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_PIDFILE_STATUS.format(path=path, shown=_shown(status)))
+    again = runner.launchd_pid(config.service)
+    if again is None:
+        raise _StepFailed(EXIT_PROBE_FAILED, FAIL_REREAD_GONE.format(service=config.service, path=path))
+    if again != launchd_pid:
+        raise _StepFailed(
+            EXIT_PROBE_FAILED, FAIL_REREAD_CHANGED.format(service=config.service, before=launchd_pid, after=again, path=path)
         )
     return f"launchd pid {launchd_pid} of {config.service} owns {config.data_dir} and {PROBE_HOST}:{config.port}; installed"
+
+
+def _shown(raw: bytes) -> str:
+    """A pid-file line as a report shows it: at most SHOWN_MAX_CHARS characters, then quoted with every
+    non-ASCII and control character escaped, so a hostile line can neither flood nor drive the terminal."""
+    text = raw.decode("utf-8", errors="backslashreplace")
+    if len(text) > SHOWN_MAX_CHARS:
+        text = text[:SHOWN_MAX_CHARS] + SHOWN_CUT
+    return ascii(text)
 
 
 def _run_step(
@@ -1290,13 +1484,22 @@ def _run_step(
         case Step.WRITE:
             try:
                 runner.publish_file(config.plist_path, data)
-            except PartialWrite as exc:
-                changed.append(f"wrote {config.plist_path}")
-                raise _StepFailed(EXIT_COMMAND_FAILED, FAIL_WRITE_LINKED.format(path=config.plist_path, name=_errno_name(exc)))
-            except FileExistsError:
-                raise _StepRefused(EXIT_CONFLICT, REFUSE_RACE.format(path=config.plist_path)) from None
             except OSError as exc:
-                raise _StepFailed(EXIT_COMMAND_FAILED, FAIL_WRITE.format(path=config.plist_path, name=_errno_name(exc)))
+                left_temp: str | None = getattr(exc, "left_temp", None)
+                suffix = "" if left_temp is None else TEMP_LEFT_SUFFIX.format(temp=left_temp)
+                if isinstance(exc, PartialWrite):
+                    changed.append(f"wrote {config.plist_path}")
+                if left_temp is not None:
+                    changed.append(TEMP_LEFT_WORD + left_temp)
+                if isinstance(exc, PartialWrite):
+                    what = FAIL_WRITE_LINKED.format(path=config.plist_path, name=_errno_name(exc))
+                    raise _StepFailed(EXIT_COMMAND_FAILED, what + suffix) from exc
+                if isinstance(exc, FileExistsError):
+                    if left_temp is None:
+                        raise _StepRefused(EXIT_CONFLICT, REFUSE_RACE.format(path=config.plist_path)) from None
+                    raise _StepFailed(EXIT_CONFLICT, FAIL_RACE_TEMP_LEFT.format(path=config.plist_path, temp=left_temp))
+                what = FAIL_WRITE.format(path=config.plist_path, name=_errno_name(exc))
+                raise _StepFailed(EXIT_COMMAND_FAILED, what + suffix) from exc
             changed.append(f"wrote {config.plist_path}")
             outcome.out.append(f"wrote {config.plist_path} (mode 0644, owner root:wheel)")
         case Step.BOOTSTRAP:
@@ -1324,6 +1527,10 @@ def _run_step(
         case Step.REMOVE:
             try:
                 runner.remove_file(config.plist_path)
+            except PartialRemove as exc:
+                changed.append(f"removed {config.plist_path}")
+                what = FAIL_REMOVE_UNLINKED.format(path=config.plist_path, name=_errno_name(exc))
+                raise _StepFailed(EXIT_COMMAND_FAILED, what) from exc
             except OSError as exc:
                 raise _StepFailed(EXIT_COMMAND_FAILED, FAIL_REMOVE.format(path=config.plist_path, name=_errno_name(exc)))
             changed.append(f"removed {config.plist_path}")

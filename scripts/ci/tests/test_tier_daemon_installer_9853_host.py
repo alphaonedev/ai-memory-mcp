@@ -261,8 +261,8 @@ class PublishFileTests(Scratch):
     def test_a_failure_before_the_link_with_a_failing_cleanup_keeps_its_kind_and_names_the_temp(self) -> None:
         rows = [
             ("write", errno.ENOSPC, OSError),
-            ("fchown", errno.EPERM, OSError),
-            ("fchmod", errno.EPERM, OSError),
+            ("fchown", errno.EPERM, PermissionError),
+            ("fchmod", errno.EPERM, PermissionError),
             ("fsync", errno.EIO, OSError),
             ("close", errno.EIO, OSError),
             ("link", errno.EEXIST, FileExistsError),
@@ -419,6 +419,39 @@ class InstallerLeftTempTests(unittest.TestCase):
             ),
         )
         self.assertFalse(any("nothing changed" in line for line in outcome.err), outcome.err)
+
+
+class _PartialRemoveFake(base.FakeRunner):
+    """``remove_file`` unlinks the plist, then fails the directory fsync, as the real one reports it."""
+
+    def remove_file(self, path: str) -> None:
+        self._require_changes()
+        self.calls.append(("remove", path))
+        del self.files[path]
+        raise tdi.PartialRemove(errno.EIO, f"{path} unlinked, then the directory fsync failed (EIO)")
+
+
+class InstallerPartialRemoveTests(unittest.TestCase):
+    """A removal whose unlink happened reports the plist as removed, never as untouched (finding 9872-r2-2 sibling)."""
+
+    def test_an_fsync_failure_after_the_unlink_reports_the_removal(self) -> None:
+        fake = _PartialRemoveFake(allow_changes=True, euid=0)
+        fake.files[PLIST] = base.PLIST_BYTES
+        fake.loaded = True
+        outcome = tdi.run(base.argv_for("REMOVE"), fake, base.INVOCATION)
+        self.assertEqual(
+            (outcome.code, outcome.err),
+            (
+                6,
+                [
+                    FAILED + f"removing {PLIST}: EIO after the plist was unlinked",
+                    f"changed: booted out {SERVICE}; removed {PLIST}",
+                    f"state: plist {PLIST} absent; service {SERVICE} not loaded",
+                    f"to finish the removal: sudo {base.CMD} --remove",
+                ],
+            ),
+        )
+        self.assertNotIn(PLIST, fake.files)
 
 
 class ReadDataDirTests(Scratch):
@@ -931,8 +964,9 @@ class CommandQuotingTests(unittest.TestCase):
             out,
         )
         self.assertIn(
-            f"  5. verify that the pid launchd reports for {SERVICE} is the first line of "
-            "'/opt/tier/pg data/postmaster.pid'; only then print installed",
+            "  5. verify that '/opt/tier/pg data/postmaster.pid' has 8 lines naming the pid launchd reports for "
+            f"{SERVICE}, data directory '/opt/tier/pg data', port 5445 and status ready, and that launchd reports "
+            "the same pid after the read; only then print installed",
             out,
         )
 
@@ -982,7 +1016,7 @@ class HandoverIdenticalTests(unittest.TestCase):
                     f"launchd pid 5151 of {SERVICE} owns /opt/tier/pgdata and 127.0.0.1:5445; installed",
                 ],
                 [],
-                [PRINT, PS, WAIT, PS, PRINT_DISABLED, PORT_CALL, BOOTSTRAP, PROBE, PRINT],
+                [PRINT, PS, WAIT, PS, PRINT_DISABLED, PORT_CALL, BOOTSTRAP, PROBE, PRINT, PRINT],
             ),
         )
 

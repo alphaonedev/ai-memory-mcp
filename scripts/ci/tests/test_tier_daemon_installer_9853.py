@@ -375,7 +375,10 @@ REMOVE_VERDICTS = {
     "notours": f"remove verdict: refuse: plist target {PLIST} is not ours ({DIFF_SUMMARY}); nothing changed",
 }
 PROBE_LINE = "probe 127.0.0.1:5445, deadline 60 s"
-VERIFY_LINE = f"verify that the pid launchd reports for {SERVICE} is the first line of {PIDFILE}; only then print installed"
+VERIFY_LINE = (
+    f"verify that {PIDFILE} has 8 lines naming the pid launchd reports for {SERVICE}, data directory /opt/tier/pgdata, "
+    "port 5445 and status ready, and that launchd reports the same pid after the read; only then print installed"
+)
 WRITE_LINE = f"write {PLIST} atomically, mode 0644, owner root:wheel, never over an existing file"
 PORT_LINE = "refuse if anything already answers on 127.0.0.1:5445"
 
@@ -486,7 +489,7 @@ OUTCOMES: dict[str, tuple[int, list[str], list[str], list[tuple[object, ...]], b
         0,
         [OUT + "--install: proceed: " + PROCEED_WORDS, FREE, WROTE, BOOTSTRAPPED, ANSWERS, INSTALLED],
         [],
-        [PORT_CALL, PUBLISH, BOOTSTRAP, PROBE, PRINT],
+        [PORT_CALL, PUBLISH, BOOTSTRAP, PROBE, PRINT, PRINT],
         True,
     ),
     "I_HANDOVER": (
@@ -502,14 +505,14 @@ OUTCOMES: dict[str, tuple[int, list[str], list[str], list[tuple[object, ...]], b
             INSTALLED,
         ],
         [],
-        [WAIT, PS, PRINT_DISABLED, PORT_CALL, PUBLISH, BOOTSTRAP, PROBE, PRINT],
+        [WAIT, PS, PRINT_DISABLED, PORT_CALL, PUBLISH, BOOTSTRAP, PROBE, PRINT, PRINT],
         True,
     ),
     "I_BOOTSTRAP": (
         0,
         [OUT + "--install: proceed: " + BOOTSTRAP_WORDS, FREE, BOOTSTRAPPED, ANSWERS, INSTALLED],
         [],
-        [PORT_CALL, BOOTSTRAP, PROBE, PRINT],
+        [PORT_CALL, BOOTSTRAP, PROBE, PRINT, PRINT],
         True,
     ),
     "LOADED_NO_PLIST": (4, [], [REFUSED + LOADED_NO_PLIST], [], True),
