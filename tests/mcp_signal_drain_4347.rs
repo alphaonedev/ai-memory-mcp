@@ -19,19 +19,24 @@
 
 #![cfg(unix)]
 
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory::governance::audit::{
-    CHAIN_HEAD_PREV_HASH, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
+    CHAIN_HEAD_PREV_HASH, EXIT_DRAIN_BUDGET, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
 };
 use serde_json::{Value, json};
-#[path = "common/child_stdin_report.rs"]
-mod child_stdin_report;
+// #9906 F1: every spawned child is owned by one guard (kill + reap + stderr on
+// every failure path), shared by the three drain test files.
+#[path = "common/mcp_child_guard.rs"]
+mod mcp_child_guard;
+use mcp_child_guard::{ChildGuard, TIER_LINE, pid_exists, requested_tiers, spawn_line_reader};
 
 /// Writer delay that makes a queued row certainly outlive a signalled process.
 const WRITER_DELAY_MS: &str = "600";
@@ -78,7 +83,7 @@ fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int])
     std::fs::write(
         config_root.join("config.toml"),
         format!(
-            "schema_version = 2\ntier = \"keyword\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
+            "schema_version = 2\ntier = \"{CHILD_TIER}\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
             forensic_dir(home).display()
         ),
     )
@@ -96,7 +101,9 @@ fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int])
         .current_dir(home)
         .arg("--db")
         .arg(db_path(home))
-        .args(["mcp", "--profile", "full"])
+        // #9906 — the tier on the command line: `mcp --tier` has a clap
+        // default that shadows the config file's tier (#9913).
+        .args(["mcp", "--profile", "full", "--tier", CHILD_TIER])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -124,22 +131,18 @@ fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int])
     cmd.spawn().expect("spawn mcp")
 }
 
-/// The child's stderr so far, for a write-failure report: waits (bounded) for
-/// the reader thread, then reads the shared buffer.
-fn collect_stderr(thread: &mut Option<std::thread::JoinHandle<()>>, buf: &Mutex<String>) -> String {
-    if let Some(t) = thread.take() {
-        child_stdin_report::finish_reader(t);
-    }
-    buf.lock().map(|b| b.clone()).unwrap_or_default()
-}
+/// How long a serving child may take to answer one request line. Steady-state
+/// work on a loaded host, so it is generous; still a bound (a hung child must
+/// fail the cell with its stderr, never block it forever, #9906 F1).
+const REQUEST_BOUND: Duration = Duration::from_secs(120);
 
 struct Session {
-    child: Child,
+    /// Owns the child and its stderr reader: killed and reaped on every
+    /// failure path and on drop.
+    guard: ChildGuard,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
-    /// Everything the child wrote to stderr so far (a reader thread fills it).
-    stderr_buf: Arc<Mutex<String>>,
-    stderr_thread: Option<std::thread::JoinHandle<()>>,
+    /// Stdout lines, read on a thread so every read is bounded.
+    lines: Receiver<String>,
 }
 
 impl Session {
@@ -158,30 +161,15 @@ impl Session {
         s
     }
 
-    /// Wrap a spawned child: capture its stderr on a reader thread.
-    fn attach(mut child: Child) -> Self {
-        let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
-        let mut child_stderr = child.stderr.take().expect("stderr");
-        let sink = Arc::clone(&stderr_buf);
-        let stderr_thread = std::thread::spawn(move || {
-            let mut chunk = [0_u8; 1024];
-            while let Ok(n) = child_stderr.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                if let Ok(mut buf) = sink.lock() {
-                    buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                }
-            }
-        });
+    /// Wrap a spawned child: the guard captures its stderr on a reader thread.
+    fn attach(child: Child) -> Self {
+        let mut guard = ChildGuard::new(child);
+        let stdin = guard.take_stdin().expect("stdin");
+        let lines = spawn_line_reader(guard.take_stdout().expect("stdout"));
         Self {
-            child,
+            guard,
             stdin: Some(stdin),
-            stdout,
-            stderr_buf,
-            stderr_thread: Some(stderr_thread),
+            lines,
         }
     }
 
@@ -209,106 +197,58 @@ impl Session {
         );
     }
 
-    /// Send one request line without waiting for its response.
+    /// Send one request line without waiting for its response; a failed
+    /// write kills and reaps the child and fails with its stderr.
     fn send(&mut self, req: &Value) {
         let stdin = self.stdin.as_mut().expect("stdin open");
-        let (thread, buf) = (&mut self.stderr_thread, &self.stderr_buf);
-        child_stdin_report::write_line_or_report_with(
-            stdin,
-            &mut self.child,
-            || collect_stderr(thread, buf),
-            "request",
-            &req.to_string(),
-        );
+        self.guard.write_line(stdin, "request", &req.to_string());
     }
 
-    /// Read one response line (blocks; the cells' children are bounded).
+    /// Read one response line, bounded by `REQUEST_BOUND`; `None` at end of
+    /// stream or when the line is not JSON.
     fn read_response(&mut self) -> Option<Value> {
-        let mut line = String::new();
-        match self.stdout.read_line(&mut line) {
-            Ok(n) if n > 0 => serde_json::from_str(&line).ok(),
-            _ => None,
-        }
+        let line = self
+            .guard
+            .recv_line(&self.lines, REQUEST_BOUND, "a response line")?;
+        serde_json::from_str(&line).ok()
     }
 
     fn request(&mut self, req: &Value) -> Value {
-        let stdin = self.stdin.as_mut().expect("stdin open");
-        let (thread, buf) = (&mut self.stderr_thread, &self.stderr_buf);
-        child_stdin_report::write_line_or_report_with(
-            stdin,
-            &mut self.child,
-            || collect_stderr(thread, buf),
-            "request",
-            &req.to_string(),
-        );
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read response");
+        self.send(req);
+        let Some(line) = self
+            .guard
+            .recv_line(&self.lines, REQUEST_BOUND, "a response line")
+        else {
+            self.guard.fail("a response line (stdout closed)", None)
+        };
         serde_json::from_str(&line).expect("json response")
     }
 
     fn signal(&self, name: &str) {
         let status = Command::new("kill")
-            .args(["-s", name, &self.child.id().to_string()])
+            .args(["-s", name, &self.guard.id().to_string()])
             .status()
             .expect("run kill");
         assert!(status.success(), "kill -s {name} failed");
     }
 
-    /// Wait for exit, bounded; kill by pid and fail when it does not exit.
+    /// Wait for exit, bounded; the guard kills the child and fails with its
+    /// stderr and `EXIT_BOUND` when it does not exit.
     fn wait_bounded(&mut self) -> std::process::ExitStatus {
-        let deadline = Instant::now() + EXIT_BOUND;
-        loop {
-            if let Some(status) = self.child.try_wait().expect("try_wait") {
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                panic!("mcp did not exit within {EXIT_BOUND:?} of the signal");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        self.guard
+            .wait_exit_bounded(EXIT_BOUND, "mcp to exit after the signal")
     }
 
     /// All of the child's stderr (call after it exited: joins the reader).
     fn stderr_text(&mut self) -> String {
-        if let Some(t) = self.stderr_thread.take() {
-            let _ = t.join();
-        }
-        self.stderr_buf
-            .lock()
-            .map(|b| b.clone())
-            .unwrap_or_default()
-    }
-
-    /// Fail at once, with the exit status and all captured stderr, when the
-    /// child has already exited while a start-up wait is still polling: a
-    /// child that crashed at start-up must not cost the full `STARTUP_BOUND`
-    /// (#4347 L-2, TEST-02).
-    fn fail_if_exited(&mut self, waiting_for: &str) {
-        if let Some(status) = self.child.try_wait().expect("try_wait") {
-            let stderr = self.stderr_text();
-            panic!(
-                "the child exited ({status:?}) while waiting for {waiting_for}; stderr:\n{stderr}"
-            );
-        }
+        self.guard.stderr_final()
     }
 
     /// Wait (bounded) until the child has written `needle` to stderr; fails
-    /// fast if the child exits first.
+    /// fast, with its exit status and stderr, if the child exits first
+    /// (#4347 L-2, TEST-02).
     fn wait_stderr_contains(&mut self, needle: &str) {
-        let deadline = Instant::now() + STARTUP_BOUND;
-        loop {
-            if self.stderr_buf.lock().is_ok_and(|b| b.contains(needle)) {
-                return;
-            }
-            self.fail_if_exited(&format!("{needle:?} on stderr"));
-            assert!(
-                Instant::now() < deadline,
-                "the child never wrote {needle:?} to stderr"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        self.guard.wait_stderr_contains(needle, STARTUP_BOUND);
     }
 
     /// Wait (bounded) for the child to reach the held point; fails fast if
@@ -316,11 +256,12 @@ impl Session {
     fn wait_entered(&mut self, dir: &Path) {
         let deadline = Instant::now() + STARTUP_BOUND;
         while !dir.join("entered").exists() {
-            self.fail_if_exited("the held request");
-            assert!(
-                Instant::now() < deadline,
-                "the child never reached the held request"
-            );
+            if !self.guard.is_running() {
+                self.guard.fail("the held request", None);
+            }
+            if Instant::now() >= deadline {
+                self.guard.fail("the held request", Some(STARTUP_BOUND));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -650,17 +591,17 @@ fn a_fenced_request_released_mid_drain_is_never_acknowledged_4347() {
 fn an_unavailable_stop_handler_refuses_to_start_4347() {
     for failing in ["SIGTERM", "SIGINT", "SIGHUP"] {
         let home = sandbox();
-        let mut child = spawn_mcp(
+        let mut guard = ChildGuard::new(spawn_mcp(
             home.path(),
             &[(
                 "AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL",
                 failing.to_string(),
             )],
             &[],
-        );
+        ));
         // Offer work; a server that started would acknowledge it. A write to
         // an already-exited child may fail: that is the refusal too.
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = guard.take_stdin() {
             let _ = writeln!(
                 stdin,
                 "{}",
@@ -669,26 +610,15 @@ fn an_unavailable_stop_handler_refuses_to_start_4347() {
                     "clientInfo":{"name":"probe4347","version":"1"}}})
             );
         }
-        let deadline = Instant::now() + STARTUP_BOUND;
-        let status = loop {
-            if let Some(st) = child.try_wait().expect("try_wait") {
-                break st;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("mcp kept running with the {failing} handler unavailable");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let status = guard.wait_exit_bounded(
+            STARTUP_BOUND,
+            &format!("mcp to refuse to start with the {failing} handler unavailable"),
+        );
         let mut out = String::new();
-        if let Some(mut o) = child.stdout.take() {
+        if let Some(mut o) = guard.take_stdout() {
             let _ = o.read_to_string(&mut out);
         }
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
-        }
+        let err = guard.stderr_final();
         assert!(
             matches!(status.code(), Some(c) if c != 0),
             "{failing}: must exit non-zero, got {status:?}; stderr: {err}"
@@ -715,7 +645,7 @@ fn an_inherited_ignored_hup_and_int_are_honoured_but_term_still_drains_4347() {
     let alive = s.request(&store_request(4000, "served-after-ignored-signals-4347"));
     assert!(alive.get("error").is_none(), "{alive}");
     assert!(
-        s.child.try_wait().expect("try_wait").is_none(),
+        s.guard.is_running(),
         "an ignored SIGHUP/SIGINT must not stop the server"
     );
     s.signal("TERM");
@@ -735,151 +665,330 @@ fn an_inherited_ignored_hup_and_int_are_honoured_but_term_still_drains_4347() {
 /// Request id for the `i`-th request of a pipelined burst.
 const BURST_BASE_ID: u64 = 100;
 
+/// The memory id a burst request `id` deletes: the one definition of the id
+/// layout, used to build the request and the expected id set (#9906 F3).
+fn burst_memory_id(id: u64) -> String {
+    format!("00000000-0000-4000-8000-{id:012}")
+}
+
 fn burst_delete(id: u64) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
-        "name":"memory_delete","arguments":{
-            "id":format!("00000000-0000-4000-8000-{id:012}")}}})
+        "name":"memory_delete","arguments":{"id":burst_memory_id(id)}}})
+}
+
+/// Requests of one pipelined burst after its leading `memory_delete` (id 2);
+/// every third one is a store, the rest are deletes.
+const BURST: u64 = 120;
+
+/// Rounds of the burst cell; round `r` signals once `burst_cut(r)` tool
+/// calls are acknowledged, so the cut walks across the whole burst.
+const BURST_ROUNDS: u64 = 6;
+
+/// #9906 slow path: the stress cell repeats a burst cut this late, when the
+/// most rows are queued behind the writer at the signal.
+const BURST_STRESS_CUT: usize = 100;
+
+/// #9906 slow path: how many late-cut bursts the stress cell runs.
+const BURST_STRESS_ITERATIONS: u64 = 3;
+
+/// #9906 — the burst cells' forensic writer delay per row. Every row the
+/// burst can queue must drain well inside `EXIT_DRAIN_BUDGET` (checked at
+/// compile time below), so a late cut tests the drain, not the budget; the
+/// 600 ms `WRITER_DELAY_MS` of the single-row cells would queue a minute.
+const BURST_WRITER_DELAY_MS: u64 = 10;
+
+/// Factor by which the burst's whole writer delay must stay under the exit
+/// drain budget, for the per-row work the delay does not model.
+const BURST_DRAIN_HEADROOM: u64 = 3;
+
+const MS_PER_SEC: u64 = 1_000;
+
+const _: () = assert!(
+    (BURST + 1) * BURST_WRITER_DELAY_MS * BURST_DRAIN_HEADROOM
+        < EXIT_DRAIN_BUDGET.as_secs() * MS_PER_SEC,
+    "the burst writer delay must drain inside EXIT_DRAIN_BUDGET with headroom"
+);
+
+/// How long a serving burst child may take to acknowledge the tool calls a
+/// cut waits for. Steady-state work, not start-up, but many requests on a
+/// loaded host, so it is generous; still a bound.
+const BURST_ACK_BOUND: Duration = Duration::from_secs(120);
+
+/// Longest a response wait sleeps on its condvar before it re-checks that the
+/// child is still alive; a response wakes it at once.
+const RESPONSE_WAKE_SLICE: Duration = Duration::from_millis(50);
+
+/// Prefix of the line `ai-memory mcp` writes after its signal-stop drain
+/// (`src/mcp/shutdown.rs::supervise`); the `DrainOutcome` follows.
+const EXIT_DRAIN_LINE: &str = "ai-memory: mcp forensic exit drain: ";
+
+/// Responses of a burst child by request id, and the condvar its stdout
+/// reader notifies after each one (and at end of stream).
+type Responses = Arc<(Mutex<HashMap<u64, Value>>, Condvar)>;
+
+/// The acknowledged tool calls (every response except `initialize`, id 1).
+fn tool_acks(map: &HashMap<u64, Value>) -> usize {
+    map.keys().filter(|id| **id != 1).count()
+}
+
+/// Wait on the reader's condvar until `done` holds, bounded by `bound`. When
+/// the child exits first, or the bound passes, the guard kills and reaps the
+/// child and the panic carries its stderr, the exit or the named deadline
+/// (#9906 F1).
+fn wait_responses(
+    responses: &Responses,
+    guard: &mut ChildGuard,
+    bound: Duration,
+    what: &str,
+    done: impl Fn(&HashMap<u64, Value>) -> bool,
+) {
+    let deadline = Instant::now() + bound;
+    let (lock, cvar) = &**responses;
+    let mut map = lock.lock().expect("responses lock");
+    while !done(&map) {
+        let timed_out = Instant::now() >= deadline;
+        if timed_out || !guard.is_running() {
+            // Release the map first: the stdout reader thread needs it to end.
+            drop(map);
+            let bound_named = timed_out.then_some(bound);
+            guard.fail(what, bound_named);
+        }
+        let now = Instant::now();
+        map = cvar
+            .wait_timeout(map, RESPONSE_WAKE_SLICE.min(deadline - now))
+            .expect("responses lock")
+            .0;
+    }
+}
+
+/// The cut of burst round `round`: how many acknowledged tool calls it waits
+/// for before the signal (0 for round 0, then evenly across the burst).
+fn burst_cut(round: u64) -> usize {
+    usize::try_from(round * (BURST + 1) / BURST_ROUNDS).expect("burst cut fits usize")
+}
+
+/// The `DrainOutcome` the child reported after its signal stop.
+fn exit_drain_outcome(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix(EXIT_DRAIN_LINE))
+        .map(|rest| rest.split_whitespace().next().unwrap_or_default())
+        .collect()
+}
+
+/// One burst round: initialize, queue the whole burst on stdin, SIGTERM the
+/// child once `cut` tool calls are acknowledged (an event, never a fixed
+/// sleep), then require the conventional exit code, an exit drain that did
+/// not time out, every acknowledged store durable, and the forensic
+/// `memory_delete` rows naming exactly the acknowledged deletes.
+fn burst_round(label: &str, cut: usize) {
+    let home = sandbox();
+    let mut guard = ChildGuard::new(spawn_mcp(
+        home.path(),
+        &[(
+            TEST_FORENSIC_WRITER_DELAY_ENV,
+            BURST_WRITER_DELAY_MS.to_string(),
+        )],
+        &[],
+    ));
+    let mut stdin = guard.take_stdin().expect("stdin");
+    let stdout = BufReader::new(guard.take_stdout().expect("stdout"));
+    let responses: Responses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    let sink = Arc::clone(&responses);
+    let reader = std::thread::spawn(move || {
+        let (lock, cvar) = &*sink;
+        for line in stdout.lines() {
+            let Ok(line) = line else { break };
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && let Some(id) = v.get("id").and_then(Value::as_u64)
+                && let Ok(mut map) = lock.lock()
+            {
+                map.insert(id, v);
+                cvar.notify_all();
+            }
+        }
+        cvar.notify_all();
+    });
+    // Initialize first and wait for the answer: the stop handlers are
+    // installed before the loop serves, so from here a signal is a graceful
+    // stop (a signal before that has nothing queued to lose).
+    guard.write_line(
+        &mut stdin,
+        "initialize",
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2024-11-05","capabilities":{},
+            "clientInfo":{"name":"probe4347","version":"1"}}})
+        .to_string(),
+    );
+    wait_responses(
+        &responses,
+        &mut guard,
+        STARTUP_BOUND,
+        &format!("{label}: the initialize response"),
+        |m| m.contains_key(&1),
+    );
+    let mut payload = String::new();
+    payload.push_str(&burst_delete(2).to_string());
+    payload.push('\n');
+    for k in 0..BURST {
+        let id = BURST_BASE_ID + k;
+        let req = if k % 3 == 2 {
+            store_request(id, &format!("burst-{label}-{id}"))
+        } else {
+            burst_delete(id)
+        };
+        payload.push_str(&req.to_string());
+        payload.push('\n');
+    }
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(payload.as_bytes());
+        let _ = stdin.flush();
+        stdin
+    });
+    wait_responses(
+        &responses,
+        &mut guard,
+        BURST_ACK_BOUND,
+        &format!("{label}: {cut} acknowledged tool calls"),
+        |m| tool_acks(m) >= cut,
+    );
+    let acked_at_signal = tool_acks(&responses.0.lock().expect("responses lock"));
+    let status = Command::new("kill")
+        .args(["-s", "TERM", &guard.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill -s TERM failed");
+    let exit = guard.wait_exit_bounded(EXIT_BOUND, &format!("{label}: mcp to exit after SIGTERM"));
+    let _stdin = writer.join().expect("writer thread");
+    reader.join().expect("reader thread");
+    let err = guard.stderr_final();
+    // The cut is where it says: the signal followed `cut` acknowledgements.
+    assert!(
+        acked_at_signal >= cut,
+        "{label}: signalled after {acked_at_signal} acknowledged tool calls, the cut is {cut}"
+    );
+    // A signal that arrives before the loop starts reading, or after EOF
+    // wins the race, is still a graceful stop with the conventional code.
+    assert_eq!(exit.code(), Some(SIGTERM_CODE), "{label}: {err}");
+    let resp = responses.0.lock().expect("responses lock").clone();
+    let mut acked_delete_ids = BTreeSet::new();
+    if resp.contains_key(&2) {
+        acked_delete_ids.insert(burst_memory_id(2));
+    }
+    for k in 0..BURST {
+        let id = BURST_BASE_ID + k;
+        let Some(r) = resp.get(&id) else { continue };
+        if k % 3 == 2 {
+            assert!(r.get("error").is_none(), "{label}: {r}");
+            assert_eq!(
+                count_title(home.path(), &format!("burst-{label}-{id}")),
+                1,
+                "{label}: acknowledged store {id} lost"
+            );
+        } else {
+            acked_delete_ids.insert(burst_memory_id(id));
+        }
+    }
+    let recs = rows(home.path());
+    // #9906 — a drain that ran out of EXIT_DRAIN_BUDGET is named here, not
+    // only as missing rows below.
+    let outcomes = exit_drain_outcome(&err);
+    let want: &[&str] = if recs.is_empty() {
+        &["Drained", "NoWriter"]
+    } else {
+        &["Drained"]
+    };
+    assert!(
+        outcomes.len() == 1 && want.contains(&outcomes[0]),
+        "{label}: exit drain outcome {outcomes:?}, want one of {want:?}; \
+         {acked_at_signal} tool calls acknowledged at the signal; stderr:\n{err}"
+    );
+    if recs.is_empty() {
+        // The signal beat the first delete: no row exists, so no TOOL call
+        // may have been acknowledged. The initialize response (id 1) is
+        // always acknowledged first and is not a tool call.
+        let mut acked: Vec<u64> = resp.keys().copied().filter(|id| *id != 1).collect();
+        acked.sort_unstable();
+        assert!(
+            acked.is_empty(),
+            "{label}: tool-call ids {acked:?} acknowledged without a forensic row; {err}"
+        );
+        return;
+    }
+    assert_one_unbroken_chain(&recs);
+    let row_ids: BTreeSet<String> = recs
+        .iter()
+        .filter(|r| r.kind == "memory_delete")
+        .filter_map(|r| {
+            r.payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        delete_rows(&recs),
+        row_ids.len(),
+        "{label}: every forensic delete row names one distinct id"
+    );
+    let missing: Vec<&String> = acked_delete_ids.difference(&row_ids).collect();
+    let unacked: Vec<&String> = row_ids.difference(&acked_delete_ids).collect();
+    assert!(
+        missing.is_empty() && unacked.is_empty(),
+        "{label}: forensic delete rows must name exactly the acknowledged deletes; \
+         acknowledged without a row {missing:?}; row without an acknowledgement {unacked:?}; \
+         stderr:\n{err}"
+    );
 }
 
 /// B2 (pipelined form) — 120 requests are queued on stdin and SIGTERM lands
-/// at a different point of the burst on every round, so some request is in
-/// flight at the signal. Whatever the timing: every ACKNOWLEDGED store is
-/// durable, the forensic `memory_delete` rows are exactly the session row
-/// plus the ACKNOWLEDGED deletes (no processed request went unacknowledged, no
-/// acknowledged one lost its row), and the chain is unbroken.
+/// at a different point of the burst on every round (after `burst_cut(r)`
+/// acknowledgements), so some request is in flight at the signal. Whatever
+/// the point: every ACKNOWLEDGED store is durable, the forensic
+/// `memory_delete` rows name exactly the ACKNOWLEDGED deletes (no processed
+/// request went unacknowledged, no acknowledged one lost its row), the exit
+/// drain finished, and the chain is unbroken.
 #[test]
 fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
-    const BURST: u64 = 120;
-    for round in 0..6_u64 {
-        let home = sandbox();
-        let mut child = spawn_mcp(home.path(), &[], &[]);
-        let mut stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
-        let responses: Arc<Mutex<std::collections::HashMap<u64, Value>>> =
-            Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let sink = Arc::clone(&responses);
-        let reader = std::thread::spawn(move || {
-            for line in stdout.lines() {
-                let Ok(line) = line else { break };
-                if let Ok(v) = serde_json::from_str::<Value>(&line)
-                    && let Some(id) = v.get("id").and_then(Value::as_u64)
-                    && let Ok(mut map) = sink.lock()
-                {
-                    map.insert(id, v);
-                }
-            }
-        });
-        // Initialize first and wait for the answer: the stop handlers are
-        // installed before the loop serves, so from here a signal is a
-        // graceful stop (a signal before that has nothing queued to lose).
-        child_stdin_report::write_line_or_report(
-            &mut stdin,
-            &mut child,
-            None,
-            "initialize",
-            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                "protocolVersion":"2024-11-05","capabilities":{},
-                "clientInfo":{"name":"probe4347","version":"1"}}})
-            .to_string(),
-        );
-        let init_deadline = Instant::now() + STARTUP_BOUND;
-        while !responses.lock().is_ok_and(|m| m.contains_key(&1)) {
-            // A child that exited at start-up fails now, with its status and
-            // stderr, instead of after the full STARTUP_BOUND (#4347 L-2).
-            if let Some(status) = child.try_wait().expect("try_wait") {
-                let mut err = String::new();
-                if let Some(mut e) = child.stderr.take() {
-                    let _ = e.read_to_string(&mut err);
-                }
-                panic!(
-                    "round {round}: the child exited ({status:?}) before answering \
-                     initialize; stderr:\n{err}"
-                );
-            }
-            assert!(Instant::now() < init_deadline, "no initialize response");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let mut payload = String::new();
-        payload.push_str(&burst_delete(2).to_string());
-        payload.push('\n');
-        for k in 0..BURST {
-            let id = BURST_BASE_ID + k;
-            let req = if k % 3 == 2 {
-                store_request(id, &format!("burst-{round}-{id}"))
-            } else {
-                burst_delete(id)
-            };
-            payload.push_str(&req.to_string());
-            payload.push('\n');
-        }
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(payload.as_bytes());
-            let _ = stdin.flush();
-            stdin
-        });
-        std::thread::sleep(Duration::from_millis(round * 60));
-        let status = Command::new("kill")
-            .args(["-s", "TERM", &child.id().to_string()])
-            .status()
-            .expect("run kill");
-        assert!(status.success(), "kill -s TERM failed");
-        let deadline = Instant::now() + EXIT_BOUND;
-        let exit = loop {
-            if let Some(st) = child.try_wait().expect("try_wait") {
-                break st;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("round {round}: mcp did not exit within {EXIT_BOUND:?}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let _stdin = writer.join().expect("writer thread");
-        reader.join().expect("reader thread");
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
-        }
-        // A signal that arrives before the loop starts reading, or after EOF
-        // wins the race, is still a graceful stop with the conventional code.
-        assert_eq!(exit.code(), Some(SIGTERM_CODE), "round {round}: {err}");
-        let resp = responses.lock().expect("responses").clone();
-        let mut acked_deletes = usize::from(resp.contains_key(&2));
-        for k in 0..BURST {
-            let id = BURST_BASE_ID + k;
-            let Some(r) = resp.get(&id) else { continue };
-            if k % 3 == 2 {
-                assert!(r.get("error").is_none(), "round {round}: {r}");
-                assert_eq!(
-                    count_title(home.path(), &format!("burst-{round}-{id}")),
-                    1,
-                    "round {round}: acknowledged store {id} lost"
-                );
-            } else {
-                acked_deletes += 1;
-            }
-        }
-        let recs = rows(home.path());
-        if recs.is_empty() {
-            // The signal beat the first delete: no row exists, so no TOOL
-            // call may have been acknowledged. The initialize response
-            // (id 1) is always acknowledged first and is not a tool call.
-            let mut acked: Vec<u64> = resp.keys().copied().filter(|id| *id != 1).collect();
-            acked.sort_unstable();
-            assert!(
-                acked.is_empty(),
-                "round {round}: tool-call ids {acked:?} acknowledged without a forensic row; {err}"
-            );
-            continue;
-        }
-        assert_one_unbroken_chain(&recs);
-        assert_eq!(
-            delete_rows(&recs),
-            acked_deletes,
-            "round {round}: forensic delete rows must equal acknowledged deletes; {err}"
-        );
+    for round in 0..BURST_ROUNDS {
+        burst_round(&format!("round {round}"), burst_cut(round));
     }
+}
+
+/// #9906 — the slow path of the burst cell, repeated: SIGTERM only after
+/// `BURST_STRESS_CUT` acknowledgements, when the most rows are queued behind
+/// the writer. The exit drain must still finish within `EXIT_DRAIN_BUDGET`
+/// and lose no acknowledged row.
+#[test]
+fn a_late_burst_cut_drains_every_acknowledged_row_within_the_budget_9906() {
+    for iteration in 0..BURST_STRESS_ITERATIONS {
+        burst_round(&format!("stress {iteration}"), BURST_STRESS_CUT);
+    }
+}
+
+/// The tier every child of this file must serve: keyword needs no model, so
+/// start-up never waits on an embedder download (#9906).
+const CHILD_TIER: &str = "keyword";
+
+/// #9906 — every MCP child of this file serves the keyword tier. The config
+/// file's `tier = "keyword"` alone does not reach `mcp` (its `--tier` has a
+/// clap default that shadows the file, #9913), so the spawn pins the tier on
+/// the command line; this cell is red when it does not. Every cell spawns
+/// through `spawn_mcp`, the one spawn site of this file.
+#[test]
+fn every_mcp_child_of_the_drain_cells_serves_the_keyword_tier_9906() {
+    let home = sandbox();
+    let mut s = Session::start(home.path());
+    s.wait_stderr_contains(TIER_LINE);
+    drop(s.stdin.take());
+    let exit = s.wait_bounded();
+    let err = s.stderr_text();
+    assert_eq!(
+        requested_tiers(&err),
+        [CHILD_TIER],
+        "requested tier lines; stderr:\n{err}"
+    );
+    assert_eq!(exit.code(), Some(0), "stdin EOF exit; stderr:\n{err}");
 }
 
 /// #4347 L-2 (negative check) - a child that exits at start-up makes each
@@ -900,30 +1009,137 @@ fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
         ));
         let dir = barrier_dir(home.path());
         let started = Instant::now();
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let msg = panic_text(|| {
             if wait == "stderr" {
                 s.wait_stderr_contains("never-written-needle-4347");
             } else {
                 s.wait_entered(&dir);
             }
-        }));
+        });
         let elapsed = started.elapsed();
-        let msg = match caught {
-            Ok(()) => panic!("{wait}: the wait returned although the child exited"),
-            Err(p) => p
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_string()))
-                .unwrap_or_default(),
-        };
         println!("L-2 negative check ({wait}): failed after {elapsed:?}: {msg}");
         assert!(
             msg.contains("the child exited"),
             "{wait}: must name the exit, not a timeout: {msg}"
         );
         assert!(
+            msg.contains("refusing to start"),
+            "{wait}: must carry the child's stderr: {msg}"
+        );
+        assert!(
             elapsed < Duration::from_secs(30),
             "{wait}: took {elapsed:?}; STARTUP_BOUND is {STARTUP_BOUND:?}"
         );
     }
+}
+
+/// The panic text of `f`, which must panic.
+fn panic_text(f: impl FnOnce()) -> String {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => panic!("the wait returned although it had to fail"),
+        Err(p) => p
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_string()))
+            .unwrap_or_default(),
+    }
+}
+
+/// #9906 F1 - the short deadline of the failure-path cells below (those cells
+/// only; the real waits keep their long bounds).
+const FAILURE_CELL_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Drive `wait_responses` to a failure against a child that never gets a
+/// request: returns the exact panic text and whether the pid still existed
+/// right after the panic (before the guard is dropped).
+fn burst_wait_failure(extra_env: &[(&str, String)], marker: &str) -> (String, bool) {
+    let home = sandbox();
+    let mut guard = ChildGuard::new(spawn_mcp(home.path(), extra_env, &[]));
+    let pid = guard.id();
+    guard.wait_stderr_contains(marker, STARTUP_BOUND);
+    let responses: Responses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    let text = panic_text(|| {
+        wait_responses(
+            &responses,
+            &mut guard,
+            FAILURE_CELL_DEADLINE,
+            "a response that is never sent",
+            |_| false,
+        );
+    });
+    (text, pid_exists(pid))
+}
+
+/// #9906 F1 - a burst wait that hits its deadline kills and reaps the child
+/// and panics with the child's stderr and the named deadline.
+#[test]
+fn a_burst_wait_that_hits_its_deadline_kills_the_child_and_reports_its_stderr_9906() {
+    let (text, alive) = burst_wait_failure(&[], TIER_LINE);
+    assert!(
+        text.contains("requested tier = keyword"),
+        "the panic must carry the child's stderr: {text}"
+    );
+    assert!(
+        text.contains("no a response that is never sent within 2s"),
+        "the panic must name the wait and its deadline: {text}"
+    );
+    assert!(
+        !alive,
+        "the child must be gone after the failed wait: {text}"
+    );
+}
+
+/// #9906 F1 - a burst wait whose child exited names the exit and carries its
+/// stderr.
+#[test]
+fn a_burst_wait_whose_child_exited_reports_its_stderr_9906() {
+    let (text, alive) = burst_wait_failure(
+        &[(
+            "AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL",
+            "SIGTERM".to_string(),
+        )],
+        "refusing to start",
+    );
+    assert!(text.contains("the child exited"), "names the exit: {text}");
+    assert!(
+        text.contains("refusing to start"),
+        "the panic must carry the child's stderr: {text}"
+    );
+    assert!(!alive, "the child must be reaped: {text}");
+}
+
+/// #9906 F1 - the guard reaps by construction: a guard dropped while its child
+/// runs (the path of any panic, including ones added later) kills and reaps it.
+#[test]
+fn dropping_the_guard_kills_and_reaps_a_running_child_9906() {
+    let home = sandbox();
+    let mut guard = ChildGuard::new(spawn_mcp(home.path(), &[], &[]));
+    let pid = guard.id();
+    assert!(guard.is_running(), "the child runs before the drop");
+    assert!(pid_exists(pid), "the pid exists before the drop");
+    drop(guard);
+    assert!(!pid_exists(pid), "the dropped guard must reap its child");
+}
+
+/// #9906 F1 - a request that is never answered fails the request wait with
+/// the child's stderr and the named bound, never a hang.
+#[test]
+fn a_bounded_line_read_that_hits_its_deadline_reports_stderr_and_kills_9906() {
+    let home = sandbox();
+    let mut s = Session::attach(spawn_mcp(home.path(), &[], &[]));
+    let pid = s.guard.id();
+    s.wait_stderr_contains(TIER_LINE);
+    let text = panic_text(|| {
+        let _ = s.guard.recv_line(
+            &s.lines,
+            FAILURE_CELL_DEADLINE,
+            "a response that is never sent",
+        );
+    });
+    assert!(
+        text.contains("no a response that is never sent within 2s")
+            && text.contains("requested tier = keyword"),
+        "bound and stderr named: {text}"
+    );
+    assert!(!pid_exists(pid), "the child must be reaped: {text}");
 }
