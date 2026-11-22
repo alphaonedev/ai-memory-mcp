@@ -56,11 +56,13 @@ LINUX_FED = '["self-hosted","linux-fed"]'
 MACOS_FED = '["self-hosted","macos-fed"]'
 EXPECTED_LEGS = ["ubuntu-latest,sqlite", "linux-fed,enterprise-fed", "macos-fed,sqlite", "macos-fed,enterprise-fed"]
 EXPECTED_CHECK_NAME = "Check (${{ matrix.leg }})"
-# The one step a draft-skipped leg runs.  The tools read it by this exact name:
-# agent-skills PR 558, tests/test_draft_skip_556.py PINNED_STEP (and its SKIP_STEP_NAME in
-# skills/pre-merge-checklist/scripts/draft_skip.py).  A rename here, or of the step in ci.yml,
-# fails test_skip_step_name_is_the_tools_pin; change both repositories together (vote DSP1 A-3).
-DRAFT_STEP = "Draft admission skip (#9821)"
+# Vote DSP2 A-4: the ONE place that holds the skip step's exact name and its exit line.  The agent-skills
+# constant SKIP_STEP_NAME (skills/pre-merge-checklist/scripts/draft_skip.py, PR 558 head d362912d,
+# line 47) is the READER of this name: its gates count a leg as draft-skipped only when a step has
+# this exact name.  A rename here or in ci.yml fails test_skip_step_pin_name_and_exit_in_one_place
+# in this repository; change both repositories together (vote DSP1 A-3, DSP2 A-4).
+SKIP_STEP_NAME = "Draft admission skip (#9821)"
+SKIP_EXIT_LINE = "exit 1"
 NEUTRALISER = "continue-on-error"  # swallows the red; banned on the check job and its steps (vote DSP1 A-1)
 EXIT_FAIL = 1
 FORK_STEP = "Fork-PR refusal (self-hosted legs never run fork code)"
@@ -73,6 +75,17 @@ FORK_ERROR = "::error::Refusing to run fork PR code on a self-hosted runner (leg
 REPOSITORY = "alphaonedev/ai-memory-mcp"
 FORK_REPOSITORY = "someone/ai-memory-mcp"
 STEP_TIMEOUT_SECS = 30
+# Vote DSP2 A-5: every job that holds the skip step, written out (never computed from the workflow).
+EXPECTED_SKIP_JOBS = ["check"]
+# The steps of such a job that do NOT carry SKIP_GUARD, by name, written out: the skip step itself and
+# the checkout (a skipped leg checks out on a hosted runner), plus the two steps that already were
+# unguarded at the base and cannot run next to the skip step's success-looking leg: the fork refusal
+# (exits 1, so a draft fork leg stays red; pinned below) and the cargo_skip short-circuit (its `if` is
+# the exact complement of the skip step's cargo_skip guard, pinned below, so it never runs on a leg the
+# skip step runs on).  Nothing else.
+CARGO_SKIP_STEP = "cargo_skip short-circuit"
+CARGO_SKIP_ONLY_IF = "needs.classify.outputs.cargo_skip == 'true'"
+EXPECTED_UNGUARDED = sorted([SKIP_STEP_NAME, FORK_STEP, CHECKOUT_PREFIX, CARGO_SKIP_STEP])
 FAILURE = "failure"
 WORK_RUNS = "work runs"  # the real work steps run; their own result decides the conclusion
 FROZEN_CONTEXTS = {
@@ -261,10 +274,10 @@ def job_expr(key):
     return found[0]
 
 
-def step_records():
-    """[{name, if, run, continue-on-error}] of the check job in order; one-line if, `run: |` blocks."""
+def step_records(block=None):
+    """[{name, if, run, continue-on-error}] of the check job (or of the given job block) in order; one-line if, `run: |` blocks."""
     out, in_steps, cur, in_run = [], False, None, False
-    for line in check_block():
+    for line in (check_block() if block is None else block):
         if line == "    steps:":
             in_steps = True
             continue
@@ -357,6 +370,54 @@ def job_neutralisers():
             if l.startswith("    if:") or re.match(r"\s*(?:- )?%s\s*:" % re.escape(NEUTRALISER), l)]
 
 
+def top_level_conjuncts(cond):
+    """Token lists of the `&&`-separated parts of an if expression at parenthesis depth 0, or None.
+
+    None (unclassifiable, so the step counts as unguarded) when the text does not tokenize, has a
+    `||` at depth 0, has unbalanced parentheses, or is empty.  Fail closed: a form this test cannot
+    read never counts as a guard.
+    """
+    try:
+        toks = tokenize(cond)
+    except ValueError:
+        return None
+    parts, cur, depth = [], [], 0
+    for tok in toks:
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and tok == "||":
+            return None
+        if depth == 0 and tok == "&&":
+            parts.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    parts.append(cur)
+    return None if depth != 0 or not toks or any(not p for p in parts) else parts
+
+
+def has_leg_skip_guard(cond):
+    """True only when SKIP_GUARD is one whole top-level `&&` conjunct of the step's one-line `if`."""
+    if not cond:
+        return False
+    parts = top_level_conjuncts(cond)
+    return parts is not None and tokenize(SKIP_GUARD) in parts
+
+
+def unguarded_step_names(block):
+    """Sorted names of the job's steps without the SKIP_GUARD conjunct; every checkout counts as CHECKOUT_PREFIX."""
+    return sorted(CHECKOUT_PREFIX if s["name"].startswith(CHECKOUT_PREFIX) else s["name"]
+                  for s in step_records(block) if not has_leg_skip_guard(s["if"]))
+
+
+def jobs_with_skip_step():
+    return [j for j in job_names() if any(s["name"] == SKIP_STEP_NAME for s in step_records(job_block(j)))]
+
+
 # ---------------------------------------------------------------- tests ----
 
 
@@ -419,9 +480,9 @@ class SkippedLegConclusion(unittest.TestCase):
     def rows(self, leg):
         fork_error = FORK_ERROR % leg
         return [
-            (True, [], False, (FAILURE, DRAFT_STEP, DRAFT_ERROR)),
-            (True, ["bug"], False, (FAILURE, DRAFT_STEP, DRAFT_ERROR)),
-            (True, [UNKNOWN_LABEL], False, (FAILURE, DRAFT_STEP, DRAFT_ERROR)),
+            (True, [], False, (FAILURE, SKIP_STEP_NAME, DRAFT_ERROR)),
+            (True, ["bug"], False, (FAILURE, SKIP_STEP_NAME, DRAFT_ERROR)),
+            (True, [UNKNOWN_LABEL], False, (FAILURE, SKIP_STEP_NAME, DRAFT_ERROR)),
             (True, [], True, (FAILURE, FORK_STEP, fork_error)),  # a draft fork fails on the fork refusal, as at base
             (True, [ADMIT_LABEL], True, (FAILURE, FORK_STEP, fork_error)),
             (False, [], True, (FAILURE, FORK_STEP, fork_error)),
@@ -463,7 +524,7 @@ class SkippedLegConclusion(unittest.TestCase):
         self.assertLessEqual(referenced(job_expr("runs-on")), FROZEN_CONTEXTS)
         frozen = (True, [])
         self.assertEqual(conclusion("linux-fed,enterprise-fed", LINUX_FED, "pull_request", *frozen),
-                         (FAILURE, DRAFT_STEP, DRAFT_ERROR))
+                         (FAILURE, SKIP_STEP_NAME, DRAFT_ERROR))
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertRegex(text, r"\n    types: \[opened, synchronize, reopened, ready_for_review\]\n")
 
@@ -472,7 +533,7 @@ class StepPins(unittest.TestCase):
     def test_every_cargo_guarded_step_also_honours_leg_skip(self):
         seen = 0
         for name, cond in steps():
-            if cond and CARGO_GUARD in cond and name not in (DRAFT_STEP, FORK_STEP):
+            if cond and CARGO_GUARD in cond and name not in (SKIP_STEP_NAME, FORK_STEP):
                 seen += 1
                 self.assertIn(SKIP_GUARD, cond, "step %r does not honour %s" % (name, SKIP_ENV))
         self.assertGreaterEqual(seen, 25)  # the guarded steps counted at the base sha are 29
@@ -491,13 +552,13 @@ class StepPins(unittest.TestCase):
     def test_draft_step_guard(self):
         by_name = dict(steps())
         # rule (b3) of check-required-contexts.sh wants a cargo_skip/docs_only guard on every step
-        self.assertEqual(by_name[DRAFT_STEP], "%s && env.%s == 'true'" % (CARGO_GUARD, SKIP_ENV))
+        self.assertEqual(by_name[SKIP_STEP_NAME], "%s && env.%s == 'true'" % (CARGO_GUARD, SKIP_ENV))
         self.assertNotIn("GH_TOKEN", "\n".join(check_block()))  # a secret here is a tainted-job violation
 
     def test_skip_step_one_error_exit_1_on_hosted(self):
         # Vote DSP1 A-2: the skip step prints exactly one ::error:: line, the pinned text, and
         # exits 1; every self-hosted leg it fails is placed on the hosted runner first.
-        step = next(s for s in step_records() if s["name"] == DRAFT_STEP)
+        step = next(s for s in step_records() if s["name"] == SKIP_STEP_NAME)
         self.assertIsNone(step[NEUTRALISER])
         rc, out = run_step(step["run"], "linux-fed,enterprise-fed")
         self.assertEqual(rc, EXIT_FAIL)
@@ -507,13 +568,78 @@ class StepPins(unittest.TestCase):
                 with self.subTest(context="Check (%s)" % leg):
                     self.assertEqual(evaluate(job_expr("runs-on"), "pull_request", True, [], runner), HOSTED)
 
-    def test_skip_step_name_is_the_tools_pin(self):
-        # Vote DSP1 A-3: agent-skills PR 558 tests/test_draft_skip_556.py pins PINNED_STEP =
-        # "Draft admission skip (#9821)" and its gates find a draft-skipped leg by that name
-        # only; a rename here would let them count the leg green, so it fails in this repository.
-        names = [s["name"] for s in step_records()]
-        self.assertEqual(names.count(DRAFT_STEP), 1, "the check job must hold exactly one %r step" % DRAFT_STEP)
-        self.assertEqual(DRAFT_STEP, "Draft admission skip (#9821)")
+    def test_skip_step_pin_name_and_exit_in_one_place(self):
+        # Vote DSP2 A-4 (3-agent vote 71472661).  The agent-skills gates find a draft-skipped
+        # leg by this exact step name only (SKIP_STEP_NAME, draft_skip.py); a rename here would
+        # let them count the leg green, so it goes red in this repository.  The exit line is
+        # the primary control: the run block ends in SKIP_EXIT_LINE with the one pinned ::error::.
+        name_lines = [l for l in workflow_lines() if SKIP_STEP_NAME in l and not l.lstrip().startswith("#")]
+        self.assertEqual(len(name_lines), 1, "the workflow must name %r on exactly one non-comment line" % SKIP_STEP_NAME)
+        found = [s for s in step_records() if s["name"] == SKIP_STEP_NAME]
+        self.assertEqual(len(found), 1, "the check job must hold exactly one %r step" % SKIP_STEP_NAME)
+        self.assertIsNotNone(found[0]["run"], "the skip step must have a run block")
+        run_lines = [l.strip() for l in found[0]["run"].splitlines() if l.strip()]
+        self.assertEqual(run_lines[-1], SKIP_EXIT_LINE, "the skip step run block must end in %r" % SKIP_EXIT_LINE)
+        self.assertEqual(run_lines.count(SKIP_EXIT_LINE), 1)
+        self.assertEqual([l for l in run_lines if "::error::" in l], ['echo "%s"' % DRAFT_ERROR])
+
+    def test_skip_step_jobs_are_exactly_the_expected_list(self):
+        # Vote DSP2 A-5 (3-agent vote 71472661): a job that gains the skip step without being in
+        # EXPECTED_SKIP_JOBS goes red, and so does a listed job that loses it.
+        self.assertEqual(jobs_with_skip_step(), EXPECTED_SKIP_JOBS)
+
+    def test_only_the_expected_steps_lack_the_leg_skip_guard(self):
+        # Vote DSP2 A-5: in every job with the skip step, the steps without the LEG_SKIP guard are
+        # exactly EXPECTED_UNGUARDED.  The agent-skills tools hold a success-concluding skip leg only
+        # by the step name and only while no second unguarded step runs (900 real jobs: no step
+        # count separates a draft-skipped leg from a ready cargo_skip leg).
+        for job in EXPECTED_SKIP_JOBS:
+            with self.subTest(job=job):
+                self.assertEqual(unguarded_step_names(job_block(job)), EXPECTED_UNGUARDED)
+
+    def test_the_two_other_unguarded_steps_cannot_run_beside_the_skip_leg(self):
+        # Vote DSP2 A-5: the fork refusal fails the leg (run block ends in SKIP_EXIT_LINE) and the
+        # cargo_skip short-circuit runs only when cargo_skip == 'true', the complement of the skip
+        # step's guard, so a leg never runs both and a leg the skip step runs never reports success.
+        for job in EXPECTED_SKIP_JOBS:
+            records = {s["name"]: s for s in step_records(job_block(job))}
+            with self.subTest(job=job):
+                fork_run = [l.strip() for l in records[FORK_STEP]["run"].splitlines() if l.strip()]
+                self.assertEqual(fork_run[-1], SKIP_EXIT_LINE)
+                self.assertEqual(records[CARGO_SKIP_STEP]["if"], CARGO_SKIP_ONLY_IF)
+                self.assertTrue(records[SKIP_STEP_NAME]["if"].startswith(CARGO_GUARD + " && "))
+
+    def test_guard_classifier_fails_closed(self):
+        # Hand-written table: (if expression, counts as guarded).  Only SKIP_GUARD as a whole
+        # top-level && conjunct guards; every form the classifier cannot read, or that can let the step run
+        # on a skipped leg, is unguarded.
+        rows = [
+            (SKIP_GUARD, True),
+            ("%s && %s" % (CARGO_GUARD, SKIP_GUARD), True),
+            ("%s && runner.environment == 'self-hosted' && %s" % (CARGO_GUARD, SKIP_GUARD), True),
+            ("always() && %s && %s" % (CARGO_GUARD, SKIP_GUARD), True),
+            ("always() && (a == 'b' || c == 'd') && %s" % SKIP_GUARD, True),  # a || inside parentheses
+            (None, False),
+            ("", False),
+            (CARGO_GUARD, False),
+            ("always()", False),
+            ("%s && always()" % CARGO_GUARD, False),
+            ("%s || always()" % SKIP_GUARD, False),
+            ("%s || true" % SKIP_GUARD, False),
+            ("%s && %s || true" % (CARGO_GUARD, SKIP_GUARD), False),
+            ("(%s)" % SKIP_GUARD, False),  # parenthesised: not a whole conjunct, so unguarded (fail closed)
+            ("!%s" % SKIP_GUARD, False),
+            ("env.LEG_SKIP == 'true'", False),
+            ("env.LEG_SKIP != 'false'", False),
+            ("env.LEG_SKIP != 'true' || env.LEG_SKIP == 'true'", False),
+            ("%s && (%s" % (CARGO_GUARD, SKIP_GUARD), False),  # unbalanced
+            ("${{ %s }}" % SKIP_GUARD, False),  # does not tokenize
+            ("%s && " % SKIP_GUARD, False),  # empty conjunct
+            ("env.LEG_SKIP != 'true' @", False),  # does not tokenize
+        ]
+        for cond, guarded in rows:
+            with self.subTest(cond=cond):
+                self.assertEqual(has_leg_skip_guard(cond), guarded)
 
     def test_check_needs_only_classify(self):
         # security MEDIUM-1: no needs edge to a job that is not required.
