@@ -352,7 +352,7 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 # rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
-**AGE self-heal (#6161, #9927).** The helper restores AGE only when its
+**AGE self-heal (#6161).** Since #9927 the helper restores AGE only when its
 `MANIFEST_SOURCE_COMMIT` equals the SSOT `AGE_SOURCE_COMMIT`; any other pairing exits 2
 with nothing written. Its pins still name the node's earlier build until #9929 rebuilds
 AGE 1.7.0 at c6b043d on the node and re-pins `MANIFEST` and `MANIFEST_SOURCE_COMMIT`, so

@@ -104,6 +104,9 @@ HISTORY_PREFIXES = {
     "docs/v0.9.0/": "v0.9.0 epic and campaign records",
     "docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/": "dated campaign record",
     "docs/compliance/evidence/": "captured evidence of past certification runs",
+    "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md":
+        "frozen certification record: check-cert-expiry holds it byte-identical while VOID or EXPIRED (#6124); "
+        "the PG 19 tier enters it only through re-certification",
     "docs/release-v0.7.1.html": "v0.7.1 release page, history",
     "docs/whats-new-v063.html": "v0.6.3 release page, history",
     "docs/v070-changelog.html": "v0.7.0 changelog page, history",
@@ -130,6 +133,8 @@ REQUIRED_CERT_CONTEXT = "Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgve
 LINE_ALLOW = {
     ("tests/qual_10_module_size_ceiling.rs", "after the AGE-1.8.0 comment rewrite"): "dated ceiling-bump history (#3297)",
     ("changelog.d/3297.docs.md", "Re-verified on AGE **1.8.0**"): "records the tier #3297 was verified on",
+    ("changelog.d/9927.changed.md", "(1.8.0 reports as a tested non-canonical version)"):
+        "names how the earlier AGE build now reports, not a tier",
     # The required status-check context is byte-identical to branch protection;
     # it is renamed together with the protection change (#9591).
     **{(p, REQUIRED_CERT_CONTEXT): "required status-check context name; renamed with branch protection (#9591)"
@@ -154,8 +159,6 @@ LINE_ALLOW = {
     ("scripts/ci/ensure-age-extension.py", "# stock age.dylib 1.8.0, apache/age#2580"): "refused stock build (#8282)",
     ("scripts/ci/ensure-age-extension.py", 'REFUSED_REASON = "refused: stock apache/age 1.8.0'): "refused stock build (#8282)",
     # Markdown table rows cannot hold a region marker line; these rows are frozen dated records.
-    ("docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md", "| F9 — campaign docs on PG16/AGE1.6.0/pgvector0.8.4 vs certified PG18.4"):
-        "2026-08-13 finding register row, a frozen record",
     ("docs/compliance/v1.0.0-DECLARATION.md",
      "| `memory_recall` hot, keyword (depth 1) | PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.6 |"):
         "hash-pinned pre-registered v1.0.0 declaration (scripts/check-declaration-hash.sh D1); revised only after a miss",

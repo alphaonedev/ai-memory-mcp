@@ -11,7 +11,8 @@ tree-independent copy lives in a node-local directory with ``share/`` and
 AGE_SOURCE_COMMIT>``).
 
 The helper names no PostgreSQL major and no AGE version of its own (#9927).
-``--pg-config`` is required: it is the ``pg_config`` of the tier the leg
+``--pg-config`` (or a non-empty ``AI_MEMORY_CI_PG_CONFIG``, which the CI step
+exports) is required: it is the ``pg_config`` of the tier the leg
 connects to, and its ``--version`` must be the certified
 ``EXPECTED_PG_VERSION``.  ``psql`` defaults to ``pg_config --bindir``.  The
 certified values are read from the SSOT ``deploy/docker-1461/provision/lib.sh``
@@ -158,6 +159,9 @@ EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
 
 DEFAULT_URL_FILE = Path.home() / ".ai-memory-ci-fed-url"
+# The CI step exports the pg_config of the PostgreSQL tree it found here, so the helper call line that #6339
+# pins byte-for-byte stays unchanged (#9927).
+PG_CONFIG_ENV = "AI_MEMORY_CI_PG_CONFIG"
 AGE_DIR_PARENT = "pg-age-stack"  # the default --age-dir is ~/pg-age-stack/age-<version>-<commit[:8]>
 AGE_DIR_COMMIT_CHARS = 8
 # #9927: the certified pins come from the SSOT, never from this file.  Each key must be assigned exactly once
@@ -807,10 +811,16 @@ def parse_args(argv):
     p.add_argument("--url-file", type=Path, default=DEFAULT_URL_FILE, help="file holding the tier URL")
     p.add_argument("--age-dir", type=Path, default=None,
                    help="node-local AGE dir with share/ and lib/ (tests only; CI uses the SSOT-derived default)")
-    p.add_argument("--pg-config", required=True,
-                   help="pg_config of the tier the CI leg connects to (its --version must be the certified one)")
+    p.add_argument("--pg-config", default=None,
+                   help="pg_config of the tier the CI leg connects to (its --version must be the certified one); "
+                        f"default ${PG_CONFIG_ENV}, which the CI step exports so the pinned call line (#6339) is unchanged")
     p.add_argument("--psql", default=None, help="path to psql (default: pg_config --bindir)/psql")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not args.pg_config:
+        args.pg_config = os.environ.get(PG_CONFIG_ENV) or None
+    if not args.pg_config:
+        p.error(f"the following arguments are required: --pg-config (or a non-empty ${PG_CONFIG_ENV})")
+    return args
 
 
 def certified_pins(path=None):

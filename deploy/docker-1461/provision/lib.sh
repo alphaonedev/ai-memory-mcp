@@ -85,7 +85,7 @@ EMBED_MODEL_CONFIG_ID="${DOCKER_1461_EMBED_CONFIG_ID:-nomic_embed_v15}"
 # PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7. This block is the ONE
 # source of truth for it (operator orders c4f4d408 / 111f59db, 2026-11-22);
 # every Dockerfile, workflow, harness and doc takes the triple from here, and
-# scripts/ci/tests/test_certified_data_tier_pins.py fails CI on any drift.
+# the certified-data-tier pin ratchet (#9927) fails CI on any drift.
 #   1. PostgreSQL: the official image for the major (PG_BASE_IMAGE), server +
 #      client bumped to the EXACT pgdg minor (PG_APT_VERSION) via
 #      apt --only-upgrade (ABI-safe within the major).

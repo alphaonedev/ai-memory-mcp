@@ -1682,7 +1682,10 @@ jobs:
           # GITHUB_PATH (for LATER steps: the test run + the always() cleanup)
           # AND to THIS step's own PATH (GITHUB_PATH does not affect the current
           # step) so the CREATE DATABASE below can find psql.  pg_bin keeps the
-          # tree found: the AGE self-heal below is given its pg_config (#9927).
+          # tree found: the AGE self-heal below reads its pg_config from
+          # AI_MEMORY_CI_PG_CONFIG (empty when no PostgreSQL 19 tree was found,
+          # which the helper refuses with exit 2), so its pinned call line
+          # (#6339) is unchanged (#9927).
           pg_bin=""
           for d in /usr/lib/postgresql/19/bin /opt/aimem/pg19/bin; do
             if [ -d "$d" ]; then
@@ -1692,6 +1695,7 @@ jobs:
             fi
           done
           export PATH
+          export AI_MEMORY_CI_PG_CONFIG="${pg_bin:+$pg_bin/pg_config}"
           url_file="$HOME/.ai-memory-ci-fed-url"
           if [ ! -f "$url_file" ]; then
             echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not provisioned on this node"
@@ -1732,17 +1736,14 @@ jobs:
           # tier's PostgreSQL tree drops its files. Self-heal from the node-local
           # copy BEFORE CREATE EXTENSION (five sha256-pinned files only; its
           # one-line reason is on stderr). #9927: the helper names no PG tree of
-          # its own; it is given the pg_config of the tree found above, which must
-          # report the SSOT EXPECTED_PG_VERSION, and does nothing when the tier
-          # already offers the SSOT EXPECTED_AGE_VERSION.
+          # its own; it takes the pg_config of the tree found above from
+          # AI_MEMORY_CI_PG_CONFIG, which must report the SSOT
+          # EXPECTED_PG_VERSION, and does nothing when the tier already offers
+          # the SSOT EXPECTED_AGE_VERSION.
           # macos-fed only: the linux-fed path is unchanged.
           # python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.
           if [ "${CI_NODE:-}" = "macos-fed" ]; then
-            if [ -z "$pg_bin" ] || [ ! -x "$pg_bin/pg_config" ]; then
-              echo "::error::enterprise-fed leg on $RUNNER_NAME: no PostgreSQL 19 pg_config found (#9927, #9929)"
-              exit 1
-            fi
-            if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file" --pg-config "$pg_bin/pg_config"; then
+            if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then
               echo "::error::enterprise-fed leg on $RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"
               exit 1
             fi

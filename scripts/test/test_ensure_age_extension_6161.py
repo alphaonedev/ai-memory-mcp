@@ -1987,6 +1987,29 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertFalse((self.base / "psql.log").exists(), "psql ran without a pg_config")
         self.assert_nothing_installed()
 
+    def test_pg_config_is_read_from_the_ci_environment_9927(self):
+        # The CI step exports AI_MEMORY_CI_PG_CONFIG so the #6339-pinned call line carries no --pg-config; the
+        # variable is honoured (a missing path is refused exactly as on argv) and an empty one counts as unset.
+        argv = [sys.executable, "-I", str(SCRIPT), "--url-file", str(self.url_file), "--psql", str(self.psql),
+                "--age-dir", str(self.age)]
+        missing = self.base / "env-pg_config"
+        r = subprocess.run(argv, capture_output=True, text=True, check=False,
+                           env=dict(os.environ, AI_MEMORY_CI_PG_CONFIG=str(missing)))
+        self.assert_fails(r, 2, "pg_config --version could not run (FileNotFoundError)")
+        r = subprocess.run(argv, capture_output=True, text=True, check=False,
+                           env=dict(os.environ, AI_MEMORY_CI_PG_CONFIG=""))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("the following arguments are required: --pg-config", r.stderr)
+        self.assertFalse((self.base / "psql.log").exists(), "psql ran without a usable pg_config")
+        self.assert_nothing_installed()
+        # argv wins over the environment: a working certified pg_config in the variable does not rescue a
+        # missing one on argv.
+        r = subprocess.run(argv + ["--pg-config", str(missing)], capture_output=True, text=True, check=False,
+                           env=dict(os.environ, AI_MEMORY_CI_PG_CONFIG=str(self.pg_config)))
+        self.assert_fails(r, 2, "pg_config --version could not run (FileNotFoundError)")
+        self.assertFalse((self.base / "psql.log").exists(), "psql ran on the environment's pg_config")
+        self.assert_nothing_installed()
+
     def test_pg_config_that_cannot_run_is_refused_9927(self):
         self.pg_config = self.base / "no-such-pg_config"
         r = self.run_script()
