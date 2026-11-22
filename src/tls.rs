@@ -2118,8 +2118,7 @@ mod tests {
     #[test]
     fn peer_fingerprint_loader_degenerate_table_9954() {
         use pin_file_cases::{
-            CASE_ROWS, Expect, OVERSIZE_100K_BYTES, OVERSIZE_REFUSAL_CEILING, build_cases,
-            loader_verdict,
+            CASE_ROWS, OVERSIZE_100K_BYTES, OVERSIZE_REFUSAL_CEILING, build_cases, loader_verdict,
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let cases = build_cases(dir.path());
