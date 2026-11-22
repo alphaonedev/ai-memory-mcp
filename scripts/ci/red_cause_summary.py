@@ -26,10 +26,12 @@ The parser (#9831) reads libtest output in one pass, linear in the input, as a s
   `` - compile fail``, `` - compile`` removed); the result is the last column-0 ``test result:`` line, a FAILED
   one winning; a ``process didn't exit successfully`` line is the crash detail.
 * OPAQUE, from that ``failures:`` line on: the captured output of the failing tests and the failures list.  Nothing
-  in it is read as a name, a list, a section label, a ``Running`` line or a crash detail; only the LAST column-0
-  ``test result:`` line is kept, and it replaces the progress result when the section closes.  The region has no
-  exit inside the input (any "this line ends the capture" rule can be forged by the captured text itself), so it
-  runs to the end of the input file: a later section of the same file (``--no-fail-fast``) is not read.
+  in it is read as a name, a list, a section label, a ``Running`` line or a crash detail; only column-0 ``test
+  result:`` lines count, the last one kept with a FAILED one winning, and it replaces the progress result when the
+  section closes.  The region has no exit inside the input (any "this line ends the capture" rule can be forged by
+  the captured text itself), so it runs to the end of the input file: a later section of the same file
+  (``--no-fail-fast``) is not read (#9870).  A section line after a kept FAILED result of the region does end its
+  attribution: no later block's result line is ever this section's (#9870, the misattribution half).
 * At its close a section gives at most one binary row: a FAILED result commits the section's progress names and is
   the row; a FAILED result without a name is ``failed, names not available; <result line>``, and so is an ``ok``
   result inside OPAQUE (a failures block with a passing verdict); no result is ``ended without a test result line
@@ -534,8 +536,8 @@ class Findings:
 class Section:
     """One binary section of one file while it is parsed; every field holds the raw value."""
 
-    __slots__ = ("raw", "number", "label", "opaque", "result_raw", "failed", "opaque_result", "crash_raw",
-                 "crash_after_ok", "names")
+    __slots__ = ("raw", "number", "label", "opaque", "result_raw", "failed", "opaque_result", "opaque_closed",
+                 "crash_raw", "crash_after_ok", "names")
 
     def __init__(self, raw, number):
         self.raw = raw  # the section line (colour and trailing blanks removed)
@@ -545,6 +547,7 @@ class Section:
         self.result_raw = None  # the kept test result line
         self.failed = False  # the kept result line is FAILED
         self.opaque_result = False  # the kept result line came from the opaque region
+        self.opaque_closed = False  # a section line after a kept opaque FAILED result: later result lines are not ours
         self.crash_raw = None  # the crash detail: the first before any result, or the first after a passing one
         self.crash_after_ok = False
         self.names = []  # the progress lines of failing tests, whole
@@ -605,7 +608,14 @@ def parse_data(data, findings):
         if section is not None and section.opaque:
             # The captured output and the failures list: only result lines count, nothing else is read.  A FAILED
             # one is kept over any later passing one (as before the header), so no line here turns a red section green.
-            if line.startswith(RESULT_PREFIX) and (line.startswith(RESULT_FAILED_PREFIX) or not section.failed):
+            # A section line after a kept FAILED result of this region starts a later block of a --no-fail-fast log:
+            # no result line after it is this section's (#9870; its rows stay unread here).  Before that a section
+            # line is captured output, so it closes nothing and cannot drop the section's own FAILED result (a forged
+            # passing result before it would otherwise hide the own one and drop the failing names).
+            if section.opaque_result and section.failed and is_section_line(line):
+                section.opaque_closed = True
+            elif (not section.opaque_closed and line.startswith(RESULT_PREFIX)
+                  and (line.startswith(RESULT_FAILED_PREFIX) or not section.failed)):
                 section.result_raw = line
                 section.failed = line.startswith(RESULT_FAILED_PREFIX)
                 section.opaque_result = True

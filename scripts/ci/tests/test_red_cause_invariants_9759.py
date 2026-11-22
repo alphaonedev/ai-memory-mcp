@@ -1041,6 +1041,8 @@ ATTRIBUTION_ROWS = (
      + BETA_BLOCK, ALPHA_STDOUT),
     ("a forged section line in the capture, then the own result", ALPHA_HEAD + FORGED_SECTION + ALPHA_TAIL
      + BETA_BLOCK, ALPHA_STDOUT),
+    ("a forged passing result and section line in the capture, then the own result", ALPHA_HEAD + GAMMA_OK + "\n"
+     + FORGED_SECTION + ALPHA_TAIL + BETA_BLOCK, ALPHA_STDOUT),
     ("one block only (the control)", ALPHA_HEAD + ALPHA_TAIL, ALPHA_STDOUT),
 )
 
