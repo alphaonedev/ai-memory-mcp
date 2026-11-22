@@ -24,13 +24,16 @@ Invariant, for every file in scope, at any depth (a function, a ``try`` / ``exce
    ``<non-literal NAME()>``.
 4. no tracked module or package directory under ``scripts`` has a standard-library name or a name in
    ``THIRD_PARTY_NAMES`` (a planted ``yaml.py`` would make ``import yaml`` resolve to the repository).
+5. any read of one of those six callables that is not the callee of a call (``e = exec``, ``f = importlib.import_module``,
+   passing ``__import__`` as an argument, putting it in a list) is the finding ``<aliased NAME>`` at the read's line:
+   what the value is later called with cannot be decided, so the escape itself is refused (PR 9817 L3).
 
 Every finding names ``file:line`` and the module or the marker. ``THIRD_PARTY_ALLOW`` rows name a file, a module or
 marker, the exact number of findings it covers, a reason and an issue; a row that matches no finding, or a
 different number of findings, is a failure. ``SHADOW_ALLOW`` rows work the same way for rule 4.
 
-Forms the AST cannot decide, and so not covered by this check: a callee reached through ``getattr``,
-``globals()``, ``vars()`` or ``sys.modules``; ``importlib.util.spec_from_file_location`` / a loader on a path (it
+Forms the AST cannot decide, and so not covered by this check: a callee reached through a string (``getattr``,
+``globals()``, ``vars()``, ``sys.modules``, ``operator.attrgetter``); ``importlib.util.spec_from_file_location`` / a loader on a path (it
 loads a file, not a module name); ``compile()`` output passed on through a variable (rule 3 reports the call as
 non-literal, not what the text imports); text run in a child process (``python -c``, ``subprocess``); ``pkgutil``,
 ``zipimport``, ``.pth`` files, ``PYTHONPATH`` and ``sys.path`` entries other than the import roots above;
@@ -70,6 +73,7 @@ CODE_CALLS = frozenset({"exec", "eval"})
 ALIAS_SOURCES = frozenset({"importlib", "importlib.util", "runpy", "builtins"})
 NONLITERAL = "<non-literal %s()>"
 UNPARSABLE = "<unparsable %s() text>"
+ALIASED = "<aliased %s>"
 
 # Import names of third-party distributions a fleet script could reach for. Rule 4 refuses a repository module
 # or package directory of any of these names. Hand-written; not derived from the running interpreter.
@@ -97,9 +101,6 @@ THIRD_PARTY_ALLOW: dict[tuple[str, str], tuple[int, str, int]] = {
     ("scripts/test/test_workflow_edited_cancel_8332.py", "yaml"): (
         4, "the two PyYAML differential-oracle cells (find_spec skip guard and the import inside each cell); the "
            "cells skip where PyYAML is absent and compare the scanner with PyYAML where it is present", 8332),
-    ("scripts/ci/tests/test_ci_tainted_job_boundary.py", "yaml"): (
-        2, "oracle two: the PyYAML full-document compare (find_spec and the import inside the cell); it fails loudly "
-           "on build-script-vetting and skips with its reason elsewhere", 9813),
     ("scripts/ci/prune_runner_tmp.py", NONLITERAL % "exec"): (
         1, "runs the shared module's source, read from its repository file", 9813),
     ("scripts/ci/tests/test_ci_base_selector_8240.py", NONLITERAL % "exec"): (
@@ -227,6 +228,7 @@ def _aliases(tree: ast.AST) -> dict[str, str]:
 def _findings(tree: ast.AST, local: frozenset[str], at_line: int | None) -> list[tuple[int, str]]:
     aliases = _aliases(tree)
     found: list[tuple[int, str]] = []
+    callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
     def check(line: int, module: str) -> None:
         if not module or module.startswith("."):
@@ -242,6 +244,11 @@ def _findings(tree: ast.AST, local: frozenset[str], at_line: int | None) -> list
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0 and node.module:
                 check(node.lineno, node.module)
+        elif isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load) \
+                and id(node) not in callees:
+            name = _callee(node, aliases)
+            if name in IMPORT_CALLS or name in CODE_CALLS:
+                found.append((at_line or node.lineno, ALIASED % name))  # rule 5: the callable escapes as a value
         elif isinstance(node, ast.Call):
             name = _callee(node.func, aliases)
             if name not in IMPORT_CALLS and name not in CODE_CALLS:
@@ -395,6 +402,47 @@ class ForeignImportDetector(unittest.TestCase):
         for name, (source, expected) in forms.items():
             with self.subTest(form=name):
                 self.assertEqual(found(source), expected)
+
+    def test_9817_l3_each_aliased_dynamic_import_callable_is_found_with_its_line(self) -> None:
+        """PR 9817 L3, rule 5: a dynamic-import or code callable read as a value (not called) is refused at the read;
+        the later call through the alias is not decidable. One row per form; each expected row is written out."""
+        forms = {
+            "exec_alias": ("e = exec\ne('import yaml')\n", [(1, "<aliased exec>")]),
+            "eval_alias": ("v = eval\nv(\"__import__('yaml')\")\n", [(1, "<aliased eval>")]),
+            "dunder_import_alias": ("i = __import__\ni('yaml')\n", [(1, "<aliased __import__>")]),
+            "import_module_attr_alias": ("import importlib\nf = importlib.import_module\nf('yaml')\n",
+                                         [(2, "<aliased import_module>")]),
+            "import_module_from_alias": ("from importlib import import_module as im\nf = im\nf('yaml')\n",
+                                         [(2, "<aliased import_module>")]),
+            "find_spec_attr_alias": ("import importlib.util\nf = importlib.util.find_spec\nf('yaml')\n",
+                                     [(2, "<aliased find_spec>")]),
+            "run_module_attr_alias": ("import runpy\nr = runpy.run_module\nr('yaml')\n",
+                                      [(2, "<aliased run_module>")]),
+            "builtins_exec_alias": ("import builtins\ne = builtins.exec\ne('import yaml')\n", [(2, "<aliased exec>")]),
+            "passed_as_argument": ("def g(h):\n    h('import yaml')\ng(exec)\n", [(3, "<aliased exec>")]),
+            "in_container": ("fs = [__import__]\nfs[0]('yaml')\n", [(1, "<aliased __import__>")]),
+            "tuple_unpack": ("a, b = print, exec\nb('import yaml')\n", [(1, "<aliased exec>")]),
+            "walrus": ("(e := exec)('import yaml')\n", [(1, "<aliased exec>")]),
+            "lambda_body": ("f = lambda: eval\n", [(1, "<aliased eval>")]),
+            "inside_exec_text": ("exec('e = exec')\n", [(1, "<aliased exec>")]),
+        }
+        for name, (source, expected) in forms.items():
+            with self.subTest(form=name):
+                self.assertEqual(found(source), expected)
+
+    def test_9817_l3_a_direct_call_and_a_definition_are_not_aliases(self) -> None:
+        """The callee of a call stays under rules 2-3, and a name that is only defined (a function or a parameter
+        named exec) or an unrelated attribute (``spec.loader.exec_module``) is no finding."""
+        clean = {
+            "direct_call": "exec('import os')\n",
+            "attr_call": "import importlib\nimportlib.import_module('os')\n",
+            "def_named_exec": "def exec_step():\n    return 1\n",
+            "exec_module": "spec.loader.exec_module(module)\n",
+            "keyword_name": "run(mode='exec')\n",
+        }
+        for name, source in clean.items():
+            with self.subTest(form=name):
+                self.assertEqual(found(source), [])
 
     def test_9813_stdlib_relative_and_repository_imports_are_allowed(self) -> None:
         allowed = {
