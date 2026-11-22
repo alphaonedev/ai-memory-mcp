@@ -129,7 +129,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 fi
 
 echo "[mesh] binary: $("$BINARY" --version)"
-"${REPO}/scripts/bench/host-facts.sh" >"${OUT_DIR}/host-facts.json"
+"${REPO}/scripts/bench/host-facts.py" >"${OUT_DIR}/host-facts.json"
 
 for N in $STEPS; do
   RUNG_DIR="${OUT_DIR}/N${N}"

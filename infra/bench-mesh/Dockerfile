@@ -11,7 +11,7 @@
 # byte-identically by every node — otherwise "the ramp" would be measuring
 # a set of binaries rather than a set of mesh sizes. The host build is
 # also the binary whose CPU / RAM / storage facts the results doc cites
-# (`scripts/bench/host-facts.sh`), so baking a second, differently-built
+# (`scripts/bench/host-facts.py`), so baking a second, differently-built
 # binary into the image would break the "every number carries its
 # producer + hardware" discipline this whole issue exists to restore
 # (docs/enterprise-deployment.md §11.1).

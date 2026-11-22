@@ -43,46 +43,108 @@ import time
 from pathlib import Path
 
 
-def _load_workflow_annotation():
-    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
-    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
-    import importlib.util
+# >>> sibling-load 9399 (canonical text; scripts/ci/sibling_load.py; test_sibling_load_9399 pins every copy)
+class SiblingLoadError(ImportError):
+    """A refused sibling load; ``reason`` is one of the fixed words the refusal line prints."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _sibling_path(filename):
     import os
-    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
-    loaded = sys.modules.get("workflow_annotation")
-    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
-        module = loaded
-    else:
-        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
-    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
-    if missing:
-        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
-    if loaded is None:
-        sys.modules["workflow_annotation"] = module
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), filename)
+
+
+def _load_sibling(filename, module_name):
+    import os
+    import stat
+    import sys
+    import types
+    here = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.realpath(os.path.join(here, filename))
+    if os.path.commonpath([here, path]) != here:
+        raise SiblingLoadError("symlink leaves the script folder")
+    loaded = sys.modules.get(module_name)
+    if loaded is not None:
+        if os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+            return loaded
+        raise SiblingLoadError("module name taken")
+    # The checked path is opened by descriptor, one component at a time from the script folder, never following a
+    # symlink: the object read is the object checked, even when a folder is swapped after the check.
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    parts = os.path.relpath(path, here).split(os.sep)
+    fds = []
+    try:
+        try:
+            fds.append(os.open(here, dir_flags))
+            for part in parts[:-1]:
+                fds.append(os.open(part, dir_flags, dir_fd=fds[-1]))
+            fds.append(os.open(parts[-1], os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0), dir_fd=fds[-1]))
+        except FileNotFoundError:
+            raise SiblingLoadError("absent") from None
+        except OSError:
+            raise SiblingLoadError("unreadable") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fds[-1]).st_mode):
+                raise SiblingLoadError("not a regular file")
+            with os.fdopen(fds[-1], "rb", closefd=False) as handle:
+                source = handle.read()
+        except OSError:
+            raise SiblingLoadError("unreadable") from None
+    finally:
+        for fd in fds:
+            os.close(fd)
+    if not source:
+        raise SiblingLoadError("empty")
+    module = types.ModuleType(module_name)
+    module.__file__ = path
+    saved_path = list(sys.path)
+    sys.modules[module_name] = module
+    try:
+        exec(compile(source, path, "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    finally:
+        sys.path[:] = saved_path
     return module
 
 
-# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
-WA_PROG = "sccache_env"
-WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("env_file_value", "log_line")
-WA_EXIT_LOAD_REFUSED = 5  # a failed shared-module load (2 usage, 3 sccache missing, 4 wrong cache)
-WA_ERROR_TO_STDERR = False
+def _sibling_refusal(prog, filename, exc):
+    import sys
+    why = exc.reason if isinstance(exc, SiblingLoadError) else type(exc).__name__
+    if not why.replace(" ", "_").isidentifier():
+        why = "BaseException"
+    # The path comes from the checkout, so a control character in a folder name must not start a second output line
+    # (a runner reads workflow commands at a line start): every non-printable character is written as its escape.
+    shown = "".join(ch if ch.isprintable() else ascii(ch)[1:-1] for ch in _sibling_path(filename))
+    print("%s: refused: sibling module %s at %s cannot be loaded (%s)" % (prog, filename, shown, why),
+          file=sys.stderr, flush=True)
+# <<< sibling-load 9399
+
+
+SIBLING_PROG = "sccache_env"
+SIBLING_EXIT_LOAD_REFUSED = 5
+
+WA_REQUIRED = ("env_file_value", "log_line")  # each must be a callable of workflow_annotation.py (#9365)
 
 try:
-    wa = _load_workflow_annotation()
-except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
-    wa_cause = type(exc).__name__
-    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
-          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
-    print("::error title=sccache_env refused::sccache_env: refused: shared module workflow_annotation.py"
-          " next to the script cannot be loaded",
-          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
-    sys.exit(WA_EXIT_LOAD_REFUSED)
+    wa = _load_sibling("workflow_annotation.py", "workflow_annotation")
+    for wa_name in WA_REQUIRED:
+        if not callable(getattr(wa, wa_name, None)):
+            raise AttributeError("workflow_annotation.py lacks " + wa_name)
+except (Exception, SystemExit) as exc:  # any failed load ends here with one fixed line (#9399)
+    _sibling_refusal(SIBLING_PROG, "workflow_annotation.py", exc)
+    sys.exit(SIBLING_EXIT_LOAD_REFUSED)
 
-import shared_cargo_target as shared  # noqa: E402  (after the load try: a failed load ends here first, #9365)
+try:
+    shared = _load_sibling("shared_cargo_target.py", "shared_cargo_target")
+except (Exception, SystemExit) as exc:  # any failed load ends here with one fixed line (#9399)
+    _sibling_refusal(SIBLING_PROG, "shared_cargo_target.py", exc)
+    sys.exit(SIBLING_EXIT_LOAD_REFUSED)
 
 SCCACHE_BINARY = "sccache"
 CACHE_ROOT_RELATIVE = shared.TARGET_ROOT_RELATIVE.parent

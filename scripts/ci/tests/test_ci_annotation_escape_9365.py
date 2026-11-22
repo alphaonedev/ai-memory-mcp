@@ -1488,6 +1488,16 @@ NON_GATE_LOAD_EXIT_CODES = {
     # 0 ok, 2 usage or a refused home. BASE; a missing attribute gave rc 1 "AttributeError: module
     # 'workflow_annotation' has no attribute 'env_file_value'" AFTER it had created the target directories
     "scripts/ci/shared_cargo_target.py": 3,
+    # 0 ok, 2 usage, 3 mint, 143 terminated, 124/137 the watchdog (ci.yml), else cargo's own code (101, 1, 128+n);
+    # the load runs before any child, so 4 is never a cargo code here. Not BASE: the load was lazy (_wa() :152-172), so
+    # this cell gave rc 2 "pg_isolated_binary: set AI_MEMORY_TEST_POSTGRES_URL (or pass --url for local admin use)"
+    # for every kind; a failed load surfaced only at the first annotation, by traceback or a silent sys.exit(0)
+    "scripts/test/pg_isolated_binary.py": 4,
+}
+# The 3 scripts that load the shared module through the #9399 sibling loader (one checked loader per file): a failed
+# load of any kind ends the process with the same exit code as before and ONE fixed line on stderr, nothing on stdout
+# ("<prog>: refused: sibling module workflow_annotation.py at <path> cannot be loaded (<reason>)").
+SIBLING_LOADER_EXIT_CODES = {
     # 0 ok, 2 usage, 3 sccache missing, 4 wrong cache. BASE; a missing attribute RAN sccache from PATH, then rc 4
     # "sccache_env: sccache --show-stats names no cache location (port 4227); refusing"
     "scripts/ci/sccache_env.py": 5,
@@ -1498,11 +1508,16 @@ NON_GATE_LOAD_EXIT_CODES = {
     # 0 ok, 2 usage. BASE; a missing attribute gave rc 1
     # "AttributeError: module 'workflow_annotation' has no attribute 'log_line'"
     "scripts/ci/prune_runner_artifacts.py": 3,
-    # 0 ok, 2 usage, 3 mint, 143 terminated, 124/137 the watchdog (ci.yml), else cargo's own code (101, 1, 128+n);
-    # the load runs before any child, so 4 is never a cargo code here. Not BASE: the load was lazy (_wa() :152-172), so
-    # this cell gave rc 2 "pg_isolated_binary: set AI_MEMORY_TEST_POSTGRES_URL (or pass --url for local admin use)"
-    # for every kind; a failed load surfaced only at the first annotation, by traceback or a silent sys.exit(0)
-    "scripts/test/pg_isolated_binary.py": 4,
+}
+SIBLING_LOADER_LINE = "{prog}: refused: sibling module {filename} at {path} cannot be loaded ({reason})"
+SIBLING_LOADER_REASONS = {  # failure kind -> the fixed reason word of the #9399 loader, written out by hand
+    "absent": "absent",
+    "unreadable": "unreadable",
+    "syntax error": "SyntaxError",
+    "raises at load": "RuntimeError",
+    "sys.exit(0) at load": "SystemExit",
+    "sys.exit(3) at load": "SystemExit",
+    "required attribute missing": "AttributeError",
 }
 # setup --emit-env sends stdout into $GITHUB_ENV: the refusal goes to stderr there, never into the env file
 SIBLING_LOAD_ERROR_TO_STDERR = frozenset({"scripts/test/pg_isolated_binary.py"})
@@ -1525,9 +1540,22 @@ WORK_BUILD_JSON_LINE = ('{"reason": "compiler-artifact", "executable": "/fx/deps
 WORK_SWEEP_CAP_BYTES = "1"  # below the 5-byte canary: a sweep that runs removes it
 
 
-def sibling_load_lines(rel, cause):
-    """(stdout, stderr) a failed load of ``rel`` must print: the cause line, then the one fixed ::error line."""
+def load_exit_code(rel):
+    """The exit code a failed shared-module load of ``rel`` must end with (one table per load shape)."""
+    for table in (GATE_LOAD_EXIT_CODES, NON_GATE_LOAD_EXIT_CODES, SIBLING_LOADER_EXIT_CODES):
+        if rel in table:
+            return table[rel]
+    return None
+
+
+def sibling_load_lines(rel, cause, base=None):
+    """(stdout, stderr) a failed load of ``rel`` must print: the cause line, then the one fixed ::error line; for a
+    script on the #9399 loader, nothing on stdout and its one refusal line (``base`` is the fixture root)."""
     prog = Path(rel).stem
+    if rel in SIBLING_LOADER_EXIT_CODES:
+        folder = os.path.realpath(str(base / "repo" / Path(rel).parent))
+        return "", SIBLING_LOADER_LINE.format(prog=prog, filename=SHARED_MODULE_NAME,
+                                              path=os.path.join(folder, SHARED_MODULE_NAME), reason=cause) + "\n"
     cause_line = GATE_LOAD_STDERR_LINE.format(prog=prog, cause=cause) + "\n"
     error_line = GATE_LOAD_ERROR_LINE.format(prog=prog) + "\n"
     if rel in SIBLING_LOAD_ERROR_TO_STDERR:
@@ -1608,9 +1636,11 @@ class SiblingLoadFailsClosed(unittest.TestCase):
         base = scratch_dir("sibling-fail-closed")
         self.addCleanup(shutil.rmtree, str(base), True)
         source, cause = SIBLING_LOAD_BREAKS[kind]
+        if rel in SIBLING_LOADER_EXIT_CODES:
+            cause = SIBLING_LOADER_REASONS[kind]
         rc, out, err, before, after = sibling_load_run(base, rel, source, flags)
-        want_out, want_err = sibling_load_lines(rel, cause)
-        code = NON_GATE_LOAD_EXIT_CODES.get(rel, GATE_LOAD_EXIT_CODES.get(rel))
+        want_out, want_err = sibling_load_lines(rel, cause, base)
+        code = load_exit_code(rel)
         self.assertNotEqual(rc, EXIT_OK_CODE, (out, err[-2000:]))
         self.assertEqual(rc, code, err[-2000:])
         self.assertEqual(out, want_out)
@@ -1620,8 +1650,20 @@ class SiblingLoadFailsClosed(unittest.TestCase):
     def test_failed_load_of_any_kind_fails_each_sibling_closed_9365(self):
         if os.geteuid() == 0:
             self.skipTest("root reads a mode-0 file")
-        self.assertEqual(len(NON_GATE_LOAD_EXIT_CODES), 8)
+        self.assertEqual(len(NON_GATE_LOAD_EXIT_CODES), 5)
         for rel in NON_GATE_LOAD_EXIT_CODES:
+            for kind in SIBLING_LOAD_BREAKS:
+                for label, flags in PYTHON_FLAG_SETS:
+                    with self.subTest(script=rel, kind=kind, flags=label):
+                        self.cell(rel, kind, flags)
+
+    def test_failed_load_through_the_sibling_loader_fails_closed_9399(self):
+        """The 3 scripts on the #9399 loader: every kind, every flag set, the same exit code, one refusal line."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        self.assertEqual(len(SIBLING_LOADER_EXIT_CODES), 3)
+        self.assertEqual(set(SIBLING_LOADER_REASONS), set(SIBLING_LOAD_BREAKS))
+        for rel in SIBLING_LOADER_EXIT_CODES:
             for kind in SIBLING_LOAD_BREAKS:
                 for label, flags in PYTHON_FLAG_SETS:
                     with self.subTest(script=rel, kind=kind, flags=label):
@@ -1639,14 +1681,13 @@ class SiblingLoadFailsClosed(unittest.TestCase):
 
     def test_a_hostile_exception_name_never_reaches_a_line_start_9365(self):
         """An exception class named with a newline and '::error::' is named as BaseException, never printed."""
-        for rel in (*GATE_LOAD_EXIT_CODES, *NON_GATE_LOAD_EXIT_CODES):
+        for rel in (*GATE_LOAD_EXIT_CODES, *NON_GATE_LOAD_EXIT_CODES, *SIBLING_LOADER_EXIT_CODES):
             with self.subTest(script=rel):
                 base = scratch_dir("sibling-hostile-cause")
                 self.addCleanup(shutil.rmtree, str(base), True)
                 rc, out, err, before, after = sibling_load_run(base, rel, HOSTILE_CAUSE_SOURCE, ())
-                want_out, want_err = sibling_load_lines(rel, FALLBACK_CAUSE)
-                self.assertEqual((rc, out, err), (NON_GATE_LOAD_EXIT_CODES.get(rel, GATE_LOAD_EXIT_CODES.get(rel)),
-                                                  want_out, want_err))
+                want_out, want_err = sibling_load_lines(rel, FALLBACK_CAUSE, base)
+                self.assertEqual((rc, out, err), (load_exit_code(rel), want_out, want_err))
                 self.assertEqual(after, before)
 
 
@@ -1766,6 +1807,117 @@ def _is_load_try(node):
             and node.body[0].value.func.id == LOADER_NAME)
 
 
+# The second accepted shape (#9399): the script embeds the one checked sibling loader (its text pinned byte for byte by
+# test_sibling_load_9399) and loads the shared module through it in exactly this try, with WA_REQUIRED, SIBLING_PROG
+# and SIBLING_EXIT_LOAD_REFUSED set before it. A script holds one shape or the other, never both.
+SIBLING_LOADER_NAME = "_load_sibling"
+SIBLING_LOADER_CANON_REL = "scripts/ci/sibling_load.py"
+SIBLING_LOADER_DEFS = ("SiblingLoadError", "_sibling_path", SIBLING_LOADER_NAME, "_sibling_refusal")
+SIBLING_SETTINGS = ("WA_REQUIRED", "SIBLING_PROG", "SIBLING_EXIT_LOAD_REFUSED")
+CANONICAL_SIBLING_TRY_SOURCE = textwrap.dedent('''\
+    try:
+        wa = _load_sibling("workflow_annotation.py", "workflow_annotation")
+        for wa_name in WA_REQUIRED:
+            if not callable(getattr(wa, wa_name, None)):
+                raise AttributeError("workflow_annotation.py lacks " + wa_name)
+    except (Exception, SystemExit) as exc:
+        _sibling_refusal(SIBLING_PROG, "workflow_annotation.py", exc)
+        sys.exit(SIBLING_EXIT_LOAD_REFUSED)
+    ''')
+
+
+def _sibling_load_calls(node):
+    """Every ``_load_sibling(...)`` call under ``node``."""
+    return [inner for inner in ast.walk(node) if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+            and inner.func.id == SIBLING_LOADER_NAME]
+
+
+def _is_sibling_wa_try(node):
+    return isinstance(node, ast.Try) and any(
+        call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value == SHARED_MODULE_NAME
+        for call in _sibling_load_calls(ast.Module(body=node.body, type_ignores=[])))
+
+
+def _before_anchor_problems(rel, tree, anchor, what, exempt=()):
+    """A non-stdlib import or a sys.path use in the module body before ``anchor`` (``exempt``: top-level nodes already
+    proven equal to the canonical loader, whose sys.path save and restore is part of the checked text)."""
+    problems = []
+    for node in tree.body[:tree.body.index(anchor)]:
+        if any(node is kept for kept in exempt):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Import):
+                modules = [alias.name for alias in inner.names]
+            elif isinstance(inner, ast.ImportFrom):
+                modules = [inner.module or ""]
+            else:
+                modules = []
+            for module in modules:
+                if module.split(".")[0] not in sys.stdlib_module_names and module != "__future__":
+                    problems.append(f"{rel}:{inner.lineno}: imports {module} before {what}")
+            if (isinstance(inner, ast.Attribute) and inner.attr == "path" and isinstance(inner.value, ast.Name)
+                    and inner.value.id == "sys"):
+                problems.append(f"{rel}:{inner.lineno}: uses sys.path before {what}")
+    return problems
+
+
+def sibling_shape_violations(rel, tree, references):
+    """Every way a script on the #9399 loader departs from the second accepted shape."""
+    problems, verified = [], []
+    canon = ast.parse((REPO / SIBLING_LOADER_CANON_REL).read_text(encoding="utf-8"))
+    canon_defs = {node.name: ast.dump(node) for node in canon.body
+                  if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in SIBLING_LOADER_DEFS}
+    for name in SIBLING_LOADER_DEFS:
+        found = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == name]
+        if len(found) != 1:
+            problems.append(f"{rel}: {len(found)} module-level {name} definitions (want 1)")
+        elif ast.dump(found[0]) != canon_defs.get(name):
+            problems.append(f"{rel}:{found[0].lineno}: {name} differs from {SIBLING_LOADER_CANON_REL}")
+        else:
+            verified.append(found[0])
+    tries = [node for node in tree.body if _is_sibling_wa_try(node)]
+    if len(tries) != 1:
+        problems.append(f"{rel}: {len(tries)} module-level sibling load try blocks of {SHARED_MODULE_NAME} (want 1)")
+        return problems
+    load_try = tries[0]
+    if ast.dump(load_try) != ast.dump(ast.parse(CANONICAL_SIBLING_TRY_SOURCE).body[0]):
+        problems.append(f"{rel}:{load_try.lineno}: the sibling load try differs from the canonical one")
+    settings = {}
+    for node in tree.body[:tree.body.index(load_try)]:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            settings[node.targets[0].id] = node.value
+        for call in _sibling_load_calls(node):
+            problems.append(f"{rel}:{call.lineno}: loads a sibling before {SHARED_MODULE_NAME}")
+    for name in SIBLING_SETTINGS:
+        if name not in settings:
+            problems.append(f"{rel}: {name} is not set before the sibling load try")
+    for name in WA_SETTINGS:
+        if name != "WA_REQUIRED" and any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(tree)):
+            problems.append(f"{rel}: {name} belongs to the first shape, not the sibling loader")
+    prog = settings.get("SIBLING_PROG")
+    if not (isinstance(prog, ast.Constant) and prog.value == Path(rel).stem):
+        problems.append(f"{rel}: SIBLING_PROG is not the literal {Path(rel).stem!r}")
+    code = settings.get("SIBLING_EXIT_LOAD_REFUSED")
+    if not (isinstance(code, ast.Constant) and type(code.value) is int
+            and code.value == SIBLING_LOADER_EXIT_CODES.get(rel)):
+        problems.append(f"{rel}: SIBLING_EXIT_LOAD_REFUSED is not the literal {SIBLING_LOADER_EXIT_CODES.get(rel)}")
+    required = settings.get("WA_REQUIRED")
+    names = ([elt.value for elt in required.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
+             if isinstance(required, ast.Tuple) else [])
+    if not names or len(names) != len(required.elts):
+        problems.append(f"{rel}: WA_REQUIRED is not a non-empty tuple of literal names")
+    used = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name) and node.value.id == "wa"}
+    if used - set(names):
+        problems.append(f"{rel}: wa.{', wa.'.join(sorted(used - set(names)))} not in WA_REQUIRED")
+    inside = {id(node) for node in ast.walk(load_try)}
+    for node in references:
+        if id(node) not in inside:
+            problems.append(f"{rel}:{node.lineno}: references the shared module outside the sibling load try")
+    problems += _before_anchor_problems(rel, tree, load_try, "the sibling load try", verified)
+    return problems
+
+
 def loader_shape_violations(rel, source):
     """Every way ``source`` (at scripts-relative ``rel``) departs from the one shape; [] when it conforms or never
     references the shared module."""
@@ -1777,6 +1929,11 @@ def loader_shape_violations(rel, source):
         references = references_outside_exception_text(references, LOADER_SHAPE_EXCEPTION_TEXTS[rel])
     if not references:
         return []
+    if rel in SIBLING_LOADER_EXIT_CODES:
+        problems = sibling_shape_violations(rel, tree, references)
+        if any(isinstance(node, ast.FunctionDef) and node.name == LOADER_NAME for node in ast.walk(tree)):
+            problems.append(f"{rel}: defines {LOADER_NAME} next to the sibling loader (one loader per file)")
+        return problems
     problems = []
     canonical_def, canonical_try = _canonical_nodes()
     defs = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == LOADER_NAME]
@@ -1863,20 +2020,7 @@ def loader_shape_violations(rel, source):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == LOADER_NAME
                 and id(node) not in inside):
             problems.append(f"{rel}:{node.lineno}: calls {LOADER_NAME} outside the load try")
-    for node in tree.body[:tree.body.index(anchor)]:
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Import):
-                modules = [alias.name for alias in inner.names]
-            elif isinstance(inner, ast.ImportFrom):
-                modules = [inner.module or ""]
-            else:
-                modules = []
-            for module in modules:
-                if module.split(".")[0] not in sys.stdlib_module_names and module != "__future__":
-                    problems.append(f"{rel}:{inner.lineno}: imports {module} before the load try")
-            if (isinstance(inner, ast.Attribute) and inner.attr == "path" and isinstance(inner.value, ast.Name)
-                    and inner.value.id == "sys"):
-                problems.append(f"{rel}:{inner.lineno}: uses sys.path before the load try")
+    problems += _before_anchor_problems(rel, tree, anchor, "the load try")
     return problems
 
 
@@ -1899,7 +2043,42 @@ class LoaderShape(unittest.TestCase):
             if not found and shared_module_references(ast.parse(source)) and rel not in LOADER_SHAPE_EXCEPTIONS:
                 conforming.add(rel)
         self.assertEqual(problems, [])
-        self.assertEqual(conforming, set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT_CODES))
+        self.assertEqual(conforming, set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT_CODES)
+                         | set(SIBLING_LOADER_EXIT_CODES))
+
+    def test_the_sibling_shape_check_flags_every_other_way_to_load_9399(self):
+        """Mutants of a script on the #9399 loader: each other load form or setting is a violation."""
+        rel = "scripts/ci/pg_isolate_split.py"
+        source = (REPO / rel).read_text(encoding="utf-8")
+        self.assertEqual(loader_shape_violations(rel, source), [])
+        wa_call = '    wa = _load_sibling("workflow_annotation.py", "workflow_annotation")\n'
+        mutants = {
+            "import by name": source + "\nimport workflow_annotation\n",
+            "sys.path insert": source.replace("import argparse\n", "import argparse\nimport sys\n"
+                                              "sys.path.insert(0, '.')\n", 1),
+            "dunder import": source + "\nwa = __import__('workflow_annotation')\n",
+            "second sibling load": source + '\nwa = _load_sibling("workflow_annotation.py", "workflow_annotation")\n',
+            "the old loader beside it": source + "\ndef _load_workflow_annotation():\n    return None\n",
+            "narrow except": source.replace("except (Exception, SystemExit) as exc:  # any failed load ends here with"
+                                            " one fixed line (#9399)\n    _sibling_refusal(SIBLING_PROG, \"workflow",
+                                            "except SiblingLoadError as exc:\n    _sibling_refusal(SIBLING_PROG,"
+                                            " \"workflow", 1),
+            "attribute check dropped": source.replace('            raise AttributeError("workflow_annotation.py lacks "'
+                                                      ' + wa_name)\n', "            pass\n", 1),
+            "wrong prog": source.replace('SIBLING_PROG = "pg_isolate_split"', 'SIBLING_PROG = "other"', 1),
+            "wrong exit code": source.replace("SIBLING_EXIT_LOAD_REFUSED = 3", "SIBLING_EXIT_LOAD_REFUSED = 0", 1),
+            "name used outside WA_REQUIRED": source + "\nwa.log_line\n",
+            "empty WA_REQUIRED": source.replace('WA_REQUIRED = ("annotation",)', "WA_REQUIRED = ()", 1),
+            "sibling loaded first": source.replace("try:\n" + wa_call, 'ptb0 = _load_sibling("x.py", "x")\n\ntry:\n'
+                                                   + wa_call, 1),
+            "loader text changed": source.replace('raise SiblingLoadError("empty")', "pass", 1),
+            "a first-shape setting": source.replace("WA_REQUIRED = (", 'WA_PROG = "pg_isolate_split"\nWA_REQUIRED = (',
+                                                    1),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, source, "the mutant did not apply")
+                self.assertNotEqual(loader_shape_violations(rel, mutant), [])
 
     def test_the_shape_check_flags_every_other_way_to_load_9365(self):
         """Mutants of a conforming script: each other load form is a violation (the check is not vacuous)."""
@@ -2161,7 +2340,8 @@ class V1FormNeutralised(unittest.TestCase):
 # process the script lets through unchanged (cargo, psql: the child's own lines, not the script's text).
 # ---------------------------------------------------------------------------------------------------------------
 
-STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT_CODES) | {"scripts/ci/" + PRUNE_SCRIPT_NAME}))
+STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT_CODES) | set(SIBLING_LOADER_EXIT_CODES)
+                              | {"scripts/ci/" + PRUNE_SCRIPT_NAME}))
 STREAM_SHARED_CALLS = SHARED_FIELD_FUNCTIONS | {"safe_value", "render", "join", "end_group_line"}
 STREAM_NUMBER_CALLS = frozenset({"len", "int", "float", "round", "abs"})  # return a number for any argument
 STREAM_TRACE_DEPTH = 6
@@ -2173,6 +2353,7 @@ STREAM_PRELOAD_FUNCTIONS = {"scripts/ci/prune_runner_tmp.py": frozenset({"load_r
                             "scripts/ci/partition_test_binaries.py": frozenset({"require_workflow_annotation"}),
                             "scripts/ci/shared_cargo_target.py": frozenset({"require_workflow_annotation"})}
 STREAM_PRELOAD_GUARD_CALL = "python_refusal"  # a module-level ``if`` that calls it is the floor check
+SIBLING_REFUSAL_FUNCTION = "_sibling_refusal"  # the one print of the #9399 loader block (see StreamTracer)
 
 
 class StreamTracer:
@@ -2195,7 +2376,10 @@ class StreamTracer:
                 isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == STREAM_PRELOAD_GUARD_CALL
                 for sub in ast.walk(node.test))
             is_preload = isinstance(node, ast.FunctionDef) and node.name in preload
-            if _is_load_try(node) or is_floor or is_preload:
+            # The #9399 sibling loader block prints one refusal line; its text is pinned byte for byte to
+            # scripts/ci/sibling_load.py by test_sibling_load_9399, and the path in it has every control character escaped.
+            is_sibling_refusal = isinstance(node, ast.FunctionDef) and node.name == SIBLING_REFUSAL_FUNCTION
+            if _is_load_try(node) or is_floor or is_preload or is_sibling_refusal:
                 self.exempt.update(id(sub) for sub in ast.walk(node))
         # a bare name bound at module level to ``getattr(wa, "<shared function>", ...)`` is that shared function
         self.shared_aliases = set()
