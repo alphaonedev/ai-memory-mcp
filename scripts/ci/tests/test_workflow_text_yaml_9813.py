@@ -601,6 +601,105 @@ class Cost(ReaderCase):
                 self.assertLess(elapsed, LONG_LINE_CEILING_SECS)
 
 
+# PR 9817 L1: the character sweep. YAML 1.2 (section 5.1) defines c-printable as exactly these ranges; the set the
+# reader must never read is their complement over every code point, generated here from the definition, not listed.
+CODE_POINT_END = 0x110000
+C_PRINTABLE_RANGES = ((0x09, 0x09), (0x0A, 0x0A), (0x0D, 0x0D), (0x20, 0x7E), (0x85, 0x85), (0xA0, 0xD7FF),
+                      (0xE000, 0xFFFD), (0x10000, 0x10FFFF))
+# Printable code points the reader still refuses before any grammar, each with its reason constant.
+PRINTABLE_REFUSED = {"\t": "TAB", "\r": "BARE_CR", "\x85": "LINE_BREAK", "\u2028": "LINE_BREAK",
+                     "\u2029": "LINE_BREAK"}
+# Every non-c-printable code point is a C0 or C1 control (Cc), a surrogate (Cs) or a noncharacter (Cn): CONTROL.
+NON_PRINTABLE_REASON = "CONTROL"
+# The character reasons a value-position sweep may raise; the only grammar reason is the line feed's KEY_FORM
+# ("a: x\ny" leaves "y" as a line with no key).
+SWEEP_REASONS = frozenset({"CONTROL", "NONASCII_SPACE", "LINE_BREAK", "TAB", "BARE_CR", "KEY_FORM"})
+# Every modelled position: (template with {c}, line of the character, document read when the character is "z").
+SWEEP_POSITIONS = {
+    "key": ("a{c}b: 1\n", 1, {"azb": 1}),
+    "plain_value": ("a: x{c}y\n", 1, {"a": "xzy"}),
+    "single_quoted_value": ("a: 'x{c}y'\n", 1, {"a": "xzy"}),
+    "double_quoted_value": ('a: "x{c}y"\n', 1, {"a": "xzy"}),
+    "comment": ("a: 1  # x{c}y\n", 1, {"a": 1}),
+    "indentation": ("a:\n{c}  b: 1\n", 2, None),
+    "block_scalar_body": ("a: |\n  x{c}y\n", 2, {"a": "xzy\n"}),
+    "sequence_item": ("a:\n  - x{c}y\n", 2, {"a": ["xzy"]}),
+    "flow_item": ("a: [x{c}y]\n", 1, {"a": ["xzy"]}),
+}
+SWEEP_VALUE_TEMPLATE = "a: x%sy\n"
+CHARACTER_SWEEP_CEILING_SECS = 60.0
+
+
+def non_printable_code_points() -> list[str]:
+    """Every code point outside the YAML 1.2 c-printable ranges, in order."""
+    printable = [False] * CODE_POINT_END
+    for low, high in C_PRINTABLE_RANGES:
+        printable[low:high + 1] = [True] * (high + 1 - low)
+    return [chr(cp) for cp in range(CODE_POINT_END) if not printable[cp]]
+
+
+class CharacterSweep(ReaderCase):
+    """PR 9817 L1. Dimensions: (1) every code point outside YAML 1.2 c-printable (2,111 of them: C0 except TAB, LF
+    and CR; DEL and C1 except NEL; the 2,048 surrogates; U+FFFE and U+FFFF) plus the five printable code points the
+    reader refuses (TAB, bare CR, NEL, LS, PS), each at every position of SWEEP_POSITIONS (key, plain, single- and
+    double-quoted value, comment, indentation, block scalar body, sequence item, flow item): each is refused with
+    its exact reason and line; (2) every code point U+0000 to U+10FFFF at the plain value position: each is refused
+    with one named reason or read exactly as written, and no code point outside c-printable is ever read. Zero
+    crashes in both; the whole sweep inside CHARACTER_SWEEP_CEILING_SECS."""
+
+    def test_9817_l1_the_generated_set_matches_the_yaml_definition(self) -> None:
+        refused = non_printable_code_points()
+        self.assertEqual(len(refused), 29 + 32 + 2048 + 2)  # C0, DEL and C1, surrogates, U+FFFE and U+FFFF
+        self.assertEqual([c for c in refused if c < "\x80"], [chr(c) for c in (*range(0x09), 0x0B, 0x0C,
+                                                                              *range(0x0E, 0x20), 0x7F)])
+        self.assertEqual(refused[-2:], ["\ufffe", "\uffff"])
+        self.assertNotIn("\x85", refused)
+        self.assertNotIn("\xa0", refused)
+
+    def test_9817_l1_each_refused_code_point_at_each_position_has_its_reason_and_line(self) -> None:
+        cases = [(c, NON_PRINTABLE_REASON) for c in non_printable_code_points()] + list(PRINTABLE_REFUSED.items())
+        start = time.monotonic()
+        for position, (template, line, readable) in SWEEP_POSITIONS.items():
+            if readable is not None:  # the position reads with a plain letter, so a refusal is the character's
+                with self.subTest(position=position, control="z"):
+                    self.assertEqual(wt.parse_text(template.format(c="z"), LABEL), readable)
+            wrong = []
+            for ch, name in cases:
+                try:
+                    got = wt.parse_text(template.format(c=ch), LABEL)
+                    wrong.append((hex(ord(ch)), "read", repr(got)[:40]))
+                except wt.WorkflowReadError as exc:
+                    if (exc.line, exc.reason) != (line, reason(name)):
+                        wrong.append((hex(ord(ch)), exc.line, exc.reason))
+                except Exception as exc:  # noqa: BLE001 - a crash is the finding this row exists for
+                    wrong.append((hex(ord(ch)), "crash", type(exc).__name__))
+            with self.subTest(position=position):
+                self.assertEqual((len(wrong), wrong[:10]), (0, []))
+        self.assertLess(time.monotonic() - start, CHARACTER_SWEEP_CEILING_SECS)
+
+    def test_9817_l1_every_code_point_at_the_value_is_refused_by_name_or_read_as_written(self) -> None:
+        named = {reason(name) for name in SWEEP_REASONS}
+        non_printable = set(non_printable_code_points())
+        wrong = []
+        start = time.monotonic()
+        for cp in range(CODE_POINT_END):
+            ch = chr(cp)
+            try:
+                got = wt.parse_text(SWEEP_VALUE_TEMPLATE % ch, LABEL)
+            except wt.WorkflowReadError as exc:
+                if exc.reason not in named or (ch in non_printable and exc.reason != reason(NON_PRINTABLE_REASON)):
+                    wrong.append((hex(cp), exc.reason))
+                continue
+            except Exception as exc:  # noqa: BLE001 - a crash is the finding this row exists for
+                wrong.append((hex(cp), "crash", type(exc).__name__))
+                continue
+            if ch in non_printable or ch in PRINTABLE_REFUSED or got != {"a": "x%sy" % ch}:
+                wrong.append((hex(cp), "read", repr(got)[:40]))
+        elapsed = time.monotonic() - start
+        self.assertEqual((len(wrong), wrong[:10]), (0, []))
+        self.assertLess(elapsed, CHARACTER_SWEEP_CEILING_SECS)
+
+
 import unittest.mock  # noqa: E402  (used by the one-descriptor row)
 
 if __name__ == "__main__":
