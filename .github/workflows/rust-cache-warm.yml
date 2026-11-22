@@ -406,6 +406,11 @@ jobs:
       # The key env of the android leg: the workflow's CARGO_INCREMENTAL and the job-level
       # cargo-audit pin of the PR job (a job env enters the rust-cache key hash).
       CARGO_INCREMENTAL: "0"
+      # #8216: the workflow-level CARGO_PROFILE_DEV_DEBUG / CARGO_PROFILE_TEST_DEBUG pair of ci.yml,
+      # which `mobile-cross-compile` inherits; the warm job must build with the profile of the job
+      # it warms (the 9732 mirror-equality invariant), so the pair is set here to the same value.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
       # #3138: named pin for the cargo-audit version the PR job installs.
       CARGO_AUDIT_VERSION: "0.22.2"
     steps:

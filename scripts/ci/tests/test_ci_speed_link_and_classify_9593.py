@@ -91,6 +91,7 @@ EXPECTED_CARGO_DEBUG: dict = {
     ("release.yml", "crates-io", ""): (_H, "", ""),
     ("rust-cache-warm.yml", "check-hosted-sqlite", ""): (_H, "0", "0"),
     ("rust-cache-warm.yml", "coverage", ""): (_H, "0", ""),
+    ("rust-cache-warm.yml", "mobile-android-audit-release", ""): (_H, _LTO, _LTO),
     ("session-boot-lifetime.yml", "lifetime-tests", "ubuntu-latest"): (_H, "", ""),
     ("session-boot-lifetime.yml", "lifetime-tests", "macos-fed"): (_H, "", ""),
     ("token-budget.yml", "budget", ""): (_H, "", ""),
@@ -124,6 +125,8 @@ ALLOWED_SETTING_SITES = (
     ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "%s=0"' % _DD),
     ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "%s=0"' % _DT),
     ("rust-cache-warm.yml", "check-hosted-sqlite", 12, 'echo "RUSTFLAGS=-C debuginfo=0"'),
+    ("rust-cache-warm.yml", "mobile-android-audit-release", 6, _DD + ": line-tables-only"),
+    ("rust-cache-warm.yml", "mobile-android-audit-release", 6, _DT + ": line-tables-only"),
     ("rust-cache-warm.yml", "coverage", 6, 'RUSTFLAGS: "-C link-arg=-fuse-ld=mold"'),
     ("rust-cache-warm.yml", "coverage", 6, _DD + ': "0"'),
 )
@@ -700,7 +703,8 @@ class NeedsBrokenCopies(unittest.TestCase):
 # name, RUSTFLAGS in a workflow env, a cargo --config, a flow-style job env, a changed value at an
 # allowed site, a duplicated allowed line, a literal echo in another workflow.
 CERT = "cert-postgres-age.yml"
-CERT_STEP = "      - name: Run #[ignore]-gated pg + AGE cells against the certified stack\n        run: |\n"
+CERT_STEP = ("      - name: Run #[ignore]-gated pg + AGE cells against the certified stack\n"
+             "        if: steps.docs.outputs.docs_only != 'true'\n        run: |\n")
 CERT_STEP_SET = CERT_STEP + "          set -euo pipefail\n"
 RCW_DEV_ECHO = '            echo "CARGO_PROFILE_DEV_DEBUG=0"\n'
 RCW_TEST_ECHO = '            echo "CARGO_PROFILE_TEST_DEBUG=0"\n'
