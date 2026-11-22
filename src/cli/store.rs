@@ -1275,8 +1275,8 @@ mod tests {
     /// absent. Install the sandbox FIRST (idempotent), then set the override,
     /// so the test's own value is the one that stays in force. The caller
     /// holds [`locked_env`]. Every sign test goes through this helper; the
-    /// structural guard for that invariant is tracked under issues #9730 and
-    /// #9786 and is not in the tree at this commit.
+    /// structural guard `tests/key_dir_bind_guard_9730.rs` pins this helper and
+    /// each of its call sites by name (#9730, #9786).
     fn bind_key_dir(dir: &std::path::Path) -> EnvVarGuard {
         let _ = crate::identity::test_key_dir::install();
         EnvVarGuard::set("AI_MEMORY_KEY_DIR", dir.as_os_str())
