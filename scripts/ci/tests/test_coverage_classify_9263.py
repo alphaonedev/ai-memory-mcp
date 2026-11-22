@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -211,6 +212,10 @@ CR, DEL, ESC, NUL, LF = b"\r", b"\x7f", b"\x1b", b"\x00", b"\n"
 ZQ = b"zq7"
 UTF8_LOCALE_CANDIDATES = ("C.UTF-8", "en_US.UTF-8")
 BIG_REASON_BYTES = 100000
+# Wall-clock ceiling in seconds for one whole classify step (git, the decider, the reason
+# test) on an answer of BIG_REASON_BYTES bytes or more; a quadratic scan costs minutes.
+BIG_STEP_CEILING_S = 30.0
+BIG_LINE_COUNT = 25000
 
 
 class Row(NamedTuple):
@@ -285,6 +290,13 @@ REASON_ROWS = [
     rej("cap plus one", WHY_OVER, b"x" * (REASON_MAX + 1), canary=b"x" * (REASON_MAX + 1)),
     rej("a RUN answer over the cap", WHY_OVER, ZQ + b"x" * REASON_MAX, skip=b"false", canary=ZQ),
     rej("a big reason", WHY_OVER, ZQ + b"y" * BIG_REASON_BYTES, canary=ZQ),
+    # 100K-byte answers of each kind; every one runs inside BIG_STEP_CEILING_S
+    rej("a big reason of NULs", WHY_NONPRINT, NUL * BIG_REASON_BYTES),
+    rej("a big reason of high bytes", WHY_NONPRINT, "é".encode() * (BIG_REASON_BYTES // 2)),
+    rej("a big answer of many lines", WHY_EXTRA, canary=ZQ,
+        answer=answer_of(b"false", b"true", OK_REASON) + (ZQ + b"=1\n") * BIG_LINE_COUNT),
+    rej("a NUL and an extra line", WHY_EXTRA, canary=ZQ,
+        answer=answer_of(b"false", b"true", OK_REASON) + NUL + LF),
     # answers that are not exactly the three key lines
     rej("LF inside the reason", WHY_EXTRA, ZQ + LF + b"cd", canary=ZQ),
     rej("a stray fourth line", WHY_EXTRA, canary=ZQ,
@@ -792,8 +804,13 @@ class ClsHarness(unittest.TestCase):
             for loc_label, loc_env in locale_cases():
                 label = "%s | %s" % (row.label, loc_label)
                 with self.subTest(label):
+                    started = time.monotonic()
                     values, stdout = self.run_cls(base, locale_env=loc_env)
+                    elapsed = time.monotonic() - started
                     self.assert_row(label, row, values, stdout)
+                    if len(row.answer) >= BIG_REASON_BYTES:
+                        self.assertLess(elapsed, BIG_STEP_CEILING_S,
+                                        label + ": a 100K-byte answer is judged in time")
 
     def assert_row(self, label, row, values, stdout):
         self.assertEqual(self.last_rc, 0, "%s: rc, stderr %r" % (label, self.last_stderr[-200:]))
