@@ -507,7 +507,10 @@ RUST_CACHE_USES_PREFIX = "Swatinem/rust-cache@"
 # the save-if is the #3089 form of the check and postgres-feature cache steps.
 MOBILE_CACHE_KEY = "mobile-${{ matrix.target }}-audit-release"
 PUSH_ONLY_SAVE_IF = "${{ github.event_name == 'push' }}"
-EXPECTED_MOBILE_CACHE_WITH = {"key": MOBILE_CACHE_KEY, "save-if": PUSH_ONLY_SAVE_IF}
+# #9732: the same value, now a `shared-key` with the chain generation `prefix-key` (the
+# chain cache pair of rust-cache-warm.yml; a `key:` input would add the job id).
+EXPECTED_MOBILE_CACHE_WITH = {"prefix-key": "chain-cache-g1", "shared-key": MOBILE_CACHE_KEY,
+                              "save-if": PUSH_ONLY_SAVE_IF}
 # (b) #9699: the longest measured time of each piece of work the job now holds
 # (push runs of ci.yml on release/v1.0.0, 2026-11-20). The job timeout must leave
 # the 20 % margin the check-leg cap rule asks for (ci.yml `timeout: 95` comment)
@@ -888,10 +891,14 @@ def cargo_audit_source_problems(text):
             why = install_problem(tokens)
             if why:
                 add("%s: %s" % (label(job, step), why))
+            # The pin is a JOB-level env: a job env enters the rust-cache key hash and a step env
+            # does not, so a step-level pin would let the version change under one cached output
+            # (review r2 F4 of PR 9798).
             pins = [e["value"] for e in envs
-                    if e["job"] == job and e["step"] == step and e["key"] == CARGO_AUDIT_PIN_VAR]
+                    if e["job"] == job and e["step"] is None and e["key"] == CARGO_AUDIT_PIN_VAR]
             if not pins:
-                add("%s: no %s pin on the install step" % (label(job, step), CARGO_AUDIT_PIN_VAR))
+                add("%s: no job-level %s pin on the job of the install step"
+                    % (label(job, step), CARGO_AUDIT_PIN_VAR))
     for e in envs:
         if e["key"] == CARGO_AUDIT_PIN_VAR and e["value"] != CARGO_AUDIT_PIN:
             add("%s: %s is %r, not %r" % (label(e["job"], e["step"]), CARGO_AUDIT_PIN_VAR,
@@ -919,11 +926,11 @@ jobs:
         run: cargo fmt --all --check
   mobile-cross-compile:
     runs-on: ubuntu-latest
+    env:
+      CARGO_AUDIT_VERSION: "0.22.2"
     steps:
       - name: Security audit
         if: matrix.once
-        env:
-          CARGO_AUDIT_VERSION: "0.22.2"
         run: |
           if ! command -v cargo-audit >/dev/null 2>&1 \\
              || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
@@ -933,11 +940,15 @@ jobs:
           python3 scripts/ci/check_cargo_audit.py
 """
 FIXTURE_INSTALL = '            cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"\n'
-FIXTURE_PIN = '          CARGO_AUDIT_VERSION: "0.22.2"\n'
+FIXTURE_PIN = '      CARGO_AUDIT_VERSION: "0.22.2"\n'
+FIXTURE_STEP_PIN_ENV = '        env:\n          CARGO_AUDIT_VERSION: "0.22.2"\n'
+FIXTURE_JOB_ENV = '    env:\n' + FIXTURE_PIN
+FIXTURE_SECURITY_STEP_HEAD = "      - name: Security audit\n        if: matrix.once\n"
 FIXTURE_LINT_STEP = "      - name: Lint\n        run: cargo fmt --all --check\n"
 INJECT = "          #INJECT\n"
 DIGEST = "7f" * 32
 AUDIT_STEP = AUDIT_JOB + ": Security audit"
+AUDIT_JOB_SCOPE = AUDIT_JOB + ": job"  # the label of an entry of the job-level env
 
 
 def inject(body):
@@ -961,8 +972,8 @@ AUDIT_SOURCE_ROWS = (
      inject('asset="cargo-audit-x86_64-unknown-linux-musl"\ntar -xzf "${asset}.tgz" -C bin'),
      [AUDIT_STEP + ": tar extract of a prebuilt cargo-audit"]),
     ("tar through an env value",
-     AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN + '          ARCHIVE: "ca-musl.tgz"\n'
-                           '          MEMBER: "cargo-audit"\n').replace(
+     AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN + '      ARCHIVE: "ca-musl.tgz"\n'
+                           '      MEMBER: "cargo-audit"\n').replace(
          INJECT, '          tar -xzf "${ARCHIVE}" "${MEMBER}"\n'),
      [AUDIT_STEP + ": tar extract of a prebuilt cargo-audit"]),
     ("unzip", inject("unzip -o cargo-audit.zip"),
@@ -975,11 +986,11 @@ AUDIT_SOURCE_ROWS = (
      [AUDIT_STEP + ": cargo binstall of a prebuilt cargo-audit"]),
     ("rustsec release URL in env",
      AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN +
-                           '          CA_URL: "https://github.com/rustsec/rustsec/releases/download/x"\n'),
-     [AUDIT_STEP + ": rustsec release URL of a prebuilt cargo-audit"]),
+                           '      CA_URL: "https://github.com/rustsec/rustsec/releases/download/x"\n'),
+     [AUDIT_JOB_SCOPE + ": rustsec release URL of a prebuilt cargo-audit"]),
     ("sha256 pin in env",
-     AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN + '          CARGO_AUDIT_TGZ_SHA256: "%s"\n' % DIGEST),
-     [AUDIT_STEP + ": sha256 pin of a prebuilt cargo-audit"]),
+     AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN + '      CARGO_AUDIT_TGZ_SHA256: "%s"\n' % DIGEST),
+     [AUDIT_JOB_SCOPE + ": sha256 pin of a prebuilt cargo-audit"]),
     ("installer action",
      lint_step("      - uses: taiki-e/install-action@0000000000000000000000000000000000000000\n"
                "        with:\n          tool: cargo-audit\n"),
@@ -1026,11 +1037,15 @@ AUDIT_SOURCE_ROWS = (
      lint_step('      - name: Tools\n        run: cargo install cargo-audit --locked --force'
                ' --version "${CARGO_AUDIT_VERSION}"\n'),
      ["lint: installs cargo-audit and never runs it",
-      "lint: Tools: no CARGO_AUDIT_VERSION pin on the install step"]),
-    ("pin changed", AUDIT_FIXTURE.replace(FIXTURE_PIN, '          CARGO_AUDIT_VERSION: "0.22.3"\n'),
-     [AUDIT_STEP + ": CARGO_AUDIT_VERSION is '0.22.3', not '0.22.2'"]),
-    ("pin removed", AUDIT_FIXTURE.replace(FIXTURE_PIN, '          OTHER: "1"\n'),
-     [AUDIT_STEP + ": no CARGO_AUDIT_VERSION pin on the install step"]),
+      "lint: Tools: no job-level CARGO_AUDIT_VERSION pin on the job of the install step"]),
+    ("pin changed", AUDIT_FIXTURE.replace(FIXTURE_PIN, '      CARGO_AUDIT_VERSION: "0.22.3"\n'),
+     [AUDIT_JOB_SCOPE + ": CARGO_AUDIT_VERSION is '0.22.3', not '0.22.2'"]),
+    ("pin removed", AUDIT_FIXTURE.replace(FIXTURE_PIN, '      OTHER: "1"\n'),
+     [AUDIT_STEP + ": no job-level CARGO_AUDIT_VERSION pin on the job of the install step"]),
+    ("pin at step scope only",
+     AUDIT_FIXTURE.replace(FIXTURE_JOB_ENV, "").replace(
+         FIXTURE_SECURITY_STEP_HEAD, FIXTURE_SECURITY_STEP_HEAD + FIXTURE_STEP_PIN_ENV),
+     [AUDIT_STEP + ": no job-level CARGO_AUDIT_VERSION pin on the job of the install step"]),
 )
 # Input-size bound for the scanner: a 100K+ line run body scans in linear time.
 SCAN_BOUND_LINES = 120_000
@@ -1051,7 +1066,11 @@ class CargoAuditSource9680(unittest.TestCase):
         wf = Workflow(CI_YML)
         step = wf.step(AUDIT_JOB, SECURITY_AUDIT)
         self.assertIsNotNone(step)
-        self.assertEqual(unquote(step["env"].get(CARGO_AUDIT_PIN_VAR)), CARGO_AUDIT_PIN)
+        job_pins = [e["value"] for e in scan_workflow(wf.text)[1]
+                    if e["job"] == AUDIT_JOB and e["step"] is None
+                    and e["key"] == CARGO_AUDIT_PIN_VAR]
+        self.assertEqual(job_pins, [CARGO_AUDIT_PIN], "the pin is a job-level env")
+        self.assertNotIn(CARGO_AUDIT_PIN_VAR, step["env"], "no step-level pin: it is outside the key")
         installs = [" ".join(l.split()) for l in shell_lines(step["run"] or "")
                     if INSTALL_RE.search(l)]
         self.assertEqual(installs, [CARGO_AUDIT_INSTALL])
