@@ -1036,6 +1036,7 @@ def run_once(gh: Any, store: StateStore, keep: int, scope: Scope, execute: bool,
         kept[run.run_id] = BoundEntry(run.run_id, run.pr, run.head_sha, run.attempt, Phase.CANCELLING, 0)
     store.write(list(kept.values()))  # I2: durable before the first cancel (also proves the file is writable)
     sent: set[int] = set()
+    landed: list[int] = []
     unconfirmed: Refusal | None = None
     for run in reversed(cancel_runs):
         outcome = cancel_checked(gh, run)
@@ -1044,16 +1045,19 @@ def run_once(gh: Any, store: StateStore, keep: int, scope: Scope, execute: bool,
             continue
         sent.add(run.run_id)
         if outcome.phase is Phase.CANCELLED:
-            kept[run.run_id] = replace(kept[run.run_id], phase=Phase.CANCELLED)
-            store.write(list(kept.values()))
+            landed.append(run.run_id)
         out("cancelled run %d%s" % (run.run_id, ": " + outcome.reason if outcome.reason else ""))
         if outcome.error is not None:
             unconfirmed = outcome.error  # the record stays CANCELLING: the next call judges the run again
             break
+    # One write for the whole loop (one fsync, not one per run).  A crash before it leaves every record CANCELLING,
+    # the state the judge already reads fail-closed (pending while queued, restartable once the cancel landed).
     unsent = [run.run_id for run in cancel_runs if run.run_id not in sent]  # left alone, or not reached after a failure
-    if unsent:
-        for run_id in unsent:
-            del kept[run_id]
+    for run_id in landed:
+        kept[run_id] = replace(kept[run_id], phase=Phase.CANCELLED)
+    for run_id in unsent:
+        del kept[run_id]
+    if landed or unsent:
         store.write(list(kept.values()))
     if unconfirmed is not None:
         raise unconfirmed
