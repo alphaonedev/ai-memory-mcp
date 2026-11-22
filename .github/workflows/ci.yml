@@ -1111,7 +1111,7 @@ jobs:
     # the label-set form. macOS is unchanged (operator directive is Linux-only).
     # #9821 (I5): a draft pull request without the `ci-fix` label does not occupy a
     # self-hosted runner. The skipped leg flips to a hosted runner so it never waits
-    # in the self-hosted queue, and its one step that runs fails (`Draft skip (#9821)`):
+    # in the self-hosted queue, and its one step that runs fails (`Draft admission skip (#9821)`):
     # a leg that did not run is red, never green under its required name. The
     # condition is the same text as LEG_SKIP below (a test pins both). An unknown draft
     # state is not `== true`, so the leg runs (fails open to run, never to skip).
@@ -1174,7 +1174,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     env:
       # #9821 (I5): 'true' only for a skipped self-hosted leg (see runs-on). Every
-      # work step guards on it and the `Draft skip (#9821)` step fails the leg; a
+      # work step guards on it and the `Draft admission skip (#9821)` step fails the leg; a
       # job-level `if:` is forbidden here (rule (b1)).
       LEG_SKIP: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true && contains(matrix.runner, 'self-hosted') && !contains(github.event.pull_request.labels.*.name, 'ci-fix') && 'true' || 'false' }}
       # Debuginfo budget for this job — the heaviest compile in CI (~600
@@ -1393,7 +1393,9 @@ jobs:
       # fails on the fork refusal above first, as at the base. The event payload of
       # a run is frozen, so a re-run of a draft-era run stays red; marking the PR
       # ready starts a new run (ready_for_review) that runs the leg.
-      - name: Draft skip (#9821)
+      # The step name is read by the agent-skills gates (PR 558, tests/test_draft_skip_556.py)
+      # and pinned by test_skip_step_name_is_the_tools_pin; rename both together.
+      - name: Draft admission skip (#9821)
         if: needs.classify.outputs.cargo_skip != 'true' && env.LEG_SKIP == 'true'
         run: |
           echo "::error::draft PR without the ci-fix label, self-hosted leg not run, mark ready or add the label"

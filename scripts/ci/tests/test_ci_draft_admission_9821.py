@@ -56,7 +56,13 @@ LINUX_FED = '["self-hosted","linux-fed"]'
 MACOS_FED = '["self-hosted","macos-fed"]'
 EXPECTED_LEGS = ["ubuntu-latest,sqlite", "linux-fed,enterprise-fed", "macos-fed,sqlite", "macos-fed,enterprise-fed"]
 EXPECTED_CHECK_NAME = "Check (${{ matrix.leg }})"
-DRAFT_STEP = "Draft skip (#9821)"
+# The one step a draft-skipped leg runs.  The tools read it by this exact name:
+# agent-skills PR 558, tests/test_draft_skip_556.py PINNED_STEP (and its SKIP_STEP_NAME in
+# skills/pre-merge-checklist/scripts/draft_skip.py).  A rename here, or of the step in ci.yml,
+# fails test_skip_step_name_is_the_tools_pin; change both repositories together (vote DSP1 A-3).
+DRAFT_STEP = "Draft admission skip (#9821)"
+NEUTRALISER = "continue-on-error"  # swallows the red; banned on the check job and its steps (vote DSP1 A-1)
+EXIT_FAIL = 1
 FORK_STEP = "Fork-PR refusal (self-hosted legs never run fork code)"
 CHECKOUT_PREFIX = "actions/checkout"
 ADMIT_LABEL = "ci-fix"
@@ -256,7 +262,7 @@ def job_expr(key):
 
 
 def step_records():
-    """[{name, if, run}] of the check job in order; one-line if, `run: |` blocks."""
+    """[{name, if, run, continue-on-error}] of the check job in order; one-line if, `run: |` blocks."""
     out, in_steps, cur, in_run = [], False, None, False
     for line in check_block():
         if line == "    steps:":
@@ -266,7 +272,7 @@ def step_records():
             continue
         if line.startswith("      - "):
             m = re.match(r"      - (?:name: (.*)|uses: (.*))", line)
-            cur = {"name": (m.group(1) or m.group(2)) if m else line.strip(), "if": None, "run": None}
+            cur = {"name": (m.group(1) or m.group(2)) if m else line.strip(), "if": None, "run": None, NEUTRALISER: None}
             out.append(cur)
             in_run = False
             continue
@@ -282,6 +288,8 @@ def step_records():
             if value.startswith((">", "|")):
                 raise AssertionError("multi-line if in step %r cannot be read" % cur["name"])
             cur["if"] = value
+        elif line.startswith("        %s:" % NEUTRALISER):
+            cur[NEUTRALISER] = line.split(":", 1)[1].strip()
         elif line.startswith("        run: |"):
             cur["run"], in_run = "", True
         elif line.startswith("        run: "):
@@ -321,7 +329,9 @@ def conclusion(leg, runner, event, draft, labels, fork=False):
     """(conclusion, failing step, its ::error:: line) of one leg up to checkout.
 
     Every step before checkout whose `if` holds is executed; the first that
-    exits non-zero fails the job.  If none fails the work steps run.
+    exits non-zero fails the job, unless it is continue-on-error (any value but
+    the absent key is taken as on, as an expression can turn it on).  If none
+    fails the work steps run.
     """
     leg_skip = Evaluator(tokenize(job_expr(SKIP_ENV)), context(event, draft, labels, runner)).parse()
     ctx = context(event, draft, labels, runner, fork=fork, leg_skip=leg_skip)
@@ -334,10 +344,17 @@ def conclusion(leg, runner, event, draft, labels, fork=False):
         if step["run"] is None:
             continue
         rc, out = run_step(step["run"], leg)
-        if rc != 0:
+        if rc != 0 and step[NEUTRALISER] in (None, "false"):
             errors = [l for l in out if l.startswith("::error::")]
             return FAILURE, step["name"], errors[0] if len(errors) == 1 else errors
     raise AssertionError("checkout step not found")
+
+
+def job_neutralisers():
+    """Lines of the check job that can turn a red leg green or skipped: a job-level `if:`
+    (the leg becomes skipped) or any continue-on-error key, at job, matrix or step level."""
+    return [l.strip() for l in check_block()
+            if l.startswith("    if:") or re.match(r"\s*(?:- )?%s\s*:" % re.escape(NEUTRALISER), l)]
 
 
 # ---------------------------------------------------------------- tests ----
@@ -414,6 +431,9 @@ class SkippedLegConclusion(unittest.TestCase):
         ]
 
     def check_context(self, leg):
+        # Vote DSP1 A-1: the red is job-level under this context's name, so nothing on the
+        # job may turn it green (continue-on-error) or skipped (a job-level if:).
+        self.assertEqual(job_neutralisers(), [], "Check (%s) can end green or skipped, not red" % leg)
         runner = self.legs()[leg]
         for draft, labels, fork, want in self.rows(leg):
             with self.subTest(context="Check (%s)" % leg, draft=draft, labels=labels, fork=fork):
@@ -473,6 +493,27 @@ class StepPins(unittest.TestCase):
         # rule (b3) of check-required-contexts.sh wants a cargo_skip/docs_only guard on every step
         self.assertEqual(by_name[DRAFT_STEP], "%s && env.%s == 'true'" % (CARGO_GUARD, SKIP_ENV))
         self.assertNotIn("GH_TOKEN", "\n".join(check_block()))  # a secret here is a tainted-job violation
+
+    def test_skip_step_one_error_exit_1_on_hosted(self):
+        # Vote DSP1 A-2: the skip step prints exactly one ::error:: line, the pinned text, and
+        # exits 1; every self-hosted leg it fails is placed on the hosted runner first.
+        step = next(s for s in step_records() if s["name"] == DRAFT_STEP)
+        self.assertIsNone(step[NEUTRALISER])
+        rc, out = run_step(step["run"], "linux-fed,enterprise-fed")
+        self.assertEqual(rc, EXIT_FAIL)
+        self.assertEqual([l for l in out if "::error::" in l], [DRAFT_ERROR])
+        for leg, runner in matrix_legs():
+            if "self-hosted" in runner:
+                with self.subTest(context="Check (%s)" % leg):
+                    self.assertEqual(evaluate(job_expr("runs-on"), "pull_request", True, [], runner), HOSTED)
+
+    def test_skip_step_name_is_the_tools_pin(self):
+        # Vote DSP1 A-3: agent-skills PR 558 tests/test_draft_skip_556.py pins PINNED_STEP =
+        # "Draft admission skip (#9821)" and its gates find a draft-skipped leg by that name
+        # only; a rename here would let them count the leg green, so it fails in this repository.
+        names = [s["name"] for s in step_records()]
+        self.assertEqual(names.count(DRAFT_STEP), 1, "the check job must hold exactly one %r step" % DRAFT_STEP)
+        self.assertEqual(DRAFT_STEP, "Draft admission skip (#9821)")
 
     def test_check_needs_only_classify(self):
         # security MEDIUM-1: no needs edge to a job that is not required.

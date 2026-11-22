@@ -12,7 +12,7 @@ ordinary ``pull_request`` run classifies against the new base), enforced at land
 scripts/ci/pr_retarget_check.py.
 
 #9821 (PR 9838): ci.yml also lists ``ready_for_review``, so a draft whose self-hosted
-legs ended red ("Draft skip") runs them in full the moment it is marked ready; it never
+legs ended red ("Draft admission skip") runs them in full the moment it is marked ready; it never
 lists ``edited`` or ``labeled``. coverage.yml keeps the three default types.
 
 Stdlib only. Run: ``python3 -I scripts/test/test_workflow_edited_7072.py``
