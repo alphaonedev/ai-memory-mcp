@@ -360,6 +360,10 @@ class Domain(unittest.TestCase):
             for item in re.findall(r'"([^"]+)"', prefixes.group(1))
         )
         self.assertEqual(written, JUDGED_PREFIXES)
+        home = re.search(r'const PY_HOME: &str = "([^"]+)";', text)
+        self.assertIsNotNone(home, "PY_HOME is missing from the Rust guard")
+        home_path = re.sub(r"\\x([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), home.group(1))
+        self.assertEqual(home_path, Path(__file__).resolve().relative_to(REPO).as_posix())
 
     def test_ledger_gate_discovers_this_module(self):
         workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

@@ -185,6 +185,12 @@ const PY_JUDGED_SUFFIX: &str = ".md";
 /// Python test decodes the escapes before it compares.
 const PY_JUDGED_PREFIXES: [&str; 2] = ["docs/", "scripts\x2fci\x2ftests\x2f"];
 
+/// The Python test that judges the `PY_JUDGED_*` domain, with its slashes as
+/// hex escapes for the same ledger reason as `PY_JUDGED_PREFIXES`. The tree
+/// test refuses to pass when the file is gone, because the Rust guard hands
+/// that domain over and nothing else would judge it.
+const PY_HOME: &str = "scripts\x2fci\x2ftests\x2ftest_key_dir_name_mentions_9730.py";
+
 /// The one definition of the variable name.
 const DEFINE: &str = "the public constant that defines the variable name for the crate";
 /// The production reader of the variable.
@@ -4407,6 +4413,10 @@ const DOCTEST_SKIPPED_INFO_COUNT: usize = 13;
 #[test]
 fn tracked_tree_holds_no_key_dir_route_outside_the_allowed_sites_9730() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        root.join(PY_HOME).is_file(),
+        "#9730 guard: {PY_HOME} is missing; the files this guard leaves to it are judged nowhere"
+    );
     let start = Instant::now();
     let got = scan::check_tree(root, &tree_tables());
     let took = start.elapsed();
