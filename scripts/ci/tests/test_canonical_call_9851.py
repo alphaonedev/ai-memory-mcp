@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from test_slot_wait_outcome_9231 import (  # noqa: E402
     CALL_HEAD, CI_DIR, S_DECODED, S_NEVER, S_NOT_CALL, S_NOT_YAML, S_OUTSIDE, S_POSITIONAL, S_TOKEN_AGAIN, SCAN_GOOD,
-    SCAN_W, TokenScanFailsClosed, hsc, load_checker, run_block, s_char)
+    SCAN_W, TokenScanFailsClosed, hsc, load_checker, need, run_block, s_char)
 
 CFG = TokenScanFailsClosed.CFG
 # Written out by hand (not taken from the checker): the characters a canonical call line may hold.
@@ -391,6 +391,270 @@ class RuleMutants(unittest.TestCase):
                 self.assertEqual(source.count(old), 1, 'mutant anchor %r' % old)
                 self.assertEqual(hsc.wait_key_violations({SCAN_W: text}), expected)
                 got = load_checker(source.replace(old, new)).wait_key_violations({SCAN_W: text})
+                self.assertNotEqual(got, expected, 'mutant %s survived' % mutant)
+
+
+# #9879 invariants A and B: the step that calls the wrapper is judged as a whole (NOTICE-9879-r1b), and every
+# spelling of the wrapper path the runner or the shell resolves first is a finding. Written out by hand: the canonical
+# prefix of the wrapper step for the gate g with 1 slot, and every reason below.
+G_W = 'workflows/g.yml'
+A_W = 'actions/x/action.yml'
+EXEC_HEAD = '  exec python3 -I scripts/ci/host_semaphore.py'
+EXEC_TAIL = (' --max-wait-secs 600 --label linux-fed/enterprise-fed -- bash --noprofile --norc -eo pipefail '
+             '.local-runs/semaphore-step')
+EXEC_LINE = EXEC_HEAD + ' --name g --slots 1' + EXEC_TAIL
+PREFIX = (
+    'set -euo pipefail',
+    '# a comment line and a blank line are removed before the compare',
+    'if [ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ] && [ -z "${HOST_SEMAPHORE_HELD:-}" ]; then',
+    '  export HOST_SEMAPHORE_HELD=1',
+    '  mkdir -p .local-runs',
+    '  cp -- "$0" .local-runs/semaphore-step',
+    EXEC_LINE,
+    'fi',
+    '',
+    'cargo test',
+)
+STEP_ENV = (('HOST_SEMAPHORE_SLOTS', '"1"'), ('HOST_SEMAPHORE_MAX_WAIT_SECS', "'600'"))
+STEP_INDENT = '      '
+BODY_INDENT = STEP_INDENT + '  '
+
+
+def with_line(at, line, lines=PREFIX):
+    """LINES with LINE inserted before index AT."""
+    return lines[:at] + (line,) + lines[at:]
+
+
+def before_exec(line):
+    """PREFIX with LINE just above the exec line (the probes of security finding 2)."""
+    return PREFIX[:PREFIX.index(EXEC_LINE)] + (line,) + PREFIX[PREFIX.index(EXEC_LINE):]
+
+
+def exec_with(path):
+    """PREFIX with the exec line calling PATH (the probed spellings of the wrapper path)."""
+    line = '  exec python3 %s --name g --slots 9 --max-wait-secs 900 --config .local-runs/c.json -- bash x' % path
+    return tuple(line if item == EXEC_LINE else item for item in PREFIX)
+
+
+def step(lines=PREFIX, env=STEP_ENV, shell='bash', extra=''):
+    """One step of job j: name, shell, env, extra keys, then the run block of LINES."""
+    text = STEP_INDENT + '- name: t\n'
+    if shell is not None:
+        text += BODY_INDENT + 'shell: %s\n' % shell
+    if env:
+        text += BODY_INDENT + 'env:\n' + ''.join(BODY_INDENT + '  %s: %s\n' % pair for pair in env)
+    text += extra
+    return text + BODY_INDENT + 'run: |\n' + ''.join(
+        (BODY_INDENT + '  ' + line).rstrip(' ') + '\n' for line in lines)
+
+
+def gated(*steps, job='', top=''):
+    """The workflow text of G_W: TOP, then job j with JOB keys and STEPS (default: the one canonical step)."""
+    return top + 'jobs:\n  j:\n' + job + '    runs-on: x\n    steps:\n' + ''.join(steps or (step(),))
+
+
+def action(*lines):
+    """A composite action whose one step runs LINES (no workflow job holds it)."""
+    return 'runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: |\n' + ''.join(
+        '        %s\n' % line for line in lines)
+
+
+S_G = 'workflows/g.yml: job j: '
+S_A1 = S_G + 'the wrapper step does not start with the canonical prefix (statement %d differs)'
+S_A1_GATE = S_G + 'the canonical prefix calls gate %s with --slots %s, not a configured gate with its slot count'
+S_A2 = S_G + 'the wrapper step names the wrapper outside its canonical exec line'
+S_A3_SHELL = S_G + 'the wrapper step does not set shell: bash exactly'
+S_A3_DIR = S_G + 'the wrapper step sets working-directory, which changes where its run value starts'
+S_A3_DEFAULTS = S_G + 'a defaults.run at %s level changes the shell or directory of the wrapper step'
+S_A4_KEY = S_G + 'the wrapper step sets env key %s, which is not in GATED_STEP_ENV_KEYS'
+S_A4_LOADER = S_G + 'the %s env sets %s, which changes what the shell or interpreter loads'
+S_A5_STEPS = S_G + '%d steps name the wrapper; a gated job has exactly one'
+S_A5_NONE = 'workflows/g.yml: job j sets HOST_SEMAPHORE_SLOTS but no step of it calls the wrapper'
+S_B2 = (S_G + 'a run line of a gated job holds an expression ${{ (the runner substitutes it into the script before '
+        'bash reads it)')
+S_B1 = ('%s: a run line names ci/host and, with quotes removed, holds a character outside the canonical call '
+        'characters')
+S_B3 = '%s: a line names a wrapper fragment (host_sem, semaphore.py) with an expression, a glob character or a dollar-quote'
+S_OUTSIDE_STEP = '%s: a run value that names the wrapper outside a step of a workflow job'
+S_STEPS_UNREADABLE = '%s: the YAML subset parser cannot read this file, so its wrapper steps are not checked'
+# The wrapper path taken wholly from a variable: no literal fragment, so no text rule reads it (the known limit of
+# docs/ci/CARRIER-BRANCH-GATES.md; #9882 closes it at run time).
+KNOWN_LIMIT_LINE = 'python3 -I "$WRAPPER" --name g --slots 9 --max-wait-secs 600 -- bash x'
+# (row, path spelling, the B rules it trips in a composite action: B1 count, B3 count)
+SPELLINGS = [
+    # security finding 1
+    ('expression inside the name', "scripts/ci/host_${{ 'semaphore' }}.py", 1, 0),
+    ('format() of the path', "${{ format('scripts/ci/host_{0}.py', 'semaphore') }}", 1, 0),
+    ('? glob', 'scripts/ci/host_sem?phore.py', 1, 1),
+    ('* glob', 'scripts/ci/host_sema*.py', 1, 1),
+    ("$'\\x5f' escape", "scripts/ci/host$'\\x5f'semaphore.py", 1, 1),
+    ("$'\\137' escape", "scripts/ci/host$'\\137'semaphore.py", 1, 1),
+    # code M-1
+    ('empty expression in the token', "scripts/ci/host_${{ '' }}semaphore.py", 1, 1),
+    ('expression for the _', "scripts/ci/host${{ '_' }}semaphore.py", 1, 1),
+    ('format() with the _', "${{ format('scripts/ci/host{0}semaphore.py', '_') }}", 1, 1),
+    # code L-1
+    ('* glob over the token', 'scripts/ci/host_sem*.py', 1, 1),
+    ('? glob inside the token', 'scripts/ci/host_sema?hore.py', 1, 1),
+]
+
+
+class GatedStepTemplate(unittest.TestCase):
+    """#9879 invariant A (rules A1 to A5) and invariant B (rules B1 to B3), each row with its reason by hand."""
+
+    def gsv(self, texts, module=None, cfg=CFG):
+        return need(self, module or hsc, 'gated_step_violations')(cfg, texts)
+
+    # (row, text of G_W, expected findings): security finding 2, the seven execution-context probes, and more
+    PROBES = [
+        ('the canonical step', gated(), []),
+        ('a python3 shadow function above the call',
+         gated(step(before_exec('  python3() { command python3 -I .local-runs/fake.py "$@"; }'))), [S_A1 % 6]),
+        ('cd above the call', gated(step(before_exec('  cd tools'))), [S_A1 % 6]),
+        ('no -I, and PYTHONPATH in the step env',
+         gated(step(tuple(item.replace(' -I ', ' ') for item in PREFIX), STEP_ENV + (('PYTHONPATH', 'shadow'),))),
+         [S_A1 % 6, S_A4_KEY % 'PYTHONPATH', S_A4_LOADER % ('step', 'PYTHONPATH')]),
+        ('BASH_ENV in the step env', gated(step(env=STEP_ENV + (('BASH_ENV', '.local-runs/env.sh'),))),
+         [S_A4_KEY % 'BASH_ENV', S_A4_LOADER % ('step', 'BASH_ENV')]),
+        ('a step shell that rewrites the script', gated(step(shell="'sed s/slots.2/slots 9/ {0} | bash -e'")),
+         [S_A3_SHELL]),
+        ('the call inside a heredoc',
+         gated(step(with_line(PREFIX.index(EXEC_LINE) + 2, 'EOF', before_exec('  cat >/dev/null <<EOF')))),
+         [S_A1 % 6]),
+        ('exit 0 above the call', gated(step(before_exec('  exit 0'))), [S_A1 % 6]),
+        # more of the same class
+        ('a statement before the prefix', gated(step(('exit 0',) + PREFIX)), [S_A1 % 1]),
+        ('no shell key', gated(step(shell=None)), [S_A3_SHELL]),
+        ('working-directory on the step', gated(step(extra=BODY_INDENT + 'working-directory: tools\n')),
+         [S_A3_DIR]),
+        ('defaults.run on the workflow', gated(top='defaults:\n  run:\n    shell: sh\n'),
+         [S_A3_DEFAULTS % 'workflow']),
+        ('PATH in the job env', gated(job='    env:\n      PATH: .local-runs\n'), [S_A4_LOADER % ('job', 'PATH')]),
+        ('an exported function in the workflow env', gated(top='env:\n  BASH_FUNC_python3%%: x\n'),
+         [S_A4_LOADER % ('workflow', "'BASH_FUNC_python3%%'")]),
+        ('ENV in lower case at job level', gated(job='    env:\n      env: x\n'), [S_A4_LOADER % ('job', 'env')]),
+        ('an env that is not a mapping', gated(step(env=None, extra=BODY_INDENT + 'env: x\n')),
+         [S_G + 'the step env is not a plain mapping, so its keys cannot be checked']),
+        ('another gate in the prefix',
+         gated(step(tuple(item.replace('--name g ', '--name h ') for item in PREFIX))), [S_A1_GATE % ('h', '1')]),
+        ('the slots hole with a word', gated(step(tuple(item.replace('--slots 1 ', '--slots 1 x ') for item in PREFIX))),
+         [S_A1 % 6]),
+        ('a statement after fi names the wrapper',
+         gated(step(PREFIX + ('python3 scripts/ci/host_semaphore.py --help',))), [S_A2]),
+        ('the call split by a continuation after the prefix',
+         gated(step(PREFIX + ('exec python3 scripts/ci/host_\\', 'semaphore.py --name g',))), [S_A2, S_B1 % G_W]),
+        ('an expression in another step of the gated job',
+         gated(step(('echo ${{ github.sha }}',), env=()), step()), [S_B2]),
+        ('slots set but no call', gated(step(('cargo test',))), [S_A5_NONE]),
+    ]
+
+    def test_each_probe_is_its_exact_finding(self):
+        for row, text, expected in self.PROBES:
+            with self.subTest(row):
+                self.assertEqual(self.gsv({G_W: text}), expected)
+
+    def test_the_canonical_step_passes_the_call_scan(self):
+        self.assertEqual(hsc.call_site_violations(CFG, {G_W: gated()}), [])
+
+    def test_each_spelling_in_a_gated_job_is_a_finding(self):
+        for row, path, _, _ in SPELLINGS:
+            with self.subTest(row):
+                got = self.gsv({G_W: gated(step(exec_with(path)))})
+                self.assertIn(S_A1 % 6, got)
+                if '${{' in path:
+                    self.assertIn(S_B2, got)
+
+    def test_each_spelling_outside_a_job_is_its_b_finding(self):
+        for row, path, b1, b3 in SPELLINGS:
+            line = 'exec python3 %s --name g --slots 9 --max-wait-secs 900 --config .local-runs/c.json -- bash x' % path
+            with self.subTest(row):
+                self.assertEqual(self.gsv({A_W: action(line)}),
+                                 [S_OUTSIDE_STEP % A_W] + [S_B1 % A_W] * b1 + [S_B3 % A_W] * b3)
+
+    def test_a_fragment_form_in_a_file_that_is_not_yaml(self):
+        self.assertEqual(self.gsv({'CODEOWNERS': 'scripts/ci/host_sem* @x\n'}), [S_B3 % 'CODEOWNERS'])
+
+    def test_an_unreadable_file_that_names_the_wrapper(self):
+        text = 'a: &x 1\nrun: python3 scripts/ci/host_semaphore.py\n'
+        self.assertEqual(self.gsv({SCAN_W: text}), [S_STEPS_UNREADABLE % SCAN_W])
+
+    def test_the_known_limit_is_pinned(self):
+        """A path taken wholly from a variable holds no literal fragment, so no text rule reads it (#9882)."""
+        text = gated(step(PREFIX + (KNOWN_LIMIT_LINE,)))
+        self.assertEqual(self.gsv({G_W: text}), [])
+        self.assertEqual(hsc.call_site_violations(CFG, {G_W: text}), [])
+
+    def test_a_100k_line_gated_step_is_linear(self):
+        text = gated(step(PREFIX + ('echo x',) * BIG))
+        self.assertGreater(len(text), BIG)
+        start = time.monotonic()
+        got = self.gsv({G_W: text})
+        self.assertLess(time.monotonic() - start, BLOCK_CEILING_SECS)
+        self.assertEqual(got, [])
+
+    def test_a_100k_word_line_in_a_gated_step_is_linear(self):
+        text = gated(step(PREFIX + ('echo ' + 'x ' * BIG + '${{ github.sha }}',)))
+        start = time.monotonic()
+        got = self.gsv({G_W: text})
+        self.assertLess(time.monotonic() - start, LINE_CEILING_SECS)
+        self.assertEqual(got, [S_B2])
+
+    def test_the_real_tree_has_no_finding(self):
+        self.assertEqual(self.gsv(hsc.github_all_texts(), cfg=hsc.load_config()), [])
+
+    # (mutant id, (old text, new text) in host_slots_check.py, texts, expected findings)
+    MUTANTS = [
+        ('A1: a statement before the branch admitted',
+         ('            found.append(F_PREFIX % (where + (index + 1,)))', '            pass'),
+         {G_W: gated(step(with_line(1, 'exit 0')))}, [S_A1 % 2]),
+        ('A1: a changed token inside the branch admitted (prefix match)',
+         ('pattern.fullmatch(statements[index])', 'pattern.match(statements[index])'),
+         {G_W: gated(step(tuple(item.replace('semaphore-step', 'semaphore-step2') if item == EXEC_LINE else item
+                                for item in PREFIX)))}, [S_A1 % 6]),
+        ('A1: the slot hole not compared', ("holes['slots'] != str(gate['slots'])", 'False'),
+         {G_W: gated(step(tuple(item.replace('--slots 1 ', '--slots 2 ') for item in PREFIX)))},
+         [S_A1_GATE % ('g', '2')]),
+        ('A2: a second wrapper mention after the prefix admitted', ('if wrapper_lines > 1:', 'if wrapper_lines > 2:'),
+         {G_W: gated(step(PREFIX + ('python3 scripts/ci/host_semaphore.py --help',)))}, [S_A2]),
+        ('A3: a shell override admitted', ('if step.get(\'shell\') != SHELL_BASH:', 'if False:'),
+         {G_W: gated(step(shell='sh'))}, [S_A3_SHELL]),
+        ('A3: a job defaults.run admitted', ("or 'run' in defaults)", 'or False)'),
+         {G_W: gated(job='    defaults:\n      run:\n        shell: sh\n')}, [S_A3_DEFAULTS % 'job']),
+        ('A3: working-directory admitted', ("if 'working-directory' in step:", 'if False:'),
+         {G_W: gated(step(extra=BODY_INDENT + 'working-directory: tools\n'))}, [S_A3_DIR]),
+        ('A4: an extra env key admitted', ('if key not in GATED_STEP_ENV_KEYS:', 'if False:'),
+         {G_W: gated(step(env=STEP_ENV + (('EXTRA', 'x'),)))}, [S_A4_KEY % 'EXTRA']),
+        ('A4: BASH_ENV at job level admitted',
+         ('return upper in LOADER_ENV_KEYS or upper.startswith(LOADER_ENV_PREFIXES)',
+          'return upper.startswith(LOADER_ENV_PREFIXES)'),
+         {G_W: gated(job='    env:\n      BASH_ENV: .local-runs/env.sh\n')}, [S_A4_LOADER % ('job', 'BASH_ENV')]),
+        ('A5: two call steps admitted', ('    if len(wrapper_steps) > 1:', '    if False:'),
+         {G_W: gated(step(), step())}, [S_A5_STEPS % 2]),
+        ('A5: zero call steps admitted', ('        found.append(F_JOB_NOT_CALLED % where)', '        pass'),
+         {G_W: gated(step(('cargo test',)))}, [S_A5_NONE]),
+        ('B1: a path character admitted',
+         ('if PATH_FRAGMENT_RE.search(quoteless) and NON_CANONICAL_RE.search(quoteless):', 'if False:'),
+         {A_W: action('exec python3 "scripts/ci/host"$S.py --name g')}, [S_OUTSIDE_STEP % A_W, S_B1 % A_W]),
+        ('B2: an expression in a gated job admitted', ('if EXPR_OPENER in line)', 'if False)'),
+         {G_W: gated(step(PREFIX + ('echo ${{ github.sha }}',)))}, [S_B2]),
+        ('B3: a glob beside a fragment admitted',
+         ('    if not FRAGMENT_OPENER_RE.search(line):\n        return False',
+          '    if True:\n        return False'),
+         {A_W: action('x=host_sem*')}, [S_OUTSIDE_STEP % A_W, S_B3 % A_W]),
+        ('a run value outside a job step admitted',
+         ('[F_RUN_OUTSIDE_STEP % wf] * (wrapper_runs - in_steps)', '[F_RUN_OUTSIDE_STEP % wf] * 0'),
+         {A_W: action(SCAN_GOOD)}, [S_OUTSIDE_STEP % A_W]),
+        ('an unreadable file admitted', ('                found.append(F_STEPS_UNREADABLE % wf)', '                pass'),
+         {SCAN_W: 'a: &x 1\nrun: python3 scripts/ci/host_semaphore.py\n'}, [S_STEPS_UNREADABLE % SCAN_W]),
+    ]
+
+    def test_each_mutant_goes_red(self):
+        source = (CI_DIR / 'host_slots_check.py').read_text()
+        for mutant, (old, new), texts, expected in self.MUTANTS:
+            with self.subTest(mutant=mutant):
+                self.assertEqual(source.count(old), 1, 'mutant anchor %r' % old)
+                self.assertEqual(self.gsv(texts), expected)
+                got = self.gsv(texts, load_checker(source.replace(old, new)))
                 self.assertNotEqual(got, expected, 'mutant %s survived' % mutant)
 
 
