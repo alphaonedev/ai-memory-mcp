@@ -1160,7 +1160,7 @@ jobs:
     # named #1492 watchdog fires before GitHub's cancel. Do not raise a cap
     # for the gate.
     # #7914: on the self-hosted linux-fed enterprise-fed leg the compile+test
-    # phase also waits for a host-local semaphore slot (2 slots, up to 3600 s);
+    # phase also waits for a host-local semaphore slot (2 slots, up to 600 s);
     # that wait counts against the cap (JOB_T0 is unchanged), hence 300 there.
     timeout-minutes: ${{ matrix.timeout }}
     env:
