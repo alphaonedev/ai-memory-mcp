@@ -54,76 +54,273 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 
 # --- ratchet implementation ---
-SCRIPTS_ROOT = REPO / "scripts"
-SCAN_ROOT = SCRIPTS_ROOT / "ci"
+SCRIPTS_DIR = "scripts"
+EXTRA_IMPORT_ROOTS = ("scripts/ci",)  # the directory the guard tests put on sys.path
 PY_SUFFIX = ".py"
-SKIP_DIR_NAMES = frozenset({"__pycache__"})
+INIT_STEM = "__init__"
+PYTHON_SHEBANG_RE = re.compile(rb"\A#![^\n]*python")
+SHEBANG_READ_BYTES = 256
+GIT_TIMEOUT_SECS = 60
 SCAN_CEILING_SECS = 30.0  # the whole tree scan, parse included
 BIG_SOURCE_LINES = 100_000
 BIG_SOURCE_CEILING_SECS = 20.0
 
-# (file relative to the repository, top-level module) -> (reason, issue number). Empty by rule (#9813).
-THIRD_PARTY_ALLOW: dict[tuple[str, str], tuple[str, int]] = {}
+IMPORT_CALLS = frozenset({"__import__", "import_module", "find_spec", "run_module"})
+CODE_CALLS = frozenset({"exec", "eval"})
+ALIAS_SOURCES = frozenset({"importlib", "importlib.util", "runpy", "builtins"})
+NONLITERAL = "<non-literal %s()>"
+UNPARSABLE = "<unparsable %s() text>"
+
+# Import names of third-party distributions a fleet script could reach for. Rule 4 refuses a repository module
+# or package directory of any of these names. Hand-written; not derived from the running interpreter.
+THIRD_PARTY_NAMES = frozenset({
+    "attr", "attrs", "boto3", "botocore", "bs4", "certifi", "chardet", "charset_normalizer", "click", "cryptography",
+    "dateutil", "docker", "git", "github", "hypothesis", "idna", "jinja2", "jsonschema", "lxml", "markdown", "mypy",
+    "nacl", "numpy", "packaging",
+    "pip", "pkg_resources", "psycopg", "psycopg2", "pydantic", "pytest", "requests", "rich", "ruamel", "setuptools",
+    "six", "toml", "typer", "urllib3", "yaml",
+})
+
+MSG_IMPORT = "%s:%d: import of %r is neither standard library nor a repository module"
+MSG_MARKER = "%s:%d: %s is not decidable as a standard-library or repository import"
+MSG_SHADOW = "%s: repository module %r shadows a standard-library or third-party name"
+MSG_READ = "%s: cannot read as UTF-8: %s"
+MSG_PARSE = "%s: cannot parse: %s"
+MSG_STALE = "allow row %r matches no finding (stale row)"
+MSG_COUNT = "allow row %r covers %d finding(s), found %d at line(s) %s"
+MSG_SHADOW_STALE = "shadow allow row %r matches no repository module (stale row)"
+MSG_GIT = "cannot list the tracked files: %s"
+MSG_EMPTY = "no tracked Python file under %s: the scan would pass on nothing"
+
+# (file relative to the repository, module or marker) -> (findings covered, reason, issue).
+THIRD_PARTY_ALLOW: dict[tuple[str, str], tuple[int, str, int]] = {
+    ("scripts/test/test_workflow_edited_cancel_8332.py", "yaml"): (
+        4, "the two PyYAML differential-oracle cells (find_spec skip guard and the import inside each cell); the "
+           "cells skip where PyYAML is absent and compare the scanner with PyYAML where it is present", 8332),
+    ("scripts/ci/tests/test_ci_tainted_job_boundary.py", "yaml"): (
+        2, "oracle two: the PyYAML full-document compare (find_spec and the import inside the cell); it fails loudly "
+           "on build-script-vetting and skips with its reason elsewhere", 9813),
+    ("scripts/ci/prune_runner_tmp.py", NONLITERAL % "exec"): (
+        1, "runs the shared module's source, read from its repository file", 9813),
+    ("scripts/ci/tests/test_ci_base_selector_8240.py", NONLITERAL % "exec"): (
+        1, "runs the materialise step snippet read from the repository's ci.yml", 9813),
+    ("scripts/ci/tests/test_ci_base_selector_8240.py", NONLITERAL % "import_module"): (
+        1, "imports the module names of the test's own spec table (repository modules)", 9813),
+    ("scripts/ci/tests/test_ci_tainted_job_boundary_prescan_uses.py", NONLITERAL % "exec"): (
+        1, "runs a mutated copy of the repository's taint_boundary.py source", 9813),
+    ("scripts/ci/tests/test_evidence_generator_5040_5042.py", NONLITERAL % "import_module"): (
+        1, "imports scripts/evidence modules by name", 9813),
+    ("scripts/ci/tests/test_evidence_generator_r7_7393.py", NONLITERAL % "exec"): (
+        1, "runs the test's own spelling-corpus rows", 9813),
+    ("scripts/ci/tests/test_impact_cargo_skip_8328.py", NONLITERAL % "exec"): (
+        1, "runs the repository's sed shim source", 9813),
+    ("scripts/claude-md-rule-compare.py", NONLITERAL % "exec"): (
+        1, "runs a trusted-base module compiled from its repository file", 9813),
+    ("scripts/ci/tests/tmp_runtime_guard_7393.py", "run_cert"): (
+        1, "scripts/evidence/run_cert.py, reached through the sys.path insert of scripts/evidence just above it", 9813),
+    ("scripts/recapture-cert-3607-posture.py", "cryptography"): (
+        2, "operator-run fixture writer; the import sits inside write_fixtures(), so the module loads without it and "
+           "no CI job runs it", 3607),
+    ("scripts/render-a2a-integration.py", "markdown"): (
+        1, "operator-run docs renderer whose docstring states it requires Python-Markdown; no CI job runs it", 3636),
+}
+
+# Repository module path (a .py file, or a package directory with a trailing "/") -> (reason, issue).
+SHADOW_ALLOW: dict[str, tuple[str, int]] = {
+    "scripts/ci/impact/select.py": (
+        "imported only as the package member impact.select; no file in scripts/ci/impact imports the top-level "
+        "name select, and scripts/ci/impact is not an import root of any other file", 9813),
+}
 
 
-def repo_local_modules() -> frozenset[str]:
-    """Top-level names the repository itself provides under scripts: every module stem and package directory."""
-    names: set[str] = set()
-    for path in SCRIPTS_ROOT.rglob("*" + PY_SUFFIX):
-        if SKIP_DIR_NAMES & set(path.parts):
+def is_python_file(repo: Path, rel: str) -> bool:
+    """A ``.py`` file, or a file whose first line is a ``#!`` line naming python."""
+    if rel.endswith(PY_SUFFIX):
+        return True
+    try:
+        with open(repo / rel, "rb") as handle:
+            head = handle.read(SHEBANG_READ_BYTES)
+    except OSError:
+        return False
+    return bool(PYTHON_SHEBANG_RE.match(head))
+
+
+def tracked_python_files(repo: Path) -> list[str]:
+    """Every tracked Python file under ``scripts`` (``git ls-files``). Raises RuntimeError when git cannot list."""
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError(MSG_GIT % "git not found")
+    try:
+        proc = subprocess.run([git, "-C", str(repo), "ls-files", "-z", "--", SCRIPTS_DIR], capture_output=True,
+                              timeout=GIT_TIMEOUT_SECS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(MSG_GIT % type(exc).__name__) from exc
+    if proc.returncode != 0:
+        raise RuntimeError(MSG_GIT % ("git ls-files rc %d" % proc.returncode))
+    names = [name for name in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if name]
+    return sorted(rel for rel in names if is_python_file(repo, rel))
+
+
+def module_names_by_dir(files: list[str]) -> dict[str, dict[str, str]]:
+    """``{directory: {top-level name: module path}}`` for every ``.py`` module and package directory in ``files``."""
+    by_dir: dict[str, dict[str, str]] = {}
+    for rel in files:
+        if not rel.endswith(PY_SUFFIX):
             continue
-        names.add(path.stem)
-        names.update(path.relative_to(SCRIPTS_ROOT).parts[:-1])
+        parts = rel.split("/")
+        parent = "/".join(parts[:-1])
+        stem = parts[-1][: -len(PY_SUFFIX)]
+        if stem != INIT_STEM:
+            by_dir.setdefault(parent, {}).setdefault(stem, rel)
+        for depth in range(1, len(parts) - 1):
+            above = "/".join(parts[:depth])
+            by_dir.setdefault(above, {}).setdefault(parts[depth], "/".join(parts[: depth + 1]) + "/")
+    return by_dir
+
+
+def import_roots(rel: str) -> list[str]:
+    """The directories a file's top-level imports resolve in: its own, each one above it up to scripts, scripts/ci."""
+    parts = rel.split("/")[:-1]
+    roots = ["/".join(parts[:depth]) for depth in range(len(parts), 0, -1)]
+    roots = [root for root in roots if root == SCRIPTS_DIR or root.startswith(SCRIPTS_DIR + "/")]
+    return roots + [root for root in EXTRA_IMPORT_ROOTS if root not in roots]
+
+
+def local_names(rel: str, by_dir: dict[str, dict[str, str]]) -> frozenset[str]:
+    """Top-level names that resolve to the repository for the file ``rel``."""
+    names: set[str] = set()
+    for root in import_roots(rel):
+        names.update(by_dir.get(root, {}))
     return frozenset(names)
 
 
+def _callee(func: ast.expr, aliases: dict[str, str]) -> str | None:
+    if isinstance(func, ast.Name):
+        return aliases.get(func.id, func.id)
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _literal_strings(node: ast.expr | None) -> list[str] | None:
+    """The string values a literal (or a conditional of literals) can take; None for anything else."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.IfExp):
+        body, orelse = _literal_strings(node.body), _literal_strings(node.orelse)
+        if body is not None and orelse is not None:
+            return body + orelse
+    return None
+
+
+def _aliases(tree: ast.AST) -> dict[str, str]:
+    """Names bound by ``from importlib import import_module as x`` (and the like) -> the function they name."""
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in ALIAS_SOURCES:
+            for alias in node.names:
+                if alias.name in IMPORT_CALLS | CODE_CALLS:
+                    found[alias.asname or alias.name] = alias.name
+    return found
+
+
+def _findings(tree: ast.AST, local: frozenset[str], at_line: int | None) -> list[tuple[int, str]]:
+    aliases = _aliases(tree)
+    found: list[tuple[int, str]] = []
+
+    def check(line: int, module: str) -> None:
+        if not module or module.startswith("."):
+            return  # a relative import is the repository itself
+        top = module.split(".")[0]
+        if top not in sys.stdlib_module_names and top not in local:
+            found.append((at_line or line, top))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                check(node.lineno, alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                check(node.lineno, node.module)
+        elif isinstance(node, ast.Call):
+            name = _callee(node.func, aliases)
+            if name not in IMPORT_CALLS and name not in CODE_CALLS:
+                continue
+            values = _literal_strings(node.args[0] if node.args else None)
+            if values is None:
+                found.append((at_line or node.lineno, NONLITERAL % name))
+            elif name in IMPORT_CALLS:
+                for value in values:
+                    check(node.lineno, value)
+            else:
+                for value in values:
+                    try:
+                        inner = ast.parse(value)
+                    except (SyntaxError, ValueError):
+                        found.append((at_line or node.lineno, UNPARSABLE % name))
+                        continue
+                    found.extend(_findings(inner, local, at_line or node.lineno))
+    return found
+
+
 def foreign_imports(source: str, filename: str, local: frozenset[str]) -> list[tuple[int, str]]:
-    """``(line, top-level module)`` of every import in ``source`` that is neither stdlib nor repository-local.
+    """``(line, module or marker)`` of every finding of rules 1-3 in ``source``.
 
     Raises SyntaxError / ValueError for source that does not parse: the caller turns that into a failure.
     """
-    tree = ast.parse(source, filename=filename)
-    found: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            tops = [alias.name.split(".")[0] for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            if node.level > 0 or not node.module:
-                continue  # a relative import is the repository itself
-            tops = [node.module.split(".")[0]]
-        else:
+    return sorted(_findings(ast.parse(source, filename=filename), local, None))
+
+
+def shadow_findings(by_dir: dict[str, dict[str, str]]) -> dict[str, str]:
+    """Rule 4: ``{module path: name}`` for every repository module or package directory with a refused name."""
+    shadows: dict[str, str] = {}
+    for directory, names in by_dir.items():
+        if directory != SCRIPTS_DIR and not directory.startswith(SCRIPTS_DIR + "/"):
             continue
-        for top in tops:
-            if top not in sys.stdlib_module_names and top not in local:
-                found.append((node.lineno, top))
-    return sorted(found)
+        for name, path in names.items():
+            if name in sys.stdlib_module_names or name in THIRD_PARTY_NAMES:
+                shadows[path] = name
+    return shadows
 
 
-def scan_tree(root: Path, local: frozenset[str], allow: dict[tuple[str, str], tuple[str, int]]) -> list[str]:
-    """One problem line per foreign import, unreadable file or unparsable file under ``root``."""
+def scan_tree(repo: Path, files: list[str], allow: dict[tuple[str, str], tuple[int, str, int]],
+              shadow_allow: dict[str, tuple[str, int]]) -> list[str]:
+    """One problem line per finding of rules 1-4, unreadable or unparsable file, and stale or miscounted row."""
     problems: list[str] = []
-    used: set[tuple[str, str]] = set()
-    for path in sorted(root.rglob("*" + PY_SUFFIX)):
-        if SKIP_DIR_NAMES & set(path.parts):
-            continue
-        rel = path.relative_to(REPO).as_posix() if REPO in path.parents else path.as_posix()
+    if not files:
+        return [MSG_EMPTY % SCRIPTS_DIR]
+    by_dir = module_names_by_dir(files)
+    covered: dict[tuple[str, str], list[int]] = {}
+    for rel in files:
         try:
-            source = path.read_bytes().decode("utf-8")
+            source = (repo / rel).read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            problems.append("%s: cannot read as UTF-8: %r" % (rel, exc))
+            problems.append(MSG_READ % (rel, type(exc).__name__))
             continue
         try:
-            imports = foreign_imports(source, rel, local)
+            findings = foreign_imports(source, rel, local_names(rel, by_dir))
         except (SyntaxError, ValueError) as exc:
-            problems.append("%s: cannot parse: %r" % (rel, exc))
+            problems.append(MSG_PARSE % (rel, type(exc).__name__))
             continue
-        for line, top in imports:
+        for line, top in findings:
             if (rel, top) in allow:
-                used.add((rel, top))
-                continue
-            problems.append("%s:%d: import of %r is neither standard library nor a repository module" % (rel, line, top))
-    for key in sorted(set(allow) - used):
-        problems.append("allow row %r matches no import (stale row)" % (key,))
+                covered.setdefault((rel, top), []).append(line)
+            elif top.startswith("<"):
+                problems.append(MSG_MARKER % (rel, line, top))
+            else:
+                problems.append(MSG_IMPORT % (rel, line, top))
+    for key, (count, _reason, _issue) in sorted(allow.items()):
+        lines = covered.get(key)
+        if not lines:
+            problems.append(MSG_STALE % (key,))
+        elif len(lines) != count:
+            problems.append(MSG_COUNT % (key, count, len(lines), ",".join(map(str, lines))))
+    shadows = shadow_findings(by_dir)
+    for path, name in sorted(shadows.items()):
+        if path not in shadow_allow:
+            problems.append(MSG_SHADOW % (path, name))
+    for path in sorted(set(shadow_allow) - set(shadows)):
+        problems.append(MSG_SHADOW_STALE % (path,))
     return problems
 # --- end ratchet implementation ---
 
