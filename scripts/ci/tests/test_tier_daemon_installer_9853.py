@@ -142,6 +142,17 @@ EXPECTED_DICT = {
 }
 FOREIGN_BYTES = b"<plist>someone else's daemon</plist>\n"
 PIDFILE_BYTES = b"4242\n/opt/tier/pgdata\n1763768852\n5445\n"
+# The eight lines postgres writes to postmaster.pid once it accepts connections: pid, data directory, start time,
+# port, socket directory, listen address, shared memory key, status (padded to 8 characters).
+PIDFILE_READY = "ready   "
+
+
+def pidfile_text(pid: int, data_dir: str = "/opt/tier/pgdata", port: str = "5445", status: str | None = PIDFILE_READY) -> bytes:
+    """A postmaster.pid in the shape postgres writes; ``status=None`` leaves line 8 out (a start in progress)."""
+    lines = [str(pid), data_dir, "1763768852", port, "/opt/tier/run", "localhost", "  5445001   65536"]
+    if status is not None:
+        lines.append(status)
+    return ("\n".join(lines) + "\n").encode()
 
 
 def _sha16(data: bytes) -> str:
@@ -245,7 +256,7 @@ class FakeRunner(tdi.HostRunner):
                 if self.loaded:
                     self.launchd_pid_value = self.started_pid
                     if self.pidfile_pid is not None:
-                        self.files[PIDFILE] = f"{self.pidfile_pid}\n/opt/tier/pgdata\n1763768852\n5445\n".encode()
+                        self.files[PIDFILE] = pidfile_text(self.pidfile_pid)
             return subprocess.CompletedProcess(argv, rc, "", "")
         if argv[0] == tdi.PS:
             pid = int(argv[2])

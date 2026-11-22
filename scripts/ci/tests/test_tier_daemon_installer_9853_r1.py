@@ -91,7 +91,7 @@ class R1Fake(base.FakeRunner):
         if verb == "bootstrap" and result.returncode == 0:
             self.launchd_pid_value = self.started_pid
             if self.pidfile_pid is not None:
-                self.files[PIDFILE] = f"{self.pidfile_pid}\n/opt/tier/pgdata\n1763768852\n5445\n".encode()
+                self.files[PIDFILE] = base.pidfile_text(self.pidfile_pid)
         return result
 
 
@@ -172,7 +172,7 @@ VERIFY_HOST_STATE = f"state: plist {PLIST} present; service {SERVICE} unknown (/
 # (name, inject, exit code, stdout, stderr, commands, plist left, loaded left)
 CLASS_A = [
     ("all good", _all_good, 0, [PROCEED, FREE, WROTE, BOOTSTRAPPED, ANSWERS, INSTALLED], [],
-     [PRINT, PORT, PUBLISH, BOOTSTRAP, PROBE, PRINT], True, True),
+     [PRINT, PORT, PUBLISH, BOOTSTRAP, PROBE, PRINT, PRINT], True, True),
     ("port taken by another process", _port_taken, 11, [PROCEED],
      [REFUSED + "127.0.0.1:5445 already answers before bootstrap; another process holds the port; nothing changed"],
      [PRINT, PORT], False, False),
@@ -301,7 +301,7 @@ class _RemoveThenFailFake(R1Fake):
         self._require_changes()
         self.calls.append(("remove", path))
         del self.files[path]
-        raise OSError(errno.EIO, "io")
+        raise getattr(tdi, "PartialRemove", OSError)(errno.EIO, "io")
 
 
 CHANGED_WROTE_BOOTSTRAPPED = f"changed: wrote {PLIST}; bootstrapped {SERVICE}"
@@ -367,12 +367,188 @@ class ClassBUndoFromStateTests(unittest.TestCase):
             (
                 6,
                 [REMOVE_PROCEED, f"booted out {SERVICE}"],
-                [FAILED + f"removing {PLIST}: EIO", f"changed: booted out {SERVICE}", STATE_ABSENT_NOT_LOADED,
-                 FINISH_REMOVAL],
+                [FAILED + f"removing {PLIST}: EIO after the plist was unlinked",
+                 f"changed: booted out {SERVICE}; removed {PLIST}", STATE_ABSENT_NOT_LOADED, FINISH_REMOVAL],
             ),
         )
         self.assertEqual(fake.calls, [PRINT, BOOTOUT, REMOVE, PRINT])
         self.assertFalse(any("bootstrap" in line for line in outcome.err), outcome.err)
+
+
+# Round 2, finding 9872-r2-1: the install proof over every state of postmaster.pid and launchd.
+# The dimensions of the table: the pid on line 1, the data directory on line 2, the port on line 4, the status on
+# line 8, the readiness probe, and the pid launchd reports when it is asked again after the pid file was read.
+PID_ROWS = {"pid same": LAUNCHD_PID, "pid other": OTHER_PID}
+DATA_ROWS = {"data same": base.DATA, "data other": "/opt/tier/other"}
+PORT_ROWS = {"port same": "5445", "port other": "5446"}
+# The status column as postgres pads it to 8 characters; None leaves line 8 out (a start still in progress).
+STATUS_ROWS = {
+    "ready": "ready   ",
+    "starting": "starting",
+    "stopping": "stopping",
+    "standby": "standby ",
+    "empty": "",
+    "missing": None,
+}
+PROBE_ROWS = {"probe answers": True, "probe silent": False}
+REREAD_ROWS = {"reread same": LAUNCHD_PID, "reread changed": OTHER_PID, "reread gone": None}
+PROOF_TABLE_SIZE = 2 * 2 * 2 * 6 * 2 * 3
+
+# The exact reasons, written out by hand (never taken from the module under test).
+WHY_PROBE = "127.0.0.1:5445 did not answer within 60 s"
+WHY_SHORT = f"{PIDFILE} has 7 lines, not the 8 a started postmaster writes"
+WHY_LONG = f"{PIDFILE} has text after line 8"
+WHY_PID = f"launchd pid 5151 of {SERVICE} is not the postmaster pid 6262 in {PIDFILE}"
+WHY_DATA = f"{PIDFILE} names data directory '/opt/tier/other', not /opt/tier/pgdata"
+WHY_PORT = f"{PIDFILE} names port '5446', not 5445"
+WHY_PORT_EMPTY = f"{PIDFILE} has an empty port line"
+WHY_PORT_NAN = f"{PIDFILE} port line '54x5' is not a number"
+WHY_STATUS_EMPTY = f"{PIDFILE} has an empty status line"
+WHY_STATUS = {
+    "starting": f"{PIDFILE} status is 'starting', not ready",
+    "stopping": f"{PIDFILE} status is 'stopping', not ready",
+    "standby": f"{PIDFILE} status is 'standby', not ready",
+}
+WHY_REREAD_CHANGED = f"launchd pid of {SERVICE} changed from 5151 to 6262 while {PIDFILE} was read"
+WHY_REREAD_GONE = f"launchd reports no pid for {SERVICE} after {PIDFILE} was read"
+WHY_TOO_BIG = f"{PIDFILE} names no postmaster pid (is larger than 4096 bytes)"
+WHY_BAD_PID = f"{PIDFILE} names no postmaster pid (does not start with a process id)"
+WHY_UNREADABLE = f"{PIDFILE} is unreadable (read {PIDFILE}: EIO)"
+PROBE_FAILED_CALLS = [PRINT, PORT, PUBLISH, BOOTSTRAP, PROBE, PRINT]
+PIDFILE_FAILED_CALLS = [PRINT, PORT, PUBLISH, BOOTSTRAP, PROBE, PRINT, PRINT]
+REREAD_FAILED_CALLS = [PRINT, PORT, PUBLISH, BOOTSTRAP, PROBE, PRINT, PRINT, PRINT]
+INSTALLED_CALLS = [PRINT, PORT, PUBLISH, BOOTSTRAP, PROBE, PRINT, PRINT]
+
+
+def expected_proof(pid: str, data: str, port: str, status: str, probe: str, reread: str) -> tuple[int, str, list]:
+    """The oracle: the exit code, the reason (empty for installed) and the commands, in the order the proof runs."""
+    if probe == "probe silent":
+        return 7, WHY_PROBE, PROBE_FAILED_CALLS
+    if status == "missing":
+        return 7, WHY_SHORT, PIDFILE_FAILED_CALLS
+    if pid == "pid other":
+        return 7, WHY_PID, PIDFILE_FAILED_CALLS
+    if data == "data other":
+        return 7, WHY_DATA, PIDFILE_FAILED_CALLS
+    if port == "port other":
+        return 7, WHY_PORT, PIDFILE_FAILED_CALLS
+    if status == "empty":
+        return 7, WHY_STATUS_EMPTY, PIDFILE_FAILED_CALLS
+    if status != "ready":
+        return 7, WHY_STATUS[status], PIDFILE_FAILED_CALLS
+    if reread == "reread changed":
+        return 7, WHY_REREAD_CHANGED, REREAD_FAILED_CALLS
+    if reread == "reread gone":
+        return 7, WHY_REREAD_GONE, REREAD_FAILED_CALLS
+    return 0, "", INSTALLED_CALLS
+
+
+class _ProofFake(R1Fake):
+    """Bootstrap writes the given pid file bytes; the second launchd query after it answers with ``reread_pid``."""
+
+    def __init__(self, pidfile_bytes: bytes | None, probe: bool, reread_pid: int | None, unreadable: bool = False) -> None:
+        super().__init__()
+        self.pidfile_bytes = pidfile_bytes
+        self.probe_result = probe
+        self.reread_pid = reread_pid
+        self.unreadable = unreadable
+        self.prints_after_bootstrap: int | None = None
+
+    def read_data_dir(self, path: str, name: str, limit: int):
+        if self.unreadable and self.prints_after_bootstrap is not None:
+            raise tdi.HostError(f"read {path}/{name}: EIO")
+        return super().read_data_dir(path, name, limit)
+
+    def _run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == [tdi.LAUNCHCTL, "print"] and self.prints_after_bootstrap is not None:
+            self.prints_after_bootstrap += 1
+            if self.prints_after_bootstrap == 2:
+                self.launchd_pid_value = self.reread_pid
+        result = super()._run(argv)
+        if argv[:2] == [tdi.LAUNCHCTL, "bootstrap"] and result.returncode == 0:
+            self.prints_after_bootstrap = 0
+            if self.pidfile_bytes is None:
+                self.files.pop(PIDFILE, None)
+            else:
+                self.files[PIDFILE] = self.pidfile_bytes
+        return result
+
+
+def _proof_row(test: unittest.TestCase, name: str, fake: _ProofFake, code: int, why: str, calls: list) -> None:
+    outcome = tdi.run(base.argv_for("INSTALL"), fake, base.INVOCATION)
+    with test.subTest(row=name):
+        if code == 0:
+            test.assertEqual((outcome.code, outcome.out, outcome.err), (0, VERIFY_OUT + [INSTALLED], []))
+        else:
+            out = VERIFY_OUT if why != WHY_PROBE else VERIFY_OUT[:-1]
+            test.assertEqual(
+                (outcome.code, outcome.out, outcome.err),
+                (code, out, [FAILED + why, CHANGED_WROTE_BOOTSTRAPPED, STATE_PRESENT_LOADED, UNDO_REMOVE]),
+            )
+            test.assertNotIn("installed", " ".join(outcome.out + outcome.err))
+        test.assertEqual(fake.calls, calls)
+
+
+class ClassAExhaustiveProofTests(unittest.TestCase):
+    def test_every_combination_of_pid_file_and_launchd_state(self) -> None:
+        rows = 0
+        installed = 0
+        for pid_name, pid in PID_ROWS.items():
+            for data_name, data_dir in DATA_ROWS.items():
+                for port_name, port in PORT_ROWS.items():
+                    for status_name, status in STATUS_ROWS.items():
+                        for probe_name, probe in PROBE_ROWS.items():
+                            for reread_name, reread in REREAD_ROWS.items():
+                                code, why, calls = expected_proof(
+                                    pid_name, data_name, port_name, status_name, probe_name, reread_name
+                                )
+                                fake = _ProofFake(base.pidfile_text(pid, data_dir, port, status), probe, reread)
+                                name = " / ".join([pid_name, data_name, port_name, status_name, probe_name, reread_name])
+                                _proof_row(self, name, fake, code, why, calls)
+                                rows += 1
+                                installed += code == 0
+        self.assertEqual((rows, installed), (PROOF_TABLE_SIZE, 1))
+
+    def test_degenerate_pid_files_are_states_with_their_own_reason(self) -> None:
+        ready = base.pidfile_text(LAUNCHD_PID)
+        degenerate = [
+            ("seven lines", base.pidfile_text(LAUNCHD_PID, status=None), WHY_SHORT),
+            ("trailing junk after line 8", ready + b"junk\n", WHY_LONG),
+            ("a blank line after line 8", ready + b"\n", WHY_LONG),
+            ("empty port line", base.pidfile_text(LAUNCHD_PID, port=""), WHY_PORT_EMPTY),
+            ("non-numeric port", base.pidfile_text(LAUNCHD_PID, port="54x5"), WHY_PORT_NAN),
+            ("port with a leading zero", base.pidfile_text(LAUNCHD_PID, port="05445"), f"{PIDFILE} names port '05445', not 5445"),
+            ("empty status line", base.pidfile_text(LAUNCHD_PID, status=""), WHY_STATUS_EMPTY),
+            ("blank status line", base.pidfile_text(LAUNCHD_PID, status="        "), WHY_STATUS_EMPTY),
+            ("status with a suffix", base.pidfile_text(LAUNCHD_PID, status="readyX  "), f"{PIDFILE} status is 'readyX', not ready"),
+            ("status cut short", base.pidfile_text(LAUNCHD_PID, status="rea"), f"{PIDFILE} status is 'rea', not ready"),
+            ("status with a tab", base.pidfile_text(LAUNCHD_PID, status="ready\t"), f"{PIDFILE} status is 'ready\\t', not ready"),
+            ("status in upper case", base.pidfile_text(LAUNCHD_PID, status="READY   "), f"{PIDFILE} status is 'READY', not ready"),
+            ("data directory with a trailing slash", base.pidfile_text(LAUNCHD_PID, data_dir=base.DATA + "/"),
+             f"{PIDFILE} names data directory '/opt/tier/pgdata/', not /opt/tier/pgdata"),
+            ("data directory in another encoding", base.pidfile_text(LAUNCHD_PID, data_dir="/opt/tier/pgdäta"),
+             f"{PIDFILE} names data directory '/opt/tier/pgd\\xe4ta', not /opt/tier/pgdata"),
+            ("over the size cap", ready + b"x" * (tdi.MAX_PIDFILE_BYTES + 1), WHY_TOO_BIG),
+            ("bad pid line", b"abc" + ready[4:], WHY_BAD_PID),
+            ("empty file", b"", f"{PIDFILE} names no postmaster pid (is empty)"),
+            ("absent", None, f"{PIDFILE} names no postmaster pid (absent)"),
+        ]
+        for name, data, why in degenerate:
+            _proof_row(self, name, _ProofFake(data, True, LAUNCHD_PID), 7, why, PIDFILE_FAILED_CALLS)
+        _proof_row(self, "unreadable", _ProofFake(ready, True, LAUNCHD_PID, unreadable=True), 7, WHY_UNREADABLE,
+                   PIDFILE_FAILED_CALLS)
+
+    def test_a_long_control_laden_line_is_shown_bounded_and_escaped(self) -> None:
+        hostile = "\x1b[2J" + "z" * 100_000
+        fake = _ProofFake(base.pidfile_text(LAUNCHD_PID, port=hostile), True, LAUNCHD_PID)
+        outcome = tdi.run(base.argv_for("INSTALL"), fake, base.INVOCATION)
+        self.assertEqual(outcome.code, 7)
+        self.assertEqual(outcome.err[0], FAILED + WHY_TOO_BIG)
+        fake = _ProofFake(base.pidfile_text(LAUNCHD_PID, port="\x1b[2J" + "z" * 200), True, LAUNCHD_PID)
+        outcome = tdi.run(base.argv_for("INSTALL"), fake, base.INVOCATION)
+        self.assertEqual(outcome.code, 7)
+        self.assertEqual(outcome.err[0], FAILED + f"{PIDFILE} port line '\\x1b[2J{'z' * 60}...' is not a number")
+        self.assertNotIn("\x1b", " ".join(outcome.err))
 
 
 if __name__ == "__main__":

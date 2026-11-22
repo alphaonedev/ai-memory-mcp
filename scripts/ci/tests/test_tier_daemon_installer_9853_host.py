@@ -12,6 +12,7 @@ Run from scripts/ci/tests: python3 -m unittest test_tier_daemon_installer_9853_h
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shlex
@@ -109,6 +110,39 @@ class Recorder:
             raise self.error
 
 
+REAL_UNLINK = os.unlink
+REAL_CLOSE = os.close
+
+
+class FailingUnlink:
+    """An ``os.unlink`` that fails with EIO the first ``times`` calls for ``name`` and is the real one otherwise."""
+
+    def __init__(self, name: str, times: int) -> None:
+        self.name = name
+        self.times = times
+        self.failed = 0
+
+    def __call__(self, path, *args, **kwargs) -> None:
+        if path == self.name and self.failed < self.times:
+            self.failed += 1
+            raise OSError(errno.EIO, "unlink")
+        REAL_UNLINK(path, *args, **kwargs)
+
+
+class FailingClose:
+    """An ``os.close`` that closes the fd for real, then reports EIO on its ``nth`` call (so no fd leaks)."""
+
+    def __init__(self, nth: int) -> None:
+        self.nth = nth
+        self.count = 0
+
+    def __call__(self, fd: int) -> None:
+        self.count += 1
+        REAL_CLOSE(fd)
+        if self.count == self.nth:
+            raise OSError(errno.EIO, "close")
+
+
 def writer(fchown: Recorder | None = None, fsync: Recorder | None = None) -> tdi.HostRunner:
     return tdi.HostRunner(True, fchown=fchown or Recorder(), fsync=fsync or Recorder())
 
@@ -188,6 +222,108 @@ class PublishFileTests(Scratch):
         self.assertEqual(leftover.read_bytes(), OTHER_BYTES)
         self.assertFalse(self.target().exists())
 
+    def temp(self) -> Path:
+        return self.root / f".{PLIST_NAME}.tmp-{os.getpid()}"
+
+    def test_both_temp_unlinks_failing_after_the_link_is_a_partial_write_naming_the_temp(self) -> None:
+        unlink = FailingUnlink(self.temp().name, 2)
+        with mock.patch.object(tdi.os, "unlink", side_effect=unlink):
+            with self.assertRaises(tdi.PartialWrite) as caught:
+                writer().publish_file(str(self.target()), DATA_BYTES)
+        self.assertEqual(caught.exception.errno, errno.EIO)
+        self.assertEqual(
+            caught.exception.strerror,
+            f"{self.target()} linked in place, then removing temp file {self.temp()} failed (EIO); "
+            f"temp file {self.temp()} left in place",
+        )
+        self.assertEqual(caught.exception.left_temp, str(self.temp()))
+        self.assertEqual(unlink.failed, 2)
+        self.assertEqual(self.target().read_bytes(), DATA_BYTES)
+        self.assertEqual(sorted(os.listdir(self.root)), sorted([PLIST_NAME, self.temp().name]))
+
+    def test_a_first_temp_unlink_failure_is_retried_once(self) -> None:
+        unlink = FailingUnlink(self.temp().name, 1)
+        with mock.patch.object(tdi.os, "unlink", side_effect=unlink):
+            writer().publish_file(str(self.target()), DATA_BYTES)
+        self.assertEqual(unlink.failed, 1)
+        self.assertEqual(self.target().read_bytes(), DATA_BYTES)
+        self.assertEqual(sorted(os.listdir(self.root)), [PLIST_NAME])
+
+    def test_a_dir_close_failure_after_the_link_is_a_partial_write(self) -> None:
+        close = FailingClose(2)
+        with mock.patch.object(tdi.os, "close", side_effect=close):
+            with self.assertRaises(tdi.PartialWrite) as caught:
+                writer().publish_file(str(self.target()), DATA_BYTES)
+        self.assertEqual(caught.exception.strerror, f"{self.target()} linked in place, then closing the directory failed (EIO)")
+        self.assertIsNone(caught.exception.left_temp)
+        self.assertEqual(sorted(os.listdir(self.root)), [PLIST_NAME])
+
+    def test_a_failure_before_the_link_with_a_failing_cleanup_keeps_its_kind_and_names_the_temp(self) -> None:
+        rows = [
+            ("write", errno.ENOSPC, OSError),
+            ("fchown", errno.EPERM, OSError),
+            ("fchmod", errno.EPERM, OSError),
+            ("fsync", errno.EIO, OSError),
+            ("close", errno.EIO, OSError),
+            ("link", errno.EEXIST, FileExistsError),
+        ]
+        for failures, left in ((2, True), (1, False)):
+            for step, code, kind in rows:
+                with self.subTest(step=step, cleanup_failures=failures):
+                    if step == "link":
+                        self.target().write_bytes(OTHER_BYTES)
+                    error = OSError(code, step)
+                    chown = Recorder(1, error) if step == "fchown" else Recorder()
+                    sync = Recorder(1, error) if step == "fsync" else Recorder()
+                    runner = writer(chown, sync)
+                    unlink = FailingUnlink(self.temp().name, failures)
+                    patches = [mock.patch.object(tdi.os, "unlink", side_effect=unlink)]
+                    if step in ("write", "fchmod"):
+                        patches.append(mock.patch.object(tdi.os, step, side_effect=error))
+                    if step == "close":
+                        patches.append(mock.patch.object(tdi.os, "close", side_effect=FailingClose(1)))
+                    with contextlib.ExitStack() as stack:
+                        for patch in patches:
+                            stack.enter_context(patch)
+                        with self.assertRaises(OSError) as caught:
+                            runner.publish_file(str(self.target()), DATA_BYTES)
+                    self.assertIs(type(caught.exception), kind)
+                    self.assertEqual(caught.exception.errno, code)
+                    self.assertEqual(unlink.failed, failures)
+                    if left:
+                        self.assertEqual(caught.exception.left_temp, str(self.temp()))
+                        self.assertTrue(self.temp().exists())
+                        self.temp().unlink()
+                    else:
+                        self.assertIsNone(getattr(caught.exception, "left_temp", None))
+                    if step == "link":
+                        self.assertEqual(self.target().read_bytes(), OTHER_BYTES)
+                        self.target().unlink()
+                    self.assertEqual(os.listdir(self.root), [])
+
+    def test_a_write_failure_is_not_replaced_by_a_failing_temp_close(self) -> None:
+        with mock.patch.object(tdi.os, "write", side_effect=OSError(errno.ENOSPC, "write")):
+            with mock.patch.object(tdi.os, "close", side_effect=FailingClose(1)):
+                with self.assertRaises(OSError) as caught:
+                    writer().publish_file(str(self.target()), DATA_BYTES)
+        self.assertEqual(caught.exception.errno, errno.ENOSPC)
+        self.assertEqual(os.listdir(self.root), [])
+
+    def test_remove_file_fsync_or_close_failure_after_the_unlink_is_a_partial_remove(self) -> None:
+        self.target().write_bytes(DATA_BYTES)
+        with self.assertRaises(tdi.PartialRemove) as caught:
+            writer(fsync=Recorder(1, OSError(errno.EIO, "dir fsync"))).remove_file(str(self.target()))
+        self.assertEqual(caught.exception.errno, errno.EIO)
+        self.assertEqual(os.listdir(self.root), [])
+        self.target().write_bytes(DATA_BYTES)
+        with mock.patch.object(tdi.os, "close", side_effect=FailingClose(1)):
+            with self.assertRaises(tdi.PartialRemove):
+                writer().remove_file(str(self.target()))
+        self.assertEqual(os.listdir(self.root), [])
+        with self.assertRaises(FileNotFoundError) as missing:
+            writer().remove_file(str(self.target()))
+        self.assertNotIsInstance(missing.exception, tdi.PartialRemove)
+
     def test_remove_file_unlinks_and_never_follows_a_symlinked_folder(self) -> None:
         self.target().write_bytes(DATA_BYTES)
         sync = Recorder()
@@ -202,6 +338,87 @@ class PublishFileTests(Scratch):
             writer().remove_file(str(self.root / "link" / PLIST_NAME))
         self.assertIn(caught.exception.errno, (errno.ELOOP, errno.ENOTDIR))
         self.assertEqual(os.listdir(real), [PLIST_NAME])
+
+
+LEFT_TEMP = f"{base.LAUNCH_DIR}/.{PLIST_NAME}.tmp-777"
+INSTALL_PROCEED = OUT + "--install: proceed: port check, write, bootstrap, probe, verify"
+
+
+class _LeftTempFake(base.FakeRunner):
+    """``publish_file`` fails the way the real one does: ``link`` says whether the target was linked first."""
+
+    def __init__(self, error: OSError, link: bool) -> None:
+        super().__init__(True)
+        self.error = error
+        self.link = link
+
+    def publish_file(self, path: str, data: bytes) -> None:
+        self._require_changes()
+        self.calls.append(("publish", path))
+        if self.link:
+            self.files[path] = data
+        raise self.error
+
+
+def _left(error: OSError) -> OSError:
+    error.left_temp = LEFT_TEMP
+    return error
+
+
+class InstallerLeftTempTests(unittest.TestCase):
+    """The installer's report for every publish failure that leaves a temp file (finding 9872-r2-2)."""
+
+    def run_row(self, error: OSError, link: bool):
+        fake = _LeftTempFake(error, link)
+        return tdi.run(base.argv_for("INSTALL"), fake, base.INVOCATION), fake
+
+    def test_both_temp_unlinks_failing_after_the_link(self) -> None:
+        error = _left(tdi.PartialWrite(errno.EIO, f"{PLIST} linked in place, then removing temp file {LEFT_TEMP} failed (EIO)"))
+        outcome, fake = self.run_row(error, True)
+        self.assertEqual(
+            (outcome.code, outcome.out, outcome.err),
+            (
+                6,
+                [INSTALL_PROCEED, f"127.0.0.1:{base.PORT} is free"],
+                [
+                    FAILED + f"writing {PLIST}: EIO after the plist was linked in place; temp file {LEFT_TEMP} left in place",
+                    f"changed: wrote {PLIST}; left temp file {LEFT_TEMP}",
+                    f"state: plist {PLIST} present; service {SERVICE} not loaded",
+                    f"undo: sudo {base.CMD} --remove",
+                    f"undo: sudo rm {LEFT_TEMP}",
+                ],
+            ),
+        )
+        self.assertEqual(fake.calls, [PRINT, PORT_CALL, ("publish", PLIST), PRINT])
+
+    def test_a_failure_before_the_link_that_left_its_temp(self) -> None:
+        outcome, _ = self.run_row(_left(PermissionError(errno.EACCES, "denied")), False)
+        self.assertEqual(
+            outcome.err,
+            [
+                FAILED + f"writing {PLIST}: EACCES; temp file {LEFT_TEMP} left in place",
+                f"changed: left temp file {LEFT_TEMP}",
+                f"state: plist {PLIST} absent; service {SERVICE} not loaded",
+                f"undo: sudo rm {LEFT_TEMP}",
+            ],
+        )
+        self.assertEqual(outcome.code, 6)
+
+    def test_the_no_clobber_race_that_left_its_temp(self) -> None:
+        outcome, _ = self.run_row(_left(FileExistsError(errno.EEXIST, "exists")), False)
+        self.assertEqual(
+            (outcome.code, outcome.err),
+            (
+                4,
+                [
+                    FAILED + f"plist target {PLIST} appeared during the install; temp file {LEFT_TEMP} left in place",
+                    f"changed: left temp file {LEFT_TEMP}",
+                    f"state: plist {PLIST} absent; service {SERVICE} not loaded",
+                    f"undo: sudo rm {LEFT_TEMP}",
+                ],
+            ),
+        )
+        self.assertFalse(any("nothing changed" in line for line in outcome.err), outcome.err)
 
 
 class ReadDataDirTests(Scratch):
