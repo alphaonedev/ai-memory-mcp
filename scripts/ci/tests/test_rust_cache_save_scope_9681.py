@@ -3259,7 +3259,7 @@ PAIR_TABLES: dict[tuple[str, str], PairTable] = {
         pr_only=(
             "Record job start (#6795)",
             "Fork-PR refusal (self-hosted legs never run fork code)",
-            "Draft admission skip (#9821)",
+            "Draft skip (#9821)",
             "Prune stale runner TMPDIR (#8634)",
             "cargo_skip short-circuit",
             "Per-runner cargo target (#7188)",
@@ -3957,7 +3957,7 @@ class PairMirrorFixtures9770(unittest.TestCase):
                                     "— mold isolation)").allowed["if"],
                          ("needs.classify.outputs.cargo_skip != 'true' && matrix.leg == "
                           "'ubuntu-latest,sqlite' && env.LEG_SKIP != 'true'", None))
-        self.assertIn("Draft admission skip (#9821)", ci.pr_only)
+        self.assertIn("Draft skip (#9821)", ci.pr_only)
         self.assertEqual(ci.env_one_sided,
                          {"SELF_HOSTED_TARGET_CAP_BYTES": "pr", "LEG_SKIP": "pr"})
         cov = PAIR_TABLES[("coverage.yml", "per-module-thresholds")]

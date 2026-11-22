@@ -61,7 +61,7 @@ EXPECTED_CHECK_NAME = "Check (${{ matrix.leg }})"
 # line 47) is the READER of this name: its gates count a leg as draft-skipped only when a step has
 # this exact name.  A rename here or in ci.yml fails test_skip_step_pin_name_and_exit_in_one_place
 # in this repository; change both repositories together (vote DSP1 A-3, DSP2 A-4).
-SKIP_STEP_NAME = "Draft admission skip (#9821)"
+SKIP_STEP_NAME = "Draft skip (#9821)"
 SKIP_EXIT_LINE = "exit 1"
 NEUTRALISER = "continue-on-error"  # swallows the red; banned on the check job and its steps (vote DSP1 A-1)
 EXIT_FAIL = 1
