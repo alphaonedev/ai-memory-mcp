@@ -1140,3 +1140,106 @@ fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
         );
     }
 }
+
+/// #9906 F1 - the short deadline of the failure-path cells below (those cells
+/// only; the real waits keep their long bounds).
+const FAILURE_CELL_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Whether `pid` still names a process (a reaped child does not).
+fn pid_exists(pid: u32) -> bool {
+    let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Drive `wait_responses` to a failure against a child that never gets a
+/// request: returns the exact panic text and whether the pid still existed
+/// right after the panic (before the cell's own cleanup).
+fn burst_wait_failure(extra_env: &[(&str, String)], marker: &str) -> (String, bool) {
+    let home = sandbox();
+    let mut child = spawn_mcp(home.path(), extra_env, &[]);
+    let pid = child.id();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let mut pipe = child.stderr.take().expect("stderr pipe");
+    let sink = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 1024];
+        while let Ok(n) = pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .expect("stderr sink")
+                .push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+    });
+    let started = Instant::now();
+    while !seen.lock().expect("stderr sink").contains(marker) {
+        assert!(
+            started.elapsed() < STARTUP_BOUND,
+            "the child never wrote {marker:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let responses: Responses = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_responses(
+            &responses,
+            &mut child,
+            FAILURE_CELL_DEADLINE,
+            "a response that is never sent",
+            |_| false,
+        );
+    }));
+    let alive = pid_exists(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = match caught {
+        Ok(()) => panic!("the wait returned although nothing was ever answered"),
+        Err(p) => p
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_string()))
+            .unwrap_or_default(),
+    };
+    (text, alive)
+}
+
+/// #9906 F1 - a burst wait that hits its deadline kills and reaps the child
+/// and panics with the child's stderr and the named deadline.
+#[test]
+fn a_burst_wait_that_hits_its_deadline_kills_the_child_and_reports_its_stderr_9906() {
+    let (text, alive) = burst_wait_failure(&[], TIER_LINE);
+    assert!(
+        text.contains("requested tier = keyword"),
+        "the panic must carry the child's stderr: {text}"
+    );
+    assert!(
+        text.contains("no a response that is never sent within 2s"),
+        "the panic must name the wait and its deadline: {text}"
+    );
+    assert!(
+        !alive,
+        "the child must be gone after the failed wait: {text}"
+    );
+}
+
+/// #9906 F1 - a burst wait whose child exited names the exit and carries its
+/// stderr.
+#[test]
+fn a_burst_wait_whose_child_exited_reports_its_stderr_9906() {
+    let (text, alive) = burst_wait_failure(
+        &[(
+            "AI_MEMORY_TEST_FAIL_STOP_SIGNAL_INSTALL",
+            "SIGTERM".to_string(),
+        )],
+        "refusing to start",
+    );
+    assert!(text.contains("the child exited"), "names the exit: {text}");
+    assert!(
+        text.contains("refusing to start"),
+        "the panic must carry the child's stderr: {text}"
+    );
+    assert!(!alive, "the child must be reaped: {text}");
+}
