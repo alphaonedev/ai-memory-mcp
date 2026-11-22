@@ -4263,7 +4263,7 @@ where
 #[must_use]
 pub fn spawn_gc_loop(
     state: Db,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
     interval: Duration,
 ) -> JoinHandle<()> {
     spawn_gc_loop_with_shadow_retention(
@@ -4357,7 +4357,7 @@ fn spawn_postgres_maintenance_loop_if_enabled(
     backend: crate::handlers::StorageBackend,
     app: &AppState,
     archive_on_gc: bool,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
 ) {
     if !matches!(backend, crate::handlers::StorageBackend::Postgres) {
         return;
@@ -4386,7 +4386,7 @@ fn spawn_postgres_maintenance_loop_if_enabled(
                 Ok(_) => {}
                 Err(e) => tracing::warn!("pg-maint: run_gc failed: {e}"),
             }
-            match app.store.archive_purge(&admin, archive_max_days).await {
+            match app.store.retention_purge(&admin, archive_max_days).await {
                 Ok(n) if n > 0 => {
                     tracing::info!("pg-maint: purged {n} old archived memories");
                 }
@@ -4540,7 +4540,7 @@ fn spawn_family_embedding_precompute_if_enabled(
 #[must_use]
 pub fn spawn_gc_loop_with_shadow_retention(
     state: Db,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
     shadow_retention_days: i64,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -4555,7 +4555,7 @@ pub fn spawn_gc_loop_with_shadow_retention(
 
 fn spawn_gc_loop_with_shadow_retention_tracked(
     state: Db,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
     shadow_retention_days: i64,
     interval: Duration,
     blocking_tasks: Arc<AtomicUsize>,
@@ -4888,7 +4888,7 @@ pub struct ServeBootstrap {
     pub app_state: AppState,
     pub api_key_state: ApiKeyState,
     pub db_state: Db,
-    pub archive_max_days: Option<i64>,
+    pub archive_max_days: Option<crate::validate::RetentionDays>,
     pub task_handles: Vec<JoinHandle<()>>,
     /// Round-3 F12 — lifecycle outcome of the daemon's signing-keypair
     /// auto-gen path, captured by [`ensure_and_load_daemon_keypair`].
@@ -7775,7 +7775,7 @@ pub async fn bootstrap_serve(
     );
     task_handles.push(spawn_gc_loop_with_shadow_retention_tracked(
         db_state.clone(),
-        app_config.archive_max_days,
+        app_config.archive_retention(),
         shadow_retention_days,
         Duration::from_secs(GC_INTERVAL_SECS),
         Arc::clone(&blocking_tasks),
@@ -7871,7 +7871,7 @@ pub async fn bootstrap_serve(
             app_state.storage_backend,
             &app_state,
             pg_archive_on_gc,
-            app_config.archive_max_days,
+            app_config.archive_retention(),
         );
     }
 
@@ -8008,7 +8008,7 @@ pub async fn bootstrap_serve(
         app_state,
         api_key_state,
         db_state,
-        archive_max_days: app_config.archive_max_days,
+        archive_max_days: app_config.archive_retention(),
         task_handles,
         daemon_keypair_outcome,
         // H7 (v0.7.0 round-2) — per-request HTTP timeout (default 60s).
@@ -11649,7 +11649,7 @@ mod tests {
             crate::handlers::StorageBackend::Postgres,
             &app,
             true,
-            Some(90),
+            90_i64.try_into().ok(),
         );
         assert_eq!(
             handles.len(),
@@ -12072,9 +12072,9 @@ mod tests {
             ResolvedTtl::default(),
             true,
         )));
-        // archive_max_days=Some(1) lets the auto_purge_archive arm
-        // execute too (covers the second match in the loop body).
-        let h = spawn_gc_loop(state.clone(), Some(1), Duration::from_secs(60));
+        // A one-day archive bound also runs the auto_purge_archive arm.
+        let one_day = 1_i64.try_into().ok();
+        let h = spawn_gc_loop(state.clone(), one_day, Duration::from_secs(60));
         // Advance past two full intervals to give both branches multiple
         // chances to log under paused time.
         tokio::time::advance(Duration::from_secs(61)).await;
@@ -13321,8 +13321,8 @@ decision = "allow"
             ResolvedTtl::default(),
             true,
         )));
-        // Long interval — we just want the spawn + abort cycle.
-        let h = spawn_gc_loop_with_shadow_retention(state, Some(30), 7, Duration::from_secs(60));
+        let days = 30_i64.try_into().ok(); // long interval: spawn + abort only
+        let h = spawn_gc_loop_with_shadow_retention(state, days, 7, Duration::from_secs(60));
         // Give it a brief moment to enter the loop body.
         tokio::time::sleep(Duration::from_millis(20)).await;
         h.abort();
@@ -14405,8 +14405,8 @@ decision = "allow"
             ResolvedTtl::default(),
             true, // archive_on_gc
         )));
-        let h = spawn_gc_loop(state.clone(), Some(30), Duration::from_millis(1));
-        // Let several sweep ticks fire.
+        let days = 30_i64.try_into().ok(); // 30-day bound; several sweep ticks fire
+        let h = spawn_gc_loop(state.clone(), days, Duration::from_millis(1));
         tokio::time::sleep(Duration::from_millis(40)).await;
         h.abort();
         let _ = h.await;

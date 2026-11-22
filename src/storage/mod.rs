@@ -16115,12 +16115,17 @@ pub fn gc_if_needed(conn: &Connection, archive: bool) -> Result<usize> {
     }
 }
 
-/// Purge old archives if `archive_max_days` is configured.
-pub fn auto_purge_archive(conn: &Connection, max_days: Option<i64>) -> Result<usize> {
-    match max_days {
-        Some(days) if days > 0 => purge_archive(conn, Some(days)),
-        _ => Ok(0),
-    }
+/// The maintenance loop's archive retention pass (#9945): with a bound,
+/// delete only rows archived strictly more than that many days ago; with
+/// `None` (an unset or invalid `archive_max_days`, see
+/// [`crate::validate::RetentionDays::from_config`]) delete nothing.
+pub fn auto_purge_archive(
+    conn: &Connection,
+    max_days: Option<crate::validate::RetentionDays>,
+) -> Result<usize> {
+    max_days.map_or(Ok(0), |days| {
+        purge_archive(conn, crate::validate::ArchivePurgeBound::OlderThan(days))
+    })
 }
 
 /// #1579 B6 (F5.7) — expired rows reaped per GC transaction.
@@ -17551,22 +17556,18 @@ fn purge_archive_matching(
 ///
 /// # Errors
 ///
-/// Returns the #962 typed `InvalidArgument` envelope when `older_than_days`
-/// is outside `0..=36500` or checked cutoff construction fails.
+/// Returns the #962 typed `InvalidArgument` envelope when checked cutoff
+/// construction fails. The bound itself is already valid: an
+/// [`ArchivePurgeBound`](crate::validate::ArchivePurgeBound) cannot hold a
+/// zero, negative or too-large day count (#9945).
 fn archive_purge_predicate(
     namespace: Option<&str>,
-    older_than_days: Option<i64>,
+    bound: crate::validate::ArchivePurgeBound,
 ) -> Result<(String, Vec<String>)> {
     let mut clauses: Vec<String> = Vec::with_capacity(2);
     let mut binds: Vec<String> = Vec::with_capacity(2);
-    if let Some(days) = older_than_days {
-        let cutoff = crate::validate::checked_days_ago(Utc::now(), "older_than_days", days, 0)
-            .map_err(|error| {
-                anyhow::Error::new(StorageError::InvalidArgument {
-                    reason: error.to_string(),
-                })
-            })?;
-        binds.push(cutoff.to_rfc3339());
+    if let Some(cutoff) = archive_purge_cutoff(bound)? {
+        binds.push(cutoff);
         clauses.push(format!("archived_at < ?{}", binds.len()));
     }
     if let Some(ns) = namespace {
@@ -17581,6 +17582,22 @@ fn archive_purge_predicate(
     Ok((where_clause, binds))
 }
 
+/// #9945 — the RFC 3339 cutoff of a bounded purge, `None` for
+/// [`ArchivePurgeBound::AllRows`](crate::validate::ArchivePurgeBound::AllRows).
+fn archive_purge_cutoff(bound: crate::validate::ArchivePurgeBound) -> Result<Option<String>> {
+    match bound {
+        crate::validate::ArchivePurgeBound::OlderThan(days) => days
+            .cutoff(Utc::now())
+            .map(|cutoff| Some(cutoff.to_rfc3339()))
+            .map_err(|error| {
+                anyhow::Error::new(StorageError::InvalidArgument {
+                    reason: error.to_string(),
+                })
+            }),
+        crate::validate::ArchivePurgeBound::AllRows => Ok(None),
+    }
+}
+
 /// #3013 — how many archived rows the SAME predicate would destroy. Read-only;
 /// backs `ai-memory archive purge --dry-run`.
 ///
@@ -17591,9 +17608,9 @@ fn archive_purge_predicate(
 pub fn count_archive_purge_candidates(
     conn: &Connection,
     namespace: Option<&str>,
-    older_than_days: Option<i64>,
+    bound: crate::validate::ArchivePurgeBound,
 ) -> Result<usize> {
-    let (where_clause, binds) = archive_purge_predicate(namespace, older_than_days)?;
+    let (where_clause, binds) = archive_purge_predicate(namespace, bound)?;
     let sql = format!("SELECT COUNT(*) FROM archived_memories WHERE {where_clause}");
     let sql_params: Vec<&dyn rusqlite::types::ToSql> = binds
         .iter()
@@ -17615,10 +17632,10 @@ pub fn count_archive_purge_candidates(
 pub fn purge_archive_scoped(
     conn: &Connection,
     namespace: Option<&str>,
-    older_than_days: Option<i64>,
+    bound: crate::validate::ArchivePurgeBound,
 ) -> Result<usize> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let (where_clause, binds) = archive_purge_predicate(namespace, older_than_days)?;
+    let (where_clause, binds) = archive_purge_predicate(namespace, bound)?;
     let sql_params: Vec<&dyn rusqlite::types::ToSql> = binds
         .iter()
         .map(|b| b as &dyn rusqlite::types::ToSql)
@@ -17626,9 +17643,19 @@ pub fn purge_archive_scoped(
     purge_archive_matching(conn, &where_clause, sql_params.as_slice())
 }
 
-pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
+/// Cross-namespace archive purge. Purge-everything is the explicit
+/// [`ArchivePurgeBound::AllRows`](crate::validate::ArchivePurgeBound::AllRows)
+/// variant, never an unset bound (#9945).
+///
+/// # Errors
+///
+/// As [`purge_archive_scoped`].
+pub fn purge_archive(
+    conn: &Connection,
+    bound: crate::validate::ArchivePurgeBound,
+) -> Result<usize> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    purge_archive_scoped(conn, None, older_than_days)
+    purge_archive_scoped(conn, None, bound)
 }
 
 /// #936 (security-critical, 2026-05-20) — caller-scoped purge variant.
@@ -17655,28 +17682,19 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
 pub fn purge_archive_for_caller(
     conn: &Connection,
     caller: &str,
-    older_than_days: Option<i64>,
+    bound: crate::validate::ArchivePurgeBound,
 ) -> Result<usize> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    match older_than_days {
-        Some(days) => {
-            let cutoff = crate::validate::checked_days_ago(Utc::now(), "older_than_days", days, 0)
-                .map_err(|error| {
-                    anyhow::Error::new(StorageError::InvalidArgument {
-                        reason: error.to_string(),
-                    })
-                })?
-                .to_rfc3339();
-            purge_archive_matching(
-                conn,
-                "archived_at < ?1 \
+    match archive_purge_cutoff(bound)? {
+        Some(cutoff) => purge_archive_matching(
+            conn,
+            "archived_at < ?1 \
                    AND ( \
                      json_extract(metadata, '$.agent_id') = ?2 OR \
                      json_extract(metadata, '$.target_agent_id') = ?2 \
                    )",
-                &[&cutoff, &caller],
-            )
-        }
+            &[&cutoff, &caller],
+        ),
         None => purge_archive_matching(
             conn,
             "json_extract(metadata, '$.agent_id') = ?1 OR \
@@ -26714,17 +26732,20 @@ mod tests {
         insert(&conn, &mem).unwrap();
         gc(&conn, true).unwrap();
 
-        let purged = purge_archive(&conn, None).unwrap();
+        let purged = purge_archive(&conn, crate::validate::ArchivePurgeBound::AllRows).unwrap();
         assert_eq!(purged, 1);
         assert_eq!(list_archived(&conn, None, 10, 0).unwrap().len(), 0);
     }
 
+    /// #9945: a negative or zero day count has no `RetentionDays`, so it
+    /// can never reach the purge; the refusal text is exact.
     #[test]
     fn purge_archive_rejects_negative_days() {
-        let conn = test_db();
-        let result = purge_archive(&conn, Some(-1));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-negative"));
+        let err = crate::validate::ArchivePurgeBound::from_request(Some(-1)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "older_than_days must be at least 1 day (got -1)"
+        );
     }
 
     #[test]
@@ -29310,21 +29331,19 @@ mod tests {
         )
         .unwrap();
 
-        // Purge with None (disabled) — no-op
-        let purged = auto_purge_archive(&conn, None).unwrap();
-        assert_eq!(purged, 0);
+        let days = crate::validate::RetentionDays::from_config;
+        // Unset, 0 and negative (#9945): no bound, no purge.
+        for unset in [None, Some(0), Some(-1)] {
+            assert_eq!(auto_purge_archive(&conn, days(unset)).unwrap(), 0);
+        }
         assert_eq!(list_archived(&conn, None, 10, 0).unwrap().len(), 1);
 
-        // Purge with 0 days — should NOT purge (guard condition)
-        let purged = auto_purge_archive(&conn, Some(0)).unwrap();
-        assert_eq!(purged, 0);
-
         // Purge with 90 days — archive is only 30 days old, should NOT purge
-        let purged = auto_purge_archive(&conn, Some(90)).unwrap();
+        let purged = auto_purge_archive(&conn, days(Some(90))).unwrap();
         assert_eq!(purged, 0);
 
         // Purge with 7 days — archive is 30 days old, should be purged
-        let purged = auto_purge_archive(&conn, Some(7)).unwrap();
+        let purged = auto_purge_archive(&conn, days(Some(7))).unwrap();
         assert_eq!(purged, 1);
         assert!(list_archived(&conn, None, 10, 0).unwrap().is_empty());
     }

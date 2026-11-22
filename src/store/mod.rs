@@ -4481,9 +4481,18 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
-    /// Purge archived rows older than `older_than_days`. When `None`,
-    /// purge ALL archived rows MATCHING THE CALLER'S OWNERSHIP scope
-    /// (NOT a global wipe — see below). Returns the count purged.
+    /// Purge archived rows archived strictly more than `older_than`
+    /// days ago, within the caller's ownership scope (see below).
+    /// Returns the count purged.
+    ///
+    /// # A bound is a type, not an `Option` (#9945, GA standard 1)
+    ///
+    /// This method took `Option<i64>` and ran `None` as "purge every
+    /// row", so the `PostgreSQL` maintenance loop with an unset
+    /// `archive_max_days` deleted the whole archive on every tick.
+    /// [`RetentionDays`](crate::validate::RetentionDays) holds only a
+    /// day count in `1..=36500`; purging every row is the separate,
+    /// named [`MemoryStore::archive_purge_all`].
     ///
     /// # Caller-vs-row-owner gate (#936, 2026-05-20)
     ///
@@ -4508,8 +4517,23 @@ pub trait MemoryStore: Send + Sync {
     async fn archive_purge(
         &self,
         _ctx: &CallerContext,
-        _older_than_days: Option<i64>,
+        _older_than: crate::validate::RetentionDays,
     ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ARCHIVE_PURGE".to_string(),
+        })
+    }
+
+    /// The explicit operator purge-all (#9945): delete EVERY archived
+    /// row in the caller's ownership scope, with the same #936 owner
+    /// gate as [`MemoryStore::archive_purge`] (an admin context
+    /// purges every owner's rows). Reached only from a request that
+    /// names no bound (`DELETE /api/v1/archive`, `memory_archive_purge`
+    /// with no `older_than_days`, `ai-memory archive purge`); never
+    /// from the maintenance loop.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn archive_purge_all(&self, _ctx: &CallerContext) -> StoreResult<usize> {
         Err(StoreError::UnsupportedCapability {
             capability: "ARCHIVE_PURGE".to_string(),
         })
@@ -5745,6 +5769,34 @@ pub trait MemoryStore: Send + Sync {
     }
 }
 
+/// #9945 (GA standard 1) — the serve loop holds `Arc<dyn MemoryStore>`.
+impl dyn MemoryStore + '_ {
+    /// One maintenance-loop archive retention pass.
+    ///
+    /// `retention` is the resolved `[storage].archive_max_days`
+    /// ([`crate::config::AppConfig::archive_retention`]). `None` (the key
+    /// unset, zero, negative or past [`crate::validate::MAX_DURATION_DAYS`])
+    /// deletes NOTHING and returns `Ok(0)` without calling the store; a
+    /// bound deletes only rows archived strictly before `now - retention`.
+    /// The loop can never reach [`MemoryStore::archive_purge_all`]: this
+    /// is the `PostgreSQL` twin of the `SQLite` loop's
+    /// [`crate::storage::auto_purge_archive`].
+    ///
+    /// # Errors
+    ///
+    /// The error of [`MemoryStore::archive_purge`] when a bound is set.
+    pub async fn retention_purge(
+        &self,
+        ctx: &CallerContext,
+        retention: Option<crate::validate::RetentionDays>,
+    ) -> StoreResult<usize> {
+        match retention {
+            Some(days) => self.archive_purge(ctx, days).await,
+            None => Ok(0),
+        }
+    }
+}
+
 /// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded
 /// through the governance enforce surface. Mirrors
 /// `crate::models::GovernedAction` but lives at the SAL layer so the
@@ -6888,7 +6940,13 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.archive_purge(&ctx, None).await.unwrap_err(),
+            s.archive_purge(&ctx, crate::validate::RetentionDays::new(1).unwrap())
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.archive_purge_all(&ctx).await.unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(

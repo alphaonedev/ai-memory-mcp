@@ -3913,9 +3913,9 @@ async fn http_restore_archive_double_restore_returns_404() {
 }
 
 #[tokio::test]
-async fn http_purge_archive_zero_days_purges_all() {
-    // older_than_days=0 means "older than 0 days ago" — purges
-    // every archive row whose archived_at < now (i.e., everything).
+async fn http_purge_archive_zero_days_refused_9945() {
+    // #9945 — older_than_days=0 is not a bound: it is refused with 400 and
+    // the exact reason, and the archived row survives (pre-fix it purged all).
     let state = test_state();
     let id = insert_test_memory(&state, "purge-zero", "x").await;
     {
@@ -3935,20 +3935,21 @@ async fn http_purge_archive_zero_days_purges_all() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // older_than_days=0 with a freshly archived row may or may not
-    // include it depending on clock resolution; either way the call
-    // must succeed and the response must report a usize count.
-    assert!(v["purged"].as_u64().is_some());
+    assert_eq!(v["error"], "older_than_days must be at least 1 day (got 0)");
+    let lock = state.lock().await;
+    let rows = db::list_archived(&lock.0, None, 10, 0).unwrap();
+    assert_eq!(rows.len(), 1, "a refused purge deletes nothing");
 }
 
 #[tokio::test]
-async fn http_purge_archive_negative_days_returns_500() {
-    // db::purge_archive bails on negative days; handler maps to 500.
+async fn http_purge_archive_negative_days_refused_9945() {
+    // #9945 — a negative bound is refused at the edge with 400 and the
+    // exact reason (pre-fix it reached db::purge_archive and mapped to 500).
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/archive/purge", axum_post(purge_archive))
@@ -3963,7 +3964,15 @@ async fn http_purge_archive_negative_days_returns_500() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v["error"],
+        "older_than_days must be at least 1 day (got -1)"
+    );
 }
 
 #[tokio::test]
@@ -7209,13 +7218,9 @@ async fn http_purge_archive_unfiltered_purges_everything() {
 }
 
 #[tokio::test]
-async fn http_purge_archive_zero_days_purges_all_archived() {
-    // older_than_days=0 → cutoff is "now", so every archived row is
-    // older than the cutoff and gets purged.
-    //
-    // #936 (security-critical, 2026-05-20) — uses the admin path so
-    // the cross-tenant wipe still runs. Owner-scoped semantics covered
-    // by `tests/archive_purge_owner_gate_936.rs`.
+async fn http_purge_archive_zero_days_admin_refused_9945() {
+    // #9945 — older_than_days=0 is refused on the admin path too: the
+    // cross-tenant wipe is only the explicit no-bound call, never a zero.
     let state = test_state();
     let id = insert_test_memory(&state, "h8a-purge-zero", "row").await;
     {
@@ -7236,13 +7241,15 @@ async fn http_purge_archive_zero_days_purges_all_archived() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // count of purged rows ≥ 1 (the recent archive is older than `now`).
-    assert!(v["purged"].as_u64().unwrap() >= 1);
+    assert_eq!(v["error"], "older_than_days must be at least 1 day (got 0)");
+    let lock = state.lock().await;
+    let rows = db::list_archived(&lock.0, None, 10, 0).unwrap();
+    assert_eq!(rows.len(), 1, "a refused admin purge deletes nothing");
 }
 
 #[tokio::test]
@@ -7400,7 +7407,7 @@ async fn http_restore_archive_after_purge_returns_404() {
         let lock = state.lock().await;
         db::archive_memory(&lock.0, &id, Some("test")).unwrap();
         // Purge unconditionally.
-        db::purge_archive(&lock.0, None).unwrap();
+        db::purge_archive(&lock.0, crate::validate::ArchivePurgeBound::AllRows).unwrap();
     }
     let app = Router::new()
         .route("/api/v1/archive/{id}/restore", axum_post(restore_archive))

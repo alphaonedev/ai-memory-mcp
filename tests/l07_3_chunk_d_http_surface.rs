@@ -1817,16 +1817,47 @@ async fn http_archive_by_ids_happy() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// #9945 — a zero, negative or over-cap bound is not a bound: the purge is
+/// refused with 400 and the exact reason, and the archived row survives
+/// (pre-#9945 `older_than_days=0` deleted every archived row).
 #[tokio::test]
-async fn http_purge_archive_with_older_than_zero() {
+async fn http_purge_archive_degenerate_bound_refused_9945() {
+    let cases = [
+        ("0", "older_than_days must be at least 1 day (got 0)"),
+        ("-7", "older_than_days must be at least 1 day (got -7)"),
+        (
+            "36501",
+            "older_than_days must not exceed 36500 days (got 36501)",
+        ),
+    ];
     let (router, _f) = build_router_fixture();
-    let req = Request::builder()
-        .method("DELETE")
-        .uri("/api/v1/archive?older_than_days=0")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.unwrap();
-    assert!(resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST);
+    let (_s, id) = create_basic(&router, "chunk-d/arch9945", "kept").await;
+    // Archive as the row's owner (`create_basic` stores as `ai:test`); an
+    // anonymous caller is not the owner and archives nothing.
+    let (status, payload) =
+        post_json_with_agent(&router, "/api/v1/archive", json!({"ids": [id]}), "ai:test").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["archived"], json!([id]), "{payload}");
+    for (bound, want) in cases {
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/archive?older_than_days={bound}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "bound={bound}");
+        let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"].as_str(), Some(want), "bound={bound}");
+    }
+    let (status, listing) = get_uri_as_admin(&router, "/api/v1/archive").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        listing.to_string().contains(&id),
+        "a refused purge destroys nothing"
+    );
 }
 
 #[tokio::test]

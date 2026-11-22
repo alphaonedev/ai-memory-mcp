@@ -156,7 +156,11 @@ archive_on_gc     = true         # archive expired memories into
                                  # Setting both emits a one-shot stderr WARN;
                                  # `ai-memory doctor` reports the effective
                                  # value and its source.
-archive_max_days  = 90
+archive_max_days  = 90         # 1..=36500: the maintenance loop purges
+                                 # archived rows older than N days (both
+                                 # backends). Unset, 0, negative or over
+                                 # the cap disables the purge (#9945).
+                                 # THIS key > the deprecated flat key.
 max_memory_mb     = 4096        # PARSED BUT NOT ENFORCED (FBL-13): caps
                                 # neither memory nor storage, and is not
                                 # an auto-tier-selection input on any live

@@ -59,7 +59,14 @@ pub(super) fn handle_archive_purge(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
-    let older_than_days = params[param_names::OLDER_THAN_DAYS].as_i64();
+    // #9945 — a present non-integer bound (`"5"`, `7.5`) read as ABSENT via
+    // `as_i64`, and absent is the purge-all request: refuse it (#3374 precedent).
+    let older_than_days =
+        crate::mcp::param_guard::optional_i64(params, param_names::OLDER_THAN_DAYS)?;
+    // #9945 — absent is the explicit purge-all; a present bound is
+    // `1..=36500`, refused here before any audit row or permission check.
+    let bound = crate::validate::ArchivePurgeBound::from_request(older_than_days)
+        .map_err(|e| e.to_string())?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // state-change audit. Archive purge permanently deletes archived
@@ -178,10 +185,10 @@ pub(super) fn handle_archive_purge(
     }
 
     let purged = if as_admin {
-        db::purge_archive(conn, older_than_days)
+        db::purge_archive(conn, bound)
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_PURGE_ARCHIVE, e))?
     } else {
-        db::purge_archive_for_caller(conn, &caller, older_than_days)
+        db::purge_archive_for_caller(conn, &caller, bound)
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_PURGE_ARCHIVE, e))?
     };
     Ok(json!({
@@ -470,7 +477,7 @@ impl McpTool for ArchiveListTool {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct ArchivePurgeRequest {
-    /// Only purge entries older than N days (0..=36500).
+    /// Only purge entries older than N days (1..=36500); omit to purge all.
     #[serde(default)]
     pub older_than_days: Option<i64>,
 
@@ -1013,6 +1020,45 @@ mod tests {
         )
         .expect("maximum bounded cutoff remains valid");
         assert_eq!(value["purged"].as_u64(), Some(0));
+    }
+
+    /// #9945 — a malformed or non-positive bound is refused with the exact
+    /// reason and destroys nothing. Pre-#9945 `as_i64` read `"5"`, `7.5` and
+    /// `true` as ABSENT, which is the purge-all request, and `0` swept every
+    /// row through the storage cutoff.
+    #[test]
+    fn archive_purge_refuses_malformed_and_non_positive_bound_9945() {
+        let cases = [
+            (json!("5"), "older_than_days must be an integer"),
+            (json!(7.5), "older_than_days must be an integer"),
+            (json!(true), "older_than_days must be an integer"),
+            (json!([1]), "older_than_days must be an integer"),
+            (json!(u64::MAX), "older_than_days must be an integer"),
+            (json!(0), "older_than_days must be at least 1 day (got 0)"),
+            (json!(-3), "older_than_days must be at least 1 day (got -3)"),
+            (
+                json!(36_501),
+                "older_than_days must not exceed 36500 days (got 36501)",
+            ),
+        ];
+        let conn = open_conn();
+        let id = seed_archived(&conn, "ns9945", "t9945", "ai:archive-owner");
+        for (bound, want) in cases {
+            let err = handle_archive_purge(
+                &conn,
+                &json!({"older_than_days": bound, "agent_id": "ai:archive-owner"}),
+            )
+            .expect_err("invalid bound must refuse");
+            assert_eq!(err, want, "bound={bound}");
+        }
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archived_memories WHERE id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .expect("count archived");
+        assert_eq!(kept, 1, "a refused purge destroys nothing");
     }
 
     // #3761 — a driver fault behind `memory_archive_restore` reaches the

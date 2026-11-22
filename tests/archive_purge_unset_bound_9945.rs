@@ -16,18 +16,22 @@
 //!
 //! ## What is asserted (one cell per backend)
 //!
-//! For each degenerate bound (unset, zero, negative) a fresh store is seeded
-//! with rows archived 10 days ago and one archived now. The retention entry
-//! point runs with the bound, and the test asserts the exact purged count
-//! (zero) and that every seeded id is still archived. A bounded case (5 days)
-//! asserts that exactly the two 10-day-old ids are deleted and the fresh one
-//! is kept. The `PostgreSQL` cell runs on its own scratch database
-//! (`common/pg_barrier.rs`), because the admin purge is store-wide.
+//! For each degenerate bound (unset, zero, negative, past the cap) a fresh
+//! store is seeded with rows archived 10 days ago and one archived now. The
+//! bound resolves the way the maintenance loop resolves it
+//! (`RetentionDays::from_config`), the retention entry point
+//! (`retention_purge`) runs with it, and the test asserts the exact purged
+//! count (zero) and that every seeded id is still archived. A bounded case
+//! (5 days) asserts that exactly the two 10-day-old ids are deleted and the
+//! fresh one is kept; the explicit `archive_purge_all` deletes every row. The
+//! `PostgreSQL` cell runs on its own scratch database (`common/pg_barrier.rs`),
+//! because the admin purge is store-wide.
 #![cfg(feature = "sal")]
 
 use ai_memory::models::{Memory, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore};
+use ai_memory::validate::{RetentionDays, RetentionDaysError};
 
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
@@ -48,8 +52,11 @@ const OLD_AGE_DAYS: i64 = 10;
 const BOUND_DAYS: i64 = 5;
 /// Rows archived `OLD_AGE_DAYS` ago per case.
 const OLD_ROWS: usize = 2;
-/// The degenerate bounds: unset, zero, negative. None of them is a bound.
-const UNBOUNDED: [Option<i64>; 3] = [None, Some(0), Some(-1)];
+/// One day past the retention cap (`MAX_DURATION_DAYS` = 36500).
+const OVER_CAP_DAYS: i64 = 36_501;
+/// The degenerate bounds: unset, zero, negative, past the cap. None of them
+/// is a bound.
+const UNBOUNDED: [Option<i64>; 4] = [None, Some(0), Some(-1), Some(OVER_CAP_DAYS)];
 /// Lock wait of the probe connection, in seconds.
 const PROBE_BUSY_SECS: u64 = 10;
 /// Scratch database prefix of the `PostgreSQL` cell.
@@ -125,6 +132,12 @@ enum Probe<'a> {
 }
 
 impl Probe<'_> {
+    // The Pg arm is the only `.await`; a `sal`-only build has just the
+    // sqlite arm.
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn backdate(&self, id: &str, days: i64) {
         match self {
             Self::Sqlite(path) => {
@@ -154,6 +167,10 @@ impl Probe<'_> {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn archived(&self, id: &str) -> bool {
         match self {
             Self::Sqlite(path) => {
@@ -166,13 +183,13 @@ impl Probe<'_> {
                 .expect("probe sqlite")
             }
             #[cfg(feature = "sal-postgres")]
-            Self::Pg(pool) => sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = $1)",
-            )
-            .bind(id)
-            .fetch_one(*pool)
-            .await
-            .expect("probe pg"),
+            Self::Pg(pool) => {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(*pool)
+                    .await
+                    .expect("probe pg")
+            }
         }
     }
 }
@@ -185,9 +202,8 @@ async fn seed_and_age(store: &dyn MemoryStore, probe: &Probe<'_>) -> Seeded {
     seeded
 }
 
-/// The degenerate-bound cell: the purge reports zero and every id survives.
-/// An `Err` (the base refuses a negative bound) also deletes nothing, so the
-/// survivor check is the invariant and the count check applies to `Ok`.
+/// The degenerate-bound cell: the retention purge reports exactly zero and
+/// every id survives, for the daemon principal and for an agent.
 async fn assert_unbounded_deletes_nothing(
     backend: &str,
     store: &dyn MemoryStore,
@@ -195,11 +211,17 @@ async fn assert_unbounded_deletes_nothing(
     bound: Option<i64>,
 ) {
     let seeded = seed_and_age(store, probe).await;
-    for ctx in [CallerContext::for_admin(ADMIN), CallerContext::for_agent(OWNER)] {
-        let outcome = store.archive_purge(&ctx, bound).await;
-        if let Ok(purged) = outcome {
-            assert_eq!(purged, 0, "{backend}: bound {bound:?} purged {purged} rows");
-        }
+    let retention = RetentionDays::from_config(bound);
+    assert_eq!(retention, None, "{backend}: {bound:?} is not a bound");
+    for ctx in [
+        CallerContext::for_admin(ADMIN),
+        CallerContext::for_agent(OWNER),
+    ] {
+        let purged = store
+            .retention_purge(&ctx, retention)
+            .await
+            .expect("an absent bound is not an error");
+        assert_eq!(purged, 0, "{backend}: bound {bound:?} purged {purged} rows");
         for id in seeded.all() {
             assert!(
                 probe.archived(&id).await,
@@ -216,8 +238,9 @@ async fn assert_bounded_deletes_exactly_old(
     probe: &Probe<'_>,
 ) {
     let seeded = seed_and_age(store, probe).await;
+    let days = RetentionDays::new(BOUND_DAYS).expect("5 is a bound");
     let purged = store
-        .archive_purge(&CallerContext::for_admin(ADMIN), Some(BOUND_DAYS))
+        .retention_purge(&CallerContext::for_admin(ADMIN), Some(days))
         .await
         .expect("bounded purge");
     assert_eq!(purged, OLD_ROWS, "{backend}: bounded purge count");
@@ -229,6 +252,56 @@ async fn assert_bounded_deletes_exactly_old(
         "{backend}: fresh row {} deleted",
         seeded.fresh
     );
+}
+
+/// The explicit, named purge-all deletes every archived row, fresh or old.
+async fn assert_purge_all_deletes_every_row(
+    backend: &str,
+    store: &dyn MemoryStore,
+    probe: &Probe<'_>,
+) {
+    let seeded = seed_and_age(store, probe).await;
+    let purged = store
+        .archive_purge_all(&CallerContext::for_admin(ADMIN))
+        .await
+        .expect("explicit purge-all");
+    assert_eq!(purged, OLD_ROWS + 1, "{backend}: purge-all count");
+    for id in seeded.all() {
+        assert!(!probe.archived(&id).await, "{backend}: purge-all kept {id}");
+    }
+}
+
+/// Every degenerate bound is refused by the validated constructor with its
+/// exact reason, so no caller can build a `RetentionDays` from it.
+#[test]
+fn degenerate_bound_has_no_constructor_9945() {
+    let table: [(i64, RetentionDaysError, &str); 4] = [
+        (
+            0,
+            RetentionDaysError::NotPositive(0),
+            "older_than_days must be at least 1 day (got 0)",
+        ),
+        (
+            -1,
+            RetentionDaysError::NotPositive(-1),
+            "older_than_days must be at least 1 day (got -1)",
+        ),
+        (
+            i64::MIN,
+            RetentionDaysError::NotPositive(i64::MIN),
+            "older_than_days must be at least 1 day (got -9223372036854775808)",
+        ),
+        (
+            OVER_CAP_DAYS,
+            RetentionDaysError::TooLarge(OVER_CAP_DAYS),
+            "older_than_days must not exceed 36500 days (got 36501)",
+        ),
+    ];
+    for (days, variant, text) in table {
+        let err = RetentionDays::new(days).expect_err("degenerate bound refused");
+        assert_eq!(err, variant, "{days}");
+        assert_eq!(err.to_string(), text, "{days}");
+    }
 }
 
 fn scratch_dir() -> tempfile::TempDir {
@@ -269,7 +342,8 @@ async fn sqlite_maintenance_purge_unset_bound_deletes_nothing_9945() {
         let probe = Probe::Sqlite(&path);
         let seeded = seed_and_age(&store, &probe).await;
         let conn = raw_sqlite(&path);
-        let purged = ai_memory::db::auto_purge_archive(&conn, bound).expect("auto purge");
+        let retention = RetentionDays::from_config(bound);
+        let purged = ai_memory::db::auto_purge_archive(&conn, retention).expect("auto purge");
         assert_eq!(purged, 0, "sqlite maintenance: bound {bound:?}");
         for id in seeded.all() {
             assert!(probe.archived(&id).await, "sqlite maintenance deleted {id}");
@@ -277,8 +351,20 @@ async fn sqlite_maintenance_purge_unset_bound_deletes_nothing_9945() {
     }
 }
 
+#[tokio::test]
+async fn sqlite_explicit_purge_all_deletes_every_row_9945() {
+    key_dir_sandbox::pin();
+    let dir = scratch_dir();
+    let path = dir.path().join("archive-9945.db");
+    let store = SqliteStore::open(&path).expect("open sqlite store");
+    assert_purge_all_deletes_every_row("sqlite", &store, &Probe::Sqlite(&path)).await;
+}
+
 #[cfg(feature = "sal-postgres")]
-async fn pg_store() -> Option<(pg_barrier::ScratchDb, ai_memory::store::postgres::PostgresStore)> {
+async fn pg_store() -> Option<(
+    pg_barrier::ScratchDb,
+    ai_memory::store::postgres::PostgresStore,
+)> {
     let Some(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .ok()
         .filter(|s| !s.is_empty())
@@ -303,8 +389,7 @@ async fn pg_unset_zero_negative_bound_deletes_nothing_9945() {
         let Some((_scratch, store)) = pg_store().await else {
             return;
         };
-        assert_unbounded_deletes_nothing("postgres", &store, &Probe::Pg(store.pool()), bound)
-            .await;
+        assert_unbounded_deletes_nothing("postgres", &store, &Probe::Pg(store.pool()), bound).await;
     }
 }
 
@@ -316,4 +401,14 @@ async fn pg_bounded_purge_deletes_exactly_older_rows_9945() {
         return;
     };
     assert_bounded_deletes_exactly_old("postgres", &store, &Probe::Pg(store.pool())).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn pg_explicit_purge_all_deletes_every_row_9945() {
+    key_dir_sandbox::pin();
+    let Some((_scratch, store)) = pg_store().await else {
+        return;
+    };
+    assert_purge_all_deletes_every_row("postgres", &store, &Probe::Pg(store.pool())).await;
 }

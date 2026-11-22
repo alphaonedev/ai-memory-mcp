@@ -9321,19 +9321,18 @@ mod tests {
     }
 
     #[test]
-    fn handle_archive_purge_with_older_than_zero() {
-        // older_than_days=0 → purges all entries; on an empty DB this is
-        // a no-op that still hits the success branch.
+    fn handle_archive_purge_with_older_than_zero_refused_9945() {
+        // #9945 — older_than_days=0 is not a bound: refused over the wire
+        // with the exact reason (pre-#9945 it purged every archived row).
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call("memory_archive_purge", json!({"older_than_days": 0}));
         let resp = invoke_handle_request(&conn, &req);
-        assert!(resp.error.is_none());
-        let text = resp.result.unwrap()["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let val: Value = serde_json::from_str(&text).unwrap();
-        assert!(val["purged"].is_u64() || val["purged"].is_i64());
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"].as_str(),
+            Some("older_than_days must be at least 1 day (got 0)")
+        );
     }
 
     #[test]
@@ -14736,7 +14735,7 @@ mod tests {
         let req = make_tools_call(
             "memory_archive_purge",
             json!({
-                "older_than_days": 0,
+                "older_than_days": 30,
                 "agent_id": "chunkc-archdeny-bot",
             }),
         );
@@ -14767,7 +14766,7 @@ mod tests {
         let req = make_tools_call(
             "memory_archive_purge",
             json!({
-                "older_than_days": 0,
+                "older_than_days": 30,
                 "agent_id": "chunkc-archask-bot",
             }),
         );

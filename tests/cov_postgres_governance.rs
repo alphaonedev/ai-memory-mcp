@@ -411,7 +411,9 @@ async fn run_gc_and_archive_purge_execute() {
     let ctx = CallerContext::for_admin("ai:cov4");
     // archive_purge with a generous retention window is a safe no-op-ish
     // call that still exercises the SQL path.
-    retry_transient(|| store.archive_purge(&ctx, Some(36500)))
+    let max_bound = ai_memory::validate::RetentionDays::new(ai_memory::validate::MAX_DURATION_DAYS)
+        .expect("the cap is a bound");
+    retry_transient(|| store.archive_purge(&ctx, max_bound))
         .await
         .expect("archive_purge");
 }

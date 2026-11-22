@@ -221,6 +221,30 @@ impl SqliteStore {
         // that split silently degraded SAL-layer stop enforcement on macOS.
         crate::store::record_stop::gate_sqlite_path(&self.record_stop_key)
     }
+
+    /// The one funnel of [`MemoryStore::archive_purge`] and
+    /// [`MemoryStore::archive_purge_all`] (#9945).
+    ///
+    /// #936 (security-critical, 2026-05-20) — owner-vs-caller gate.
+    /// Same posture as the postgres branch: non-admin callers are
+    /// constrained to rows whose `metadata.agent_id` matches the
+    /// caller (with the inbox-target carve-out); admin callers
+    /// (`ctx.bypass_visibility == true`) bypass the filter. The shared
+    /// admin-role allowlist at `handlers::admin_role::require_admin`
+    /// exclusively controls who reaches the bypass branch.
+    async fn archive_purge_bounded(
+        &self,
+        ctx: &CallerContext,
+        bound: crate::validate::ArchivePurgeBound,
+    ) -> StoreResult<usize> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        if ctx.bypass_visibility {
+            db::purge_archive(&conn, bound).map_err(box_err)
+        } else {
+            db::purge_archive_for_caller(&conn, ctx.effective_principal(), bound).map_err(box_err)
+        }
+    }
 }
 
 fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
@@ -3283,24 +3307,18 @@ impl MemoryStore for SqliteStore {
     async fn archive_purge(
         &self,
         ctx: &CallerContext,
-        older_than_days: Option<i64>,
+        older_than: crate::validate::RetentionDays,
     ) -> StoreResult<usize> {
-        // #936 (security-critical, 2026-05-20) — owner-vs-caller gate.
-        // Same posture as the postgres branch: non-admin callers are
-        // constrained to rows whose `metadata.agent_id` matches the
-        // caller (with the inbox-target carve-out); admin callers
-        // (`ctx.bypass_visibility == true`) bypass the filter for
-        // the operator full-wipe surface. The shared admin-role
-        // allowlist at `handlers::admin_role::require_admin`
-        // exclusively controls who reaches the bypass branch.
-        self.gate_record_stop()?;
-        let conn = self.state.lock().await;
-        if ctx.bypass_visibility {
-            db::purge_archive(&conn, older_than_days).map_err(box_err)
-        } else {
-            db::purge_archive_for_caller(&conn, ctx.effective_principal(), older_than_days)
-                .map_err(box_err)
-        }
+        self.archive_purge_bounded(
+            ctx,
+            crate::validate::ArchivePurgeBound::OlderThan(older_than),
+        )
+        .await
+    }
+
+    async fn archive_purge_all(&self, ctx: &CallerContext) -> StoreResult<usize> {
+        self.archive_purge_bounded(ctx, crate::validate::ArchivePurgeBound::AllRows)
+            .await
     }
 
     async fn archive_by_ids(
@@ -6012,7 +6030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_purge_zero_threshold_purges_all() {
+    async fn archive_purge_empty_archive_purges_nothing() {
         let store = fresh_store();
         // Admin context — full owner-blind wipe (the operator path).
         // The non-admin owner-scoped path is exercised by the
@@ -6020,15 +6038,15 @@ mod tests {
         let admin = CallerContext::for_admin("ops:admin");
         // Empty archive ⇒ 0 purged.
         let n = store
-            .archive_purge(&admin, Some(0))
+            .archive_purge(&admin, crate::validate::RetentionDays::new(1).unwrap())
             .await
             .expect("archive_purge");
         assert_eq!(n, 0);
-        // None means "purge all" — still zero on empty archive.
+        // The explicit purge-all (#9945) — still zero on empty archive.
         let n = store
-            .archive_purge(&admin, None)
+            .archive_purge_all(&admin)
             .await
-            .expect("archive_purge all");
+            .expect("archive_purge_all");
         assert_eq!(n, 0);
     }
 
