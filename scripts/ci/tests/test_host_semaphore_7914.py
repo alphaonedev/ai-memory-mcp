@@ -4,6 +4,7 @@ Real subprocesses against a scratch lock root; nothing here touches the
 operator's ~/.cache. Python 3.9+, standard library only.
 """
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -19,8 +20,19 @@ SCRATCH = os.environ.get('TMPDIR') or None
 SLEEPER = [sys.executable, '-c', 'import time; time.sleep(60)']
 
 
+GATE_CONFIG_NAME = 'gate-n.json'  # the wrapper refuses a gate its configuration does not hold (#9846)
+GATE_CONFIG = {'registered_runners': [], 'gates': {'n': {'slots': 2, 'label': 'x', 'serving_runners': []}}}
+
+
 def start(root, args, child, **kw):
-    cmd = [sys.executable, '-I', str(SCRIPT), '--root', str(root), '--label', 'T'] + args + ['--'] + child
+    config = Path(root).parent / GATE_CONFIG_NAME  # next to the lock root, inside the test's scratch directory
+    if not config.exists():
+        config.write_text(json.dumps(GATE_CONFIG))
+    cmd = [sys.executable, '-I', str(SCRIPT), '--root', str(root), '--label', 'T', '--config', str(config)] + args
+    cmd += ['--'] + child
+    # the wait key and the runner name are wrapper input (#9231): values inherited from the caller (a CI runner
+    # sets RUNNER_NAME) must not steer these tests
+    kw.setdefault('env', {k: v for k, v in os.environ.items() if k not in ('HOST_SEMAPHORE_MAX_WAIT_SECS', 'RUNNER_NAME')})
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
 
 
@@ -40,7 +52,8 @@ def wait_for_line(proc, needle, limit=15.0):
 class Semaphore(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory(dir=SCRATCH)
-        self.root = Path(self._td.name)
+        self.root = Path(self._td.name) / 'locks'
+        self.root.mkdir()
 
     def tearDown(self):
         self._td.cleanup()
@@ -60,10 +73,10 @@ class Semaphore(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertEqual(hs.SEMAPHORE_SLOTS_DEFAULT, 2)
-        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 3600)
+        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 600)
         self.assertEqual(hs.SEMAPHORE_POLL_SECS_DEFAULT, 30)
 
-    def test_extra_waiter_times_out_with_exit_3(self):
+    def test_extra_waiter_times_out_with_the_no_slot_code_82(self):
         a = start(self.root, ['--name', 'n', '--slots', '1'], SLEEPER)
         b = None
         try:
@@ -71,8 +84,8 @@ class Semaphore(unittest.TestCase):
             b = start(self.root, ['--name', 'n', '--slots', '1', '--max-wait-secs', '1', '--poll-secs', '1'],
                       [sys.executable, '-c', 'print("must not run")'])
             out, _ = b.communicate(timeout=30)
-            self.assertEqual(b.returncode, 3, out)
-            self.assertIn("[#7914 semaphore] 'T': no slot free after 1s", out)
+            self.assertEqual(b.returncode, 82, out)
+            self.assertIn("[#7914 semaphore] 'T': infra-no-slot: no slot free after 1s", out)
             self.assertNotIn('must not run', out)
         finally:
             a.terminate()
@@ -178,17 +191,20 @@ class Semaphore(unittest.TestCase):
         p = start(self.root, ['--name', 'n', '--slots', '0'], ['true'])
         p.communicate(timeout=30)
         self.assertEqual(p.returncode, 2)
+        # #9851: a --name that is not a plain gate name is refused as an unknown gate (83), not a usage error
         p = start(self.root, ['--name', '../x', '--slots', '1'], ['true'])
-        p.communicate(timeout=30)
-        self.assertEqual(p.returncode, 2)
+        out, _ = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 83, out)
+        self.assertIn('--name is not a plain gate name', out)
 
     def test_name_with_newline_rejected_7914(self):
         """A trailing or embedded newline is not a valid name and creates nothing (fullmatch, not match)."""
         for bad in ('x\n', 'x\ny'):
             before = sorted(q.name for q in self.root.iterdir())
             p = start(self.root, ['--name', bad, '--slots', '1'], ['true'])
-            p.communicate(timeout=30)
-            self.assertEqual(p.returncode, 2, repr(bad))
+            out, _ = p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 83, repr(bad))  # #9851: refused as an unknown gate
+            self.assertIn('--name is not a plain gate name', out, repr(bad))
             self.assertEqual(sorted(q.name for q in self.root.iterdir()), before, repr(bad))
 
 

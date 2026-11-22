@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parents[3]
 CI = (REPO / '.github' / 'workflows' / 'ci.yml').read_text()
 sys.path.insert(0, str(REPO / 'scripts' / 'ci'))
 import host_semaphore  # noqa: E402
+import host_slots_check  # noqa: E402
 
 
 # Measured on the 4-runner linux-fed host (#7914 attempt-2 evidence comment, run
@@ -49,9 +50,15 @@ class SemaphoreWiring(unittest.TestCase):
         self.assertIn('[ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ]', step)
         self.assertIn('[ -z "${HOST_SEMAPHORE_HELD:-}" ]', step)
         self.assertIn('export HOST_SEMAPHORE_HELD=1', step)
-        self.assertIn('exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests '
-                      '--slots "$HOST_SEMAPHORE_SLOTS"', step)
-        self.assertIn('-- bash --noprofile --norc -eo pipefail "$0"', step)
+        # #9851: the call line is canonical (no quote or expansion), so the script is copied to a fixed path
+        self.assertIn('cp -- "$0" .local-runs/semaphore-step', step)
+        self.assertIn('exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 '
+                      '--max-wait-secs 600 --label linux-fed/enterprise-fed '
+                      '-- bash --noprofile --norc -eo pipefail .local-runs/semaphore-step', step)
+        self.assertLess(step.index('cp -- "$0" .local-runs/semaphore-step'),
+                        step.index('exec python3 -I scripts/ci/host_semaphore.py'))
+        # the literal slot count is the one the env expression gives this leg
+        self.assertIn("matrix.tier == 'enterprise-fed' && '2' || '0'", step)
         # the guard runs before JOB_T0 handling and before any cargo call
         guard = step.index('exec python3 -I scripts/ci/host_semaphore.py')
         self.assertLess(guard, step.index('JOB_T0_VALID=0'))
@@ -73,10 +80,16 @@ class SemaphoreWiring(unittest.TestCase):
             gate = re.search(r"'--max-wait-secs', type=_non_negative_int, default=(\d+)",
                              (REPO / 'scripts' / 'ci' / 'load_gate.py').read_text())
         gate_wait = int(gate.group(1))
-        sem = re.search(r"HOST_SEMAPHORE_MAX_WAIT_SECS: '(\d+)'", CI)
-        self.assertIsNotNone(sem, 'the semaphore wait must be one named env constant')
-        semaphore_wait = int(sem.group(1))
-        self.assertIn('--max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS"', CI)
+        # #9231: the value is read from the parsed workflows (comments and quoting ignored), exactly once.
+        defs = host_slots_check.parsed_env_values(
+            {p.name: p.read_text() for p in (REPO / '.github' / 'workflows').glob('*.yml')},
+            'HOST_SEMAPHORE_MAX_WAIT_SECS')
+        self.assertEqual(len(defs), 1, 'the semaphore wait must be one named env constant: %r' % defs)
+        semaphore_wait = int(defs[0][1])
+        self.assertLessEqual(semaphore_wait, host_slots_check.IDLE_SEAT_CEILING_SECS,
+                             'the wait bound must stay within the idle seat ceiling (#9231)')
+        # #9851: the call gives the env constant's value as a literal
+        self.assertIn('--max-wait-secs %d --label' % semaphore_wait, CI)
         safety = re.search(r'JOB_T0\) - (\d+) \)\)', CI)
         self.assertIsNotNone(safety)
         safety_secs = int(safety.group(1))
@@ -85,8 +98,8 @@ class SemaphoreWiring(unittest.TestCase):
             slack, SERIAL_SHARD_SECS,
             'cap %d - gate %d - semaphore %d - compile %d - safety %d = %d < serial shard %d'
             % (cap_secs, gate_wait, semaphore_wait, COLD_COMPILE_SECS, safety_secs, slack, SERIAL_SHARD_SECS))
-        self.assertIn('cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 '
-                      '+ safety 300 + serial shard 7800 (= 17000 s)', CI)
+        self.assertIn('cap 18000 s >= load-gate wait 1200 + semaphore wait 600 + cold compile 4100 '
+                      '+ safety 300 + serial shard 7800 (= 14000 s)', CI)
 
     def test_only_the_linux_fed_enterprise_leg_has_300(self):
         rows = re.findall(r'- leg: (\S+)\n(?:(?!\n          - leg:).)*?timeout: (\d+)\n', CI, re.S)

@@ -1160,7 +1160,7 @@ jobs:
     # named #1492 watchdog fires before GitHub's cancel. Do not raise a cap
     # for the gate.
     # #7914: on the self-hosted linux-fed enterprise-fed leg the compile+test
-    # phase also waits for a host-local semaphore slot (2 slots, up to 3600 s);
+    # phase also waits for a host-local semaphore slot (2 slots, up to 600 s);
     # that wait counts against the cap (JOB_T0 is unchanged), hence 300 there.
     timeout-minutes: ${{ matrix.timeout }}
     env:
@@ -1317,15 +1317,17 @@ jobs:
             # table: docs/ci/CARRIER-BRANCH-GATES.md.
             # #7914 - 300 on this leg only (self-hosted, no billing). The
             # host-local semaphore ("Run tests (impact-aware)" runs under
-            # scripts/ci/host_semaphore.py) admits 2 compile+test phases at
+            # the host semaphore wrapper of scripts/ci) admits 2 compile+test phases at
             # once and its wait counts against this cap: run 39686450440
             # attempt 2 had the serial shard budget cut to 5239 s (160 min -
             # 4061 s elapsed - 300 s) and the #1492 watchdog killed it
             # (serial=124) with no test failing; the same leg alone took
             # ~7980 s. Budget identity (pinned by test_ci_semaphore_wiring_7914):
-            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)
-            # The waits are kept, not shrunk, because they are what bound
-            # contention on a 4-runner host (#7928). The semaphore wait is the
+            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 600 + cold compile 4100 + safety 300 + serial shard 7800 (= 14000 s)
+            # The semaphore wait was 3600 s (#7928) and is 600 s since #9231: the
+            # runners that serve this leg are tied to the 2 slots by
+            # scripts/ci/host_slots.json, so no job queues inside the semaphore.
+            # The semaphore wait is the
             # one named constant HOST_SEMAPHORE_MAX_WAIT_SECS below. The
             # macos-fed and hosted caps are unchanged.
             timeout: 300
@@ -1370,8 +1372,12 @@ jobs:
       # job-level `if:` here (#2494 wedge class).
       - name: Fork-PR refusal (self-hosted legs never run fork code)
         if: needs.classify.outputs.cargo_skip != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
+        # #9879: matrix.leg via env, never inlined into the script body (a gated
+        # job's run text holds no expression; scripts/ci/host_slots_check.py).
+        env:
+          LEG: ${{ matrix.leg }}
         run: |
-          echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.leg }})."
+          echo "::error::Refusing to run fork PR code on a self-hosted runner (leg $LEG)."
           exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -1386,7 +1392,8 @@ jobs:
         if: needs.classify.outputs.cargo_skip == 'true'
         env:
           CARGO_SKIP_REASON: ${{ needs.classify.outputs.cargo_skip_reason }}
-        run: echo "::notice::cargo_skip - ${{ matrix.leg }} matrix leg is a no-op ($CARGO_SKIP_REASON)"
+          LEG: ${{ matrix.leg }}
+        run: echo "::notice::cargo_skip - $LEG matrix leg is a no-op ($CARGO_SKIP_REASON)"
 
       # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
       # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,
@@ -1846,7 +1853,10 @@ jobs:
       # Self-hosted legs only: hosted runners are dedicated VMs.
       - name: Load gate (#6795)
         if: needs.classify.outputs.cargo_skip != 'true' && contains(matrix.runner, 'self-hosted')
-        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+        # #9879: the label via env (a gated job's run text holds no expression).
+        env:
+          LOAD_GATE_LABEL: ${{ matrix.node }}/${{ matrix.tier }}
+        run: python3 -I scripts/ci/load_gate.py --label "$LOAD_GATE_LABEL"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.cargo_skip != 'true'
@@ -1871,17 +1881,38 @@ jobs:
           # linux-fed enterprise-fed leg; 0 = no semaphore (every other leg).
           HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' && '2' || '0' }}
           # #7928 - the one place the semaphore wait is set (seconds); it is a
-          # term of the job cap identity in the matrix timeout comment.
-          HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'
+          # term of the job cap identity in the matrix timeout comment. #9231:
+          # 600 s (was 3600 s): the serving runners equal the slots
+          # (scripts/ci/host_slots.json), so a wait only bridges a handover; a
+          # slot hold lasts about 2 h, so a longer wait never ended in a slot and
+          # only held a runner idle. No slot ends as the named outcome
+          # infra-no-slot: one error annotation whose message carries that token
+          # (a job log shows the message only) and exit code 82. The codes 82 to
+          # 85 are reserved: a command that exits with one of them is reported as
+          # 84, and a runner outside scripts/ci/host_slots.json ends as
+          # infra-unknown-runner (83). The gate stays red, no job output is set.
+          # The wrapper refuses, before any slot or command, a wait above the
+          # 900 s ceiling of scripts/ci/host_slot_limits.py, a repeated flag, or
+          # a flag that differs from this key: infra-wait-refused, exit code 85.
+          # Set the wait only here; run text reads it as a plain $ read. #9851:
+          # the wrapper call below gives the same value as a literal (its line
+          # is canonical: no quote or expansion), and the wrapper refuses a
+          # flag that differs from this key with exit code 85.
+          HOST_SEMAPHORE_MAX_WAIT_SECS: '600'
         shell: bash
         run: |
           set -euo pipefail
           # #7914 - bound how many legs compile and test at once on this host:
-          # re-run this very script under host_semaphore.py (the slot is held
-          # for the whole compile+test phase; the exit code is the script's).
+          # re-run this very script under the host semaphore wrapper (the slot
+          # is held for the whole compile+test phase; the exit code is the
+          # script's). #9851: the wrapper call is one canonical line (letters,
+          # digits, space and _ . / = : , - only), so the script is first copied
+          # to a fixed path and the slot count, wait and label are literals.
           if [ "${HOST_SEMAPHORE_SLOTS:-0}" -gt 0 ] && [ -z "${HOST_SEMAPHORE_HELD:-}" ]; then
             export HOST_SEMAPHORE_HELD=1
-            exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots "$HOST_SEMAPHORE_SLOTS" --max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS" --label "${CI_NODE}/${TIER}" -- bash --noprofile --norc -eo pipefail "$0"
+            mkdir -p .local-runs
+            cp -- "$0" .local-runs/semaphore-step
+            exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 --max-wait-secs 600 --label linux-fed/enterprise-fed -- bash --noprofile --norc -eo pipefail .local-runs/semaphore-step
           fi
           # #6795 — JOB_T0 is written to $GITHUB_ENV by the first step of the job.
           # Invalid or missing: warn and keep the flat watchdog values (fail
@@ -2773,13 +2804,15 @@ jobs:
       # prune step above never touches that directory, so this is its only cap.
       # --lock takes <root>/.evict.lock (the flock of the idle-target eviction)
       # for the sweep, waits at most 20 s and then skips with one warning and exit 0.
+      # #9879: the cap is read as the workflow env variable it already is (a
+      # gated job's run text holds no expression).
       - name: Sweep target/debug to the size cap (self-hosted)
         if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
-        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+        run: python3 scripts/ci-sweep-target.py --target target --max-bytes "${SELF_HOSTED_TARGET_CAP_BYTES:?size cap not set}"
 
       - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
         if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
-        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes "${SELF_HOSTED_TARGET_CAP_BYTES:?size cap not set}"
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

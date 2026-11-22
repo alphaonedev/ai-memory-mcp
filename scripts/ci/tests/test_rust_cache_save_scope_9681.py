@@ -3195,7 +3195,7 @@ CI_CARGO_ENV = "\n".join((
     "CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}",
     "HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' "
     "&& '2' || '0' }}",
-    "HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'",
+    "HOST_SEMAPHORE_MAX_WAIT_SECS: '600'",
 ))
 CI_RUST_CACHE_ALLOWED = {"if": (CI_IF_HOSTED, None), "id": (None, WARM_CACHE_ID),
                          "name": (None, WARM_CACHE_NAME)}
@@ -3528,7 +3528,7 @@ CI_CARGO_ENV_9770 = "\n".join((
     "CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}",
     "HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' "
     "&& '2' || '0' }}",
-    "HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'",
+    "HOST_SEMAPHORE_MAX_WAIT_SECS: '600'",
 ))
 
 
