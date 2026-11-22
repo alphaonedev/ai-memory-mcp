@@ -280,5 +280,100 @@ class ClassBFailureKindTests(unittest.TestCase):
         )
 
 
+class _OwnerSwapFake(R1Fake):
+    """Bootstrap succeeds, and the data directory read by the verify step shows the given facts."""
+
+    def __init__(self, verify_facts) -> None:
+        super().__init__()
+        self.verify_facts = verify_facts
+
+    def _run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        result = super()._run(argv)
+        if argv[:2] == [tdi.LAUNCHCTL, "bootstrap"] and result.returncode == 0:
+            self.facts[base.DATA] = self.verify_facts
+        return result
+
+
+class _RemoveThenFailFake(R1Fake):
+    """The unlink takes effect, then the remove step still reports an error (a failed directory fsync)."""
+
+    def remove_file(self, path: str) -> None:
+        self._require_changes()
+        self.calls.append(("remove", path))
+        del self.files[path]
+        raise OSError(errno.EIO, "io")
+
+
+CHANGED_WROTE_BOOTSTRAPPED = f"changed: wrote {PLIST}; bootstrapped {SERVICE}"
+VERIFY_CALLS = [PRINT, PORT, PUBLISH, BOOTSTRAP, PROBE, PRINT, PRINT]
+VERIFY_OUT = [PROCEED, FREE, WROTE, BOOTSTRAPPED, ANSWERS]
+# (name, facts the verify step reads, the exact refusal it reports)
+VERIFY_DATA_DIR_ROWS = [
+    ("owned by root", tdi.Facts(tdi.Kind.DIR, 0, 0o700),
+     f"--data-dir {base.DATA} is owned by uid 0, not by {base.ACCOUNT} (uid {base.ACCOUNT_UID})"),
+    ("owned by another account", tdi.Facts(tdi.Kind.DIR, 502, 0o700),
+     f"--data-dir {base.DATA} is owned by uid 502, not by {base.ACCOUNT} (uid {base.ACCOUNT_UID})"),
+    ("group writable", tdi.Facts(tdi.Kind.DIR, base.ACCOUNT_UID, 0o770),
+     f"--data-dir {base.DATA} is group or world writable"),
+    ("world writable", tdi.Facts(tdi.Kind.DIR, base.ACCOUNT_UID, 0o702),
+     f"--data-dir {base.DATA} is group or world writable"),
+    ("replaced by a symlink", tdi.Facts(tdi.Kind.SYMLINK), f"--data-dir {base.DATA} is a symlink"),
+]
+
+
+class ClassAOwnershipAfterBootstrapTests(unittest.TestCase):
+    def test_a_data_dir_that_fails_the_check_at_verify_is_never_installed(self) -> None:
+        for name, facts, why in VERIFY_DATA_DIR_ROWS:
+            fake = _OwnerSwapFake(facts)
+            outcome = tdi.run(base.argv_for("INSTALL"), fake, base.INVOCATION)
+            with self.subTest(row=name):
+                self.assertEqual(
+                    (outcome.code, outcome.out, outcome.err),
+                    (7, VERIFY_OUT, [FAILED + why, CHANGED_WROTE_BOOTSTRAPPED, STATE_PRESENT_LOADED, UNDO_REMOVE]),
+                )
+                self.assertEqual(fake.calls, VERIFY_CALLS)
+                self.assertNotIn("installed", " ".join(outcome.out + outcome.err))
+
+
+class ClassBUndoFromStateTests(unittest.TestCase):
+    def test_an_unknown_service_state_after_bootstrap_still_offers_the_bootout(self) -> None:
+        fake = R1Fake()
+        fake.files[PLIST] = base.PLIST_BYTES
+        fake.probe_result = False
+        fake.raise_from["print"] = 2
+        outcome = tdi.run(base.argv_for("INSTALL"), fake, base.INVOCATION)
+        self.assertEqual(
+            (outcome.code, outcome.out, outcome.err),
+            (
+                7,
+                [OUT + "--install: proceed: port check, bootstrap, probe, verify", FREE, BOOTSTRAPPED],
+                [
+                    FAILED + "127.0.0.1:5445 did not answer within 60 s",
+                    f"changed: bootstrapped {SERVICE}",
+                    VERIFY_HOST_STATE,
+                    f"undo: sudo /bin/launchctl bootout {SERVICE}",
+                ],
+            ),
+        )
+        self.assertEqual(fake.calls, [PRINT, PORT, BOOTSTRAP, PROBE, PRINT])
+
+    def test_a_remove_that_left_no_plist_never_offers_a_bootstrap(self) -> None:
+        fake = _RemoveThenFailFake()
+        fake.files[PLIST] = base.PLIST_BYTES
+        fake.loaded = True
+        outcome = tdi.run(base.argv_for("REMOVE"), fake, base.INVOCATION)
+        self.assertEqual(
+            (outcome.code, outcome.out, outcome.err),
+            (
+                6,
+                [REMOVE_PROCEED, f"booted out {SERVICE}"],
+                [FAILED + f"removing {PLIST}: EIO", f"changed: booted out {SERVICE}", STATE_ABSENT_NOT_LOADED,
+                 FINISH_REMOVAL],
+            ),
+        )
+        self.assertEqual(fake.calls, [PRINT, BOOTOUT, REMOVE, PRINT])
+        self.assertFalse(any("bootstrap" in line for line in outcome.err), outcome.err)
+
+
 if __name__ == "__main__":
     unittest.main()
