@@ -132,9 +132,9 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   named as a .NET runner endpoint (`dotnet-diagnostic-<pid>-…`,
   `clr-debug-pipe-<pid>-…`) whose pid is a live process is kept; one of a dead
   process is removed.
-- On the macOS node TMPDIR is `<runner folder>/_tmp` under the shared home
-  runner root or the volume runner root named by `F1_VOLUME_RUNNER_ROOT`
-  (folders `fed`, `fed<digits>`); it is proven by identity the same way (the
+- On the macOS node TMPDIR is `<runner folder>/_tmp` under the volume runner
+  root named by `F1_VOLUME_RUNNER_ROOT` (folders `fed`, `fed<digits>`), the
+  one runner-folder layout in `RUNNER_FOLDER_LAYOUTS`; it is proven by identity the same way (the
   folder's name, read from the open root, must match the layout and its parent
   must be that root). The folder must also be the folder of the job's runner:
   `RUNNER_NAME` is looked up in `RUNNER_FOLDER_BY_NAME`, written out from the
@@ -221,9 +221,10 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 - refusal: `TMPDIR contains the home directory or the workspace: <path>`
 
 - A failure on one entry (permission, vanished, busy, over a bound) is counted
-  and printed but does not fail the job: the step exits 0 with
+  and printed; at job start it does not fail the job (at job end it exits 3,
+  above): the step exits 0 with
   `pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>` and one
-  `::warning` annotation `failed=<n> not removed: <first 5 names, sorted>`
+  `::warning` annotation `failed=<n> layout=<row> not removed: <first 5 names, sorted>`
   (`(list cut at 5 of <n>)` when more failed; names escaped, line bounded at
   1000 characters). An unexpected
   internal error (a defect, not a misconfiguration) names the error, prints
