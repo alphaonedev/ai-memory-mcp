@@ -43,7 +43,7 @@ class StepExec(unittest.TestCase):
             env.update({
                 'PATH': '%s:%s' % (stub.parent, env.get('PATH', '')),
                 'AI_MEMORY_NO_CONFIG': '1', 'TIER': tier, 'CI_NODE': 'ubuntu-latest',
-                'TEST_IMPACT': impact, 'JOB_TIMEOUT_MIN': '95', 'JOB_T0': job_t0,
+                'TEST_IMPACT': impact, 'TEST_STEP_DEADLINE_MIN': '83', 'JOB_T0': job_t0,
                 'RUNNER_TEMP': str(d), 'GITHUB_ENV': str(d / 'env'),
                 'TEST_RESULT_LOG': str(d / 'result.log'),
             })

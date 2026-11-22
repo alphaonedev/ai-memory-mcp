@@ -32,10 +32,17 @@ Subcommands:
   exit 2, and the step then runs the unsharded suite instead (fail closed to full coverage).
 
 * ``suite-plan --workflow F --job J --node N --tier T``: before the first invocation of the full suite. The
-  whole-suite ceiling ``WHOLE_SUITE_CEILING_SECS`` plus the same ``MARGIN_PCT`` margin must fit the timeout of
-  job J as the workflow F states it (``timeout-minutes``, or the ``timeout`` of the matrix leg N, T when the
-  job reads ``${{ matrix.timeout }}``). A ceiling that cannot fit is ``EXIT_MARGIN_LOST`` at derivation, so
-  the suite is red before it runs, never killed by the job cap.
+  whole-suite ceiling ``WHOLE_SUITE_CEILING_SECS`` plus the same ``MARGIN_PCT`` margin must fit the test step
+  deadline of job J (``test_step_deadline_secs``: the job timeout as the workflow F states it, its
+  ``timeout-minutes`` or the ``timeout`` of the matrix leg N, T when the job reads ``${{ matrix.timeout }}``,
+  minus ``POST_STEP_MARGIN_MIN``). A ceiling that cannot fit is ``EXIT_MARGIN_LOST`` at derivation, so the
+  suite is red before it runs, never killed by the step bound or the job cap.
+* ``step-bound --workflow F --job J --node N --tier T --job-start T0 --github-output PATH [--now S]`` (#9852):
+  directly before the test step. The test step deadline is the one source of the limit the test step runs
+  under, counted from job start ``T0`` (epoch seconds): it appends ``minutes=M`` (the step's
+  ``timeout-minutes``: the whole minutes left to the deadline at ``S``, default now) and ``deadline_min=D``
+  (the deadline in minutes from job start) to PATH. ``M`` below ``MIN_TEST_STEP_MIN`` is ``EXIT_MARGIN_LOST``
+  with a named refusal; ``T0`` after ``S`` is malformed.
 * ``suite-sum --expect N ROW...``: after the last invocation. Each ROW is one ``<seconds><TAB><label>``
   argument per invocation, kept by the step in a shell array (never a file a test process can write);
   a count other than N is malformed. Their sum over ``WHOLE_SUITE_CEILING_SECS`` is ``EXIT_MARGIN_LOST``
@@ -47,8 +54,8 @@ log, so each gate profiles only its own invocation.
 
 Every margin red names issue #9229 and the slowest binaries, so a lane does not read it as its own defect.
 
-Exit codes: 0 ok, 2 malformed input (argparse usage too), 3 margin lost (an invocation, the whole suite, or
-a whole-suite plan that cannot fit the job), 4 the shared workflow_annotation.py next to this file cannot be
+Exit codes: 0 ok, 2 malformed input (argparse usage too), 3 margin lost (an invocation, the whole suite, a
+whole-suite plan that cannot fit the test step deadline, or a step bound below the minimum), 4 the shared workflow_annotation.py next to this file cannot be
 loaded.
 Malformed input is always red with a named error, never a silent pass: every subcommand ends with 0, 2 or 3
 and a named reason line for every input up to ``MAX_TEXT_BYTES`` / ``MAX_LOG_BYTES``, never a traceback (an
@@ -120,9 +127,18 @@ MAX_MARGIN_PCT = 99
 WATCHDOG_KILL_CODES = (124, 137)  # GNU timeout: TERM fired / KILL after --kill-after
 TIMER_KILLED_CODES = (143,)  # the margin timer ended by the caller's SIGTERM (128 + 15) before it fired
 # The most seconds the invocations of the sqlite full suite may sum to (ruling b29 cdfe800f). It fits both
-# sqlite legs with the margin: 80 percent of the 80-minute macos-fed job is 3840 s, of the 95-minute ubuntu-latest
-# job 4560 s (suite-plan checks the running leg). The measured unsharded suite is about 2000 s on ubuntu-latest.
+# sqlite legs with the margin, measured on the test step deadline (job timeout minus POST_STEP_MARGIN_MIN):
+# 80 percent of the 75-minute deadline of the 87-minute macos-fed job is 3600 s, of the 83-minute deadline of
+# the 95-minute ubuntu-latest job 3984 s (suite-plan checks the running leg). The measured unsharded suite is
+# about 2000 s on ubuntu-latest.
 WHOLE_SUITE_CEILING_SECS = 3600
+STEP_TAG = "[#9852 step bound]"
+# Minutes of the job timeout kept for the steps after the test step (the uploads and the job's post steps),
+# counted from JOB start: the test step deadline is the job timeout minus this, whenever the test step starts.
+POST_STEP_MARGIN_MIN = 12
+# The fewest minutes a test step bound may give; less means the earlier steps used the job's time, a named red.
+MIN_TEST_STEP_MIN = 10
+EPOCH_MAX_SECS = 10 ** 11  # a job start or a clock at or past this is not an epoch second (year 5138)
 # Carried by every margin red, so another lane reads it as the suite's cost, not as its own failure.
 ISSUE_NOTE = "this red is issue #9229 (the cost of the sqlite suite), not a failure of the change under test"
 NO_PROFILE = "slowest binaries: none profiled"
@@ -604,16 +620,71 @@ def job_timeout_secs(text, job, node, tier):
     return int(minutes) * 60
 
 
+def test_step_deadline_secs(text, job, node, tier):
+    """Seconds from job start by which the test step of the leg (node, tier) must end: the job timeout minus
+    POST_STEP_MARGIN_MIN. The one source of the limit the test step runs under (#9852): the step bound, the
+    in-step budgets, the suite plan and the budget identity pin all read it."""
+    secs = job_timeout_secs(text, job, node, tier) - POST_STEP_MARGIN_MIN * 60
+    if secs < MIN_TEST_STEP_MIN * 60:
+        raise MalformedInput("job %r (node=%s tier=%s) timeout leaves %ds after the %d-min post-step margin, below "
+                             "the %d-min minimum test step" % (job, node, tier, secs, POST_STEP_MARGIN_MIN,
+                                                               MIN_TEST_STEP_MIN))
+    return secs
+
+
+def step_bound(deadline_secs, job_start, now):
+    """Whole minutes the test step may run when it starts at ``now``: (deadline - elapsed) // 60, so the step
+    ends by job_start + deadline_secs. MalformedInput when the clock values are not epoch seconds in order."""
+    for name, value in (("job start", job_start), ("now", now)):
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 < value < EPOCH_MAX_SECS:
+            raise MalformedInput("%s %r is not an epoch second" % (name, value))
+    if job_start > now:
+        raise MalformedInput("job start %d is after now %d" % (job_start, now))
+    return (deadline_secs - (now - job_start)) // 60
+
+
+def run_step_bound(workflow_path, job, node, tier, job_start, github_output, now=None):
+    now = int(time.time()) if now is None else now
+    try:
+        text = _read_text(workflow_path, "workflow file")
+        job_secs = job_timeout_secs(text, job, node, tier)
+        deadline = test_step_deadline_secs(text, job, node, tier)
+        minutes = step_bound(deadline, job_start, now)
+    except MalformedInput as exc:
+        print(wa.annotation("error", "%s malformed input: %s; refusing to start the test step"
+                            % (STEP_TAG, exc)), flush=True)
+        return EXIT_MALFORMED
+    elapsed = now - job_start
+    where = "job '%s' (node=%s tier=%s): job limit %d min - %ds elapsed since job start - post-step margin %d min" \
+        % (job, node, tier, job_secs // 60, elapsed, POST_STEP_MARGIN_MIN)
+    if minutes < MIN_TEST_STEP_MIN:
+        print(wa.annotation("error", "%s refused: %s leaves %d min, below the %d-min minimum test step; the steps "
+                            "before the test step used the job's time" % (STEP_TAG, where, max(minutes, 0),
+                                                                          MIN_TEST_STEP_MIN)), flush=True)
+        return EXIT_MARGIN_LOST
+    try:
+        with open(github_output, "a", encoding="utf-8") as out:
+            out.write("minutes=%d\ndeadline_min=%d\n" % (minutes, deadline // 60))
+    except OSError as exc:
+        print(wa.annotation("error", "%s cannot append to the step output file (%s); refusing to start the test "
+                            "step" % (STEP_TAG, type(exc).__name__)), flush=True)
+        return EXIT_MALFORMED
+    print(wa.annotation("notice", "%s test step bound %d min: %s; step deadline %d min from job start"
+                        % (STEP_TAG, minutes, where, deadline // 60)), flush=True)
+    return EXIT_OK
+
+
 def run_suite_plan(workflow_path, job, node, tier, ceiling=WHOLE_SUITE_CEILING_SECS, margin_pct=MARGIN_PCT):
     try:
-        secs = job_timeout_secs(_read_text(workflow_path, "workflow file"), job, node, tier)
+        secs = test_step_deadline_secs(_read_text(workflow_path, "workflow file"), job, node, tier)
         room = margin_deadline(secs, margin_pct)
     except MalformedInput as exc:
         print(wa.annotation("error", "%s whole-suite plan: malformed input: %s; refusing to pass (#9229)"
                             % (TAG, exc)), flush=True)
         return EXIT_MALFORMED
-    where = "the %d-minute timeout of job '%s' (node=%s tier=%s) with the required %d percent margin (at most %ds)" \
-        % (secs // 60, job, node, tier, margin_pct, room)
+    where = ("the %d-minute test step deadline of job '%s' (node=%s tier=%s; job limit minus the %d-min post-step "
+             "margin) with the required %d percent margin (at most %ds)"
+             % (secs // 60, job, node, tier, POST_STEP_MARGIN_MIN, margin_pct, room))
     if ceiling > room:
         print(wa.annotation("error", "%s whole-suite plan refused: the %ds whole-suite ceiling "
                             "(WHOLE_SUITE_CEILING_SECS) does not fit %s; %s; cut the suite cost or shard it, do not "
@@ -748,6 +819,14 @@ def _dispatch(argv):
     w.add_argument("--job", required=True)
     w.add_argument("--node", required=True)
     w.add_argument("--tier", required=True)
+    b = sub.add_parser("step-bound")
+    b.add_argument("--workflow", required=True)
+    b.add_argument("--job", required=True)
+    b.add_argument("--node", required=True)
+    b.add_argument("--tier", required=True)
+    b.add_argument("--job-start", type=_int_arg, required=True)
+    b.add_argument("--github-output", required=True)
+    b.add_argument("--now", type=_int_arg, default=None)
     u = sub.add_parser("suite-sum")
     u.add_argument("--expect", type=_int_arg, required=True)
     u.add_argument("rows", nargs="*")
@@ -762,6 +841,9 @@ def _dispatch(argv):
         return run_shard_args(args.metadata, args.features, args.part)
     if args.cmd == "suite-plan":
         return run_suite_plan(args.workflow, args.job, args.node, args.tier)
+    if args.cmd == "step-bound":
+        return run_step_bound(args.workflow, args.job, args.node, args.tier, args.job_start, args.github_output,
+                              args.now)
     if args.cmd == "suite-sum":
         return run_suite_sum(args.rows, args.expect)
     return run_profile(args.log, args.top)

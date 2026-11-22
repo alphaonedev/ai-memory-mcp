@@ -18,14 +18,23 @@ that the named watchdog, not a nameless job-level cancel, is what fires (#6411).
 | Tier / leg | Watchdog (`WATCHDOG_SECS`) | Job `timeout-minutes` | Measured uncontended | Measured contended |
 |---|---|---|---|---|
 | `ubuntu-latest,sqlite` | 2100 s (35 min) | 95 | see #3538 | see #3538 |
-| `macos-fed,sqlite` | 2400 s (40 min) | 80 | about 27 min (#3461) | n/a |
+| `macos-fed,sqlite` | 2400 s (40 min) | 87 (#9852) | about 27 min (#3461) | n/a |
 | `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 300 (#7914) | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
 | `macos-fed,enterprise-fed` | 7800 s (130 min) per shard | 160 | n/a | n/a |
 
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. On the sharded
 `enterprise-fed` legs the stricter rule applies: job `timeout-minutes` >=
 watchdog minutes + 28 (pre-watchdog compile and database setup) + 2 (teardown)
-= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 3600 s, counted against the cap; identity: cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)). All four rows meet both.
+= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 3600 s, counted against the cap; identity: step deadline 17280 s (cap 18000 - post-step margin 720) >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)). All four rows meet both.
+
+Test step deadline (#9852): the step `Test step bound (#9852)` runs `suite_budget.py step-bound` directly before
+`Run tests (impact-aware)` and gives it `timeout-minutes` equal to the whole minutes left to the test step deadline,
+the leg `timeout` minus `POST_STEP_MARGIN_MIN` (12) counted from `JOB_T0`, so the upload and cleanup steps after it
+keep that margin however late the step starts. `suite_budget.test_step_deadline_secs` is the one source: the bound,
+`TEST_STEP_DEADLINE_MIN` (read by `job_left`, the serial shard budget and its notice), the whole-suite plan and the
+#7914 identity all read it. Fewer than 10 minutes left, or a `JOB_T0` that is not an epoch second, is a named red
+(exit 2) of the bound step, so the test step never runs unbounded. The macos-fed sqlite leg is 87 so its 75-minute
+deadline keeps the whole-suite ceiling below with its 20 percent margin.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
 
@@ -232,9 +241,10 @@ constant hides the growth.
   checked against one constant, `WHOLE_SUITE_CEILING_SECS` (3600 s). Before
   the first invocation `suite_budget.py suite-plan` reads the timeout of job
   `check` for the running leg from `ci.yml` (`timeout-minutes`, or the
-  matrix leg's `timeout`) and requires the ceiling plus the same 20 percent margin
-  to fit it (at most 4560 s of the 95-minute ubuntu-latest leg, 3840 s of the
-  80-minute macos-fed leg); a ceiling that cannot fit is a named red (exit 3)
+  matrix leg's `timeout`), takes its test step deadline (that timeout minus the
+  12-minute post-step margin, #9852) and requires the ceiling plus the same 20 percent
+  margin to fit it (at most 3984 s of the 83-minute deadline of the ubuntu-latest leg,
+  3600 s of the 75-minute deadline of the macos-fed leg); a ceiling that cannot fit is a named red (exit 3)
   before any test runs, never a job kill, and an absent or unreadable timeout
   is exit 2. Each gated invocation appends `<seconds><TAB><label>` to the
   bash array `SUITE_SECONDS` of the step shell (no file: a test process can

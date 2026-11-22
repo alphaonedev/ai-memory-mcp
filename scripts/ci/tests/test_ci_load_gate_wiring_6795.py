@@ -67,7 +67,7 @@ class SerialBudget(unittest.TestCase):
         self.assertIn('SHARD_BUDGET="$(cap_to_job_left "$SERIAL_BUDGET_SECS")"', body)
         left = function_body(CI, 'job_left')
         self.assertIn('JOB_T0', left)
-        self.assertIn('JOB_TIMEOUT_MIN * 60', left)
+        self.assertIn('TEST_STEP_DEADLINE_MIN * 60', left)  # the test step deadline, #9852
 
     def test_non_sharded_watchdog_is_capped_too(self):
         self.assertIn('local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"',
@@ -78,7 +78,7 @@ class SerialBudget(unittest.TestCase):
 
     def test_timeout_comment_table_matches_matrix(self):
         for row in ('ubuntu-latest,sqlite      95', 'linux-fed,enterprise-fed 300',
-                    'macos-fed,sqlite          80', 'macos-fed,enterprise-fed 160'):
+                    'macos-fed,sqlite          87', 'macos-fed,enterprise-fed 160'):
             self.assertIn(row, CI)
 
 
