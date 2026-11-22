@@ -27,6 +27,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "scripts"
@@ -35,7 +36,15 @@ BLOCK_BEGIN = "# >>> sibling-load 9399"
 BLOCK_END = "# <<< sibling-load 9399"
 PYTHON = sys.executable
 SUBPROCESS_TIMEOUT_S = 120
-FIFO_TIMEOUT_S = 20
+FIFO_TIMEOUT_S = 20  # a FIFO open that blocks (O_NONBLOCK dropped) fails the row at this ceiling instead of hanging
+DEGENERATE_TIMEOUT_S = 20  # wall-clock ceiling of one site run against one degenerate or broken sibling
+# The reason words of the refusal line, written out by hand (never read from the loader under test).
+REASON_ABSENT = "absent"
+REASON_UNREADABLE = "unreadable"
+REASON_NOT_REGULAR = "not a regular file"
+REASON_LEAVES = "symlink leaves the script folder"
+REASON_EMPTY = "empty"
+REASON_TAKEN = "module name taken"
 EXIT_REFUSED_DEFAULT = 3
 EXIT_REFUSED_SCCACHE = 5  # sccache_env.py already spends 2, 3 and 4 on its own outcomes
 MARKER_ENV = "DECOY_MARKER_9399"
@@ -63,11 +72,12 @@ SITES = (
     ("ci/impact/read_set.py", "read_set", 3, (("common.py", "impact.common"),), ("-I",)),
     ("ci/impact/select.py", "select", 3, (("common.py", "impact.common"),), ("-I",)),
     ("ci/pg_isolate_split.py", "pg_isolate_split", EXIT_REFUSED_DEFAULT,
-     (("partition_test_binaries.py", "partition_test_binaries"),), ()),
+     (("workflow_annotation.py", "workflow_annotation"),
+      ("partition_test_binaries.py", "partition_test_binaries")), ()),
     ("ci/prune_runner_artifacts.py", "prune_runner_artifacts", EXIT_REFUSED_DEFAULT,
-     (("shared_cargo_target.py", "shared_cargo_target"),), ()),
+     (("workflow_annotation.py", "workflow_annotation"), ("shared_cargo_target.py", "shared_cargo_target")), ()),
     ("ci/sccache_env.py", "sccache_env", EXIT_REFUSED_SCCACHE,
-     (("shared_cargo_target.py", "shared_cargo_target"),), ()),
+     (("workflow_annotation.py", "workflow_annotation"), ("shared_cargo_target.py", "shared_cargo_target")), ()),
     ("bench/mesh_probe.py", "mesh_probe", 3,
      (("benchlib.py", "benchlib"), ("ops_producer.py", "ops_producer")), ()),
     ("bench/ops_producer.py", "ops_producer", 3, (("benchlib.py", "benchlib"),), ()),
@@ -212,6 +222,120 @@ class AbsentSibling(Scratch):
                             shutil.rmtree(self.root / leftover, ignore_errors=True)
 
 
+# One hand-written row per degenerate or broken sibling object: (kind, the reason the refusal line prints). Every row
+# runs at every (site, sibling) of SITES. A device node cannot be made in a checkout without root (mknod), so the site
+# row reaches a device through a symlink (/dev/null, outside the folder); LoaderAlone opens a real device in place.
+DEGENERATE_ROWS = (
+    ("fifo", REASON_NOT_REGULAR),
+    ("device", REASON_LEAVES),
+    ("directory", REASON_NOT_REGULAR),
+    ("out-of-tree symlink", REASON_LEAVES),
+    ("empty", REASON_EMPTY),
+    ("unreadable", REASON_UNREADABLE),
+)
+# A sibling that is a regular file but broken: the site's except clause must catch every kind (L1, #9399).
+BROKEN_ROWS = (
+    ("syntax error", "def broken(:\n", "SyntaxError"),
+    ("exit 0", "raise SystemExit(0)\n", "SystemExit"),
+    ("exit 3", "raise SystemExit(3)\n", "SystemExit"),
+    ("raises", "raise RuntimeError('broken')\n", "RuntimeError"),
+)
+EVIL_SOURCE = "open(%r, 'w').close()\n"
+
+
+class SiteRefusesEachObject(Scratch):
+    """Every (site, sibling) of SITES, the sibling replaced by each degenerate or broken object in a copy of the
+    script folder: the run ends within DEGENERATE_TIMEOUT_S with ONE exact stderr line, empty stdout and the site's own
+    exit code, and nothing outside the folder runs."""
+
+    def folder_copy(self, script_rel):
+        folder_rel = Path(script_rel).parent
+        copy_dir = self.root / ("copy-" + "-".join(folder_rel.parts)) / "scripts" / folder_rel
+        if not copy_dir.exists():
+            shutil.copytree(SCRIPTS / folder_rel, copy_dir, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        return copy_dir
+
+    def place(self, kind, target, body):
+        target.unlink()
+        if kind == "fifo":
+            os.mkfifo(target)
+        elif kind == "device":
+            os.symlink(os.devnull, target)
+        elif kind == "directory":
+            target.mkdir()
+        elif kind == "out-of-tree symlink":
+            outside = self.root / ("outside-" + target.name)
+            outside.write_text(body, encoding="utf-8")
+            os.symlink(outside, target)
+        elif kind == "empty":
+            target.write_bytes(b"")
+        elif kind == "unreadable":
+            target.write_text("VALUE = 1\n", encoding="utf-8")
+            target.chmod(0)
+        else:
+            target.write_text(body, encoding="utf-8")
+
+    def restore(self, target, original):
+        if target.is_dir() and not target.is_symlink():
+            target.rmdir()
+        else:
+            if not target.is_symlink() and target.exists():
+                target.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            target.unlink()
+        shutil.copy2(original, target)
+
+    def check(self, row, sibling, kind, body, why):
+        script_rel, prog, code, _siblings, flags = row
+        copy_dir = self.folder_copy(script_rel)
+        target = copy_dir / sibling
+        marker = self.root / "evil-ran"
+        marker.unlink(missing_ok=True)
+        self.place(kind, target, body if body is not None else EVIL_SOURCE % str(marker))
+        try:
+            try:
+                got = run([*flags, str(copy_dir / Path(script_rel).name), "--help"], self.root,
+                          timeout=DEGENERATE_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self.fail("%s with a %s %s did not end within %d s" % (script_rel, kind, sibling, DEGENERATE_TIMEOUT_S))
+            expected = "%s: refused: sibling module %s at %s cannot be loaded (%s)\n" % (
+                prog, sibling, os.path.join(os.path.realpath(copy_dir), sibling), why)
+            self.assertEqual(got.stderr, expected)
+            self.assertEqual(got.returncode, code)
+            self.assertEqual(got.stdout, "")
+            self.assertFalse(marker.exists(), "the file outside the script folder ran")
+        finally:
+            self.restore(target, SCRIPTS / Path(script_rel).parent / sibling)
+
+    def test_every_site_refuses_each_degenerate_sibling_within_the_ceiling(self):
+        for row in SITES:
+            for sibling, _ in row[3]:
+                for kind, why in DEGENERATE_ROWS:
+                    with self.subTest(script=row[0], sibling=sibling, kind=kind):
+                        self.check(row, sibling, kind, None, why)
+
+    def test_every_site_refuses_each_broken_sibling_with_its_own_exit_code(self):
+        for row in SITES:
+            for sibling, _ in row[3]:
+                for kind, body, why in BROKEN_ROWS:
+                    with self.subTest(script=row[0], sibling=sibling, kind=kind):
+                        self.check(row, sibling, kind, body, why)
+
+
+CHILD_LOAD_SOURCE = (
+    "import sys\n"
+    "block, script, filename = sys.argv[1:4]\n"
+    "ns = {'__file__': script, '__name__': 'child_9399'}\n"
+    "with open(block, encoding='utf-8') as handle:\n"
+    "    exec(compile(handle.read(), block, 'exec'), ns)\n"
+    "try:\n"
+    "    ns['_load_sibling'](filename, 'child_sibling_9399')\n"
+    "except ns['SiblingLoadError'] as exc:\n"
+    "    print('refused: ' + exc.reason)\n"
+    "else:\n"
+    "    print('loaded')\n"
+)
+
+
 class LoaderAlone(Scratch):
     """The loader text of sibling_load.py, run in a namespace whose ``__file__`` is a scratch script."""
 
@@ -287,11 +411,83 @@ class LoaderAlone(Scratch):
         (self.folder / "adir.py").mkdir()
         self.refused("adir.py", "adir_9399", "not a regular file")
 
+    def child_load(self, script, filename):
+        """Run the canonical block in a fresh child (``__file__`` = ``script``) loading ``filename``, bounded by
+        FIFO_TIMEOUT_S: an open that blocks fails the row instead of hanging the suite (L2)."""
+        block_file = self.root / "block.py"
+        block_file.write_text(block_of(canon_text()), encoding="utf-8")
+        child = self.root / "child.py"
+        child.write_text(CHILD_LOAD_SOURCE, encoding="utf-8")
+        try:
+            got = run([str(child), str(block_file), str(script), filename], self.root, timeout=FIFO_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            self.fail("loading %s did not end within %d s" % (filename, FIFO_TIMEOUT_S))
+        self.assertEqual(got.stderr, "")
+        return got.stdout
+
     def test_a_fifo_is_refused_without_blocking(self):
         os.mkfifo(self.folder / "pipe.py")
         started = time.monotonic()
-        self.refused("pipe.py", "pipe_9399", "not a regular file")
+        self.assertEqual(self.child_load(self.script, "pipe.py"), "refused: " + REASON_NOT_REGULAR + "\n")
         self.assertLess(time.monotonic() - started, FIFO_TIMEOUT_S)
+
+    def test_a_device_in_the_script_folder_is_not_a_regular_file(self):
+        """A script whose folder is /dev (nothing is written there): the sibling ``null`` is a character device."""
+        self.assertEqual(self.child_load(os.path.join(os.path.dirname(os.devnull), "tool_9399.py"),
+                                         os.path.basename(os.devnull)), "refused: " + REASON_NOT_REGULAR + "\n")
+
+    def test_an_empty_file_is_refused(self):
+        self.write("blank.py", b"")
+        self.refused("blank.py", "blank_9399", REASON_EMPTY)
+
+    def test_a_folder_swapped_for_a_symlink_after_the_check_is_refused(self):
+        """F2: the containment check resolves the path, the open walks the same folders by descriptor. A folder
+        swapped for a symlink to outside between the check and the open is refused and the outside file never runs.
+        The swap happens inside the first ``os.open`` call, so no timing is involved."""
+        sub = self.folder / "sub"
+        sub.mkdir()
+        (sub / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+        outside = self.root / "outside"
+        outside.mkdir()
+        marker = self.root / "evil-ran"
+        (outside / "mod.py").write_text(EVIL_SOURCE % str(marker), encoding="utf-8")
+        real_open = os.open
+        swapped = []
+
+        def swap_then_open(path, flags, *args, **kwargs):
+            if not swapped:
+                swapped.append(path)
+                os.rename(sub, self.root / "sub-moved")
+                os.symlink(outside, sub)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(os, "open", swap_then_open):
+            self.refused("sub/mod.py", "swapdir_9399", REASON_UNREADABLE)
+        self.assertEqual(len(swapped), 1)
+        self.assertFalse(marker.exists(), "the file outside the script folder ran")
+
+    def test_the_script_folder_swapped_after_the_check_is_refused(self):
+        """The script's own folder (the last component of the resolved folder) swapped for a symlink before the
+        first open: the folder itself is opened without following a symlink."""
+        moved = self.root / "scripts" / "ci-moved"
+        outside = self.root / "outside"
+        outside.mkdir()
+        marker = self.root / "evil-ran"
+        (outside / "mod.py").write_text(EVIL_SOURCE % str(marker), encoding="utf-8")
+        self.write("mod.py", "VALUE = 1\n")
+        real_open = os.open
+        swapped = []
+
+        def swap_then_open(path, flags, *args, **kwargs):
+            if not swapped:
+                swapped.append(path)
+                os.rename(self.folder, moved)
+                os.symlink(outside, self.folder)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(os, "open", swap_then_open):
+            self.refused("mod.py", "swaphere_9399", REASON_UNREADABLE)
+        self.assertFalse(marker.exists(), "the file outside the script folder ran")
 
     def test_a_symlink_inside_the_folder_is_followed(self):
         self.write("real_target.py", "VALUE = 3\n")
