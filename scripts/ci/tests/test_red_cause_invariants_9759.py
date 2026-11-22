@@ -940,5 +940,127 @@ class FunnelConformance(unittest.TestCase):
         self.assertNotEqual(funnel_problems(mutated), [])
 
 
+
+# #9871 (r3 L2 and LATE): every fail-closed branch of redact_shown, with the exact shown text written out.
+REDACTION_FAILED_TEXT = "<redaction failed>"
+REDACTION_SPENT_TEXT = "<redaction budget spent>"
+FUNNEL_RAW = "ghp_" + "Z8x7C6v5B4n3M2l1K0j9H8g7F6d5S4a3P2o1"  # a raw value that must never come back
+
+
+class NonStrRedaction:
+    """A redactor whose result is not a str."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __call__(self, raw):
+        return self.value
+
+
+def raising_redaction(error):
+    def redact(raw):
+        raise error
+    return redact
+
+
+# (row, redactor installed as _redact_line, the exact shown text): one row per fail-closed branch; the expected
+# column is written out, never taken from the module.
+FUNNEL_FAIL_CLOSED_ROWS = (
+    ("no redactor loaded (:354)", None, REDACTION_FAILED_TEXT),
+    ("redactor returns None (:368)", NonStrRedaction(None), REDACTION_FAILED_TEXT),
+    ("redactor returns an int (:368)", NonStrRedaction(7), REDACTION_FAILED_TEXT),
+    ("redactor returns bytes (:368)", NonStrRedaction(b"x"), REDACTION_FAILED_TEXT),
+    ("redactor returns a list (:368)", NonStrRedaction(["x"]), REDACTION_FAILED_TEXT),
+    ("redactor raises ValueError (:366)", raising_redaction(ValueError("v")), REDACTION_FAILED_TEXT),
+    ("redactor raises RuntimeError (:366)", raising_redaction(RuntimeError("r")), REDACTION_FAILED_TEXT),
+    ("redactor raises UnicodeError (:366)", raising_redaction(UnicodeError("u")), REDACTION_FAILED_TEXT),
+)
+
+
+class FunnelFailsClosed9871(unittest.TestCase):
+    """#9871: no fail-closed branch of redact_shown ever returns the raw value; each gives its exact fixed text."""
+
+    def funnel(self, redactor, calls=0):
+        module = load_script()
+        module._redact_line = redactor
+        module._redaction_calls = calls
+        return module, module.redact_shown(FUNNEL_RAW)
+
+    def test_every_fail_closed_branch_gives_the_exact_fixed_text(self):
+        for row, redactor, expected in FUNNEL_FAIL_CLOSED_ROWS:
+            module, shown = self.funnel(redactor)
+            self.assertIs(type(shown), module.Redacted, row)
+            self.assertEqual(shown.text, expected, row)
+            self.assertNotIn(FUNNEL_RAW[:8], shown.text, row)
+
+    def test_a_spent_budget_gives_its_fixed_text_before_any_redactor_call(self):
+        module, shown = self.funnel(NonStrRedaction(FUNNEL_RAW), calls=REDACTION_CALLS)
+        self.assertEqual(shown.text, REDACTION_SPENT_TEXT)
+
+    def test_the_control_row_an_identity_redactor_shows_the_value(self):
+        # The table rows differ from this one only in the redactor, so a red row is the branch, not the value.
+        module, shown = self.funnel(lambda raw: raw)
+        self.assertEqual(shown.text, FUNNEL_RAW)
+
+    def test_a_non_str_raw_value_is_refused_with_the_exact_reason(self):
+        module = load_script()
+        module.load_redaction()
+        with self.assertRaises(TypeError) as caught:
+            module.redact_shown(b"raw")
+        self.assertEqual(str(caught.exception), "redact_shown takes a str")
+
+
+# #9870 (r3 L1, misattribution half): in a --no-fail-fast log the first failures block makes the rest of the file
+# opaque; a result line of a later block is never attributed to the first block's binary.  The rows of the later
+# blocks stay lost here (ruling acc4d9e3, lane fix-9831-opaque-exit); only the attribution is fixed.
+ALPHA_RESULT = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+BETA_RESULT = "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+DOC_RESULT = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s"
+GAMMA_OK = "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s"
+FORGED_IN_CAPTURE = "test result: FAILED. 0 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s"
+ALPHA_HEAD = ("     Running tests/alpha.rs (target/debug/deps/alpha-0123456789abcdef)\n"
+              "test a::good ... ok\ntest a::bad ... FAILED\n\nfailures:\n\n---- a::bad stdout ----\nboom\n")
+ALPHA_TAIL = "\nfailures:\n    a::bad\n\n" + ALPHA_RESULT + "\n\n"
+BETA_BLOCK = ("     Running tests/beta.rs (target/debug/deps/beta-fedcba9876543210)\n"
+              "test b::x ... FAILED\ntest b::y ... FAILED\n\nfailures:\n\n---- b::x stdout ----\nx\n"
+              "\nfailures:\n    b::x\n    b::y\n\n" + BETA_RESULT + "\n\n")
+DOC_BLOCK = ("   Doc-tests alpha\ntest src/lib.rs - f (line 3) ... FAILED\n\nfailures:\n\n"
+             "failures:\n    src/lib.rs - f (line 3)\n\n" + DOC_RESULT + "\n\n")
+GAMMA_BLOCK = "     Running tests/gamma.rs (target/debug/deps/gamma-00112233445566aa)\n" + GAMMA_OK + "\n\n"
+FORGED_SECTION = "     Running tests/forged.rs (target/debug/deps/forged-0123456789abcdef)\n"
+ALPHA_ROW = "::error title=failing test binary::alpha: " + ALPHA_RESULT + "\n"
+ALPHA_TEST = "::error title=failing test::alpha: a\\x3a:bad\n"
+ALPHA_STDOUT = ALPHA_ROW + ALPHA_TEST
+# (row, log, the exact stdout): one row per shape of a later block after the first failures block.
+ATTRIBUTION_ROWS = (
+    ("two failing blocks", ALPHA_HEAD + ALPHA_TAIL + BETA_BLOCK, ALPHA_STDOUT),
+    ("three failing blocks", ALPHA_HEAD + ALPHA_TAIL + BETA_BLOCK + DOC_BLOCK, ALPHA_STDOUT),
+    ("a failing doc-tests block after", ALPHA_HEAD + ALPHA_TAIL + DOC_BLOCK, ALPHA_STDOUT),
+    ("a passing block, then a failing one", ALPHA_HEAD + ALPHA_TAIL + GAMMA_BLOCK + BETA_BLOCK, ALPHA_STDOUT),
+    ("a forged FAILED result in the capture, then the own one", ALPHA_HEAD + FORGED_IN_CAPTURE + "\n" + ALPHA_TAIL
+     + BETA_BLOCK, ALPHA_STDOUT),
+    ("a forged section line in the capture, then the own result", ALPHA_HEAD + FORGED_SECTION + ALPHA_TAIL
+     + BETA_BLOCK, ALPHA_STDOUT),
+    ("one block only (the control)", ALPHA_HEAD + ALPHA_TAIL, ALPHA_STDOUT),
+)
+
+
+class OpaqueAttribution9870(Base):
+    """#9870 misattribution: the row of the first binary carries its own result line, never a later block's."""
+
+    def test_every_later_block_leaves_the_first_row_its_own_result_line(self):
+        module = load_script()
+        for row, log, expected in ATTRIBUTION_ROWS:
+            out, summary = self.run_inproc([str(self.write("in.log", log))], module)
+            self.assertEqual(out, expected, row)
+            self.assertIn("| alpha | " + ALPHA_RESULT + " |\n", summary, row)
+            for later in (BETA_RESULT, DOC_RESULT, GAMMA_OK, FORGED_IN_CAPTURE):
+                self.assertNotIn(later, out + summary, row)
+
+    def test_the_two_block_log_through_the_script(self):
+        out, summary = self.run_log(ALPHA_HEAD + ALPHA_TAIL + BETA_BLOCK)
+        self.assertEqual(out, ALPHA_STDOUT)
+        self.assertEqual(counts(summary), (1, 1))
+
 if __name__ == "__main__":
     unittest.main()
