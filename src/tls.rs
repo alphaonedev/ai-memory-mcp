@@ -67,6 +67,16 @@ pub const FED_PEER_FINGERPRINTS_ENV: &str = "AI_MEMORY_FED_PEER_FINGERPRINTS";
 /// same string scattered across the parser's bail arms.
 const PEER_FP_LABEL: &str = "peer fingerprint file";
 
+/// #9954 — the read cap on the peer server-cert pin file. One pin line is
+/// about 80 bytes, so 64 KiB holds roughly 800 pins: far above any real
+/// federation. A file larger than this is refused (fail closed), never
+/// read to the end.
+pub const PEER_FP_FILE_MAX_BYTES: u64 = 64 * 1024;
+
+/// #9954 — the shared pin-file case table (loader and doctor-row tests).
+#[cfg(test)]
+pub(crate) mod pin_file_cases;
+
 /// **[#2448, v1.0.0]** Env var gating the outbound federation accept-ANY
 /// server-cert disposition. Defaults **ON** (fail-closed): with it enabled,
 /// [`select_sync_tls_mode`] REFUSES to resolve
@@ -1995,6 +2005,41 @@ mod tests {
             std::env::remove_var(FED_PEER_FINGERPRINTS_ENV);
         }
         assert!(peer_fingerprint_map_from_env().unwrap().is_none());
+    }
+
+    /// #9954 — every degenerate pin-file form is refused by the runtime
+    /// loader with its exact reason, every valid form is accepted, and no
+    /// row blocks past the row deadline (a FIFO with no writer, a 100K+
+    /// file). The expected column is written by hand in `pin_file_cases`.
+    #[cfg(unix)]
+    #[test]
+    fn peer_fingerprint_loader_degenerate_table_9954() {
+        use pin_file_cases::{
+            Expect, OVERSIZE_100K_BYTES, OVERSIZE_REFUSAL_CEILING, build_cases, loader_verdict,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = build_cases(dir.path());
+        assert!(cases.len() >= 25, "table shrank: {} rows", cases.len());
+        let mut wrong = Vec::new();
+        for case in &cases {
+            let started = std::time::Instant::now();
+            let got = loader_verdict(&case.path);
+            let elapsed = started.elapsed();
+            let want = match &case.expect {
+                Expect::Accept { .. } => Ok(()),
+                Expect::Refuse(reason) => Err(reason.clone()),
+            };
+            if got != want {
+                wrong.push(format!("{}: got {got:?}, want {want:?}", case.name));
+            }
+            if case.name == "100K+ input" && elapsed > OVERSIZE_REFUSAL_CEILING {
+                wrong.push(format!(
+                    "{}: {OVERSIZE_100K_BYTES}-byte refusal took {elapsed:?}",
+                    case.name
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "loader rows wrong:\n{}", wrong.join("\n"));
     }
 
     #[test]

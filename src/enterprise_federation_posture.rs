@@ -100,6 +100,9 @@ mod synchronous;
 /// #3199 — the backup-manifest-signing posture row (check #22) and its test.
 mod backup_signing;
 
+/// #9954 — the peer server-cert pin-file posture row (check #10) and its tests.
+mod peer_pins;
+
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
 /// name here — deliberately not a free-form string so a typo in
@@ -982,7 +985,8 @@ mod tests {
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
 
         let fp_file = tempfile::NamedTempFile::new().expect("tempfile");
-        std::fs::write(fp_file.path(), "example.org abc123\n").expect("write fp file");
+        std::fs::write(fp_file.path(), crate::tls::pin_file_cases::valid_pin_line())
+            .expect("write fp");
 
         unsafe {
             std::env::set_var(TRUST_DOMAIN_ENV_FOR_TEST, "test-fleet");
