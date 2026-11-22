@@ -726,9 +726,18 @@ class HandlerReasons(unittest.TestCase):
         self.assertEqual(str(caught.exception), reason)
         self.assertIsInstance(caught.exception.__cause__, tb.YamlError)
 
-    def test_9452_pyyaml_import_reason_is_kept(self) -> None:
+    def test_9452_import_reason_and_oracle_missing_reason_are_kept(self) -> None:
+        """The main cells keep the classifier's import reason, and a missing oracle (the standard-library line
+        reader, #9813) fails the cell with its exact reason; it never skips. PR 9817 M1: PyYAML is gone from the
+        main module, so this reads only names it defines (guarded by test_ci_module_attribute_reads_9817)."""
         import test_ci_tainted_job_boundary as main_cells
-        self.assertEqual(main_cells.pyyaml is None, main_cells.PYYAML_IMPORT_ERROR != "")
+        self.assertEqual(main_cells.tb is None, main_cells.IMPORT_ERROR != "")
+        self.assertTrue(main_cells.ORACLE_PATH.is_file(), main_cells.ORACLE_MISSING)
+        missing = main_cells.ORACLE_PATH.with_name("yaml_line_oracle_absent_9817.py")
+        with unittest.mock.patch.object(main_cells, "ORACLE_PATH", missing):
+            with self.assertRaises(self.failureException) as caught:
+                main_cells._load_oracle(self)
+        self.assertEqual(str(caught.exception), main_cells.ORACLE_MISSING)
 
     def test_9452_no_handler_only_drops_its_exception(self) -> None:
         here = Path(__file__).resolve().parent
