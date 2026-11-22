@@ -44,6 +44,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -56,8 +57,12 @@ SHARED_MODULE_NAME = "workflow_annotation.py"
 # single_line is the base-selector's own copy of env_file_value (see test_single_line_matches_env_file_value_9365);
 # version_text is prune_runner_tmp's own copy of safe_value for the version refusal, which runs before the shared
 # module is loaded (see test_local_version_escape_equals_safe_value_for_every_code_point_9365)
+# summary_text is red_cause_summary's escape for the GITHUB_STEP_SUMMARY markdown file (#9709, PR 9759): the runner never
+# parses that file for workflow commands, so ``::`` stays readable there; it keeps every value on one line (see
+# test_summary_text_keeps_one_line_for_every_code_point_9709)
 SHARED_FIELD_FUNCTIONS = frozenset({"safe_text", "property_value", "annotation", "log_line", "env_file_value", "single_line",
-                                    "version_text"})
+                                    "version_text", "summary_text"})
+RED_CAUSE_SCRIPT_NAME = "red_cause_summary.py"
 # v2 form: "::name" at a line start; v1 form: "##[" anywhere in a line (actions/runner ActionCommand.TryParse uses
 # message.IndexOf("##[") with no trim; TryParseV2 uses message.TrimStart().StartsWith("::"))
 COMMAND_RE = re.compile(r"(?m)^::[a-z][a-z-]*|##\[")
@@ -658,6 +663,20 @@ class ScriptBehaviour(CommandAssertions):
                 self.assertEqual(common.single_line(value), shared.env_file_value(value))
                 self.assertEqual(len(common.single_line(value).splitlines()), 1)
 
+    def test_summary_text_keeps_one_line_for_every_code_point_9709(self):
+        """The summary file's own escape leaves no line break, control or surrogate over all code points, in bounded
+        time, and every hostile value stays one line (#9709: the allowlisted ``summary_text``)."""
+        red = load_module(CI_DIR / RED_CAUSE_SCRIPT_NAME, "red_cause_summary_9365_pin")
+        corpus = "".join(chr(code) for code in range(ALL_CODEPOINTS)) + "::" * HUGE_VALUE_CHARS
+        started = time.monotonic()
+        escaped = red.summary_text(corpus)
+        self.assertLess(time.monotonic() - started, HUGE_WALL_CLOCK_SECS)
+        self.assertEqual(escaped.splitlines(), [escaped])
+        self.assertEqual([char for char in escaped if unicodedata.category(char) in ("Cc", "Cs", "Zl", "Zp")], [])
+        for key, value in self.hostile_values():
+            with self.subTest(key):
+                self.assertEqual(red.summary_text(value).splitlines(), [red.summary_text(value)] if value else [])
+
     def test_shared_cargo_target_env_file_9365(self):
         for key in ("raw_newline", "raw_cr", "command"):
             with self.subTest(key):
@@ -1109,6 +1128,7 @@ SIBLING_SCRIPTS = {
     "scripts/ci/prune_runner_artifacts.py": ("scripts/ci/shared_cargo_target.py",),
     "scripts/ci/sccache_env.py": ("scripts/ci/shared_cargo_target.py",),
     "scripts/ci/suite_budget.py": (),  # #9229 suite margin gate
+    "scripts/ci/red_cause_summary.py": (),  # #9709 red-cause step summary
 }
 SHARED_MODULE_PATH = "scripts/ci/" + SHARED_MODULE_NAME
 
@@ -1370,9 +1390,9 @@ class OsPlantNeverRuns(unittest.TestCase):
                     self.assertEqual(planted, clean)
 
     def test_sibling_scripts_os_plant_table_9365(self):
-        """Table over the 14 sibling scripts (the 13 of 0f1ec1b7 plus suite_budget of #9229): ``--help`` with an os.py plant equals the clean run."""
+        """Table over the 15 sibling scripts (the 13 of 0f1ec1b7 plus suite_budget of #9229 and red_cause_summary of #9709): ``--help`` with an os.py plant equals the clean run."""
         scripts = (*SIBLING_SCRIPTS, "scripts/test/pg_isolated_binary.py")
-        self.assertEqual(len(scripts), 14)
+        self.assertEqual(len(scripts), 15)
         layout = SiblingLoadInvariant.layout
         for rel in scripts:
             for where in OS_PLANT_PLACES:
@@ -1409,6 +1429,9 @@ GATE_LOAD_EXIT_CODES = {
     "scripts/ci/host_semaphore.py": 4,  # EXIT_LOAD_REFUSED (3 = no slot; any other code is the child's)
     "scripts/ci/partition_test_binaries.py": 2,  # EXIT_FAIL_CLOSED
     "scripts/ci/suite_budget.py": 4,  # EXIT_LOAD_REFUSED (2 = malformed input, 3 = margin lost) #9229
+    # EXIT_LOAD_REFUSED: the one non-zero code of the red-cause step (#9709); every other internal error exits 0, and
+    # the step carries continue-on-error so the code never changes the job result
+    "scripts/ci/red_cause_summary.py": 4,
 }
 GATE_LOAD_ERROR_LINE = ("::error title={prog} refused::{prog}: refused: shared module workflow_annotation.py next to "
                         "the script cannot be loaded")
@@ -2165,7 +2188,7 @@ STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT
 STREAM_SHARED_CALLS = SHARED_FIELD_FUNCTIONS | {"safe_value", "render", "join", "end_group_line"}
 STREAM_NUMBER_CALLS = frozenset({"len", "int", "float", "round", "abs"})  # return a number for any argument
 STREAM_TRACE_DEPTH = 6
-STREAM_SCRIPT_COUNT = 15  # 14 + suite_budget (#9229)
+STREAM_SCRIPT_COUNT = 16  # 14 + suite_budget (#9229) + red_cause_summary (#9709)
 STREAM_MODULE_VARS = frozenset({"wa"})  # the name every script binds the loaded module to
 # Runs before the shared module exists, so it cannot use it; each output is fixed text pinned by its own test:
 # prune_runner_tmp's floor check (VERSION_REFUSAL_AT_0F1EC1B7 cells) and load refusal (SiblingLoadFailsClosed, P1).

@@ -144,6 +144,8 @@ CI_GATE_NEEDS = ("select", "classify", "build-script-vetting", "check", "mobile-
 
 # Job -> ordered labels of its test and gate steps (run text matching TEST_RUN_RE). A plain YAML
 # step name ends at ` #`, so some labels below stop mid-parenthesis exactly as GitHub shows them.
+# #9709 (PR 9759) adds `Red cause summary (#9709)` directly after the last test step of the four
+# jobs it covers (its run line calls python3, so it is a test or gate step label).
 TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
     "ci.yml": {
         "select": ("Materialise the base selector (#8240)",),
@@ -172,6 +174,7 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
                   "Run the pg_isolated_binary live cells (enterprise-fed legs only)",
                   "Load gate (#6795)",
                   "Run tests (impact-aware)",
+                  "Red cause summary (#9709)",
                   "Cleanup enterprise-fed ephemeral db",
                   "sccache hit-rate summary (#7199)",
                   "sccache stop CI server (#7199)",
@@ -184,10 +187,11 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
                                  "Security audit",
                                  "Build release (once leg — release-profile smoke)"),
         "sal-feature": ("Clippy (sal feature)", "Build release (sal feature)",
-                        "Run lib tests (sal feature)"),
+                        "Run lib tests (sal feature)", "Red cause summary (#9709)"),
         "vectorlite-feature": ("Clippy (vectorlite feature, all targets)",
                                "Run vectorlite no-native-lib seam tests (#1860)",
-                               "Run config-precedence under vectorlite (#2256 feature-gated pin)"),
+                               "Run config-precedence under vectorlite (#2256 feature-gated pin)",
+                               "Red cause summary (#9709)"),
         "dockerfile-validate": (),
         "ci-gate": ("Materialise the base gate (#8240)",
                     "Fold job results (bootstrap, PR-tree gate)",
@@ -196,7 +200,7 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
     "coverage.yml": {
         "classify": ("run: # LOAD-BEARING (#2496): on `pull_request` this base is the PR",),
         "per-module-thresholds": ("PostgreSQL package repair + preflight (#9235)",
-                                  "Generate coverage JSON"),
+                                  "Generate coverage JSON", "Red cause summary (#9709)"),
     },
     "batman-mode-acceptance.yml": {
         "rust-integration": ("Build release binary", "Compose stack boot smoke (#3838)",

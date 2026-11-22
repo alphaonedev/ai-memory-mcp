@@ -526,9 +526,15 @@ SECS_PER_MINUTE = 60
 # (a) #9698: the only steps of the workflow that may carry continue-on-error.
 # The select job widens the run when the selector is unusable (ci.yml, the
 # comment above `select:`); nothing else may turn a failed step green.
+# #9709 (PR 9759): the red-cause summary runs only when its job is already red or cancelled
+# (`if: failure() || cancelled()`), so its continue-on-error can never turn a failed job green; it
+# only keeps a fault of the report itself from changing the result.
 CONTINUE_ON_ERROR_BY_DESIGN = {
     ("select", "Build impact index"): "true",
     ("select", "Select jobs"): "true",
+    ("check", "Red cause summary (#9709)"): "true",
+    ("sal-feature", "Red cause summary (#9709)"): "true",
+    ("vectorlite-feature", "Red cause summary (#9709)"): "true",
 }
 FAIL_OPEN_RUN_RE = re.compile(r"\|\|\s*(?:true|:)(?:\s|;|$)|\bset\s+\+e\b")
 # #9687: the classify unit-test steps run on every event, unconditionally.

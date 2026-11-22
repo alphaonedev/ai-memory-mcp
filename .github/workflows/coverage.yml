@@ -708,6 +708,9 @@ jobs:
         # trimming the instrumented binary enough that mold can link
         # it under the 7 GB runner ceiling.
         run: |
+          # #9709: the start marker names this step as the failing one when the job goes red here.
+          mkdir -p "${RUNNER_TEMP}/red-cause" || true
+          touch "${RUNNER_TEMP}/red-cause/coverage-json.started" || true
           mkdir -p coverage
           cargo llvm-cov \
             --no-report \
@@ -746,6 +749,16 @@ jobs:
         if: always()
         run: |
           echo "COV_SWEEP_END=$(date +%s)" >> "$GITHUB_ENV"
+
+      # #9709: the llvm-cov command shape above is pinned (Section E of
+      # scripts/test/test-ci-workflow-invariants.sh), so no tee capture is added
+      # here; the step start marker names "Generate coverage JSON" as the failing step ("cause not identified").
+      # It follows the #9263 sweep-end record, so the recorded sweep time never includes this step.
+      - name: Red cause summary (#9709)
+        if: failure() || cancelled()
+        continue-on-error: true
+        timeout-minutes: 5
+        run: python3 -I scripts/ci/red_cause_summary.py --step "${RUNNER_TEMP}/red-cause/coverage-json.started" "Generate coverage JSON" "${RUNNER_TEMP}/red-cause"
 
       - name: Enforce per-module thresholds
         id: thresholds
