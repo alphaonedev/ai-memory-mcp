@@ -19,7 +19,10 @@ directory, through a symlink, under ``python3 -I``, with decoys of the same name
   folder"); a symlink that stays inside is resolved before the open;
 * the resolved path is opened by descriptor, one component at a time: the script folder, then each folder below it
   with ``dir_fd`` on the folder before it, every one ``O_DIRECTORY | O_NOFOLLOW``, and the file ``O_NOFOLLOW |
-  O_NONBLOCK`` (a FIFO open never blocks). A folder or the file swapped for a symlink after the resolve is refused.
+  O_NONBLOCK`` (a FIFO open never blocks). The script folder opened must have the device and inode that a stat
+  recorded right after the resolve, so a swap of that folder or of any folder above it, for a symlink or by a rename,
+  is refused as "unreadable"; every folder below it and the file are opened relative to the descriptor before them
+  and never through a symlink, so what is read lies inside that verified folder.
   ``fstat`` on the file descriptor must say regular file, and the bytes read from that descriptor are what gets
   compiled and run: no second open, no check on one object and use of another. Absent raises "absent", any other
   open or read failure "unreadable", a directory, FIFO or device "not a regular file", a file of zero bytes "empty".
@@ -55,6 +58,11 @@ def _load_sibling(filename, module_name):
     import sys
     import types
     here = os.path.dirname(os.path.realpath(__file__))
+    try:
+        here_st = os.stat(here)
+    except OSError:
+        raise SiblingLoadError("unreadable") from None
+    here_id = (here_st.st_dev, here_st.st_ino)
     path = os.path.realpath(os.path.join(here, filename))
     if os.path.commonpath([here, path]) != here:
         raise SiblingLoadError("symlink leaves the script folder")
@@ -63,8 +71,9 @@ def _load_sibling(filename, module_name):
         if os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
             return loaded
         raise SiblingLoadError("module name taken")
-    # The checked path is opened by descriptor, one component at a time from the script folder, never following a
-    # symlink: the object read is the object checked, even when a folder is swapped after the check.
+    # The script folder opened must have the device and inode the stat above recorded, so a swap of that folder or of
+    # any folder above it (for a symlink or by a rename) is refused; each component below it is opened relative to the
+    # descriptor before it and never through a symlink; the type check, the read and the compile use one descriptor.
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
     parts = os.path.relpath(path, here).split(os.sep)
@@ -72,6 +81,9 @@ def _load_sibling(filename, module_name):
     try:
         try:
             fds.append(os.open(here, dir_flags))
+            opened = os.fstat(fds[0])
+            if (opened.st_dev, opened.st_ino) != here_id:
+                raise SiblingLoadError("unreadable")
             for part in parts[:-1]:
                 fds.append(os.open(part, dir_flags, dir_fd=fds[-1]))
             fds.append(os.open(parts[-1], os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0), dir_fd=fds[-1]))
