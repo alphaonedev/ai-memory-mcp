@@ -69,6 +69,16 @@ fn prefix_token() -> String {
     ["AI", "MEMORY", "KEY"].join("_")
 }
 
+/// The module of the test key-dir sandbox.
+fn sandbox_mod_token() -> String {
+    ["test", "key", "dir"].join("_")
+}
+
+/// The armed-sandbox entry point of that module.
+fn armed_token() -> String {
+    ["armed", "sandbox"].join("_")
+}
+
 /// Expands the placeholders used in the tables below.
 fn expand(template: &str) -> String {
     template
@@ -78,6 +88,22 @@ fn expand(template: &str) -> String {
         .replace("@B@", &call_token())
         .replace("@K@", &frag_token())
         .replace("@P@", &prefix_token())
+        .replace("@T@", &sandbox_mod_token())
+        .replace("@A@", &armed_token())
+}
+
+/// The kind of use an allowed site names: the call its innermost enclosing
+/// parenthesis belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Op {
+    /// `var`, `var_os`, `vars`, `env!`, `option_env!`.
+    Read,
+    /// `set_var`, `remove_var`, and the `set` / `remove` of an env guard.
+    Write,
+    /// `env`, `envs`, `env_remove`, `env_clear` on a child `Command`.
+    Child,
+    /// Any other place: a definition, an argument of another call, a path.
+    Use,
 }
 
 /// One allowed site: a file and the exact site path inside it.
@@ -2641,4 +2667,432 @@ fn tracked_tree_holds_no_key_dir_route_outside_the_allowed_sites_9730() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let got = scan::check_tree(root, &tree_tables());
     assert!(got.is_empty(), "{}", report(&got));
+}
+
+/// The scratch root of the fixture trees the class rows build.
+const FIXTURE_DIR: &str = "key_dir_bind_guard_9730";
+/// The tracker of the forms the text scan cannot see.
+const KNOWN_GREEN_TRACKER: u32 = 9786;
+
+/// One tracked fixture tree and the exact findings the guard must report on it.
+struct TreeCase {
+    name: &'static str,
+    files: Vec<(&'static str, Vec<u8>)>,
+    sites: Vec<(&'static str, &'static str, Op)>,
+    non_rust: Vec<(&'static str, usize)>,
+    expected: Vec<String>,
+}
+
+fn tree_case(
+    name: &'static str,
+    files: &[(&'static str, &str)],
+    sites: &[(&'static str, &'static str, Op)],
+    non_rust: &[(&'static str, usize)],
+    expected: &[&str],
+) -> TreeCase {
+    TreeCase {
+        name,
+        files: files
+            .iter()
+            .map(|(p, t)| (*p, expand(t).into_bytes()))
+            .collect(),
+        sites: sites.to_vec(),
+        non_rust: non_rust.to_vec(),
+        expected: expected.iter().map(|e| expand(e)).collect(),
+    }
+}
+
+/// Writes `files` under a fresh directory and tracks them in a new git repository.
+fn fixture_tree(name: &str, files: &[(&str, Vec<u8>)]) -> std::path::PathBuf {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(FIXTURE_DIR)
+        .join(name);
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove the old fixture tree");
+    }
+    for (rel, bytes) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a fixture path has a parent"))
+            .expect("create the fixture directory");
+        std::fs::write(&path, bytes).expect("write the fixture file");
+    }
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed: {status}");
+    };
+    git(&["init", "-q"]);
+    let mut add = vec!["add", "--"];
+    add.extend(files.iter().map(|(rel, _)| *rel));
+    git(&add);
+    root
+}
+
+fn fixture_tables(sites: &[(&str, &str, Op)], non_rust: &[(&str, usize)]) -> Tables {
+    Tables {
+        sites: sites
+            .iter()
+            .map(|(f, s, _)| ((*f).to_owned(), expand(s)))
+            .collect(),
+        fragments: Vec::new(),
+        left_out: non_rust
+            .iter()
+            .map(|(p, _)| p.rsplit_once('.').map_or(*p, |(_, ext)| ext).to_owned())
+            .collect(),
+    }
+}
+
+fn run_tree_cases(cases: &[TreeCase]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for c in cases {
+        let root = fixture_tree(c.name, &c.files);
+        let mut got = scan::check_tree(&root, &fixture_tables(&c.sites, &c.non_rust));
+        got.sort();
+        let mut expected = c.expected.clone();
+        expected.sort();
+        if got != expected {
+            failures.push(format!("{}: expected {expected:?}, got {got:?}", c.name));
+        }
+    }
+    failures
+}
+
+/// `name` with its first letter written in each escape form a config file decodes.
+fn escaped_forms(name: &str) -> Vec<String> {
+    let first = name.chars().next().expect("a name has a first letter");
+    let rest = &name[first.len_utf8()..];
+    let code = u32::from(first);
+    vec![
+        format!("a = \"\\x{code:02X}{rest}\""),
+        format!("b = \"\\u{{{code:x}}}{rest}\""),
+        format!("c = &#{code};{rest}"),
+        format!("d = %{code:02X}{rest}"),
+    ]
+}
+
+fn utf16le(text: &str, bom: bool) -> Vec<u8> {
+    let mut out = if bom { vec![0xFF, 0xFE] } else { Vec::new() };
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+/// Class A: every tracked non-Rust file is pinned by its own path and its
+/// mention count, after decoding; a file compiled as Rust is scanned as Rust.
+fn non_rust_rows() -> Vec<TreeCase> {
+    let lib = ("src/lib.rs", "");
+    let mut rows = vec![
+        tree_case(
+            "a1-new-file-of-a-listed-kind",
+            &[
+                lib,
+                ("docs/old.md", "set @V@\n"),
+                ("docs/new.md", "uses @V@ here\n"),
+            ],
+            &[],
+            &[("docs/old.md", 1)],
+            &["#9730 guard: docs/new.md holds 1 key-dir name mention(s) and has no NON_RUST row"],
+        ),
+        tree_case(
+            "a1b-new-mention-in-a-listed-file",
+            &[lib, ("docs/old.md", "set @V@\nand @C@ too\n")],
+            &[],
+            &[("docs/old.md", 1)],
+            &["#9730 guard: docs/old.md holds 2 key-dir name mention(s); its NON_RUST row says 1"],
+        ),
+        tree_case(
+            "a1c-stale-non-rust-row",
+            &[lib, ("docs/old.md", "set @V@\n")],
+            &[],
+            &[("docs/old.md", 1), ("docs/gone.md", 1)],
+            &[
+                "#9730 guard: non-Rust row docs/gone.md matches no tracked non-Rust file; remove the row",
+            ],
+        ),
+        tree_case(
+            "a4-include-of-a-txt-file",
+            &[
+                (
+                    "src/lib.rs",
+                    "fn main() {\n    include!(\"body.txt\");\n}\n",
+                ),
+                ("src/body.txt", "let _ = std::env::var(\"@V@\");\n"),
+            ],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/body.txt:1: `@V@` string at `fn main` is outside the allowed sites",
+            ],
+        ),
+        tree_case(
+            "a4b-path-attr-to-an-md-file",
+            &[
+                ("src/lib.rs", "#[path = \"m.md\"]\nmod m;\n"),
+                ("src/m.md", "fn f() { let _ = std::env::var(\"@V@\"); }\n"),
+            ],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/m.md:1: `@V@` string at `mod m::fn f` is outside the allowed sites",
+            ],
+        ),
+        tree_case(
+            "a5-include-of-a-missing-file",
+            &[("src/lib.rs", "include!(\"gone.txt\");\n")],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:1: `include!` target `gone.txt` is not a tracked file; the guard cannot classify it",
+            ],
+        ),
+        tree_case(
+            "a5b-include-of-a-computed-path",
+            &[("src/lib.rs", "include!(concat!(\"bo\", \"dy.rs\"));\n")],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:1: `include!` target is not a string literal; the guard cannot classify it",
+            ],
+        ),
+        tree_case(
+            "a6-mod-with-no-file",
+            &[("src/lib.rs", "mod gone;\n")],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:1: `mod gone` resolves to no tracked file; the guard cannot classify it",
+            ],
+        ),
+    ];
+    for (name, bom) in [
+        ("a2-utf16-toml-with-a-bom", true),
+        ("a2b-utf16-toml-without-a-bom", false),
+    ] {
+        let mut case = tree_case(
+            name,
+            &[lib],
+            &[],
+            &[],
+            &["#9730 guard: cfg/a.toml holds 1 key-dir name mention(s) and has no NON_RUST row"],
+        );
+        case.files
+            .push(("cfg/a.toml", utf16le(&expand("dir = \"@V@\"\n"), bom)));
+        rows.push(case);
+    }
+    let mut escaped = tree_case(
+        "a3-escaped-names-in-a-config-file",
+        &[lib],
+        &[],
+        &[],
+        &["#9730 guard: cfg/a.cfg holds 4 key-dir name mention(s) and has no NON_RUST row"],
+    );
+    escaped.files.push((
+        "cfg/a.cfg",
+        (escaped_forms(&var_token()).join("\n") + "\n").into_bytes(),
+    ));
+    rows.push(escaped);
+    rows
+}
+
+/// Class B: an allowance names one item path (with its cfg) and one kind of use.
+fn site_rows() -> Vec<TreeCase> {
+    vec![
+        tree_case(
+            "b1-write-in-an-allowed-reader",
+            &[(
+                "src/lib.rs",
+                "fn reader() {\n    let _ = std::env::var(\"@V@\");\n    unsafe { std::env::set_var(\"@V@\", \"x\") };\n}\n",
+            )],
+            &[("src/lib.rs", "fn reader", Op::Read)],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:3: `@V@` string at `fn reader` is a write; the allowed rows there are read",
+            ],
+        ),
+        tree_case(
+            "b2-cfg-not-test-twin",
+            &[(
+                "src/lib.rs",
+                "#[cfg(test)]\nmod tests {\n    fn t() { let _ = std::env::var(\"@V@\"); }\n}\n\n#[cfg(not(test))]\nmod tests {\n    fn t() { let _ = std::env::var(\"@V@\"); }\n}\n",
+            )],
+            &[("src/lib.rs", "#[cfg(test)] mod tests::fn t", Op::Read)],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:8: `@V@` string at `#[cfg(not(test))] mod tests::fn t` is outside the allowed sites",
+            ],
+        ),
+        tree_case(
+            "b3-new-product-caller-of-the-sandbox",
+            &[(
+                "src/lib.rs",
+                "fn main() {\n    crate::identity::@T@::install();\n}\n",
+            )],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:2: `@T@` identifier at `fn main` is outside the allowed sites",
+            ],
+        ),
+        tree_case(
+            "b4-cfg-on-a-mod-declaration",
+            &[
+                ("src/lib.rs", "#[cfg(not(test))]\nmod child;\n"),
+                (
+                    "src/child.rs",
+                    "fn f() { let _ = std::env::var(\"@V@\"); }\n",
+                ),
+            ],
+            &[("src/child.rs", "#[cfg(test)] mod child::fn f", Op::Read)],
+            &[],
+            &[
+                "#9730 guard: src/child.rs:1: `@V@` string at `#[cfg(not(test))] mod child::fn f` is outside the allowed sites",
+                "#9730 guard: allowed site src/child.rs `#[cfg(test)] mod child::fn f` (read) matches nothing; remove the row",
+            ],
+        ),
+    ]
+}
+
+/// Class C: a direct spelling inside a doc-comment code block is scanned.
+fn doctest_rows() -> Vec<TreeCase> {
+    vec![
+        tree_case(
+            "c1-direct-spelling-in-a-doctest",
+            &[(
+                "src/lib.rs",
+                "/// ```\n/// unsafe { std::env::set_var(\"@V@\", \"x\") };\n/// ```\nfn documented() {}\n",
+            )],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:2: `@V@` string at `<file root>::doctest` is outside the allowed sites",
+            ],
+        ),
+        tree_case(
+            "c2-unlisted-fence-info",
+            &[("src/lib.rs", "//! ```python\n//! print(1)\n//! ```\n")],
+            &[],
+            &[],
+            &[
+                "#9730 guard: src/lib.rs:1: doctest fence info `python` is not in DOCTEST_SKIPPED_INFO; the guard cannot classify it",
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn non_rust_files_are_pinned_by_path_9730() {
+    let failures = run_tree_cases(&non_rust_rows());
+    assert!(failures.is_empty(), "{}", report(&failures));
+}
+
+#[test]
+fn sites_are_pinned_by_cfg_and_op_9730() {
+    let failures = run_tree_cases(&site_rows());
+    assert!(failures.is_empty(), "{}", report(&failures));
+}
+
+#[test]
+fn doctests_are_scanned_9730() {
+    let failures = run_tree_cases(&doctest_rows());
+    assert!(failures.is_empty(), "{}", report(&failures));
+}
+
+/// Forms a text scan cannot see (computed names). Each row asserts the form
+/// is NOT detected today; the day one is detected this test goes red and the
+/// row moves to the deny rows. Tracked at issue `KNOWN_GREEN_TRACKER`.
+fn known_green_rows() -> Vec<(&'static str, String)> {
+    let v = var_token();
+    let witness = ["WITNESS", "KEY", "DIR", "ENV"].join("_");
+    let chars: Vec<String> = v.chars().map(|c| format!("'{c}'")).collect();
+    let bytes: Vec<String> = v.bytes().map(|b| b.to_string()).collect();
+    let read = |arg: &str| format!("fn f() {{ let _ = std::env::var({arg}); }}");
+    vec![
+        (
+            "concat-3",
+            read(&format!(
+                "concat!(\"{}\", \"{}\", \"{}\")",
+                &v[..5],
+                &v[5..13],
+                &v[13..]
+            )),
+        ),
+        (
+            "concat-security",
+            read(&format!(
+                "concat!(\"{}\", \"{}\", \"{}\")",
+                &v[..9],
+                &v[9..13],
+                &v[13..]
+            )),
+        ),
+        (
+            "join-4",
+            read("[\"AI\", \"MEMORY\", \"KEY\", \"DIR\"].join(\"_\")"),
+        ),
+        (
+            "format-3",
+            read(&format!(
+                "format!(\"{{}}_{{}}_{{}}\", \"{}\", \"{}\", \"{}\")",
+                &v[..9],
+                &v[10..13],
+                &v[14..]
+            )),
+        ),
+        (
+            "chars",
+            read(&format!("[{}].iter().collect::<String>()", chars.join(", "))),
+        ),
+        (
+            "bytes",
+            read(&format!(
+                "String::from_utf8(vec![{}]).unwrap_or_default()",
+                bytes.join(", ")
+            )),
+        ),
+        (
+            "witness-replace",
+            read(&format!("crate::w::{witness}.replace(\"WITNESS_\", \"\")")),
+        ),
+        (
+            "prose-split",
+            read(&format!(
+                "\"{v} is the name\".split(' ').next().unwrap_or_default()"
+            )),
+        ),
+        (
+            "suffix-scan",
+            format!(
+                "fn f() {{ let _ = std::env::vars().find(|(k, _)| k.ends_with(\"{}\") && k.contains(\"{}\")); }}",
+                &v[13..],
+                &v[3..13]
+            ),
+        ),
+        (
+            "doctest-computed-name",
+            "/// ```\n/// unsafe { std::env::set_var([\"AI\", \"MEMORY\", \"KEY\", \"DIR\"].join(\"_\"), \"x\") };\n/// ```\nfn f() {}\n".to_owned(),
+        ),
+    ]
+}
+
+#[test]
+fn known_green_forms_stay_undetected_9786() {
+    let mut detected = Vec::new();
+    for (name, source) in known_green_rows() {
+        let got = run_case(&Case {
+            name,
+            source: source.into_bytes(),
+            expected: Vec::new(),
+        });
+        if !got.is_empty() {
+            detected.push(format!(
+                "{name} (#{KNOWN_GREEN_TRACKER}) is detected now; move it to the deny rows: {got:?}"
+            ));
+        }
+    }
+    assert!(detected.is_empty(), "{}", report(&detected));
 }
