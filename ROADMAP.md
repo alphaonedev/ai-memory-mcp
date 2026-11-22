@@ -575,7 +575,7 @@ The v3 L3-5 blocks report compile-time-static presence, so on the default `sqlit
 
 Each release section below names the seven-property contributions explicitly. Every commitment passes the §3 scope test or is reclassified.
 
-> **Companion documents.** [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md) is the v1.1.0 workstream document — seven workstreams on use-time applicability, measurement and docs truth, with the MemTrapBench workstream 5 harness as the **P1 gate** on any downstream-benefit claim. §11.9 below is the release-line summary; that file is the workstream detail, and the two must be read together.
+> **Companion documents.** [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md) is the v1.1.0 workstream document — nine workstreams (w1–w9) on use-time applicability, measurement, docs truth and enterprise-federation hardening, with the MemTrapBench workstream 5 harness as the **P1 gate** on any downstream-benefit claim. §11.9 below is the release-line summary; that file is the workstream detail, and the two must be read together.
 > Certification posture, the standard, the pre-registered declaration and the procurement appendix live in `docs/compliance/` (see §9.8 for what is on this branch today and what arrives with the rehearsal promotion).
 
 ### 11.1 v0.6.3 — Structured Memory + Performance — SHIPPED 2026-04-27
@@ -1163,6 +1163,20 @@ experiment behind it.
   CLOSED and was the docs-drift reconciliation only, never an implementation carrier. *Cost until done:* an
   operator with an existing OTLP collector has no standard export and must scrape the Prometheus surface
   instead.
+
+**Enterprise-federation hardening (research checkpoint, issue #4404)**
+
+- [#4404](https://github.com/alphaonedev/ai-memory-mcp/issues/4404#issuecomment-7080826506) research checkpoint
+  (2026-11-22): its APPLICABLE items and top-5 actions are workstream **w9** in
+  [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md), rows H1–H18 — caller binding on every route, role checks on
+  governance writes, tenancy leaks, audit-tamper detection, PostgreSQL parity of shipped surfaces, no lost
+  writes under concurrency, provenance through reflection and consolidation, poisoning and erasure proofs,
+  enterprise-scale measurement, and positioning on federation, attested identity, audit and security. Every row
+  is first-party hardening, a fix, a test or docs for an existing capability; none adds a new feature, and most
+  carriers sit on the v1.0.0 GA milestone, so a row still open at the GA tag is a v1.1.0 entry condition.
+  *Cost until done:* the multi-tenant federation posture cannot be called production-ready while a caller can
+  claim another agent's identity, a tenant can read another tenant's pending rows, or the PostgreSQL tier
+  behaves differently from SQLite on a shipped surface.
 
 ---
 
