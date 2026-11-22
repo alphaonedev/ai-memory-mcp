@@ -8,20 +8,26 @@ gated by it. Rules:
 * the configuration is well typed (one error line, never a traceback, on a malformed file);
 * serving runners are registered runners, none listed twice, and never exceed the slot count,
   so a job that holds a runner always finds a slot and never idles in the semaphore wait;
-* every `host_semaphore.py` call in a workflow or composite action under .github (`.yml` and
-  `.yaml`) names a literal configured gate with `--name` in any position, gives `--max-wait-secs`
-  exactly once before the ` -- ` of the wrapped command, and every configured gate is called;
+* every occurrence of the token host_semaphore (any case) in every file under .github is either a
+  fully classified call or a finding with its reason (an allowlist, fail closed by construction).
+  A fully classified call is `python3 [no-argument flags] scripts/ci/host_semaphore.py` with the
+  literal path, exactly one literal configured `--name` in any position and exactly one
+  `--max-wait-secs` before the ` -- ` of the wrapped command, whose value is a plain decimal within
+  the ceiling or the plain read of HOST_SEMAPHORE_MAX_WAIT_SECS. Each call on a line is checked on
+  its own; comments are stripped before the flags are parsed. The only other admitted sites are the
+  HOST_SEMAPHORE_* environment names in ENV_NAMES and the prose comment lines in COMMENT_SITES, each
+  with its reason. Every configured gate is called;
 * HOST_SEMAPHORE_MAX_WAIT_SECS has exactly one definition across the workflows and composite
-  actions, parsed with the YAML subset parser of scripts/ci/taint_boundary.py, and is at most
-  IDLE_SEAT_CEILING_SECS (scripts/ci/host_slot_limits.py, the value host_semaphore.py also refuses
-  above at run time);
+  actions, parsed with the YAML subset parser of scripts/ci/taint_boundary.py, and is a plain
+  decimal (PLAIN_DECIMAL_PATTERN of scripts/ci/host_slot_limits.py) from 1 to IDLE_SEAT_CEILING_SECS,
+  the values host_semaphore.py also accepts at run time;
 * in the run text of those files HOST_SEMAPHORE_MAX_WAIT_SECS appears only as its env mapping key or as
   a plain `$KEY` / `${KEY}` read: any other use (an assignment, export, declare, read, `${KEY:=v}`, an env
   prefix, an expression read) is refused, so the one parsed definition is the only value;
 * the slot count of the gated leg in ci.yml equals the configured slots.
 
-CI runs it inside the existing "Shard partition and wiring unit tests (#6344)" step: unittest discover
-runs test_slot_wait_outcome_9231, which executes this script on the repository (a failing script is a red test).
+CI runs it inside the existing "Shard partition and wiring unit tests (#6344)" step: the #9231 unit
+tests execute this script on the repository (a failing script is a red test).
 
 Usage: python3 -I scripts/ci/host_slots_check.py
 Exit 0 when everything holds, 1 with one line per violation, 2 on a malformed configuration.
@@ -34,7 +40,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import taint_boundary  # noqa: E402  (the repository's own YAML subset parser)
-from host_slot_limits import IDLE_SEAT_CEILING_SECS  # noqa: E402  (the one ceiling, shared with host_semaphore.py)
+# the one ceiling and the one wait grammar, shared with host_semaphore.py
+from host_slot_limits import IDLE_SEAT_CEILING_SECS, PLAIN_DECIMAL_PATTERN  # noqa: E402
 
 REPO = HERE.parents[1]
 CONFIG_PATH = HERE / 'host_slots.json'
@@ -42,19 +49,60 @@ GITHUB_DIR = REPO / '.github'
 WAIT_KEY = 'HOST_SEMAPHORE_MAX_WAIT_SECS'
 SLOTS_KEY = 'HOST_SEMAPHORE_SLOTS'
 MAX_SLOTS = 64
-GATE_NAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')
-CALL_RE = re.compile(r'python3?\s+(?:-\S+\s+)*\S*host_semaphore\.py\b')
+GATE_NAME_RE = re.compile(r'[A-Za-z0-9_-]+')  # used with fullmatch: no trailing newline slips through
+PLAIN_DECIMAL_RE = re.compile(PLAIN_DECIMAL_PATTERN)  # used with fullmatch, exactly as the wrapper does
+SHOWN_VALUE_MAX = 64  # a refused value is shown cut to this many characters
+# decision: an allowlist of token sites over a list of forbidden call spellings, because a list of forbidden
+# forms is never complete (`-m`, a variable or split path, a glob, a second call after `;`); every site that is
+# not a fully classified call is a finding by construction (#9231 F1).
+TOKEN_RE = re.compile(r'host_semaphore', re.IGNORECASE)  # IGNORECASE: a macOS runner opens HOST_SEMAPHORE.PY too
+# The environment names of the gated leg: each holds the token but names no script.
+ENV_NAMES = ('HOST_SEMAPHORE_SLOTS', 'HOST_SEMAPHORE_MAX_WAIT_SECS', 'HOST_SEMAPHORE_HELD')
+ENV_NAME_RE = re.compile(r'(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_])' % '|'.join(ENV_NAMES))
+ENV_LIKE_RE = re.compile(r'HOST_SEMAPHORE_[A-Za-z0-9_]*', re.IGNORECASE)
+# {(file under .github, comment line stripped): reason} - prose comments that hold the token and run nothing.
+COMMENT_SITES = {
+    ('workflows/ci.yml', '# scripts/ci/host_semaphore.py) admits 2 compile+test phases at'):
+        'prose: the slot budget comment of the linux-fed leg (#7914)',
+    ('workflows/ci.yml', '# re-run this very script under host_semaphore.py (the slot is held'):
+        'prose: the comment above the one call of the linux-fed leg (#7914)',
+}
+SCRIPT_PATH = 'scripts/ci/host_semaphore.py'
+# Python options that take no argument; -c, -m, -W and -X take one, so a call with them is not classified.
+CALL_RE = re.compile(r'(?<![^\s;&|(])python3(?:\s+-[bBdEiIOPqRsSuvx]+)*\s+(?:\./)?'
+                     + re.escape(SCRIPT_PATH) + r'(?=[\s;&|)]|$)')
+# The wrapper's own arguments end at its ` -- `, at a shell separator or at the next call on the line.
+SEGMENT_END_RE = re.compile(r'\s--(?=\s|$)|[;&|)`]')
 NAME_FLAG_RE = re.compile(r'(?:^|\s)--name(?:=|\s+)(\S+)')
-MAX_WAIT_FLAG_RE = re.compile(r'(?:^|\s)--max-wait-secs(?:=|\s|$)')
+MAX_WAIT_FLAG_RE = re.compile(r'(?:^|\s)--max-wait-secs(?:=|\s+|$)(\S*)')
+WAIT_KEY_READS = ('$%s' % WAIT_KEY, '${%s}' % WAIT_KEY, '"$%s"' % WAIT_KEY, '"${%s}"' % WAIT_KEY)
+QUOTE_CHARS = '\'"\\'
 # decision: an allowlist of the env mapping key and a plain $ / ${} read over a list of forbidden assignment
 # forms, because shell has open-ended ways to write a variable (export, declare, readonly, local, read,
 # printf -v, ${:=}, eval, env X=) and an allowlist fails closed on each (#9231 R2-C).
 WAIT_KEY_USE_RE = re.compile(r'(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])' % WAIT_KEY)
 WAIT_KEY_MAPPING_RE = re.compile(r'\s*%s\s*:' % WAIT_KEY)
-SLOTS_EXPR_RE = re.compile(r"&& '(\d+)' \|\| '0'")
+SLOTS_EXPR_RE = re.compile(r"&& '(%s)' \|\| '0'" % PLAIN_DECIMAL_PATTERN)
 EXIT_OK = 0
 EXIT_VIOLATION = 1
 EXIT_MALFORMED = 2
+
+# Findings of the token scan, one exact reason per form (the file is the first %s).
+F_NOT_A_CALL = '%s: a host_semaphore.py reference that is not a python3 call'
+F_MODULE = '%s: host_semaphore run as a module (-m); call the literal path scripts/ci/host_semaphore.py'
+F_VARIABLE = '%s: a host_semaphore path built from a variable or a substitution'
+F_GLOB = '%s: a host_semaphore path with a glob character'
+F_SPLIT = '%s: a host_semaphore path split by a quote or a backslash'
+F_ENV_NAME = '%s: %s is not a listed HOST_SEMAPHORE_ environment name'
+F_COMMENT = '%s: a host_semaphore reference in a comment that is not a listed comment site'
+F_NOT_TEXT = '%s: not UTF-8 text, so the host_semaphore token scan cannot read it'
+F_NO_NAME = '%s: a host_semaphore.py call without exactly one literal --name'
+F_UNCONFIGURED = '%s: calls the unconfigured gate %s'
+F_NO_WAIT = '%s: a host_semaphore.py call without exactly one --max-wait-secs'
+F_WAIT_NOT_LITERAL = ('%s: a host_semaphore.py call whose --max-wait-secs is neither a literal nor a plain read of '
+                      + WAIT_KEY)
+F_WAIT_VALUE = '%s: a host_semaphore.py call whose --max-wait-secs %s'
+F_NEVER_CALLED = '%s: configured but no workflow calls it'
 
 
 class ConfigError(Exception):
@@ -84,7 +132,7 @@ def load_config(path=CONFIG_PATH):
     if not isinstance(gates, dict) or not gates:
         raise ConfigError('gates must be a non-empty object')
     for name, gate in gates.items():
-        if not GATE_NAME_RE.match(name):
+        if not GATE_NAME_RE.fullmatch(name):
             raise ConfigError('gate name %r is not a plain name' % name)
         if not isinstance(gate, dict):
             raise ConfigError('gate %s must be an object' % name)
@@ -114,36 +162,174 @@ def config_violations(cfg):
     return found
 
 
+def wait_value_finding(value):
+    """Why VALUE is not an accepted wait (the reason, starting with 'is'), or None; the wrapper's grammar."""
+    if not isinstance(value, str) or not PLAIN_DECIMAL_RE.fullmatch(value):
+        return 'is not a plain decimal integer'
+    if value == '0':
+        return 'is 0; the wait is at least 1 s'
+    # the length first: a huge digit string is above the ceiling without converting it
+    if len(value) > len(str(IDLE_SEAT_CEILING_SECS)) or int(value) > IDLE_SEAT_CEILING_SECS:
+        return 'is above the %d s idle seat ceiling' % IDLE_SEAT_CEILING_SECS
+    return None
+
+
+def _shown(value):
+    """repr(VALUE), cut to SHOWN_VALUE_MAX characters so a huge value never floods the output."""
+    text = repr(value)
+    return text if len(text) <= SHOWN_VALUE_MAX else text[:SHOWN_VALUE_MAX] + '...'
+
+
 def _code_lines(text):
     """The text with comment-only lines blanked and shell line continuations joined."""
     lines = [('' if line.lstrip().startswith('#') else line) for line in text.splitlines()]
     return re.sub(r'\\\n', ' ', '\n'.join(lines)).splitlines()
 
 
+def _comment_start(line):
+    """The index where the shell or YAML comment of LINE starts (an unquoted # at a word start), or len(LINE)."""
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+        elif quote == "'":
+            if char == "'":
+                quote = None
+        elif char == '\\':
+            escaped = True
+        elif quote == '"':
+            if char == '"':
+                quote = None
+        elif char in '\'"':
+            quote = char
+        elif char == '#' and (index == 0 or line[index - 1].isspace()):
+            return index
+    return len(line)
+
+
+def _quoted_mask(text):
+    """For each index of TEXT: True when that character lies inside a quoted span or follows a backslash.
+
+    One linear pass, so checking every flag of a segment stays linear in its length."""
+    mask = []
+    quote = None
+    escaped = False
+    for char in text:
+        mask.append(quote is not None or escaped)
+        if escaped:
+            escaped = False
+        elif quote == "'":
+            if char == "'":
+                quote = None
+        elif char == '\\':
+            escaped = True
+        elif quote == '"':
+            if char == '"':
+                quote = None
+        elif char in '\'"':
+            quote = char
+    return mask
+
+
+def _dequoted(word):
+    return ''.join(char for char in word if char not in QUOTE_CHARS)
+
+
+def _token_count(word):
+    """Occurrences of the token in WORD once quotes and backslashes are removed, the listed env names left out."""
+    plain = _dequoted(word)
+    return len(TOKEN_RE.findall(plain)) - len(ENV_NAME_RE.findall(plain))
+
+
+def _site_reason(wf, word, previous, in_comment):
+    """The exact finding for a token site in WORD that is not a classified call."""
+    if in_comment:
+        return F_COMMENT % wf
+    if previous == '-m' or word.startswith('-m'):
+        return F_MODULE % wf
+    if '$' in word or '`' in word:
+        return F_VARIABLE % wf
+    if any(char in word for char in '*?['):
+        return F_GLOB % wf
+    if any(char in word for char in QUOTE_CHARS):
+        return F_SPLIT % wf
+    for env_like in ENV_LIKE_RE.finditer(_dequoted(word)):
+        if env_like.group(0) not in ENV_NAMES:
+            return F_ENV_NAME % (wf, env_like.group(0)[:SHOWN_VALUE_MAX])
+    return F_NOT_A_CALL % wf
+
+
+def _call_findings(wf, cfg, segment, called):
+    """The findings of one classified call whose own arguments are SEGMENT."""
+    # a flag spelled inside a quoted argument (`--label "--name x"`) is text the shell passes as one word, not a flag
+    quoted = _quoted_mask(segment)
+    names = [match.group(1) for match in NAME_FLAG_RE.finditer(segment) if not quoted[match.start(1) - 1]]
+    if len(names) != 1 or not GATE_NAME_RE.fullmatch(names[0]):
+        return [F_NO_NAME % wf]
+    found = []
+    called.add(names[0])
+    if names[0] not in cfg['gates']:
+        found.append(F_UNCONFIGURED % (wf, names[0]))
+    waits = [match for match in MAX_WAIT_FLAG_RE.finditer(segment) if not quoted[match.start(1) - 1]]
+    if len(waits) != 1:
+        found.append(F_NO_WAIT % wf)
+        return found
+    value = waits[0].group(1)
+    if value in WAIT_KEY_READS:
+        return found  # the one parsed definition, bounded by bound_violations
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in '\'"':
+        value = value[1:-1]
+    if any(char in value for char in '$`*?[\'"\\'):
+        found.append(F_WAIT_NOT_LITERAL % wf)
+    else:
+        problem = wait_value_finding(value)
+        if problem:
+            found.append(F_WAIT_VALUE % (wf, problem))
+    return found
+
+
+def _line_findings(wf, cfg, line, called):
+    """The findings of one logical line: each call checked on its own, each other token site a finding."""
+    code_end = 0 if line.lstrip().startswith('#') else _comment_start(line)
+    code = line[:code_end]
+    calls = list(CALL_RE.finditer(code))
+    found = []
+    path_starts = set()
+    for number, call in enumerate(calls):
+        path_starts.add(code.index('scripts/', call.start()) - (2 if code[:call.end()].endswith(
+            './' + SCRIPT_PATH) else 0))
+        stop = calls[number + 1].start() if number + 1 < len(calls) else len(code)
+        rest = code[call.end():stop]
+        end = SEGMENT_END_RE.search(rest)
+        found.extend(_call_findings(wf, cfg, rest[:end.start()] if end else rest, called))
+    listed = (wf, line.strip()) in COMMENT_SITES and code_end == 0
+    previous = ''
+    for match in re.finditer(r'\S+', line):
+        word = match.group(0)
+        count = _token_count(word)
+        if match.start() in path_starts:
+            count -= 1
+        if count > 0 and not listed:
+            found.extend([_site_reason(wf, word, previous, match.start() >= code_end)] * count)
+        previous = word
+    return found
+
+
 def call_site_violations(cfg, workflow_texts):
-    """One line per call with no literal gate name, of an unconfigured gate, and per gate never called."""
+    """Every token site that is not a classified call, every finding of a call, and every gate never called."""
     called = set()
     found = []
     for wf, text in sorted(workflow_texts.items()):
-        for line in _code_lines(text):
-            if 'host_semaphore.py' not in line:
-                continue
-            call = CALL_RE.search(line)
-            if call is None:
-                found.append('%s: a host_semaphore.py reference that is not a python3 call' % wf)
-                continue
-            segment = re.split(r'\s--(?:\s|$)', line[call.end():], maxsplit=1)[0]
-            names = NAME_FLAG_RE.findall(segment)
-            if len(names) != 1 or not GATE_NAME_RE.match(names[0]):
-                found.append('%s: a host_semaphore.py call without exactly one literal --name' % wf)
-                continue
-            called.add(names[0])
-            if names[0] not in cfg['gates']:
-                found.append('%s: calls the unconfigured gate %s' % (wf, names[0]))
-            if len(MAX_WAIT_FLAG_RE.findall(segment)) != 1:
-                found.append('%s: a host_semaphore.py call without exactly one --max-wait-secs' % wf)
+        if text is None:
+            found.append(F_NOT_TEXT % wf)
+            continue
+        # a backslash-newline joins two lines into one shell line; comments stay, so a token there still counts
+        for line in re.sub(r'\\\n', '', text).splitlines():
+            if TOKEN_RE.search(_dequoted(line)):
+                found.extend(_line_findings(wf, cfg, line, called))
     for name in sorted(set(cfg['gates']) - called):
-        found.append('%s: configured but no workflow calls it' % name)
+        found.append(F_NEVER_CALLED % name)
     return found
 
 
@@ -191,26 +377,30 @@ def parsed_env_values(workflow_texts, key):
 
 
 def bound_violations(cfg, workflow_texts):
-    """The wait bound is defined once, is an integer and is within the idle seat ceiling; slots match the config."""
+    """The wait bound is defined once and is an accepted wait (the wrapper's grammar); slots match the config."""
     found = []
     waits = parsed_env_values(workflow_texts, WAIT_KEY)
     if len(waits) != 1:
         found.append('%s must be defined exactly once, found %d' % (WAIT_KEY, len(waits)))
     for wf, value in waits:
-        if _is_int(value):  # a bare 3600 is an integer scalar for the parser; quoting must not matter
+        if _is_int(value):  # a bare 600 is an integer scalar for the parser; quoting must not matter
             value = str(value)
-        if not isinstance(value, str) or not value.isdigit():
-            found.append('%s: %s is not a plain integer (%r)' % (wf, WAIT_KEY, value))
-        elif int(value) > IDLE_SEAT_CEILING_SECS:
-            found.append('%s: %s %s is above the %d s idle seat ceiling'
-                         % (wf, WAIT_KEY, value, IDLE_SEAT_CEILING_SECS))
+        problem = wait_value_finding(value)
+        if problem == 'is not a plain decimal integer':
+            found.append('%s: %s is not a plain integer (%s)' % (wf, WAIT_KEY, _shown(value)))
+        elif problem and problem.startswith('is above'):
+            shown = value if len(value) <= SHOWN_VALUE_MAX else value[:SHOWN_VALUE_MAX] + '...'
+            found.append('%s: %s %s %s' % (wf, WAIT_KEY, shown, problem))
+        elif problem:
+            found.append('%s: %s %s' % (wf, WAIT_KEY, problem))
     slots = parsed_env_values(workflow_texts, SLOTS_KEY)
     configured = {gate['slots'] for gate in cfg['gates'].values()}
     for wf, value in slots:
         match = SLOTS_EXPR_RE.search(value) if isinstance(value, str) else None
-        if match is None or int(match.group(1)) not in configured:
-            found.append('%s: %s %r matches no configured slot count %s'
-                         % (wf, SLOTS_KEY, value, sorted(configured)))
+        count = match.group(1) if match else ''
+        if not count or len(count) > len(str(MAX_SLOTS)) or int(count) not in configured:
+            found.append('%s: %s %s matches no configured slot count %s'
+                         % (wf, SLOTS_KEY, _shown(value), sorted(configured)))
     if not slots:
         found.append('%s is defined nowhere' % SLOTS_KEY)
     return found
@@ -222,12 +412,23 @@ def github_texts(github_dir=GITHUB_DIR):
     return {str(p.relative_to(github_dir)): p.read_text(encoding='utf-8') for p in paths}
 
 
+def github_all_texts(github_dir=GITHUB_DIR):
+    """{relative path: text, or None when not UTF-8} of every file under .github: the token scan reads them all."""
+    found = {}
+    for path in sorted(p for p in github_dir.rglob('*') if p.is_file()):
+        try:
+            found[path.relative_to(github_dir).as_posix()] = path.read_bytes().decode('utf-8')
+        except UnicodeDecodeError:
+            found[path.relative_to(github_dir).as_posix()] = None
+    return found
+
+
 def main():
     try:
         cfg = load_config()
         texts = github_texts()
         # every .github text, composite actions included: a definition there counts and is bounded too
-        problems = (config_violations(cfg) + call_site_violations(cfg, texts)
+        problems = (config_violations(cfg) + call_site_violations(cfg, github_all_texts())
                     + bound_violations(cfg, texts) + wait_key_violations(texts))
     except (ConfigError, taint_boundary.YamlError) as exc:
         print('host_slots_check: malformed: %s' % exc)

@@ -924,6 +924,14 @@ class TokenScanFailsClosed(unittest.TestCase):
         ('the token inside a trailing comment', 'run: echo hi  # see scripts/ci/host_semaphore.py\n' + SCAN_GOOD + '\n',
          [S_COMMENT]),
         ('a # inside quotes is not a comment', 'run: echo "a # b"; %s\n' % SCAN_GOOD, []),
+        # a flag spelled inside a quoted argument is one word the shell passes, never a flag
+        ('the wait flag inside a quoted label',
+         'run: python3 scripts/ci/host_semaphore.py --name g --label "x --max-wait-secs 600" -- bash\n', [S_NO_WAIT]),
+        ('the name flag inside a quoted label',
+         "run: python3 scripts/ci/host_semaphore.py --label 'y --name g' --max-wait-secs 600 -- bash\n",
+         [S_NO_NAME, S_NEVER]),
+        ('a quoted label beside both flags',
+         'run: python3 scripts/ci/host_semaphore.py --name g --label "${CI_NODE}/x" --max-wait-secs 600 -- bash\n', []),
         # other wait values: non-ASCII digits, a leading zero, a superscript digit
         ('Arabic-Indic digits', scan_wait('٦٠٠'), [S_NOT_PLAIN]),
         ('Devanagari digits', scan_wait('०९'), [S_NOT_PLAIN]),

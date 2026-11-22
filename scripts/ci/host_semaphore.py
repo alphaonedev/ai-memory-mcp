@@ -95,7 +95,8 @@ LIMITS_RELATIVE_PATH = "host_slot_limits.py"
 
 
 def _load_host_slot_limits():
-    """host_slot_limits.py from this file's real directory, by path only; its IDLE_SEAT_CEILING_SECS is a positive int."""
+    """host_slot_limits.py from this file's real directory, by path only; its IDLE_SEAT_CEILING_SECS is a positive int
+    and its PLAIN_DECIMAL_PATTERN a str that compiles."""
     import importlib.util
     path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), LIMITS_RELATIVE_PATH))
     loaded = sys.modules.get("host_slot_limits")
@@ -110,6 +111,13 @@ def _load_host_slot_limits():
         raise TypeError("IDLE_SEAT_CEILING_SECS is not an int")
     if value <= 0:
         raise ValueError("IDLE_SEAT_CEILING_SECS is not positive")
+    pattern = module.PLAIN_DECIMAL_PATTERN  # absent: AttributeError
+    if type(pattern) is not str:
+        raise TypeError("PLAIN_DECIMAL_PATTERN is not a str")
+    try:
+        re.compile(pattern)
+    except re.error:
+        raise ValueError("PLAIN_DECIMAL_PATTERN does not compile") from None
     return module
 
 
@@ -166,8 +174,8 @@ SEMAPHORE_POLL_SECS_DEFAULT = 30
 # decision: reserved codes 82, 83, 84 and 85 over sharing 75, because the product binary exits 75
 # (src/main.rs) and a child's own code passes through this wrapper unchanged. 82-85 are none of
 # 0-4 (this wrapper, load_gate.py), 64-78 (sysexits, the product binary), 86-87 (a test stub),
-# 90-109 (nextest, cargo 101), 124-127 (timeout, shell), 128+signal; the table that pins this is
-# scripts/ci/tests/test_slot_wait_outcome_9231.py.
+# 90-109 (nextest, cargo 101), 124-127 (timeout, shell), 128+signal; the ExitCodeCollisionTable test of
+# #9231 pins this.
 # decision: a refused wait exits 85 over argparse's 2, because a child's own 2 passes through, so a 2
 # could be either; 85 is reserved, so a child's 85 is reported as 84 and 85 is only ever a refusal.
 EXIT_NO_SLOT = 82
@@ -179,7 +187,7 @@ OUTCOME_WAIT_REFUSED = 'infra-wait-refused'
 TITLE_WAIT_REFUSED = 'infra wait-refused'
 FLAG_MAX_WAIT = '--max-wait-secs'
 ENV_MAX_WAIT = 'HOST_SEMAPHORE_MAX_WAIT_SECS'  # the workflow's one env mapping key for the wait
-PLAIN_DECIMAL_RE = re.compile(r'0|[1-9][0-9]*')  # ASCII digits only: int() would also take " 9", "+9", "٩"
+PLAIN_DECIMAL_RE = re.compile(_limits.PLAIN_DECIMAL_PATTERN)  # the one grammar, shared with host_slots_check.py
 NEGATIVE_RE = re.compile(r'-[0-9]+')
 OUTCOME_NO_SLOT = 'infra-no-slot'  # token in the annotation message; a CI failure class for it is tracked in #9833
 OUTCOME_UNKNOWN_RUNNER = 'infra-unknown-runner'
