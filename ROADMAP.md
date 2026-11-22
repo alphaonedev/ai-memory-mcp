@@ -575,7 +575,7 @@ The v3 L3-5 blocks report compile-time-static presence, so on the default `sqlit
 
 Each release section below names the seven-property contributions explicitly. Every commitment passes the §3 scope test or is reclassified.
 
-> **Companion documents.** [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md) is the v1.1.0 workstream document — seven workstreams on use-time applicability, measurement and docs truth, with the MemTrapBench workstream 5 harness as the **P1 gate** on any downstream-benefit claim. §11.9 below is the release-line summary; that file is the workstream detail, and the two must be read together.
+> **Companion documents.** [`docs/ROADMAP-v110.md`](docs/ROADMAP-v110.md) is the v1.1.0 workstream document — nine workstreams (w1–w9) on use-time applicability, measurement, docs truth and enterprise-federation hardening, with the MemTrapBench workstream 5 harness as the **P1 gate** on any downstream-benefit claim. §11.9 below is the release-line summary; that file is the workstream detail, and the two must be read together.
 > Certification posture, the standard, the pre-registered declaration and the procurement appendix live in `docs/compliance/` (see §9.8 for what is on this branch today and what arrives with the rehearsal promotion).
 
 ### 11.1 v0.6.3 — Structured Memory + Performance — SHIPPED 2026-04-27
