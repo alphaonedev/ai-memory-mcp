@@ -21,6 +21,8 @@ SLEEPER = [sys.executable, '-c', 'import time; time.sleep(60)']
 
 def start(root, args, child, **kw):
     cmd = [sys.executable, '-I', str(SCRIPT), '--root', str(root), '--label', 'T'] + args + ['--'] + child
+    # the wait key is part of the wrapper's input (#9231): a value inherited from the caller must not steer these tests
+    kw.setdefault('env', {k: v for k, v in os.environ.items() if k != 'HOST_SEMAPHORE_MAX_WAIT_SECS'})
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
 
 
@@ -60,10 +62,10 @@ class Semaphore(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertEqual(hs.SEMAPHORE_SLOTS_DEFAULT, 2)
-        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 3600)
+        self.assertEqual(hs.SEMAPHORE_MAX_WAIT_SECS_DEFAULT, 600)
         self.assertEqual(hs.SEMAPHORE_POLL_SECS_DEFAULT, 30)
 
-    def test_extra_waiter_times_out_with_exit_3(self):
+    def test_extra_waiter_times_out_with_the_no_slot_code_82(self):
         a = start(self.root, ['--name', 'n', '--slots', '1'], SLEEPER)
         b = None
         try:
@@ -71,8 +73,8 @@ class Semaphore(unittest.TestCase):
             b = start(self.root, ['--name', 'n', '--slots', '1', '--max-wait-secs', '1', '--poll-secs', '1'],
                       [sys.executable, '-c', 'print("must not run")'])
             out, _ = b.communicate(timeout=30)
-            self.assertEqual(b.returncode, 3, out)
-            self.assertIn("[#7914 semaphore] 'T': no slot free after 1s", out)
+            self.assertEqual(b.returncode, 82, out)
+            self.assertIn("[#7914 semaphore] 'T': infra-no-slot: no slot free after 1s", out)
             self.assertNotIn('must not run', out)
         finally:
             a.terminate()

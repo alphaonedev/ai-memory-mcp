@@ -1323,9 +1323,11 @@ jobs:
             # 4061 s elapsed - 300 s) and the #1492 watchdog killed it
             # (serial=124) with no test failing; the same leg alone took
             # ~7980 s. Budget identity (pinned by test_ci_semaphore_wiring_7914):
-            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)
-            # The waits are kept, not shrunk, because they are what bound
-            # contention on a 4-runner host (#7928). The semaphore wait is the
+            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 600 + cold compile 4100 + safety 300 + serial shard 7800 (= 14000 s)
+            # The semaphore wait was 3600 s (#7928) and is 600 s since #9231: the
+            # runners that serve this leg are tied to the 2 slots by
+            # scripts/ci/host_slots.json, so no job queues inside the semaphore.
+            # The semaphore wait is the
             # one named constant HOST_SEMAPHORE_MAX_WAIT_SECS below. The
             # macos-fed and hosted caps are unchanged.
             timeout: 300
@@ -1871,8 +1873,21 @@ jobs:
           # linux-fed enterprise-fed leg; 0 = no semaphore (every other leg).
           HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' && '2' || '0' }}
           # #7928 - the one place the semaphore wait is set (seconds); it is a
-          # term of the job cap identity in the matrix timeout comment.
-          HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'
+          # term of the job cap identity in the matrix timeout comment. #9231:
+          # 600 s (was 3600 s): the serving runners equal the slots
+          # (scripts/ci/host_slots.json), so a wait only bridges a handover; a
+          # slot hold lasts about 2 h, so a longer wait never ended in a slot and
+          # only held a runner idle. No slot ends as the named outcome
+          # infra-no-slot: one error annotation whose message carries that token
+          # (a job log shows the message only) and exit code 82. The codes 82 to
+          # 85 are reserved: a command that exits with one of them is reported as
+          # 84, and a runner outside scripts/ci/host_slots.json ends as
+          # infra-unknown-runner (83). The gate stays red, no job output is set.
+          # The wrapper refuses, before any slot or command, a wait above the
+          # 900 s ceiling of scripts/ci/host_slot_limits.py, a repeated flag, or
+          # a flag that differs from this key: infra-wait-refused, exit code 85.
+          # Set the wait only here; run text reads it as a plain $ read.
+          HOST_SEMAPHORE_MAX_WAIT_SECS: '600'
         shell: bash
         run: |
           set -euo pipefail
