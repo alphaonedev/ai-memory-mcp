@@ -108,18 +108,37 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 
 - Only DIRECT entries of the resolved `TMPDIR` are removed (#9820). The clear is
   bound to the job boundary, never to polling for an idle runner (f1 runners go
-  from one job to the next in 2 s): the action runs a second time as the last
-  step of every self-hosted job (`mode: job-end`, `if: always()`), which removes
-  every entry, and at job start (`mode: job-start`, covers a job whose end step
-  never ran: runner lost, hard cancel), which keeps an entry whose own mtime
-  (lstat, never a symlink target) is within `JOB_START_GRACE_SECS` (30) as owned
-  by a live writer. An entry with an append-only or immutable flag has the flag
-  cleared through its open descriptor and is then removed. A removed directory
+  from one job to the next in 2 s): the action runs a second time near the end
+  of every self-hosted job (`mode: job-end`, `if: always()`, after every build
+  and test step; only the two #7160 sweep steps come after it, and it needs the
+  job's checkout step to have succeeded), which removes every entry, and at job
+  start (`mode: job-start`, covers a job whose end step never ran: runner lost,
+  hard cancel), which keeps an entry whose own mtime (lstat, never a symlink
+  target) is within `JOB_START_GRACE_SECS` (30) as owned by a live writer.
+- At job end a TMPDIR that is not cleared fails the step: a refusal or any
+  entry it could not remove prints one `::error` annotation and the step
+  exits 3 (`EXIT_NOT_CLEARED`). At job start the same outcome is a `::warning`
+  with exit 0, because the end step of the same job clears it or fails the job.
+  An internal error exits 1 in both modes.
+- An entry with an append-only or immutable flag (EPERM or EACCES) has the flag
+  cleared through its open descriptor, never through a symlink, and is then
+  removed; a file with more than one hard link is never unflagged (its inode is
+  shared with a file that may be outside TMPDIR) and stays a counted failure. A
+  directory the job owns that lacks owner rwx (a `chmod -R a-w` tree) gets owner
+  rwx through its descriptor and its entries are removed. A removed directory
   goes whole, whatever its children's mtimes. A symlink is unlinked and never
-  followed, so a sibling `runner-N` directory is never touched.
-- On the macOS node TMPDIR is `<runner folder>/_tmp` under `/Users/Shared` or
-  the volume runner root named by `F1_VOLUME_RUNNER_ROOT`; it is proven by identity the same way (the folder's name
-  must match the layout and its parent must be that root).
+  followed, so a sibling `runner-N` directory is never touched. A socket or FIFO
+  named as a .NET runner endpoint (`dotnet-diagnostic-<pid>-…`,
+  `clr-debug-pipe-<pid>-…`) whose pid is a live process is kept; one of a dead
+  process is removed.
+- On the macOS node TMPDIR is `<runner folder>/_tmp` under the shared home
+  runner root or the volume runner root named by `F1_VOLUME_RUNNER_ROOT`
+  (folders `fed`, `fed<digits>`); it is proven by identity the same way (the
+  folder's name, read from the open root, must match the layout and its parent
+  must be that root). The folder must also be the folder of the job's runner:
+  `RUNNER_NAME` is looked up in `RUNNER_FOLDER_BY_NAME`, written out from the
+  live runner `.env` files, and an unset name or a folder of another runner is
+  a refusal.
 - TMPDIR is proven, by file identity (device and inode of the opened
   directory, never by path text), to be `<runner root>/runner-<digits>`: the
   last component must match `runner-<digits>` and the directory's parent must be
@@ -170,10 +189,11 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   when that is set, escaped the same way; a summary it cannot write is named on
   stderr and changes no exit code.
 - Every input it cannot prove ends in a named refusal with nothing deleted. A
-  refusal prints a `::warning` annotation with the escaped reason (and the same
-  line on stderr) and the step still exits 0: it does not fail the job and does
-  not skip the steps after it, because a housekeeping step must never take down
-  the required checks. The reasons, each pinned by a test against the code:
+  refusal prints one annotation with the escaped reason (and the same line on
+  stderr): at job start a `::warning` and exit 0, at job end an `::error` and
+  the step exits 3. The job-end step runs after every build and test step, so
+  its failure skips nothing but the #7160 sweeps, which run on `always()`. The
+  reasons, each pinned by a test against the code:
 
 - refusal: `python <found> is older than <wanted>`
 - refusal: `this platform lacks a working descriptor-relative call: <call> raised <error> (<why>)`
@@ -195,6 +215,9 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 - refusal: `TMPDIR is not owned by the current user: <path>`
 - refusal: `TMPDIR is not named runner-<digits>: <name>`
 - refusal: `TMPDIR is not <root>/<runner folder>/_tmp of an allowed layout: <path>`
+- refusal: `RUNNER_NAME is unset or empty; the runner folder cannot be bound: <path>`
+- refusal: `TMPDIR folder <folder> is not the folder of runner <runner>: <path>`
+- refusal: `TMPDIR carries an immutable or append-only flag: <path>`
 - refusal: `TMPDIR is outside the allowed roots <roots>: <path>`
 - refusal: `TMPDIR contains the home directory or the workspace: <path>`
 

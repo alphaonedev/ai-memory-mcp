@@ -2,23 +2,26 @@ name: Prune runner TMPDIR (#8634, #9820)
 description: >-
   Self-hosted runners only (the caller gates it with runner.environment ==
   'self-hosted'). Clears direct entries of this runner's own TMPDIR at the job
-  boundary (scripts/ci/prune_runner_tmp.py, #9820): mode job-end (last step,
-  if: always()) removes every entry, mode job-start keeps an entry touched in the
-  last 30 s as a live writer's; never follows a
-  symlink and never touches another runner's directory. A refusal (TMPDIR
-  unset, relative, a symlink, not owned by the user, not named runner-<digits>
-  or <runner folder>/_tmp, outside the confirmed runner roots) prints a
-  ::warning annotation with the
-  reason, deletes nothing and does not fail the job or skip the steps after it
-  (ruling f23a9ae4). A per-entry removal failure does not fail the job: the step
-  exits 0, prints pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n> and
-  one ::warning annotation with the count and the first 5 names (escaped; the
-  line states when the list is cut) (ruling 7af294fb). A tree over the depth or
-  entry bound is one counted failure, counted before anything under it is
-  removed; a mount point is never entered. The platform check makes one real
-  descriptor-relative call of each needed function in a probe directory it
-  removes again. The prune-facts line also goes to the job summary. An
-  unexpected error fails the job.
+  boundary (scripts/ci/prune_runner_tmp.py, #9820): mode job-end (after every
+  build and test step, before only the #7160 sweeps, if: always()) removes every
+  entry, mode job-start keeps an entry touched in the last 30 s as a live
+  writer's; never follows a symlink and never touches another runner's
+  directory. On the macOS node the runner folder must be the folder of
+  RUNNER_NAME (RUNNER_FOLDER_BY_NAME). A refusal (TMPDIR unset, relative, a
+  symlink, not owned by the user, not named runner-<digits> or
+  <runner folder>/_tmp, outside the confirmed runner roots, the folder of
+  another runner, an immutable or append-only TMPDIR) deletes nothing. At job
+  end a refusal or any entry it could not remove prints one ::error annotation
+  and the step exits 3, so the job says why TMPDIR was not cleared. At job
+  start the same outcome is one ::warning annotation and exit 0, because the
+  end step of the same job clears it or fails the job. The step prints
+  pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>; the failure
+  annotation carries the count and the first 5 names (escaped; the line states
+  when the list is cut). A tree over the depth or entry bound is one counted
+  failure, counted before anything under it is removed; a mount point is never
+  entered. The platform check makes one real descriptor-relative call of each
+  needed function in a probe directory it removes again. The prune-facts line
+  also goes to the job summary. An unexpected error exits 1.
 inputs:
   mode:
     description: job-start (keep entries touched in the last 30 s) or job-end (remove every entry)

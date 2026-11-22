@@ -337,6 +337,20 @@ class Base(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    def as_other_user(self):
+        """Make the MEDIUM-5 owner rwx retry fail as it does on a directory of another user (EPERM).
+
+        A 0500 directory the job owns is now opened up and cleared (MEDIUM-5); a read-only directory the
+        job cannot chmod is the case that stays unremovable and counted, which these tests are about. The
+        TMPDIR owner proof still sees the real uid.
+        """
+        def refuse_fchmod(_fd, _mode):
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+        patch = mock.patch.object(PRUNE.os, "fchmod", refuse_fchmod)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def run_prune(self, tmpdir, *extra, env_extra=None):
         environ = {} if tmpdir is None else {"TMPDIR": str(tmpdir)}
         environ.update(env_extra or {})
@@ -512,6 +526,7 @@ class PruneRules(Base):
         inner.chmod(0o500)
         age(locked, OLD_AGE_SECS)
         self.addCleanup(lambda: inner.chmod(0o700))
+        self.as_other_user()
         rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
         self.assertIn("pruned=1 kept=0 failed=1", out)
@@ -1195,6 +1210,7 @@ class HostileNames(Base):
             os.chmod(os.path.join(raw, b"sub"), 0o500)
             locked.append(raw)
         self.addCleanup(lambda: [os.chmod(os.path.join(raw, b"sub"), 0o700) for raw in locked])
+        self.as_other_user()
         rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
         self.assertIn(f"failed={len(names)} ", out)
@@ -2898,6 +2914,7 @@ class JobBoundaryClear9820(Base):
 
     def test_high1_the_same_failure_at_job_start_is_a_warning_with_exit_0(self):
         flagged = self.make_scratch()
+        age(flagged, OLD_AGE_SECS)  # past the job-start grace, so it is tried (the young left.db, left-dir are kept)
         self.flag_world("linux", flagged)
         with mock.patch.object(PRUNE, "FLAG_CLEARERS", {}):
             rc, out, err = self.run_prune(self.runner, "--mode", "job-start")
