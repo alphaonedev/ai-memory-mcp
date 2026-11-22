@@ -913,12 +913,9 @@ fn read_pin_file_capped(path: &Path) -> Result<String> {
         // the open return so the regular-file check below refuses it.
         opts.custom_flags(libc::O_NONBLOCK);
     }
-    let file = opts
-        .open(path)
-        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
-    let meta = file
-        .metadata()
-        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
+    let read_failed = || format!("failed to read {PEER_FP_LABEL} from {}", path.display());
+    let file = opts.open(path).with_context(read_failed)?;
+    let meta = file.metadata().with_context(read_failed)?;
     if meta.is_dir() {
         anyhow::bail!(
             "{PEER_FP_LABEL} {} is a directory, not a pin file",
@@ -942,7 +939,7 @@ fn read_pin_file_capped(path: &Path) -> Result<String> {
     let mut bytes = Vec::new();
     file.take(PEER_FP_FILE_MAX_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
+        .with_context(read_failed)?;
     let read_len = u64::try_from(bytes.len()).map_err(|_| over_cap())?;
     if read_len > PEER_FP_FILE_MAX_BYTES {
         return Err(over_cap());
