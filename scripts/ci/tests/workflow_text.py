@@ -322,8 +322,6 @@ def _read_checked(target: Path) -> bytes:
             raise WorkflowReadError(label, None, SYMLINK) from None
         if exc.errno in (errno.ENOENT, errno.ENOTDIR):
             raise WorkflowReadError(label, None, MISSING) from None
-        if exc.errno == errno.EISDIR:
-            raise WorkflowReadError(label, None, DIRECTORY) from None
         raise WorkflowReadError(label, None, UNREADABLE) from None
     try:
         mode = os.fstat(fd).st_mode
