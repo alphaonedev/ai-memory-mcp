@@ -455,6 +455,22 @@ write_files:
 
       : > "$FED_DIR/MESH-READY"
       echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
+  # #9965: the one upstream AGE fix of the certified build. main.tf renders the
+  # AGE pin lines of the docker-1461 SSOT, the applier and the patch file it
+  # pins; provision.sh runs the applier between checkout and make and again
+  # with --verify after make install.
+  - path: /opt/age-provision/lib.sh
+    permissions: '0644'
+    encoding: b64
+    content: ${age_pins_b64}
+  - path: /opt/age-provision/apply_age_patch.py
+    permissions: '0644'
+    encoding: gz+b64
+    content: ${age_applier_gzb64}
+  - path: /opt/age-provision/patches/${age_patch_file}
+    permissions: '0644'
+    encoding: b64
+    content: ${age_patch_b64}
   - path: /opt/ai-memory/provision.sh
     permissions: '0755'
     content: |
@@ -482,9 +498,11 @@ write_files:
       fi
 
       # --- build + install certified Apache AGE 1.7.0 against PG19 ---
-      # Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d
-      # (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
-      # Built unmodified; HEAD must equal the pinned commit or the build fails.
+      # Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus
+      # upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache
+      # release; upstream has no 1.7.0 release for PostgreSQL 19). HEAD must
+      # equal the pinned commit and apply_age_patch.py must accept the patch
+      # and the patched tree, or the build fails.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
         rm -rf /opt/age-src
         git init -q /opt/age-src
@@ -493,8 +511,10 @@ write_files:
         git fetch -q --depth 1 origin c6b043d1c8f4909331b9080d6640b487782fc958
         git checkout -q --detach FETCH_HEAD
         test "$(git rev-parse HEAD)" = c6b043d1c8f4909331b9080d6640b487782fc958
+        python3 /opt/age-provision/apply_age_patch.py --ssot /opt/age-provision/lib.sh --src /opt/age-src
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
+        python3 /opt/age-provision/apply_age_patch.py --ssot /opt/age-provision/lib.sh --src /opt/age-src --verify
       fi
 
       # --- preload AGE + restart postgres ---

@@ -359,11 +359,11 @@ jobs:
             "$CERT_EXPECTED_AGE_VERSION") echo "Apache AGE $age_ver == certified $CERT_EXPECTED_AGE_VERSION OK" ;;
             *) echo "::error::expected Apache AGE exactly $CERT_EXPECTED_AGE_VERSION (certified, deploy/docker-1461/provision/lib.sh EXPECTED_AGE_VERSION), got '$age_ver' — CI must not certify a version it does not run (§5.4(3))"; exit 1 ;;
           esac
-          # pgvector must match the SSOT-pinned semver exactly (allowing only
-          # for a trailing suffix the extversion column itself might carry).
+          # pgvector must match the SSOT-pinned semver exactly: extversion
+          # carries no suffix, so 0.8.70 or 0.8.7-1 is a different build (#9968).
           case "$vec_ver" in
             "") echo "::error::pgvector extension not present"; exit 1 ;;
-            ${CERT_EXPECTED_PGVECTOR_VERSION}*) echo "pgvector $vec_ver == certified ${CERT_EXPECTED_PGVECTOR_VERSION} OK" ;;
+            "$CERT_EXPECTED_PGVECTOR_VERSION") echo "pgvector $vec_ver == certified ${CERT_EXPECTED_PGVECTOR_VERSION} OK" ;;
             *) echo "::error::expected pgvector exactly ${CERT_EXPECTED_PGVECTOR_VERSION} (certified, deploy/docker-1461/provision/lib.sh PGVECTOR_APT_VERSION), got '$vec_ver' — CI must not certify a version it does not run (§5.4(3))"; exit 1 ;;
           esac
 

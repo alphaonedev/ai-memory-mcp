@@ -4,11 +4,14 @@
 # PostgreSQL 19 + Apache AGE 1.7.0 + pgvector for the docker-1461 mesh.
 #
 # Certified data tier: PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7.
-# Apache AGE 1.7.0 is built from upstream PG19 branch commit c6b043d (not a
-# tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+# Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus
+# upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release;
+# upstream has no 1.7.0 release for PostgreSQL 19).
 # pgdg ships no `postgresql-19-age` package and apache/age publishes no PG19
-# image, so the AGE layer is a source build of that ONE pinned commit,
-# unmodified (no patch, no substitution). The tagged v1.7.0-rc0 source of the
+# image, so the AGE layer is a source build of that ONE pinned commit plus
+# that ONE pinned upstream fix (provision/patches/, pinned by sha256 in
+# provision/lib.sh), applied by provision/apply_age_patch.py, which refuses
+# any other source, patch or patched result (#9965). The tagged v1.7.0-rc0 source of the
 # previous major does not compile against PostgreSQL 19 (changed executor and table-AM
 # signatures); commit c6b043d is upstream's own PG19 port at
 # default_version 1.7.0 (#2457).
@@ -16,8 +19,9 @@
 #   Stage `age-build`: the official PostgreSQL image for the major, server +
 #     server-dev bumped to the EXACT pgdg minor (PG_APT_VERSION), the AGE
 #     source fetched at AGE_SOURCE_COMMIT and checked with `git rev-parse
-#     HEAD` (a mismatch fails the build), then `make install` into a
-#     staging DESTDIR.
+#     HEAD` (a mismatch fails the build), the pinned upstream fix applied
+#     and checked by apply_age_patch.py, then `make install` into a
+#     staging DESTDIR and apply_age_patch.py --verify on the built tree.
 #   Final stage: the same base, server + client bumped to PG_APT_VERSION,
 #     pgvector from pgdg apt (PGVECTOR_APT_VERSION), the staged AGE files
 #     copied in, and AGE's own initdb script so `CREATE EXTENSION age` runs
@@ -37,6 +41,12 @@ ARG AGE_SOURCE_COMMIT
 
 USER root
 
+# The one upstream AGE fix of the certified build (#9965): the SSOT, the
+# applier and the patch file it pins, from the build context (the campaign
+# directory). apply_age_patch.py refuses any other source, patch or result.
+COPY provision/lib.sh provision/apply_age_patch.py /age-provision/
+COPY provision/patches/ /age-provision/patches/
+
 RUN : "${PG_MAJOR:?}" "${PG_APT_VERSION:?}" "${AGE_SOURCE_REPO:?}" "${AGE_SOURCE_COMMIT:?}" \
  && apt-get update \
  && apt-get install -y --no-install-recommends --only-upgrade \
@@ -44,14 +54,16 @@ RUN : "${PG_MAJOR:?}" "${PG_APT_VERSION:?}" "${AGE_SOURCE_REPO:?}" "${AGE_SOURCE
       "postgresql-client-${PG_MAJOR}=${PG_APT_VERSION}" \
  && apt-get install -y --no-install-recommends \
       "postgresql-server-dev-${PG_MAJOR}=${PG_APT_VERSION}" \
-      bison build-essential ca-certificates flex git \
+      bison build-essential ca-certificates flex git python3 \
  && git init -q /src/age \
  && git -C /src/age remote add origin "${AGE_SOURCE_REPO}" \
  && git -C /src/age fetch -q --depth 1 origin "${AGE_SOURCE_COMMIT}" \
  && git -C /src/age checkout -q --detach FETCH_HEAD \
  && test "$(git -C /src/age rev-parse HEAD)" = "${AGE_SOURCE_COMMIT}" \
+ && python3 /age-provision/apply_age_patch.py --ssot /age-provision/lib.sh --src /src/age \
  && make -C /src/age -j"$(nproc)" PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
  && make -C /src/age install DESTDIR=/age-dist PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
+ && python3 /age-provision/apply_age_patch.py --ssot /age-provision/lib.sh --src /src/age --verify \
  && install -D -m 0644 /src/age/docker/docker-entrypoint-initdb.d/00-create-extension-age.sql \
       /age-dist/docker-entrypoint-initdb.d/00-create-extension-age.sql
 

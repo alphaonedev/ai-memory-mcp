@@ -1,0 +1,49 @@
+From 06ce678d74210539705c77e2dc7c9fa861e2a331 Mon Sep 17 00:00:00 2001
+From: SpongeRobert <32210594+SpongeRobert@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 03:11:46 -0300
+Subject: [PATCH] Do not read the catalog in is_age_extension_exists() outside
+ a live transaction (#2581)
+
+With age in shared_preload_libraries, post_parse_analyze runs for every
+statement, the ROLLBACK of a failed transaction included. When the caches of
+that backend were reset (the shared invalidation queue overflowed while it
+was not reading), the cached answer of is_age_extension_exists() is gone and
+get_extension_oid() misses the catcache: pg_extension and pg_class are opened
+in TBLOCK_ABORT, after the resource owner of the transaction was released.
+The locks are granted on the fast path and ResourceOwnerEnlarge() then fails
+("called after release started"). Nothing releases those locks any more; the
+backend exits with them in its PGPROC, and every later backend on that PGPROC
+fails at connect with "failed to re-find shared lock object" until the
+server restarts. With --enable-cassert the same path trips
+Assert(IsTransactionState()) in AssertCouldGetRelation().
+
+Return false outside a live transaction and cache nothing, so the next live
+transaction asks the catalog again. Only the statements that leave a failed
+transaction reach the parser there, and AGE has nothing to analyse in them.
+
+Fixes 2580.
+
+---
+ src/backend/catalog/ag_catalog.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/backend/catalog/ag_catalog.c b/src/backend/catalog/ag_catalog.c
+index 107de370d37aebaf4f42fd084ad808df7c566231..33b087a2cdd46a7f2d949afbb8f7308b62856ac8 100644
+--- a/src/backend/catalog/ag_catalog.c
++++ b/src/backend/catalog/ag_catalog.c
+@@ -75,6 +75,15 @@ is_age_extension_exists(void)
+ {
+     static bool callback_registered = false;
+ 
++    /*
++     * Outside a live transaction (the ROLLBACK of a failed one) the catalog
++     * must not be read: the resource owner is already released, and the locks
++     * a catalog scan takes here would leak into the PGPROC. Nothing is cached,
++     * so the next live transaction asks the catalog again.
++     */
++    if (!IsTransactionState())
++        return false;
++
+     if (extension_cache_is_valid)
+         return age_extension_exists;
+ 

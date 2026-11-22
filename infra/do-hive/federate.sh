@@ -300,16 +300,17 @@ EOS
     fi
   done
 
-  # Certified data-tier pins, asserted from the provisioned hosts.
+  # Certified data-tier pins, asserted from the provisioned hosts: each is a
+  # whole-line fixed-string match, so 19.01, 1.7.00 or 0.8.70 is refused (#9968).
   for i in $(seq 0 $((NODE_COUNT - 1))); do
     versions="$(node_sh "$i" <<'EOS'
-sudo -u postgres psql -d aimemory -Atc "SELECT current_setting('server_version')"
+sudo -u postgres psql -d aimemory -Atc "SELECT split_part(current_setting('server_version'), ' ', 1)"
 sudo -u postgres psql -d aimemory -Atc "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 EOS
 )"
-    echo "$versions" | grep -q '^19\.0' && ok "node $((i + 1)) PostgreSQL 19.0 (certified)" || no "node $((i + 1)) PostgreSQL is not 19.0 ($versions)"
-    echo "$versions" | grep -qx 'age=1.7.0' && ok "node $((i + 1)) AGE 1.7.0" || no "node $((i + 1)) AGE is not 1.7.0 ($versions)"
-    echo "$versions" | grep -qx 'vector=0.8.7' && ok "node $((i + 1)) pgvector 0.8.7" || no "node $((i + 1)) pgvector is not 0.8.7 ($versions)"
+    echo "$versions" | grep -qxF '19.0' && ok "node $((i + 1)) PostgreSQL 19.0 (certified)" || no "node $((i + 1)) PostgreSQL is not 19.0 ($versions)"
+    echo "$versions" | grep -qxF 'age=1.7.0' && ok "node $((i + 1)) AGE 1.7.0" || no "node $((i + 1)) AGE is not 1.7.0 ($versions)"
+    echo "$versions" | grep -qxF 'vector=0.8.7' && ok "node $((i + 1)) pgvector 0.8.7" || no "node $((i + 1)) pgvector is not 0.8.7 ($versions)"
   done
 
   # These two assertions intentionally originate on f2/public internet.

@@ -17,8 +17,10 @@
 #   * postgresql-<major>-pgvector exact pgdg .deb (PGVECTOR_APT_VERSION)
 #   * Apache AGE built from source at AGE_SOURCE_COMMIT (pgdg ships no AGE
 #     package for this major); `git rev-parse HEAD` must equal the pin or
-#     the install fails.
-#     Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+#     the install fails, then apply_age_patch.py (staged from the docker-1461
+#     SSOT directory) applies the one pinned upstream fix and fails closed on
+#     any other source, patch or result (#9965).
+#     Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
 #
 # Native specifics vs. the old container model:
 #   * The cluster is (re)created with --data-checksums for parity with the
@@ -44,6 +46,10 @@
 # It is rendered into a 0600 role.sql, scp'd to each pg droplet, applied, then
 # shredded remotely — never echoed, never on a command line, never committed.
 source "$(dirname "$0")/lib.sh"
+# The AGE patch pins live in the docker-1461 SSOT; the applier reads them there.
+AGE_PROVISION_DIR="$(cd "$(dirname "$0")/../../docker-1461/provision" && pwd)"
+AGE_PATCH_FILE="$(sed -n 's/^AGE_PATCH_FILE="\${DOCKER_1461_AGE_PATCH_FILE:-\([^}"]*\)}".*/\1/p' "$AGE_PROVISION_DIR/lib.sh")"
+: "${AGE_PATCH_FILE:?docker-1461 SSOT did not define AGE_PATCH_FILE}"
 
 require_inventory
 
@@ -226,10 +232,12 @@ apt-get install -y -qq \
   "postgresql-client-${PG_MAJOR}=${PG_APT_VERSION}" \
   "postgresql-server-dev-${PG_MAJOR}=${PG_APT_VERSION}" \
   "postgresql-${PG_MAJOR}-pgvector=${PGVECTOR_APT_VERSION}" \
-  bison build-essential flex git
+  bison build-essential flex git python3
 
-# 2b. Apache AGE from source at the ONE pinned upstream commit, unmodified.
-#     The checked-out HEAD must equal AGE_SOURCE_COMMIT or the install fails.
+# 2b. Apache AGE from source at the ONE pinned upstream commit plus the ONE
+#     pinned upstream fix (#9965). The checked-out HEAD must equal
+#     AGE_SOURCE_COMMIT and apply_age_patch.py must accept the patch and the
+#     patched tree, or the install fails.
 log "building Apache AGE at ${AGE_SOURCE_COMMIT}"
 rm -rf /usr/local/src/age
 git init -q /usr/local/src/age
@@ -240,8 +248,10 @@ AGE_HEAD="$(git -C /usr/local/src/age rev-parse HEAD)"
 if [ "$AGE_HEAD" != "$AGE_SOURCE_COMMIT" ]; then
   log "Apache AGE source HEAD $AGE_HEAD != pinned $AGE_SOURCE_COMMIT"; exit 1
 fi
+python3 "$PG_STAGE_DIR/age-provision/apply_age_patch.py" --ssot "$PG_STAGE_DIR/age-provision/lib.sh" --src /usr/local/src/age
 make -C /usr/local/src/age -j"$(nproc)" PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
 make -C /usr/local/src/age install PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+python3 "$PG_STAGE_DIR/age-provision/apply_age_patch.py" --ssot "$PG_STAGE_DIR/age-provision/lib.sh" --src /usr/local/src/age --verify
 
 # 3. fresh cluster WITH data checksums (parity with the container initdb),
 #    gated by a sentinel so re-runs never wipe an initialized cluster.
@@ -300,6 +310,11 @@ EOS
   scp_to "$PG_HBA"     "$pg_pub" "$PG_STAGE_DIR/pg_hba.conf"
   scp_to "$SYSTEM_SQL" "$pg_pub" "$PG_STAGE_DIR/system.sql"
   scp_to "$ROLE_SQL"   "$pg_pub" "$PG_STAGE_DIR/role.sql"
+  # The AGE patch applier, the SSOT it reads its pins from and the patch file (#9965).
+  ssh_node "$pg_pub" "mkdir -p $PG_STAGE_DIR/age-provision/patches"
+  scp_to "$AGE_PROVISION_DIR/lib.sh"             "$pg_pub" "$PG_STAGE_DIR/age-provision/lib.sh"
+  scp_to "$AGE_PROVISION_DIR/apply_age_patch.py" "$pg_pub" "$PG_STAGE_DIR/age-provision/apply_age_patch.py"
+  scp_to "$AGE_PROVISION_DIR/patches/$AGE_PATCH_FILE" "$pg_pub" "$PG_STAGE_DIR/age-provision/patches/$AGE_PATCH_FILE"
   ssh_node "$pg_pub" "chmod 0600 $PG_STAGE_DIR/role.sql"
 
   log "[$pg_host] running native PG $EXPECTED_PG_VERSION + AGE $EXPECTED_AGE_VERSION + pgvector $EXPECTED_PGVECTOR_VERSION install (pinned .debs + AGE source build at $AGE_SOURCE_COMMIT)"

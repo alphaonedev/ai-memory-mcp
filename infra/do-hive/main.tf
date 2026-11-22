@@ -250,6 +250,14 @@ resource "digitalocean_vpc" "hive" {
 // lands. What DOES ride templatefile vars is everything knowable at plan
 // time: `node_index`, `node_count`, `fed_identity`, `quorum_writes`.
 
+// #9965: where the AGE patch applier, its SSOT and the pinned patch live.
+locals {
+  age_provision  = "${path.module}/../../deploy/docker-1461/provision"
+  age_ssot       = "${local.age_provision}/lib.sh"
+  age_pin_line   = "^AGE_(SOURCE_COMMIT|PATCH_UPSTREAM_COMMIT|PATCH_FILE|PATCH_SHA256|PATCHED_FILE_SHA256)=\"\\$\\{DOCKER_1461_"
+  age_patch_file = regex("AGE_PATCH_FILE=\"\\$\\{DOCKER_1461_AGE_PATCH_FILE:-([^}\"]+)\\}\"", file(local.age_ssot))[0]
+}
+
 resource "digitalocean_droplet" "memory" {
   count    = var.memory_count
   image    = "ubuntu-24-04-x64"
@@ -271,6 +279,12 @@ resource "digitalocean_droplet" "memory" {
     node_count          = var.memory_count
     fed_identity        = "ai:hive-memory-${count.index + 1}"
     quorum_writes       = var.quorum_writes
+    # #9965: the AGE pin lines of the docker-1461 SSOT (the user_data limit
+    # leaves no room for the whole file), the applier and the patch it pins.
+    age_pins_b64      = base64encode(join("\n", concat([for l in split("\n", file(local.age_ssot)) : l if can(regex(local.age_pin_line, l))], [""])))
+    age_applier_gzb64 = base64gzip(file("${local.age_provision}/apply_age_patch.py"))
+    age_patch_file    = local.age_patch_file
+    age_patch_b64     = filebase64("${local.age_provision}/patches/${local.age_patch_file}")
   })
 
   lifecycle {

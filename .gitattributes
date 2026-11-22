@@ -10,6 +10,10 @@
 *.jsonl text eol=lf
 *.json  text eol=lf
 
+# The pinned AGE patch is hashed byte for byte (AGE_PATCH_SHA256 in
+# deploy/docker-1461/provision/lib.sh, #9965): never convert it.
+deploy/docker-1461/provision/patches/*.patch -text -whitespace
+
 # Shell scripts always LF (POSIX-only consumers).
 *.sh    text eol=lf
 

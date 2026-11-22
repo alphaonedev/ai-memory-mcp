@@ -43,6 +43,8 @@ on:
       - ".github/Dockerfile.ci"
       - ".github/workflows/publish-ci-image.yml"
       - "deploy/docker-1461/provision/lib.sh"
+      - "deploy/docker-1461/provision/apply_age_patch.py"
+      - "deploy/docker-1461/provision/patches/**"
 
 permissions:
   contents: read
@@ -86,6 +88,9 @@ jobs:
             echo "CI_PG_APT_VERSION=${PG_APT_VERSION}"
             echo "CI_AGE_SOURCE_REPO=${AGE_SOURCE_REPO}"
             echo "CI_AGE_SOURCE_COMMIT=${AGE_SOURCE_COMMIT}"
+            echo "CI_AGE_PATCH_UPSTREAM_COMMIT=${AGE_PATCH_UPSTREAM_COMMIT}"
+            echo "CI_AGE_PATCH_FILE=${AGE_PATCH_FILE}"
+            echo "CI_AGE_PATCH_SHA256=${AGE_PATCH_SHA256}"
             echo "CI_PGVECTOR_APT_VERSION=${PGVECTOR_APT_VERSION}"
             echo "CI_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
             echo "CI_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
@@ -109,6 +114,8 @@ jobs:
         with:
           context: .github
           file: .github/Dockerfile.ci
+          build-contexts: |
+            age-provision=deploy/docker-1461/provision
           load: true
           tags: ai-memory-ci:verify
           build-args: |
@@ -155,6 +162,10 @@ jobs:
             echo "| PostgreSQL | $pg_ver | ${CI_EXPECTED_PG_VERSION} |"
             echo "| Apache AGE | $age_ver | ${CI_EXPECTED_AGE_VERSION} |"
             echo "| pgvector | $vec_ver | ${CI_EXPECTED_PGVECTOR_VERSION} |"
+            echo ""
+            echo "Base image, pinned by digest (SSOT PG_BASE_IMAGE): \`${CI_PG_BASE_IMAGE}\`"
+            echo ""
+            echo "Apache AGE source: \`${CI_AGE_SOURCE_COMMIT}\` plus upstream fix commit \`${CI_AGE_PATCH_UPSTREAM_COMMIT}\` (\`${CI_AGE_PATCH_FILE}\`, sha256 \`${CI_AGE_PATCH_SHA256}\`)"
           } >> "$GITHUB_STEP_SUMMARY"
           case "$pg_ver" in
             "$CI_EXPECTED_PG_VERSION") : ;;
@@ -165,7 +176,7 @@ jobs:
             *) echo "::error::Apache AGE $age_ver != certified $CI_EXPECTED_AGE_VERSION (SSOT) — refusing to publish"; exit 1 ;;
           esac
           case "$vec_ver" in
-            ${CI_EXPECTED_PGVECTOR_VERSION}*) : ;;
+            "$CI_EXPECTED_PGVECTOR_VERSION") : ;;
             *) echo "::error::pgvector $vec_ver != certified ${CI_EXPECTED_PGVECTOR_VERSION} (SSOT) — refusing to publish"; exit 1 ;;
           esac
           # The AGE source commit is the fourth pin: the build already fails
@@ -184,6 +195,8 @@ jobs:
         with:
           context: .github
           file: .github/Dockerfile.ci
+          build-contexts: |
+            age-provision=deploy/docker-1461/provision
           push: true
           tags: |
             ${{ env.IMAGE_REPO }}:${{ env.CI_IMAGE_TAG }}
