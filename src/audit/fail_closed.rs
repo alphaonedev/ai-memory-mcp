@@ -248,28 +248,42 @@ fn probe_trail() -> bool {
 /// come due after [`PROBE_INTERVAL_MS`] of wall clock, and a sink-less child
 /// then cleared the latch. A test that needs an immediate retry calls
 /// [`reset_probe_clock_for_test`]. Callers hold `audit::sink_test_lock` and
-/// keep the returned guard alive for the span of the latch: its `Drop` calls
-/// [`force_on_for_test`]`(false)`, so a panic cannot leave a never-due latch
-/// behind for the rest of the process.
+/// keep the returned guard alive for the span of the latch: its `Drop` puts
+/// back the forced mode, the latch and the retry clock the gate had when the
+/// guard was taken, so a panic cannot leave a never-due latch behind for the
+/// rest of the process and an inner guard never un-latches an outer one
+/// (#9840). Guards drop innermost first, which scope order guarantees.
 #[cfg(test)]
 pub(crate) fn latch_for_test() -> LatchGuard {
     require_isolated_child("latch_for_test");
+    let prior = LatchGuard {
+        forced: FORCE_ON_FOR_TEST.load(Ordering::SeqCst),
+        latched: LATCHED.load(Ordering::SeqCst),
+        probe_ms: LAST_PROBE_MS.load(Ordering::SeqCst),
+    };
     FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
     LATCHED.store(true, Ordering::SeqCst);
     LAST_PROBE_MS.store(u64::MAX, Ordering::SeqCst);
-    LatchGuard(())
+    prior
 }
 
-/// Test-only RAII guard from [`latch_for_test`]: dropping it restores the mode
-/// to the environment and clears the latch and retry clock (idempotent).
+/// Test-only RAII guard from [`latch_for_test`]. It holds the gate state from
+/// before the guard was taken (forced mode, latched flag, retry clock) and
+/// dropping it puts exactly that back, at any nesting depth (#9840).
 #[cfg(test)]
-#[must_use = "dropping the guard immediately un-latches the audit trail"]
-pub(crate) struct LatchGuard(());
+#[must_use = "dropping the guard immediately restores the prior audit trail state"]
+pub(crate) struct LatchGuard {
+    forced: bool,
+    latched: bool,
+    probe_ms: u64,
+}
 
 #[cfg(test)]
 impl Drop for LatchGuard {
     fn drop(&mut self) {
-        force_on_for_test(false);
+        FORCE_ON_FOR_TEST.store(self.forced, Ordering::SeqCst);
+        LATCHED.store(self.latched, Ordering::SeqCst);
+        LAST_PROBE_MS.store(self.probe_ms, Ordering::SeqCst);
     }
 }
 
@@ -278,6 +292,20 @@ impl Drop for LatchGuard {
 pub(crate) fn reset_probe_clock_for_test() {
     require_isolated_child("reset_probe_clock_for_test");
     LAST_PROBE_MS.store(0, Ordering::SeqCst);
+}
+
+/// Test-only read of the forced-mode flag (a read needs no isolation; the
+/// latch-isolation ratchet keeps the static itself out of `mod tests`, #9840).
+#[cfg(test)]
+fn forced_for_test() -> bool {
+    FORCE_ON_FOR_TEST.load(Ordering::SeqCst)
+}
+
+/// Test-only read of the retry clock, for the same reason as
+/// [`forced_for_test`] (#9840).
+#[cfg(test)]
+fn probe_clock_for_test() -> u64 {
+    LAST_PROBE_MS.load(Ordering::SeqCst)
 }
 
 /// Test-only: reset the process-global latch state.
@@ -425,5 +453,84 @@ mod tests {
         assert!(gate_with(false, 1, || panic!("no retry when the mode is off")).is_ok());
         assert!(!audit_trail_latched());
         reset_for_test();
+    }
+
+    /// #9840 — the whole gate state, asserted field by field with its label.
+    /// A forced gate must also report the mode on; the unforced mode follows
+    /// the environment, which these tests never touch.
+    fn assert_gate_state_9840(what: &str, forced: bool, latched: bool, probe_ms: u64) {
+        assert_eq!(forced_for_test(), forced, "{what}: forced mode");
+        assert_eq!(audit_trail_latched(), latched, "{what}: latched flag");
+        assert_eq!(probe_clock_for_test(), probe_ms, "{what}: probe clock");
+        if forced {
+            assert!(
+                require_audit_trail_enabled(),
+                "{what}: mode on while forced"
+            );
+        }
+    }
+
+    /// #9840 — dropping the guard returns the gate to the exact state it had
+    /// when the guard was taken. Pins the `Drop` body: replacing it with
+    /// `reset_for_test()` (forced mode left on) or a no-op (latch left on)
+    /// turns this red.
+    #[test]
+    fn dropping_a_latch_guard_restores_the_gate_9840() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "audit::fail_closed::tests::dropping_a_latch_guard_restores_the_gate_9840",
+        ) {
+            return;
+        }
+        let _g = lock();
+        force_on_for_test(false);
+        assert_gate_state_9840("before", false, false, 0);
+        let guard = latch_for_test();
+        assert_gate_state_9840("held", true, true, u64::MAX);
+        drop(guard);
+        assert_gate_state_9840("after drop", false, false, 0);
+        force_on_for_test(false);
+    }
+
+    /// #9840 — guards nest: an inner drop leaves the outer latch in place, at
+    /// depths 2 and 3, and a guard taken over a forced, unlatched gate gives
+    /// that state back. Red before the fix: the inner drop un-latched the
+    /// outer guard.
+    #[test]
+    fn nested_latch_guards_restore_the_prior_state_at_each_depth_9840() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "audit::fail_closed::tests::nested_latch_guards_restore_the_prior_state_at_each_depth_9840",
+        ) {
+            return;
+        }
+        let _g = lock();
+        force_on_for_test(false);
+        let outer = latch_for_test();
+        let middle = latch_for_test();
+        let inner = latch_for_test();
+        assert_gate_state_9840("depth 3 held", true, true, u64::MAX);
+        drop(inner);
+        assert_gate_state_9840("inner dropped", true, true, u64::MAX);
+        drop(middle);
+        assert_gate_state_9840("middle dropped", true, true, u64::MAX);
+        drop(outer);
+        assert_gate_state_9840("outer dropped", false, false, 0);
+
+        // Depth 2 with the retry clock rewound under the outer guard: the
+        // inner guard hands that clock back too.
+        let outer = latch_for_test();
+        reset_probe_clock_for_test();
+        let inner = latch_for_test();
+        assert_gate_state_9840("depth 2 held", true, true, u64::MAX);
+        drop(inner);
+        assert_gate_state_9840("depth 2 inner dropped", true, true, 0);
+        drop(outer);
+        assert_gate_state_9840("depth 2 outer dropped", false, false, 0);
+
+        // A guard taken over a forced, unlatched gate gives exactly that back.
+        force_on_for_test(true);
+        let guard = latch_for_test();
+        drop(guard);
+        assert_gate_state_9840("forced prior", true, false, 0);
+        force_on_for_test(false);
     }
 }
