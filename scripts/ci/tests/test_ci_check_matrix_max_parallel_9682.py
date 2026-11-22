@@ -55,7 +55,6 @@ EXPECTED_JOB_NAMES = {
     "build-script-vetting": "Build-script custom-build ledger gate (#2635)",
     "actionlint": "actionlint (workflow-injection guard)",
     "msrv": "MSRV (Rust 1.98)",
-    "draft-admission": "Draft admission re-check",
     "check": "Check (${{ matrix.leg }})",
     "postgres-feature": "Postgres feature gate",
     "mobile-cross-compile": "Cross-compile (${{ matrix.target }})",
@@ -287,9 +286,8 @@ class RequiredContexts(unittest.TestCase):
 
     def test_check_still_needs_only_classify(self):
         needs = [ln for ln in active(job_of(CHECK_JOB)) if re.match(r"^    needs:", ln)]
-        # #9821: draft-admission is the one added edge (the fresh draft read behind a skipped leg).
-        self.assertEqual([ln.strip() for ln in needs], ["needs: [classify, draft-admission]"],
-                         "job check: `needs:` changed from classify and draft-admission")
+        self.assertEqual([ln.strip() for ln in needs], ["needs: classify"],
+                         "job check: `needs:` changed from classify only")
 
 
 class MaxParallel(unittest.TestCase):

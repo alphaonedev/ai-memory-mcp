@@ -97,7 +97,6 @@ JOBS: dict[str, dict[str, str]] = {
         "build-script-vetting": "Build-script custom-build ledger gate (#2635)",
         "actionlint": "actionlint (workflow-injection guard)",
         "msrv": "MSRV (Rust 1.98)",
-        "draft-admission": "Draft admission re-check",
         "check": "Check (${{ matrix.leg }})",
         "postgres-feature": "Postgres feature gate",
         "mobile-cross-compile": "Cross-compile (${{ matrix.target }})",
@@ -140,7 +139,7 @@ JOBS: dict[str, dict[str, str]] = {
 
 # ci-gate folds these jobs (the others are required contexts by their own names); a step moved
 # into a job outside this list and outside the required contexts stops failing a required context.
-CI_GATE_NEEDS = ("select", "classify", "build-script-vetting", "draft-admission", "check", "mobile-cross-compile")
+CI_GATE_NEEDS = ("select", "classify", "build-script-vetting", "check", "mobile-cross-compile")
 
 # Job -> ordered labels of its test and gate steps (run text matching TEST_RUN_RE). A plain YAML
 # step name ends at ` #`, so some labels below stop mid-parenthesis exactly as GitHub shows them.

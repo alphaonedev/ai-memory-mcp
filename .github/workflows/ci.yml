@@ -1073,30 +1073,6 @@ jobs:
         # check on 1.99.1 and stop exercising the declared floor.
         run: cargo +1.98.0 check --all-targets
 
-  # #9821 (I5) - the fresh read behind a draft skip. Runs on every pull_request,
-  # checks out nothing (no pull-request code ever shares its token), never fails
-  # (an unreadable PR leaves the verdict empty and the skipped leg fails closed),
-  # and blocks nothing itself (ledger: required-contexts-not-required.txt).
-  draft-admission:
-    name: Draft admission re-check
-    # RUNNER PLACEMENT - GitHub-hosted: one gh call and one jq filter.
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      verdict: ${{ steps.recheck.outputs.verdict }}
-    steps:
-      - id: recheck
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          verdict="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq 'if .draft == true and (.labels | type) == "array" and ([.labels[].name] | index("ci-fix") == null and index("run-self-hosted") == null) then "skip" else "run" end' || true)"
-          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
-
   # Cross-platform correctness matrix. These job names are required by
   # branch protection on main/develop/release/**, so the jobs MUST run
   # and complete SUCCESS even on docs-only PRs. Per-step `if:` makes the
@@ -1125,7 +1101,7 @@ jobs:
   # `services: postgres:` block and no per-PR pg image build.
   check:
     name: Check (${{ matrix.leg }})
-    needs: [classify, draft-admission]
+    needs: classify
     # RUNNER PLACEMENT — PER-LEG (rule at the head of this file). Only the leg
     # that needs the native pg tier is self-hosted on Linux; the Linux sqlite
     # leg is GitHub-hosted. `runs-on` therefore cannot be a fixed shape, so it
@@ -1133,12 +1109,13 @@ jobs:
     # `fromJSON` turns into the list `runs-on` wants. A one-element
     # `["ubuntu-latest"]` is the hosted form; `["self-hosted","linux-fed"]` is
     # the label-set form. macOS is unchanged (operator directive is Linux-only).
-    # #9821 (I5): a draft pull request without `ci-fix` or `run-self-hosted` does not
-    # occupy a self-hosted runner. The skipped leg flips to a hosted runner so it never
-    # waits in the self-hosted queue, then only reports (notice + draft re-check). The
+    # #9821 (I5): a draft pull request without the `ci-fix` label does not occupy a
+    # self-hosted runner. The skipped leg flips to a hosted runner so it never waits
+    # in the self-hosted queue, and its one step that runs fails (`Draft skip (#9821)`):
+    # a leg that did not run is red, never green under its required name. The
     # condition is the same text as LEG_SKIP below (a test pins both). An unknown draft
     # state is not `== true`, so the leg runs (fails open to run, never to skip).
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.draft == true && contains(matrix.runner, 'self-hosted') && !contains(github.event.pull_request.labels.*.name, 'ci-fix') && !contains(github.event.pull_request.labels.*.name, 'run-self-hosted') && '["ubuntu-latest"]' || matrix.runner) }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.draft == true && contains(matrix.runner, 'self-hosted') && !contains(github.event.pull_request.labels.*.name, 'ci-fix') && '["ubuntu-latest"]' || matrix.runner) }}
     # #1487 — bound the job so a wedged test (e.g. a stalled HF-Hub model
     # download on the semantic-tier CLI recall path) fails fast instead of
     # pinning a runner for hours.
@@ -1197,8 +1174,9 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     env:
       # #9821 (I5): 'true' only for a skipped self-hosted leg (see runs-on). Every
-      # work step guards on it; a job-level `if:` is forbidden here (rule (b1)).
-      LEG_SKIP: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true && contains(matrix.runner, 'self-hosted') && !contains(github.event.pull_request.labels.*.name, 'ci-fix') && !contains(github.event.pull_request.labels.*.name, 'run-self-hosted') && 'true' || 'false' }}
+      # work step guards on it and the `Draft skip (#9821)` step fails the leg; a
+      # job-level `if:` is forbidden here (rule (b1)).
+      LEG_SKIP: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true && contains(matrix.runner, 'self-hosted') && !contains(github.event.pull_request.labels.*.name, 'ci-fix') && 'true' || 'false' }}
       # Debuginfo budget for this job — the heaviest compile in CI (~600
       # integration test binaries per leg).
       #
@@ -1404,24 +1382,22 @@ jobs:
       # contexts and rule (b1) of scripts/check-required-contexts.sh forbids a
       # job-level `if:` here (#2494 wedge class).
       - name: Fork-PR refusal (self-hosted legs never run fork code)
-        if: needs.classify.outputs.cargo_skip != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted') && env.LEG_SKIP != 'true'
+        if: needs.classify.outputs.cargo_skip != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
         run: |
           echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.leg }})."
           exit 1
-      # #9821 - a skipped leg (draft PR, no ci-fix or run-self-hosted) fails unless
-      # the `draft-admission` job just re-read the PR and found it still a draft
-      # with neither label. The event payload is frozen at the first run, so a
-      # re-run after ready_for_review or a label would otherwise skip for good.
-      # No token here: the job holds it, before and apart from any pull-request
-      # code (scripts/ci/taint_boundary.py allows no new secret in this job). An
-      # empty or other verdict (API error, unknown state) fails the leg closed.
-      - name: Draft admission skip (#9821)
+      # #9821 (I5, PR 9838 class A) - a skipped leg (draft PR without the ci-fix
+      # label) did not run its real work, so it ends RED under its required name,
+      # never green: red is fail closed in every tool that reads a conclusion. It
+      # runs on a hosted runner (see runs-on) and holds no token. A draft fork PR
+      # fails on the fork refusal above first, as at the base. The event payload of
+      # a run is frozen, so a re-run of a draft-era run stays red; marking the PR
+      # ready starts a new run (ready_for_review) that runs the leg.
+      - name: Draft skip (#9821)
         if: needs.classify.outputs.cargo_skip != 'true' && env.LEG_SKIP == 'true'
-        env:
-          VERDICT: ${{ needs.draft-admission.outputs.verdict }}
         run: |
-          echo "::notice::draft PR without ci-fix or run-self-hosted - ${{ matrix.leg }} is not run on a self-hosted runner"
-          test "${VERDICT}" = skip
+          echo "::error::draft PR without the ci-fix label, self-hosted leg not run, mark ready or add the label"
+          exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -1437,11 +1413,6 @@ jobs:
           CARGO_SKIP_REASON: ${{ needs.classify.outputs.cargo_skip_reason }}
         run: echo "::notice::cargo_skip - ${{ matrix.leg }} matrix leg is a no-op ($CARGO_SKIP_REASON)"
 
-      # #9821 (I5) - a skipped self-hosted leg still reports through this same job
-      # (same name, success), so `ci-gate` and the required context are unchanged.
-      # The step re-reads the PR as it is now and FAILS the leg when the PR is no
-      # longer a draft or now carries a label (a stale re-run), so a skip can never
-      # turn a real red into green. STEP-level, never job-level (rule (b1), #2494).
       # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
       # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,
       # outside the checkout (checkout cleaning cannot wipe it), under the runner
@@ -3324,7 +3295,6 @@ jobs:
       - select
       - classify
       - build-script-vetting
-      - draft-admission
       - check
       - mobile-cross-compile
     # RUNNER PLACEMENT - GitHub-hosted: it only reads the needs context.

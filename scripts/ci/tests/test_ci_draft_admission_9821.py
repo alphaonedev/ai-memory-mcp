@@ -477,7 +477,7 @@ class StepPins(unittest.TestCase):
     def test_check_needs_only_classify(self):
         # security MEDIUM-1: no needs edge to a job that is not required.
         needs = [l.strip() for l in check_block() if l.startswith("    needs:")]
-        self.assertEqual(needs, ["needs: [classify]"])
+        self.assertEqual(needs, ["needs: classify"])  # the base form, byte for byte
         self.assertNotIn(REMOVED_JOB, job_names())
         gate = job_block("ci-gate")
         self.assertFalse([l for l in gate if l.strip() == "- %s" % REMOVED_JOB])
