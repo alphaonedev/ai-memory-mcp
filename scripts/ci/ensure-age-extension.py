@@ -839,6 +839,34 @@ def certified_pins(path=None):
     return pins
 
 
+# A control character (a newline above all) in the path would split the refusal line and the log (#9967).
+PG_CONFIG_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def require_pg_config_path(pg_config):
+    """Refuse a pg_config that is not an absolute path to an existing executable regular file (#9967).
+
+    A relative path or a bare name would be resolved against the working directory or PATH, so the heal
+    could run another tree's pg_config. A symlink is accepted when it resolves to an executable regular
+    file (Homebrew's opt/ prefix is a symlink tree); the checks follow it, and the --version check that
+    follows runs the same path. Every refusal is exit 2 (EXIT_BAD_INPUT) with its own message.
+    """
+    if PG_CONFIG_CONTROL_CHARS.search(pg_config):
+        raise HelperError("pg_config path holds a control character", EXIT_BAD_INPUT)
+    if not os.path.isabs(pg_config):
+        raise HelperError(f"pg_config {pg_config} is not an absolute path", EXIT_BAD_INPUT)
+    try:
+        st = os.stat(pg_config)
+    except FileNotFoundError:
+        raise HelperError(f"pg_config {pg_config} does not exist", EXIT_BAD_INPUT)
+    except OSError as exc:
+        raise HelperError(f"pg_config {pg_config} cannot be examined ({type(exc).__name__})", EXIT_BAD_INPUT)
+    if not stat.S_ISREG(st.st_mode):
+        raise HelperError(f"pg_config {pg_config} is not a regular file", EXIT_BAD_INPUT)
+    if not os.access(pg_config, os.X_OK):
+        raise HelperError(f"pg_config {pg_config} is not executable", EXIT_BAD_INPUT)
+
+
 def require_certified_pg(pg_config, pins):
     """Refuse a pg_config that is not the certified PostgreSQL (#9927): a heal never writes into another tree."""
     try:
@@ -855,7 +883,8 @@ def require_certified_pg(pg_config, pins):
 
 
 def resolve_args(args, pins):
-    """Fill the SSOT- and tier-derived defaults after the pg_config check (#9927)."""
+    """Fill the SSOT- and tier-derived defaults after the pg_config checks (#9927, #9967)."""
+    require_pg_config_path(args.pg_config)
     require_certified_pg(args.pg_config, pins)
     if args.psql is None:
         args.psql = str(pg_config_value(args.pg_config, "--bindir") / "psql")
