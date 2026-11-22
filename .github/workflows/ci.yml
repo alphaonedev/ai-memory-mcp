@@ -703,15 +703,14 @@ jobs:
           docs_only=false
           cargo_skip=false
           cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
-          # #9263: cap on the reason length (rejected, never cut) and the why of a rejection.
-          reason_max=300
+          # #9263: the why of a rejection (one fixed token from answer_shape.py).
           reason_why=""
           trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
           trust_impact="$trust_dir/scripts/ci/impact"
           trust_ref=$(git merge-base HEAD "$cls_base" 2>/dev/null || echo "$cls_base")
           mkdir -p "$trust_impact"
           trusted=true
-          for trust_file in __init__.py common.py cargo_skip.py rules.json; do
+          for trust_file in __init__.py common.py cargo_skip.py answer_shape.py rules.json; do
             git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
           done
           skip_out="${RUNNER_TEMP:-.}/cargo-skip.out"
@@ -721,42 +720,36 @@ jobs:
           elif echo "$changed" | grep -E '^(\.github/|scripts/ci/)' | grep -qvE '^scripts/ci/tests/'; then
             cargo_skip_reason="classifier-or-workflow-edited-fail-closed cargo_skip-rules"
           elif echo "$changed" | python3 -I "$trust_impact/cargo_skip.py" --stdin --rules "$trust_impact/rules.json" --event-name "$EVENT_NAME" --base-ref "$PR_BASE_REF" > "$skip_out"; then
-            # #9263: the answer is exactly three lines, one per key, and nothing
-            # else (a fourth or empty line, a second or missing key, a line
-            # break inside a value, no answer) or it is rejected.
-            answer_lines=$(grep -c '' "$skip_out" || true)
-            if [ "$answer_lines" != "3" ] \
-              || [ "$(grep -c '^docs_only=' "$skip_out" || true)" != "1" ] \
-              || [ "$(grep -c '^cargo_skip=' "$skip_out" || true)" != "1" ] \
-              || [ "$(grep -c '^cargo_skip_reason=' "$skip_out" || true)" != "1" ]; then
-              reason_why="extra-line"
-            else
-              # Any byte that is not printable ASCII (a tab, a NUL, a carriage
-              # return, DEL, ESC, any byte above 0x7e) anywhere in the answer is
-              # a rejection. The file is read directly because a shell variable
-              # drops NUL; nothing is parsed before it passes.
-              nonprint=$(tr -d '[:print:]\n' < "$skip_out" | wc -c)
-              if [ "$nonprint" -ne 0 ]; then
-                reason_why="not-printable-ascii"
+            # #9263 / #9815: ONE byte test in Python judges the answer and names
+            # the reason (answer_shape.py, loaded from the merge-base tree with
+            # the decider). No grep, tr, sed or wc computes a reason here: their
+            # byte handling differs between BSD (macOS) and GNU (hosted Linux)
+            # userland. Exit 0 prints the three normalised lines, exit 1 prints
+            # one fixed token, any other exit is a checker-error RUN.
+            shape_rc=0
+            shape_out=$(python3 -I "$trust_impact/cargo_skip.py" --judge-answer "$skip_out") || shape_rc=$?
+            if [ "$shape_rc" = "0" ]; then
+              shape_docs=""; shape_skip=""; shape_reason=""
+              { IFS= read -r shape_docs || :; IFS= read -r shape_skip || :; IFS= read -r shape_reason || :; } <<< "$shape_out"
+              # An accept must hold the three keys in order and a non-empty reason; a checker
+              # that exits 0 with anything else is a checker-error RUN, never a skip.
+              if [ "${shape_docs#docs_only=}" != "$shape_docs" ] \
+                && [ "${shape_skip#cargo_skip=}" != "$shape_skip" ] \
+                && [ -n "${shape_reason#cargo_skip_reason=}" ] \
+                && [ "${shape_reason#cargo_skip_reason=}" != "$shape_reason" ]; then
+                docs_only=${shape_docs#docs_only=}
+                cargo_skip=${shape_skip#cargo_skip=}
+                cargo_skip_reason=${shape_reason#cargo_skip_reason=}
               else
-                docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
-                cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
-                cargo_skip_reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out")
+                reason_why="checker-error"
               fi
-            fi
-          fi
-          # #9263: a success needs a reason of at most reason_max printable
-          # characters with one non-blank one; otherwise a RUN, with one line.
-          if [ -z "$reason_why" ]; then
-            if [ -z "$cargo_skip_reason" ]; then
-              reason_why="empty"
-            elif [ "${#cargo_skip_reason}" -gt "$reason_max" ]; then
-              reason_why="over-cap-$reason_max"
-            else
-              case "$cargo_skip_reason" in
-                *[![:space:]]*) ;;
-                *) reason_why="blank-only" ;;
+            elif [ "$shape_rc" = "1" ]; then
+              case "$shape_out" in
+                extra-line|not-printable-ascii|empty|over-cap-300|blank-only) reason_why="$shape_out" ;;
+                *) reason_why="checker-error" ;;
               esac
+            else
+              reason_why="checker-error"
             fi
           fi
           if [ -n "$reason_why" ]; then

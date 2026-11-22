@@ -440,7 +440,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="github.event_name; a push always runs the full pipeline")
     parser.add_argument("--base-ref", default="",
                         help="github.base_ref; release/*, main and develop run in full")
+    parser.add_argument("--judge-answer", metavar="FILE", default=None,
+                        help="judge the three-line answer FILE byte-wise with answer_shape "
+                             "(exit 0 accept and print it, 1 reject and print one reason "
+                             "token, 2 error) and do nothing else (#9263)")
     args = parser.parse_args(argv)
+    if args.judge_answer is not None:
+        # Imported here, not at the top: the decider itself never depends on it. The
+        # workflow keeps this ONE trusted-dir script as the only interpreter operand of
+        # the classify step (the taint boundary pins that operand, #9537).
+        from impact import answer_shape  # noqa: E402
+        return answer_shape.main(["answer_shape", args.judge_answer])
     try:
         section = load_section(Path(args.rules))
         truncated = False

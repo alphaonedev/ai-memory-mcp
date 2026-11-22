@@ -1086,8 +1086,18 @@ def run_cls_with_stub(stub_lines):
         for name in ("__init__.py", "common.py"):
             (impact / name).write_text("")
         (impact / "rules.json").write_text("{}\n")
+        # The step judges the answer with the trusted answer_shape.py (#9263), reached through
+        # the decider script's --judge-answer flag; the stub hands that flag to the real file.
+        shutil.copy(str(REPO / "scripts" / "ci" / "impact" / "answer_shape.py"),
+                    str(impact / "answer_shape.py"))
         (impact / "cargo_skip.py").write_text(
-            "import sys\nsys.stdin.read()\nsys.stdout.write(%r)\n" % "".join(l + "\n" for l in stub_lines))
+            "import sys\n"
+            "from pathlib import Path\n"
+            "if '--judge-answer' in sys.argv:\n"
+            "    sys.path.append(str(Path(__file__).resolve().parents[1]))\n"
+            "    from impact import answer_shape\n"
+            "    sys.exit(answer_shape.main(['answer_shape', sys.argv[-1]]))\n"
+            "sys.stdin.read()\nsys.stdout.write(%r)\n" % "".join(l + "\n" for l in stub_lines))
         (repo / "docs").mkdir()
         (repo / "docs" / "a.md").write_text("a\n")
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}

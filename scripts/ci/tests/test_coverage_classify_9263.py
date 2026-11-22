@@ -46,6 +46,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NamedTuple, Optional
 
 REPO = Path(__file__).resolve().parents[3]
@@ -58,6 +59,18 @@ CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 IMPACT_DIR = REPO / "scripts" / "ci" / "impact"
 SCRATCH = REPO / ".local-runs"
 SCRIPT = IMPACT_DIR / "cargo_skip.py"
+# The one byte test both classify steps call (#9815): answer_shape.py, reached through the
+# trusted decider script so the step keeps one interpreter operand (taint boundary #9537).
+SHAPE_FLAG = "--judge-answer"
+# A planted trusted decider prints its answer; given the judge flag it behaves as the real
+# decider does and hands the file to the trusted answer_shape.py next to it.
+PLANT_PRELUDE = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "if '%s' in sys.argv:\n"
+    "    sys.path.append(str(Path(__file__).resolve().parents[1]))\n"
+    "    from impact import answer_shape\n"
+    "    sys.exit(answer_shape.main(['answer_shape', sys.argv[-1]]))\n" % SHAPE_FLAG)
 TIMEOUT_S = 120
 # Hand-written: a rules.json version bump must come with a reviewed table update.
 V = "cargo_skip-rules-v1"
@@ -89,6 +102,8 @@ MAX_PATHS = 5000
 LIST_READING_ROWS = 2
 LIST_PASSES = 3
 FAIL_CLOSED = "classifier-error-fail-closed"
+# The reason a step prints when the judge call itself is broken (exit 2, junk, unknown token).
+JUDGE_BROKEN_WHY = "checker-error"
 # Hand-written copy of the cap on the classify reason (reason_max in coverage.yml).
 REASON_MAX = 300
 CI_FAIL_CLOSED = "classifier-error-fail-closed cargo_skip-rules"
@@ -717,6 +732,39 @@ class DeciderCli(unittest.TestCase):
         self.assertEqual(sorted(got), ["docs/a.md", "src/a.rs"])
 
 
+def judge_call_deciders():
+    """Planted deciders that answer in the new shape but whose judge call is broken.
+
+    Rows (e) to (g) break the call itself (exit 2, junk on exit 0, an unknown token on
+    exit 1). Rows (h) to (k) exit 0 with exactly one wrong line out of three, so each key
+    and the reason check of a step is the only thing that refuses the answer.
+    """
+    answer = (b"print('docs_only=true')\nprint('cargo_skip=true')\n"
+              b"print('cargo_skip_reason=old-skip')\n")
+    head = b"import sys\nif '--judge-answer' in sys.argv:\n"
+
+    def says(docs, skip, reason):
+        lines = "".join("    print(%r)\n" % text for text in (docs, skip, reason))
+        return head + lines.encode() + b"    sys.exit(0)\n" + answer
+
+    rows = [
+        ("(e) valid answer, judge exits 2", head + b"    sys.exit(2)\n" + answer),
+        ("(f) valid answer, judge exits 0 with junk",
+         head + b"    print('hello')\n    sys.exit(0)\n" + answer),
+        ("(g) valid answer, judge exits 1 with an unknown token",
+         head + b"    print('bogus-token')\n    sys.exit(1)\n" + answer),
+        ("(h) judge exits 0, docs key wrong",
+         says("docs_onlyX=true", "cargo_skip=true", "cargo_skip_reason=old-skip")),
+        ("(i) judge exits 0, skip key wrong",
+         says("docs_only=true", "cargo_skipX=true", "cargo_skip_reason=old-skip")),
+        ("(j) judge exits 0, reason key wrong",
+         says("docs_only=true", "cargo_skip=true", "cargo_skip_reasonX=old-skip")),
+        ("(k) judge exits 0, reason empty",
+         says("docs_only=true", "cargo_skip=true", "cargo_skip_reason=")),
+    ]
+    return [(label, {"cargo_skip.py": data}) for label, data in rows]
+
+
 class ClsHarness(unittest.TestCase):
     """The coverage.yml cls block, extracted and run against git fixtures."""
 
@@ -727,7 +775,8 @@ class ClsHarness(unittest.TestCase):
         "coverage/README.md": "# c\n",
         "scripts/ci/tests/t.py": "# t\n",
     }
-    IMPACT_FILES = ("__init__.py", "common.py", "cargo_skip.py", "rules.json")
+    IMPACT_FILES = ("__init__.py", "common.py", "cargo_skip.py", "answer_shape.py",
+                    "rules.json")
 
     def setUp(self):
         self.work = scratch_dir()
@@ -766,6 +815,34 @@ class ClsHarness(unittest.TestCase):
             (values.get("docs_only"), values.get("cargo_skip"), values.get("cargo_skip_reason")),
             (docs_only, skip, reason), label)
 
+    def planted_files(self, files, label, rel_path):
+        """Commit these files as the trusted impact tree, then edit `rel_path` in the PR."""
+        target = self.repo / "scripts" / "ci" / "impact"
+        for name, data in files.items():
+            (target / name).write_bytes(data)
+        run_git(self.repo, "add", "-A")
+        run_git(self.repo, "commit", "-q", "--allow-empty", "-m", "trusted impact tree " + label)
+        base = run_git(self.repo, "rev-parse", "HEAD")
+        self.write(rel_path, "# changed %s\n" % label)
+        self.commit()
+        values, _ = self.run_cls(base)
+        return values
+
+    def check_judge_rows(self):
+        """Every broken judge call ends as a RUN with this step's fail-closed reason."""
+        self.commit_base()
+        diffs = [("docs only", "docs/a.md"), ("tests only", "scripts/ci/tests/x.py")]
+        for dlabel, files in judge_call_deciders():
+            for flabel, rel in diffs:
+                label = "%s | %s" % (dlabel, flabel)
+                with self.subTest(label):
+                    values = self.planted_files(files, label, rel)
+                    self.expect(label, values, "false", "false", self.FAIL_REASON)
+                    notices = [ln for ln in self.last_stdout.decode("utf-8", "replace").splitlines()
+                               if ln.startswith("::notice::")]
+                    rejected = SimpleNamespace(passed=None, why=JUDGE_BROKEN_WHY)
+                    self.assertEqual(notices, self.expected_notices(rejected), label)
+
     # Set by each step class: the fail-closed reason and the notice lines of a row.
     FAIL_REASON = FAIL_CLOSED
 
@@ -787,7 +864,7 @@ class ClsHarness(unittest.TestCase):
     def plant(self, row):
         """Commit a trusted decider that prints this exact answer; return the base to run from."""
         planted = self.repo / "scripts" / "ci" / "impact" / "cargo_skip.py"
-        planted.write_text("import sys\nsys.stdout.buffer.write(%r)\n" % row.answer)
+        planted.write_text(PLANT_PRELUDE + "sys.stdout.buffer.write(%r)\n" % row.answer)
         self.commit("trusted decider " + row.label)
         base = run_git(self.repo, "rev-parse", "HEAD")
         self.write("docs/a.md", "# changed %s\n" % row.label)
@@ -1020,19 +1097,6 @@ class CoverageClassifyRuns(ClsHarness):
         """
         self.check_reason_rows()
 
-    def planted_files(self, files, label, rel_path):
-        """Commit these files as the trusted impact tree, then edit `rel_path` in the PR."""
-        target = self.repo / "scripts" / "ci" / "impact"
-        for name, data in files.items():
-            (target / name).write_bytes(data)
-        run_git(self.repo, "add", "-A")
-        run_git(self.repo, "commit", "-q", "--allow-empty", "-m", "trusted impact tree " + label)
-        base = run_git(self.repo, "rev-parse", "HEAD")
-        self.write(rel_path, "# changed %s\n" % label)
-        self.commit()
-        values, _ = self.run_cls(base)
-        return values
-
     def test_a_decider_that_does_not_answer_in_the_new_shape_runs(self):
         """A PR whose merge-base predates #9263 runs the old decider with `--stdin0`.
 
@@ -1074,6 +1138,10 @@ class CoverageClassifyRuns(ClsHarness):
                 with self.subTest(label):
                     values = self.planted_files(files, label, rel)
                     self.expect(label, values, "false", "false", FAIL_CLOSED)
+
+    def test_a_broken_judge_call_runs_in_coverage_yml(self):
+        """Judge exits 2, prints junk, prints an unknown token or accepts a wrong line: a RUN."""
+        self.check_judge_rows()
 
     @staticmethod
     def frozen_files(directory=FROZEN_DIR, pins=None):
@@ -1371,6 +1439,147 @@ class CiClassifyReasonRuns(ClsHarness):
         The whole step output is checked: no line of any prefix carries the answer.
         """
         self.check_reason_rows()
+
+    def test_a_broken_judge_call_runs_in_ci_yml(self):
+        """Judge exits 2, prints junk, prints an unknown token or accepts a wrong line: a RUN."""
+        self.check_judge_rows()
+
+
+# The byte test answer_shape.py, called as the steps call it. Hand-written columns:
+# (label, answer bytes, exit code, stdout). Exit 0 prints the three normalised lines,
+# exit 1 prints the one fixed reason token.
+SHAPE_ACCEPT, SHAPE_REJECT, SHAPE_ERROR = 0, 1, 2
+THREE_OK = b"docs_only=false\ncargo_skip=true\ncargo_skip_reason=ok\n"
+HUGE_ANSWER_BYTES = 5000000
+BIG_ANSWER_CEILING_S = 5.0
+HUGE_ANSWER_CEILING_S = 10.0
+
+
+def shape_head(reason: bytes) -> bytes:
+    return b"docs_only=false\ncargo_skip=true\ncargo_skip_reason=" + reason
+
+
+ANSWER_FORMS = [
+    ("a fourth line", THREE_OK + b"x=1\n", SHAPE_REJECT, b"extra-line\n"),
+    ("an empty fourth line", THREE_OK + b"\n", SHAPE_REJECT, b"extra-line\n"),
+    ("two lines only", b"docs_only=false\ncargo_skip=true\n", SHAPE_REJECT, b"extra-line\n"),
+    ("empty answer", b"", SHAPE_REJECT, b"extra-line\n"),
+    ("a lone line feed", b"\n", SHAPE_REJECT, b"extra-line\n"),
+    ("a look-alike key", b"docs_only=false\ncargo_skipX=true\ncargo_skip_reason=ok\n",
+     SHAPE_REJECT, b"extra-line\n"),
+    ("a duplicate key", b"docs_only=false\ndocs_only=false\ncargo_skip_reason=ok\n",
+     SHAPE_REJECT, b"extra-line\n"),
+    ("a line feed inside the reason", shape_head(b"a\nb\n"), SHAPE_REJECT, b"extra-line\n"),
+    ("a NUL and an extra line: the line count comes first", THREE_OK + b"\x00\n",
+     SHAPE_REJECT, b"extra-line\n"),
+    ("a 100K-line answer", b"x=1\n" * 25000, SHAPE_REJECT, b"extra-line\n"),
+    ("no line feed after the last line", shape_head(b"ok"), SHAPE_ACCEPT,
+     b"docs_only=false\ncargo_skip=true\ncargo_skip_reason=ok\n"),
+    ("the keys in another order",
+     b"cargo_skip_reason=ok\ncargo_skip=true\ndocs_only=false\n", SHAPE_ACCEPT, THREE_OK),
+    ("CR LF line endings", b"docs_only=false\r\ncargo_skip=true\r\ncargo_skip_reason=ok\r\n",
+     SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("one CR at the end", shape_head(b"ok\r\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("a NUL only reason", shape_head(b"\x00\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("a NUL inside the reason", shape_head(b"a\x00b\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("a NUL at the end without a line feed", shape_head(b"ab\x00"), SHAPE_REJECT,
+     b"not-printable-ascii\n"),
+    ("a NUL inside a value", b"docs_only=fa\x00lse\ncargo_skip=true\ncargo_skip_reason=ok\n",
+     SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("a 2-byte character", shape_head(b"caf\xc3\xa9\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("a lone 0xff", shape_head(b"a\xff\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("a lone 0x80", shape_head(b"\x80\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("a tab", shape_head(b"a\tb\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("DEL", shape_head(b"a\x7fb\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("ESC", shape_head(b"a\x1bb\n"), SHAPE_REJECT, b"not-printable-ascii\n"),
+    ("0x7e is printable", shape_head(b"~\n"), SHAPE_ACCEPT,
+     b"docs_only=false\ncargo_skip=true\ncargo_skip_reason=~\n"),
+    ("a space is printable", shape_head(b"a b\n"), SHAPE_ACCEPT,
+     b"docs_only=false\ncargo_skip=true\ncargo_skip_reason=a b\n"),
+    ("an empty reason", shape_head(b"\n"), SHAPE_REJECT, b"empty\n"),
+    ("blanks only", shape_head(b"   \n"), SHAPE_REJECT, b"blank-only\n"),
+    ("the cap", shape_head(b"x" * 300 + b"\n"), SHAPE_ACCEPT,
+     b"docs_only=false\ncargo_skip=true\ncargo_skip_reason=" + b"x" * 300 + b"\n"),
+    ("the cap plus one", shape_head(b"x" * 301 + b"\n"), SHAPE_REJECT, b"over-cap-300\n"),
+    ("a 100K reason", shape_head(b"y" * 100000 + b"\n"), SHAPE_REJECT, b"over-cap-300\n"),
+    ("a 100K reason of NULs", shape_head(b"\x00" * 100000 + b"\n"), SHAPE_REJECT,
+     b"not-printable-ascii\n"),
+    ("a 100K reason of high bytes", shape_head(b"\xc3\xa9" * 50000 + b"\n"), SHAPE_REJECT,
+     b"not-printable-ascii\n"),
+    ("a 5M reason", shape_head(b"z" * HUGE_ANSWER_BYTES + b"\n"), SHAPE_REJECT,
+     b"over-cap-300\n"),
+    ("a skip answer", THREE_OK, SHAPE_ACCEPT, THREE_OK),
+]
+# Rows whose time is bounded, with the ceiling in seconds of each.
+TIMED_FORMS = {
+    "a 100K reason": BIG_ANSWER_CEILING_S, "a 100K reason of NULs": BIG_ANSWER_CEILING_S,
+    "a 100K reason of high bytes": BIG_ANSWER_CEILING_S,
+    "a 100K-line answer": BIG_ANSWER_CEILING_S, "a 5M reason": HUGE_ANSWER_CEILING_S,
+}
+
+
+class AnswerShapeTable(unittest.TestCase):
+    """The byte test of both classify steps (answer_shape.py), run as the steps run it."""
+
+    def setUp(self):
+        self.work = scratch_dir()
+
+    def tearDown(self):
+        shutil.rmtree(str(self.work), ignore_errors=True)
+
+    def run_shape(self, data: bytes):
+        answer = self.work / "answer.out"
+        answer.write_bytes(data)
+        started = time.monotonic()
+        res = subprocess.run([sys.executable, "-I", str(SCRIPT), SHAPE_FLAG, str(answer)],
+                             capture_output=True, timeout=TIMEOUT_S, cwd=str(self.work))
+        return res, time.monotonic() - started
+
+    def test_every_answer_form_has_its_written_reason(self):
+        labels = [form[0] for form in ANSWER_FORMS]
+        self.assertEqual(len(labels), len(set(labels)), "form labels are unique")
+        for label, data, rc, out in ANSWER_FORMS:
+            with self.subTest(label):
+                res, elapsed = self.run_shape(data)
+                self.assertEqual((res.returncode, res.stdout), (rc, out),
+                                 "%s: stderr %r" % (label, res.stderr[-200:]))
+                if label in TIMED_FORMS:
+                    self.assertLess(elapsed, TIMED_FORMS[label], label + ": judged in time")
+
+    def test_every_reason_row_of_the_step_table_has_the_same_reason(self):
+        """The step table and the byte test agree: a rejected row gives its token (a bad
+        value, WHY_SHAPE, is accepted here and refused by the step's own value guard)."""
+        for row in REASON_ROWS:
+            with self.subTest(row.label):
+                res, _ = self.run_shape(row.answer)
+                if row.why:
+                    self.assertEqual((res.returncode, res.stdout),
+                                     (SHAPE_REJECT, row.why.encode() + b"\n"), row.label)
+                else:
+                    self.assertEqual(res.returncode, SHAPE_ACCEPT, row.label)
+                    if row.passed is not None:
+                        want = "docs_only=%s\ncargo_skip=%s\ncargo_skip_reason=%s\n" % row.passed
+                        self.assertEqual(res.stdout, want.encode(), row.label)
+
+    def test_an_unreadable_answer_and_a_bad_call_are_no_verdict(self):
+        """A missing file and a missing argument exit 2 with no stdout: never an accept,
+        never a reason token."""
+        missing = subprocess.run([sys.executable, "-I", str(SCRIPT), SHAPE_FLAG,
+                                  str(self.work / "none.out")], capture_output=True,
+                                 timeout=TIMEOUT_S)
+        bare = subprocess.run([sys.executable, "-I", str(SCRIPT), SHAPE_FLAG],
+                              capture_output=True, timeout=TIMEOUT_S)
+        judge = str(SCRIPT.parent / "answer_shape.py")
+        good = self.work / "good.out"
+        good.write_bytes(THREE_OK)
+        direct_none = subprocess.run([sys.executable, "-I", judge], capture_output=True,
+                                     timeout=TIMEOUT_S)
+        direct_two = subprocess.run([sys.executable, "-I", judge, str(good), str(good)],
+                                    capture_output=True, timeout=TIMEOUT_S)
+        for label, res in (("missing file", missing), ("no argument", bare),
+                           ("direct call, no file", direct_none),
+                           ("direct call, two files", direct_two)):
+            self.assertEqual((res.returncode, res.stdout), (SHAPE_ERROR, b""), label)
 
 
 if __name__ == "__main__":
