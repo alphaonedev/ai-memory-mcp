@@ -102,7 +102,7 @@ EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "suite_budget"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "log_line", "safe_value")
+WA_REQUIRED = ("annotation", "env_file_value", "log_line", "safe_value")
 WA_EXIT_LOAD_REFUSED = EXIT_LOAD_REFUSED
 WA_ERROR_TO_STDERR = False
 
@@ -664,7 +664,7 @@ def run_step_bound(workflow_path, job, node, tier, job_start, github_output, now
         return EXIT_MARGIN_LOST
     try:
         with open(github_output, "a", encoding="utf-8") as out:
-            out.write("minutes=%d\ndeadline_min=%d\n" % (minutes, deadline // 60))
+            out.write("minutes=%s\ndeadline_min=%s\n" % (wa.env_file_value(minutes), wa.env_file_value(deadline // 60)))
     except OSError as exc:
         print(wa.annotation("error", "%s cannot append to the step output file (%s); refusing to start the test "
                             "step" % (STEP_TAG, type(exc).__name__)), flush=True)

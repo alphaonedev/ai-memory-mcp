@@ -171,6 +171,8 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
                   "Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)",
                   "Run the pg_isolated_binary live cells (enterprise-fed legs only)",
                   "Load gate (#6795)",
+                  # #9852: the test step's timeout-minutes is the output of this step.
+                  "Test step bound (#9852)",
                   "Run tests (impact-aware)",
                   "Cleanup enterprise-fed ephemeral db",
                   "sccache hit-rate summary (#7199)",
