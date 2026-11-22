@@ -1725,6 +1725,11 @@ pub fn build_router_with_timeout(
         // `issue_1579_b4_*` router tests.
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(CorsLayer::new())
+        // #9864 — a response to a request that can mutate waits for its
+        // forensic audit rows to be durable (bounded; inside the timeout).
+        .layer(axum::middleware::from_fn(
+            handlers::ack_barrier::ack_barrier_layer,
+        ))
         // H7 (v0.7.0 round-2) — per-request wall-clock timeout.
         // Applied outermost (last in the layer stack) so it bounds
         // every other middleware: the API-key auth, the postgres

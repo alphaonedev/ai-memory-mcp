@@ -103,6 +103,7 @@ pub(crate) fn fed_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub mod a2a;
 pub mod accept_provenance;
+pub mod ack_barrier;
 pub mod admin;
 pub mod admin_role;
 pub mod agent_api_key;

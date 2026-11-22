@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use ai_memory::governance::audit::{
     CHAIN_HEAD_PREV_HASH, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
+    TEST_FORENSIC_WRITER_HOLD_DIR_ENV, TEST_FORENSIC_WRITER_HOLD_FILE,
 };
 use serde_json::{Value, json};
 #[path = "common/child_stdin_report.rs"]
@@ -845,10 +846,13 @@ fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
         // wins the race, is still a graceful stop with the conventional code.
         assert_eq!(exit.code(), Some(SIGTERM_CODE), "round {round}: {err}");
         let resp = responses.lock().expect("responses").clone();
-        let mut acked_deletes = usize::from(resp.contains_key(&2));
+        // #9864 — the not-durable refusal acknowledges nothing.
+        let mut acked_deletes = usize::from(resp.get(&2).is_some_and(acknowledged));
         for k in 0..BURST {
             let id = BURST_BASE_ID + k;
-            let Some(r) = resp.get(&id) else { continue };
+            let Some(r) = resp.get(&id).filter(|r| acknowledged(r)) else {
+                continue;
+            };
             if k % 3 == 2 {
                 assert!(r.get("error").is_none(), "round {round}: {r}");
                 assert_eq!(
@@ -865,7 +869,11 @@ fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
             // The signal beat the first delete: no row exists, so no TOOL
             // call may have been acknowledged. The initialize response
             // (id 1) is always acknowledged first and is not a tool call.
-            let mut acked: Vec<u64> = resp.keys().copied().filter(|id| *id != 1).collect();
+            let mut acked: Vec<u64> = resp
+                .iter()
+                .filter(|(id, r)| **id != 1 && acknowledged(r))
+                .map(|(id, _)| *id)
+                .collect();
             acked.sort_unstable();
             assert!(
                 acked.is_empty(),
@@ -926,4 +934,300 @@ fn a_child_that_exits_at_start_up_fails_every_start_up_wait_fast_4347() {
             "{wait}: took {elapsed:?}; STARTUP_BOUND is {STARTUP_BOUND:?}"
         );
     }
+}
+
+/// #9864 — the directory of the writer hold for one cell.
+fn hold_dir(home: &Path) -> PathBuf {
+    let dir = home.join("writer-hold");
+    std::fs::create_dir_all(&dir).expect("create writer hold dir");
+    dir
+}
+
+/// #9864 — wait (bounded, on a condition) until `n` forensic delete rows are
+/// on disk, so a hold created next cannot catch a handshake row.
+fn wait_delete_rows(s: &mut Session, home: &Path, n: usize) {
+    let deadline = Instant::now() + STARTUP_BOUND;
+    while delete_rows(&rows(home)) < n {
+        s.fail_if_exited("the handshake rows");
+        assert!(
+            Instant::now() < deadline,
+            "the handshake rows never reached disk"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// #9864 — the JSON-RPC code of the not-durable reply, written by hand.
+const AUDIT_NOT_DURABLE_CODE: i64 = -32_010;
+
+/// #9864 — a reply acknowledges its request unless it is the named
+/// not-durable error (`-32010`, the only reply that says "not acknowledged").
+fn acknowledged(resp: &Value) -> bool {
+    resp.get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_i64)
+        != Some(AUDIT_NOT_DURABLE_CODE)
+}
+
+/// #9864 — an acknowledgement is written only after the forensic row is
+/// durable. The writer is held (a hold file, not a sleep) with the delete's
+/// row queued and nothing on disk; SIGTERM then runs the exit drain, which
+/// times out on the held writer. Every delete the child acknowledged must
+/// still have its forensic row on disk after exit. The carrier acknowledges
+/// once the row is QUEUED, so the held row is acknowledged and lost (CI run
+/// 44973448614: left 6, right 31).
+#[test]
+fn an_acknowledged_delete_keeps_its_forensic_row_past_the_exit_drain_9864() {
+    let home = sandbox();
+    let dir = hold_dir(home.path());
+    let mut s = Session::start_with(
+        home.path(),
+        &[
+            (TEST_FORENSIC_WRITER_DELAY_ENV, "0".to_string()),
+            (TEST_FORENSIC_WRITER_HOLD_DIR_ENV, dir.display().to_string()),
+        ],
+    );
+    wait_delete_rows(&mut s, home.path(), 1);
+    std::fs::write(dir.join(TEST_FORENSIC_WRITER_HOLD_FILE), b"hold\n").expect("create hold");
+    // The handshake's delete is acknowledged and on disk.
+    let mut acked_deletes = 1_usize;
+    let resp = s.request(&json!({"jsonrpc":"2.0","id":100,"method":"tools/call",
+        "params":{"name":"memory_delete","arguments":{
+            "id":"00000000-0000-4000-8000-000000009864"}}}));
+    assert_eq!(resp.get("id"), Some(&json!(100)), "no reply: {resp}");
+    if acknowledged(&resp) {
+        acked_deletes += 1;
+    }
+    s.signal("TERM");
+    let status = s.wait_bounded();
+    let err = s.stderr_text();
+    assert_eq!(
+        status.code(),
+        Some(SIGTERM_CODE),
+        "SIGTERM exit code; stderr: {err}"
+    );
+    let recs = rows(home.path());
+    assert_eq!(
+        delete_rows(&recs),
+        acked_deletes,
+        "every acknowledged delete must have its forensic row after SIGTERM \
+         (reply: {resp}); stderr: {err}"
+    );
+    assert_one_unbroken_chain(&recs);
+    assert_acked_write_durable(home.path());
+}
+
+/// #9864 — how a mixed burst is ended.
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    /// Graceful: the exit drain runs.
+    Term,
+    /// Ungraceful: nothing runs after the signal.
+    Kill,
+}
+
+/// #9864 — rounds per mixed burst cell (the vote's K-3 asks for 30).
+const MIXED_ROUNDS: u64 = 30;
+/// #9864 — requests per mixed burst.
+const MIXED_BURST: u64 = 32;
+/// #9864 — the cut points cycle through this many milliseconds.
+const MIXED_CUT_SPAN_MS: u64 = 700;
+/// #9864 — the cut the vote names: the signal 400 ms into the burst.
+const MIXED_FIRST_CUT_MS: u64 = 400;
+const MIXED_NAMESPACE: &str = "t9864";
+const LINK_SOURCE_TITLE: &str = "link-source-9864";
+const LINK_TARGET_TITLE: &str = "link-target-9864";
+
+fn memory_id(home: &Path, title: &str) -> String {
+    let conn = rusqlite::Connection::open(db_path(home)).expect("open db");
+    conn.query_row("SELECT id FROM memories WHERE title = ?1", [title], |r| {
+        r.get(0)
+    })
+    .expect("memory id")
+}
+
+fn memory_content(home: &Path, id: &str) -> String {
+    let conn = rusqlite::Connection::open(db_path(home)).expect("open db");
+    conn.query_row("SELECT content FROM memories WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .expect("memory content")
+}
+
+fn link_count(home: &Path, source: &str, target: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db_path(home)).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+        [source, target],
+        |r| r.get(0),
+    )
+    .expect("count links")
+}
+
+/// The `k`-th request of a mixed burst: store, update, delete, link in turn.
+fn mixed_request(round: u64, k: u64, source: &str, target: &str) -> Value {
+    let id = BURST_BASE_ID + k;
+    let (name, args) = match k % 4 {
+        0 => (
+            "memory_store",
+            json!({"title":format!("mixed-{round}-{id}"),"content":"burst",
+                   "namespace":MIXED_NAMESPACE,"tier":"long"}),
+        ),
+        1 => (
+            "memory_update",
+            json!({"id":source,"content":format!("update-{id}")}),
+        ),
+        2 => (
+            "memory_delete",
+            json!({"id":format!("00000000-0000-4000-8000-{id:012}")}),
+        ),
+        _ => (
+            "memory_link",
+            json!({"source_id":source,"target_id":target,"relation":"related_to"}),
+        ),
+    };
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+           "params":{"name":name,"arguments":args}})
+}
+
+/// #9864 K-3 — a pipelined burst of every write kind (store, update, delete,
+/// link) cut by `stop` at a different instant each round. Whatever the
+/// timing, everything acknowledged is on disk: each acknowledged store's
+/// memory, the content of an update at least as late as the last
+/// acknowledged one, the link once any link was acknowledged (and never
+/// twice: K-2), and at least one forensic delete row per acknowledged delete.
+/// After SIGTERM the delete rows EQUAL the acknowledged deletes (the in-flight
+/// request is answered inside the stop budget) and the chain is unbroken.
+fn mixed_burst_cut(stop: Stop) {
+    for round in 0..MIXED_ROUNDS {
+        let home = sandbox();
+        let mut s = Session::start_with(
+            home.path(),
+            &[(TEST_FORENSIC_WRITER_DELAY_ENV, "0".to_string())],
+        );
+        for (rid, title) in [(10_u64, LINK_SOURCE_TITLE), (11, LINK_TARGET_TITLE)] {
+            let r = s.request(&json!({"jsonrpc":"2.0","id":rid,"method":"tools/call",
+                "params":{"name":"memory_store","arguments":{
+                    "title":title,"content":"seed","namespace":MIXED_NAMESPACE,"tier":"long"}}}));
+            assert!(r.get("error").is_none(), "seed store: {r}");
+        }
+        let source = memory_id(home.path(), LINK_SOURCE_TITLE);
+        let target = memory_id(home.path(), LINK_TARGET_TITLE);
+        let mut payload = String::new();
+        for k in 0..MIXED_BURST {
+            payload.push_str(&mixed_request(round, k, &source, &target).to_string());
+            payload.push('\n');
+        }
+        let mut stdin = s.stdin.take().expect("stdin");
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+            let _ = stdin.flush();
+            stdin
+        });
+        let cut_ms = if round == 0 {
+            MIXED_FIRST_CUT_MS
+        } else {
+            (round * 47) % MIXED_CUT_SPAN_MS
+        };
+        std::thread::sleep(Duration::from_millis(cut_ms));
+        match stop {
+            Stop::Term => s.signal("TERM"),
+            Stop::Kill => s.signal("KILL"),
+        }
+        let status = s.wait_bounded();
+        let _stdin = writer.join().expect("writer thread");
+        // The replies of MIXED_BURST requests fit the pipe buffer, so the
+        // child never blocks on stdout; read them all after it exited.
+        let mut resp = std::collections::HashMap::new();
+        while let Some(v) = s.read_response() {
+            if let Some(id) = v.get("id").and_then(Value::as_u64) {
+                resp.insert(id, v);
+            }
+        }
+        let err = s.stderr_text();
+        match stop {
+            Stop::Term => assert_eq!(status.code(), Some(SIGTERM_CODE), "round {round}: {err}"),
+            Stop::Kill => assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGKILL),
+                "round {round}"
+            ),
+        }
+        let mut acked_deletes = 1_usize; // the handshake's delete
+        let mut last_update = None;
+        let mut any_link = false;
+        for k in 0..MIXED_BURST {
+            let id = BURST_BASE_ID + k;
+            let Some(r) = resp.get(&id).filter(|r| acknowledged(r)) else {
+                continue;
+            };
+            // A delete of an unknown id is refused by its gate, but its
+            // forensic row is written first, so any acknowledged reply
+            // counts; every other kind counts when it succeeded.
+            let succeeded =
+                r.get("error").is_none() && r["result"]["isError"].as_bool() != Some(true);
+            assert!(
+                k % 4 == 2 || succeeded,
+                "round {round}: request {id} failed: {r}"
+            );
+            match k % 4 {
+                0 => assert_eq!(
+                    count_title(home.path(), &format!("mixed-{round}-{id}")),
+                    1,
+                    "round {round}: acknowledged store {id} lost; {err}"
+                ),
+                1 => last_update = Some(id),
+                2 => acked_deletes += 1,
+                _ => any_link = true,
+            }
+        }
+        if let Some(want) = last_update {
+            let content = memory_content(home.path(), &source);
+            let got: u64 = content
+                .strip_prefix("update-")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("round {round}: update {want} lost: {content:?}"));
+            assert!(
+                got >= want,
+                "round {round}: update {want} lost, content is update {got}"
+            );
+        }
+        let links = link_count(home.path(), &source, &target);
+        assert!(
+            links <= 1,
+            "round {round}: a retried link made {links} links (K-2)"
+        );
+        if any_link {
+            assert_eq!(links, 1, "round {round}: an acknowledged link was lost");
+        }
+        let recs = rows(home.path());
+        match stop {
+            Stop::Term => {
+                assert_eq!(
+                    delete_rows(&recs),
+                    acked_deletes,
+                    "round {round} (cut {cut_ms} ms): forensic delete rows must equal \
+                     acknowledged deletes after SIGTERM; {err}"
+                );
+                assert_one_unbroken_chain(&recs);
+            }
+            Stop::Kill => assert!(
+                delete_rows(&recs) >= acked_deletes,
+                "round {round} (cut {cut_ms} ms): {} forensic delete rows on disk, \
+                 {acked_deletes} deletes acknowledged before SIGKILL",
+                delete_rows(&recs)
+            ),
+        }
+        assert_acked_write_durable(home.path());
+    }
+}
+
+#[test]
+fn a_mixed_burst_cut_by_sigterm_keeps_every_acknowledged_write_9864() {
+    mixed_burst_cut(Stop::Term);
+}
+
+#[test]
+fn a_mixed_burst_cut_by_sigkill_keeps_every_acknowledged_write_9864() {
+    mixed_burst_cut(Stop::Kill);
 }

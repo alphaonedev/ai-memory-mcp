@@ -91,6 +91,8 @@ mod param_numeric_3374_tests;
 // sibling so `mod.rs` stays under its size ceiling. The #3549 structural
 // guard parses it from its own file.
 mod read_only_tools;
+// #9864 — replies wait for their forensic audit rows.
+mod ack_barrier;
 
 // v1.0.0 #3549 — doc-hidden test entry into the REAL `tools/call` dispatch
 // arm, so `tests/` can drive the dispatch-level authority refusal with the
@@ -184,11 +186,14 @@ fn ok_response(id: Value, result: Value) -> RpcResponse {
 /// "no reply after a stop" is uniform (parse-error and oversize replies carry
 /// no write, but the invariant must not depend on that). `false`: the request
 /// was fenced, nothing was written and the caller stops serving.
-fn reply_unless_fenced(stdout: &mut io::Stdout, resp: &RpcResponse) -> anyhow::Result<bool> {
+fn reply_unless_fenced(
+    stdout: &mut io::Stdout,
+    reply: &ack_barrier::Reply,
+) -> anyhow::Result<bool> {
     if !shutdown::gate().commit_ack() {
         return Ok(false);
     }
-    let out = serde_json::to_string(resp)?;
+    let out = serde_json::to_string(reply.response())?;
     writeln!(stdout, "{out}")?;
     stdout.flush()?;
     Ok(true)
@@ -5300,7 +5305,7 @@ pub fn run_mcp_server(
                          and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
                     ),
                 );
-                if !reply_unless_fenced(&mut stdout, &resp)? {
+                if !reply_unless_fenced(&mut stdout, &ack_barrier::Reply::error(resp))? {
                     break;
                 }
                 let _ = db::checkpoint(&conn);
@@ -5312,7 +5317,7 @@ pub fn run_mcp_server(
                 jsonrpc::PARSE_ERROR,
                 format!("parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes"),
             );
-            if !reply_unless_fenced(&mut stdout, &resp)? {
+            if !reply_unless_fenced(&mut stdout, &ack_barrier::Reply::error(resp))? {
                 break;
             }
             continue;
@@ -5332,7 +5337,7 @@ pub fn run_mcp_server(
                     jsonrpc::PARSE_ERROR,
                     format!("parse error: invalid UTF-8: {e}"),
                 );
-                if !reply_unless_fenced(&mut stdout, &resp)? {
+                if !reply_unless_fenced(&mut stdout, &ack_barrier::Reply::error(resp))? {
                     break;
                 }
                 continue;
@@ -5350,7 +5355,7 @@ pub fn run_mcp_server(
                     jsonrpc::PARSE_ERROR,
                     format!("parse error: {e}"),
                 );
-                if !reply_unless_fenced(&mut stdout, &resp)? {
+                if !reply_unless_fenced(&mut stdout, &ack_barrier::Reply::error(resp))? {
                     break;
                 }
                 continue;
@@ -5472,6 +5477,7 @@ pub fn run_mcp_server(
         let archive_on_gc = app_config.effective_archive_on_gc();
         let autonomous_hooks = app_config.effective_autonomous_hooks();
         let resolved_recall_scope = app_config.effective_recall_scope();
+        let pending_ack = ack_barrier::begin(&req);
         let resp = handle_request(
             &conn,
             db_path,
@@ -5501,11 +5507,12 @@ pub fn run_mcp_server(
         );
         // #4347 — test seam: hold the finished request before its ack.
         shutdown::hold_before_ack_for_test(req.id.as_ref());
-        // #4347 — the forensic row for this request is already queued. Commit
-        // to acknowledging it BEFORE the stop path can start its drain; once
-        // the stop fenced this request (its in-flight budget expired) it is
-        // never acknowledged, so no acknowledged request lacks its row.
-        if !reply_unless_fenced(&mut stdout, &resp)? {
+        // #9864 — wait until this request's forensic rows are durable (or
+        // answer with the named refusal), then commit to acknowledging it
+        // BEFORE the stop path can start its drain (#4347); a fenced request
+        // is never acknowledged, so no acknowledged request lacks its row.
+        let reply = ack_barrier::settle(pending_ack, resp);
+        if !reply_unless_fenced(&mut stdout, &reply)? {
             break;
         }
     }

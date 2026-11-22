@@ -62,6 +62,12 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub(crate) mod ack_barrier;
+pub use ack_barrier::{
+    ACK_BARRIER_DEADLINE, ACK_BARRIER_DEADLINE_TEST_ENV, AUDIT_NOT_DURABLE_REASON, AckBarrierError,
+    AckMark, AuditDurable, ack_mark, wait_durable,
+};
+
 /// Tracing target for the forensic audit sink (#1558 tracing-target SSOT).
 pub(crate) const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
 
@@ -151,10 +157,14 @@ const WRITER_THREAD_NAME: &str = "ai-memory-audit-writer";
 /// A unit of work for the background writer: a row's fields, which the
 /// writer chains, signs and appends under the forensic lock (#4304), or a
 /// barrier whose acknowledgement channel is signalled once every row
-/// enqueued before it has been handled.
+/// enqueued before it has been written and synced.
 enum WriteOp {
     /// #4304 — the UNSIGNED fields: `prev_hash` is only known under the lock.
-    Row(Box<PendingRow>),
+    /// #9864 — `seq` is the row's number in the acknowledgement ledger.
+    Row {
+        seq: u64,
+        row: Box<PendingRow>,
+    },
     /// Test-only: a raw formed line for a given path (bypasses the chain).
     #[cfg(test)]
     Append {
@@ -361,8 +371,10 @@ fn append_record<W: Write>(w: &mut W, line: &str) -> std::io::Result<()> {
 
 /// Drain loop for the background writer (`serve` / `mcp`). Each queued row is
 /// chained, signed and appended by [`append_to_chain`] under the forensic
-/// lock (#4304); barriers are acknowledged once every row before them is
-/// written.
+/// lock (#4304). #9864: after each batch the written files are synced once
+/// ([`sync_chain`]) and the acknowledgement ledger is settled, and only then
+/// are the batch's barriers acknowledged, so a barrier (and every reply that
+/// waited on the ledger) implies the rows before it are on stable storage.
 fn run_writer(rx: Receiver<WriteOp>) {
     // Test-only raw appends keep their own cached handle; real rows go
     // through the chain writer, which owns its handle.
@@ -371,40 +383,108 @@ fn run_writer(rx: Receiver<WriteOp>) {
     let mut pending_barriers: Vec<Sender<()>> = Vec::new();
 
     while let Ok(first) = rx.recv() {
+        // #9864 — test seam: a batch that starts with a row can be held
+        // before any of it is written (the losing interleaving: the row is
+        // queued, nothing is on disk). Barrier-only batches (the boot flush,
+        // the exit drain) are never held.
+        #[cfg(any(test, debug_assertions))]
+        if matches!(first, WriteOp::Row { .. }) {
+            hold_writer_for_test();
+        }
         let mut batch = vec![first];
         while let Ok(next) = rx.try_recv() {
             batch.push(next);
         }
 
+        let mut rows = Vec::with_capacity(batch.len());
         for op in batch {
-            #[cfg(any(test, debug_assertions))]
-            if !matches!(op, WriteOp::Barrier(_)) {
-                if let Some(delay) = test_writer_delay() {
-                    std::thread::sleep(delay);
-                }
-            }
             match op {
-                WriteOp::Row(row) => {
-                    if let Err(e) = append_to_chain(*row) {
-                        // The row was not written: say so, count it.
-                        crate::metrics::inc_forensic_sink_unavailable();
-                        tracing::error!(
-                            target: AUDIT_TRACE_TARGET,
-                            "forensic: a queued row was not written: {e:#}"
-                        );
-                    }
-                }
+                WriteOp::Row { seq, row } => rows.push((seq, row)),
                 #[cfg(test)]
                 WriteOp::Append { path, line } => append_raw_for_test(&mut open_file, path, &line),
                 WriteOp::Barrier(ack) => pending_barriers.push(ack),
             }
         }
+        write_batch(rows, &ack_barrier::LEDGER, write_queued_row, sync_chain);
 
-        // Every write above went straight to its file (no user-space
-        // buffer), so a barrier can be acknowledged now.
         for ack in pending_barriers.drain(..) {
+            // A barrier whose waiter gave up (the exit drain's timeout) has
+            // no receiver; nothing is left to tell it.
             let _ = ack.send(());
         }
+    }
+}
+
+/// #9864 — whether a row reached its file.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOutcome {
+    Written,
+    NotWritten,
+}
+
+/// One queued row through the chain writer; a row the writer could not chain
+/// is counted and reported, and settles as not written.
+fn write_queued_row(row: PendingRow) -> RowOutcome {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(delay) = test_writer_delay() {
+        std::thread::sleep(delay);
+    }
+    append_to_chain(row).unwrap_or_else(|e| {
+        crate::metrics::inc_forensic_sink_unavailable();
+        tracing::error!(
+            target: AUDIT_TRACE_TARGET,
+            "forensic: a queued row was not written: {e:#}"
+        );
+        RowOutcome::NotWritten
+    })
+}
+
+/// #9864 — write one batch of rows, sync once, then settle the ledger.
+/// A failed sync turns every written row of the batch into a failed one:
+/// none of them is known to be on stable storage. The write and the sync are
+/// injected so the batching rule (one sync per batch, the ledger settled
+/// only after it) is testable without the process writer.
+fn write_batch(
+    rows: Vec<(u64, Box<PendingRow>)>,
+    ledger: &ack_barrier::Ledger,
+    mut write: impl FnMut(PendingRow) -> RowOutcome,
+    sync: impl FnOnce() -> std::io::Result<()>,
+) {
+    let Some(max_seq) = rows.iter().map(|(seq, _)| *seq).max() else {
+        return;
+    };
+    let mut written = Vec::with_capacity(rows.len());
+    let mut failed = Vec::new();
+    for (seq, row) in rows {
+        match write(*row) {
+            RowOutcome::Written => written.push(seq),
+            RowOutcome::NotWritten => failed.push(seq),
+        }
+    }
+    if !written.is_empty() {
+        if let Err(e) = sync() {
+            crate::metrics::inc_forensic_sink_unavailable();
+            tracing::error!(
+                target: AUDIT_TRACE_TARGET,
+                "forensic: syncing the written rows failed: {e}; {} rows are not known \
+                 to be durable (#9864)",
+                written.len()
+            );
+            failed.append(&mut written);
+        }
+    }
+    ledger.settle(max_seq, &failed);
+}
+
+/// #9864 — sync every file the chain writer wrote since the last sync.
+fn sync_chain() -> std::io::Result<()> {
+    let mut guard = chain_writer()
+        .lock()
+        .map_err(|_| std::io::Error::other("forensic chain mutex poisoned"))?;
+    match guard.as_mut() {
+        Some(w) => w.sync_written(),
+        None => Ok(()),
     }
 }
 
@@ -453,7 +533,9 @@ pub fn flush_blocking() {
 /// Off by default: rows are written inline, before `append_row` returns. Only
 /// the long-running request servers (`serve`, `mcp`) switch it on, from
 /// `main` before [`init`], so per-request file I/O stays off their request
-/// path; their queued rows are drained at exit by [`drain_bounded`].
+/// thread. #9864: their replies still wait for the row ([`wait_durable`],
+/// the acknowledgement barrier), so a row is queued at exit only for a
+/// request that was never acknowledged; [`drain_bounded`] writes those.
 static BACKGROUND_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn background_writer_enabled() -> bool {
@@ -472,17 +554,24 @@ pub fn use_background_writer() {
 /// is queued. Rows are formed in memory already; this only bounds the file
 /// writes, so a healthy writer needs milliseconds. A writer stuck on I/O is
 /// abandoned at the bound rather than holding the process.
+///
+/// #9864 — this bound covers only UNACKNOWLEDGED rows: a reply to a request
+/// that can mutate leaves only after [`wait_durable`] saw every row queued
+/// before it settled, so no row of an acknowledged write is still queued when
+/// the drain starts. (A read-only request never waits; a row it queued, such
+/// as a governance decision, can still be in the queue.)
 pub const EXIT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// #4319 — what a bounded drain of the background writer found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
-    /// Every row queued before the drain is on disk.
+    /// Every row queued before the drain is on disk and synced.
     Drained,
     /// No background writer exists in this process: nothing to drain.
     NoWriter,
     /// The writer did not finish within the budget. The rows still queued
     /// are lost; counted in `ai_memory_forensic_sink_unavailable_total`.
+    /// None of them belongs to an acknowledged write (#9864).
     TimedOut,
 }
 
@@ -513,7 +602,8 @@ fn drain_writer(tx: &Sender<WriteOp>, budget: std::time::Duration) -> DrainOutco
                 std::io::stderr(),
                 "ai-memory: the forensic audit writer did not finish within {budget:?} at \
                  exit; rows still queued were not written (counted in \
-                 ai_memory_forensic_sink_unavailable_total) (#4319)"
+                 ai_memory_forensic_sink_unavailable_total); none of them belongs to an \
+                 acknowledged write (#4319, #9864)"
             );
             DrainOutcome::TimedOut
         }
@@ -679,6 +769,46 @@ fn test_writer_delay() -> Option<std::time::Duration> {
             .filter(|ms| *ms > 0)
             .map(std::time::Duration::from_millis)
     })
+}
+
+/// #9864 — test seam: the directory of the writer hold. While the file
+/// [`TEST_FORENSIC_WRITER_HOLD_FILE`] exists in it, the background writer
+/// does not start a batch that begins with a row, and it creates
+/// [`TEST_FORENSIC_WRITER_HELD_FILE`] there to say it is holding. Removing
+/// the hold file releases the writer. Read in debug and test builds only.
+pub const TEST_FORENSIC_WRITER_HOLD_DIR_ENV: &str = "AI_MEMORY_TEST_FORENSIC_WRITER_HOLD_DIR";
+
+/// #9864 — the file whose presence holds the background writer.
+pub const TEST_FORENSIC_WRITER_HOLD_FILE: &str = "hold";
+
+/// #9864 — the file the held writer creates.
+pub const TEST_FORENSIC_WRITER_HELD_FILE: &str = "held";
+
+/// #9864 — how often the held writer re-checks the hold file.
+#[cfg(any(test, debug_assertions))]
+const TEST_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+#[cfg(any(test, debug_assertions))]
+fn hold_writer_for_test() {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        std::env::var_os(TEST_FORENSIC_WRITER_HOLD_DIR_ENV)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
+    let Some(dir) = dir else {
+        return;
+    };
+    let hold = dir.join(TEST_FORENSIC_WRITER_HOLD_FILE);
+    if !hold.exists() {
+        return;
+    }
+    // A test seam: a failure to create the marker only makes the test that
+    // waits for it time out, it never changes what the writer does.
+    let _ = std::fs::write(dir.join(TEST_FORENSIC_WRITER_HELD_FILE), b"held\n");
+    while hold.exists() {
+        std::thread::sleep(TEST_HOLD_POLL);
+    }
 }
 
 /// Test-only: enqueue a raw append directly to the background writer,
@@ -1481,6 +1611,9 @@ fn start_sink(dir: &Path, signing_key: Option<SigningKey>, install_signers: bool
         },
         file: None,
         lock_contended_until: None,
+        sync_tracked: background_writer_enabled(),
+        unsynced: false,
+        retired: Vec::new(),
     });
     *guard = Some(ForensicSink {
         dir: dir.to_path_buf(),
@@ -1597,16 +1730,28 @@ fn append_row(
     // row is written (inline) or queued (background), so a re-init can never
     // interleave with it.
     if background_writer_enabled() {
-        // #1472 — `serve` / `mcp` only: the blocking lock, read and write run
-        // off the request thread; the #4319 exit drain covers what is queued.
-        writer()?
-            .send(WriteOp::Row(Box::new(row)))
-            .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
-        Ok(())
+        // #1472 — `serve` / `mcp` only: the blocking lock, read, write and
+        // sync run off the request thread. #9864: the row is numbered in the
+        // acknowledgement ledger as it is queued, and the request's reply
+        // waits on that ledger (`wait_durable`), so no acknowledgement leaves
+        // before the row is durable. The #4319 exit drain covers only rows of
+        // requests that were never acknowledged.
+        let tx = writer()?;
+        ack_barrier::LEDGER.enqueue(|seq| {
+            tx.send(WriteOp::Row {
+                seq,
+                row: Box::new(row),
+            })
+            .map_err(|_| anyhow!("forensic audit writer thread has stopped"))
+        })
     } else {
         // #4319 — every other process writes the row before `append_row`
-        // returns, so nothing is queued when it exits.
-        append_to_chain(row)
+        // returns, so nothing is queued when it exits. decision: inline
+        // write-before-return without an fsync over an fsync per CLI row,
+        // because a process kill (#9864 K-3) needs only the write. An
+        // inline row that could not be written is still not an error here
+        // (the inline fail-open, issue #9887).
+        append_to_chain(row).map(|_outcome| ())
     }
 }
 
@@ -1703,6 +1848,14 @@ struct ChainWriter {
     /// costs each row that, not the full [`FORENSIC_LOCK_BUDGET`]. Any
     /// successful lock clears it.
     lock_contended_until: Option<std::time::Instant>,
+    /// #9864 — the background writer syncs after each batch: then a written
+    /// row is tracked until [`Self::sync_written`]. Inline mode (CLI) never
+    /// syncs, so it tracks nothing and holds no retired handle.
+    sync_tracked: bool,
+    /// A row was written to `file` since its last sync.
+    unsynced: bool,
+    /// Handles replaced (rotation, rewrite) while they held unsynced rows.
+    retired: Vec<File>,
 }
 
 static CHAIN: OnceLock<Mutex<Option<ChainWriter>>> = OnceLock::new();
@@ -1842,15 +1995,16 @@ static LOCK_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
 /// # Errors
 /// The chain tail could not be read (the row is not written: chaining it
 /// from a guessed head would fork the chain), or the chain mutex is poisoned.
-/// A failed WRITE is counted and reported by [`writer_failure`], as before,
-/// and is not an error here.
-fn append_to_chain(row: PendingRow) -> Result<()> {
+/// A failed open or WRITE is counted and reported by [`writer_failure`], as
+/// before, and is `Ok(RowOutcome::NotWritten)` here (#9864: the background
+/// writer settles it as failed, so no reply waits it out as durable).
+fn append_to_chain(row: PendingRow) -> Result<RowOutcome> {
     let mut guard = chain_writer()
         .lock()
         .map_err(|_| anyhow!("forensic chain mutex poisoned"))?;
     match guard.as_mut() {
         Some(w) => w.append(row),
-        None => Ok(()),
+        None => Ok(RowOutcome::NotWritten),
     }
 }
 
@@ -1877,7 +2031,38 @@ impl ChainWriter {
         lock
     }
 
-    fn append(&mut self, row: PendingRow) -> Result<()> {
+    /// #9864 — drop the cached handle, keeping it for the next sync while it
+    /// holds rows not yet synced.
+    fn retire_file(&mut self) {
+        if let Some((_, file)) = self.file.take() {
+            if self.sync_tracked && self.unsynced {
+                self.retired.push(file);
+            }
+        }
+        self.unsynced = false;
+    }
+
+    /// #9864 — `sync_data` every handle that holds rows written since the
+    /// last sync. The first error is returned; every handle is still tried.
+    fn sync_written(&mut self) -> std::io::Result<()> {
+        let mut first_err = None;
+        for file in self.retired.drain(..) {
+            if let Err(e) = file.sync_data() {
+                first_err.get_or_insert(e);
+            }
+        }
+        if self.unsynced {
+            if let Some((_, file)) = &self.file {
+                if let Err(e) = file.sync_data() {
+                    first_err.get_or_insert(e);
+                }
+            }
+            self.unsynced = false;
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    fn append(&mut self, row: PendingRow) -> Result<RowOutcome> {
         let lock = self.acquire_lock();
         let path = daily_path(&self.dir, &row.now);
         // Fast path only when locked and the file is exactly as this process
@@ -1897,7 +2082,7 @@ impl ChainWriter {
             // this process left it was truncated: chaining from its new tail
             // would hide that, so the row continues this process's head and
             // the break stays visible to `verify` (the pre-#4304 property).
-            self.file = None;
+            self.retire_file();
             tracing::error!(
                 target: AUDIT_TRACE_TARGET,
                 path = %path.display(),
@@ -1906,7 +2091,7 @@ impl ChainWriter {
                  reports the break (#4304)"
             );
         } else if !unchanged {
-            self.file = None;
+            self.retire_file();
             let today = date_code(&row.now);
             match read_chain_tail_as_of(&self.dir, today) {
                 Ok(tail) => {
@@ -1938,36 +2123,40 @@ impl ChainWriter {
         let line = serde_json::to_string(&record).context("serialising forensic row")?;
 
         if self.file.as_ref().is_none_or(|(p, _)| p != &path) {
+            self.retire_file();
             // Opened (and line-aligned, #4205) under the lock.
             match open_for_append_line_aligned(&path) {
                 Ok(file) => self.file = Some((path.clone(), file)),
                 Err(e) => {
                     writer_failure("opening", &path, &e);
                     self.cursor.at = None;
-                    return Ok(());
+                    return Ok(RowOutcome::NotWritten);
                 }
             }
         }
         let written = match self.file.as_mut() {
             Some((_, file)) => append_record(file, &line).and_then(|()| file.metadata()),
-            None => return Ok(()),
+            None => return Ok(RowOutcome::NotWritten),
         };
-        match written {
+        let outcome = match written {
             Ok(meta) => {
                 // The head moves only once the row is on disk.
                 self.cursor.last_hash = self_hash;
                 self.cursor.at = Some(FileMark::of(&path, &meta));
+                self.unsynced = self.sync_tracked;
+                RowOutcome::Written
             }
             Err(e) => {
                 writer_failure("appending to", &path, &e);
                 // Resync from the file next time: the handle may be past a
                 // partial write, and the row is not in the chain.
-                self.file = None;
+                self.retire_file();
                 self.cursor.at = None;
+                RowOutcome::NotWritten
             }
-        }
+        };
         drop(lock);
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -5358,6 +5547,9 @@ pub(crate) fn forensic_sink_test_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod chain_4304_tests;
+
+#[cfg(test)]
+mod ack_barrier_9864_tests;
 
 #[cfg(test)]
 mod writer_spawn_tests_3164 {
