@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Write (or check) the #9709 census fixture: every Rust ``fn`` name under ``src/`` and ``tests/``.
 
-The red-cause summary prints a failing test name unmasked only when it has the plain Rust path shape and no token
-shape (scripts/ci/red_cause_summary.py, ``render_name``). The census proves that rule keeps real names readable:
-``test_ci_red_cause_summary.Census`` asserts that at least 99% of these names print unmasked. The fixture is one name
-per line, sorted and unique, so a regenerated file diffs cleanly.
+The red-cause summary shows a failing test name from its whole progress line, passed through the one funnel
+(scripts/ci/red_cause_summary.py, ``redact_shown``: the whole line redacted by scripts/cert_gate_evidence.py, then
+cut). The census proves real names stay readable: ``test_ci_red_cause_summary.Census`` asserts that at least 99% of
+the names shorter than 32 characters print unmasked, and that a longer snake_case name is masked until #9856 (the
+shared redactor masks every run of 32+ ``[A-Za-z0-9+/_-]`` characters) is fixed. The fixture is one name per line,
+sorted and unique, so a regenerated file diffs cleanly.
 
 Usage: ``python3 scripts/ci/tests/gen_red_cause_census_9709.py`` rewrites the fixture; ``--check`` exits 1 when the
 tracked fixture differs from a fresh walk (exit 0 when it matches).
 
 The fixture is a dated snapshot, not a live census (#9759 r1, code finding 10): it was regenerated on 2026-11-21 from
-the ``src/`` and ``tests/`` tree of f4bf8277d6fdda33c31a695f5f63499fa69f0ce2 (28574 names). ``--check`` is a manual
-tool and runs in no CI job, so a Rust PR never has to regenerate it; the 99% floor holds on any later tree because
+the ``src/`` and ``tests/`` tree of f4bf8277d6fdda33c31a695f5f63499fa69f0ce2 (28574 names). ``--check`` exits 1 on any
+tree other than f4bf8277, because every chain commit that adds, renames or removes a Rust ``fn`` moves the tree. For
+that reason it runs in no CI job (decision, #9759 r2: a dated snapshot over a CI ``--check``, because a CI check would
+be red on unrelated Rust changes), so a Rust PR never has to regenerate it; the floor holds on a later tree because
 the names it samples are the repository's own naming style, and a regeneration is one command.
 """
 

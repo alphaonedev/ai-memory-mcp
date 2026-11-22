@@ -42,7 +42,6 @@ CAUSE_TITLE = base.CAUSE_TITLE
 
 LINE_BYTES = 300
 FILE_BYTES = 16 * 1024 * 1024
-NAME_KEY_BYTES = 284
 LISTED = 50
 ANNOTATIONS = 10
 SUMMARY_BYTES = 32768
@@ -130,25 +129,31 @@ class RedactBeforeCut(Base):
             self.assert_no_canary(out + summary, "offset %d error line" % offset)
             self.assertIn("build: error:", out + summary)
 
-    def test_a_canary_across_the_value_cut_of_clean_leaves_no_fragment(self):
+    def test_a_canary_across_the_value_cut_of_the_funnel_leaves_no_fragment(self):
+        # Under PRE_CAP_BYTES (400) the whole value is redacted, then cut to LINE_BYTES: offset + 85 <= 385.
         module = load_script()
         module.load_redaction()
         for offset in CANARY_OFFSETS:
-            text = padded("v ", offset) + CANARY + " tail" + " pad" * 40
-            shown = module.clean(text).text
+            text = padded("v ", offset) + CANARY + " tail" + " pad" * 10
+            shown = module.redact_shown(text).text
             self.assertLessEqual(len(shown.encode("utf-8")), LINE_BYTES)
-            self.assert_no_canary(shown, "clean() at offset %d" % offset)
+            self.assert_no_canary(shown, "redact_shown() at offset %d" % offset)
 
-    def test_a_name_that_is_one_long_token_run_is_a_marked_row_in_both_forms(self):
-        # the token-safe line cut drops a run whole; a name that is ONE run is then the fixed marker, never lost.
+    def test_a_name_that_is_one_long_run_is_a_counted_marker_row(self):
+        # A progress line over PRE_CAP_BYTES is never redacted or shown: the fixed marker with its size, still counted.
+        # The list form after failures: is opaque (#9831): its names are never read, so only the progress form counts.
         run = "a" * (LINE_BYTES * 4)
-        for form in ("test %s ... FAILED\n\nfailures:\n    %s\n\n", "failures:\n    %s\n\ntest %s ... FAILED\n"):
-            with self.subTest(form=form[:8]):
-                out, summary = self.run_log(RUNNING_B + form % (run, run) + RESULT_FAILED_LINE + "\n")
-                self.assertIn("failing tests: 1\n", summary)
-                self.assertIn("| b | &lt;redacted> |\n", summary)
-                self.assertIn(TEST_TITLE + "b: <redacted>\n", out)
-                self.assertNotIn("a" * 32, out + summary)
+        line = "test %s ... FAILED" % run
+        marker = "<line not shown: %d bytes>" % len(line)
+        out, summary = self.run_log(RUNNING_B + line + "\n\nfailures:\n    %s\n\n" % run + RESULT_FAILED_LINE + "\n")
+        self.assertIn("failing tests: 1\n", summary)
+        self.assertIn("| b | &lt;line not shown: %d bytes> |\n" % len(line), summary)
+        self.assertIn(TEST_TITLE + "b: " + marker + "\n", out)
+        self.assertNotIn("a" * 32, out + summary)
+        list_first = RUNNING_B + "failures:\n    %s\n\n" % run + line + "\n" + RESULT_FAILED_LINE + "\n"
+        out, summary = self.run_inproc([str(self.write("list-first.log", list_first))])
+        self.assertEqual(counts(summary), (1, 0), summary)
+        self.assertNotIn("a" * 32, out + summary)
 
     def test_names_that_differ_stay_distinct_after_redaction(self):
         names = ["t::k_%s" % (CANARY[:-1] + tail) for tail in "AB"]
@@ -157,22 +162,19 @@ class RedactBeforeCut(Base):
         self.assertIn("failing tests: 2\n", summary)
         self.assert_no_canary(out + summary, "two token names")
 
-    def test_x1_a_long_crash_detail_keeps_its_signal_and_counts_the_cut(self):
+    def test_x1_a_long_crash_detail_is_cut_at_the_line_bound_and_the_cut_is_counted(self):
         # A dot in every component: the shared redaction masks a 32+ run of [A-Za-z0-9+/_-] whole, so a path without one
-        # would show as <redacted> and the components the shrink keeps could not be seen.
-        path = "/" + "abcd.fghi/" * 19 + "crashy"
-        fixed = len("process didn't exit successfully: `") + len("` (signal: 11, SIGSEGV: invalid memory reference)")
-        path += "z" * (298 - fixed - len(path))
+        # would show as <redacted>.  The detail is redacted whole, then the one cut keeps its first 297 bytes and "...".
+        # decision: one cut of the redacted value over the round-1 path shrink because the shrink cut raw text (#9830).
+        path = "/" + "abcd.fghi/" * 25 + "crashy"
         detail = "process didn't exit successfully: `%s` (signal: 11, SIGSEGV: invalid memory reference)" % path
-        self.assertEqual(len(detail), 298)
+        self.assertGreater(len(detail), LINE_BYTES)
+        self.assertLessEqual(len(detail), 400)
         out, summary = self.run_log(RUNNING_CRASHY + "  " + detail + "\n")
         line = [row for row in out.splitlines() if row.startswith(BINARY_TITLE)]
         self.assertEqual(len(line), 1, out)
         message = line[0][len(BINARY_TITLE + "crashy: "):]
-        self.assertTrue(message.startswith(NO_RESULT + "; process didn't exit successfully: `.../abcd.fghi/"), message)
-        self.assertTrue(message.endswith("crashy" + "z" * (298 - fixed - 1 - 190 - 6)
-                                         + "` (signal: 11, SIGSEGV: invalid memory reference)"), message)
-        self.assertLessEqual(len(message.encode("utf-8")), LINE_BYTES)
+        self.assertEqual(message, NO_RESULT + "; " + detail[:LINE_BYTES - 3] + "...")
         self.assertIn("shown values cut: 1 (limit 300 bytes)\n", summary)
 
 
@@ -203,18 +205,20 @@ class WorkBeforeTheCap(Base):
         started = time.monotonic()
         out, summary = self.run_inproc([str(log)], module)
         elapsed = time.monotonic() - started
-        self.assertIn("failing test binaries: 100000\n", summary)
-        self.assertIn("failing test binaries not listed: 99950 (limit 50)", summary)
+        # #9831: one section is at most one binary row and one result, the last FAILED one.
+        self.assertIn("failing test binaries: 1\n", summary)
+        self.assertNotIn("not listed", summary)
+        self.assertIn("names not available; test result: FAILED. 099999 of the ones", summary)
         self.assertLessEqual(len(calls), REDACTION_CALLS)
         self.assertLess(elapsed, 20.0)
 
     def test_b_the_redaction_budget_stops_at_its_bound(self):
-        """The budget is a backstop the row limits never reach in a log, so it is driven through clean() directly."""
+        """The budget is a backstop the row limits never reach in a log, so it is driven through the funnel directly."""
         module = load_script()
         calls = self.counting(module)
         module.load_redaction()
         over = 5
-        shown = [module.clean("value %d" % index).text for index in range(REDACTION_CALLS + over)]
+        shown = [module.redact_shown("value %d" % index).text for index in range(REDACTION_CALLS + over)]
         self.assertEqual(len(calls), REDACTION_CALLS)
         self.assertEqual(shown[:2], ["value 0", "value 1"])
         self.assertEqual(shown[REDACTION_CALLS:], ["<redaction budget spent>"] * over)
@@ -279,8 +283,10 @@ class UnanchoredLogText(Base):
         ("once", RUNNING_B + "test a::x ... FAILED\n\nfailures:\n    a::x\n\n" + RESULT_FAILED_LINE + "\n", 1, 1),
         ("h03", RUNNING_B + "test a::x ... FAILED\n\nfailures:\n\n---- a::x stdout ----\ntest a::y ... FAILED\n"
          "    a::z\nfailures\n\nfailures:\n    a::x\n\n" + RESULT_FAILED_LINE + "\n", 1, 1),
-        ("list-wins", RUNNING_B + "test a::x ... FAILED\ntest a::y ... FAILED\n\nfailures:\n    a::x\n\n"
-         + RESULT_FAILED_LINE + "\n", 1, 1),
+        # #9831: names come only from the progress lines; the failures list is opaque and never read.
+        ("progress-names", RUNNING_B + "test a::x ... FAILED\ntest a::y ... FAILED\n\nfailures:\n    a::x\n\n"
+         + RESULT_FAILED_LINE + "\n", 2, 1),
+        ("list-only", RUNNING_B + "failures:\n    a::x\n    a::y\n\n" + RESULT_FAILED_LINE + "\n", 0, 1),
     )
 
     def test_names_come_only_from_their_own_section_and_its_failed_result(self):
@@ -407,7 +413,7 @@ class LowFindings(Base):
             ("a‮b", "a\\u202eb"),
         )
         for raw, expected in rows:
-            self.assertEqual(module.md_cell(raw), expected, raw)
+            self.assertEqual(module.md_cell(module.Redacted(raw, module._MINT)), expected, raw)
 
     def test_l5_a_raising_redaction_shows_the_fixed_marker_end_to_end(self):
         script = self.fixture_copy()
@@ -416,25 +422,28 @@ class LowFindings(Base):
         self.write("in.log", RUNNING_B + RESULT_FAILED_LINE + "\n")
         rc, out, err, summary = self.run_script(["in.log"], script=str(script))
         self.assertEqual(rc, 0, err)
-        self.assertIn("| b | &lt;redaction failed> |", summary)
-        self.assertIn(BINARY_TITLE + "b: <redaction failed>\n", out)
+        # No progress name, so the row is the names-not-available reason with the failed redaction of the result.
+        self.assertIn("| b | failed, names not available; &lt;redaction failed> |", summary)
+        self.assertIn(BINARY_TITLE + "b: failed, names not available; <redaction failed>\n", out)
         self.assertNotIn("1 passed; 2 failed", out + summary)
 
 
 class Survivors(Base):
     """The round-1 mutants that no test killed (F11): each row pins the bound from both sides."""
 
-    def test_m03_clean_cuts_to_the_line_bound_exactly(self):
+    def test_m03_the_funnel_cuts_to_the_line_bound_exactly(self):
         module = load_script()
         module.load_redaction()
-        shown = module.clean(":" * 400).text
-        self.assertEqual(len(shown.encode("utf-8")), LINE_BYTES)
-        self.assertEqual(module.clean(":" * LINE_BYTES).text, ":" * LINE_BYTES)
+        shown = module.redact_shown(":" * PRE_CAP_BYTES).text
+        self.assertEqual(shown, ":" * (LINE_BYTES - 3) + "...")
+        self.assertEqual(module.redact_shown(":" * LINE_BYTES).text, ":" * LINE_BYTES)
         cuts = module._shown_cuts
-        one_over = module.clean(":" * (LINE_BYTES + 1)).text  # the first length that is cut (both sides of the bound)
-        self.assertEqual(len(one_over.encode("utf-8")), LINE_BYTES)
-        self.assertNotEqual(one_over, ":" * (LINE_BYTES + 1))
+        one_over = module.redact_shown(":" * (LINE_BYTES + 1)).text  # the first length that is cut (both sides)
+        self.assertEqual(one_over, ":" * (LINE_BYTES - 3) + "...")
         self.assertEqual(module._shown_cuts, cuts + 1, "the cut of a value one byte over the bound is counted")
+        over_cap = module.redact_shown(":" * (PRE_CAP_BYTES + 1)).text
+        self.assertEqual(over_cap, "<line not shown: %d bytes>" % (PRE_CAP_BYTES + 1))
+        self.assertEqual(module._shown_cuts, cuts + 2, "a value one byte over the pre-cap is counted")
 
     def test_m27_a_step_log_of_the_file_bound_and_one_above_names_its_last_error(self):
         tail = b"error: at the end\n"
@@ -459,11 +468,12 @@ class Survivors(Base):
         self.assertGreater(len(line), ANNOTATION_DEFAULT_CHARS)
         self.assertTrue(line.endswith("\\\\u2060"), line[-40:])
 
-    def test_x5_names_equal_in_their_first_key_bytes_are_one_test(self):
-        stem = "t::" + "n" * (NAME_KEY_BYTES - 3)
-        log = (RUNNING_B + "\nfailures:\n    %sA\n    %sB\n\n" % (stem, stem) + RESULT_FAILED_LINE + "\n")
-        out, summary = self.run_log(log)
-        self.assertIn("failing tests: 1\n", summary)
+    def test_x5_progress_names_are_keyed_on_their_whole_raw_text(self):
+        # decision: whole raw names as keys over the round-1 key prefix because a shared prefix merged distinct tests.
+        stem = "t::" + "n" * 200
+        log = RUNNING_B + "test %sA ... FAILED\ntest %sB ... FAILED\ntest %sA ... FAILED\n" % (stem, stem, stem)
+        out, summary = self.run_log(log + RESULT_FAILED_LINE + "\n")
+        self.assertIn("failing tests: 2\n", summary)
 
 
 # The F12 ratchet: an allowlist over the whole script, never a list of forbidden spellings.
@@ -676,7 +686,9 @@ class OneFunnel(Base):
         self.assertIs(type(shown), module.Redacted)
         self.assertEqual(shown.text, "plain")
         for call in (lambda: module.Redacted("x"), lambda: module.cut_redacted("x"), lambda: module.md_cell("x"),
-                     lambda: module.notice("x"), lambda: module.summary_text("x"),
+                     lambda: module.notice("x"),
+                     # decision: summary_text stays the str file escape over a Redacted check because every value in
+                     # its line already came through md_cell or compose; it adds no shown text of its own.
                      lambda: module.compose(module.NAMES_NOT_AVAILABLE_REASON, "x")):
             with self.assertRaises(TypeError):
                 call()

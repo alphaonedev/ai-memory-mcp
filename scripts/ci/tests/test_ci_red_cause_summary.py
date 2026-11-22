@@ -155,6 +155,8 @@ CAUSE_TITLE = "::error title=red cause::"
 CENSUS_FIXTURE = REPO / "scripts" / "ci" / "tests" / "fixtures" / "red_cause_census_9709.txt"
 CENSUS_FLOOR = 0.99
 CENSUS_MIN_NAMES = 1000
+CENSUS_LONG_RUN = 32  # the shared redactor's long base64 run (cert_gate_evidence.py LONG_B64, #9856)
+CENSUS_LONG_SAMPLE = 200  # long census names checked as masked
 
 TITLE_LINE = "**Red cause (#9709)**"
 NOTICE = "::notice title=red cause summary::"
@@ -164,7 +166,21 @@ RESULT_FAILED_LINE = "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 meas
 CRASH_DETAIL = ("process didn't exit successfully: `/x/crashy-fedcba9876543210` "
                 "(signal: 11, SIGSEGV: invalid memory reference)")
 
+# #9831: a section is opaque from its first failures: line to the end of the input, so the sections after the one
+# with the failures list come first here (cargo with --no-fail-fast prints them in any order; later ones are unread).
 FIXTURE_A = (
+    "     Running tests/crashy.rs (target/debug/deps/crashy-fedcba9876543210)\n"
+    "\n"
+    "running 1 test\n"
+    "error: test failed, to rerun pass `--test crashy`\n"
+    "\n"
+    "Caused by:\n"
+    "  " + CRASH_DETAIL + "\n"
+    "   Doc-tests ai_memory\n"
+    "\n"
+    "running 0 tests\n"
+    "\n"
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
     "     Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)\n"
     "\n"
     "running 3 tests\n"
@@ -184,18 +200,6 @@ FIXTURE_A = (
     "" + RESULT_FAILED_LINE + "\n"
     "\n"
     "error: test failed, to rerun pass `--lib`\n"
-    "     Running tests/crashy.rs (target/debug/deps/crashy-fedcba9876543210)\n"
-    "\n"
-    "running 1 test\n"
-    "error: test failed, to rerun pass `--test crashy`\n"
-    "\n"
-    "Caused by:\n"
-    "  " + CRASH_DETAIL + "\n"
-    "   Doc-tests ai_memory\n"
-    "\n"
-    "running 0 tests\n"
-    "\n"
-    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
 )
 SECTION_T = "     Running tests/t.rs (target/debug/deps/t-0123456789abcdef)\n"
 SECTION_T_ROW = "| t | " + RESULT_FAILED_LINE + " |\n"
@@ -211,9 +215,9 @@ FIXTURE_A_SUMMARY = (
     "\n"
     "| Binary | Reason |\n"
     "| --- | --- |\n"
-    "| ai&#95;memory | " + RESULT_FAILED_LINE + " |\n"
     "| crashy | ended without a test result line (crash, timeout or signal); process didn't exit successfully: "
     "&#96;/x/crashy-f​edcba9876543210&#96; (signal: 11, SIGSEGV: invalid memory reference) |\n"
+    "| ai&#95;memory | " + RESULT_FAILED_LINE + " |\n"
     "\n"
     "failing tests: 2\n"
     "\n"
@@ -226,9 +230,9 @@ FIXTURE_A_SUMMARY = (
 # never emphasis, and a zero-width space after the first hex digit of a 7+ digit run keeps GitHub from linking it as
 # a commit sha.
 FIXTURE_A_STDOUT = (
-    "::error title=failing test binary::ai_memory: " + RESULT_FAILED_LINE + "\n"
     "::error title=failing test binary::crashy: ended without a test result line (crash, timeout or signal); "
     + CRASH_DETAIL + "\n"
+    "::error title=failing test binary::ai_memory: " + RESULT_FAILED_LINE + "\n"
     "::error title=failing test::ai_memory: a\\x3a:bad\n"
     "::error title=failing test::ai_memory: a\\x3a:worse\n"
 )
@@ -357,23 +361,26 @@ class ParseAndRender(Scratch):
         self.assertEqual((rc, out), (0, NOTICE + "cause not identified; no failing test or test binary found in 1 input file(s)\n"))
         self.assertEqual(summary, TITLE_LINE + "\ncause not identified; no failing test or test binary found in 1 input file(s)\n")
 
-    def test_failures_list_without_failed_lines_names_the_tests(self):
-        self.write("a.log", "     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\n\nfailures:\n    m::one\n    m::two\n\n"
-                            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n")
+    def test_a_failures_list_without_progress_lines_is_one_names_not_available_row(self):
+        # #9831: the failures list is opaque (captured output can print it), so it never names a test.
+        x_result = "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out"
+        self.write("a.log", "     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\n\nfailures:\n\n    m::one\n"
+                            "    m::two\n\n" + x_result + "\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| x | m::one |\n| x | m::two |\n", summary)
-        self.assertIn("failing tests: 2\n", summary)
+        self.assertEqual(out, "::error title=failing test binary::x: failed, names not available; " + x_result + "\n")
+        self.assertEqual(summary, TITLE_LINE + "\n\nfailing test binaries: 1\n\n| Binary | Reason |\n| --- | --- |\n"
+                                  "| x | failed, names not available; " + x_result + " |\n")
 
-    def test_blank_lines_between_the_failures_header_and_the_names_are_skipped(self):
-        self.write("a.log", "     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\n\nfailures:\n\n\n    m::one\n"
-                            "    m::two\n\n    m::not_listed\n"
-                            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n")
+    def test_a_passing_result_after_the_failures_list_never_hides_the_failed_one(self):
+        x_result = "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out"
+        self.write("a.log", "     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\ntest m::one ... FAILED\n"
+                            "\nfailures:\n    m::one\n\n" + x_result + "\n" + "test result: ok. 3 passed; 0 failed\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| x | m::one |\n| x | m::two |\n", summary)
-        self.assertNotIn("not_listed", summary)
-        self.assertIn("failing tests: 2\n", summary)
+        self.assertIn("| x | " + x_result + " |\n", summary)
+        self.assertIn("| x | m::one |\n", summary)
+        self.assertNotIn("3 passed", out + summary)
 
     def test_doc_test_failure_and_ansi_colour(self):
         self.write("a.log", "   Doc-tests ai_memory\n\x1b[31mtest src/lib.rs - foo (line 3) ... FAILED\x1b[0m\n"
@@ -452,11 +459,14 @@ class Hostile(Scratch):
                             "  process didn't exit successfully: ::notice::`x` %0A\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertEqual(out, "::error title=failing test binary::b\\x3a:c: test result: FAILED. 0 passed; \\x3a:error\\x3a:pwn | <i>\n"
+        # #9831: no progress line names a test of b::c, so its row is the names-not-available reason.
+        self.assertEqual(out, "::error title=failing test binary::b\\x3a:c: failed, names not available; "
+                              "test result: FAILED. 0 passed; \\x3a:error\\x3a:pwn | <i>\n"
                               "::error title=failing test binary::d: ended without a test result line (crash, timeout or signal); "
                               "process didn't exit successfully: \\x3a:notice\\x3a:`x` \\x250A\n")
         self.assertEqual(summary, TITLE_LINE + "\n\nfailing test binaries: 2\n\n| Binary | Reason |\n| --- | --- |\n"
-                                  "| b::c | test result: FAILED. 0 passed; ::error::pwn &#124; &lt;i> |\n"
+                                  "| b::c | failed, names not available; test result: FAILED. 0 passed; ::error::pwn "
+                                  "&#124; &lt;i> |\n"
                                   "| d | ended without a test result line (crash, timeout or signal); process didn't exit successfully: "
                                   "::notice::&#96;x&#96; %0A |\n")
 
@@ -540,8 +550,10 @@ class Bounds(Scratch):
         self.write("a.log", self.long_line(301))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0)
-        self.assertIn("| t | " + "ab::" * 71 + " |\n", summary)
-        self.assertTrue(summary.endswith("\ninput lines over 300 bytes cut: 1\n"))
+        # #9831: the reader cut leaves a line that is no progress line, so it is shown whole (redacted, then cut to the
+        # line bound) as the test cell; both cuts are counted.
+        self.assertIn("| t | test " + "ab::" * 71 + "a ... FA... |\n", summary)
+        self.assertTrue(summary.endswith("\ninput lines over 300 bytes cut: 1\nshown values cut: 1 (limit 300 bytes)\n"))
 
     def test_summary_bound_at_the_bound_and_one_above(self):
         module = load_module()
@@ -689,8 +701,10 @@ class LinearTime(Scratch):
         elapsed, (rc, out, err, summary) = self.timed("a.log")
         self.assertEqual(rc, 0)
         self.assertLess(elapsed, WALL_CLOCK_CEILING_SECONDS)
-        self.assertIn("| t | &lt;redacted> |\n", summary)
-        self.assertTrue(summary.endswith("\ninput lines over 300 bytes cut: 1\n"))
+        # #9830: a line over the 400-byte pre-cap is never sent to the redactor; it is a counted marker (the 7-hex-digit
+        # run gets the commit-autolink break).
+        self.assertIn("| t | &lt;line not shown: 1​0485776 bytes> |\n", summary)
+        self.assertTrue(summary.endswith("\ninput lines over 300 bytes cut: 1\nshown values cut: 1 (limit 300 bytes)\n"))
 
     def test_a_10mb_line_of_colons_and_escapes(self):
         self.write("a.log", b"test " + b":" * (10 * 1024 * 1024) + b" ... FAILED\n")
@@ -1149,46 +1163,65 @@ def canary_shapes():
 
 
 class CleanedByConstruction(Scratch):
-    """Every shown value is a Cleaned made only by clean()/render_name(); counting runs on raw values (#9709 r1)."""
+    """#9830: every shown value is a Redacted made only by the funnel (redact_shown, compose, fixed); counting runs on
+    raw values.  The refusal texts are written out here, never read from the module."""
+
+    FUNNEL_ONLY_TEXT = "Redacted is made only by redact_shown(), compose() or fixed()"
+    NEEDS_REDACTED_TEXT = "a shown value must be a Redacted"
+    NEEDS_STR_TEXT = "redact_shown takes a str"
 
     def module(self):
         module = load_module()
         module.load_redaction()
+        module.reset_counters()
         return module
 
-    def test_cleaned_cannot_be_made_outside_clean(self):
+    def test_redacted_cannot_be_made_outside_the_funnel(self):
         module = self.module()
-        with self.assertRaises(TypeError):
-            module.Cleaned("x", object())
-        self.assertIsInstance(module.clean("x"), module.Cleaned)
-        self.assertIsInstance(module.render_name("x"), module.Cleaned)
+        for args in (("x",), ("x", object()), ("x", None)):
+            with self.subTest(args=len(args)):
+                with self.assertRaises(TypeError) as caught:
+                    module.Redacted(*args)
+                self.assertEqual(str(caught.exception), self.FUNNEL_ONLY_TEXT)
+        with self.assertRaises(TypeError) as caught:
+            module.redact_shown(b"x")
+        self.assertEqual(str(caught.exception), self.NEEDS_STR_TEXT)
+        self.assertIs(type(module.redact_shown("x")), module.Redacted)
 
-    def test_add_methods_refuse_a_str(self):
+    def test_note_methods_refuse_a_str(self):
         module = self.module()
-        findings = module.Findings()
-        shown = module.clean("b")
-        with self.assertRaises(TypeError):
-            findings.add_binary("b", "r", "b", shown)
-        with self.assertRaises(TypeError):
-            findings.add_binary("b", "r", shown, "r")
-        with self.assertRaises(TypeError):
-            findings.add_test("b", "n", "b", shown)
-        with self.assertRaises(TypeError):
-            findings.add_test("b", "n", shown, "n")
+        shown = module.redact_shown("b")
+        for case, pair in (("binary str", ("b", shown)), ("reason str", (shown, "r"))):
+            with self.subTest(case=case):
+                findings = module.Findings()
+                with self.assertRaises(TypeError) as caught:
+                    findings.note_binary(b"k", lambda: pair)
+                self.assertEqual(str(caught.exception), self.NEEDS_REDACTED_TEXT)
+                with self.assertRaises(TypeError) as caught:
+                    findings.note_test(b"k", lambda: pair)
+                self.assertEqual(str(caught.exception), self.NEEDS_REDACTED_TEXT)
+        with self.assertRaises(TypeError) as caught:
+            module.md_cell("b")
+        self.assertEqual(str(caught.exception), self.NEEDS_REDACTED_TEXT)
+        with self.assertRaises(TypeError) as caught:
+            module.cut_redacted("b")
+        self.assertEqual(str(caught.exception), self.NEEDS_REDACTED_TEXT)
 
     def test_a_token_shaped_binary_never_reaches_any_output(self):
         canary_text = canary("gh" + "p_", 36)
         running = "     Running tests/x.rs (target/debug/deps/%s-0123456789abcdef)\n" % canary_text
+        # #9831: the section with the failures list is last, because a section is opaque from that list to the end.
         self.write("a.log", running + "test m::a ... FAILED\n" + RESULT_FAILED_LINE + "\n"
-                   + running + "failures:\n    m::b\n\n" + RESULT_FAILED_LINE + "\n"
                    + running + "running 1 test\n" + "  process didn't exit successfully: `x`\n"
                    + "test " + canary_text + " ... FAILED\n"
-                   + RESULT_FAILED_LINE + "\n")  # #9759 r1 (C): the result line commits the token-shaped name
+                   + RESULT_FAILED_LINE + "\n"
+                   + running + "failures:\n    m::b\n\n" + RESULT_FAILED_LINE + "\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
         for text in (out, err, summary):
             self.assertNotIn(canary_text[4:20], text)
-        self.assertIn("failing tests: 3\n", summary)
+        self.assertIn("failing tests: 2\n", summary)
+        self.assertNotIn("m::b", out + summary)
 
     def test_three_long_failing_names_print_three_rows(self):
         names = ["tests::store_rejects_oversized_content_with_exact_reason_4410",
@@ -1201,8 +1234,9 @@ class CleanedByConstruction(Scratch):
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
         self.assertIn("failing tests: 3\n", summary)
-        for name in names:
-            self.assertIn("| ai&#95;memory | %s |\n" % name.replace("_", "&#95;"), summary)  # #9759 r1 format
+        # #9856: the shared redactor masks a snake_case run of 32+ characters, so the three rows show the same text;
+        # they stay three rows because the keys are the raw names.
+        self.assertEqual(summary.count("| ai&#95;memory | tests::&lt;redacted> |\n"), 3)
         self.assertEqual(out.count("::error title=failing test::"), 3)
 
     def test_every_canary_shape_is_masked(self):
@@ -1210,7 +1244,7 @@ class CleanedByConstruction(Scratch):
         for shape, canary_text in canary_shapes():
             for raw in (canary_text, "tests::" + canary_text, "tests::x_" + canary_text):
                 with self.subTest(shape=shape, raw=raw[:12]):
-                    shown = module.render_name(raw).text
+                    shown = module.redact_shown(raw).text
                     self.assertNotIn(canary_text, shown)
                     self.assertNotEqual(shown, raw)
 
@@ -1227,21 +1261,22 @@ class CleanedByConstruction(Scratch):
                 self.assertNotIn(canary_text, text)
 
 
-# Hand-written: every key prefix of NAME_TOKEN_MARKERS, never read from the module (#9709 r3 D1). A body of
-# underscore-separated groups has no 32-character alphanumeric run, so only the marker (and the base64url run of the
-# redaction) can mask a name built from it.
+# Hand-written: every key prefix the shared redactor masks, never read from the module.  A token body has no
+# underscore, so a body of underscore-separated groups is masked only when the redactor's key pattern takes it.
 KEY_PREFIXES = ("ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-", "eyJ")
 UNDERSCORE_BODY = "A1b2_C3d4_E5f6_G7h8_J9k1_L2m3_N4p5_Q6r7"
-RENDER_NAME_BOUND = 300  # written out: the line bound MAX_LINE_BYTES, never read from the module
+SHOWN_BOUND = 300  # written out: the line bound MAX_LINE_BYTES, never read from the module
+PRE_CAP = 400  # written out: PRE_CAP_BYTES
 
 
 class NameMarkerAndLengthRows(Scratch):
-    """#9709 r3 D1 and D16: the two guards of render_name that the first rows left alive. A name with the plain Rust
-    path shape is printed as written only when it is at most the line bound and has no key prefix and no long run."""
+    """#9830: the one funnel shows a name as the redactor leaves it, cut to the line bound; a value over the pre-cap is
+    a counted marker and never reaches the redactor."""
 
     def module(self):
         module = load_module()
         module.load_redaction()
+        module.reset_counters()
         return module
 
     def test_a_name_with_a_key_prefix_is_masked_even_with_the_plain_path_shape(self):
@@ -1249,26 +1284,34 @@ class NameMarkerAndLengthRows(Scratch):
         for prefix in KEY_PREFIXES:
             raw = "tests::" + prefix + UNDERSCORE_BODY
             with self.subTest(prefix=prefix):
-                shown = module.render_name(raw).text
+                shown = module.redact_shown(raw).text
                 self.assertNotEqual(shown, raw)
                 self.assertNotIn(UNDERSCORE_BODY[:20], shown)
 
     def test_the_same_body_without_a_key_prefix_prints_as_written(self):
         module = self.module()
-        raw = "tests::x_" + UNDERSCORE_BODY
-        self.assertEqual(module.render_name(raw).text, raw)
+        raw = "tests::x_" + UNDERSCORE_BODY[:14]  # a run under 32 characters (#9856 masks a longer one)
+        self.assertEqual(module.redact_shown(raw).text, raw)
 
-    def test_a_name_over_the_line_bound_is_cut_and_masked_and_one_at_the_bound_is_not(self):
+    def test_a_name_over_the_line_bound_is_cut_and_one_at_the_bound_is_not(self):
         module = self.module()
-        at_bound = ("a_" * RENDER_NAME_BOUND)[:RENDER_NAME_BOUND]
-        over = ("a_" * RENDER_NAME_BOUND)[:RENDER_NAME_BOUND + 1]
-        huge = ("a_" * 5000)[:10000]
-        self.assertEqual(module.render_name(at_bound).text, at_bound)
-        for raw in (over, huge):
-            with self.subTest(length=len(raw)):
-                shown = module.render_name(raw).text
-                self.assertNotEqual(shown, raw)
-                self.assertLessEqual(len(shown), RENDER_NAME_BOUND)
+        at_bound = ("ab::" * SHOWN_BOUND)[:SHOWN_BOUND]  # "::" breaks every run, so the redactor leaves it as written
+        over = ("ab::" * SHOWN_BOUND)[:SHOWN_BOUND + 1]
+        self.assertEqual(module.redact_shown(at_bound).text, at_bound)
+        self.assertEqual(module._shown_cuts, 0)
+        self.assertEqual(module.redact_shown(over).text, over[:SHOWN_BOUND - 3] + "...")
+        self.assertEqual(module._shown_cuts, 1)
+
+    def test_a_name_over_the_pre_cap_is_a_counted_marker(self):
+        module = self.module()
+        calls = []
+        module._redact_line = lambda text: calls.append(text) or text
+        for size in (PRE_CAP + 1, 10000):
+            raw = ("a_" * size)[:size]
+            with self.subTest(size=size):
+                self.assertEqual(module.redact_shown(raw).text, "<line not shown: %d bytes>" % size)
+        self.assertEqual(calls, [])
+        self.assertEqual(module._shown_cuts, 2)
 
 
 class ScratchCleanup(Scratch):
@@ -1326,8 +1369,12 @@ class RequiredPinCount(unittest.TestCase):
 
 
 class Census(unittest.TestCase):
-    """At least 99% of the repository's fn names print unmasked (fixture: a dated snapshot written by
-    gen_red_cause_census_9709.py, source sha in its docstring; #9759 r1 code finding 10)."""
+    """At least 99% of the repository's fn names under the shared redactor's long-run length print unmasked through
+    the one funnel (fixture: a dated snapshot written by gen_red_cause_census_9709.py, source sha in its docstring;
+    #9759 r1 code finding 10).  decision: the floor is taken over the names shorter than CENSUS_LONG_RUN over a floor
+    of about 0.45 over all names, because #9856 (the shared redactor masks every snake_case run of 32+ characters)
+    is a redactor defect outside this file, and a floor over all names would hide a regression in the short names
+    that #9759 r2 does show; the long names are pinned as masked so the fix of #9856 turns this test red on purpose."""
 
     def test_real_fn_names_print_unmasked(self):
         module = load_module()
@@ -1335,9 +1382,24 @@ class Census(unittest.TestCase):
         names = CENSUS_FIXTURE.read_text(encoding="utf-8").splitlines()
         self.assertGreaterEqual(len(names), CENSUS_MIN_NAMES)
         self.assertEqual(names, sorted(set(names)))
+        short = [name for name in names if len(name) < CENSUS_LONG_RUN]
+        self.assertGreaterEqual(len(short), CENSUS_MIN_NAMES)
         for prefix in ("", "tests::", "store::sqlite::tests::"):
-            kept = sum(module.render_name(prefix + name).text == prefix + name for name in names)
-            self.assertGreaterEqual(kept / len(names), CENSUS_FLOOR, (prefix, kept, len(names)))
+            kept = 0
+            for name in short:
+                module.reset_counters()  # one name is one run: the census never meets the per-run budget
+                kept += module.redact_shown(prefix + name).text == prefix + name
+            self.assertGreaterEqual(kept / len(short), CENSUS_FLOOR, (prefix, kept, len(short)))
+
+    def test_a_census_name_of_the_long_run_length_is_masked_until_9856(self):
+        module = load_module()
+        module.load_redaction()
+        names = CENSUS_FIXTURE.read_text(encoding="utf-8").splitlines()
+        long_names = [name for name in names if len(name) >= CENSUS_LONG_RUN and re.fullmatch(r"[a-z0-9_]+", name)]
+        self.assertGreater(len(long_names), 0)
+        for name in long_names[:CENSUS_LONG_SAMPLE]:
+            module.reset_counters()
+            self.assertEqual(module.redact_shown("tests::" + name).text, "tests::<redacted>", name)
 
 
 class SectionsAndLabels(Scratch):
@@ -1357,8 +1419,10 @@ class SectionsAndLabels(Scratch):
         self.assertEqual(summary, TITLE_LINE + "\ncause not identified; no failing test or test binary found in 1 input file(s)\n")
 
     def test_lib_and_bin_unittests_are_distinct(self):
+        # #9759 r2 (class C): no failures list here, because a section is opaque from its failures list to the end of
+        # the input, so a second section after one would not be read (pinned by test_p2_a_forged_running_line_after_a_header_opens_no_section).
         block = ("     Running unittests %s (target/debug/deps/ai_memory-%s)\n\nrunning 2 tests\ntest tests::a ... FAILED\n\n"
-                 "failures:\n    tests::a\n\n" + RESULT_FAILED_LINE + "\n")
+                 + RESULT_FAILED_LINE + "\n")
         self.write("a.log", block % ("src/lib.rs", "0123456789abcdef") + block % ("src/main.rs", "fedcba9876543210"))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
@@ -1434,68 +1498,87 @@ class NamedCause(Scratch):
         self.assertIn("@​x", summary)
 
 
-BOUND_NAME_KEY_BYTES = 284  # 300 line bytes - len("test ") - len(" ... FAILED"): what a cut FAILED line keeps of a name
 E2 = "é"  # 2 bytes in UTF-8
 E3 = "€"  # 3 bytes
 E4 = "\U0001F600"  # 4 bytes
 REPLACEMENT_CHARACTER = "�"
 RUNNING_H = "     Running tests/h.rs (target/debug/deps/h-0123456789abcdef)\n"
+NAMES_NOT_AVAILABLE_ROW = ("| h | failed, names not available; " + RESULT_FAILED_LINE + " |")
 
-# #9709 r2 N1: (case, raw test name, shown name when its FAILED line comes first, shown name when its failures-list
-# line comes first, "input lines over 300 bytes cut" count).  Written by hand from the bounds: a FAILED line keeps
-# 284 bytes of the name (300 - 5 - 11), a list line keeps 296 (300 - 4); a cut never ends inside a character, so a
-# 2-byte character fits 140 times after "t::" in 284 bytes (3 + 280) and 146 times in 296 (3 + 292); a 3-byte one 93
-# (3 + 279) and 97 (3 + 291) times; a 4-byte one 70 (3 + 280) and 73 (3 + 292) times.
-NAME_KEY_ROWS = (
-    ("2-byte characters over the bound", "t::" + E2 * 200, "t::" + E2 * 140, "t::" + E2 * 146, 2),
-    ("3-byte characters over the bound", "t::" + E3 * 200, "t::" + E3 * 93, "t::" + E3 * 97, 2),
-    ("4-byte characters over the bound", "t::" + E4 * 200, "t::" + E4 * 70, "t::" + E4 * 73, 2),
-    ("284 bytes: at the bound", "t::" + E2 * 140 + "a", "t::" + E2 * 140 + "a", "t::" + E2 * 140 + "a", 0),
-    ("283 bytes: just under", "t::" + E2 * 140, "t::" + E2 * 140, "t::" + E2 * 140, 0),
-    ("285 bytes: one over, only the FAILED line is cut", "t::" + E2 * 141, "t::" + E2 * 140, "t::" + E2 * 141, 1),
+# #9759 r2 (class A): a failing test's progress line is redacted whole, then cut: (case, raw test name, the shown
+# summary cell, "input lines over 300 bytes cut" count).  Written by hand from the bounds: the line is the name plus
+# 16 bytes ("test " and " ... FAILED"); a line over 400 bytes (PRE_CAP) is the marker with its size; a line over 300
+# is cut to 297 bytes on a character boundary plus "...", and "test t::" is 8 bytes, so 144 2-byte characters (8 +
+# 288 = 296, the 145th would end at 298), 96 3-byte ones (8 + 288) or 72 4-byte ones (8 + 288) fit.  The failures
+# list line (4 + the name) is counted as an input line over 300 bytes too.
+NAME_ROWS = (
+    ("2-byte characters over the pre-cap", "t::" + E2 * 200, "&lt;line not shown: 419 bytes>", 2),
+    ("3-byte characters over the pre-cap", "t::" + E3 * 200, "&lt;line not shown: 619 bytes>", 2),
+    ("4-byte characters over the pre-cap", "t::" + E4 * 200, "&lt;line not shown: 819 bytes>", 2),
+    ("2-byte characters across the cut", "t::" + E2 * 190, "test t::" + E2 * 144 + "...", 2),
+    ("3-byte characters across the cut", "t::" + E3 * 127, "test t::" + E3 * 96 + "...", 2),
+    ("4-byte characters across the cut", "t::" + E4 * 95, "test t::" + E4 * 72 + "...", 2),
+    ("300 line bytes: at the bound", "t::" + E2 * 140 + "a", "t::" + E2 * 140 + "a", 0),
+    ("301 line bytes: one over", "t::" + E2 * 141, "test t::" + E2 * 141 + " ... FA...", 1),  # 8 + 282 + 7 = 297
 )
-NAME_KEY_FORMS = (
-    ("FAILED line first", "test %s ... FAILED\n\nfailures:\n    %s\n\n"),
-    ("failures list first", "failures:\n    %s\n\ntest %s ... FAILED\n"),
-)
+FAILED_FIRST = "test %s ... FAILED\n\nfailures:\n    %s\n\n"
+LIST_FIRST = "failures:\n    %s\n\ntest %s ... FAILED\n"
 
 
 def escaped_name(name):
     return name.replace("::", "\\x3a:")
 
 
+def unescaped_cell(cell):
+    return cell.replace("&lt;", "<")
+
+
 class NameKeyBytes(Scratch):
-    """#9709 r2 N1: lines are cut in bytes, so the key of a failing test is cut in bytes too, on a character boundary:
-    one failing test is ONE row whatever form its line has and whatever characters its name has, and nothing printed
-    is ever split inside a multi-byte character."""
+    """#9759 r2: a name is shown from its whole progress line, redacted first and cut after, never split inside a
+    multi-byte character; it is keyed by the raw line, so a cut never merges two tests; a failures list that comes
+    before the progress line makes the section opaque, so its names are not available (class C)."""
 
-    def test_the_key_bound_is_the_common_byte_prefix_of_the_two_forms(self):
-        module = load_module()
-        self.assertEqual(module.NAME_KEY_BYTES, BOUND_NAME_KEY_BYTES)
-        self.assertEqual(module.NAME_KEY_BYTES,
-                         module.MAX_LINE_BYTES - len(module.TEST_PREFIX) - len(module.FAILED_SUFFIX))
+    def test_a_progress_line_is_shown_whole_cut_or_as_a_marker_and_no_character_is_split(self):
+        for case, raw, cell, cuts in NAME_ROWS:
+            with self.subTest(case=case):
+                self.write("a.log", RUNNING_H + FAILED_FIRST % (raw, raw) + RESULT_FAILED_LINE + "\n")
+                (self.dir / "summary.md").unlink(missing_ok=True)
+                rc, out, err, summary = self.run_script(["a.log"])
+                self.assertEqual((rc, err), (0, ""))
+                self.assertIn("failing tests: 1\n", summary)
+                self.assertEqual([line for line in summary.splitlines() if line.startswith("| h | ")][-1],
+                                 "| h | " + cell + " |")
+                self.assertEqual(out.splitlines()[-1], "::error title=failing test::h: " + escaped_name(unescaped_cell(cell)))
+                self.assertEqual(len(out.splitlines()), 2)
+                self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
+                notes = ("input lines over 300 bytes cut: %d\n" % cuts if cuts else "") + (
+                    "" if cell == raw else "shown values cut: 1 (limit 300 bytes)\n")
+                if notes:
+                    self.assertTrue(summary.endswith(notes), summary[-120:])
+                else:
+                    self.assertNotIn(" cut: ", summary)
 
-    def test_both_forms_of_one_name_are_one_row_and_no_character_is_split(self):
-        for case, raw, _shown_failed_first, shown_list_first, cuts in NAME_KEY_ROWS:
-            for form, template in NAME_KEY_FORMS:
-                with self.subTest(case=case, form=form):
-                    # #9759 r1 (C): names come from the failures list when the section has one, whichever line came
-                    # first, so both forms show the list form of the name (shown_failed_first is the FAILED-line
-                    # form, kept in the table for the key bound it documents).
-                    first_shown = shown_list_first
-                    self.write("a.log", RUNNING_H + template % (raw, raw) + RESULT_FAILED_LINE + "\n")
-                    (self.dir / "summary.md").unlink(missing_ok=True)
-                    rc, out, err, summary = self.run_script(["a.log"])
-                    self.assertEqual((rc, err), (0, ""))
-                    self.assertIn("failing tests: 1\n", summary)
-                    # #9759 r1: the summary file keeps `::` raw; only the annotation escapes it.
-                    self.assertEqual([line for line in summary.splitlines() if line.startswith("| h | t::")],
-                                     ["| h | " + first_shown + " |"])
-                    self.assertEqual(out.splitlines()[-1], "::error title=failing test::h: " + escaped_name(first_shown))
-                    self.assertEqual(len(out.splitlines()), 2)
-                    self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
-                    note = "input lines over 300 bytes cut: %d\n" % cuts
-                    self.assertEqual(summary.endswith(note), cuts > 0, summary[-80:])
+    def test_a_failures_list_before_the_progress_line_shows_no_name(self):
+        for case, raw, _cell, _cuts in NAME_ROWS:
+            with self.subTest(case=case):
+                self.write("a.log", RUNNING_H + LIST_FIRST % (raw, raw) + RESULT_FAILED_LINE + "\n")
+                (self.dir / "summary.md").unlink(missing_ok=True)
+                rc, out, err, summary = self.run_script(["a.log"])
+                self.assertEqual((rc, err), (0, ""))
+                self.assertNotIn("failing tests:", summary)
+                self.assertIn(NAMES_NOT_AVAILABLE_ROW + "\n", summary)
+                self.assertNotIn("t::", summary + out)
+                self.assertEqual(len(out.splitlines()), 1)
+
+    def test_two_names_that_differ_only_after_the_cut_stay_two_tests(self):
+        names = ("t::" + E2 * 150 + "a", "t::" + E2 * 150 + "b")  # 320-byte lines: the cut hides the last byte
+        self.write("a.log", RUNNING_H + "".join("test %s ... FAILED\n" % n for n in names) + "\nfailures:\n"
+                   + "".join("    %s\n" % n for n in names) + "\n" + RESULT_FAILED_LINE + "\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("failing tests: 2\n", summary)
+        rows = [line for line in summary.splitlines() if line.startswith("| h | test t::")]
+        self.assertEqual(rows, ["| h | test t::" + E2 * 144 + "... |"] * 2)
 
     def test_the_reproducer_prints_one_failing_test(self):
         raw = "t::" + E2 * 200
@@ -1531,30 +1614,43 @@ class NameKeyBytes(Scratch):
         self.assertEqual(len([line for line in summary.splitlines() if line.startswith("| h | m")]), 2)
 
     def test_an_error_line_over_the_bound_is_cut_on_a_character_boundary(self):
-        # sibling: the shown cause is cut in bytes (#9759 r1 A): "Build: error: " is 14 bytes and 14 + 141 x 2 = 296
-        # bytes fit under the 297-byte cut, a 142nd character would pass it; "..." marks the cut.
-        self.write("logs/sal-build.log", "error: " + E2 * 200 + "\n")
-        rc, out, err, summary = self.run_script(["--step", "logs/sal-build.log", "Build", "logs"])
-        self.assertEqual((rc, err), (0, ""))
-        self.assertEqual(out, CAUSE_TITLE + "Build: error: " + E2 * 141 + "...\n")
-        self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
+        # sibling (#9759 r2 class A): the error line is redacted whole, then cut to 297 bytes plus "...": "error: " is
+        # 7 bytes and 7 + 145 x 2 = 297 fit exactly; "error: x" is 8 bytes, 8 + 144 x 2 = 296 and the 145th character
+        # would pass 297; a line over 400 bytes is the marker with its size.
+        rows = (("error: " + E2 * 190, "error: " + E2 * 145 + "..."),
+                ("error: x" + E2 * 190, "error: x" + E2 * 144 + "..."),
+                ("error: " + E2 * 200, "<line not shown: 407 bytes>"))
+        for raw, shown in rows:
+            with self.subTest(shown=shown[:20]):
+                self.write("logs/sal-build.log", raw + "\n")
+                (self.dir / "summary.md").unlink(missing_ok=True)
+                rc, out, err, summary = self.run_script(["--step", "logs/sal-build.log", "Build", "logs"])
+                self.assertEqual((rc, err), (0, ""))
+                self.assertEqual(out, CAUSE_TITLE + "Build: " + shown + "\n")
+                self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
 
     def test_a_crash_detail_over_the_bound_is_cut_on_a_character_boundary(self):
-        # sibling: the shown reason is cut in bytes (#9759 r1 A): the reason text up to the detail is 61 + 34 = 95 bytes,
-        # 95 + 101 x 2 = 297 bytes fit the 297-byte cut, a 102nd character would pass it; "..." marks the cut.
-        detail = "process didn't exit successfully: " + E2 * 200
-        self.write("a.log", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n   " + detail + "\n")
-        rc, out, err, summary = self.run_script(["a.log"])
-        self.assertEqual((rc, err), (0, ""))
-        self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
-        self.assertIn("process didn't exit successfully: " + E2 * 101 + "... |\n", summary)
+        # sibling (#9759 r2 class A): the crash detail (the stripped line) is redacted whole, then cut:
+        # "process didn't exit successfully: " is 34 bytes, 34 + 131 x 2 = 296 and the 132nd character would pass
+        # 297; a detail over 400 bytes is the marker with its size.
+        rows = (("process didn't exit successfully: " + E2 * 170,
+                 "process didn't exit successfully: " + E2 * 131 + "... |\n"),
+                ("process didn't exit successfully: " + E2 * 200, "&lt;line not shown: 434 bytes> |\n"))
+        for detail, cell_end in rows:
+            with self.subTest(cell_end=cell_end[:20]):
+                self.write("a.log", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n   " + detail + "\n")
+                (self.dir / "summary.md").unlink(missing_ok=True)
+                rc, out, err, summary = self.run_script(["a.log"])
+                self.assertEqual((rc, err), (0, ""))
+                self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
+                self.assertIn("| c | ended without a test result line (crash, timeout or signal); " + cell_end, summary)
 
 
 class CrashRowKeys(Scratch):
     """#9709 r2 N2 (D11): crashed binaries are de-duplicated on the raw values, before cutting and masking."""
 
     def test_two_crashes_whose_shown_rows_are_equal_stay_two_rows(self):
-        head = "  process didn't exit successfully: " + "word " * 50
+        head = "  process didn't exit successfully: " + "word " * 60  # 339-byte details: the cut hides the last word
         self.write("a.log", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n" + head + "first\n"
                             "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n" + head + "second\n")
         rc, out, err, summary = self.run_script(["a.log"])
