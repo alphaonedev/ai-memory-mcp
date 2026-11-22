@@ -367,7 +367,12 @@ class Domain(unittest.TestCase):
 
     def test_ledger_gate_discovers_this_module(self):
         workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("python3 -m unittest discover -s scripts/ci/tests", workflow)
+        # The whole-directory run step, alone on its line: a narrower run of one
+        # module (`... -p test_x.py`) does not discover this module.
+        self.assertRegex(
+            workflow,
+            re.compile(r"^\s*run: python3 -m unittest discover -s scripts/ci/tests\s*$", re.MULTILINE),
+        )
         self.assertRegex(Path(__file__).name, r"^test.*\.py$")
         self.assertEqual(Path(__file__).resolve().parent, REPO / "scripts" / "ci" / "tests")
 
