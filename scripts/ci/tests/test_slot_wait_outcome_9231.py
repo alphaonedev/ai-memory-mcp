@@ -534,7 +534,11 @@ class RunnerSlotTie(unittest.TestCase):
             ('continued line', {'workflows/w.yml': run_block('exec python3 -I scripts/ci/host_semaphore.py \\',
                                                              '  --slots 1 --name g --max-wait-secs 600 -- x')},
              ['workflows/w.yml: a host_semaphore line with the character U+005C, outside the canonical call '
-              'characters (letters, digits, space and _ . / = : , -)', 'g: configured but no workflow calls it']),
+              'characters (letters, digits, space and _ . / = : , -)',
+              # #9847: the shell runs the joined line, so the join is its own finding
+              'workflows/w.yml: a host_semaphore line joined from two or more lines by a backslash-newline '
+              'continuation (the shell runs the joined line, which is never a canonical call)',
+              'g: configured but no workflow calls it']),
             # R2-C: exactly one --max-wait-secs per call (the wrapper refuses a repeat at run time too)
             ('W6 a second --max-wait-secs 3600 at the call site',
              {'workflows/w.yml': run_block(self.CALL % '--name g --slots 1 --max-wait-secs 3600')}, [self.NO_FLAG]),
@@ -1321,7 +1325,8 @@ class ScanSegmentAndFlags(unittest.TestCase):
         ('the charset dropped', ('    bad = NON_CANONICAL_RE.search(line)', '    bad = None'), 'a ; in a label'),
         ('a token outside a block admitted', ('if reason is None and not in_block:', 'if False:'),
          'a plain run scalar'),
-        ('the decoded cross-check dropped', ('found.extend(_decoded_findings(wf, text, block_lines))', 'pass'),
+        ('the decoded cross-check dropped',
+         ('found.extend(_decoded_findings(wf, text, block_lines, outside))', 'pass'),
          'a run block inside another block scalar'),
         ('the env-name check dropped', ('    if unlisted and not TOKEN_RE', '    if False and not TOKEN_RE'),
          'an unlisted env name'),

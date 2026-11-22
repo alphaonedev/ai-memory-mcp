@@ -132,7 +132,8 @@ class ReviewerRepros(unittest.TestCase):
         ('security-M2 double-quoted escape', 'run: "%s"\n' % SCAN_GOOD.replace(' -- bash', '\\x20--config\\x20/e -- b'),
          [S_OUTSIDE, S_DECODED, S_NEVER]),
         # delta r2 finding D: the interpreter word is exactly python3, never a word that starts with it
-        ('r2-D python3x', run_block('exec python3x -I scripts/ci/host_semaphore.py' + GOOD_TAIL), [S_NOT_CALL, S_NEVER]),
+        ('r2-D python3x', run_block('exec python3x -I scripts/ci/host_semaphore.py' + GOOD_TAIL),
+         [S_NOT_CALL, S_NEVER]),
         ('r2-D python3.12', run_block('exec python3.12 -I scripts/ci/host_semaphore.py' + GOOD_TAIL),
          [S_NOT_CALL, S_NEVER]),
         ('r2-D python3-evil', run_block('exec python3-evil -I scripts/ci/host_semaphore.py' + GOOD_TAIL),
@@ -325,6 +326,53 @@ class RuleMutants(unittest.TestCase):
         ('a one-dash word taken as a value', ("not words[index].startswith('-')", 'True'),
          {SCAN_W: run_block(LABEL_CALL % '-x')}, [
              'workflows/w.yml: a host_semaphore.py call whose --label has no value', S_POSITIONAL]),
+        # delta r2 finding D: the interpreter word matched by prefix
+        ('python3 matched by prefix', ('words[index:index + 1] != [PYTHON_WORD]',
+                                       'not words[index].startswith(PYTHON_WORD)'),
+         {SCAN_W: run_block('exec python3x -I scripts/ci/host_semaphore.py' + GOOD_TAIL)}, [S_NOT_CALL, S_NEVER]),
+        # #9847 continuation class: the join, its count, the parse gate, an empty join, a file that is not YAML
+        ('no line continues', ('        if segment.endswith(CONTINUATION):', '        if False:'),
+         {SCAN_W: run_block('exec python3 -I scripts/ci/host_\\', 'semaphore.py' + EVIL_TAIL)}, [S_JOINED, S_NEVER]),
+        ('a joined line not counted', ('out.joined += sum(', 'out.joined += 0 * sum('),
+         {SCAN_W: run_block('env X=1 \\', 'python3 scripts/ci/host_semaphore.py' + GOOD_TAIL)}, [S_JOINED]),
+        ('the parse only for a raw token (CRLF)', ('if holds_token or CONTINUATION in text:', 'if holds_token:'),
+         {SCAN_W: 'run: |\r\n  exec python3 scripts/ci/host_\\\r\n  semaphore.py%s\r\n' % EVIL_TAIL},
+         [S_JOINED, S_NEVER]),
+        ('a join before nothing counted',
+         ('any(parts[1:])))\n            parts = []', 'True))\n            parts = []'),
+         {SCAN_W: run_block(SCAN_GOOD + ' \\')}, [s_char('U+005C'), S_NEVER]),
+        ('a continuation outside YAML not joined', ('for source in (text, joined)', 'for source in (text,)'),
+         {'scripts.sh': 'python3 scripts/ci/host_\\\nsemaphore.py x\n', SCAN_W: run_block(SCAN_GOOD)},
+         [S_NOT_YAML % 'scripts.sh']),
+        # #9847 escape class: \x5f in a run value (the parse gate), \u005f in a run value, a key, a value
+        ('the parse only for a raw token (\\x5f)', ('if holds_token or CONTINUATION in text:', 'if holds_token:'),
+         {SCAN_W: 'run: "exec python3 scripts/ci/host\\x5fsemaphore.py%s"\n' % EVIL_TAIL}, [S_DECODED, S_NEVER]),
+        ('the decoded run lines not compared',
+         ('found = [] if sorted(decoded.call_lines) == sorted(block_lines) else [F_DECODED_DIFFERS % wf]',
+          'found = []'),
+         {SCAN_W: 'run: "exec python3 scripts/ci/host\\u005fsemaphore.py%s"\n' % EVIL_TAIL}, [S_DECODED, S_NEVER]),
+        ('a key not scanned', ('out.other += sum(1 for line in key.split(',
+                               'out.other += 0 * sum(1 for line in key.split('),
+         {SCAN_W: '"host\\u005fsemaphore": 1\n' + run_block(SCAN_GOOD)}, [S_ESCAPED]),
+        ('a value not scanned', ('out.other += sum(1 for line in node.split(',
+                                 'out.other += 0 * sum(1 for line in node.split('),
+         {SCAN_W: run_block(SCAN_GOOD) + 'env:\n  X: "host\\x5fsemaphore"\n'}, [S_ESCAPED]),
+        # #9847 quoting and folding class: a single-quoted run value and a folded one, read decoded
+        ('a quoted run value not compared',
+         ('found = [] if sorted(decoded.call_lines) == sorted(block_lines) else [F_DECODED_DIFFERS % wf]',
+          'found = []'),
+         {SCAN_W: "run: 'python3 scripts/ci/host_semaphore.py --label ''x''%s'\n" % GOOD_TAIL},
+         [S_OUTSIDE, S_DECODED, S_NEVER]),
+        ('a folded run value not joined', ('        if segment.endswith(CONTINUATION):', '        if False:'),
+         {SCAN_W: 'run: >\n  exec python3 scripts/ci/host_\\\n\n  semaphore.py%s\n' % EVIL_TAIL}, [S_JOINED, S_NEVER]),
+    ]
+    # (mutant id, (old text, new text), workflow text, expected wait-key findings) of the #9847 wait-key sibling
+    WAIT_MUTANTS = [
+        ('the wait key joined with a space', ("return '\\n'.join(lines).replace(CONTINUATION + '\\n', '')",
+                                              "return '\\n'.join(lines).replace(CONTINUATION + '\\n', ' ')"),
+         'run: |\n  export HOST_SEMAPHORE_MAX_\\\n  WAIT_SECS=3600\n', [S_KEY_USE]),
+        ('the wait key not decoded', ('if CONTINUATION in text and rel.endswith(YAML_SUFFIXES):', 'if False:'),
+         'run: "export HOST\\x5fSEMAPHORE_MAX_WAIT_SECS=3600"\n', [S_KEY_USE]),
     ]
 
     def test_each_mutant_goes_red(self):
@@ -334,6 +382,15 @@ class RuleMutants(unittest.TestCase):
                 self.assertEqual(source.count(old), 1, 'mutant anchor %r' % old)
                 self.assertEqual(hsc.call_site_violations(CFG, texts), expected)
                 got = load_checker(source.replace(old, new)).call_site_violations(CFG, texts)
+                self.assertNotEqual(got, expected, 'mutant %s survived' % mutant)
+
+    def test_each_wait_key_mutant_goes_red(self):
+        source = (CI_DIR / 'host_slots_check.py').read_text()
+        for mutant, (old, new), text, expected in self.WAIT_MUTANTS:
+            with self.subTest(mutant=mutant):
+                self.assertEqual(source.count(old), 1, 'mutant anchor %r' % old)
+                self.assertEqual(hsc.wait_key_violations({SCAN_W: text}), expected)
+                got = load_checker(source.replace(old, new)).wait_key_violations({SCAN_W: text})
                 self.assertNotEqual(got, expected, 'mutant %s survived' % mutant)
 
 

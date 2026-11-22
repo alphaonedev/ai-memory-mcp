@@ -20,9 +20,11 @@ gated by it. Rules:
   --name, --max-wait-secs, --slots, --label and --poll-secs, each with one word as its value, then ` -- `
   and a command. Exactly one configured --name; exactly one --max-wait-secs, a plain decimal within the
   ceiling; --slots is required and equals the configured slot count; --label and --poll-secs at most
-  once, --poll-secs a plain decimal. The parsed YAML document is a cross-check: the token lines of its
-  decoded `run` values equal the block lines this scan read, else a finding. Every configured gate is
-  called;
+  once, --poll-secs a plain decimal. The checker judges what the runner executes (#9847): the parsed YAML
+  document (escapes such as \\x5f and \\u005f decoded, block scalars folded) is read too, and its `run` values
+  with every backslash-newline continuation joined. Its token lines equal the block lines this scan read, a
+  joined line that holds the token is a finding, and so is a decoded key or value that holds the token where
+  no raw line does. Every configured gate is called;
 * HOST_SEMAPHORE_MAX_WAIT_SECS has exactly one definition across the workflows and composite
   actions, parsed with the YAML subset parser of scripts/ci/taint_boundary.py, and is a plain
   decimal (PLAIN_DECIMAL_PATTERN of scripts/ci/host_slot_limits.py) from 1 to IDLE_SEAT_CEILING_SECS,
@@ -111,6 +113,17 @@ F_CHAR = ('%s: a host_semaphore line with the character %s, outside the canonica
           '(letters, digits, space and _ . / = : , -)')
 F_YAML_UNREADABLE = '%s: the YAML subset parser cannot read this file, so its host_semaphore lines are not checked'
 F_DECODED_DIFFERS = '%s: the host_semaphore lines of the parsed run values differ from its run: | block lines'
+F_JOINED = ('%s: a host_semaphore line joined from two or more lines by a backslash-newline continuation (the shell '
+            'runs the joined line, which is never a canonical call)')
+F_ESCAPED = ('%s: a parsed YAML key or value outside the run values holds host_semaphore where no raw line does (an '
+             'escaped spelling)')
+# decision: scan the decoded step scripts (YAML parsed, continuations joined) as the primary source and keep the
+# raw-line scan only as a cross-check, over patching the two reported spellings, because the reviewer's M-A and M-B
+# are one root (#9847, PR 9851 delta r2): the checker judges what the runner will execute, not the source text.
+# A YAML spelling whose decoded text differs from its raw text needs a backslash (an escape such as \x5f, \u005f
+# or \U0000005f, or a continuation): YAML folding joins with a space and the parser refuses multi-line quoted and plain
+# scalars. So a file with neither the token nor a backslash holds no decoded token the raw lines miss.
+CONTINUATION = '\\'
 F_TOKEN_AGAIN = '%s: a host_semaphore.py call line that names host_semaphore again'
 F_NO_NAME = '%s: a host_semaphore.py call without exactly one plain --name'
 F_UNCONFIGURED = '%s: calls the unconfigured gate %s'
@@ -206,9 +219,36 @@ def _shown(value):
 
 
 def _code_lines(text):
-    """The text with comment-only lines blanked and shell line continuations joined."""
+    """The text with comment-only lines blanked and shell line continuations joined.
+
+    #9847: a backslash-newline joins with nothing, as bash removes it before it splits words (a join with a space
+    would split `HOST_SEMAPHORE_MAX_\\` + `WAIT_SECS=1` into two words the scan never matches)."""
     lines = [('' if line.lstrip().startswith('#') else line) for line in text.splitlines()]
-    return re.sub(r'\\\n', ' ', '\n'.join(lines)).splitlines()
+    return '\n'.join(lines).replace(CONTINUATION + '\n', '').split('\n')
+
+
+def _joined_lines(value):
+    """(logical line, True when a backslash-newline joined it) for each line of the shell script VALUE.
+
+    Every line that ends with a backslash continues on the next (fail closed: an escaped backslash or a backslash
+    inside single quotes is joined too, so the scan reads more joins than the shell, never fewer). A join counts
+    only when text follows it: a backslash before an empty line or the end of the script adds nothing, and the
+    raw scan has already judged that line. Linear."""
+    out = []
+    parts = []
+    for segment in value.split('\n'):
+        if segment.endswith(CONTINUATION):
+            parts.append(segment[:-1])
+            continue
+        if parts:
+            parts.append(segment)
+            out.append((''.join(parts), any(parts[1:])))
+            parts = []
+        else:
+            out.append((segment, False))
+    if parts:
+        out.append((''.join(parts), any(parts[1:])))
+    return out
 
 
 def _token_text(line):
@@ -259,17 +299,33 @@ def _placed_lines(text):
             key_indent = len(header.group(1)) + len(header.group(2) or '')
 
 
-def _decoded_call_lines(node, out):
-    """The stripped call lines of every `run` string value of the parsed YAML document NODE."""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key == 'run' and isinstance(value, str):
-                out.extend(line.strip() for line in value.split('\n') if _is_call_line(line))
-            else:
-                _decoded_call_lines(value, out)
-    elif isinstance(node, list):
-        for item in node:
-            _decoded_call_lines(item, out)
+class _Decoded:
+    """What the parsed YAML document holds, as the runner reads it (#9847)."""
+
+    def __init__(self):
+        self.call_lines = []  # the stripped call lines of every `run` value, split as written
+        self.joined = 0  # the logical lines of `run` values that a continuation joined and that hold the token
+        self.other = 0  # the lines of every other key or string value that hold the token
+
+
+def _decoded_scan(node, out):
+    """Fill the _Decoded OUT from every string of the parsed YAML document NODE (keys included)."""
+    stack = [node]
+    while stack:  # an explicit stack: a deep document never reaches the recursion limit
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(key, str):
+                    out.other += sum(1 for line in key.split('\n') if _holds_token(line))
+                if key == 'run' and isinstance(value, str):
+                    out.call_lines.extend(line.strip() for line in value.split('\n') if _is_call_line(line))
+                    out.joined += sum(1 for line, joined in _joined_lines(value) if joined and _holds_token(line))
+                else:
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(reversed(node))
+        elif isinstance(node, str):
+            out.other += sum(1 for line in node.split('\n') if _holds_token(line))
 
 
 def _call_words(wf, words):
@@ -362,21 +418,31 @@ def _call_findings(wf, cfg, line, called):
     return found
 
 
-def _decoded_findings(wf, text, block_lines):
-    """F_YAML_UNREADABLE or F_DECODED_DIFFERS when the parsed run values do not hold exactly BLOCK_LINES."""
+def _decoded_findings(wf, text, block_lines, outside):
+    """The findings of the parsed document of TEXT, the script the runner executes.
+
+    F_YAML_UNREADABLE when it cannot be parsed; F_DECODED_DIFFERS when its run values do not hold exactly the
+    BLOCK_LINES the raw scan read; one F_JOINED per joined logical run line that holds the token; F_ESCAPED when
+    the other keys and values hold more token lines than the OUTSIDE raw lines (each already a finding) plus the
+    block lines YAML reads under another key (a move that F_DECODED_DIFFERS already reports)."""
+    decoded = _Decoded()
     try:
-        decoded = []
-        _decoded_call_lines(taint_boundary.parse_yaml(text, wf), decoded)
+        _decoded_scan(taint_boundary.parse_yaml(text, wf), decoded)
     except (taint_boundary.Unclassifiable, RecursionError, ValueError):
         return [F_YAML_UNREADABLE % wf]
-    return [] if sorted(decoded) == sorted(block_lines) else [F_DECODED_DIFFERS % wf]
+    found = [] if sorted(decoded.call_lines) == sorted(block_lines) else [F_DECODED_DIFFERS % wf]
+    found.extend([F_JOINED % wf] * decoded.joined)
+    if decoded.other > outside + max(0, len(block_lines) - len(decoded.call_lines)):
+        found.append(F_ESCAPED % wf)
+    return found
 
 
 def call_site_violations(cfg, workflow_texts):
     """Every token site that is not a classified call, every finding of a call, and every gate never called.
 
-    One pass per line; the parsed document is a cross-check, so a line this scan places in a `run: |` block
-    that YAML reads otherwise (or a folded, quoted or escaped run value) is a finding, never clean."""
+    The decoded document is what the runner executes (#9847): a file that holds the token or a backslash is
+    parsed, and every decoded token site the raw lines did not read (an escape, a continuation join, a folded,
+    quoted or escaped run value) is a finding, never clean. The raw scan reads the canonical call lines."""
     called = set()
     found = []
     for wf, text in sorted(workflow_texts.items()):
@@ -384,10 +450,12 @@ def call_site_violations(cfg, workflow_texts):
             found.append(F_NOT_TEXT % wf)
             continue
         if not wf.endswith(YAML_SUFFIXES):
-            if any(_holds_token(line) for line in text.split('\n')):
+            joined = text.replace(CONTINUATION + '\n', '')
+            if any(_holds_token(line) for source in (text, joined) for line in source.split('\n')):
                 found.append(F_NOT_YAML % wf)
             continue
         block_lines = []
+        outside = 0
         holds_token = False
         for line, in_block in _placed_lines(text):
             if not _holds_token(line):
@@ -396,13 +464,15 @@ def call_site_violations(cfg, workflow_texts):
             reason = _env_name_finding(wf, line)
             if reason is None and not in_block:
                 reason = F_OUTSIDE_BLOCK % wf
+            if not in_block:
+                outside += 1
             if reason is not None:
                 found.append(reason)
                 continue
             block_lines.append(line.strip())
             found.extend(_call_findings(wf, cfg, line, called))
-        if holds_token:
-            found.extend(_decoded_findings(wf, text, block_lines))
+        if holds_token or CONTINUATION in text:
+            found.extend(_decoded_findings(wf, text, block_lines, outside))
     for name in sorted(set(cfg['gates']) - called):
         found.append(F_NEVER_CALLED % name)
     return found
@@ -417,15 +487,50 @@ def _allowed_wait_key_use(line, start, end):
     return line[max(0, start - 2):start] == '${' and line[end:end + 1] == '}'
 
 
+def _bad_wait_key_uses(lines):
+    """The number of uses of the wait key in LINES that are neither its env mapping key nor a plain read."""
+    return sum(1 for line in lines for use in WAIT_KEY_USE_RE.finditer(line)
+               if not _allowed_wait_key_use(line, use.start(), use.end()))
+
+
+def _decoded_wait_key_uses(node):
+    """The bad wait key uses of the parsed document NODE: run values with comments blanked and continuations
+    joined (#9847, what the shell runs), every other string value by line, and every key other than the key."""
+    count = 0
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(key, str) and key != WAIT_KEY:
+                    count += _bad_wait_key_uses(key.split('\n'))
+                if key == 'run' and isinstance(value, str):
+                    count += _bad_wait_key_uses(_code_lines(value))
+                else:
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, str):
+            count += _bad_wait_key_uses(node.split('\n'))
+    return count
+
+
 def wait_key_violations(texts):
-    """One line per use of the wait key in run text that is neither its env mapping key nor a plain read."""
+    """One line per use of the wait key in run text that is neither its env mapping key nor a plain read.
+
+    The raw lines are scanned; a file with a backslash (an escape or a continuation, the only spellings whose
+    decoded text differs from the raw text) is also parsed, and each decoded use beyond the raw count is one more
+    line. A file the parser cannot read keeps the raw count: bound_violations parses it too and main exits 2."""
     found = []
+    reason = '%s: %s is used other than as its env mapping key or a plain $ read; set it only in the one env mapping'
     for rel, text in sorted(texts.items()):
-        for line in _code_lines(text):
-            for use in WAIT_KEY_USE_RE.finditer(line):
-                if not _allowed_wait_key_use(line, use.start(), use.end()):
-                    found.append('%s: %s is used other than as its env mapping key or a plain $ read; '
-                                 'set it only in the one env mapping' % (rel, WAIT_KEY))
+        count = _bad_wait_key_uses(_code_lines(text))
+        if CONTINUATION in text and rel.endswith(YAML_SUFFIXES):
+            try:
+                count = max(count, _decoded_wait_key_uses(taint_boundary.parse_yaml(text, rel)))
+            except (taint_boundary.Unclassifiable, RecursionError, ValueError):
+                pass  # the raw count stands; the unreadable file is refused by bound_violations
+        found.extend([reason % (rel, WAIT_KEY)] * count)
     return found
 
 
