@@ -206,18 +206,20 @@ VALUE_ROWS = {
                       {"a": 1, "b": 1.5, "c": True, "d": None, "e": None, "f": "010"}),
 }
 
-# Ten secrets-looking canaries, built at run time so no scanner matches this file.
-CANARIES = (
-    "gh" + "p_" + "Q" * 36,
-    "AK" + "IA" + "Q" * 16,
-    "xo" + "xb-" + "1" * 10 + "-" + "Q" * 24,
-    "-----BEGIN " + "PRIVATE KEY-----",
-    "pass" + "word=hunter2canary",
-    "postgres://u:" + "s3cretcanary" + "@db.invalid/x",
-    "s" + "k-" + "Q" * 40,
-    "gl" + "pat-" + "Q" * 20,
-    "ey" + "J" + "hbGciOiJIUzI1NiJ9.canary.sig",
-    "AI" + "za" + "Q" * 35,
+# Ten distinct marker strings in ten shapes (long runs, digits, dashes, an equals sign, a URL form, a dotted form),
+# built at run time. A refusal must never quote any text of the document it refused, so each marker is written into
+# a fixture and the refusal text is searched for it.
+MARKERS = (
+    "mk-" + "Q" * 36,
+    "ID" + "Q" * 16,
+    "ab-" + "1" * 10 + "-" + "Q" * 24,
+    "-----BEGIN " + "MARKER-----",
+    "field=" + "canaryvalue2",
+    "scheme://u:" + "canaryvalue" + "@host.invalid/x",
+    "m-" + "Q" * 40,
+    "ab-" + "Q" * 20,
+    "mk" + "J" + "hbGciOiJIUzI1NiJ9.canary.sig",
+    "zz" + "Q" * 35,
 )
 # (template with {S} for the canary, reason constant name, line) for every text-level refusal branch.
 CANARY_TEMPLATES = {
@@ -377,8 +379,6 @@ class FileChecks(ReaderCase):
                 outcome.append("returned")
             except wt.WorkflowReadError as exc:
                 outcome.append(exc)
-            except BaseException as exc:  # noqa: BLE001 - the row reports any other outcome
-                outcome.append(repr(exc))
 
         worker = threading.Thread(target=read, daemon=True)
         worker.start()
@@ -500,36 +500,36 @@ class FileChecks(ReaderCase):
 class Canaries(ReaderCase):
     def test_9817_no_text_refusal_quotes_the_document(self) -> None:
         for name, (template, constant, line) in CANARY_TEMPLATES.items():
-            for secret in CANARIES:
-                with self.subTest(branch=name, canary=secret[:4]):
-                    exc = self.refused(wt.parse_text, template.replace("{S}", secret), LABEL)
-                    self.assertNotIn(secret, str(exc))
+            for marker in MARKERS:
+                with self.subTest(branch=name, canary=marker[:4]):
+                    exc = self.refused(wt.parse_text, template.replace("{S}", marker), LABEL)
+                    self.assertNotIn(marker, str(exc))
                     self.assert_refusal(exc, LABEL, line, REASON_TEXTS[constant])
 
     def test_9817_no_shape_refusal_quotes_the_document(self) -> None:
         for name, (template, text) in SHAPE_ROWS.items():
-            for secret in CANARIES:
-                with self.subTest(shape=name, canary=secret[:4]):
-                    path = self.write(template.replace("{S}", secret))
+            for marker in MARKERS:
+                with self.subTest(shape=name, canary=marker[:4]):
+                    path = self.write(template.replace("{S}", marker))
                     exc = self.refused(wt.read_all_steps, path)
-                    self.assertNotIn(secret, str(exc))
+                    self.assertNotIn(marker, str(exc))
                     self.assert_refusal(exc, str(path), None, text)
 
     def test_9817_no_file_refusal_quotes_the_document(self) -> None:
-        joined = "\n".join("k%d: '%s'" % (n, s) for n, s in enumerate(CANARIES))
+        joined = "\n".join("k%d: '%s'" % (n, s) for n, s in enumerate(MARKERS))
         rows = {
             "utf8": (joined.encode(UTF8) + b"\n\xff\n", 11, "UTF8"),
             "bom": (b"\xef\xbb\xbf" + joined.encode(UTF8), 1, "BOM"),
             "over_cap": ((joined + "\n#" + "x" * wt.MAX_DOCUMENT_BYTES + "\n").encode(UTF8), None, "OVER_CAP"),
             "nesting": (("".join("%sk%d:\n" % ("  " * d, d) for d in range(NESTING_PAST_LIMIT)) +
-                         "%sv: '%s'\n" % ("  " * NESTING_PAST_LIMIT, CANARIES[0])).encode(UTF8), "any", None),
+                         "%sv: '%s'\n" % ("  " * NESTING_PAST_LIMIT, MARKERS[0])).encode(UTF8), "any", None),
         }
         for name, (data, line, constant) in rows.items():
             with self.subTest(file=name):
                 path = self.write(data)
                 exc = self.refused(wt.read_document, path)
-                for secret in CANARIES:
-                    self.assertNotIn(secret, str(exc))
+                for marker in MARKERS:
+                    self.assertNotIn(marker, str(exc))
                 if constant is not None:
                     self.assert_refusal(exc, str(path), line, REASON_TEXTS[constant])
                 else:
