@@ -248,19 +248,6 @@ def _note(message):
     print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
 
 
-def serving_runners(name, config_path=None):
-    """The runner names declared to serve gate NAME in host_slots.json, or None when unknown."""
-    path = Path(config_path) if config_path else Path(__file__).resolve().parent / HOST_SLOTS_CONFIG
-    try:
-        names = json.loads(path.read_text(encoding='utf-8'))['gates'][name]['serving_runners']
-        if isinstance(names, list) and all(isinstance(n, str) for n in names):
-            return names
-        raise TypeError('serving_runners is not a list of strings')
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        _note('serving runners of %r unavailable (%s)' % (name, type(exc).__name__))
-        return None
-
-
 def gate_runners(names, config_path=None):
     """(serving runners, None) when NAMES is exactly one gate of the slot configuration, else (None, the reason).
 

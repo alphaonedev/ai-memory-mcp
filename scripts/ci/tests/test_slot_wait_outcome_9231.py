@@ -294,7 +294,9 @@ class WrapperOutcome(unittest.TestCase):
     def test_the_shipped_config_lists_the_runner_seen_in_the_real_no_slot_job(self):
         cfg = json.loads(CONFIG.read_text())
         self.assertIn('f2-linux-fed-4', cfg['registered_runners'])  # run 44292743356 job 134771214198
-        self.assertEqual(hs.serving_runners('linux-fed-tests'), ['f2-linux-fed', 'f2-linux-fed-2'])
+        # #9846: gate_runners is the one loader of the configuration; it refuses, never reports "unknown"
+        self.assertEqual(hs.gate_runners(['linux-fed-tests']), (['f2-linux-fed', 'f2-linux-fed-2'], None))
+        self.assertFalse(hasattr(hs, 'serving_runners'))
 
 
 class UnknownGateRefused(unittest.TestCase):
