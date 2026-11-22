@@ -104,7 +104,8 @@ build_fixture() {
         # is the thing under test).
         mkdir -p scripts/ci/impact scripts/ci/tests
         cp "$ROOT/scripts/ci/impact/__init__.py" "$ROOT/scripts/ci/impact/common.py" \
-           "$ROOT/scripts/ci/impact/cargo_skip.py" "$ROOT/scripts/ci/impact/rules.json" \
+           "$ROOT/scripts/ci/impact/cargo_skip.py" "$ROOT/scripts/ci/impact/answer_shape.py" \
+           "$ROOT/scripts/ci/impact/rules.json" \
            scripts/ci/impact/
         echo "# ci test" > scripts/ci/tests/test_fixture.py
         # Passthrough stub: records the base it was handed, then emits the

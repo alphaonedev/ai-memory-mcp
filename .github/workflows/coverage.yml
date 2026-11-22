@@ -218,19 +218,27 @@ jobs:
           # MERGE-BASE tree (git merge-base HEAD "$base", the whole PR) and run
           # with -I from outside the workspace, so a PR cannot edit its own
           # judgement. Anything unexpected is false.
+          # #9263 / #9815: one locale for every byte test below. BSD tr and
+          # bash 3.2 (macOS) and GNU tr and bash 5 (ubuntu) otherwise disagree
+          # on [:print:] and ${#var} for bytes above 0x7f, so the answer check
+          # is made byte-wise, here, whatever locale the caller exports.
+          export LC_ALL=C
           docs_only=false
           cargo_skip=false
           reason="classifier-error-fail-closed"
+          reason_why=""
           trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
           trust_impact="$trust_dir/scripts/ci/impact"
           trust_ref=$(git merge-base HEAD "$base" 2>/dev/null || echo "$base")
           mkdir -p "$trust_impact"
           trusted=true
-          for trust_file in __init__.py common.py cargo_skip.py rules.json; do
+          for trust_file in __init__.py common.py cargo_skip.py answer_shape.py rules.json; do
             git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
           done
           skip_out="${RUNNER_TEMP:-.}/cov-skip.out"
           : > "$skip_out"
+          judge_out="${RUNNER_TEMP:-.}/answer-judge.out"
+          : > "$judge_out"
           # No `grep -q` at the end of a pipe (pipefail turns the SIGPIPE of
           # the first grep into a failure): capture the lines instead.
           ci_edit=$(tr '\0' '\n' < "$paths_z" | grep -E '^(\.github/|scripts/ci/)' | grep -vE '^scripts/ci/tests/' || true)
@@ -239,28 +247,65 @@ jobs:
           elif [ -n "$ci_edit" ]; then
             reason="classifier-or-workflow-edited-fail-closed"
           elif python3 -I "$trust_impact/cargo_skip.py" --stdin0 --rules "$trust_impact/rules.json" --event-name "$COV_EVENT_NAME" --base-ref "$COV_BASE_REF" < "$paths_z" > "$skip_out"; then
-            if [ "$(grep -c '^docs_only=' "$skip_out")" = "1" ] \
-              && [ "$(grep -c '^cargo_skip=' "$skip_out")" = "1" ] \
-              && [ "$(grep -c '^cargo_skip_reason=' "$skip_out")" = "1" ]; then
-              docs_only=$(sed -n 's/^docs_only=//p' "$skip_out")
-              cargo_skip=$(sed -n 's/^cargo_skip=//p' "$skip_out")
-              reason=$(sed -n 's/^cargo_skip_reason=//p' "$skip_out" | tr -cd '[:print:]' | cut -c1-300)
+            # #9263 / #9815: ONE byte test in Python judges the answer and names
+            # the reason (answer_shape.py, loaded from the merge-base tree with
+            # the decider). No grep, tr, sed or wc computes a reason here: their
+            # byte handling differs between BSD (macOS) and GNU (hosted Linux)
+            # userland. Exit 0 prints the three normalised lines and nothing else, exit 1
+            # prints one fixed token and nothing else, every other exit code (2 included,
+            # whatever it prints) is a checker-error RUN.
+            shape_rc=0
+            python3 -I "$trust_impact/cargo_skip.py" --judge-answer "$skip_out" > "$judge_out" || shape_rc=$?
+            # The answer is read from a file, line by line, and the lines are counted: a
+            # command substitution would drop trailing blank lines and hide an extra one.
+            shape_lines=0; shape_docs=""; shape_skip=""; shape_reason=""
+            while IFS= read -r shape_line || [ -n "$shape_line" ]; do
+              shape_lines=$((shape_lines + 1))
+              case "$shape_lines" in
+                1) shape_docs=$shape_line ;;
+                2) shape_skip=$shape_line ;;
+                3) shape_reason=$shape_line ;;
+              esac
+            done < "$judge_out"
+            if [ "$shape_rc" = "0" ] && [ "$shape_lines" = "3" ]; then
+              # An accept is exit 0 with exactly three lines: the three keys in order and a
+              # non-empty reason. Anything else is a checker-error RUN, never a skip.
+              if [ "${shape_docs#docs_only=}" != "$shape_docs" ] \
+                && [ "${shape_skip#cargo_skip=}" != "$shape_skip" ] \
+                && [ -n "${shape_reason#cargo_skip_reason=}" ] \
+                && [ "${shape_reason#cargo_skip_reason=}" != "$shape_reason" ]; then
+                docs_only=${shape_docs#docs_only=}
+                cargo_skip=${shape_skip#cargo_skip=}
+                reason=${shape_reason#cargo_skip_reason=}
+              else
+                reason_why="checker-error"
+              fi
+            elif [ "$shape_rc" = "1" ] && [ "$shape_lines" = "1" ]; then
+              case "$shape_docs" in
+                extra-line|not-printable-ascii|empty|over-cap-300|blank-only) reason_why="$shape_docs" ;;
+                *) reason_why="checker-error" ;;
+              esac
+            else
+              reason_why="checker-error"
             fi
           fi
           # Shape guard. Each of the three values is checked on its own:
           # docs_only and cargo_skip must each be exactly `true` or `false`
           # (so a split value such as `falset` + `rue`, an empty, blank, CR or
           # newline-carrying value is refused), docs_only=true needs
-          # cargo_skip=true, and the reason must not be empty. Anything else
-          # is a RUN with the fail-closed reason, never a skip.
+          # cargo_skip=true, and the reason is judged by answer_shape.py
+          # (one to 300 printable ASCII bytes, one of them not a blank). Anything else is a RUN with the fail-closed
+          # reason, never a skip, and one line holding one fixed token names
+          # why; the answer text itself is never printed.
           shape_ok=1
           case "$docs_only" in true|false) ;; *) shape_ok=0 ;; esac
           case "$cargo_skip" in true|false) ;; *) shape_ok=0 ;; esac
           if [ "$docs_only" = "true" ] && [ "$cargo_skip" != "true" ]; then
             shape_ok=0
           fi
-          if [ -z "$reason" ]; then
+          if [ -n "$reason_why" ]; then
             shape_ok=0
+            echo "::notice::coverage classify: reason rejected ($reason_why), fail-closed RUN"
           fi
           if [ "$shape_ok" != "1" ]; then
             docs_only=false

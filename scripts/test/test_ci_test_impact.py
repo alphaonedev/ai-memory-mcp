@@ -13,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 SELECTOR = ROOT / "scripts/ci-test-impact.sh"
 IMPACT_DIR = ROOT / "scripts/ci/impact"
-IMPACT_FILES = ("__init__.py", "common.py", "cargo_skip.py", "rules.json")
+IMPACT_FILES = ("__init__.py", "common.py", "cargo_skip.py", "answer_shape.py", "rules.json")
 
 
 class TestCiTestImpact(unittest.TestCase):
