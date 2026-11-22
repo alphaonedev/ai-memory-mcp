@@ -207,6 +207,11 @@ impl ChildGuard {
                 return;
             }
             if !self.is_running() {
+                // The child may have written the needle and exited before the
+                // reader thread appended it: read to end of file, then decide.
+                if self.stderr_final().contains(needle) {
+                    return;
+                }
                 self.fail(&format!("{needle:?} on stderr"), None);
             }
             if Instant::now() >= deadline {
