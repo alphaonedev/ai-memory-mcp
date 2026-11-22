@@ -29,7 +29,10 @@ Exit codes: the child's code, passed through unchanged (75 of the product binary
 (COMMAND never ran, one ``::error`` line, #9365);
 82 infra-no-slot, no slot free within the wait (COMMAND never ran, one
 ``::error title=infra no-slot::`` line, #9231);
-83 infra-unknown-runner, the runner is not a serving runner of the gate in host_slots.json;
+83 infra-unknown-runner, the runner is not a serving runner of the gate in host_slots.json, or the gate is
+refused before any slot: a ``--name`` that fails NAME_RE, is given more than once or is not a gate of the
+configuration, a gate without a serving_runners list of strings, or a configuration that is missing,
+unreadable, not UTF-8 JSON, without a gates object or with a duplicate key (#9846, #9851);
 84 the child itself ended with 82, 83, 84 or 85 (one ``::error title=infra reserved-code::`` line);
 85 infra-wait-refused, the wait is refused as above (COMMAND never ran, no slot taken, one
 ``::error title=infra wait-refused::`` line);
@@ -118,6 +121,10 @@ def _load_host_slot_limits():
         re.compile(pattern)
     except re.error:
         raise ValueError("PLAIN_DECIMAL_PATTERN does not compile") from None
+    if not callable(module.no_duplicate_keys):  # absent: AttributeError (the one duplicate-key hook, #9851)
+        raise TypeError("no_duplicate_keys is not callable")
+    if not (isinstance(module.DuplicateKeyError, type) and issubclass(module.DuplicateKeyError, ValueError)):
+        raise TypeError("DuplicateKeyError is not a ValueError class")
     return module
 
 
@@ -197,6 +204,7 @@ TITLE_NO_SLOT = 'infra no-slot'  # titles carry no colon or comma, so no propert
 TITLE_UNKNOWN_RUNNER = 'infra unknown-runner'
 TITLE_RESERVED_CODE = 'infra reserved-code'
 HOST_SLOTS_CONFIG = 'host_slots.json'
+NAME_REFUSED_REASON = '--name is not a plain gate name'  # fixed text: a refused name is never echoed
 ENV_RUNNER_NAME = 'RUNNER_NAME'  # set by the GitHub runner for every step
 KILL_GRACE_SECS = 20
 TAG = '[#7914 semaphore]'
@@ -261,9 +269,12 @@ def gate_runners(names, config_path=None):
     name = names[0]
     path = Path(config_path) if config_path else Path(__file__).resolve().parent / HOST_SLOTS_CONFIG
     try:
-        config = json.loads(path.read_text(encoding='utf-8'))
+        config = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=_limits.no_duplicate_keys)
     except OSError as exc:
         return None, 'the slot configuration cannot be read (%s)' % type(exc).__name__
+    # before ValueError (DuplicateKeyError is one): a repeated key is a refusal, never "the last one wins" (#9851 L3)
+    except _limits.DuplicateKeyError:
+        return None, 'the slot configuration has a duplicate key'
     # UnicodeDecodeError is a ValueError; nesting past the recursion limit is RecursionError
     except (ValueError, RecursionError):
         return None, 'the slot configuration is not valid UTF-8 JSON'
@@ -452,7 +463,9 @@ def main(argv=None):
     if not command:
         p.error('a command is required after --')
     if not all(NAME_RE.fullmatch(name) for name in args.name):
-        p.error('--name must match %s' % NAME_RE.pattern)
+        # a malformed --name is an unknown gate: exit 83 with a fixed reason, the name never echoed (#9851 L4)
+        print(unknown_gate_annotation(args.label, NAME_REFUSED_REASON), flush=True)
+        return EXIT_UNKNOWN_RUNNER
     # The gate is refused after the wait and before the runner check, the slot directory and any wait (#9846).
     runners, problem = gate_runners(args.name, args.config)
     if problem is not None:
