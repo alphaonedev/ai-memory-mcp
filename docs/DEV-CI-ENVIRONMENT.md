@@ -473,12 +473,21 @@ session neither the `gui/<uid>` nor the `user/<uid>` domain accepts a bootstrap.
 without a login is the system domain, which needs root.
 
 **The tool.** `scripts/ci/tier_daemon_installer.py` prepares that system daemon. Every host value is an argument:
-`--postgres-bin`, `--data-dir`, `--account`, `--label` and `--port`. Each is checked before use. A path must be absolute, in
-normal form, exist and not be a symlink. The binary must be an executable regular file, not writable by group or others.
-The data directory must be owned by `--account` and not group or world writable. The account must not be `root`, uid 0
-or primary gid 0. Each refusal prints one `tier-daemon-installer: refused: ...` line and exits non-zero. The plist runs
-the binary as an argument list (`postgres -D <data dir> -p <port>`, no shell) under `UserName`/`GroupName` of that
-account, with `WorkingDirectory` set to the data directory, `RunAtLoad`, `KeepAlive` and `ExitTimeOut` 60.
+`--postgres-bin`, `--data-dir`, `--account`, `--label` and `--port`. Each is checked before use. A text value is refused
+when it holds a control character (C0, DEL or C1), a format character (category Cf, the bidi controls among them), a
+line or paragraph separator, or a noncharacter (U+FDD0 to U+FDEF and every U+xxFFFE / U+xxFFFF), and when it is not valid
+UTF-8. A path must be absolute, in normal form, exist and not be a symlink. Every parent folder of the binary and of the
+data directory must be a directory, not a symlink, owned by root or `--account` and not writable by group or others.
+The binary must be an executable regular file owned by root or `--account` and not writable by group or others. The
+data directory must be owned by `--account` and not group or world writable; it and its `postmaster.pid` are read
+through one opened directory, never re-read by path. `/Library/LaunchDaemons` and each of its parents must be root-owned
+directories closed to group and others (exit 9 otherwise). The account must not be `root`, uid 0 or primary gid 0. Each
+refusal prints one `tier-daemon-installer: refused: ...` line and exits non-zero. The plist runs the binary as an
+argument list (`postgres -D <data dir> -p <port>`, no shell) under `UserName`/`GroupName` of that account, with
+`WorkingDirectory` set to the data directory, `RunAtLoad`, `KeepAlive`, `ExitTimeOut` 60 and both log paths
+(`StandardOutPath`, `StandardErrorPath`) set to `<data dir>/<label>.log`. The tool refuses a plist that does not read
+back as written. Every printed command is quoted with `shlex`, and the printed root command is
+`<python> -I <absolute path of the script> ...`.
 
 **Dry run (the default).** With no `--install` and no `--remove`, the tool changes nothing. The only commands it runs
 are the read-only `launchctl print system/<label>` and `ps -p <pid>` for the pid in `postmaster.pid`. It prints:
@@ -486,27 +495,45 @@ are the read-only `launchctl print system/<label>` and `ps -p <pid>` for the pid
 - the plist target state (absent, identical bytes, or different bytes with sizes and digests, never the content);
 - whether the service is loaded and the postmaster state;
 - the full plist;
-- the install commands in order, the hand-over order and the removal commands;
+- the install commands in order, the hand-over order and the removal commands, each rendered from the same plan the
+  real run executes;
 - the verdict install and remove would reach now.
 
 **Install needs the operator's word.** `--install` and `--remove` refuse unless the effective uid is 0, and print the
 `sudo` command to run; the tool never calls sudo. `--install` behaves as follows:
 - different bytes at `/Library/LaunchDaemons/<label>.plist` refuse and change nothing;
 - identical bytes with the service loaded are a no-op, exit 0;
-- a postmaster alive on the data directory refuses unless `--handover` is given. With it, the tool waits up to 300 s
-  for that pid to exit (it never signals a process) and refuses if a new postmaster holds the directory;
-- otherwise it writes the plist atomically (temp file in the same directory, fsync, then a link that fails if the
-  target appeared), mode 0644, owner root:wheel. Then it runs `launchctl bootstrap system <plist>` and checks that
-  127.0.0.1:`<port>` answers within 60 s;
-- a failure after the write prints the state it re-read and the removal commands. It undoes nothing on its own.
+- a postmaster alive on the data directory refuses (exit 5) unless `--handover` is given. `--handover` needs
+  `--agent-label`, the label of the interim login agent. With it, the tool waits up to 300 s for that pid to exit (it
+  never signals a process; exit 8 at the deadline), refuses if a new postmaster holds the directory, and refuses (exit
+  12) unless `launchctl print-disabled user/<uid>` lists that agent as disabled, so only one supervisor can start the
+  tier;
+- 127.0.0.1:`<port>` must not answer before the bootstrap; if it does, another process holds the port and the tool
+  refuses (exit 11) before any change;
+- it writes the plist atomically (temp file in the same directory, fchown, fchmod, fsync, then a link that fails if the
+  target appeared, then a directory fsync), mode 0644, owner root:wheel. No temp file survives a failed step. If the
+  target appears during the install the tool refuses (exit 4) and leaves that file alone. Then it runs
+  `launchctl bootstrap system <plist>` and checks that 127.0.0.1:`<port>` answers within 60 s;
+- it prints `installed` only when the pid launchd reports for the service equals the first line of `postmaster.pid`;
+  a missing launchd pid, a missing pid file or a mismatch is a failure (exit 7);
+- a failure after the first change prints what changed, the state it re-read and the undo step true for that state.
+  It undoes nothing on its own. A failure before any change says `nothing changed`.
 
 The hand-over order is:
-1. stop the interim supervisor;
+1. disable the interim login agent persistently (`launchctl disable gui/<uid>/<agent label>`) and stop it
+   (`launchctl bootout gui/<uid>/<agent label>`);
 2. stop the running postmaster cleanly with `pg_ctl -D <data dir> stop -m fast` as the account;
-3. run `--install --handover`.
+3. run `--install --handover --agent-label <agent label>`.
 
-**Removal.** `--remove` is the inverse: `launchctl bootout system/<label>`, then removes the plist. It refuses a plist
-whose bytes it would not have written and is a no-op when the plist is absent and the service is not loaded.
+**Removal.** `--remove` is the inverse: `launchctl bootout system/<label>`, then removes the plist. The bootout makes
+launchd stop postgres with SIGTERM (a smart shutdown that waits for clients to disconnect) and then SIGKILL after
+`ExitTimeOut`, 60 s. It refuses a plist whose bytes it would not have written and is a no-op when the plist is absent and
+the service is not loaded.
+
+**Exit codes.** 0 done or no-op; 2 a refused argument or plist; 3 not root; 4 a plist target conflict; 5 a postmaster
+holds the data directory; 6 a command or write failed; 7 the probe or the ownership check failed; 8 the hand-over wait
+timed out; 9 a host probe failed before any change; 10 not macOS; 11 the port answers before the bootstrap; 12 the
+interim login agent is not disabled.
 
 ### Self-hosted runners
 ```bash
