@@ -1293,6 +1293,10 @@ jobs:
             # timeout-minutes (#9699); this leg now runs neither, and its cap
             # stays at 95 until the post-move maxima of this leg are measured.
             timeout: 95
+            # #9852 - step-level bound of "Run tests (impact-aware)" on every
+            # leg: timeout - 12, so the uploads and the cleanup steps after it
+            # still run inside the job limit (an expression cannot subtract).
+            test_step_timeout: 83
           - leg: linux-fed,enterprise-fed
             runner: '["self-hosted","linux-fed"]'
             node: linux-fed
@@ -1329,11 +1333,13 @@ jobs:
             # one named constant HOST_SEMAPHORE_MAX_WAIT_SECS below. The
             # macos-fed and hosted caps are unchanged.
             timeout: 300
+            test_step_timeout: 288
           - leg: macos-fed,sqlite
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: sqlite
             timeout: 80
+            test_step_timeout: 68
           - leg: macos-fed,enterprise-fed
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
@@ -1349,6 +1355,7 @@ jobs:
             # from the per-shard timings after the first green run. Budget
             # table: docs/ci/CARRIER-BRANCH-GATES.md.
             timeout: 160
+            test_step_timeout: 148
     steps:
       # #6795 — job start, recorded FIRST so every later budget (the serial
       # shard, the parallel shards and the non-sharded watchdogs) is derived
@@ -1616,6 +1623,8 @@ jobs:
       # keeps the tool build off the ubuntu critical path.
       - name: Prebuild t0 orchestrator (macOS e1 anti-flake, #1853)
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.node == 'macos-fed'
+        # #9852 - its own bound, so a hung build names this step, not the job limit.
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
@@ -1667,6 +1676,8 @@ jobs:
       # a missing URL file or a failed CREATE reds the leg.
       - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
+        # #9852 - its own bound, so a hung database call names this step, not the job limit.
+        timeout-minutes: 10
         shell: bash
         env:
           # matrix.leg via env (never inlined into the script body) so the
@@ -1769,6 +1780,8 @@ jobs:
       # URL or psql into a failure instead of a silent skip.
       - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
+        # #9852 - its own bound, so a hung cell names this step, not the job limit.
+        timeout-minutes: 10
         shell: bash
         env:
           AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
@@ -1850,6 +1863,9 @@ jobs:
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.cargo_skip != 'true'
+        # #9852 - the step bound (leg timeout - 12): a hang names this step and the
+        # upload and cleanup steps after it still run inside the job limit.
+        timeout-minutes: ${{ matrix.test_step_timeout }}
         env:
           AI_MEMORY_NO_CONFIG: "1"
           TIER: ${{ matrix.tier }}
@@ -1864,8 +1880,10 @@ jobs:
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
-          # #6795 — the job cap (minutes) the serial shard budget is derived from.
-          JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
+          # #6795 — the cap (minutes from JOB_T0) the serial shard budget is derived from.
+          # #9852 - the step bound, not the job limit: measured from the job start it
+          # ends no later than the step bound, so every named watchdog fires first.
+          JOB_TIMEOUT_MIN: ${{ matrix.test_step_timeout }}
           CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
           # #7914 - slots of the host-local semaphore for the self-hosted
           # linux-fed enterprise-fed leg; 0 = no semaphore (every other leg).
@@ -2124,8 +2142,8 @@ jobs:
             # __ALL__ tag path builds ~448 debug integration binaries; that
             # compile legitimately grew past the cap during the v1.0.0 epic,
             # which the watchdog was misreading as a hang (it is not — the full
-            # suite runs to completion). The job-level `timeout-minutes` cap
-            # still bounds the build. A genuine runtime hang still trips the
+            # suite runs to completion). The step-level `timeout-minutes` of this
+            # step (#9852, leg timeout - 12) bounds the build. A genuine runtime hang still trips the
             # $WATCHDOG_SECS cap below.
             cargo test --no-run "$@" || return "$?"
             # `--no-fail-fast` (#2500) — see the identical rationale on
@@ -2460,7 +2478,7 @@ jobs:
                 # directory, a FIFO or a device gives an empty field); at most READ_BYTES are read back from the end; the field
                 # is the last line cut to CUT_BYTES bytes, or the last CUT_BYTES bytes read when that window holds no line feed.
                 # workflow_annotation.render escapes each field once, so no line break, %, :: or ##[ of a log line reaches the
-                # runner through this notice (the raw shard logs printed below are #9433); a cut inside a multi-byte character
+                # runner through this notice (the shard lines themselves are printed by the #9852 follower below); a cut inside a multi-byte character
                 # shows as \udcXX and the line is written as UTF-8. set -e is live here: a failed call is reported on stderr and
                 # that report cannot fail (`|| true`), so no failure of the notice ends the loop or changes the step result.
                 python3 -I -c 'if True:
@@ -2490,23 +2508,86 @@ jobs:
                     print(wa.annotation("notice", wa.render("[#6344] progress | serial: {s} | parallel_1: {p1} | parallel_2: {p2}", s=s, p1=p1, p2=p2), max_chars=2 * wa.MAX_ANNOTATION_CHARS), flush=True)' "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" || { echo "[#6344] progress notice not written: python3 exited $?" >&2 || true; }
               done ) &
             hb=$!
+            # #9852 (Refs #9433): the shard logs reach the job log while the shards run, not after the last one exits, so a
+            # leg the step bound or the job limit stops still shows what each shard was doing. One python3 -I follower reads
+            # each log rb from its own offset (O_NONBLOCK, regular files only, at most CHUNK_BYTES per read and
+            # LIVE_CHUNKS reads per log per poll), prints every complete line once as "[shard] line" through
+            # workflow_annotation.log_line (no line break, leading :: or ##[ of a log line reaches the runner), in
+            # PIECE_CHARS pieces, and holds an unterminated tail up to HOLD_BYTES. On SIGTERM it reads every log to its end,
+            # prints the held tails and exits 0. A follower that ends early is reported on stderr and never changes the step
+            # result: the shard-logs artifact holds every line.
+            python3 -I -c 'if True:
+                # [#9852] live shard output: each complete line of each shard log, prefixed and escaped, as it is written
+                import os, signal, stat, sys, time
+                sys.path.insert(0, "scripts/ci")
+                import workflow_annotation as wa
+                POLL_SECS = 5  # seconds between two reads of the logs
+                SLICE_SECS = 0.2  # sleep slice, so a stop is seen at once
+                CHUNK_BYTES = 1048576  # bytes per read
+                LIVE_CHUNKS = 16  # reads per log per poll while the shards run (no limit on the final read)
+                PIECE_CHARS = 4096  # characters per printed piece of a long line
+                HOLD_BYTES = 65536  # an unterminated tail longer than this is printed as it is
+                stop = []
+                signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
+                sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+                paths = sys.argv[1:]
+                names = [os.path.basename(path)[:-len(".log")] for path in paths]
+                offsets = [0] * len(paths)
+                held = [b""] * len(paths)
+                def emit(name, data):
+                    text = data.decode("utf-8", "surrogateescape")
+                    for start in range(0, max(len(text), 1), PIECE_CHARS):
+                        print(wa.log_line("[%s] %s" % (name, text[start:start + PIECE_CHARS])), flush=True)
+                def read(index):
+                    try:
+                        with open(paths[index], "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK | os.O_NOCTTY)) as log:
+                            if not stat.S_ISREG(os.fstat(log.fileno()).st_mode):
+                                return b""
+                            log.seek(offsets[index])
+                            data = log.read(CHUNK_BYTES)
+                    except OSError:
+                        return b""
+                    offsets[index] += len(data)
+                    return data
+                def poll(final):
+                    for index, name in enumerate(names):
+                        reads = 0
+                        while True:
+                            data = read(index)
+                            reads += 1
+                            lines = (held[index] + data).split(b"\n")
+                            held[index] = lines.pop()
+                            for line in lines:
+                                emit(name, line)
+                            if len(held[index]) > HOLD_BYTES:
+                                emit(name, held[index])
+                                held[index] = b""
+                            if len(data) < CHUNK_BYTES or (not final and reads >= LIVE_CHUNKS):
+                                break
+                while not stop:
+                    poll(False)
+                    deadline = time.monotonic() + POLL_SECS
+                    while not stop and time.monotonic() < deadline:
+                        time.sleep(SLICE_SECS)
+                poll(True)
+                for index, name in enumerate(names):
+                    if held[index]:
+                        emit(name, held[index])' "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" &
+            fl=$!
             # Wait on each PID separately: a bare `wait` discards the exit codes.
             wait "$pid_s" || rc_s=$?
             wait "$pid_1" || rc_1=$?
             wait "$pid_2" || rc_2=$?
             kill "$hb" 2>/dev/null || true
             wait "$hb" 2>/dev/null || true
-            for n in serial parallel_1 parallel_2; do
-              echo "::group::[#6344] ${n} shard output"
-              cat "$sd/$n.log"
-              echo "::endgroup::"
-            done
+            kill "$fl" 2>/dev/null || true
+            wait "$fl" || { echo "[#9852] live shard output ended early: python3 exited $?; the shard-logs artifact holds every line" >&2 || true; }
             echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}"
             for n in "$rc_s" "$rc_1" "$rc_2"; do
               if [ "$n" -ne 0 ]; then rc="$n"; fi
             done
             if [ "$rc" -ne 0 ]; then
-              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the shard output groups above"
+              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the [serial] / [parallel_N] lines above"
             fi
             return "$rc"
           }
@@ -2630,9 +2711,9 @@ jobs:
           retention-days: 30
 
       # #6344 r1 B5: each shard writes its own log under $RUNNER_TEMP/ci-shard
-      # and prints it only after every shard exits, so a cancel or the job cap
-      # would otherwise leave no per-shard output (the 5-min heartbeat keeps
-      # only 90 chars). always(): uploaded on success, failure, cancel and
+      # and the #9852 follower prints its lines to the job log as they are
+      # written, escaped; this artifact keeps the raw bytes of every line, also
+      # when a cancel or a timeout stops the follower. always(): uploaded on success, failure, cancel and
       # timeout. build.jsonl (the compile JSON, large) is not uploaded.
       - name: Upload shard logs (#6344)
         if: always() && needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
