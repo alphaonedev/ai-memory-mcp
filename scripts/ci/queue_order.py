@@ -139,6 +139,7 @@ REASON_GONE = "run no longer exists"
 REASON_JOB_STARTED = "a job has started"
 REASON_NO_SELF_HOSTED = "does not wait on a self-hosted runner"
 REASON_CANCEL_PENDING = "cancel pending"
+REASON_STARTED_AGAIN = "started again (status %s, attempt %d)"
 REASON_RESTART_PENDING = "restart pending"
 
 
@@ -521,7 +522,7 @@ def judge(entry: BoundEntry, run: Any, scope: Scope, pr_facts_fn: Callable[[int]
     if out_of_scope:
         return Judgment(Disposition.DROP, "record out of scope: %s" % out_of_scope)
     if attempt > entry.attempt:
-        return Judgment(Disposition.DROP, "started again (status %s, attempt %d)" % (status, attempt))
+        return Judgment(Disposition.DROP, REASON_STARTED_AGAIN % (status, attempt))
     if entry.phase is Phase.RESTARTED:
         if restart_landing:
             if status == COMPLETED and conclusion == CANCELLED:
@@ -530,9 +531,12 @@ def judge(entry: BoundEntry, run: Any, scope: Scope, pr_facts_fn: Callable[[int]
         if status in QUEUE_STATUSES:
             return Judgment(Disposition.REQUEUED, "")
         return Judgment(Disposition.DROP, "restarted run left the queue (status %s)" % status)
-    if status != COMPLETED:
-        # the cancel was accepted and has not landed; a run picked up meanwhile is still cancelled by it
+    if status in QUEUE_STATUSES:
+        # the cancel was accepted and has not landed
         return Judgment(Disposition.PENDING, REASON_CANCEL_PENDING)
+    if status != COMPLETED:
+        # a run that started is never cancelled (I4), so it has nothing to restart: dropped with its reason
+        return Judgment(Disposition.DROP, REASON_STARTED_AGAIN % (status, attempt))
     if conclusion != CANCELLED:
         return Judgment(Disposition.DROP, "finished (conclusion %s)" % conclusion)
     facts = pr_facts_fn(entry.pr)

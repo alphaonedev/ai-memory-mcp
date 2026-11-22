@@ -619,7 +619,7 @@ class RecordTable(TestBase):
     def entry(self, phase, attempt=1, waited=0):
         return qo.BoundEntry(3, 3, SHA_A, attempt, phase, waited)
 
-    def run(self, status="completed", conclusion="cancelled", attempt=1):
+    def live_run(self, status="completed", conclusion="cancelled", attempt=1):
         return {"id": 3, "name": "CI", "event": "pull_request", "head_branch": "fix/x", "head_sha": SHA_A, "status": status, "conclusion": conclusion,
                 "created_at": stamp(3), "run_attempt": attempt, "pull_requests": [{"number": 3}], "head_repository": {"full_name": REPO}}
 
@@ -629,20 +629,20 @@ class RecordTable(TestBase):
         rows = (
             # (name, entry, live run or None, pr facts, newer run, disposition, reason)
             ("gone", self.entry(cancelled), None, open_pr, None, "DROP", "run no longer exists"),
-            ("cancel pending", self.entry(cancelled), self.run("queued", None), open_pr, None, "PENDING", "cancel pending"),
-            ("cancel never landed, run started", self.entry(cancelled), self.run("in_progress", None), open_pr, None, "DROP",
+            ("cancel pending", self.entry(cancelled), self.live_run("queued", None), open_pr, None, "PENDING", "cancel pending"),
+            ("cancel never landed, run started", self.entry(cancelled), self.live_run("in_progress", None), open_pr, None, "DROP",
              "started again (status in_progress, attempt 1)"),
-            ("finished", self.entry(cancelled), self.run("completed", "success"), open_pr, None, "DROP", "finished (conclusion success)"),
-            ("pr closed", self.entry(cancelled), self.run(), qo.PrFacts(False, SHA_A, False, False), None, "DROP", "pr 3 closed"),
-            ("superseded", self.entry(cancelled), self.run(), qo.PrFacts(True, SHA_B, False, False), None, "DROP", "superseded by a newer head of pr 3"),
-            ("newer run", self.entry(cancelled), self.run(), open_pr, 9, "DROP", "newer run of pr 3 exists: run 9"),
-            ("restartable", self.entry(cancelled), self.run(), open_pr, None, "RESTARTABLE", ""),
-            ("restarted, queued again", self.entry(restarted, 2), self.run("queued", None, 2), open_pr, None, "REQUEUED", ""),
-            ("restarted, running", self.entry(restarted, 2), self.run("in_progress", None, 2), open_pr, None, "DROP",
+            ("finished", self.entry(cancelled), self.live_run("completed", "success"), open_pr, None, "DROP", "finished (conclusion success)"),
+            ("pr closed", self.entry(cancelled), self.live_run(), qo.PrFacts(False, SHA_A, False, False), None, "DROP", "pr 3 closed"),
+            ("superseded", self.entry(cancelled), self.live_run(), qo.PrFacts(True, SHA_B, False, False), None, "DROP", "superseded by a newer head of pr 3"),
+            ("newer run", self.entry(cancelled), self.live_run(), open_pr, 9, "DROP", "newer run of pr 3 exists: run 9"),
+            ("restartable", self.entry(cancelled), self.live_run(), open_pr, None, "RESTARTABLE", ""),
+            ("restarted, queued again", self.entry(restarted, 2), self.live_run("queued", None, 2), open_pr, None, "REQUEUED", ""),
+            ("restarted, running", self.entry(restarted, 2), self.live_run("in_progress", None, 2), open_pr, None, "DROP",
              "restarted run left the queue (status in_progress)"),
-            ("restarted, finished", self.entry(restarted, 2), self.run("completed", "success", 2), open_pr, None, "DROP",
+            ("restarted, finished", self.entry(restarted, 2), self.live_run("completed", "success", 2), open_pr, None, "DROP",
              "restarted run left the queue (status completed)"),
-            ("restarted, re-run again", self.entry(restarted, 2), self.run("queued", None, 3), open_pr, None, "DROP",
+            ("restarted, re-run again", self.entry(restarted, 2), self.live_run("queued", None, 3), open_pr, None, "DROP",
              "started again (status queued, attempt 3)"),
         )
         scope = qo.Scope(("CI",), REPO)
