@@ -16,6 +16,7 @@ synthetic workflows are named constants below. No file is written.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import time
 import unittest
@@ -51,6 +52,19 @@ FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 NEW_VIOLATION_ISSUE = 9553
 RELEASE_ISSUE = 9570
 RUNNER_ISSUE = 9455
+# #9813 / PR 9817 H1: the two oracles of the subset parser. Oracle one is the standard-library line reader
+# scripts/ci/tests/yaml_line_oracle.py (every node); oracle two is PyYAML, present on the build-script-vetting
+# job (ubuntu-latest system python3, which runs `python3 -m unittest discover -s scripts/ci/tests`).
+ORACLE_PATH = Path(__file__).resolve().parent / "yaml_line_oracle.py"
+ORACLE_MISSING = "independent line reader scripts/ci/tests/yaml_line_oracle.py is missing"
+PYYAML_JOB = "build-script-vetting"
+PYYAML_JOB_ENV = "GITHUB_JOB"
+PYYAML_MISSING = "PyYAML is not importable on the %s job, which must run oracle two" % PYYAML_JOB
+PYYAML_SKIP = "PyYAML is not importable here; oracle two runs on the %s job" % PYYAML_JOB
+GUARDED_COMPOSE = "infra/pgbouncer/docker-compose.yml"
+GUARDED_FILE_FLOOR = 26  # the workflows, actions and the compose file at this head; a scope below it is a failure
+HIDDEN_BREAKS = {"bare CR": "\r", "NEL": "\x85", "LS": " ", "PS": " "}
+HIDDEN_REF = "${{ github.event.pull_request.head.sha }}"
 SYNTH = "synthetic.yml"
 # The step key of an R2 (iv) violation: the job's `runs-on`, not one of its steps.
 R2_STEP = "runs-on"
@@ -986,6 +1000,25 @@ def _load_workflow_text():
     return module
 
 
+def _load_oracle(case: unittest.TestCase):
+    """Oracle one, the independent line reader (#9813), loaded from its file (sys.path untouched)."""
+    if not ORACLE_PATH.is_file():
+        case.fail(ORACLE_MISSING)
+    spec = importlib.util.spec_from_file_location("yaml_line_oracle_9813", ORACLE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _on_key_as_text(node: object) -> object:
+    """PyYAML's document with the YAML 1.1 boolean key `on` (True) read back as the text GitHub reads."""
+    if isinstance(node, dict):
+        return {("on" if key is True else key): _on_key_as_text(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_on_key_as_text(item) for item in node]
+    return node
+
+
 def _real_job(workflow: str, job: str) -> dict[str, object]:
     workflows, _, _ = _real()
     doc = tb.parse_yaml(workflows[workflow], workflow)
@@ -1563,8 +1596,8 @@ class RealWorkflows(unittest.TestCase):
                           ("ci.yml", "select", "Select the full matrix (base selector unavailable)")})
 
     def test_9452_subset_parser_reads_every_real_file_and_matches_the_line_reader(self) -> None:
-        """#9813: no PyYAML oracle (a fleet node has none). Every real file parses to a mapping, and the job ids
-        of every workflow equal the ids of the independent line-based reader (workflow_text.read_jobs)."""
+        """Every real file parses to a mapping, and the job ids of every workflow equal the ids of the job-id
+        reader (workflow_text.read_jobs). The full-document compares are the two oracle cells below."""
         _need_module(self)
         reader = _load_workflow_text()
         workflows, actions, _ = _real()
@@ -1576,6 +1609,67 @@ class RealWorkflows(unittest.TestCase):
             with self.subTest(jobs=name):
                 parsed = tb.parse_yaml(text, name)["jobs"]
                 self.assertEqual(list(parsed), list(reader.read_jobs(WORKFLOW_DIR / name)))
+
+    def test_9813_oracle_one_reads_every_guarded_file_as_the_subset_parser(self) -> None:
+        """Oracle one (standard library, every node): for every workflow, action and the pgbouncer compose file,
+        the whole document of the subset parser equals the whole document of the independent line reader (every
+        key path, every scalar and its type), and the strict reader reads the file."""
+        _need_module(self)
+        oracle = _load_oracle(self)
+        reader = _load_workflow_text()
+        guarded = oracle.guarded_files(REPO_ROOT)
+        self.assertGreaterEqual(len(guarded), GUARDED_FILE_FLOOR)
+        self.assertIn(REPO_ROOT / GUARDED_COMPOSE, guarded)
+        for path in guarded:
+            name = str(path.relative_to(REPO_ROOT))
+            with self.subTest(file=name):
+                text = path.read_bytes().decode("utf-8")
+                document, _lines = oracle.read(text)
+                self.assertIsNone(oracle.first_difference(tb.parse_yaml(text, name), document))
+                self.assertEqual(reader.read_document(path), document)
+
+    def test_9813_oracle_two_pyyaml_reads_every_guarded_file_as_the_subset_parser(self) -> None:
+        """Oracle two (PyYAML): the same whole-document compare against PyYAML's safe loader. It runs wherever
+        PyYAML imports, fails on the build-script-vetting job when PyYAML is missing there, and skips with its
+        reason elsewhere. PyYAML reads the workflow key `on` as the boolean true (YAML 1.1); that one key is put
+        back as text before the compare, and every other YAML 1.1 form is refused by oracle one."""
+        _need_module(self)
+        if importlib.util.find_spec("yaml") is None:
+            if os.environ.get(PYYAML_JOB_ENV) == PYYAML_JOB:
+                self.fail(PYYAML_MISSING)
+            self.skipTest(PYYAML_SKIP)
+        import yaml
+
+        oracle = _load_oracle(self)
+        guarded = oracle.guarded_files(REPO_ROOT)
+        self.assertGreaterEqual(len(guarded), GUARDED_FILE_FLOOR)
+        for path in guarded:
+            name = str(path.relative_to(REPO_ROOT))
+            with self.subTest(file=name):
+                text = path.read_bytes().decode("utf-8")
+                expected = _on_key_as_text(yaml.load(text, Loader=yaml.SafeLoader))
+                self.assertIsNone(oracle.first_difference(tb.parse_yaml(text, name), expected))
+
+    def test_9817_h1_a_key_after_a_yaml_line_break_is_seen_by_the_oracle_and_refused(self) -> None:
+        """H1: the subset parser splits on LF only, so a key written after a bare CR, NEL, LS or PS is part of
+        the scalar before it for the parser and a key for YAML. The oracle sees the key, and the strict reader
+        refuses the document with the line-break reason."""
+        _need_module(self)
+        oracle = _load_oracle(self)
+        reader = _load_workflow_text()
+        for name, brk in HIDDEN_BREAKS.items():
+            text = ("on: pull_request_target\njobs:\n  a:\n    runs-on: x\n    steps:\n"
+                    "      - uses: actions/checkout@v4 # pinned%s        with:%s          ref: %s\n"
+                    % (brk, brk, HIDDEN_REF))
+            with self.subTest(form=name):
+                document, _lines = oracle.read(text)
+                self.assertEqual(document["jobs"]["a"]["steps"][0],
+                                 {"uses": "actions/checkout@v4", "with": {"ref": HIDDEN_REF}})
+                self.assertIsNotNone(oracle.first_difference(tb.parse_yaml(text, SYNTH), document))
+                with self.assertRaises(reader.WorkflowReadError) as caught:
+                    reader.parse_text(text, SYNTH)
+                self.assertEqual(caught.exception.reason,
+                                 reader.BARE_CR if brk == "\r" else reader.LINE_BREAK)
 
 
 if __name__ == "__main__":

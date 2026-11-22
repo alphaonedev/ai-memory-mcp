@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Issue #9813: the strict standard-library workflow reader of ``workflow_text`` refuses what it cannot read.
+"""Issue #9813, PR 9817 round 1: the strict standard-library reader of ``workflow_text`` refuses what it cannot read.
 
-Class: a CI guard that reads a workflow file must fail (never skip, never pass, never return a guessed value) on a
-file it cannot read or a value it cannot parse, and it must do that with the standard library alone so the guard
-loads on a fleet node that has no PyYAML.
+Class: a CI guard that reads a workflow, action or compose file must see the value the consumer (GitHub Actions,
+docker compose) uses, or refuse with one exact reason. A document or a key it cannot classify is a refusal that turns
+the guard red, never a pass; a job field can never be present in the text and absent from what the classifier sees.
 
-Invariant, for every input: ``workflow_text.read_document`` returns exactly what the shared subset parser
-(``taint_boundary.parse_yaml``) returns for a readable UTF-8 file, or raises ``WorkflowReadError`` naming the file,
-and for a parse refusal the line. ``workflow_text.read_all_steps`` returns the ``(job id, step)`` pairs of a document
-whose shape it can read and refuses every other shape with its reason. Each row below asserts the exact value or the
-exact refusal.
+Invariant, for every input: ``workflow_text.read_document`` / ``parse_text`` return the document only when the file
+check, the character scan, the closed-grammar prescan, the subset parser and the independent reader
+(``yaml_line_oracle``) all accept it and the two readers agree on every key path and scalar; otherwise they raise
+``WorkflowReadError`` whose ``reason`` is one named constant and whose message is ``<file>: line <n>: <reason>`` (or
+``<file>: <reason>``), never document text. Each row below asserts the exact reason and line.
 
 Run: /opt/homebrew/bin/python3.12 -I scripts/ci/tests/test_workflow_text_yaml_9813.py
 """
 
 from __future__ import annotations
 
+import os
+import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -31,9 +34,237 @@ sys.path.insert(0, str(TESTS_DIR))
 
 import workflow_text as wt  # noqa: E402
 
+UTF8 = "utf-8"
 BIG_FILE_LINES = 100_000
 BIG_FILE_CEILING_SECS = 20.0
-UTF8 = "utf-8"
+LONG_LINE_BYTES = 1024 * 1024
+LONG_LINE_CEILING_SECS = 10.0
+FIFO_CEILING_SECS = 5.0
+NESTING_PAST_LIMIT = 70
+LABEL = "<t>"
+
+# The reason texts, written out by hand (not read from the module): a constant whose text changes, or a branch that
+# raises another constant, turns a row red.
+REASON_TEXTS = {
+    "MISSING": "missing file",
+    "SYMLINK": "a symbolic link (not followed)",
+    "DIRECTORY": "a directory, not a file",
+    "FIFO": "a FIFO, not a regular file",
+    "DEVICE": "a device, not a regular file",
+    "NOT_REGULAR": "not a regular file",
+    "UNREADABLE": "cannot be opened or read",
+    "OVER_CAP": "larger than 8388608 bytes",
+    "UTF8": "not valid UTF-8",
+    "BOM": "byte order mark",
+    "EMPTY": "empty file",
+    "BLANK_ONLY": "no content (blank or comment lines only)",
+    "BARE_CR": "carriage return not followed by a line feed",
+    "LINE_BREAK": "line break other than LF or CR LF (NEL, LS or PS)",
+    "TAB": "tab character",
+    "CONTROL": "control or format character",
+    "NONASCII_SPACE": "non-ASCII space character",
+    "DOCUMENT_MARKER": "document marker (`---` or `...`)",
+    "DIRECTIVE": "YAML directive",
+    "QUOTED_KEY": "quoted key",
+    "TRAILING_SPACE_KEY": "blank before the `:` of a key",
+    "NONASCII_KEY": "non-ASCII key",
+    "MERGE_KEY": "merge key `<<`",
+    "ANCHOR": "anchor",
+    "ALIAS": "alias",
+    "TAG": "tag",
+    "COMPLEX_KEY": "complex key `?`",
+    "FLOW_BLOCK": "flow collection where a block is read (`jobs`, a job, or `steps`), or as a block item",
+    "BLOCK_SCALAR": "block scalar header outside the subset",
+    "DUPLICATE_KEY": "duplicate key",
+    "INDENT": "indentation outside the subset (a multi-line plain scalar or a second document)",
+    "KEY_FORM": "key form outside the subset",
+    "QUOTED_SCALAR": "quoted scalar outside the subset",
+    "FLOW": "flow collection outside the subset",
+    "PLAIN": "plain scalar outside the subset",
+    "OUTSIDE_SUBSET": "form outside the subset",
+    "AMBIGUOUS_SCALAR": "plain scalar whose type differs between YAML 1.1 and 1.2",
+    "KEY_NOT_TEXT": "key that does not read as text",
+    "ORACLE_REFUSED": "form the independent reader does not read",
+    "ORACLE_DIFFERS": "the subset parser and the independent reader disagree",
+    "TOP_NOT_MAPPING": "top level is not a mapping",
+    "JOBS_MISSING": "`jobs` is missing",
+    "JOBS_NOT_MAPPING": "`jobs` is not a mapping",
+}
+NESTING_TEXT = "nesting deeper than 64 levels"
+
+
+def reason(name: str) -> str:
+    """The module's constant `name`; a marker when it is absent, so a missing constant is a red row, not an error."""
+    return getattr(wt, name, "<absent constant %s>" % name)
+
+
+# A privileged workflow (pull_request_target, write token) whose checkout step hides `with: ref:` behind a line
+# break that the subset parser does not split on: GitHub Actions reads the key, a reader that misses it does not.
+H1_VISIBLE = (
+    "on: pull_request_target\n"
+    "permissions:\n"
+    "  contents: write\n"
+    "jobs:\n"
+    "  build:\n"
+    "    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    "      - uses: actions/checkout@v4{BREAK}"
+    "        with:{BREAK}"
+    "          ref: ${{{{ github.event.pull_request.head.sha }}}}\n"
+    "      - run: make\n"
+)
+H1_BREAKS = {"bare_cr": ("\r", "BARE_CR"), "nel": ("\x85", "LINE_BREAK"), "ls": ("\u2028", "LINE_BREAK"),
+             "ps": ("\u2029", "LINE_BREAK")}
+H1_LINE = 8
+
+# (text, reason constant name, line) for every form the closed grammar refuses.
+HOSTILE_FORMS = {
+    "duplicate_key": ("a: 1\na: 2\n", "DUPLICATE_KEY", 2),
+    "duplicate_job_field": ("jobs:\n  b:\n    runs-on: x\n    runs-on: y\n    steps:\n      - run: z\n",
+                            "DUPLICATE_KEY", 4),
+    "anchor_value": ("a: &x 1\n", "ANCHOR", 1),
+    "anchor_block": ("a: &x\n  b: 1\n", "ANCHOR", 1),
+    "anchor_item": ("a:\n  - &x 1\n", "ANCHOR", 2),
+    "anchor_in_flow": ("a: [&x 1]\n", "ANCHOR", 1),
+    "alias_value": ("a: 1\nb: *x\n", "ALIAS", 2),
+    "alias_item": ("a:\n  - *x\n", "ALIAS", 2),
+    "alias_in_flow": ("a: [1, *x]\n", "ALIAS", 1),
+    "merge_key": ("a:\n  <<: {b: 1}\n", "MERGE_KEY", 2),
+    "merge_key_in_flow": ("a: {<<: b}\n", "MERGE_KEY", 1),
+    "tag_value": ("a: !!str x\n", "TAG", 1),
+    "tag_key": ("!!str a: 1\n", "TAG", 1),
+    "tag_in_flow": ("a: [!!str x]\n", "TAG", 1),
+    "flow_jobs": ("jobs: {build: {steps: [{run: x}]}}\n", "FLOW_BLOCK", 1),
+    "flow_job": ("jobs:\n  b: {steps: [{run: x}]}\n", "FLOW_BLOCK", 2),
+    "flow_steps": ("jobs:\n  b:\n    steps: [{run: x}]\n", "FLOW_BLOCK", 3),
+    "zero_jobs": ("jobs: {}\n", "FLOW_BLOCK", 1),
+    "zero_steps": ("jobs:\n  b:\n    steps: []\n", "FLOW_BLOCK", 3),
+    "flow_mapping_item": ("a:\n  - {run: x}\n", "FLOW_BLOCK", 2),
+    "flow_sequence_item": ("a:\n  - [x]\n", "FLOW_BLOCK", 2),
+    "double_quoted_key": ('"a": 1\n', "QUOTED_KEY", 1),
+    "single_quoted_key": ("'a': 1\n", "QUOTED_KEY", 1),
+    "quoted_key_in_item": ("a:\n  - 'b': 1\n", "QUOTED_KEY", 2),
+    "tab_indented_key": ("a:\n\tb: 1\n", "TAB", 2),
+    "tab_in_value": ("a: b\tc\n", "TAB", 1),
+    "blank_before_colon": ("a : 1\n", "TRAILING_SPACE_KEY", 1),
+    "complex_key": ("? a\n: 1\n", "COMPLEX_KEY", 1),
+    "second_document": ("a: 1\n---\nb: 2\n", "DOCUMENT_MARKER", 2),
+    "document_start": ("---\na: 1\n", "DOCUMENT_MARKER", 1),
+    "document_end": ("a: 1\n...\n", "DOCUMENT_MARKER", 2),
+    "directive": ("%YAML 1.2\na: 1\n", "DIRECTIVE", 1),
+    "bare_cr": ("a: 1\rb: 2\n", "BARE_CR", 1),
+    "nel": ("a: 1\x85b: 2\n", "LINE_BREAK", 1),
+    "line_separator": ("a: 1\u2028b: 2\n", "LINE_BREAK", 1),
+    "paragraph_separator": ("a: 1\u2029b: 2\n", "LINE_BREAK", 1),
+    "nul": ("a: 1\x00\n", "CONTROL", 1),
+    "escape": ("a: \x1b[31m\n", "CONTROL", 1),
+    "delete": ("a: 1\x7f\n", "CONTROL", 1),
+    "zero_width_space": ("a\u200b: 1\n", "CONTROL", 1),
+    "bom_inside_text": ("a: 1\n\ufeffb: 2\n", "CONTROL", 2),
+    "nbsp_indentation": ("a:\n\u00a0 b: 1\n", "NONASCII_SPACE", 2),
+    "nbsp_in_key": ("a\u00a0b: 1\n", "NONASCII_SPACE", 1),
+    "ideographic_space": ("a:\u3000b\n", "NONASCII_SPACE", 1),
+    "nonascii_key": ("\u00e9: 1\n", "NONASCII_KEY", 1),
+    "block_header_indent_digit": ("a: |2\n  x\n", "BLOCK_SCALAR", 1),
+    "block_header_text": ("a: |x\n  y\n", "BLOCK_SCALAR", 1),
+    "multi_line_plain": ("a: b\n  c\n", "INDENT", 2),
+    "multi_line_quoted": ('a: "x\n  y"\n', "QUOTED_SCALAR", 1),
+    "unterminated_quote_second_line": ("a: 1\nb: 'x\n\n\nc: 2\n", "QUOTED_SCALAR", 2),
+    "bad_escape_second_line": ('a: 1\nb: "x\\q"\nc: 2\n', "QUOTED_SCALAR", 2),
+    "unterminated_quote_in_item_mapping": ("a:\n  - b: 'x\n", "QUOTED_SCALAR", 2),
+    "text_after_quote": ("a: 'x' y\n", "QUOTED_SCALAR", 1),
+    "yaml11_bool_value": ("a: yes\n", "AMBIGUOUS_SCALAR", 1),
+    "yaml11_off_value": ("a: Off\n", "AMBIGUOUS_SCALAR", 1),
+    "leading_zero": ("a: 010\n", "AMBIGUOUS_SCALAR", 1),
+    "hex": ("a: 0x1f\n", "AMBIGUOUS_SCALAR", 1),
+    "exponent": ("a: 1e3\n", "AMBIGUOUS_SCALAR", 1),
+    "underscore": ("a: 1_000\n", "AMBIGUOUS_SCALAR", 1),
+    "sexagesimal": ("a: 1:30\n", "AMBIGUOUS_SCALAR", 1),
+    "infinity": ("a: .inf\n", "AMBIGUOUS_SCALAR", 1),
+    "date": ("a: 2026-11-21\n", "AMBIGUOUS_SCALAR", 1),
+    "yaml11_key": ("yes: 1\n", "KEY_NOT_TEXT", 1),
+    "null_key": ("null: 1\n", "KEY_NOT_TEXT", 1),
+    "int_key": ("1: a\n", "KEY_NOT_TEXT", 1),
+    "keep_chomp_trailing_blank": ("a: x\nb: |+\n  y\n\n", "ORACLE_DIFFERS", 2),
+    "folded_leading_blank": ("a: >\n\n  x\n", "ORACLE_REFUSED", 2),
+    "comment_only": ("# x\n\n", "BLANK_ONLY", 1),
+}
+
+# Texts both readers accept: the value the consumer reads.
+VALUE_ROWS = {
+    "block_scalar_hides_keys": ("run: |\n  shell: bash\n  jobs: x\nshell: sh\n",
+                                {"run": "shell: bash\njobs: x\n", "shell": "sh"}),
+    "commented_key_is_absent": ("# shell: bash\nname: x\n", {"name": "x"}),
+    "trailing_comment": ("shell: bash  # trailing\n", {"shell": "bash"}),
+    "quoted_hash_and_colon": ("run: \"a # b: c\"\nother: 'x: y # z'\n", {"run": "a # b: c", "other": "x: y # z"}),
+    "crlf": ("a: 1\r\nb: two\r\nrun: |\r\n  x\r\n  y\r\n", {"a": 1, "b": "two", "run": "x\ny\n"}),
+    "on_key_is_text": ("on: push\n", {"on": "push"}),
+    "needs_flow_list": ("jobs:\n  b:\n    needs: [a, c]\n    steps:\n      - run: x\n",
+                        {"jobs": {"b": {"needs": ["a", "c"], "steps": [{"run": "x"}]}}}),
+    "nonascii_value": ("name: caf\u00e9 \u2014 ok\n", {"name": "caf\u00e9 \u2014 ok"}),
+    "typed_scalars": ("a: 1\nb: 1.5\nc: true\nd: null\ne: ~\nf: '010'\n",
+                      {"a": 1, "b": 1.5, "c": True, "d": None, "e": None, "f": "010"}),
+}
+
+# Ten secrets-looking canaries, built at run time so no scanner matches this file.
+CANARIES = (
+    "gh" + "p_" + "Q" * 36,
+    "AK" + "IA" + "Q" * 16,
+    "xo" + "xb-" + "1" * 10 + "-" + "Q" * 24,
+    "-----BEGIN " + "PRIVATE KEY-----",
+    "pass" + "word=hunter2canary",
+    "postgres://u:" + "s3cretcanary" + "@db.invalid/x",
+    "s" + "k-" + "Q" * 40,
+    "gl" + "pat-" + "Q" * 20,
+    "ey" + "J" + "hbGciOiJIUzI1NiJ9.canary.sig",
+    "AI" + "za" + "Q" * 35,
+)
+# (template with {S} for the canary, reason constant name, line) for every text-level refusal branch.
+CANARY_TEMPLATES = {
+    "duplicate_key": ("k: '{S}'\nk: '{S}'\n", "DUPLICATE_KEY", 2),
+    "anchor": ("a: &x '{S}'\n", "ANCHOR", 1),
+    "alias": ("a: '{S}'\nb: *x\n", "ALIAS", 2),
+    "tag": ("a: !t '{S}'\n", "TAG", 1),
+    "tab_value": ("a: '{S}'\tb\n", "TAB", 1),
+    "merge_key": ("a:\n  b: '{S}'\n  <<: x\n", "MERGE_KEY", 3),
+    "quoted_key": ("'{S}': 1\n", "QUOTED_KEY", 1),
+    "blank_before_colon": ("a : '{S}'\n", "TRAILING_SPACE_KEY", 1),
+    "nonascii_key": ("\u00e9: '{S}'\n", "NONASCII_KEY", 1),
+    "complex_key": ("? '{S}'\n", "COMPLEX_KEY", 1),
+    "flow_block": ("jobs: ['{S}']\n", "FLOW_BLOCK", 1),
+    "document_marker": ("a: '{S}'\n---\n", "DOCUMENT_MARKER", 2),
+    "directive": ("%TAG '{S}'\na: 1\n", "DIRECTIVE", 1),
+    "bare_cr": ("a: '{S}'\rb: 1\n", "BARE_CR", 1),
+    "line_break": ("a: '{S}'\x85b: 1\n", "LINE_BREAK", 1),
+    "control": ("a: '{S}'\x00\n", "CONTROL", 1),
+    "nonascii_space": ("a: '{S}'\u3000\n", "NONASCII_SPACE", 1),
+    "block_header": ("a: |9x\n  '{S}'\n", "BLOCK_SCALAR", 1),
+    "indent": ("a: x{S}\n  y{S}\n", "INDENT", 2),
+    "key_form": ("a: 1\nx{S}\n", "KEY_FORM", 2),
+    "quoted_scalar": ("a: \"{S}\\q\"\n", "QUOTED_SCALAR", 1),
+    "multi_line_quoted": ("a: \"{S}\n  y\"\n", "QUOTED_SCALAR", 1),
+    "flow": ("a: [b, '{S}'\n", "FLOW", 1),
+    "ambiguous": ("a: '{S}'\nb: yes\n", "AMBIGUOUS_SCALAR", 2),
+    "key_not_text": ("a: '{S}'\nnull: 1\n", "KEY_NOT_TEXT", 2),
+    "oracle_differs": ("a: '{S}'\nb: |+\n  x\n\n", "ORACLE_DIFFERS", 2),
+    "oracle_refused": ("a: '{S}'\nb: >\n\n  x\n", "ORACLE_REFUSED", 3),
+}
+# (template, exact refusal text after the label) for every read_all_steps shape branch.
+SHAPE_ROWS = {
+    "top_not_mapping": ("- '{S}'\n- b\n", "top level is not a mapping"),
+    "jobs_missing": ("name: '{S}'\n", "`jobs` is missing"),
+    "jobs_not_mapping": ("jobs: '{S}'\n", "`jobs` is not a mapping"),
+    "job_not_mapping": ("jobs:\n  a: '{S}'\n", "job 1 is not a mapping"),
+    "job_no_steps": ("jobs:\n  a:\n    runs-on: '{S}'\n", "job 1 has neither `steps` nor `uses`"),
+    "steps_null": ("jobs:\n  a:\n    name: '{S}'\n    steps:\n", "job 1: `steps` is null"),
+    "steps_not_list": ("jobs:\n  a:\n    steps: '{S}'\n", "job 1: `steps` is not a list"),
+    "step_not_mapping": ("jobs:\n  a:\n    steps:\n      - '{S}'\n", "job 1: step 1 is not a mapping"),
+    "run_null": ("jobs:\n  a:\n    steps:\n      - name: '{S}'\n        run:\n", "job 1: step 1: `run` is null"),
+    "run_number": ("jobs:\n  a:\n    steps:\n      - name: '{S}'\n        run: 5\n", "job 1: step 1: `run` is not text"),
+    "run_list": ("jobs:\n  a:\n    steps:\n      - run: ['{S}']\n", "job 1: step 1: `run` is not text"),
+    "second_job_second_step": ("jobs:\n  a:\n    uses: ./x.yml\n  b:\n    steps:\n      - run: x\n      - '{S}'\n",
+                               "job 2: step 2 is not a mapping"),
+}
 
 
 class ReaderCase(unittest.TestCase):
@@ -50,84 +281,230 @@ class ReaderCase(unittest.TestCase):
         path.write_bytes(text if isinstance(text, bytes) else text.encode(UTF8))
         return path
 
-    def refusal(self, path: Path) -> str:
+    def refused(self, call, *args) -> Exception:
         with self.assertRaises(wt.WorkflowReadError) as ctx:
-            wt.read_document(path)
-        return str(ctx.exception)
+            call(*args)
+        return ctx.exception
+
+    def assert_refusal(self, exc: Exception, label: str, line: int | None, reason_text: str) -> None:
+        self.assertEqual((exc.label, exc.line, exc.reason), (label, line, reason_text))
+        where = "%s: line %d" % (label, line) if line is not None else label
+        self.assertEqual(str(exc), "%s: %s" % (where, reason_text))
 
 
-class ReadDocumentRows(ReaderCase):
-    def test_9813_tab_indented_key_is_refused_with_its_line(self) -> None:
-        path = self.write("jobs:\n\tbuild:\n    steps: []\n")
-        self.assertEqual(self.refusal(path), "%s: line 2: tab in indentation" % path)
+class ReasonConstants(unittest.TestCase):
+    def test_9817_every_reason_constant_has_its_written_text(self) -> None:
+        for name, text in REASON_TEXTS.items():
+            with self.subTest(constant=name):
+                self.assertEqual(reason(name), text)
+        self.assertEqual(getattr(wt, "NESTING", None), "nesting deeper than %d levels")
 
-    def test_9813_duplicate_key_is_refused_with_its_line(self) -> None:
-        path = self.write("jobs:\n  a: 1\n  a: 2\n")
-        self.assertEqual(self.refusal(path), "%s: line 3: duplicate key 'a'" % path)
+    def test_9817_the_read_cap_equals_the_classifier_cap(self) -> None:
+        self.assertEqual(getattr(wt, "MAX_DOCUMENT_BYTES", None), wt.load_taint_boundary().MAX_YAML_BYTES)
 
-    def test_9813_a_key_inside_a_block_scalar_is_text_not_a_key(self) -> None:
-        path = self.write("run: |\n  shell: bash\n  jobs: x\nshell: sh\n")
-        self.assertEqual(wt.read_document(path), {"run": "shell: bash\njobs: x\n", "shell": "sh"})
-
-    def test_9813_a_commented_out_key_is_absent(self) -> None:
-        path = self.write("# shell: bash\nname: x\n")
-        self.assertEqual(wt.read_document(path), {"name": "x"})
-
-    def test_9813_a_trailing_comment_is_not_part_of_the_value(self) -> None:
-        path = self.write("shell: bash  # trailing\n")
-        self.assertEqual(wt.read_document(path), {"shell": "bash"})
-
-    def test_9813_a_quoted_value_keeps_hash_and_colon(self) -> None:
-        path = self.write("run: \"a # b: c\"\nother: 'x: y # z'\n")
-        self.assertEqual(wt.read_document(path), {"run": "a # b: c", "other": "x: y # z"})
-
-    def test_9813_crlf_line_ends_read_like_lf(self) -> None:
-        path = self.write("a: 1\r\nb: two\r\nrun: |\r\n  x\r\n  y\r\n")
-        self.assertEqual(wt.read_document(path), {"a": 1, "b": "two", "run": "x\ny\n"})
-
-    def test_9813_an_empty_file_is_refused(self) -> None:
-        path = self.write("")
-        self.assertEqual(self.refusal(path), "%s: line 1: empty file" % path)
-
-    def test_9813_a_comment_only_file_is_refused_as_an_empty_document(self) -> None:
-        path = self.write("# nothing\n")
-        self.assertEqual(self.refusal(path), "%s: line 3: empty document" % path)
-
-    def test_9813_a_missing_file_is_refused_naming_the_path(self) -> None:
-        path = self.dir / "absent.yml"
-        self.assertEqual(self.refusal(path), "%s: cannot read: No such file or directory" % path)
-
-    def test_9813_a_directory_is_refused_naming_the_path(self) -> None:
-        self.assertEqual(self.refusal(self.dir), "%s: cannot read: Is a directory" % self.dir)
-
-    def test_9813_bad_utf8_is_refused_with_its_byte_offset(self) -> None:
-        path = self.write(b"a: \xff\n")
-        self.assertEqual(self.refusal(path), "%s: not valid UTF-8: invalid start byte at byte 3" % path)
-
-    def test_9813_each_form_the_subset_does_not_parse_is_refused_with_its_line(self) -> None:
-        forms = {
-            "tag": ("a: !!str x\n", "line 1: scalar form outside the subset: '!!str x'"),
-            "anchor": ("a: &x 1\n", "line 1: scalar form outside the subset: '&x 1'"),
-            "multi_line_quoted": ('a: "x\n  y"\n', "line 2: unterminated or multi-line quoted scalar"),
+    def test_9817_every_parser_refusal_maps_to_a_reason_constant(self) -> None:
+        boundary = wt.load_taint_boundary()
+        rows = {
+            "a:\n\tb: 1\n": "TAB",
+            "a: 1\n  b: 2\n": "INDENT",
+            "a: 'x\n": "QUOTED_SCALAR",
+            "a: [b\n": "FLOW",
         }
-        for name, (text, reason) in forms.items():
+        for text, name in rows.items():
+            with self.subTest(text=text):
+                with self.assertRaises(boundary.YamlError) as ctx:
+                    boundary.parse_yaml(text, "<document>")
+                _, mapped = wt._parser_reason(str(ctx.exception))
+                self.assertEqual(mapped, reason(name))
+        self.assertEqual(wt._parser_reason("<document>: line 3: nesting deeper than 64")[1], NESTING_TEXT)
+        self.assertEqual(wt._parser_reason("<document>: line 2: an unknown refusal"), (2, reason("OUTSIDE_SUBSET")))
+
+
+class HostileForms(ReaderCase):
+    def test_9817_every_form_outside_the_grammar_is_refused_with_its_reason_and_line(self) -> None:
+        for name, (text, constant, line) in HOSTILE_FORMS.items():
             with self.subTest(form=name):
+                exc = self.refused(wt.parse_text, text, LABEL)
+                self.assert_refusal(exc, LABEL, line, REASON_TEXTS[constant])
+
+    def test_9817_nesting_past_the_limit_is_refused(self) -> None:
+        text = "".join("%sk%d:\n" % ("  " * depth, depth) for depth in range(NESTING_PAST_LIMIT)) + \
+            "%sv: 1\n" % ("  " * NESTING_PAST_LIMIT)
+        exc = self.refused(wt.parse_text, text, LABEL)
+        self.assertEqual(exc.reason, NESTING_TEXT)
+
+    def test_9817_h1_hidden_key_not_seen_is_a_refusal(self) -> None:
+        """The reviewer's probe: `with: ref:` behind a line break the subset parser keeps inside one line."""
+        for name, (brk, constant) in H1_BREAKS.items():
+            with self.subTest(line_break=name):
+                path = self.write(H1_VISIBLE.format(BREAK=brk))
+                exc = self.refused(wt.read_document, path)
+                self.assert_refusal(exc, str(path), H1_LINE, REASON_TEXTS[constant])
+
+    def test_9817_h1_visible_key_is_seen(self) -> None:
+        document = wt.parse_text(H1_VISIBLE.format(BREAK="\n"), LABEL)
+        step = document["jobs"]["build"]["steps"][0]
+        self.assertEqual(step["with"], {"ref": "${{ github.event.pull_request.head.sha }}"})
+
+    def test_9817_each_value_row_reads_the_consumer_value(self) -> None:
+        for name, (text, expected) in VALUE_ROWS.items():
+            with self.subTest(row=name):
+                self.assertEqual(wt.parse_text(text, LABEL), expected)
+
+
+class FileChecks(ReaderCase):
+    def test_9817_a_missing_file_is_refused(self) -> None:
+        path = self.dir / "absent.yml"
+        self.assert_refusal(self.refused(wt.read_document, path), str(path), None, REASON_TEXTS["MISSING"])
+
+    def test_9817_a_directory_is_refused(self) -> None:
+        self.assert_refusal(self.refused(wt.read_document, self.dir), str(self.dir), None, REASON_TEXTS["DIRECTORY"])
+
+    def test_9817_a_symlink_to_a_good_file_is_refused(self) -> None:
+        target = self.write("a: 1\n", "target.yml")
+        link = self.dir / "link.yml"
+        os.symlink(target, link)
+        self.assert_refusal(self.refused(wt.read_document, link), str(link), None, REASON_TEXTS["SYMLINK"])
+
+    def test_9817_a_fifo_is_refused_inside_its_time_limit(self) -> None:
+        fifo = self.dir / "pipe.yml"
+        os.mkfifo(fifo)
+        outcome: list = []
+
+        def read() -> None:
+            try:
+                wt.read_document(fifo)
+                outcome.append("returned")
+            except wt.WorkflowReadError as exc:
+                outcome.append(exc)
+            except BaseException as exc:  # noqa: BLE001 - the row reports any other outcome
+                outcome.append(repr(exc))
+
+        worker = threading.Thread(target=read, daemon=True)
+        worker.start()
+        worker.join(FIFO_CEILING_SECS)
+        if worker.is_alive():
+            with open(fifo, "wb"):  # release the blocked open so the daemon thread can end
+                pass
+            self.fail("reading a FIFO did not return within %.0f s" % FIFO_CEILING_SECS)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], wt.WorkflowReadError)
+        self.assert_refusal(outcome[0], str(fifo), None, REASON_TEXTS["FIFO"])
+
+    def test_9817_a_character_device_is_refused(self) -> None:
+        for device in ("/dev/null", "/dev/zero"):
+            with self.subTest(device=device):
+                self.assertTrue(stat.S_ISCHR(os.stat(device).st_mode))
+                exc = self.refused(wt.read_document, Path(device))
+                self.assert_refusal(exc, device, None, REASON_TEXTS["DEVICE"])
+
+    def test_9817_an_unreadable_file_is_refused(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 file; the row needs an unprivileged user")
+        path = self.write("a: 1\n")
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o600)
+        self.assert_refusal(self.refused(wt.read_document, path), str(path), None, REASON_TEXTS["UNREADABLE"])
+
+    def test_9817_a_file_over_the_cap_is_refused_and_one_at_the_cap_reads(self) -> None:
+        cap = wt.MAX_DOCUMENT_BYTES
+        head = "a: 1\n#"
+        at_cap = self.write(head + "x" * (cap - len(head) - 1) + "\n", "at.yml")
+        self.assertEqual(at_cap.stat().st_size, cap)
+        self.assertEqual(wt.read_document(at_cap), {"a": 1})
+        over = self.write(head + "x" * (cap - len(head)) + "\n", "over.yml")
+        self.assertEqual(over.stat().st_size, cap + 1)
+        self.assert_refusal(self.refused(wt.read_document, over), str(over), None, REASON_TEXTS["OVER_CAP"])
+
+    def test_9817_invalid_utf8_is_refused_with_its_line(self) -> None:
+        path = self.write(b"a: 1\nb: \xff\n")
+        self.assert_refusal(self.refused(wt.read_document, path), str(path), 2, REASON_TEXTS["UTF8"])
+
+    def test_9817_a_byte_order_mark_is_refused(self) -> None:
+        path = self.write(b"\xef\xbb\xbfa: 1\n")
+        self.assert_refusal(self.refused(wt.read_document, path), str(path), 1, REASON_TEXTS["BOM"])
+
+    def test_9817_an_empty_file_is_refused(self) -> None:
+        path = self.write("")
+        self.assert_refusal(self.refused(wt.read_document, path), str(path), 1, REASON_TEXTS["EMPTY"])
+
+    def test_9817_a_blank_only_file_is_refused(self) -> None:
+        for name, text in {"blank": "\n  \n", "comment": "# x\n", "crlf_blank": "\r\n\r\n"}.items():
+            with self.subTest(file=name):
                 path = self.write(text)
-                self.assertEqual(self.refusal(path), "%s: %s" % (path, reason))
+                exc = self.refused(wt.read_document, path)
+                self.assert_refusal(exc, str(path), 1, REASON_TEXTS["BLANK_ONLY"])
 
-    def test_9813_a_100k_line_file_reads_inside_the_ceiling(self) -> None:
-        lines = ["key%d: value%d" % (n, n) for n in range(BIG_FILE_LINES)]
-        path = self.write("\n".join(lines) + "\n")
-        start = time.monotonic()
-        document = wt.read_document(path)
-        elapsed = time.monotonic() - start
-        self.assertEqual(len(document), BIG_FILE_LINES)
-        self.assertEqual(document["key0"], "value0")
-        self.assertEqual(document["key%d" % (BIG_FILE_LINES - 1)], "value%d" % (BIG_FILE_LINES - 1))
-        self.assertLess(elapsed, BIG_FILE_CEILING_SECS)
+    def test_9817_the_check_and_the_read_use_one_descriptor(self) -> None:
+        path = self.write("a: 1\n")
+        calls: list = []
+        real_open, real_fstat, real_read = os.open, os.fstat, os.read
+
+        def spy_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            calls.append(("open", fd, args[1] if len(args) > 1 else kwargs.get("flags")))
+            return fd
+
+        def spy_fstat(fd):
+            calls.append(("fstat", fd))
+            return real_fstat(fd)
+
+        def spy_read(fd, n):
+            calls.append(("read", fd))
+            return real_read(fd, n)
+
+        with unittest.mock.patch.object(wt.os, "open", spy_open), \
+                unittest.mock.patch.object(wt.os, "fstat", spy_fstat), \
+                unittest.mock.patch.object(wt.os, "read", spy_read):
+            self.assertEqual(wt.read_document(path), {"a": 1})
+        opens = [c for c in calls if c[0] == "open"]
+        self.assertEqual(len(opens), 1)
+        fd, flags = opens[0][1], opens[0][2]
+        self.assertEqual(flags & (os.O_NOFOLLOW | os.O_NONBLOCK), os.O_NOFOLLOW | os.O_NONBLOCK)
+        self.assertEqual({c[1] for c in calls}, {fd})
+        self.assertEqual([c[0] for c in calls][:2], ["open", "fstat"])
 
 
-class ReadAllStepsRows(ReaderCase):
+class Canaries(ReaderCase):
+    def test_9817_no_text_refusal_quotes_the_document(self) -> None:
+        for name, (template, constant, line) in CANARY_TEMPLATES.items():
+            for secret in CANARIES:
+                with self.subTest(branch=name, canary=secret[:4]):
+                    exc = self.refused(wt.parse_text, template.replace("{S}", secret), LABEL)
+                    self.assertNotIn(secret, str(exc))
+                    self.assert_refusal(exc, LABEL, line, REASON_TEXTS[constant])
+
+    def test_9817_no_shape_refusal_quotes_the_document(self) -> None:
+        for name, (template, text) in SHAPE_ROWS.items():
+            for secret in CANARIES:
+                with self.subTest(shape=name, canary=secret[:4]):
+                    path = self.write(template.replace("{S}", secret))
+                    exc = self.refused(wt.read_all_steps, path)
+                    self.assertNotIn(secret, str(exc))
+                    self.assert_refusal(exc, str(path), None, text)
+
+    def test_9817_no_file_refusal_quotes_the_document(self) -> None:
+        joined = "\n".join("k%d: '%s'" % (n, s) for n, s in enumerate(CANARIES))
+        rows = {
+            "utf8": (joined.encode(UTF8) + b"\n\xff\n", 11, "UTF8"),
+            "bom": (b"\xef\xbb\xbf" + joined.encode(UTF8), 1, "BOM"),
+            "over_cap": ((joined + "\n#" + "x" * wt.MAX_DOCUMENT_BYTES + "\n").encode(UTF8), None, "OVER_CAP"),
+            "nesting": (("".join("%sk%d:\n" % ("  " * d, d) for d in range(NESTING_PAST_LIMIT)) +
+                         "%sv: '%s'\n" % ("  " * NESTING_PAST_LIMIT, CANARIES[0])).encode(UTF8), "any", None),
+        }
+        for name, (data, line, constant) in rows.items():
+            with self.subTest(file=name):
+                path = self.write(data)
+                exc = self.refused(wt.read_document, path)
+                for secret in CANARIES:
+                    self.assertNotIn(secret, str(exc))
+                if constant is not None:
+                    self.assert_refusal(exc, str(path), line, REASON_TEXTS[constant])
+                else:
+                    self.assertEqual(exc.reason, NESTING_TEXT)
+
+
+class ReadAllSteps(ReaderCase):
     GOOD = (
         "name: w\n"
         "jobs:\n"
@@ -147,11 +524,6 @@ class ReadAllStepsRows(ReaderCase):
         "          - name: not-a-step\n"
     )
 
-    def refusal(self, path: Path) -> str:  # type: ignore[override]
-        with self.assertRaises(wt.WorkflowReadError) as ctx:
-            wt.read_all_steps(path)
-        return str(ctx.exception)
-
     def test_9813_steps_come_back_in_file_order_with_their_job(self) -> None:
         path = self.write(self.GOOD)
         self.assertEqual(
@@ -163,30 +535,41 @@ class ReadAllStepsRows(ReaderCase):
             ],
         )
 
-    def test_9813_each_unreadable_shape_is_refused_with_its_reason(self) -> None:
-        shapes = {
-            "root_list": ("- a\n- b\n", "top level is not a mapping"),
-            "no_jobs": ("name: w\n", "`jobs` is missing or not a mapping"),
-            "jobs_text": ("jobs: x\n", "`jobs` is missing or not a mapping"),
-            "job_text": ("jobs:\n  a: x\n", "job 'a' is not a mapping"),
-            "steps_text": ("jobs:\n  a:\n    steps: x\n", "job 'a': `steps` is not a list"),
-            "step_text": ("jobs:\n  a:\n    steps:\n      - x\n", "job 'a': step 0 is not a mapping"),
-            "run_number": ("jobs:\n  a:\n    steps:\n      - run: 5\n", "job 'a': step 0: `run` is not text"),
-            "run_list": ("jobs:\n  a:\n    steps:\n      - run: [x]\n", "job 'a': step 0: `run` is not text"),
-        }
-        for name, (text, reason) in shapes.items():
+    def test_9817_each_unreadable_shape_is_refused_with_its_ordinal_reason(self) -> None:
+        for name, (template, text) in SHAPE_ROWS.items():
             with self.subTest(shape=name):
-                path = self.write(text)
-                self.assertEqual(self.refusal(path), "%s: %s" % (path, reason))
+                path = self.write(template.replace("{S}", "v"))
+                self.assert_refusal(self.refused(wt.read_all_steps, path), str(path), None, text)
 
-    def test_9813_a_parse_refusal_passes_through_with_its_line(self) -> None:
+    def test_9817_a_grammar_refusal_passes_through_read_all_steps(self) -> None:
         path = self.write("jobs:\n  a:\n    steps:\n\t- run: x\n")
-        self.assertEqual(self.refusal(path), "%s: line 4: tab in indentation" % path)
+        self.assert_refusal(self.refused(wt.read_all_steps, path), str(path), 4, REASON_TEXTS["TAB"])
 
-    def test_9813_a_missing_file_is_refused(self) -> None:
-        path = self.dir / "absent.yml"
-        self.assertEqual(self.refusal(path), "%s: cannot read: No such file or directory" % path)
 
+class Cost(ReaderCase):
+    def test_9817_a_100k_line_document_reads_inside_its_ceiling(self) -> None:
+        lines = ["key%d: value%d" % (n, n) for n in range(BIG_FILE_LINES)]
+        path = self.write("\n".join(lines) + "\n")
+        start = time.monotonic()
+        document = wt.read_document(path)
+        elapsed = time.monotonic() - start
+        self.assertEqual(len(document), BIG_FILE_LINES)
+        self.assertEqual(document["key%d" % (BIG_FILE_LINES - 1)], "value%d" % (BIG_FILE_LINES - 1))
+        self.assertLess(elapsed, BIG_FILE_CEILING_SECS)
+
+    def test_9817_a_1mb_line_reads_inside_its_ceiling(self) -> None:
+        for name, value in {"plain": "x" * LONG_LINE_BYTES, "quoted": "'%s'" % ("x" * LONG_LINE_BYTES),
+                            "flow": "[%s]" % ", ".join(["x"] * (LONG_LINE_BYTES // 3))}.items():
+            with self.subTest(form=name):
+                path = self.write("a: %s\n" % value)
+                start = time.monotonic()
+                document = wt.read_document(path)
+                elapsed = time.monotonic() - start
+                self.assertIn("a", document)
+                self.assertLess(elapsed, LONG_LINE_CEILING_SECS)
+
+
+import unittest.mock  # noqa: E402  (used by the one-descriptor row)
 
 if __name__ == "__main__":
     unittest.main()
