@@ -1140,25 +1140,34 @@ jobs:
     #                                 It also no longer needs the contention
     #                                 headroom #3139 measured: this is now the
     #                                 ONLY Linux `check` leg on the fleet.
-    #   macos-fed,sqlite          80  Unchanged. With the #3140 watchdog fix
-    #                                 below, a macOS hang is now cut at the
-    #                                 per-invocation cap instead of burning
-    #                                 this whole 80-min budget (#3140 observed
-    #                                 72 wasted minutes on a nondeterministic
-    #                                 `Check (macos-fed,sqlite)` hang).
-    #                                 #3461 raised the macos-fed SQLITE
+    #   macos-fed,sqlite          87  With the #3140 watchdog fix below, a
+    #                                 macOS hang is cut at the per-invocation
+    #                                 cap instead of burning the whole budget
+    #                                 (#3140 observed 72 wasted minutes on a
+    #                                 nondeterministic `Check (macos-fed,sqlite)`
+    #                                 hang). #3461 raised the macos-fed SQLITE
     #                                 per-invocation cap to 2400s; compile is
     #                                 hoisted outside it (#2657) and 2400s
-    #                                 (40 min) still sits well inside this 80,
-    #                                 so the named watchdog, not a nameless
-    #                                 job-level cancel, is still what fires.
+    #                                 (40 min) still sits well inside the
+    #                                 75-min test step deadline, so the named
+    #                                 watchdog, not a nameless cancel, fires.
+    #                                 #9852 raised 80 to 87: the test step
+    #                                 deadline is the job limit minus the
+    #                                 12-min post-step margin, and the 3600 s
+    #                                 whole-suite ceiling (ruling cdfe800f)
+    #                                 with its 20 percent margin needs 75 min.
     #   macos-fed,enterprise-fed 160  Same sharded suite and cap as the linux-fed
     #                                 enterprise-fed leg (see its matrix entry).
     #
     # #6795: the Load gate step may wait up to 1200 s inside these caps; every
-    # watchdog and shard budget is capped to the job time left (JOB_T0), so a
-    # named #1492 watchdog fires before GitHub's cancel. Do not raise a cap
-    # for the gate.
+    # watchdog and shard budget is capped to the time left to the test step
+    # deadline (JOB_T0), so a named #1492 watchdog fires before the step bound
+    # and GitHub's cancel. Do not raise a cap for the gate.
+    # #9852: the "Test step bound (#9852)" step gives "Run tests
+    # (impact-aware)" the whole minutes left to its deadline, the leg timeout
+    # minus suite_budget.POST_STEP_MARGIN_MIN (12) counted from job start,
+    # so the uploads and cleanup steps after it keep that margin whenever the
+    # test step starts; fewer than 10 minutes left is a named red.
     # #7914: on the self-hosted linux-fed enterprise-fed leg the compile+test
     # phase also waits for a host-local semaphore slot (2 slots, up to 3600 s);
     # that wait counts against the cap (JOB_T0 is unchanged), hence 300 there.
@@ -1322,8 +1331,9 @@ jobs:
             # attempt 2 had the serial shard budget cut to 5239 s (160 min -
             # 4061 s elapsed - 300 s) and the #1492 watchdog killed it
             # (serial=124) with no test failing; the same leg alone took
-            # ~7980 s. Budget identity (pinned by test_ci_semaphore_wiring_7914):
-            #   cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)
+            # ~7980 s. Budget identity (pinned by test_ci_semaphore_wiring_7914;
+            # the test step deadline is the one source, #9852):
+            #   step deadline 17280 s (cap 18000 - post-step margin 720) >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)
             # The waits are kept, not shrunk, because they are what bound
             # contention on a 4-runner host (#7928). The semaphore wait is the
             # one named constant HOST_SEMAPHORE_MAX_WAIT_SECS below. The
@@ -1333,7 +1343,9 @@ jobs:
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: sqlite
-            timeout: 80
+            # #9852 - 87 = the 75-min test step deadline + the 12-min post-step
+            # margin; see the cap table above.
+            timeout: 87
           - leg: macos-fed,enterprise-fed
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
@@ -1616,6 +1628,8 @@ jobs:
       # keeps the tool build off the ubuntu critical path.
       - name: Prebuild t0 orchestrator (macOS e1 anti-flake, #1853)
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.node == 'macos-fed'
+        # #9852 - its own bound, so a hung build names this step, not the job limit.
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
@@ -1666,6 +1680,8 @@ jobs:
       # a maintenance connection to issue CREATE/DROP DATABASE. Fail-closed:
       # a missing URL file or a failed CREATE reds the leg.
       - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)
+        # #9852 - its own bound, so a hung database call names this step, not the job limit.
+        timeout-minutes: 10
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
@@ -1768,6 +1784,8 @@ jobs:
       # this leg is the one that has AI_MEMORY_TEST_POSTGRES_URL (minted above). The flag turns a missing
       # URL or psql into a failure instead of a silent skip.
       - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
+        # #9852 - its own bound, so a hung cell names this step, not the job limit.
+        timeout-minutes: 10
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
@@ -1848,8 +1866,24 @@ jobs:
         if: needs.classify.outputs.cargo_skip != 'true' && contains(matrix.runner, 'self-hosted')
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
+      # #9852 - the bound of the test step, computed when it starts: the whole
+      # minutes left to the test step deadline (the leg timeout minus the 12-min
+      # post-step margin, counted from JOB_T0). A late start gets a shorter bound,
+      # never one past the deadline; fewer than 10 minutes left, or a JOB_T0 that
+      # is not an epoch second, is a named red here, so the test step never runs
+      # unbounded. `deadline_min` is the one source of the in-step budgets.
+      - name: Test step bound (#9852)
+        id: test_step_bound
+        if: needs.classify.outputs.cargo_skip != 'true'
+        timeout-minutes: 2
+        run: |
+          python3 -I scripts/ci/suite_budget.py step-bound --workflow .github/workflows/ci.yml --job check --node "${{ matrix.node }}" --tier "${{ matrix.tier }}" --job-start "$JOB_T0" --github-output "$GITHUB_OUTPUT"
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.cargo_skip != 'true'
+        # #9852 - the computed bound: a hang names this step and the upload and
+        # cleanup steps after it keep the post-step margin of the job limit.
+        timeout-minutes: ${{ fromJSON(steps.test_step_bound.outputs.minutes) }}
         env:
           AI_MEMORY_NO_CONFIG: "1"
           TIER: ${{ matrix.tier }}
@@ -1864,8 +1898,10 @@ jobs:
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
-          # #6795 — the job cap (minutes) the serial shard budget is derived from.
-          JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
+          # #6795 — the minutes from JOB_T0 the in-step budgets are derived from.
+          # #9852 - the test step deadline (job limit minus the post-step margin),
+          # the bound step's output: every named watchdog fires before the step bound.
+          TEST_STEP_DEADLINE_MIN: ${{ steps.test_step_bound.outputs.deadline_min }}
           CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
           # #7914 - slots of the host-local semaphore for the self-hosted
           # linux-fed enterprise-fed leg; 0 = no semaphore (every other leg).
@@ -2022,9 +2058,10 @@ jobs:
             # and a watchdog that fires on a healthy suite reports a hang that
             # did not happen, which misdirects triage exactly as #2657
             # described. 2400s is ~1.6x the measured runtime: real variance
-            # headroom on shared hardware, still far short of the 80-minute
-            # (4800s) job cap, so the watchdog — not a silent, nameless
-            # job-level cancel — remains what fires on a genuine hang.
+            # headroom on shared hardware, still far short of the 75-minute
+            # (4500s) test step deadline of the macOS leg (#9852), so the
+            # watchdog — not a silent, nameless cancel — remains what fires on
+            # a genuine hang.
             #
             # RAISED RATHER THAN SPLIT. Splitting the macOS `__ALL__`
             # invocation in two would mean hand-enumerating ~600 `--test`
@@ -2091,11 +2128,11 @@ jobs:
           else
             echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} — no coreutils gtimeout/timeout found (job-level timeout-minutes still applies)"
           fi
-          # #6795 — seconds left under the job timeout-minutes, minus 300 s for
-          # teardown/upload, so a watchdog always fires (named) before GitHub's
+          # #6795 — seconds left to the test step deadline (#9852), minus 300 s,
+          # so a watchdog always fires (named) before the step bound and GitHub's
           # nameless job cancel. Floor 60 s: `timeout 0` would mean no limit.
           job_left() {
-            local left=$(( JOB_TIMEOUT_MIN * 60 - ($(date +%s) - JOB_T0) - 300 ))
+            local left=$(( TEST_STEP_DEADLINE_MIN * 60 - ($(date +%s) - JOB_T0) - 300 ))
             if [ "$left" -lt 60 ]; then left=60; fi
             echo "$left"
           }
@@ -2124,8 +2161,8 @@ jobs:
             # __ALL__ tag path builds ~448 debug integration binaries; that
             # compile legitimately grew past the cap during the v1.0.0 epic,
             # which the watchdog was misreading as a hang (it is not — the full
-            # suite runs to completion). The job-level `timeout-minutes` cap
-            # still bounds the build. A genuine runtime hang still trips the
+            # suite runs to completion). The step-level `timeout-minutes` of this
+            # step (#9852, leg timeout - 12) bounds the build. A genuine runtime hang still trips the
             # $WATCHDOG_SECS cap below.
             cargo test --no-run "$@" || return "$?"
             # `--no-fail-fast` (#2500) — see the identical rationale on
@@ -2442,16 +2479,17 @@ jobs:
             if [ "$JOB_T0_VALID" -eq 1 ]; then
               job_now=$(date +%s)
               job_elapsed=$(( job_now - JOB_T0 ))
-              SERIAL_BUDGET_SECS=$(( JOB_TIMEOUT_MIN * 60 - (job_now - JOB_T0) - 300 ))
+              SERIAL_BUDGET_SECS=$(( TEST_STEP_DEADLINE_MIN * 60 - (job_now - JOB_T0) - 300 ))
               if [ "$SERIAL_BUDGET_SECS" -lt 60 ]; then SERIAL_BUDGET_SECS=60; fi
             fi
-            echo "::notice::[#6795] serial shard budget ${SERIAL_BUDGET_SECS}s (job cap ${JOB_TIMEOUT_MIN} min - ${job_elapsed}s elapsed since job start - 300s safety); parallel shards min(${WATCHDOG_SECS}s, job time left)"
+            echo "::notice::[#6795] serial shard budget ${SERIAL_BUDGET_SECS}s (test step deadline ${TEST_STEP_DEADLINE_MIN} min from job start, the job limit minus the 12-min post-step margin - ${job_elapsed}s elapsed since job start - 300s safety); parallel shards min(${WATCHDOG_SECS}s, time left to the test step deadline)"
             ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
             pid_s=$!
             ( run_shard parallel_1 "$sd" 3 skip 0 ) > "$sd/parallel_1.log" 2>&1 &
             pid_1=$!
             ( run_shard parallel_2 "$sd" 3 skip 0 ) > "$sd/parallel_2.log" 2>&1 &
             pid_2=$!
+            {
             ( while true; do
                 sleep 300 >/dev/null 2>&1
                 # #9430: the last lines of the shard logs are pull-request text. The one python3 -I call below reads them itself
@@ -2460,7 +2498,7 @@ jobs:
                 # directory, a FIFO or a device gives an empty field); at most READ_BYTES are read back from the end; the field
                 # is the last line cut to CUT_BYTES bytes, or the last CUT_BYTES bytes read when that window holds no line feed.
                 # workflow_annotation.render escapes each field once, so no line break, %, :: or ##[ of a log line reaches the
-                # runner through this notice (the raw shard logs printed below are #9433); a cut inside a multi-byte character
+                # runner through this notice (the shard lines themselves are printed by the #9852 follower below); a cut inside a multi-byte character
                 # shows as \udcXX and the line is written as UTF-8. set -e is live here: a failed call is reported on stderr and
                 # that report cannot fail (`|| true`), so no failure of the notice ends the loop or changes the step result.
                 python3 -I -c 'if True:
@@ -2490,23 +2528,129 @@ jobs:
                     print(wa.annotation("notice", wa.render("[#6344] progress | serial: {s} | parallel_1: {p1} | parallel_2: {p2}", s=s, p1=p1, p2=p2), max_chars=2 * wa.MAX_ANNOTATION_CHARS), flush=True)' "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" || { echo "[#6344] progress notice not written: python3 exited $?" >&2 || true; }
               done ) &
             hb=$!
+            } > "$sd/progress.out" 2>&1
+            # #9852 (Refs #9433): the shard logs reach the job log while the shards run, not after the last one exits, so a
+            # leg the step bound or the job limit stops still shows what each shard was doing. One python3 -I follower is
+            # the one writer of the step output while the shards run: the heartbeat above writes to progress.out and the
+            # follower relays a genuine #6344 progress notice as it is, so no line of either is cut by the other. It reads
+            # progress.out and each shard log rb from its own offset (O_NONBLOCK, regular files only, CHUNK_BYTES per read,
+            # LIVE_CHUNKS reads per source per poll, so a large backlog never starves another shard) and prints every
+            # complete line once as "[source] line" through workflow_annotation.log_line (no line break, leading :: or ##[
+            # of a log line reaches the runner), in PIECE_CHARS pieces; an unterminated tail longer than HOLD_BYTES is
+            # printed as it is, so it holds at most HOLD_BYTES per source. After PRINT_BYTES printed for one source it
+            # prints one notice and no more of that source. Output goes out in whole lines through one os.write loop.
+            # Once the stop file (its first argument) exists, or the shell that started it is gone, it reads every source
+            # to its end, prints the held tails and exits 0. A follower that ends early is reported on stderr and never
+            # changes the step result: the shard-logs artifact holds every line.
+            python3 -I -c 'if True:
+                # [#9852] live shard output: each complete line of each shard log, prefixed and escaped, as it is written
+                import os, stat, sys, time
+                sys.path.insert(0, "scripts/ci")
+                import workflow_annotation as wa
+                POLL_SECS = 5  # seconds between two reads of the sources
+                SLICE_SECS = 0.2  # sleep slice, so a stop is seen at once
+                CHUNK_BYTES = 262144  # bytes per read
+                LIVE_CHUNKS = 16  # reads per source per poll while the shards run (no limit on the final read)
+                PIECE_CHARS = 4096  # characters per printed piece of a long line
+                HOLD_BYTES = 65536  # an unterminated tail longer than this is printed as it is
+                PRINT_BYTES = 8388608  # bytes printed per source; then one notice and no more of that source
+                WRITE_BYTES = 65536  # pending output written once it reaches this, and at the end of each poll
+                PROGRESS_COMMAND = "::notice::"
+                PROGRESS_PREFIX = PROGRESS_COMMAND + "[#6344] progress | "
+                PROGRESS_CHARS = 2 * wa.MAX_ANNOTATION_CHARS  # the longest heartbeat notice the heartbeat writes
+                stop_path, parent = sys.argv[1], os.getppid()
+                def stopped():
+                    return os.path.lexists(stop_path) or os.getppid() != parent
+                paths = sys.argv[2:]
+                names = ["progress"] + [os.path.basename(path)[:-len(".log")] for path in paths[1:]]
+                offsets = [0] * len(paths)
+                held = [b""] * len(paths)
+                printed = [0] * len(paths)  # bytes printed per source; -1 once the source is capped
+                pending = []
+                pending_bytes = [0]
+                def flush():
+                    data = b"".join(pending)
+                    del pending[:]
+                    pending_bytes[0] = 0
+                    while data:
+                        data = data[os.write(1, data):]
+                def write(index, line):
+                    if printed[index] < 0:
+                        return
+                    data = (line + "\n").encode("utf-8", "backslashreplace")
+                    if printed[index] + len(data) > PRINT_BYTES:
+                        printed[index] = -1
+                        data = (wa.annotation("notice", "[#9852] live output of %s capped at %d bytes; the shard-logs artifact holds every line" % (names[index], PRINT_BYTES)) + "\n").encode("utf-8", "backslashreplace")
+                    else:
+                        printed[index] += len(data)
+                    pending.append(data)
+                    pending_bytes[0] += len(data)
+                    if pending_bytes[0] >= WRITE_BYTES:
+                        flush()
+                def relayed(text):
+                    return (text.startswith(PROGRESS_PREFIX) and len(text) <= PROGRESS_CHARS and text.isprintable()
+                            and "::" not in text[len(PROGRESS_COMMAND):] and "%" not in text and "#[" not in text)
+                def emit(index, data):
+                    text = data.decode("utf-8", "surrogateescape")
+                    if index == 0 and relayed(text):
+                        write(index, text)
+                        return
+                    for start in range(0, max(len(text), 1), PIECE_CHARS):
+                        write(index, wa.log_line("[%s] %s" % (names[index], text[start:start + PIECE_CHARS])))
+                def read(index):
+                    try:
+                        with open(paths[index], "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK | os.O_NOCTTY)) as log:
+                            if not stat.S_ISREG(os.fstat(log.fileno()).st_mode):
+                                return b""
+                            log.seek(offsets[index])
+                            data = log.read(CHUNK_BYTES)
+                    except OSError:
+                        return b""
+                    offsets[index] += len(data)
+                    return data
+                def poll(final):
+                    for index in range(len(paths)):
+                        reads = 0
+                        while printed[index] >= 0:
+                            data = read(index)
+                            reads += 1
+                            lines = (held[index] + data).split(b"\n")
+                            held[index] = lines.pop()
+                            for line in lines:
+                                if printed[index] < 0:
+                                    break
+                                emit(index, line)
+                            if printed[index] >= 0 and len(held[index]) > HOLD_BYTES:
+                                emit(index, held[index])
+                                held[index] = b""
+                            if len(data) < CHUNK_BYTES or (not final and reads >= LIVE_CHUNKS):
+                                break
+                    flush()
+                while not stopped():
+                    poll(False)
+                    deadline = time.monotonic() + POLL_SECS
+                    while not stopped() and time.monotonic() < deadline:
+                        time.sleep(SLICE_SECS)
+                poll(True)
+                for index in range(len(paths)):
+                    if held[index] and printed[index] >= 0:
+                        emit(index, held[index])
+                flush()' "$sd/follow.stop" "$sd/progress.out" "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" &
+            fl=$!
             # Wait on each PID separately: a bare `wait` discards the exit codes.
             wait "$pid_s" || rc_s=$?
             wait "$pid_1" || rc_1=$?
             wait "$pid_2" || rc_2=$?
             kill "$hb" 2>/dev/null || true
             wait "$hb" 2>/dev/null || true
-            for n in serial parallel_1 parallel_2; do
-              echo "::group::[#6344] ${n} shard output"
-              cat "$sd/$n.log"
-              echo "::endgroup::"
-            done
+            touch "$sd/follow.stop" 2>/dev/null || kill "$fl" 2>/dev/null || true
+            wait "$fl" || { echo "[#9852] live shard output ended early: python3 exited $?; the shard-logs artifact holds every line" >&2 || true; }
             echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}"
             for n in "$rc_s" "$rc_1" "$rc_2"; do
               if [ "$n" -ne 0 ]; then rc="$n"; fi
             done
             if [ "$rc" -ne 0 ]; then
-              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the shard output groups above"
+              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the [serial] / [parallel_N] lines above"
             fi
             return "$rc"
           }
@@ -2630,9 +2774,9 @@ jobs:
           retention-days: 30
 
       # #6344 r1 B5: each shard writes its own log under $RUNNER_TEMP/ci-shard
-      # and prints it only after every shard exits, so a cancel or the job cap
-      # would otherwise leave no per-shard output (the 5-min heartbeat keeps
-      # only 90 chars). always(): uploaded on success, failure, cancel and
+      # and the #9852 follower prints its lines to the job log as they are
+      # written, escaped; this artifact keeps the raw bytes of every line, also
+      # when a cancel or a timeout stops the follower. always(): uploaded on success, failure, cancel and
       # timeout. build.jsonl (the compile JSON, large) is not uploaded.
       - name: Upload shard logs (#6344)
         if: always() && needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'

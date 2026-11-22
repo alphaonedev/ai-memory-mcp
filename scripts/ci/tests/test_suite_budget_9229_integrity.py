@@ -222,7 +222,7 @@ def run_step(text, runs=(), prebuild=(), metadata_rc=0, meta="default", impact="
         env.update({
             "PATH": "%s:%s" % (bindir, env.get("PATH", "")),
             "AI_MEMORY_NO_CONFIG": "1", "TIER": "sqlite", "CI_NODE": node, "TEST_IMPACT": impact,
-            "JOB_TIMEOUT_MIN": "95", "JOB_T0": "",  # no job-left caps: the frozen clock is far from real time
+            "TEST_STEP_DEADLINE_MIN": "83", "JOB_T0": "",  # no job-left caps: the frozen clock is far from real time
             "RUNNER_TEMP": str(runner_temp), "GITHUB_ENV": str(d / "github-env"),
         })
         r = subprocess.run(["bash", str(script)], cwd=str(REPO), env=env, capture_output=True, text=True,

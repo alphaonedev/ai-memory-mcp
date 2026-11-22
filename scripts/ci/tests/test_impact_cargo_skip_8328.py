@@ -917,7 +917,7 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         env = {k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP}
         env.update(PATH="%s%s%s" % (work / "bin", os.pathsep, os.environ.get("PATH", "")),
                    TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="ubuntu-latest",
-                   HOST_SEMAPHORE_SLOTS="0", JOB_TIMEOUT_MIN="60", AI_MEMORY_NO_CONFIG="1",
+                   HOST_SEMAPHORE_SLOTS="0", TEST_STEP_DEADLINE_MIN="60", AI_MEMORY_NO_CONFIG="1",
                    RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env"))
         res = subprocess.run(RUNNER_BASH + [consumer_step_body()], cwd=str(work), env=env,
                              capture_output=True, text=True, timeout=TIMEOUT_S)
