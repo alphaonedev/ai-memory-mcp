@@ -353,7 +353,13 @@ class Domain(unittest.TestCase):
         self.assertIsNotNone(suffix, "PY_JUDGED_SUFFIX is missing from the Rust guard")
         self.assertIsNotNone(prefixes, "PY_JUDGED_PREFIXES is missing from the Rust guard")
         self.assertEqual(suffix.group(1), JUDGED_SUFFIX)
-        self.assertEqual(tuple(re.findall(r'"([^"]+)"', prefixes.group(1))), JUDGED_PREFIXES)
+        # The Rust constant writes a slash as a hex escape so the cargo skip
+        # ledger does not count the guard as a reader of that directory.
+        written = tuple(
+            re.sub(r"\\x([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), item)
+            for item in re.findall(r'"([^"]+)"', prefixes.group(1))
+        )
+        self.assertEqual(written, JUDGED_PREFIXES)
 
     def test_ledger_gate_discovers_this_module(self):
         workflow = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

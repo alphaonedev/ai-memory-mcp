@@ -38,6 +38,13 @@
 //!   (BOM, UTF-16, UTF-8, else Latin-1) and unescaped once; when it holds the
 //!   variable name, its constant or the bind helper, `NON_RUST` must have a
 //!   row with its exact path and mention count.
+//! - The files of the `cargo_skip` set (any `.md`, `docs/`, `scripts/ci/tests/`)
+//!   are not read here: a change to only such a file skips cargo, so a test
+//!   that read them would not run on it (#9842). They are judged by
+//!   `scripts/ci/tests/test_key_dir_name_mentions_9730.py` with the same
+//!   decode, unescape, count and written-out rows, and the ledger gate
+//!   runs it on every change. That test proves its domain covers the set and
+//!   equals `PY_JUDGED_SUFFIX` and `PY_JUDGED_PREFIXES` below.
 //! - The table sizes are pinned (`table_sizes_are_pinned_9730`) and the tree
 //!   scan has a wall-clock ceiling (`TREE_WALL_CLOCK_CEILING`).
 //! - A row of any table that matches nothing is a failure.
@@ -164,6 +171,20 @@ struct NonRustRow {
     reason: &'static str,
 }
 
+/// A tracked file whose name ends with this is judged by the Python test
+/// `scripts/ci/tests/test_key_dir_name_mentions_9730.py`, not here.
+const PY_JUDGED_SUFFIX: &str = ".md";
+/// A tracked file whose path starts with one of these is judged by the same
+/// Python test. Together with the suffix this is the `cargo_skip` set: a change
+/// to only such a file skips cargo, so a Rust test that read it would not run
+/// on that change (#9842). The Python test proves the set is covered.
+///
+/// The second prefix writes its slashes as hex escapes on purpose: a plain
+/// path literal naming that directory would count as a read of every file in
+/// it for the cargo skip ledger, which is the defect this split removes. The
+/// Python test decodes the escapes before it compares.
+const PY_JUDGED_PREFIXES: [&str; 2] = ["docs/", "scripts\x2fci\x2ftests\x2f"];
+
 /// The one definition of the variable name.
 const DEFINE: &str = "the public constant that defines the variable name for the crate";
 /// The production reader of the variable.
@@ -197,14 +218,6 @@ const SANDBOX_GATE: &str = "a statement of the production resolver compiled only
 /// The declaration of the sandbox module.
 const SANDBOX_DECL: &str =
     "the declaration of the sandbox module, compiled only under test or the test-support feature";
-/// Docs.
-const DOCS: &str = "documentation that names the variable for operators; it sets nothing";
-/// Data and evidence files.
-const DATA: &str =
-    "recorded data or evidence that names the variable; nothing reads it as configuration";
-/// Review records.
-const REVIEW_DATA: &str =
-    "a review record that names the variable; nothing reads it as configuration";
 /// Python and shell tooling.
 const TOOLING: &str = "a Python or shell script outside the Rust test tree: it sets the variable for a process it starts, or checks how tests bind it";
 /// Deploy and CI configuration.
@@ -1554,32 +1567,15 @@ const ALLOWED_FRAGMENTS: &[FragmentRow] = &[
     },
 ];
 
-/// Every tracked non-Rust file that names the variable, with its mention count.
+/// Every tracked non-Rust file that names the variable, with its mention count,
+/// except the files of the `cargo_skip` set: `PY_JUDGED_SUFFIX` and
+/// `PY_JUDGED_PREFIXES` name them, and
+/// `scripts/ci/tests/test_key_dir_name_mentions_9730.py` holds their rows.
 const NON_RUST: &[NonRustRow] = &[
     NonRustRow {
         path: ".github/workflows/batman-mode-acceptance.yml",
         mentions: 6,
         reason: DEPLOY,
-    },
-    NonRustRow {
-        path: "CHANGELOG.md",
-        mentions: 4,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "changelog.d/3584.fixed.md",
-        mentions: 6,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "changelog.d/7181.fixed.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "changelog.d/7229.fixed.md",
-        mentions: 1,
-        reason: DOCS,
     },
     NonRustRow {
         path: "cookbook/production-deployment/01-secure-bootstrap.sh",
@@ -1615,121 +1611,6 @@ const NON_RUST: &[NonRustRow] = &[
         path: "deploy/hive-1461/provision/45_zero_touch.sh",
         mentions: 3,
         reason: TOOLING,
-    },
-    NonRustRow {
-        path: "docs/ADMIN_GUIDE.md",
-        mentions: 2,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/CLI_REFERENCE.md",
-        mentions: 5,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/a2a-integration.html",
-        mentions: 4,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/a2a-integration.md",
-        mentions: 4,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/agent-skills.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/attestation.md",
-        mentions: 5,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/compliance/evidence/cert-385da3a05/recapture-posture.sh",
-        mentions: 3,
-        reason: TOOLING,
-    },
-    NonRustRow {
-        path: "docs/compliance/evidence/cert-55/SANITIZATION.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/federation-identity.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/federation.md",
-        mentions: 2,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/forensic-export.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/governance/agent-action-rules.md",
-        mentions: 3,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/internal/v070-feature-inventory.md",
-        mentions: 2,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/production-deployment.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/reference/ARCHITECTURE_REFERENCE.md",
-        mentions: 7,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/reviews/AI-MEMORY-COMPETITIVE-ADVANTAGE-FACET-REGISTER-2026-09-27.md",
-        mentions: 8,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md",
-        mentions: 2,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/reviews/branch-hygiene-3x7-2026-09-18.tsv",
-        mentions: 1,
-        reason: REVIEW_DATA,
-    },
-    NonRustRow {
-        path: "docs/reviews/gpt6-astra-20260905-evidence/issues-coverage.csv",
-        mentions: 3,
-        reason: REVIEW_DATA,
-    },
-    NonRustRow {
-        path: "docs/security/audit-trail.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/signed-events-v4.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/zero-touch-quickstart.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "docs/zero-touch-trust.html",
-        mentions: 1,
-        reason: DOCS,
     },
     NonRustRow {
         path: "entrypoint.plan-c.sh",
@@ -1772,11 +1653,6 @@ const NON_RUST: &[NonRustRow] = &[
         reason: TOOLING,
     },
     NonRustRow {
-        path: "scripts/bench/README.md",
-        mentions: 1,
-        reason: DOCS,
-    },
-    NonRustRow {
         path: "scripts/bench/run-ops-producers.sh",
         mentions: 2,
         reason: TOOLING,
@@ -1804,16 +1680,6 @@ const NON_RUST: &[NonRustRow] = &[
     NonRustRow {
         path: "scripts/check-test-keydir-mode.py",
         mentions: 12,
-        reason: TOOLING,
-    },
-    NonRustRow {
-        path: "scripts/ci/tests/data/certification_scope_8262_pins.json",
-        mentions: 1,
-        reason: DATA,
-    },
-    NonRustRow {
-        path: "scripts/ci/tests/test_recapture_cert_3607_5038.py",
-        mentions: 7,
         reason: TOOLING,
     },
     NonRustRow {
@@ -1855,16 +1721,6 @@ const NON_RUST: &[NonRustRow] = &[
         path: "scripts/test/test_cert_gate_evidence_7181.py",
         mentions: 3,
         reason: TOOLING,
-    },
-    NonRustRow {
-        path: "sdk/python/README.md",
-        mentions: 4,
-        reason: DOCS,
-    },
-    NonRustRow {
-        path: "sdk/typescript/README.md",
-        mentions: 4,
-        reason: DOCS,
     },
 ];
 
@@ -1934,8 +1790,8 @@ mod scan {
     use std::process::Command;
 
     use super::{
-        DOCTEST_SKIPPED_INFO, Op, Tables, Used, armed_token, call_token, const_token, frag_token,
-        sandbox_mod_token, var_token,
+        DOCTEST_SKIPPED_INFO, Op, PY_JUDGED_PREFIXES, PY_JUDGED_SUFFIX, Tables, Used, armed_token,
+        call_token, const_token, frag_token, sandbox_mod_token, var_token,
     };
 
     /// Most distinct module paths one file may be reached under.
@@ -3564,6 +3420,15 @@ mod scan {
         out
     }
 
+    /// True for a file the Python test judges (`PY_JUDGED_SUFFIX`,
+    /// `PY_JUDGED_PREFIXES`); the tree scan leaves it out and reads nothing of it.
+    pub(super) fn is_python_judged(name: &str) -> bool {
+        name.ends_with(PY_JUDGED_SUFFIX)
+            || PY_JUDGED_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    }
+
     fn is_rust(name: &str) -> bool {
         // Any case of the extension is lexed as Rust.
         Path::new(name)
@@ -3871,7 +3736,12 @@ mod scan {
         let others: Vec<String> = walk
             .tracked
             .iter()
-            .filter(|n| !is_rust(n) && !walk.scanned.contains_key(*n) && !walk.failed.contains(*n))
+            .filter(|n| {
+                !is_rust(n)
+                    && !is_python_judged(n)
+                    && !walk.scanned.contains_key(*n)
+                    && !walk.failed.contains(*n)
+            })
             .cloned()
             .collect();
         for name in others {
@@ -4528,7 +4398,7 @@ const ALLOWED_SITES_COUNT: usize = 205;
 /// Rows of `ALLOWED_FRAGMENTS`.
 const ALLOWED_FRAGMENTS_COUNT: usize = 17;
 /// Rows of `NON_RUST`.
-const NON_RUST_COUNT: usize = 62;
+const NON_RUST_COUNT: usize = 30;
 /// Rows of `known_green_rows`, the forms tracked at `KNOWN_GREEN_TRACKER`.
 const KNOWN_GREEN_COUNT: usize = 10;
 /// Entries of `DOCTEST_SKIPPED_INFO`.
@@ -4689,27 +4559,61 @@ fn non_rust_rows() -> Vec<TreeCase> {
             "a1-new-file-of-a-listed-kind",
             &[
                 lib,
-                ("docs/old.md", "set @V@\n"),
-                ("docs/new.md", "uses @V@ here\n"),
+                ("cfg/old.cfg", "set @V@\n"),
+                ("cfg/new.cfg", "uses @V@ here\n"),
             ],
             &[],
-            &[("docs/old.md", 1)],
-            &["#9730 guard: docs/new.md holds 1 key-dir name mention(s) and has no NON_RUST row"],
+            &[("cfg/old.cfg", 1)],
+            &["#9730 guard: cfg/new.cfg holds 1 key-dir name mention(s) and has no NON_RUST row"],
         ),
         tree_case(
             "a1b-new-mention-in-a-listed-file",
-            &[lib, ("docs/old.md", "set @V@\nand @C@ too\n")],
+            &[lib, ("cfg/old.cfg", "set @V@\nand @C@ too\n")],
             &[],
-            &[("docs/old.md", 1)],
-            &["#9730 guard: docs/old.md holds 2 key-dir name mention(s); its NON_RUST row says 1"],
+            &[("cfg/old.cfg", 1)],
+            &["#9730 guard: cfg/old.cfg holds 2 key-dir name mention(s); its NON_RUST row says 1"],
         ),
         tree_case(
             "a1c-stale-non-rust-row",
-            &[lib, ("docs/old.md", "set @V@\n")],
+            &[lib, ("cfg/old.cfg", "set @V@\n")],
             &[],
-            &[("docs/old.md", 1), ("docs/gone.md", 1)],
+            &[("cfg/old.cfg", 1), ("cfg/gone.cfg", 1)],
             &[
-                "#9730 guard: non-Rust row docs/gone.md matches no tracked non-Rust file; remove the row",
+                "#9730 guard: non-Rust row cfg/gone.cfg matches no tracked non-Rust file; remove the row",
+            ],
+        ),
+        tree_case(
+            "a1d-skip-set-files-are-judged-in-python-not-read-here",
+            &[
+                lib,
+                ("docs/notes.md", "set @V@\n"),
+                ("CHANGELOG.md", "set @V@\n"),
+                ("changelog.d/1.fixed.md", "set @V@\n"),
+                ("sdk/python/README.md", "set @V@\n"),
+                ("scripts/ci/tests/data/pins.json", "set @V@\n"),
+                ("scripts/ci/tests/test_x.py", "set @V@\n"),
+                ("docs/a2a.html", "set @V@\n"),
+            ],
+            &[],
+            &[],
+            &[],
+        ),
+        tree_case(
+            "a1e-near-misses-of-the-skip-set-are-judged-here",
+            &[
+                lib,
+                ("notes.MD", "set @V@\n"),
+                ("doc/notes.txt", "set @V@\n"),
+                ("scripts/ci/other.py", "set @V@\n"),
+                ("xdocs/notes.txt", "set @V@\n"),
+            ],
+            &[],
+            &[],
+            &[
+                "#9730 guard: doc/notes.txt holds 1 key-dir name mention(s) and has no NON_RUST row",
+                "#9730 guard: notes.MD holds 1 key-dir name mention(s) and has no NON_RUST row",
+                "#9730 guard: scripts/ci/other.py holds 1 key-dir name mention(s) and has no NON_RUST row",
+                "#9730 guard: xdocs/notes.txt holds 1 key-dir name mention(s) and has no NON_RUST row",
             ],
         ),
         tree_case(
