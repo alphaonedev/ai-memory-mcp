@@ -5,6 +5,7 @@
 import os
 import errno
 import stat
+import unittest
 import unittest.mock as mock
 
 import sys
@@ -405,3 +406,6 @@ class Publish7729(ScratchCase):
         self.assertEqual(swapped, [True])
         self.assertEqual((self.dest / "a.txt").read_bytes(), FORGED["a.txt"])
         self.assertEqual(list(self.dest.with_name("cleaned-owned").iterdir()), [])
+
+if __name__ == "__main__":
+    unittest.main()

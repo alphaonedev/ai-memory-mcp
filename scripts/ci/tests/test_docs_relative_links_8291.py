@@ -44,7 +44,7 @@ LINK_RE = re.compile(r"\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 LINUX_SYMLOOP_LIMIT = 40  # the Linux symlink hop limit; macOS stops at 32 (#9705)
 SYMLOOP_PROBE_CAP = 128
 LONG_NAME_LEN = 250  # below NAME_MAX (255) on both kernels
-TRAILING_SLASH_REASON ="trailing slash on a file target"
+TRAILING_SLASH_REASON = "trailing slash on a file target"
 EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "#", "tel:", "ftp://")
 
 
