@@ -133,8 +133,9 @@ def follower_program(lines):
     for i, line in enumerate(stripped):
         if line != FOLLOWER_OPEN:
             continue
-        close = next((j for j in range(i, len(lines)) if lines[j].endswith(FOLLOWER_ARGS_LINE)), None)
-        if close is None:
+        # The program holds no single quote, so the first line after the open that holds one closes it.
+        close = next((j for j in range(i + 1, len(lines)) if "'" in lines[j]), None)
+        if close is None or not lines[close].endswith(FOLLOWER_ARGS_LINE):
             continue
         body = "\n".join(lines[i:close + 1])
         if FOLLOWER_MARKER not in body:
