@@ -333,7 +333,8 @@ fn purge_destruction_intent_removes_bundles() {
 
     // Purge = explicit destruction intent; the bundle must go with the row
     // so the redundancy layer cannot resurrect purged content.
-    let purged = db::purge_archive(&f.conn, None).expect("purge");
+    let purged =
+        db::purge_archive(&f.conn, ai_memory::validate::ArchivePurgeBound::AllRows).expect("purge");
     assert_eq!(purged, 1);
     assert!(!bundle.exists(), "purge must remove the row's bundle");
     assert!(
@@ -646,14 +647,18 @@ fn one_store_lock_serializes_sweep_publication_and_purge() {
     // Both operations must block on the SAME canonical lock inode. The short
     // timeout is not the correctness oracle by itself: each operation then
     // completes successfully immediately after the held guard is dropped.
+    // #9980: open (and migrate) before the lock and the deadline, so the
+    // deadline measures only the walk to the lock, not a debug-build open.
+    let conn = db::open(&f.db_path).expect("open purge connection");
     let held = archive_sync::coordination_lock_for_tests(&f.conn).expect("hold store lock");
     archive_sync::reset_lock_attempts_for_tests();
-    let purge_db = f.db_path.clone();
     let (purge_tx, purge_rx) = std::sync::mpsc::channel();
     let purge_thread = std::thread::spawn(move || {
-        let conn = db::open(&purge_db).expect("open purge connection");
         purge_tx
-            .send(db::purge_archive(&conn, None))
+            .send(db::purge_archive(
+                &conn,
+                ai_memory::validate::ArchivePurgeBound::AllRows,
+            ))
             .expect("send purge result");
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -679,12 +684,11 @@ fn one_store_lock_serializes_sweep_publication_and_purge() {
     purge_thread.join().expect("purge thread");
 
     seed_archived(&f.conn, "row-lock-sweep-2", "fresh sweep candidate", None);
+    let conn = db::open(&f.db_path).expect("open sweep connection"); // #9980
     let held = archive_sync::coordination_lock_for_tests(&f.conn).expect("hold store lock");
     archive_sync::reset_lock_attempts_for_tests();
-    let sweep_db = f.db_path.clone();
     let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
     let sweep_thread = std::thread::spawn(move || {
-        let conn = db::open(&sweep_db).expect("open sweep connection");
         let store = archive_sync::store_for_conn(&conn)
             .expect("store")
             .expect("enabled");
@@ -730,10 +734,9 @@ fn prepared_stale_snapshot_cannot_publish_after_purge_and_compaction() {
     let f = fixture();
     seed_archived(&f.conn, "row-aba", "must never resurrect", None);
     archive_sync::set_pause_before_publish_lock_for_tests(true);
-    let sweep_db = f.db_path.clone();
+    let conn = db::open(&f.db_path).expect("open stale sweep connection"); // #9980
     let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
     let sweep_thread = std::thread::spawn(move || {
-        let conn = db::open(&sweep_db).expect("open stale sweep connection");
         let store = archive_sync::store_for_conn(&conn)
             .expect("store")
             .expect("enabled");
@@ -756,7 +759,10 @@ fn prepared_stale_snapshot_cannot_publish_after_purge_and_compaction() {
 
     // The old implementation had already passed its sole marker check here.
     // Complete purge and marker compaction before allowing stale publication.
-    assert_eq!(db::purge_archive(&f.conn, None).expect("purge"), 1);
+    assert_eq!(
+        db::purge_archive(&f.conn, ai_memory::validate::ArchivePurgeBound::AllRows).expect("purge"),
+        1
+    );
     let store = archive_sync::store_for_conn(&f.conn)
         .expect("store")
         .expect("enabled");
@@ -969,7 +975,7 @@ fn purge_marker_creation_failure_is_fail_closed() {
         .join("row-marker-failure");
     std::fs::create_dir_all(&marker_path).expect("occupy marker path with a directory");
 
-    let error = db::purge_archive(&f.conn, None)
+    let error = db::purge_archive(&f.conn, ai_memory::validate::ArchivePurgeBound::AllRows)
         .expect_err("purge must not proceed when its intent cannot be journaled");
     assert!(
         format!("{error:#}").contains("create purge-intent marker"),
@@ -1008,7 +1014,8 @@ fn purge_refuses_symlinked_lock_and_marker_without_touching_targets() {
 
     let lock_path = store.dir().join(".erasure-coordination.lock");
     std::os::unix::fs::symlink(&victim, &lock_path).expect("plant lock symlink");
-    let lock_error = db::purge_archive(&f.conn, None).expect_err("symlinked lock must fail closed");
+    let lock_error = db::purge_archive(&f.conn, ai_memory::validate::ArchivePurgeBound::AllRows)
+        .expect_err("symlinked lock must fail closed");
     assert!(format!("{lock_error:#}").contains("coordination lock"));
     assert_eq!(
         std::fs::read(&victim).expect("read victim"),
@@ -1022,8 +1029,8 @@ fn purge_refuses_symlinked_lock_and_marker_without_touching_targets() {
     std::fs::create_dir_all(&journal).expect("create journal dir");
     std::os::unix::fs::symlink(&victim, journal.join("row-symlink-defense"))
         .expect("plant marker symlink");
-    let marker_error =
-        db::purge_archive(&f.conn, None).expect_err("symlinked marker must fail closed");
+    let marker_error = db::purge_archive(&f.conn, ai_memory::validate::ArchivePurgeBound::AllRows)
+        .expect_err("symlinked marker must fail closed");
     assert!(format!("{marker_error:#}").contains("purge-intent marker"));
     assert_eq!(
         std::fs::read(&victim).expect("read victim"),
@@ -1591,7 +1598,10 @@ fn gc_loop_runs_detached_erasure_arm_for_file_backed_db() {
             std::time::Duration::from_millis(5),
         );
         let manifest = erasure_dir(&db_path).join("row-loop").join("manifest.json");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // #9980: each detached tick opens its own connection by design, and a
+        // debug-build open on a loaded host takes about a minute. The loop
+        // exits as soon as the manifest lands, so this is only a ceiling.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         while !manifest.is_file() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
