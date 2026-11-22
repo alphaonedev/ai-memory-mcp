@@ -1995,7 +1995,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         missing = self.base / "env-pg_config"
         r = subprocess.run(argv, capture_output=True, text=True, check=False,
                            env=dict(os.environ, AI_MEMORY_CI_PG_CONFIG=str(missing)))
-        self.assert_fails(r, 2, "pg_config --version could not run (FileNotFoundError)")
+        self.assert_fails(r, 2, f"pg_config {missing} does not exist")
         r = subprocess.run(argv, capture_output=True, text=True, check=False,
                            env=dict(os.environ, AI_MEMORY_CI_PG_CONFIG=""))
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
@@ -2006,16 +2006,72 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # missing one on argv.
         r = subprocess.run(argv + ["--pg-config", str(missing)], capture_output=True, text=True, check=False,
                            env=dict(os.environ, AI_MEMORY_CI_PG_CONFIG=str(self.pg_config)))
-        self.assert_fails(r, 2, "pg_config --version could not run (FileNotFoundError)")
+        self.assert_fails(r, 2, f"pg_config {missing} does not exist")
         self.assertFalse((self.base / "psql.log").exists(), "psql ran on the environment's pg_config")
         self.assert_nothing_installed()
 
     def test_pg_config_that_cannot_run_is_refused_9927(self):
         self.pg_config = self.base / "no-such-pg_config"
         r = self.run_script()
-        self.assert_fails(r, 2, "pg_config --version could not run (FileNotFoundError)")
+        self.assert_fails(r, 2, f"pg_config {self.pg_config} does not exist")
         self.assertFalse((self.base / "psql.log").exists())
         self.assert_nothing_installed()
+
+    def test_pg_config_must_be_an_absolute_path_to_an_executable_regular_file_9967(self):
+        # Rule (#9967): the pg_config the heal runs is an absolute path, free of control characters, to an
+        # existing executable regular file. A symlink is accepted when it resolves to an executable regular
+        # file (Homebrew's opt/ prefix is a symlink tree) and refused like its target otherwise. Every
+        # refusal is exit 2 before psql or any write.
+        real = self.pg_config
+        (self.base / "bin").mkdir()
+        write_exe(self.base / "bin" / "pg_config", real.read_text())
+        plain = self.base / "plain-pg_config"
+        plain.write_text(real.read_text())
+        plain.chmod(0o644)
+        links = {"to-dir": self.base / "bin", "dangling": self.base / "no-such-target",
+                 "to-plain": plain}
+        for name, target in links.items():
+            (self.base / f"link-{name}").symlink_to(target)
+        missing = self.base / "absent-pg_config"
+        cases = [
+            ("relative", "bin/pg_config", "pg_config bin/pg_config is not an absolute path"),
+            ("dot-relative", "./pg_config", "pg_config ./pg_config is not an absolute path"),
+            ("bare name on PATH", "pg_config", "pg_config pg_config is not an absolute path"),
+            ("missing", str(missing), f"pg_config {missing} does not exist"),
+            ("directory", str(self.base / "bin"), f"pg_config {self.base / 'bin'} is not a regular file"),
+            ("non-executable", str(plain), f"pg_config {plain} is not executable"),
+            ("symlink to a directory", str(self.base / "link-to-dir"),
+             f"pg_config {self.base / 'link-to-dir'} is not a regular file"),
+            ("dangling symlink", str(self.base / "link-dangling"),
+             f"pg_config {self.base / 'link-dangling'} does not exist"),
+            ("symlink to a non-executable", str(self.base / "link-to-plain"),
+             f"pg_config {self.base / 'link-to-plain'} is not executable"),
+            ("newline", f"{real}\n", "pg_config path holds a control character"),
+            ("embedded newline", f"{self.base}\n/pg_config", "pg_config path holds a control character"),
+            ("tab", f"{real}\t", "pg_config path holds a control character"),
+            ("delete char", f"{real}\x7f", "pg_config path holds a control character"),
+        ]
+        env = dict(os.environ, PATH=f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}")
+        for label, value, message in cases:
+            with self.subTest(label):
+                self.pg_config = value
+                r = subprocess.run(self.cmd(), capture_output=True, text=True, check=False, cwd=self.base, env=env)
+                self.assert_fails(r, 2, message)
+                self.assertEqual(r.stderr, PREFIX + message + "\n")
+                self.assertFalse((self.base / "psql.log").exists(), f"psql ran on pg_config {label}")
+                self.assert_nothing_installed()
+        with self.subTest("empty"):
+            self.pg_config = ""
+            r = subprocess.run(self.cmd(), capture_output=True, text=True, check=False, cwd=self.base, env=env)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("the following arguments are required: --pg-config", r.stderr)
+            self.assert_nothing_installed()
+        # Accepted: the absolute path itself, and a symlink to the executable regular file.
+        (self.base / "link-ok").symlink_to(real)
+        self.pg_config = self.base / "link-ok"
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assert_restored()
 
     def test_pg_config_of_another_postgresql_is_refused_before_any_write_9927(self):
         # The heal never writes into a tree of another major (F4).  Accepted: the certified version, optionally
