@@ -41,6 +41,9 @@ SWEEP_SCRIPT = "scripts/ci-sweep-target.py"
 CAP_ENV = "SELF_HOSTED_TARGET_CAP_BYTES"
 CAP_VALUE = "42949672960"
 CAP_ARG = "--max-bytes ${{ env.%s }}" % CAP_ENV
+# #9879: the check job is gated by the host semaphore, so its run text holds no ${{ expression; its sweeps read the
+# cap as the workflow env variable it already is.
+CHECK_CAP_ARG = '--max-bytes "${%s:?size cap not set}"' % CAP_ENV
 WORKSPACE_TARGET_ARG = "--target target "
 SHARED_TARGET_ARG = '--target "${CARGO_TARGET_DIR:?'
 ALLOW_ROOT = "--allow-root"
@@ -195,7 +198,9 @@ class CheckJobSweep(unittest.TestCase):
             for idx in range(4):
                 (deps / ("lib%d.rlib" % idx)).write_bytes(b"x" * 600)
             step = [s for s in self.sweeps if runs_on_leg(s, True)][0]
-            run = field(step, "run").replace("${{ env.%s }}" % CAP_ENV, "1000")
+            run = field(step, "run")
+            self.assertIn(CHECK_CAP_ARG, run)
+            env[CAP_ENV] = "1000"
             result = subprocess.run(["bash", "-e", "-c", run], cwd=str(REPO), env=env,
                                     capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -219,7 +224,8 @@ class CheckJobSweep(unittest.TestCase):
             self.assertIn(DOCS_ONLY_GUARD, cond)
             self.assertIn(SELF_HOSTED_GUARD, cond)
             self.assertEqual(field(step, "continue-on-error"), "")
-            self.assertIn(CAP_ARG, field(step, "run"))
+            self.assertIn(CHECK_CAP_ARG, field(step, "run"))
+            self.assertNotIn("${{", field(step, "run"))
 
     def test_sweep_steps_come_after_the_prune_step_7160_s10(self):
         all_steps = steps(self.job)

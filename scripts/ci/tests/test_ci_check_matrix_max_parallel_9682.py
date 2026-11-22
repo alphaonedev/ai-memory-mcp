@@ -433,7 +433,9 @@ class HostGuards(unittest.TestCase):
                       "job check: leg linux-fed,enterprise-fed lost its 2 slots")
         self.assertIn("matrix.node == 'linux-fed'", m.group(1),
                       "job check: the semaphore slots are no longer keyed to linux-fed")
-        self.assertIn("--name linux-fed-tests --slots \"$HOST_SEMAPHORE_SLOTS\"", body,
+        # #9851: the call is a canonical literal form, so the slot count is written out and must
+        # equal the count the env expression gives the leg (the checker also pins it to host_slots.json)
+        self.assertIn("--name linux-fed-tests --slots %s " % EXPECTED_SEMAPHORE_SLOTS, body,
                       "job check: the semaphore invocation changed")
 
     def test_load_gate_runs_before_the_tests(self):

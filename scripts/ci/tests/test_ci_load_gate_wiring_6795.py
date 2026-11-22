@@ -34,7 +34,9 @@ class LoadGateStep(unittest.TestCase):
         self.assertIn("contains(matrix.runner, 'self-hosted')", body)
         # #8322: the cargo legs gate on cargo_skip (a superset of docs_only).
         self.assertIn("needs.classify.outputs.cargo_skip != 'true'", body)
-        self.assertIn('python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"', body)
+        # #9879: the label reaches the script through env (the check job's run text holds no ${{ expression).
+        self.assertIn('LOAD_GATE_LABEL: ${{ matrix.node }}/${{ matrix.tier }}', body)
+        self.assertIn('python3 -I scripts/ci/load_gate.py --label "$LOAD_GATE_LABEL"', body)
 
     def test_exactly_one_gate_step(self):
         self.assertEqual(CI.count('- name: Load gate (#6795)'), 1)
