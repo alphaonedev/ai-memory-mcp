@@ -155,6 +155,20 @@ env:
   # #7160 - size cap for the persistent self-hosted target/debug build state
   # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
   SELF_HOSTED_TARGET_CAP_BYTES: 42949672960
+  # #8216 - the debuginfo pair is DECLARED for every job, never inherited from
+  # a runner `.env` or from cargo's default (`dev` = full debuginfo, ~250 MB per
+  # test binary). A job that runs cargo and states neither value is a finding:
+  # the 9593 debuginfo pin reads every cargo
+  # job of every workflow and fails on it. `line-tables-only` is the value the
+  # hosted jobs and rust-cache-warm.yml use, so a warm job and the leg whose
+  # cache key it writes hash the same env (Swatinem/rust-cache hashes every
+  # CARGO* variable into the key). The `check` job overrides both to 0 on its
+  # three self-hosted legs below; the other self-hosted workflows
+  # (cert-postgres-age.yml, postgres-ignored.yml) declare 0 themselves. DEV and
+  # TEST are stated together because the `test` profile inherits `dev` only
+  # while nothing overrides it.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
   # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
   # rust-cache guards below), so the value must be declared here. Incremental
@@ -1188,17 +1202,26 @@ jobs:
       # leave the test profile at this value. Both are stated at every point
       # they are set, so the pair can never drift apart.
       #
-      # #9593 - the self-hosted linux-fed enterprise-fed leg links ~1,057 test
-      # executables (55 min median; the macos-fed leg does the same set in
-      # 7-11 min). Its matrix entry sets `cargo_debug: '0'`, which turns
-      # debuginfo off for BOTH profiles on that one leg (the test binaries use
-      # the test profile, the package library they link against the dev
-      # profile; cert-postgres-age.yml and postgres-ignored.yml already do
-      # this), so backtraces on that leg carry no file:line. No other leg has
-      # a `cargo_debug` key: the two macOS legs keep line-tables-only, and the
-      # hosted sqlite leg sets 0 in its own low-mem step below. Environment
-      # only: no Cargo.toml or .cargo change, and no release-shaped or
-      # coverage build reads this key.
+      # #9593 / #8216 - the three self-hosted legs set `cargo_debug: '0'` in
+      # their matrix entry, which turns debuginfo off for BOTH profiles (the
+      # test binaries use the test profile, the package library they link
+      # against the dev profile; cert-postgres-age.yml and postgres-ignored.yml
+      # do the same). linux-fed links ~1,057 test executables (55 min median);
+      # the two macos-fed legs share one boot disk, and a full-debuginfo-class
+      # target there grew to 49 GiB in 11 minutes on 2026-11-21 (about 375 test
+      # binaries of about 250 MB) and lost runner jobs to a full disk, which is
+      # why every self-hosted leg is 0 and `line-tables-only` is not enough.
+      # The hosted legs read the workflow-level `line-tables-only` (the hosted
+      # sqlite leg sets 0 in its own low-mem step below). The matrix value is a
+      # QUOTED string: `||` takes the literal for a bare 0, which is falsy.
+      # Environment only: no Cargo.toml or .cargo change, and no release-shaped
+      # or coverage build reads this key.
+      #
+      # BACKTRACES: on a self-hosted leg a failing test's backtrace carries no
+      # file:line (panic locations still print; symbol names stay). To get
+      # file:line, rerun the test locally with CARGO_PROFILE_DEV_DEBUG and
+      # CARGO_PROFILE_TEST_DEBUG set to line-tables-only, or read the hosted
+      # leg of the same run.
       CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
       CARGO_PROFILE_TEST_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
     strategy:
@@ -1303,7 +1326,7 @@ jobs:
             # the hosted and macOS legs do not set it and keep their default
             # workspace `target/`.
             shared_target: true
-            # #9593 - debuginfo off on this leg only (see the job env above).
+            # #9593 - debuginfo off on every self-hosted leg (see the job env above).
             cargo_debug: '0'
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
@@ -1333,11 +1356,15 @@ jobs:
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: sqlite
+            # #8216 - debuginfo off (see the job env above).
+            cargo_debug: '0'
             timeout: 80
           - leg: macos-fed,enterprise-fed
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: enterprise-fed
+            # #8216 - debuginfo off (see the job env above).
+            cargo_debug: '0'
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
             # inside this outer bound. 160 = 130 min watchdog + 28 min of

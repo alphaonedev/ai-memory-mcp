@@ -114,10 +114,15 @@ env:
   # Declaring it at workflow level also means no job depends on the runner
   # `.env` supplying it.
   CARGO_INCREMENTAL: "0"
-  # No dev debug info to keep the heavy sal-postgres test-compile lean. No
+  # No debug info to keep the heavy sal-postgres test-compile lean. No
   # `-fuse-ld=mold` RUSTFLAGS: mold was a GitHub-hosted-runner headroom hack;
-  # the self-hosted node uses its provisioned system linker.
+  # the self-hosted node uses its provisioned system linker. #8216: TEST is
+  # stated next to DEV (the `test` profile inherits `dev` only while nothing
+  # overrides it), so the pair is declared and equal; backtraces on this
+  # self-hosted job carry no file:line (rerun locally with both set to
+  # line-tables-only to get them).
   CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   # AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL are NO LONGER hardcoded
   # here — they are read at runtime from the node's $HOME/.ai-memory-ci-fed-url
   # (the always-up native cert tier: pg18.6 + AGE 1.8.0 + pgvector 0.8.7, TLS
