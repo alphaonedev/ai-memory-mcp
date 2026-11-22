@@ -3166,6 +3166,27 @@ class JobBoundaryClear9820(Base):
         self.assert_not_cleared(rc, err, CONTAINS_REFUSAL.format(path=leaf))
         self.assertTrue(workspace.exists())
 
+    def test_medium4_a_runner_folder_tmp_on_another_device_than_its_root_is_refused(self):
+        self.layouts_here()
+        leaf = self.leaf("fed")
+        victim = self.make_file("old.db", 0, leaf)
+        leaf_info = os.lstat(leaf)
+        leaf_ident = (leaf_info.st_dev, leaf_info.st_ino)
+        real_fstat, real_lstat = os.fstat, os.lstat
+
+        def shifted(info):
+            if (info.st_dev, info.st_ino) != leaf_ident:
+                return info
+            values = list(info)
+            values[stat.ST_DEV] = info.st_dev + 1
+            return os.stat_result(values)
+
+        with mock.patch.object(PRUNE.os, "fstat", lambda fd: shifted(real_fstat(fd))), \
+                mock.patch.object(PRUNE.os, "lstat", lambda path, **kw: shifted(real_lstat(path, **kw))):
+            rc, out, err = self.run_prune(leaf, "--mode", "job-end", env_extra={"RUNNER_NAME": "f1-macos-fed"})
+        self.assert_not_cleared(rc, err, MOUNT_DIFFERS_REASON.format(path=leaf))
+        self.assertTrue(victim.exists())
+
     def test_a_tmp_folder_under_a_root_that_is_not_a_layout_root_is_refused(self):
         elsewhere = self.base / "elsewhere" / "fed" / PRUNE.RUNNER_FOLDER_LEAF
         elsewhere.mkdir(parents=True)
