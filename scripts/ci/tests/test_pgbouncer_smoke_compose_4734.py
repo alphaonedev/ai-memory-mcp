@@ -1,6 +1,6 @@
 """Guard the pgbouncer smoke stack against #4734 / #4735 regressions.
 
-Compose is parsed (PyYAML when importable, otherwise a structured stdlib
+Compose is parsed (the standard-library subset reader of workflow_text, #9813: a structured
 parse of services -> ports / environment / network_mode; trailing comments are
 stripped either way): every published port of every service must bind
 127.0.0.1, only the pgbouncer service may publish, network_mode is forbidden,
@@ -52,7 +52,7 @@ extends/include/secrets/configs/env_file and any top-level key besides name and 
 a definition after then/do/else/elif/time/`!` is read as a definition; the group scan tracks do..done
 and case..esac and RAISES on a closer with no opener; a trailing comment holds no heredoc opener; both
 script headers are pinned to the exit codes the script uses (code 1 from its rc=1 site).
-r13: PyYAML is required (the guard fails without it) and the compose scalars are scanned AS DECODED,
+r13: the stdlib reader is required (#9813: the guard fails without it, PyYAML is not used) and the compose scalars are scanned AS DECODED,
 because compose interpolates after decoding; refused in the YAML: a backslash escape in a double-quoted
 scalar, block scalars, a scalar or flow collection over several lines, a `$` inside a quoted scalar
 (one pinned `user:` scalar excepted); every `docker compose` call passes the pinned `-f` and
@@ -102,12 +102,13 @@ import tempfile
 import time
 import types
 import unittest
-
-import yaml  # r13 S14: required (the guard FAILS, never skips, without it); compose is scanned decoded
+import importlib.util
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent.parent
 PGB = REPO / "infra" / "pgbouncer"
 COMPOSE = PGB / "docker-compose.yml"
+WORKFLOW_TEXT = pathlib.Path(__file__).resolve().parent / "workflow_text.py"
+COMPOSE_LABEL = "docker-compose.yml"
 INI = PGB / "pgbouncer.ini"
 SMOKE = PGB / "smoke-test.sh"
 ENVELOPE = REPO / "infra" / "pillar4-envelope" / "measure-envelope.sh"
@@ -439,8 +440,25 @@ def _fallback_parse(text):
     return services
 
 
+def _load_reader():
+    """#9813, #9817: the shared strict stdlib YAML reader (workflow_text.parse_text: the closed grammar, the
+    subset parser and the independent line reader compared in full), loaded from its file. It refuses every
+    form it does not read with WorkflowReadError (file, line, one reason constant, no document text)."""
+    spec = importlib.util.spec_from_file_location("workflow_text_4734_reader", WORKFLOW_TEXT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_READER = _load_reader()
+
+
+def _parse_document(text):
+    return _READER.parse_text(text, COMPOSE_LABEL)
+
+
 def _yaml_parse(text):
-    doc = yaml.safe_load(text)
+    doc = _parse_document(text)
     out = {}
     for name, spec in (doc.get("services") or {}).items():
         env = spec.get("environment") or {}
@@ -529,22 +547,43 @@ def _compose_scan(text):
     extends/include/secrets/configs/env_file and any top-level key besides name and services."""
     names, problems = _interpolations(text)
     if YAML_ANCHOR_ALIAS.search(text):
-        problems.append("YAML anchor or alias")
+        problems.append(COMPOSE_ANCHOR_ALIAS)
     if YAML_MERGE_KEY.search(text):
-        problems.append("YAML merge key")
+        problems.append(COMPOSE_MERGE_KEY)
     for m in COMPOSE_BANNED_KEYS.finditer(text):
-        problems.append("banned key %s" % m.group(0).strip("\"' :"))
+        problems.append(COMPOSE_BANNED_KEY % m.group(0).strip("\"' :"))
     tops = set()
-    for ln in text.splitlines():
+    for number, ln in enumerate(text.splitlines(), 1):
         if ln.strip() and not ln[0].isspace():
             key = COMPOSE_TOP_KEY.match(ln)
             if key is None:
-                problems.append("top-level line that is not a key: %r" % ln[:20])
+                problems.append(COMPOSE_TOP_NOT_KEY % number)  # #9817 L2: the line number, never its text
             else:
                 tops.add(key.group(1))
-    if tops != {"name", "services"}:
-        problems.append("top-level keys %s differ from name, services" % sorted(tops))
+    if tops != COMPOSE_TOP_KEYS:
+        problems.append(COMPOSE_TOP_KEYS_DIFFER % sorted(tops))
     return names, problems
+
+
+# #9817 L2/L4: the refusal texts of the two compose scans, shared by the scans and their selftests. A refusal
+# names the line, never the document text, so a value in the compose file cannot reach a log.
+COMPOSE_TOP_KEYS = {"name", "services"}
+COMPOSE_ANCHOR_ALIAS = "YAML anchor or alias"
+COMPOSE_MERGE_KEY = "YAML merge key"
+COMPOSE_BANNED_KEY = "banned key %s"
+DOLLAR_RUN_REFUSED = "a run of %d dollars (escape plus interpolation)"
+COMPOSE_TOP_NOT_KEY = "line %d: top-level line that is not a key"
+COMPOSE_TOP_KEYS_DIFFER = "top-level keys %s differ from name, services"
+DECODED_TAG = "explicit YAML tag: %s"
+DECODED_UNPARSED = "the compose text does not parse: %s"
+DECODED_BLOCK_SCALAR = "line %d: block scalar"
+DECODED_BACKSLASH = "line %d: backslash escape in a double-quoted scalar"
+DECODED_QUOTED_DOLLAR = "line %d: dollar inside a quoted scalar"
+# The selftest rows go in before the `ports:` key of the head compose file, at this line; a moved file turns
+# test_decoded_scan_selftest red so the expected line numbers are re-checked by hand.
+DECODED_ROW_LINE = 49
+# A value that stands for a secret in a refused compose line; no refusal may carry it (#9817 L2).
+SECRET_CANARY_9817 = "canary9817secretvalue"
 
 
 COMPOSE_QUOTED_DOLLAR_OK = {
@@ -558,49 +597,62 @@ def _interpolations(value):
     names, problems = set(), []
     for m in DOLLAR_RUN.finditer(value):
         if len(m.group(1)) >= 3:
-            problems.append("a run of %d dollars (escape plus interpolation)" % len(m.group(1)))
+            problems.append(DOLLAR_RUN_REFUSED % len(m.group(1)))
         if len(m.group(1)) % 2 == 1 and m.group(2):
             names.add(m.group(2))
     return names, problems
 
 
+BLOCK_SCALAR_HEADER = re.compile(r"(?:^|[:\-])\s+[|>][-+0-9]*\s*(?:#.*)?$")
+DOUBLE_QUOTED_SPAN = re.compile(r'"[^"\n]*"')
+SINGLE_QUOTED_SPAN = re.compile(r"'[^'\n]*'")
+
+
+def _decoded_strings(node):
+    """Every key and every string value of a decoded document, in order."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _decoded_strings(key)
+            yield from _decoded_strings(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _decoded_strings(item)
+    elif isinstance(node, str):
+        yield node
+
+
 def _decoded_scan(text):
-    """r13 K4+S14: (interpolated names, refusals) of the compose file as YAML DECODES it, because
-    compose interpolates the decoded scalar, not the raw text. Needs PyYAML. Every scalar value
-    (keys included) goes through the escape rule; and every construct in which the raw text and the
-    decoded scalar can differ is refused: a backslash escape in a double-quoted scalar, a block
-    scalar (`|`, `>`), a scalar continued over several lines (folded join, escaped line break,
-    comment-looking continuation), a flow collection over several lines, and a `$` inside a quoted
-    scalar except the one pinned `user:` scalar."""
-    names, problems, flow = set(), [], []
+    """r13 K4+S14, #9813: (interpolated names, refusals) of the compose file as the stdlib subset reader
+    decodes it, because compose interpolates the decoded scalar, not the raw text. Every scalar value
+    (keys included) goes through the escape rule; every construct in which the raw text and the decoded
+    scalar can differ is refused: a backslash escape in a double-quoted scalar, a block scalar (`|`, `>`),
+    an explicit tag, and text the reader does not parse (a scalar or flow collection over several lines
+    is one of those), and a `$` inside a quoted scalar except the one pinned `user:` scalar.
+
+    #9817: the reader is workflow_text.parse_text, so a refusal carries `<label>: line N: <reason constant>`
+    and no document text (L2); each refusal text is a named constant pinned row by row in
+    test_decoded_scan_selftest (L4)."""
+    names, problems = set(), []
     try:
-        events = list(yaml.parse(text))
-    except yaml.YAMLError as exc:
-        return names, ["the compose text does not parse: %s" % str(exc).splitlines()[0]]
-    for ev in events:
-        # r14 S18: compose decodes an explicit tag (`!!binary`, `!!str`, a verbatim tag) BEFORE it
-        # interpolates, so the raw text and the scalar the checks below see are not what it renders.
-        if isinstance(ev, (yaml.ScalarEvent, yaml.MappingStartEvent, yaml.SequenceStartEvent)) and ev.tag is not None:
-            problems.append("explicit YAML tag %r" % ev.tag)
-        if isinstance(ev, yaml.ScalarEvent):
-            raw = text[ev.start_mark.index : ev.end_mark.index]
-            if ev.start_mark.line != ev.end_mark.line:
-                problems.append("scalar over several lines: %r" % raw[:30])
-            if ev.style in ("|", ">"):
-                problems.append("block scalar")
-            if ev.style == '"' and "\\" in raw:
-                problems.append("backslash escape in a double-quoted scalar: %r" % raw[:30])
-            if ev.style in ('"', "'") and "$" in raw and raw not in COMPOSE_QUOTED_DOLLAR_OK:
-                problems.append("dollar inside a quoted scalar: %r" % raw[:30])
-            found, bad = _interpolations(ev.value)
-            names |= found
-            problems.extend(bad)
-        elif isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
-            flow.append((bool(ev.flow_style), ev.start_mark.line))
-        elif isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
-            is_flow, line = flow.pop()
-            if is_flow and ev.end_mark.line != line:
-                problems.append("flow collection over several lines")
+        document = _parse_document(text)
+    except _READER.WorkflowReadError as exc:
+        if exc.reason == _READER.TAG:
+            return names, [DECODED_TAG % exc]
+        return names, [DECODED_UNPARSED % exc]
+    for number, line in enumerate(text.splitlines(), 1):
+        code = _strip_comment(line)
+        if BLOCK_SCALAR_HEADER.search(code):
+            problems.append(DECODED_BLOCK_SCALAR % number)
+        for span in DOUBLE_QUOTED_SPAN.findall(code):
+            if "\\" in span:
+                problems.append(DECODED_BACKSLASH % number)
+        for span in DOUBLE_QUOTED_SPAN.findall(code) + SINGLE_QUOTED_SPAN.findall(code):
+            if "$" in span and span not in COMPOSE_QUOTED_DOLLAR_OK:
+                problems.append(DECODED_QUOTED_DOLLAR % number)
+    for value in _decoded_strings(document):
+        found, bad = _interpolations(value)
+        names |= found
+        problems.extend(bad)
     return names, problems
 
 
@@ -2459,26 +2511,40 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         self.assertEqual(_compose_scan(base)[1], [])
         legit = base.replace(port, "    environment:\n      SMOKE_NOTE: $$HOME\n" + port, 1)
         self.assertEqual(_compose_scan(legit), (COMPOSE_NAMES, []))
+        # #9817 L4: the exact (names, problems) pair per row, written out by hand; the anchor-only, merge-only,
+        # x-top and not-a-key rows are each caught by one check alone.
+        with_pg = COMPOSE_NAMES | {"PGPASSWORD"}
+        run3 = [DOLLAR_RUN_REFUSED % 3]
         rows = {
-            "R1": "    environment:\n      X: $$$PGPASSWORD\n",
-            "R1b": "    environment:\n      X: $$${PGPASSWORD}\n",
-            "F1": "    environment:\n      - X=$$$PGPASSWORD\n",
-            "F1b": "    labels:\n      - x=$$${PGPASSWORD}\n",
-            "R2": "    x-a: &a ${PGPASSWORD}\n    labels:\n      smoke.copy: *a\n",
-            "R4": "    <<: *a\n",
-            "R7": "    extends:\n      file: other.yml\n      service: s\n",
-            "R3": "    env_file: .smoke.env\n",
+            "R1": ("    environment:\n      X: $$$PGPASSWORD\n", with_pg, run3),
+            "R1b": ("    environment:\n      X: $$${PGPASSWORD}\n", with_pg, run3),
+            "F1": ("    environment:\n      - X=$$$PGPASSWORD\n", with_pg, run3),
+            "F1b": ("    labels:\n      - x=$$${PGPASSWORD}\n", with_pg, run3),
+            "R2": ("    x-a: &a ${PGPASSWORD}\n    labels:\n      smoke.copy: *a\n", with_pg, [COMPOSE_ANCHOR_ALIAS]),
+            "R4": ("    <<: *a\n", COMPOSE_NAMES, [COMPOSE_ANCHOR_ALIAS, COMPOSE_MERGE_KEY]),
+            "R7": ("    extends:\n      file: other.yml\n      service: s\n", COMPOSE_NAMES, [COMPOSE_BANNED_KEY % "extends"]),
+            "R3": ("    env_file: .smoke.env\n", COMPOSE_NAMES, [COMPOSE_BANNED_KEY % "env_file"]),
+            "anchor-only": ("    x-a: &a plain\n", COMPOSE_NAMES, [COMPOSE_ANCHOR_ALIAS]),
+            "merge-only": ("    <<: x\n", COMPOSE_NAMES, [COMPOSE_MERGE_KEY]),
+            "one-dollar-name": ("    environment:\n      X: $PGPASSWORD\n", with_pg, []),
         }
-        for row, extra in rows.items():
-            names, problems = _compose_scan(base.replace(port, extra + port, 1))
-            self.assertTrue(problems or names != COMPOSE_NAMES, "row %s is not refused" % row)
+        for row, (extra, want_names, want_problems) in rows.items():
+            with self.subTest(row=row):
+                self.assertEqual(_compose_scan(base.replace(port, extra + port, 1)), (want_names, want_problems))
+        appended = base.rstrip("\n").count("\n") + 2
         top = {
-            "R12": "include:\n  - other.yml\n",
-            "R5": "secrets:\n  s:\n    environment: PGPASSWORD\n",
-            "R6": "configs:\n  c:\n    environment: PGPASSWORD\n",
+            "R12": ("include:\n  - other.yml\n", [COMPOSE_BANNED_KEY % "include",
+                                                 COMPOSE_TOP_KEYS_DIFFER % ["include", "name", "services"]]),
+            "R5": ("secrets:\n  s:\n    environment: PGPASSWORD\n",
+                   [COMPOSE_BANNED_KEY % "secrets", COMPOSE_TOP_KEYS_DIFFER % ["name", "secrets", "services"]]),
+            "R6": ("configs:\n  c:\n    environment: PGPASSWORD\n",
+                   [COMPOSE_BANNED_KEY % "configs", COMPOSE_TOP_KEYS_DIFFER % ["configs", "name", "services"]]),
+            "x-top": ("x-extra: 1\n", [COMPOSE_TOP_KEYS_DIFFER % ["name", "services", "x-extra"]]),
+            "not-a-key": ("- item\n", [COMPOSE_TOP_NOT_KEY % appended]),
         }
-        for row, extra in top.items():
-            self.assertTrue(_compose_scan(base.rstrip("\n") + "\n" + extra)[1], "row %s is not refused" % row)
+        for row, (extra, want_problems) in top.items():
+            with self.subTest(row=row):
+                self.assertEqual(_compose_scan(base.rstrip("\n") + "\n" + extra), (COMPOSE_NAMES, want_problems))
         # N1 parity alone (no run of three): an odd run is an interpolation, an even run is not.
         self.assertEqual(_compose_scan("a: $$$$HOME\nb: $${HOME}\nc: ${HOME}")[0], {"HOME"})
         self.assertEqual(_compose_scan("a: $$HOME")[0], set())
@@ -2499,42 +2565,89 @@ class PgbouncerSmokeComposeTest(unittest.TestCase):
         }
         for row, extra in legit.items():
             self.assertEqual(_decoded_scan(base.replace(port, extra + port, 1)), (COMPOSE_NAMES, []), row)
+        # #9817 L4: every row asserts the exact (names, problems) pair, written out by hand, so switching off any
+        # one check (block scalar, backslash, quoted dollar, the double-quoted span, the parse refusal, the tag
+        # rule) turns at least one row red; the M13-M17 rows are each caught by that one check alone. The
+        # inserted text starts at line ROW_LINE (the line of the ports key in the head compose file).
+        row_line = base[: base.index(port)].count("\n") + 1
+        self.assertEqual(row_line, DECODED_ROW_LINE, "the head compose file moved; re-check the expected lines")
+        first, second, third = row_line, row_line + 1, row_line + 2
+        with_pg = COMPOSE_NAMES | {"PGPASSWORD"}
+
+        def unparsed(line, reason):
+            return [DECODED_UNPARSED % ("%s: line %d: %s" % (COMPOSE_LABEL, line, reason))]
+
+        def tagged(line):
+            return [DECODED_TAG % ("%s: line %d: %s" % (COMPOSE_LABEL, line, _READER.TAG))]
+
         refused = {
-            "hex-escape": '    environment:\n      X: "\\x24{PGPASSWORD}"\n',
-            "unicode-escape": '    environment:\n      X: "\\u0024{PGPASSWORD}"\n',
-            "escaped-line-break": '    environment:\n      X: "$\\\n        {PGPASSWORD}"\n',
-            "block-pipe": "    labels:\n      smoke.copy: |\n        ${PGPASSWORD}\n",
-            "block-fold": "    labels:\n      smoke.copy: >-\n        ${PGPASSWORD}\n",
-            "folded-join": "    labels:\n      smoke.copy: aaa\n        ${PGPASSWORD}\n",
-            "multi-line-flow": "    environment: {A: b,\n      C: ${PGPASSWORD}}\n",
-            "dollar-in-dq": '    environment:\n      X: "$PGPASSWORD"\n',
-            "dollar-in-sq": "    environment:\n      X: '${PGPASSWORD}'\n",
-            "comment-continuation": '    labels:\n      smoke.copy: "a\n# b\n      ${PGPASSWORD}"\n',
-            "plain-second-name": "    environment:\n      X: ${PGPASSWORD}\n",
-            "dollar-run": "    environment:\n      X: $$$PGPASSWORD\n",
+            "hex-escape": ('    environment:\n      X: "\\x24{PGPASSWORD}"\n', with_pg, [DECODED_BACKSLASH % second]),
+            "unicode-escape": ('    environment:\n      X: "\\u0024{PGPASSWORD}"\n', with_pg, [DECODED_BACKSLASH % second]),
+            "escaped-line-break": ('    environment:\n      X: "$\\\n        {PGPASSWORD}"\n', set(),
+                                   unparsed(third, _READER.FLOW_BLOCK)),
+            "block-pipe": ("    labels:\n      smoke.copy: |\n        ${PGPASSWORD}\n", with_pg, [DECODED_BLOCK_SCALAR % second]),
+            "block-fold": ("    labels:\n      smoke.copy: >-\n        ${PGPASSWORD}\n", with_pg, [DECODED_BLOCK_SCALAR % second]),
+            "folded-join": ("    labels:\n      smoke.copy: aaa\n        ${PGPASSWORD}\n", set(), unparsed(third, _READER.INDENT)),
+            "multi-line-flow": ("    environment: {A: b,\n      C: ${PGPASSWORD}}\n", set(), unparsed(first, _READER.FLOW)),
+            "dollar-in-dq": ('    environment:\n      X: "$PGPASSWORD"\n', with_pg, [DECODED_QUOTED_DOLLAR % second]),
+            "dollar-in-sq": ("    environment:\n      X: '${PGPASSWORD}'\n", with_pg, [DECODED_QUOTED_DOLLAR % second]),
+            "comment-continuation": ('    labels:\n      smoke.copy: "a\n# b\n      ${PGPASSWORD}"\n', set(),
+                                     unparsed(second, _READER.QUOTED_SCALAR)),
+            "plain-second-name": ("    environment:\n      X: ${PGPASSWORD}\n", with_pg, []),
+            "dollar-run": ("    environment:\n      X: $$$PGPASSWORD\n", with_pg, [DOLLAR_RUN_REFUSED % 3]),
             # r14 S18: an explicit tag is decoded by compose before it interpolates: X1 `!!binary`
             # under a non-environment key, X2 under environment, X3 `!!str` carrying a dollar, X4 a
             # tagged mapping, plus a tagged sequence and a verbatim tag
-            "X1-binary-hostname": "    hostname: !!binary |\n      JHtQR1BBU1NXT1JEfQ==\n",
-            "X1b-binary-flow": "    hostname: !!binary JHtQR1BBU1NXT1JEfQ==\n",
-            "X2-binary-environment": "    environment:\n      X: !!binary JHtQR1BBU1NXT1JEfQ==\n",
-            "X3-str-tag-dollar": "    hostname: !!str ${PGPASSWORD}\n",
-            "X3b-str-tag-plain": "    hostname: !!str plain\n",
-            "X4-tagged-mapping": "    environment: !!map\n      X: plain\n",
-            "X4b-tagged-sequence": "    dns: !!seq\n      - 1.1.1.1\n",
-            "X4c-verbatim-tag": "    hostname: !<tag:yaml.org,2002:str> plain\n",
-            "X4d-local-tag": "    hostname: !x plain\n",
+            "X1-binary-hostname": ("    hostname: !!binary |\n      JHtQR1BBU1NXT1JEfQ==\n", set(), tagged(first)),
+            "X1b-binary-flow": ("    hostname: !!binary JHtQR1BBU1NXT1JEfQ==\n", set(), tagged(first)),
+            "X2-binary-environment": ("    environment:\n      X: !!binary JHtQR1BBU1NXT1JEfQ==\n", set(), tagged(second)),
+            "X3-str-tag-dollar": ("    hostname: !!str ${PGPASSWORD}\n", set(), tagged(first)),
+            "X3b-str-tag-plain": ("    hostname: !!str plain\n", set(), tagged(first)),
+            "X4-tagged-mapping": ("    environment: !!map\n      X: plain\n", set(), tagged(first)),
+            "X4b-tagged-sequence": ("    dns: !!seq\n      - 1.1.1.1\n", set(), tagged(first)),
+            "X4c-verbatim-tag": ("    hostname: !<tag:yaml.org,2002:str> plain\n", set(), tagged(first)),
+            "X4d-local-tag": ("    hostname: !x plain\n", set(), tagged(first)),
+            # #9817 L4: one row per check that no other layer catches (no interpolated name, the text parses)
+            "M13-block-plain": ("    labels:\n      smoke.copy: |\n        plain\n", COMPOSE_NAMES, [DECODED_BLOCK_SCALAR % second]),
+            "M13-block-keep": ("    labels:\n      smoke.copy: >+\n        plain\n", COMPOSE_NAMES, [DECODED_BLOCK_SCALAR % second]),
+            "M14-dq-tab-escape": ('    environment:\n      X: "a\\tb"\n', COMPOSE_NAMES, [DECODED_BACKSLASH % second]),
+            "M14-dq-quote-escape": ('    environment:\n      X: "a\\"b"\n', COMPOSE_NAMES, [DECODED_BACKSLASH % second]),
+            "M15-M16-dq-even-dollar": ('    environment:\n      X: "$$HOME"\n', COMPOSE_NAMES, [DECODED_QUOTED_DOLLAR % second]),
+            "M15-sq-even-dollar": ("    environment:\n      X: '$$HOME'\n", COMPOSE_NAMES, [DECODED_QUOTED_DOLLAR % second]),
+            "M17-unclosed-flow": ("    environment:\n      X: [a,\n", set(), unparsed(second, _READER.FLOW)),
+            "M17-duplicate-key": ("    environment:\n      X: a\n      X: b\n", set(), unparsed(third, _READER.DUPLICATE_KEY)),
         }
-        for row, extra in refused.items():
-            names, problems = _decoded_scan(base.replace(port, extra + port, 1))
-            self.assertTrue(problems or names != COMPOSE_NAMES, "row %s is not refused" % row)
-            if row.startswith(("X1", "X2", "X3", "X4")):
-                self.assertTrue([p for p in problems if p.startswith("explicit YAML tag")], "row %s: the tag rule did not fire" % row)
+        for row, (extra, want_names, want_problems) in refused.items():
+            with self.subTest(row=row):
+                self.assertEqual(_decoded_scan(base.replace(port, extra + port, 1)), (want_names, want_problems))
+
+    def test_decoded_scan_refusals_never_carry_document_text_9817(self):
+        # #9817 L2: a value in the compose file never reaches a refusal: the parse refusal names the line and a
+        # reason constant, and the block, backslash, quoted-dollar and top-level refusals name the line only.
+        base = COMPOSE.read_text()
+        port = '    ports:\n      - "127.0.0.1:6432:6432"'
+        rows = {
+            "unparsed": "    environment:\n      X: [%s,\n" % SECRET_CANARY_9817,
+            "duplicate": "    environment:\n      %s: a\n      %s: b\n" % (SECRET_CANARY_9817, SECRET_CANARY_9817),
+            "backslash": '    environment:\n      X: "%s\\t"\n' % SECRET_CANARY_9817,
+            "quoted-dollar": "    environment:\n      X: '$$%s'\n" % SECRET_CANARY_9817,
+            "block": "    labels:\n      smoke.copy: |\n        %s\n" % SECRET_CANARY_9817,
+            "tag": "    hostname: !!str %s\n" % SECRET_CANARY_9817,
+            "control": "    hostname: %s\x07\n" % SECRET_CANARY_9817,
+        }
+        for row, extra in rows.items():
+            with self.subTest(row=row):
+                problems = _decoded_scan(base.replace(port, extra + port, 1))[1]
+                self.assertTrue(problems, row)
+                self.assertNotIn(SECRET_CANARY_9817, "\n".join(problems))
+        code = _compose_code()
+        top = code.rstrip("\n") + "\n" + SECRET_CANARY_9817 + "\n"
+        self.assertEqual(_compose_scan(top)[1], [COMPOSE_TOP_NOT_KEY % (code.rstrip("\n").count("\n") + 2)])
 
     def test_decoded_environment_and_labels_are_pinned_on_head(self):
         # r13 S14: the head environment keys, the absence of labels/command/entrypoint and the
         # decoded values are pinned, so an interpolation shows here as well as in the scan.
-        doc = yaml.safe_load(COMPOSE.read_text())
+        doc = _parse_document(COMPOSE.read_text())
         self.assertEqual(set(doc), {"name", "services"})
         env_keys = {name: sorted((spec.get("environment") or {})) for name, spec in doc["services"].items()}
         # A new environment key is allowed (its value is scanned below); the head keys must stay.
