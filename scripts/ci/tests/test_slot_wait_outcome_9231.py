@@ -354,10 +354,8 @@ class RunnerSlotTie(unittest.TestCase):
             ('--name of the wrapped command is not the gate',
              {'workflows/w.yml': 'exec python3 scripts/ci/host_semaphore.py --name g --max-wait-secs 600 -- tool --name zz\n'},
              []),
-            # F1 (round 1 of PR 9837): a commented call is not a call, and an unlisted comment site is a finding
             ('commented call is not a call', {'workflows/w.yml': '# python3 scripts/ci/host_semaphore.py --name other\n'
-                                              + (self.CALL % '--name g')},
-             ['workflows/w.yml: a host_semaphore reference in a comment that is not a listed comment site']),
+                                              + (self.CALL % '--name g')}, []),
             ('reference that is not a python call', {'workflows/w.yml': 'run: cat scripts/ci/host_semaphore.py\n'
                                                      + (self.CALL % '--name g')},
              ['workflows/w.yml: a host_semaphore.py reference that is not a python3 call']),
@@ -831,209 +829,13 @@ class MainReadsEveryGithubText(unittest.TestCase):
             'host_slots_check: workflows/ci.yml: a host_semaphore.py call without exactly one --max-wait-secs']))
 
 
-SCAN_W = 'workflows/w.yml'
-SCAN_GOOD = 'python3 -I scripts/ci/host_semaphore.py --name g --max-wait-secs 600 -- bash'
-SCAN_OTHER = 'python3 -I scripts/ci/host_semaphore.py --name other --max-wait-secs 600 -- bash'
-SCAN_NO_WAIT = 'python3 -I scripts/ci/host_semaphore.py --name g -- bash'
-# Every expected reason is written out by hand (never taken from host_slots_check.py).
-S_OTHER = 'workflows/w.yml: calls the unconfigured gate other'
-S_NO_WAIT = 'workflows/w.yml: a host_semaphore.py call without exactly one --max-wait-secs'
-S_NO_NAME = 'workflows/w.yml: a host_semaphore.py call without exactly one literal --name'
-S_NOT_CALL = 'workflows/w.yml: a host_semaphore.py reference that is not a python3 call'
-S_MODULE = 'workflows/w.yml: host_semaphore run as a module (-m); call the literal path scripts/ci/host_semaphore.py'
-S_VARIABLE = 'workflows/w.yml: a host_semaphore path built from a variable or a substitution'
-S_GLOB = 'workflows/w.yml: a host_semaphore path with a glob character'
-S_SPLIT = 'workflows/w.yml: a host_semaphore path split by a quote or a backslash'
-S_COMMENT = 'workflows/w.yml: a host_semaphore reference in a comment that is not a listed comment site'
-S_NOT_PLAIN = 'workflows/w.yml: a host_semaphore.py call whose --max-wait-secs is not a plain decimal integer'
-S_ZERO = 'workflows/w.yml: a host_semaphore.py call whose --max-wait-secs is 0; the wait is at least 1 s'
-S_ABOVE = 'workflows/w.yml: a host_semaphore.py call whose --max-wait-secs is above the 900 s idle seat ceiling'
-S_NOT_LITERAL = ('workflows/w.yml: a host_semaphore.py call whose --max-wait-secs is neither a literal nor a plain '
-                 'read of HOST_SEMAPHORE_MAX_WAIT_SECS')
-S_NEVER = 'g: configured but no workflow calls it'
+class WaitGrammarParity(unittest.TestCase):
+    """F2 (round 1 of PR 9837): one plain decimal grammar; the wrapper and the bound check agree on every value.
 
-
-def scan_wait(value):
-    return 'run: python3 -I scripts/ci/host_semaphore.py --name g --max-wait-secs %s -- bash\n' % value
-
-
-class TokenScanFailsClosed(unittest.TestCase):
-    """F1 + L1 (round 1 of PR 9837): every host_semaphore token site is a fully classified call or a finding."""
+    The call-site wait-value check moved with the token scan to its own issue (split of PR 9837).
+    """
 
     CFG = {'registered_runners': ['a'], 'gates': {'g': {'slots': 1, 'label': 'x', 'serving_runners': ['a']}}}
-    # (name, text of workflows/w.yml, expected findings); the gate g is called on another file when the row needs it
-    TABLE = [
-        # the forms that must stay clean
-        ('one call', 'run: %s\n' % SCAN_GOOD, []),
-        ('./ path', 'run: python3 ./scripts/ci/host_semaphore.py --name g --max-wait-secs 600 -- bash\n', []),
-        ('several no-argument flags', 'run: exec python3 -I -u -B scripts/ci/host_semaphore.py --name g '
-         '--max-wait-secs 600 -- bash\n', []),
-        ('the = forms', 'run: python3 scripts/ci/host_semaphore.py --name=g --max-wait-secs=600 -- bash\n', []),
-        ('quoted literal wait', scan_wait("'600'"), []),
-        ('the env read', scan_wait('"$HOST_SEMAPHORE_MAX_WAIT_SECS"'), []),
-        ('the braced env read', scan_wait('"${HOST_SEMAPHORE_MAX_WAIT_SECS}"'), []),
-        ('the ceiling itself', scan_wait('900'), []),
-        ('one second', scan_wait('1'), []),
-        ('listed env names', 'env:\n  HOST_SEMAPHORE_SLOTS: 2\n  HOST_SEMAPHORE_HELD: 1\nrun: %s\n' % SCAN_GOOD, []),
-        ('a flag after the wrapped command', 'run: %s --max-wait-secs 5 --name zz\n' % SCAN_GOOD, []),
-        ('a comment without the token', 'run: %s  # waits for a slot\n' % SCAN_GOOD, []),
-        ('continued line', 'run: python3 scripts/ci/host_semaphore.py \\\n  --name g \\\n  --max-wait-secs 600 -- x\n',
-         []),
-        ('in a subshell', 'run: (python3 scripts/ci/host_semaphore.py --name g --max-wait-secs 600 -- bash)\n', []),
-        # a second call after ; and after &&
-        ('second call after ;', 'run: %s; %s\n' % (SCAN_GOOD, SCAN_OTHER), [S_OTHER]),
-        ('second call after ; without a wait', 'run: %s; %s\n' % (SCAN_GOOD, SCAN_NO_WAIT), [S_NO_WAIT]),
-        ('second call after ; with no space', 'run: %s;%s\n' % (SCAN_GOOD, SCAN_NO_WAIT), [S_NO_WAIT]),
-        ('second call after &&', 'run: %s && %s\n' % (SCAN_GOOD, SCAN_NO_WAIT), [S_NO_WAIT]),
-        ('second call after ||', 'run: %s || %s\n' % (SCAN_GOOD, SCAN_OTHER), [S_OTHER]),
-        ('first call ends at ; with no --', 'run: python3 scripts/ci/host_semaphore.py --name g; %s\n' % SCAN_GOOD,
-         [S_NO_WAIT]),
-        ('three calls on one line', 'run: %s; %s; %s\n' % (SCAN_GOOD, SCAN_OTHER, SCAN_NO_WAIT), [S_OTHER, S_NO_WAIT]),
-        ('three calls, all refused', 'run: %s && %s && %s\n' % (SCAN_NO_WAIT, SCAN_NO_WAIT, SCAN_NO_WAIT),
-         [S_NO_WAIT, S_NO_WAIT, S_NO_WAIT]),
-        # the -m form
-        ('-m module form', 'run: python3 -m scripts.ci.host_semaphore --name g --max-wait-secs 600 -- bash\n',
-         [S_MODULE, S_NEVER]),
-        ('-m joined', 'run: python3 -mhost_semaphore --name g -- bash\n', [S_MODULE, S_NEVER]),
-        # a split path
-        ('path split by quotes', 'run: python3 scripts/ci/host_"sema"phore.py --name g --max-wait-secs 600 -- b\n',
-         [S_SPLIT, S_NEVER]),
-        ('path split by a backslash', 'run: python3 scripts/ci/host_sema\\phore.py --name g --max-wait-secs 600 -- b\n',
-         [S_SPLIT, S_NEVER]),
-        ('whole path quoted', 'run: python3 "scripts/ci/host_semaphore.py" --name g --max-wait-secs 600 -- b\n',
-         [S_SPLIT, S_NEVER]),
-        # a variable path
-        ('variable directory', 'run: python3 "$CI/host_semaphore.py" --name g --max-wait-secs 600 -- b\n',
-         [S_VARIABLE, S_NEVER]),
-        ('braced variable directory', 'run: python3 ${CI}/host_semaphore.py --name g --max-wait-secs 600 -- b\n',
-         [S_VARIABLE, S_NEVER]),
-        ('command substitution', 'run: python3 $(pwd)/scripts/ci/host_semaphore.py --name g --max-wait-secs 600 -- b\n',
-         [S_VARIABLE, S_NEVER]),
-        # a glob
-        ('glob directory', 'run: python3 scripts/*/host_semaphore.py --name g --max-wait-secs 600 -- b\n',
-         [S_GLOB, S_NEVER]),
-        ('glob suffix', 'run: python3 scripts/ci/host_semaphore.p? --name g --max-wait-secs 600 -- b\n',
-         [S_GLOB, S_NEVER]),
-        ('bracket glob', 'run: python3 scripts/ci/host_semaphore.[p]y --name g --max-wait-secs 600 -- b\n',
-         [S_GLOB, S_NEVER]),
-        # the flag inside a comment
-        ('the wait flag inside a comment', 'run: %s  # --max-wait-secs 600\n' % SCAN_NO_WAIT, [S_NO_WAIT]),
-        ('the name flag inside a comment',
-         'run: python3 scripts/ci/host_semaphore.py --max-wait-secs 600 -- bash  # --name g\n', [S_NO_NAME, S_NEVER]),
-        ('a second wait flag inside a comment is not counted', 'run: %s  # --max-wait-secs 3600\n' % SCAN_GOOD, []),
-        ('the token inside a trailing comment', 'run: echo hi  # see scripts/ci/host_semaphore.py\n' + SCAN_GOOD + '\n',
-         [S_COMMENT]),
-        ('a # inside quotes is not a comment', 'run: echo "a # b"; %s\n' % SCAN_GOOD, []),
-        # a flag spelled inside a quoted argument is one word the shell passes, never a flag
-        ('the wait flag inside a quoted label',
-         'run: python3 scripts/ci/host_semaphore.py --name g --label "x --max-wait-secs 600" -- bash\n', [S_NO_WAIT]),
-        ('the name flag inside a quoted label',
-         "run: python3 scripts/ci/host_semaphore.py --label 'y --name g' --max-wait-secs 600 -- bash\n",
-         [S_NO_NAME, S_NEVER]),
-        ('a quoted label beside both flags',
-         'run: python3 scripts/ci/host_semaphore.py --name g --label "${CI_NODE}/x" --max-wait-secs 600 -- bash\n', []),
-        # other wait values: non-ASCII digits, a leading zero, a superscript digit
-        ('Arabic-Indic digits', scan_wait('٦٠٠'), [S_NOT_PLAIN]),
-        ('Devanagari digits', scan_wait('०९'), [S_NOT_PLAIN]),
-        ('fullwidth digits', scan_wait('６００'), [S_NOT_PLAIN]),
-        ('leading zero', scan_wait('0600'), [S_NOT_PLAIN]),
-        ('two zeros', scan_wait('00'), [S_NOT_PLAIN]),
-        ('superscript digit', scan_wait('6²'), [S_NOT_PLAIN]),
-        ('superscript alone', scan_wait('²'), [S_NOT_PLAIN]),
-        ('a sign', scan_wait('+600'), [S_NOT_PLAIN]),
-        ('negative', scan_wait('-5'), [S_NOT_PLAIN]),
-        ('underscore digits', scan_wait('6_00'), [S_NOT_PLAIN]),
-        ('zero', scan_wait('0'), [S_ZERO]),
-        ('above the ceiling', scan_wait('901'), [S_ABOVE]),
-        ('a huge value', scan_wait('9' * 100000), [S_ABOVE]),
-        ('empty before --', 'run: python3 scripts/ci/host_semaphore.py --name g --max-wait-secs -- bash\n',
-         [S_NOT_PLAIN]),
-        ('another variable', scan_wait('"$OTHER"'), [S_NOT_LITERAL]),
-        ('a default expansion', scan_wait('"${HOST_SEMAPHORE_MAX_WAIT_SECS:-3600}"'), [S_NOT_LITERAL]),
-        # references that are not calls
-        ('cat of the script', 'run: cat scripts/ci/host_semaphore.py\n' + SCAN_GOOD + '\n', [S_NOT_CALL]),
-        ('upper case script name', 'run: python3 scripts/ci/HOST_SEMAPHORE.PY --name g --max-wait-secs 600 -- b\n',
-         [S_NOT_CALL, S_NEVER]),
-        ('python, not python3', 'run: python scripts/ci/host_semaphore.py --name g --max-wait-secs 600 -- b\n',
-         [S_NOT_CALL, S_NEVER]),
-        ('a flag that takes an argument', 'run: python3 -X dev scripts/ci/host_semaphore.py --name g '
-         '--max-wait-secs 600 -- b\n', [S_NOT_CALL, S_NEVER]),
-        ('another directory', 'run: python3 tools/host_semaphore.py --name g --max-wait-secs 600 -- b\n',
-         [S_NOT_CALL, S_NEVER]),
-        ('two tokens in one word', 'run: echo host_semaphore/host_semaphore\n' + SCAN_GOOD + '\n',
-         [S_NOT_CALL, S_NOT_CALL]),
-        ('an unlisted environment name', 'env:\n  HOST_SEMAPHORE_OTHER: 1\nrun: %s\n' % SCAN_GOOD,
-         ['workflows/w.yml: HOST_SEMAPHORE_OTHER is not a listed HOST_SEMAPHORE_ environment name']),
-        ('a comment-only line', '# host_semaphore.py runs here\nrun: %s\n' % SCAN_GOOD, [S_COMMENT]),
-    ]
-
-    def test_scan_table(self):
-        for name, text, expected in self.TABLE:
-            with self.subTest(name):
-                self.assertEqual(hsc.call_site_violations(self.CFG, {SCAN_W: text}), expected)
-
-    def test_every_file_kind_under_github_is_scanned(self):
-        rows = [
-            ({'CODEOWNERS': 'scripts/ci/host_semaphore.py @x\n'},
-             ['CODEOWNERS: a host_semaphore.py reference that is not a python3 call']),
-            ({'workflows/notes.md': 'run python3 -m host_semaphore\n'},
-             ['workflows/notes.md: host_semaphore run as a module (-m); call the literal path scripts/ci/host_semaphore.py']),
-            ({'bin.dat': None}, ['bin.dat: not UTF-8 text, so the host_semaphore token scan cannot read it']),
-        ]
-        for extra, expected in rows:
-            with self.subTest(sorted(extra)):
-                texts = {'workflows/x.yml': 'run: %s\n' % SCAN_GOOD}
-                texts.update(extra)
-                self.assertEqual(hsc.call_site_violations(self.CFG, texts), expected)
-
-    def test_github_all_texts_reads_every_file(self):
-        with scratch() as td:
-            gh_dir = Path(td) / '.github'
-            (gh_dir / 'workflows').mkdir(parents=True)
-            (gh_dir / 'workflows' / 'a.yml').write_text('x: 1\n')
-            (gh_dir / 'CODEOWNERS').write_text('* @x\n')
-            (gh_dir / 'Dockerfile.ci').write_text('FROM x\n')
-            (gh_dir / 'bin.dat').write_bytes(b'\xff\xfe')
-            self.assertEqual(need(self, hsc, 'github_all_texts')(gh_dir), {
-                'CODEOWNERS': '* @x\n', 'Dockerfile.ci': 'FROM x\n', 'bin.dat': None, 'workflows/a.yml': 'x: 1\n'})
-
-    def test_the_listed_comment_sites_are_exact(self):
-        """The allowlist: only these lines of ci.yml, each with its reason; the same text elsewhere is a finding."""
-        sites = need(self, hsc, 'COMMENT_SITES')
-        self.assertEqual(sorted(sites), [
-            ('workflows/ci.yml', '# re-run this very script under host_semaphore.py (the slot is held'),
-            ('workflows/ci.yml', '# scripts/ci/host_semaphore.py) admits 2 compile+test phases at')])
-        self.assertTrue(all(reason.startswith('prose: ') for reason in sites.values()))
-        ci_lines = [line.strip() for line in CI_YML.read_text().splitlines()]
-        for _, line in sites:
-            with self.subTest(line):
-                self.assertEqual(ci_lines.count(line), 1)
-                self.assertEqual(hsc.call_site_violations(self.CFG, {SCAN_W: '  %s\n%s\n' % (line, SCAN_GOOD)}),
-                                 [S_COMMENT])
-        self.assertEqual(need(self, hsc, 'ENV_NAMES'),
-                         ('HOST_SEMAPHORE_SLOTS', 'HOST_SEMAPHORE_MAX_WAIT_SECS', 'HOST_SEMAPHORE_HELD'))
-
-    def test_the_shipped_github_tree_is_clean_and_every_token_site_is_accounted(self):
-        cfg = hsc.load_config()
-        self.assertEqual(hsc.call_site_violations(cfg, need(self, hsc, 'github_all_texts')()), [])
-
-    def test_scan_is_linear_on_large_inputs(self):
-        texts = {
-            'workflows/a.yml': 'run: ' + 'host_semaphore ' * 10000 + '\n',
-            'workflows/b.yml': 'run: ' + 'python3 ' * 20000 + 'x\n',
-            'workflows/c.yml': 'run: ' + ('%s; ' % SCAN_GOOD) * 2000 + '\n',
-            'workflows/d.yml': 'run: echo "' + '#' * 200000 + '"\n',
-        }
-        self.assertGreater(sum(len(t) for t in texts.values()), 400000)
-        start = time.monotonic()
-        got = hsc.call_site_violations(self.CFG, texts)
-        self.assertLess(time.monotonic() - start, 5.0)
-        self.assertEqual(len(got), 10000)
-        self.assertEqual(set(got), {'workflows/a.yml: a host_semaphore.py reference that is not a python3 call'})
-
-
-class WaitGrammarParity(unittest.TestCase):
-    """F2 (round 1 of PR 9837): one plain decimal grammar; the scan and the wrapper agree on every value."""
 
     # (value, accepted): written by hand
     CORPUS = [
@@ -1044,15 +846,14 @@ class WaitGrammarParity(unittest.TestCase):
         ('6²', False), ('⁹', False), ('๙', False), ('6.0', False), ('six', False),
     ]
 
-    def test_the_wrapper_scan_and_bound_give_the_same_answer(self):
+    def test_the_wrapper_and_bound_give_the_same_answer(self):
         for value, accepted in self.CORPUS:
             with self.subTest(value=value[:12]):
                 wrapper_ok = hs.wait_value_problem('--max-wait-secs', value) is None
-                scan_ok = hsc.call_site_violations(TokenScanFailsClosed.CFG, {SCAN_W: scan_wait(value)}) == []
-                bound = hsc.bound_violations(TokenScanFailsClosed.CFG, {'workflows/ci.yml': (
+                bound = hsc.bound_violations(self.CFG, {'workflows/ci.yml': (
                     "env:\n  HOST_SEMAPHORE_SLOTS: ${{ x && '1' || '0' }}\n"
                     "  HOST_SEMAPHORE_MAX_WAIT_SECS: '%s'\n" % value)})
-                self.assertEqual((wrapper_ok, scan_ok, bound == []), (accepted, accepted, accepted), bound[:2])
+                self.assertEqual((wrapper_ok, bound == []), (accepted, accepted), bound[:2])
 
     def test_bound_reasons_are_exact_and_never_a_traceback(self):
         rows = [
@@ -1071,7 +872,7 @@ class WaitGrammarParity(unittest.TestCase):
         for value, message in rows:
             with self.subTest(value=value[:12]):
                 text = "env:\n  HOST_SEMAPHORE_SLOTS: ${{ x && '1' || '0' }}\n  HOST_SEMAPHORE_MAX_WAIT_SECS: %s\n" % value
-                self.assertEqual(hsc.bound_violations(TokenScanFailsClosed.CFG, {'workflows/ci.yml': text}), [message])
+                self.assertEqual(hsc.bound_violations(self.CFG, {'workflows/ci.yml': text}), [message])
 
     def test_both_scripts_use_the_one_named_pattern(self):
         limits = (CI_DIR / 'host_slot_limits.py').read_text()
