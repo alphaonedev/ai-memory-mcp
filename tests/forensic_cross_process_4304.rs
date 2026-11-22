@@ -23,6 +23,9 @@ mod child_stdin_report;
 /// storage call, so an empty archive is fine).
 const PROBE_NAMESPACE: &str = "t4304";
 
+/// #9906 — the tier every child serves (config file and `mcp --tier`).
+const CHILD_TIER: &str = "keyword";
+
 fn sandbox() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
     std::fs::create_dir_all(&root).expect("create test scratch root");
@@ -41,7 +44,7 @@ fn command(home: &Path, env: &[(&str, &str)]) -> Command {
     std::fs::write(
         config_root.join("config.toml"),
         format!(
-            "schema_version = 2\ntier = \"keyword\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
+            "schema_version = 2\ntier = \"{CHILD_TIER}\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
             forensic_dir(home).display()
         ),
     )
@@ -128,7 +131,9 @@ fn mcp_chains_from_a_row_another_process_wrote_while_it_ran_4304() {
     assert_eq!(rows(home.path()).len(), 1, "seed row");
 
     let mut child = command(home.path(), &[])
-        .args(["mcp", "--profile", "full"])
+        // #9906 — the tier on the command line: `mcp --tier` has a clap
+        // default that shadows the config file's tier (#9913).
+        .args(["mcp", "--profile", "full", "--tier", CHILD_TIER])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -28,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory::governance::audit::{
-    CHAIN_HEAD_PREV_HASH, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
+    CHAIN_HEAD_PREV_HASH, EXIT_DRAIN_BUDGET, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
 };
 use serde_json::{Value, json};
 #[path = "common/child_stdin_report.rs"]
@@ -79,7 +79,7 @@ fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int])
     std::fs::write(
         config_root.join("config.toml"),
         format!(
-            "schema_version = 2\ntier = \"keyword\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
+            "schema_version = 2\ntier = \"{CHILD_TIER}\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
             forensic_dir(home).display()
         ),
     )
@@ -97,7 +97,9 @@ fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int])
         .current_dir(home)
         .arg("--db")
         .arg(db_path(home))
-        .args(["mcp", "--profile", "full"])
+        // #9906 — the tier on the command line: `mcp --tier` has a clap
+        // default that shadows the config file's tier (#9913).
+        .args(["mcp", "--profile", "full", "--tier", CHILD_TIER])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -757,6 +759,24 @@ const BURST_STRESS_CUT: usize = 100;
 /// #9906 slow path: how many late-cut bursts the stress cell runs.
 const BURST_STRESS_ITERATIONS: u64 = 3;
 
+/// #9906 — the burst cells' forensic writer delay per row. Every row the
+/// burst can queue must drain well inside `EXIT_DRAIN_BUDGET` (checked at
+/// compile time below), so a late cut tests the drain, not the budget; the
+/// 600 ms `WRITER_DELAY_MS` of the single-row cells would queue a minute.
+const BURST_WRITER_DELAY_MS: u64 = 10;
+
+/// Factor by which the burst's whole writer delay must stay under the exit
+/// drain budget, for the per-row work the delay does not model.
+const BURST_DRAIN_HEADROOM: u64 = 3;
+
+const MS_PER_SEC: u64 = 1_000;
+
+const _: () = assert!(
+    (BURST + 1) * BURST_WRITER_DELAY_MS * BURST_DRAIN_HEADROOM
+        < EXIT_DRAIN_BUDGET.as_secs() * MS_PER_SEC,
+    "the burst writer delay must drain inside EXIT_DRAIN_BUDGET with headroom"
+);
+
 /// How long a serving burst child may take to acknowledge the tool calls a
 /// cut waits for. Steady-state work, not start-up, but many requests on a
 /// loaded host, so it is generous; still a bound.
@@ -833,7 +853,14 @@ fn exit_drain_outcome(stderr: &str) -> Vec<&str> {
 /// `memory_delete` rows naming exactly the acknowledged deletes.
 fn burst_round(label: &str, cut: usize) {
     let home = sandbox();
-    let mut child = spawn_mcp(home.path(), &[], &[]);
+    let mut child = spawn_mcp(
+        home.path(),
+        &[(
+            TEST_FORENSIC_WRITER_DELAY_ENV,
+            BURST_WRITER_DELAY_MS.to_string(),
+        )],
+        &[],
+    );
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let mut child_stderr = child.stderr.take().expect("stderr");

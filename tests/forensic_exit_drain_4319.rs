@@ -34,6 +34,9 @@ const PROBE_NAMESPACE: &str = "t4319";
 /// Writer delay that makes a queued row certainly outlive a short process.
 const WRITER_DELAY_MS: &str = "400";
 
+/// #9906 — the tier every child serves (config file and `mcp --tier`).
+const CHILD_TIER: &str = "keyword";
+
 /// Short-lived runs per cell.
 const RUNS: usize = 12;
 
@@ -55,7 +58,7 @@ fn command(home: &Path, env: &[(&str, &str)]) -> Command {
     std::fs::write(
         config_root.join("config.toml"),
         format!(
-            "schema_version = 2\ntier = \"keyword\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
+            "schema_version = 2\ntier = \"{CHILD_TIER}\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
             forensic_dir(home).display()
         ),
     )
@@ -176,7 +179,9 @@ fn mcp_drains_its_queued_forensic_rows_at_exit_4319() {
         home.path(),
         &[(TEST_FORENSIC_WRITER_DELAY_ENV, WRITER_DELAY_MS)],
     )
-    .args(["mcp", "--profile", "full"])
+    // #9906 — the tier on the command line: `mcp --tier` has a clap default
+    // that shadows the config file's tier (#9913).
+    .args(["mcp", "--profile", "full", "--tier", CHILD_TIER])
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::null())
