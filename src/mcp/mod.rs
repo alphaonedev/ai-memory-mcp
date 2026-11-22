@@ -9692,6 +9692,11 @@ mod tests {
     /// resolved, and the read does not depend on one (#3523 arm (e)).
     #[test]
     fn a_latched_audit_trail_refuses_mcp_writes_but_not_reads_4400() {
+        if crate::test_support::run_env_isolated_child_or_spawn(
+            "mcp::tests::a_latched_audit_trail_refuses_mcp_writes_but_not_reads_4400",
+        ) {
+            return;
+        }
         let _sink = crate::audit::sink_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _latch = crate::audit::fail_closed_latch_for_test();
