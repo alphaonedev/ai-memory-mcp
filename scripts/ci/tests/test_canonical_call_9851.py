@@ -492,6 +492,8 @@ class GatedStepTemplate(unittest.TestCase):
          gated(step(('echo ${{ github.sha }}',), env=()), step()), [S_B2]),
         # review LOW (#9879 r2): B1 judges a line with its quote characters removed
         ('a quoted ci/host path in another line of the gated job', gated(step(PREFIX + ('echo "scripts/ci/host_slots.json"',))), []),
+        # review L2 (#9905 r1): a step env that sets HOST_SEMAPHORE_SLOTS gates the job with no wrapper fragment
+        ('a gated job by its env only', gated(step(('echo ${{ github.sha }}',))), [S_B2]),
     ]
 
     def test_each_probe_is_its_exact_finding(self):
@@ -558,6 +560,9 @@ class GatedStepTemplate(unittest.TestCase):
          {G_W: gated(step(PREFIX + ('echo "scripts/ci/host_slots.json"',)))}, []),
         ('B2: an expression in a gated job admitted', ('if EXPR_OPENER in line)', 'if False)'),
          {G_W: gated(step(PREFIX + ('echo ${{ github.sha }}',)))}, [S_B2]),
+        ('B2: the HOST_SEMAPHORE_SLOTS env not a gating signal (review L2)',
+         ('if not wrapper_steps and not any(SLOTS_KEY in env for env in slot_envs):', 'if not wrapper_steps:'),
+         {G_W: gated(step(('echo ${{ github.sha }}',)))}, [S_B2]),
         ('B3: a glob beside a fragment admitted',
          ('    if not FRAGMENT_OPENER_RE.search(line):\n        return False',
           '    if True:\n        return False'),
