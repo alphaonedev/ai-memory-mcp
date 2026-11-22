@@ -863,9 +863,15 @@ fn server_name_host_key(server_name: &rustls::pki_types::ServerName<'_>) -> Opti
 /// lines to pin multiple acceptable fingerprints (rotation). Fail-closed:
 /// an empty result errors, because the pinning verifier rejects every
 /// unpinned host and an empty map would silently break ALL federation.
-pub fn load_peer_fingerprint_map(path: &Path) -> Result<HashMap<String, HashSet<[u8; 32]>>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
+///
+/// #9954: this is the ONE parser for the pin file. The runtime verifier and
+/// the `doctor --posture enterprise-federation` row both call it, so they
+/// can never disagree. The file is opened once and every check runs on that
+/// open handle (no TOCTOU): a directory, a FIFO or other non-regular file,
+/// a file over [`PEER_FP_FILE_MAX_BYTES`] and non-UTF-8 bytes are refused
+/// with their own reason.
+pub fn load_peer_fingerprint_map(path: &Path) -> Result<PinnedFingerprints> {
+    let text = read_pin_file_capped(path)?;
     let mut map: HashMap<String, HashSet<[u8; 32]>> = HashMap::new();
     for (idx, raw) in text.lines().enumerate() {
         let lineno = idx + 1;
@@ -890,13 +896,110 @@ pub fn load_peer_fingerprint_map(path: &Path) -> Result<HashMap<String, HashSet<
             path.display()
         );
     }
-    Ok(map)
+    PinnedFingerprints::try_from_map(map)
+}
+
+/// Read the pin file through ONE open handle, refusing a non-regular file
+/// and any file over [`PEER_FP_FILE_MAX_BYTES`] (#9954).
+fn read_pin_file_capped(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // A FIFO with no writer would block `open` forever; O_NONBLOCK makes
+        // the open return so the regular-file check below refuses it.
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts
+        .open(path)
+        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
+    if meta.is_dir() {
+        anyhow::bail!(
+            "{PEER_FP_LABEL} {} is a directory, not a pin file",
+            path.display()
+        );
+    }
+    if !meta.is_file() {
+        anyhow::bail!("{PEER_FP_LABEL} {} is not a regular file", path.display());
+    }
+    let over_cap = || {
+        anyhow::anyhow!(
+            "{PEER_FP_LABEL} {} exceeds the {PEER_FP_FILE_MAX_BYTES}-byte cap",
+            path.display()
+        )
+    };
+    if meta.len() > PEER_FP_FILE_MAX_BYTES {
+        return Err(over_cap());
+    }
+    // The file may grow after `metadata`; read at most cap + 1 bytes and
+    // re-check the length actually read.
+    let mut bytes = Vec::new();
+    file.take(PEER_FP_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
+    let read_len = u64::try_from(bytes.len()).map_err(|_| over_cap())?;
+    if read_len > PEER_FP_FILE_MAX_BYTES {
+        return Err(over_cap());
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("{PEER_FP_LABEL} {} is not valid UTF-8", path.display()))
+}
+
+/// A parsed, NON-EMPTY outbound peer server-cert pin set (#9954, CBC-03).
+///
+/// The field is private and the only constructors refuse an empty map, so
+/// "pinning on with zero pins" (which would reject every peer) cannot be
+/// represented. Both the runtime verifier and the doctor row hold this type.
+#[derive(Debug, Clone)]
+pub struct PinnedFingerprints {
+    map: HashMap<String, HashSet<[u8; 32]>>,
+}
+
+impl PinnedFingerprints {
+    /// Build from an already-parsed host map (keys must already be
+    /// normalized host keys). Refuses an empty map and a host with no pin.
+    ///
+    /// # Errors
+    /// The map is empty, or a host maps to an empty fingerprint set.
+    pub fn try_from_map(map: HashMap<String, HashSet<[u8; 32]>>) -> Result<Self> {
+        if map.is_empty() {
+            anyhow::bail!("{PEER_FP_LABEL} pin set is empty");
+        }
+        if let Some(host) = map.iter().find_map(|(h, s)| s.is_empty().then_some(h)) {
+            anyhow::bail!("{PEER_FP_LABEL} host `{host}` has no pinned fingerprint");
+        }
+        Ok(Self { map })
+    }
+
+    /// The pinned fingerprints of a normalized host key.
+    #[must_use]
+    pub fn get(&self, host: &str) -> Option<&HashSet<[u8; 32]>> {
+        self.map.get(host)
+    }
+
+    /// Number of distinct pinned hosts (always at least 1).
+    #[must_use]
+    pub fn host_count(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Total pinned fingerprints across all hosts (always at least 1).
+    #[must_use]
+    pub fn pin_count(&self) -> usize {
+        self.map.values().map(HashSet::len).sum()
+    }
 }
 
 /// Resolve the outbound peer server-cert pin map from
 /// `AI_MEMORY_FED_PEER_FINGERPRINTS`. `Ok(None)` ⇒ pinning OFF (env unset
 /// or empty), so callers leave the pre-#1678 client path byte-identical.
-pub fn peer_fingerprint_map_from_env() -> Result<Option<HashMap<String, HashSet<[u8; 32]>>>> {
+pub fn peer_fingerprint_map_from_env() -> Result<Option<PinnedFingerprints>> {
     let Some(raw) = std::env::var_os(FED_PEER_FINGERPRINTS_ENV) else {
         return Ok(None);
     };
@@ -939,13 +1042,13 @@ pub enum UnpinnedHostPolicy {
 /// handshake. (#1678 — 5-agent vote 4d3ea1c5.)
 #[derive(Debug)]
 pub struct FingerprintPinServerVerifier {
-    pins: HashMap<String, HashSet<[u8; 32]>>,
+    pins: PinnedFingerprints,
     unpinned: UnpinnedHostPolicy,
 }
 
 impl FingerprintPinServerVerifier {
     #[must_use]
-    pub fn new(pins: HashMap<String, HashSet<[u8; 32]>>, unpinned: UnpinnedHostPolicy) -> Self {
+    pub fn new(pins: PinnedFingerprints, unpinned: UnpinnedHostPolicy) -> Self {
         Self { pins, unpinned }
     }
 }
@@ -1028,7 +1131,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintPinServerVerifier
 /// pinning the fingerprint replaces CA trust for pinned hosts, and unpinned
 /// hosts are refused regardless of CA.
 pub fn build_rustls_pinning_client_config(
-    pins: HashMap<String, HashSet<[u8; 32]>>,
+    pins: PinnedFingerprints,
     client_cert_path: Option<&Path>,
     client_key_path: Option<&Path>,
 ) -> Result<rustls::ClientConfig> {
@@ -1820,14 +1923,14 @@ mod tests {
     }
 
     /// Build a single-host pin map: `host` → SHA-256(`cert_bytes`).
-    fn pin_map(host: &str, cert_bytes: &[u8]) -> HashMap<String, HashSet<[u8; 32]>> {
+    fn pin_map(host: &str, cert_bytes: &[u8]) -> PinnedFingerprints {
         use sha2::{Digest, Sha256};
         let fp: [u8; 32] = Sha256::digest(cert_bytes).into();
         let mut set = HashSet::new();
         set.insert(fp);
         let mut map = HashMap::new();
         map.insert(normalize_host_key(host), set);
-        map
+        PinnedFingerprints::try_from_map(map).expect("one host, one pin")
     }
 
     #[test]
@@ -1906,8 +2009,10 @@ mod tests {
     fn pin_verifier_signature_methods_are_not_stubbed() {
         use rustls::client::danger::ServerCertVerifier;
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let verifier =
-            FingerprintPinServerVerifier::new(HashMap::new(), UnpinnedHostPolicy::Reject);
+        let verifier = FingerprintPinServerVerifier::new(
+            pin_map("peer.example", b"some other cert"),
+            UnpinnedHostPolicy::Reject,
+        );
         assert!(!verifier.supported_verify_schemes().is_empty());
         let cert = rustls::pki_types::CertificateDer::from(vec![0u8; 32]);
         let dss = bogus_dss();
@@ -1958,14 +2063,15 @@ mod tests {
         );
         let tmp = write_tmp(&body);
         let map = load_peer_fingerprint_map(tmp.path()).unwrap();
-        assert_eq!(map.len(), 2, "two distinct hosts");
+        assert_eq!(map.host_count(), 2, "two distinct hosts");
+        assert_eq!(map.pin_count(), 3, "three pins in all");
         assert_eq!(
-            map["peer-one.example"].len(),
-            2,
+            map.get("peer-one.example").map(HashSet::len),
+            Some(2),
             "host one has two pinned fps"
         );
         assert!(
-            map.contains_key("peer-two.example"),
+            map.get("peer-two.example").is_some(),
             "host key is lowercased"
         );
     }
@@ -2015,11 +2121,12 @@ mod tests {
     #[test]
     fn peer_fingerprint_loader_degenerate_table_9954() {
         use pin_file_cases::{
-            Expect, OVERSIZE_100K_BYTES, OVERSIZE_REFUSAL_CEILING, build_cases, loader_verdict,
+            CASE_ROWS, Expect, OVERSIZE_100K_BYTES, OVERSIZE_REFUSAL_CEILING, build_cases,
+            loader_verdict,
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let cases = build_cases(dir.path());
-        assert!(cases.len() >= 25, "table shrank: {} rows", cases.len());
+        assert_eq!(cases.len(), CASE_ROWS, "pin-file table row count");
         let mut wrong = Vec::new();
         for case in &cases {
             let started = std::time::Instant::now();
@@ -2040,6 +2147,26 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "loader rows wrong:\n{}", wrong.join("\n"));
+    }
+
+    /// #9954 — `PinnedFingerprints` cannot hold an empty pin set (CBC-03):
+    /// both empty shapes are refused with their exact reason.
+    #[test]
+    fn pinned_fingerprints_refuses_empty_shapes_9954() {
+        let empty = PinnedFingerprints::try_from_map(HashMap::new()).map(|_| ());
+        assert_eq!(
+            empty.map_err(|e| format!("{e:#}")),
+            Err("peer fingerprint file pin set is empty".to_string())
+        );
+        let hollow = PinnedFingerprints::try_from_map(HashMap::from([(
+            "peer.example".to_string(),
+            HashSet::new(),
+        )]))
+        .map(|_| ());
+        assert_eq!(
+            hollow.map_err(|e| format!("{e:#}")),
+            Err("peer fingerprint file host `peer.example` has no pinned fingerprint".to_string())
+        );
     }
 
     #[test]

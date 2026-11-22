@@ -177,9 +177,7 @@ fn inbound_configured() -> Result<bool> {
     let fingerprints = crate::tls::peer_fingerprint_map_from_env()?;
     let bindings = crate::tls::cert_peer_binding_map_from_env()?;
     let trust = super::identity::trust_bundle::TrustBundle::load_from_env()?;
-    Ok(fingerprints.is_some_and(|m| !m.is_empty())
-        || bindings.is_some_and(|m| !m.is_empty())
-        || !trust.is_empty())
+    Ok(fingerprints.is_some() || bindings.is_some_and(|m| !m.is_empty()) || !trust.is_empty())
 }
 
 /// Observe this process's configuration. `None` means argv is unavailable,

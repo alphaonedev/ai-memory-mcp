@@ -7,6 +7,48 @@
 //! Split out of `enterprise_federation_posture.rs` under the QUAL-10
 //! submodule-over-bump rule (the `synchronous` / `backup_signing`
 //! precedent).
+//!
+//! The row passes only when the file parses, through the SAME resolver the
+//! runtime verifier uses (`tls::peer_fingerprint_map_from_env`), to the
+//! typed non-empty [`crate::tls::PinnedFingerprints`]. A refusal names the
+//! runtime's own reason, so doctor and runtime cannot disagree.
+
+use super::{PostureCheck, check};
+use crate::tls::FED_PEER_FINGERPRINTS_ENV;
+
+const REQUIRED: &str = "<set> to a peer server-cert pin file that parses (non-empty `<host> \
+                        <sha256-hex>` lines)";
+const REMEDIATION: &str =
+    "set AI_MEMORY_FED_PEER_FINGERPRINTS to a `<host> <sha256-hex>` pin file (#1678)";
+const ACTUAL_UNSET: &str = "(unset)";
+
+/// Check #10 — `AI_MEMORY_FED_PEER_FINGERPRINTS` names a pin file whose
+/// content the runtime accepts (#9954).
+pub(super) fn check_peer_fingerprints() -> PostureCheck {
+    let (actual, pass) = match crate::tls::peer_fingerprint_map_from_env() {
+        Ok(Some(pins)) => {
+            let path = std::env::var_os(FED_PEER_FINGERPRINTS_ENV).unwrap_or_default();
+            (
+                format!(
+                    "{}: {} host(s), {} pin(s)",
+                    std::path::Path::new(&path).display(),
+                    pins.host_count(),
+                    pins.pin_count()
+                ),
+                true,
+            )
+        }
+        Ok(None) => (ACTUAL_UNSET.to_string(), false),
+        Err(e) => (format!("{e:#}"), false),
+    };
+    check(
+        FED_PEER_FINGERPRINTS_ENV,
+        REQUIRED,
+        actual,
+        pass,
+        REMEDIATION,
+    )
+}
 
 #[cfg(all(test, unix))]
 mod tests {

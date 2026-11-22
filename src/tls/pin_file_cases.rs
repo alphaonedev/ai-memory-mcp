@@ -27,6 +27,10 @@ pub(crate) const OVERSIZE_100K_BYTES: usize = 128 * 1024;
 /// Wall-clock ceiling for refusing the 100K+ input.
 pub(crate) const OVERSIZE_REFUSAL_CEILING: Duration = Duration::from_secs(2);
 
+/// Rows [`build_cases`] builds: 4 accepted forms and 20 refused forms. A
+/// table that loses a row fails the loader test instead of passing smaller.
+pub(crate) const CASE_ROWS: usize = 24;
+
 /// The reason text of a deadline miss.
 pub(crate) const DEADLINE_MISS: &str = "loader did not return within the row deadline";
 

@@ -470,7 +470,7 @@ impl FederationConfig {
         if let Some(pins) = crate::tls::peer_fingerprint_map_from_env()? {
             tracing::info!(
                 target: FED_LOG_TARGET,
-                pinned_hosts = pins.len(),
+                pinned_hosts = pins.host_count(),
                 "outbound federation TLS: server-cert PINNING active, fail-closed for \
                  unpinned peers (#1678)"
             );

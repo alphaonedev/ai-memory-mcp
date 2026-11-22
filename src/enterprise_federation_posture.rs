@@ -450,22 +450,7 @@ pub fn evaluate_with_live(
     ));
 
     // ---- 10. AI_MEMORY_FED_PEER_FINGERPRINTS=<set> -----------------
-    let fp_path = std::env::var(crate::tls::FED_PEER_FINGERPRINTS_ENV).unwrap_or_default();
-    let fp_set = !fp_path.trim().is_empty();
-    let fp_readable = fp_set && std::path::Path::new(fp_path.trim()).is_file();
-    out.push(check(
-        crate::tls::FED_PEER_FINGERPRINTS_ENV,
-        "<set> to a readable peer server-cert pin file",
-        if !fp_set {
-            "(unset)".to_string()
-        } else if fp_readable {
-            fp_path.clone()
-        } else {
-            format!("{fp_path} (not a readable file)")
-        },
-        fp_readable,
-        "set AI_MEMORY_FED_PEER_FINGERPRINTS to a `<host> <sha256-hex>` pin file (#1678)",
-    ));
+    out.push(peer_pins::check_peer_fingerprints());
 
     // ---- 11 + 12. AI_MEMORY_FED_PEER_ATTESTATION -------------------
     let attestation_raw = std::env::var(PEER_ATTESTATION_ENV).unwrap_or_default();
