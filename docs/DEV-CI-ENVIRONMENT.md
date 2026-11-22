@@ -465,6 +465,49 @@ file (mode 0600) as the source of truth and set the role from it, with no value 
    remove it.
 Rotating the password itself means writing the new URL file first (0600), then step 2.
 
+### macOS tier supervision (#9853)
+**Why.** The macOS native tier above is one `postgres -D <pg-age-stack>/pgdata` process on port 5445. When its
+supervisor is a launchd agent of the GUI login domain, it stops with the login session: on 2026-11-21 a WindowServer
+crash ended the session, launchd terminated the agent, and every macOS enterprise-fed leg failed or hung. Without a login
+session neither the `gui/<uid>` nor the `user/<uid>` domain accepts a bootstrap. The only launchd domain that exists
+without a login is the system domain, which needs root.
+
+**The tool.** `scripts/ci/tier_daemon_installer.py` prepares that system daemon. Every host value is an argument:
+`--postgres-bin`, `--data-dir`, `--account`, `--label` and `--port`. Each is checked before use. A path must be absolute, in
+normal form, exist and not be a symlink. The binary must be an executable regular file, not writable by group or others.
+The data directory must be owned by `--account` and not group or world writable. The account must not be `root`, uid 0
+or primary gid 0. Each refusal prints one `tier-daemon-installer: refused: ...` line and exits non-zero. The plist runs
+the binary as an argument list (`postgres -D <data dir> -p <port>`, no shell) under `UserName`/`GroupName` of that
+account, with `RunAtLoad`, `KeepAlive` and `ExitTimeOut` 60.
+
+**Dry run (the default).** With no `--install` and no `--remove`, the tool changes nothing. The only commands it runs
+are the read-only `launchctl print system/<label>` and `ps -p <pid>` for the pid in `postmaster.pid`. It prints:
+- the account;
+- the plist target state (absent, identical bytes, or different bytes with sizes and digests, never the content);
+- whether the service is loaded and the postmaster state;
+- the full plist;
+- the install commands in order, the hand-over order and the removal commands;
+- the verdict install and remove would reach now.
+
+**Install needs the operator's word.** `--install` and `--remove` refuse unless the effective uid is 0, and print the
+`sudo` command to run; the tool never calls sudo. `--install` behaves as follows:
+- different bytes at `/Library/LaunchDaemons/<label>.plist` refuse and change nothing;
+- identical bytes with the service loaded are a no-op, exit 0;
+- a postmaster alive on the data directory refuses unless `--handover` is given. With it, the tool waits up to 300 s
+  for that pid to exit (it never signals a process) and refuses if a new postmaster holds the directory;
+- otherwise it writes the plist atomically (temp file in the same directory, fsync, then a link that fails if the
+  target appeared), mode 0644, owner root:wheel. Then it runs `launchctl bootstrap system <plist>` and checks that
+  127.0.0.1:`<port>` answers within 60 s;
+- a failure after the write prints the state it re-read and the removal commands. It undoes nothing on its own.
+
+The hand-over order is:
+1. stop the interim supervisor;
+2. stop the running postmaster cleanly with `pg_ctl -D <data dir> stop -m fast` as the account;
+3. run `--install --handover`.
+
+**Removal.** `--remove` is the inverse: `launchctl bootout system/<label>`, then removes the plist. It refuses a plist
+whose bytes it would not have written and is a no-op when the plist is absent and the service is not loaded.
+
 ### Self-hosted runners
 ```bash
 gh api repos/alphaonedev/ai-memory-mcp/actions/runners --jq '.runners[]|"\(.name) [\(.status)]"'
