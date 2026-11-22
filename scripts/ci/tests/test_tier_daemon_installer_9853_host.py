@@ -18,6 +18,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -48,6 +49,9 @@ OTHER_BYTES = b"<plist>someone else's</plist>\n"
 PIDFILE_NAME = "postmaster.pid"
 PIDFILE_CAP = 4096
 SWAPPED_PIDFILE = b"9999\n"
+# A pidfile read that has not returned within this many seconds blocked in its open.
+FIFO_OPEN_DEADLINE_SECONDS = 5
+FIFO_BLOCKED = f"read_data_dir did not return within {FIFO_OPEN_DEADLINE_SECONDS} s on a FIFO pidfile with no writer"
 CHILD_ENV_EXPECTED = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
 SPAWN_KWARGS_EXPECTED = {
     "capture_output": True,
@@ -256,10 +260,28 @@ class ReadDataDirTests(Scratch):
 
     def test_a_fifo_pidfile_is_refused_without_blocking(self) -> None:
         data = self.data_dir(pidfile=None)
-        os.mkfifo(data / PIDFILE_NAME)
-        with self.assertRaises(tdi.HostError) as caught:
-            tdi.HostRunner(False).read_data_dir(str(data), PIDFILE_NAME, PIDFILE_CAP)
-        self.assertEqual(str(caught.exception), f"open {data}/{PIDFILE_NAME}: not a regular file")
+        fifo = data / PIDFILE_NAME
+        os.mkfifo(fifo)
+        outcome: list[object] = []
+
+        def read() -> None:
+            try:
+                outcome.append(tdi.HostRunner(False).read_data_dir(str(data), PIDFILE_NAME, PIDFILE_CAP))
+            except tdi.HostError as exc:
+                outcome.append(exc)
+
+        worker = threading.Thread(target=read, daemon=True)
+        worker.start()
+        worker.join(FIFO_OPEN_DEADLINE_SECONDS)
+        blocked = worker.is_alive()
+        if blocked:
+            # Release the blocked open: a writer end opened without blocking lets the reader's open return.
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            worker.join(FIFO_OPEN_DEADLINE_SECONDS)
+        self.assertFalse(blocked, FIFO_BLOCKED)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], tdi.HostError)
+        self.assertEqual(str(outcome[0]), f"open {data}/{PIDFILE_NAME}: not a regular file")
 
     def test_absent_directory_absent_pidfile_and_the_cap(self) -> None:
         runner = tdi.HostRunner(False)
