@@ -2982,9 +2982,12 @@ class JobBoundaryClear9820(Base):
         os.mkfifo(self.runner / live_name)
         os.mkfifo(self.runner / f"dotnet-diagnostic-{dead.pid}-2-socket")
         self.make_file(f"dotnet-diagnostic-{os.getpid()}-3-socket", 0)  # a regular file is never kept
+        # pid 0 (kill reaches the process group) and pid 1 (init answers EPERM) are below MIN_ENDPOINT_PID
+        for floor_pid in (0, 1):
+            os.mkfifo(self.runner / f"clr-debug-pipe-{floor_pid}-4-in")
         rc, out, err = self.run_prune(self.runner, "--mode", "job-end")
         self.assertEqual((rc, err), (EXIT_OK, ""))
-        self.assertRegex(out, r"^pruned=2 kept=1 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertRegex(out, r"^pruned=4 kept=1 failed=0 freed_bytes=\d+ skipped=0\n$")
         self.assertEqual(self.names(), [live_name])
 
     def test_job_end_removes_an_entry_touched_a_moment_ago_and_one_dated_in_the_future(self):
