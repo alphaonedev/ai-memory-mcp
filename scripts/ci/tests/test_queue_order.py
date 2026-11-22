@@ -83,6 +83,9 @@ class FakeGh:
                    a change between the listing and the cancel.
     later_jobs[id] jobs used from the SECOND run_jobs call of that run on.
     async_cancel   a cancel lands only at tick(), as GitHub's cancel is asynchronous.
+    start_at_cancel  runs whose job starts inside the window between the last re-read and the
+                   cancel call: the run is picked up first, then the cancel is accepted and lands at tick().
+    fail_after_cancel  failures that begin once a cancel call was accepted (the re-read after it).
     """
 
     def __init__(self) -> None:
@@ -99,6 +102,8 @@ class FakeGh:
         self.later_run: dict[int, dict | None] = {}
         self.later_jobs: dict[int, list] = {}
         self.jobs_calls: dict[int, int] = {}
+        self.start_at_cancel: set[int] = set()
+        self.fail_after_cancel: dict[str, object] = {}
         self.on_list = None
         self.list_calls = 0
 
@@ -172,6 +177,12 @@ class FakeGh:
     def cancel(self, run_id: int) -> None:
         self._maybe_fail("cancel")
         self.cancels.append(run_id)
+        self.fail.update(self.fail_after_cancel)
+        if run_id in self.start_at_cancel:
+            self.runs[run_id]["status"] = "in_progress"
+            self.jobs[run_id] = [{"status": "in_progress", "labels": ["self-hosted", "linux-fed"]}]
+            self.pending_cancels.append(run_id)
+            return
         if self.async_cancel:
             self.pending_cancels.append(run_id)
             return
@@ -665,6 +676,79 @@ class RecordTable(TestBase):
         self.assertEqual(code, qo.EXIT_GH)
         self.assertIn("queue_order: refused: gh call failed: cancel run 4: HTTP 500 (server error)", err)
         self.assertEqual(set(recorded(self.state)), {3, 4})  # recorded before the cancel that failed
+
+
+class CancelWindow(TestBase):
+    """G (9860): the check-then-cancel window.  GitHub has no conditional cancel, so a job can start between the
+    re-read and the call; the re-read after the call finds it and the record restarts the run exactly once.
+    Every interleaving is driven by the fake gh (no sleep); reasons are exact."""
+
+    def test_interleavings(self) -> None:
+        # (name, setup of run 3, expected line, cancel sent?, recorded phase or None)
+        rows = (
+            ("start before the re-read", lambda gh: gh.later_jobs.update({3: [{"status": "in_progress", "labels": ["self-hosted", "linux-fed"]}]}),
+             "left alone run 3: a job has started", False, None),
+            ("start between re-read and cancel", lambda gh: gh.start_at_cancel.add(3), "cancelled run 3: cancel raced a start", True, "CANCELLING"),
+            ("no start", lambda gh: None, "cancelled run 3", True, "CANCELLED"),
+            ("no start, the cancel lands later", lambda gh: setattr(gh, "async_cancel", True), "cancelled run 3: cancel pending", True, "CANCELLING"),
+        )
+        for pos, (name, setup, line, sent, phase) in enumerate(rows):
+            with self.subTest(row=name):
+                gh = self.queue(3)
+                setup(gh)
+                state = Path(self._tmp.name) / ("w%d.json" % pos)
+                code, lines, err = call(gh, state, "--execute")
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn(line, lines)
+                self.assertEqual(gh.cancels, [3] if sent else [])
+                got = recorded(state)
+                self.assertEqual(got[3].phase if 3 in got else None, None if phase is None else qo.Phase[phase])
+
+    def test_raced_run_restarts_exactly_once(self) -> None:
+        gh = self.queue(3)
+        gh.start_at_cancel.add(3)
+        call(gh, self.state, "--execute")
+        code, lines, _ = call(gh, self.state, "--execute")  # the run is running and the cancel has not landed
+        self.assertEqual(code, 0)
+        self.assertIn("record kept run 3: cancel raced a start", lines)
+        self.assertEqual((gh.cancels, gh.reruns), ([3], []))
+        gh.tick()
+        finish(gh, 1, 2)
+        _, lines, _ = call(gh, self.state, "--execute")
+        self.assertIn("started run 3", lines)
+        self.assertEqual(gh.reruns, [3])
+        self.assertIs(recorded(self.state)[3].phase, qo.Phase.RESTARTED)
+        for _ in range(3):
+            call(gh, self.state, "--execute")
+        self.assertEqual((gh.cancels, gh.reruns), ([3], [3]))
+
+    def test_re_read_after_the_cancel_fails(self) -> None:
+        gh = self.queue(3)
+        gh.fail_after_cancel["get_run"] = gh_error(500)
+        code, lines, err = call(gh, self.state, "--execute")
+        self.assertEqual(code, qo.EXIT_GH)
+        self.assertIn("cancelled run 3: cancel not confirmed", lines)
+        self.assertIn("queue_order: refused: gh call failed: run 3: HTTP 500 (server error)", err)
+        self.assertIs(recorded(self.state)[3].phase, qo.Phase.CANCELLING)
+
+    def test_judge_rows_of_an_unconfirmed_cancel(self) -> None:
+        open_pr = qo.PrFacts(True, SHA_A, False, False)
+        rows = (
+            # (name, live run status, conclusion, newer run, disposition, reason)
+            ("cancel not landed", "queued", None, None, "PENDING", "cancel pending"),
+            ("cancel raced a start", "in_progress", None, None, "PENDING", "cancel raced a start"),
+            ("raced run finished", "completed", "success", None, "DROP", "finished (conclusion success)"),
+            ("cancel landed", "completed", "cancelled", None, "RESTARTABLE", ""),
+            ("cancel landed, newer run", "completed", "cancelled", 9, "DROP", "newer run of pr 3 exists: run 9"),
+        )
+        scope = qo.Scope(("CI",), REPO)
+        for name, status, conclusion, newer, kind, reason in rows:
+            with self.subTest(row=name):
+                gh = FakeGh()
+                gh.add_run(3, pr=3, minutes=3, status=status, conclusion=conclusion)
+                entry = qo.BoundEntry(3, 3, SHA_A, 1, qo.Phase.CANCELLING, 0)
+                got = qo.judge(entry, gh.runs[3], scope, lambda _n: open_pr, lambda _e, _name, newer=newer: newer)
+                self.assertEqual((got.kind, got.reason), (qo.Disposition[kind], reason))
 
 
 class AgingBound(TestBase):
