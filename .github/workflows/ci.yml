@@ -1675,9 +1675,9 @@ jobs:
       # a maintenance connection to issue CREATE/DROP DATABASE. Fail-closed:
       # a missing URL file or a failed CREATE reds the leg.
       - name: Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)
-        if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         # #9852 - its own bound, so a hung database call names this step, not the job limit.
         timeout-minutes: 10
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
           # matrix.leg via env (never inlined into the script body) so the
@@ -1779,9 +1779,9 @@ jobs:
       # this leg is the one that has AI_MEMORY_TEST_POSTGRES_URL (minted above). The flag turns a missing
       # URL or psql into a failure instead of a silent skip.
       - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
-        if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         # #9852 - its own bound, so a hung cell names this step, not the job limit.
         timeout-minutes: 10
+        if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
         shell: bash
         env:
           AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
@@ -2513,12 +2513,13 @@ jobs:
             # each log rb from its own offset (O_NONBLOCK, regular files only, at most CHUNK_BYTES per read and
             # LIVE_CHUNKS reads per log per poll), prints every complete line once as "[shard] line" through
             # workflow_annotation.log_line (no line break, leading :: or ##[ of a log line reaches the runner), in
-            # PIECE_CHARS pieces, and holds an unterminated tail up to HOLD_BYTES. On SIGTERM it reads every log to its end,
-            # prints the held tails and exits 0. A follower that ends early is reported on stderr and never changes the step
-            # result: the shard-logs artifact holds every line.
+            # PIECE_CHARS pieces, and holds an unterminated tail up to HOLD_BYTES. Once the stop file (its first argument)
+            # exists, or the shell that started it is gone, it reads every log to its end, prints the held tails and exits 0.
+            # A follower that ends early is reported on stderr and never changes the step result: the shard-logs artifact
+            # holds every line.
             python3 -I -c 'if True:
                 # [#9852] live shard output: each complete line of each shard log, prefixed and escaped, as it is written
-                import os, signal, stat, sys, time
+                import os, stat, sys, time
                 sys.path.insert(0, "scripts/ci")
                 import workflow_annotation as wa
                 POLL_SECS = 5  # seconds between two reads of the logs
@@ -2527,10 +2528,11 @@ jobs:
                 LIVE_CHUNKS = 16  # reads per log per poll while the shards run (no limit on the final read)
                 PIECE_CHARS = 4096  # characters per printed piece of a long line
                 HOLD_BYTES = 65536  # an unterminated tail longer than this is printed as it is
-                stop = []
-                signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
+                stop_path, parent = sys.argv[1], os.getppid()
+                def stopped():
+                    return os.path.lexists(stop_path) or os.getppid() != parent
                 sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
-                paths = sys.argv[1:]
+                paths = sys.argv[2:]
                 names = [os.path.basename(path)[:-len(".log")] for path in paths]
                 offsets = [0] * len(paths)
                 held = [b""] * len(paths)
@@ -2564,15 +2566,15 @@ jobs:
                                 held[index] = b""
                             if len(data) < CHUNK_BYTES or (not final and reads >= LIVE_CHUNKS):
                                 break
-                while not stop:
+                while not stopped():
                     poll(False)
                     deadline = time.monotonic() + POLL_SECS
-                    while not stop and time.monotonic() < deadline:
+                    while not stopped() and time.monotonic() < deadline:
                         time.sleep(SLICE_SECS)
                 poll(True)
                 for index, name in enumerate(names):
                     if held[index]:
-                        emit(name, held[index])' "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" &
+                        emit(name, held[index])' "$sd/follow.stop" "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" &
             fl=$!
             # Wait on each PID separately: a bare `wait` discards the exit codes.
             wait "$pid_s" || rc_s=$?
@@ -2580,7 +2582,7 @@ jobs:
             wait "$pid_2" || rc_2=$?
             kill "$hb" 2>/dev/null || true
             wait "$hb" 2>/dev/null || true
-            kill "$fl" 2>/dev/null || true
+            touch "$sd/follow.stop" 2>/dev/null || kill "$fl" 2>/dev/null || true
             wait "$fl" || { echo "[#9852] live shard output ended early: python3 exited $?; the shard-logs artifact holds every line" >&2 || true; }
             echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}"
             for n in "$rc_s" "$rc_1" "$rc_2"; do

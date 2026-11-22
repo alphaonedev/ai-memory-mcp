@@ -12,7 +12,7 @@ shard exited, so the job log held nothing of the shards, and nothing named the s
    bound, so each named watchdog fires before the step bound does.
 2. The shard logs reach the job log while the shards run: one python3 follower started after the three shard
    launches prints every complete line once, prefixed with the shard name, through workflow_annotation.log_line,
-   and is stopped and reaped after the waits; the old print-after-exit loop is gone, so no line is printed twice.
+   and is stopped (a stop file, or its parent shell gone) and reaped after the waits; the old print-after-exit loop is gone, so no line is printed twice.
 3. The three upload steps run after a failed, timed-out or cancelled test step (`always()` plus their conditions).
 
 Siblings bounded in the same job: the prebuild, enterprise-fed configure and live-cell steps (SIBLING_BOUNDS).
@@ -22,7 +22,6 @@ Set WORKFLOW_UNDER_TEST to check another copy of ci.yml (the mutation runs of th
 """
 import os
 import re
-import signal
 import subprocess
 import sys
 import tempfile
@@ -68,9 +67,9 @@ EXPECTED_UPLOAD_IFS = {
 # The live follower in run_sharded (invariant 2).
 FOLLOWER_MARKER = "[#9852] live shard output"
 FOLLOWER_OPEN = "python3 -I -c 'if True:"
-FOLLOWER_ARGS_LINE = "' \"$sd/serial.log\" \"$sd/parallel_1.log\" \"$sd/parallel_2.log\" &"
+FOLLOWER_ARGS_LINE = "' \"$sd/follow.stop\" \"$sd/serial.log\" \"$sd/parallel_1.log\" \"$sd/parallel_2.log\" &"
 FOLLOWER_PID_LINE = "fl=$!"
-FOLLOWER_KILL_LINE = 'kill "$fl" 2>/dev/null || true'
+FOLLOWER_KILL_LINE = 'touch "$sd/follow.stop" 2>/dev/null || kill "$fl" 2>/dev/null || true'
 FOLLOWER_WAIT_LINE = ('wait "$fl" || { echo "[#9852] live shard output ended early: python3 exited $?;'
                       ' the shard-logs artifact holds every line" >&2 || true; }')
 LAST_LAUNCH_LINE = "pid_2=$!"
@@ -85,6 +84,29 @@ SEEN_DEADLINE_SECS = 30.0
 STOP_DEADLINE_SECS = 30.0
 POLL_SLEEP_SECS = 0.05
 LONG_LINE_CHARS = 9000
+
+
+# Starts the follower program (argv[3]) with the rest of argv, writes its PID to argv[2], waits until the follower
+# has printed into argv[1] (so it has read its parent PID) and exits without waiting for it.
+ORPHAN_LAUNCHER = ("import pathlib, subprocess, sys, time\n"
+                   "child = subprocess.Popen([sys.executable, '-I', '-c'] + sys.argv[3:])\n"
+                   "pathlib.Path(sys.argv[2]).write_text(str(child.pid))\n"
+                   "deadline = time.monotonic() + 30\n"
+                   "while not pathlib.Path(sys.argv[1]).read_bytes() and time.monotonic() < deadline:\n"
+                   "    time.sleep(0.05)\n")
+
+
+def process_alive(pid):
+    """True while `pid` runs; a zombie (exited, not yet reaped by its new parent) counts as ended."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat_path = Path("/proc/%d/stat" % pid)
+    try:
+        return stat_path.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
 
 
 def read_text():
@@ -222,14 +244,22 @@ class FollowerBehaviourTests(unittest.TestCase):
         self.program, _, _ = follower_program(run_sharded_lines())
 
     def start(self):
-        paths = [str(self.dir / ("%s.log" % name)) for name in SHARD_NAMES]
         self.out_path = self.dir / "out.txt"
         self.out = open(self.out_path, "wb")
         self.addCleanup(self.out.close)
-        proc = subprocess.Popen([sys.executable, "-I", "-c", self.program] + paths, cwd=REPO, stdout=self.out,
-                                stderr=subprocess.PIPE)
+        proc = subprocess.Popen([sys.executable, "-I", "-c", self.program] + self.args(), cwd=REPO,
+                                stdout=self.out, stderr=subprocess.PIPE)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         return proc
+
+    def args(self):
+        self.stop_path = self.dir / "follow.stop"
+        return [str(self.stop_path)] + [str(self.dir / ("%s.log" % name)) for name in SHARD_NAMES]
+
+    def stop(self, proc):
+        self.stop_path.touch()
+        _, err = proc.communicate(timeout=STOP_DEADLINE_SECS)
+        return proc.returncode, err
 
     def output(self):
         return self.out_path.read_bytes().decode("utf-8").split("\n")
@@ -252,9 +282,7 @@ class FollowerBehaviourTests(unittest.TestCase):
             log.write(b"second\ncr\rinside\nno-line-feed")
         self.wait_for("[serial] second", proc)
         (self.dir / "parallel_1.log").write_bytes(b"late\n")
-        proc.send_signal(signal.SIGTERM)
-        _, err = proc.communicate(timeout=STOP_DEADLINE_SECS)
-        self.assertEqual((proc.returncode, err), (0, b""))
+        self.assertEqual(self.stop(proc), (0, b""))
         lines = self.output()
         self.assertEqual(lines[-1], "", "the output ends with a line feed")
         by_shard = {name: [line for line in lines if line.startswith("[%s] " % name)] for name in SHARD_NAMES}
@@ -273,9 +301,27 @@ class FollowerBehaviourTests(unittest.TestCase):
         (self.dir / "parallel_1.log").write_bytes(b"only\n")
         proc = self.start()
         self.wait_for("[parallel_1] only", proc)
-        proc.send_signal(signal.SIGTERM)
-        _, err = proc.communicate(timeout=STOP_DEADLINE_SECS)
-        self.assertEqual((proc.returncode, err, self.output()), (0, b"", ["[parallel_1] only", ""]))
+        self.assertEqual(self.stop(proc) + (self.output(),), (0, b"", ["[parallel_1] only", ""]))
+
+    def test_a_follower_whose_parent_is_gone_drains_and_exits(self):
+        # The follower's parent exits at once and no stop file is ever written: the follower still prints and ends,
+        # so a shell killed between the launch and the stop never leaves it running.
+        (self.dir / "serial.log").write_bytes(b"orphan\n")
+        self.out_path = self.dir / "out.txt"
+        pid_path = self.dir / "pid.txt"
+        with open(self.out_path, "wb") as out:
+            subprocess.run([sys.executable, "-I", "-c", ORPHAN_LAUNCHER, str(self.out_path), str(pid_path),
+                            self.program] + self.args(), cwd=REPO, stdout=out, check=True,
+                           timeout=STOP_DEADLINE_SECS)
+        pid = int(pid_path.read_text())
+        deadline = time.monotonic() + STOP_DEADLINE_SECS
+        while process_alive(pid):
+            if time.monotonic() > deadline:
+                os.kill(pid, 9)
+                self.fail("the orphaned follower %d was still running after %ss" % (pid, STOP_DEADLINE_SECS))
+            time.sleep(POLL_SLEEP_SECS)
+        self.assertEqual(self.output(), ["[serial] orphan", ""])
+        self.assertFalse(self.stop_path.exists())
 
 
 if __name__ == "__main__":
