@@ -644,17 +644,20 @@ class RealManifestCheckOnCi(unittest.TestCase):
 
 class WholeSuite(unittest.TestCase):
     """Ruling b29 cdfe800f: one named ceiling for the sum of the full-suite invocations, and that ceiling plus
-    the same margin fits the timeout of the enclosing job as ci.yml states it."""
+    the same margin fits the test step deadline of the enclosing job (its ci.yml timeout minus the post-step
+    margin, #9852)."""
 
     def setUp(self):
         self.sb = load()
 
     def test_named_ceiling_fits_every_sqlite_leg_of_the_real_workflow(self):
         self.assertEqual(self.sb.WHOLE_SUITE_CEILING_SECS, CEILING)
-        for node, minutes in (("ubuntu-latest", 95), ("macos-fed", 80)):
+        # leg -> (job timeout, test step deadline), minutes, written out (#9852).
+        for node, minutes, deadline in (("ubuntu-latest", 95, 83), ("macos-fed", 87, 75)):
             with self.subTest(node=node):
-                secs = self.sb.job_timeout_secs(CI, "check", node, "sqlite")
-                self.assertEqual(secs, minutes * 60)
+                self.assertEqual(self.sb.job_timeout_secs(CI, "check", node, "sqlite"), minutes * 60)
+                secs = self.sb.test_step_deadline_secs(CI, "check", node, "sqlite")
+                self.assertEqual(secs, deadline * 60)
                 self.assertLessEqual(CEILING, self.sb.margin_deadline(secs))
         # The four per-invocation budgets must not become a silent 8400 s suite.
         self.assertLess(CEILING, 4 * BUDGET)
@@ -713,22 +716,24 @@ class WholeSuite(unittest.TestCase):
                                         "--job", "check", "--node", "ubuntu-latest", "--tier", "sqlite"])
         self.assertEqual(rc, 0)
         self.assertEqual(out, "::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the "
-                              "95-minute timeout of job 'check' (node=ubuntu-latest tier=sqlite) with the required "
-                              "20 percent margin (at most 4560s)\n")
+                              "83-minute test step deadline of job 'check' (node=ubuntu-latest tier=sqlite; job "
+                              "limit minus the 12-min post-step margin) with the required 20 percent margin (at "
+                              "most 3984s)\n")
 
     def test_a_ceiling_that_cannot_fit_the_job_is_a_named_red_at_derivation(self):
         with scratch() as d:
-            rc, out, _ = self.plan(d, workflow(legs=(("ubuntu-latest", "sqlite", "74"),)))
+            rc, out, _ = self.plan(d, workflow(legs=(("ubuntu-latest", "sqlite", "86"),)))
             self.assertEqual(rc, 3)
             self.assertEqual(out, "::error::[#9229 margin] whole-suite plan refused: the 3600s whole-suite ceiling "
-                                  "(WHOLE_SUITE_CEILING_SECS) does not fit the 74-minute timeout of job 'check' "
-                                  "(node=ubuntu-latest tier=sqlite) with the required 20 percent margin (at most 3552s); "
+                                  "(WHOLE_SUITE_CEILING_SECS) does not fit the 74-minute test step deadline of job "
+                                  "'check' (node=ubuntu-latest tier=sqlite; job limit minus the 12-min post-step "
+                                  "margin) with the required 20 percent margin (at most 3552s); "
                                   + ISSUE_NOTE + "; cut the suite cost or shard it, do not raise the ceiling\n")
-            rc, _, _ = self.plan(d, workflow(legs=(("ubuntu-latest", "sqlite", "75"),)))
-            self.assertEqual(rc, 0)  # 75 min = 4500 s, 80 percent = 3600 s: the ceiling exactly fits
-            rc, out, _ = self.plan(d, workflow(job_timeout="80"))
+            rc, _, _ = self.plan(d, workflow(legs=(("ubuntu-latest", "sqlite", "87"),)))
+            self.assertEqual(rc, 0)  # 87 - 12 = 75 min = 4500 s, 80 percent = 3600 s: the ceiling exactly fits
+            rc, out, _ = self.plan(d, workflow(job_timeout="92"))
             self.assertEqual(rc, 0)  # a literal job timeout is read as it stands
-            self.assertIn("fits the 80-minute timeout of job 'check'", out)
+            self.assertIn("fits the 80-minute test step deadline of job 'check'", out)
 
     def test_absent_or_unreadable_job_timeout_is_named_never_a_pass(self):
         rows = (
@@ -906,7 +911,7 @@ class StepExec(unittest.TestCase):
             env.update({
                 "PATH": "%s:%s" % (bindir, env.get("PATH", "")),
                 "AI_MEMORY_NO_CONFIG": "1", "TIER": "sqlite", "CI_NODE": node,
-                "TEST_IMPACT": impact, "JOB_TIMEOUT_MIN": "95", "JOB_T0": str(FROZEN_EPOCH),
+                "TEST_IMPACT": impact, "TEST_STEP_DEADLINE_MIN": "83", "JOB_T0": str(FROZEN_EPOCH),
                 "RUNNER_TEMP": str(d), "GITHUB_ENV": str(d / "env"),
             })
             r = subprocess.run(["bash", str(script)], cwd=str(REPO), env=env, capture_output=True, text=True,
@@ -938,8 +943,8 @@ class StepExec(unittest.TestCase):
                                         "full suite shard 2/4: bins, integration tests and tested examples, part 1/2 10s, "
                                         "full suite shard 3/4: bins, integration tests and tested examples, part 2/2 10s, "
                                         "full suite shard 4/4: doc tests 10s")
-        self.assertIn("::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the 95-minute "
-                      "timeout of job 'check'", r.stdout)
+        self.assertIn("::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the 83-minute "
+                      "test step deadline of job 'check'", r.stdout)
         self.assertIn("::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 40s of the 3600s whole-suite "
                       "ceiling", r.stdout)
         self.assertLess(r.stdout.index("whole-suite plan"), r.stdout.index("'full suite shard 1/4"))

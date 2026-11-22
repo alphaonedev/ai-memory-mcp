@@ -10,15 +10,25 @@ the 300 min cap while the macos-fed and hosted caps are unchanged.
 Run: python3 -m unittest discover -s scripts/ci/tests
 Python 3.9+, standard library only (the workflow is read as text).
 """
+import importlib.util
+import os
 import re
 import sys
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-CI = (REPO / '.github' / 'workflows' / 'ci.yml').read_text()
+CI_PATH = Path(os.environ.get('WORKFLOW_UNDER_TEST') or REPO / '.github' / 'workflows' / 'ci.yml')
+CI = CI_PATH.read_text()
 sys.path.insert(0, str(REPO / 'scripts' / 'ci'))
 import host_semaphore  # noqa: E402
+
+_SPEC = importlib.util.spec_from_file_location('suite_budget_7914', str(REPO / 'scripts' / 'ci' / 'suite_budget.py'))
+suite_budget = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(suite_budget)
+
+# The leg's own `timeout:` key, anchored on its whole line so no other key ending in `timeout` matches (#9852).
+LEG_TIMEOUT_RE = r'- leg: (\S+)\n(?:(?!\n          - leg:).)*?\n            timeout: (\d+)\n'
 
 
 # Measured on the 4-runner linux-fed host (#7914 attempt-2 evidence comment, run
@@ -65,9 +75,11 @@ class SemaphoreWiring(unittest.TestCase):
         self.assertNotIn('linux-fed-tests', re.sub(r'--name linux-fed-tests', '', CI))
 
     def test_job_cap_covers_every_wait_plus_the_serial_shard_7928(self):
-        """The cap, the gate wait, the semaphore wait and the safety are read from the YAML text."""
-        caps = dict(re.findall(r'- leg: (\S+)\n(?:(?!\n          - leg:).)*?timeout: (\d+)\n', CI, re.S))
-        cap_secs = int(caps['linux-fed,enterprise-fed']) * 60
+        """The test step deadline (the one source, #9852), the gate wait, the semaphore wait and the safety."""
+        caps = dict(re.findall(LEG_TIMEOUT_RE, CI, re.S))
+        cap_secs = suite_budget.test_step_deadline_secs(CI, 'check', 'linux-fed', 'enterprise-fed')
+        self.assertEqual(cap_secs, int(caps['linux-fed,enterprise-fed']) * 60
+                         - suite_budget.POST_STEP_MARGIN_MIN * 60)
         gate = re.search(r'load_gate\.py[^\n]*--max-wait-secs (\d+)', CI)
         if gate is None:  # no flag in the workflow: the helper default applies
             gate = re.search(r"'--max-wait-secs', type=_non_negative_int, default=(\d+)",
@@ -85,20 +97,21 @@ class SemaphoreWiring(unittest.TestCase):
             slack, SERIAL_SHARD_SECS,
             'cap %d - gate %d - semaphore %d - compile %d - safety %d = %d < serial shard %d'
             % (cap_secs, gate_wait, semaphore_wait, COLD_COMPILE_SECS, safety_secs, slack, SERIAL_SHARD_SECS))
-        self.assertIn('cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 '
-                      '+ safety 300 + serial shard 7800 (= 17000 s)', CI)
+        self.assertIn('step deadline %d s (cap 18000 - post-step margin 720) >= load-gate wait 1200 '
+                      '+ semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)'
+                      % cap_secs, CI)
 
     def test_only_the_linux_fed_enterprise_leg_has_300(self):
-        rows = re.findall(r'- leg: (\S+)\n(?:(?!\n          - leg:).)*?timeout: (\d+)\n', CI, re.S)
+        rows = re.findall(LEG_TIMEOUT_RE, CI, re.S)
         caps = dict(rows)
         self.assertEqual(caps['linux-fed,enterprise-fed'], '300')
         self.assertEqual(caps['macos-fed,enterprise-fed'], '160')
-        self.assertEqual(caps['macos-fed,sqlite'], '80')
+        self.assertEqual(caps['macos-fed,sqlite'], '87')
         self.assertEqual(caps['ubuntu-latest,sqlite'], '95')
 
     def test_job_left_still_derives_from_job_t0(self):
         body = step_text('Run tests (impact-aware)')
-        self.assertIn('JOB_TIMEOUT_MIN * 60 - ($(date +%s) - JOB_T0)', body)
+        self.assertIn('TEST_STEP_DEADLINE_MIN * 60 - ($(date +%s) - JOB_T0)', body)
 
 
 if __name__ == '__main__':
