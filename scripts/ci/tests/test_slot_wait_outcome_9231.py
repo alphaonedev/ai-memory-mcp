@@ -1014,7 +1014,10 @@ class MainReadsEveryGithubText(unittest.TestCase):
         anchor = '            exec python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests'
         self.assertIn(anchor, text)
         mutant = text.replace(anchor, '            HOST_SEMAPHORE_MAX_WAIT_SECS=3600\n' + anchor, 1)
+        # #9879: the inserted line is also a statement inside the canonical prefix of the wrapper step
         self.assertEqual(self.run_check({'.github/workflows/ci.yml': mutant}), (1, [
+            'host_slots_check: workflows/ci.yml: job check: the wrapper step does not start with the canonical prefix '
+            '(statement 6 differs)',
             'host_slots_check: workflows/ci.yml: HOST_SEMAPHORE_MAX_WAIT_SECS is used other than as its env mapping key '
             'or a plain $ read; set it only in the one env mapping']))
 
@@ -1024,7 +1027,10 @@ class MainReadsEveryGithubText(unittest.TestCase):
         self.assertEqual(text.count(anchor), 1)
         mutant = text.replace(anchor, ' --max-wait-secs 600 --max-wait-secs 3600' + anchor[len(' --max-wait-secs 600'):])
         self.assertEqual(self.run_check({'.github/workflows/ci.yml': mutant}), (1, [
-            'host_slots_check: workflows/ci.yml: a host_semaphore.py call without exactly one --max-wait-secs']))
+            'host_slots_check: workflows/ci.yml: a host_semaphore.py call without exactly one --max-wait-secs',
+            # #9879: the exec line of the canonical prefix differs too
+            'host_slots_check: workflows/ci.yml: job check: the wrapper step does not start with the canonical prefix '
+            '(statement 6 differs)']))
 
 
 SCAN_W = 'workflows/w.yml'
