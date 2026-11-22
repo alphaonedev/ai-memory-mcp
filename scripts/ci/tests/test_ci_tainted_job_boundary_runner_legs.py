@@ -37,13 +37,6 @@ else:
     IMPORT_ERROR = ""
 
 RUNNER_ISSUE = 9455
-# The check job's `runs-on` (#9821), exactly as the classifier prints the one opaque leg.
-CHECK_FLIP_LEG = (
-    '["${{ fromJSON(github.event_name == \'pull_request\' && github.event.pull_request.draft == true'
-    " && contains(matrix.runner, 'self-hosted') && !contains(github.event.pull_request.labels.*.name, 'ci-fix')"
-    " && !contains(github.event.pull_request.labels.*.name, 'run-self-hosted')"
-    ' && \'[\\"ubuntu-latest\\"]\' || matrix.runner) }}"]'
-)
 SESSION_BOOT_WORKFLOW = "session-boot-lifetime.yml"
 SESSION_BOOT_JOB = "lifetime-tests"
 SESSION_BOOT_PERSISTENT_LEG = '["self-hosted","macos-fed"]'
@@ -72,12 +65,11 @@ class OpenLegRow(NamedTuple):
 # postgres jobs need a PG 18 + AGE + pgvector tier a hosted run reaches.
 OPEN_RUNNER_LEG_ROWS = (
     OpenLegRow("cert-postgres-age.yml", "cert-postgres-age", '["self-hosted","linux-fed"]', RUNNER_ISSUE),
-    # #9821: the check job's runs-on is one opaque expression (a skipped draft leg flips to hosted),
-    # which the classifier reads as one non-hosted leg; it replaces the two literal matrix rows.
-    OpenLegRow("ci.yml", "check", CHECK_FLIP_LEG, RUNNER_ISSUE),
+    OpenLegRow("ci.yml", "check", '["self-hosted","linux-fed"]', RUNNER_ISSUE),
+    OpenLegRow("ci.yml", "check", '["self-hosted","macos-fed"]', RUNNER_ISSUE),
     OpenLegRow("postgres-ignored.yml", "postgres-ignored", '["self-hosted","linux-fed"]', RUNNER_ISSUE),
 )
-OPEN_RUNNER_LEG_PIN = 3
+OPEN_RUNNER_LEG_PIN = 4
 
 
 def leg_text(leg: tuple[str, ...]) -> str:
@@ -213,6 +205,22 @@ FORM_CASES = (
      "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
      "          - runner: '[\"macos-latest\"]'\n    runs-on: ${{ fromJSON(matrix.runner) }}\n",
      set(), []),
+    # PR 9838 (#9821): the flip form `fromJSON(<cond> && '<json>' || matrix.<axis>)` yields every
+    # axis value AND the literal arm, so a new self-hosted matrix label is a new row.
+    ("flip form, hosted literal arm",
+     "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
+     "          - runner: '[\"self-hosted\",\"macos-fed\"]'\n          - runner: '[\"self-hosted\",\"new-fed\"]'\n"
+     "    runs-on: ${{ fromJSON(github.event.pull_request.draft == true && '[\"ubuntu-latest\"]' || matrix.runner) }}\n",
+     {(SYNTH, JOB, '["self-hosted","macos-fed"]'), (SYNTH, JOB, '["self-hosted","new-fed"]')}, []),
+    ("flip form, self-hosted literal arm",
+     "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
+     "    runs-on: ${{ fromJSON(inputs.x == 'a' && '[\"self-hosted\",\"arm-fed\"]' || matrix.runner) }}\n",
+     {(SYNTH, JOB, '["self-hosted","arm-fed"]')}, []),
+    ("flip form with || in the condition is opaque",
+     "    strategy:\n      matrix:\n        include:\n          - runner: '[\"ubuntu-latest\"]'\n"
+     "    runs-on: ${{ fromJSON(inputs.x || inputs.y && '[\"ubuntu-latest\"]' || matrix.runner) }}\n",
+     {(SYNTH, JOB, leg_text(("${{ fromJSON(inputs.x || inputs.y && '[\"ubuntu-latest\"]' || matrix.runner) }}",)))},
+     []),
     ("opaque expression", "    runs-on: ${{ inputs.runner }}\n", {(SYNTH, JOB, '["${{ inputs.runner }}"]')}, []),
     ("unclassifiable: number", "    runs-on: 42\n", set(),
      [f"{SYNTH}/{JOB}: runs-on value 42 outside the known forms"]),

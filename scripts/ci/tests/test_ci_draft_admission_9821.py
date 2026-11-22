@@ -1,43 +1,52 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Pin the #9821 admission rule (I5): drafts do not occupy self-hosted runners.
+"""Pin the #9821 admission rule (I5): drafts do not occupy self-hosted runners,
+and a leg that did not run never reports success.
 
-Invariant: a self-hosted `Check` leg of ci.yml does not run for a draft pull
-request unless it carries `ci-fix` or `run-self-hosted`; the leg still reports
-(same job, same name, success), the hosted and the macOS-less hosted leg are
-unaffected, and an unknown draft state fails open (the leg runs).
+Invariant (PR 9838 class A): for every required `Check (...)` context and every
+pull-request state (draft or ready, `ci-fix` or not, fork or not, a re-run of a
+draft-era run), a leg whose real work did not run concludes `failure`, never
+`success`.  A self-hosted leg of a draft pull request without `ci-fix` flips to
+a hosted runner (it never waits in the self-hosted queue) and its one step that
+runs fails with the exact line DRAFT_ERROR.  `ci-fix` is the one label that
+admits a draft; there is no other.  An unknown draft state is not `== true`, so
+the leg runs (fails open to run, never to skip).
 
 How the skip is made without changing a required name (rule (b1) of
 scripts/check-required-contexts.sh forbids a job-level `if:` on this matrix
 job): a job-level env `LEG_SKIP` carries the decision, `runs-on` flips a
-skipped leg to a hosted runner so it never waits in the self-hosted queue, and
-every step that does work carries `env.LEG_SKIP != 'true'` next to its
-`cargo_skip` guard.  A skipped leg runs only the notice and the re-check step
-which fails the leg unless the `draft-admission` job (one gh call and one jq
-filter, no checkout, so no pull-request code can reach its token) re-read the
-PR and still found a draft without either label: a stale re-run cannot turn a
-now-ready PR into a green skip.
+skipped leg to a hosted runner, and every step that does work carries
+`env.LEG_SKIP != 'true'` next to its `cargo_skip` guard.  The fork refusal is
+NOT guarded by LEG_SKIP: a draft fork pull request fails on the fork refusal,
+as at the base.
+
+A re-run of a draft-era run reuses that run's frozen event payload, so LEG_SKIP
+stays 'true' and the re-run stays red; the run GitHub starts on
+`ready_for_review` is a new run with the new payload and runs the legs.
 
 The allow and deny tables below are hand-written.  The real expression is read
 from the workflow and evaluated by a small evaluator for the expression subset
-(&&, ||, !, ==, !=, contains, fromJSON) so the table tests the shipped text.
-The workflow under test is ci.yml or the file named by WORKFLOW_UNDER_TEST.
+(&&, ||, !, ==, !=, contains, fromJSON) so the table tests the shipped text, and
+the steps that run before checkout are executed in bash so the conclusion is
+measured, not read.  The workflow under test is ci.yml or the file named by
+WORKFLOW_UNDER_TEST.
 
 Run: python3.12 -m unittest scripts/ci/tests/test_ci_draft_admission_9821.py
 Python 3.12+, standard library only (the workflow is read by line).
 """
-import json
 import os
 import re
-import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOW = Path(os.environ.get("WORKFLOW_UNDER_TEST") or REPO / ".github" / "workflows" / "ci.yml")
-
+GATE_PY = REPO / "scripts" / "ci" / "impact" / "gate.py"
+NOT_REQUIRED_LEDGER = REPO / "scripts" / "qc-allowlists" / "required-contexts-not-required.txt"
+SCRATCH = REPO / ".local-runs"
 CHECK_JOB = "check"
 SKIP_ENV = "LEG_SKIP"
 SKIP_GUARD = "env.LEG_SKIP != 'true'"
@@ -47,8 +56,25 @@ LINUX_FED = '["self-hosted","linux-fed"]'
 MACOS_FED = '["self-hosted","macos-fed"]'
 EXPECTED_LEGS = ["ubuntu-latest,sqlite", "linux-fed,enterprise-fed", "macos-fed,sqlite", "macos-fed,enterprise-fed"]
 EXPECTED_CHECK_NAME = "Check (${{ matrix.leg }})"
-NOTICE_STEP = "Draft admission skip (#9821)"
-RECHECK_JOB = "draft-admission"
+DRAFT_STEP = "Draft skip (#9821)"
+FORK_STEP = "Fork-PR refusal (self-hosted legs never run fork code)"
+CHECKOUT_PREFIX = "actions/checkout"
+ADMIT_LABEL = "ci-fix"
+UNKNOWN_LABEL = "run-self-hosted"  # never created (b29 07d44e43); it admits nothing
+REMOVED_JOB = "draft-admission"
+DRAFT_ERROR = "::error::draft PR without the ci-fix label, self-hosted leg not run, mark ready or add the label"
+FORK_ERROR = "::error::Refusing to run fork PR code on a self-hosted runner (leg %s)."
+REPOSITORY = "alphaonedev/ai-memory-mcp"
+FORK_REPOSITORY = "someone/ai-memory-mcp"
+STEP_TIMEOUT_SECS = 30
+FAILURE = "failure"
+WORK_RUNS = "work runs"  # the real work steps run; their own result decides the conclusion
+FROZEN_CONTEXTS = {
+    "github.event_name",
+    "github.event.pull_request.draft",
+    "github.event.pull_request.labels.*.name",
+    "matrix.runner",
+}
 
 
 # ---------------------------------------------------------- expression ----
@@ -159,21 +185,51 @@ class Evaluator:
         raise ValueError("unknown function %r" % name)
 
 
-def evaluate(expr, event, draft, labels, runner):
+def context(event, draft, labels, runner, fork=False, leg_skip=None):
     ctx = {
         "github.event_name": event,
         "github.event.pull_request.draft": draft,
         "github.event.pull_request.labels.*.name": list(labels),
+        "github.event.pull_request.head.repo.full_name": FORK_REPOSITORY if fork else REPOSITORY,
+        "github.repository": REPOSITORY,
         "matrix.runner": runner,
+        "needs.classify.outputs.cargo_skip": "false",
     }
-    return Evaluator(tokenize(expr), ctx).parse()
+    if leg_skip is not None:
+        ctx["env.LEG_SKIP"] = leg_skip
+    return ctx
+
+
+def evaluate(expr, event, draft, labels, runner):
+    return Evaluator(tokenize(expr), context(event, draft, labels, runner)).parse()
+
+
+def referenced(expr):
+    """Context names an expression reads (not literals, operators or function names)."""
+    toks = tokenize(expr)
+    out = set()
+    for i, tok in enumerate(toks):
+        if tok.startswith("'") or tok in ("&&", "||", "!", "==", "!=", "(", ")", ",", "true", "false"):
+            continue
+        if i + 1 < len(toks) and toks[i + 1] == "(":
+            continue
+        out.add(tok)
+    return out
 
 
 # ----------------------------------------------------------- workflow ----
 
 
+def workflow_lines():
+    return WORKFLOW.read_text(encoding="utf-8").splitlines()
+
+
+def job_names():
+    return [m.group(1) for m in (re.match(r"  ([A-Za-z0-9_-]+):\s*$", l) for l in workflow_lines()) if m]
+
+
 def job_block(job):
-    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    lines = workflow_lines()
     start = next((i for i, l in enumerate(lines) if l == "  %s:" % job), None)
     if start is None:
         raise AssertionError("job %s not found in %s" % (job, WORKFLOW))
@@ -199,9 +255,9 @@ def job_expr(key):
     return found[0]
 
 
-def steps():
-    """[(name, if-expression or None)] of the check job, one-line if only."""
-    out, in_steps, cur = [], False, None
+def step_records():
+    """[{name, if, run}] of the check job in order; one-line if, `run: |` blocks."""
+    out, in_steps, cur, in_run = [], False, None, False
     for line in check_block():
         if line == "    steps:":
             in_steps = True
@@ -209,20 +265,79 @@ def steps():
         if not in_steps:
             continue
         if line.startswith("      - "):
-            if cur:
-                out.append(tuple(cur))
             m = re.match(r"      - (?:name: (.*)|uses: (.*))", line)
-            cur = [(m.group(1) or m.group(2)) if m else line.strip(), None]
-        elif cur and cur[1] is None and line.startswith("        if:"):
+            cur = {"name": (m.group(1) or m.group(2)) if m else line.strip(), "if": None, "run": None}
+            out.append(cur)
+            in_run = False
+            continue
+        if cur is None:
+            continue
+        if in_run:
+            if line.startswith("          ") or not line.strip():
+                cur["run"] += line[10:] + "\n"
+                continue
+            in_run = False
+        if line.startswith("        if:") and cur["if"] is None:
             value = line.split("if:", 1)[1].strip()
             if value.startswith((">", "|")):
-                raise AssertionError("multi-line if in step %r cannot be read" % cur[0])
-            cur[1] = value
-        elif cur and cur[0].startswith("actions/checkout") is False and line.startswith("        name:") and cur[0] == line.strip():
-            pass
-    if cur:
-        out.append(tuple(cur))
+                raise AssertionError("multi-line if in step %r cannot be read" % cur["name"])
+            cur["if"] = value
+        elif line.startswith("        run: |"):
+            cur["run"], in_run = "", True
+        elif line.startswith("        run: "):
+            cur["run"] = line.split("run: ", 1)[1] + "\n"
     return out
+
+
+def steps():
+    return [(s["name"], s["if"]) for s in step_records()]
+
+
+def matrix_legs():
+    """[(leg, runner)] from the include list of the check job."""
+    block = check_block()
+    out = []
+    for i, line in enumerate(block):
+        m = re.match(r"          - leg: (.*)", line)
+        if m:
+            runner = next(re.match(r"            runner: '(.*)'", l).group(1) for l in block[i + 1:] if re.match(r"            runner: ", l))
+            out.append((m.group(1), runner))
+    return out
+
+
+def run_step(script, leg):
+    """Run one step's script in bash as the runner would; (rc, stdout lines)."""
+    if "${{" in script.replace("${{ matrix.leg }}", ""):
+        raise AssertionError("step script holds an expression this test does not model: %r" % script)
+    SCRATCH.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=SCRATCH) as tmp:
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_ENV": str(Path(tmp) / "env"), "HOME": tmp}
+        proc = subprocess.run(["bash", "-e", "-c", script.replace("${{ matrix.leg }}", leg)], env=env, cwd=tmp,
+                              capture_output=True, text=True, timeout=STEP_TIMEOUT_SECS)
+    return proc.returncode, proc.stdout.splitlines()
+
+
+def conclusion(leg, runner, event, draft, labels, fork=False):
+    """(conclusion, failing step, its ::error:: line) of one leg up to checkout.
+
+    Every step before checkout whose `if` holds is executed; the first that
+    exits non-zero fails the job.  If none fails the work steps run.
+    """
+    leg_skip = Evaluator(tokenize(job_expr(SKIP_ENV)), context(event, draft, labels, runner)).parse()
+    ctx = context(event, draft, labels, runner, fork=fork, leg_skip=leg_skip)
+    for step in step_records():
+        if step["name"].startswith(CHECKOUT_PREFIX):
+            return WORK_RUNS if leg_skip != "true" else "success", None, None
+        cond = step["if"] or "true"
+        if not Evaluator.truthy(Evaluator(tokenize(cond), ctx).parse()):
+            continue
+        if step["run"] is None:
+            continue
+        rc, out = run_step(step["run"], leg)
+        if rc != 0:
+            errors = [l for l in out if l.startswith("::error::")]
+            return FAILURE, step["name"], errors[0] if len(errors) == 1 else errors
+    raise AssertionError("checkout step not found")
 
 
 # ---------------------------------------------------------------- tests ----
@@ -236,11 +351,12 @@ class AdmissionTables(unittest.TestCase):
         ("pull_request", True, [], LINUX_FED, True),
         ("pull_request", True, [], MACOS_FED, True),
         ("pull_request", True, ["bug"], LINUX_FED, True),
-        ("pull_request", True, ["ci-fix"], LINUX_FED, False),
-        ("pull_request", True, ["run-self-hosted"], MACOS_FED, False),
-        ("pull_request", True, ["bug", "ci-fix", "run-self-hosted"], LINUX_FED, False),
+        ("pull_request", True, [ADMIT_LABEL], LINUX_FED, False),
+        ("pull_request", True, [UNKNOWN_LABEL], MACOS_FED, True),  # not a label: it admits nothing
+        ("pull_request", True, [UNKNOWN_LABEL], LINUX_FED, True),
+        ("pull_request", True, ["bug", ADMIT_LABEL, UNKNOWN_LABEL], LINUX_FED, False),
         ("pull_request", False, [], LINUX_FED, False),
-        ("pull_request", False, ["ci-fix"], LINUX_FED, False),
+        ("pull_request", False, [ADMIT_LABEL], LINUX_FED, False),
         ("pull_request", None, [], LINUX_FED, False),  # unknown draft state fails open: the leg runs
         ("pull_request", True, [], HOSTED, False),  # the hosted leg is never skipped
         ("push", None, [], LINUX_FED, False),
@@ -271,46 +387,107 @@ class AdmissionTables(unittest.TestCase):
         self.assertEqual(leg_skip, "%s && 'true' || 'false'" % m.group(1))
 
 
+class SkippedLegConclusion(unittest.TestCase):
+    """PR 9838 class A: a skipped leg concludes failure, never success, under its required name.
+
+    One test per self-hosted context; rows are (draft, labels, fork) -> (conclusion,
+    failing step, exact ::error:: line).  The steps before checkout are run in bash.
+    """
+
+    def legs(self):
+        legs = dict(matrix_legs())
+        self.assertEqual(list(legs), EXPECTED_LEGS)
+        return legs
+
+    def rows(self, leg):
+        fork_error = FORK_ERROR % leg
+        return [
+            (True, [], False, (FAILURE, DRAFT_STEP, DRAFT_ERROR)),
+            (True, ["bug"], False, (FAILURE, DRAFT_STEP, DRAFT_ERROR)),
+            (True, [UNKNOWN_LABEL], False, (FAILURE, DRAFT_STEP, DRAFT_ERROR)),
+            (True, [], True, (FAILURE, FORK_STEP, fork_error)),  # a draft fork fails on the fork refusal, as at base
+            (True, [ADMIT_LABEL], True, (FAILURE, FORK_STEP, fork_error)),
+            (False, [], True, (FAILURE, FORK_STEP, fork_error)),
+            (True, [ADMIT_LABEL], False, (WORK_RUNS, None, None)),
+            (False, [], False, (WORK_RUNS, None, None)),
+            (None, [], False, (WORK_RUNS, None, None)),
+        ]
+
+    def check_context(self, leg):
+        runner = self.legs()[leg]
+        for draft, labels, fork, want in self.rows(leg):
+            with self.subTest(context="Check (%s)" % leg, draft=draft, labels=labels, fork=fork):
+                self.assertEqual(conclusion(leg, runner, "pull_request", draft, labels, fork), want)
+
+    def test_context_linux_fed_enterprise_fed_skip_is_failure(self):
+        self.check_context("linux-fed,enterprise-fed")
+
+    def test_context_macos_fed_sqlite_skip_is_failure(self):
+        self.check_context("macos-fed,sqlite")
+
+    def test_context_macos_fed_enterprise_fed_skip_is_failure(self):
+        self.check_context("macos-fed,enterprise-fed")
+
+    def test_hosted_context_never_skips(self):
+        runner = self.legs()["ubuntu-latest,sqlite"]
+        for draft, labels, fork in [(True, [], False), (True, [], True), (False, [], False)]:
+            with self.subTest(draft=draft, labels=labels, fork=fork):
+                self.assertEqual(conclusion("ubuntu-latest,sqlite", runner, "pull_request", draft, labels, fork),
+                                 (WORK_RUNS, None, None))
+
+    def test_rerun_of_draft_era_run_stays_red(self):
+        # The skip reads only the frozen event payload and the matrix: a re-run of a
+        # draft-era run (after ready_for_review or after the label) sees draft == true
+        # again and fails again.  Only the new run of the ready_for_review event runs.
+        self.assertLessEqual(referenced(job_expr(SKIP_ENV)), FROZEN_CONTEXTS)
+        self.assertLessEqual(referenced(job_expr("runs-on")), FROZEN_CONTEXTS)
+        frozen = (True, [])
+        self.assertEqual(conclusion("linux-fed,enterprise-fed", LINUX_FED, "pull_request", *frozen),
+                         (FAILURE, DRAFT_STEP, DRAFT_ERROR))
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertRegex(text, r"\n    types: \[opened, synchronize, reopened, ready_for_review\]\n")
+
+
 class StepPins(unittest.TestCase):
     def test_every_cargo_guarded_step_also_honours_leg_skip(self):
         seen = 0
         for name, cond in steps():
-            if cond and CARGO_GUARD in cond and name != NOTICE_STEP:
+            if cond and CARGO_GUARD in cond and name not in (DRAFT_STEP, FORK_STEP):
                 seen += 1
                 self.assertIn(SKIP_GUARD, cond, "step %r does not honour %s" % (name, SKIP_ENV))
         self.assertGreaterEqual(seen, 25)  # the guarded steps counted at the base sha are 29
 
-    def test_checkout_is_skipped_too(self):
+    def test_checkout_stays_unguarded(self):
         for name, cond in steps():
-            if name.startswith("actions/checkout"):
-                self.assertEqual(cond, None)  # checkout stays unguarded (rule b3 exempts it)
+            if name.startswith(CHECKOUT_PREFIX):
+                self.assertEqual(cond, None)  # rule b3 exempts checkout; a skipped leg checks out on a hosted runner
                 return
         self.fail("checkout step not found")
 
-    def test_notice_and_recheck_steps(self):
+    def test_fork_refusal_is_not_guarded_by_the_draft_rule(self):
         by_name = dict(steps())
-        self.assertIn(NOTICE_STEP, by_name)
-        # rule (b3) of check-required-contexts.sh wants a cargo_skip/docs_only guard on every step
-        self.assertEqual(by_name[NOTICE_STEP], "%s && env.%s == 'true'" % (CARGO_GUARD, SKIP_ENV))
-        text = "\n".join(check_block())
-        self.assertIn("needs: [classify, draft-admission]", text)
-        self.assertIn('VERDICT: ${{ needs.draft-admission.outputs.verdict }}', text)
-        self.assertIn('test "${VERDICT}" = skip', text)  # anything but an explicit skip fails the leg
-        self.assertNotIn("GH_TOKEN", text)  # a secret in the check job is a tainted-job violation (taint_boundary.py)
+        self.assertNotIn(SKIP_ENV, by_name[FORK_STEP])
 
-    def test_recheck_job_holds_the_token_without_pr_code(self):
-        block = job_block(RECHECK_JOB)
-        text = "\n".join(block)
-        self.assertNotIn("checkout", text)  # no pull-request code ever shares the token
-        self.assertNotIn("uses:", text)
-        self.assertIn("    runs-on: ubuntu-latest", block)
-        self.assertIn("      pull-requests: read", block)
-        self.assertNotRegex(text, r"(?m)^\s+(pull-requests|contents|issues|actions): write")
-        # No step-level continue-on-error (#9698 allows it only in the select job): a failed read leaves
-        # the verdict empty through `|| true`, and an empty verdict fails the skipped leg closed.
-        self.assertNotIn("continue-on-error", text)
-        self.assertIn("|| true)\"", text)
-        self.assertIn("        if: github.event_name == 'pull_request'", block)
+    def test_draft_step_guard(self):
+        by_name = dict(steps())
+        # rule (b3) of check-required-contexts.sh wants a cargo_skip/docs_only guard on every step
+        self.assertEqual(by_name[DRAFT_STEP], "%s && env.%s == 'true'" % (CARGO_GUARD, SKIP_ENV))
+        self.assertNotIn("GH_TOKEN", "\n".join(check_block()))  # a secret here is a tainted-job violation
+
+    def test_check_needs_only_classify(self):
+        # security MEDIUM-1: no needs edge to a job that is not required.
+        needs = [l.strip() for l in check_block() if l.startswith("    needs:")]
+        self.assertEqual(needs, ["needs: [classify]"])
+        self.assertNotIn(REMOVED_JOB, job_names())
+        gate = job_block("ci-gate")
+        self.assertFalse([l for l in gate if l.strip() == "- %s" % REMOVED_JOB])
+        self.assertNotIn('"%s"' % REMOVED_JOB, GATE_PY.read_text(encoding="utf-8"))
+        self.assertNotIn(" %s " % REMOVED_JOB, NOT_REQUIRED_LEDGER.read_text(encoding="utf-8"))
+
+    def test_no_reference_to_the_unknown_label(self):
+        for path in (WORKFLOW, REPO / "docs" / "ci" / "CARRIER-BRANCH-GATES.md", REPO / "changelog.d" / "9821.changed.md"):
+            with self.subTest(path=path.name):
+                self.assertNotIn(UNKNOWN_LABEL, path.read_text(encoding="utf-8"))
 
     def test_ready_for_review_starts_a_run(self):
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -320,52 +497,8 @@ class StepPins(unittest.TestCase):
     def test_required_names_unchanged(self):
         block = check_block()
         self.assertIn("    name: %s" % EXPECTED_CHECK_NAME, block)
-        legs = [re.match(r"          - leg: (.*)", l).group(1) for l in block if re.match(r"          - leg: ", l)]
-        self.assertEqual(legs, EXPECTED_LEGS)
+        self.assertEqual([leg for leg, _ in matrix_legs()], EXPECTED_LEGS)
         self.assertFalse([l for l in block if l.startswith("    if:")], "job-level if on a matrix job breaks rule (b1)")
-
-
-class Recheck(unittest.TestCase):
-    """The re-check filter shipped in the workflow: a stale skip must fail, never pass."""
-
-    @classmethod
-    def setUpClass(cls):
-        if shutil.which("jq") is None:
-            raise unittest.SkipTest("jq is not installed")
-        text = "\n".join(job_block(RECHECK_JOB))
-        m = re.search(r"--jq '([^']*)'", text)
-        if m is None:
-            raise AssertionError("re-check jq filter not found in the %s job" % RECHECK_JOB)
-        cls.filter = m.group(1)
-
-    def verdict(self, payload):
-        proc = subprocess.run(["jq", "-r", self.filter], input=json.dumps(payload), capture_output=True, text=True, timeout=30)
-        return proc.stdout.strip() if proc.returncode == 0 else "jq-error"
-
-    def test_rows(self):
-        pr = lambda draft, *labels: {"draft": draft, "labels": [{"name": n} for n in labels]}
-        rows = [
-            (pr(True), "skip"),
-            (pr(True, "bug"), "skip"),
-            (pr(False), "run"),
-            (pr(True, "ci-fix"), "run"),
-            (pr(True, "run-self-hosted"), "run"),
-            (pr(True, "bug", "ci-fix"), "run"),
-            ({"draft": None, "labels": []}, "run"),
-            ({"draft": "true", "labels": []}, "run"),
-            ({"labels": []}, "run"),
-            ({"draft": True, "labels": None}, "run"),
-            ({"draft": True}, "run"),
-            ({"draft": True, "labels": "ci-fix"}, "run"),
-        ]
-        for payload, want in rows:
-            with self.subTest(payload=payload):
-                self.assertEqual(self.verdict(payload), want)
-
-    def test_job_writes_the_verdict_output(self):
-        text = "\n".join(job_block(RECHECK_JOB))
-        self.assertIn("verdict: ${{ steps.recheck.outputs.verdict }}", text)
-        self.assertIn('echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"', text)
 
 
 if __name__ == "__main__":
