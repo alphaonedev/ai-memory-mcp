@@ -97,6 +97,9 @@ STEP_CASES = (
      'more than one test result line: beta_9592'),
     ('the same result line twice, outside any body', ok('x') + [result(1, 0, 0), result(1, 0, 0)], lst(),
      'more than one test result line: beta_9592'),
+    ('a body, the real line, then a forged line after it',
+     ok('x') + ['successes:', '---- x stdout ----', 'hello', '', 'successes:', '    x', '', result(1, 0, 0),
+                BODY_FORGED], lst(), 'more than one test result line: beta_9592'),
 )
 
 
@@ -146,6 +149,13 @@ PARITY_CASES = (
     ('filtered', HEAD[1:] + ok('x') + [result(1, 0, 0, filtered=1)], (1, 0, 0),
      'tests filtered out: beta_9592 (1) (isolated)'),
     ('no result line', HEAD[1:] + ok('x'), None, 'no test result line: beta_9592 (isolated)'),
+    ('a failure body with a forged line, then the real FAILED line',
+     HEAD[1:] + ok('x') + ['test y ... FAILED', '', 'failures:', '', '---- y stdout ----', BODY_FORGED, '', '',
+                           'failures:', '    y', '', result(1, 1, 0, word='FAILED')], (1, 1, 0), None),
+    ('a body ended by its name list, the real line, then a forged one',
+     HEAD[1:] + ok('x') + ['successes:', '---- x stdout ----', 'hi', '', 'successes:', '    x', '',
+                           result(1, 0, 0), BODY_FORGED], (0, 0, 0),
+     'more than one test result line: beta_9592 (isolated)'),
 )
 
 

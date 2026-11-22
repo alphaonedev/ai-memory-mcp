@@ -27,9 +27,12 @@ and this step only proves that nothing was deferred.
 
 The step fails closed on: a wrapper exit other than 0, a missing log, a log
 without its current_database evidence line, its binary path or its ``test
-result:`` line, a binary with no test line (passed, failed and ignored all
-zero), a binary that is not on a clone of this run, two binaries on one clone, a residual off the shared database, any
-test that prints a skip message, an ignored total that differs from the
+result:`` line, a log whose test lines do not prove its result line
+(pg_isolate_parity.evidence_reason: no test line at all, an extra result line
+outside a captured-output body, ok / FAILED / ignored lines that differ from
+the totals, or any test filtered out), a binary that is not on a clone of
+this run, two binaries on one clone, a residual off the shared database, any
+test that prints a skip message, ignored test names that differ from the
 binary's own ``--list --ignored``, a teardown failure and any clone or template
 left after teardown. Teardown, the leftover check and the log redaction run in
 ``finally`` and on SIGTERM / SIGINT (I-11).
@@ -83,7 +86,6 @@ JOBS = '8'
 FEATURES = ['--features', 'sal-postgres']
 TEST_ARGS = ['--test-arg=--test-threads=1', '--test-arg=--show-output']
 LIST_IGNORED = ['--list', '--ignored']
-LIST_TEST_SUFFIX = ': test'
 WATCHDOG_CAP_SECS = 7800
 WATCHDOG_MARGIN_SECS = 300
 KILL_AFTER = '--kill-after=60'
@@ -247,7 +249,12 @@ def _shown(names: list[str]) -> str:
 
 
 def ledger_reasons(text: str, targets: list[str], run_id: str, residual: set[str], shared_db: str) -> list[str]:
-    """Every reason the ledger does not prove that each deferred binary ran with at least one test in this run.
+    """Every reason the ledger does not prove that each deferred binary was accounted in this run.
+
+    A row is written only for a binary whose log passed the evidence rule of ``_log_reasons``
+    (pg_isolate_parity.evidence_reason: at least one test line, the totals equal to the counted
+    lines, 0 filtered out; ignored names equal to ``--list --ignored``), so ``tests`` (ran) plus
+    ``ignored`` is at least 1: a row with both 0 is red, an all-ignored row (tests=0, ignored>0) is not.
 
     A row's mode must be the one the deferred lists give its binary (residual when ``residual`` names it,
     else isolated; #9751), an isolated row must name a clone of this run and a residual row the shared
@@ -269,7 +276,8 @@ def ledger_reasons(text: str, targets: list[str], run_id: str, residual: set[str
             break
         if (row := LEDGER_ROW_RE.fullmatch(line)):
             name, mode, db = row.group(1), row.group(4), row.group(5)
-            tests = int(row.group(2)) + int(row.group(3))  # ran + ignored: zero means no test line
+            # ran + ignored; _log_reasons writes a row only after evidence_reason, so 0 here is a forged row
+            tests = int(row.group(2)) + int(row.group(3))
             if name in seen:
                 reasons.append('ledger names a binary twice: %s' % name)
             elif name not in deferred:
@@ -537,19 +545,14 @@ def _log_reasons(host, env: dict, log_dir: Path, names: list[str], residual: set
             reasons.append('more than one test run in the log: %s' % name)
             continue
         seg = segs[0]
-        if seg.totals is None:
-            reasons.append('no test result line: %s' % name)
+        # The one evidence rule (pg_isolate_parity.evidence_reason, the core of structural; PR 9841 r1):
+        # at least one test line, the real (last) result line, its three totals equal to the counted
+        # test lines and 0 filtered out. An all-#[ignore] binary passes it and is then held to the
+        # ignored NAMES of its own --list --ignored below (#9592 B(iii) follow-on).
+        if (evidence := parity().evidence_reason(seg)) is not None:
+            reasons.append(evidence)
             continue
         passed, failed, ignored = seg.totals
-        ran = (sum(1 for o in seg.tests.values() if o == 'ok'), sum(1 for o in seg.tests.values() if o == 'FAILED'))
-        # Zero tests means no test line at all, as in parity().structural: an all-#[ignore] binary
-        # is accounted by the --list --ignored check below (#9592 B(iii) follow-on).
-        if passed + failed + ignored == 0:
-            reasons.append('zero tests: %s' % name)
-            continue
-        if ran != (passed, failed):
-            reasons.append('result totals differ from the test lines: %s' % name)
-            continue
         if name in residual:
             if mode != 'residual' or db != shared_db:
                 reasons.append('residual not on the shared database: %s' % name)
@@ -576,10 +579,8 @@ def _log_reasons(host, env: dict, log_dir: Path, names: list[str], residual: set
         if rc != 0:
             reasons.append('cannot list ignored tests of %s (exit %d)' % (name, rc))
             continue
-        listed = sum(1 for line in out.splitlines() if line.endswith(LIST_TEST_SUFFIX))
-        if listed != ignored:
-            reasons.append('ignored count differs from --list --ignored: %s (log=%d list=%d)'
-                           % (name, ignored, listed))
+        if (unlisted := parity().ignored_reason(seg, parity().listed_names(out))) is not None:
+            reasons.append(unlisted)
             continue
         counts[mode] += 1
         rows.append((name, passed + failed, ignored, mode, db))

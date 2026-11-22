@@ -10,10 +10,12 @@ and :133, which run only with ``--ignored``) was red although every test it hold
 log and cross-checked against the binary's own ``--list --ignored``. The parity checker already
 defines zero tests as "no test line at all" (scripts/ci/pg_isolate_parity.py ``structural``).
 
-Invariant: a binary is "zero tests" exactly when its log has no test line (passed + failed +
-ignored == 0), in the log check and in the completion ledger alike; an all-ignored binary is green
-only when its ignored total equals ``--list --ignored`` (that check is unchanged), and a binary with
-no test at all stays red with the exact reason. Expected reasons and counts are written by hand.
+Invariant: a binary is "zero tests" exactly when its log has no test line (ok, FAILED or ignored),
+in the log check and in the completion ledger alike; an all-ignored binary is green only when its
+ignored test lines equal the result totals, nothing is filtered out and its ignored test NAMES equal
+``--list --ignored`` (pg_isolate_parity.evidence_reason and ignored_reason, PR 9841 r1; the table of
+evidence forms is test_pg_isolate_evidence_9592.py), and a binary with no test at all stays red with
+the exact reason. Expected reasons and counts are written by hand.
 """
 import sys
 import time

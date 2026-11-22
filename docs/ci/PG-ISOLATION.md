@@ -68,11 +68,17 @@ run id, ledger, kill switch or `GITHUB_ENV` is red, never "nothing to do".
    (`scripts/ci/pg_isolate_cluster_audit.py`) finds with a cluster-global
    operation or a wall-time assert (the load-sensitive class of PR 8230
    defect 2, issue 6796), so those never run beside the pool.
-3. **Fail closed.** The step is red on a missing log, a zero-test binary, a
-   log without its evidence line, two binaries on one database, any test that
-   prints a skip message (the word `skip`, `skips`, `skipped` or `skipping`
-   in any case, with or without a colon), an
-   ignored total that differs from the binary's own `--list --ignored`, a
+3. **Fail closed.** The step is red on a missing log, a zero-test binary (a
+   log with no test line at all: no `test X ... ok`, `FAILED` or `ignored`
+   line, whatever its result line says), a log whose test lines do not prove
+   its result line (the ok / FAILED / ignored lines differ from the passed /
+   failed / ignored totals, the result line has no filtered-out count or any
+   test is filtered out, or a second `test result:` line appears outside a
+   `---- X stdout ----` / `---- X stderr ----` body; the real one is the
+   last), a log without its evidence line, two binaries on one database, any
+   test that prints a skip message (the word `skip`, `skips`, `skipped` or
+   `skipping` in any case, with or without a colon), ignored test names that
+   differ from the binary's own `--list --ignored`, a
    clone mint failure, a teardown failure and any clone or template of the
    run left after teardown. Teardown runs in a
    `finally` and on SIGTERM, passing `AI_MEMORY_TEST_PG_TEMPLATE`, the run id

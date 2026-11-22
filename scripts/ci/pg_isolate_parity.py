@@ -7,6 +7,19 @@ ignored) as on the serial path, residual binaries included, and the comparison
 fails closed on a missing log, a zero-test binary, a duplicate binary log and a
 log without a ``test result:`` line.
 
+One rule in one place, ``evidence_reason`` (PR 9841 r1), also applied by the
+serial step (scripts/ci/pg_isolate_serial_step.py) to every isolated binary: a
+segment is well formed only when it has at least one test line (ok, FAILED or
+ignored; a result line alone is "zero tests"), its ok / FAILED / ignored test
+lines equal the passed / failed / ignored totals of its real result line, and
+that line says ``0 filtered out``. The real result line is the LAST one of the
+segment; an earlier one is accepted only inside a libtest captured-output body
+(after a ``---- X stdout ----`` or ``---- X stderr ----`` header, which
+``--show-output`` prints before the real line, and before the ``successes:`` /
+``failures:`` name list that ends the bodies); anywhere else the segment is
+refused. ``ignored_reason`` compares the ignored test NAMES with the binary's
+own ``--list --ignored``.
+
 Usage:
   pg_isolate_parity.py --iso-log-dir DIR --targets-file FILE --serial-log FILE
                        [--residual-file FILE]
@@ -40,18 +53,33 @@ TEST_RE = re.compile(r'^test (\S+) \.\.\. (ok|FAILED|ignored)\b')
 # --test-threads=1, so at most one test is open at a time).
 OPEN_RE = re.compile(r'^test (\S+) \.\.\. ')
 LONE_OUTCOME_RE = re.compile(r'^(ok|FAILED|ignored)(?:, .*)?$')
-RESULT_RE = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;')
+RESULT_RE = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;'
+                       r'(?: \d+ measured; (\d+) filtered out;)?')
+# libtest's captured-output header (``--show-output`` successes, and failures): test output follows it.
+BODY_RE = re.compile(r'^---- \S+ std(?:out|err) ----$')
+# libtest's name-list header after the bodies ends them: the real result line follows it outside any body,
+# so a result line printed after the real one is never inside a body (a test that prints this header
+# itself only ends its body early, which turns a later printed result line red, never green).
+BODY_END_RE = re.compile(r'^(?:successes|failures):$')
+LIST_TEST_SUFFIX = ': test'
+IGNORED_SHOWN_MAX = 20
 
 
 class Segment:
     """One binary's part of a cargo test log."""
 
-    __slots__ = ('name', 'tests', 'totals')
+    __slots__ = ('name', 'tests', 'totals', 'filtered', 'stray_result', 'in_body', 'last_in_body')
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.tests: dict[str, str] = {}
+        # Taken from the LAST result line of the segment, the real one (libtest prints it last).
         self.totals: tuple[int, int, int] | None = None
+        self.filtered: int | None = None
+        # An earlier result line outside a captured-output body: the segment is refused.
+        self.stray_result = False
+        self.in_body = False
+        self.last_in_body = False
 
 
 def plain(line: str) -> str:
@@ -76,22 +104,74 @@ def segments(text: str) -> list[Segment]:
         elif out and open_test is not None and (m := LONE_OUTCOME_RE.match(line)):
             out[-1].tests[open_test] = m.group(1)
             open_test = None
-        elif out and out[-1].totals is None and (m := RESULT_RE.match(line)):
-            out[-1].totals = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        elif out and (m := RESULT_RE.match(line)):
+            seg = out[-1]
+            if seg.totals is not None and not seg.last_in_body:
+                seg.stray_result = True
+            seg.totals = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            seg.filtered = None if m.group(4) is None else int(m.group(4))
+            seg.last_in_body = seg.in_body
             open_test = None
+        elif out and BODY_RE.match(line):
+            out[-1].in_body = True
+            open_test = None
+        elif out and BODY_END_RE.match(line):
+            out[-1].in_body = False
     return out
 
 
-def structural(seg: Segment, side: str) -> str | None:
-    """The fail-closed reason of one segment, or None when it is well formed."""
+def evidence_reason(seg: Segment) -> str | None:
+    """The fail-closed reason of one segment, or None when its test lines prove its result line.
+
+    The one definition (PR 9841 r1) of "every runnable test of this binary ran", read from the test
+    lines, never from the totals alone: at least one test line (ok, FAILED or ignored), one real result
+    line, its passed / failed / ignored totals equal to the counted ok / FAILED / ignored lines, and
+    ``0 filtered out``."""
     if not seg.tests:
-        return 'zero tests: %s (%s)' % (seg.name, side)
+        return 'zero tests: %s' % seg.name
     if seg.totals is None:
-        return 'no test result line: %s (%s)' % (seg.name, side)
+        return 'no test result line: %s' % seg.name
+    if seg.stray_result:
+        return 'more than one test result line: %s' % seg.name
     counted = tuple(sum(1 for o in seg.tests.values() if o == word) for word in ('ok', 'FAILED', 'ignored'))
     if counted != seg.totals:
-        return 'result totals differ from the test lines: %s (%s)' % (seg.name, side)
+        return 'result totals differ from the test lines: %s' % seg.name
+    if seg.filtered is None:
+        return 'no filtered-out count on the test result line: %s' % seg.name
+    if seg.filtered:
+        return 'tests filtered out: %s (%d)' % (seg.name, seg.filtered)
     return None
+
+
+def structural(seg: Segment, side: str) -> str | None:
+    """The fail-closed reason of one segment (``evidence_reason`` naming the side), or None."""
+    reason = evidence_reason(seg)
+    return None if reason is None else '%s (%s)' % (reason, side)
+
+
+def listed_names(list_output: str) -> set[str]:
+    """The test names of a binary's ``--list --ignored`` output (``<name>: test`` lines; benches are not tests)."""
+    return {line[:-len(LIST_TEST_SUFFIX)] for line in list_output.splitlines() if line.endswith(LIST_TEST_SUFFIX)}
+
+
+def _names_shown(names: set[str]) -> str:
+    shown = sorted(names)
+    text = ', '.join(shown[:IGNORED_SHOWN_MAX])
+    if len(shown) > IGNORED_SHOWN_MAX:
+        text += ' (+%d more)' % (len(shown) - IGNORED_SHOWN_MAX)
+    return text or 'none'
+
+
+def ignored_reason(seg: Segment, listed: set[str]) -> str | None:
+    """None when the ignored test NAMES of ``seg`` equal ``listed`` (the binary's ``--list --ignored``)."""
+    logged = {test for test, outcome in seg.tests.items() if outcome == 'ignored'}
+    if logged == listed:
+        return None
+    if len(logged) != len(listed):
+        return 'ignored count differs from --list --ignored: %s (log=%d list=%d)' % (seg.name, len(logged),
+                                                                                    len(listed))
+    return 'ignored tests differ from --list --ignored: %s (log only: %s; list only: %s)' % (
+        seg.name, _names_shown(logged - listed), _names_shown(listed - logged))
 
 
 def compare_logs(iso_logs: dict[str, str], serial_text: str,

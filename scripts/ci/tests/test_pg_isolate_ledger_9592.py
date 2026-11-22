@@ -515,9 +515,15 @@ class SkipDetector(base.Base):
         self.assertEqual(len(hits), self.e.SKIP_HITS_MAX)
 
 
+IGNORED_NAMES = 'abcdefgh'
+
+
 def ignored_log(name, db, ignored):
+    # The evidence rule (PR 9841 r1) counts the ignored test LINES, so the fixture prints one line per
+    # ignored test (named a, b, ... as in the --list --ignored fixtures), not only the result total.
     text = base.good_log(name, db, 'isolated')
-    return text.replace('0 ignored', '%d ignored' % ignored)
+    lines = ''.join('test %s ... ignored\n' % IGNORED_NAMES[i] for i in range(ignored))
+    return text.replace('test result:', lines + 'test result:', 1).replace('0 ignored', '%d ignored' % ignored)
 
 
 class IgnoredParity(base.Base):
