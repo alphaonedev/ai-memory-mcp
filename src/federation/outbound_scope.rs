@@ -15,6 +15,20 @@
 //! {"https://peer-b:9077": {"allowed_namespaces": ["team/a/**", "shared"]}}
 //! ```
 //!
+//! An entry may also name `peer_ids` (#10037): the authenticated peer ids
+//! under which that peer pulls `GET /sync/since`, at most
+//! [`MAX_OUTBOUND_PEER_IDS`] per entry and each named by one entry only:
+//!
+//! ```json
+//! {"https://peer-b:9077": {"allowed_namespaces": ["team/a/**"], "peer_ids": ["ai:peer-b"]}}
+//! ```
+//!
+//! The pull path applies the same scope as the push lanes
+//! ([`super::outbound_scope_serve`]). The peer id is the authenticated one
+//! only: the id bound to the presented mTLS certificate, else an
+//! `X-Peer-Id` whose signature verified. An unauthenticated request, an id
+//! no entry names, an unset value or a malformed one is served nothing.
+//!
 //! Patterns use the receive side's own matcher
 //! ([`super::peer_attestation::namespace_allowed_test_glob`]), so both sides
 //! agree by construction. The all-namespaces pattern is the literal
@@ -59,6 +73,10 @@ pub const MAX_OUTBOUND_PATTERNS: usize = 256;
 pub const MAX_OUTBOUND_PATTERN_LEN: usize = 512;
 /// Ceiling on the raw env value in bytes.
 pub const MAX_OUTBOUND_SCOPE_ENV_BYTES: usize = 1 << 20;
+/// Ceiling on `peer_ids` per entry (#10037, the pull-side identities).
+pub const MAX_OUTBOUND_PEER_IDS: usize = 16;
+/// Ceiling on bytes per `peer_ids` value.
+pub const MAX_OUTBOUND_PEER_ID_LEN: usize = 256;
 
 /// Refusal reason: the peer has no outbound scope.
 pub const REASON_NO_OUTBOUND_SCOPE: &str = "outbound scope: peer has no outbound namespace scope";
@@ -80,7 +98,9 @@ pub const OUTBOUND_SCOPE_TRACE_TARGET: &str = "federation::outbound_scope";
 pub const MAX_FILTERED_SERIES: usize = 1024;
 /// Namespace label of filtered items once [`MAX_FILTERED_SERIES`] is reached.
 pub const FILTERED_OVERFLOW_LABEL: &str = "_overflow";
-/// Namespace label of a filtered item that carries no namespace.
+/// Namespace label of a filtered item that carries no namespace, and the
+/// peer label of a `/sync/since` pull whose authenticated peer no entry
+/// names (#10039).
 pub const FILTERED_UNRESOLVED_LABEL: &str = "_unresolved";
 /// Ceiling on the bytes of a namespace used as a counter label; a longer
 /// one is cut at a char boundary.
@@ -498,11 +518,25 @@ pub fn admit_counted(
     Ok(ScopedOutbound { body, stored })
 }
 
-/// Config entry shape, the inbound `PeerScope` minus the sender list.
+/// Config entry shape, the inbound `PeerScope` minus the sender list, plus
+/// the optional `peer_ids` (#10037): the authenticated `X-Peer-Id` values
+/// under which this peer pulls `/sync/since`. An entry without them scopes
+/// the push lanes only; a pull from an id no entry names is served nothing.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OutboundScopeEntry {
     allowed_namespaces: Vec<String>,
+    #[serde(default)]
+    peer_ids: Vec<String>,
+}
+
+/// One parsed config entry: the peer's scope and its pull-side identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboundScopeConfigEntry {
+    /// The scope applied to every push and pull for this peer.
+    pub scope: PeerOutboundScope,
+    /// The authenticated peer ids that select this entry on `/sync/since`.
+    pub peer_ids: Vec<String>,
 }
 
 /// Why the outbound scope config was refused (boot fails closed).
@@ -523,6 +557,13 @@ pub enum OutboundScopeConfigError {
     /// Two keys normalise to the same peer (case or a trailing `/`), so
     /// which scope applies would depend on key order.
     DuplicatePeer(String),
+    /// A `peer_ids` list is over [`MAX_OUTBOUND_PEER_IDS`], or a value is
+    /// empty, over [`MAX_OUTBOUND_PEER_ID_LEN`] bytes or holds a control
+    /// character (the shown peer, never the id text).
+    BadPeerId(String),
+    /// One peer id is named by two entries, so which scope a pull gets would
+    /// depend on key order (the shown peer of the second entry).
+    DuplicatePeerId(String),
 }
 
 impl std::fmt::Display for OutboundScopeConfigError {
@@ -551,6 +592,16 @@ impl std::fmt::Display for OutboundScopeConfigError {
                 f,
                 "{OUTBOUND_SCOPE_ENV}: peer {p} is named by more than one key"
             ),
+            Self::BadPeerId(p) => write!(
+                f,
+                "{OUTBOUND_SCOPE_ENV}: peer {p} has more than {MAX_OUTBOUND_PEER_IDS} peer_ids, \
+                 or an empty one, one over {MAX_OUTBOUND_PEER_ID_LEN} bytes or one with a \
+                 control character"
+            ),
+            Self::DuplicatePeerId(p) => write!(
+                f,
+                "{OUTBOUND_SCOPE_ENV}: peer {p} names a peer id another entry already names"
+            ),
         }
     }
 }
@@ -576,12 +627,33 @@ fn malformed_position(e: &serde_json::Error) -> String {
 ///
 /// [`OutboundScopeConfigError`] for any value outside the contract.
 pub fn parse(raw: &str) -> Result<BTreeMap<String, PeerOutboundScope>, OutboundScopeConfigError> {
+    Ok(parse_entries(raw)?
+        .into_iter()
+        .map(|(id, e)| (id, e.scope))
+        .collect())
+}
+
+/// True when `id` is a usable `peer_ids` value.
+fn peer_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_OUTBOUND_PEER_ID_LEN && !id.chars().any(char::is_control)
+}
+
+/// Parse the env value into a map of stable peer id to entry (scope and
+/// pull-side peer ids). [`parse`] is this map's scope column.
+///
+/// # Errors
+///
+/// [`OutboundScopeConfigError`] for any value outside the contract.
+pub fn parse_entries(
+    raw: &str,
+) -> Result<BTreeMap<String, OutboundScopeConfigEntry>, OutboundScopeConfigError> {
     if raw.len() > MAX_OUTBOUND_SCOPE_ENV_BYTES {
         return Err(OutboundScopeConfigError::TooLarge);
     }
     let entries: BTreeMap<String, OutboundScopeEntry> = serde_json::from_str(raw)
         .map_err(|e| OutboundScopeConfigError::Malformed(malformed_position(&e)))?;
     let mut out = BTreeMap::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
     for (url, entry) in entries {
         let shown = crate::url_display::url_origin_and_path(&url);
         if entry.allowed_namespaces.len() > MAX_OUTBOUND_PATTERNS {
@@ -594,13 +666,27 @@ pub fn parse(raw: &str) -> Result<BTreeMap<String, PeerOutboundScope>, OutboundS
         {
             return Err(OutboundScopeConfigError::BadPattern(shown));
         }
+        if entry.peer_ids.len() > MAX_OUTBOUND_PEER_IDS
+            || !entry.peer_ids.iter().all(|id| peer_id_ok(id))
+        {
+            return Err(OutboundScopeConfigError::BadPeerId(shown));
+        }
+        for id in &entry.peer_ids {
+            if !seen_ids.insert(id.clone()) {
+                return Err(OutboundScopeConfigError::DuplicatePeerId(shown));
+            }
+        }
         let scope = if entry.allowed_namespaces.is_empty() {
             PeerOutboundScope::Deny
         } else {
             PeerOutboundScope::Namespaces(entry.allowed_namespaces)
         };
+        let parsed = OutboundScopeConfigEntry {
+            scope,
+            peer_ids: entry.peer_ids,
+        };
         if out
-            .insert(super::peer::stable_peer_id(&url), scope)
+            .insert(super::peer::stable_peer_id(&url), parsed)
             .is_some()
         {
             return Err(OutboundScopeConfigError::DuplicatePeer(shown));

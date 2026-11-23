@@ -68,6 +68,7 @@ pub mod identity;
 /// #4478 — the #4356 ancestor-owner bind gate on the federated namespace_meta apply.
 pub mod ns_meta_ancestor_gate;
 pub mod outbound_scope;
+pub mod outbound_scope_serve;
 pub mod peer;
 pub mod peer_attestation;
 pub mod peer_posture;

@@ -45,6 +45,10 @@ use ai_memory::federation::{FederationConfig, PeerEndpoint, sync};
 use ai_memory::models::{Memory, MemoryLinkRelation};
 use ai_memory::replication::{QuorumError, QuorumFailureReason, QuorumPolicy};
 
+/// #10037 / #10039: the pull path (`GET /sync/since`).
+#[path = "federation_outbound_scope_9996_serve/serve.rs"]
+mod serve;
+
 // ---------------------------------------------------------------------------
 // Recording loopback peer
 // ---------------------------------------------------------------------------
