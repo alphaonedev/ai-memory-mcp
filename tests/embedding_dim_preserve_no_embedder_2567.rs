@@ -17,8 +17,8 @@
 //! infrastructure, that
 //!
 //! 1. the only conversion in the `connect_with_dim_and_timeout_auto_migrate`
-//!    funnel is the UNFORCED `migrate_embedding_dim_for(intent, false)`
-//!    (#9933: boot never NULLs a stored vector), the decision comes from
+//!    funnel is the order-less `migrate_embedding_dim_for(intent, None)`
+//!    (#9933/#9952: boot never NULLs a stored vector), the decision comes from
 //!    `decide_auto_migrate(..., embedder_available)`, and its no-embedder
 //!    arm PRESERVES the vectors + WARNs before any conversion (#2567). The
 //!    decision table itself is pinned behaviourally by the
@@ -55,9 +55,9 @@ const AUTO_MIGRATE_FN: &str = "connect_with_dim_and_timeout_auto_migrate";
 /// The new #2567 gate parameter.
 const EMBEDDER_AVAILABLE_PARAM: &str = "embedder_available";
 
-/// The one conversion the funnel may make: unforced, so a populated column
-/// refuses inside the conversion's own lock (#9933).
-const CONVERSION_CALL: &str = "migrate_embedding_dim_for(intent, false)";
+/// The one conversion the funnel may make: with no `ForceReembedOrder`, so a
+/// populated column refuses inside the conversion's own lock (#9933/#9952).
+const CONVERSION_CALL: &str = "migrate_embedding_dim_for(intent, None)";
 
 /// The forced conversion that NULLs stored vectors; never in the funnel.
 const FORCED_CALL_PREFIX: &str = "migrate_embedding_dim";

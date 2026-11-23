@@ -46,7 +46,7 @@ pub const MIGRATION_V96_POSTGRES: &str =
 
 /// Transactional teardown for the Postgres v96 embedding-dependent trigger.
 ///
-/// `migrate_embedding_dim` runs this only after its embedding-NULL update has
+/// `migrate_embedding_dim_for` runs this only after its embedding-NULL update has
 /// fired the trigger, then recreates the trigger before committing. PostgreSQL
 /// transactional DDL means any later failure rolls the drop back with the rest
 /// of the conversion.

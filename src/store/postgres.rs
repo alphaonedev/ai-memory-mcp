@@ -149,8 +149,15 @@ use super::{
 use crate::models::{AgentRegistration, Memory, MemoryLink, Tier};
 pub use crate::store::embedding_dim_policy::EmbeddingDimIntent;
 use crate::store::embedding_dim_policy::{
-    AutoMigrateDecision, EmbeddingDimMismatch, decide_auto_migrate,
+    AutoMigrateDecision, EmbeddingDimMismatch, ForceReembedOrder, decide_auto_migrate,
 };
+
+/// #9963 — declared dim of `memories.embedding` for the `memories` table the
+/// session `search_path` resolves (the same one every unqualified statement
+/// of the conversion names). One probe text for every reader.
+const SQL_MEMORIES_EMBEDDING_ATTTYPMOD: &str = "SELECT a.atttypmod FROM pg_attribute a \
+     WHERE a.attrelid = to_regclass('memories') AND a.attname = 'embedding' \
+     AND NOT a.attisdropped";
 
 /// Tracing target for postgres-SAL events. Pre-#1562 these were
 /// emitted as a FIELD (`target = `), which RUST_LOG target filtering
@@ -2518,16 +2525,13 @@ pub use crate::store::PoolConfig;
 /// holding the conversion lock, or a pooled connection).
 /// [`PostgresStore::current_embedding_dim`] delegates here.
 async fn current_embedding_dim_on(conn: &mut sqlx::PgConnection) -> StoreResult<Option<i32>> {
-    let row: Option<(i32,)> = sqlx::query_as(
-        "SELECT atttypmod FROM pg_attribute a
-         JOIN pg_class c ON c.oid = a.attrelid
-         JOIN pg_namespace n ON c.relnamespace = n.oid
-         WHERE c.relname = 'memories' AND a.attname = 'embedding'
-         AND n.nspname = 'public'",
-    )
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| to_store_err("read memories.embedding atttypmod", e))?;
+    // #9963 — resolve `memories` through the session search_path, exactly
+    // as the unqualified LOCK / ALTER / COUNT of the conversion do, so the
+    // check and the use name one table. NULL (no such table) gives no row.
+    let row: Option<(i32,)> = sqlx::query_as(SQL_MEMORIES_EMBEDDING_ATTTYPMOD)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| to_store_err("read memories.embedding atttypmod", e))?;
     Ok(row.map(|(t,)| t))
 }
 
@@ -2706,7 +2710,7 @@ impl PostgresStore {
     ///
     /// For an existing schema, this call does NOT alter pre-declared
     /// `vector(M)` columns — the operator must invoke the explicit
-    /// `migrate_embedding_dim` helper (typically via
+    /// `migrate_embedding_dim_for` conversion (typically via
     /// `ai-memory schema-init --embedding-dim N`) to perform the
     /// destructive in-place conversion. Calling `connect_with_dim`
     /// against a mismatched schema emits a WARN and falls back to the
@@ -3223,13 +3227,7 @@ impl PostgresStore {
         // log a WARN here so the operator notices before writes start
         // failing on a dim-mismatch insert. (#304 nit; v0.7.0 L3 made
         // the comparand parameterisable.)
-        let typmod: Option<(i32,)> = sqlx::query_as(
-            "SELECT atttypmod FROM pg_attribute a
-             JOIN pg_class c ON c.oid = a.attrelid
-             JOIN pg_namespace n ON c.relnamespace = n.oid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'
-             AND n.nspname = 'public'",
-        )
+        let typmod: Option<(i32,)> = sqlx::query_as(SQL_MEMORIES_EMBEDDING_ATTTYPMOD)
         .fetch_optional(&pool)
         .await
         .ok()
@@ -3495,10 +3493,11 @@ impl PostgresStore {
                      disagrees with the requested dim ({requested}) and holds no embeddings; \
                      converting the empty column in place."
                 );
-                // #9933 — force = false: the count above saw no vector, and
-                // the conversion re-counts under its table lock, so a row
-                // embedded in between makes it refuse rather than NULL it.
-                store.migrate_embedding_dim_for(intent, false).await?;
+                // #9933 / #9952 — no order: boot never holds an argv
+                // `ForceReembedOrder`, and the conversion re-counts under its
+                // table lock, so a row embedded in between makes it refuse
+                // rather than NULL it.
+                store.migrate_embedding_dim_for(intent, None).await?;
                 Ok(store)
             }
             AutoMigrateDecision::Refuse(mismatch) => Err(mismatch.into()),
@@ -10490,7 +10489,7 @@ impl PostgresStore {
     /// implicitly on daemon startup. The connect-time pass here just
     /// records that we've reached v29 once the bookkeeping is in place;
     /// the explicit conversion lives at
-    /// [`Self::migrate_embedding_dim`].
+    /// [`Self::migrate_embedding_dim_for`].
     async fn migrate_v29_stamp(&self) -> StoreResult<()> {
         let mut tx = self
             .pool
@@ -10548,18 +10547,6 @@ impl PostgresStore {
         count_embeddings_at_risk_on(&mut conn).await
     }
 
-    /// Operator-initiated `vector(N)` conversion with an explicitly chosen
-    /// dimension. Equivalent to [`Self::migrate_embedding_dim_for`] with
-    /// [`EmbeddingDimIntent::Explicit`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::migrate_embedding_dim_for`].
-    pub async fn migrate_embedding_dim(&self, target_dim: u32, force: bool) -> StoreResult<bool> {
-        self.migrate_embedding_dim_for(EmbeddingDimIntent::Explicit(target_dim), force)
-            .await
-    }
-
     /// Operator-initiated `vector(N)` conversion. Destructive on the
     /// embedding column: rows have their `embedding` NULLed (vectors
     /// cannot be reprojected dim-to-dim), the HNSW indexes on both
@@ -10581,29 +10568,35 @@ impl PostgresStore {
     /// the requested dim) AND the corpus holds stored embeddings, the call
     /// REFUSES with [`EmbeddingDimMismatch`] (`StoreError::InvalidInput`,
     /// naming both dims, the source of the requested one, the count and the
-    /// opt-in) unless `force` is set. `force = true` is ONLY the explicit
-    /// `ai-memory schema-init --embedding-dim <N> --force-reembed` opt-in;
-    /// no boot path passes it (#9933).
+    /// opt-in) unless `order` is a [`ForceReembedOrder`] that authorizes
+    /// `intent` (#9952). Only the `schema-init` argv parser builds one, from
+    /// `--embedding-dim <N> --force-reembed` together; no boot path holds
+    /// one, and an order for another dim or a non-explicit intent is ignored.
     ///
-    /// #9933 — the dim check and the count run INSIDE the conversion
-    /// transaction after `LOCK TABLE memories, archived_memories IN ACCESS
-    /// EXCLUSIVE MODE`, so a row embedded between a caller's decision and
-    /// the conversion is counted and refused, never NULLed unseen.
+    /// #9961 — a column whose dim already matches is detected on a pooled
+    /// connection first and returns `Ok(false)` without the table lock, so a
+    /// no-op call never queues behind a writer. Otherwise the dim is read
+    /// again and the count runs INSIDE the conversion transaction after
+    /// `LOCK TABLE memories, archived_memories IN ACCESS EXCLUSIVE MODE`
+    /// (#9933), so a row embedded between a caller's decision and the
+    /// conversion is counted and refused, never NULLed unseen.
     ///
     /// # Errors
     ///
     /// - `StoreError::InvalidInput` when the requested dim is not one of
     ///   the supported values (`SUPPORTED_EMBEDDING_DIMS`).
     /// - `StoreError::InvalidInput` (the [`EmbeddingDimMismatch`] text)
-    ///   when stored embeddings exist and `force` is `false`.
+    ///   when stored embeddings exist and `order` does not authorize `intent`.
     /// - `StoreError::BackendUnavailable` on any SQL failure during
     ///   the conversion.
     pub async fn migrate_embedding_dim_for(
         &self,
         intent: EmbeddingDimIntent,
-        force: bool,
+        order: Option<ForceReembedOrder>,
     ) -> StoreResult<bool> {
         self.gate_record_stop().await?;
+        // #9952 — only the argv order for this explicit dim may NULL vectors.
+        let force = order.is_some_and(|o| o.authorizes(intent));
         let target_dim = intent.dim();
         let target_i32 = i32::try_from(target_dim).map_err(|_| StoreError::InvalidInput {
             detail: format!("target_dim {target_dim} out of i32 range"),
@@ -10614,6 +10607,18 @@ impl PostgresStore {
                     "unsupported target embedding dim {target_dim}: expected one of {SUPPORTED_EMBEDDING_DIMS:?}"
                 ),
             });
+        }
+
+        // #9961 — the no-op check needs no lock: a matching column returns
+        // here without queueing behind writers. A differing one is re-read
+        // under the lock below, so this read never authorizes a conversion.
+        if intent.matches_live(self.current_embedding_dim().await?) {
+            tracing::info!(
+                target: TRACE_TARGET,
+                dim = target_i32,
+                "v29 embedding-dim migration: column already vector({target_i32}); no-op"
+            );
+            return Ok(false);
         }
 
         let mut tx = self
@@ -10797,7 +10802,7 @@ impl PostgresStore {
     /// cannot be handed back out and re-grabbed in place of one we have not
     /// cleared yet. Connections opened after this returns are born fresh and
     /// prepare post-`ALTER` plans on first use. Called on the
-    /// destructive-migrate path only (see [`Self::migrate_embedding_dim`]),
+    /// destructive-migrate path only (see [`Self::migrate_embedding_dim_for`]),
     /// which at daemon boot has no concurrent readers, so acquiring
     /// `pool.size()` connections deterministically reaches every open one
     /// without forcing new connections above the current open count.
@@ -11124,16 +11129,10 @@ impl PostgresStore {
         // exists with whatever dim the operator chose at connect time.
         // Falls back to DEFAULT_EMBEDDING_DIM if the probe comes back
         // empty (defensive — should never happen in practice).
-        let existing_dim: Option<(i32,)> = sqlx::query_as(
-            "SELECT atttypmod FROM pg_attribute a
-             JOIN pg_class c ON c.oid = a.attrelid
-             JOIN pg_namespace n ON c.relnamespace = n.oid
-             WHERE c.relname = 'memories' AND a.attname = 'embedding'
-             AND n.nspname = 'public'",
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("read memories.embedding dim in v18", e))?;
+        let existing_dim: Option<(i32,)> = sqlx::query_as(SQL_MEMORIES_EMBEDDING_ATTTYPMOD)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("read memories.embedding dim in v18", e))?;
         let dim_for_archive = existing_dim.map_or(DEFAULT_EMBEDDING_DIM, |(d,)| {
             u32::try_from(d).unwrap_or(DEFAULT_EMBEDDING_DIM)
         });
@@ -36090,7 +36089,7 @@ mod tests {
     #[test]
     fn render_schema_sql_handles_arbitrary_dim() {
         // The rendering helper itself doesn't gate on supported dims —
-        // the gate lives in `connect_with_dim` / `migrate_embedding_dim`.
+        // the gate lives in `connect_with_dim` / `migrate_embedding_dim_for`.
         // This test just verifies the substitution is purely textual.
         let rendered = render_schema_sql("vector({EMBEDDING_DIM})", 1024);
         assert_eq!(rendered, "vector(1024)");

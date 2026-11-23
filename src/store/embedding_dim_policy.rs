@@ -3,8 +3,8 @@
 //! A boot or `schema-init` that derived the `memories.embedding` column
 //! shape from a configured or compiled-default dimension used to NULL every
 //! stored vector when that dimension disagreed with the live column (the
-//! #877 auto-migrate ran `migrate_embedding_dim(dim, true)`). The invariant
-//! this module carries:
+//! #877 auto-migrate ran the destructive conversion with the force flag
+//! set). The invariant this module carries:
 //!
 //! 1. No boot path NULLs a stored embedding because a requested dimension
 //!    differs from the live column. A populated mismatch is a refusal
@@ -13,8 +13,16 @@
 //!    (the #1781 flag; no second convention).
 //! 2. Where the dimension came from is part of the type
 //!    ([`EmbeddingDimIntent`]): a defaulted value (tier preset, compiled
-//!    default) is never mistaken for an operator's explicit choice, and a
-//!    defaulted `schema-init` adopts the live column instead of converting it.
+//!    default) or a configured value (environment variable, config file,
+//!    configured model) is never mistaken for the `--embedding-dim`
+//!    argument, and a defaulted `schema-init` adopts the live column
+//!    instead of converting it.
+//! 3. #9952 — the destructive conversion needs a [`ForceReembedOrder`],
+//!    which only the `schema-init` argv parser can build, and only when that
+//!    call carries BOTH `--embedding-dim N` and `--force-reembed`. The
+//!    conversion function takes the order in its signature, so no caller
+//!    (boot, a future route, a test helper) can reach the destructive branch
+//!    with a dimension from the environment, a config file or a default.
 //!
 //! The decision is a pure function of `(live dim, intent, stored embeddings
 //! at risk, embedder available)` so every row of that table is a unit test
@@ -29,9 +37,15 @@ use super::StoreError;
 /// compiled default).
 pub const DEFAULTED_SOURCE_LABEL: &str = "a defaulted dimension (tier preset or compiled default)";
 
-/// Refusal label for a dimension the operator set (`--embedding-dim`,
-/// `[embeddings].dim`, `AI_MEMORY_EMBED_DIM`, or a configured model).
-pub const EXPLICIT_SOURCE_LABEL: &str = "an explicitly configured dimension";
+/// Refusal label for a dimension the operator configured outside the argv
+/// of the call (`AI_MEMORY_EMBED_DIM`, `[embeddings].dim`, or a configured
+/// embedding model).
+pub const CONFIGURED_SOURCE_LABEL: &str =
+    "a configured dimension (environment variable, config file or embedding model)";
+
+/// Refusal label for a dimension given as `--embedding-dim N` in the argv of
+/// the `schema-init` call.
+pub const EXPLICIT_SOURCE_LABEL: &str = "an explicit --embedding-dim argument";
 
 /// Opening words of every destructive-conversion refusal. Kept from the
 /// #1781 text so operators' and tests' substring matches keep working.
@@ -40,12 +54,20 @@ pub const REFUSAL_PREFIX: &str = "refusing destructive embedding-dim conversion"
 /// A requested embedding dimension together with where it came from.
 ///
 /// The variant, not a bool beside a `u32`, decides how a mismatch with the
-/// live column is handled: only [`Self::Explicit`] may drive a `schema-init`
-/// conversion, and a [`Self::Defaulted`] value adopts the live column there.
+/// live column is handled: only [`Self::Explicit`] together with a
+/// [`ForceReembedOrder`] may drive a destructive `schema-init` conversion; a
+/// [`Self::Configured`] value converts only an empty column, and a
+/// [`Self::Defaulted`] value adopts the live column there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingDimIntent {
-    /// The operator chose this dimension.
+    /// The dimension is the `--embedding-dim N` argument of this
+    /// `schema-init` call. Built only by the argv path
+    /// (`cli::schema_init::run`); the #9960 allowlist guard pins every
+    /// construction site in the tree.
     Explicit(u32),
+    /// The operator configured this dimension outside the call's argv
+    /// (environment variable, config file or configured model).
+    Configured(u32),
     /// The dimension is a default (tier preset or compiled constant).
     Defaulted(u32),
 }
@@ -55,7 +77,7 @@ impl EmbeddingDimIntent {
     #[must_use]
     pub const fn dim(self) -> u32 {
         match self {
-            Self::Explicit(d) | Self::Defaulted(d) => d,
+            Self::Explicit(d) | Self::Configured(d) | Self::Defaulted(d) => d,
         }
     }
 
@@ -64,6 +86,7 @@ impl EmbeddingDimIntent {
     pub const fn source_label(self) -> &'static str {
         match self {
             Self::Explicit(_) => EXPLICIT_SOURCE_LABEL,
+            Self::Configured(_) => CONFIGURED_SOURCE_LABEL,
             Self::Defaulted(_) => DEFAULTED_SOURCE_LABEL,
         }
     }
@@ -74,6 +97,81 @@ impl EmbeddingDimIntent {
     #[must_use]
     pub fn matches_live(self, live: Option<i32>) -> bool {
         live.is_some_and(|l| i64::from(l) == i64::from(self.dim()))
+    }
+}
+
+/// #9952 — the operator's order to NULL stored vectors and convert the
+/// column: a value that exists only when ONE `schema-init` argv carried both
+/// `--embedding-dim N` and `--force-reembed`.
+///
+/// The field is private and the only constructor is crate-private
+/// [`Self::from_argv`], called from `SchemaInitArgs::force_reembed_order`
+/// (the parsed argv). A dimension from the environment, a config file or a
+/// default has no path to a value of this type, and the conversion function
+/// requires one to take its destructive branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForceReembedOrder {
+    dim: u32,
+}
+
+impl ForceReembedOrder {
+    /// Build the order from the two argv flags of one `schema-init` call:
+    /// `Some` only when both `--embedding-dim N` and `--force-reembed` are
+    /// present.
+    #[must_use]
+    pub(crate) const fn from_argv(embedding_dim: Option<u32>, force_reembed: bool) -> Option<Self> {
+        match (embedding_dim, force_reembed) {
+            (Some(dim), true) => Some(Self { dim }),
+            (Some(_) | None, false) | (None, true) => None,
+        }
+    }
+
+    /// The dimension the order converts to.
+    #[must_use]
+    pub const fn dim(self) -> u32 {
+        self.dim
+    }
+
+    /// `true` only for the [`EmbeddingDimIntent::Explicit`] dimension this
+    /// order was given with. A configured or defaulted intent, or another
+    /// dimension, is never authorised.
+    #[must_use]
+    pub const fn authorizes(self, intent: EmbeddingDimIntent) -> bool {
+        match intent {
+            EmbeddingDimIntent::Explicit(d) => d == self.dim,
+            EmbeddingDimIntent::Configured(_) | EmbeddingDimIntent::Defaulted(_) => false,
+        }
+    }
+}
+
+/// What the `schema-init` argv asked for about re-embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReembedRequest {
+    /// No `--force-reembed`.
+    NotRequested,
+    /// `--force-reembed` without `--embedding-dim`: never an order.
+    WithoutDim,
+    /// Both flags in the argv.
+    Order(ForceReembedOrder),
+}
+
+impl ReembedRequest {
+    /// The order carried by the request, if any.
+    #[must_use]
+    pub const fn order(self) -> Option<ForceReembedOrder> {
+        match self {
+            Self::Order(o) => Some(o),
+            Self::NotRequested | Self::WithoutDim => None,
+        }
+    }
+
+    /// `true` when the argv carried `--force-reembed`.
+    #[must_use]
+    pub const fn force_flag(self) -> bool {
+        match self {
+            Self::NotRequested => false,
+            Self::WithoutDim | Self::Order(_) => true,
+        }
     }
 }
 
@@ -162,7 +260,7 @@ pub enum AutoMigrateDecision {
     /// (#2567) and WARN.
     PreserveNoEmbedder,
     /// Mismatch on a column that holds no embeddings: converting loses
-    /// nothing (#877). The adapter converts WITHOUT the force flag, so a row
+    /// nothing (#877). The adapter converts WITHOUT an order, so a row
     /// written after the count still makes the conversion refuse.
     ConvertEmpty,
     /// Mismatch on a populated column: refuse to boot.
@@ -194,18 +292,18 @@ pub fn decide_auto_migrate(
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaInitDecision {
-    /// Call the conversion with this force flag (it is a no-op when the
-    /// column already matches, and refuses a populated column unless
-    /// forced).
+    /// Call the conversion with this order (it is a no-op when the column
+    /// already matches, and refuses a populated column without an order).
     Migrate {
-        /// The `--force-reembed` opt-in, passed through.
-        force: bool,
+        /// The argv order, passed through only for the explicit dimension it
+        /// was given with.
+        order: Option<ForceReembedOrder>,
     },
     /// A defaulted dimension met a different live column: keep the live
     /// column and report it.
     AdoptLive,
-    /// A defaulted dimension with `--force-reembed` over a populated column:
-    /// a defaulted value never authorises destroying vectors.
+    /// A defaulted or configured dimension over a populated column that
+    /// differs: such a value never authorises destroying vectors.
     Refuse(EmbeddingDimMismatch),
 }
 
@@ -213,20 +311,28 @@ pub enum SchemaInitDecision {
 pub fn decide_schema_init(
     live: Option<i32>,
     intent: EmbeddingDimIntent,
-    force_reembed: bool,
+    request: ReembedRequest,
     at_risk: i64,
 ) -> SchemaInitDecision {
+    if intent.matches_live(live) {
+        return SchemaInitDecision::Migrate { order: None };
+    }
     match intent {
         EmbeddingDimIntent::Explicit(_) => SchemaInitDecision::Migrate {
-            force: force_reembed,
+            order: request.order().filter(|o| o.authorizes(intent)),
         },
+        EmbeddingDimIntent::Configured(_) => {
+            if at_risk == 0 {
+                SchemaInitDecision::Migrate { order: None }
+            } else {
+                SchemaInitDecision::Refuse(EmbeddingDimMismatch::new(live, intent, at_risk))
+            }
+        }
         EmbeddingDimIntent::Defaulted(_) => {
-            if intent.matches_live(live) {
-                SchemaInitDecision::Migrate { force: false }
-            } else if !force_reembed {
+            if !request.force_flag() {
                 SchemaInitDecision::AdoptLive
             } else if at_risk == 0 {
-                SchemaInitDecision::Migrate { force: false }
+                SchemaInitDecision::Migrate { order: None }
             } else {
                 SchemaInitDecision::Refuse(EmbeddingDimMismatch::new(live, intent, at_risk))
             }
@@ -234,12 +340,14 @@ pub fn decide_schema_init(
     }
 }
 
-/// Tags `dim` with its source: [`EmbeddingDimIntent::Explicit`] when the
-/// operator chose it, [`EmbeddingDimIntent::Defaulted`] otherwise.
+/// Tags a dimension resolved from configuration with its source:
+/// [`EmbeddingDimIntent::Configured`] when the operator configured it,
+/// [`EmbeddingDimIntent::Defaulted`] otherwise. It never yields
+/// [`EmbeddingDimIntent::Explicit`]: configuration is not the argv (#9952).
 #[must_use]
-pub const fn intent_for(dim: u32, operator_chosen: bool) -> EmbeddingDimIntent {
-    if operator_chosen {
-        EmbeddingDimIntent::Explicit(dim)
+pub const fn intent_for(dim: u32, operator_configured: bool) -> EmbeddingDimIntent {
+    if operator_configured {
+        EmbeddingDimIntent::Configured(dim)
     } else {
         EmbeddingDimIntent::Defaulted(dim)
     }
@@ -260,7 +368,7 @@ pub fn config_names_embedder_model(app: &crate::config::AppConfig) -> bool {
 /// `true` when an API backend's dim came from the operator
 /// (`AI_MEMORY_EMBED_DIM` or `[embeddings].dim`), not a compiled table.
 #[must_use]
-pub const fn api_dim_is_explicit(source: crate::config::EmbedDimSource) -> bool {
+pub const fn api_dim_is_configured(source: crate::config::EmbedDimSource) -> bool {
     matches!(
         source,
         crate::config::EmbedDimSource::Env | crate::config::EmbedDimSource::ConfigFile
@@ -268,270 +376,5 @@ pub const fn api_dim_is_explicit(source: crate::config::EmbedDimSource) -> bool 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const LIVE: i32 = 768;
-    const OTHER: u32 = 384;
-    const SAME: u32 = 768;
-    const AT_RISK: i64 = 3;
-
-    const EXPECTED_DEFAULTED: &str = "refusing destructive embedding-dim conversion: live column is vector(768), requested vector(384) from a defaulted dimension (tier preset or compiled default); 3 stored embeddings would be NULLed. To keep them, configure an embedder whose dimension is 768; to convert them and re-embed, run `ai-memory schema-init --embedding-dim 384 --force-reembed`.";
-    const EXPECTED_EXPLICIT: &str = "refusing destructive embedding-dim conversion: live column is vector(768), requested vector(384) from an explicitly configured dimension; 3 stored embeddings would be NULLed. To keep them, configure an embedder whose dimension is 768; to convert them and re-embed, run `ai-memory schema-init --embedding-dim 384 --force-reembed`.";
-    const EXPECTED_NO_COLUMN: &str = "refusing destructive embedding-dim conversion: live column has no declared vector dimension, requested vector(384) from an explicitly configured dimension; 3 stored embeddings would be NULLed. To convert them and re-embed, run `ai-memory schema-init --embedding-dim 384 --force-reembed`.";
-
-    use AutoMigrateDecision as A;
-    use EmbeddingDimIntent::{Defaulted, Explicit};
-
-    fn refuse(live: Option<i32>, intent: EmbeddingDimIntent) -> EmbeddingDimMismatch {
-        EmbeddingDimMismatch::new(live, intent, AT_RISK)
-    }
-
-    /// Every (live, intent, at_risk, embedder) combination over the corpus,
-    /// with the expected decision written out by hand.
-    #[test]
-    fn auto_migrate_table_9933() {
-        let rows: [(Option<i32>, EmbeddingDimIntent, i64, bool, A); 16] = [
-            (Some(LIVE), Explicit(SAME), AT_RISK, true, A::Keep),
-            (Some(LIVE), Explicit(SAME), 0, false, A::Keep),
-            (Some(LIVE), Defaulted(SAME), AT_RISK, true, A::Keep),
-            (Some(LIVE), Defaulted(SAME), 0, false, A::Keep),
-            (
-                Some(LIVE),
-                Explicit(OTHER),
-                AT_RISK,
-                true,
-                A::Refuse(refuse(Some(LIVE), Explicit(OTHER))),
-            ),
-            (
-                Some(LIVE),
-                Defaulted(OTHER),
-                AT_RISK,
-                true,
-                A::Refuse(refuse(Some(LIVE), Defaulted(OTHER))),
-            ),
-            (
-                Some(LIVE),
-                Explicit(OTHER),
-                AT_RISK,
-                false,
-                A::PreserveNoEmbedder,
-            ),
-            (
-                Some(LIVE),
-                Defaulted(OTHER),
-                AT_RISK,
-                false,
-                A::PreserveNoEmbedder,
-            ),
-            (Some(LIVE), Explicit(OTHER), 0, true, A::ConvertEmpty),
-            (Some(LIVE), Defaulted(OTHER), 0, true, A::ConvertEmpty),
-            (Some(LIVE), Explicit(OTHER), 0, false, A::PreserveNoEmbedder),
-            (
-                Some(LIVE),
-                Defaulted(OTHER),
-                0,
-                false,
-                A::PreserveNoEmbedder,
-            ),
-            (
-                None,
-                Explicit(OTHER),
-                AT_RISK,
-                true,
-                A::Refuse(refuse(None, Explicit(OTHER))),
-            ),
-            (None, Defaulted(OTHER), 0, true, A::ConvertEmpty),
-            (None, Explicit(OTHER), AT_RISK, false, A::PreserveNoEmbedder),
-            (Some(-1), Explicit(SAME), 0, true, A::ConvertEmpty),
-        ];
-        for (live, intent, at_risk, embedder, expected) in rows {
-            assert_eq!(
-                decide_auto_migrate(live, intent, at_risk, embedder),
-                expected,
-                "live={live:?} intent={intent:?} at_risk={at_risk} embedder={embedder}"
-            );
-        }
-    }
-
-    #[test]
-    fn schema_init_table_9933() {
-        use SchemaInitDecision as S;
-        let rows: [(Option<i32>, EmbeddingDimIntent, bool, i64, S); 12] = [
-            (
-                Some(LIVE),
-                Explicit(OTHER),
-                false,
-                AT_RISK,
-                S::Migrate { force: false },
-            ),
-            (
-                Some(LIVE),
-                Explicit(OTHER),
-                true,
-                AT_RISK,
-                S::Migrate { force: true },
-            ),
-            (
-                Some(LIVE),
-                Explicit(SAME),
-                false,
-                AT_RISK,
-                S::Migrate { force: false },
-            ),
-            (
-                Some(LIVE),
-                Explicit(SAME),
-                true,
-                AT_RISK,
-                S::Migrate { force: true },
-            ),
-            (
-                Some(LIVE),
-                Defaulted(SAME),
-                false,
-                AT_RISK,
-                S::Migrate { force: false },
-            ),
-            (
-                Some(LIVE),
-                Defaulted(SAME),
-                true,
-                AT_RISK,
-                S::Migrate { force: false },
-            ),
-            (Some(LIVE), Defaulted(OTHER), false, AT_RISK, S::AdoptLive),
-            (Some(LIVE), Defaulted(OTHER), false, 0, S::AdoptLive),
-            (
-                Some(LIVE),
-                Defaulted(OTHER),
-                true,
-                0,
-                S::Migrate { force: false },
-            ),
-            (
-                Some(LIVE),
-                Defaulted(OTHER),
-                true,
-                AT_RISK,
-                S::Refuse(refuse(Some(LIVE), Defaulted(OTHER))),
-            ),
-            (None, Defaulted(OTHER), false, 0, S::AdoptLive),
-            (
-                None,
-                Defaulted(OTHER),
-                true,
-                AT_RISK,
-                S::Refuse(refuse(None, Defaulted(OTHER))),
-            ),
-        ];
-        for (live, intent, force, at_risk, expected) in rows {
-            assert_eq!(
-                decide_schema_init(live, intent, force, at_risk),
-                expected,
-                "live={live:?} intent={intent:?} force={force} at_risk={at_risk}"
-            );
-        }
-    }
-
-    #[test]
-    fn refusal_text_names_both_dims_and_opt_in_9933() {
-        assert_eq!(
-            refuse(Some(LIVE), Defaulted(OTHER)).to_string(),
-            EXPECTED_DEFAULTED
-        );
-        assert_eq!(
-            refuse(Some(LIVE), Explicit(OTHER)).to_string(),
-            EXPECTED_EXPLICIT
-        );
-        assert_eq!(
-            refuse(None, Explicit(OTHER)).to_string(),
-            EXPECTED_NO_COLUMN
-        );
-        let err: StoreError = refuse(Some(LIVE), Explicit(OTHER)).into();
-        assert_eq!(
-            err.to_string(),
-            format!("invalid input: {EXPECTED_EXPLICIT}")
-        );
-    }
-
-    #[test]
-    fn intent_accessors_9933() {
-        assert_eq!(Explicit(OTHER).dim(), OTHER);
-        assert_eq!(Defaulted(SAME).dim(), SAME);
-        assert_eq!(Explicit(OTHER).source_label(), EXPLICIT_SOURCE_LABEL);
-        assert_eq!(Defaulted(OTHER).source_label(), DEFAULTED_SOURCE_LABEL);
-        // No wrap: u32::MAX never equals a negative or smaller i32.
-        assert!(!Explicit(u32::MAX).matches_live(Some(-1)));
-        assert!(!Explicit(u32::MAX).matches_live(Some(i32::MAX)));
-        assert!(Explicit(SAME).matches_live(Some(LIVE)));
-        assert!(!Explicit(SAME).matches_live(None));
-        let m = refuse(Some(LIVE), Defaulted(OTHER));
-        assert_eq!(
-            (m.live(), m.intent(), m.at_risk()),
-            (Some(LIVE), Defaulted(OTHER), AT_RISK)
-        );
-    }
-
-    #[test]
-    fn intent_for_tags_the_source_9933() {
-        assert_eq!(intent_for(OTHER, true), Explicit(OTHER));
-        assert_eq!(intent_for(OTHER, false), Defaulted(OTHER));
-    }
-
-    /// Unset, empty and whitespace names are not a choice (they fall to the
-    /// safe Defaulted side); a real name in either field is.
-    #[test]
-    #[allow(deprecated)]
-    fn config_names_embedder_model_rows_9933() {
-        use crate::config::{AppConfig, EmbeddingsSection};
-        const NAME: &str = "nomic_embed_v15";
-        let section = |m: Option<&str>| {
-            Some(EmbeddingsSection {
-                model: m.map(str::to_string),
-                ..EmbeddingsSection::default()
-            })
-        };
-        let rows: [(Option<EmbeddingsSection>, Option<&str>, bool); 9] = [
-            (None, None, false),
-            (section(None), None, false),
-            (section(Some("")), None, false),
-            (section(Some(" \t\n")), None, false),
-            (None, Some(""), false),
-            (None, Some("   "), false),
-            (section(Some(NAME)), None, true),
-            (None, Some(NAME), true),
-            (section(Some(" ")), Some(NAME), true),
-        ];
-        for (embeddings, legacy, expected) in rows {
-            let app = AppConfig {
-                embeddings: embeddings.clone(),
-                embedding_model: legacy.map(str::to_string),
-                ..AppConfig::default()
-            };
-            assert_eq!(
-                config_names_embedder_model(&app),
-                expected,
-                "embeddings={embeddings:?} legacy={legacy:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn api_dim_is_explicit_rows_9933() {
-        use crate::config::EmbedDimSource as D;
-        let rows = [
-            (D::Env, true),
-            (D::ConfigFile, true),
-            (D::CompiledTable, false),
-            (D::Unknown, false),
-        ];
-        for (source, expected) in rows {
-            // No wildcard: a new variant breaks the build until its row exists.
-            match source {
-                D::Env | D::ConfigFile | D::CompiledTable | D::Unknown => {}
-            }
-            assert_eq!(api_dim_is_explicit(source), expected, "{source:?}");
-        }
-    }
-}
+#[path = "embedding_dim_policy_tests.rs"]
+mod tests;

@@ -74,7 +74,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::CliOutput;
 use crate::migrate;
-use crate::store::embedding_dim_policy::EmbeddingDimIntent;
+use crate::store::embedding_dim_policy::{EmbeddingDimIntent, ForceReembedOrder, ReembedRequest};
 
 /// Tracing target for schema-init events (#1562 — was emitted as a
 /// field via `target = `; now the real metadata target). All three
@@ -131,28 +131,51 @@ pub struct SchemaInitArgs {
     /// explicit value only to override the config-resolved default.
     ///
     /// For Postgres targets, a fresh schema is initialised with
-    /// `vector(<dim>)` columns directly. \#9933 — an existing column whose
-    /// dim differs is converted in place only for an explicit dim (this
-    /// flag, or a dim or model the config names): HNSW indexes are
-    /// dropped + recreated, existing embedding values are NULLed
-    /// (cross-dim reprojection isn't well-defined), and the column
-    /// type is altered; a populated column also needs `--force-reembed`.
-    /// A defaulted dim (tier preset or compiled default) never converts a
-    /// differing column: the live column dim is kept and reported.
+    /// `vector(<dim>)` columns directly. \#9933 / \#9952 — an existing
+    /// column whose dim differs and that holds stored embeddings is
+    /// converted in place ONLY when this call's argv carries both this
+    /// flag and `--force-reembed`: HNSW indexes are dropped + recreated,
+    /// existing embedding values are NULLed (cross-dim reprojection isn't
+    /// well-defined), and the column type is altered. A dim from the
+    /// environment, the config file or a configured model converts only
+    /// a column with no stored embeddings and otherwise refuses; a
+    /// defaulted dim (tier preset or compiled default) keeps and reports
+    /// the live column dim.
     ///
     /// For SQLite targets the flag is a no-op (SQLite stores
     /// embeddings as opaque BLOBs without a column-level dim).
     #[arg(long, value_name = "DIM")]
     pub embedding_dim: Option<u32>,
-    /// Force a destructive embedding-dim conversion (#1781, #9933). Required
-    /// to proceed when an explicit dim differs from the live
-    /// `memories.embedding` column dim AND the corpus already holds
-    /// stored embeddings: the conversion NULLs every embedding
-    /// (cross-dim reprojection isn't well-defined), so by default the
-    /// verb REFUSES and prints how many embeddings would be lost. Pass
-    /// this flag only when you accept a full re-embed afterwards.
+    /// Force a destructive embedding-dim conversion (#1781, #9933, #9952).
+    /// Takes effect only together with `--embedding-dim N` in the same
+    /// argv, when N differs from the live `memories.embedding` column dim
+    /// AND the corpus already holds stored embeddings: the conversion
+    /// NULLs every embedding (cross-dim reprojection isn't well-defined),
+    /// so without both flags the verb REFUSES and prints how many
+    /// embeddings would be lost. Pass it only when you accept a full
+    /// re-embed afterwards.
     #[arg(long, default_value_t = false)]
     pub force_reembed: bool,
+}
+
+impl SchemaInitArgs {
+    /// #9952 — the destructive-conversion order of this argv: `Some` only
+    /// when BOTH `--embedding-dim N` and `--force-reembed` were given. A dim
+    /// from the environment, a config file or a default never builds one.
+    #[must_use]
+    pub fn force_reembed_order(&self) -> Option<ForceReembedOrder> {
+        ForceReembedOrder::from_argv(self.embedding_dim, self.force_reembed)
+    }
+
+    /// #9952 — what this argv asked for about re-embedding.
+    #[must_use]
+    pub fn reembed_request(&self) -> ReembedRequest {
+        match (self.force_reembed_order(), self.force_reembed) {
+            (Some(order), _) => ReembedRequest::Order(order),
+            (None, true) => ReembedRequest::WithoutDim,
+            (None, false) => ReembedRequest::NotRequested,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +315,17 @@ pub async fn run(
     //      case, matching the daemon's `connect_with_dim` keyword arm.
     // #9933 — the source travels with the dim: only an explicit one may
     // convert a differing live column (`decide_schema_init`).
+    // #9952 — `Explicit` means "the argv of this call": a caller-supplied
+    // config intent is never explicit, whatever variant it carries.
     let intent: EmbeddingDimIntent = args
         .embedding_dim
         .map(EmbeddingDimIntent::Explicit)
-        .or(config_default)
+        .or(config_default.map(|c| match c {
+            EmbeddingDimIntent::Explicit(d) | EmbeddingDimIntent::Configured(d) => {
+                EmbeddingDimIntent::Configured(d)
+            }
+            EmbeddingDimIntent::Defaulted(d) => EmbeddingDimIntent::Defaulted(d),
+        }))
         .unwrap_or(EmbeddingDimIntent::Defaulted(
             DEFAULT_SCHEMA_INIT_EMBEDDING_DIM,
         ));
@@ -329,7 +359,7 @@ pub async fn run(
     } else if is_postgres_url(&args.store_url) {
         #[cfg(feature = "sal-postgres")]
         {
-            init_and_enumerate_postgres(&args.store_url, intent, args.force_reembed).await?
+            init_and_enumerate_postgres(&args.store_url, intent, args.reembed_request()).await?
         }
         #[cfg(not(feature = "sal-postgres"))]
         {
@@ -510,14 +540,15 @@ fn read_schema_version_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
 /// `connect_with_dim` emits a WARN but does NOT auto-convert — the
 /// destructive conversion runs only via the explicit
 /// `migrate_embedding_dim_for` call below, and only when
-/// [`decide_schema_init`] allows it (#9933: a defaulted dim adopts the
-/// live column; a defaulted dim with `--force-reembed` on a populated
-/// column refuses, because the opt-in needs an explicit `--embedding-dim`).
+/// [`decide_schema_init`] passes the argv [`ForceReembedOrder`] through
+/// (#9933, #9952: a defaulted dim adopts the live column; a configured or
+/// defaulted dim on a populated column refuses, whatever the flags, because
+/// the opt-in needs `--embedding-dim N --force-reembed` in this argv).
 #[cfg(feature = "sal-postgres")]
 async fn init_and_enumerate_postgres(
     url: &str,
     intent: EmbeddingDimIntent,
-    force_reembed: bool,
+    request: ReembedRequest,
 ) -> Result<SchemaInitReport> {
     use crate::store::StoreError;
     use crate::store::embedding_dim_policy::{SchemaInitDecision, decide_schema_init};
@@ -557,12 +588,12 @@ async fn init_and_enumerate_postgres(
     };
     // Returns `true` if a real conversion happened (destructive —
     // embeddings NULLed); `false` when the column already had the dim or
-    // a defaulted dim adopted the live column. #1781 — `force` threads the
-    // operator's `--force-reembed` opt-in; without it a populated column
-    // REFUSES with the typed InvalidInput the `?` propagates.
-    let migrated = match decide_schema_init(live, intent, force_reembed, at_risk) {
-        SchemaInitDecision::Migrate { force } => store
-            .migrate_embedding_dim_for(intent, force)
+    // a defaulted dim adopted the live column. #9952 — `order` is the argv
+    // order, passed only for its own explicit dim; without it a populated
+    // column REFUSES with the typed InvalidInput the `?` propagates.
+    let migrated = match decide_schema_init(live, intent, request, at_risk) {
+        SchemaInitDecision::Migrate { order } => store
+            .migrate_embedding_dim_for(intent, order)
             .await
             .with_context(|| format!("migrate embedding dim to {dim}"))?,
         SchemaInitDecision::AdoptLive => {
@@ -1144,7 +1175,7 @@ mod tests {
             // never "unbounded": the connect is already bounded by the pool
             // `acquire_timeout` (30s), and an ordinary DDL lock wait is bounded
             // by the `after_connect` envelope (`lock_timeout` 5s). The long
-            // wait is `migrate_embedding_dim`'s BOOTSTRAP taking the migration
+            // wait is `migrate_embedding_dim_for`'s BOOTSTRAP taking the migration
             // ADVISORY lock on a DEDICATED connection whose timeouts are
             // CLEARED by `prepare_migration_lock_connection` (SQL_CLEAR_*),
             // then polling `pg_try_advisory_lock` for up to
@@ -1194,12 +1225,19 @@ mod tests {
                                 return;
                             }
                         };
-                        // force=true: this is a shared TEST database and the
-                        // teardown's sole purpose is leaving the schema as
+                        // The argv order of `--embedding-dim 384
+                        // --force-reembed`: this is a shared TEST database and
+                        // the teardown's sole purpose is leaving the schema as
                         // this test found it, so any 768-dim embeddings this
                         // test itself produced are fine to NULL on the way
                         // back down to 384.
-                        if let Err(e) = store.migrate_embedding_dim(384, true).await {
+                        if let Err(e) = store
+                            .migrate_embedding_dim_for(
+                                EmbeddingDimIntent::Explicit(384),
+                                ForceReembedOrder::from_argv(Some(384), true),
+                            )
+                            .await
+                        {
                             eprintln!(
                                 "schema_init_postgres_embedding_dim_conversion: restore-to-384 teardown failed: {e}"
                             );
@@ -1512,7 +1550,12 @@ mod tests {
             .record_stop(&ctx, true, "ai:3491", "record-plane")
             .await
             .expect("engage record stop");
-        let stopped_result = store.migrate_embedding_dim(384, true).await;
+        let stopped_result = store
+            .migrate_embedding_dim_for(
+                EmbeddingDimIntent::Explicit(384),
+                ForceReembedOrder::from_argv(Some(384), true),
+            )
+            .await;
         store
             .record_stop(&ctx, false, "ai:3491", "record-plane")
             .await
@@ -1758,7 +1801,7 @@ mod tests {
         let err = init_and_enumerate_postgres(
             "postgres://x:y@127.0.0.1:1/no_db",
             EmbeddingDimIntent::Explicit(384),
-            false,
+            ReembedRequest::NotRequested,
         )
         .await
         .expect_err("must fail");

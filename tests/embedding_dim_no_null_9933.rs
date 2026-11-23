@@ -64,11 +64,18 @@ conversion: live column is vector(768), requested vector(384) from a defaulted d
 configure an embedder whose dimension is 768; to convert them and re-embed, run \
 `ai-memory schema-init --embedding-dim 384 --force-reembed`.";
 
-/// Exact refusal for an EXPLICITLY configured 384 over the seeded 768 corpus.
+/// Exact refusal for a CONFIGURED 384 (boot) over the seeded 768 corpus.
+const EXPECTED_CONFIGURED_REFUSAL: &str = "invalid input: refusing destructive embedding-dim \
+conversion: live column is vector(768), requested vector(384) from a configured dimension \
+(environment variable, config file or embedding model); 3 stored embeddings would be NULLed. \
+To keep them, configure an embedder whose dimension is 768; to convert them and re-embed, run \
+`ai-memory schema-init --embedding-dim 384 --force-reembed`.";
+
+/// Exact refusal for an argv `--embedding-dim 384` over the seeded 768 corpus.
 const EXPECTED_EXPLICIT_REFUSAL: &str = "invalid input: refusing destructive embedding-dim \
-conversion: live column is vector(768), requested vector(384) from an explicitly configured \
-dimension; 3 stored embeddings would be NULLed. To keep them, configure an embedder whose \
-dimension is 768; to convert them and re-embed, run \
+conversion: live column is vector(768), requested vector(384) from an explicit \
+--embedding-dim argument; 3 stored embeddings would be NULLed. To keep them, configure an \
+embedder whose dimension is 768; to convert them and re-embed, run \
 `ai-memory schema-init --embedding-dim 384 --force-reembed`.";
 
 /// Where the boot's dimension came from (the first table axis).
@@ -106,7 +113,7 @@ const BOOT_TABLE: [(Source, Relation, Expect); 6] = [
     (
         Source::Configured,
         Relation::Differing,
-        Expect::Refuses(EXPECTED_EXPLICIT_REFUSAL),
+        Expect::Refuses(EXPECTED_CONFIGURED_REFUSAL),
     ),
     (Source::Defaulted, Relation::Matching, Expect::Boots),
     (
@@ -272,7 +279,7 @@ async fn boot(
     embedder_available: bool,
 ) -> Result<PostgresStore, String> {
     let intent = match source {
-        Source::Configured => Some(EmbeddingDimIntent::Explicit(dim)),
+        Source::Configured => Some(EmbeddingDimIntent::Configured(dim)),
         Source::Defaulted => Some(EmbeddingDimIntent::Defaulted(dim)),
         Source::Absent => None,
     };

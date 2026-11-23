@@ -12,7 +12,7 @@
 //! Fix: the postgres adapter exposes
 //! `connect_with_dim_and_timeout_auto_migrate(url, dim, secs)` — a new
 //! daemon-bootstrap entry point that detects the dim mismatch and runs
-//! the destructive `migrate_embedding_dim` in-place. The daemon
+//! the destructive `migrate_embedding_dim_for` in-place. The daemon
 //! `bootstrap_serve` path resolves the configured embedder dim from the
 //! same ladder `build_embedder` uses (`app_config` override > tier preset)
 //! and threads it through `build_store_handle` → the new auto-migrate
@@ -45,6 +45,18 @@ use sqlx::postgres::PgPoolOptions;
 mod common;
 use common::postgres_env::PublicSchemaLock;
 use common::postgres_url;
+
+/// #9952 — the argv order `schema-init --embedding-dim 768 --force-reembed`,
+/// built the only way a caller outside the crate can: from parsed args.
+fn argv_order_768() -> Option<ai_memory::store::embedding_dim_policy::ForceReembedOrder> {
+    ai_memory::cli::schema_init::SchemaInitArgs {
+        store_url: String::new(),
+        json: false,
+        embedding_dim: Some(768),
+        force_reembed: true,
+    }
+    .force_reembed_order()
+}
 
 // Issue #1381 (2026-05-28): the three tests in this file exercise
 // substrate paths that are HARDCODED to probe + mutate
@@ -201,7 +213,7 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
     {
         let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
             &url,
-            EmbeddingDimIntent::Explicit(768),
+            EmbeddingDimIntent::Configured(768),
             30,
             PoolConfig::default(),
             // #2567 — embedder available: this test exercises the destructive
@@ -223,7 +235,7 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
     {
         let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
             &url,
-            EmbeddingDimIntent::Explicit(768),
+            EmbeddingDimIntent::Configured(768),
             30,
             PoolConfig::default(),
             // #2567 — embedder available: this test exercises the destructive
@@ -259,7 +271,7 @@ async fn auto_migrate_no_op_when_fresh_schema_already_matches() {
     {
         let _store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
             &url,
-            EmbeddingDimIntent::Explicit(768),
+            EmbeddingDimIntent::Configured(768),
             30,
             PoolConfig::default(),
             // #2567 — embedder available: this test exercises the destructive
@@ -306,7 +318,7 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
     //    bootstrap path with an autonomous-tier embedder).
     let store = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
         &url,
-        EmbeddingDimIntent::Explicit(768),
+        EmbeddingDimIntent::Configured(768),
         30,
         PoolConfig::default(),
         // #2567 — embedder available: this test exercises the destructive
@@ -370,7 +382,7 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
 /// server on its next `list` — alternating 200/503 across pool
 /// connections until they recycle. The fix
 /// ([`PostgresStore::discard_pool_cached_plans`], invoked at the tail of
-/// `migrate_embedding_dim`) evicts every pooled connection's
+/// `migrate_embedding_dim_for`) evicts every pooled connection's
 /// prepared-statement cache immediately after the DDL commits.
 ///
 /// This is the production-faithful reproduction: warm the serving pool
@@ -443,11 +455,11 @@ async fn list_survives_embedding_dim_alter_without_cached_plan_503_1881() {
     }
 
     // The #877 in-place dim migrate (384→768) on the SAME warmed pool.
-    // `force = true` mirrors the daemon auto-migrate opt-in. This is the
+    // The argv order (`--embedding-dim 768 --force-reembed`) authorises it. This is the
     // DDL whose column-type change invalidates the cached `SELECT *`
     // plans; the fix must evict them here.
     let converted = store
-        .migrate_embedding_dim(768, true)
+        .migrate_embedding_dim_for(EmbeddingDimIntent::Explicit(768), argv_order_768())
         .await
         .expect("in-place embedding-dim migrate to 768");
     assert!(converted, "a real 384→768 conversion returns Ok(true)");
@@ -631,9 +643,9 @@ async fn default_deploy_no_boot_alter_cross_process_1882() {
 }
 
 /// Issue #1781 — refuse-destructive-by-default guard on
-/// `migrate_embedding_dim`. With stored embeddings present, a real
-/// dim conversion REFUSES (typed `InvalidInput`) without `force` and
-/// leaves the embedding intact; with `force = true` it proceeds and
+/// `migrate_embedding_dim_for`. With stored embeddings present, a real
+/// dim conversion REFUSES (typed `InvalidInput`) without a `ForceReembedOrder`
+/// and leaves the embedding intact; with the argv order it proceeds and
 /// NULLs the embedding. Precedent: the #1785 DROP-confirm pattern.
 #[tokio::test]
 async fn migrate_embedding_dim_refuses_when_embeddings_exist_without_force() {
@@ -679,10 +691,10 @@ async fn migrate_embedding_dim_refuses_when_embeddings_exist_without_force() {
         .expect("seed 384-dim embedding");
 
     // 1) A real conversion (384 -> 768) with stored embeddings present
-    //    and force = false MUST refuse with a typed InvalidInput and
+    //    and no order MUST refuse with a typed InvalidInput and
     //    MUST NOT mutate anything.
     let refusal = store
-        .migrate_embedding_dim(768, false)
+        .migrate_embedding_dim_for(EmbeddingDimIntent::Explicit(768), None)
         .await
         .expect_err("must refuse a destructive conversion of a populated corpus");
     match &refusal {
@@ -714,12 +726,12 @@ async fn migrate_embedding_dim_refuses_when_embeddings_exist_without_force() {
         "refusal must leave the stored embedding non-NULL (nothing destroyed)"
     );
 
-    // 2) With force = true the same conversion proceeds: Ok(true), the
+    // 2) With the argv order the same conversion proceeds: Ok(true), the
     //    column flips to vector(768), and the embedding is NULLed.
     let did_convert = store
-        .migrate_embedding_dim(768, true)
+        .migrate_embedding_dim_for(EmbeddingDimIntent::Explicit(768), argv_order_768())
         .await
-        .expect("force = true must proceed with the destructive conversion");
+        .expect("the argv order must proceed with the destructive conversion");
     assert!(did_convert, "a real conversion returns Ok(true)");
     assert_eq!(
         current_dim(&inspect).await,

@@ -1,6 +1,6 @@
 #![cfg(feature = "sal-postgres")]
 //! #9952 round 1 (#9956, #9957/#9959, #9958, #9961, #9963): the stored
-//! embedding column is never NULLed or re-typed unless the operator typed
+//! embedding column is never set to NULL or re-typed unless the operator typed
 //! BOTH `--embedding-dim N` and `--force-reembed` on that very
 //! `schema-init` call.
 //!

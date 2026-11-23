@@ -4977,10 +4977,10 @@ pub struct ServeBootstrap {
 ///   preset, no constructible model) → `None`.
 ///
 /// Returns `None` when no embedder is active (keyword tier); the postgres
-/// bootstrap then uses `connect_with_dim` (no auto-migrate). #9933 — the
-/// dim carries its source: `Explicit` only for an operator pin (API:
+/// bootstrap then uses `connect_with_dim` (no auto-migrate). #9933/#9952 —
+/// the dim carries its source: `Configured` for an operator pin (API:
 /// `[embeddings].dim` / env; local: an honoured configured model), else
-/// `Defaulted`, so a preset never drives a `schema-init` conversion.
+/// `Defaulted`; never `Explicit`, which only the schema-init argv makes.
 ///
 /// # \#1882 — root-cause fix
 ///
@@ -5008,7 +5008,7 @@ fn resolve_configured_embedding_dim(
     if crate::config::is_api_embed_backend(&resolved.backend) {
         // API backend: gated by the tier preset (Some/None), dim from the
         // resolver (explicit override or canonical lookup).
-        let chosen = policy::api_dim_is_explicit(resolved.dim_source);
+        let chosen = policy::api_dim_is_configured(resolved.dim_source);
         let dim = tier_config.embedding_model.and(resolved.embedding_dim);
         return dim.map(|d| policy::intent_for(d, chosen));
     }
@@ -13623,7 +13623,7 @@ decision = "allow"
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
         assert_eq!(
             dim,
-            Some(Edi::Explicit(768)),
+            Some(Edi::Configured(768)),
             "legacy alias nomic_embed_v15 canonicalises to nomic-embed-text-v1.5 (768)"
         );
     }
@@ -14289,7 +14289,7 @@ decision = "allow"
         let tier_cfg = FeatureTier::Semantic.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
         assert!(
-            dim == Some(Edi::Explicit(768)),
+            dim == Some(Edi::Configured(768)),
             "canonical lookup MUST return 768 for nomic-embed-text-v1.5; got: {dim:?}"
         );
     }
@@ -14312,7 +14312,7 @@ decision = "allow"
         let tier_cfg = FeatureTier::Semantic.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
         assert!(
-            dim == Some(Edi::Explicit(384)),
+            dim == Some(Edi::Configured(384)),
             "legacy flat-field path MUST resolve mini_lm_l6_v2 to 384; got: {dim:?}"
         );
     }

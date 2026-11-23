@@ -109,7 +109,7 @@ pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
 /// hoisted here and referenced by name at every site: the sqlite HNSW-size
 /// doctor probe (`src/cli/doctor.rs`), `storage::count_embedded_memories`,
 /// and the #1781 postgres destructive-conversion guard
-/// (`PostgresStore::migrate_embedding_dim`). One spelling, per the pm-v3.1
+/// (`PostgresStore::migrate_embedding_dim_for`). One spelling, per the pm-v3.1
 /// no-hardcoded-literal-duplication discipline.
 pub const SQL_COUNT_EMBEDDED_MEMORIES: &str =
     "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL";

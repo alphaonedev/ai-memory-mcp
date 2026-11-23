@@ -36,7 +36,7 @@
 //!   the `429` envelope).
 //! - **`src/cli/schema_init.rs`** — the live-Postgres `embedding_dim`
 //!   in-place conversion arm (`init_and_enumerate_postgres` →
-//!   `migrate_embedding_dim` returning `true`) + the AGE-bootstrap branch
+//!   `migrate_embedding_dim_for` returning `true`) + the AGE-bootstrap branch
 //!   when the `age` extension is present, via the public
 //!   [`ai_memory::cli::schema_init::run`] entry-point.
 //!
@@ -803,7 +803,7 @@ async fn pg_sync_push_quota_refusal_returns_429() {
 
 // ===================================================================
 // cli::schema_init — live-postgres embedding-dim in-place conversion arm
-// (init_and_enumerate_postgres → migrate_embedding_dim returning `true`).
+// (init_and_enumerate_postgres → migrate_embedding_dim_for returning `true`).
 // ===================================================================
 
 #[tokio::test]
@@ -846,7 +846,7 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
     let v0 = run_at(384).await;
     assert_eq!(v0["embedding_dim"].as_i64(), Some(384), "init at 384: {v0}");
 
-    // Step 2 — convert to 768. migrate_embedding_dim alters the column,
+    // Step 2 — convert to 768. migrate_embedding_dim_for alters the column,
     // NULLs embeddings, and returns true → embedding_dim_migrated=true
     // (the live-conversion arm init_and_enumerate_postgres:413-425). When the
     // DB was already at 768 from a prior run this is a no-op (false); accept
@@ -859,7 +859,7 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
     );
 
     // Step 3 — re-run at 768: idempotent no-op (embedding_dim_migrated=false),
-    // exercising the migrate_embedding_dim Ok(false) arm.
+    // exercising the migrate_embedding_dim_for Ok(false) arm.
     let idempotent_rerun = run_at(768).await;
     assert_eq!(
         idempotent_rerun["embedding_dim"].as_i64(),
