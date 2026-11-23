@@ -209,6 +209,7 @@ async fn push_signed_is_accepted_2297() {
         &peer_url,
         None,
         100,
+        &ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     )
     .await;
 
@@ -269,6 +270,7 @@ async fn push_unsigned_is_refused_2297() {
         &peer_url,
         None,
         100,
+        &ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     )
     .await;
 

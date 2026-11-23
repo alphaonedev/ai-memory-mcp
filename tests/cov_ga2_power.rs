@@ -1150,6 +1150,8 @@ fn fed_cfg(peer_urls: &[String], w: usize) -> ai_memory::federation::FederationC
         .map(|(i, raw)| ai_memory::federation::PeerEndpoint {
             id: format!("peer-{i}"),
             sync_push_url: format!("{}/api/v1/sync/push", raw.trim_end_matches('/')),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         })
         .collect();
     ai_memory::federation::FederationConfig {

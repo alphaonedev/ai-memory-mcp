@@ -14,7 +14,7 @@
 //!
 //! - `post_once` outbound headers: `X-Memory-Sig` + `X-Memory-Nonce`
 //!   (signing-key branch), `x-api-key`, `x-peer-id`, `Idempotency-Key`.
-//! - `post_once` 2xx-with-unparseable-body ⇒ still an Ack.
+//! - `post_once` 2xx-with-unparseable-body ⇒ not an Ack (#9996 C-2).
 //! - `post_once` id-drift (`ids` array disagrees) ⇒ NOT an ack.
 //! - `post_and_classify` retry-once recovering a transient 500.
 //! - Per-variant `AckOutcome::Fail` warn arms (peer 500 at W=2 ⇒ quorum
@@ -110,6 +110,7 @@ fn peer(id: &str, url: &str) -> PeerEndpoint {
     PeerEndpoint {
         id: id.to_string(),
         sync_push_url: url.to_string(),
+        outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     }
 }
 
@@ -118,6 +119,7 @@ fn dead_peer(id: &str) -> PeerEndpoint {
     PeerEndpoint {
         id: id.to_string(),
         sync_push_url: "https://127.0.0.1:1/api/v1/sync/push".to_string(),
+        outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     }
 }
 
@@ -364,6 +366,10 @@ impl FederationDlqSink for RecordingDlqSink {
         Ok(())
     }
 
+    async fn quarantine_dlq_row(&self, _id: i64, _last_error: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn pending_dlq_count(&self) -> Result<i64, String> {
         Ok(0)
     }
@@ -373,6 +379,11 @@ impl FederationDlqSink for RecordingDlqSink {
     }
 
     async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+        Ok(0)
+    }
+
+    /// #9996 — this harness holds no out-of-scope row.
+    async fn redrive_out_of_scope_quarantine(&self, _prefix: &str) -> Result<u64, String> {
         Ok(0)
     }
 
@@ -461,19 +472,43 @@ async fn store_fanout_signed_w2_attaches_full_header_set() {
     );
 }
 
-/// A 2xx response whose body is not JSON still counts as an ack (the
-/// `Err(_) => Ack` arm): W=2 quorum must be met by that peer.
+/// #9996 (vote V2-9996 C-2) — a 2xx whose body is not JSON is no proof
+/// that the peer applied the write, so it is NOT an ack: W=2 quorum is not
+/// met, and the DLQ keeps the row with the typed unparseable-body reason
+/// (transient, bounded by `MAX_REPLAY_ATTEMPTS`), never a delete.
 #[tokio::test]
-async fn store_fanout_2xx_unparseable_body_still_acks() {
+async fn store_fanout_2xx_unparseable_body_is_not_an_ack_9996() {
     let (url, _st) = spawn_peer(|_| (200, "definitely-not-json{{".to_string(), 0)).await;
-    let cfg = config(vec![peer("peer-notjson", &url)], 2, 2_000);
+    let sink = Arc::new(RecordingDlqSink::default());
+    let mut cfg = config(vec![peer("peer-notjson", &url)], 2, 2_000);
+    cfg.dlq_sink = Some(sink.clone());
     let mem = fixture_memory("mem-notjson");
     let tracker = sync::broadcast_store_quorum(&cfg, &mem)
         .await
         .expect("store quorum tracker");
+    let err = tracker
+        .finalise(std::time::Instant::now())
+        .expect_err("2xx with an unparseable body must not count as an ack");
+    let ai_memory::replication::QuorumError::QuorumNotMet { got, needed, .. } = err else {
+        panic!("expected QuorumNotMet, got {err:?}");
+    };
+    assert_eq!((got, needed), (1, 2), "only the local commit counts");
+    let rows = sink
+        .rows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(rows.len(), 1, "the row is kept for replay, never dropped");
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].1.as_str()),
+        ("mem-notjson", "peer-notjson")
+    );
     assert!(
-        tracker.finalise(std::time::Instant::now()).is_ok(),
-        "2xx with unparseable body must count as an ack"
+        rows[0]
+            .2
+            .contains("peer 2xx with an unparseable body (not proof of apply)"),
+        "DLQ reason must name the unparseable 2xx; got: {}",
+        rows[0].2
     );
 }
 
@@ -733,12 +768,20 @@ macro_rules! assert_variant_quorum_arms {
 
 #[tokio::test]
 async fn delete_quorum_ack_and_fail_arms() {
-    assert_variant_quorum_arms!(|cfg| sync::broadcast_delete_quorum(&cfg, "del-var-1"));
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_delete_quorum(
+        &cfg,
+        "del-var-1",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new()
+    ));
 }
 
 #[tokio::test]
 async fn restore_quorum_ack_and_fail_arms() {
-    assert_variant_quorum_arms!(|cfg| sync::broadcast_restore_quorum(&cfg, "restore-var-1"));
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_restore_quorum(
+        &cfg,
+        "restore-var-1",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new()
+    ));
 }
 
 #[tokio::test]
@@ -757,12 +800,20 @@ async fn consolidate_quorum_ack_and_fail_arms() {
 #[tokio::test]
 async fn link_quorum_ack_and_fail_arms() {
     let link = fixture_link();
-    assert_variant_quorum_arms!(|cfg| sync::broadcast_link_quorum(&cfg, &link));
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_link_quorum(
+        &cfg,
+        &link,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new()
+    ));
 }
 
 #[tokio::test]
 async fn archive_quorum_ack_and_fail_arms() {
-    assert_variant_quorum_arms!(|cfg| sync::broadcast_archive_quorum(&cfg, "arch-var-1"));
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_archive_quorum(
+        &cfg,
+        "arch-var-1",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new()
+    ));
 }
 
 #[tokio::test]
@@ -774,13 +825,21 @@ async fn pending_quorum_ack_and_fail_arms() {
 #[tokio::test]
 async fn pending_decision_quorum_ack_and_fail_arms() {
     let decision = fixture_decision();
-    assert_variant_quorum_arms!(|cfg| sync::broadcast_pending_decision_quorum(&cfg, &decision));
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_pending_decision_quorum(
+        &cfg,
+        &decision,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new()
+    ));
 }
 
 #[tokio::test]
 async fn action_transition_quorum_ack_and_fail_arms() {
     let op = fixture_transition();
-    assert_variant_quorum_arms!(|cfg| sync::broadcast_action_transition_quorum(&cfg, &op));
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_action_transition_quorum(
+        &cfg,
+        &op,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new()
+    ));
 }
 
 #[tokio::test]

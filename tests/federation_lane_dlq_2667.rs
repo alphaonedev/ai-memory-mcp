@@ -157,6 +157,8 @@ fn build_cfg(peer_url: &str, sink: Arc<dyn FederationDlqSink>) -> FederationConf
         peers: vec![PeerEndpoint {
             id: "peer-down".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client,
         sender_agent_id: "ai:lane-dlq-2667".to_string(),
@@ -362,7 +364,13 @@ fn sample_namespace_meta() -> NamespaceMetaEntry {
 #[tokio::test]
 async fn archive_lane_lands_prefixed_dlq_row_2667() {
     let (_tmp, _peer, sink, cfg) = down_peer().await;
-    broadcast_archive_quorum(&cfg, "mem-arch").await.unwrap();
+    broadcast_archive_quorum(
+        &cfg,
+        "mem-arch",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .unwrap();
     let row = assert_single_row(&sink, "archive:mem-arch").await;
     assert_eq!(
         row.payload_json["archives"],
@@ -373,7 +381,13 @@ async fn archive_lane_lands_prefixed_dlq_row_2667() {
 #[tokio::test]
 async fn restore_lane_lands_prefixed_dlq_row_2667() {
     let (_tmp, _peer, sink, cfg) = down_peer().await;
-    broadcast_restore_quorum(&cfg, "mem-rest").await.unwrap();
+    broadcast_restore_quorum(
+        &cfg,
+        "mem-rest",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .unwrap();
     let row = assert_single_row(&sink, "restore:mem-rest").await;
     assert_eq!(
         row.payload_json["restores"],
@@ -384,7 +398,13 @@ async fn restore_lane_lands_prefixed_dlq_row_2667() {
 #[tokio::test]
 async fn link_lane_lands_composite_prefixed_dlq_row_2667() {
     let (_tmp, _peer, sink, cfg) = down_peer().await;
-    broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+    broadcast_link_quorum(
+        &cfg,
+        &sample_link(),
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .unwrap();
     // Composite key includes the relation so two links between the same pair
     // with different relations do not collide (last-wins) in the DLQ.
     let row = assert_single_row(&sink, "link:mem-a:mem-b:related_to").await;
@@ -405,9 +425,13 @@ async fn pending_lane_lands_prefixed_dlq_row_2667() {
 #[tokio::test]
 async fn pending_decision_lane_lands_prefixed_dlq_row_2667() {
     let (_tmp, _peer, sink, cfg) = down_peer().await;
-    broadcast_pending_decision_quorum(&cfg, &sample_decision())
-        .await
-        .unwrap();
+    broadcast_pending_decision_quorum(
+        &cfg,
+        &sample_decision(),
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .unwrap();
     let row = assert_single_row(&sink, "pending_decision:pa-1").await;
     assert_eq!(row.payload_json["pending_decisions"][0]["id"], "pa-1");
 }
@@ -415,9 +439,13 @@ async fn pending_decision_lane_lands_prefixed_dlq_row_2667() {
 #[tokio::test]
 async fn action_transition_lane_lands_per_transition_key_2667() {
     let (_tmp, _peer, sink, cfg) = down_peer().await;
-    broadcast_action_transition_quorum(&cfg, &sample_action_transition())
-        .await
-        .unwrap();
+    broadcast_action_transition_quorum(
+        &cfg,
+        &sample_action_transition(),
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .unwrap();
     // Per-transition key (action_id:to_state:updated_at) — a last-wins
     // action_id key would drop an intermediate CAS transition and strand a peer.
     let row = assert_single_row(&sink, "action_transition:act-1:claimed:0").await;

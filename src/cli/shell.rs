@@ -432,6 +432,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                         crate::federation::erasure_outbox::enqueue_erasure(
                             conn,
                             &target.id,
+                            &target.namespace,
                             crate::federation::erasure_outbox::surfaces::CLI_DELETE,
                         );
                         crate::audit::emit(crate::audit::EventBuilder::new(

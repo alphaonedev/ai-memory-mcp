@@ -155,6 +155,8 @@ async fn peer(rows: Vec<Memory>) -> (FederationConfig, Arc<Notify>, Task) {
         peers: vec![PeerEndpoint {
             id: PEER.to_string(),
             sync_push_url: format!("http://{address}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))

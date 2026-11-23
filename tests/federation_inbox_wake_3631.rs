@@ -419,6 +419,8 @@ fn catchup_config(peer_url: &str) -> FederationConfig {
         peers: vec![PeerEndpoint {
             id: CATCHUP_PEER_ID.to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(5))

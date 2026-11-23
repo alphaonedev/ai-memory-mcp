@@ -183,12 +183,17 @@ pub async fn restore_archive(
         let ctx = crate::store::CallerContext::for_agent(caller.clone());
         return match app.store.archive_restore(&ctx, &id).await {
             Ok(true) => {
+                // #9996 — the restore is admitted against the restored
+                // row's namespace; an unread row goes only to
+                // all-namespaces peers.
+                let mut restore_ns = crate::federation::outbound_scope::ItemNamespaces::new();
                 // #950 SECURITY-medium (Track A QC sweep, 2026-05-20)
                 // — fire subscription dispatch on the postgres restore
                 // path. Re-fetch the restored row to anchor the event
                 // on its namespace; if the lookup fails, skip dispatch
                 // rather than firing with a synthetic namespace.
                 if let Ok(mem) = app.store.get(&ctx, &id).await {
+                    restore_ns.insert(&id, &mem.namespace);
                     let mem_owner = mem
                         .metadata
                         .get("agent_id")
@@ -210,7 +215,7 @@ pub async fn restore_archive(
                     json!({"restored": true, "id": id, (field_names::STORAGE_BACKEND): "postgres"});
                 if let Err(resp) = super::fed_fanout::fanout_into(
                     &app,
-                    super::fed_fanout::FanoutEffect::Restore(&id),
+                    super::fed_fanout::FanoutEffect::Restore(&id, &restore_ns),
                     &mut receipt,
                 )
                 .await
@@ -245,9 +250,33 @@ pub async fn restore_archive(
     // on the calling thread pre-fix.
     let id_for_restore = id.clone();
     let caller_for_restore = caller.clone();
-    let restored = match super::transport::flatten_db_op(
+    let (restored, restored_namespace) = match super::transport::flatten_db_op(
         super::db_op(app.db.clone(), move |guard| {
-            db::restore_archived_for_caller(&guard.0, &id_for_restore, &caller_for_restore)
+            // #9996 — read the restored row's namespace in the same
+            // locked op, so the fan-out is admitted against it.
+            // The restore has committed when the read runs, so a failed
+            // read never turns it into an error: the id stays unresolved
+            // and the fan-out goes only to all-namespaces peers.
+            db::restore_archived_for_caller(&guard.0, &id_for_restore, &caller_for_restore).map(
+                |restored| {
+                    let namespace = if restored {
+                        match db::get(&guard.0, &id_for_restore) {
+                            Ok(row) => row.map(|m| m.namespace),
+                            Err(e) => {
+                                tracing::warn!(
+                                    memory_id = %id_for_restore,
+                                    error = %e,
+                                    "outbound scope: restored namespace unreadable (#9996)"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    (restored, namespace)
+                },
+            )
         })
         .await,
     ) {
@@ -274,9 +303,13 @@ pub async fn restore_archive(
     // #8741 — the one funnel (pre-fix a broadcast `Err` was warned and
     // answered 200).
     let mut receipt = json!({"restored": true, "id": id});
+    let mut restore_ns = crate::federation::outbound_scope::ItemNamespaces::new();
+    if let Some(ns) = restored_namespace.as_deref() {
+        restore_ns.insert(&id, ns);
+    }
     if let Err(resp) = super::fed_fanout::fanout_into(
         &app,
-        super::fed_fanout::FanoutEffect::Restore(&id),
+        super::fed_fanout::FanoutEffect::Restore(&id, &restore_ns),
         &mut receipt,
     )
     .await
@@ -602,6 +635,21 @@ pub async fn archive_by_ids(
         // the SAL trait. If a follow-up `archive_get_by_id`-style read
         // is unavailable on this trait surface, we fall back to an
         // empty namespace + no owner (best-effort dispatch).
+        // #9996 — the archived rows' namespaces, read from the archive
+        // table, so each peer's outbound scope is admitted against them.
+        // A failed read leaves the id unresolved (all-namespaces peers only).
+        let mut archive_ns = crate::federation::outbound_scope::ItemNamespaces::new();
+        for id in &archived {
+            match app.store.archived_namespace_by_id(&ctx, id).await {
+                Ok(Some(ns)) => archive_ns.insert(id, &ns),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    memory_id = %id,
+                    error = %e,
+                    "outbound scope: archived namespace unreadable (#9996)"
+                ),
+            }
+        }
         for id in &archived {
             // The row no longer lives in `memories`; reading via
             // app.store.get returns NotFound after the archive write.
@@ -632,6 +680,7 @@ pub async fn archive_by_ids(
             &app,
             super::fed_fanout::BulkEffect::Archive,
             &archived,
+            &archive_ns,
             &mut receipt,
         )
         .await
@@ -641,6 +690,7 @@ pub async fn archive_by_ids(
         return (StatusCode::OK, Json(receipt)).into_response();
     }
 
+    let mut archive_ns = crate::federation::outbound_scope::ItemNamespaces::new();
     for id in &body.ids {
         // Local archive. Hold the lock only across this one call per id so
         // we can release it before a potentially slow network fanout.
@@ -660,7 +710,22 @@ pub async fn archive_by_ids(
         let moved = {
             let lock = app.db.lock().await;
             match db::archive_memory_for_caller(&lock.0, id, Some(&reason), &caller) {
-                Ok(v) => v,
+                Ok(true) => {
+                    // #9996 — the archived row's namespace, read under
+                    // the same lock; a failed read leaves the id
+                    // unresolved (all-namespaces peers only).
+                    match db::archived_namespace_by_id(&lock.0, id) {
+                        Ok(Some(ns)) => archive_ns.insert(id, &ns),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            memory_id = %id,
+                            error = %e,
+                            "outbound scope: archived namespace unreadable (#9996)"
+                        ),
+                    }
+                    true
+                }
+                Ok(false) => false,
                 Err(e) => {
                     tracing::error!("archive_by_ids: archive_memory({id}) failed: {e}");
                     return (
@@ -697,6 +762,7 @@ pub async fn archive_by_ids(
         &app,
         super::fed_fanout::BulkEffect::Archive,
         &archived,
+        &archive_ns,
         &mut receipt,
     )
     .await

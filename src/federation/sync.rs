@@ -39,6 +39,11 @@ pub(super) enum AckOutcome {
     Throttled(String),
 }
 
+/// #9996 (vote V2-9996 C-2) — the reason detail stamped when a peer answers
+/// 2xx with a body that is not JSON. One named constant so the tests pin it.
+pub const UNPARSEABLE_SUCCESS_BODY_REASON: &str =
+    "peer 2xx with an unparseable body (not proof of apply)";
+
 /// Canonical `AckOutcome` reason for a non-2xx peer response. One named
 /// helper so the `"http {status}"` shape lives in exactly one place
 /// (pm-v3.1 no-scattered-literals discipline).
@@ -232,7 +237,7 @@ fn build_governed_peer_post(
 pub(super) async fn post_once(
     client: &reqwest::Client,
     peer: &PeerEndpoint,
-    body: &serde_json::Value,
+    body: &super::outbound_scope::ScopedOutbound,
     expected_id: &str,
     idempotency_key: Option<&str>,
     api_key: Option<&str>,
@@ -241,7 +246,7 @@ pub(super) async fn post_once(
     let outcome = post_once_unobserved(
         client,
         &peer.sync_push_url,
-        body,
+        body.body(),
         expected_id,
         idempotency_key,
         api_key,
@@ -309,7 +314,13 @@ async fn post_once_unobserved(
                     }
                     AckOutcome::Ack
                 }
-                Err(_) => AckOutcome::Ack, // body unparseable but 2xx = ack
+                // #9996 (vote V2-9996 C-2) — a 2xx whose body cannot be read is
+                // no proof the write was applied: it is a transient non-ack,
+                // retried and bounded by `MAX_REPLAY_ATTEMPTS`, never an ack.
+                Err(_) => AckOutcome::Fail(
+                    super::dlq_class::DlqErrorClass::PeerRefused
+                        .stamp(UNPARSEABLE_SUCCESS_BODY_REASON),
+                ),
             }
         }
         Ok(resp) => {
@@ -427,7 +438,7 @@ pub(super) const FANOUT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 pub(super) async fn post_and_classify(
     client: &reqwest::Client,
     peer: &PeerEndpoint,
-    body: &serde_json::Value,
+    body: &super::outbound_scope::ScopedOutbound,
     expected_id: &str,
     idempotency_key: Option<&str>,
     api_key: Option<&str>,
@@ -563,10 +574,9 @@ pub(super) const DEADLINE_EXCEEDED_REASON: &str = "deadline_exceeded";
 pub(super) async fn land_push_failures(
     config: &FederationConfig,
     tracker: &AckTracker,
-    dispatched_peer_ids: &[String],
+    plan: &super::outbound_scope::DispatchPlan,
     explicit_failures: Vec<(String, String)>,
     dlq_key: &str,
-    body: &serde_json::Value,
     lane: &str,
 ) {
     let Some(sink) = config.dlq_sink.as_ref() else {
@@ -575,7 +585,10 @@ pub(super) async fn land_push_failures(
     let acked = tracker.acked_peer_ids();
     let explicit_map: std::collections::HashMap<String, String> =
         explicit_failures.into_iter().collect();
-    for peer_id in dispatched_peer_ids {
+    // #9996 — only admitted peers can have a row, and only with the body cut
+    // to their scope.
+    for (peer, scoped) in plan.admitted() {
+        let peer_id = &peer.id;
         if acked.contains(peer_id) {
             continue;
         }
@@ -594,7 +607,7 @@ pub(super) async fn land_push_failures(
             .cloned()
             .unwrap_or_else(|| DEADLINE_EXCEEDED_REASON.to_string());
         if let Err(e) = sink
-            .enqueue_push_failure(dlq_key, peer_id, body, &reason)
+            .enqueue_push_failure(dlq_key, peer_id, scoped.stored(), &reason)
             .await
         {
             tracing::warn!(
@@ -701,13 +714,16 @@ pub async fn broadcast_store_quorum_with_embedding(
     // (deadline-evicted tasks never report; pre-#933 they were
     // silently lost).
     // #2678 — always collect; the DLQ landing pass below is no longer sal-gated.
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
-    for peer in &config.peers {
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "store");
+    plan.record_quorum_scope(&mut *tracker.lock().await, "store");
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let id = peer.id.clone();
         let mem_id = mem.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
         joins.spawn(peer.id.clone(), async move {
@@ -753,7 +769,7 @@ pub async fn broadcast_store_quorum_with_embedding(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: peer {peer_id} failed for {}: {reason}", mem.id);
-                explicit_failures.push((peer_id.clone(), reason.clone()));
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: peer join error: {e}");
@@ -839,9 +855,9 @@ pub async fn broadcast_store_quorum_with_embedding(
     // exactly which urls fell behind.
     if tracker.finalise(Instant::now()).is_ok() {
         let acked = tracker.acked_peer_ids();
-        let mut missing: Vec<String> = config
-            .peers
-            .iter()
+        let mut missing: Vec<String> = plan
+            .admitted()
+            .map(|(p, _)| p)
             .filter(|p| !acked.contains(&p.id))
             // #3667/#3711 — a log line is a sink: the peer renders as its
             // origin + path (#3675 identity), never its userinfo or query.
@@ -881,16 +897,7 @@ pub async fn broadcast_store_quorum_with_embedding(
     // migrations created the table and metrics advertised depth=0 healthy.
     // #2667 — via the shared landing pass. Store keeps the BARE memory-id key
     // (documented store-then-delete last-wins collision with the delete lane).
-    land_push_failures(
-        config,
-        &tracker,
-        &dispatched_peer_ids,
-        explicit_failures,
-        &mem.id,
-        &body,
-        "store",
-    )
-    .await;
+    land_push_failures(config, &tracker, &plan, explicit_failures, &mem.id, "store").await;
     Ok(tracker)
 }
 
@@ -913,8 +920,9 @@ pub async fn broadcast_store_quorum_with_embedding(
 pub async fn broadcast_delete_quorum(
     config: &FederationConfig,
     id: &str,
+    namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
-    delete_quorum(config, std::slice::from_ref(&id), Some(id)).await
+    delete_quorum(config, std::slice::from_ref(&id), namespaces, Some(id)).await
 }
 
 /// Detail of the `LocalWriteFailed` a batched delete returns when the
@@ -953,6 +961,7 @@ fn deletion_body(config: &FederationConfig, ids: &[&str]) -> serde_json::Value {
 pub async fn broadcast_delete_batch_quorum(
     config: &FederationConfig,
     ids: &[String],
+    namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
     if ids.len() > crate::handlers::MAX_BULK_SIZE {
         return Err(QuorumError::LocalWriteFailed {
@@ -960,13 +969,14 @@ pub async fn broadcast_delete_batch_quorum(
         });
     }
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-    delete_quorum(config, &ids, None).await
+    delete_quorum(config, &ids, namespaces, None).await
 }
 
 /// Shared body of the single-id and chunked delete lanes.
 async fn delete_quorum(
     config: &FederationConfig,
     ids: &[&str],
+    namespaces: &super::outbound_scope::ItemNamespaces,
     idempotency_key: Option<&str>,
 ) -> Result<AckTracker, QuorumError> {
     let now = Instant::now();
@@ -986,7 +996,10 @@ async fn delete_quorum(
         format!("{first_id} (+{} more)", ids.len() - 1)
     };
     let idempotency_key = idempotency_key.map(str::to_string);
-    let body = deletion_body(config, ids);
+    let mut body = deletion_body(config, ids);
+    // #9996 (vote V2-9996 C-1) — the erased ids' namespaces ride the body
+    // so each peer's outbound scope is admitted against them.
+    namespaces.subset(ids.iter().copied()).annotate(&mut body);
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     // #2498 — mirror of the #933 store-lane bookkeeping. Snapshot the
@@ -1002,12 +1015,15 @@ async fn delete_quorum(
     // and could later LWW-resurrect it.
     // #2717 — always collect; the delete-lane DLQ landing pass below is no
     // longer sal-gated (mirrors the #2678/#2681 store-lane un-gating).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
-    for peer in &config.peers {
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "delete");
+    plan.record_quorum_scope(&mut *tracker.lock().await, "delete");
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = first_id.to_string();
         let key = idempotency_key.clone();
         let api_key = config.api_key.clone();
@@ -1162,10 +1178,9 @@ async fn delete_quorum(
         land_push_failures(
             config,
             &tracker,
-            &dispatched_peer_ids,
+            &plan,
             explicit_failures,
             first_id,
-            &body,
             "delete",
         )
         .await;
@@ -1174,10 +1189,13 @@ async fn delete_quorum(
             land_push_failures(
                 config,
                 &tracker,
-                &dispatched_peer_ids,
+                &plan.rescoped(&{
+                    let mut one_body = deletion_body(config, std::slice::from_ref(one));
+                    namespaces.subset([*one]).annotate(&mut one_body);
+                    one_body
+                }),
                 explicit_failures.clone(),
                 one,
-                &deletion_body(config, std::slice::from_ref(one)),
                 "delete",
             )
             .await;
@@ -1202,28 +1220,35 @@ async fn delete_quorum(
 pub async fn broadcast_archive_quorum(
     config: &FederationConfig,
     id: &str,
+    namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "archives": [id],
         "dry_run": false,
     });
+    // #9996 (vote V2-9996 C-1) — the namespaces of the ids this push
+    // names; an id with none goes only to an all-namespaces peer.
+    namespaces.annotate(&mut body);
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "archive");
+    plan.record_quorum_scope(&mut *tracker.lock().await, "archive");
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -1290,10 +1315,9 @@ pub async fn broadcast_archive_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("archive:{id}"),
-        &body,
         "archive",
     )
     .await;
@@ -1317,28 +1341,35 @@ pub async fn broadcast_archive_quorum(
 pub async fn broadcast_restore_quorum(
     config: &FederationConfig,
     id: &str,
+    namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "restores": [id],
         "dry_run": false,
     });
+    // #9996 (vote V2-9996 C-1) — the namespaces of the ids this push
+    // names; an id with none goes only to an all-namespaces peer.
+    namespaces.annotate(&mut body);
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "restore");
+    plan.record_quorum_scope(&mut *tracker.lock().await, "restore");
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = id.to_string();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -1405,10 +1436,9 @@ pub async fn broadcast_restore_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("restore:{id}"),
-        &body,
         "restore",
     )
     .await;
@@ -1426,29 +1456,36 @@ pub async fn broadcast_restore_quorum(
 pub async fn broadcast_link_quorum(
     config: &FederationConfig,
     link: &MemoryLink,
+    namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "links": [link],
         "dry_run": false,
     });
+    // #9996 (vote V2-9996 C-1) — the namespaces of the ids this push
+    // names; an id with none goes only to an all-namespaces peer.
+    namespaces.annotate(&mut body);
     let log_id = format!("{}→{}", link.source_id, link.target_id);
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "link");
+    plan.record_quorum_scope(&mut *tracker.lock().await, "link");
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let log_id = log_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -1515,7 +1552,7 @@ pub async fn broadcast_link_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!(
             "link:{}:{}:{}",
@@ -1523,7 +1560,6 @@ pub async fn broadcast_link_quorum(
             link.target_id,
             link.relation.as_str()
         ),
-        &body,
         "link",
     )
     .await;
@@ -1570,24 +1606,38 @@ pub async fn broadcast_consolidate_quorum(
     memories.push(new_mem);
     memories.extend(tombstoned_sources.iter());
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": memories,
         "deletions": deletions,
         "links": derived_edges,
         "dry_run": false,
     });
+    // #9996 (vote V2-9996 C-1) — the id-only items (`links`, `deletions`) are
+    // admitted against the namespaces of the rows the push carries: the
+    // consolidated row and the tombstoned sources. A legacy hard-delete id
+    // whose row is not in the push stays unresolved, so a narrowed peer is
+    // never sent it (counted under the unresolved label).
+    let mut namespaces = super::outbound_scope::ItemNamespaces::new();
+    for m in &memories {
+        namespaces.insert(&m.id, &m.namespace);
+    }
+    namespaces.annotate(&mut body);
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan =
+        super::outbound_scope::DispatchPlan::new(config, &body, crate::audit::OP_CONSOLIDATE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, crate::audit::OP_CONSOLIDATE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = new_mem.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -1661,10 +1711,9 @@ pub async fn broadcast_consolidate_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("{}:{}", crate::audit::OP_CONSOLIDATE, new_mem.id),
-        &body,
         crate::audit::OP_CONSOLIDATE,
     )
     .await;
@@ -1698,15 +1747,18 @@ pub async fn broadcast_pending_quorum(
     });
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "pending");
+    plan.record_quorum_scope(&mut *tracker.lock().await, "pending");
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = pending.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -1776,10 +1828,9 @@ pub async fn broadcast_pending_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("pending:{}", pending.id),
-        &body,
         "pending",
     )
     .await;
@@ -1799,28 +1850,37 @@ pub async fn broadcast_pending_quorum(
 pub async fn broadcast_pending_decision_quorum(
     config: &FederationConfig,
     decision: &PendingDecision,
+    namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "pending_decision";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "pending_decisions": [decision],
         "dry_run": false,
     });
+    // #9996 (vote V2-9996 C-1) — the namespaces of the ids this push
+    // names; an id with none goes only to an all-namespaces peer.
+    namespaces.annotate(&mut body);
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = decision.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -1890,11 +1950,10 @@ pub async fn broadcast_pending_decision_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("pending_decision:{}", decision.id),
-        &body,
-        "pending_decision",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -1968,28 +2027,37 @@ pub struct ActionTransitionOp {
 pub async fn broadcast_action_transition_quorum(
     config: &FederationConfig,
     op: &ActionTransitionOp,
+    namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "action_transition";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
         "memories": [],
         "action_transitions": [op],
         "dry_run": false,
     });
+    // #9996 (vote V2-9996 C-1) — the namespaces of the ids this push
+    // names; an id with none goes only to an all-namespaces peer.
+    namespaces.annotate(&mut body);
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = op.action_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -2064,7 +2132,7 @@ pub async fn broadcast_action_transition_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!(
             "action_transition:{}:{}:{}",
@@ -2072,8 +2140,7 @@ pub async fn broadcast_action_transition_quorum(
             op.to_state.as_str(),
             op.updated_at
         ),
-        &body,
-        "action_transition",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2100,6 +2167,8 @@ pub async fn broadcast_checkpoint_resolution_quorum(
     config: &FederationConfig,
     checkpoint: &crate::models::Checkpoint,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "checkpoint_resolution";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2112,15 +2181,18 @@ pub async fn broadcast_checkpoint_resolution_quorum(
     });
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = checkpoint.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -2190,11 +2262,10 @@ pub async fn broadcast_checkpoint_resolution_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("checkpoint:{}", checkpoint.id),
-        &body,
-        "checkpoint_resolution",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2215,6 +2286,8 @@ pub async fn broadcast_signal_create_quorum(
     config: &FederationConfig,
     signal: &crate::models::signal::Signal,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "signal";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2227,15 +2300,18 @@ pub async fn broadcast_signal_create_quorum(
     });
 
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target_id = signal.id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -2305,11 +2381,10 @@ pub async fn broadcast_signal_create_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("signal:{}", signal.id),
-        &body,
-        "signal",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2330,6 +2405,8 @@ pub async fn broadcast_namespace_meta_quorum(
     config: &FederationConfig,
     entry: &NamespaceMetaEntry,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "namespace_meta";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2343,15 +2420,18 @@ pub async fn broadcast_namespace_meta_quorum(
 
     let target_id = entry.namespace.clone();
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target = target_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -2421,11 +2501,10 @@ pub async fn broadcast_namespace_meta_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("namespace_meta:{}", entry.namespace),
-        &body,
-        "namespace_meta",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2448,6 +2527,8 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     config: &FederationConfig,
     namespaces: &[String],
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "namespace_meta_clear";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2463,15 +2544,18 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     // post-quorum logs carry enough context to trace back to the operation.
     let target_id = namespaces.join(",");
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
-    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    // #9996 — only peers whose outbound scope admits this push get a
+    // request, each with the body cut to its scope.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.clone();
         let target = target_id.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
@@ -2541,11 +2625,10 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     land_push_failures(
         config,
         &tracker,
-        &dispatched_peer_ids,
+        &plan,
         explicit_failures,
         &format!("namespace_meta_clear:{target_id}"),
-        &body,
-        "namespace_meta_clear",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2597,12 +2680,14 @@ pub async fn bulk_catchup_push(
         "memories": memories,
         "dry_run": false,
     });
+    // #9996 — catch-up obeys the same outbound scope as the live lanes.
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "bulk_catchup");
     let mut joins: PeerTasks<(String, Result<(), String>)> = PeerTasks::new();
-    for peer in &config.peers {
+    for (peer, scoped) in plan.admitted() {
         let client = config.client.clone();
         let url = peer.sync_push_url.clone();
         let id = peer.id.clone();
-        let payload = body.clone();
+        let payload = scoped.body().clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
         joins.spawn(peer.id.clone(), async move {
@@ -2647,14 +2732,15 @@ pub async fn bulk_catchup_push(
                     // connection returns to the keep-alive pool.
                     // #3654 — and read the receiver's own report while doing
                     // so: the peer's push freshness counts a batch as a
-                    // success only when the peer applied it (#2341). An
-                    // unreadable 2xx body stays an ack, as in `post_once`.
-                    let applied = resp.bytes().await.ok().is_none_or(|bytes| {
-                        serde_json::from_slice::<serde_json::Value>(&bytes)
-                            .ok()
-                            .and_then(|v| success_report_non_ack_reason(&v))
-                            .is_none()
-                    });
+                    // success only when the peer applied it (#2341). #9996
+                    // (vote V2-9996 C-2) — an unreadable 2xx body is no proof
+                    // of apply, as in `post_once`, so it is not a success.
+                    let applied = resp
+                        .bytes()
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .is_some_and(|v| success_report_non_ack_reason(&v).is_none());
                     let observation = if applied {
                         Observation::Success
                     } else {

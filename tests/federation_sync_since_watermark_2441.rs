@@ -50,6 +50,14 @@
 //! null cursor never skips anything). It exists to block the naive fix
 //! (`examined.last()`), which WOULD silently drop rows sharing the boundary
 //! timestamp under the strict `updated_at > since` predicate.
+//!
+//! #9996 / #10037 — the pull serves only an authenticated peer its
+//! outbound scope names, so every pull here is signed with an enrolled
+//! key under the all-namespaces outbound scope for that peer: the
+//! attestation and visibility filters these rows pin decide the page.
+
+#[path = "common/signed_pull.rs"]
+mod signed_pull;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -146,7 +154,9 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
 /// `allow_all_legacy` and mask the entire defect).
 fn set_posture() {
     unsafe {
-        std::env::set_var(REQUIRE_SIG_ENV, "0");
+        // #9996 — the signature is what authenticates the pulling peer, so
+        // it stays required (the default); `pull` signs every request.
+        std::env::remove_var(REQUIRE_SIG_ENV);
         std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
         std::env::remove_var(TRUST_PEER_ENV);
         std::env::set_var(
@@ -185,21 +195,26 @@ async fn seed(db: &ai_memory::handlers::Db, id: &str, ns: &str, updated_at: &str
 
 /// One `/sync/since` pull as `PEER_ID`. Returns the decoded envelope.
 async fn pull(router: &axum::Router, since: Option<&str>, limit: usize) -> Value {
-    let mut uri = format!("/api/v1/sync/since?limit={limit}&peer={PEER_ID}");
+    let mut query = format!("limit={limit}&peer={PEER_ID}");
     if let Some(s) = since {
-        uri.push_str("&since=");
-        uri.push_str(&urlencode(s));
+        query.push_str("&since=");
+        query.push_str(&urlencode(s));
     }
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header(
-            ai_memory::federation::peer_attestation::PEER_ID_HEADER,
-            PEER_ID,
-        )
+    let uri = format!("{}?{query}", signed_pull::SYNC_SINCE_PATH);
+    // #9996 — the peer signs its pull and its outbound scope names it.
+    signed_pull::set_outbound_scope_all(&[PEER_ID]);
+    let pullers = signed_pull::EnrolledPullers::enrol(&[PEER_ID]);
+    let builder = Request::builder().method("GET").uri(uri).header(
+        ai_memory::federation::peer_attestation::PEER_ID_HEADER,
+        PEER_ID,
+    );
+    let req = pullers
+        .sign_get(builder, PEER_ID, signed_pull::SYNC_SINCE_PATH, &query)
         .body(Body::empty())
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
+    signed_pull::clear();
+    drop(pullers);
     assert_eq!(resp.status(), StatusCode::OK, "pull must answer 200");
     let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
         .await
@@ -463,7 +478,8 @@ async fn projected_page_diagnostics_are_unchanged_2441() {
 async fn default_deny_arm_publishes_a_null_cursor_2441() {
     let _g = ENV_LOCK.lock().await;
     unsafe {
-        std::env::set_var(REQUIRE_SIG_ENV, "0");
+        // #9996 — signature required (the default); `pull` signs.
+        std::env::remove_var(REQUIRE_SIG_ENV);
         std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
         std::env::remove_var(TRUST_PEER_ENV);
         std::env::set_var(

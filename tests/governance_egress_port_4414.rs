@@ -82,6 +82,8 @@ fn fed_config(url: &str) -> FederationConfig {
         peers: vec![PeerEndpoint {
             id: "peer-4414".into(),
             sync_push_url: url.into(),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(2))

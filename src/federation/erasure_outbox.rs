@@ -195,12 +195,28 @@ pub fn deletion_body(sender_agent_id: &str, memory_id: &str) -> serde_json::Valu
 /// WITHOUT a sender identity (see [`deletion_body`]). Kept as a real,
 /// inspectable body so an operator draining the DLQ by hand sees exactly
 /// what is pending.
-fn queued_payload(memory_id: &str) -> serde_json::Value {
-    serde_json::json!({
+///
+/// #9996 (vote V2-9996 C-1) — the payload records the erased memory's
+/// namespace under the outbound-scope annotation, so the daemon that
+/// expands the sentinel sends the erasure only to peers whose outbound
+/// scope admits that namespace. The annotation never reaches the wire.
+fn queued_payload(memory_id: &str, namespace: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({
         "memories": [],
         "deletions": [memory_id],
         "dry_run": false,
-    })
+    });
+    super::outbound_scope::ItemNamespaces::of(memory_id, namespace).annotate(&mut body);
+    body
+}
+
+/// One erased memory: its id and the namespace it lived in (#9996).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErasedMemory {
+    /// The erased memory id.
+    pub id: String,
+    /// The namespace the memory lived in when it was erased.
+    pub namespace: String,
 }
 
 /// Resolve the sidecar marker path for the database `conn` is open on.
@@ -339,24 +355,26 @@ pub fn is_drainable(conn: &Connection) -> bool {
 /// infallible: returns `true` when a row was written.
 ///
 /// Callers invoke this AFTER the local erasure has committed.
-pub fn enqueue_erasure(conn: &Connection, memory_id: &str, surface: &str) -> bool {
+/// `namespace` is the erased memory's namespace (#9996: the sender's
+/// outbound scope is admitted against it at expansion time).
+pub fn enqueue_erasure(conn: &Connection, memory_id: &str, namespace: &str, surface: &str) -> bool {
     if !is_drainable(conn) {
         return false;
     }
-    enqueue_unchecked(conn, memory_id, surface)
+    enqueue_unchecked(conn, memory_id, namespace, surface)
 }
 
 /// Queue a batch of erased memory ids (the bulk `forget` shape).
 /// Best-effort and infallible: returns the number of rows written.
 ///
 /// The drainability probe runs ONCE for the whole batch.
-pub fn enqueue_erasures(conn: &Connection, memory_ids: &[String], surface: &str) -> usize {
+pub fn enqueue_erasures(conn: &Connection, memory_ids: &[ErasedMemory], surface: &str) -> usize {
     if memory_ids.is_empty() || !is_drainable(conn) {
         return 0;
     }
     let mut written = 0usize;
-    for id in memory_ids {
-        if enqueue_unchecked(conn, id, surface) {
+    for m in memory_ids {
+        if enqueue_unchecked(conn, &m.id, &m.namespace, surface) {
             written += 1;
         }
     }
@@ -389,7 +407,7 @@ pub fn collect_forget_ids(
     pattern: Option<&str>,
     tier: Option<&crate::models::Tier>,
     owner: Option<&str>,
-) -> Vec<String> {
+) -> Vec<ErasedMemory> {
     if !is_drainable(conn) {
         return Vec::new();
     }
@@ -424,14 +442,19 @@ pub fn collect_forget_ids(
         );
         rows.truncate(MAX_ERASURE_IDS_PER_CALL);
     }
-    rows.into_iter().map(|m| m.id).collect()
+    rows.into_iter()
+        .map(|m| ErasedMemory {
+            id: m.id,
+            namespace: m.namespace,
+        })
+        .collect()
 }
 
 /// Insert one sentinel row, assuming drainability has already been
 /// established. Swallows and logs any failure.
-fn enqueue_unchecked(conn: &Connection, memory_id: &str, surface: &str) -> bool {
+fn enqueue_unchecked(conn: &Connection, memory_id: &str, namespace: &str, surface: &str) -> bool {
     let now = chrono::Utc::now().to_rfc3339();
-    let payload = queued_payload(memory_id).to_string();
+    let payload = queued_payload(memory_id, namespace).to_string();
     // ON CONFLICT mirrors `push_dlq`'s enqueue: two erasures of the same
     // id coalesce onto ONE pending row rather than stacking duplicates.
     // `attempt_count` is deliberately NOT bumped on conflict — a sentinel
@@ -476,6 +499,13 @@ fn enqueue_unchecked(conn: &Connection, memory_id: &str, surface: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn erased(id: &str) -> ErasedMemory {
+        ErasedMemory {
+            id: id.to_string(),
+            namespace: "team/a".to_string(),
+        }
+    }
 
     /// A FILE-backed database (never `:memory:`): the drainability marker
     /// is a sidecar beside the db file, so a memoryless connection is by
@@ -557,9 +587,14 @@ mod tests {
     fn erasure_writes_nothing_without_the_drainability_marker() {
         let (_tmp, conn) = db();
         assert!(!is_drainable(&conn));
-        assert!(!enqueue_erasure(&conn, "m-1", "mcp:memory_delete"));
+        assert!(!enqueue_erasure(
+            &conn,
+            "m-1",
+            "team/a",
+            "mcp:memory_delete"
+        ));
         assert_eq!(
-            enqueue_erasures(&conn, &["m-2".into(), "m-3".into()], "cli:forget"),
+            enqueue_erasures(&conn, &[erased("m-2"), erased("m-3")], "cli:forget"),
             0
         );
         assert_eq!(
@@ -600,8 +635,8 @@ mod tests {
     fn queued_erasure_lands_one_sentinel_row_and_coalesces() {
         let (_tmp, conn) = db();
         mark_federation_drainable(&conn, 1).unwrap();
-        assert!(enqueue_erasure(&conn, "m-1", "mcp:memory_forget"));
-        assert!(enqueue_erasure(&conn, "m-1", "mcp:memory_forget"));
+        assert!(enqueue_erasure(&conn, "m-1", "team/a", "mcp:memory_forget"));
+        assert!(enqueue_erasure(&conn, "m-1", "team/a", "mcp:memory_forget"));
         assert_eq!(pending_count(&conn), 1, "repeat erasure coalesces");
         let (peer_id, payload, attempts): (String, String, i32) = conn
             .query_row(
@@ -619,6 +654,11 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(body["deletions"], serde_json::json!(["m-1"]));
+        // #9996 — the erased memory's namespace rides the queued payload.
+        assert_eq!(
+            crate::federation::outbound_scope::ItemNamespaces::from_body(&body),
+            crate::federation::outbound_scope::ItemNamespaces::of("m-1", "team/a")
+        );
     }
 
     /// The sentinel and a REAL per-peer row for the SAME memory id
@@ -634,7 +674,7 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(enqueue_erasure(&conn, "m-1", "cli:delete"));
+        assert!(enqueue_erasure(&conn, "m-1", "team/a", "cli:delete"));
         assert_eq!(
             pending_count(&conn),
             2,
@@ -685,8 +725,13 @@ mod tests {
         conn.execute_batch("DROP TABLE federation_push_dlq;")
             .unwrap();
         // No panic, no error type: just `false`.
-        assert!(!enqueue_erasure(&conn, "m-1", "mcp:memory_delete"));
-        assert_eq!(enqueue_erasures(&conn, &["m-2".into()], "cli:forget"), 0);
+        assert!(!enqueue_erasure(
+            &conn,
+            "m-1",
+            "team/a",
+            "mcp:memory_delete"
+        ));
+        assert_eq!(enqueue_erasures(&conn, &[erased("m-2")], "cli:forget"), 0);
     }
 
     /// The daemon-side body carries the live sender identity and is

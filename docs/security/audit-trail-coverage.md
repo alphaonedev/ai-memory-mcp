@@ -475,7 +475,22 @@ memory newer than the watermark with no per-peer namespace scope.
 Compromise of any single mTLS peer key thus exfiltrated the entire
 database. Red-team #230 caught it; #239 closes it.
 
-The fix:
+**Outbound scope first (#9996 / #10037).** Before the table below
+applies, the pull is bound to the AUTHENTICATED peer: the id bound to
+the mTLS client certificate (the `bindings` map), else an `x-peer-id`
+whose request signature (`x-memory-sig` + `x-memory-nonce` over
+`GET\n<path>\n<query>`) verified against that peer's enrolled key. That
+peer must be named in the `peer_ids` of an `AI_MEMORY_FED_PEER_OUTBOUND_SCOPE`
+entry. An unauthenticated pull, a bare `x-peer-id`, an id no entry names
+and an unset or malformed scope all get the empty page with
+`scope_status: "outbound_scope_deny"`, before any store read. A served
+row must pass BOTH that outbound scope and the attestation scope below;
+`AI_MEMORY_FED_SYNC_TRUST_PEER=1` widens only the attestation test,
+never the outbound scope. Every row the outbound scope leaves out is
+counted in `ai_memory_federation_outbound_scope_filtered_total` under
+the entry's configured peer id (`_unresolved` when none resolves).
+
+The #239 fix:
 
 | Inbound `x-peer-id` header | Operator config            | Bypass env | Result                                                         |
 |----------------------------|----------------------------|------------|----------------------------------------------------------------|
@@ -489,7 +504,7 @@ Response envelope additions (back-compat — additive fields only):
 
 - `excluded_for_scope: <count>` — number of rows filtered out by
   the per-peer namespace allowlist (honest about the partial view).
-- `scope_status: "scoped" | "no_allowlist_default_deny" | "legacy_bypass"`.
+- `scope_status: "scoped" | "no_allowlist_default_deny" | "legacy_bypass" | "outbound_scope_deny"`.
 
 **Implementation surface**:
 

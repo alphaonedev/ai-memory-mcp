@@ -152,6 +152,13 @@ pub enum QuorumFailureReason {
     /// confuse "give it more time" with "peers are gone"
     /// (#299 item 3 — classification was previously inverted).
     InFlight,
+    /// #9996 (vote V2-9996 C-4) — fewer replicas are in the sender's
+    /// outbound scope for this write (the local commit plus the admitted
+    /// peers) than the quorum minimum `W`. The write can never reach
+    /// quorum; the admitted peers still get the push, and the write is
+    /// refused with this reason, distinct from a timeout, and is
+    /// never reported as quorum-met.
+    OutboundScope,
 }
 
 /// Collects remote acks against a deadline. Pure logic — no I/O.
@@ -162,6 +169,9 @@ pub struct AckTracker {
     local_committed: bool,
     acks: HashSet<String>,
     id_drifts: Vec<String>,
+    /// #9996 — replicas in outbound scope (local + admitted peers), when
+    /// the lane recorded them. `W` is never lowered to this number.
+    scope_replicas: Option<usize>,
 }
 
 impl AckTracker {
@@ -176,6 +186,7 @@ impl AckTracker {
             local_committed: false,
             acks: HashSet::new(),
             id_drifts: Vec::new(),
+            scope_replicas: None,
         }
     }
 
@@ -183,6 +194,24 @@ impl AckTracker {
     /// durably persisted the memory.
     pub fn record_local(&mut self) {
         self.local_committed = true;
+    }
+
+    /// #9996 (vote V2-9996 C-4) — record the replicas in outbound scope for
+    /// this write: the local commit plus `admitted_peers`. The quorum
+    /// denominator is that set; the minimum stays the policy's `W`. When
+    /// the set is smaller than `W` the write can never be quorum-met and
+    /// [`Self::finalise`] answers [`QuorumFailureReason::OutboundScope`].
+    /// Returns `(w, replicas)` when the set is below `W`, else `None`.
+    pub fn record_scope_replicas(&mut self, admitted_peers: usize) -> Option<(usize, usize)> {
+        let replicas = admitted_peers.saturating_add(1);
+        self.scope_replicas = Some(replicas);
+        (replicas < self.policy.w).then_some((self.policy.w, replicas))
+    }
+
+    /// The quorum minimum `W` of this attempt.
+    #[must_use]
+    pub fn quorum_minimum(&self) -> usize {
+        self.policy.w
     }
 
     /// Record a peer ack. `peer_id` is the caller's opaque identifier
@@ -241,7 +270,10 @@ impl AckTracker {
         //
         // `InFlight` is a distinct variant so retry strategies can tell
         // "give it more time" apart from "the peers are gone".
-        let reason = if now > self.deadline {
+        let below_scope = self.scope_replicas.is_some_and(|r| r < self.policy.w);
+        let reason = if below_scope {
+            QuorumFailureReason::OutboundScope
+        } else if now > self.deadline {
             if self.acks.is_empty() {
                 QuorumFailureReason::Unreachable
             } else {

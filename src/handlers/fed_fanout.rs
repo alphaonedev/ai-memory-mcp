@@ -50,6 +50,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use serde_json::{Value, json};
 
+use crate::federation::outbound_scope::ItemNamespaces;
 use crate::federation::{FederationConfig, QuorumNotMetPayload};
 use crate::models::{
     GovernedAction, Memory, MemoryLink, NamespaceMetaEntry, PendingAction, PendingDecision,
@@ -82,17 +83,20 @@ pub(crate) enum FanoutEffect<'a> {
     /// A stored / updated / promoted row (insert-if-newer on the peer).
     Store(&'a Memory),
     /// A single deletion, delivered as a `sync_push.deletions` tombstone.
-    Delete(&'a str),
+    /// #9996 — every id-only effect carries the namespaces of the ids it
+    /// names; the peer's outbound scope is admitted against them, and an
+    /// id with none goes only to an all-namespaces peer.
+    Delete(&'a str, &'a ItemNamespaces),
     /// Up to [`super::MAX_BULK_SIZE`] deletions in one tombstone body.
-    DeleteBatch(&'a [String]),
-    /// A created link.
-    Link(&'a MemoryLink),
+    DeleteBatch(&'a [String], &'a ItemNamespaces),
+    /// A created link (both endpoint namespaces).
+    Link(&'a MemoryLink, &'a ItemNamespaces),
     /// An archived memory id.
-    Archive(&'a str),
+    Archive(&'a str, &'a ItemNamespaces),
     /// A restored memory id.
-    Restore(&'a str),
+    Restore(&'a str, &'a ItemNamespaces),
     /// A governance decision on a pending action (`sync_push.pending_decisions`).
-    PendingDecision(&'a PendingDecision),
+    PendingDecision(&'a PendingDecision, &'a ItemNamespaces),
     /// A namespace standard binding (`sync_push.namespace_meta`).
     NamespaceMeta(&'a NamespaceMetaEntry),
     /// Cleared namespace standards (`sync_push.namespace_meta_clears`).
@@ -105,15 +109,23 @@ async fn broadcast(
 ) -> Result<AckTracker, QuorumError> {
     match effect {
         FanoutEffect::Store(mem) => crate::federation::broadcast_store_quorum(fed, mem).await,
-        FanoutEffect::Delete(id) => crate::federation::broadcast_delete_quorum(fed, id).await,
-        FanoutEffect::DeleteBatch(ids) => {
-            crate::federation::broadcast_delete_batch_quorum(fed, ids).await
+        FanoutEffect::Delete(id, ns) => {
+            crate::federation::broadcast_delete_quorum(fed, id, ns).await
         }
-        FanoutEffect::Link(link) => crate::federation::broadcast_link_quorum(fed, link).await,
-        FanoutEffect::Archive(id) => crate::federation::broadcast_archive_quorum(fed, id).await,
-        FanoutEffect::Restore(id) => crate::federation::broadcast_restore_quorum(fed, id).await,
-        FanoutEffect::PendingDecision(decision) => {
-            crate::federation::broadcast_pending_decision_quorum(fed, decision).await
+        FanoutEffect::DeleteBatch(ids, ns) => {
+            crate::federation::broadcast_delete_batch_quorum(fed, ids, ns).await
+        }
+        FanoutEffect::Link(link, ns) => {
+            crate::federation::broadcast_link_quorum(fed, link, ns).await
+        }
+        FanoutEffect::Archive(id, ns) => {
+            crate::federation::broadcast_archive_quorum(fed, id, ns).await
+        }
+        FanoutEffect::Restore(id, ns) => {
+            crate::federation::broadcast_restore_quorum(fed, id, ns).await
+        }
+        FanoutEffect::PendingDecision(decision, ns) => {
+            crate::federation::broadcast_pending_decision_quorum(fed, decision, ns).await
         }
         FanoutEffect::NamespaceMeta(entry) => {
             crate::federation::broadcast_namespace_meta_quorum(fed, entry).await
@@ -289,10 +301,19 @@ impl Produced {
 pub(crate) async fn fanout_decision(
     app: &AppState,
     decision: &PendingDecision,
+    namespace: &str,
     produced: &Produced,
     receipt: &mut Value,
 ) -> Result<(), Response> {
-    fanout_into(app, FanoutEffect::PendingDecision(decision), receipt).await?;
+    // #9996 — the decision travels only to peers whose outbound scope
+    // admits the pending action's namespace.
+    let namespaces = ItemNamespaces::of(&decision.id, namespace);
+    fanout_into(
+        app,
+        FanoutEffect::PendingDecision(decision, &namespaces),
+        receipt,
+    )
+    .await?;
     match produced {
         Produced::Nothing => Ok(()),
         Produced::Row(mem) => fanout_into(app, FanoutEffect::Store(mem), receipt).await,
@@ -313,35 +334,49 @@ pub(crate) enum BulkEffect {
 pub(crate) enum OwnedEffect {
     /// An imported / captured memory row.
     Store(Memory),
-    /// An imported link.
-    Link(MemoryLink),
-    /// Up to [`MAX_BULK_SIZE`] erased ids, one tombstone body per peer.
-    DeleteChunk(Vec<String>),
-    /// One archived id.
-    Archive(String),
+    /// An imported link and its endpoint namespaces (#9996).
+    Link(MemoryLink, ItemNamespaces),
+    /// Up to [`MAX_BULK_SIZE`] erased ids, one tombstone body per peer,
+    /// with the namespaces of the chunk's own ids (#9996).
+    DeleteChunk(Vec<String>, ItemNamespaces),
+    /// One archived id and its namespace (#9996).
+    Archive(String, ItemNamespaces),
 }
 
 impl OwnedEffect {
     fn borrowed(&self) -> FanoutEffect<'_> {
         match self {
             Self::Store(mem) => FanoutEffect::Store(mem),
-            Self::Link(link) => FanoutEffect::Link(link),
-            Self::DeleteChunk(ids) => FanoutEffect::DeleteBatch(ids),
-            Self::Archive(id) => FanoutEffect::Archive(id),
+            Self::Link(link, ns) => FanoutEffect::Link(link, ns),
+            Self::DeleteChunk(ids, ns) => FanoutEffect::DeleteBatch(ids, ns),
+            Self::Archive(id, ns) => FanoutEffect::Archive(id, ns),
         }
     }
 }
 
 /// The owned effects of a bulk mutation: erased ids travel in chunks of at
 /// most [`MAX_BULK_SIZE`] (the receiver's default page cap), archived ids
-/// one per effect.
-pub(crate) fn bulk_effects(kind: BulkEffect, ids: &[String]) -> Vec<OwnedEffect> {
+/// one per effect. Each effect carries the `namespaces` entries of its own
+/// ids only (#9996).
+pub(crate) fn bulk_effects(
+    kind: BulkEffect,
+    ids: &[String],
+    namespaces: &ItemNamespaces,
+) -> Vec<OwnedEffect> {
     match kind {
         BulkEffect::Delete => ids
             .chunks(MAX_BULK_SIZE)
-            .map(|chunk| OwnedEffect::DeleteChunk(chunk.to_vec()))
+            .map(|chunk| {
+                OwnedEffect::DeleteChunk(
+                    chunk.to_vec(),
+                    namespaces.subset(chunk.iter().map(String::as_str)),
+                )
+            })
             .collect(),
-        BulkEffect::Archive => ids.iter().cloned().map(OwnedEffect::Archive).collect(),
+        BulkEffect::Archive => ids
+            .iter()
+            .map(|id| OwnedEffect::Archive(id.clone(), namespaces.subset([id.as_str()])))
+            .collect(),
     }
 }
 
@@ -359,9 +394,10 @@ pub(crate) async fn fanout_bulk_into(
     app: &AppState,
     kind: BulkEffect,
     ids: &[String],
+    namespaces: &ItemNamespaces,
     receipt: &mut Value,
 ) -> Result<(), Response> {
-    fanout_effects_into(app, bulk_effects(kind, ids), receipt).await
+    fanout_effects_into(app, bulk_effects(kind, ids, namespaces), receipt).await
 }
 
 /// The folded outcome of a batched delivery: the minimum ack count over the
@@ -480,6 +516,52 @@ async fn deliver_batch(
     out.min_acks
         .map(Some)
         .ok_or_else(|| local_code(FANOUT_TASK_FAILED))
+}
+
+/// #9996 (vote V2-9996 C-1) — the namespaces of a link's two endpoints,
+/// read on the sqlite connection the caller already holds. An endpoint
+/// that cannot be read gets no entry, so the link goes only to an
+/// all-namespaces peer (fail closed; nothing is deleted).
+pub(crate) fn link_namespaces_sqlite(
+    conn: &rusqlite::Connection,
+    source_id: &str,
+    target_id: &str,
+) -> ItemNamespaces {
+    let mut ns = ItemNamespaces::new();
+    for id in [source_id, target_id] {
+        match crate::db::get(conn, id) {
+            Ok(Some(m)) => ns.insert(id, &m.namespace),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                memory_id = %id,
+                error = %e,
+                "outbound scope: link endpoint namespace unreadable; the link goes only to all-namespaces peers (#9996)"
+            ),
+        }
+    }
+    ns
+}
+
+/// #9996 — the store twin of [`link_namespaces_sqlite`].
+#[cfg(feature = "sal")]
+pub(crate) async fn link_namespaces_store(
+    app: &AppState,
+    ctx: &crate::store::CallerContext,
+    source_id: &str,
+    target_id: &str,
+) -> ItemNamespaces {
+    let mut ns = ItemNamespaces::new();
+    for id in [source_id, target_id] {
+        match app.store.get(ctx, id).await {
+            Ok(m) => ns.insert(id, &m.namespace),
+            Err(e) => tracing::warn!(
+                memory_id = %id,
+                error = %e,
+                "outbound scope: link endpoint namespace unreadable; the link goes only to all-namespaces peers (#9996)"
+            ),
+        }
+    }
+    ns
 }
 
 #[cfg(test)]

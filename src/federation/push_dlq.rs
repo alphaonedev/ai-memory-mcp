@@ -158,6 +158,13 @@ pub trait FederationDlqSink: Send + Sync {
     /// long the row has been stuck).
     async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String>;
 
+    /// #9996 — move one pending row to the terminal state: `attempt_count`
+    /// is raised to at least [`MAX_REPLAY_ATTEMPTS`] and `last_error` is
+    /// replaced, so the row is never taken for replay again. The row and its
+    /// payload are kept (never a delete); it stays counted by
+    /// `pending_dlq_count` and the per-peer backlog.
+    async fn quarantine_dlq_row(&self, id: i64, last_error: &str) -> anyhow::Result<()>;
+
     /// Return the current number of pending DLQ rows. Used by the
     /// replay worker to maintain the `federation_push_dlq_depth`
     /// Prometheus gauge.
@@ -193,6 +200,16 @@ pub trait FederationDlqSink: Send + Sync {
     /// quarantined (resetting those would resume infinite no-op POST
     /// amplification). Returns the number of rows un-quarantined.
     async fn reset_throttled_quarantine(&self) -> Result<u64, String>;
+
+    /// #9996 (vote V2-9996 C-3) — re-drive the rows quarantined because they
+    /// were outside the peer's outbound scope: reset `attempt_count = 0` for
+    /// unreplayed rows whose `last_error` starts with `stamped_prefix` (the
+    /// sender-stamped permanent `outbound_scope:` reason, a `LIKE` prefix).
+    /// The replay worker calls it once per process start, so each row is
+    /// re-admitted under the scope this boot loaded: a row the wider scope
+    /// admits is sent, the rest return to the terminal state. Returns the
+    /// number of rows re-driven. Nothing is deleted.
+    async fn redrive_out_of_scope_quarantine(&self, stamped_prefix: &str) -> Result<u64, String>;
 
     /// #2446 — expand ONE erasure-outbox sentinel row (a row whose
     /// `peer_id` is [`crate::federation::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID`])
@@ -359,6 +376,7 @@ pub fn spawn_replay_federation_push_dlq(
         // — avoids spurious "connection refused" on a fresh cluster
         // boot if the peer is also coming up.
         tokio::time::sleep(Duration::from_secs(5)).await;
+        redrive_out_of_scope_once(sink.as_ref()).await;
         loop {
             replay_once(&config, sink.as_ref()).await;
             tokio::time::sleep(interval).await;
@@ -440,6 +458,25 @@ pub fn replay_max_batch() -> usize {
 /// systematic-rejection footguns quickly.
 pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
 
+/// #9996 — the most pending rows one peer may hold. An enqueue of a
+/// non-delete payload for a NEW `(memory_id, peer_id)` pair past this bound
+/// is refused with [`REASON_DLQ_PEER_CAP`] and counted per peer in
+/// [`super::push_dlq_cap`] (review #10026 C-F3); a refresh of an existing
+/// pending row still lands. Nothing is deleted: the refused write stays
+/// reachable through the peer's `/sync/since` catch-up. A deletion-class
+/// payload (a non-empty `deletions` array) is exempt: a deletion is not
+/// recoverable through catch-up, and its rows are bounded by the corpus
+/// size. Concurrent enqueues on Postgres can pass the bound by at most the
+/// number of writers in flight.
+pub const MAX_PENDING_DLQ_ROWS_PER_PEER: i64 = 50_000;
+
+/// #9996 — the error text of an enqueue refused by
+/// [`MAX_PENDING_DLQ_ROWS_PER_PEER`].
+pub const REASON_DLQ_PEER_CAP: &str = "push DLQ: per-peer pending-row cap reached";
+
+/// #9996 — the lane name the replay worker reports refusals under.
+const REPLAY_LANE: &str = "dlq_replay";
+
 /// #1544 — env knob for the federation push-DLQ depth WARN threshold.
 const FED_DLQ_DEPTH_WARN_THRESHOLD_ENV: &str = "AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD";
 /// Compiled default depth at which the rising-edge WARN fires.
@@ -509,6 +546,12 @@ fn already_marked_legacy(last_error: &str) -> bool {
 static LEGACY_PEER_ID_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// #9996 (vote V2-9996 C-3) — the quarantine cause label of a row the sender
+/// refused to send because it is outside the peer's outbound scope. The row
+/// is kept (never deleted); [`redrive_out_of_scope_once`] re-admits it at the
+/// next replay-worker start, so widening the scope and restarting re-drives it.
+pub const CAUSE_OUTBOUND_SCOPE: &str = "outbound_scope";
+
 /// #1544 — map a free-text DLQ `last_error` to a CLOSED-set quarantine
 /// cause label so the Prometheus label cardinality is bounded by
 /// construction (never the raw string). `quota` is operator-actionable
@@ -530,6 +573,11 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         }
         if detail.contains(CAUSE_NAMESPACE_PROBE_UNRESOLVABLE) {
             return CAUSE_NAMESPACE_PROBE_UNRESOLVABLE;
+        }
+        // #9996 — the sender's own scope check stamped this token (never a
+        // peer), so it is a trusted refinement of the class label.
+        if detail.starts_with(CAUSE_OUTBOUND_SCOPE) {
+            return CAUSE_OUTBOUND_SCOPE;
         }
         return class.quarantine_cause();
     }
@@ -608,6 +656,42 @@ fn classify_quarantine_cause_legacy(last_error: &str) -> &'static str {
         CAUSE_PERMANENT
     } else {
         CAUSE_OTHER
+    }
+}
+
+/// #9996 — the `LIKE` prefix of a row quarantined by the sender's outbound
+/// scope check: the permanent class tag, then `outbound_scope: `. The class
+/// tag is sender-minted and opens the column, so a peer's reason text can
+/// never take this form. Review #10026 L3: the stamp is LIKE-escaped (`\`
+/// is the escape character, `ESCAPE '\'` on both backends) so its `_` and
+/// any `%` match only themselves; the one wildcard is the trailing `%`.
+#[must_use]
+pub fn out_of_scope_like_prefix() -> String {
+    let stamp =
+        super::dlq_class::DlqErrorClass::Permanent.stamp(&format!("{CAUSE_OUTBOUND_SCOPE}: "));
+    let mut p = crate::storage::escape_like_pattern(&stamp);
+    p.push('%');
+    p
+}
+
+/// #9996 (vote V2-9996 C-3) — re-drive the out-of-scope quarantine once,
+/// at replay-worker start: the outbound scope is read at boot, so a scope
+/// widened by a restart re-admits the rows it now covers. Public so tests
+/// drive it without the worker's start delay. Best-effort like the worker.
+pub async fn redrive_out_of_scope_once(sink: &dyn FederationDlqSink) {
+    match sink
+        .redrive_out_of_scope_quarantine(&out_of_scope_like_prefix())
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            "replay: re-driving {n} out-of-scope DLQ row(s) under the current outbound scope"
+        ),
+        Err(e) => tracing::warn!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            "replay: redrive_out_of_scope_quarantine failed; the rows stay quarantined: {e}"
+        ),
     }
 }
 
@@ -928,10 +1012,25 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             }
         }
 
+        // #9996 — a queued row is re-admitted under the peer's CURRENT
+        // outbound scope: a row queued before the scope narrowed, or by an
+        // older binary, is never sent. It moves to the terminal state.
+        let scoped = match super::outbound_scope::admit_recorded(
+            &row.peer_id,
+            &peer.outbound_scope,
+            &row.payload_json,
+        ) {
+            Ok(scoped) => scoped,
+            Err(refusal) => {
+                super::outbound_scope::note_refusal(&row.peer_id, REPLAY_LANE, &refusal);
+                quarantine_out_of_scope_row(sink, &row, refusal.reason()).await;
+                continue;
+            }
+        };
         let outcome = post_once(
             &config.client,
             peer,
-            &row.payload_json,
+            &scoped,
             &row.memory_id,
             Some(&row.memory_id),
             config.api_key.as_deref(),
@@ -1041,6 +1140,45 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
     refresh_depth_gauge(sink).await;
 }
 
+/// #9996 — move a refused row to the terminal state and count it under its
+/// quarantine cause. A sink error leaves the row pending; the next tick
+/// re-admits it and refuses it again, so nothing is sent meanwhile.
+async fn quarantine_out_of_scope_row(
+    sink: &dyn FederationDlqSink,
+    row: &FederationPushDlqRow,
+    reason: &str,
+) {
+    let stamped = super::dlq_class::DlqErrorClass::Permanent
+        .stamp(&format!("{CAUSE_OUTBOUND_SCOPE}: {reason}"));
+    if let Err(e) = sink.quarantine_dlq_row(row.id, &stamped).await {
+        tracing::warn!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            row_id = row.id,
+            peer_id = %row.peer_id,
+            "replay: out-of-scope row {} could not be quarantined ({e}); it stays \
+             pending and is refused again next tick (never sent)",
+            row.id,
+        );
+        return;
+    }
+    crate::metrics::registry()
+        .federation_push_dlq_quarantined
+        .inc();
+    crate::metrics::registry()
+        .federation_push_dlq_quarantined_by_cause
+        .with_label_values(&[classify_quarantine_cause(&stamped)])
+        .inc();
+    tracing::warn!(
+        target: PUSH_DLQ_TRACE_TARGET,
+        row_id = row.id,
+        peer_id = %row.peer_id,
+        memory_id = %row.memory_id,
+        "replay: row {} quarantined: outside the peer's outbound scope ({reason}); \
+         kept, never sent, re-drivable after the scope is widened",
+        row.id,
+    );
+}
+
 /// #2446 — `last_error` stamped on a per-peer row minted by expanding an
 /// erasure-outbox sentinel.
 ///
@@ -1053,7 +1191,8 @@ const ERASURE_EXPANDED_LAST_ERROR: &str =
 
 /// #2446 — expand ONE erasure-outbox sentinel row into per-peer delete
 /// rows. Best-effort: every failure leaves the sentinel pending for the
-/// next tick (never drops the erasure).
+/// next tick, and a sentinel no configured peer's outbound scope admits is
+/// quarantined (kept, re-drivable); the erasure is never dropped.
 async fn expand_erasure_sentinel_row(
     config: &FederationConfig,
     sink: &dyn FederationDlqSink,
@@ -1082,23 +1221,32 @@ async fn expand_erasure_sentinel_row(
         );
         return;
     }
-    let peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
-    if peer_ids.is_empty() {
-        // Unreachable in production (`FederationConfig::build` returns
-        // `None` on an empty peer list, so no worker is spawned), but a
-        // silent drop of an erasure is never acceptable: leave it pending.
-        tracing::warn!(
-            target: PUSH_DLQ_TRACE_TARGET,
-            row_id = row.id,
-            "replay: erasure sentinel row {} has no configured peers to expand to — \
-             leaving pending",
-            row.id,
-        );
-        return;
-    }
     // The DAEMON owns the federation identity, so the canonical delete
     // body is built HERE, not by the MCP / CLI writer (which has none).
-    let body = super::erasure_outbox::deletion_body(&config.sender_agent_id, &row.memory_id);
+    let mut body = super::erasure_outbox::deletion_body(&config.sender_agent_id, &row.memory_id);
+    // #9996 (vote V2-9996 C-1) — the queued payload carries the erased
+    // memory's namespace; a row with none (queued before the upgrade)
+    // stays unresolved and expands only to an all-namespaces peer.
+    super::outbound_scope::ItemNamespaces::from_body(&row.payload_json).annotate(&mut body);
+    // #9996 — the erasure fans out only to peers whose outbound scope
+    // admits the delete (a peer with no outbound scope gets nothing).
+    let peer_ids: Vec<String> = config
+        .peers
+        .iter()
+        .filter(|p| super::outbound_scope::admit(&p.outbound_scope, &body).is_ok())
+        .map(|p| p.id.clone())
+        .collect();
+    if peer_ids.is_empty() {
+        // Review #10026 C-F2: every configured peer refuses this namespace
+        // (or has no outbound scope). Left pending, the sentinel would be
+        // retaken every tick forever and, in a backlog, starve the replay
+        // window. Quarantine it instead: the row is kept (never dropped),
+        // stamped with the outbound-scope cause, and re-driven by the
+        // outbound-scope redrive once a peer's scope admits the namespace.
+        quarantine_out_of_scope_row(sink, row, super::outbound_scope::REASON_NOTHING_IN_SCOPE)
+            .await;
+        return;
+    }
     match sink
         .expand_erasure_sentinel(
             row.id,
@@ -1286,20 +1434,42 @@ impl FederationDlqSink for SqliteDlqSink {
         // must not coalesce onto the stale first-failure snapshot); the
         // receiver-side LWW `insert_if_newer` makes replaying newer
         // content safe. Partial unique index from the v48 migration
-        // backs this conflict target.
-        conn.execute(
-            "INSERT INTO federation_push_dlq \
+        // backs this conflict target. #9996: a NEW non-delete pair past the
+        // per-peer bound inserts nothing (n == 0), is refused and counted
+        // (review #10026 C-F3); a deletion (`?7`) is exempt.
+        let n = conn
+            .execute(
+                "INSERT INTO federation_push_dlq \
                  (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
-                 VALUES (?1, ?2, ?3, 1, ?4, ?5) \
+                 SELECT ?1, ?2, ?3, 1, ?4, ?5 \
+                 WHERE (SELECT COUNT(*) FROM federation_push_dlq \
+                        WHERE peer_id = ?2 AND replayed_at IS NULL) < ?6 \
+                    OR EXISTS (SELECT 1 FROM federation_push_dlq \
+                        WHERE memory_id = ?1 AND peer_id = ?2 AND replayed_at IS NULL) \
+                    OR ?7 \
                  ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS NULL \
                  DO UPDATE SET \
                    attempt_count = attempt_count + 1, \
                    last_error    = excluded.last_error, \
                    payload_json  = excluded.payload_json, \
                    failed_at     = excluded.failed_at",
-            rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
-        )
-        .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
+                rusqlite::params![
+                    memory_id,
+                    peer_id,
+                    payload_str,
+                    last_error,
+                    now,
+                    MAX_PENDING_DLQ_ROWS_PER_PEER,
+                    payload_is_delete(payload_json)
+                ],
+            )
+            .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
+        if n == 0 {
+            super::push_dlq_cap::record_cap_refusal(peer_id);
+            return Err(format!(
+                "{REASON_DLQ_PEER_CAP} ({MAX_PENDING_DLQ_ROWS_PER_PEER})"
+            ));
+        }
         Ok(())
     }
 
@@ -1374,6 +1544,18 @@ impl FederationDlqSink for SqliteDlqSink {
             rusqlite::params![last_error, id],
         )
         .map_err(|e| format!("sqlite bump_dlq_attempt: {e}"))?;
+        Ok(())
+    }
+
+    async fn quarantine_dlq_row(&self, id: i64, last_error: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE federation_push_dlq \
+                 SET attempt_count = MAX(attempt_count, ?3), last_error = ?1 \
+                 WHERE id = ?2 AND replayed_at IS NULL",
+            rusqlite::params![last_error, id, MAX_REPLAY_ATTEMPTS],
+        )
+        .map_err(|e| anyhow::anyhow!("sqlite quarantine_dlq_row: {e}"))?;
         Ok(())
     }
 
@@ -1462,6 +1644,20 @@ impl FederationDlqSink for SqliteDlqSink {
                 ],
             )
             .map_err(|e| format!("sqlite reset_throttled_quarantine: {e}"))?;
+        Ok(n as u64)
+    }
+
+    async fn redrive_out_of_scope_quarantine(&self, stamped_prefix: &str) -> Result<u64, String> {
+        // #9996 — byte-for-byte the postgres predicate; the prefix is
+        // LIKE-escaped with `\` (review #10026 L3).
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE federation_push_dlq SET attempt_count = 0 \
+                 WHERE replayed_at IS NULL AND last_error LIKE ?1 ESCAPE '\\'",
+                rusqlite::params![stamped_prefix],
+            )
+            .map_err(|e| format!("sqlite redrive_out_of_scope_quarantine: {e}"))?;
         Ok(n as u64)
     }
 
@@ -1629,11 +1825,18 @@ impl FederationDlqSink for PostgresDlqSink {
         // newest failed push (mirrors the sqlite arm) so a later failure
         // never coalesces onto the stale first-failure body. `failed_at`
         // has a `DEFAULT now()` (see migrations/postgres/0030_*), so
-        // `EXCLUDED.failed_at` is the fresh insert-time instant.
-        sqlx::query(
+        // `EXCLUDED.failed_at` is the fresh insert-time instant. #9996: a NEW
+        // non-delete pair past the per-peer bound inserts nothing, is
+        // refused and counted (review #10026 C-F3); a deletion is exempt.
+        let done = sqlx::query(
             "INSERT INTO federation_push_dlq \
              (memory_id, peer_id, payload_json, attempt_count, last_error) \
-             VALUES ($1, $2, $3::jsonb, 1, $4) \
+             SELECT $1, $2, $3::jsonb, 1, $4 \
+             WHERE (SELECT COUNT(*) FROM federation_push_dlq \
+                    WHERE peer_id = $2 AND replayed_at IS NULL) < $5 \
+                OR EXISTS (SELECT 1 FROM federation_push_dlq \
+                    WHERE memory_id = $1 AND peer_id = $2 AND replayed_at IS NULL) \
+                OR $6 \
              ON CONFLICT (memory_id, peer_id) WHERE replayed_at IS NULL \
              DO UPDATE SET \
                attempt_count = federation_push_dlq.attempt_count + 1, \
@@ -1645,9 +1848,17 @@ impl FederationDlqSink for PostgresDlqSink {
         .bind(peer_id)
         .bind(payload_json.to_string())
         .bind(last_error)
+        .bind(MAX_PENDING_DLQ_ROWS_PER_PEER)
+        .bind(payload_is_delete(payload_json))
         .execute(pool)
         .await
         .map_err(|e| format!("postgres enqueue_push_failure: {e}"))?;
+        if done.rows_affected() == 0 {
+            super::push_dlq_cap::record_cap_refusal(peer_id);
+            return Err(format!(
+                "{REASON_DLQ_PEER_CAP} ({MAX_PENDING_DLQ_ROWS_PER_PEER})"
+            ));
+        }
         Ok(())
     }
 
@@ -1734,6 +1945,22 @@ impl FederationDlqSink for PostgresDlqSink {
         Ok(())
     }
 
+    async fn quarantine_dlq_row(&self, id: i64, last_error: &str) -> anyhow::Result<()> {
+        let pool = self.store.pool();
+        sqlx::query(
+            "UPDATE federation_push_dlq \
+             SET attempt_count = GREATEST(attempt_count, $3), last_error = $1 \
+             WHERE id = $2 AND replayed_at IS NULL",
+        )
+        .bind(last_error)
+        .bind(id)
+        .bind(MAX_REPLAY_ATTEMPTS)
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("postgres quarantine_dlq_row: {e}"))?;
+        Ok(())
+    }
+
     async fn pending_dlq_count(&self) -> Result<i64, String> {
         let pool = self.store.pool();
         let row: (i64,) =
@@ -1802,6 +2029,21 @@ impl FederationDlqSink for PostgresDlqSink {
         .execute(pool)
         .await
         .map_err(|e| format!("postgres reset_throttled_quarantine: {e}"))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn redrive_out_of_scope_quarantine(&self, stamped_prefix: &str) -> Result<u64, String> {
+        // #9996 — byte-for-byte the sqlite predicate; the prefix is
+        // LIKE-escaped with `\` (review #10026 L3).
+        let pool = self.store.pool();
+        let res = sqlx::query(
+            "UPDATE federation_push_dlq SET attempt_count = 0 \
+             WHERE replayed_at IS NULL AND last_error LIKE $1 ESCAPE '\\'",
+        )
+        .bind(stamped_prefix)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres redrive_out_of_scope_quarantine: {e}"))?;
         Ok(res.rows_affected())
     }
 
@@ -1951,6 +2193,8 @@ mod replay_arm_tests {
         rows: Mutex<Vec<FederationPushDlqRow>>,
         marked_replayed: Mutex<Vec<i64>>,
         bumped: Mutex<Vec<(i64, String)>>,
+        /// #9996 — rows moved to the terminal state.
+        quarantined: Mutex<Vec<(i64, String)>>,
         // #1544 — records note_dlq_throttled calls so a test can assert a
         // 429 throttle did NOT go through bump_dlq_attempt.
         throttled: Mutex<Vec<(i64, String)>>,
@@ -2026,6 +2270,14 @@ mod replay_arm_tests {
             Ok(())
         }
 
+        async fn quarantine_dlq_row(&self, id: i64, last_error: &str) -> anyhow::Result<()> {
+            self.quarantined
+                .lock()
+                .unwrap()
+                .push((id, last_error.to_string()));
+            Ok(())
+        }
+
         async fn pending_dlq_count(&self) -> Result<i64, String> {
             if self.count_should_err {
                 return Err("mock count error".to_string());
@@ -2052,6 +2304,34 @@ mod replay_arm_tests {
             let mut n = 0u64;
             for row in self.rows.lock().unwrap().iter_mut() {
                 if row.attempt_count >= MAX_REPLAY_ATTEMPTS && row.last_error.contains("429") {
+                    row.attempt_count = 0;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        }
+
+        async fn redrive_out_of_scope_quarantine(
+            &self,
+            stamped_prefix: &str,
+        ) -> Result<u64, String> {
+            // The LIKE prefix, unescaped (review #10026 L3).
+            let mut prefix = String::new();
+            let mut chars = stamped_prefix
+                .strip_suffix('%')
+                .unwrap_or(stamped_prefix)
+                .chars();
+            while let Some(c) = chars.next() {
+                prefix.push(if c == '\\' {
+                    chars.next().unwrap_or(c)
+                } else {
+                    c
+                });
+            }
+            let prefix = prefix.as_str();
+            let mut n = 0u64;
+            for row in self.rows.lock().unwrap().iter_mut() {
+                if row.last_error.starts_with(prefix) {
                     row.attempt_count = 0;
                     n += 1;
                 }
@@ -2141,6 +2421,8 @@ mod replay_arm_tests {
             peers: vec![PeerEndpoint {
                 id: peer_id.to_string(),
                 sync_push_url: url.to_string(),
+                outbound_scope: crate::federation::outbound_scope::PeerOutboundScope::all_explicit(
+                ),
             }],
             client: reqwest::Client::builder()
                 .timeout(Duration::from_millis(200))

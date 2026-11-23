@@ -210,7 +210,11 @@ pub async fn transition_action(
             &node_agent_id,
             now,
         );
-        match crate::federation::broadcast_action_transition_quorum(fed, &op).await {
+        // #9996 — the transition is admitted against the action's namespace.
+        let transition_ns =
+            crate::federation::outbound_scope::ItemNamespaces::of(&action_id, &namespace);
+        match crate::federation::broadcast_action_transition_quorum(fed, &op, &transition_ns).await
+        {
             Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
                 Ok(got) => {
                     response[QUORUM_ACKS_FIELD] = json!(got);

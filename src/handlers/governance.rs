@@ -377,8 +377,18 @@ pub async fn approve_pending(
                     approved: true,
                     decider: agent_id.clone(),
                 };
-                match super::fed_fanout::fanout_decision(&app, &decision, &produced_mem, &mut body)
-                    .await
+                // #9996 — admitted against the pending action's namespace.
+                let pending_ns = pending_snapshot
+                    .as_ref()
+                    .map_or("", |p| p.namespace.as_str());
+                match super::fed_fanout::fanout_decision(
+                    &app,
+                    &decision,
+                    pending_ns,
+                    &produced_mem,
+                    &mut body,
+                )
+                .await
                 {
                     Ok(()) => Json(body).into_response(),
                     Err(resp) => resp,
@@ -480,6 +490,9 @@ pub async fn approve_pending(
                     match super::fed_fanout::fanout_decision(
                         &app,
                         &decision,
+                        pending_snapshot
+                            .as_ref()
+                            .map_or("", |p| p.namespace.as_str()),
                         &produced_mem,
                         &mut body,
                     )
@@ -623,6 +636,16 @@ pub async fn reject_pending(
         // `pending_decide(.., false, ..)`, which asks nothing about WHO is
         // deciding, so any `X-Agent-Id` principal — including the requester,
         // whom approve refuses — could veto any other tenant's queued action.
+        // #9996 — the pending action's namespace, read before the reject
+        // so the decision fan-out is admitted against it.
+        let pending_ns = app
+            .store
+            .get_pending(&ctx, &id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.namespace)
+            .unwrap_or_default();
         return match app
             .store
             .reject_with_approver_type(&ctx, &id, &agent_id)
@@ -656,6 +679,7 @@ pub async fn reject_pending(
                 match super::fed_fanout::fanout_decision(
                     &app,
                     &decision,
+                    &pending_ns,
                     &super::fed_fanout::Produced::Nothing,
                     &mut body,
                 )
@@ -687,6 +711,12 @@ pub async fn reject_pending(
     // this surface is multi-tenant via per-request X-Agent-Id and sets no
     // process AI_MEMORY_AGENT_ID, so the storage-layer env opt-in would never
     // fire here.
+    // #9996 — the pending action's namespace, read before the reject.
+    let pending_ns = db::get_pending_action(&lock.0, &id)
+        .ok()
+        .flatten()
+        .map(|p| p.namespace)
+        .unwrap_or_default();
     match db::reject_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
         Ok(db::RejectOutcome::Rejected) => {
             drop(lock);
@@ -701,6 +731,7 @@ pub async fn reject_pending(
             match super::fed_fanout::fanout_decision(
                 &app,
                 &decision,
+                &pending_ns,
                 &super::fed_fanout::Produced::Nothing,
                 &mut body,
             )

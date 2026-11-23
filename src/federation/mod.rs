@@ -67,6 +67,8 @@ pub mod freshness;
 pub mod identity;
 /// #4478 — the #4356 ancestor-owner bind gate on the federated namespace_meta apply.
 pub mod ns_meta_ancestor_gate;
+pub mod outbound_scope;
+pub mod outbound_scope_serve;
 pub mod peer;
 pub mod peer_attestation;
 pub mod peer_posture;
@@ -83,6 +85,7 @@ mod peer_tasks;
 // `#[cfg(feature = "sal-postgres")]` inside the module.
 // proj-feature-additive: un-gating is additive; do NOT flip `default`.
 pub mod push_dlq;
+pub mod push_dlq_cap;
 pub mod push_lanes;
 pub mod quorum;
 pub mod receive;
@@ -94,6 +97,7 @@ pub mod reflection_bookkeeping;
 // `401 Unauthorized` when `AI_MEMORY_FED_REQUIRE_SIG=1` (default).
 pub mod signing;
 pub mod sync;
+pub mod sync_daemon_push;
 pub mod vector_clock;
 
 pub use quorum::*;
@@ -182,6 +186,10 @@ pub struct FederationConfig {
 pub struct PeerEndpoint {
     pub id: String,
     pub sync_push_url: String,
+    /// #9996 — what this node may send to this peer. Built `Deny` by
+    /// [`FederationConfig::build`]; set from
+    /// `AI_MEMORY_FED_PEER_OUTBOUND_SCOPE` by [`outbound_scope::apply_env`].
+    pub outbound_scope: outbound_scope::PeerOutboundScope,
 }
 
 /// #1566 / #1579 B1 — embed-once-replicate-vector. A source-side
@@ -605,6 +613,8 @@ mod tests {
                 .map(|(i, url)| PeerEndpoint {
                     id: format!("peer-{i}:{url}"),
                     sync_push_url: format!("{url}/api/v1/sync/push"),
+                    outbound_scope:
+                        crate::federation::outbound_scope::PeerOutboundScope::all_explicit(),
                 })
                 .collect(),
             client,
@@ -991,7 +1001,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let tracker = broadcast_archive_quorum(&cfg, "mem-s29").await.unwrap();
+        let tracker = broadcast_archive_quorum(
+            &cfg,
+            "mem-s29",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let result = finalise_quorum(&tracker);
         assert!(result.is_ok(), "expected quorum met, got {result:?}");
         // Let detached fanout complete so both peers are observed.
@@ -1011,7 +1027,13 @@ mod tests {
         let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2], 3, 500);
-        let tracker = broadcast_archive_quorum(&cfg, "mem-s29").await.unwrap();
+        let tracker = broadcast_archive_quorum(
+            &cfg,
+            "mem-s29",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         match err {
             QuorumError::QuorumNotMet { got, needed, .. } => {
@@ -1034,7 +1056,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let tracker = broadcast_delete_quorum(&cfg, "mem-del").await.unwrap();
+        let tracker = broadcast_delete_quorum(
+            &cfg,
+            "mem-del",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         assert!(finalise_quorum(&tracker).is_ok());
         for _ in 0..20 {
             if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
@@ -1051,7 +1079,13 @@ mod tests {
         let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2], 3, 500);
-        let tracker = broadcast_delete_quorum(&cfg, "mem-del").await.unwrap();
+        let tracker = broadcast_delete_quorum(
+            &cfg,
+            "mem-del",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         match err {
             QuorumError::QuorumNotMet { got, needed, .. } => {
@@ -1069,7 +1103,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let tracker = broadcast_restore_quorum(&cfg, "mem-restore").await.unwrap();
+        let tracker = broadcast_restore_quorum(
+            &cfg,
+            "mem-restore",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         assert!(finalise_quorum(&tracker).is_ok());
         for _ in 0..20 {
             if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
@@ -1086,7 +1126,13 @@ mod tests {
         let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2], 3, 500);
-        let tracker = broadcast_restore_quorum(&cfg, "mem-restore").await.unwrap();
+        let tracker = broadcast_restore_quorum(
+            &cfg,
+            "mem-restore",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
     }
@@ -1114,7 +1160,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let tracker = broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+        let tracker = broadcast_link_quorum(
+            &cfg,
+            &sample_link(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         assert!(finalise_quorum(&tracker).is_ok());
         for _ in 0..20 {
             if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
@@ -1131,7 +1183,13 @@ mod tests {
         let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2], 3, 500);
-        let tracker = broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+        let tracker = broadcast_link_quorum(
+            &cfg,
+            &sample_link(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
     }
@@ -1242,9 +1300,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
-            .await
-            .unwrap();
+        let tracker = broadcast_action_transition_quorum(
+            &cfg,
+            &sample_action_transition(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         assert!(finalise_quorum(&tracker).is_ok());
         for _ in 0..20 {
             if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
@@ -1261,9 +1323,13 @@ mod tests {
         let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2], 3, 500);
-        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
-            .await
-            .unwrap();
+        let tracker = broadcast_action_transition_quorum(
+            &cfg,
+            &sample_action_transition(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
     }
@@ -1331,9 +1397,13 @@ mod tests {
         let url1 = spawn_id_drift_peer().await;
         let url2 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1, url2], 2, 1000);
-        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
-            .await
-            .unwrap();
+        let tracker = broadcast_action_transition_quorum(
+            &cfg,
+            &sample_action_transition(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { got: 1, .. }));
         assert_eq!(tracker.id_drift_count(), 2);
@@ -1366,9 +1436,13 @@ mod tests {
         let (url_fast, _) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url_slow, _) = spawn_mock_peer(MockBehaviour::SlowFail).await;
         let cfg = build_config(vec![url_fast, url_slow], 1, 2000);
-        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
-            .await
-            .unwrap();
+        let tracker = broadcast_action_transition_quorum(
+            &cfg,
+            &sample_action_transition(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         // local + the fast peer's ack meet W=1; the slow-fail peer is detached.
         assert!(finalise_quorum(&tracker).is_ok());
         // Let the detached task drain the SlowFail peer (covers the inner arm).
@@ -1404,9 +1478,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let tracker = broadcast_pending_decision_quorum(&cfg, &sample_decision())
-            .await
-            .unwrap();
+        let tracker = broadcast_pending_decision_quorum(
+            &cfg,
+            &sample_decision(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         assert!(finalise_quorum(&tracker).is_ok());
         for _ in 0..20 {
             if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
@@ -1423,9 +1501,13 @@ mod tests {
         let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2], 3, 500);
-        let tracker = broadcast_pending_decision_quorum(&cfg, &sample_decision())
-            .await
-            .unwrap();
+        let tracker = broadcast_pending_decision_quorum(
+            &cfg,
+            &sample_decision(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
     }
@@ -2038,6 +2120,8 @@ mod tests {
             peers: vec![PeerEndpoint {
                 id: "peer-0".to_string(),
                 sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+                outbound_scope: crate::federation::outbound_scope::PeerOutboundScope::all_explicit(
+                ),
             }],
             client,
             sender_agent_id: "ai:catchup-test".to_string(),
@@ -2524,6 +2608,7 @@ mod tests {
         PeerEndpoint {
             id: format!("peer-test-{}", uuid::Uuid::new_v4()),
             sync_push_url: url.to_string(),
+            outbound_scope: crate::federation::outbound_scope::PeerOutboundScope::all_explicit(),
         }
     }
 
@@ -2551,7 +2636,7 @@ mod tests {
     async fn post_and_classify_persistent_fail_concatenates_both_reasons() {
         let (url, count) = spawn_mock_peer(MockBehaviour::Fail).await;
         let client = crate::test_support::tls_test_client(Duration::from_millis(2000));
-        let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
+        let body = scoped_test_body();
         let target = format!("{url}/api/v1/sync/push");
 
         let outcome = post_and_classify(
@@ -2613,7 +2698,7 @@ mod tests {
         let url = format!("{base}/api/v1/sync/push");
 
         let client = crate::test_support::tls_test_client(Duration::from_millis(2000));
-        let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
+        let body = scoped_test_body();
         let outcome = post_and_classify(
             &client,
             &test_peer(&url),
@@ -2651,10 +2736,24 @@ mod tests {
         format!("{base}/api/v1/sync/push")
     }
 
+    /// #9996 — a one-memory body admitted for an all-namespaces peer; the
+    /// transport only accepts a body the outbound scope admitted.
+    fn scoped_test_body() -> super::outbound_scope::ScopedOutbound {
+        let raw = serde_json::json!({
+            "sender_agent_id": "ai:test",
+            "memories": [{"id": "mem-x", "namespace": "transport-test"}],
+        });
+        super::outbound_scope::admit(
+            &super::outbound_scope::PeerOutboundScope::all_explicit(),
+            &raw,
+        )
+        .expect("an all-namespaces peer admits a one-memory body")
+    }
+
     async fn classify_against_envelope(envelope: serde_json::Value) -> AckOutcome {
         let url = spawn_envelope_peer(envelope).await;
         let client = crate::test_support::tls_test_client(Duration::from_millis(2000));
-        let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
+        let body = scoped_test_body();
         super::sync::post_once(
             &client,
             &test_peer(&url),
@@ -2955,7 +3054,13 @@ mod tests {
         // is the only source of acks; quorum cannot be met.
         let cfg = build_config(vec![url1, url2], 2, 200);
         let start = Instant::now();
-        let tracker = broadcast_archive_quorum(&cfg, "mem-arch-id").await.unwrap();
+        let tracker = broadcast_archive_quorum(
+            &cfg,
+            "mem-arch-id",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let elapsed = start.elapsed();
         // Loop must give up at the deadline, not hang for the full 10s
         // peer sleep.
@@ -3032,6 +3137,8 @@ mod tests {
                         // No /api/v1/sync/push suffix — verifies the trim is
                         // tolerant of unexpected shapes.
                         sync_push_url: url.clone(),
+                        outbound_scope:
+                            crate::federation::outbound_scope::PeerOutboundScope::all_explicit(),
                     }],
                     client,
                     sender_agent_id: "ai:no-suffix".to_string(),
@@ -3299,7 +3406,13 @@ mod tests {
         let url1 = spawn_id_drift_peer().await;
         let url2 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1, url2], 2, 1000);
-        let tracker = broadcast_delete_quorum(&cfg, "mem-del-x").await.unwrap();
+        let tracker = broadcast_delete_quorum(
+            &cfg,
+            "mem-del-x",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         // local + 0 peer acks = 1 < W=2 → not met.
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(
@@ -3320,7 +3433,13 @@ mod tests {
     async fn archive_quorum_id_drift_peer_records_drift_not_ack() {
         let url1 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1], 2, 1000);
-        let tracker = broadcast_archive_quorum(&cfg, "mem-arch-x").await.unwrap();
+        let tracker = broadcast_archive_quorum(
+            &cfg,
+            "mem-arch-x",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
         assert_eq!(tracker.id_drift_count(), 1);
@@ -3332,7 +3451,13 @@ mod tests {
     async fn restore_quorum_id_drift_peer_records_drift_not_ack() {
         let url1 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1], 2, 1000);
-        let tracker = broadcast_restore_quorum(&cfg, "mem-res-x").await.unwrap();
+        let tracker = broadcast_restore_quorum(
+            &cfg,
+            "mem-res-x",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
         assert_eq!(tracker.id_drift_count(), 1);
@@ -3344,7 +3469,13 @@ mod tests {
     async fn link_quorum_id_drift_peer_records_drift_not_ack() {
         let url1 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1], 2, 1000);
-        let tracker = broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+        let tracker = broadcast_link_quorum(
+            &cfg,
+            &sample_link(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
         assert_eq!(tracker.id_drift_count(), 1);
@@ -3385,9 +3516,13 @@ mod tests {
     async fn pending_decision_quorum_id_drift_peer_records_drift_not_ack() {
         let url1 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1], 2, 1000);
-        let tracker = broadcast_pending_decision_quorum(&cfg, &sample_decision())
-            .await
-            .unwrap();
+        let tracker = broadcast_pending_decision_quorum(
+            &cfg,
+            &sample_decision(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
         assert_eq!(tracker.id_drift_count(), 1);
@@ -3433,7 +3568,13 @@ mod tests {
         let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url3, count3) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2, url3], 2, 2000);
-        let _tracker = broadcast_delete_quorum(&cfg, "mem-detach").await.unwrap();
+        let _tracker = broadcast_delete_quorum(
+            &cfg,
+            "mem-detach",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         // Wait long enough for the detached failing peer to finish its
         // first attempt + 250ms backoff + retry.
         for _ in 0..100 {
@@ -3501,9 +3642,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::FailThenAck { fail_until: 1 }).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let _tracker = broadcast_delete_quorum(&cfg, "mem-del-retry")
-            .await
-            .unwrap();
+        let _tracker = broadcast_delete_quorum(
+            &cfg,
+            "mem-del-retry",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         for _ in 0..200 {
             if count1.load(Ordering::Relaxed) >= 1 && count2.load(Ordering::Relaxed) >= 2 {
                 break;
@@ -3522,9 +3667,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::FailThenAck { fail_until: 1 }).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let _tracker = broadcast_archive_quorum(&cfg, "mem-arc-retry")
-            .await
-            .unwrap();
+        let _tracker = broadcast_archive_quorum(
+            &cfg,
+            "mem-arc-retry",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         for _ in 0..200 {
             if count1.load(Ordering::Relaxed) >= 1 && count2.load(Ordering::Relaxed) >= 2 {
                 break;
@@ -3539,9 +3688,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::FailThenAck { fail_until: 1 }).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let _tracker = broadcast_restore_quorum(&cfg, "mem-res-retry")
-            .await
-            .unwrap();
+        let _tracker = broadcast_restore_quorum(
+            &cfg,
+            "mem-res-retry",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         for _ in 0..200 {
             if count1.load(Ordering::Relaxed) >= 1 && count2.load(Ordering::Relaxed) >= 2 {
                 break;
@@ -3556,7 +3709,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::FailThenAck { fail_until: 1 }).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let _tracker = broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+        let _tracker = broadcast_link_quorum(
+            &cfg,
+            &sample_link(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         for _ in 0..200 {
             if count1.load(Ordering::Relaxed) >= 1 && count2.load(Ordering::Relaxed) >= 2 {
                 break;
@@ -3607,9 +3766,13 @@ mod tests {
         let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
         let (url2, count2) = spawn_mock_peer(MockBehaviour::FailThenAck { fail_until: 1 }).await;
         let cfg = build_config(vec![url1, url2], 2, 2000);
-        let _tracker = broadcast_pending_decision_quorum(&cfg, &sample_decision())
-            .await
-            .unwrap();
+        let _tracker = broadcast_pending_decision_quorum(
+            &cfg,
+            &sample_decision(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         for _ in 0..200 {
             if count1.load(Ordering::Relaxed) >= 1 && count2.load(Ordering::Relaxed) >= 2 {
                 break;
@@ -3661,9 +3824,13 @@ mod tests {
         let url1 = spawn_id_drift_peer().await;
         let url2 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1, url2], 2, 1000);
-        let tracker = broadcast_delete_quorum(&cfg, "mem-del-drift")
-            .await
-            .unwrap();
+        let tracker = broadcast_delete_quorum(
+            &cfg,
+            "mem-del-drift",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         match err {
             QuorumError::QuorumNotMet { got, .. } => assert_eq!(got, 1),
@@ -3676,9 +3843,13 @@ mod tests {
         let url1 = spawn_id_drift_peer().await;
         let url2 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1, url2], 2, 1000);
-        let tracker = broadcast_archive_quorum(&cfg, "mem-arc-drift")
-            .await
-            .unwrap();
+        let tracker = broadcast_archive_quorum(
+            &cfg,
+            "mem-arc-drift",
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
     }
@@ -3688,7 +3859,13 @@ mod tests {
         let url1 = spawn_id_drift_peer().await;
         let url2 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1, url2], 2, 1000);
-        let tracker = broadcast_link_quorum(&cfg, &sample_link()).await.unwrap();
+        let tracker = broadcast_link_quorum(
+            &cfg,
+            &sample_link(),
+            &crate::federation::outbound_scope::ItemNamespaces::new(),
+        )
+        .await
+        .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
     }

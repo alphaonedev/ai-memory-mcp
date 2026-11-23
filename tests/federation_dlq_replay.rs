@@ -179,6 +179,8 @@ fn build_cfg_with_sink(
         peers: vec![PeerEndpoint {
             id: "peer-0".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client,
         sender_agent_id: "ai:dlq-test".to_string(),
@@ -773,6 +775,9 @@ async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
         async fn bump_dlq_attempt(&self, _id: i64, _e: &str) -> Result<(), String> {
             Ok(())
         }
+        async fn quarantine_dlq_row(&self, _id: i64, _e: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn pending_dlq_count(&self) -> Result<i64, String> {
             Ok(1)
         }
@@ -780,6 +785,10 @@ async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
             Ok(())
         }
         async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+            Ok(0)
+        }
+        /// #9996 — this sink holds no out-of-scope row.
+        async fn redrive_out_of_scope_quarantine(&self, _prefix: &str) -> Result<u64, String> {
             Ok(0)
         }
         /// #2446 — never exercised here (this sink models the store-lane

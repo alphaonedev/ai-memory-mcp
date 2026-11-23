@@ -184,6 +184,8 @@ fn build_cfg(
             .map(|(id, url)| PeerEndpoint {
                 id: (*id).to_string(),
                 sync_push_url: format!("{url}/api/v1/sync/push"),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             })
             .collect(),
         client,
@@ -230,9 +232,13 @@ async fn peer_down_leaves_pending_delete_dlq_row_2498() {
     let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg(&[("peer-down", &peer_url)], sink.clone(), 2000, 500);
 
-    let tracker = broadcast_delete_quorum(&cfg, "del-2498-down")
-        .await
-        .expect("broadcast returns the tracker");
+    let tracker = broadcast_delete_quorum(
+        &cfg,
+        "del-2498-down",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
     assert!(
         !tracker.is_quorum_met(std::time::Instant::now()),
         "W=N=2 with the peer down cannot reach quorum"
@@ -267,9 +273,13 @@ async fn peer_200_with_skipped_leaves_pending_delete_dlq_row_2498() {
     let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg(&[("peer-refuses", &peer_url)], sink.clone(), 2000, 1000);
 
-    let _ = broadcast_delete_quorum(&cfg, "del-2498-refused")
-        .await
-        .expect("broadcast returns the tracker");
+    let _ = broadcast_delete_quorum(
+        &cfg,
+        "del-2498-refused",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
 
     let pending = sink.take_pending_dlq_rows(64).await.expect("take pending");
     assert_eq!(
@@ -307,9 +317,13 @@ async fn deadline_evicted_peer_leaves_pending_delete_dlq_row_2498() {
         10_000,
     );
 
-    let _ = broadcast_delete_quorum(&cfg, "del-2498-deadline")
-        .await
-        .expect("broadcast returns the tracker");
+    let _ = broadcast_delete_quorum(
+        &cfg,
+        "del-2498-deadline",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
 
     let pending = sink.take_pending_dlq_rows(64).await.expect("take pending");
     assert_eq!(
@@ -345,9 +359,13 @@ async fn acking_peer_leaves_no_delete_dlq_row_2498() {
         1000,
     );
 
-    let _ = broadcast_delete_quorum(&cfg, "del-2498-mixed")
-        .await
-        .expect("broadcast returns the tracker");
+    let _ = broadcast_delete_quorum(
+        &cfg,
+        "del-2498-mixed",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
 
     let pending = sink.take_pending_dlq_rows(64).await.expect("take pending");
     assert_eq!(
@@ -384,9 +402,13 @@ async fn replay_redelivers_deletion_and_clears_row_2498() {
     let cfg = build_cfg(&[("peer-0", &peer_url)], sink.clone(), 2000, 500);
 
     // Step 1: peer down → the erasure lands in the DLQ.
-    let _ = broadcast_delete_quorum(&cfg, "del-2498-replay")
-        .await
-        .expect("broadcast returns the tracker");
+    let _ = broadcast_delete_quorum(
+        &cfg,
+        "del-2498-replay",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
     assert_eq!(
         sink.pending_dlq_count().await.unwrap(),
         1,
@@ -454,9 +476,13 @@ async fn pg_delete_lane_dlq_parity_2498() {
     let mem_id = format!("del-2498-pg-{}", uuid::Uuid::new_v4());
     let cfg = build_cfg(&[("peer-2498-pg", &peer_url)], sink.clone(), 2000, 500);
 
-    let _ = broadcast_delete_quorum(&cfg, &mem_id)
-        .await
-        .expect("broadcast returns the tracker");
+    let _ = broadcast_delete_quorum(
+        &cfg,
+        &mem_id,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
 
     let pending = sink.take_pending_dlq_rows(256).await.expect("pg take");
     let row = pending

@@ -621,9 +621,13 @@ pub async fn create_link(
                     "relation": relation,
                     (field_names::ATTEST_LEVEL): attest_level,
                 });
+                // #9996 — both endpoint namespaces admit the link.
+                let link_ns =
+                    super::fed_fanout::link_namespaces_store(&app, &ctx, &source_id, &target_id)
+                        .await;
                 if let Err(resp) = super::fed_fanout::fanout_into(
                     &app,
-                    super::fed_fanout::FanoutEffect::Link(&link),
+                    super::fed_fanout::FanoutEffect::Link(&link, &link_ns),
                     &mut receipt,
                 )
                 .await
@@ -814,6 +818,13 @@ pub async fn create_link(
             );
         }
     }
+    // #9996 — both endpoint namespaces, read under the lock, admit the
+    // link against each peer's outbound scope.
+    let link_ns = if create_result.is_ok() && app.federation.as_ref().is_some() {
+        super::fed_fanout::link_namespaces_sqlite(&lock.0, &source_id, &target_id)
+    } else {
+        crate::federation::outbound_scope::ItemNamespaces::new()
+    };
     // Drop DB lock before fanning out — peers POST back to our sync_push
     // and we'd deadlock on the shared Mutex if we held it.
     drop(lock);
@@ -856,7 +867,7 @@ pub async fn create_link(
                 // warned and answered 201).
                 if let Err(resp) = super::fed_fanout::fanout_into(
                     &app,
-                    super::fed_fanout::FanoutEffect::Link(&link),
+                    super::fed_fanout::FanoutEffect::Link(&link, &link_ns),
                     &mut receipt,
                 )
                 .await

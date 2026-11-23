@@ -138,6 +138,8 @@ fn federation_cfg_for_test(peer_urls: &[String], quorum_writes: usize) -> Federa
             PeerEndpoint {
                 id: format!("peer-{i}"),
                 sync_push_url: format!("{trimmed}/api/v1/sync/push"),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             }
         })
         .collect();

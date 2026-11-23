@@ -263,6 +263,7 @@ async fn reflect_fanout(
     fed: Option<&crate::federation::FederationConfig>,
     mem: &crate::models::Memory,
     links: &[crate::models::MemoryLink],
+    link_namespaces: &crate::federation::outbound_scope::ItemNamespaces,
 ) -> Option<axum::response::Response> {
     let fed = fed?;
     match crate::federation::broadcast_store_quorum(fed, mem).await {
@@ -279,7 +280,10 @@ async fn reflect_fanout(
     for link in links.iter().filter(|l| {
         l.relation == crate::models::MemoryLinkRelation::ReflectsOn && l.source_id == mem.id
     }) {
-        if let Err(e) = crate::federation::broadcast_link_quorum(fed, link).await {
+        // #9996 — the edge is admitted against both endpoint namespaces.
+        let mut ns = link_namespaces.subset([link.source_id.as_str(), link.target_id.as_str()]);
+        ns.insert(&mem.id, &mem.namespace);
+        if let Err(e) = crate::federation::broadcast_link_quorum(fed, link, &ns).await {
             tracing::warn!("reflect edge fanout error (local committed): {e:?}");
         }
     }
@@ -641,8 +645,23 @@ pub async fn handle_reflect_http(
                     .get_links_for_anchor(&outcome.id)
                     .await
                     .unwrap_or_default();
+                let mut link_ns = crate::federation::outbound_scope::ItemNamespaces::new();
+                for l in &links {
+                    let ends = super::fed_fanout::link_namespaces_store(
+                        &app,
+                        &caller,
+                        &l.source_id,
+                        &l.target_id,
+                    )
+                    .await;
+                    for id in [l.source_id.as_str(), l.target_id.as_str()] {
+                        if let Some(ns) = ends.get(id) {
+                            link_ns.insert(id, ns);
+                        }
+                    }
+                }
                 if let Some(resp) =
-                    reflect_fanout(app.federation.as_ref().as_ref(), &mem, &links).await
+                    reflect_fanout(app.federation.as_ref().as_ref(), &mem, &links, &link_ns).await
                 {
                     return resp;
                 }
@@ -748,13 +767,26 @@ pub async fn handle_reflect_http(
         Ok(v) => v.get("id").and_then(|x| x.as_str()).and_then(|id| {
             let mem = crate::db::get(&lock.0, id).ok().flatten();
             let links = crate::db::get_links(&lock.0, id).unwrap_or_default();
-            mem.map(|m| (m, links))
+            // #9996 — the edges' endpoint namespaces, read under the lock.
+            let mut link_ns = crate::federation::outbound_scope::ItemNamespaces::new();
+            for l in &links {
+                let ends =
+                    super::fed_fanout::link_namespaces_sqlite(&lock.0, &l.source_id, &l.target_id);
+                for end in [l.source_id.as_str(), l.target_id.as_str()] {
+                    if let Some(ns) = ends.get(end) {
+                        link_ns.insert(end, ns);
+                    }
+                }
+            }
+            mem.map(|m| (m, links, link_ns))
         }),
         Err(_) => None,
     };
     drop(lock);
-    if let Some((mem, links)) = fanout.as_ref() {
-        if let Some(resp) = reflect_fanout(app.federation.as_ref().as_ref(), mem, links).await {
+    if let Some((mem, links, link_ns)) = fanout.as_ref() {
+        if let Some(resp) =
+            reflect_fanout(app.federation.as_ref().as_ref(), mem, links, link_ns).await
+        {
             return resp;
         }
     }

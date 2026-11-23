@@ -34,6 +34,14 @@
 //!    + an honest `excluded_for_scope` count.
 //! 3. **No allowlist + env bypass = full dump (legacy)**.
 //! 4. **No allowlist + no bypass = empty + WARN** (default-deny).
+//!
+//! #9996 / #10037 — the pull serves only an authenticated peer its
+//! outbound scope names, so every pull here is signed with an enrolled
+//! key and runs under the all-namespaces outbound scope for that peer:
+//! the attestation allowlist these cases pin is the layer that decides.
+
+#[path = "common/signed_pull.rs"]
+mod signed_pull;
 
 use ai_memory::models::ConfidenceSource;
 use axum::body::Body;
@@ -197,14 +205,22 @@ fn reset_env() {
 async fn sync_since_body(router: axum::Router, peer_id: Option<&str>) -> Value {
     let mut req_builder = Request::builder()
         .method("GET")
-        .uri("/api/v1/sync/since")
+        .uri(signed_pull::SYNC_SINCE_PATH)
         .header("content-type", "application/json");
-    if let Some(p) = peer_id {
+    // #9996 — the peer signs its pull and its outbound scope names it.
+    let pullers = peer_id.map(|p| {
+        signed_pull::set_outbound_scope_all(&[p]);
+        signed_pull::EnrolledPullers::enrol(&[p])
+    });
+    if let (Some(p), Some(pullers)) = (peer_id, pullers.as_ref()) {
         req_builder =
             req_builder.header(ai_memory::federation::peer_attestation::PEER_ID_HEADER, p);
+        req_builder = pullers.sign_get(req_builder, p, signed_pull::SYNC_SINCE_PATH, "");
     }
     let req = req_builder.body(Body::empty()).unwrap();
     let resp = router.oneshot(req).await.unwrap();
+    signed_pull::clear();
+    drop(pullers);
     assert_eq!(resp.status(), StatusCode::OK, "sync_since must always 200");
     let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
         .await

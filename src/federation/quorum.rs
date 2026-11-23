@@ -26,6 +26,11 @@ pub fn finalise_quorum(tracker: &AckTracker) -> Result<usize, QuorumError> {
 /// [`QuorumNotMetPayload::from_err`] arms emit it.
 const QUORUM_NOT_MET: &str = "quorum_not_met";
 
+/// #9996 (vote V2-9996 C-4) — the public `reason` of a quorum refusal whose
+/// cause is the sender's outbound scope: fewer replicas are in scope than
+/// the quorum minimum `W`.
+pub const QUORUM_REASON_OUTBOUND_SCOPE: &str = "outbound_scope";
+
 /// Serialised 503 payload for failed quorum writes.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuorumNotMetPayload {
@@ -59,6 +64,7 @@ impl QuorumNotMetPayload {
                         "timeout".to_string()
                     }
                     QuorumFailureReason::IdDrift => "id_drift".to_string(),
+                    QuorumFailureReason::OutboundScope => QUORUM_REASON_OUTBOUND_SCOPE.to_string(),
                 },
             },
             QuorumError::InvalidPolicy { detail } => Self {

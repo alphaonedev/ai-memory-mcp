@@ -2895,16 +2895,16 @@ pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<
 /// arms fire once an operator enrols a peer key.
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch (mirrors the
 /// `/sync/push` env-var posture).
-pub(super) fn verify_get_signature_or_reject(
+pub(super) fn verify_get_signature(
     method: &str,
     path: &str,
     query: &str,
     headers: &HeaderMap,
     peer_id: Option<&str>,
     federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
-) -> Option<Response> {
+) -> GetSigOutcome {
     if !fed_signing::require_sig() {
-        return None;
+        return GetSigOutcome::Unauthenticated;
     }
     let sig_header = headers
         .get(fed_signing::SIGNATURE_HEADER)
@@ -2936,7 +2936,7 @@ pub(super) fn verify_get_signature_or_reject(
                     remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                     "sync_since: X-Memory-Sig verification failed"
                 );
-                return Some(
+                return GetSigOutcome::Refused(
                     (
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
@@ -2952,7 +2952,7 @@ pub(super) fn verify_get_signature_or_reject(
             match nonce_header {
                 Some(nonce) if !nonce.is_empty() => {
                     match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
-                        crate::identity::replay::ReplayDecision::Fresh => None,
+                        crate::identity::replay::ReplayDecision::Fresh => GetSigOutcome::Verified,
                         crate::identity::replay::ReplayDecision::Replay => {
                             tracing::warn!(
                                 target: crate::federation::SIGNING_TRACE_TARGET,
@@ -2961,7 +2961,7 @@ pub(super) fn verify_get_signature_or_reject(
                                 remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                                 "sync_since: X-Memory-Nonce replay detected"
                             );
-                            Some(
+                            GetSigOutcome::Refused(
                                 (
                                     StatusCode::UNAUTHORIZED,
                                     Json(json!({
@@ -2983,7 +2983,7 @@ pub(super) fn verify_get_signature_or_reject(
                             remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
                             "sync_since: X-Memory-Nonce header absent — strict refusal"
                         );
-                        Some(
+                        GetSigOutcome::Refused(
                             (
                                 StatusCode::UNAUTHORIZED,
                                 Json(json!({
@@ -2999,7 +2999,7 @@ pub(super) fn verify_get_signature_or_reject(
                             peer_id = %pid_for_cache,
                             "sync_since: X-Memory-Nonce absent — permissive, accepting"
                         );
-                        None
+                        GetSigOutcome::Verified
                     }
                 }
             }
@@ -3011,7 +3011,7 @@ pub(super) fn verify_get_signature_or_reject(
                 remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_since: X-Memory-Sig present but no enrolled public key for peer-id (#1031)"
             );
-            Some(
+            GetSigOutcome::Refused(
                 (
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
@@ -3029,7 +3029,7 @@ pub(super) fn verify_get_signature_or_reject(
                 remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_SIG,
                 "sync_since: enrolled peer omitted X-Memory-Sig header (#1031)"
             );
-            Some(
+            GetSigOutcome::Refused(
                 (
                     StatusCode::UNAUTHORIZED,
                     Json(json!({
@@ -3055,7 +3055,7 @@ pub(super) fn verify_get_signature_or_reject(
                     remediation = crate::handlers::federation_wire_notes::remediation::PEER_ENROLLMENT,
                     "sync_since: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
-                return Some(
+                return GetSigOutcome::Refused(
                     (
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
@@ -3071,8 +3071,49 @@ pub(super) fn verify_get_signature_or_reject(
                 peer_id = %peer_id.unwrap_or(""),
                 "sync_since: unsigned (no enrolled key for peer-id) — strict enforcement skipped"
             );
-            None
+            GetSigOutcome::Unauthenticated
         }
+    }
+}
+
+/// #9996 / #10037 — what a `/sync/since` GET signature check concluded.
+///
+/// Only [`GetSigOutcome::Verified`] proves the `X-Peer-Id` header: the
+/// signature was checked against the key enrolled for that peer id. Every
+/// permissive arm (`AI_MEMORY_FED_REQUIRE_SIG=0`, the unenrolled rollout
+/// window) is [`GetSigOutcome::Unauthenticated`], so the header stays a
+/// caller-supplied label and selects no outbound scope.
+#[must_use]
+pub(super) enum GetSigOutcome {
+    /// The signature verified against the peer id's enrolled key.
+    Verified,
+    /// The request proceeds, but the peer id is not proven.
+    Unauthenticated,
+    /// The request is refused with this response.
+    Refused(Response),
+}
+
+/// [`verify_get_signature`] as the refuse-or-proceed gate (the unit-test
+/// matrix below drives it; the handler matches [`GetSigOutcome`] itself).
+#[cfg(test)]
+pub(super) fn verify_get_signature_or_reject(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    peer_id: Option<&str>,
+    federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
+) -> Option<Response> {
+    match verify_get_signature(
+        method,
+        path,
+        query,
+        headers,
+        peer_id,
+        federation_nonce_cache,
+    ) {
+        GetSigOutcome::Refused(r) => Some(r),
+        GetSigOutcome::Verified | GetSigOutcome::Unauthenticated => None,
     }
 }
 

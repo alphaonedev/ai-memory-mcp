@@ -345,11 +345,15 @@ async fn assert_no_disclosure(mut app: AppState) {
             ai_memory::federation::PeerEndpoint {
                 id: DSN.to_owned(),
                 sync_push_url: DSN.to_owned(),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             },
             // #3654 D3: a peer this node has pushed to (and never pulled).
             ai_memory::federation::PeerEndpoint {
                 id: PUSHED_PEER.to_owned(),
                 sync_push_url: "https://peer-pushed.invalid:9077".to_owned(),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             },
         ],
         client: reqwest::Client::new(),

@@ -78,6 +78,8 @@ fn federation_config(push_url: &str) -> ai_memory::federation::FederationConfig 
         peers: vec![ai_memory::federation::PeerEndpoint {
             id: "peer-2391".to_string(),
             sync_push_url: push_url.to_string(),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(5))

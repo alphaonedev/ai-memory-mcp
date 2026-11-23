@@ -871,6 +871,7 @@ async fn replication_pending_is_surfaced(app: &AppState) {
     let peer = ai_memory::federation::PeerEndpoint {
         id: "peer-failing-8444".to_string(),
         sync_push_url: spawn_failing_peer().await,
+        outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     };
     let config = ai_memory::federation::FederationConfig {
         policy: ai_memory::replication::QuorumPolicy::new(

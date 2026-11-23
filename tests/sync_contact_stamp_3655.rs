@@ -87,6 +87,7 @@ async fn empty_window_stamps_contact_but_not_the_data_watermark_3655() {
         &peer_url,
         None,
         10,
+        &ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     )
     .await
     .expect("an empty window is a successful cycle");
@@ -134,6 +135,7 @@ async fn empty_window_stamps_contact_but_not_the_data_watermark_3655() {
         &peer_url,
         None,
         10,
+        &ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     )
     .await
     .expect("second cycle");
@@ -171,6 +173,7 @@ async fn non_2xx_pull_never_stamps_contact_3655() {
             &peer_url,
             None,
             10,
+            &ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
         )
         .await;
         assert!(res.is_err(), "a 500 pull is a failed cycle: {res:?}");

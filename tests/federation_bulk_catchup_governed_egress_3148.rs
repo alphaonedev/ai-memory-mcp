@@ -104,6 +104,8 @@ fn config(peer_url: &str) -> FederationConfig {
         peers: vec![PeerEndpoint {
             id: "peer-refused-3148".to_string(),
             sync_push_url: peer_url.to_string(),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(2))

@@ -187,6 +187,8 @@ fn federation_cfg(
         peers: vec![PeerEndpoint {
             id: PEER_ID.to_string(),
             sync_push_url: format!("{}{}", peer.url, routes::SYNC_PUSH),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client,
         sender_agent_id: ADMIN_AGENT.to_string(),

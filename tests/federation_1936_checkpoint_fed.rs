@@ -521,6 +521,8 @@ async fn broadcast_includes_checkpoint_in_push_body() {
         peers: vec![ai_memory::federation::PeerEndpoint {
             id: "peer-cap".to_string(),
             sync_push_url: format!("http://{addr}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(2))

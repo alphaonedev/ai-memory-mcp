@@ -1626,6 +1626,35 @@ fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report)
             .iter()
             .map(|e| ("observation_error".into(), e.clone())),
     );
+    // #9996 (vote V2-9996 C-5/C-6) — one row per configured peer's outbound
+    // scope and per filtered series; an unscoped peer fails under every posture.
+    let (scope_facts, alarm) = crate::federation::outbound_scope::doctor_facts(
+        &report.outbound_scope,
+        &report.outbound_scope_filtered,
+    );
+    facts.extend(scope_facts);
+    let severity = match alarm {
+        crate::federation::outbound_scope::ScopeAlarm::Unscoped => Severity::Critical,
+        crate::federation::outbound_scope::ScopeAlarm::AllNamespaces => {
+            severity_max(severity, Severity::Warning)
+        }
+        crate::federation::outbound_scope::ScopeAlarm::Clear => severity,
+    };
+    // #9996 (review #10026 C-F3) — one row per peer whose push-DLQ enqueues
+    // the per-peer cap refused; any refusal warns (the write reaches that peer
+    // only through its `/sync/since` catch-up).
+    facts.extend(report.push_dlq_cap_refused.iter().map(|r| {
+        (
+            format!("push_dlq_cap_refused.{}", r.peer_id),
+            r.count.to_string(),
+        )
+    }));
+    let severity = if report.push_dlq_cap_refused.is_empty() {
+        severity
+    } else {
+        severity_max(severity, Severity::Warning)
+    };
+    let scope_note = crate::federation::outbound_scope::doctor_note(alarm);
     let note = match report.verdict {
         Verdict::Refused | Verdict::Warning => Some(
             "#3582: peer authorization needs attention or shared key enrollment is present/unobservable. \
@@ -1641,6 +1670,10 @@ fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report)
                 .into(),
         ),
         Verdict::Allowed | Verdict::NoPeersObserved => None,
+    };
+    let note = match (note, scope_note) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
     };
     ReportSection {
         name: "Federation peer authorization".into(),
@@ -5550,6 +5583,43 @@ mod tests {
     use crate::cli::test_utils::{TestEnv, materialize_empty_schema, seed_memory};
     use rusqlite::params;
 
+    /// #9996 (review #10026 C-F3): a push-DLQ cap refusal is a doctor row
+    /// per peer and raises the section to Warning; no refusal adds no row.
+    #[test]
+    fn push_dlq_cap_refusals_are_rows_and_warn_9996() {
+        use crate::federation::peer_posture::{Allowlist, Observation, evaluate};
+        let mut report = evaluate(
+            crate::security_profile::SecurityPosture::Standard,
+            Observation::Absent,
+            Observation::Absent,
+            Observation::Absent,
+            Observation::Absent,
+            Allowlist::Configured,
+        );
+        let clear = section_peer_allowlist_3582(&report);
+        assert_eq!(clear.severity, Severity::Info);
+        assert!(
+            !clear
+                .facts
+                .iter()
+                .any(|(k, _)| k.starts_with("push_dlq_cap_refused."))
+        );
+        report.push_dlq_cap_refused = vec![crate::federation::push_dlq_cap::CapRefusals {
+            peer_id: "peer-cap-9996".into(),
+            count: 3,
+        }];
+        let refused = section_peer_allowlist_3582(&report);
+        assert_eq!(refused.severity, Severity::Warning);
+        assert!(
+            refused
+                .facts
+                .iter()
+                .any(|(k, v)| k == "push_dlq_cap_refused.peer-cap-9996" && v == "3"),
+            "{:?}",
+            refused.facts
+        );
+    }
+
     // -------------------------------------------------------------------
     // Severity / Report helpers (pure, no DB)
     // -------------------------------------------------------------------
@@ -9392,6 +9462,19 @@ enabled = true
                 crate::approvals::signed::APPROVER_PUBKEYS_ENV,
                 &approver_pubkey_b64,
             );
+        }
+        // #9996 check #23 (review #10026 S-F2) — only a process that holds the
+        // peer list can pass the row, so record the boot scope row a daemon
+        // serving one narrowed peer records; a fresh process without it FAILs
+        // the row unverifiable
+        // (`fresh_process_with_narrowed_env_fails_unverifiable_9996`).
+        {
+            const PEER: &str = "https://peer-1.example.org:9077";
+            let scope = crate::federation::outbound_scope::PeerOutboundScope::Namespaces(vec![
+                "public/*".to_string(),
+            ]);
+            let id = crate::federation::peer::stable_peer_id(PEER);
+            crate::federation::outbound_scope::record_boot_scopes([(id.as_str(), PEER, &scope)]);
         }
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED (the other half of the
