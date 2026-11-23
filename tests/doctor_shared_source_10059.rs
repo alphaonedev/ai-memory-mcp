@@ -19,6 +19,10 @@ use ai_memory::federation::outbound_scope::OUTBOUND_SCOPE_ENV;
 use ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV;
 use ai_memory::federation::shared_source::{PEERS_ENV, SharedSourceError};
 
+/// The key name operators write in the deploy env file
+/// (`docs/deploy/enterprise-federation.env`). Spelled out, not taken from
+/// [`PEERS_ENV`], so a renamed key fails the binding test below (C-10).
+const OPERATOR_PEERS_KEY: &str = "AI_MEMORY_FED_QUORUM_PEERS";
 /// The one peer of the shared source.
 const PEER: &str = "https://peer-1.example.org:9077";
 /// A second peer the source does not name.
@@ -175,7 +179,7 @@ fn matching_flag_binds_and_boot_digest_equals_doctor_digest_10059() {
     let credentialed = "https://user:s3cret@peer-1.example.org:9077";
     let scope = format!(r#"{{"{credentialed}":{{"allowed_namespaces":["public/*"]}}}}"#);
     let envs = [
-        (PEERS_ENV, credentialed),
+        (OPERATOR_PEERS_KEY, credentialed),
         (OUTBOUND_SCOPE_ENV, scope.as_str()),
     ];
     let sb = sandbox("matching-flag");

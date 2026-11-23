@@ -576,6 +576,13 @@ mod tests {
             BoundFederationSource::from_values(os(&format!("{PEER_A},{PEER_B}")), os(&edited))
                 .unwrap();
         assert_ne!(changed.digest_line(), line);
+        // A same-length edit changes the digest too: the pattern bytes are
+        // hashed, not only their lengths.
+        let same_len = scopes.replace("\"ops\"", "\"dev\"");
+        let renamed =
+            BoundFederationSource::from_values(os(&format!("{PEER_A},{PEER_B}")), os(&same_len))
+                .unwrap();
+        assert_ne!(renamed.digest_line(), line);
         let deny_b =
             BoundFederationSource::from_values(os(&format!("{PEER_A},{PEER_B}")), None).unwrap();
         assert_ne!(deny_b.digest_line(), line);
