@@ -35,7 +35,7 @@ difference from the SSH-coupled hive topology).
 |-------------------------|------|----------------|------------------------------------------------------------|
 | `docker-1461-peer-1`    | peer | `127.0.0.1:19280` | federated `ai-memory serve` (HTTPS+mTLS on `:19077`)    |
 | `docker-1461-peer-2`    | peer | `127.0.0.1:19281` | federated `ai-memory serve` (HTTPS+mTLS on `:19077`)    |
-| `docker-1461-pg-age`    | data | `127.0.0.1:15433` | PostgreSQL 16 + Apache AGE 1.6.0 + pgvector; per-peer schema (`ic_peer_1`, `ic_peer_2`) |
+| `docker-1461-pg-age`    | data | `127.0.0.1:15433` | PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7 (the certified tier, `provision/lib.sh`); per-peer schema (`ic_peer_1`, `ic_peer_2`) |
 
 The 2 peers form a `W=2`-of-`N=2` write-quorum mesh on the `docker-1461-mesh`
 bridge (`172.31.80.0/24`, a distinct subnet so it co-exists with other local
