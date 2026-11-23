@@ -662,11 +662,14 @@ fn classify_quarantine_cause_legacy(last_error: &str) -> &'static str {
 /// #9996 — the `LIKE` prefix of a row quarantined by the sender's outbound
 /// scope check: the permanent class tag, then `outbound_scope: `. The class
 /// tag is sender-minted and opens the column, so a peer's reason text can
-/// never take this form.
+/// never take this form. Review #10026 L3: the stamp is LIKE-escaped (`\`
+/// is the escape character, `ESCAPE '\'` on both backends) so its `_` and
+/// any `%` match only themselves; the one wildcard is the trailing `%`.
 #[must_use]
 pub fn out_of_scope_like_prefix() -> String {
-    let mut p =
+    let stamp =
         super::dlq_class::DlqErrorClass::Permanent.stamp(&format!("{CAUSE_OUTBOUND_SCOPE}: "));
+    let mut p = crate::storage::escape_like_pattern(&stamp);
     p.push('%');
     p
 }
@@ -1645,12 +1648,13 @@ impl FederationDlqSink for SqliteDlqSink {
     }
 
     async fn redrive_out_of_scope_quarantine(&self, stamped_prefix: &str) -> Result<u64, String> {
-        // #9996 — byte-for-byte the postgres predicate.
+        // #9996 — byte-for-byte the postgres predicate; the prefix is
+        // LIKE-escaped with `\` (review #10026 L3).
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
                 "UPDATE federation_push_dlq SET attempt_count = 0 \
-                 WHERE replayed_at IS NULL AND last_error LIKE ?1",
+                 WHERE replayed_at IS NULL AND last_error LIKE ?1 ESCAPE '\\'",
                 rusqlite::params![stamped_prefix],
             )
             .map_err(|e| format!("sqlite redrive_out_of_scope_quarantine: {e}"))?;
@@ -2029,11 +2033,12 @@ impl FederationDlqSink for PostgresDlqSink {
     }
 
     async fn redrive_out_of_scope_quarantine(&self, stamped_prefix: &str) -> Result<u64, String> {
-        // #9996 — byte-for-byte the sqlite predicate.
+        // #9996 — byte-for-byte the sqlite predicate; the prefix is
+        // LIKE-escaped with `\` (review #10026 L3).
         let pool = self.store.pool();
         let res = sqlx::query(
             "UPDATE federation_push_dlq SET attempt_count = 0 \
-             WHERE replayed_at IS NULL AND last_error LIKE $1",
+             WHERE replayed_at IS NULL AND last_error LIKE $1 ESCAPE '\\'",
         )
         .bind(stamped_prefix)
         .execute(pool)
@@ -2310,7 +2315,20 @@ mod replay_arm_tests {
             &self,
             stamped_prefix: &str,
         ) -> Result<u64, String> {
-            let prefix = stamped_prefix.trim_end_matches('%');
+            // The LIKE prefix, unescaped (review #10026 L3).
+            let mut prefix = String::new();
+            let mut chars = stamped_prefix
+                .strip_suffix('%')
+                .unwrap_or(stamped_prefix)
+                .chars();
+            while let Some(c) = chars.next() {
+                prefix.push(if c == '\\' {
+                    chars.next().unwrap_or(c)
+                } else {
+                    c
+                });
+            }
+            let prefix = prefix.as_str();
             let mut n = 0u64;
             for row in self.rows.lock().unwrap().iter_mut() {
                 if row.last_error.starts_with(prefix) {
