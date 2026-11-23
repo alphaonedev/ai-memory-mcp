@@ -552,7 +552,9 @@ async fn set_raw_columns(store: &PostgresStore, live: &[String]) {
     raw_update(
         pool,
         sqlx::query(
-            "UPDATE memories SET atom_of = $1, mentioned_entity_id = $2, kind_provenance = $3, \
+            "UPDATE memories SET atom_of = $1, \
+             mentioned_entity_id = $2, \
+             kind_provenance = $3, \
              metadata = metadata || jsonb_build_object('entity_id', $2::text, \
              'kind_provenance', $3::text) WHERE id = $4",
         )
