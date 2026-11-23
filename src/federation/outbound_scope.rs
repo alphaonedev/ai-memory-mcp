@@ -98,7 +98,7 @@ const KEY_TARGET_ID: &str = "target_id";
 const ENVELOPE_KEYS: [&str; 6] = [
     crate::models::field_names::SENDER_AGENT_ID,
     KEY_DRY_RUN,
-    "sender_clock",
+    crate::federation::push_lanes::SyncPushMetadataField::SenderClock.wire_field(),
     "sender_wall_clock",
     crate::models::field_names::SENDER_POLICY_SEQ,
     crate::models::field_names::SENDER_POLICY_DIGEST_HEX,
@@ -109,11 +109,14 @@ const KEY_ACTION_ID: &str = "action_id";
 
 const NAMESPACED_ITEM_KEYS: [&str; 5] = [
     KEY_MEMORIES,
-    "checkpoints",
+    crate::federation::receive_auth::LANE_CHECKPOINTS,
     "pendings",
     "signals",
-    "namespace_meta",
+    crate::federation::receive_auth::LANE_NAMESPACE_META,
 ];
+
+/// Posture label for a scope that admits every namespace (`**`).
+const POSTURE_ALL_NAMESPACES: &str = "all_namespaces";
 
 /// A peer's outbound namespace scope. Unset is [`Self::Deny`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -924,7 +927,7 @@ impl ScopePosture {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unscoped => "unscoped",
-            Self::AllNamespaces => "all_namespaces",
+            Self::AllNamespaces => POSTURE_ALL_NAMESPACES,
             Self::Narrowed => "narrowed",
         }
     }

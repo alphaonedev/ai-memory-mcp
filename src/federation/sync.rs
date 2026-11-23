@@ -1852,6 +1852,8 @@ pub async fn broadcast_pending_decision_quorum(
     decision: &PendingDecision,
     namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "pending_decision";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -1869,8 +1871,8 @@ pub async fn broadcast_pending_decision_quorum(
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
     // #9996 — only peers whose outbound scope admits this push get a
     // request, each with the body cut to its scope.
-    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "pending_decision");
-    plan.record_quorum_scope(&mut *tracker.lock().await, "pending_decision");
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
@@ -1951,7 +1953,7 @@ pub async fn broadcast_pending_decision_quorum(
         &plan,
         explicit_failures,
         &format!("pending_decision:{}", decision.id),
-        "pending_decision",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2027,6 +2029,8 @@ pub async fn broadcast_action_transition_quorum(
     op: &ActionTransitionOp,
     namespaces: &super::outbound_scope::ItemNamespaces,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "action_transition";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2044,8 +2048,8 @@ pub async fn broadcast_action_transition_quorum(
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
     // #9996 — only peers whose outbound scope admits this push get a
     // request, each with the body cut to its scope.
-    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "action_transition");
-    plan.record_quorum_scope(&mut *tracker.lock().await, "action_transition");
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
@@ -2136,7 +2140,7 @@ pub async fn broadcast_action_transition_quorum(
             op.to_state.as_str(),
             op.updated_at
         ),
-        "action_transition",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2163,6 +2167,8 @@ pub async fn broadcast_checkpoint_resolution_quorum(
     config: &FederationConfig,
     checkpoint: &crate::models::Checkpoint,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "checkpoint_resolution";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2177,8 +2183,8 @@ pub async fn broadcast_checkpoint_resolution_quorum(
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
     // #9996 — only peers whose outbound scope admits this push get a
     // request, each with the body cut to its scope.
-    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "checkpoint_resolution");
-    plan.record_quorum_scope(&mut *tracker.lock().await, "checkpoint_resolution");
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
@@ -2259,7 +2265,7 @@ pub async fn broadcast_checkpoint_resolution_quorum(
         &plan,
         explicit_failures,
         &format!("checkpoint:{}", checkpoint.id),
-        "checkpoint_resolution",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2280,6 +2286,8 @@ pub async fn broadcast_signal_create_quorum(
     config: &FederationConfig,
     signal: &crate::models::signal::Signal,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "signal";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2294,8 +2302,8 @@ pub async fn broadcast_signal_create_quorum(
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
     // #9996 — only peers whose outbound scope admits this push get a
     // request, each with the body cut to its scope.
-    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "signal");
-    plan.record_quorum_scope(&mut *tracker.lock().await, "signal");
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
@@ -2376,7 +2384,7 @@ pub async fn broadcast_signal_create_quorum(
         &plan,
         explicit_failures,
         &format!("signal:{}", signal.id),
-        "signal",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2397,6 +2405,8 @@ pub async fn broadcast_namespace_meta_quorum(
     config: &FederationConfig,
     entry: &NamespaceMetaEntry,
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "namespace_meta";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2412,8 +2422,8 @@ pub async fn broadcast_namespace_meta_quorum(
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
     // #9996 — only peers whose outbound scope admits this push get a
     // request, each with the body cut to its scope.
-    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "namespace_meta");
-    plan.record_quorum_scope(&mut *tracker.lock().await, "namespace_meta");
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
@@ -2494,7 +2504,7 @@ pub async fn broadcast_namespace_meta_quorum(
         &plan,
         explicit_failures,
         &format!("namespace_meta:{}", entry.namespace),
-        "namespace_meta",
+        SURFACE,
     )
     .await;
     Ok(tracker)
@@ -2517,6 +2527,8 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     config: &FederationConfig,
     namespaces: &[String],
 ) -> Result<AckTracker, QuorumError> {
+    /// The surface name this broadcast records in scope rows and failure lanes.
+    const SURFACE: &str = "namespace_meta_clear";
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
@@ -2534,8 +2546,8 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
     // #9996 — only peers whose outbound scope admits this push get a
     // request, each with the body cut to its scope.
-    let plan = super::outbound_scope::DispatchPlan::new(config, &body, "namespace_meta_clear");
-    plan.record_quorum_scope(&mut *tracker.lock().await, "namespace_meta_clear");
+    let plan = super::outbound_scope::DispatchPlan::new(config, &body, SURFACE);
+    plan.record_quorum_scope(&mut *tracker.lock().await, SURFACE);
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
@@ -2616,7 +2628,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
         &plan,
         explicit_failures,
         &format!("namespace_meta_clear:{target_id}"),
-        "namespace_meta_clear",
+        SURFACE,
     )
     .await;
     Ok(tracker)

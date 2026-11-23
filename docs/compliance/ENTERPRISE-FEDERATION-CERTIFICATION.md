@@ -942,7 +942,7 @@ permissive one named here, so a reader must not assume the control:
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). [`run_posture`](../../src/cli/doctor.rs)
-returns **0 iff all 22 checks pass, else 2**
+returns **0 iff all 23 checks pass, else 2**
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
 boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
 landed check #19 append-only-audit-spine-armed** — append-only spine ON
@@ -955,7 +955,10 @@ rather than parking a forever-un-approvable pending — then **20 → 21 when
 **21 → 22 when #3199 landed check #22 backup-manifest-signing**: the operator public key
 `restore` verifies backup manifests against resolves, and any local operator
 signing key matches it; `N/A` PASS on a postgres backend, where `ai-memory
-backup` is SQLite-only). The four-leg capture
+backup` is SQLite-only), then **22 → 23 when #9996 landed check #23
+outbound-scope**: every configured peer has an explicit outbound namespace
+scope narrower than all namespaces: an unscoped peer or an explicit `**`
+scope fails the row). The four-leg capture
 below was taken 2026-08-13 on the release-built binary at the
 post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
 #2929); raw output in `docs/compliance/evidence/cert-54/` (see that
@@ -964,7 +967,7 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > **Evidence note (2026-08-29 recapture, `cert-55/`):** the four-leg
 > §2 captures are **measured** at 20 checks on the release-built binary
 > at `23f943ca` (Wave-2 B10 certified tip). [`ENTERPRISE_FEDERATION_CHECK_COUNT`](../../src/enterprise_federation_posture.rs)
-> was 20 at that tip (it is 22 on the current tree). Raw output in
+> was 20 at that tip (it is 23 on the current tree). Raw output in
 > `docs/compliance/evidence/cert-55/` (`SANITIZATION.md` +
 > `MANIFEST.sha256`). The `cert-54/` 18-check captures (2026-08-13)
 > remain the removal-proof evidence of record; they are **not** the
