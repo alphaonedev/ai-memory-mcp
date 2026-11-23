@@ -661,3 +661,88 @@ async fn admin_export_refuses_a_row_sealed_mid_walk_10028() {
     );
     assert!(page["memories"].is_null(), "{uri}: a refusal carried rows");
 }
+
+/// Page limits the SAL refusal table walks: a page smaller than, equal to and
+/// larger than the seeded corpus, so the sealed row falls on page 1, a later
+/// page, or the only page.
+#[cfg(feature = "sal")]
+const SAL_REFUSAL_LIMITS_10062: [usize; 4] = [1, 2, 3, 10];
+
+/// Rows the SAL refusal test seeds (the sealed one is the last in walk order).
+#[cfg(feature = "sal")]
+const SAL_REFUSAL_ROWS_10062: usize = 4;
+
+/// Assert one SAL result is the TYPED sealed-export refusal naming `id`, with
+/// the exact wire code (never the generic `DATABASE_ERROR` of a flattened
+/// backend error).
+#[cfg(feature = "sal")]
+fn assert_typed_refusal_10062<T: std::fmt::Debug>(
+    what: &str,
+    got: Result<T, ai_memory::store::StoreError>,
+    id: &str,
+) {
+    let err = got.expect_err(&format!("{what}: a sealed row must refuse the export"));
+    assert_eq!(
+        err.code(),
+        SEALED_REFUSAL_CODE_10028,
+        "{what}: the refusal lost its code at the adapter: {err:?}"
+    );
+    match &err {
+        ai_memory::store::StoreError::SealedExportRefused(r) => {
+            assert_eq!(r.first_id, id, "{what}: the refusal names another row");
+        }
+        other => panic!("{what}: not the typed refusal: {other:?}"),
+    }
+}
+
+/// #10062 (backend parity): the SQLite SAL adapter returns the typed
+/// `StoreError::SealedExportRefused` with code `SEALED_EXPORT_REFUSED` for a
+/// sealed row on every export method that can meet one (the one-shot export,
+/// the first page of a walk at every limit, and a resumed page after a row is
+/// sealed mid-walk), exactly as the PostgreSQL adapter does
+/// (`tests/export_paging_3288_pg.rs`, `pg_sal_adapter_keeps_the_sealed_refusal_typed_10062`).
+/// Pre-fix the adapter flattened it to `StoreError::Backend` (`DATABASE_ERROR`).
+/// The envelope is garbage bytes, so the refusal is decided from the column.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn sqlite_sal_adapter_keeps_the_sealed_refusal_typed_10062() {
+    use ai_memory::store::MemoryStore as _;
+    let (_dir, path) = fixture();
+    let conn = ai_memory::db::open(&path).expect("open");
+    let ids = seed(&conn, SAL_REFUSAL_ROWS_10062);
+    drop(conn);
+    let sealed_id = ids.last().expect("seeded rows").clone();
+    let store = ai_memory::store::sqlite::SqliteStore::open(&path).expect("open SqliteStore");
+    let as_of = chrono::Utc::now();
+    let first = store
+        .export_memories_page(None, 2, as_of, None)
+        .await
+        .expect("an unsealed store pages");
+    let cursor = first.next_cursor.expect("a second page");
+
+    let conn = ai_memory::db::open(&path).expect("reopen");
+    let changed = conn
+        .execute(
+            "UPDATE memories SET encrypted_envelope = ?1 WHERE id = ?2",
+            rusqlite::params![vec![0_u8; 96], sealed_id],
+        )
+        .expect("plant an at-rest envelope");
+    assert_eq!(changed, 1, "one row sealed");
+    drop(conn);
+
+    assert_typed_refusal_10062(
+        "resumed page",
+        store
+            .export_memories_page(Some(&cursor), 2, as_of, None)
+            .await,
+        &sealed_id,
+    );
+    for limit in SAL_REFUSAL_LIMITS_10062 {
+        assert_typed_refusal_10062(
+            &format!("first page, limit {limit}"),
+            store.export_memories_page(None, limit, as_of, None).await,
+            &sealed_id,
+        );
+    }
+    assert_typed_refusal_10062("export_memories", store.export_memories().await, &sealed_id);
+}

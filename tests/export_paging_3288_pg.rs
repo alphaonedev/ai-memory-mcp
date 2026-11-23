@@ -259,6 +259,96 @@ async fn pg_export_memories_walk_refuses_a_sealed_row_10033() {
     );
 }
 
+/// Page limits the SAL refusal table walks (#10062): smaller than, equal to
+/// and larger than the seeded corpus.
+const SAL_REFUSAL_LIMITS_10062: [usize; 4] = [1, 2, 3, 10];
+
+/// #10062 (backend parity): the PostgreSQL SAL adapter returns the TYPED
+/// `StoreError::SealedExportRefused` with the exact code
+/// `SEALED_EXPORT_REFUSED`, naming the row, on the one-shot export, on the
+/// first page of a scoped walk at every limit and on a page resumed after the
+/// row is sealed mid-walk; the SQLite twin is
+/// `tests/export_paging_3288.rs`, `sqlite_sal_adapter_keeps_the_sealed_refusal_typed_10062`.
+/// Every result is collected and the rows removed BEFORE any assertion, so a
+/// red never leaves a sealed row behind for another cell.
+#[tokio::test]
+async fn pg_sal_adapter_keeps_the_sealed_refusal_typed_10062() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    let ns = format!("export-10062-typed-{}", uuid::Uuid::new_v4());
+    let ctx = CallerContext::for_agent("ai:3288");
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let id = format!("{ns}-{i:03}");
+        let ts = format!("2030-08-01T00:00:{i:02}.000000Z");
+        store
+            .store(&ctx, &mem(&id, &ns, &ts))
+            .await
+            .expect("seed row");
+        ids.push(id);
+    }
+    let sealed_id = ids[3].clone();
+    let as_of = chrono::Utc::now();
+    let first = store
+        .export_memories_page(None, 2, as_of, Some(&ns))
+        .await
+        .expect("an unsealed scope pages");
+    let cursor = first.next_cursor.clone().expect("a second page");
+    sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
+        .bind(vec![0_u8; 96])
+        .bind(&sealed_id)
+        .execute(store.pool())
+        .await
+        .expect("plant an at-rest envelope");
+    let mut results: Vec<(String, Option<ai_memory::store::StoreError>)> = Vec::new();
+    results.push((
+        "resumed page".to_string(),
+        store
+            .export_memories_page(Some(&cursor), 2, as_of, Some(&ns))
+            .await
+            .err(),
+    ));
+    for limit in SAL_REFUSAL_LIMITS_10062 {
+        results.push((
+            format!("first page, limit {limit}"),
+            store
+                .export_memories_page(None, limit, as_of, Some(&ns))
+                .await
+                .err(),
+        ));
+    }
+    results.push((
+        "export_memories".to_string(),
+        store.export_memories().await.err(),
+    ));
+    sqlx::query("DELETE FROM memories WHERE namespace = $1")
+        .bind(&ns)
+        .execute(store.pool())
+        .await
+        .expect("cleanup");
+    for (what, err) in results {
+        let err = err.unwrap_or_else(|| panic!("{what}: a sealed row must refuse the export"));
+        assert_eq!(
+            err.code(),
+            SEALED_REFUSAL_CODE,
+            "{what}: the refusal lost its code at the adapter: {err:?}"
+        );
+        match &err {
+            ai_memory::store::StoreError::SealedExportRefused(r) => {
+                assert_eq!(
+                    r.first_id, sealed_id,
+                    "{what}: the refusal names another row"
+                );
+            }
+            other => panic!("{what}: not the typed refusal: {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn pg_export_links_page_never_dangles_in_import_order_3288() {
     let Some(url) = postgres_url() else {
