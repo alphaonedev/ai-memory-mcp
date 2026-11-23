@@ -56,6 +56,12 @@ const REFUSE_MODE: &str = "mcp session signer (#9926): signing key file is reada
 const REFUSE_UNBOUND: &str = "mcp session signer (#9926): the session agent has no bound public key; refusing to start (bind it with `ai-memory agents bind-key`)";
 const REFUSE_MISMATCH: &str = "mcp session signer (#9926): signing key does not match the public key bound to the session agent; refusing to start";
 
+/// The identity layer's exact refusal of a store that names another agent.
+const REFUSE_FOREIGN_AGENT: &str = "agent_id mismatch: caller 'ai:signer-9926' may only store as itself (requested 'ai:unkeyed-9926')";
+/// #10011 — the exact refusal of a caller-signed merge no session signer can
+/// re-sign (mirrors `session_signer::MERGE_RESEAL_REFUSAL`).
+const REFUSE_MERGE_RESEAL: &str = "ATTESTATION_FAILED: a signed memory_store that merges into an existing row needs the session signer of its agent to re-sign the merged row (#10011); retry with on_conflict \"version\" or a new title";
+
 struct Sandbox {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -215,8 +221,14 @@ impl Sandbox {
         Mcp::spawn(cmd)
     }
 
+    /// A READ-ONLY connection to the sandbox store: the assertions only read,
+    /// so they never run migrations or take a write lock under a live server.
     fn conn(&self) -> rusqlite::Connection {
-        ai_memory::db::open(&self.db()).expect("open sandbox db")
+        rusqlite::Connection::open_with_flags(
+            self.db(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open sandbox db read-only")
     }
 }
 
@@ -654,21 +666,31 @@ fn other_session_without_key_is_unchanged_9926() {
     );
 }
 
+fn count_titled(sb: &Sandbox, title: &str) -> i64 {
+    sb.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE title = ?1",
+            [title],
+            |r| r.get(0),
+        )
+        .expect("count")
+}
+
 /// Per-session key isolation inside ONE keyed process: a write that names a
-/// different agent id is never signed with the session key. It either runs
-/// today's unsigned path (lands `claimed`, no signature) or is refused by the
-/// identity layer; it never lands `agent_attested`. End to end the identity
-/// layer refuses first; the `covers` guard itself is pinned by the unit test
+/// different agent id is never signed with the session key. The identity
+/// layer refuses it with its exact mismatch reason and nothing is stored.
+/// The `covers` guard itself is pinned by the unit test
 /// `signer_covers_only_its_session_agent_9926`.
 #[test]
 fn keyed_session_never_signs_for_another_agent_9926() {
+    const TITLE: &str = "isolation other agent 9926";
     let sb = Sandbox::new();
     let key = sb.bound_key_file();
     let mut mcp = sb.start(AGENT, "0", Some(&key));
     let (is_error, text) = mcp.call_raw(
         "memory_store",
         &json!({
-            "title": "isolation other agent 9926",
+            "title": TITLE,
             "content": "A body attributed to another agent, long enough to read as prose.",
             "namespace": NAMESPACE,
             "kind": "observation",
@@ -676,69 +698,244 @@ fn keyed_session_never_signs_for_another_agent_9926() {
         }),
     );
     drop(mcp);
-    if is_error {
-        assert!(
-            text.contains("agent_id mismatch"),
-            "a foreign-agent write is refused by the identity layer: {text}"
-        );
-        return;
-    }
-    let out: Value = serde_json::from_str(&text).expect("tool JSON");
-    let id = out["id"].as_str().expect("store id");
-    let mem = get_memory(&sb, id);
-    assert_eq!(mem.metadata["agent_id"], OTHER_AGENT, "attributed as named");
-    assert_eq!(
-        attest_level(&mem),
-        CLAIMED,
-        "another agent's write is not session-signed"
-    );
+    assert!(is_error, "a foreign-agent write is refused: {text}");
     assert!(
-        mem.metadata.get("write_signature").is_none(),
-        "no session signature on another agent's write"
+        text.contains(REFUSE_FOREIGN_AGENT),
+        "exact identity-layer reason `{REFUSE_FOREIGN_AGENT}`; got: {text}"
     );
+    assert_eq!(count_titled(&sb, TITLE), 0, "nothing stored");
+}
+
+/// One `memory_store` of `body` under `title` at `tier`; returns the result.
+fn store_body(mcp: &mut Mcp, title: &str, body: &str, tier: &str) -> Value {
+    mcp.call(
+        "memory_store",
+        &json!({
+            "title": title,
+            "content": body,
+            "namespace": NAMESPACE,
+            "kind": "observation",
+            "tier": tier,
+        }),
+    )
+}
+
+const MERGE_BODY_A: &str = "The first body of the merge title, written as a plain sentence.";
+const MERGE_BODY_B: &str = "The second body of the merge title, a different plain sentence.";
+
+/// `(what, body, tier)`: a new title, an overwrite of it (the default
+/// `on_conflict` merge), and an identical re-store, across tiers.
+const MERGE_ROWS: [(&str, &str, &str); 3] = [
+    ("new title", MERGE_BODY_A, "mid"),
+    ("overwrite", MERGE_BODY_B, "long"),
+    ("identical re-store", MERGE_BODY_B, "short"),
+];
+
+/// #10011 — a keyed session that re-stores an existing title (the merge
+/// detour) leaves the merged row `agent_attested` with a signature over the
+/// merged row that verifies against the bound key, under both postures.
+fn assert_same_title_merge_attested(require: &str) {
+    const TITLE: &str = "merge title 10011";
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(AGENT, require, Some(&key));
+    let mut first_id: Option<String> = None;
+    for (what, body, tier) in MERGE_ROWS {
+        let what = format!("{what} REQUIRE={require}");
+        let out = store_body(&mut mcp, TITLE, body, tier);
+        let id = out["id"].as_str().expect("store id").to_string();
+        match &first_id {
+            None => first_id = Some(id.clone()),
+            Some(first) => {
+                assert_eq!(&id, first, "{what}: merged into the existing row");
+                assert_eq!(out["duplicate"], true, "{what}: merge detour taken");
+            }
+        }
+        assert_eq!(get_memory(&sb, &id).content, body, "{what}: content");
+        assert_attested_and_verifies(&sb, &id, &what);
+    }
+    drop(mcp);
+    assert_eq!(count_titled(&sb, TITLE), 1, "one row for the title");
+}
+
+#[test]
+fn keyed_same_title_merge_lands_attested_permissive_10011() {
+    assert_same_title_merge_attested("0");
+}
+
+#[test]
+fn keyed_same_title_merge_lands_attested_strict_10011() {
+    assert_same_title_merge_attested("1");
+}
+
+/// A caller-signed `memory_store` of `body` under `title`, signed by
+/// `AGENT`'s own key over a fresh `created_at`.
+fn caller_signed_store(sb: &Sandbox, mcp: &mut Mcp, title: &str, body: &str) -> (bool, String) {
+    let keypair = ai_memory::identity::keypair::load(AGENT, &sb.keys()).expect("load keypair");
+    let created_at = ai_memory::identity::attest::now_attestable_rfc3339();
+    let digest = ai_memory::identity::attest::content_sha256(body);
+    let write = ai_memory::identity::sign::SignableWrite {
+        agent_id: AGENT,
+        namespace: NAMESPACE,
+        title,
+        kind: "observation",
+        created_at: &created_at,
+        content_sha256: &digest,
+    };
+    let sig = ai_memory::identity::sign::sign_write(&keypair, &write).expect("caller signs");
+    mcp.call_raw(
+        "memory_store",
+        &json!({
+            "title": title,
+            "content": body,
+            "namespace": NAMESPACE,
+            "kind": "observation",
+            "signature": base64::engine::general_purpose::STANDARD.encode(&sig),
+            "created_at": created_at,
+        }),
+    )
+}
+
+fn result_id(is_error: bool, text: &str, what: &str) -> String {
+    assert!(!is_error, "{what} accepted: {text}");
+    let out: Value = serde_json::from_str(text).expect("tool JSON");
+    out["id"].as_str().expect("store id").to_string()
+}
+
+/// #10011 caller-signed sibling, keyed session: a caller-signed re-store of
+/// an existing title is re-sealed over the merged row by the session signer.
+#[test]
+fn keyed_caller_signed_merge_lands_attested_10011() {
+    const TITLE: &str = "caller merge keyed 10011";
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    for require in POSTURES {
+        let title = format!("{TITLE} {require}");
+        let mut mcp = sb.start(AGENT, require, Some(&key));
+        let (e, t) = caller_signed_store(&sb, &mut mcp, &title, MERGE_BODY_A);
+        let first = result_id(e, &t, "first caller-signed store");
+        let (e, t) = caller_signed_store(&sb, &mut mcp, &title, MERGE_BODY_B);
+        let merged = result_id(e, &t, "caller-signed merge");
+        drop(mcp);
+        let what = format!("caller-signed merge REQUIRE={require}");
+        assert_eq!(merged, first, "{what}: merged into the existing row");
+        assert_eq!(get_memory(&sb, &merged).content, MERGE_BODY_B, "{what}");
+        assert_attested_and_verifies(&sb, &merged, &what);
+    }
+}
+
+/// #10011 caller-signed sibling, no session signer: a caller-signed merge
+/// cannot be re-signed over the merged row, so it is REFUSED with the exact
+/// reason and the existing row is left as it was (signed, unchanged).
+#[test]
+fn unkeyed_caller_signed_merge_is_refused_10011() {
+    const TITLE: &str = "caller merge unkeyed 10011";
+    let sb = Sandbox::new();
+    sb.generate(AGENT);
+    sb.bind(AGENT);
+    for require in POSTURES {
+        let title = format!("{TITLE} {require}");
+        let what = format!("unkeyed caller-signed merge REQUIRE={require}");
+        let mut mcp = sb.start(AGENT, require, None);
+        let (e, t) = caller_signed_store(&sb, &mut mcp, &title, MERGE_BODY_A);
+        let first = result_id(e, &t, "first caller-signed store");
+        let (is_error, text) = caller_signed_store(&sb, &mut mcp, &title, MERGE_BODY_B);
+        drop(mcp);
+        assert!(is_error, "{what}: refused: {text}");
+        assert!(
+            text.contains(REFUSE_MERGE_RESEAL),
+            "{what}: exact reason `{REFUSE_MERGE_RESEAL}`; got: {text}"
+        );
+        assert_eq!(get_memory(&sb, &first).content, MERGE_BODY_A, "{what}");
+        assert_attested_and_verifies(&sb, &first, &what);
+        assert_eq!(count_titled(&sb, &title), 1, "{what}: one row");
+    }
 }
 
 /// No silent downgrade at write time: when the bound key is revoked after
-/// boot (the seal verifies against the key bound NOW), the session-signed
-/// write does not verify and is REFUSED with the seal reason; it never lands
-/// `claimed`, even under the permissive posture.
+/// boot (the seal verifies against the key bound NOW), every session-signed
+/// write of the four wired tools does not verify and is REFUSED with the seal
+/// reason; none lands `claimed`, even under the permissive posture.
 #[test]
 fn write_time_seal_failure_refuses_not_downgrades_9926() {
+    const STORE_TITLE: &str = "downgrade 9926";
+    const REFLECT_TITLE: &str = "downgrade reflection 9926";
+    const CONSOLIDATE_TITLE: &str = "downgrade consolidation 9926";
+    const ENTITY_NAME: &str = "Downgrade Entity 9926";
     let sb = Sandbox::new();
     let key = sb.bound_key_file();
     let mut mcp = sb.start(AGENT, "0", Some(&key));
     let before = mcp.store("before revoke 9926");
     assert_attested_and_verifies(&sb, &before, "write before the revoke");
+    let a = mcp.store("downgrade source a 9926");
+    let b = mcp.store("downgrade source b 9926");
+    let c = mcp.store("downgrade source c 9926");
+    let d = mcp.store("downgrade source d 9926");
     let out = sb.cli(AGENT, &["agents", "revoke-key", "--agent-id", AGENT]);
     assert!(
         out.status.success(),
         "agents revoke-key: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let (is_error, text) = mcp.call_raw(
-        "memory_store",
-        &json!({
-            "title": "downgrade 9926",
-            "content": "A body whose session seal cannot verify, long enough to read as prose.",
-            "namespace": NAMESPACE,
-            "kind": "observation",
-        }),
-    );
+    // (tool, arguments, the title or canonical_name that must not be stored)
+    let rows: [(&str, Value, &str); 4] = [
+        (
+            "memory_store",
+            json!({
+                "title": STORE_TITLE,
+                "content": "A body whose session seal cannot verify, long enough to read as prose.",
+                "namespace": NAMESPACE,
+                "kind": "observation",
+            }),
+            STORE_TITLE,
+        ),
+        (
+            "memory_reflect",
+            json!({
+                "source_ids": [a, b],
+                "title": REFLECT_TITLE,
+                "content": "A reflection whose session seal cannot verify, written as plain prose.",
+                "namespace": NAMESPACE,
+            }),
+            REFLECT_TITLE,
+        ),
+        (
+            "memory_consolidate",
+            json!({
+                "ids": [c, d],
+                "title": CONSOLIDATE_TITLE,
+                "summary": "A consolidation whose session seal cannot verify, written as prose.",
+                "namespace": NAMESPACE,
+            }),
+            CONSOLIDATE_TITLE,
+        ),
+        (
+            "memory_entity_register",
+            json!({
+                "canonical_name": ENTITY_NAME,
+                "namespace": NAMESPACE,
+                "aliases": ["downgrade-entity-9926"],
+            }),
+            ENTITY_NAME,
+        ),
+    ];
+    let mut results = Vec::with_capacity(rows.len());
+    for (tool, args, title) in &rows {
+        results.push((*tool, *title, mcp.call_raw(tool, args)));
+    }
     drop(mcp);
-    assert!(is_error, "write-time seal failure refuses: {text}");
-    assert!(
-        text.contains(ai_memory::identity::session_signer::SEAL_REFUSAL_PREFIX),
-        "exact seal refusal: {text}"
-    );
-    let n: i64 = sb
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM memories WHERE title = 'downgrade 9926'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count");
-    assert_eq!(n, 0, "nothing stored, no claimed fallback");
+    for (tool, title, (is_error, text)) in results {
+        assert!(is_error, "{tool}: write-time seal failure refuses: {text}");
+        assert!(
+            text.contains(ai_memory::identity::session_signer::SEAL_REFUSAL_PREFIX),
+            "{tool}: exact seal refusal: {text}"
+        );
+        assert_eq!(
+            count_titled(&sb, title),
+            0,
+            "{tool}: nothing stored, no claimed fallback"
+        );
+    }
 }
 
 /// Unset key: today's behaviour. Permissive lands `claimed` with no
