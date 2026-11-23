@@ -84,7 +84,7 @@ pub(crate) fn loader_verdict(path: &Path) -> Expect {
     let path = path.to_path_buf();
     with_deadline(move || match super::load_peer_fingerprint_map(&path) {
         Ok(pins) => Expect::Accept {
-            hosts: pins.host_count(),
+            hosts: pins.len(),
             pins: pins.pin_count(),
         },
         Err(e) => Expect::Refuse(format!("{e:#}")),

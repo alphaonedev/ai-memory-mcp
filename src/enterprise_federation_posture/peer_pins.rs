@@ -32,7 +32,7 @@ pub(super) fn check_peer_fingerprints() -> PostureCheck {
                 format!(
                     "{}: {} host(s), {} pin(s)",
                     std::path::Path::new(&path).display(),
-                    pins.host_count(),
+                    pins.len(),
                     pins.pin_count()
                 ),
                 true,

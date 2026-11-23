@@ -982,8 +982,15 @@ impl PinnedFingerprints {
 
     /// Number of distinct pinned hosts (always at least 1).
     #[must_use]
-    pub fn host_count(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// Always `false`: the constructors refuse an empty map. Kept so
+    /// existing `is_empty` callers compile unchanged.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     /// Total pinned fingerprints across all hosts (always at least 1).
@@ -2060,7 +2067,7 @@ mod tests {
         );
         let tmp = write_tmp(&body);
         let map = load_peer_fingerprint_map(tmp.path()).unwrap();
-        assert_eq!(map.host_count(), 2, "two distinct hosts");
+        assert_eq!(map.len(), 2, "two distinct hosts");
         assert_eq!(map.pin_count(), 3, "three pins in all");
         assert_eq!(
             map.get("peer-one.example").map(HashSet::len),
@@ -2081,6 +2088,50 @@ mod tests {
             err.to_string().contains("contained no entries"),
             "got: {err}"
         );
+    }
+
+    /// #9954 / #8950 census guard: the one raw open `read_pin_file_capped`
+    /// adds is READ-only. Behaviour: a read-only (0o400) pin file loads and
+    /// its bytes and length are unchanged afterwards (a write, create or
+    /// truncate flag would fail the open for a non-root runner or change the
+    /// file). Contract pin (the `key_file_open_is_read_only_8950_9367`
+    /// precedent): the function body opens once, reads, and sets no write
+    /// flag.
+    #[cfg(unix)]
+    #[test]
+    fn pin_file_open_is_read_only_8950_9954() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let body = pin_file_cases::valid_pin_line();
+        let tmp = write_tmp(&body);
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o400))
+            .expect("chmod 0400");
+        let pins = load_peer_fingerprint_map(tmp.path()).expect("read-only pin file loads");
+        assert_eq!((pins.len(), pins.pin_count()), (1, 1));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path()).expect("re-read"),
+            body,
+            "the pin file is unchanged"
+        );
+
+        let src = include_str!("tls.rs");
+        let start = src
+            .find("fn read_pin_file_capped(")
+            .expect("reader present");
+        let len = src[start..].find("\n}\n").expect("reader body ends");
+        let reader = &src[start..start + len];
+        let count = |needle: &str| reader.matches(needle).count();
+        assert_eq!(count("opts.open(path)"), 1, "one open");
+        assert_eq!(count("opts.read(true);"), 1, "the open reads");
+        for flag in [
+            ".write(",
+            ".append(",
+            ".create(",
+            ".create_new(",
+            ".truncate(",
+        ] {
+            assert_eq!(count(flag), 0, "`{flag}`: the pin-file open never writes");
+        }
     }
 
     #[test]
