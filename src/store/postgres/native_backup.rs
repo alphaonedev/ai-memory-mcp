@@ -116,6 +116,56 @@ const SQL_AGE_PRESENT: &str = "SELECT to_regclass('ag_catalog.ag_graph') IS NOT 
 /// The store's schema version.
 const SQL_SCHEMA_VERSION: &str = "SELECT MAX(version)::int8 FROM public.schema_version";
 
+/// The name of the AGE graph a restore re-projects into.
+const AGE_GRAPH_NAME: &str = "memory_graph";
+
+/// Every label table of the AGE graph `$1` (#10045: the graph schema is
+/// excluded from the dump, so its emptiness is checked on its own).
+const SQL_AGE_LABEL_TABLES: &str = "SELECT n.nspname::text, c.relname::text \
+     FROM ag_catalog.ag_label l JOIN ag_catalog.ag_graph g ON g.graphid = l.graph \
+     JOIN pg_class c ON c.oid = l.relation JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE g.name = $1 ORDER BY 1, 2";
+
+/// Every user trigger that `session_replication_role = replica` leaves on
+/// (`ENABLE ALWAYS` = 'A', `ENABLE REPLICA` = 'R') and every rewrite rule
+/// other than a view's `_RETURN`, on any table (#10048).
+const SQL_ACTIVE_TRIGGERS_AND_RULES: &str = "SELECT n.nspname::text, c.relname::text, \
+       'trigger'::text, t.tgname::text \
+     FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE NOT t.tgisinternal AND t.tgenabled IN ('A', 'R') \
+     UNION ALL \
+     SELECT n.nspname::text, c.relname::text, 'rule'::text, r.rulename::text \
+     FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE r.rulename <> '_RETURN' \
+     ORDER BY 1, 2, 3, 4";
+
+/// SQLSTATE `insufficient_privilege`.
+const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
+
+/// Rows of `memory_links` read per keyset page during the AGE re-projection
+/// (#10046: memory stays bounded whatever the link count).
+pub(crate) const LINK_PAGE_ROWS: i64 = 1000;
+
+/// One `memory_links` row as the AGE re-projection reads it.
+type LinkRow = (
+    String,
+    String,
+    String,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+const SQL_LINKS_FIRST_PAGE: &str = "SELECT source_id, target_id, relation, valid_from, \
+       valid_until FROM public.memory_links \
+     ORDER BY source_id, target_id, relation LIMIT $1";
+
+const SQL_LINKS_NEXT_PAGE: &str = "SELECT source_id, target_id, relation, valid_from, \
+       valid_until FROM public.memory_links \
+     WHERE (source_id, target_id, relation) > ($1, $2, $3) \
+     ORDER BY source_id, target_id, relation LIMIT $4";
+
 /// `"schema"."name"` with every `"` doubled, safe for any catalog name.
 fn quote_qualified(schema: &str, name: &str) -> String {
     format!(
@@ -290,18 +340,22 @@ async fn read_catalog(tx: &mut Transaction<'_, Postgres>) -> StoreResult<Catalog
     })
 }
 
+/// A relation's catalog key: `(schema, name)`. A tuple, never the joined
+/// display text, so `a.b`/`c` and `a`/`b.c` are two keys (#10051).
+type RelKey = (String, String);
+
 /// Kahn's order over the foreign keys among `tables`: a parent before its
-/// children, ties by qualified name, self references ignored. Linear in
+/// children, ties by `(schema, name)`, self references ignored. Linear in
 /// tables plus edges (with a log factor for the ready set).
 fn fk_order(
-    tables: &[(String, String)],
+    tables: &[RelKey],
     fks: &[(String, String, String, String)],
-) -> StoreResult<Vec<(String, String)>> {
-    let known: BTreeSet<String> = tables.iter().map(|(s, n)| qualified(s, n)).collect();
-    let mut parents_left: BTreeMap<String, usize> = known.iter().map(|q| (q.clone(), 0)).collect();
-    let mut children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+) -> StoreResult<Vec<RelKey>> {
+    let known: BTreeSet<RelKey> = tables.iter().cloned().collect();
+    let mut parents_left: BTreeMap<RelKey, usize> = known.iter().map(|k| (k.clone(), 0)).collect();
+    let mut children: BTreeMap<RelKey, BTreeSet<RelKey>> = BTreeMap::new();
     for (cs, cn, ps, pn) in fks {
-        let (child, parent) = (qualified(cs, cn), qualified(ps, pn));
+        let (child, parent) = ((cs.clone(), cn.clone()), (ps.clone(), pn.clone()));
         if child == parent || !known.contains(&child) || !known.contains(&parent) {
             continue;
         }
@@ -311,14 +365,10 @@ fn fk_order(
             }
         }
     }
-    let mut ready: BTreeSet<String> = parents_left
+    let mut ready: BTreeSet<RelKey> = parents_left
         .iter()
         .filter(|(_, n)| **n == 0)
-        .map(|(q, _)| q.clone())
-        .collect();
-    let by_name: BTreeMap<String, (String, String)> = tables
-        .iter()
-        .map(|(s, n)| (qualified(s, n), (s.clone(), n.clone())))
+        .map(|(k, _)| k.clone())
         .collect();
     let mut out = Vec::with_capacity(tables.len());
     while let Some(next) = ready.pop_first() {
@@ -332,16 +382,14 @@ fn fk_order(
                 }
             }
         }
-        if let Some(pair) = by_name.get(&next) {
-            out.push(pair.clone());
-        }
+        out.push(next);
     }
-    if out.len() != tables.len() {
-        let placed: BTreeSet<String> = out.iter().map(|(s, n)| qualified(s, n)).collect();
-        let cycle: Vec<&str> = known
+    if out.len() != known.len() {
+        let placed: BTreeSet<&RelKey> = out.iter().collect();
+        let cycle: Vec<String> = known
             .iter()
-            .filter(|q| !placed.contains(*q))
-            .map(String::as_str)
+            .filter(|k| !placed.contains(k))
+            .map(|(s, n)| qualified(s, n))
             .collect();
         return Err(catalog_err(format!(
             "foreign keys form a cycle among {}",
@@ -482,19 +530,23 @@ pub(super) async fn native_backup_pg(
 }
 
 /// Refuse unless the target's tables, columns and sequences are exactly the
-/// artifact's.
+/// artifact's, both ways, keyed by `(schema, name)` (#10044, #10051).
 fn check_catalog(body: &NativeDumpBody, target: &Catalog) -> StoreResult<()> {
-    let target_tables: BTreeMap<String, &TableSpec> =
-        target.tables.iter().map(|t| (t.qualified(), t)).collect();
+    let target_tables: BTreeMap<(&str, &str), &TableSpec> = target
+        .tables
+        .iter()
+        .map(|t| ((t.schema.as_str(), t.name.as_str()), t))
+        .collect();
     let mut seen = BTreeSet::new();
     for seg in &body.tables {
+        let key = (seg.schema.as_str(), seg.name.as_str());
         let q = seg.qualified();
-        if !seen.insert(q.clone()) {
+        if !seen.insert(key) {
             return Err(catalog_err(format!(
                 "table {q} appears twice in the artifact"
             )));
         }
-        let Some(t) = target_tables.get(&q) else {
+        let Some(t) = target_tables.get(&key) else {
             return Err(catalog_err(format!(
                 "table {q} does not exist on the target"
             )));
@@ -505,23 +557,39 @@ fn check_catalog(body: &NativeDumpBody, target: &Catalog) -> StoreResult<()> {
             )));
         }
     }
-    for q in target_tables.keys() {
-        if !seen.contains(q) {
+    for (key, t) in &target_tables {
+        if !seen.contains(key) {
             return Err(catalog_err(format!(
-                "table {q} exists on the target but not in the artifact"
+                "table {} exists on the target but not in the artifact",
+                t.qualified()
             )));
         }
     }
-    let target_seqs: BTreeSet<String> = target
+    let target_seqs: BTreeSet<(&str, &str)> = target
         .sequences
         .iter()
-        .map(|(s, n)| qualified(s, n))
+        .map(|(s, n)| (s.as_str(), n.as_str()))
         .collect();
+    let mut seen_seqs = BTreeSet::new();
     for s in &body.sequences {
+        let key = (s.schema.as_str(), s.name.as_str());
         let q = qualified(&s.schema, &s.name);
-        if !target_seqs.contains(&q) {
+        if !seen_seqs.insert(key) {
+            return Err(catalog_err(format!(
+                "sequence {q} appears twice in the artifact"
+            )));
+        }
+        if !target_seqs.contains(&key) {
             return Err(catalog_err(format!(
                 "sequence {q} does not exist on the target"
+            )));
+        }
+    }
+    for key in &target_seqs {
+        if !seen_seqs.contains(key) {
+            return Err(catalog_err(format!(
+                "sequence {} exists on the target but not in the artifact",
+                qualified(key.0, key.1)
             )));
         }
     }
@@ -564,6 +632,123 @@ async fn feed_segment(
         .into());
     }
     Ok(())
+}
+
+/// Map a failed `SET LOCAL session_replication_role`: SQLSTATE 42501 is the
+/// exact [`NativeBackupError::InsufficientPrivilege`] (#10047), anything
+/// else keeps its context.
+fn replica_role_err(e: sqlx::Error, context: &str) -> StoreError {
+    match &e {
+        sqlx::Error::Database(db)
+            if db.code().as_deref() == Some(SQLSTATE_INSUFFICIENT_PRIVILEGE) =>
+        {
+            NativeBackupError::InsufficientPrivilege.into()
+        }
+        _ => to_store_err(context, e),
+    }
+}
+
+/// Refuse unless every label table of the AGE graph is empty (#10045).
+/// `ONLY` so a row is attributed to the label table that holds it, not to
+/// the parent label it inherits from.
+async fn check_age_graph_empty(tx: &mut Transaction<'_, Postgres>) -> StoreResult<()> {
+    let labels: Vec<(String, String)> = sqlx::query_as(SQL_AGE_LABEL_TABLES)
+        .bind(AGE_GRAPH_NAME)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("native restore: list AGE labels", e))?;
+    for (schema, name) in labels {
+        // Locked like the dumped tables, so no writer can add a vertex or an
+        // edge between this check and the re-projection.
+        sqlx::query(&format!(
+            "LOCK TABLE ONLY {} IN ACCESS EXCLUSIVE MODE",
+            quote_qualified(&schema, &name)
+        ))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("native restore: lock AGE labels", e))?;
+        let any: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM ONLY {})",
+            quote_qualified(&schema, &name)
+        ))
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("native restore: AGE emptiness check", e))?;
+        if any {
+            return Err(NativeBackupError::TargetNotEmpty {
+                table: qualified(&schema, &name),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse when a dumped table carries a trigger that replica mode leaves on
+/// or a rewrite rule (#10048): the load must not run any user code.
+async fn check_no_active_triggers_or_rules(
+    tx: &mut Transaction<'_, Postgres>,
+    body: &NativeDumpBody,
+) -> StoreResult<()> {
+    let dumped: BTreeSet<(&str, &str)> = body
+        .tables
+        .iter()
+        .map(|t| (t.schema.as_str(), t.name.as_str()))
+        .collect();
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(SQL_ACTIVE_TRIGGERS_AND_RULES)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("native restore: list triggers and rules", e))?;
+    match rows
+        .into_iter()
+        .find(|(s, n, _, _)| dumped.contains(&(s.as_str(), n.as_str())))
+    {
+        Some((schema, name, kind, rule)) => Err(NativeBackupError::ActiveTriggerOrRule {
+            table: qualified(&schema, &name),
+            kind,
+            name: rule,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// Re-project every `memory_links` row into AGE in keyset pages of
+/// [`LINK_PAGE_ROWS`] (#10046), the stamps rendered by the live writers'
+/// SSOT (#10049). Fails closed: a link that cannot be projected refuses the
+/// restore rather than leaving the graph behind the relational rows.
+async fn reproject_links(tx: &mut Transaction<'_, Postgres>) -> StoreResult<u64> {
+    let mut projected = 0_u64;
+    let mut after: Option<(String, String, String)> = None;
+    loop {
+        let page: Vec<LinkRow> = match &after {
+            None => {
+                sqlx::query_as(SQL_LINKS_FIRST_PAGE)
+                    .bind(LINK_PAGE_ROWS)
+                    .fetch_all(&mut **tx)
+                    .await
+            }
+            Some((s, t, r)) => {
+                sqlx::query_as(SQL_LINKS_NEXT_PAGE)
+                    .bind(s)
+                    .bind(t)
+                    .bind(r)
+                    .bind(LINK_PAGE_ROWS)
+                    .fetch_all(&mut **tx)
+                    .await
+            }
+        }
+        .map_err(|e| to_store_err("native restore: read links", e))?;
+        let full = i64::try_from(page.len()).is_ok_and(|n| n == LINK_PAGE_ROWS);
+        for (src, tgt, rel, vf, vu) in page {
+            project_link_into_age(tx, &src, &tgt, &rel, vf, vu).await?;
+            projected = projected.saturating_add(1);
+            after = Some((src, tgt, rel));
+        }
+        if !full {
+            return Ok(projected);
+        }
+    }
 }
 
 /// Restore a verified backup into an empty, freshly migrated store, in one
@@ -622,10 +807,19 @@ pub(super) async fn native_restore_pg(
         }
     }
 
+    let age_present: bool = sqlx::query_scalar(SQL_AGE_PRESENT)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("native restore: probe AGE catalog", e))?;
+    if age_present {
+        check_age_graph_empty(&mut tx).await?;
+    }
+    check_no_active_triggers_or_rules(&mut tx, &body).await?;
+
     sqlx::query("SET LOCAL session_replication_role = replica")
         .execute(&mut *tx)
         .await
-        .map_err(|e| to_store_err("native restore: triggers off", e))?;
+        .map_err(|e| replica_role_err(e, "native restore: triggers off"))?;
     let mut buf = vec![0_u8; PG_BACKUP_CHUNK_BYTES];
     let mut rows_total = 0_u64;
     for seg in &body.tables {
@@ -689,35 +883,11 @@ pub(super) async fn native_restore_pg(
         .await
         .map_err(|e| to_store_err("native restore: triggers on", e))?;
 
-    let age_present: bool = sqlx::query_scalar(SQL_AGE_PRESENT)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("native restore: probe AGE catalog", e))?;
-    let mut age_edges_projected = 0_u64;
-    if age_present && has(LINKS_TABLE) {
-        type LinkRow = (
-            String,
-            String,
-            String,
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        );
-        let links: Vec<LinkRow> = sqlx::query_as(
-            "SELECT source_id, target_id, relation, valid_from, valid_until \
-             FROM public.memory_links ORDER BY source_id, target_id, relation",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("native restore: read links", e))?;
-        for (src, tgt, rel, vf, vu) in links {
-            let vf = vf.map(|t| t.to_rfc3339());
-            let vu = vu.map(|t| t.to_rfc3339());
-            // Fail closed: a link that cannot be projected refuses the restore
-            // rather than leaving the graph silently behind the relational rows.
-            project_link_into_age(&mut tx, &src, &tgt, &rel, vf.as_deref(), vu.as_deref()).await?;
-            age_edges_projected = age_edges_projected.saturating_add(1);
-        }
-    }
+    let age_edges_projected = if age_present && has(LINKS_TABLE) {
+        reproject_links(&mut tx).await?
+    } else {
+        0
+    };
 
     tx.commit()
         .await
@@ -768,6 +938,66 @@ mod tests {
             err.to_string(),
             StoreError::from(NativeBackupError::CatalogMismatch {
                 detail: "foreign keys form a cycle among public.a, public.b".to_string()
+            })
+            .to_string()
+        );
+    }
+
+    /// #10051: `a.b`/`c` and `a`/`b.c` share the display text `a.b.c` but are
+    /// two relations; neither the order nor the catalog check may merge them.
+    #[test]
+    fn catalog_keys_never_collide_on_dotted_names_10051() {
+        let tables = [t("a.b", "c"), t("a", "b.c")];
+        let fks = [(
+            "a.b".to_string(),
+            "c".to_string(),
+            "a".to_string(),
+            "b.c".to_string(),
+        )];
+        let got = fk_order(&tables, &fks).expect("order");
+        assert_eq!(got, vec![t("a", "b.c"), t("a.b", "c")]);
+
+        let spec = |s: &str, n: &str| TableSpec {
+            schema: s.to_string(),
+            name: n.to_string(),
+            columns: vec![ColumnSpec {
+                name: "id".to_string(),
+                type_name: "text".to_string(),
+            }],
+        };
+        let seg = |s: &str, n: &str| TableSegment {
+            schema: s.to_string(),
+            name: n.to_string(),
+            columns: spec(s, n).columns,
+            rows: 0,
+            offset: 0,
+            len: 0,
+            sha256: String::new(),
+        };
+        let body = |tables: Vec<TableSegment>| NativeDumpBody {
+            domain: PG_BACKUP_DOMAIN.to_string(),
+            backend: PG_BACKUP_BACKEND.to_string(),
+            layout_version: PG_BACKUP_LAYOUT_VERSION,
+            schema_version: 1,
+            tables,
+            sequences: Vec::new(),
+            exclusions: Vec::new(),
+            data_len: 0,
+            data_sha256: String::new(),
+            created_at: String::new(),
+        };
+        let target = Catalog {
+            tables: vec![spec("a.b", "c"), spec("a", "b.c")],
+            sequences: Vec::new(),
+            exclusions: Vec::new(),
+        };
+        check_catalog(&body(vec![seg("a.b", "c"), seg("a", "b.c")]), &target)
+            .expect("both relations match");
+        let err = check_catalog(&body(vec![seg("a.b", "c")]), &target).expect_err("one missing");
+        assert_eq!(
+            err.to_string(),
+            StoreError::from(NativeBackupError::CatalogMismatch {
+                detail: "table a.b.c exists on the target but not in the artifact".to_string()
             })
             .to_string()
         );

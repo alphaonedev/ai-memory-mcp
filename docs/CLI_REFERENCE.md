@@ -886,9 +886,26 @@ on a Postgres store when `--store-url` (or `AI_MEMORY_STORE_URL_FILE` /
   unknown layout version; a backup of another backend (cross-backend
   restore is not supported); a schema version other than the target's;
   a table or column set other than the target's; a target that is not
-  empty (`restore target is not empty`); no operator public key; and
+  empty (`restore target is not empty`), the Apache AGE graph's label
+  tables included; a sequence set other than the target's, in either
+  direction; a data file that changed after verification (each segment's
+  digest is checked again as it is loaded); a dumped table that carries
+  an `ENABLE ALWAYS` or `ENABLE REPLICA` trigger or a rewrite rule
+  (`which replica mode does not turn off`); no operator public key; and
   `--skip-verify`, `--allow-unsigned-manifest` or `--latest`, which are
   not accepted on this path.
+- **Privilege.** The load turns user triggers off with
+  `SET LOCAL session_replication_role = replica`, which needs a superuser
+  or a role granted `SET` on that parameter. A role without it (a usual
+  managed-PostgreSQL application role) is refused with
+  `native restore needs a role that may SET session_replication_role`,
+  and nothing is written. Run the restore as the superuser account
+  (`rds_superuser`, `cloudsqlsuperuser`, the CloudNativePG superuser), or
+  `GRANT SET ON PARAMETER session_replication_role TO <role>` first; see
+  [`managed-postgres.md`](managed-postgres.html).
+- The AGE graph is rebuilt from `memory_links` in pages of 1000 rows, so
+  restore memory stays bounded whatever the link count, and the edges
+  carry the same validity stamps the live writers use.
 
 A build without `sal-postgres` refuses a Postgres store as described
 above; such a deployment is restored with Postgres' own tooling — see

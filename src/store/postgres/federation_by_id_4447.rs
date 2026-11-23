@@ -144,15 +144,13 @@ impl PostgresStore {
             // edge carries `valid_until`; project it onto the AGE edge so the
             // receiver's current-view Cypher reads exclude it exactly as the
             // relational reads do (else the relayed retraction is lost graph-side).
-            let vf_str = valid_from.map(|t| t.to_rfc3339());
-            let vu_str = valid_until.map(|t| t.to_rfc3339());
             match project_link_into_age(
                 &mut tx,
                 &link.source_id,
                 &link.target_id,
                 link.relation.as_str(),
-                vf_str.as_deref(),
-                vu_str.as_deref(),
+                valid_from,
+                valid_until,
             )
             .await
             {
@@ -939,15 +937,13 @@ impl PostgresStore {
                                 .await
                                 .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
                             // #2377 (FIX #9) — carry the restored edge's validity.
-                            let vf_str = valid_from.map(|t| t.to_rfc3339());
-                            let vu_str = valid_until.map(|t| t.to_rfc3339());
                             match project_link_into_age(
                                 &mut tx,
                                 src,
                                 dst,
                                 rel,
-                                vf_str.as_deref(),
-                                vu_str.as_deref(),
+                                *valid_from,
+                                *valid_until,
                             )
                             .await
                             {

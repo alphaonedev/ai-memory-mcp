@@ -309,6 +309,27 @@ pub enum NativeBackupError {
         /// `schema.table`.
         table: String,
     },
+    /// The restoring role may not turn user triggers off (#10047): `SET
+    /// session_replication_role` needs a superuser or a `SET` grant on it.
+    #[error(
+        "native restore needs a role that may SET session_replication_role (a superuser or a \
+         role granted SET on it); the connecting role lacks it, restore refused"
+    )]
+    InsufficientPrivilege,
+    /// A dumped table carries a trigger that replica mode does not turn off
+    /// (`ENABLE ALWAYS` / `ENABLE REPLICA`) or a rewrite rule (#10048).
+    #[error(
+        "restore target table {table} carries {kind} {name}, which replica mode does not turn \
+         off; restore refused"
+    )]
+    ActiveTriggerOrRule {
+        /// `schema.table`.
+        table: String,
+        /// `trigger` or `rule`.
+        kind: String,
+        /// The trigger or rule name.
+        name: String,
+    },
     /// A file operation failed.
     #[error("pg backup i/o error while {context}: {detail}")]
     Io {

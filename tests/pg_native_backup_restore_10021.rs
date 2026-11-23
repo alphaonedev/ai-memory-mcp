@@ -188,7 +188,7 @@ fn anchor_pub() -> VerifyingKey {
 struct Db {
     pool: PgPool,
     store: PostgresStore,
-    _scratch: pg_barrier::ScratchDb,
+    scratch: pg_barrier::ScratchDb,
 }
 
 async fn fresh(prefix: &str) -> Db {
@@ -226,7 +226,7 @@ async fn fresh(prefix: &str) -> Db {
     Db {
         pool,
         store,
-        _scratch: scratch,
+        scratch,
     }
 }
 
@@ -449,6 +449,17 @@ async fn now_epoch(pool: &PgPool) -> i64 {
 async fn round_trip_is_byte_exact_10021() {
     let src = fresh("pgnb10021rts").await;
     seed_corpus(&src.pool).await;
+    // #10049: a distinct (last_value, is_called) per sequence, both is_called states, so a
+    // restore that resets or drops either half is red.
+    for (k, s) in EXPECTED_SEQUENCES.iter().enumerate() {
+        let (last, called) = seq_value(k);
+        sqlx::query(&format!("SELECT setval('public.{s}', $1, $2)"))
+            .bind(last)
+            .bind(called)
+            .execute(&src.pool)
+            .await
+            .expect("setval");
+    }
     let art = dump(&src, "rt").await;
 
     let names: Vec<String> = art
@@ -479,11 +490,12 @@ async fn round_trip_is_byte_exact_10021() {
     }
     let seqs: Vec<SequenceValue> = EXPECTED_SEQUENCES
         .iter()
-        .map(|s| SequenceValue {
+        .enumerate()
+        .map(|(k, s)| SequenceValue {
             schema: "public".to_string(),
             name: (*s).to_string(),
-            last_value: 1,
-            is_called: true,
+            last_value: seq_value(k).0,
+            is_called: seq_value(k).1,
         })
         .collect();
     assert_eq!(
@@ -529,17 +541,35 @@ async fn round_trip_is_byte_exact_10021() {
         )
     );
 
-    // Sequences continue past the restored maximum (mutant: drop the sequence reset).
-    for s in EXPECTED_SEQUENCES {
+    // Every sequence carries the source's exact (last_value, is_called) and continues from
+    // it (#10049; mutants: drop the sequence reset, bind a constant last_value).
+    for (k, s) in EXPECTED_SEQUENCES.iter().enumerate() {
+        let (last, called) = seq_value(k);
+        let state: (i64, bool) =
+            sqlx::query_as(&format!("SELECT last_value, is_called FROM public.{s}"))
+                .fetch_one(&tgt.pool)
+                .await
+                .expect("sequence state");
+        assert_eq!(
+            state,
+            (last, called),
+            "#10049 sequence public.{s} state on the target"
+        );
         let next: i64 = sqlx::query_scalar(&format!("SELECT nextval('public.{s}')"))
             .fetch_one(&tgt.pool)
             .await
             .expect("nextval");
+        let want = if called { last + 1 } else { last };
         assert_eq!(
-            next, 2,
-            "#10021 sequence public.{s} must continue past the restored max"
+            next, want,
+            "#10049 sequence public.{s} must continue from the restored state"
         );
     }
+}
+
+/// The `(last_value, is_called)` the round trip sets on sequence `k` (#10049).
+fn seq_value(k: usize) -> (i64, bool) {
+    (100 + i64::try_from(k).expect("k"), k.is_multiple_of(2))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -710,6 +740,90 @@ async fn restore_refuses_a_table_missing_on_the_target_10021() {
         .to_string()
     );
     assert_empty(&tgt.pool, "missing table").await;
+}
+
+/// A sequence on the target that the artifact does not carry refuses the restore before
+/// any write (#10044, the reverse direction of the sequence check).
+/// Mutant: drop the target-to-artifact sequence loop in `check_catalog`.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_a_sequence_only_on_the_target_10044() {
+    let src = fresh("pgnb10044xss").await;
+    seed_corpus(&src.pool).await;
+    let art = dump(&src, "xs").await;
+    let tgt = fresh("pgnb10044xst").await;
+    sqlx::query("CREATE SEQUENCE public.extra_seq_10021")
+        .execute(&tgt.pool)
+        .await
+        .expect("extra sequence");
+    let err = restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect_err("must refuse");
+    assert_eq!(
+        integrity_detail(err),
+        NativeBackupError::CatalogMismatch {
+            detail: "sequence public.extra_seq_10021 exists on the target but not in the artifact"
+                .to_string(),
+        }
+        .to_string()
+    );
+    assert_empty(&tgt.pool, "extra target sequence").await;
+}
+
+/// A data file changed in place after verification (same inode, same length, one byte
+/// flipped inside `public.memories`) is caught by the per-segment re-hash during the load:
+/// the exact digest refusal, nothing written, and a retry after the byte is restored
+/// succeeds (#10043). Mutant: drop the digest check in `feed_segment`.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_a_data_file_changed_after_verification_10021() {
+    use std::io::{Seek as _, SeekFrom};
+    let src = fresh("pgnb10043tcs").await;
+    seed_corpus(&src.pool).await;
+    let art = dump(&src, "tc").await;
+    let tgt = fresh("pgnb10043tct").await;
+
+    let seg = segment(&art.body, "public.memories").clone();
+    let at = seg.offset + seg.len / 2;
+    let flip = |path: &Path| {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open data in place");
+        let mut b = [0u8; 1];
+        f.seek(SeekFrom::Start(at)).expect("seek");
+        std::io::Read::read_exact(&mut f, &mut b).expect("read byte");
+        b[0] ^= 0x01;
+        f.seek(SeekFrom::Start(at)).expect("seek back");
+        f.write_all(&b).expect("write byte");
+        f.sync_all().expect("sync");
+    };
+    let len_before = std::fs::metadata(&art.data).expect("meta").len();
+
+    let verified = verify(&art.manifest, &art.data).expect("the good artifact verifies");
+    flip(&art.data);
+    assert_eq!(
+        std::fs::metadata(&art.data).expect("meta").len(),
+        len_before
+    );
+    let err = tgt
+        .store
+        .native_restore(verified)
+        .await
+        .expect_err("a file changed after verification must be refused");
+    assert_eq!(
+        integrity_detail(err),
+        NativeBackupError::DigestMismatch {
+            table: "public.memories".to_string()
+        }
+        .to_string()
+    );
+    assert_empty(&tgt.pool, "changed after verification").await;
+
+    flip(&art.data);
+    restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect("a retry with the original bytes succeeds");
+    assert_tables_equal(&src.pool, &tgt.pool, &[]).await;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -940,6 +1054,43 @@ async fn non_empty_target_is_refused_for_every_table_10021() {
         assert_eq!(count_rows(&tgt.pool, &format!("public.{table}")).await, 0);
     }
     assert_empty(&tgt.pool, "after every refusal").await;
+
+    // #10045: the AGE graph schema is not dumped, so one vertex under any label of
+    // memory_graph makes the target non-empty too (mutant: drop check_age_graph_empty).
+    {
+        let mut tx = tgt.pool.begin().await.expect("tx");
+        sqlx::query("LOAD 'age'")
+            .execute(&mut *tx)
+            .await
+            .expect("load age");
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
+            .execute(&mut *tx)
+            .await
+            .expect("search_path");
+        sqlx::query(
+            "SELECT * FROM cypher('memory_graph', $$ CREATE (:probe_10045 {id: 'x'}) $$) \
+             AS (v agtype)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("probe vertex");
+        tx.commit().await.expect("commit");
+    }
+    let err = restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect_err("a non-empty graph must be refused");
+    assert_eq!(
+        integrity_detail(err),
+        NativeBackupError::TargetNotEmpty {
+            table: "memory_graph.probe_10045".to_string()
+        }
+        .to_string()
+    );
+    assert_empty(&tgt.pool, "after the graph refusal").await;
+    sqlx::query("DELETE FROM memory_graph.probe_10045")
+        .execute(&tgt.pool)
+        .await
+        .expect("delete probe vertex");
 
     // The freshly migrated store (seeded rows only) accepts the restore ...
     restore(&tgt, &art.manifest, &art.data)
@@ -1297,5 +1448,305 @@ async fn artifact_is_0600_and_holds_no_secret_10021() {
         data.windows(token_hash.len())
             .any(|w| w == token_hash.as_bytes()),
         "the bound key hash (table content) is in the artifact"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// #10048, #10047, #10046, #10049: refusals before user code runs, paging, AGE equality
+// ---------------------------------------------------------------------------------------
+
+/// A dumped table with a trigger that replica mode leaves on (`ENABLE ALWAYS`) or with a
+/// rewrite rule refuses the restore with the exact error naming it, writing nothing; once
+/// it is gone the restore succeeds (#10048). Mutant: drop `check_no_active_triggers_or_rules`.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_refuses_an_always_trigger_or_a_rule_10048() {
+    let src = fresh("pgnb10048trs").await;
+    seed_corpus(&src.pool).await;
+    let art = dump(&src, "tr").await;
+    let tgt = fresh("pgnb10048trt").await;
+
+    for sql in [
+        "CREATE FUNCTION public.t_10048_fn() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RETURN NEW; END $$",
+        "CREATE TRIGGER t_10048 BEFORE INSERT ON public.memories \
+         FOR EACH ROW EXECUTE FUNCTION public.t_10048_fn()",
+        "ALTER TABLE public.memories ENABLE ALWAYS TRIGGER t_10048",
+    ] {
+        sqlx::query(sql).execute(&tgt.pool).await.expect("trigger");
+    }
+    let err = restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect_err("an ALWAYS trigger must be refused");
+    assert_eq!(
+        integrity_detail(err),
+        NativeBackupError::ActiveTriggerOrRule {
+            table: "public.memories".to_string(),
+            kind: "trigger".to_string(),
+            name: "t_10048".to_string(),
+        }
+        .to_string()
+    );
+    assert_empty(&tgt.pool, "always trigger").await;
+    sqlx::query("DROP TRIGGER t_10048 ON public.memories")
+        .execute(&tgt.pool)
+        .await
+        .expect("drop trigger");
+
+    sqlx::query("CREATE RULE r_10048 AS ON INSERT TO public.memory_links DO ALSO NOTHING")
+        .execute(&tgt.pool)
+        .await
+        .expect("rule");
+    let err = restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect_err("a rule must be refused");
+    assert_eq!(
+        integrity_detail(err),
+        NativeBackupError::ActiveTriggerOrRule {
+            table: "public.memory_links".to_string(),
+            kind: "rule".to_string(),
+            name: "r_10048".to_string(),
+        }
+        .to_string()
+    );
+    assert_empty(&tgt.pool, "rule").await;
+    sqlx::query("DROP RULE r_10048 ON public.memory_links")
+        .execute(&tgt.pool)
+        .await
+        .expect("drop rule");
+
+    restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect("restore succeeds once the trigger and rule are gone");
+    assert_tables_equal(&src.pool, &tgt.pool, &[]).await;
+}
+
+/// A restoring role that holds every table privilege but may not SET
+/// `session_replication_role` gets the exact `InsufficientPrivilege` refusal, nothing written
+/// (#10047). Mutant: map the SET failure through the generic error path.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_as_a_non_superuser_is_refused_exactly_10047() {
+    let src = fresh("pgnb10047lps").await;
+    seed_corpus(&src.pool).await;
+    let art = dump(&src, "lp").await;
+    let tgt = fresh("pgnb10047lpt").await;
+    let role = format!("restore_lowpriv_10047_{}", std::process::id());
+    // The managed-PostgreSQL shape: the restoring role inherits the privileges of the
+    // role that owns every object (the store's connect-time bootstrap re-runs owner
+    // DDL), but holds no SUPERUSER attribute of its own.
+    let owner: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&tgt.pool)
+        .await
+        .expect("owner");
+    for sql in [
+        format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER"),
+        format!("GRANT \"{owner}\" TO {role}"),
+    ] {
+        sqlx::query(&sql)
+            .execute(&tgt.pool)
+            .await
+            .expect("role setup");
+    }
+    let base = tgt.scratch.url();
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let low_url = format!("{base}{sep}options=-c%20role%3D{role}");
+
+    let outcome = match PostgresStore::connect(&low_url).await {
+        Ok(low) => {
+            let verified = verify(&art.manifest, &art.data).expect("verifies");
+            let r = low.native_restore(verified).await;
+            drop(low);
+            Ok(r)
+        }
+        Err(e) => Err(format!("{e:?}")),
+    };
+    for sql in [format!("DROP OWNED BY {role}"), format!("DROP ROLE {role}")] {
+        sqlx::query(&sql)
+            .execute(&tgt.pool)
+            .await
+            .expect("role cleanup");
+    }
+    let err = outcome
+        .expect("the low-privilege role connects")
+        .expect_err("a non-superuser restore must be refused");
+    assert_eq!(
+        integrity_detail(err),
+        NativeBackupError::InsufficientPrivilege.to_string()
+    );
+    assert_empty(&tgt.pool, "non-superuser").await;
+}
+
+/// More links than one keyset page (2001 = two full pages and one row) are all re-projected
+/// into AGE (#10046). Mutant: stop after the first page.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_projects_every_link_across_pages_10046() {
+    const EXTRA: i64 = 2000;
+    let src = fresh("pgnb10046pgs").await;
+    seed_corpus(&src.pool).await;
+    {
+        let cols: String = sqlx::query_scalar(
+            "SELECT string_agg(column_name::text, ', ' ORDER BY ordinal_position) \
+             FROM information_schema.columns WHERE table_schema = 'public' \
+             AND table_name = 'memory_links' AND is_generated = 'NEVER' \
+             AND column_name <> 'source_id'",
+        )
+        .fetch_one(&src.pool)
+        .await
+        .expect("link columns");
+        let mut tx = src.pool.begin().await.expect("tx");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .expect("replica");
+        sqlx::query(&format!(
+            "INSERT INTO public.memory_links (source_id, {cols}) \
+             SELECT 'pg10046-' || lpad(g::text, 5, '0'), {cols} \
+             FROM public.memory_links CROSS JOIN generate_series(1, $1::int8) g"
+        ))
+        .bind(EXTRA)
+        .execute(&mut *tx)
+        .await
+        .expect("many links");
+        tx.commit().await.expect("commit");
+    }
+    let links = count_rows(&src.pool, "public.memory_links").await;
+    assert_eq!(links, EXTRA + 1);
+    let art = dump(&src, "pg").await;
+    let tgt = fresh("pgnb10046pgt").await;
+    let report = restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect("restore");
+    assert_eq!(
+        report.age_edges_projected,
+        u64::try_from(links).expect("links")
+    );
+    let edges: i64 = sqlx::query_scalar("SELECT count(1) FROM memory_graph._ag_label_edge")
+        .fetch_one(&tgt.pool)
+        .await
+        .expect("edge count");
+    assert_eq!(
+        edges, links,
+        "#10046 every link is an AGE edge on the target"
+    );
+}
+
+/// Every AGE edge as `(label, start vertex props, end vertex props, edge props)`, all text.
+async fn age_edge_set(pool: &PgPool) -> BTreeSet<(String, String, String, String)> {
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("LOAD 'age'")
+        .execute(&mut *tx)
+        .await
+        .expect("load age");
+    sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
+        .execute(&mut *tx)
+        .await
+        .expect("search_path");
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT e.tableoid::regclass::text, s.properties::text, t.properties::text, \
+                e.properties::text \
+         FROM memory_graph._ag_label_edge e \
+         JOIN memory_graph._ag_label_vertex s ON s.id = e.start_id \
+         JOIN memory_graph._ag_label_vertex t ON t.id = e.end_id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .expect("age edges");
+    tx.rollback().await.expect("rollback");
+    rows.into_iter().collect()
+}
+
+/// Links written through the store API (plain, bounded by `valid_from` / `valid_until`, and
+/// kg-invalidated) restore into an AGE edge set equal to the source's in every endpoint,
+/// label and property (#10049). Mutant: re-project with no validity stamps.
+#[tokio::test(flavor = "multi_thread")]
+async fn restored_age_edges_equal_the_source_10049() {
+    let _keys = key_dir_sandbox::pin();
+    let src = fresh("pgnb10049ags").await;
+    seed_corpus(&src.pool).await;
+    // The corpus link is raw SQL with no AGE edge; drop it so every source link is one
+    // the live writers projected.
+    {
+        let mut tx = src.pool.begin().await.expect("tx");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .expect("replica");
+        sqlx::query("DELETE FROM public.memory_links")
+            .execute(&mut *tx)
+            .await
+            .expect("drop corpus link");
+        tx.commit().await.expect("commit");
+    }
+    let kp = keypair::generate(AGENT).expect("keypair");
+    keypair::save(&kp, key_dir_sandbox::pin()).expect("save keypair");
+    let ctx = CallerContext::for_agent(AGENT);
+    let mk = |s: &str, t: &str, rel, vf: Option<&str>, vu: Option<&str>| MemoryLink {
+        source_id: s.to_string(),
+        target_id: t.to_string(),
+        relation: rel,
+        created_at: "2026-01-02T03:04:05Z".to_string(),
+        signature: None,
+        observed_by: Some(AGENT.to_string()),
+        valid_from: vf.map(str::to_string),
+        valid_until: vu.map(str::to_string),
+        attest_level: None,
+        source_cid: None,
+        target_cid: None,
+    };
+    let links = [
+        mk(
+            "m1-10021",
+            "m2-10021",
+            MemoryLinkRelation::RelatedTo,
+            None,
+            None,
+        ),
+        mk(
+            "m2-10021",
+            "m1-10021",
+            MemoryLinkRelation::Supersedes,
+            Some("2026-02-03T04:05:06.123456Z"),
+            Some("2027-02-03T04:05:06Z"),
+        ),
+        mk(
+            "m1-10021",
+            "m2-10021",
+            MemoryLinkRelation::Contradicts,
+            None,
+            None,
+        ),
+    ];
+    for l in &links {
+        src.store
+            .link_signed(&ctx, l, Some(&kp))
+            .await
+            .expect("link");
+    }
+    src.store
+        .invalidate_link(
+            "m1-10021",
+            "m2-10021",
+            "contradicts",
+            Some("2026-06-07T08:09:10Z"),
+            Some(AGENT),
+        )
+        .await
+        .expect("kg_invalidate");
+
+    let want = age_edge_set(&src.pool).await;
+    assert_eq!(
+        want.len(),
+        3,
+        "#10049 the source graph holds the three links"
+    );
+    let art = dump(&src, "ag").await;
+    let tgt = fresh("pgnb10049agt").await;
+    let report = restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect("restore");
+    assert_eq!(report.age_edges_projected, 3);
+    let got = age_edge_set(&tgt.pool).await;
+    assert_eq!(
+        got, want,
+        "#10049 restored AGE edges must equal the source's"
     );
 }
