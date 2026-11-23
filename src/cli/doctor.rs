@@ -9463,6 +9463,19 @@ enabled = true
                 &approver_pubkey_b64,
             );
         }
+        // #9996 check #23 (review #10026 S-F2) — only a process that holds the
+        // peer list can pass the row, so record the boot scope row a daemon
+        // serving one narrowed peer records; a fresh process without it FAILs
+        // the row unverifiable
+        // (`fresh_process_with_narrowed_env_fails_unverifiable_9996`).
+        {
+            const PEER: &str = "https://peer-1.example.org:9077";
+            let scope = crate::federation::outbound_scope::PeerOutboundScope::Namespaces(vec![
+                "public/*".to_string(),
+            ]);
+            let id = crate::federation::peer::stable_peer_id(PEER);
+            crate::federation::outbound_scope::record_boot_scopes([(id.as_str(), PEER, &scope)]);
+        }
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED (the other half of the
         // pairing). Isolated per env-isolated child; the OnceLock persists for

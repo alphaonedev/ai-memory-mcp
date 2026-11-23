@@ -8,17 +8,21 @@
 //! submodule-over-bump rule (the #3553 `synchronous.rs` precedent). In a
 //! daemon that configured peers the row reads the scope rows recorded at boot
 //! (`federation::outbound_scope::boot_scope_rows`). A process that configured
-//! no peer (the `doctor --posture` CLI) cannot see the daemon's peer list, so
-//! it judges `AI_MEMORY_FED_PEER_OUTBOUND_SCOPE` itself: unset, malformed,
-//! empty, an empty list or the explicit all-namespaces pattern all fail.
+//! no peer (the `doctor --posture` CLI) cannot see the daemon's peer list (the
+//! `serve --quorum-peers` argument), so the env value alone never passes the
+//! row (review #10026 S-F2): it FAILs with [`UNVERIFIABLE`].
 
 use super::{PostureCheck, check};
 use crate::federation::outbound_scope::{
-    self as scope, OUTBOUND_SCOPE_ENV, PeerOutboundScope, PeerScopeRow, ScopePosture,
+    self as scope, OutboundScopeConfigError, PeerOutboundScope, PeerScopeRow, ScopePosture,
 };
+use std::collections::BTreeMap;
 
 /// Control name of check #23.
 pub(super) const CONTROL_OUTBOUND_SCOPE: &str = "federation outbound scope";
+
+/// The `actual` text of check #23 in a process that cannot see the peer list.
+pub(super) const UNVERIFIABLE: &str = "unverifiable from this process";
 
 /// The pass verdict and `actual` text for the rows a daemon recorded.
 fn judge_rows(rows: &[PeerScopeRow]) -> (bool, String) {
@@ -37,63 +41,65 @@ fn judge_rows(rows: &[PeerScopeRow]) -> (bool, String) {
     )
 }
 
-/// The pass verdict and `actual` text for the env value, judged in a process
-/// that configured no peer.
-fn judge_env(
-    parsed: Result<
-        std::collections::BTreeMap<String, PeerOutboundScope>,
-        scope::OutboundScopeConfigError,
-    >,
-    present: bool,
+/// The pass verdict and `actual` text for a peer list `peers` (the URLs the
+/// daemon would serve with) against the parsed scope map. `None` is a list
+/// this process cannot see: FAIL with [`UNVERIFIABLE`], whatever the env
+/// holds. Every listed peer needs a narrowed entry; a peer is named by
+/// origin and path only, never credentials.
+fn judge_peers(
+    peers: Option<&[String]>,
+    parsed: Result<BTreeMap<String, PeerOutboundScope>, OutboundScopeConfigError>,
 ) -> (bool, String) {
-    const UNSEEN: &str = "(peers are not observable from this process)";
-    let map = match parsed {
-        Ok(map) => map,
-        Err(e) => return (false, format!("{e} {UNSEEN}")),
-    };
-    if !present || map.is_empty() {
+    let Some(peers) = peers else {
+        let env = match &parsed {
+            Ok(map) => format!("{} scoped peer key(s) in the env", map.len()),
+            Err(e) => e.to_string(),
+        };
         return (
             false,
-            format!("{OUTBOUND_SCOPE_ENV} unset or empty: every peer is unscoped {UNSEEN}"),
+            format!("{UNVERIFIABLE}: the peer list is the `serve --quorum-peers` argument; {env}"),
+        );
+    };
+    let map = match parsed {
+        Ok(map) => map,
+        Err(e) => return (false, e.to_string()),
+    };
+    let mut not_narrowed = Vec::new();
+    let mut known = 0usize;
+    for url in peers {
+        let entry = map.get(&crate::federation::peer::stable_peer_id(url));
+        if entry.is_some() {
+            known = known.saturating_add(1);
+        }
+        if entry.map(ScopePosture::of) != Some(ScopePosture::Narrowed) {
+            not_narrowed.push(crate::url_display::url_origin_and_path(url));
+        }
+    }
+    let unknown = map.len().saturating_sub(known);
+    if !not_narrowed.is_empty() {
+        return (
+            false,
+            format!(
+                "peer(s) without a narrowed outbound scope: {}",
+                not_narrowed.join(", ")
+            ),
         );
     }
-    let all = map.values().filter(|s| s.is_all()).count();
-    let deny = map
-        .values()
-        .filter(|s| matches!(s, PeerOutboundScope::Deny))
-        .count();
-    (
-        all == 0 && deny == 0,
-        format!(
-            "{} scoped peer key(s): all_namespaces={all} empty_list={deny} {UNSEEN}",
-            map.len()
-        ),
-    )
-}
-
-/// The `actual` text of check #23 in a process that cannot see the peer list.
-pub(super) const UNVERIFIABLE: &str = "unverifiable from this process";
-
-/// Red stub (review #10026 S-F2): keeps the env-only judgment.
-#[cfg_attr(not(test), allow(dead_code))]
-fn judge_peers(
-    _peers: Option<&[String]>,
-    parsed: Result<
-        std::collections::BTreeMap<String, PeerOutboundScope>,
-        scope::OutboundScopeConfigError,
-    >,
-) -> (bool, String) {
-    judge_env(parsed, true)
+    if unknown > 0 {
+        return (
+            false,
+            format!("{unknown} scope key(s) name no configured peer"),
+        );
+    }
+    (true, format!("{} peer(s): every one narrowed", peers.len()))
 }
 
 /// Render check #23.
 pub(super) fn check_outbound_scope() -> PostureCheck {
     let (pass, actual) = match scope::boot_scope_rows() {
         Some(rows) => judge_rows(&rows),
-        None => judge_env(
-            scope::from_env(),
-            std::env::var_os(OUTBOUND_SCOPE_ENV).is_some(),
-        ),
+        // No process but `serve` holds the peer list (review #10026 S-F2).
+        None => judge_peers(None, scope::from_env()),
     };
     check(
         CONTROL_OUTBOUND_SCOPE,
@@ -103,7 +109,7 @@ pub(super) fn check_outbound_scope() -> PostureCheck {
         pass,
         "set AI_MEMORY_FED_PEER_OUTBOUND_SCOPE to a JSON object naming, for each peer URL, \
          the namespaces it may receive (`{\"<peer url>\": {\"allowed_namespaces\": [...]}}`); \
-         do not use `**`",
+         do not use `**`; judge it in the running daemon (its boot rows)",
     )
 }
 
@@ -111,18 +117,26 @@ pub(super) fn check_outbound_scope() -> PostureCheck {
 pub(super) mod tests {
     use super::*;
 
-    /// Sets the outbound scope env to one peer with a narrowed scope, the
-    /// passing form of check #23. The caller holds the posture env lock and
-    /// restores the variable (it is in the parent's isolated-env list).
+    /// The peer the passing form of check #23 configures.
+    const NARROWED_PEER_URL: &str = "https://peer-1.example.org:9077";
+
+    /// Sets the outbound scope env to one peer with a narrowed scope and
+    /// records that peer's boot scope row, the passing form of check #23 (a
+    /// daemon that configured the peer). The caller holds the posture env lock,
+    /// runs in an env-isolated child and restores the variable (it is in the
+    /// parent's isolated-env list).
     pub(in crate::enterprise_federation_posture) fn set_narrowed_scope_env() {
         // SAFETY: the parent's posture tests serialise every env write
         // through their env lock; no other thread reads the variable here.
         unsafe {
             std::env::set_var(
                 crate::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
-                r#"{"https://peer-1.example.org:9077":{"allowed_namespaces":["public/*"]}}"#,
+                format!(r#"{{"{NARROWED_PEER_URL}":{{"allowed_namespaces":["public/*"]}}}}"#),
             );
         }
+        let narrowed = PeerOutboundScope::Namespaces(vec!["public/*".to_string()]);
+        let id = crate::federation::peer::stable_peer_id(NARROWED_PEER_URL);
+        scope::record_boot_scopes([(id.as_str(), NARROWED_PEER_URL, &narrowed)]);
     }
 
     fn row(posture: ScopePosture) -> PeerScopeRow {
@@ -145,44 +159,6 @@ pub(super) mod tests {
         for (postures, want) in cases {
             let rows: Vec<_> = postures.iter().copied().map(row).collect();
             assert_eq!(judge_rows(&rows).0, want, "{postures:?}");
-        }
-    }
-
-    #[test]
-    fn env_fails_unset_malformed_empty_all_and_empty_list_9996() {
-        let parse = scope::parse;
-        let cases: [(Option<&str>, bool); 7] = [
-            (None, false),
-            (Some("not json"), false),
-            (Some("{}"), false),
-            (
-                Some(r#"{"https://peer-a:9077": {"allowed_namespaces": ["**"]}}"#),
-                false,
-            ),
-            (
-                Some(r#"{"https://peer-a:9077": {"allowed_namespaces": []}}"#),
-                false,
-            ),
-            (
-                Some(r#"{"https://peer-a:9077": {"allowed_namespaces": ["team/*"]}}"#),
-                true,
-            ),
-            (
-                Some(
-                    r#"{"https://peer-a:9077": {"allowed_namespaces": ["team/*"]},
-                        "https://peer-b:9077": {"allowed_namespaces": ["**"]}}"#,
-                ),
-                false,
-            ),
-        ];
-        for (raw, want) in cases {
-            let parsed = raw.map_or_else(|| Ok(Default::default()), parse);
-            let (pass, actual) = judge_env(parsed, raw.is_some());
-            assert_eq!(pass, want, "{raw:?} -> {actual}");
-            assert!(
-                !actual.contains("peer-a"),
-                "no peer URL in the row: {actual}"
-            );
         }
     }
 
@@ -261,7 +237,7 @@ pub(super) mod tests {
             "unverifiable from this process: the peer list is the `serve --quorum-peers` \
              argument; 1 scoped peer key(s) in the env"
         );
-        let (pass, actual) = judge_peers(None, Ok(std::collections::BTreeMap::new()));
+        let (pass, actual) = judge_peers(None, Ok(BTreeMap::new()));
         assert!(!pass);
         assert_eq!(
             actual,
