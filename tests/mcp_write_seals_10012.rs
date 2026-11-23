@@ -1,0 +1,1586 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #10012 / #10010 — every stdio MCP write tool seals its writes with the
+//! session signer (GA standard 3, "signed writes").
+//!
+//! PR #9953 sealed four tools (`memory_store`, `memory_reflect`,
+//! `memory_consolidate`, `memory_entity_register`). Every other stdio tool
+//! that inserts or changes a `memories` row (update, promote, notify, share,
+//! namespace standards, restore, skill promotion, ...) stored it `claimed`
+//! with no signature, and the tools with their own signature column signed
+//! with the on-disk active key instead of the session key.
+//!
+//! Invariant pinned here, one `ai-memory mcp` process per posture: with a
+//! session key installed, after EVERY registered tool call
+//! - every `memories` row the call inserted or changed and the session agent
+//!   owns is `agent_attested` with a `write_signature` that verifies against
+//!   the key BOUND to the session agent;
+//! - no row the call inserted or changed is sealed for another agent; under
+//!   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` no such row is stored at all;
+//! - every row the call inserted or changed in a table with a signature
+//!   column carries a non-empty signature;
+//! - every other table the call changed is a table the tool's classification
+//!   row names (the `needs-format` tables, which have no signature carrier).
+//!
+//! The ratchet (`every_registered_tool_is_classified_and_driven_10012`)
+//! fails on any registered tool that has no classification row or no drive
+//! step, so a new tool fails by default.
+//!
+//! Stdio MCP opens SQLite only (`run_mcp_server` calls `db::open`, and the
+//! seal funnel is armed in `db::open`), so there is no postgres cell for
+//! this transport.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+use base64::Engine as _;
+use serde_json::{Value, json};
+
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
+
+const AGENT: &str = "ai:sealer-10012";
+const OTHER_AGENT: &str = "ai:other-10012";
+const EXTRA_AGENT: &str = "ai:extra-10012";
+const ENV_KEY_FILE: &str = "AI_MEMORY_MCP_SIGNING_KEY_FILE";
+const ENV_REQUIRE: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTATION";
+const NAMESPACE: &str = "seal-10012";
+const FORGET_NAMESPACE: &str = "seal-forget-10012";
+const WAIT_LABEL: &str = "mcp_write_seals_10012";
+const ATTESTED: &str = "agent_attested";
+const SCRATCH: &str = ".local-runs/mcp_write_seals_10012";
+const POSTURES: [&str; 2] = ["0", "1"];
+
+/// Tables the attestation and bookkeeping machinery writes on every path;
+/// they are never a tool's stored state (reason per entry).
+const EXEMPT_TABLES: [(&str, &str); 14] = [
+    (
+        "audit_log",
+        "hash-chained audit trail of the write, not the write",
+    ),
+    ("attested_write_ledger", "replay ledger of the seal itself"),
+    ("signed_events", "the signed event stream of the write"),
+    ("token_cost_counters", "usage counters, no stored memory"),
+    ("embed_skip", "embedder skip cache, regenerable"),
+    ("memories_fts", "FTS index, regenerable from memories"),
+    ("memories_fts_data", "FTS shadow table, regenerable"),
+    ("memories_fts_idx", "FTS shadow table, regenerable"),
+    ("memories_fts_docsize", "FTS shadow table, regenerable"),
+    ("agent_quotas", "per-agent quota counter, no stored memory"),
+    (
+        "archived_memories",
+        "verbatim archive copy of a prior memories row; its metadata keeps that row's write_signature",
+    ),
+    (
+        "forget_tombstones",
+        "removal receipt signed by the daemon audit key (#1832); records that a row is gone",
+    ),
+    (
+        "memory_revisions",
+        "identity-only revision leaf signed by the daemon audit key (#1823), not a session row",
+    ),
+    (
+        "skill_resources",
+        "covered by the parent skills row signature, which commits to every resource digest",
+    ),
+];
+
+/// Tables with a signature carrier: `(table, signature column)`.
+const SIGNED_TABLES: [(&str, &str); 6] = [
+    ("memory_links", "signature"),
+    ("signals", "signature"),
+    ("checkpoints", "signature"),
+    ("routines", "signature"),
+    ("skills", "signature"),
+    ("offloaded_blobs", "signature_b64"),
+];
+
+/// Side tables with no signature carrier (`needs-format`, #10012 STOP rule).
+const NEEDS_FORMAT_TABLES: [&str; 13] = [
+    "actions",
+    "action_edges",
+    "leases",
+    "subscriptions",
+    "subscription_events",
+    "subscription_dlq",
+    "pending_actions",
+    "namespace_meta",
+    "routine_runs",
+    "recall_observations",
+    "memory_transcripts",
+    "memory_transcript_links",
+    "entity_aliases",
+];
+
+/// How a tool's stored writes are attested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Class {
+    /// Writes no stored state of its own (any `memories` row it touched is
+    /// still swept and must verify).
+    ReadOnly,
+    /// Writes `memories` rows (sealed by the funnel) and/or signature-column
+    /// rows (signed with the session key).
+    Sealed,
+    /// Also writes a side table with no signature carrier (named per row).
+    NeedsFormat,
+}
+
+/// One classification row per registered tool: `(tool, class, side tables
+/// the tool may change without a signature carrier, reason)`.
+const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
+    ("memory_store", Class::Sealed, &[], "inserts memories rows"),
+    (
+        "memory_recall",
+        Class::NeedsFormat,
+        &["recall_observations"],
+        "logs a recall observation row",
+    ),
+    (
+        "memory_recall_observations",
+        Class::ReadOnly,
+        &[],
+        "lists recall observations",
+    ),
+    ("memory_search", Class::ReadOnly, &[], "keyword search"),
+    ("memory_list", Class::ReadOnly, &[], "lists rows"),
+    (
+        "memory_load_family",
+        Class::ReadOnly,
+        &[],
+        "returns a tool family",
+    ),
+    (
+        "memory_smart_load",
+        Class::ReadOnly,
+        &[],
+        "returns a tool family",
+    ),
+    (
+        "memory_get_taxonomy",
+        Class::ReadOnly,
+        &[],
+        "namespace counts",
+    ),
+    (
+        "memory_check_duplicate",
+        Class::ReadOnly,
+        &[],
+        "similarity probe",
+    ),
+    (
+        "memory_entity_register",
+        Class::NeedsFormat,
+        &["entity_aliases"],
+        "entity memory plus alias rows",
+    ),
+    (
+        "memory_entity_get_by_alias",
+        Class::ReadOnly,
+        &[],
+        "alias lookup",
+    ),
+    ("memory_kg_timeline", Class::ReadOnly, &[], "link timeline"),
+    (
+        "memory_kg_invalidate",
+        Class::Sealed,
+        &[],
+        "changes a signed link row",
+    ),
+    ("memory_kg_query", Class::ReadOnly, &[], "graph traversal"),
+    ("memory_find_paths", Class::ReadOnly, &[], "graph traversal"),
+    ("memory_lineage", Class::ReadOnly, &[], "lineage walk"),
+    (
+        "memory_delete",
+        Class::Sealed,
+        &[],
+        "removes a row (nothing left to seal)",
+    ),
+    (
+        "memory_promote",
+        Class::Sealed,
+        &[],
+        "changes a memories row",
+    ),
+    (
+        "memory_forget",
+        Class::Sealed,
+        &[],
+        "removes rows (nothing left to seal)",
+    ),
+    ("memory_stats", Class::ReadOnly, &[], "counts"),
+    (
+        "memory_update",
+        Class::Sealed,
+        &[],
+        "changes a memories row",
+    ),
+    ("memory_get", Class::ReadOnly, &[], "reads a row"),
+    (
+        "memory_link",
+        Class::Sealed,
+        &[],
+        "inserts a signed link row",
+    ),
+    ("memory_get_links", Class::ReadOnly, &[], "reads links"),
+    ("memory_verify", Class::ReadOnly, &[], "verifies signatures"),
+    ("memory_replay", Class::ReadOnly, &[], "replays history"),
+    (
+        "memory_reflect",
+        Class::Sealed,
+        &[],
+        "inserts a reflection row",
+    ),
+    (
+        "memory_export_reflection",
+        Class::ReadOnly,
+        &[],
+        "renders a reflection",
+    ),
+    ("memory_persona", Class::ReadOnly, &[], "reads a persona"),
+    (
+        "memory_persona_generate",
+        Class::Sealed,
+        &[],
+        "inserts a persona row",
+    ),
+    (
+        "memory_reflection_origin",
+        Class::ReadOnly,
+        &[],
+        "reads provenance",
+    ),
+    (
+        "memory_dependents_of_invalidated",
+        Class::ReadOnly,
+        &[],
+        "graph walk",
+    ),
+    (
+        "memory_swarm_rewind",
+        Class::ReadOnly,
+        &[],
+        "dry-run rewind",
+    ),
+    (
+        "memory_consolidate",
+        Class::Sealed,
+        &[],
+        "inserts the consolidated row",
+    ),
+    (
+        "memory_ingest_multistep",
+        Class::Sealed,
+        &[],
+        "inserts memories rows",
+    ),
+    ("memory_atomise", Class::Sealed, &[], "inserts atom rows"),
+    ("memory_share", Class::Sealed, &[], "inserts a shared copy"),
+    (
+        "memory_action_create",
+        Class::NeedsFormat,
+        &["actions"],
+        "action row, no signature column",
+    ),
+    ("memory_action_get", Class::ReadOnly, &[], "reads an action"),
+    (
+        "memory_action_transition",
+        Class::NeedsFormat,
+        &["actions"],
+        "action state, no signature column",
+    ),
+    ("memory_action_list", Class::ReadOnly, &[], "lists actions"),
+    (
+        "memory_action_add_edge",
+        Class::NeedsFormat,
+        &["action_edges"],
+        "edge row, no signature column",
+    ),
+    ("memory_action_edges", Class::ReadOnly, &[], "reads edges"),
+    (
+        "memory_action_frontier",
+        Class::ReadOnly,
+        &[],
+        "reads the frontier",
+    ),
+    (
+        "memory_action_next",
+        Class::ReadOnly,
+        &[],
+        "reads the next action",
+    ),
+    (
+        "memory_lease_acquire",
+        Class::NeedsFormat,
+        &["leases"],
+        "lease row, no signature column",
+    ),
+    (
+        "memory_lease_renew",
+        Class::NeedsFormat,
+        &["leases"],
+        "lease row, no signature column",
+    ),
+    (
+        "memory_lease_release",
+        Class::NeedsFormat,
+        &["leases"],
+        "lease row, no signature column",
+    ),
+    ("memory_lease_get", Class::ReadOnly, &[], "reads a lease"),
+    (
+        "memory_signal_send",
+        Class::Sealed,
+        &[],
+        "inserts a signed signal row",
+    ),
+    ("memory_signal_read", Class::ReadOnly, &[], "reads a signal"),
+    ("memory_signal_inbox", Class::ReadOnly, &[], "lists signals"),
+    (
+        "memory_signal_thread",
+        Class::ReadOnly,
+        &[],
+        "lists a thread",
+    ),
+    (
+        "memory_signal_ack",
+        Class::Sealed,
+        &[],
+        "changes a signed signal row",
+    ),
+    (
+        "memory_checkpoint_create",
+        Class::Sealed,
+        &[],
+        "inserts a signed checkpoint",
+    ),
+    (
+        "memory_checkpoint_resolve",
+        Class::Sealed,
+        &[],
+        "changes a signed checkpoint",
+    ),
+    (
+        "memory_checkpoint_query",
+        Class::ReadOnly,
+        &[],
+        "lists checkpoints",
+    ),
+    (
+        "memory_checkpoint_verify",
+        Class::ReadOnly,
+        &[],
+        "verifies a checkpoint",
+    ),
+    (
+        "memory_routine_create",
+        Class::Sealed,
+        &[],
+        "inserts a signed routine",
+    ),
+    (
+        "memory_routine_freeze",
+        Class::Sealed,
+        &[],
+        "changes a signed routine",
+    ),
+    (
+        "memory_routine_run",
+        Class::NeedsFormat,
+        &["routine_runs"],
+        "run row, no signature column",
+    ),
+    ("memory_routine_status", Class::ReadOnly, &[], "reads a run"),
+    (
+        "memory_routine_list",
+        Class::ReadOnly,
+        &[],
+        "lists routines",
+    ),
+    (
+        "memory_calibrate_confidence",
+        Class::ReadOnly,
+        &[],
+        "computes a report",
+    ),
+    (
+        "memory_capabilities",
+        Class::ReadOnly,
+        &[],
+        "reports capabilities",
+    ),
+    (
+        "memory_capture_turn",
+        Class::NeedsFormat,
+        &["memory_transcripts", "memory_transcript_links"],
+        "transcript rows, no signature column",
+    ),
+    (
+        "memory_expand_query",
+        Class::ReadOnly,
+        &[],
+        "query expansion",
+    ),
+    (
+        "memory_auto_tag",
+        Class::Sealed,
+        &[],
+        "changes a memories row",
+    ),
+    (
+        "memory_detect_contradiction",
+        Class::Sealed,
+        &[],
+        "may insert a link row",
+    ),
+    (
+        "memory_archive_list",
+        Class::ReadOnly,
+        &[],
+        "lists the archive",
+    ),
+    (
+        "memory_archive_restore",
+        Class::Sealed,
+        &[],
+        "re-inserts a memories row",
+    ),
+    (
+        "memory_archive_purge",
+        Class::Sealed,
+        &[],
+        "removes archive rows",
+    ),
+    ("memory_archive_stats", Class::ReadOnly, &[], "counts"),
+    (
+        "memory_gc",
+        Class::NeedsFormat,
+        &["recall_observations"],
+        "removes expired rows, prunes recall observations",
+    ),
+    (
+        "memory_session_start",
+        Class::ReadOnly,
+        &[],
+        "loads context",
+    ),
+    (
+        "memory_namespace_set_standard",
+        Class::NeedsFormat,
+        &["namespace_meta"],
+        "standard pointer row, no signature column",
+    ),
+    (
+        "memory_namespace_get_standard",
+        Class::ReadOnly,
+        &[],
+        "reads the standard",
+    ),
+    (
+        "memory_namespace_clear_standard",
+        Class::NeedsFormat,
+        &["namespace_meta"],
+        "standard pointer row, no signature column",
+    ),
+    (
+        "memory_pending_list",
+        Class::ReadOnly,
+        &[],
+        "lists pending actions",
+    ),
+    (
+        "memory_pending_approve",
+        Class::NeedsFormat,
+        &["pending_actions"],
+        "pending row, no signature column",
+    ),
+    (
+        "memory_pending_reject",
+        Class::NeedsFormat,
+        &["pending_actions"],
+        "pending row, no signature column",
+    ),
+    (
+        "memory_agent_register",
+        Class::Sealed,
+        &[],
+        "inserts an agent memories row",
+    ),
+    ("memory_agent_list", Class::ReadOnly, &[], "lists agents"),
+    (
+        "memory_notify",
+        Class::Sealed,
+        &[],
+        "inserts an inbox memories row",
+    ),
+    ("memory_inbox", Class::ReadOnly, &[], "lists the inbox"),
+    (
+        "memory_subscribe",
+        Class::NeedsFormat,
+        &["subscriptions"],
+        "subscription row, no signature column",
+    ),
+    (
+        "memory_unsubscribe",
+        Class::NeedsFormat,
+        &["subscriptions"],
+        "subscription row, no signature column",
+    ),
+    (
+        "memory_list_subscriptions",
+        Class::ReadOnly,
+        &[],
+        "lists subscriptions",
+    ),
+    (
+        "memory_subscription_replay",
+        Class::NeedsFormat,
+        &["subscription_events", "subscription_dlq"],
+        "replay rows, no signature column",
+    ),
+    (
+        "memory_subscription_dlq_list",
+        Class::ReadOnly,
+        &[],
+        "lists the dlq",
+    ),
+    ("memory_quota_status", Class::ReadOnly, &[], "reads quotas"),
+    (
+        "memory_check_agent_action",
+        Class::ReadOnly,
+        &[],
+        "policy probe",
+    ),
+    ("memory_rule_list", Class::ReadOnly, &[], "lists rules"),
+    (
+        "memory_skill_register",
+        Class::Sealed,
+        &[],
+        "inserts a signed skill",
+    ),
+    ("memory_skill_list", Class::ReadOnly, &[], "lists skills"),
+    ("memory_skill_get", Class::ReadOnly, &[], "reads a skill"),
+    (
+        "memory_skill_resource",
+        Class::ReadOnly,
+        &[],
+        "reads a resource",
+    ),
+    (
+        "memory_skill_export",
+        Class::ReadOnly,
+        &[],
+        "writes files outside the store",
+    ),
+    (
+        "memory_skill_promote_from_reflection",
+        Class::Sealed,
+        &[],
+        "inserts a signed skill",
+    ),
+    (
+        "memory_skill_retire",
+        Class::Sealed,
+        &[],
+        "changes a signed skill",
+    ),
+    ("memory_skill_delete", Class::Sealed, &[], "removes a skill"),
+    (
+        "memory_skill_compositional_context",
+        Class::ReadOnly,
+        &[],
+        "reads context",
+    ),
+    (
+        "memory_offload",
+        Class::Sealed,
+        &[],
+        "inserts a signed blob",
+    ),
+    ("memory_deref", Class::ReadOnly, &[], "reads a blob"),
+];
+
+/// One drive step: the tool, its arguments (with `$SLOT` placeholders), and
+/// the slot to fill from the named key of the result.
+struct Step {
+    tool: &'static str,
+    args: fn() -> Value,
+    capture: Option<(&'static str, &'static str)>,
+    expect: Expect,
+}
+
+/// The exact outcome of one drive step.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    /// The call succeeds under both postures.
+    Ok,
+    /// The call fails under both postures with this exact message prefix
+    /// (a tier gate or a missing fixture; it writes nothing).
+    Refused(&'static str),
+    /// The call writes a memories row owned by another agent: it succeeds
+    /// with strict mode off (the row stays unsigned) and is refused with
+    /// exactly [`FOREIGN_ROW_STRICT_REFUSAL`] with strict mode on.
+    ForeignRow,
+}
+
+/// The session signer's strict refusal for a memories row it does not own
+/// (`ai_memory::identity::session_signer::FOREIGN_ROW_STRICT_REFUSAL`, written
+/// out so this test also compiles on the base, where it is red).
+const FOREIGN_ROW_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a write to a memory row the session agent does not own cannot be sealed; refused";
+
+/// Rows a create step stores unsigned BY DESIGN: the row is signed when it
+/// is frozen or resolved, and the sweep checks the signature at that step.
+const SIGNED_LATER: [(&str, &str, &str); 2] = [
+    (
+        "memory_checkpoint_create",
+        "checkpoints",
+        "signed at resolve (src/checkpoints/mod.rs)",
+    ),
+    (
+        "memory_routine_create",
+        "routines",
+        "signed at freeze (src/routines/mod.rs)",
+    ),
+];
+
+const fn step(tool: &'static str, args: fn() -> Value) -> Step {
+    Step {
+        tool,
+        args,
+        capture: None,
+        expect: Expect::Ok,
+    }
+}
+
+const fn refused(tool: &'static str, args: fn() -> Value, prefix: &'static str) -> Step {
+    Step {
+        tool,
+        args,
+        capture: None,
+        expect: Expect::Refused(prefix),
+    }
+}
+
+const fn foreign(tool: &'static str, args: fn() -> Value) -> Step {
+    Step {
+        tool,
+        args,
+        capture: None,
+        expect: Expect::ForeignRow,
+    }
+}
+
+const fn cap(
+    tool: &'static str,
+    args: fn() -> Value,
+    slot: &'static str,
+    key: &'static str,
+) -> Step {
+    Step {
+        tool,
+        args,
+        capture: Some((slot, key)),
+        expect: Expect::Ok,
+    }
+}
+
+fn body(title: &str) -> String {
+    format!("Body of {title}: a plain sentence long enough to be stored as prose.")
+}
+
+fn store_args(title: &str) -> Value {
+    json!({"title": title, "content": body(title), "namespace": NAMESPACE, "kind": "observation"})
+}
+
+const INLINE_SKILL: &str = "---\nname: seal-skill-10012\nnamespace: seal-10012\ndescription: A test skill for the seal sweep.\n---\n\n# Seal skill\n\nDo the sealed thing.\n";
+
+/// Every registered tool, driven once or more, in dependency order.
+const STEPS: &[Step] = &[
+    cap("memory_store", || store_args("seal a 10012"), "A", "id"),
+    cap("memory_store", || store_args("seal b 10012"), "B", "id"),
+    cap("memory_store", || store_args("seal c 10012"), "C", "id"),
+    cap("memory_store", || store_args("seal d 10012"), "D", "id"),
+    cap(
+        "memory_store",
+        || json!({"title": "seal forget 10012", "content": body("forget"), "namespace": FORGET_NAMESPACE}),
+        "F",
+        "id",
+    ),
+    step(
+        "memory_update",
+        || json!({"id": "$A", "content": body("seal a updated 10012")}),
+    ),
+    step(
+        "memory_promote",
+        || json!({"id": "$B", "target_tier": "long"}),
+    ),
+    step(
+        "memory_link",
+        || json!({"source_id": "$A", "target_id": "$B", "relation": "related_to"}),
+    ),
+    cap(
+        "memory_reflect",
+        || json!({"source_ids": ["$A", "$B"], "title": "seal reflection 10012", "content": body("reflection"), "namespace": NAMESPACE}),
+        "R",
+        "id",
+    ),
+    cap(
+        "memory_consolidate",
+        || json!({"ids": ["$C", "$D"], "title": "seal consolidation 10012", "summary": body("consolidation"), "namespace": NAMESPACE}),
+        "CON",
+        "id",
+    ),
+    cap(
+        "memory_entity_register",
+        || json!({"canonical_name": "Seal Entity 10012", "namespace": NAMESPACE, "aliases": ["seal-entity-10012"]}),
+        "ENT",
+        "entity_id",
+    ),
+    step(
+        "memory_entity_get_by_alias",
+        || json!({"alias": "seal-entity-10012", "namespace": NAMESPACE}),
+    ),
+    step(
+        "memory_persona",
+        || json!({"entity_id": "$ENT", "namespace": NAMESPACE}),
+    ),
+    refused(
+        "memory_persona_generate",
+        || json!({"entity_id": "$ENT", "namespace": NAMESPACE}),
+        "memory_persona_generate requires smart tier or higher",
+    ),
+    refused(
+        "memory_auto_tag",
+        || json!({"id": "$A"}),
+        "auto-tagging requires smart or autonomous tier",
+    ),
+    refused(
+        "memory_detect_contradiction",
+        || json!({"id_a": "$A", "id_b": "$B"}),
+        "contradiction detection requires smart or autonomous tier",
+    ),
+    refused(
+        "memory_check_duplicate",
+        || json!({"title": "seal a 10012", "content": body("seal a 10012"), "namespace": NAMESPACE}),
+        "memory_check_duplicate requires the embedder",
+    ),
+    step("memory_atomise", || json!({"memory_id": "$A"})),
+    step(
+        "memory_ingest_multistep",
+        || json!({"content": body("ingest"), "namespace": NAMESPACE}),
+    ),
+    step(
+        "memory_capture_turn",
+        || json!({"host_session_id": "seal-session-10012", "host_turn_index": 1, "role": "user", "content": body("turn"), "namespace": NAMESPACE}),
+    ),
+    foreign(
+        "memory_share",
+        || json!({"source_memory_id": "$A", "target_agent_id": OTHER_AGENT}),
+    ),
+    step(
+        "memory_notify",
+        || json!({"target_agent_id": OTHER_AGENT, "title": "seal notify 10012", "payload": body("notify")}),
+    ),
+    step("memory_inbox", || json!({})),
+    step(
+        "memory_namespace_set_standard",
+        || json!({"namespace": NAMESPACE, "id": "$B"}),
+    ),
+    step(
+        "memory_namespace_get_standard",
+        || json!({"namespace": NAMESPACE}),
+    ),
+    step(
+        "memory_namespace_clear_standard",
+        || json!({"namespace": NAMESPACE}),
+    ),
+    step("memory_get", || json!({"id": "$A"})),
+    step("memory_get_links", || json!({"id": "$A"})),
+    step("memory_kg_query", || json!({"source_id": "$A"})),
+    step("memory_kg_timeline", || json!({"source_id": "$A"})),
+    step(
+        "memory_find_paths",
+        || json!({"source_id": "$A", "target_id": "$B"}),
+    ),
+    step("memory_lineage", || json!({"id": "$R"})),
+    step(
+        "memory_verify",
+        || json!({"source_id": "$A", "target_id": "$B", "relation": "related_to"}),
+    ),
+    step("memory_replay", || json!({"memory_id": "$A"})),
+    step("memory_reflection_origin", || json!({"memory_id": "$R"})),
+    step("memory_export_reflection", || json!({"memory_id": "$R"})),
+    step(
+        "memory_kg_invalidate",
+        || json!({"source_id": "$A", "target_id": "$B", "relation": "related_to"}),
+    ),
+    step(
+        "memory_dependents_of_invalidated",
+        || json!({"memory_id": "$A"}),
+    ),
+    cap(
+        "memory_skill_promote_from_reflection",
+        || json!({"reflection_id": "$R", "skill_name": "seal-promoted-10012", "skill_description": "A skill promoted from the seal reflection."}),
+        "SKP",
+        "skill_id",
+    ),
+    cap(
+        "memory_skill_register",
+        || json!({"inline_skill": INLINE_SKILL}),
+        "SK",
+        "id",
+    ),
+    step("memory_skill_list", || json!({})),
+    step("memory_skill_get", || json!({"skill_id": "$SK"})),
+    // An inline skill carries no resource files; the read is refused and
+    // writes nothing (the tool is read-only either way).
+    refused(
+        "memory_skill_resource",
+        || json!({"skill_id": "$SK", "resource_path": "SKILL.md"}),
+        "resource not found: skill_id=",
+    ),
+    step(
+        "memory_skill_export",
+        || json!({"skill_id": "$SK", "target_folder": "export"}),
+    ),
+    step(
+        "memory_skill_compositional_context",
+        || json!({"skill_id": "$SK"}),
+    ),
+    step(
+        "memory_skill_retire",
+        || json!({"skill_id": "$SK", "reason": "seal sweep"}),
+    ),
+    step(
+        "memory_skill_delete",
+        || json!({"skill_id": "$SKP", "force": true}),
+    ),
+    cap(
+        "memory_action_create",
+        || json!({"namespace": NAMESPACE, "kind": "task", "title": "seal action 10012"}),
+        "ACT",
+        "id",
+    ),
+    cap(
+        "memory_action_create",
+        || json!({"namespace": NAMESPACE, "kind": "task", "title": "seal action two 10012"}),
+        "ACT2",
+        "id",
+    ),
+    step(
+        "memory_action_add_edge",
+        || json!({"from_action": "$ACT", "to_action": "$ACT2", "edge_type": "blocks"}),
+    ),
+    step("memory_action_get", || json!({"id": "$ACT"})),
+    step("memory_action_list", || json!({"namespace": NAMESPACE})),
+    step("memory_action_edges", || json!({"id": "$ACT"})),
+    step("memory_action_frontier", || json!({"namespace": NAMESPACE})),
+    step("memory_action_next", || json!({"namespace": NAMESPACE})),
+    step(
+        "memory_lease_acquire",
+        || json!({"action_id": "$ACT", "holder": AGENT}),
+    ),
+    step("memory_lease_get", || json!({"action_id": "$ACT"})),
+    step(
+        "memory_lease_renew",
+        || json!({"action_id": "$ACT", "holder": AGENT}),
+    ),
+    step(
+        "memory_lease_release",
+        || json!({"action_id": "$ACT", "holder": AGENT}),
+    ),
+    step(
+        "memory_action_transition",
+        || json!({"id": "$ACT", "to": "claimed", "claimed_by": AGENT}),
+    ),
+    step(
+        "memory_action_transition",
+        || json!({"id": "$ACT", "to": "in_progress", "claimed_by": AGENT}),
+    ),
+    cap(
+        "memory_signal_send",
+        || json!({"namespace": NAMESPACE, "from_agent": AGENT, "to_agent": AGENT, "subject": "seal signal 10012", "correlation_id": "seal-corr-10012"}),
+        "SIG",
+        "id",
+    ),
+    step("memory_signal_read", || json!({"id": "$SIG"})),
+    step("memory_signal_inbox", || json!({"namespace": NAMESPACE})),
+    step(
+        "memory_signal_thread",
+        || json!({"correlation_id": "seal-corr-10012"}),
+    ),
+    step("memory_signal_ack", || json!({"id": "$SIG"})),
+    cap(
+        "memory_checkpoint_create",
+        || json!({"namespace": NAMESPACE, "title": "seal checkpoint 10012"}),
+        "CK",
+        "id",
+    ),
+    step(
+        "memory_checkpoint_query",
+        || json!({"namespace": NAMESPACE}),
+    ),
+    step("memory_checkpoint_verify", || json!({"id": "$CK"})),
+    step(
+        "memory_checkpoint_resolve",
+        || json!({"id": "$CK", "state": "resolved", "resolved_by": AGENT}),
+    ),
+    cap(
+        "memory_routine_create",
+        || json!({"namespace": NAMESPACE, "name": "seal-routine-10012", "template": {"steps": []}}),
+        "RT",
+        "id",
+    ),
+    step("memory_routine_list", || json!({"namespace": NAMESPACE})),
+    step("memory_routine_freeze", || json!({"id": "$RT"})),
+    cap(
+        "memory_routine_run",
+        || json!({"routine_id": "$RT", "arguments": {}}),
+        "RUN",
+        "id",
+    ),
+    step("memory_routine_status", || json!({"run_id": "$RUN"})),
+    cap(
+        "memory_offload",
+        || json!({"content": body("offload"), "namespace": NAMESPACE}),
+        "REF",
+        "ref_id",
+    ),
+    step("memory_deref", || json!({"ref_id": "$REF"})),
+    cap(
+        "memory_subscribe",
+        || json!({"url": "https://example.invalid/seal-10012", "secret": "seal-hmac-10012"}),
+        "SUB",
+        "id",
+    ),
+    step("memory_list_subscriptions", || json!({})),
+    step(
+        "memory_subscription_replay",
+        || json!({"subscription_id": "$SUB", "since": "2026-01-01T00:00:00Z"}),
+    ),
+    step("memory_subscription_dlq_list", || json!({})),
+    step("memory_unsubscribe", || json!({"id": "$SUB"})),
+    step("memory_pending_list", || json!({})),
+    refused(
+        "memory_pending_approve",
+        || json!({"id": "seal-no-such-pending-10012"}),
+        "pending action not found: seal-no-such-pending-10012",
+    ),
+    refused(
+        "memory_pending_reject",
+        || json!({"id": "seal-no-such-pending-10012"}),
+        "pending action not found or already decided: seal-no-such-pending-10012",
+    ),
+    foreign(
+        "memory_agent_register",
+        || json!({"agent_id": EXTRA_AGENT, "agent_type": "ai:test"}),
+    ),
+    step("memory_agent_list", || json!({})),
+    step("memory_quota_status", || json!({})),
+    step(
+        "memory_check_agent_action",
+        || json!({"kind": "custom", "custom_kind": "seal-10012"}),
+    ),
+    step("memory_rule_list", || json!({})),
+    step("memory_calibrate_confidence", || json!({})),
+    step("memory_capabilities", || json!({})),
+    refused(
+        "memory_expand_query",
+        || json!({"query": "seal"}),
+        "query expansion requires smart or autonomous tier",
+    ),
+    step("memory_get_taxonomy", || json!({})),
+    step("memory_list", || json!({"namespace": NAMESPACE})),
+    step("memory_search", || json!({"query": "seal"})),
+    step(
+        "memory_recall",
+        || json!({"context": "seal", "namespace": NAMESPACE}),
+    ),
+    step("memory_recall_observations", || json!({})),
+    step("memory_smart_load", || json!({"intent": "store a memory"})),
+    step("memory_load_family", || json!({"family": "core"})),
+    step("memory_session_start", || json!({"namespace": NAMESPACE})),
+    step("memory_stats", || json!({})),
+    step(
+        "memory_swarm_rewind",
+        || json!({"to": "$A", "dry_run": true}),
+    ),
+    step("memory_delete", || json!({"id": "$B"})),
+    step(
+        "memory_forget",
+        || json!({"namespace": FORGET_NAMESPACE, "pattern": "forget"}),
+    ),
+    step("memory_archive_list", || json!({})),
+    step("memory_archive_restore", || json!({"id": "$F"})),
+    step("memory_archive_stats", || json!({})),
+    step("memory_archive_purge", || json!({})),
+    step("memory_gc", || json!({})),
+];
+
+struct Sandbox {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl Sandbox {
+    fn new() -> Self {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join(SCRATCH);
+        std::fs::create_dir_all(&scratch).expect("scratch dir under .local-runs");
+        let dir = tempfile::Builder::new()
+            .prefix("seal-")
+            .tempdir_in(&scratch)
+            .expect("tempdir under .local-runs");
+        let root = dir.path().to_path_buf();
+        let keys = root.join("keys");
+        std::fs::create_dir_all(&keys).expect("key dir");
+        set_mode(&keys, 0o700);
+        Self { _dir: dir, root }
+    }
+
+    fn db(&self) -> PathBuf {
+        self.root.join("store.db")
+    }
+
+    fn base_command(&self, agent: &str, require: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+        cmd.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.root.join("home"))
+            .env("XDG_CONFIG_HOME", self.root.join("home/.config"))
+            .env("TMPDIR", &self.root)
+            .env("AI_MEMORY_KEY_DIR", self.root.join("keys"))
+            .env("AI_MEMORY_DB", self.db())
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_AGENT_ID", agent)
+            .env(ENV_REQUIRE, require);
+        cmd
+    }
+
+    fn cli(&self, agent: &str, args: &[&str]) -> Output {
+        self.base_command(agent, "0")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run ai-memory cli")
+    }
+
+    fn cli_ok(&self, agent: &str, args: &[&str]) -> String {
+        let out = self.cli(agent, args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `AGENT` generated, registered and bound; its key copied to a 0600
+    /// session key file.
+    fn bound_key_file(&self) -> PathBuf {
+        let out = self.cli(AGENT, &["identity", "generate", "--agent-id", AGENT]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() || err.contains("already exists"),
+            "identity generate: {err}"
+        );
+        let priv_path = self.root.join("keys").join(format!("{AGENT}.priv"));
+        self.cli_ok(
+            AGENT,
+            &[
+                "agents",
+                "register",
+                "--agent-id",
+                AGENT,
+                "--agent-type",
+                "ai:test",
+            ],
+        );
+        self.cli_ok(
+            AGENT,
+            &[
+                "agents",
+                "register",
+                "--agent-id",
+                OTHER_AGENT,
+                "--agent-type",
+                "ai:test",
+            ],
+        );
+        let pubkey = self.cli_ok(AGENT, &["identity", "export-pub", "--agent-id", AGENT]);
+        assert!(!pubkey.is_empty(), "export-pub printed a key");
+        self.cli_ok(
+            AGENT,
+            &[
+                "agents",
+                "bind-key",
+                "--agent-id",
+                AGENT,
+                "--pubkey",
+                &pubkey,
+            ],
+        );
+        let bytes = std::fs::read(&priv_path).expect("read generated key");
+        let path = self.root.join("session.key");
+        let mut f = std::fs::File::create(&path).expect("create key file");
+        f.write_all(&bytes).expect("write key file");
+        drop(f);
+        set_mode(&path, 0o600);
+        path
+    }
+
+    fn start(&self, require: &str, key_file: &Path) -> Mcp {
+        let mut cmd = self.base_command(AGENT, require);
+        cmd.args([
+            "--db",
+            self.db().to_str().expect("utf-8 db path"),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ])
+        .env(ENV_KEY_FILE, key_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        Mcp::spawn(cmd)
+    }
+
+    /// A READ-ONLY connection: the sweep never migrates or takes a write lock.
+    fn conn(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(self.db(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open sandbox db read-only")
+    }
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+struct Mcp {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::sync::mpsc::Receiver<String>,
+    next_id: u64,
+}
+
+impl Mcp {
+    fn spawn(mut cmd: Command) -> Self {
+        let mut child = cmd.spawn().expect("spawn ai-memory mcp");
+        let input = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let (tx, output) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut mcp = Self {
+            child,
+            input,
+            output,
+            next_id: 1,
+        };
+        let response = mcp.request(
+            "initialize",
+            &json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "seal-10012", "version": "1"}
+            }),
+        );
+        assert!(response.get("error").is_none(), "initialize: {response}");
+        mcp
+    }
+
+    fn request(&mut self, method: &str, params: &Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        child_stdin_report::write_line_or_report(
+            &mut self.input,
+            &mut self.child,
+            None,
+            "MCP request",
+            &req.to_string(),
+        );
+        loop {
+            let line = mcp_wait::recv_mcp_response(&self.output, WAIT_LABEL);
+            let response: Value = serde_json::from_str(&line).expect("JSON RPC");
+            if response.get("id") == req.get("id") {
+                return response;
+            }
+        }
+    }
+
+    /// `(is_error, text)` of one tool call; an RPC-level error is reported
+    /// as `is_error` with the error object as text.
+    fn call_raw(&mut self, tool: &str, arguments: &Value) -> (bool, String) {
+        let response = self.request("tools/call", &json!({"name": tool, "arguments": arguments}));
+        if let Some(err) = response.get("error") {
+            return (true, err.to_string());
+        }
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (response["result"]["isError"] == true, text)
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Replace `$SLOT` strings (whole value, or a `$DIR/...` prefix).
+fn fill(value: &Value, slots: &BTreeMap<String, String>) -> Value {
+    match value {
+        Value::String(s) if s.starts_with('$') => {
+            let (head, tail) = s[1..]
+                .split_once('/')
+                .map_or((&s[1..], ""), |(h, t)| (h, t));
+            slots.get(head).map_or_else(
+                || value.clone(),
+                |v| {
+                    if tail.is_empty() {
+                        Value::String(v.clone())
+                    } else {
+                        Value::String(format!("{v}/{tail}"))
+                    }
+                },
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|v| fill(v, slots)).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), fill(v, slots)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// Every user table's rows as `(table -> {row text})`; `memories` keeps
+/// only the signed columns so an access-count bump is not a change.
+type Snapshot = BTreeMap<String, BTreeMap<String, String>>;
+
+fn table_names(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .expect("list tables");
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .expect("query tables")
+        .map(|r| r.expect("table name"))
+        .collect()
+}
+
+fn cell_text(v: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => "NULL".to_string(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(f) => f.to_string(),
+        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+        ValueRef::Blob(b) => base64::engine::general_purpose::STANDARD.encode(b),
+    }
+}
+
+fn snapshot(sb: &Sandbox) -> Snapshot {
+    let conn = sb.conn();
+    let mut snap = Snapshot::new();
+    for table in table_names(&conn) {
+        let sql = if table == "memories" {
+            "SELECT id, namespace, title, content, memory_kind, created_at, metadata FROM memories"
+                .to_string()
+        } else {
+            format!("SELECT rowid, * FROM \"{table}\"")
+        };
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue; // virtual tables without rowid
+        };
+        let cols = stmt.column_count();
+        let mut rows = BTreeMap::new();
+        let mut q = stmt.query([]).expect("query rows");
+        while let Some(row) = q.next().expect("next row") {
+            let key = cell_text(row.get_ref(0).expect("key"));
+            let text: Vec<String> = (0..cols)
+                .map(|i| {
+                    format!(
+                        "{}={}",
+                        row.as_ref().column_name(i).unwrap_or("?"),
+                        cell_text(row.get_ref(i).expect("cell"))
+                    )
+                })
+                .collect();
+            rows.insert(key, text.join("\u{1f}"));
+        }
+        snap.insert(table, rows);
+    }
+    snap
+}
+
+/// Keys of rows inserted or changed between two snapshots of one table.
+fn changed(before: &Snapshot, after: &Snapshot, table: &str) -> Vec<String> {
+    let empty = BTreeMap::new();
+    let old = before.get(table).unwrap_or(&empty);
+    after
+        .get(table)
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|(k, v)| old.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// The exact defects of one memories row the step inserted or changed, or
+/// none when it is sealed for the session agent and verifies.
+fn memory_row_defects(sb: &Sandbox, id: &str, require: &str) -> Vec<String> {
+    let conn = sb.conn();
+    let Some(mem) = ai_memory::db::get_any(&conn, id).expect("get_any") else {
+        return Vec::new();
+    };
+    let owner = mem.metadata["agent_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let level = mem.metadata["attest_level"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if owner != AGENT {
+        if require == "1" {
+            return vec![format!(
+                "row {id} owned by {owner:?} stored under strict mode"
+            )];
+        }
+        if level == ATTESTED {
+            let bound = ai_memory::db::agent_pubkey(&conn, &owner).expect("owner key lookup");
+            if bound.is_none() {
+                return vec![format!(
+                    "row {id} owned by {owner:?} is agent_attested with no key of its own"
+                )];
+            }
+        }
+        return Vec::new();
+    }
+    if level != ATTESTED {
+        return vec![format!(
+            "row {id} attest_level {level:?}, expected {ATTESTED:?}"
+        )];
+    }
+    let Some(sig_b64) = mem.metadata["write_signature"].as_str() else {
+        return vec![format!("row {id} has no write_signature")];
+    };
+    let Ok(sig) = base64::engine::general_purpose::STANDARD.decode(sig_b64) else {
+        return vec![format!("row {id} write_signature is not base64")];
+    };
+    let bound = ai_memory::db::agent_pubkey(&conn, AGENT).expect("bound key lookup");
+    match ai_memory::identity::attest::resolve_write_attest_level(
+        &mem,
+        AGENT,
+        bound.as_deref(),
+        Some(&sig),
+        true,
+    ) {
+        Ok(ai_memory::identity::verify::AttestLevel::AgentAttested) => Vec::new(),
+        Ok(other) => vec![format!("row {id} verified level {other:?}")],
+        Err(e) => vec![format!(
+            "row {id} signature does not verify against the bound key: {e}"
+        )],
+    }
+}
+
+fn signed_row_defect(after: &Snapshot, table: &str, column: &str, key: &str) -> Option<String> {
+    let row = &after[table][key];
+    let needle = format!("{column}=");
+    let value = row
+        .split('\u{1f}')
+        .find_map(|cell| cell.strip_prefix(needle.as_str()))
+        .unwrap_or("NULL");
+    (value == "NULL" || value.is_empty()).then(|| format!("{table} row {key} has no {column}"))
+}
+
+/// The exact mismatch between a step's outcome and its [`Expect`], if any.
+fn outcome_defect(expect: Expect, require: &str, is_error: bool, text: &str) -> Option<String> {
+    let strict = require == "1";
+    let refused_with = match expect {
+        Expect::Ok => None,
+        Expect::Refused(prefix) => Some(prefix),
+        Expect::ForeignRow => strict.then_some(FOREIGN_ROW_STRICT_REFUSAL),
+    };
+    match (refused_with, is_error) {
+        (None, false) => None,
+        (None, true) => Some(format!("expected success, got error {text:?}")),
+        (Some(p), true) if text.starts_with(p) => None,
+        (Some(p), true) => Some(format!("expected refusal {p:?}, got error {text:?}")),
+        (Some(p), false) => Some(format!("expected refusal {p:?}, got success {text:?}")),
+    }
+}
+
+fn class_of(tool: &str) -> (Class, &'static [&'static str]) {
+    TOOL_CLASS
+        .iter()
+        .find(|(name, ..)| *name == tool)
+        .map_or_else(
+            || panic!("{tool} has no TOOL_CLASS row"),
+            |(_, c, t, _)| (*c, *t),
+        )
+}
+
+/// Drive every step under one posture; return every defect, attributed to
+/// the tool call that produced it.
+fn sweep_all_tools(require: &str) -> Vec<String> {
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(require, &key);
+    let mut slots = BTreeMap::new();
+    slots.insert("DIR".to_string(), sb.root.to_string_lossy().into_owned());
+    let mut defects = Vec::new();
+    let mut before = snapshot(&sb);
+    for (n, s) in STEPS.iter().enumerate() {
+        let args = fill(&(s.args)(), &slots);
+        let (is_error, text) = mcp.call_raw(s.tool, &args);
+        if let (false, Some((slot, field))) = (is_error, s.capture) {
+            let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if let Some(id) = parsed[field].as_str() {
+                slots.insert(slot.to_string(), id.to_string());
+            }
+        }
+        let after = snapshot(&sb);
+        let label = format!("step {n} {} REQUIRE={require}", s.tool);
+        let (_class, side) = class_of(s.tool);
+        if let Some(d) = outcome_defect(s.expect, require, is_error, &text) {
+            defects.push(format!("{label}: {d}"));
+        }
+        for id in changed(&before, &after, "memories") {
+            for d in memory_row_defects(&sb, &id, require) {
+                defects.push(format!("{label}: {d}"));
+            }
+        }
+        for (table, column) in SIGNED_TABLES {
+            if SIGNED_LATER
+                .iter()
+                .any(|(t, tb, _)| *t == s.tool && *tb == table)
+            {
+                continue;
+            }
+            for k in changed(&before, &after, table) {
+                if let Some(d) = signed_row_defect(&after, table, column, &k) {
+                    defects.push(format!("{label}: {d}"));
+                }
+            }
+        }
+        for table in after.keys() {
+            let known = table == "memories"
+                || EXEMPT_TABLES.iter().any(|(t, _)| t == table)
+                || SIGNED_TABLES.iter().any(|(t, _)| t == table)
+                || side.contains(&table.as_str());
+            if !known && !changed(&before, &after, table).is_empty() {
+                defects.push(format!(
+                    "{label}: changed table {table} its TOOL_CLASS row does not name"
+                ));
+            }
+        }
+        eprintln!(
+            "seal-10012 {label}: is_error={is_error} {}",
+            text.chars().take(100).collect::<String>()
+        );
+        before = after;
+    }
+    defects
+}
+
+/// FAILS on the base (`fix/stdio-selfsign`): `memory_update`,
+/// `memory_promote`, ... store `claimed` rows and the side tools sign with
+/// the on-disk key, not the session key.
+#[test]
+fn every_tool_write_is_sealed_permissive_10012() {
+    let defects = sweep_all_tools(POSTURES[0]);
+    assert!(
+        defects.is_empty(),
+        "{} defects:\n{}",
+        defects.len(),
+        defects.join("\n")
+    );
+}
+
+#[test]
+fn every_tool_write_is_sealed_strict_10012() {
+    let defects = sweep_all_tools(POSTURES[1]);
+    assert!(
+        defects.is_empty(),
+        "{} defects:\n{}",
+        defects.len(),
+        defects.join("\n")
+    );
+}
+
+/// The ratchet: the registry, `TOOL_CLASS` and `STEPS` name the same tools,
+/// each `TOOL_CLASS` name once, every side table a known `needs-format`
+/// table, and only `NeedsFormat` rows name side tables.
+#[test]
+fn every_registered_tool_is_classified_and_driven_10012() {
+    let defs = ai_memory::mcp::tool_definitions();
+    let registry: BTreeSet<String> = defs["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().expect("tool name").to_string())
+        .collect();
+    let classified: Vec<&str> = TOOL_CLASS.iter().map(|(n, ..)| *n).collect();
+    let classified_set: BTreeSet<String> = classified.iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(
+        classified.len(),
+        classified_set.len(),
+        "a TOOL_CLASS name repeats"
+    );
+    let driven: BTreeSet<String> = STEPS.iter().map(|s| s.tool.to_string()).collect();
+    let unclassified: Vec<_> = registry.difference(&classified_set).collect();
+    let undriven: Vec<_> = registry.difference(&driven).collect();
+    let unknown: Vec<_> = classified_set
+        .union(&driven)
+        .filter(|n| !registry.contains(*n))
+        .collect();
+    assert_eq!(
+        unclassified,
+        Vec::<&String>::new(),
+        "registered tools with no TOOL_CLASS row"
+    );
+    assert_eq!(
+        undriven,
+        Vec::<&String>::new(),
+        "registered tools with no drive step"
+    );
+    assert_eq!(
+        unknown,
+        Vec::<&String>::new(),
+        "classified or driven tools not in the registry"
+    );
+    for (name, class, side, reason) in TOOL_CLASS {
+        assert!(!reason.is_empty(), "{name}: reason");
+        assert_eq!(
+            class == Class::NeedsFormat,
+            !side.is_empty(),
+            "{name}: NeedsFormat iff side tables"
+        );
+        for t in side {
+            assert!(
+                NEEDS_FORMAT_TABLES.contains(t),
+                "{name}: {t} is not a needs-format table"
+            );
+        }
+    }
+}
