@@ -141,6 +141,30 @@ const ARCHIVED_ROW: (&str, &str, Tier, &str) = (
 /// The embedding seed of the archived row.
 const ARCHIVED_SEED: usize = 99;
 
+// ── raw column values the trait funnels do not write (#10014, #10015) ──────
+// Every value is written out here; none is read from the code under test.
+
+/// The title of the sealed corpus row (#10015).
+const SEALED_TITLE: &str = "sealed row";
+/// The plaintext the sealed row's envelope opens to.
+const SEALED_PLAINTEXT: &str = "sealed plaintext — 封印 ✓";
+const LAST_ACCESSED_AT: &str = "2031-04-03T08:15:00.250000+00:00";
+/// The claim window in the canonical micros-`Z` rendering every write funnel
+/// stores (`validate::canonical_valid_time_opt`).
+const CLAIM_VALID_FROM: &str = "2031-01-01T00:00:00.000000Z";
+const CLAIM_VALID_UNTIL: &str = "2099-12-31T23:59:59.000000Z";
+const LINK_VALID_UNTIL: &str = "2097-02-01T00:00:00.000000+00:00";
+/// A `ConfidenceSignals` envelope in its serialised field order.
+const CONFIDENCE_SIGNALS: &str = r#"{"source_age_days":12.5,"atom_derivation":false,"prior_corroboration_count":2,"freshness_factor":0.75,"baseline_per_source":0.5}"#;
+const CONFIDENCE_DECAYED_AT: &str = "2031-04-04T00:00:00.000000+00:00";
+const PERSONA_VERSION: i32 = 4;
+const ENTITY_ID: &str = "entity-fidelity-9944";
+const SOURCE_URI: &str = "file:///fidelity-9944/source.md";
+const SOURCE_SPAN: &str = r#"{"start":0,"end":17}"#;
+const KIND_PROVENANCE: &str = "declared";
+const ATOMISED_INTO: i32 = 2;
+const TARGET_AGENT: &str = "ai:fidelity-9944-peer";
+
 // ── classification of the admin export → import path ───────────────────────
 
 const NOT_EXPORT_CLASS: &str = "by design: the admin export carries memories and links only";
@@ -165,6 +189,29 @@ const UNSIGNED_ATTEST_LEVEL: &str = "unsigned";
 /// The admin export carries the A2A task records on its final page, but the
 /// import lands memories and links only, so the tasks are dropped (#10024).
 const A2A_NOT_IMPORTED: &str = "the admin import drops the a2a_tasks the export carries (#10024)";
+
+/// The admin export opens a sealed row and the import writes the plaintext
+/// back with no envelope (#10033).
+const SEALED_ROW_UNSEALED: &str = "the postgres admin export/import writes a sealed row back as plaintext with no envelope (#10033)";
+/// The main export cells seed no sealed row (#10033); the dedicated red
+/// cell seeds one and stays red until the fix lands.
+const MAIN_CELL_SEALED: Sealed = Sealed::Absent;
+/// `models::Memory` has no field for the atomisation and entity-mention
+/// columns, so the admin page never carries them (#10034). The dedicated red
+/// cell `pg_router_export_keeps_every_atomisation_column_10034` checks them.
+const ATOM_COLUMNS_DROPPED: &str = "the admin export page has no field for this memories column, so the import lands NULL (#10034)";
+/// The admin import re-creates each edge through link(), which does not write
+/// the carried endpoint cid mirrors (#10035). The dedicated red cell
+/// `pg_router_export_keeps_every_link_cid_mirror_10035` checks them.
+const LINK_CID_DROPPED: &str =
+    "the admin import re-creates each edge through link(), which drops the cid mirrors (#10035)";
+/// The declared vector dimension describes the vector the export does not
+/// carry, so it goes with it.
+const VECTOR_DIM_NOT_EXPORTED: &str = "by design: embedding_dim declares the vector the export does not carry; the destination re-embeds";
+/// The atomisation and entity-mention columns the admin pair drops (#10034).
+const ATOM_COLUMNS: &[&str] = &["atomised_into", "atom_of", "mentioned_entity_id"];
+/// The edge cid mirrors the admin pair drops (#10035).
+const LINK_CID_COLUMNS: &[&str] = &["source_cid", "target_cid"];
 
 static EXPORT_IMPORT: Classification = Classification {
     path: "postgres admin export/import",
@@ -247,8 +294,14 @@ static EXPORT_IMPORT: Classification = Classification {
     lossy: &[
         ("memories", "embedding", VECTOR_NOT_EXPORTED),
         ("memories", "embedding_space", VECTOR_NOT_EXPORTED),
+        ("memories", "embedding_dim", VECTOR_DIM_NOT_EXPORTED),
+        ("memories", "atomised_into", ATOM_COLUMNS_DROPPED),
+        ("memories", "atom_of", ATOM_COLUMNS_DROPPED),
+        ("memories", "mentioned_entity_id", ATOM_COLUMNS_DROPPED),
         ("memory_links", "signature", CONVENIENCE_LINK_UNSIGNED),
         ("memory_links", "observed_by", CONVENIENCE_LINK_UNSIGNED),
+        ("memory_links", "source_cid", LINK_CID_DROPPED),
+        ("memory_links", "target_cid", LINK_CID_DROPPED),
     ],
     rederived: &[Rederived {
         table: "memory_links",
@@ -257,7 +310,7 @@ static EXPORT_IMPORT: Classification = Classification {
         expect: Expect::Text(UNSIGNED_ATTEST_LEVEL),
     }],
     sparse: &[],
-    null_columns: &[],
+    null_columns: &[("memories", "encrypted_envelope", SEALED_ROW_UNSEALED)],
     schema: SchemaBaseline::Destination,
 };
 
@@ -351,10 +404,12 @@ fn edge(source_id: &str, target_id: &str) -> MemoryLink {
 struct Corpus {
     live: Vec<String>,
     archived: String,
+    /// The sealed live row, when the shape seeds one.
+    sealed: Option<String>,
 }
 
 /// Seed the corpus through the trait funnels a postgres daemon writes with.
-async fn seed(store: &PostgresStore) -> Corpus {
+async fn seed(store: &PostgresStore, sealed: Sealed) -> Corpus {
     let ctx = ctx();
     let mut live = Vec::new();
     for (i, (title, ns, tier, content, tags, with_emb)) in LIVE_ROWS.iter().enumerate() {
@@ -406,7 +461,126 @@ async fn seed(store: &PostgresStore) -> Corpus {
         .await
         .expect("archive");
     assert_eq!(moved, 1, "the archived corpus row must move to the archive");
-    Corpus { live, archived }
+    set_raw_columns(store, &live).await;
+    let sealed = match sealed {
+        Sealed::Present => Some(seed_sealed_row(store).await),
+        Sealed::Absent => None,
+    };
+    Corpus {
+        live,
+        archived,
+        sealed,
+    }
+}
+
+/// Whether the corpus holds a sealed live row (#10015; CBC-02: an enum, not
+/// a bool). A path that loses the class seeds `Absent` in its main cell and
+/// names the tracked defect; its dedicated red cell seeds `Present`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sealed {
+    Present,
+    Absent,
+}
+
+/// Execute one raw UPDATE on the source and require exactly `want` rows changed.
+async fn raw_update(
+    pool: &sqlx::PgPool,
+    q: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    what: &str,
+    want: u64,
+) {
+    let done = q
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(done.rows_affected(), want, "{what}: rows changed");
+}
+
+/// One live row whose content is sealed (#10015): empty content and the
+/// envelope in `encrypted_envelope`, as the at-rest seal funnel leaves it.
+async fn seed_sealed_row(store: &PostgresStore) -> String {
+    let mem = corpus_memory(SEALED_TITLE, NAMESPACE_A, Tier::Long, "", &["sealed"]);
+    let id = store.store(&ctx(), &mem).await.expect("store sealed row");
+    let kp = ai_memory::encryption::get_or_create_keypair(CORPUS_AGENT).expect("x25519 keypair");
+    let envelope =
+        ai_memory::encryption::encrypt(SEALED_PLAINTEXT, &kp.public).expect("seal plaintext");
+    raw_update(
+        store.pool(),
+        sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
+            .bind(envelope.to_bytes())
+            .bind(&id),
+        "sealed envelope",
+        1,
+    )
+    .await;
+    id
+}
+
+/// Set every optional `memories` / `memory_links` column the trait funnels
+/// leave NULL, so no compared column passes vacuously (#10014).
+async fn set_raw_columns(store: &PostgresStore, live: &[String]) {
+    let pool = store.pool();
+    raw_update(
+        pool,
+        sqlx::query(
+            "UPDATE memories SET last_accessed_at = $1::timestamptz, valid_from = $2, \
+             valid_until = $3, confidence_signals = $4, confidence_decayed_at = $5, \
+             persona_version = $6, entity_id = $7, source_uri = $8, source_span = $9, \
+             kind_provenance = $10, atomised_into = $11, embedding_dim = $12, \
+             metadata = metadata || jsonb_build_object('target_agent_id', $13::text, \
+             'kind_provenance', $10::text) \
+             WHERE id = $14",
+        )
+        .bind(LAST_ACCESSED_AT)
+        .bind(CLAIM_VALID_FROM)
+        .bind(CLAIM_VALID_UNTIL)
+        .bind(CONFIDENCE_SIGNALS)
+        .bind(CONFIDENCE_DECAYED_AT)
+        .bind(PERSONA_VERSION)
+        .bind(ENTITY_ID)
+        .bind(SOURCE_URI)
+        .bind(SOURCE_SPAN)
+        .bind(KIND_PROVENANCE)
+        .bind(ATOMISED_INTO)
+        .bind(i32::try_from(EMBEDDING_DIM).expect("small"))
+        .bind(TARGET_AGENT)
+        .bind(&live[0]),
+        "memories optional columns",
+        1,
+    )
+    .await;
+    raw_update(
+        pool,
+        sqlx::query(
+            "UPDATE memories SET atom_of = $1, mentioned_entity_id = $2, kind_provenance = $3, \
+             metadata = metadata || jsonb_build_object('entity_id', $2::text, \
+             'kind_provenance', $3::text) WHERE id = $4",
+        )
+        .bind(&live[0])
+        .bind(ENTITY_ID)
+        .bind(KIND_PROVENANCE)
+        .bind(&live[1]),
+        "memories atom columns",
+        1,
+    )
+    .await;
+    raw_update(
+        pool,
+        sqlx::query(
+            // The cid mirrors hold each endpoint's `memories.cid`, as the
+            // lineage-DAG link funnel writes them (`models::link` source_cid).
+            "UPDATE memory_links SET valid_until = $1::timestamptz, \
+             source_cid = (SELECT cid FROM memories WHERE id = $2), \
+             target_cid = (SELECT cid FROM memories WHERE id = $3) \
+             WHERE source_id = $2 AND target_id = $3",
+        )
+        .bind(LINK_VALID_UNTIL)
+        .bind(&live[0])
+        .bind(&live[1]),
+        "memory_links optional columns",
+        1,
+    )
+    .await;
 }
 
 // ── typed full-store snapshot (sqlx) ────────────────────────────────────────
@@ -602,7 +776,7 @@ async fn pg_export_then_import_reproduces_memories_and_links_9944() {
     let Some(admin) = admin_url() else { return };
     let (_src_db, src) = scratch_store(&admin).await;
     let (_dst_db, dst) = scratch_store(&admin).await;
-    seed(&src).await;
+    seed(&src, MAIN_CELL_SEALED).await;
     let before = snapshot(&src).await;
     assert_corpus_is_rich(&before);
     let dst_schema = snapshot(&dst).await.schema;
@@ -788,7 +962,7 @@ async fn pg_router_export_then_import_reproduces_memories_and_links_9944() {
     let Some(admin) = admin_url() else { return };
     let (_src_db, src) = scratch_store(&admin).await;
     let (_dst_db, dst) = scratch_store(&admin).await;
-    seed(&src).await;
+    seed(&src, MAIN_CELL_SEALED).await;
     let before = snapshot(&src).await;
     assert_corpus_is_rich(&before);
     let dst_schema = snapshot(&dst).await.schema;
@@ -803,6 +977,138 @@ async fn pg_router_export_then_import_reproduces_memories_and_links_9944() {
         &source_store(&EXPORT_IMPORT, before),
         &snapshot(&dst).await,
         &dst_schema,
+    );
+}
+
+// ── dedicated red cells for the tracked admin-path defects ─────────────────
+
+/// One router export → import of a corpus with the given shape: the corpus,
+/// the source image and the restored image.
+async fn router_run(sealed: Sealed) -> Option<(Corpus, StoreSnapshot, StoreSnapshot)> {
+    let admin = admin_url()?;
+    let (_src_db, src) = scratch_store(&admin).await;
+    let (_dst_db, dst) = scratch_store(&admin).await;
+    let corpus = seed(&src, sealed).await;
+    let before = snapshot(&src).await;
+    assert_corpus_is_rich(&before);
+    router_export_import(&src, &dst).await;
+    let restored = snapshot(&dst).await;
+    Some((corpus, before, restored))
+}
+
+/// `table` rows keyed by `key`, projected onto `columns`.
+fn keyed_columns(
+    s: &StoreSnapshot,
+    table: &str,
+    key: &[&str],
+    columns: &[&str],
+) -> BTreeMap<Vec<Option<SqlValue>>, Vec<Option<SqlValue>>> {
+    let pick = |r: &Row, cols: &[&str]| cols.iter().map(|c| r.get(*c).cloned()).collect();
+    s.tables[table]
+        .rows
+        .iter()
+        .map(|r| (pick(r, key), pick(r, columns)))
+        .collect()
+}
+
+/// Some source row of `table` sets each of `columns` (the red cell is not
+/// vacuous), and the restore keeps them row for row.
+fn assert_columns_kept(
+    before: &StoreSnapshot,
+    restored: &StoreSnapshot,
+    table: &str,
+    key: &[&str],
+    columns: &[&str],
+    defect: &str,
+) {
+    let want = keyed_columns(before, table, key, columns);
+    for (idx, col) in columns.iter().enumerate() {
+        assert!(
+            want.values()
+                .any(|v| v[idx].as_ref().is_some_and(|v| !v.is_null())),
+            "{table}.{col}: the corpus never sets it, so the cell would be vacuous"
+        );
+    }
+    let got = keyed_columns(restored, table, key, columns);
+    assert_eq!(got, want, "{table} {columns:?} not kept ({defect})");
+}
+
+/// Defect #10033, red until it lands: the admin export then import must keep
+/// a sealed row sealed (empty content, the envelope byte for byte, and it
+/// still opens to the written plaintext). The fix removes the
+/// `SEALED_ROW_UNSEALED` null-column entry and sets `MAIN_CELL_SEALED` Present.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_router_export_keeps_a_sealed_row_sealed_10033() {
+    let Some((corpus, before, restored)) = router_run(Sealed::Present).await else {
+        return;
+    };
+    let id = corpus.sealed.expect("the shape seeds a sealed row");
+    let image = |s: &StoreSnapshot| {
+        s.rows_where("memories", "id", &id).first().map(|r| {
+            (
+                r.get("content").cloned(),
+                r.get("encrypted_envelope").cloned(),
+            )
+        })
+    };
+    let want = image(&before);
+    assert!(
+        matches!(&want, Some((_, Some(v))) if !v.is_null()),
+        "the corpus sealed row holds no envelope"
+    );
+    assert_eq!(
+        image(&restored),
+        want,
+        "the admin export/import unsealed a sealed row (defect #10033)"
+    );
+    let Some((_, Some(SqlValue::Text(hex)))) = image(&restored) else {
+        panic!("the restored sealed row holds no envelope (defect #10033)");
+    };
+    let hex = std::str::from_utf8(&hex).expect("bytea text");
+    let hex = hex.strip_prefix("\\x").expect("bytea hex rendering");
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
+        .collect();
+    let kp = ai_memory::encryption::get_or_create_keypair(CORPUS_AGENT).expect("x25519 keypair");
+    let parsed = ai_memory::encryption::Envelope::from_bytes(&bytes).expect("parse envelope");
+    let plain = ai_memory::encryption::decrypt(&parsed, &kp.secret).expect("decrypt envelope");
+    assert_eq!(plain, SEALED_PLAINTEXT, "the restored envelope decrypts");
+}
+
+/// Defect #10034, red until it lands: the admin export then import must keep
+/// every atomisation and entity-mention column. The fix removes the
+/// `ATOM_COLUMNS_DROPPED` lossy entries above.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_router_export_keeps_every_atomisation_column_10034() {
+    let Some((_, before, restored)) = router_run(MAIN_CELL_SEALED).await else {
+        return;
+    };
+    assert_columns_kept(
+        &before,
+        &restored,
+        "memories",
+        &["id"],
+        ATOM_COLUMNS,
+        "defect #10034",
+    );
+}
+
+/// Defect #10035, red until it lands: the admin export then import must keep
+/// every edge's endpoint cid mirrors. The fix removes the `LINK_CID_DROPPED`
+/// lossy entries above.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_router_export_keeps_every_link_cid_mirror_10035() {
+    let Some((_, before, restored)) = router_run(MAIN_CELL_SEALED).await else {
+        return;
+    };
+    assert_columns_kept(
+        &before,
+        &restored,
+        "memory_links",
+        &["source_id", "target_id", "relation"],
+        LINK_CID_COLUMNS,
+        "defect #10035",
     );
 }
 
@@ -828,7 +1134,7 @@ fn row_image(s: &StoreSnapshot, id: &str) -> (Vec<Row>, Vec<Row>) {
 async fn pg_archive_then_restore_reproduces_the_row_its_embedding_and_its_links_9944() {
     let Some(admin) = admin_url() else { return };
     let (_db, store) = scratch_store(&admin).await;
-    let corpus = seed(&store).await;
+    let corpus = seed(&store, Sealed::Present).await;
     let ctx = ctx();
     assert!(
         store
@@ -882,7 +1188,7 @@ async fn pg_archive_then_restore_reproduces_the_row_its_embedding_and_its_links_
 async fn pg_every_live_table_is_classified_9944() {
     let Some(admin) = admin_url() else { return };
     let (_db, store) = scratch_store(&admin).await;
-    seed(&store).await;
+    seed(&store, Sealed::Present).await;
     let problems = EXPORT_IMPORT.ratchet(&snapshot(&store).await);
     assert!(
         problems.is_empty(),
@@ -947,7 +1253,7 @@ fn rows_mut<'a>(s: &'a mut StoreSnapshot, table: &str) -> &'a mut Vec<Row> {
 async fn pg_the_comparison_catches_every_mutation_class_9944() {
     let Some(admin) = admin_url() else { return };
     let (_db, store) = scratch_store(&admin).await;
-    seed(&store).await;
+    seed(&store, Sealed::Present).await;
     let snap = snapshot(&store).await;
     assert_corpus_is_rich(&snap);
     let class = exact_probe_class(&snap);
