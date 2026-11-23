@@ -4,7 +4,7 @@
 # docker-1461 — reproducible "0→60" full-spectrum test mesh.
 #
 #   2 IronClaw ai-memory peers (HTTPS + mTLS + zero-touch enrollment)
-#   1 PostgreSQL 18 + Apache AGE + pgvector substrate
+#   1 PostgreSQL 19 + Apache AGE + pgvector substrate
 #
 # This file declares ONLY topology + wiring. Every concrete value
 # (image tags, container names, ports, store URLs, federation ids,
@@ -31,7 +31,7 @@ name: ${COMPOSE_PROJECT:-ai-memory-docker-1461}
 
 services:
   pg-age:
-    # PostgreSQL 18 + Apache AGE (graph) + pgvector (embedding type).
+    # PostgreSQL 19 + Apache AGE (graph) + pgvector (embedding type).
     # Built from the campaign Dockerfile.pg-age-vector; the bare
     # apache/age image ships AGE but not pgvector, which the
     # sal-postgres adapter requires for the embedding column type.
@@ -71,7 +71,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD must be set in campaign.env}
       POSTGRES_DB: ${PG_DB:?PG_DB must be set in campaign.env}
       POSTGRES_INITDB_ARGS: "--data-checksums"
-      # PG18+ moved the default PGDATA to a major-version-specific dir
+      # The postgres image keeps the default PGDATA in a major-version-specific dir
       # (/var/lib/postgresql/$PG_MAJOR/docker) and the entrypoint refuses
       # to boot when a volume is mounted at the legacy
       # /var/lib/postgresql/data while PGDATA is the new default

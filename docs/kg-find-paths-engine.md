@@ -2,7 +2,13 @@
 layout: doc
 ---
 
-# `find_paths` executed engine (AGE 1.8.0 re-verify)
+# `find_paths` executed engine (#3297 re-verify, 2026-09-11)
+
+The certified tier is now PostgreSQL 19.0 + AGE 1.7.0 + pgvector 0.8.7 (Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19); `deploy/docker-1461/provision/lib.sh`, #9927). The capture below is dated and was taken on the
+AGE pin of that time. The `find_paths` dispatcher is the relational CTE on both `KgBackend`
+values and does not depend on the list-predicate results on any AGE version.
+
+<!-- tier-history: begin (#3297 capture of 2026-09-11 on the AGE pin of that time) -->
 
 Issue [#3297](https://github.com/alphaonedev/ai-memory-mcp/issues/3297)
 N15: re-verify the #2582 `find_paths` "relational CTE only" rationale
@@ -40,6 +46,8 @@ is **stale for `ALL`/`ANY` on 1.8.0**. The find_paths guard still does
 not succeed (runtime, not parse). Restoring an AGE `find_paths` reader
 is follow-up [#3609](https://github.com/alphaonedev/ai-memory-mcp/issues/3609);
 this docs lane does not change the dispatcher.
+
+<!-- tier-history: end -->
 
 ## EXPLAIN of a PARSEABLE AGE walk (no `ALL` guard)
 

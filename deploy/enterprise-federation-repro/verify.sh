@@ -8,8 +8,8 @@
 # what it observed AND what it required, so a peer reviewer reads the evidence
 # directly rather than trusting a green tick. Run AFTER repro.sh.
 #
-#   1. SELECT version()                      == PostgreSQL 18.6
-#   2. age / vector extversion               == 1.8.0 / 0.8.7
+#   1. SELECT version()                      == PostgreSQL $EXPECTED_PG_VERSION (SSOT)
+#   2. age / vector extversion               == $EXPECTED_AGE_VERSION / $EXPECTED_PGVECTOR_VERSION
 #   3. SHOW ssl                              == on
 #   4. cleartext (sslmode=disable) TCP       == REFUSED pre-auth
 #   5. encrypted session                     negotiates TLS 1.3
@@ -43,9 +43,9 @@ pg_sql() { DK exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/d
 
 # ---------------------------------------------------------------- 1. version
 hdr "1. PostgreSQL version"
-# `SHOW server_version` returns e.g. `18.6 (Debian 18.6-1.pgdg13+2)`; extract
+# `SHOW server_version` returns e.g. `19.0 (Debian 19.0-2.pgdg13+1)`; extract
 # the leading MAJOR.MINOR numeric so the packaging suffix does not defeat the
-# match (stripping whitespace would mangle it into `18.6(Debian…`).
+# match (stripping whitespace would mangle it into `19.0(Debian…`).
 ver_raw="$(pg_sql 'SHOW server_version;')"
 ver="$(printf '%s' "$ver_raw" | grep -oE '^[0-9]+\.[0-9]+' | head -1)"
 printf '  observed server_version = %s (raw: %s) ; required = %s\n' "${ver:-<none>}" "${ver_raw:-<none>}" "$EXPECTED_PG_VERSION"

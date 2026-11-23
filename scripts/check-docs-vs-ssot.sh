@@ -954,7 +954,7 @@ NCPY
 # EXPLICITLY-LABELLED non-certified evidence. A line asserting a pgvector
 # figure alongside the alternate PG16/AGE1.6 stack, or self-labelled
 # `alternate matrix` / `second tested combination`, is definitionally not
-# the certified pin, so it is skipped. The certified pin is PG 18.4 / AGE
+# the certified pin, so it is skipped. The certified pin is PG 19.0 / AGE
 # 1.7.0, so these markers never appear on a genuine certified line — the
 # guard's only failure mode is a rare false-NEGATIVE, never a false drift
 # report. (The register's F9 findings-row form `pgvector0.8.5` — no space,

@@ -4628,7 +4628,7 @@ def _workflow_forms():
         )
     ]
     m["c2-services-select"] = [
-        rep(SEL_JOB_ENV, SEL_JOB_ENV + "    services:\n      db:\n        image: postgres:18\n")
+        rep(SEL_JOB_ENV, SEL_JOB_ENV + "    services:\n      db:\n        image: postgres:19\n")
     ]
     m["c2-job-defaults-shell-gate"] = [
         rep(

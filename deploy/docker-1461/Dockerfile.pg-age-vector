@@ -1,53 +1,94 @@
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
 #
-# PostgreSQL 18 + Apache AGE + pgvector for the docker-1461 mesh.
+# PostgreSQL 19 + Apache AGE 1.7.0 + pgvector for the docker-1461 mesh.
 #
-# The upstream apache/age image ships AGE 1.7.0 compiled into the PG18 tree
-# (age.so + age--<ver>.sql + age.control) at the image's server minor.
-# Three adjustments, all from precompiled pgdg .debs on the CANONICAL
-# PostgreSQL apt channel — NO source build:
+# Certified data tier: PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7.
+# Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus
+# upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release;
+# upstream has no 1.7.0 release for PostgreSQL 19).
+# pgdg ships no `postgresql-19-age` package and apache/age publishes no PG19
+# image, so the AGE layer is a source build of that ONE pinned commit plus
+# that ONE pinned upstream fix (provision/patches/, pinned by sha256 in
+# provision/lib.sh), applied by provision/apply_age_patch.py, which refuses
+# any other source, patch or patched result (#9965). The tagged v1.7.0-rc0 source of the
+# previous major does not compile against PostgreSQL 19 (changed executor and table-AM
+# signatures); commit c6b043d is upstream's own PG19 port at
+# default_version 1.7.0 (#2457).
 #
-#   1. Bump the server + client to the EXACT target minor (PG_APT_VERSION)
-#      via `apt --only-upgrade postgresql-<major>`. ABI-safe within a major.
-#   2. Bump AGE to 1.8.0 via `postgresql-<major>-age=<AGE_APT_VERSION>`.
-#      pgdg already publishes AGE 1.8.0 (the apache/age Docker Hub image is
-#      only at release_PG18_1.7.0, but the apt repo is ahead), so this is a
-#      pinned apt install — the same mechanism the do-1461 NATIVE lane uses.
-#      It overlays the base image's make-install'd 1.7.0 files cleanly (no
-#      dpkg conflict) and sets age.control default_version = 1.8.0, so
-#      `CREATE EXTENSION age` reports extversion = 1.8.0. Apache AGE tags
-#      EVERY release `X.Y.Z-rc0` on GitHub (its release-vote convention),
-#      which is why the pgdg package version reads `1.8.0~rc0-...`; 1.8.0 is
-#      the newest released AGE for PG18 (github.com/apache/age/releases,
-#      PG18/v1.8.0-rc0, 2026-07-09).
-#   3. Install pgvector — the ai-memory sal-postgres adapter maps Rust
-#      embedding vectors to the server-side `vector` type.
+#   Stage `age-build`: the official PostgreSQL image for the major, server +
+#     server-dev bumped to the EXACT pgdg minor (PG_APT_VERSION), the AGE
+#     source fetched at AGE_SOURCE_COMMIT and checked with `git rev-parse
+#     HEAD` (a mismatch fails the build), the pinned upstream fix applied
+#     and checked by apply_age_patch.py, then `make install` into a
+#     staging DESTDIR and apply_age_patch.py --verify on the built tree.
+#   Final stage: the same base, server + client bumped to PG_APT_VERSION,
+#     pgvector from pgdg apt (PGVECTOR_APT_VERSION), the staged AGE files
+#     copied in, and AGE's own initdb script so `CREATE EXTENSION age` runs
+#     on first start, as the former apache/age base image did.
 #
 # Every version literal lives in ONE place (provision/lib.sh) and arrives
-# here as a --build-arg; this Dockerfile carries no hardcoded version.
+# here as a --build-arg; this Dockerfile carries no hardcoded version. A
+# missing build arg fails the build (`: "${VAR:?}"`), never a silent default.
 
-ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0
-FROM ${AGE_BASE_IMAGE}
+ARG PG_BASE_IMAGE
+FROM ${PG_BASE_IMAGE} AS age-build
 
-# Re-declare post-FROM so the build args are in scope for the RUN layer.
-ARG PG_MAJOR=18
+ARG PG_MAJOR
 ARG PG_APT_VERSION
-ARG AGE_APT_VERSION
-ARG PGVECTOR_APT_VERSION
+ARG AGE_SOURCE_REPO
+ARG AGE_SOURCE_COMMIT
 
 USER root
 
-# Pinned, reproducible: exact minor for server + client, exact AGE, exact
-# pgvector — all from pgdg apt.
-RUN apt-get update \
+# The one upstream AGE fix of the certified build (#9965): the SSOT, the
+# applier and the patch file it pins, from the build context (the campaign
+# directory). apply_age_patch.py refuses any other source, patch or result.
+COPY provision/lib.sh provision/apply_age_patch.py /age-provision/
+COPY provision/patches/ /age-provision/patches/
+
+RUN : "${PG_MAJOR:?}" "${PG_APT_VERSION:?}" "${AGE_SOURCE_REPO:?}" "${AGE_SOURCE_COMMIT:?}" \
+ && apt-get update \
  && apt-get install -y --no-install-recommends --only-upgrade \
       "postgresql-${PG_MAJOR}=${PG_APT_VERSION}" \
       "postgresql-client-${PG_MAJOR}=${PG_APT_VERSION}" \
  && apt-get install -y --no-install-recommends \
-      "postgresql-${PG_MAJOR}-age=${AGE_APT_VERSION}" \
+      "postgresql-server-dev-${PG_MAJOR}=${PG_APT_VERSION}" \
+      bison build-essential ca-certificates flex git python3 \
+ && git init -q /src/age \
+ && git -C /src/age remote add origin "${AGE_SOURCE_REPO}" \
+ && git -C /src/age fetch -q --depth 1 origin "${AGE_SOURCE_COMMIT}" \
+ && git -C /src/age checkout -q --detach FETCH_HEAD \
+ && test "$(git -C /src/age rev-parse HEAD)" = "${AGE_SOURCE_COMMIT}" \
+ && python3 /age-provision/apply_age_patch.py --ssot /age-provision/lib.sh --src /src/age \
+ && make -C /src/age -j"$(nproc)" PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
+ && make -C /src/age install DESTDIR=/age-dist PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" \
+ && python3 /age-provision/apply_age_patch.py --ssot /age-provision/lib.sh --src /src/age --verify \
+ && install -D -m 0644 /src/age/docker/docker-entrypoint-initdb.d/00-create-extension-age.sql \
+      /age-dist/docker-entrypoint-initdb.d/00-create-extension-age.sql
+
+ARG PG_BASE_IMAGE
+FROM ${PG_BASE_IMAGE}
+
+# Re-declare post-FROM so the build args are in scope for the RUN layer.
+ARG PG_MAJOR
+ARG PG_APT_VERSION
+ARG PGVECTOR_APT_VERSION
+
+USER root
+
+# Pinned, reproducible: exact minor for server + client and exact pgvector
+# from pgdg apt; AGE from the pinned-commit build stage above.
+RUN : "${PG_MAJOR:?}" "${PG_APT_VERSION:?}" "${PGVECTOR_APT_VERSION:?}" \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends --only-upgrade \
+      "postgresql-${PG_MAJOR}=${PG_APT_VERSION}" \
+      "postgresql-client-${PG_MAJOR}=${PG_APT_VERSION}" \
+ && apt-get install -y --no-install-recommends \
       "postgresql-${PG_MAJOR}-pgvector=${PGVECTOR_APT_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=age-build /age-dist/ /
 
 # Fail-closed hostssl healthcheck (#2658). Baked in so "healthy" means
 # "hostssl PROVABLY armed" (a plaintext sslmode=disable TCP connection is
@@ -56,5 +97,7 @@ RUN apt-get update \
 COPY pg-hostssl-healthcheck.sh /usr/local/bin/pg-hostssl-healthcheck.sh
 RUN chmod 0755 /usr/local/bin/pg-hostssl-healthcheck.sh
 
-# Base image entrypoint + USER state preserved; AGE auto-installs via
-# its own /docker-entrypoint-initdb.d/00-create-extension-age.sql.
+# Official postgres entrypoint + USER state preserved; AGE is preloaded and
+# auto-created via /docker-entrypoint-initdb.d/00-create-extension-age.sql,
+# exactly as the former apache/age base image's CMD did.
+CMD ["postgres", "-c", "shared_preload_libraries=age"]

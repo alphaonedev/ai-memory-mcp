@@ -76,6 +76,9 @@ fn a_pg_health_check_issues_no_corpus_count_2617() {
 
 #[cfg(feature = "sal-postgres")]
 mod pg {
+    use ai_memory::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier};
+    use ai_memory::store::postgres::PostgresStore;
+    use ai_memory::store::{CallerContext, MemoryStore};
     use sqlx::Row;
     use sqlx::postgres::PgPoolOptions;
 
@@ -93,14 +96,77 @@ mod pg {
     /// says so instead of passing vacuously.
     const MIN_MEANINGFUL_CORPUS: i64 = 2;
 
+    /// The cells top the corpus up to this many rows themselves (#9927): under
+    /// the CI v2 isolation wrapper every binary gets a fresh clone with no
+    /// schema and no rows, so a cell that only READ an existing corpus could
+    /// never run there. Well above `MIN_MEANINGFUL_CORPUS`, so the control's
+    /// full scan and the probe's single row are far apart.
+    const SEED_CORPUS: i64 = 64;
+
+    /// Agent the seeded rows are written as.
+    const SEED_AGENT: &str = "ai:health-probe-2617";
+
+    /// Open the adapter (which applies the schema), top the corpus up to
+    /// `SEED_CORPUS` rows in a namespace of its own, and return a one-connection
+    /// pool for the plan checks. `None` only when no test database is
+    /// configured. Rows are never deleted: the two cells run concurrently on the
+    /// same database, and a delete between one cell's count and its EXPLAIN
+    /// would break that cell's comparison.
     async fn probe_pool() -> Option<sqlx::PgPool> {
         let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
-        match PgPoolOptions::new().max_connections(1).connect(&url).await {
-            Ok(p) => Some(p),
-            Err(e) => {
-                eprintln!("skip: connect failed: {e}");
-                None
-            }
+        let store = PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres adapter (applies the schema)");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect probe pool");
+        let have = corpus_size(&pool).await;
+        let ns = format!("health-probe-2617-{}", uuid::Uuid::new_v4());
+        let ctx = CallerContext::for_agent(SEED_AGENT);
+        for i in have..SEED_CORPUS {
+            store
+                .store(&ctx, &seed_memory(&ns, i))
+                .await
+                .expect("seed a corpus row");
+        }
+        Some(pool)
+    }
+
+    fn seed_memory(ns: &str, i: i64) -> Memory {
+        let now = "2026-11-22T00:00:00+00:00";
+        Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: format!("health-probe corpus row {i}"),
+            content: format!("corpus row {i} for the #2617 constant-cost probe"),
+            tags: vec!["health-probe-2617".to_string()],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({ "agent_id": SEED_AGENT }),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: LifecycleState::Open,
         }
     }
 
@@ -119,8 +185,9 @@ mod pg {
     /// Largest `rows=N` reported by any ACTUAL (executed) plan node — i.e. how
     /// many rows the statement really touched.
     ///
-    /// `PostgreSQL` **18** renders actual row counts with two decimal places
-    /// (`rows=1317.00`); 17 and earlier render a bare integer (`rows=1317`).
+    /// `PostgreSQL` 19 (the certified tier) renders actual row counts with two
+    /// decimal places (`rows=1317.00`), as 18 did; 17 and earlier render a
+    /// bare integer (`rows=1317`).
     /// The integral part is taken TEXTUALLY so both render forms parse on the
     /// same path with no float arithmetic and no lossy cast (PERF-07/09). A
     /// token that parses as neither would silently vanish from the `max()` and
@@ -135,7 +202,7 @@ mod pg {
             let Some(token) = after.split_whitespace().next() else {
                 continue;
             };
-            // `1317` (pg <= 17) and `1317.00` (pg 18) both yield `1317`.
+            // `1317` (17 and earlier) and `1317.00` (18 and later) both yield `1317`.
             let integral = token.split('.').next().unwrap_or(token);
             let n: u64 = integral.parse().unwrap_or_else(|e| {
                 panic!(
@@ -167,7 +234,7 @@ mod pg {
         assert!(
             corpus >= MIN_MEANINGFUL_CORPUS,
             "corpus is {corpus} row(s) — too small for an O(1)-vs-O(corpus) comparison to \
-             mean anything; point AI_MEMORY_TEST_POSTGRES_URL at a populated database"
+             mean anything; the seed step should have written {SEED_CORPUS}"
         );
 
         let plan = explain_analyze(&pool, PROBE_SQL).await;

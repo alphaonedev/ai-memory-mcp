@@ -114,7 +114,7 @@ right when a constraint listed in the "use case" column is breached.
 |---|---|---|---|---|---|---|---|---|---|
 | **T1 — Singleton** | Solo developer; 1 NHI experimentation; offline | SQLite (WAL) | One process; one host | 1 | 1 | <10 ms | none | none | `ai-memory backup --keep 48` |
 | **T2 — Multi-agent / single server** | Engineering team (≤5 agents) on a shared workstation or single VM | SQLite (WAL) shared | Many agents → one daemon | 2–10 | 1 | <15 ms | none (local mTLS optional) | none | hourly local + weekly off-host |
-| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.6 + AGE 1.8.0 + pgvector 0.8.7 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
+| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 19.0 + AGE 1.7.0 + pgvector 0.8.7 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
 | **T4 — Multi-rack / same DC** | Production cluster with rack-affinity routing | Postgres primary + ≥1 streaming replicas; AGE on primary | Rack-affinity W-of-N; per-rack ai-memory replicas | 50–250 | 5–15 | <50 ms (cross-rack RTT) | mandatory | rack-aware W-of-N | pg_basebackup + WAL archive + rack-tagged snapshots |
 | **T5 — Multi-DC / same region** | Multi-AZ within a region; DR ready | Postgres primary + sync replica in second DC (or async-with-RPO) + AGE | Cross-DC federation peers; quorum spans DCs | 250–1000 | 15–50 | 50–150 ms (intra-region WAN) | mandatory | cross-DC W-of-N with quorum tuned for partition | pg_basebackup + WAL ship + off-region | 
 | **T6 — Multi-region / global** | Global product; data-residency requirements | Postgres + AGE **per region**; federation peers between regions | Regional clusters federate; local-first recall | 1000+ | 50–500 | <30 ms local recall; 150–500 ms global propagation | mandatory; per-region CA | regional clusters peer via signed `X-Memory-Sig` + `X-Memory-Nonce` | regional pg snapshots + cross-region object store |
@@ -463,9 +463,9 @@ production Dockerfile. Quick summary:
 
 | Component | Pinned version |
 |---|---|
-| PostgreSQL | **18.6** (canonical; SSOT `deploy/docker-1461/provision/lib.sh` `EXPECTED_PG_VERSION`). PG 16 + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
-| Apache AGE | **1.8.0** (canonical extversion; SSOT `EXPECTED_AGE_VERSION`) — overlaid via a pinned pgdg apt install on top of the `apache/age:release_PG18_1.7.0` base image (the Docker Hub image ships AGE 1.7.0; the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` bumps `age.control` to 1.8.0, so `CREATE EXTENSION age` reports extversion 1.8.0) |
-| pgvector | **0.8.7** (`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`; Rust binding crate `pgvector = "0.4"`) |
+| PostgreSQL | **19.0** (canonical; SSOT `deploy/docker-1461/provision/lib.sh` `EXPECTED_PG_VERSION`). PG 16 + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
+| Apache AGE | **1.7.0** (canonical extversion; SSOT `EXPECTED_AGE_VERSION`) — Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). SSOT `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`; the first stage of the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` builds that commit plus the one pinned upstream fix (applied by `provision/apply_age_patch.py`, #9965) on the official PostgreSQL 19 base image pinned by digest (`PG_BASE_IMAGE`) and checks `git rev-parse HEAD`, so `CREATE EXTENSION age` reports extversion 1.7.0 |
+| pgvector | **0.8.7** (`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`; Rust binding crate `pgvector = "0.4"`) |
 | ai-memory build | `cargo build --release --features sal-postgres` |
 
 Bootstrap a fresh postgres backend with:
@@ -628,7 +628,7 @@ mTLS + `X-Memory-Sig` + `X-Memory-Nonce` envelope.
 
 ### 5.3 Postgres streaming replication
 
-Standard PG 18 streaming replication. Primary `postgresql.conf`:
+Standard PostgreSQL 19 streaming replication. Primary `postgresql.conf`:
 
 ```ini
 wal_level = replica
@@ -650,7 +650,7 @@ Replica: `primary_conninfo = 'host=primary.rackA.internal user=aimemory_repl pas
 | Sync (`synchronous_standby_names`) | Primary + slowest sync replica RTT | 0 (committed only after replica ack) | Safest durability; any replica outage stalls writes |
 | Sync with quorum (`ANY 1 (replica1, replica2)`) | Primary + fastest of N RTT | 0 if any synced replica survives | Best balance for T4 |
 
-PG 18's `synchronous_standby_names = 'ANY 1 (replica_b)'` is the
+PostgreSQL's `synchronous_standby_names = 'ANY 1 (replica_b)'` is the
 recommended T4 default: any one named replica must ack before commit,
 so a single-replica outage doesn't stall writes but a primary loss
 guarantees the survivor has every committed transaction.
@@ -1495,11 +1495,14 @@ build time and `hnsw.ef_search=80` at query time
 
 See [`postgres-age-guide.md §"Install — Ubuntu 24.04 example"`](postgres-age-guide.html)
 for the AGE from-source recipe. The bundled
-`deploy/docker-1461/Dockerfile.pg-age-vector` (#1065) does NO source
-build — it overlays pinned pgdg `.deb`s on top of the
-`apache/age:release_PG18_1.7.0` base image: the server minor is bumped to
-PG 18.6, AGE to 1.8.0 (extversion), and pgvector 0.8.7 is installed — so
-K8s / ECS / Cloud Run users don't have to build AGE themselves.
+`deploy/docker-1461/Dockerfile.pg-age-vector` (#1065, #9927) is a two-stage
+build on the official PostgreSQL 19 base image pinned by digest (`PG_BASE_IMAGE`):
+the first stage builds AGE 1.7.0 from upstream PG19 branch commit c6b043d
+(`AGE_SOURCE_COMMIT`, not a tagged Apache release), checks `git rev-parse HEAD`,
+and applies the one pinned upstream fix 06ce678d through
+`deploy/docker-1461/provision/apply_age_patch.py` (#9965); the final stage installs the pinned
+pgdg PostgreSQL 19.0 and pgvector 0.8.7 packages and copies the AGE files in —
+so K8s / ECS / Cloud Run users don't have to build AGE themselves.
 
 Permissions:
 
@@ -1549,24 +1552,25 @@ Retention sizing reference:
 
 ### 10.6 Upgrade path — AGE minor version pinning
 
-**Pin AGE to a specific minor.** The v1.0.0 reference builds on the
-`apache/age:release_PG18_1.7.0` base image but pins AGE to **1.8.0**
-(extversion) and pgvector to **0.8.7** via the bundled
-`Dockerfile.pg-age-vector` apt overlay (SSOT `provision/lib.sh`
-`AGE_APT_VERSION` / `PGVECTOR_APT_VERSION`). Do not let your Postgres
-host's apt-update silently upgrade AGE across a minor — the Cypher
-binding semantics have changed between AGE minors historically, and the
-v1.0.0 canonical substrate targets AGE 1.8.0.
+**Pin AGE to a specific source commit.** The v1.0.0 reference pins AGE to
+**1.7.0** (extversion) and pgvector to **0.8.7** on PostgreSQL 19.0 (SSOT
+`provision/lib.sh` `AGE_SOURCE_COMMIT` / `PGVECTOR_APT_VERSION`). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+Do not let a host rebuild or package update move AGE off that commit — the
+Cypher binding semantics have changed between AGE versions historically, and the
+v1.0.0 canonical substrate targets AGE 1.7.0 at commit c6b043d plus upstream fix commit 06ce678d (#9965).
 
 Upgrade procedure:
 
 1. Snapshot the primary (`pg_basebackup` + verify).
 2. Stop the ai-memory daemons.
-3. Stop Postgres (`systemctl stop postgresql@18-main`).
-4. Upgrade AGE (`apt install postgresql-18-age=<AGE_APT_VERSION>`, e.g.
-   the pinned 1.8.0 `.deb`) — operator-paced.
+3. Stop Postgres (`systemctl stop postgresql@19-main`).
+4. Install AGE built from the pinned `AGE_SOURCE_COMMIT` (`git fetch` the full
+   sha, check `git rev-parse HEAD`, run
+   `deploy/docker-1461/provision/apply_age_patch.py --ssot deploy/docker-1461/provision/lib.sh --src <age checkout>`,
+   `make install` with the PostgreSQL 19 `PG_CONFIG`, then the same applier with
+   `--verify`; recipe in `postgres-age-guide.md`) — operator-paced.
 5. Start Postgres; verify `SELECT extversion FROM pg_extension WHERE
-   extname='age';` reports the new version (expect `1.8.0`).
+   extname='age';` reports the new version (expect `1.7.0`).
 6. Start the ai-memory daemons.
 7. Run the `tests/recall_scoring_parity.rs` + `tests/age_vs_cte.rs`
    parity suite against the upgraded host (operator-side, against a
@@ -2023,7 +2027,7 @@ it, and flip it back.
 ### 14.8 Backup + tooling discipline
 
 - [ ] Backup cadence per §13.1; quarterly restore drill against a scratch host (§13.2).
-- [ ] Daemon binary version pinned per-host (no auto-update); AGE minor pinned (v1.0.0 reference: 1.8.0 extversion; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
+- [ ] Daemon binary version pinned per-host (no auto-update); AGE pinned to its source commit (v1.0.0 reference: 1.7.0 extversion at commit c6b043d plus the pinned upstream fix 06ce678d; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
 
 ### 14.9 One-command hardened posture + the certified-posture gate
 

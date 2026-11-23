@@ -76,7 +76,7 @@ AGE + pgvector storage backend.
 > supported. **MCP-stdio is
 > structurally SQLite-only** ([#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)):
 > a Postgres-backed deployment serves MCP clients through the HTTP daemon,
-> not `ai-memory mcp`. The certified **PG 18.6 / AGE 1.8.0 / pgvector
+> not `ai-memory mcp`. The certified **PG 19.0 / AGE 1.7.0 / pgvector
 > 0.8.7** stack is now exercised in-PR on every `release/**` PR: the
 > `.github/workflows/cert-postgres-age.yml` workflow runs the pg-parity and
 > AGE suites against a per-job database on the runner's native
@@ -309,21 +309,25 @@ green under `--features sal,sal-postgres --include-ignored` against the
 pgvector layered in at service start via the `postgresql-16-pgvector` apt
 package. This PG 16 / AGE 1.6.0 combination is the documented **alternate**
 matrix — the stack `coverage.yml` measures line coverage against; the
-certified PG 18.6 / AGE 1.8.0 / pgvector 0.8.7 stack is exercised in-PR
+certified PG 19.0 / AGE 1.7.0 / pgvector 0.8.7 stack is exercised in-PR
 separately by `.github/workflows/cert-postgres-age.yml` (next paragraph).
 
-**CI-asserted in-PR on `release/**` (SSOT-pinned): PostgreSQL 18.6 + Apache
-AGE 1.8.0 + pgvector 0.8.7.** These are the pins
+**CI-asserted in-PR on `release/**` (SSOT-pinned): PostgreSQL 19.0 + Apache
+AGE 1.7.0 + pgvector 0.8.7.** These are the pins
 the deployment SSOT carries — `deploy/docker-1461/provision/lib.sh`
-(`EXPECTED_PG_VERSION=18.6`, `EXPECTED_AGE_VERSION=1.8.0`,
-`PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1`,
-`AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0` with AGE upgraded to 1.8.0
-via a pinned pgdg apt install; the pgvector Rust binding
-is the `pgvector` crate `0.4`, `features = ["sqlx"]`) — standardized to the
-current-stable line by operator directive 2026-08-18. **Apache AGE 1.8.0 is
-the newest RELEASED AGE for PG18** (tagged `PG18/v1.8.0-rc0` per Apache
-AGE's release-vote convention; `CREATE EXTENSION age` reports extversion
-1.8.0), installed via the pinned pgdg `postgresql-18-age` `.deb`. As of
+(`PG_BASE_IMAGE=postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60`, `EXPECTED_PG_VERSION=19.0`,
+`AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`,
+`AGE_PATCH_UPSTREAM_COMMIT=06ce678d74210539705c77e2dc7c9fa861e2a331`,
+`AGE_PATCH_SHA256=7efe593224097d43bd6779075388e16ae793f555da0ff3c5ced951d9b906d20c`,
+`EXPECTED_AGE_VERSION=1.7.0`, `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`; the
+pgvector Rust binding is the `pgvector` crate `0.4`, `features = ["sqlx"]`)
+— set by operator directives c4f4d408 and 111f59db ([#9927](https://github.com/alphaonedev/ai-memory-mcp/issues/9927)).
+**Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit
+06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for
+PostgreSQL 19).** The image build checks `git rev-parse HEAD` against the pin, applies that one
+fix through `deploy/docker-1461/provision/apply_age_patch.py` (which refuses any other patch
+bytes or patched result and checks the `IsTransactionState()` guard after the build, #9965),
+and `CREATE EXTENSION age` reports extversion 1.7.0. As of
 [#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548) /
 [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) the
 AGE/KG + recall-purity suites run against this exact stack in-PR: the
@@ -331,8 +335,8 @@ AGE/KG + recall-purity suites run against this exact stack in-PR: the
 AGE suites (`--include-ignored`) against a per-job database on the
 runner's native PostgreSQL/AGE/pgvector tier and checks its live versions
 against the pins in `deploy/docker-1461/provision/lib.sh` — the EXACT
-pinned minors (PostgreSQL 18.6, Apache AGE 1.8.0, pgvector 0.8.7 — not
-merely "PG 18" or "pgvector >= 0.8.7") — so the certified version triple
+pinned minors (PostgreSQL 19.0, Apache AGE 1.7.0, pgvector 0.8.7 — not
+merely "PG 19" or "pgvector >= 0.8.7") — so the certified version triple
 is proven by execution on the cert branch, not merely claimed. The
 workflow does NOT build or run the
 `deploy/docker-1461/Dockerfile.pg-age-vector` image: the former per-PR
@@ -341,6 +345,16 @@ rewrite, so CI certifies the pinned versions, not the deploy image
 artifact itself. The PG 16 / AGE 1.6.0 combination in
 `coverage.yml` remains as the documented alternate matrix.
 
+> **PostgreSQL 19.0 + Apache AGE 1.7.0 (2026-11-22, [#9927](https://github.com/alphaonedev/ai-memory-mcp/issues/9927)).**
+> v1.0.0 GA is certified on PostgreSQL 19.0 · Apache AGE 1.7.0 · pgvector 0.8.7
+> (operator directives c4f4d408 and 111f59db). Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release;
+> upstream has no 1.7.0 release for PostgreSQL 19).
+> Both fleet nodes carry this one triple (operator 618908f7); the macos-fed rebuild
+> is [#9929](https://github.com/alphaonedev/ai-memory-mcp/issues/9929). The
+> hash-pinned v1.0.0 declaration keeps its registered labels: the move revises no
+> acceptance target, so it is not re-registered.
+
+<!-- tier-history: begin (pgvector 0.8.7 and #2872 notes on the PG 18 tier of that time) -->
 > **pgvector 0.8.6 to 0.8.7 (2026-10-23, [#8224](https://github.com/alphaonedev/ai-memory-mcp/issues/8224)).**
 > v1.0.0 GA is certified on PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.7
 > (operator directive). Both fleet nodes serve this triple; the SSOT pins below
@@ -370,6 +384,7 @@ artifact itself. The PG 16 / AGE 1.6.0 combination in
 > certified AGE 1.8.0 / PG 18 canonical stack is now exercised in-PR by
 > `.github/workflows/cert-postgres-age.yml`, while `coverage.yml`'s
 > PG 16 / AGE 1.6.0 run is the documented alternate matrix.
+<!-- tier-history: end -->
 
 ### What those AGE greens attest — read this before relying on them
 
@@ -406,9 +421,9 @@ per-call fallback WARN that removal left silent). `find_paths` results
 were and remain correct (the CTE reads the durable `memory_links`);
 `kg_query` / `kg_timeline` / `lineage` still use AGE Cypher.
 
-### CI posture for the SSOT-pinned (18.6) stack — exercised in-PR on `release/**`
+### CI posture for the SSOT-pinned (19.0) stack — exercised in-PR on `release/**`
 
-**The certified PG 18.6 + AGE 1.8.0 + pgvector 0.8.7 stack is now
+**The certified PG 19.0 + AGE 1.7.0 + pgvector 0.8.7 stack is now
 exercised in-PR.** `.github/workflows/cert-postgres-age.yml`
 ([#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548))
 triggers on `pull_request` + `push` to `release/**`, resolves every
@@ -421,7 +436,7 @@ that path was removed in the v1.0.0 self-hosted CI rewrite), runs the
 AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
 self-skipping) under `--features sal-postgres --include-ignored`, and a
 version-assert step hard-fails on ANY drift from the exact pinned minors
-— PostgreSQL 18.6, Apache AGE 1.8.0, pgvector 0.8.7, not a looser "PG 18"
+— PostgreSQL 19.0, Apache AGE 1.7.0, pgvector 0.8.7, not a looser "PG 19"
 / "pgvector >= 0.8.7" match. This is what makes the 2026-08-01 cutline
 ruling §5.4(3) executable — the certified tier is proven by execution on
 the cert branch, at the exact certified minors the docs cite.
@@ -442,7 +457,7 @@ against an `apache/age:release_PG16_1.6.0` service container — **PG 16 +
 AGE 1.6.0**, retained as the documented alternate matrix (a line-coverage
 measurement, not the certified tier). The former CI-vs-SSOT AGE drift
 ([#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect
-2) is **resolved**: CI now exercises the certified AGE 1.8.0 canonical
+2) is **resolved**: CI now exercises the certified AGE 1.7.0 canonical
 tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
 
 ## Additive surfaces
@@ -613,13 +628,16 @@ supersedes ROADMAP §11.6's "public security audit by named third-party
 firm" line for this epic). ROADMAP §27 sequences it as a five-step
 program:
 
-1. **DigitalOcean full-spectrum testing + attestation.** The then-SSOT-pinned
+1. **DigitalOcean full-spectrum testing + attestation.**
+   <!-- tier-history: begin (DO campaign on the then-pinned PG 18.4 stack) -->
+   The then-SSOT-pinned
    PG 18.4 + AGE 1.7.0 + pgvector 0.8.5 stack was exercised full-spectrum
    on DigitalOcean (the off-CI validation host — at the time this campaign
    ran, DO was the only place that exact triple had been exercised end to
    end; CI has since begun exercising the certified triple in-PR on
-   `release/**` — now standardized to PG 18.6 / AGE 1.8.0 / pgvector 0.8.7
-   (operator directives 2026-08-18 and 2026-10-23) — the `cert-postgres-age.yml` workflow
+   <!-- tier-history: end -->
+   `release/**` — now standardized to PG 19.0 / AGE 1.7.0 / pgvector 0.8.7
+   (operator directives c4f4d408 and 111f59db, #9927) — the `cert-postgres-age.yml` workflow
    runs the pg-parity and AGE suites against a per-job database on the
    runner's native PostgreSQL/AGE/pgvector tier and checks its live
    versions against the pins in `deploy/docker-1461/provision/lib.sh` — see

@@ -252,7 +252,42 @@ Constants (named in code, change them there): `SCCACHE_CACHE_SIZE = "50G"` in `s
 - f2 layout: `~/.cache/ai-memory-ci` is a symlink to a directory on the 1.8 TB external SSD mount (1.2 TB free when moved), so the cargo targets and the sccache directory share that disk: four labelled runners need about 4 x 165 + 50 + 200 = 910 GiB.
 - Relabel a runner once the budget allows: re-add the `linux-fed` label to the next unlabelled runner (f2-linux-fed-3, then -4) only when `df -BG ~/.cache/ai-memory-ci/` shows free space of at least `FREE_FLOOR_GIB` plus one more per-runner target after the new runner's first cold build; relabel one runner at a time and watch the first job's sccache hit rate and free space before the next.
 
-## macos-fed AGE build: 1.8.0 + apache/age 06ce678d (#7162, #8282)
+## macos-fed AGE build: certified commit c6b043d plus 06ce678d (#9927, #9929, #9965)
+
+The macos-fed node carries the same certified triple as the Linux node (operator 618908f7):
+PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7. Apache AGE 1.7.0, built from upstream
+PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged
+Apache release; upstream has no 1.7.0 release for PostgreSQL 19). The checkout is checked with
+`git rev-parse HEAD` against `AGE_SOURCE_COMMIT` in `deploy/docker-1461/provision/lib.sh`, and
+the one fix is applied by the same applier the Linux images run,
+`deploy/docker-1461/provision/apply_age_patch.py`. It reads `AGE_PATCH_FILE`,
+`AGE_PATCH_SHA256`, `AGE_PATCH_UPSTREAM_COMMIT` and `AGE_PATCHED_FILE_SHA256` from that SSOT
+and exits non-zero on any other source commit, patch bytes or patched result, or when the
+`IsTransactionState()` guard is absent after the build (#9965). Without the fix the build leaks
+a lock under `shared_preload_libraries = 'age'` (the apache/age#2580 failure described in the
+build record below).
+
+**Build (on the macos-fed node).** From the repository root, with `$AGE` an empty
+node-local directory:
+
+    git init -q "$AGE" && git -C "$AGE" remote add origin https://github.com/apache/age.git
+    git -C "$AGE" fetch -q --depth 1 origin c6b043d1c8f4909331b9080d6640b487782fc958
+    git -C "$AGE" checkout -q --detach FETCH_HEAD
+    python3.12 deploy/docker-1461/provision/apply_age_patch.py \
+        --ssot deploy/docker-1461/provision/lib.sh --src "$AGE"
+    nice -n 19 make -C "$AGE" -j4 PG_CONFIG=/opt/homebrew/opt/postgresql@19/bin/pg_config \
+        BISON=/opt/homebrew/opt/bison/bin/bison FLEX=/opt/homebrew/opt/flex/bin/flex
+    python3.12 deploy/docker-1461/provision/apply_age_patch.py \
+        --ssot deploy/docker-1461/provision/lib.sh --src "$AGE" --verify
+
+The helper
+`ensure-age-extension.py` restores AGE only when its `MANIFEST_SOURCE_COMMIT` equals that
+pin and exits 2 otherwise; #9929 rebuilds AGE on the node and re-pins `MANIFEST` and
+`MANIFEST_SOURCE_COMMIT`. Until then the `Check (macos-fed,enterprise-fed)` job is red. The
+record of the earlier node build follows.
+
+<!-- tier-history: begin (macos-fed AGE 1.8.0 build record, superseded by #9929) -->
+### Earlier build: 1.8.0 + apache/age 06ce678d (#7162, #8282)
 
 The `Check (macos-fed,enterprise-fed)` job runs against a native PostgreSQL 18
 (Homebrew `postgresql@18`) with Apache AGE in `shared_preload_libraries`. Stock AGE
@@ -370,3 +405,4 @@ run `ROLLBACK;` in A; then open fresh connections while B takes
 `ResourceOwnerEnlarge` error and a fresh backend dies with
 `FATAL: failed to re-find shared lock object`. Patched AGE: `ROLLBACK` succeeds and
 every connection works.
+<!-- tier-history: end -->

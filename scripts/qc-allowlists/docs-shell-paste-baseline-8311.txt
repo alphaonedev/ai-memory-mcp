@@ -67,7 +67,7 @@
 2 docs/persona.md
 8 docs/plan-c-deployment.md
 18 docs/policy-engine.md
-17 docs/postgres-age-guide.md
+16 docs/postgres-age-guide.md
 13 docs/production-deployment.md
 1 docs/promotion-geometry.md
 3 docs/reference/ARCHITECTURE_REFERENCE.md

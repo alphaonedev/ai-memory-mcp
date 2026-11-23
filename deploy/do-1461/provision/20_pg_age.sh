@@ -2,7 +2,7 @@
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
 #
-# Stand up the per-REGION PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7
+# Stand up the per-REGION PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7
 # substrate droplets (role=pg, ONE per region) — NATIVE, no Docker (operator
 # decision: zero Docker anywhere on the DO fleet). Within each region every peer
 # keys to its own search_path schema (ic_peer_<K>) on THAT region's pg node and
@@ -13,11 +13,14 @@
 # independently hosts ic_peer_1..K for its own K peers.
 #
 # Install vector (verified against the live pgdg noble repo — see lib.sh):
-#   * postgresql-18          18.6   exact pgdg .deb
-#   * postgresql-18-pgvector 0.8.7  exact pgdg .deb
-#   * postgresql-18-age      age.control default_version='1.8.0' (extversion
-#     1.8.0) — same commit as the apache/age:release_PG18_1.8.0 image; the
-#     pgdg "~rc0" is only a Debian revision label. No source build.
+#   * postgresql-<major>          exact pgdg .deb (PG_APT_VERSION)
+#   * postgresql-<major>-pgvector exact pgdg .deb (PGVECTOR_APT_VERSION)
+#   * Apache AGE built from source at AGE_SOURCE_COMMIT (pgdg ships no AGE
+#     package for this major); `git rev-parse HEAD` must equal the pin or
+#     the install fails, then apply_age_patch.py (staged from the docker-1461
+#     SSOT directory) applies the one pinned upstream fix and fails closed on
+#     any other source, patch or result (#9965).
+#     Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
 #
 # Native specifics vs. the old container model:
 #   * The cluster is (re)created with --data-checksums for parity with the
@@ -33,7 +36,7 @@
 #   * pg_hba.conf is hostssl-ONLY: a non-TLS TCP connection is rejected
 #     pre-auth. The local unix socket stays `trust` for the postgres probes.
 #
-# Benchmark-matrix knobs (#172) are EMPTY by default → stock PG18.6 = the B0
+# Benchmark-matrix knobs (#172) are EMPTY by default → stock server = the B0
 # control. A matrix arm re-provisions with exactly ONE knob set (lib.sh).
 #
 # Secret handling: a SINGLE fleet PG password is generated once into the
@@ -43,6 +46,10 @@
 # It is rendered into a 0600 role.sql, scp'd to each pg droplet, applied, then
 # shredded remotely — never echoed, never on a command line, never committed.
 source "$(dirname "$0")/lib.sh"
+# The AGE patch pins live in the docker-1461 SSOT; the applier reads them there.
+AGE_PROVISION_DIR="$(cd "$(dirname "$0")/../../docker-1461/provision" && pwd)"
+AGE_PATCH_FILE="$(python3 "$AGE_PROVISION_DIR/apply_age_patch.py" --ssot "$AGE_PROVISION_DIR/lib.sh" --print-pin AGE_PATCH_FILE)"
+: "${AGE_PATCH_FILE:?docker-1461 SSOT did not define AGE_PATCH_FILE}"
 
 require_inventory
 
@@ -198,7 +205,8 @@ export DEBIAN_FRONTEND=noninteractive
 PG_MAJOR='$PG_MAJOR'; PG_CLUSTER='$PG_CLUSTER'
 PG_CONF_DIR='$PG_CONF_DIR'; PG_TLS_DIR='$PG_TLS_DIR'; PG_STAGE_DIR='$PG_STAGE_DIR'
 PG_USER='$PG_USER'; PG_DB='$PG_DB'; PGDG_CODENAME='$PGDG_CODENAME'
-PG_APT_VERSION='$PG_APT_VERSION'; PGVECTOR_APT_VERSION='$PGVECTOR_APT_VERSION'; AGE_APT_VERSION='$AGE_APT_VERSION'
+PG_APT_VERSION='$PG_APT_VERSION'; PGVECTOR_APT_VERSION='$PGVECTOR_APT_VERSION'
+AGE_SOURCE_REPO='$AGE_SOURCE_REPO'; AGE_SOURCE_COMMIT='$AGE_SOURCE_COMMIT'
 REMOTE_TLS='$REMOTE_TLS'
 EOF
     cat <<'EOS'
@@ -217,13 +225,33 @@ if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
 fi
 apt-get update -qq
 
-# 2. pinned native install (server + client + pgvector + AGE)
-log "installing pinned PG${PG_MAJOR} + pgvector + AGE"
+# 2. pinned native install (server + client + server-dev + pgvector)
+log "installing pinned PG${PG_MAJOR} + pgvector"
 apt-get install -y -qq \
   "postgresql-${PG_MAJOR}=${PG_APT_VERSION}" \
-  "postgresql-client-${PG_MAJOR}" \
+  "postgresql-client-${PG_MAJOR}=${PG_APT_VERSION}" \
+  "postgresql-server-dev-${PG_MAJOR}=${PG_APT_VERSION}" \
   "postgresql-${PG_MAJOR}-pgvector=${PGVECTOR_APT_VERSION}" \
-  "postgresql-${PG_MAJOR}-age=${AGE_APT_VERSION}"
+  bison build-essential flex git python3
+
+# 2b. Apache AGE from source at the ONE pinned upstream commit plus the ONE
+#     pinned upstream fix (#9965). The checked-out HEAD must equal
+#     AGE_SOURCE_COMMIT and apply_age_patch.py must accept the patch and the
+#     patched tree, or the install fails.
+log "building Apache AGE at ${AGE_SOURCE_COMMIT}"
+rm -rf /usr/local/src/age
+git init -q /usr/local/src/age
+git -C /usr/local/src/age remote add origin "$AGE_SOURCE_REPO"
+git -C /usr/local/src/age fetch -q --depth 1 origin "$AGE_SOURCE_COMMIT"
+git -C /usr/local/src/age checkout -q --detach FETCH_HEAD
+AGE_HEAD="$(git -C /usr/local/src/age rev-parse HEAD)"
+if [ "$AGE_HEAD" != "$AGE_SOURCE_COMMIT" ]; then
+  log "Apache AGE source HEAD $AGE_HEAD != pinned $AGE_SOURCE_COMMIT"; exit 1
+fi
+python3 "$PG_STAGE_DIR/age-provision/apply_age_patch.py" --ssot "$PG_STAGE_DIR/age-provision/lib.sh" --src /usr/local/src/age
+make -C /usr/local/src/age -j"$(nproc)" PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+make -C /usr/local/src/age install PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+python3 "$PG_STAGE_DIR/age-provision/apply_age_patch.py" --ssot "$PG_STAGE_DIR/age-provision/lib.sh" --src /usr/local/src/age --verify
 
 # 3. fresh cluster WITH data checksums (parity with the container initdb),
 #    gated by a sentinel so re-runs never wipe an initialized cluster.
@@ -282,9 +310,14 @@ EOS
   scp_to "$PG_HBA"     "$pg_pub" "$PG_STAGE_DIR/pg_hba.conf"
   scp_to "$SYSTEM_SQL" "$pg_pub" "$PG_STAGE_DIR/system.sql"
   scp_to "$ROLE_SQL"   "$pg_pub" "$PG_STAGE_DIR/role.sql"
+  # The AGE patch applier, the SSOT it reads its pins from and the patch file (#9965).
+  ssh_node "$pg_pub" "mkdir -p $PG_STAGE_DIR/age-provision/patches"
+  scp_to "$AGE_PROVISION_DIR/lib.sh"             "$pg_pub" "$PG_STAGE_DIR/age-provision/lib.sh"
+  scp_to "$AGE_PROVISION_DIR/apply_age_patch.py" "$pg_pub" "$PG_STAGE_DIR/age-provision/apply_age_patch.py"
+  scp_to "$AGE_PROVISION_DIR/patches/$AGE_PATCH_FILE" "$pg_pub" "$PG_STAGE_DIR/age-provision/patches/$AGE_PATCH_FILE"
   ssh_node "$pg_pub" "chmod 0600 $PG_STAGE_DIR/role.sql"
 
-  log "[$pg_host] running native PG18.6 + AGE1.8.0 + pgvector0.8.7 install (this builds nothing — pinned .debs)"
+  log "[$pg_host] running native PG $EXPECTED_PG_VERSION + AGE $EXPECTED_AGE_VERSION + pgvector $EXPECTED_PGVECTOR_VERSION install (pinned .debs + AGE source build at $AGE_SOURCE_COMMIT)"
   ssh_node "$pg_pub" "bash $PG_STAGE_DIR/pg-install.sh"
 
   log "[$pg_host] waiting for postgres ready"
@@ -319,7 +352,7 @@ EOS
       die "[$pg_host] FAIL-CLOSED (#2658): hostssl is NOT provably armed -- a plaintext (sslmode=disable) TCP connection to $pg_priv:$PG_PORT was NOT refused pre-auth. REFUSING to declare this pg substrate ready (a cleartext-accepting postgres reporting healthy is the silent disarm this gate exists to prevent). probe: ${plain_out}" ;;
   esac
 
-  log "region $region PG18.6/AGE1.8.0/pgvector substrate ready ($pg_host @ $pg_priv:$PG_PORT, $peer_n peer schemas, NATIVE/no-docker)"
+  log "region $region PG $EXPECTED_PG_VERSION/AGE $EXPECTED_AGE_VERSION/pgvector substrate ready ($pg_host @ $pg_priv:$PG_PORT, $peer_n peer schemas, NATIVE/no-docker)"
 }
 
 # Drive each region's pg node. bash-3.2: feed the hostname list via a here-doc
@@ -331,4 +364,4 @@ done <<EOF
 $PG_HOSTS
 EOF
 
-log "all regional PG18.6/AGE1.8.0/pgvector substrates ready ($(inv_regions | tr '\n' ' ')— one pg per region, NATIVE/no-docker)"
+log "all regional PG $EXPECTED_PG_VERSION/AGE $EXPECTED_AGE_VERSION/pgvector substrates ready ($(inv_regions | tr '\n' ' ')— one pg per region, NATIVE/no-docker)"

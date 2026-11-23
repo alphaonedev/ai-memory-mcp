@@ -5,7 +5,7 @@
 #
 # This kit stands up the EXACT environment the v1.0.0 enterprise-federation
 # audit used, so any AI NHI (or human peer reviewer) can reproduce it 100%
-# from committed steps: a PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7
+# from committed steps: the certified PostgreSQL + Apache AGE + pgvector
 # data tier over TLS 1.3 (hostssl-only, cleartext refused) + mTLS to the
 # store, an ai-memory daemon wired into ONLY that tier over the encrypted
 # store link and served on the client<->daemon mTLS API (:9077) under the
@@ -67,8 +67,9 @@ die()  { printf '[%s] FATAL %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; exit 1; }
 : "${EXPECTED_AGE_VERSION:?docker-1461 SSOT did not define EXPECTED_AGE_VERSION}"
 : "${PGVECTOR_APT_VERSION:?docker-1461 SSOT did not define PGVECTOR_APT_VERSION}"
 : "${PG_APT_VERSION:?docker-1461 SSOT did not define PG_APT_VERSION}"
-: "${AGE_APT_VERSION:?docker-1461 SSOT did not define AGE_APT_VERSION}"
-: "${AGE_BASE_IMAGE:?docker-1461 SSOT did not define AGE_BASE_IMAGE}"
+: "${PG_BASE_IMAGE:?docker-1461 SSOT did not define PG_BASE_IMAGE}"
+: "${AGE_SOURCE_REPO:?docker-1461 SSOT did not define AGE_SOURCE_REPO}"
+: "${AGE_SOURCE_COMMIT:?docker-1461 SSOT did not define AGE_SOURCE_COMMIT}"
 : "${PG_MAJOR:?docker-1461 SSOT did not define PG_MAJOR}"
 : "${AGE_GRAPH_NAME:?docker-1461 SSOT did not define AGE_GRAPH_NAME}"
 
@@ -119,7 +120,7 @@ JUDGE_KEY_DIR="${KEYS_DIR}/judge"
 STOPPER_KEY_DIR="${KEYS_DIR}/stopper"
 
 # --------------------------------------------------------------------------
-# PostgreSQL 18.6 + AGE 1.8.0 + pgvector 0.8.7 container.
+# certified PostgreSQL + AGE + pgvector container (versions from the SSOT).
 # --------------------------------------------------------------------------
 PG_CONTAINER="${EF_REPRO_PG_CONTAINER:-${CAMPAIGN}-pg}"
 PG_IMAGE="${EF_REPRO_PG_IMAGE:-ai-memory-cert-pg:pg${EXPECTED_PG_VERSION}-age${EXPECTED_AGE_VERSION}-pgv${EXPECTED_PGVECTOR_VERSION}}"

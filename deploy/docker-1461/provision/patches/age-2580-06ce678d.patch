@@ -1,0 +1,20 @@
+diff --git a/src/backend/catalog/ag_catalog.c b/src/backend/catalog/ag_catalog.c
+index 107de370d37aebaf4f42fd084ad808df7c566231..33b087a2cdd46a7f2d949afbb8f7308b62856ac8 100644
+--- a/src/backend/catalog/ag_catalog.c
++++ b/src/backend/catalog/ag_catalog.c
+@@ -75,6 +75,15 @@ is_age_extension_exists(void)
+ {
+     static bool callback_registered = false;
+ 
++    /*
++     * Outside a live transaction (the ROLLBACK of a failed one) the catalog
++     * must not be read: the resource owner is already released, and the locks
++     * a catalog scan takes here would leak into the PGPROC. Nothing is cached,
++     * so the next live transaction asks the catalog again.
++     */
++    if (!IsTransactionState())
++        return false;
++
+     if (extension_cache_is_valid)
+         return age_extension_exists;
+ 

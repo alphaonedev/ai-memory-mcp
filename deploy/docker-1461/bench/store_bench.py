@@ -51,7 +51,7 @@ CORPUS = [
      "succeed without presenting the daemon HTTP api_key."),
     ("pgvector hnsw",
      "pgvector 0.8.7 HNSW index over the 768-dim nomic-embed-text vectors "
-     "stored in PostgreSQL 18.4; the daemon connects over TLS verify-full and "
+     "stored in PostgreSQL 19.0; the daemon connects over TLS verify-full and "
      "the ANN search honors hnsw.ef_search at query time."),
     ("provisioning reflection",
      "Reflection: across the do-1461 provisioning run the role.sql application "

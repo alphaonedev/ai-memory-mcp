@@ -112,12 +112,13 @@ fi
 # --------------------------------------------------------------------------
 if [ "${EF_REPRO_FORCE_REBUILD:-0}" = "1" ] || ! DK image inspect "$PG_IMAGE" >/dev/null 2>&1; then
   [ -f "$DOCKER_1461_DOCKERFILE" ] || die "canonical Dockerfile missing: $DOCKER_1461_DOCKERFILE"
-  log "repro: building $PG_IMAGE from $DOCKER_1461_DOCKERFILE (PG $PG_APT_VERSION + AGE $AGE_APT_VERSION + pgvector $PGVECTOR_APT_VERSION)"
+  log "repro: building $PG_IMAGE from $DOCKER_1461_DOCKERFILE (PG $PG_APT_VERSION + AGE $EXPECTED_AGE_VERSION @ $AGE_SOURCE_COMMIT + pgvector $PGVECTOR_APT_VERSION)"
   DK build \
-    --build-arg "AGE_BASE_IMAGE=$AGE_BASE_IMAGE" \
+    --build-arg "PG_BASE_IMAGE=$PG_BASE_IMAGE" \
     --build-arg "PG_MAJOR=$PG_MAJOR" \
     --build-arg "PG_APT_VERSION=$PG_APT_VERSION" \
-    --build-arg "AGE_APT_VERSION=$AGE_APT_VERSION" \
+    --build-arg "AGE_SOURCE_REPO=$AGE_SOURCE_REPO" \
+    --build-arg "AGE_SOURCE_COMMIT=$AGE_SOURCE_COMMIT" \
     --build-arg "PGVECTOR_APT_VERSION=$PGVECTOR_APT_VERSION" \
     -f "$DOCKER_1461_DOCKERFILE" -t "$PG_IMAGE" \
     "$(dirname "$DOCKER_1461_DOCKERFILE")"

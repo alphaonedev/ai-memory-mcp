@@ -76,11 +76,14 @@ fn mk_memory(namespace: &str, title: &str, now: &str) -> Memory {
 ///
 /// Why not `DROP EXTENSION age CASCADE` + `CREATE EXTENSION age` (the #3881
 /// real-world path): the survival of the schema across that drop is
-/// VERSION-DEPENDENT. MEASURED by f1 on PG 18.6 / AGE 1.8.0 (the certified
-/// tier): the drop takes the schema with it, so the fixture produced
+/// tier-history: begin (#3883 measured on the tier certified in 2026-09)
+/// VERSION-DEPENDENT. MEASURED by f1 on PG 18.6 / AGE 1.8.0 (the tier
+/// then certified): the drop takes the schema with it, so the fixture produced
 /// (schema absent, registry absent), the link re-created the graph, and the
 /// cell failed on a missing outbox row for a reason that had nothing to do
-/// with the product. The catalog-row construction is version-independent, and
+/// with the product.
+/// tier-history: end
+/// The catalog-row construction is version-independent, and
 /// the caller asserts BOTH halves of the orphan shape before relying on it.
 async fn orphan_the_graph(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -137,8 +140,8 @@ async fn heal_the_graph(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     // called against (:174 recovers a crashed prior run): healthy (ag_graph row
     // + schema), ORPHAN (schema present, NO ag_graph row — the `orphan_the_graph`
     // shape: it deletes the `ag_label` + `ag_graph` rows and leaves the schema,
-    // version-independent since `DROP EXTENSION age` takes the schema with it on
-    // AGE 1.8), and fully absent. A REGISTERED graph MUST be torn down with AGE's
+    // version-independent since `DROP EXTENSION age` can take the schema with
+    // it, as measured above), and fully absent. A REGISTERED graph MUST be torn down with AGE's
     // `drop_graph`, for a reason that holds regardless of the lane's
     // `shared_preload_libraries`: a raw `DROP SCHEMA ... CASCADE` under an active
     // AGE session fires the object_access hook (`2BP01 table "_ag_label_edge" is
@@ -277,7 +280,9 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
         "fixture precondition: the memory_graph SCHEMA must SURVIVE orphaning (else this is an absent graph, not an orphan)"
     );
     // NEVER reuse a backend that saw the graph before the raw catalog delete. MEASURED in CI on
+    // tier-history: begin (#3883 CI capture of 2026-09-24)
     // f2-linux-fed-2 (PG 18.6 / AGE 1.8.0, 2026-09-24 15:13 EDT): a pooled connection that had
+    // tier-history: end
     // cached `memory_graph` ran the link's cypher MERGE after the ag_graph/ag_label rows were
     // deleted under it and AGE SEGFAULTED the backend ("terminated by signal 11"), which
     // restarts the WHOLE shared cluster. A raw DELETE sends AGE no cache invalidation, so the

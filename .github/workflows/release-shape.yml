@@ -123,9 +123,10 @@ jobs:
           echo "::add-mask::$pw"
           echo "PGTLS_DIR=$d" >> "$GITHUB_ENV"
           echo "PGTLS_PW=$pw" >> "$GITHUB_ENV"
-          # Image: pgvector/pgvector 0.8.7-pg18 (canonical PostgreSQL 18.6 + pgvector 0.8.7
-          # stack of the repo SSOT), pinned by digest; no Apache AGE in this image.
-          docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof -v "$d:/certs:ro" pgvector/pgvector@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11 -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf
+          # Image: pgvector/pgvector 0.8.7-pg19-trixie (PostgreSQL 19.0 + pgvector 0.8.7, the
+          # certified major and pgvector of the repo SSOT), pinned by digest; no Apache AGE
+          # in this image.
+          docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof -v "$d:/certs:ro" pgvector/pgvector@sha256:ace863afa68a13560603dc7366fad0adb4f5ddd0a21c8f06418195f32e03fa08 -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf
           for _ in $(seq 1 60); do
             if docker exec release-shape-pg pg_isready -U postgres -d proof >/dev/null 2>&1; then
               ready=1; break

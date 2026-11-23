@@ -10,7 +10,7 @@
 #
 # THIS JOB. Runs ONLY the ignored tests (`--ignored`, not a full-suite
 # `--include-ignored` duplicate of the already-required enterprise-fed
-# Check). Same native pg18.6+AGE1.8.0+pgvector0.8.7 tier, same
+# Check). Same native PG 19.0+AGE 1.7.0+pgvector 0.8.7 tier, same
 # per-job ephemeral db pattern as cert-postgres-age.yml.
 #
 # RUNNER PLACEMENT — self-hosted linux-fed (pg-tier). Needs :5445.
@@ -90,7 +90,7 @@ jobs:
         if: steps.docs.outputs.docs_only != 'true'
         run: |
           set -euo pipefail
-          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+          for d in /usr/lib/postgresql/19/bin /opt/aimem/pg19/bin; do
             if [ -d "$d" ]; then
               echo "$d" >> "$GITHUB_PATH"
               PATH="$d:$PATH"
@@ -155,7 +155,7 @@ jobs:
             echo "::notice::no ephemeral db to drop (CI_FED_DB unset — configure never ran)"
             exit 0
           fi
-          for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
+          for d in /usr/lib/postgresql/19/bin /opt/aimem/pg19/bin; do
             [ -d "$d" ] && PATH="$d:$PATH"
           done
           export PATH

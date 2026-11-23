@@ -57,7 +57,7 @@ PEER_PUBLISHED_PORT_BASE="${DOCKER_1461_PORT_BASE:-19280}"        # host loopbac
 QUORUM_WRITES="${DOCKER_1461_QUORUM_WRITES:-2}"                   # W-of-N synchronous
 
 # --------------------------------------------------------------------------
-# PostgreSQL 18 + Apache AGE + pgvector
+# PostgreSQL + Apache AGE + pgvector (certified data tier, pins below)
 # --------------------------------------------------------------------------
 PG_CONTAINER="${DOCKER_1461_PG_CONTAINER:-${CAMPAIGN}-pg-age}"
 PG_HOSTNAME="${DOCKER_1461_PG_HOSTNAME:-pg-age}"                  # intra-bridge DNS
@@ -81,43 +81,52 @@ EXPECTED_SCHEMA="${DOCKER_1461_EXPECTED_SCHEMA:-57}"
 EMBED_DIM="${DOCKER_1461_EMBED_DIM:-768}"
 EMBED_MODEL="${DOCKER_1461_EMBED_MODEL:-nomic-embed-text}"        # Ollama tag
 EMBED_MODEL_CONFIG_ID="${DOCKER_1461_EMBED_CONFIG_ID:-nomic_embed_v15}"
-# PostgreSQL + Apache AGE + pgvector stack pins. The apache/age PG18 base
-# ships AGE 1.7.0 compiled into the PG18 tree (age.so + age--<ver>.sql +
-# age.control) at the image's server minor. We bump ALL THREE via pinned
-# pgdg apt .debs inside Dockerfile.pg-age-vector — no source build:
-#   1. server + client to the EXACT target minor (PG_APT_VERSION),
-#      apt --only-upgrade (ABI-safe within major 18).
-#   2. AGE to 1.8.0 via `postgresql-<major>-age=<AGE_APT_VERSION>` — the
-#      CANONICAL PostgreSQL apt channel (pgdg) already ships it, so no
-#      source clone/`make install` is needed. This mirrors the do-1461
-#      NATIVE lane's `postgresql-18-age` install. AGE 1.8.0 is the NEWEST
-#      released AGE for PostgreSQL 18 per github.com/apache/age/releases
-#      (PG18/v1.8.0-rc0, 2026-07-09). Apache AGE tags EVERY release
-#      `X.Y.Z-rc0` on GitHub (its release-vote convention), which is why the
-#      pgdg package version reads `1.8.0~rc0-...`; `CREATE EXTENSION age`
-#      reports extversion = 1.8.0 (asserted by the validate/standup harness).
-#      NOTE: the project download page (age.apache.org/download) still lists
-#      1.7.0 as "current stable" and lags the releases page — we track the
-#      newest RELEASED AGE for PG18. The apt package overlays the base
-#      image's make-install'd 1.7.0 files cleanly (no dpkg conflict;
-#      verified) and its age.control default becomes 1.8.0.
+# PostgreSQL + Apache AGE + pgvector stack pins: the certified data tier is
+# PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7. This block is the ONE
+# source of truth for it (operator orders c4f4d408 / 111f59db, 2026-11-22);
+# every Dockerfile, workflow, harness and doc takes the triple from here, and
+# the certified-data-tier pin ratchet (#9927) fails CI on any drift.
+#   1. PostgreSQL: the official image for the major (PG_BASE_IMAGE), pinned
+#      by digest (#9969), server + client bumped to the EXACT pgdg minor
+#      (PG_APT_VERSION) via apt --only-upgrade (ABI-safe within the major).
+#   2. Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus
+#      upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache
+#      release; upstream has no 1.7.0 release for PostgreSQL 19).
+#      pgdg ships no postgresql-19-age package and apache/age publishes no
+#      PG19 image, so Dockerfile.pg-age-vector checks out AGE_SOURCE_COMMIT
+#      from AGE_SOURCE_REPO, fails the build when `git rev-parse HEAD`
+#      differs from it, and runs provision/apply_age_patch.py, which applies
+#      exactly one upstream commit, AGE_PATCH_UPSTREAM_COMMIT (#2580/#2581:
+#      is_age_extension_exists() returns false outside a live transaction, so
+#      a backend with age preloaded no longer leaks a lock), from
+#      provision/patches/AGE_PATCH_FILE. The build fails when the patch bytes
+#      differ from AGE_PATCH_SHA256, it applies with any offset or fuzz, the
+#      guard is absent, or the patched ag_catalog.c differs from
+#      AGE_PATCHED_FILE_SHA256 (#9965). The tagged v1.7.0-rc0 source of the previous major does not
+#      compile against PostgreSQL 19 (71 errors: changed executor and table-AM
+#      signatures); c6b043d is upstream's PG19 port (#2457) at
+#      default_version 1.7.0. `CREATE EXTENSION age` reports extversion 1.7.0
+#      (EXPECTED_AGE_VERSION, asserted by the validate/standup harness).
 #   3. pgvector (PGVECTOR_APT_VERSION) — the sal-postgres adapter's server
-#      `vector` type. Advanced 0.8.6 -> 0.8.7 (current-stable, certified 2026-10-23).
+#      `vector` type, from pgdg apt.
 # Every literal lives HERE (SSOT), passed to the build as --build-arg,
 # asserted by the validate harness; the Dockerfile carries no version
-# literal of its own. AGE_BASE_IMAGE stays release_PG18_1.7.0 (it provides
-# PG18 + the apt/build environment); AGE is replaced by the apt pin above.
-AGE_BASE_IMAGE="${DOCKER_1461_AGE_BASE_IMAGE:-apache/age:release_PG18_1.7.0}"
-PG_MAJOR="${DOCKER_1461_PG_MAJOR:-18}"                            # server major (apt pkg suffix)
-PG_APT_VERSION="${DOCKER_1461_PG_APT_VERSION:-18.6-1.pgdg13+2}"   # pinned exact pgdg .deb
-AGE_APT_VERSION="${DOCKER_1461_AGE_APT_VERSION:-1.8.0~rc0-2.pgdg13+1}" # AGE 1.8.0 (extversion 1.8.0)
-PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.7-1.pgdg13+1}"
+# literal of its own.
+PG_BASE_IMAGE="${DOCKER_1461_PG_BASE_IMAGE:-postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60}"  # official image, Debian 13 / pgdg13, by digest
+PG_MAJOR="${DOCKER_1461_PG_MAJOR:-19}"                            # server major (apt pkg suffix)
+PG_APT_VERSION="${DOCKER_1461_PG_APT_VERSION:-19.0-2.pgdg13+1}"   # pinned exact pgdg .deb
+AGE_SOURCE_REPO="${DOCKER_1461_AGE_SOURCE_REPO:-https://github.com/apache/age.git}"
+AGE_SOURCE_COMMIT="${DOCKER_1461_AGE_SOURCE_COMMIT:-c6b043d1c8f4909331b9080d6640b487782fc958}" # AGE 1.7.0, upstream PG19 branch
+AGE_PATCH_UPSTREAM_COMMIT="${DOCKER_1461_AGE_PATCH_UPSTREAM_COMMIT:-06ce678d74210539705c77e2dc7c9fa861e2a331}" # apache/age#2581
+AGE_PATCH_FILE="${DOCKER_1461_AGE_PATCH_FILE:-age-2580-06ce678d.patch}"
+AGE_PATCH_SHA256="${DOCKER_1461_AGE_PATCH_SHA256:-7efe593224097d43bd6779075388e16ae793f555da0ff3c5ced951d9b906d20c}"
+AGE_PATCHED_FILE_SHA256="${DOCKER_1461_AGE_PATCHED_FILE_SHA256:-3156a9b8ce13246fab82a07091303ad61a05981bdb3f88998b4e97bb778c640b}"
+PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.7-1.pgdg13+2}"
 # Reproducibility assertion anchors (validate harness asserts these exact
-# upstream-reported versions — the directive: results must reflect the data
-# tier PG 18.6 (current stable) + AGE 1.8.0 (newest released AGE for PG18) +
-# pgvector 0.8.7 (current stable)).
-EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-18.6}"
-EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.8.0}"
+# upstream-reported versions: PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector
+# 0.8.7).
+EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-19.0}"
+EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.7.0}"
 PG_AGE_VECTOR_IMAGE="${DOCKER_1461_PG_IMAGE:-ai-memory-${CAMPAIGN}-pg-age-vector:latest}"
 DAEMON_IMAGE="${DOCKER_1461_DAEMON_IMAGE:-ai-memory-${CAMPAIGN}-daemon:latest}"
 CARGO_FEATURES="${DOCKER_1461_CARGO_FEATURES:-sal,sal-postgres}"

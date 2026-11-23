@@ -2,7 +2,7 @@
 Copyright 2026 AlphaOne LLC
 SPDX-License-Identifier: Apache-2.0
 -->
-# do-1461 — Secure Enterprise Federated Reference Architecture (3-region, PG18.6/AGE1.8.0)
+# do-1461 — Secure Enterprise Federated Reference Architecture (3-region, PG19.0/AGE1.7.0)
 
 A deterministic, idempotent, **0→60** build of the `ai-memory` v0.7.0 federated
 test fleet on DigitalOcean: a **3-region AI Agent Hive** (the Secure Enterprise
@@ -14,7 +14,7 @@ verification harness proves it.
 
 The fleet is **12 nodes across 3 regions** (nyc3 US-East, fra1 EU-Central, sgp1
 Asia-SE). Each region is a self-contained substrate cluster: **one regional
-PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7 node + 3 ai-memory daemon
+PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7 node + 3 ai-memory daemon
 peers**. A region's peers key to their own `search_path` schema (`ic_peer_1..K`,
 within-region) on **their region's** pg node and dial it on **that region's
 private VPC IP under TLS verify-full**. The 9 peers federate into ONE cross-region
@@ -22,15 +22,12 @@ quorum mesh over public IPs secured by mTLS + per-message Ed25519 signing + nonc
 anti-replay + peer enrollment. Every node runs the **Batman-active
 MAXIMUM-SECURE posture**.
 
-> **Data-tier versions.** PostgreSQL 18.6 and pgvector 0.8.7 are current-stable.
-> Apache AGE 1.8.0 is the newest released AGE for PostgreSQL 18 per
-> [github.com/apache/age/releases](https://github.com/apache/age/releases)
-> (`PG18/v1.8.0-rc0`, 2026-07-09). Apache AGE tags every release `X.Y.Z-rc0` on
-> GitHub (its release-vote convention), which is why the pgdg package version
-> reads `1.8.0~rc0-…`; `CREATE EXTENSION age` reports `extversion = 1.8.0`.
-> NOTE: the project download page (age.apache.org/download) still lists 1.7.0 as
-> "current stable" and lags the releases page — this lane tracks the newest
-> released AGE for PG18.
+> **Data-tier versions.** PostgreSQL 19.0 and pgvector 0.8.7 are pinned pgdg apt
+> packages (`$PG_APT_VERSION`, `$PGVECTOR_APT_VERSION`). pgdg ships no AGE
+> package for PostgreSQL 19, so the installer builds AGE from source at the one
+> pinned commit `$AGE_SOURCE_COMMIT`, unmodified, and fails when
+> `git rev-parse HEAD` differs: Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19).
+> `CREATE EXTENSION age` reports `extversion = 1.7.0`.
 
 ```
 make seed up provision validate test  # build, prove, full-spectrum test
@@ -46,15 +43,15 @@ Hostnames encode each node's function: `do-1461-<function>-<region>-<NN>`.
 | `do-1461-peer-nyc3-01`| peer  | nyc3   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-nyc3-02`| peer  | nyc3   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-nyc3-03`| peer  | nyc3   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
-| `do-1461-pg-nyc3-01`  | pg    | nyc3   | s-4vcpu-8gb   | regional PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7|
+| `do-1461-pg-nyc3-01`  | pg    | nyc3   | s-4vcpu-8gb   | regional PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7|
 | `do-1461-peer-fra1-01`| peer  | fra1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-fra1-02`| peer  | fra1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-fra1-03`| peer  | fra1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
-| `do-1461-pg-fra1-01`  | pg    | fra1   | s-4vcpu-8gb   | regional PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7|
+| `do-1461-pg-fra1-01`  | pg    | fra1   | s-4vcpu-8gb   | regional PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7|
 | `do-1461-peer-sgp1-01`| peer  | sgp1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-sgp1-02`| peer  | sgp1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-sgp1-03`| peer  | sgp1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
-| `do-1461-pg-sgp1-01`  | pg    | sgp1   | s-4vcpu-8gb   | regional PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7|
+| `do-1461-pg-sgp1-01`  | pg    | sgp1   | s-4vcpu-8gb   | regional PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7|
 
 The **9 peers** (3 per region) form ONE cross-region federation mesh. ai-memory
 federation is **primarily EVENTUAL**: every HTTP write commits **locally**, then
@@ -166,7 +163,7 @@ SSH command line.
 | 05   | `05_wait_ssh.sh`        | block until every node accepts SSH                               |
 | 10   | `10_binary.sh`          | fan out the golden binary to every node; assert version + sha   |
 | 15   | `15_tls.sh`             | one campaign CA + per-node leaf certs (peer **and** EACH region's pg server cert, whose SAN pins that region's pg private VPC IP) + mTLS allowlist fan-out — **before** PG so each cert exists before its pg starts |
-| 20   | `20_pg_age.sh`          | install + start the native PG18.6/AGE1.8.0/pgvector substrate on EACH region's pg node (hostssl-only, region-VPC bind); render init SQL from `lib.sh` per region (extensions + AGE graph + within-region `ic_peer_1..K` schemas + grants). Peers AUTO-MIGRATE their own v57 tables on `serve` — no `schema-init` step |
+| 20   | `20_pg_age.sh`          | install + start the native PG19.0/AGE1.7.0/pgvector substrate on EACH region's pg node (hostssl-only, region-VPC bind); render init SQL from `lib.sh` per region (extensions + AGE graph + within-region `ic_peer_1..K` schemas + grants). Peers AUTO-MIGRATE their own v57 tables on `serve` — no `schema-init` step |
 | 25   | `25_ollama_embed.sh`    | per-peer CPU Ollama sidecar serving `nomic-embed-text` (768-dim) |
 | 30   | `30_config.sh`          | render + push per-role `config.toml` + secret EnvironmentFile    |
 | 45   | `45_zero_touch.sh`      | mint campaign CA + per-peer credential; fan out keys/bundle/cred; wire peer-enrollment env (O(1) trust) |
@@ -205,9 +202,9 @@ SSH command line.
 
 - **Pinned artifacts** (`provision/lib.sh`): binary `sha256`, version `0.7.0`,
   schema `v57`, the pinned native Ollama release (`$OLLAMA_VERSION`), and the
-  pinned pgdg apt `.deb`s — **PostgreSQL 18.6** (`$PG_APT_VERSION`), **Apache AGE
-  1.8.0** (`$AGE_APT_VERSION`), **pgvector 0.8.7** (`$PGVECTOR_APT_VERSION`),
-  installed NATIVELY (no Docker anywhere on the fleet) — plus embedder/LLM model
+  pinned pgdg apt `.deb`s — **PostgreSQL 19.0** (`$PG_APT_VERSION`), **pgvector
+  0.8.7** (`$PGVECTOR_APT_VERSION`) — and **Apache AGE 1.7.0** built from source at
+  the pinned `$AGE_SOURCE_COMMIT`, installed NATIVELY (no Docker anywhere on the fleet) — plus embedder/LLM model
   ids, the synchronous write quorum (auto `W=$FED_SYNC_QUORUM_W` clamped to the
   node count, or `$QUORUM_WRITES`), and the zero-touch credential TTL
   (`$FED_CRED_TTL_SECS`) — all single-source constants, overridable by env for
@@ -252,14 +249,15 @@ runs on every peer. These controls are asserted LIVE over the wire by the
 Checks: binary `sha256` + `--version` (every node); `/api/v1/health`,
 `storage_backend == postgres`, `db_schema_version == 57`, single-instance, and
 systemd-active (every peer); **pg-node upstream-stack assertions** (the live
-server reports PostgreSQL `18.6`, Apache AGE `1.8.0`, pgvector `0.8.7`; the AGE
+server reports PostgreSQL `19.0`, Apache AGE `1.7.0`, pgvector `0.8.7`; the AGE
 graph is present; and every daemon→PG backend is TLS — `>=1 ssl, 0 plaintext`);
 and a fleet **federation-convergence** probe that writes a collective-scope
 marker to one peer and reads it back by id on another over the encrypted path.
 
 The canonical green baseline report is committed under
 [`results/`](results/) and is regenerated from a clean 0→60 run of THIS
-(3-region PG18.4) fleet; the prior single-region / PG16 hive numbers do not apply.
+(3-region) fleet and records the data-tier versions it ran on; the prior
+single-region / PG16 hive numbers do not apply.
 
 ## Full-spectrum testing (`make test`)
 
@@ -283,7 +281,7 @@ green. Groups:
 
 The canonical green report is committed under
 [`results/`](results/) and is regenerated from a clean 0→60 run of THIS
-(3-region PG18.4) fleet: every `crypto` negative refused at `000`; the
+(3-region) fleet, which records the data-tier versions it ran on: every `crypto` negative refused at `000`; the
 `federation` write committed locally under the synchronous `W=2` durability gate
 and then converged on all 8 other peers across the 3 regions via the async
 catch-up window; the `zerotouch` enrolled peer converged on its CA credential

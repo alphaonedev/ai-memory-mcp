@@ -2,8 +2,11 @@
 # refs #2960 / #3089).
 #
 # WHAT THIS PUBLISHES. `.github/Dockerfile.ci` — one image that bakes the
-# CERTIFIED data tier (PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.7,
-# the ONE TRUE triple from deploy/docker-1461/provision/lib.sh) PLUS the Rust
+# CERTIFIED data tier (PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector 0.8.7,
+# the ONE TRUE triple from deploy/docker-1461/provision/lib.sh; Apache AGE
+# 1.7.0, built from upstream PG19 branch commit c6b043d (not a tagged Apache
+# release; upstream has no 1.7.0 release for PostgreSQL 19), full sha
+# c6b043d1c8f4909331b9080d6640b487782fc958 = AGE_SOURCE_COMMIT) PLUS the Rust
 # CI build deps the postgres-backed jobs `apt-get install` at job start (mold,
 # build-essential, jq, sqlite3, postgresql-client). Publishing it once and
 # having jobs PULL it moves the apt-mirror flake + the per-run `docker build`
@@ -30,7 +33,7 @@
 # cert-postgres-age.yml). A base-image or apt-snapshot drift that silently
 # moved a version off its SSOT pin reds here and NO image is pushed — a bad
 # image can never reach the registry for a consumer to pull.
-name: "Publish CI image (pg18.6/AGE1.8.0/pgvector0.8.6)"
+name: "Publish CI image (pg19.0-age1.7.0-pgv0.8.7)"
 
 on:
   workflow_dispatch:
@@ -40,6 +43,8 @@ on:
       - ".github/Dockerfile.ci"
       - ".github/workflows/publish-ci-image.yml"
       - "deploy/docker-1461/provision/lib.sh"
+      - "deploy/docker-1461/provision/apply_age_patch.py"
+      - "deploy/docker-1461/provision/patches/**"
 
 permissions:
   contents: read
@@ -74,13 +79,18 @@ jobs:
           # Triple-encoded tag: a pin bump yields a new tag, so consumers that
           # resolve the same tag from the same SSOT never pull a stale image
           # under a moving tag. pgvector's tag segment uses the bare semver
-          # (strip the pgdg package suffix), matching pg_extension.extversion.
-          img_tag="pg${EXPECTED_PG_VERSION}-age${EXPECTED_AGE_VERSION}-pgvector${PGVECTOR_APT_VERSION%%-*}"
+          # (strip the pgdg package suffix), matching pg_extension.extversion;
+          # the form matches the repro image tag (e.g. pg19.0-age1.7.0-pgv0.8.7).
+          img_tag="pg${EXPECTED_PG_VERSION}-age${EXPECTED_AGE_VERSION}-pgv${PGVECTOR_APT_VERSION%%-*}"
           {
-            echo "CI_AGE_BASE_IMAGE=${AGE_BASE_IMAGE}"
+            echo "CI_PG_BASE_IMAGE=${PG_BASE_IMAGE}"
             echo "CI_PG_MAJOR=${PG_MAJOR}"
             echo "CI_PG_APT_VERSION=${PG_APT_VERSION}"
-            echo "CI_AGE_APT_VERSION=${AGE_APT_VERSION}"
+            echo "CI_AGE_SOURCE_REPO=${AGE_SOURCE_REPO}"
+            echo "CI_AGE_SOURCE_COMMIT=${AGE_SOURCE_COMMIT}"
+            echo "CI_AGE_PATCH_UPSTREAM_COMMIT=${AGE_PATCH_UPSTREAM_COMMIT}"
+            echo "CI_AGE_PATCH_FILE=${AGE_PATCH_FILE}"
+            echo "CI_AGE_PATCH_SHA256=${AGE_PATCH_SHA256}"
             echo "CI_PGVECTOR_APT_VERSION=${PGVECTOR_APT_VERSION}"
             echo "CI_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
             echo "CI_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
@@ -104,13 +114,16 @@ jobs:
         with:
           context: .github
           file: .github/Dockerfile.ci
+          build-contexts: |
+            age-provision=deploy/docker-1461/provision
           load: true
           tags: ai-memory-ci:verify
           build-args: |
-            AGE_BASE_IMAGE=${{ env.CI_AGE_BASE_IMAGE }}
+            PG_BASE_IMAGE=${{ env.CI_PG_BASE_IMAGE }}
             PG_MAJOR=${{ env.CI_PG_MAJOR }}
             PG_APT_VERSION=${{ env.CI_PG_APT_VERSION }}
-            AGE_APT_VERSION=${{ env.CI_AGE_APT_VERSION }}
+            AGE_SOURCE_REPO=${{ env.CI_AGE_SOURCE_REPO }}
+            AGE_SOURCE_COMMIT=${{ env.CI_AGE_SOURCE_COMMIT }}
             PGVECTOR_APT_VERSION=${{ env.CI_PGVECTOR_APT_VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -149,6 +162,10 @@ jobs:
             echo "| PostgreSQL | $pg_ver | ${CI_EXPECTED_PG_VERSION} |"
             echo "| Apache AGE | $age_ver | ${CI_EXPECTED_AGE_VERSION} |"
             echo "| pgvector | $vec_ver | ${CI_EXPECTED_PGVECTOR_VERSION} |"
+            echo ""
+            echo "Base image, pinned by digest (SSOT PG_BASE_IMAGE): \`${CI_PG_BASE_IMAGE}\`"
+            echo ""
+            echo "Apache AGE source: \`${CI_AGE_SOURCE_COMMIT}\` plus upstream fix commit \`${CI_AGE_PATCH_UPSTREAM_COMMIT}\` (\`${CI_AGE_PATCH_FILE}\`, sha256 \`${CI_AGE_PATCH_SHA256}\`)"
           } >> "$GITHUB_STEP_SUMMARY"
           case "$pg_ver" in
             "$CI_EXPECTED_PG_VERSION") : ;;
@@ -159,8 +176,16 @@ jobs:
             *) echo "::error::Apache AGE $age_ver != certified $CI_EXPECTED_AGE_VERSION (SSOT) — refusing to publish"; exit 1 ;;
           esac
           case "$vec_ver" in
-            ${CI_EXPECTED_PGVECTOR_VERSION}*) : ;;
+            "$CI_EXPECTED_PGVECTOR_VERSION") : ;;
             *) echo "::error::pgvector $vec_ver != certified ${CI_EXPECTED_PGVECTOR_VERSION} (SSOT) — refusing to publish"; exit 1 ;;
+          esac
+          # The AGE source commit is the fourth pin: the build already fails
+          # when `git rev-parse HEAD` differs from it; the label proves the
+          # published image carries the SSOT sha.
+          age_rev=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision.age" }}' ai-memory-ci:verify)
+          case "$age_rev" in
+            "$CI_AGE_SOURCE_COMMIT") : ;;
+            *) echo "::error::Apache AGE source commit $age_rev != certified $CI_AGE_SOURCE_COMMIT (SSOT) — refusing to publish"; exit 1 ;;
           esac
           docker rm -f ci-image-verify >/dev/null 2>&1 || true
           echo "certified triple asserted — safe to push"
@@ -170,15 +195,18 @@ jobs:
         with:
           context: .github
           file: .github/Dockerfile.ci
+          build-contexts: |
+            age-provision=deploy/docker-1461/provision
           push: true
           tags: |
             ${{ env.IMAGE_REPO }}:${{ env.CI_IMAGE_TAG }}
             ${{ env.IMAGE_REPO }}:latest
           build-args: |
-            AGE_BASE_IMAGE=${{ env.CI_AGE_BASE_IMAGE }}
+            PG_BASE_IMAGE=${{ env.CI_PG_BASE_IMAGE }}
             PG_MAJOR=${{ env.CI_PG_MAJOR }}
             PG_APT_VERSION=${{ env.CI_PG_APT_VERSION }}
-            AGE_APT_VERSION=${{ env.CI_AGE_APT_VERSION }}
+            AGE_SOURCE_REPO=${{ env.CI_AGE_SOURCE_REPO }}
+            AGE_SOURCE_COMMIT=${{ env.CI_AGE_SOURCE_COMMIT }}
             PGVECTOR_APT_VERSION=${{ env.CI_PGVECTOR_APT_VERSION }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}

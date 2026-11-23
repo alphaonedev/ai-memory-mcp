@@ -1,5 +1,5 @@
 #cloud-config
-# Track E1 -- ai-memory + PostgreSQL 18 + pgvector + Apache AGE bootstrap on the
+# Track E1 -- ai-memory + PostgreSQL 19 + pgvector + Apache AGE bootstrap on the
 # DO substrate droplet. Templated by `infra/do-hive/main.tf`. Operator-triggered.
 #
 # #1842 fix (v0.8.1): the prior template installed postgresql-16 but never
@@ -11,9 +11,12 @@
 # AI_MEMORY_STORE_URL_FILE (#4577; never on argv).
 #
 # #2293 fix (v1.0.0): the noble apt package `postgresql-16-pgvector` pins
-# pgvector 0.6.0, below the daemon's tested 0.7.x-0.8.x range (the v0.9.0 GA
-# reference round certified 0.8.4). pgvector is now built from source, same
-# as AGE, pinned to the certified v0.8.4 tag.
+# pgvector 0.6.0, below the daemon's tested 0.7.x-0.8.x range. pgvector is now
+# built from source, same as AGE, pinned to the certified tag (v0.8.7).
+#
+# #9927: the certified tier is PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector
+# 0.8.7. AGE is fetched at the one pinned upstream commit, unmodified, and the
+# build fails when `git rev-parse HEAD` differs from it.
 #
 # All provisioning is logged to /var/log/ai-memory-provision.log for SSH triage.
 package_update: true
@@ -27,13 +30,13 @@ bootcmd:
   # 0750 root:aimemory mode the fed-bootstrap script sets (install -d) once the
   # service user exists.
   - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
-  # PG 18 is supplied by PGDG on Ubuntu Noble. Install the signed repository
+  # PG 19 is supplied by PGDG on Ubuntu Noble. Install the signed repository
   # before cloud-init's packages module runs; never fall back to Ubuntu's PG16.
   - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"]
   - [bash, -c, "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update"]
 packages:
-  - postgresql-18=18.6-1.pgdg24.04+2
-  - postgresql-server-dev-18=18.6-1.pgdg24.04+2
+  - postgresql-19=19.0-2.pgdg24.04+1
+  - postgresql-server-dev-19=19.0-2.pgdg24.04+1
   - pgbouncer
   - build-essential
   - flex
@@ -452,6 +455,22 @@ write_files:
 
       : > "$FED_DIR/MESH-READY"
       echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
+  # #9965: the one upstream AGE fix of the certified build. main.tf renders the
+  # AGE pin lines of the docker-1461 SSOT, the applier and the patch file it
+  # pins; provision.sh runs the applier between checkout and make and again
+  # with --verify after make install.
+  - path: /opt/age-provision/lib.sh
+    permissions: '0644'
+    encoding: b64
+    content: ${age_pins_b64}
+  - path: /opt/age-provision/apply_age_patch.py
+    permissions: '0644'
+    encoding: gz+b64
+    content: ${age_applier_gzb64}
+  - path: /opt/age-provision/patches/${age_patch_file}
+    permissions: '0644'
+    encoding: b64
+    content: ${age_patch_b64}
   - path: /opt/ai-memory/provision.sh
     permissions: '0755'
     content: |
@@ -468,7 +487,7 @@ write_files:
       chown aimemory:aimemory /etc/ai-memory/store-url
       chmod 0600 /etc/ai-memory/store-url
 
-      # --- build + install certified pgvector 0.8.7 against PG18 ---
+      # --- build + install certified pgvector 0.8.7 against PG19 ---
       # Build the exact certified v0.8.7 tag rather than accepting apt drift.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
         rm -rf /opt/pgvector-src
@@ -478,22 +497,28 @@ write_files:
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- build + install certified Apache AGE 1.8.0 against PG18 ---
+      # --- build + install certified Apache AGE 1.7.0 against PG19 ---
+      # Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus
+      # upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache
+      # release; upstream has no 1.7.0 release for PostgreSQL 19). HEAD must
+      # equal the pinned commit and apply_age_patch.py must accept the patch
+      # and the patched tree, or the build fails.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
         rm -rf /opt/age-src
-        git clone https://github.com/apache/age.git /opt/age-src
+        git init -q /opt/age-src
         cd /opt/age-src
-        git checkout release/PG18/1.8.0
-        # bison 3.8 flags AGE's %pure-parser as deprecated; under -Werror that is
-        # fatal (same fix as the f1 macOS tier build). Drop -Werror outright -
-        # "-Wno-error=other" is not a valid gcc warning name and fails the build.
-        sed -i 's/-Werror//g' Makefile
+        git remote add origin https://github.com/apache/age.git
+        git fetch -q --depth 1 origin c6b043d1c8f4909331b9080d6640b487782fc958
+        git checkout -q --detach FETCH_HEAD
+        test "$(git rev-parse HEAD)" = c6b043d1c8f4909331b9080d6640b487782fc958
+        python3 /opt/age-provision/apply_age_patch.py --ssot /opt/age-provision/lib.sh --src /opt/age-src
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
+        python3 /opt/age-provision/apply_age_patch.py --ssot /opt/age-provision/lib.sh --src /opt/age-src --verify
       fi
 
       # --- preload AGE + restart postgres ---
-      PGCONF="/etc/postgresql/18/main/postgresql.conf"
+      PGCONF="/etc/postgresql/19/main/postgresql.conf"
       if ! grep -q "shared_preload_libraries.*age" "$PGCONF"; then
         echo "shared_preload_libraries = 'age'" >> "$PGCONF"
       fi

@@ -14,7 +14,15 @@ Edits to the standard's text go through a new revision of the reviews/ source, n
 # ai-memory v1.0.0 — Mission-Critical Certification Standard (v1)
 
 **Author:** Claude Fable 5.1 (Conductor, sole merger of `release/v1.0.0`)
-**Date:** 2026-09-09 (revision 4.3: pgvector 0.8.7 in §0.1, 2026-10-23; revision 4.2: freeze line recorded in §6 and §7)
+**Date:** 2026-09-09 (revision 4.4: PostgreSQL 19.0 + Apache AGE 1.7.0 in §0.1, 2026-11-22; revision 4.3: pgvector 0.8.7 in §0.1, 2026-10-23; revision 4.2: freeze line recorded in §6 and §7)
+**Revision 4.4 (2026-11-22):** the certified backend is PostgreSQL 19.0 + Apache AGE 1.7.0 +
+pgvector 0.8.7. Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus
+upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no
+1.7.0 release for PostgreSQL 19), is pinned as `AGE_SOURCE_COMMIT` plus `AGE_PATCH_SHA256` in
+`deploy/docker-1461/provision/lib.sh` (#9965). Reason: operator directives
+c4f4d408 and 111f59db (tracked in #9927). The PG 19 move revises no acceptance target, so the
+declaration is not re-registered.
+<!-- tier-history: begin (revision 4.3 and 4.2 notes, superseded by revision 4.4) -->
 **Revision 4.3 (2026-10-23):** the certified backend is advanced from pgvector 0.8.6 to
 pgvector 0.8.7 (PostgreSQL 18.6 and Apache AGE 1.8.0 unchanged). Reason: operator-set
 certified stack, "certified PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.7 => ai-memory
@@ -23,6 +31,7 @@ The hash-pinned v1.0.0 declaration (docs/compliance/v1.0.0-DECLARATION.md, regis
 revision 1) keeps its pgvector 0.8.6 label: its acceptance targets apply unchanged to
 pgvector 0.8.7, a patch-level upgrade that revises no target, so the declaration is not
 re-registered.
+<!-- tier-history: end -->
 **Status:** NORMATIVE for the v1.0.0 certification decision. Supersedes Phase 6
 ("release and adoption decision") of `GPT-6-ASTRA-AI-NHI-TEST-PLAN-2026-09-05.md` and
 prepends a scope-and-envelope section that plan lacked. Phases 1–5 of that plan remain
@@ -54,7 +63,7 @@ A certificate is void outside its envelope. The envelope enumerates:
 
 | Axis | Declared values (v1.0.0 candidate) |
 |---|---|
-| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` ([`DEFAULT_DB_SYNCHRONOUS`](../../src/storage/connection.rs), the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` ([`ENV_DB_SYNCHRONOUS`](../../src/storage/connection.rs)) or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 18.6 + Apache AGE 1.8.0 (apt package `1.8.0~rc0`, extension version 1.8.0) + pgvector 0.8.7; pins are the package SHA-256s mirrored in the bundle, the apt strings are informational |
+| Backends | SQLite (bundled, WAL) with `PRAGMA synchronous=FULL` — **not the compiled default**, which is `NORMAL` ([`DEFAULT_DB_SYNCHRONOUS`](../../src/storage/connection.rs), the documented #1579 B7 posture); the certified posture requires `AI_MEMORY_DB_SYNCHRONOUS=FULL` ([`ENV_DB_SYNCHRONOUS`](../../src/storage/connection.rs)) or the `asi-hard` profile, `ai-memory doctor --posture` attests it (N26), and a `NORMAL` node is inside the envelope only under the `local-only` durability class with its RPO declared accordingly · PostgreSQL 19.0 + Apache AGE 1.7.0 (built from upstream PG19 branch commit c6b043d, `AGE_SOURCE_COMMIT`, plus upstream fix commit 06ce678d, `AGE_PATCH_SHA256`; not a tagged Apache release; extension version 1.7.0) + pgvector 0.8.7; pins are the AGE source commit, the AGE patch SHA-256 and the package SHA-256s mirrored in the bundle, the apt strings are informational |
 | Feature builds | exactly the Cargo feature sets certified: `default` (sqlite-bundled) · `sal` · `sal-postgres` (implies `sal`) · `vectorlite`. The CI lane named `enterprise-fed` is `sal-postgres` run against the certified PG/AGE/pgvector pins; it is not a Cargo feature |
 | Transports and principals | HTTP with per-agent enrolled keys is the only **multi-principal** transport. MCP over stdio resolves its caller from the launcher's `AI_MEMORY_AGENT_ID` environment ([`resolve_read_visibility_caller`](../../src/identity/mod.rs); absent → single-tenant trust-all) and is certified as a **single trust domain**: one launcher, one principal. A swarm of N agents is certifiable only over HTTP, or over stdio when an orchestrator provably controls each child's environment and is itself the certified principal |
 | Hosts / adapters | an adapter contract with a tested version **range** per host, recorded in the N4 matrix; `ai-memory doctor --host <name>` (new, item 21) runs the wrapper self-test on the installed node; a node outside the range is NOT CERTIFIED for that host |
@@ -334,7 +343,7 @@ ship as the freeze list clears. Track column: `tag` = inside the v1.0.0 freeze
 | 16 | N20 | Soak host and 24 h / 72 h qualification soak with the growth ledger. Last binary-changing step precedes it. Child of #3308 Config 3. | cert | L | infra (operator) + harness |
 | 17 | N20 | Power-interruption VM for the persistence boundary named in `tests/power_loss_durability.rs` (carried inside N20). | cert | M | infra (operator) |
 | 18 | N22(b) | Procurement appendix (§8) and the ballot procedure into `docs/compliance/` (N22's certificate half; 0a is its tag half). | cert | S | docs |
-| 19 | N15 | AGE claim labelling into #3297's truthfulness pass; re-verify the `find_paths` relational-only rationale on AGE 1.8.0 with an EXPLAIN capture. Differential relational↔AGE suite is v1.1. | tag (docs) | S | docs + harness |
+| 19 | N15 | AGE claim labelling into #3297's truthfulness pass; re-verify the `find_paths` relational-only rationale on the certified AGE with an EXPLAIN capture (2026-09-11 capture: `docs/kg-find-paths-engine.md`). Differential relational↔AGE suite is v1.1. | tag (docs) | S | docs + harness |
 | 21 | N4 | `wrap codex` fails closed outside the tested version range (Codex ≥ 0.153 rejects `--system`; `--system-flag` overrides exist); boot sentinel; `ai-memory doctor --host <name>` wrapper self-test; docs rewritten. Matrix generation from acceptance runs is certificate work (G2). | tag (S) / cert (M) | M | code + docs |
 | 22 | N8 | Trust signals as distinct machine-readable claims; stop deriving `provenance_tier` from the incident edge; stop bucketing caller 1.0 as `confirmed`. | tag | M | code |
 | 22a | N31 | GA subset of the mission suite: correction reachability and poisoned memory with the harness-owned reference agent, n ≥ 30, preregistered threshold. Produces G3. | cert | M | harness |

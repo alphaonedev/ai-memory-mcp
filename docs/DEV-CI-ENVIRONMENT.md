@@ -33,9 +33,11 @@ Every enterprise-fed test tier runs the identical certified stack:
 
 | Component | Version |
 |---|---|
-| PostgreSQL | **18.6** |
-| Apache AGE | **1.8.0** |
+| PostgreSQL | **19.0** |
+| Apache AGE | **1.7.0** |
 | pgvector | **0.8.7** |
+
+Apache AGE 1.7.0, built from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581) (not a tagged Apache release; upstream has no 1.7.0 release for PostgreSQL 19). The pins live in `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION`, `AGE_SOURCE_COMMIT`, `EXPECTED_AGE_VERSION`, `PGVECTOR_APT_VERSION`; #9927, operator directives c4f4d408 and 111f59db). Both nodes carry this one triple (operator 618908f7); the macos-fed rebuild is #9929. PG 16 + AGE 1.6.0 remains the tested alternate (`infra/lan-parity-test/`).
 
 **TLS is mandatory on every tier, both nodes** — no customer permits unencrypted
 traffic to/from PostgreSQL. Each tier enforces:
@@ -63,8 +65,9 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 ### 3.1 Linux node (self-hosted `linux-fed`)
 
 - **OS:** Linux x86_64 (Ubuntu/Pop!_OS noble-class)
-- **Data tier:** **native** (pgdg apt pg18.6 + pgvector 0.8.7; **AGE 1.8.0 built
-  from source** — AGE is not packaged in pgdg apt)
+- **Data tier:** **native** (pgdg apt PostgreSQL 19.0 + pgvector 0.8.7; **AGE 1.7.0 built
+  from upstream PG19 branch commit c6b043d plus upstream fix commit 06ce678d** (#9965) — not a tagged Apache release, and AGE is
+  not packaged in pgdg apt)
   - Cluster listens on `127.0.0.1:5445`
   - TLS certs operator-local (postgres-owned; CA reused from `pg-age-stack/certs`)
   - Boot-managed via the distro postgresql systemd template
@@ -74,8 +77,12 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
 ### 3.2 macOS node (self-hosted `macos-fed`)
 
 - **OS:** macOS arm64 (Apple Silicon)
-- **Data tier:** **native** (Homebrew `postgresql@18` 18.6 + pgvector 0.8.7 built
-  from source; **AGE 1.8.0 built from source**, branch `release/PG18/1.8.0`)
+- **Data tier:** **native**, the same certified triple as the Linux node (PostgreSQL 19.0 +
+  AGE 1.7.0 from commit c6b043d + pgvector 0.8.7, operator 618908f7); the rebuild is #9929.
+<!-- tier-history: begin (macos-fed build before the #9929 rebuild) -->
+  Until #9929 lands the node runs its earlier build: Homebrew `postgresql@18` 18.6 +
+  pgvector 0.8.7 built from source; AGE 1.8.0 built from source, branch `release/PG18/1.8.0`.
+<!-- tier-history: end -->
   - Cluster listens on `127.0.0.1:5445`
   - Certs / env / init script live under the operator-local `pg-age-stack/` tree
 - **Self-hosted runner labels:** `self-hosted,macOS,ARM64,macos-fed`
@@ -237,7 +244,7 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 
 **Test matrix — self-hosted 2×2:**
 
-|                     | sqlite (local/default) | enterprise-fed (pg18.6+AGE1.8.0+pgvector0.8.7, TLS) |
+|                     | sqlite (local/default) | enterprise-fed (pg19.0+AGE1.7.0+pgvector0.8.7, TLS) |
 |---------------------|:----------------------:|:---------------------------------------------------:|
 | **Linux** (f2)      | ✓ self-hosted          | ✓ self-hosted (native `:5445`)                      |
 | **macOS** (f1)      | ✓ self-hosted          | ✓ self-hosted (native `:5445`)                      |
@@ -311,7 +318,11 @@ The containerized certified stack is retained as a **dormant reproduction
 artifact** so a reviewer can spin up an equivalent enterprise-fed environment:
 
 - Compose: `pg-age-stack/docker-compose.yml` + `pg-age-stack/Dockerfile`
-- Image (kept): `ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.7`
+- Image: `pg-age-vector:PG19.0-1.7.0-pgvector0.8.7`, built from
+  `deploy/docker-1461/Dockerfile.pg-age-vector` with the `lib.sh` pins
+<!-- tier-history: begin (image of the PG 18.6 tier, retired by #9927) -->
+- Retired image of the earlier tier: `ai-memory-cert-pg:pg18.6-age1.8.0-pgv0.8.7`
+<!-- tier-history: end -->
 - Deploy recipe (SSOT for the triple): `deploy/docker-1461/`
 
 A reviewer reproduces the enterprise-fed tier via docker; this brings up the certified pg+AGE+pgvector stack:
@@ -328,20 +339,28 @@ cd pg-age-stack && docker compose up -d
 Start, stop or restart the native pg cluster (operator-local cluster name), list the clusters, then connect over the local socket (trust auth). A from-scratch rebuild uses the operator-local `linux-native-tier.sh`.
 
 ```bash
-sudo pg_ctlcluster 18 <cluster> start|stop|restart
+sudo pg_ctlcluster 19 <cluster> start|stop|restart
 pg_lsclusters
 sudo -u postgres psql -p 5445 -d <test-db>
 ```
 
 ### macOS native tier
 ```bash
-# PATH: keg-only postgresql@18, then:
+# PATH: the node's keg-only Homebrew PostgreSQL, then:
 pg_ctl -D <pg-age-stack>/pgdata start|stop
 # env file on the node exports AI_MEMORY_TEST_POSTGRES_URL (never committed)
 # rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
-**AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
+**AGE self-heal (#6161).** Since #9927 the helper restores AGE only when its
+`MANIFEST_SOURCE_COMMIT` equals the SSOT `AGE_SOURCE_COMMIT`; any other pairing exits 2
+with nothing written. Its pins still name the node's earlier build until #9929 rebuilds
+AGE 1.7.0 at c6b043d on the node and re-pins `MANIFEST` and `MANIFEST_SOURCE_COMMIT`, so
+the macos-fed `Check (macos-fed,enterprise-fed)` row is red until then. The record of that
+earlier build follows.
+
+<!-- tier-history: begin (macos-fed AGE 1.8.0 self-heal record, superseded by #9929) -->
+The hand-built AGE 1.8.0 files originally lived inside
 Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
 them (CI then fails with `extension "age" is not available`). A brew-independent
 copy now lives in `<pg-age-stack>/age-1.8.0-06ce678d/{share,lib}` (the suffix is the
@@ -380,6 +399,7 @@ macos-fed node the "Configure enterprise-fed tier" step runs
   re-runs of older workflow runs keep their old merge sha and stay red by
   design. Before and after any tier restart the installed `age.dylib` sha must
   equal the pin (`DEVELOPER_SETUP_NOTES.md`, "macos-fed AGE build").
+<!-- tier-history: end -->
 - **Health check.** AGE counts as present only when `pg_available_extensions`
   lists `age` (that view reflects `age.control` alone) AND all five files are at
   their destinations as regular files with the pinned hashes, none of them group-
@@ -446,7 +466,7 @@ macos-fed node the "Configure enterprise-fed tier" step runs
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
-Keep `postgresql@18` and `pgvector` brew-pinned on the node regardless.
+Keep the node's Homebrew PostgreSQL and `pgvector` brew-pinned regardless.
 
 ### Tier credential pre-flight and re-alignment (#8686)
 Every enterprise-fed leg runs `python3 -I scripts/ci/tier_cred_preflight.py --url-file "$url_file"` before its
@@ -476,20 +496,26 @@ The command lists runner status (names and ids are not published here). Service 
 
 ## 9. Build gotchas (recorded for future rebuilds)
 
-**Apache AGE from source (both OSes):** bison ≥ 3.8 makes the deprecated
-`%pure-parser` directive fatal under AGE's `-Werror`. Patch the AGE `Makefile`
-BISONFLAGS: replace `-Werror` with `-Wno-error=deprecated -Wno-error=other`.
+**Apache AGE from source (both OSes):** the certified build is upstream PG19 branch
+commit c6b043d plus upstream fix commit 06ce678d (apache/age#2581), checked with
+`git rev-parse HEAD` and patched by `deploy/docker-1461/provision/apply_age_patch.py`
+(run with `--ssot deploy/docker-1461/provision/lib.sh --src <age checkout>` before `make`
+and again with `--verify` after it), exactly as `deploy/docker-1461/Dockerfile.pg-age-vector`
+does (#9965). The applier refuses any other source commit, patch bytes or patched result.
+Older AGE branches failed under bison ≥ 3.8 (the deprecated `%pure-parser` directive is fatal
+under AGE's `-Werror`); that Makefile patch is never applied to the certified commit.
 
-**macOS Homebrew `postgresql@18` is keg-only:** `pg_config` reports `@18`-suffixed
-paths (`/opt/homebrew/{share,include,lib}/postgresql@18`) that are incomplete
-stubs. Fix by symlinking each to the keg subdir
-(`/opt/homebrew/opt/postgresql@18/{share/postgresql,include/postgresql,lib/postgresql}`)
+**macOS Homebrew `postgresql@N` is keg-only** (N is the major, `PG_MAJOR`): `pg_config`
+reports `@N`-suffixed paths (`/opt/homebrew/{share,include,lib}/postgresql@N`) that are
+incomplete stubs. Fix by symlinking each to the keg subdir
+(`/opt/homebrew/opt/postgresql@N/{share/postgresql,include/postgresql,lib/postgresql}`)
 **before** building AGE/pgvector, then build both from source with
-`PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config`. Also install brew
+`PG_CONFIG=/opt/homebrew/opt/postgresql@N/bin/pg_config`. Also install brew
 `bison`+`flex` (Apple's bison 2.3 is too old).
 
-**Linux:** pgdg apt provides pg18.6 + pgvector 0.8.7 (`noble-pgdg`); AGE must be
-built from source (`release/PG18/1.8.0`) with the same BISONFLAGS patch.
+**Linux:** pgdg apt provides PostgreSQL 19.0 + pgvector 0.8.7; AGE is built from
+source at `AGE_SOURCE_COMMIT` (upstream PG19 branch commit c6b043d) plus the one pinned
+upstream fix, applied by `apply_age_patch.py` as above.
 
 **Rust on a CI node must be rustup-managed, never Homebrew (2026-08-22):**
 Homebrew's `rustup` formula installs proxies in `~/.cargo/bin` (`cargo -> rustup`,

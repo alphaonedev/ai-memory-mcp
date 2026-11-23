@@ -4,7 +4,7 @@
 #
 # docker-1461 — Atlas Corpus full-spectrum ingest + exercise harness.
 #
-# Drives the LIVE 2-peer + PG18.4/AGE1.7.0 mesh at corpus scale over the SAME
+# Drives the LIVE 2-peer + PG19.0/AGE1.7.0 mesh at corpus scale over the SAME
 # TLS+mTLS path real traffic uses, then emits BOTH a machine-readable JSON
 # report and a human PASS/FAIL table. Exit status is 0 iff every check passes.
 # Run AFTER `make validate` (D5) and `test/run.sh` (D6) are green.

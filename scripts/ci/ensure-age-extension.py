@@ -4,18 +4,32 @@
 """Self-heal the Apache AGE extension on the macos-fed runner (#6161).
 
 AGE on the macos-fed node is a hand-built install whose files live inside the
-Homebrew-managed ``postgresql@18`` share/lib trees.  A ``brew upgrade`` relinks
-those trees and drops the AGE files, so ``CREATE EXTENSION age`` fails.  A
-brew-independent copy lives in a node-local directory (default
-``~/pg-age-stack/age-1.8.0-06ce678d`` with ``share/`` and ``lib/``; the suffix
-is the upstream apache/age commit the build carries, see ``MANIFEST``).
+PostgreSQL share/lib trees of the tier the CI leg connects to.  A rebuild or
+relink of that tree drops the AGE files, so ``CREATE EXTENSION age`` fails.  A
+tree-independent copy lives in a node-local directory with ``share/`` and
+``lib/`` (default ``~/pg-age-stack/age-<EXPECTED_AGE_VERSION>-<first 8 hex of
+AGE_SOURCE_COMMIT>``).
+
+The helper names no PostgreSQL major and no AGE version of its own (#9927).
+``--pg-config`` (or a non-empty ``AI_MEMORY_CI_PG_CONFIG``, which the CI step
+exports) is required: it is the ``pg_config`` of the tier the leg
+connects to, and its ``--version`` must be the certified
+``EXPECTED_PG_VERSION``.  ``psql`` defaults to ``pg_config --bindir``.  The
+certified values are read from the SSOT ``deploy/docker-1461/provision/lib.sh``
+(the defaults, never a ``DOCKER_1461_*`` override).  A restore refuses (exit 2,
+no write) when ``MANIFEST_SOURCE_COMMIT`` is not the SSOT ``AGE_SOURCE_COMMIT``.
 
 The files installed are fixed by ``MANIFEST``: exactly five names, each pinned
 to a sha256.  Nothing else in the source directory is ever read or copied.
+While ``MANIFEST`` pins a build of another AGE commit than the SSOT, the helper
+never writes: healthy is then the probe alone (the tier advertises the certified
+AGE version) plus an installed, non-writable library that is not a refused build;
+anything else is exit 2.
 
 Behaviour:
-  1. Healthy = ``pg_available_extensions`` lists ``age`` (that view reflects the
-     ``.control`` file only) AND every manifest file exists at its destination
+  1. Healthy = ``pg_available_extensions`` lists ``age`` with ``default_version``
+     the SSOT ``EXPECTED_AGE_VERSION`` (that view reflects the ``.control`` file
+     only) AND every manifest file exists at its destination
      as a regular file with the pinned sha256.  Healthy -> exit 0, no writes.
   2. Otherwise validate the source: the age, share and lib dirs and every
      manifest file must be real (no symlinks), owned by the running uid and not
@@ -93,7 +107,7 @@ under), credentials (``PGUSER``, ``PGPASSWORD``, ``PGPASSFILE``, ``PGSSLCERT``, 
 
 psql runs with ``PGCONNECT_TIMEOUT=15`` and a 60 second overall limit.  A
 ``connect_timeout`` in the URL overrides the default but must be an integer in
-1..60 (#6338).  That timeout bounds only the connect phase of ONE host, and psql 18.6
+1..60 (#6338).  That timeout bounds only the connect phase of ONE host, and psql
 catches SIGALRM, so it cannot bound a psql that stalls after authentication or one that
 tries several hosts.  The bound that holds is a supervisor (#6517, #6505): psql runs as
 the child of a small stdlib process (this file in ``--supervise`` mode, own session) that
@@ -105,7 +119,7 @@ cannot be caught) and keeps the pipe open.  If only the supervisor is killed the
 kills its process group.  Only the loss of the helper AND the supervisor together leaves
 psql unbounded after authentication: the connect timeout ends only the connect phase,
 and nothing ends an authenticated psql until the server closes the connection (#6673;
-macOS has no parent-death signal and psql 18.6 catches SIGALRM).
+macOS has no parent-death signal and psql catches SIGALRM).
 
 Every signal that is valid on the platform and can be caught ends the probe like SIGINT
 (#6504), except the default-ignored, job-control and synchronous-fault signals in
@@ -145,9 +159,19 @@ EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
 
 DEFAULT_URL_FILE = Path.home() / ".ai-memory-ci-fed-url"
-DEFAULT_AGE_DIR = Path.home() / "pg-age-stack" / "age-1.8.0-06ce678d"
-DEFAULT_PG_CONFIG = "/opt/homebrew/opt/postgresql@18/bin/pg_config"
-DEFAULT_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
+# The CI step exports the pg_config of the PostgreSQL tree it found here, so the helper call line that #6339
+# pins byte-for-byte stays unchanged (#9927).
+PG_CONFIG_ENV = "AI_MEMORY_CI_PG_CONFIG"
+AGE_DIR_PARENT = "pg-age-stack"  # the default --age-dir is ~/pg-age-stack/age-<version>-<commit[:8]>
+AGE_DIR_COMMIT_CHARS = 8
+# #9927: the certified pins come from the SSOT, never from this file.  Each key must be assigned exactly once
+# as KEY="${DOCKER_1461_KEY:-<value>}" with a value of the given shape.
+SSOT_FILE = Path(__file__).resolve().parents[2] / "deploy" / "docker-1461" / "provision" / "lib.sh"
+SSOT_SHAPES = {
+    "EXPECTED_PG_VERSION": r"[0-9]+\.[0-9]+",
+    "EXPECTED_AGE_VERSION": r"[0-9]+\.[0-9]+\.[0-9]+",
+    "AGE_SOURCE_COMMIT": r"[0-9a-f]{40}",
+}
 PROBE_TIMEOUT_SECONDS = 60
 PROBE_POLL_SECONDS = 0.2  # how often the probe looks at the interrupt flag (#6337)
 MAX_CONNECT_TIMEOUT_SECONDS = PROBE_TIMEOUT_SECONDS  # URL connect_timeout range 1..60 (#6338)
@@ -161,11 +185,13 @@ NOT_INTERRUPT_SIGNALS = (
     "SIGTTOU", "SIGPIPE", "SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE",
 )
 CONNECT_TIMEOUT_SECONDS = "15"  # PGCONNECT_TIMEOUT for psql; a connect_timeout in the URL overrides it
-PROBE_SQL = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
+# #9927: the version is the SSOT EXPECTED_AGE_VERSION (shape-checked digits and dots, so it is safe in a literal).
+PROBE_SQL_TEMPLATE = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age' AND default_version = '{}'"
 URL_SCHEMES = ("postgres", "postgresql")
 # Non-secret libpq connection parameters accepted as tier URL query keys,
-# compared exactly as libpq does (case-sensitive).  Source: PostgreSQL 18 libpq
-# docs, "Connection Strings" > "Parameter Key Words" (LIBPQ-PARAMKEYWORDS).
+# compared exactly as libpq does (case-sensitive).  Source: the libpq docs,
+# "Connection Strings" > "Parameter Key Words" (LIBPQ-PARAMKEYWORDS); the
+# installed libpq's PQconndefaults is checked against it by LibpqOracleTests.
 # ``password`` is handled separately (moved to PGPASSWORD); every other key,
 # including the secrets libpq cannot take from the environment, is refused.
 ALLOWED_QUERY_KEYS = frozenset((
@@ -196,19 +222,22 @@ TLS_ROOT_KEY = "sslrootcert"
 PSQL_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "TZ")
 TEMP_SUFFIX = ".age-restore"
 
-# (source subdir, file name, sha256) for AGE 1.8.0 built against postgresql@18.
+# The upstream apache/age commit the MANIFEST bytes were built from.  A restore runs only when it equals the
+# SSOT AGE_SOURCE_COMMIT (#9927); the node rebuild and this re-pin are #9929.
+MANIFEST_SOURCE_COMMIT = "06ce678d74210539705c77e2dc7c9fa861e2a331"
+
+# (source subdir, file name, sha256) for the node's AGE build at MANIFEST_SOURCE_COMMIT.
 # "lib" entries go to `pg_config --pkglibdir`, "share" entries to
 # `pg_config --sharedir`/extension.  lib is listed (and installed) first so the
 # control file never appears ahead of its module.
 #
-# The dylib pin is the node's build of release/PG18/1.8.0 plus upstream commit
-# 06ce678d74210539705c77e2dc7c9fa861e2a331 (apache/age#2580 / #2581: no catalog
-# read in is_age_extension_exists() outside a live transaction).  Stock 1.8.0
+# The pins below are the node's earlier build at MANIFEST_SOURCE_COMMIT (apache/age#2580 /
+# #2581: no catalog read in is_age_extension_exists() outside a live transaction).  Stock 1.8.0
 # leaks fast-path locks on the ROLLBACK of a failed transaction and every
 # later backend on that PGPROC fails to connect with "failed to re-find shared
 # lock object" (#7162, #8282).  A pin on the stock bytes makes this helper
 # REINSTALL the defect over the patched library (that is how #8282 happened),
-# so the pin and DEFAULT_AGE_DIR change together with every AGE rebuild and the
+# so the pins and MANIFEST_SOURCE_COMMIT change together with every AGE rebuild and the
 # superseded dylib digest joins REFUSED_SHAS; the recipe is in
 # docs/DEVELOPER_SETUP_NOTES.md ("macos-fed AGE build").
 MANIFEST = (
@@ -570,11 +599,16 @@ def run_supervised(psql_argv, env, timeout_seconds=None, what="age probe"):
     return proc.returncode, stdout, stderr
 
 
+def probe_sql(pins=None):
+    """The probe's only SQL: does the tier offer age at the SSOT EXPECTED_AGE_VERSION (#6896, #9927)."""
+    return PROBE_SQL_TEMPLATE.format((pins or certified_pins())["EXPECTED_AGE_VERSION"])
+
+
 def probe_lists_age(psql, url):
-    """Return True when the tier lists ``age`` in pg_available_extensions."""
+    """Return True when the tier lists ``age`` at the certified version in pg_available_extensions."""
     target, password, database = probe_target(url)  # #6676: refuses a URL that names no database
     env = psql_env(password, database)  # #6676: an allowlist; no caller PG* variable reaches psql
-    psql_argv = [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL]
+    psql_argv = [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", probe_sql()]
     try:
         returncode, stdout, _stderr = run_supervised(psql_argv, env)
     except subprocess.TimeoutExpired:
@@ -650,7 +684,28 @@ def installed_ok(dests):
     return True
 
 
+def manifest_is_certified(pins=None):
+    """True when MANIFEST pins a build of the SSOT AGE_SOURCE_COMMIT (#9927)."""
+    return MANIFEST_SOURCE_COMMIT == (pins or certified_pins())["AGE_SOURCE_COMMIT"]
+
+
+def installed_lib_safe(dests):
+    """True when every MANIFEST lib file is installed, regular, not group/world-writable and not refused.
+
+    The check that still holds while MANIFEST pins another build (#9927): no digest pin, but #7016 and #8282.
+    """
+    for sub, name, _pin in MANIFEST:
+        if sub != "lib":
+            continue
+        digest = sha256_of_regular_file(dests[sub] / name, refuse_writable=True)
+        if digest is None or digest in REFUSED_SHAS:
+            return False
+    return True
+
+
 def healthy(args, dests, url):
+    if not manifest_is_certified():
+        return installed_lib_safe(dests) and probe_lists_age(args.psql, url)
     return installed_ok(dests) and probe_lists_age(args.psql, url)
 
 
@@ -704,9 +759,18 @@ def read_source(path, pin):
     return data, stat.S_IMODE(st.st_mode)
 
 
-def load_sources(age_dir):
-    """Validate the source tree and return [(sub, name, bytes, mode)] in MANIFEST order."""
+def load_sources(age_dir, pins=None):
+    """Validate the source tree and return [(sub, name, bytes, mode)] in MANIFEST order.
+
+    #9927: refuses before reading any source byte when MANIFEST pins a build of another AGE commit than the SSOT.
+    """
     check_dir(age_dir)
+    certified = (pins or certified_pins())["AGE_SOURCE_COMMIT"]
+    if MANIFEST_SOURCE_COMMIT != certified:
+        raise HelperError(f"age source refused: MANIFEST pins a build of apache/age "
+                          f"{MANIFEST_SOURCE_COMMIT[:AGE_DIR_COMMIT_CHARS]}, the certified AGE_SOURCE_COMMIT is "
+                          f"{certified[:AGE_DIR_COMMIT_CHARS]}; re-pin MANIFEST to the node build (issue 9929)",
+                          EXIT_BAD_INPUT)
     for sub in sorted({sub for sub, _, _ in MANIFEST}):
         check_dir(age_dir / sub)
     return [(sub, name) + read_source(age_dir / sub / name, pin) for sub, name, pin in MANIFEST]
@@ -743,13 +807,91 @@ def install(sources, dests):
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(description="Restore the AGE extension files when Homebrew dropped them (#6161).")
+    p = argparse.ArgumentParser(description="Restore the AGE extension files when a PostgreSQL tree rebuild dropped them (#6161).")
     p.add_argument("--url-file", type=Path, default=DEFAULT_URL_FILE, help="file holding the tier URL")
-    p.add_argument("--age-dir", type=Path, default=DEFAULT_AGE_DIR,
-                   help="node-local AGE dir with share/ and lib/ (tests only; CI uses the default)")
-    p.add_argument("--pg-config", default=DEFAULT_PG_CONFIG, help="path to pg_config")
-    p.add_argument("--psql", default=DEFAULT_PSQL, help="path to psql")
-    return p.parse_args(argv)
+    p.add_argument("--age-dir", type=Path, default=None,
+                   help="node-local AGE dir with share/ and lib/ (tests only; CI uses the SSOT-derived default)")
+    p.add_argument("--pg-config", default=None,
+                   help="pg_config of the tier the CI leg connects to (its --version must be the certified one); "
+                        f"default ${PG_CONFIG_ENV}, which the CI step exports so the pinned call line (#6339) is unchanged")
+    p.add_argument("--psql", default=None, help="path to psql (default: pg_config --bindir)/psql")
+    args = p.parse_args(argv)
+    if not args.pg_config:
+        args.pg_config = os.environ.get(PG_CONFIG_ENV) or None
+    if not args.pg_config:
+        p.error(f"the following arguments are required: --pg-config (or a non-empty ${PG_CONFIG_ENV})")
+    return args
+
+
+def certified_pins(path=None):
+    """Read the certified pins from the SSOT (#9927); any missing, repeated or malformed key is exit 2."""
+    path = SSOT_FILE if path is None else path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise HelperError(f"certified pin file {path} is unreadable", EXIT_BAD_INPUT)
+    pins = {}
+    for key, shape in SSOT_SHAPES.items():
+        found = re.findall(rf'^{key}="\$\{{DOCKER_1461_{key}:-([^}}"]*)\}}"', text, re.MULTILINE)
+        if len(found) != 1 or re.fullmatch(shape, found[0]) is None:
+            raise HelperError(f"certified pin {key} is not set exactly once in {path}", EXIT_BAD_INPUT)
+        pins[key] = found[0]
+    return pins
+
+
+# A control character (a newline above all) in the path would split the refusal line and the log (#9967).
+PG_CONFIG_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def require_pg_config_path(pg_config):
+    """Refuse a pg_config that is not an absolute path to an existing executable regular file (#9967).
+
+    A relative path or a bare name would be resolved against the working directory or PATH, so the heal
+    could run another tree's pg_config. A symlink is accepted when it resolves to an executable regular
+    file (Homebrew's opt/ prefix is a symlink tree); the checks follow it, and the --version check that
+    follows runs the same path. Every refusal is exit 2 (EXIT_BAD_INPUT) with its own message.
+    """
+    if PG_CONFIG_CONTROL_CHARS.search(pg_config):
+        raise HelperError("pg_config path holds a control character", EXIT_BAD_INPUT)
+    if not os.path.isabs(pg_config):
+        raise HelperError(f"pg_config {pg_config} is not an absolute path", EXIT_BAD_INPUT)
+    try:
+        st = os.stat(pg_config)
+    except FileNotFoundError:
+        raise HelperError(f"pg_config {pg_config} does not exist", EXIT_BAD_INPUT)
+    except OSError as exc:
+        raise HelperError(f"pg_config {pg_config} cannot be examined ({type(exc).__name__})", EXIT_BAD_INPUT)
+    if not stat.S_ISREG(st.st_mode):
+        raise HelperError(f"pg_config {pg_config} is not a regular file", EXIT_BAD_INPUT)
+    if not os.access(pg_config, os.X_OK):
+        raise HelperError(f"pg_config {pg_config} is not executable", EXIT_BAD_INPUT)
+
+
+def require_certified_pg(pg_config, pins):
+    """Refuse a pg_config that is not the certified PostgreSQL (#9927): a heal never writes into another tree."""
+    try:
+        proc = subprocess.run([pg_config, "--version"], capture_output=True, text=True, errors="replace",
+                              check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HelperError(f"pg_config --version could not run ({type(exc).__name__})", EXIT_BAD_INPUT)
+    reported = proc.stdout.strip()
+    want = pins["EXPECTED_PG_VERSION"]
+    if proc.returncode != 0 or re.fullmatch(rf"PostgreSQL {re.escape(want)}(?: .*)?", reported) is None:
+        shown = reported[:40] if re.fullmatch(r"[ -~]*", reported[:40]) else "an unprintable answer"
+        raise HelperError(f"pg_config {pg_config} reports {shown or 'nothing'!s} (exit {proc.returncode}); "
+                          f"the certified tier is PostgreSQL {want}", EXIT_BAD_INPUT)
+
+
+def resolve_args(args, pins):
+    """Fill the SSOT- and tier-derived defaults after the pg_config checks (#9927, #9967)."""
+    require_pg_config_path(args.pg_config)
+    require_certified_pg(args.pg_config, pins)
+    if args.psql is None:
+        args.psql = str(pg_config_value(args.pg_config, "--bindir") / "psql")
+    if args.age_dir is None:
+        commit = pins["AGE_SOURCE_COMMIT"][:AGE_DIR_COMMIT_CHARS]
+        args.age_dir = Path.home() / AGE_DIR_PARENT / f"age-{pins['EXPECTED_AGE_VERSION']}-{commit}"
+    return args
 
 
 def require_verified_tls(target):
@@ -809,7 +951,8 @@ def run(args):
 def main(argv=None):
     install_interrupt_handlers()  # every catchable signal ends like SIGINT; the probe stops psql first
     try:
-        run(parse_args(argv))
+        pins = certified_pins()
+        run(resolve_args(parse_args(argv), pins))
     except HelperError as exc:
         print(f"ensure-age-extension: {exc}", file=sys.stderr)
         return exc.code

@@ -90,7 +90,7 @@ resource "digitalocean_firewall" "campaign" {
     source_addresses = var.harness_source_addresses
   }
 
-  # Shared PostgreSQL 18.4 + AGE 1.7.0 substrate (daemon->PG TLS leg),
+  # Shared PostgreSQL 19.0 + AGE 1.7.0 substrate (daemon->PG TLS leg),
   # east-west among campaign nodes only. Only the pg node listens, but the
   # tag-scoped rule keeps the policy a pure function of the campaign tag.
   inbound_rule {
