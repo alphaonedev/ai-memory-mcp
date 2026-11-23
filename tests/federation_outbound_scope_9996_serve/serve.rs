@@ -108,6 +108,13 @@ fn app_state(db: Db, store: Arc<dyn MemoryStore>, backend: StorageBackend) -> Ap
     }
 }
 
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    allow(
+        clippy::unused_async,
+        reason = "only the sal-postgres arm awaits (PostgresStore::connect); one signature serves both backends"
+    )
+)]
 async fn host(backend: &Backend) -> Host {
     let key_tmp = tempfile::TempDir::new().expect("key tempdir");
     // The key-dir guard (#3198) refuses a group-writable directory; pin

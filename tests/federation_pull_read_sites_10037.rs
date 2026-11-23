@@ -28,7 +28,7 @@
 //! second read without a second funnel call is red.
 //!
 //! Left out of the walk, each with its reason ([`SKIPPED_DIRS`]): build output,
-//! VCS metadata, lane scratch, the CodeGraph index and the vendored
+//! VCS metadata, lane scratch, the `CodeGraph` index and the vendored
 //! third-party crates (they do not depend on this crate, so they cannot call
 //! it). Files that are not `.rs` are not compiled Rust and cannot call the
 //! read. Known limit: an identifier spliced together by a token-pasting macro
@@ -206,17 +206,14 @@ fn blank_non_code(src: &str) -> String {
                 let ch_len = src[i + 1..].chars().next().map_or(0, char::len_utf8);
                 (b.get(i + 1 + ch_len) == Some(&b'\'')).then_some(i + 1 + ch_len)
             };
-            match close {
-                Some(end) => {
-                    for &x in &b[i..=end] {
-                        out.push(keep_nl(x));
-                    }
-                    i = end + 1;
+            if let Some(end) = close {
+                for &x in &b[i..=end] {
+                    out.push(keep_nl(x));
                 }
-                None => {
-                    out.push(c);
-                    i += 1;
-                }
+                i = end + 1;
+            } else {
+                out.push(c);
+                i += 1;
             }
         } else {
             out.push(c);
@@ -262,7 +259,7 @@ fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<String, usize>, problems: &m
             walk(&path, root, out, problems);
             continue;
         }
-        if !name.ends_with(".rs") {
+        if path.extension().is_none_or(|ext| ext != "rs") {
             continue;
         }
         let rel = path
