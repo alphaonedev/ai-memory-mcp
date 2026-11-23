@@ -201,7 +201,16 @@ struct SignedScopedPull {
 }
 
 impl SignedScopedPull {
-    const SCOPE_URL: &'static str = "https://lib-pull-peer.sync-since-9996.invalid:9077";
+    // The scheme separator is spelled as two char literals, not one string
+    // with a double slash: scripts/check-count-assertion-declared.sh strips
+    // line comments before string literals, so a double slash inside a
+    // string desyncs its parse of every later assertion in this file.
+    const SCOPE_URL: &'static str = concat!(
+        "https:",
+        '/',
+        '/',
+        "lib-pull-peer.sync-since-9996.invalid:9077"
+    );
 
     fn new(_fed: &PermissiveFedEnv, peer_id: &'static str) -> Self {
         use crate::identity::keypair as kp;
