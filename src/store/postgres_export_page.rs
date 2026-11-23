@@ -113,7 +113,9 @@ pub(crate) async fn export_memories_page(
         q = q.bind(n);
     }
     // #10033 — the first page of a walk refuses when ANY row of the scope is
-    // sealed at rest, so no partial walk is ever handed out.
+    // sealed at rest at that time; a row sealed later refuses on the page
+    // that reads it (the per-row guard below), so a client discards a walk
+    // that ends in SEALED_EXPORT_REFUSED.
     if lower.is_none() {
         sealed_scope_precheck(pool, as_of, namespace).await?;
     }

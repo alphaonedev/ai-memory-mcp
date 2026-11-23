@@ -155,8 +155,11 @@ pub fn classify_sqlite_row<T>(
 }
 
 /// The scope pre-check of a paged walk: `count` sealed rows in the scope, the
-/// least id `first`. A walk refuses on its FIRST page when the scope holds any
-/// sealed row, so a client never stores pages of a walk a later page refuses.
+/// least id `first`. A walk refuses on its first page when the scope holds a
+/// sealed row at that time. A row sealed later refuses on the page that reads
+/// it (the per-row guard of the later page), after earlier pages were
+/// delivered, so a client discards a walk that ends in
+/// `SEALED_EXPORT_REFUSED`.
 ///
 /// # Errors
 ///
