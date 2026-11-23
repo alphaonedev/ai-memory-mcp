@@ -32,6 +32,20 @@ use crate::export_paging::{
 };
 use crate::models::{LifecycleState, MemoryLink};
 
+/// #3427 / #10028 — the namespace-scope predicate every scoped read of this
+/// module appends, bound as `:ns`. One definition so the page read, the
+/// sealed-scope pre-check and the counterpart re-read can never disagree.
+const NAMESPACE_SCOPE_PREDICATE: &str = "AND namespace = :ns";
+
+/// The namespace-scope predicate when a namespace is set, else nothing.
+fn namespace_scope(namespace: Option<&str>) -> &'static str {
+    if namespace.is_some() {
+        NAMESPACE_SCOPE_PREDICATE
+    } else {
+        ""
+    }
+}
+
 /// Expiry cutoff rendered the way [`crate::storage::export_all`] renders
 /// `now`, so the page read applies the identical TEXT comparison.
 fn as_of_text(as_of: DateTime<Utc>) -> String {
@@ -81,11 +95,7 @@ pub fn memories_page(
     // #3427 — the namespace scope is a WHERE predicate on the same query the
     // walk orders by, never a post-filter: a scoped page is exactly the
     // scoped rows in key order, and the page ceiling counts scoped rows.
-    let ns = if namespace.is_some() {
-        "AND namespace = :ns"
-    } else {
-        ""
-    };
+    let ns = namespace_scope(namespace);
     let sql = format!(
         "SELECT * FROM memories \
          WHERE (expires_at IS NULL OR expires_at > :as_of) {lv} {after} {ns} \
@@ -159,11 +169,7 @@ fn sealed_scope_precheck(
     namespace: Option<&str>,
 ) -> Result<()> {
     let lv = crate::models::lifecycle_visible_clause("");
-    let ns = if namespace.is_some() {
-        "AND namespace = :ns"
-    } else {
-        ""
-    };
+    let ns = namespace_scope(namespace);
     let sql = format!(
         "SELECT COUNT(*), MIN(id) FROM memories \
          WHERE (expires_at IS NULL OR expires_at > :as_of) {lv} {ns} \
@@ -339,11 +345,7 @@ fn surviving_counterparts(
     let as_of_s = as_of_text(as_of);
     // #3427 — a counterpart outside the namespace scope is not carried by
     // the export, so it does not survive: its edge is withheld.
-    let ns = if namespace.is_some() {
-        "AND namespace = :ns"
-    } else {
-        ""
-    };
+    let ns = namespace_scope(namespace);
     let sql = format!(
         "SELECT * FROM memories \
          WHERE id IN (SELECT value FROM json_each(:ids)) \
