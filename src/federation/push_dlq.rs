@@ -1184,7 +1184,8 @@ const ERASURE_EXPANDED_LAST_ERROR: &str =
 
 /// #2446 — expand ONE erasure-outbox sentinel row into per-peer delete
 /// rows. Best-effort: every failure leaves the sentinel pending for the
-/// next tick (never drops the erasure).
+/// next tick, and a sentinel no configured peer's outbound scope admits is
+/// quarantined (kept, re-drivable); the erasure is never dropped.
 async fn expand_erasure_sentinel_row(
     config: &FederationConfig,
     sink: &dyn FederationDlqSink,
@@ -1229,16 +1230,14 @@ async fn expand_erasure_sentinel_row(
         .map(|p| p.id.clone())
         .collect();
     if peer_ids.is_empty() {
-        // Unreachable in production (`FederationConfig::build` returns
-        // `None` on an empty peer list, so no worker is spawned), but a
-        // silent drop of an erasure is never acceptable: leave it pending.
-        tracing::warn!(
-            target: PUSH_DLQ_TRACE_TARGET,
-            row_id = row.id,
-            "replay: erasure sentinel row {} has no configured peer in outbound scope \
-             to expand to — leaving pending",
-            row.id,
-        );
+        // Review #10026 C-F2: every configured peer refuses this namespace
+        // (or has no outbound scope). Left pending, the sentinel would be
+        // retaken every tick forever and, in a backlog, starve the replay
+        // window. Quarantine it instead: the row is kept (never dropped),
+        // stamped with the outbound-scope cause, and re-driven by the
+        // outbound-scope redrive once a peer's scope admits the namespace.
+        quarantine_out_of_scope_row(sink, row, super::outbound_scope::REASON_NOTHING_IN_SCOPE)
+            .await;
         return;
     }
     match sink
