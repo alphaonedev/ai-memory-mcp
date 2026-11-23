@@ -622,7 +622,7 @@ pub fn install_write_seal_funnel(conn: &rusqlite::Connection) -> Result<FunnelSt
         // closed or stored (rusqlite `Context::get_connection` contract).
         let conn = unsafe { ctx.get_connection() }?;
         record_prior_seal(&conn, &prior_ledger, &id)
-            .map(|()| 0_i64)
+            .map(|_recorded| 0_i64)
             .map_err(|reason| rusqlite::Error::UserFunctionError(reason.into()))
     })?;
     conn.create_scalar_function(SEAL_FN, 2, FunctionFlags::SQLITE_UTF8, move |ctx| {
@@ -729,13 +729,15 @@ fn classify_seal(
 }
 
 /// BEFORE UPDATE body: record the seal state of row `id` as it is now.
+/// Returns the state recorded, or `None` when no session signer is
+/// installed (nothing is recorded).
 fn record_prior_seal(
     conn: &rusqlite::Connection,
     ledger: &SharedLedger,
     id: &str,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Option<PriorSeal>, String> {
     let Some(signer) = session_signer() else {
-        return Ok(());
+        return Ok(None);
     };
     let fresh = with_ledger(ledger, |state| state.fresh.contains(id))?;
     let prior = if fresh {
@@ -745,7 +747,8 @@ fn record_prior_seal(
     };
     with_ledger(ledger, |state| {
         state.prior.entry(id.to_string()).or_default().push(prior);
-    })
+    })?;
+    Ok(Some(prior))
 }
 
 /// The #10012 funnel body: seal row `id` when the session authored its
