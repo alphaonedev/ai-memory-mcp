@@ -345,6 +345,8 @@ posture_env() {
     AI_MEMORY_FED_TRUST_DOMAIN=test-fleet \
     AI_MEMORY_FED_PEER_FINGERPRINTS="$FPFILE_A" \
     AI_MEMORY_FED_PEER_ATTESTATION='{"peer-1":{"allowed_namespaces":["public/*"]}}' \
+    AI_MEMORY_FED_QUORUM_PEERS='https://peer-1.example.org:9077' \
+    AI_MEMORY_FED_PEER_OUTBOUND_SCOPE='{"https://peer-1.example.org:9077":{"allowed_namespaces":["public/*"]}}' \
     AI_MEMORY_STORE_URL="$3" \
     ${2:+AI_MEMORY_PG_AT_REST_ATTESTED=$2} \
     AI_MEMORY_APPEND_ONLY=1 \

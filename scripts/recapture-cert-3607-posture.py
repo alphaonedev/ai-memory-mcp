@@ -166,6 +166,12 @@ PEER_ATTESTATION = (
     '{"peer-a":{"allowed_sender_agent_ids":["agent-a"],'
     '"allowed_namespaces":["team-x/ops","team-x/shared"]}}\n'
 )
+# #10059: the one peer of the shared source (`AI_MEMORY_FED_QUORUM_PEERS`) and
+# its narrowed outbound scope, so check #23 can pass in the certified leg.
+CERT_PEER_URL = "https://peer-a.example:9077"
+CERT_OUTBOUND_SCOPE = (
+    '{"https://peer-a.example:9077":{"allowed_namespaces":["team-x/ops","team-x/shared"]}}'
+)
 SQLCIPHER_OUT_FILE = "posture-sqlcipher-pass.out"
 SUMMARY_FILES = ("posture-bare-env.out", "posture-hardened-env.out", "posture-sqlcipher-pass.out")
 PASSPHRASE_BYTES = 32
@@ -1258,6 +1264,9 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
         "AI_MEMORY_FED_TRUST_DOMAIN": "cert-fleet-01",
         "AI_MEMORY_FED_PEER_FINGERPRINTS": str(FIX / "peer-fingerprints.txt"),
         "AI_MEMORY_FED_PEER_ATTESTATION": attest,
+        # #10059: the shared peer-list source check #23 judges, and its scope.
+        "AI_MEMORY_FED_QUORUM_PEERS": CERT_PEER_URL,
+        "AI_MEMORY_FED_PEER_OUTBOUND_SCOPE": CERT_OUTBOUND_SCOPE,
         "AI_MEMORY_ENCRYPT_AT_REST": "1",
         "AI_MEMORY_APPEND_ONLY": "1",
         "AI_MEMORY_OPERATOR_PUBKEY": op_pub,

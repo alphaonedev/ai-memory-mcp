@@ -313,6 +313,7 @@ Pinned by [`tests/federation_b2_hardening.rs`](../tests/federation_b2_hardening.
 | Var | Default | Effect |
 |---|---|---|
 | `AI_MEMORY_FED_PEER_OUTBOUND_SCOPE` | unset → every peer denied | Sender-side per-peer namespace scope (#9996): JSON keyed by peer URL, `{"allowed_namespaces":[...]}` per peer. A peer with no key is sent nothing on any outbound path; `["**"]` is the explicit all-scope and fails `doctor --posture enterprise-federation`. Malformed or unknown keys refuse boot. |
+| `AI_MEMORY_FED_QUORUM_PEERS` | unset | The one shared source of the peer list under the enterprise-federation posture (#10059): comma-separated https peer URLs, the exact `--quorum-peers` / `--peers` value. With the posture armed, `serve` and `sync-daemon` refuse boot when it is absent or names a different peer set than the flag, and `doctor --posture enterprise-federation` check #23 judges the outbound scope against it. Outside the posture it is not read. |
 | `AI_MEMORY_FED_PEER_ATTESTATION` | unset → empty allowlist | When set to JSON, populates the per-peer `PeerScope` allowlist. Unset = absent authorization: default-deny on `/sync/since` and default-required inbound writes. With configured peers, Standard warns and `asi-hard` refuses boot. Key enrollment is separate. |
 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (deny) | When set to `"1"`, widens "no scope row" cases on `/sync/since` to legacy full-dump behavior. Once a scope row exists for a peer, its namespace list is the authoritative gate and the bypass is ignored. |
 | `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` | unset (deny) | When set to `"1"`, the substrate trusts the wire body's `agent_id` claim instead of the authenticated peer-id. Default: header wins. |
@@ -583,6 +584,22 @@ export AI_MEMORY_FED_PEER_OUTBOUND_SCOPE='{
   `outbound_scope.<peer id>` row per unscoped peer under every posture,
   and `doctor --posture enterprise-federation` check #23 fails on an
   unscoped peer or an explicit `**` scope.
+- Under the enterprise-federation posture the peer list comes from ONE
+  shared source, `AI_MEMORY_FED_QUORUM_PEERS` (#10059), which `serve`,
+  `sync-daemon` and a fresh `doctor --posture` parse with the same
+  function. The daemon refuses boot when the key is absent, malformed or
+  names a different peer set than `--quorum-peers` / `--peers`, or when a
+  scope key names no peer of it. A bound boot prints
+  `federation shared source bound: <n> peer(s), digest sha256:<hex>`, and
+  check #23 prints the same digest: the row proves the boot configuration
+  the daemon is bound to, and an edit applies only after a restart. The
+  digest carries no credential. A fresh doctor without the posture signal
+  FAILs check #23.
+- **Upgrade note (#10059).** A deployment that ran under the
+  enterprise-federation posture with `--quorum-peers` alone must set
+  `AI_MEMORY_FED_QUORUM_PEERS` to the same comma-separated value before
+  upgrading, or the daemon refuses boot with a message that names the key
+  and the fix. Outside the posture nothing changes.
 - Items left out are counted per peer and namespace in
   `ai_memory_federation_outbound_scope_filtered_total{peer_id,namespace}`
   (Prometheus `/metrics`) and in the capabilities `federation_security`
