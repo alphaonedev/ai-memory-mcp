@@ -40,7 +40,7 @@
 
 #![cfg(feature = "sal")]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result};
 
@@ -257,6 +257,84 @@ pub async fn plan(
     run(from, None, batch_size, namespace_filter).await
 }
 
+/// #10060 — prefix of the one report error a refused source census records.
+/// Nothing has been read from or written to the destination when it fires.
+const CENSUS_REFUSED_PREFIX: &str = "source census refused before any write: ";
+
+/// #10060 — the source census: every migratable row id mapped to its
+/// namespace, read through the classifying export page so a sealed row
+/// refuses the whole run (`SEALED_EXPORT_REFUSED`) before it can be
+/// decrypted or dropped. The walk is bounded by `max_rows`.
+async fn source_census(
+    from: &dyn MemoryStore,
+    page_size: usize,
+    max_rows: usize,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let as_of = chrono::Utc::now();
+    let mut census: BTreeMap<String, String> = BTreeMap::new();
+    let mut cursor: Option<crate::export_paging::ExportCursor> = None;
+    loop {
+        let page = from
+            .export_memories_page(cursor.as_ref(), page_size, as_of, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        // The classifying page never drops a row: every raw row is either a
+        // carried memory or a refusal. A gap here is a dropped row.
+        if page.raw_rows() != page.memories.len() || page.undecryptable != 0 {
+            return Err(format!(
+                "census page holds {} raw row(s) but carries {} memories",
+                page.raw_rows(),
+                page.memories.len()
+            ));
+        }
+        for mem in page.memories {
+            if census.len() >= max_rows {
+                return Err(format!(
+                    "source exceeds the {max_rows}-memory migrate cap; refusing \
+                     to continue rather than risk silent truncation"
+                ));
+            }
+            census.insert(mem.id, mem.namespace);
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(census),
+        }
+    }
+}
+
+/// #10060 — compare the paged read against the census. `Some(error)` when
+/// the read returned a row the census does not hold, or the census holds a
+/// row of the migrated scope (`namespace` exact, or every row when `None`)
+/// the read never returned.
+fn census_mismatch(
+    census: &BTreeMap<String, String>,
+    seen: &HashSet<String>,
+    namespace: Option<&str>,
+) -> Option<String> {
+    let mut extra: Vec<&String> = seen.iter().filter(|id| !census.contains_key(*id)).collect();
+    extra.sort();
+    if let Some(first) = extra.first() {
+        return Some(format!(
+            "incomplete migrate: paged read returned {} row(s) the source census \
+             does not hold (first id {first}); refusing to report success",
+            extra.len()
+        ));
+    }
+    let missing: Vec<&String> = census
+        .iter()
+        .filter(|(id, ns)| namespace.is_none_or(|want| ns.as_str() == want) && !seen.contains(*id))
+        .map(|(id, _)| id)
+        .collect();
+    missing.first().map(|first| {
+        format!(
+            "incomplete migrate: source census holds {} row(s) the paged read \
+             never returned (first id {first}); refusing to report success",
+            missing.len()
+        )
+    })
+}
+
 /// Shared body of [`migrate`] / [`plan`]. `to == None` IS the dry run —
 /// the type makes "dry run touches the destination" unrepresentable.
 #[allow(clippy::too_many_lines)]
@@ -306,6 +384,23 @@ async fn run(
     const MAX_ROWS: usize = 1_000_000;
     let page_size = batch_size.clamp(1, crate::storage::LIST_MAX_LIMIT);
 
+    // #10060 — the source census, taken BEFORE any destination read or write.
+    // It walks the classifying export page (`export_memories_page`, both
+    // backends), which looks at the at-rest envelope column BEFORE any
+    // decrypt and refuses the whole scope with `SEALED_EXPORT_REFUSED` when
+    // one row is sealed. `list` below decrypts a sealed row through the key
+    // (plaintext copied to the destination) or drops it (silent loss), so
+    // without this census a sealed row was either leaked or lost. The census
+    // is store-wide (namespace `None`): the paged `list` also returns legacy
+    // inbox-alias rows that an exact-namespace census would miss, so a scoped
+    // migrate refuses when ANY row of the source is sealed (fail closed).
+    let census = match source_census(from, page_size, MAX_ROWS).await {
+        Ok(census) => census,
+        Err(e) => {
+            report.errors.push(format!("{CENSUS_REFUSED_PREFIX}{e}"));
+            return report;
+        }
+    };
     let mut seen: HashSet<String> = HashSet::new();
     // #3060 F4 — ids that actually landed on the destination (or, under
     // `dry_run`, every unique source id). Phase 3 copies their embeddings.
@@ -425,15 +520,24 @@ async fn run(
     }
 
     // Completeness safety — never let an INCOMPLETE migrate report success.
-    // The paginator reads the source to exhaustion, so `memories_read` is
-    // the authoritative count of migratable rows (the SAME expiry +
-    // lifecycle filter `list` applies on both backends; a separate raw
-    // COUNT(*) would over-count legitimately-excluded expired/tombstoned
-    // rows, which is why no independent count is taken here). Every read
-    // either writes-ok or records an error, so `written < read` with an
-    // empty error set is structurally impossible today — assert it so any
-    // future regression that silently drops a write FAILS LOUDLY instead of
-    // minting a false success.
+    // #10060 — the independent source count is the census taken above: the
+    // export page applies the SAME expiry + lifecycle filter `list` applies
+    // on both backends, so the census holds exactly the migratable rows, and
+    // a raw COUNT(*) is not used (it would over-count legitimately-excluded
+    // expired/tombstoned rows). Two checks, both fail closed:
+    //   (a) every row the paged read returned is in the census, and
+    //   (b) every census row in the migrated scope was returned by the read
+    //       (a row the paged `list` dropped, e.g. one it could not decrypt,
+    //       fails here instead of vanishing from the destination).
+    // Then every read either writes-ok or records an error, so `written <
+    // read` with an empty error set is structurally impossible today — assert
+    // it so any future regression that silently drops a write FAILS LOUDLY
+    // instead of minting a false success.
+    if report.errors.is_empty()
+        && let Some(e) = census_mismatch(&census, &seen, namespace_filter.as_deref())
+    {
+        report.errors.push(e);
+    }
     if !dry_run && report.errors.is_empty() && report.memories_written != report.memories_read {
         report.errors.push(format!(
             "incomplete migrate: read {} memories but wrote {} with no \
@@ -1232,6 +1336,9 @@ mod tests {
         inner: SqliteStore,
         fail_list: std::sync::atomic::AtomicBool,
         fail_list_links: std::sync::atomic::AtomicBool,
+        /// #10060 — an id `list` silently drops (a projection that skips a
+        /// row), for the census mismatch test.
+        drop_list_id: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1274,7 +1381,22 @@ mod tests {
                     crate::store::BoxBackendError::new("injected list failure"),
                 ));
             }
-            self.inner.list(ctx, filter).await
+            let mut rows = self.inner.list(ctx, filter).await?;
+            if let Some(drop) = &self.drop_list_id {
+                rows.retain(|m| &m.id != drop);
+            }
+            Ok(rows)
+        }
+        async fn export_memories_page(
+            &self,
+            cursor: Option<&crate::export_paging::ExportCursor>,
+            limit: usize,
+            as_of: chrono::DateTime<chrono::Utc>,
+            namespace: Option<&str>,
+        ) -> crate::store::StoreResult<crate::export_paging::ExportMemoriesPage> {
+            self.inner
+                .export_memories_page(cursor, limit, as_of, namespace)
+                .await
         }
         async fn search(
             &self,
@@ -1331,6 +1453,7 @@ mod tests {
             inner,
             fail_list: std::sync::atomic::AtomicBool::new(true),
             fail_list_links: std::sync::atomic::AtomicBool::new(false),
+            drop_list_id: None,
         };
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let r = migrate(&src, &dst, 10, None, false).await;
@@ -1355,6 +1478,7 @@ mod tests {
             inner,
             fail_list: std::sync::atomic::AtomicBool::new(false),
             fail_list_links: std::sync::atomic::AtomicBool::new(true),
+            drop_list_id: None,
         };
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let r = migrate(&src, &dst, 10, None, false).await;
@@ -1369,6 +1493,45 @@ mod tests {
             "errors: {:?}",
             r.errors
         );
+    }
+
+    /// #10060 — a source whose paged `list` silently drops a row (the shape
+    /// of a projection that skips a row it cannot open) no longer reports
+    /// success: the independent census holds the row, so the run fails closed
+    /// with the exact incomplete-migrate error.
+    #[tokio::test]
+    async fn migrate_fails_closed_when_list_drops_a_census_row_10060() {
+        let src_tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let inner = SqliteStore::open(src_tmp.path()).unwrap();
+        let ctx = CallerContext::for_agent("ai:seed");
+        for n in 0..6 {
+            inner
+                .store(
+                    &ctx,
+                    &sample_memory(&format!("D{n}"), "ns", &format!("d{n}")),
+                )
+                .await
+                .unwrap();
+        }
+        let src = FailingListStore {
+            inner,
+            fail_list: std::sync::atomic::AtomicBool::new(false),
+            fail_list_links: std::sync::atomic::AtomicBool::new(false),
+            drop_list_id: Some("D3".to_string()),
+        };
+        let dst = SqliteStore::open(dst_tmp.path()).unwrap();
+        // One page, so the dropped row is the only one the walk misses.
+        let r = migrate(&src, &dst, 10, None, false).await;
+        assert_eq!(
+            r.errors,
+            vec![
+                "incomplete migrate: source census holds 1 row(s) the paged read never \
+                 returned (first id D3); refusing to report success"
+                    .to_string()
+            ]
+        );
+        assert_eq!(r.memories_read, 5);
     }
 
     #[tokio::test]
@@ -1388,6 +1551,7 @@ mod tests {
             inner: dst_inner,
             fail_list: std::sync::atomic::AtomicBool::new(false),
             fail_list_links: std::sync::atomic::AtomicBool::new(true),
+            drop_list_id: None,
         };
         let r = migrate(&src_inner, &dst, 10, None, false).await;
         // #3435 — the destination pre-snapshot is taken in Phase 0 (it is

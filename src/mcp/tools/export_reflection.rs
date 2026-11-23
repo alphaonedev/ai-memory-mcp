@@ -82,7 +82,14 @@ pub(crate) fn handle_export_reflection_for_caller(
     };
     let format = parse_format_for_mcp(format_str).map_err(crate::errors::invalid_input)?;
 
+    // #10061 — the rendered payload is an export format with no field for
+    // the at-rest envelope: a reflection sealed at rest is refused with
+    // `SEALED_EXPORT_REFUSED` instead of being rendered as plaintext. The
+    // row is classified BEFORE any decrypting read, and the refusal comes
+    // after the visibility gate so a hidden row stays hidden.
+    refuse_if_visible_and_sealed(conn, memory_id, caller)?;
     let mem = read_reflection_member(conn, memory_id, memory_id, caller)?;
+    export_reflections::refuse_if_sealed(conn, &mem.id)?;
     if !matches!(mem.memory_kind, MemoryKind::Reflection) {
         return Err(crate::errors::refusal(format!(
             "memory is not a reflection: {memory_id}"
@@ -114,6 +121,64 @@ pub(super) fn read_reflection_member(
         .context("reading reflection substrate")?
         .filter(|memory| crate::visibility::is_readable_on_query(memory, caller, None))
         .ok_or_else(|| anyhow::Error::new(crate::errors::ReflectionNotFound::new(reflection_id)))
+}
+
+/// #10061 — classify the reflection row without decrypting it. An absent or
+/// unsealed row is left to [`read_reflection_member`]. A sealed row is never
+/// passed to the decrypting read: hidden from `caller`, not recall-visible or
+/// with metadata that does not parse (fail closed), it is reported as not
+/// found exactly as [`read_reflection_member`] reports a hidden row; visible,
+/// it is refused with `SEALED_EXPORT_REFUSED`. The visibility gate reads only
+/// the row's namespace and metadata, which are never sealed.
+fn refuse_if_visible_and_sealed(
+    conn: &rusqlite::Connection,
+    id: &str,
+    caller: Option<&str>,
+) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension as _;
+    let header = conn
+        .query_row(
+            "SELECT namespace, metadata, lifecycle_state, encrypted_envelope IS NOT NULL \
+             FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .context("classifying reflection row")?;
+    let Some((namespace, metadata, lifecycle, sealed)) = header else {
+        return Ok(());
+    };
+    if !sealed {
+        return Ok(());
+    }
+    let not_found = || anyhow::Error::new(crate::errors::ReflectionNotFound::new(id));
+    let Ok(metadata) = serde_json::from_str::<Value>(&metadata) else {
+        return Err(not_found());
+    };
+    let lifecycle_state = crate::models::LifecycleState::from_str(&lifecycle).unwrap_or_default();
+    let probe = crate::models::Memory {
+        id: id.to_owned(),
+        namespace,
+        metadata,
+        lifecycle_state,
+        ..Default::default()
+    };
+    if !probe.lifecycle_state.is_recall_visible()
+        || !crate::visibility::is_readable_on_query(&probe, caller, None)
+    {
+        return Err(not_found());
+    }
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
+    let _: Option<()> = guard.take(crate::export_sealed::ExportRow::Sealed { id: id.to_owned() });
+    guard.finish().map_err(anyhow::Error::new)
 }
 
 /// Local copy of the format parser — kept here so the MCP error

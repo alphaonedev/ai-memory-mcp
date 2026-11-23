@@ -3434,7 +3434,16 @@ impl MemoryStore for SqliteStore {
         namespace: Option<&str>,
     ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
         let conn = self.state.lock().await;
-        db::export_page::memories_page(&conn, cursor, limit, as_of, namespace).map_err(box_err)
+        // #10060 — keep the typed sealed-row refusal instead of flattening it
+        // into `Backend` ("underlying backend error: ..."), so the SQLite page
+        // reports `SEALED_EXPORT_REFUSED` exactly as the Postgres page does
+        // (`postgres_export_page.rs` maps it to the same variant).
+        db::export_page::memories_page(&conn, cursor, limit, as_of, namespace).map_err(|e| {
+            match e.downcast::<crate::export_sealed::SealedExportRefused>() {
+                Ok(refused) => StoreError::SealedExportRefused(refused),
+                Err(other) => box_err(other),
+            }
+        })
     }
 
     async fn export_links_page(
