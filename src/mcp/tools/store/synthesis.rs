@@ -845,9 +845,12 @@ mod tests {
             Expect10011::Attested,
         ),
         (
+            // #10012: the write-seal funnel seals every row the session
+            // agent owns, so even an unsigned incoming merge is stored
+            // `agent_attested` (it was `MergedUnsigned` before #10012).
             KEYED_OWNER_10011,
             super::super::IncomingAttestation::Unsigned,
-            Expect10011::MergedUnsigned,
+            Expect10011::Attested,
         ),
         (
             UNKEYED_OWNER_10011,
@@ -900,23 +903,40 @@ mod tests {
     /// owner it is refused and nothing of the merge is committed.
     #[test]
     fn synthesis_update_reseals_or_refuses_and_rolls_back_10011() {
+        // #10012: installing the process-wide session signer arms every later
+        // `db::open` with the write-seal funnel, which under strict mode
+        // refuses foreign rows; run alone so no other lib test shares it.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::store::synthesis::tests::synthesis_update_reseals_or_refuses_and_rolls_back_10011",
+        ) {
+            return;
+        }
         crate::identity::attest::permissive_attestation_for_lib_tests();
         let kp = crate::identity::keypair::generate(KEYED_OWNER_10011).expect("keypair");
+        // The session agent is registered and bound BEFORE the signer exists,
+        // as the stdio boot requires (#9926 REFUSE_UNBOUND); the rows then
+        // run on a connection opened after install, armed by the funnel
+        // (#10012). Each row writes its own candidate (distinct title).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("synthesis-10011.db");
+        {
+            let boot = db::open(&path).expect("boot open");
+            db::register_agent(&boot, KEYED_OWNER_10011, "nhi", &[]).expect("register");
+            db::bind_agent_pubkey_with_keypair(&boot, KEYED_OWNER_10011, &kp).expect("bind");
+        }
         assert_eq!(
             crate::identity::session_signer::install_for_lib_test(KEYED_OWNER_10011, kp.clone()),
             KEYED_OWNER_10011,
             "the lib-test session signer covers the keyed owner"
         );
-        for (owner, incoming, expected) in SYNTHESIS_RESEAL_ROWS {
+        let conn = db::open(&path).expect("open after install");
+        for (row_no, (owner, incoming, expected)) in SYNTHESIS_RESEAL_ROWS.into_iter().enumerate() {
             let what = format!("{owner} {incoming:?}");
-            let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
-            db::register_agent(&conn, KEYED_OWNER_10011, "nhi", &[]).expect("register");
-            db::bind_agent_pubkey_with_keypair(&conn, KEYED_OWNER_10011, &kp).expect("bind");
             let now = crate::identity::attest::now_attestable_rfc3339();
             let stored = Memory {
                 id: uuid::Uuid::new_v4().to_string(),
                 namespace: "synthesis-10011".to_string(),
-                title: "synthesis candidate 10011".to_string(),
+                title: format!("synthesis candidate 10011 row {row_no}"),
                 content: STORED_BODY_10011.to_string(),
                 created_at: now.clone(),
                 updated_at: now,

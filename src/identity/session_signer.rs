@@ -186,13 +186,28 @@ pub enum SideRowSigner {
 /// cover `agent_id`, and strict MCP attestation is on.
 pub fn side_row_signer(agent_id: &str) -> std::result::Result<SideRowSigner, String> {
     use crate::identity::attest;
-    let Some(signer) = session_signer() else {
+    side_row_decision(
+        session_signer(),
+        agent_id,
+        attest::require_agent_attestation_for(attest::WriteSurface::Mcp),
+    )
+}
+
+/// The pure decision behind [`side_row_signer`]: the installed signer (if
+/// any), the agent the side row is attributed to, and whether strict MCP
+/// attestation is on (#10012).
+fn side_row_decision(
+    signer: Option<&SessionSigner>,
+    agent_id: &str,
+    strict: bool,
+) -> std::result::Result<SideRowSigner, String> {
+    let Some(signer) = signer else {
         return Ok(SideRowSigner::NoSession);
     };
     if signer.covers(agent_id) {
         return Ok(SideRowSigner::Session(signer.keypair.clone()));
     }
-    if attest::require_agent_attestation_for(attest::WriteSurface::Mcp) {
+    if strict {
         Err(SIDE_ROW_STRICT_REFUSAL.to_string())
     } else {
         Ok(SideRowSigner::NotCoveredPermissive)
@@ -840,5 +855,137 @@ mod tests {
         }
         assert!(read_session_key(&ok).is_ok());
         assert_eq!(read_session_key(dir.path()).err(), Some(REFUSE_NOT_REGULAR));
+    }
+
+    const SIDE_SESSION_AGENT_10012: &str = "agent-side-session-10012";
+    const SIDE_OTHER_AGENT_10012: &str = "agent-side-other-10012";
+
+    /// The decision a side-row signer test row expects (#10012).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SideExpect {
+        NoSession,
+        SessionKey,
+        NotCoveredPermissive,
+        Refused,
+    }
+
+    /// #10012: the full truth table of the side-row signer decision over
+    /// (signer installed?, side row's agent, strict mode). The expected column
+    /// is written by hand; the refusal is the exact text.
+    #[test]
+    fn side_row_decision_truth_table_10012() {
+        const ROWS: [(bool, &str, bool, SideExpect); 8] = [
+            (
+                false,
+                SIDE_SESSION_AGENT_10012,
+                false,
+                SideExpect::NoSession,
+            ),
+            (false, SIDE_SESSION_AGENT_10012, true, SideExpect::NoSession),
+            (false, SIDE_OTHER_AGENT_10012, false, SideExpect::NoSession),
+            (false, SIDE_OTHER_AGENT_10012, true, SideExpect::NoSession),
+            (
+                true,
+                SIDE_SESSION_AGENT_10012,
+                false,
+                SideExpect::SessionKey,
+            ),
+            (true, SIDE_SESSION_AGENT_10012, true, SideExpect::SessionKey),
+            (
+                true,
+                SIDE_OTHER_AGENT_10012,
+                false,
+                SideExpect::NotCoveredPermissive,
+            ),
+            (true, SIDE_OTHER_AGENT_10012, true, SideExpect::Refused),
+        ];
+        let kp = crate::identity::keypair::generate(SIDE_SESSION_AGENT_10012).expect("keypair");
+        let signer = SessionSigner {
+            agent_id: SIDE_SESSION_AGENT_10012.to_string(),
+            keypair: kp.clone(),
+        };
+        let session_public = encode_public_base64(&kp.public);
+        for (installed, agent, strict, expected) in ROWS {
+            let what = format!("installed={installed} agent={agent} strict={strict}");
+            let got = side_row_decision(installed.then_some(&signer), agent, strict);
+            let observed = match got {
+                Ok(SideRowSigner::NoSession) => SideExpect::NoSession,
+                Ok(SideRowSigner::Session(used)) => {
+                    assert_eq!(
+                        encode_public_base64(&used.public),
+                        session_public,
+                        "{what}: signs with the session key"
+                    );
+                    SideExpect::SessionKey
+                }
+                Ok(SideRowSigner::NotCoveredPermissive) => SideExpect::NotCoveredPermissive,
+                Err(text) => {
+                    assert_eq!(text, SIDE_ROW_STRICT_REFUSAL, "{what}: exact refusal");
+                    SideExpect::Refused
+                }
+            };
+            assert_eq!(observed, expected, "{what}");
+        }
+    }
+
+    const OPEN_ARM_AGENT_10012: &str = "agent-open-arm-10012";
+
+    /// #10012: a connection opened AFTER the signer is installed (the
+    /// governance and backfill connections of the stdio server, any later
+    /// `db::open`) is armed by `storage::connection::open` itself, so a
+    /// session-agent row written through it is stored sealed. Runs alone in a
+    /// child process because the signer is process-wide.
+    #[test]
+    fn every_later_db_open_seals_session_rows_10012() {
+        use base64::Engine as _;
+        if crate::config::run_env_isolated_child_or_spawn(
+            "identity::session_signer::tests::every_later_db_open_seals_session_rows_10012",
+        ) {
+            return;
+        }
+        crate::identity::attest::permissive_attestation_for_lib_tests();
+        let kp = crate::identity::keypair::generate(OPEN_ARM_AGENT_10012).expect("keypair");
+        // Registered and bound before the signer exists, as the stdio boot
+        // requires (REFUSE_UNBOUND); the write goes through a LATER open.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("open-arm-10012.db");
+        {
+            let boot = crate::db::open(&path).expect("boot open");
+            crate::db::register_agent(&boot, OPEN_ARM_AGENT_10012, "nhi", &[]).expect("register");
+            crate::db::bind_agent_pubkey_with_keypair(&boot, OPEN_ARM_AGENT_10012, &kp)
+                .expect("bind");
+        }
+        assert_eq!(
+            install_for_lib_test(OPEN_ARM_AGENT_10012, kp.clone()),
+            OPEN_ARM_AGENT_10012
+        );
+        let conn = crate::db::open(&path).expect("open after install");
+        let now = crate::identity::attest::now_attestable_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: "open-arm-10012".to_string(),
+            title: "open arm 10012".to_string(),
+            content: "written through a later connection".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({ crate::META_KEY_AGENT_ID: OPEN_ARM_AGENT_10012 }),
+            ..Memory::default()
+        };
+        let id = crate::db::insert(&conn, &mem).expect("insert");
+        let row = crate::db::get(&conn, &id).expect("read").expect("row");
+        assert_eq!(
+            row.metadata[crate::models::field_names::ATTEST_LEVEL].as_str(),
+            Some("agent_attested"),
+            "attest_level of a row written through a later db::open"
+        );
+        let stored = row.metadata[crate::models::field_names::WRITE_SIGNATURE]
+            .as_str()
+            .expect("write_signature");
+        let stored = base64::engine::general_purpose::STANDARD
+            .decode(stored)
+            .expect("base64 signature");
+        let expected = crate::identity::attest::sign_memory_write(&kp, &row, OPEN_ARM_AGENT_10012)
+            .expect("re-sign stored row");
+        assert_eq!(stored, expected, "signature over the stored row");
     }
 }
