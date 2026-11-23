@@ -224,11 +224,8 @@ impl Sandbox {
     /// A READ-ONLY connection to the sandbox store: the assertions only read,
     /// so they never run migrations or take a write lock under a live server.
     fn conn(&self) -> rusqlite::Connection {
-        rusqlite::Connection::open_with_flags(
-            self.db(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("open sandbox db read-only")
+        rusqlite::Connection::open_with_flags(self.db(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open sandbox db read-only")
     }
 }
 
@@ -548,11 +545,15 @@ fn boot_refuses_unbound_session_agent_9926() {
     let sb = Sandbox::new();
     let priv_path = sb.generate(AGENT);
     let key = sb.key_file_from(&priv_path, "unbound.key", 0o600);
-    assert_eq!(
-        ai_memory::db::agent_pubkey(&sb.conn(), AGENT).expect("lookup"),
-        None,
-        "premise: AGENT is not bound"
-    );
+    // Premise: nothing has bound AGENT. No store exists yet, so no binding
+    // can (the read-only `conn` cannot open a store that is not there).
+    if sb.db().exists() {
+        assert_eq!(
+            ai_memory::db::agent_pubkey(&sb.conn(), AGENT).expect("lookup"),
+            None,
+            "premise: AGENT is not bound"
+        );
+    }
     for require in POSTURES {
         let out = sb.boot_with_env(AGENT, require, key.as_os_str());
         assert_boot_refused(&out, REFUSE_UNBOUND, &format!("unbound REQUIRE={require}"));
@@ -724,11 +725,14 @@ const MERGE_BODY_A: &str = "The first body of the merge title, written as a plai
 const MERGE_BODY_B: &str = "The second body of the merge title, a different plain sentence.";
 
 /// `(what, body, tier)`: a new title, an overwrite of it (the default
-/// `on_conflict` merge), and an identical re-store, across tiers.
-const MERGE_ROWS: [(&str, &str, &str); 3] = [
+/// `on_conflict` merge), an identical re-store, and a merge back to the
+/// first body (its re-seal re-derives an already-admitted signature), across
+/// tiers.
+const MERGE_ROWS: [(&str, &str, &str); 4] = [
     ("new title", MERGE_BODY_A, "mid"),
     ("overwrite", MERGE_BODY_B, "long"),
     ("identical re-store", MERGE_BODY_B, "short"),
+    ("back to the first body", MERGE_BODY_A, "long"),
 ];
 
 /// #10011 — a keyed session that re-stores an existing title (the merge

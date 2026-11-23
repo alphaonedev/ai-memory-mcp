@@ -134,6 +134,22 @@ pub fn session_signer() -> Option<&'static SessionSigner> {
     SESSION_SIGNER.get()
 }
 
+/// Lib-test-only: install `keypair` as the session signer of `agent_id`
+/// without the key-file checks of [`install_from_env`] (which reads an env
+/// var lib tests must not set). It covers ONLY `agent_id`, so every other
+/// lib test keeps the unkeyed path. Returns the installed signer's agent:
+/// a second call is a no-op that reports the first agent.
+#[cfg(test)]
+pub(crate) fn install_for_lib_test(agent_id: &str, keypair: AgentKeypair) -> &'static str {
+    SESSION_SIGNER
+        .get_or_init(|| SessionSigner {
+            agent_id: agent_id.to_string(),
+            keypair,
+        })
+        .agent_id
+        .as_str()
+}
+
 /// Whether the installed signer covers writes attributed to `agent_id`.
 #[must_use]
 pub fn covers(agent_id: &str) -> bool {
@@ -361,6 +377,115 @@ fn seal_with(
     }
     attest::persist_write_signature(mem, &signature);
     Ok(Sealed)
+}
+
+/// Refusal for a signed `memory_store` whose merge detour cannot be
+/// re-sealed: no session signer covers the agent (#10011).
+pub const MERGE_RESEAL_REFUSAL: &str = "ATTESTATION_FAILED: a signed memory_store that merges into an existing row needs the session signer of its agent to re-sign the merged row (#10011); retry with on_conflict \"version\" or a new title";
+
+/// Proof that [`reseal_row_sync`] signed the stored row, verified it as
+/// `agent_attested` against the bound key and persisted the seal (CBC-05).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resealed;
+
+/// Re-seal row `id` after a merge rewrote its content (#10011).
+///
+/// `db::update` never mints an attestation (#3420), so the merge detour of a
+/// signed `memory_store` lands the merged row `claimed`. This signs the row
+/// AS STORED (its id, namespace, title, kind and `created_at`, plus the
+/// merged content) with the session signer of `agent_id`, verifies the
+/// signature against the agent's CURRENT bound key, records it in the replay
+/// ledger and persists `attest_level` + `write_signature` through
+/// [`crate::storage::row_attestation::set_row_attestation`].
+///
+/// The caller runs this inside the write transaction that wrote the content,
+/// so an `Err` rolls the merge back: a merged row is never committed as
+/// claimed when its write was signed.
+///
+/// A ledger `Replay` is admitted here. decision: admit over refuse because
+/// the signature is minted by the session key over this row's own envelope
+/// (no presented envelope is being replayed), and Ed25519 is deterministic,
+/// so a merge back to an earlier body re-derives an already-spent
+/// fingerprint; refusing it would lose a legitimate write.
+///
+/// # Errors
+///
+/// [`MERGE_RESEAL_REFUSAL`] when no session signer covers `agent_id`; a
+/// reason starting with [`SEAL_REFUSAL_PREFIX`] for every other failure
+/// (row missing, owner mismatch, unstable `created_at`, stored bytes that
+/// redaction would change, signing, a key rebound after boot, ledger
+/// unavailable, persistence).
+pub fn reseal_row_sync(
+    conn: &rusqlite::Connection,
+    id: &str,
+    agent_id: &str,
+) -> std::result::Result<Resealed, String> {
+    let Some(signer) = session_signer().filter(|signer| signer.covers(agent_id)) else {
+        return Err(MERGE_RESEAL_REFUSAL.to_string());
+    };
+    reseal_with(conn, id, signer).map_err(|reason| format!("{SEAL_REFUSAL_PREFIX}: {reason}"))
+}
+
+fn reseal_with(
+    conn: &rusqlite::Connection,
+    id: &str,
+    signer: &SessionSigner,
+) -> std::result::Result<Resealed, String> {
+    use crate::identity::attest;
+    use crate::identity::verify::AttestLevel;
+    use base64::Engine as _;
+
+    let mut row = crate::db::get(conn, id)
+        .map_err(|e| format!("merged row read failed: {e}"))?
+        .ok_or_else(|| "the merged row is gone".to_string())?;
+    let owner = row
+        .metadata
+        .get(crate::mcp::param_names::AGENT_ID)
+        .and_then(serde_json::Value::as_str);
+    if owner != Some(signer.agent_id.as_str()) {
+        return Err("the merged row is not owned by the session agent".to_string());
+    }
+    // The row keeps its original `created_at`; restamping it here would
+    // rewrite the row's identity, so an unstable value refuses instead.
+    if !attest::created_at_is_storage_stable(&row.created_at) {
+        return Err("the merged row created_at is not storage-stable".to_string());
+    }
+    let stored = (row.title.clone(), row.content.clone(), row.tags.clone());
+    attest::redact_before_sign(&mut row);
+    if (&row.title, &row.content, &row.tags) != (&stored.0, &stored.1, &stored.2) {
+        return Err("the merged row bytes differ from their redacted form".to_string());
+    }
+    let signature = attest::sign_memory_write(&signer.keypair, &row, &signer.agent_id)
+        .map_err(|e| format!("signing failed: {e}"))?;
+    let bound = crate::db::agent_pubkey(conn, &signer.agent_id)
+        .map_err(|e| format!("bound key lookup failed: {e}"))?;
+    let level = attest::stamp_attestation(
+        &mut row,
+        &signer.agent_id,
+        bound.as_deref(),
+        Some(&signature),
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    match level {
+        AttestLevel::AgentAttested => {}
+        AttestLevel::Claimed => {
+            return Err("the re-signed row did not verify as agent_attested".to_string());
+        }
+    }
+    match attest::admit_attested_write_sync(conn, &signer.agent_id, &row.created_at, &signature)? {
+        attest::AttestedWriteAdmission::Fresh | attest::AttestedWriteAdmission::Replay => {}
+    }
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    crate::storage::row_attestation::set_row_attestation(
+        conn,
+        id,
+        AttestLevel::AgentAttested.as_str(),
+        &signature_b64,
+    )
+    .map_err(|e| format!("persisting the seal failed: {e}"))?;
+    Ok(Resealed)
 }
 
 #[cfg(test)]

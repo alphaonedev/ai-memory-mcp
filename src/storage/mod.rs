@@ -896,6 +896,8 @@ pub use merge_inbound_authorized_4023::{
 mod federation_by_id_4447;
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod title_slot_archive;
+// #10011 — the attested-update entry point the session-signer re-seal uses.
+pub mod row_attestation;
 // #9405 / #9273 — gated `update_with_expected_version` body: gate, then open or join the txn.
 mod versioned_update_txn;
 pub use federation_by_id_4447::{

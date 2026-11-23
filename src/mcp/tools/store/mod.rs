@@ -39,6 +39,44 @@ use std::path::Path;
 
 use self::validation::OnConflict;
 
+/// How the incoming `memory_store` was attested before any detour (#10011).
+/// A detour that rewrites an existing row through `db::update` (which never
+/// mints, #3420) must re-seal that row for every signed variant, so the
+/// merged row is never committed as `claimed` (CBC-02, CBC-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IncomingAttestation {
+    /// The stdio session signer sealed the write (#9926).
+    SessionSealed,
+    /// The caller presented a v1 `signature` or a v2 `write_v2` envelope.
+    CallerSigned,
+    /// No signature and no session signer for this agent: lands `claimed`.
+    Unsigned,
+}
+
+impl IncomingAttestation {
+    /// Re-seal row `id` after a detour rewrote it, inside the caller's write
+    /// transaction. `Unsigned` keeps the `db::update` outcome unchanged and
+    /// returns `None`; every signed variant returns the seal proof.
+    ///
+    /// # Errors
+    ///
+    /// The exact refusal of
+    /// [`crate::identity::session_signer::reseal_row_sync`].
+    pub(super) fn reseal_merged_row(
+        self,
+        conn: &rusqlite::Connection,
+        id: &str,
+        agent_id: &str,
+    ) -> Result<Option<crate::identity::session_signer::Resealed>, String> {
+        match self {
+            Self::SessionSealed | Self::CallerSigned => {
+                crate::identity::session_signer::reseal_row_sync(conn, id, agent_id).map(Some)
+            }
+            Self::Unsigned => Ok(None),
+        }
+    }
+}
+
 // pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
 const SITE_HANDLE_STORE_INNER: &str = "handle_store_inner";
 
@@ -483,9 +521,10 @@ fn handle_store_inner(
     // REJECT on every surface (including MCP), regardless of the require flag.
     let presented_v2 =
         crate::identity::attest_v2::parse_presented(params).map_err(|e| e.to_string())?;
-    if let Some(v2) = presented_v2 {
+    let incoming = if let Some(v2) = presented_v2 {
         crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err("parse_presented", e))?;
+        IncomingAttestation::CallerSigned
     } else {
         let presented_sig = params["signature"]
             .as_str()
@@ -537,6 +576,7 @@ fn handle_store_inner(
             // #1801→#1954 item 2 — sender EMIT: persist the author's presented
             // signature so it propagates verbatim across federation relay hops.
             crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
+            IncomingAttestation::CallerSigned
         } else {
             // #9926 — the session signer seals an unsigned write of the
             // session agent: signed over the canonical envelope, verified
@@ -545,7 +585,7 @@ fn handle_store_inner(
             // fallback to `claimed`. Any other agent runs the path below.
             use crate::identity::session_signer::{SealOutcome, seal_sync};
             match seal_sync(conn, &mut mem, &agent_id) {
-                SealOutcome::Signed => {}
+                SealOutcome::Signed => IncomingAttestation::SessionSealed,
                 SealOutcome::Refused(reason) => return Err(reason),
                 SealOutcome::UnsignedOtherAgent => {
                     // #3018 — stamp `attest_level` UNCONDITIONALLY on the unsigned
@@ -567,10 +607,11 @@ fn handle_store_inner(
                     .map_err(|e| {
                         crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_STORE_INNER, e)
                     })?;
+                    IncomingAttestation::Unsigned
                 }
             }
         }
-    }
+    };
 
     // #969 — single `to_value(&mem)` shared across the K9 permission
     // gate and the K3 governance gate below. Pre-fix the two scoped
@@ -863,6 +904,9 @@ fn handle_store_inner(
         active_keypair,
         // #3173 — re-checked at every `db::update` / `db::delete` inside.
         mutation_caller.as_deref(),
+        // #10011 — every merged candidate is re-sealed inside the merge txn.
+        incoming,
+        &agent_id,
     )? {
         return Ok(resp);
     }
@@ -924,20 +968,34 @@ fn handle_store_inner(
         // incoming store.
         let preserved_metadata =
             crate::identity::preserve_provenance_keys_for_merge(&dup.metadata, &mem.metadata);
-        let (_found, content_changed) = db::update(
-            conn,
-            &dup.id,
-            None,                       // title (unchanged)
-            Some(mem.content.as_str()), // content (update)
-            Some(&mem.tier),            // tier
-            None,                       // namespace (unchanged)
-            Some(&mem.tags),            // tags
-            Some(mem.priority),         // priority
-            Some(mem.confidence),       // confidence
-            None,                       // expires_at
-            Some(&preserved_metadata),  // metadata (agent_id preserved)
-        )
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("metadata", e))?;
+        // #10011 — the content update and the re-seal of a signed write commit
+        // as one unit: a re-seal refusal rolls the merge back and refuses the
+        // store, so the merged row is never committed as `claimed`.
+        let mut reseal_refusal: Option<String> = None;
+        let merged = crate::storage::in_write_txn(conn, || {
+            let updated = db::update(
+                conn,
+                &dup.id,
+                None,                       // title (unchanged)
+                Some(mem.content.as_str()), // content (update)
+                Some(&mem.tier),            // tier
+                None,                       // namespace (unchanged)
+                Some(&mem.tags),            // tags
+                Some(mem.priority),         // priority
+                Some(mem.confidence),       // confidence
+                None,                       // expires_at
+                Some(&preserved_metadata),  // metadata (agent_id preserved)
+            )?;
+            if let Err(reason) = incoming.reseal_merged_row(conn, &dup.id, &agent_id) {
+                anyhow::bail!(reseal_refusal.insert(reason).clone());
+            }
+            Ok(updated)
+        });
+        if let Some(reason) = reseal_refusal {
+            return Err(reason);
+        }
+        let (_found, content_changed) =
+            merged.map_err(|e| crate::mcp::error_text::mcp_foreign_err("metadata", e))?;
         // Regenerate embedding if content changed during dedup update
         if content_changed && let Some(emb) = embedder {
             let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
