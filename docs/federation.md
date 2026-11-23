@@ -586,8 +586,17 @@ export AI_MEMORY_FED_PEER_OUTBOUND_SCOPE='{
 - Items left out are counted per peer and namespace in
   `ai_memory_federation_outbound_scope_filtered_total{peer_id,namespace}`
   (Prometheus `/metrics`) and in the capabilities `federation_security`
-  report. The `/sync/since` serve-side namespace filter counts into the
-  same series. Peer labels are hashed ids, never URLs; namespace labels are
+  report. The `/sync/since` serve-side filter counts into the same
+  series, under the configured peer id of the entry that scoped the pull.
+- `/sync/since` (the pull) is scoped the same way (#10037). An entry may
+  name `"peer_ids": ["ai:peer-b"]`, the authenticated ids that pull under
+  it. The pulling peer is the id bound to its mTLS client certificate,
+  else an `X-Peer-Id` whose `X-Memory-Sig` verified against its enrolled
+  key (`AI_MEMORY_FED_REQUIRE_SIG`, default on); a bare header selects
+  nothing. An unauthenticated pull or an id no entry names gets an empty
+  page with `scope_status: "outbound_scope_deny"`. A served row must pass
+  both this scope and `AI_MEMORY_FED_PEER_ATTESTATION`;
+  `AI_MEMORY_FED_SYNC_TRUST_PEER=1` never widens the outbound scope. Peer labels are hashed ids, never URLs; namespace labels are
   cut at 128 bytes and the series set is capped at 1024 (`_overflow`).
 
 ## Federation subcollection coverage on a PostgreSQL receiver

@@ -236,8 +236,8 @@ fn catchup_memory_namespace_authorized(
 /// #2290 — sign an outbound `/sync/since` catch-up GET so an ENROLLED peer
 /// accepts the pull under the default `AI_MEMORY_FED_REQUIRE_SIG=1` posture.
 ///
-/// The inbound `/sync/since` receiver (`verify_get_signature_or_reject`)
-/// refuses an enrolled peer's request that omits `X-Memory-Sig` with
+/// The inbound `/sync/since` receiver (`verify_get_signature`) refuses an
+/// enrolled peer's request that omits `X-Memory-Sig` with
 /// `401 x_memory_sig_missing`, but pre-#2290 NO outbound catch-up client
 /// signed the GET — so the MOST-secure (fully enrolled, default-strict)
 /// mesh got the WORST catch-up (structurally 401'd every tick). This mirrors
@@ -245,7 +245,10 @@ fn catchup_memory_namespace_authorized(
 /// over the shared canonical GET bytes). When no daemon signing key is on
 /// disk the request stays unsigned (byte-identical to the pre-#2290 wire),
 /// preserving the permissive / unenrolled `AI_MEMORY_FED_REQUIRE_SIG=0`
-/// posture. `url` is parsed exactly as `reqwest` will send it, so the signed
+/// posture; #9996 / #10037: such a pull authenticates no peer (unless the
+/// mTLS client certificate binds one), so the receiver's outbound scope
+/// resolves to Deny and it serves an empty `outbound_scope_deny` page.
+/// `url` is parsed exactly as `reqwest` will send it, so the signed
 /// path+query match the receiver's `OriginalUri` byte-for-byte.
 fn sign_catchup_get(
     req: reqwest::RequestBuilder,

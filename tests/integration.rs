@@ -28,6 +28,9 @@ use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http
 use common::child_stdin_report;
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
+// #9996 / #10037 — the outbound-scope config of a signed `/sync/since` puller.
+#[path = "common/signed_pull.rs"]
+mod signed_pull;
 
 /// #998 (2026-05-21) — concrete admin id seeded into
 /// `AI_MEMORY_ADMIN_AGENT_IDS` for every spawned integration daemon.
@@ -8510,9 +8513,16 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     // below still kills the spawned daemon and unlinks db_a/db_b
     // during unwind. Bare `Child` would orphan the server to PID 1
     // (the same failure mode #401 fixed in the mTLS test).
+    //
+    // #9996 — serve B hands rows only to an authenticated peer its outbound
+    // scope names: enrol peer A's key (the sync-daemon signs its pulls with
+    // it) and give peer A the all-namespaces scope.
+    let _peer_a_key = enrol_pull_peer_9996("peer-a");
+    let pull_env = signed_pull_serve_env_9996(&["peer-a"]);
     let port_b = free_port();
     let (stderr_file, stderr_log) = serve_stderr_log();
     let serve_b_child = cmd(bin)
+        .envs(pull_env.iter().map(|(k, v)| (*k, v.as_str())))
         .args([
             "--db",
             db_b.to_str().unwrap(),
@@ -8876,9 +8886,16 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // so an assert panic anywhere below still kills the spawned daemon
     // and unlinks the temp fixture files (DBs, certs, keys, allowlist)
     // during unwind. Bare `Child` would orphan the server to PID 1.
+    //
+    // #9996 — the mTLS allowlist pins the connection; the rows still go only
+    // to an authenticated peer the outbound scope names, so peer A signs its
+    // pulls with its enrolled key and holds the all-namespaces scope.
+    let _peer_a_key = enrol_pull_peer_9996("peer-a");
+    let pull_env = signed_pull_serve_env_9996(&["peer-a"]);
     let port_b = free_port();
     let (stderr_file, stderr_log) = serve_stderr_log();
     let serve_b_child = cmd(bin)
+        .envs(pull_env.iter().map(|(k, v)| (*k, v.as_str())))
         .args([
             "--db",
             db_b.to_str().unwrap(),
@@ -9661,6 +9678,12 @@ struct DaemonGuard {
 
 impl DaemonGuard {
     fn spawn() -> Self {
+        Self::spawn_with_env(&[])
+    }
+
+    /// `spawn` with per-test env overrides (they shadow the `cmd()` suite
+    /// defaults, because a later `.env()` call wins).
+    fn spawn_with_env(extra_env: &[(&str, &str)]) -> Self {
         let bin = env!("CARGO_BIN_EXE_ai-memory");
         let db = integration_scratch_db("http-parity");
         let port = free_port();
@@ -9681,6 +9704,7 @@ impl DaemonGuard {
                 "--tls-key",
                 tls_key(),
             ])
+            .envs(extra_env.iter().copied())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(stderr_file))
             .spawn()
@@ -9705,6 +9729,94 @@ impl Drop for DaemonGuard {
         let _ = std::fs::remove_file(&self.stderr_log);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #9996 / #10037 — `/sync/since` serves rows only to an AUTHENTICATED peer
+// whose outbound scope (`AI_MEMORY_FED_PEER_OUTBOUND_SCOPE`) names it. A pull with
+// no peer, or a bare `X-Peer-Id`, gets the empty `outbound_scope_deny` page.
+// The suite-level `AI_MEMORY_FED_REQUIRE_SIG=0` (see `cmd()`) authenticates
+// nobody, so the pull tests below re-enable signing on the serving daemon,
+// enrol the pulling peer's key in the suite's key dir and give that peer the
+// all-namespaces outbound scope. Their own assertions are unchanged.
+// ---------------------------------------------------------------------------
+
+/// Load, or mint once, the full key pair of a pulling peer in the suite's
+/// key dir. The serving daemon (same key dir) verifies its pulls against the
+/// public half; a sync-daemon running as that id signs with the private half.
+fn enrol_pull_peer_9996(peer_id: &str) -> ai_memory::identity::keypair::AgentKeypair {
+    use ai_memory::identity::keypair;
+    static MINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = MINT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_, keys) = isolated_home_and_keys();
+    if let Ok(kp) = keypair::load(peer_id, keys)
+        && kp.private.is_some()
+    {
+        return kp;
+    }
+    let kp = keypair::generate(peer_id).expect("#9996: generate the pull peer key");
+    keypair::save(&kp, keys).expect("#9996: save the pull peer key");
+    kp
+}
+
+/// Env overrides for a serving daemon that lets `peer_ids` pull every
+/// namespace with a signed `/sync/since` GET.
+fn signed_pull_serve_env_9996(peer_ids: &[&str]) -> [(&'static str, String); 2] {
+    [
+        (
+            ai_memory::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
+            signed_pull::outbound_scope_all(peer_ids),
+        ),
+        (ai_memory::federation::signing::REQUIRE_SIG_ENV, "1".into()),
+    ]
+}
+
+/// Spawn a `serve` daemon that lets `peer_id` pull every namespace.
+fn spawn_signed_pull_daemon_9996(peer_id: &str) -> DaemonGuard {
+    let env = signed_pull_serve_env_9996(&[peer_id]);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    DaemonGuard::spawn_with_env(&env)
+}
+
+/// `curl_get` of `path_and_query` signed as the enrolled peer `kp`
+/// (`X-Peer-Id` + `X-Memory-Sig` + `X-Memory-Nonce`).
+fn curl_get_signed_pull_9996(
+    port: u16,
+    path_and_query: &str,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) -> (String, serde_json::Value) {
+    use ai_memory::federation::{peer_attestation::PEER_ID_HEADER, signing};
+    let url = format!("https://127.0.0.1:{port}{path_and_query}");
+    let (sig, nonce) = signing::sign_get_url(kp.private.as_ref(), &url)
+        .expect("#9996: sign the pull (the peer key has a private half)");
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-m",
+            CURL_REQUEST_MAX_SECS,
+            "-w",
+            "\n%{http_code}",
+            "--cacert",
+            tls_cert(),
+            "-H",
+            &format!("{PEER_ID_HEADER}: {}", kp.agent_id),
+            "-H",
+            &format!("{}: {sig}", signing::SIGNATURE_HEADER),
+            "-H",
+            &format!("{}: {nonce}", signing::NONCE_HEADER),
+            &url,
+        ])
+        .output()
+        .unwrap();
+    let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (body, code) = raw.rsplit_once('\n').unwrap_or(("", ""));
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    (code.trim().to_string(), v)
+}
+
+/// The pulling peer of the two S39 `/sync/since` tests.
+const S39_PULL_PEER_9996: &str = "ai:s39-pull-peer";
 
 #[test]
 fn http_capabilities_returns_json_with_version() {
@@ -10783,7 +10895,9 @@ fn http_sync_since_echoes_since_param() {
     //   1. updated_since in the response body equals the supplied param
     //      (proves handler-side since-parsing didn't silently drop it).
     //   2. memories[] contains the just-posted row.
-    let d = DaemonGuard::spawn();
+    // #9996 — the pull is a signed pull by a peer the outbound scope names.
+    let puller = enrol_pull_peer_9996(S39_PULL_PEER_9996);
+    let d = spawn_signed_pull_daemon_9996(S39_PULL_PEER_9996);
 
     // 2 minutes ago, RFC 3339.
     let since = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
@@ -10811,7 +10925,11 @@ fn http_sync_since_echoes_since_param() {
     // otherwise treat `+` as a space. RFC 3339 always has either `Z` or
     // `±HH:MM`.
     let encoded = since.replace('+', "%2B").replace(':', "%3A");
-    let (code, body) = curl_get(d.port, &format!("/api/v1/sync/since?since={encoded}"));
+    let (code, body) = curl_get_signed_pull_9996(
+        d.port,
+        &format!("/api/v1/sync/since?since={encoded}"),
+        &puller,
+    );
     assert_eq!(code, "200", "sync_since body: {body}");
     assert_eq!(
         body["updated_since"].as_str().unwrap_or_default(),
@@ -11195,7 +11313,9 @@ fn http_sync_since_returns_post_checkpoint_writes() {
     // the result contains exactly the second batch. If this passes,
     // the S39 scenario failure in a2a-hermes is a harness ssh
     // STOP/CONT reliability issue, not a product bug.
-    let d = DaemonGuard::spawn();
+    // #9996 — the pull is a signed pull by a peer the outbound scope names.
+    let puller = enrol_pull_peer_9996(S39_PULL_PEER_9996);
+    let d = spawn_signed_pull_daemon_9996(S39_PULL_PEER_9996);
 
     // Batch 1: 10 memories.
     for i in 0..10 {
@@ -11249,9 +11369,10 @@ fn http_sync_since_returns_post_checkpoint_writes() {
 
     // Query /sync/since?since=<checkpoint>.
     let encoded = checkpoint.replace('+', "%2B").replace(':', "%3A");
-    let (code, body) = curl_get(
+    let (code, body) = curl_get_signed_pull_9996(
         d.port,
         &format!("/api/v1/sync/since?since={encoded}&limit=1000"),
+        &puller,
     );
     assert_eq!(code, "200", "sync_since: {body}");
     let mems = body["memories"].as_array().expect("memories array");

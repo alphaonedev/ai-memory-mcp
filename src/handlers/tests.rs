@@ -183,6 +183,104 @@ impl Drop for PermissiveFedEnv {
     }
 }
 
+/// #9996 / #10037 — `/sync/since` serves rows only to an AUTHENTICATED
+/// peer that the outbound scope names. This fixture makes the test a
+/// signed, scoped puller: it enrols `peer_id`'s public key in a private
+/// key directory, points `AI_MEMORY_KEY_DIR` at it, requires signatures,
+/// and sets an all-namespaces (`**`) outbound scope that names `peer_id`.
+/// It takes the key-dir lock while the caller already holds the
+/// federation env lock (the `&PermissiveFedEnv` borrow proves it), the one
+/// order every test in this module uses (CONCURRENCY-04). Every variable
+/// is restored on drop.
+struct SignedScopedPull {
+    peer_id: &'static str,
+    key: crate::identity::keypair::AgentKeypair,
+    prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _key_dir: tempfile::TempDir,
+    _key_lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SignedScopedPull {
+    const SCOPE_URL: &'static str = "https://lib-pull-peer.sync-since-9996.invalid:9077";
+
+    fn new(_fed: &PermissiveFedEnv, peer_id: &'static str) -> Self {
+        use crate::identity::keypair as kp;
+        let key_lock = kp::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
+        let key = kp::generate(peer_id).expect("generate the puller key");
+        let public_only = kp::AgentKeypair {
+            agent_id: key.agent_id.clone(),
+            public: key.public,
+            private: None,
+        };
+        kp::save_public_only(&public_only, key_dir.path()).expect("enrol the puller key");
+        let scope = json!({
+            Self::SCOPE_URL: { "allowed_namespaces": ["**"], "peer_ids": [peer_id] }
+        })
+        .to_string();
+        let set: [(&'static str, std::ffi::OsString); 3] = [
+            (kp::KEY_DIR_ENV, key_dir.path().as_os_str().to_owned()),
+            (crate::federation::signing::REQUIRE_SIG_ENV, "1".into()),
+            (
+                crate::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
+                scope.into(),
+            ),
+        ];
+        let mut prev = Vec::with_capacity(set.len());
+        for (name, value) in set {
+            prev.push((name, std::env::var_os(name)));
+            // SAFETY: env mutation under the federation env lock and the
+            // key-dir lock, both held for this fixture's lifetime.
+            unsafe { std::env::set_var(name, value) };
+        }
+        Self {
+            peer_id,
+            key,
+            prev,
+            _key_dir: key_dir,
+            _key_lock: key_lock,
+        }
+    }
+
+    /// A `GET <path_and_query>` signed as this fixture's peer.
+    fn get(&self, path_and_query: &str) -> axum::http::request::Builder {
+        let (path, query) = path_and_query
+            .split_once('?')
+            .unwrap_or((path_and_query, ""));
+        let signing_key = self
+            .key
+            .private
+            .as_ref()
+            .expect("the puller holds its private key");
+        let (sig, nonce) =
+            crate::federation::signing::sign_get_request(signing_key, "GET", path, query);
+        axum::http::Request::builder()
+            .uri(path_and_query)
+            .header(
+                crate::federation::peer_attestation::PEER_ID_HEADER,
+                self.peer_id,
+            )
+            .header(crate::federation::signing::SIGNATURE_HEADER, sig)
+            .header(crate::federation::signing::NONCE_HEADER, nonce)
+    }
+}
+
+impl Drop for SignedScopedPull {
+    fn drop(&mut self) {
+        for (name, value) in self.prev.drain(..) {
+            // SAFETY: both locks are still held (fields drop after this).
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
 /// S5-C1 fix campaign (2026-05-13): synthesise a K7-style
 /// `(timestamp, signature)` pair for an inbound approve/reject body, signed
 /// over the #8495 v2 subject `<pending_id>@<approver>`.
@@ -2360,7 +2458,9 @@ fn http_sync_push_governance_bypass_on_peer_attested() {
 #[tokio::test]
 async fn http_sync_since_streams_new_memories_only() {
     // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
+    let fed = PermissiveFedEnv::new();
+    // #9996 / #10037 — pull as a signed peer the outbound scope names.
+    let puller = SignedScopedPull::new(&fed, "lib-puller-streams");
     // Phase 3 — GET /api/v1/sync/since?since=<ts> returns only memories
     // with updated_at > ts.
     //
@@ -2419,8 +2519,8 @@ async fn http_sync_since_streams_new_memories_only() {
 
     let resp = app
         .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/since?since=2020-06-01T00:00:00%2B00:00")
+            puller
+                .get("/api/v1/sync/since?since=2020-06-01T00:00:00%2B00:00")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2443,7 +2543,9 @@ async fn http_sync_since_streams_new_memories_only() {
 #[tokio::test]
 async fn http_sync_since_includes_s39_diagnostic_fields() {
     // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
+    let fed = PermissiveFedEnv::new();
+    // #9996 / #10037 — pull as a signed peer the outbound scope names.
+    let puller = SignedScopedPull::new(&fed, "lib-puller-s39");
     // S39 — the response must echo `updated_since` (parsed `since`)
     // and earliest/latest `updated_at` from the returned set. This
     // lets the scenario pin whether the server saw the expected
@@ -2503,8 +2605,8 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
     let since = "2024-01-01T00:00:00%2B00:00";
     let resp = app
         .oneshot(
-            axum::http::Request::builder()
-                .uri(format!("/api/v1/sync/since?since={since}"))
+            puller
+                .get(&format!("/api/v1/sync/since?since={since}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2528,8 +2630,8 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
         .with_state(test_app_state(state));
     let resp = empty_app
         .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/since?since=2099-01-01T00:00:00%2B00:00")
+            puller
+                .get("/api/v1/sync/since?since=2099-01-01T00:00:00%2B00:00")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4659,15 +4761,18 @@ async fn http_recall_post_keyword_mode_returns_mode_field() {
 #[tokio::test]
 async fn http_sync_since_empty_db_returns_zero_count() {
     // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
+    let fed = PermissiveFedEnv::new();
+    // #9996 / #10037 — pull as a signed peer the outbound scope names, so
+    // the empty page comes from the store read, not the outbound-deny page.
+    let puller = SignedScopedPull::new(&fed, "lib-puller-empty-db");
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum::routing::get(sync_since))
         .with_state(test_app_state(state));
     let resp = app
         .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/since?since=2000-01-01T00:00:00Z&limit=10")
+            puller
+                .get("/api/v1/sync/since?since=2000-01-01T00:00:00Z&limit=10")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4678,6 +4783,11 @@ async fn http_sync_since_empty_db_returns_zero_count() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_ne!(
+        v["scope_status"],
+        crate::federation::outbound_scope_serve::SCOPE_STATUS_OUTBOUND_DENY,
+        "a signed, scoped puller reaches the store read: {v}"
+    );
     assert_eq!(v["count"], 0);
     assert!(v["earliest_updated_at"].is_null());
     assert!(v["latest_updated_at"].is_null());
@@ -4686,15 +4796,18 @@ async fn http_sync_since_empty_db_returns_zero_count() {
 #[tokio::test]
 async fn http_sync_since_clamps_oversized_limit() {
     // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
+    let fed = PermissiveFedEnv::new();
+    // #9996 / #10037 — signed, scoped puller: the clamp is measured on the
+    // served page, not on the outbound-deny page.
+    let puller = SignedScopedPull::new(&fed, "lib-puller-clamp");
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum::routing::get(sync_since))
         .with_state(test_app_state(state));
     let resp = app
         .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/since?limit=999999")
+            puller
+                .get("/api/v1/sync/since?limit=999999")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4705,6 +4818,11 @@ async fn http_sync_since_clamps_oversized_limit() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_ne!(
+        v["scope_status"],
+        crate::federation::outbound_scope_serve::SCOPE_STATUS_OUTBOUND_DENY,
+        "a signed, scoped puller reaches the served page: {v}"
+    );
     // Limit must be clamped to <= 10_000.
     assert!(v["limit"].as_u64().unwrap() <= 10_000);
 }
@@ -4712,7 +4830,10 @@ async fn http_sync_since_clamps_oversized_limit() {
 #[tokio::test]
 async fn http_sync_since_empty_since_string_treated_as_full_snapshot() {
     // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
+    let fed = PermissiveFedEnv::new();
+    // #9996 / #10037 — pull as a signed peer the outbound scope names, so
+    // the snapshot path is reached instead of the outbound-deny page.
+    let puller = SignedScopedPull::new(&fed, "lib-puller-snapshot");
     // since="" must NOT be parsed as RFC 3339. The handler short-circuits
     // empty strings to "no since filter" and returns a full snapshot.
     let state = test_state();
@@ -4722,20 +4843,32 @@ async fn http_sync_since_empty_since_string_treated_as_full_snapshot() {
         .with_state(test_app_state(state));
     let resp = app
         .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/since?since=")
+            puller
+                .get("/api/v1/sync/since?since=")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_ne!(
+        v["scope_status"],
+        crate::federation::outbound_scope_serve::SCOPE_STATUS_OUTBOUND_DENY,
+        "a signed, scoped puller reaches the snapshot path: {v}"
+    );
 }
 
 #[tokio::test]
 async fn http_sync_since_records_peer_via_observe() {
     // #1789 — downstream-intent test; opt back to permissive enrollment.
-    let _fed = PermissiveFedEnv::new();
+    let fed = PermissiveFedEnv::new();
+    // #9996 / #10037 — the observe write runs only past the outbound
+    // scope, so pull as a signed peer the scope names.
+    let puller = SignedScopedPull::new(&fed, "peer-x");
     // Hitting sync_since with a `peer=` param and an X-Agent-Id header
     // exercises the side-effect sync_state_observe write path.
     let state = test_state();
@@ -4745,8 +4878,8 @@ async fn http_sync_since_records_peer_via_observe() {
         .with_state(test_app_state(state.clone()));
     let resp = app
         .oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/sync/since?peer=peer-x")
+            puller
+                .get("/api/v1/sync/since?peer=peer-x")
                 .header("x-agent-id", "alice")
                 .body(Body::empty())
                 .unwrap(),
@@ -4754,6 +4887,12 @@ async fn http_sync_since_records_peer_via_observe() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let lock = state.lock().await;
+    let clock = crate::storage::sync_state_load(&lock.0, "alice").expect("load the clock");
+    assert!(
+        clock.entries.contains_key("peer-x"),
+        "the pull recorded the peer: {clock:?}"
+    );
 }
 
 // ---- Capabilities + session_start + taxonomy ----

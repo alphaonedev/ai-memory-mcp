@@ -45,6 +45,14 @@
 //! 5. Inbox-target row + peer caller==target_agent_id → INCLUDED.
 //! 6. Scope=shared row → INCLUDED (post-#948 canonical shareable shape).
 //! 7. `excluded_for_scope_private` counter reflects the new gate.
+//!
+//! #9996 / #10037 — the pull serves only an authenticated peer its
+//! outbound scope names, so every pull here is signed with an enrolled
+//! key under the all-namespaces outbound scope for that peer: the
+//! visibility gate these rows pin is the layer that decides.
+
+#[path = "common/signed_pull.rs"]
+mod signed_pull;
 
 use ai_memory::models::ConfidenceSource;
 use axum::body::Body;
@@ -180,17 +188,24 @@ fn reset_env() {
 }
 
 async fn sync_since_body(router: axum::Router, peer_id: &str) -> Value {
-    let req = Request::builder()
+    // #9996 — the peer signs its pull and its outbound scope names it.
+    signed_pull::set_outbound_scope_all(&[peer_id]);
+    let pullers = signed_pull::EnrolledPullers::enrol(&[peer_id]);
+    let builder = Request::builder()
         .method("GET")
-        .uri("/api/v1/sync/since")
+        .uri(signed_pull::SYNC_SINCE_PATH)
         .header("content-type", "application/json")
         .header(
             ai_memory::federation::peer_attestation::PEER_ID_HEADER,
             peer_id,
-        )
+        );
+    let req = pullers
+        .sign_get(builder, peer_id, signed_pull::SYNC_SINCE_PATH, "")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
+    signed_pull::clear();
+    drop(pullers);
     assert_eq!(resp.status(), StatusCode::OK, "sync_since must always 200");
     let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
         .await

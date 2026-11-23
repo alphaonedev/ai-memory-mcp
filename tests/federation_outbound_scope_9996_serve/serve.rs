@@ -181,6 +181,9 @@ enum Posture {
     /// Attested for `public/*`; outbound scope names only the alpha
     /// namespace and maps the signing peer (the reviewer's probe).
     WideAttestationNarrowOutbound,
+    /// The mirror row: the outbound scope names `public/*`, the attestation
+    /// only the alpha namespace. The attestation half still filters.
+    WideOutboundNarrowAttestation,
     /// No attestation, `AI_MEMORY_FED_SYNC_TRUST_PEER=1`; the same narrow
     /// outbound scope.
     TrustBypassNarrowOutbound,
@@ -254,6 +257,16 @@ fn apply(posture: Posture, w: &Window) {
         std::env::set_var(OUTBOUND_SCOPE_ENV, outbound_config(&w.alpha_ns, PEER_AGENT));
         match posture {
             Posture::WideAttestationNarrowOutbound => {}
+            Posture::WideOutboundNarrowAttestation => {
+                std::env::set_var(
+                    PEER_ATTESTATION_ENV,
+                    format!(
+                        r#"{{"{PEER_AGENT}":{{"allowed_namespaces":["{}"]}}}}"#,
+                        w.alpha_ns
+                    ),
+                );
+                std::env::set_var(OUTBOUND_SCOPE_ENV, outbound_config("public/*", PEER_AGENT));
+            }
             Posture::TrustBypassNarrowOutbound => {
                 std::env::remove_var(PEER_ATTESTATION_ENV);
                 std::env::set_var(SYNC_TRUST_PEER_ENV, "1");
@@ -358,7 +371,9 @@ async fn cell(backend: Backend, posture: Posture) {
         "{posture:?}: zero out-of-scope rows; served {served:?}"
     );
     match posture {
-        Posture::WideAttestationNarrowOutbound | Posture::TrustBypassNarrowOutbound => {
+        Posture::WideAttestationNarrowOutbound
+        | Posture::WideOutboundNarrowAttestation
+        | Posture::TrustBypassNarrowOutbound => {
             assert_eq!(
                 served,
                 vec![w.alpha_id.clone()],
@@ -439,6 +454,11 @@ async fn sync_since_narrow_outbound_wide_attestation_serves_only_in_scope_sqlite
 }
 
 #[tokio::test]
+async fn sync_since_wide_outbound_narrow_attestation_serves_only_attested_sqlite_10037() {
+    cell(Backend::Sqlite, Posture::WideOutboundNarrowAttestation).await;
+}
+
+#[tokio::test]
 async fn sync_since_trust_bypass_never_widens_the_outbound_scope_sqlite_10037() {
     cell(Backend::Sqlite, Posture::TrustBypassNarrowOutbound).await;
 }
@@ -479,6 +499,13 @@ fn pg_backend() -> Option<Backend> {
 async fn sync_since_narrow_outbound_wide_attestation_serves_only_in_scope_postgres_9996() {
     let Some(b) = pg_backend() else { return };
     cell(b, Posture::WideAttestationNarrowOutbound).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn sync_since_wide_outbound_narrow_attestation_serves_only_attested_postgres_9996() {
+    let Some(b) = pg_backend() else { return };
+    cell(b, Posture::WideOutboundNarrowAttestation).await;
 }
 
 #[cfg(feature = "sal-postgres")]

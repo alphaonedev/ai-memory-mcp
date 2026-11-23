@@ -15,18 +15,26 @@ use axum::{
     Json,
     extract::{OriginalUri, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 
 use crate::db;
+use crate::federation::outbound_scope_serve::{
+    AuthenticatedPullPeer, SCOPE_STATUS_OUTBOUND_DENY, SignatureProof, admit_rows,
+    note_pull_refused, resolve_pull_scope,
+};
 use crate::federation::peer_attestation::{self, PeerAttestationConfig};
 use crate::models::Memory;
 use crate::validate;
 
 use super::AppState;
 use super::federation_receive::{SyncSinceQuery, extract_peer_id};
-use super::federation_signing_check::verify_get_signature_or_reject;
+use super::federation_signing_check::{GetSigOutcome, verify_get_signature};
+
+/// `scope_status` of a pull refused because the attestation map has no
+/// scope row for the peer.
+const SCOPE_STATUS_NO_ALLOWLIST: &str = "no_allowlist_default_deny";
 #[cfg(feature = "sal")]
 use super::{StorageBackend, store_err_to_response};
 
@@ -39,35 +47,29 @@ const SYNC_SINCE_NO_SCOPE_REFUSAL: &str = "sync_since: no scope allowlist for pe
      as the only guarantee, and the enterprise posture check reports it as a weakening; use it \
      only for a legacy-peer migration window.";
 
-/// #9996 C-6 — keep the rows `allowed` admits and count each row left out
-/// per `(peer, namespace)` in the filtered series stats and doctor show.
-/// The peer label is the hashed stable id of the attested peer header, so
-/// the series carries no raw header text; a peer with no scope row never
-/// reaches this filter (default-deny returns first), which bounds the label
-/// set to the configured peers.
-fn scope_filter(
-    mems: Vec<Memory>,
-    allowed: impl Fn(&str) -> bool,
-    peer_header: Option<&str>,
-) -> Vec<Memory> {
-    let mut tally = crate::federation::outbound_scope::FilteredTally::default();
-    let kept: Vec<Memory> = mems
-        .into_iter()
-        .filter(|m| {
-            let ok = allowed(&m.namespace);
-            if !ok {
-                tally.add(&m.namespace);
-            }
-            ok
-        })
-        .collect();
-    if let Some(peer) = peer_header {
-        crate::federation::outbound_scope::record_filtered(
-            &crate::federation::peer::stable_peer_id(peer),
-            &tally,
-        );
-    }
-    kept
+/// #9996 / #10037 — the empty page of a refused pull. `scope_status` names
+/// which gate refused it; no arm that returns this page reads the store.
+fn refused_page(limit: usize, since: Option<String>, scope_status: &str) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "count": 0,
+            "limit": limit,
+            (field_names::UPDATED_SINCE): since,
+            (field_names::EARLIEST_UPDATED_AT): serde_json::Value::Null,
+            (field_names::LATEST_UPDATED_AT): serde_json::Value::Null,
+            // #2441 — this arm never reads the DB, so there is no
+            // examined row set to derive a cursor from. `null` is the
+            // honest answer: `scope_status` says the pull was refused, so
+            // a pinned cursor here is a correct refusal, not a silent stall.
+            (field_names::NEXT_SINCE): serde_json::Value::Null,
+            "memories": Vec::<Memory>::new(),
+            (field_names::EXCLUDED_FOR_SCOPE): 0,
+            (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): 0,
+            (field_names::SCOPE_STATUS): scope_status,
+        })),
+    )
+        .into_response()
 }
 
 /// #2441 — compute the honest PULL CURSOR for one `/sync/since` page.
@@ -187,7 +189,7 @@ pub async fn sync_since(
     ) {
         return rejection;
     }
-    if let Some(rejection) = verify_get_signature_or_reject(
+    let signature_verified = match verify_get_signature(
         "GET",
         original_uri.path(),
         original_uri.query().unwrap_or(""),
@@ -195,8 +197,10 @@ pub async fn sync_since(
         peer_header_for_sig.as_deref(),
         &app.federation_nonce_cache,
     ) {
-        return rejection;
-    }
+        GetSigOutcome::Refused(rejection) => return rejection,
+        GetSigOutcome::Verified => true,
+        GetSigOutcome::Unauthenticated => false,
+    };
     // Validate `since` parses as RFC 3339 BEFORE hitting the DB so a
     // garbage timestamp returns a clear 400 instead of a 200 with the
     // entire database (red-team #247).
@@ -220,6 +224,35 @@ pub async fn sync_since(
     // response CompressionLayer runs — an asymmetric, peer-triggered
     // memory-amplification vector. The pull page now matches the push cap.
     let limit = q.limit.unwrap_or(500).min(app.max_page_size);
+
+    // #9996 / #10037 — the outbound namespace scope of the AUTHENTICATED
+    // peer bounds every row this pull hands out, exactly as it bounds the
+    // push lanes. The peer is the id bound to the mTLS client certificate,
+    // else an `X-Peer-Id` whose signature verified; a bare header selects
+    // nothing. An unauthenticated pull, an id no entry names and an unset
+    // or malformed config all resolve to Deny, which returns before the
+    // attestation check and before any store read. The trust-peer bypass
+    // below can widen the attestation test only, never this scope.
+    let auth_peer = cert_peer
+        .as_ref()
+        .and_then(|e| AuthenticatedPullPeer::tls_bound(&e.0))
+        .or_else(|| {
+            if signature_verified {
+                peer_header_for_sig.as_deref().and_then(|h| {
+                    AuthenticatedPullPeer::signature_verified(
+                        h,
+                        SignatureProof::mint_after_signature_check(),
+                    )
+                })
+            } else {
+                None
+            }
+        });
+    let serve_scope = resolve_pull_scope(auth_peer.as_ref());
+    if serve_scope.is_deny() {
+        note_pull_refused(&serve_scope);
+        return refused_page(limit, q.since, SCOPE_STATUS_OUTBOUND_DENY);
+    }
 
     // v0.7.0 #239 — per-peer namespace allowlist. Read the
     // `x-peer-id` header + the operator-configured attestation map
@@ -341,27 +374,7 @@ pub async fn sync_since(
             peer = %peer_header.as_deref().unwrap_or(""),
             "{SYNC_SINCE_NO_SCOPE_REFUSAL}"
         );
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "count": 0,
-                "limit": limit,
-                (field_names::UPDATED_SINCE): q.since,
-                (field_names::EARLIEST_UPDATED_AT): serde_json::Value::Null,
-                (field_names::LATEST_UPDATED_AT): serde_json::Value::Null,
-                // #2441 — this arm never reads the DB, so there is no
-                // examined row set to derive a cursor from. `null` is
-                // the honest answer: the peer is default-denied and
-                // `scope_status` already says so, so a pinned cursor
-                // here is a correct refusal, not a silent stall.
-                (field_names::NEXT_SINCE): serde_json::Value::Null,
-                "memories": Vec::<Memory>::new(),
-                (field_names::EXCLUDED_FOR_SCOPE): 0,
-                (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): 0,
-                (field_names::SCOPE_STATUS): "no_allowlist_default_deny",
-            })),
-        )
-            .into_response();
+        return refused_page(limit, q.since, SCOPE_STATUS_NO_ALLOWLIST);
     }
 
     // Helper closure: namespace test for the resolved scope.
@@ -400,15 +413,17 @@ pub async fn sync_since(
         // the watermark over a straddling tie group.
         let next_since = next_since_watermark(&mems, raw_count, limit);
         warn_if_cursor_pinned(next_since.as_deref(), raw_count, limit);
-        let ns_filtered = scope_filter(mems, allowed, peer_header.as_deref());
-        let after_ns = ns_filtered.len();
+        // #9996 / #10037 — the one admission funnel: outbound scope AND
+        // attestation allowlist, each row left out counted per peer.
+        let mut filtered = admit_rows(mems, &serve_scope, allowed);
+        let after_ns = filtered.len();
         let excluded = total.saturating_sub(after_ns);
         // #948 visibility post-filter (see `federation_caller`
         // resolution above): drop any scope=private row whose owner /
         // inbox-target does NOT match the federation caller. The
         // canonical helper centralises the predicate so future scope
         // semantics change once and land everywhere.
-        let filtered: Vec<Memory> = ns_filtered.into_iter().filter(visibility_ok).collect();
+        filtered.retain(visibility_ok);
         let excluded_for_scope_private = after_ns.saturating_sub(filtered.len());
         let earliest_updated_at = filtered.first().map(|m| m.updated_at.clone());
         let latest_updated_at = filtered.last().map(|m| m.updated_at.clone());
@@ -461,7 +476,8 @@ pub async fn sync_since(
     // watermark over a straddling tie group.
     let next_since = next_since_watermark(&mems, raw_count, limit);
     warn_if_cursor_pinned(next_since.as_deref(), raw_count, limit);
-    let mems = scope_filter(mems, allowed, peer_header.as_deref());
+    // #9996 / #10037 — the one admission funnel (see the postgres arm).
+    let mut mems = admit_rows(mems, &serve_scope, allowed);
     let excluded = total.saturating_sub(mems.len());
 
     // v0.7.0 #948 — scope=private visibility post-filter. The
@@ -474,7 +490,7 @@ pub async fn sync_since(
     // namespace-allowlist count so operators can tell the two
     // filtering modes apart).
     let after_ns = mems.len();
-    let mems: Vec<Memory> = mems.into_iter().filter(visibility_ok).collect();
+    mems.retain(visibility_ok);
     let excluded_for_scope_private = after_ns.saturating_sub(mems.len());
 
     // Record the puller as a peer so subsequent incremental push/pull

@@ -53,6 +53,14 @@
 //! - `shared_scope_row_unaffected_948`: a `scope=shared` row in an
 //!   allowlisted namespace is projected to every peer regardless of
 //!   the scope filter — confirms the post-filter doesn't over-block.
+//!
+//! #9996 / #10037 — the pull serves only an authenticated peer its
+//! outbound scope names, so every pull here is signed with an enrolled
+//! key under the all-namespaces outbound scope for that peer: the
+//! visibility gate these rows pin is the layer that decides.
+
+#[path = "common/signed_pull.rs"]
+mod signed_pull;
 
 use ai_memory::models::ConfidenceSource;
 use axum::body::Body;
@@ -197,17 +205,25 @@ async fn sync_since_with_headers(
 ) -> (StatusCode, Value) {
     let mut req_builder = Request::builder()
         .method("GET")
-        .uri("/api/v1/sync/since")
+        .uri(signed_pull::SYNC_SINCE_PATH)
         .header("content-type", "application/json");
-    if let Some(p) = peer_id {
+    // #9996 — the peer signs its pull and its outbound scope names it.
+    let pullers = peer_id.map(|p| {
+        signed_pull::set_outbound_scope_all(&[p]);
+        signed_pull::EnrolledPullers::enrol(&[p])
+    });
+    if let (Some(p), Some(pullers)) = (peer_id, pullers.as_ref()) {
         req_builder =
             req_builder.header(ai_memory::federation::peer_attestation::PEER_ID_HEADER, p);
+        req_builder = pullers.sign_get(req_builder, p, signed_pull::SYNC_SINCE_PATH, "");
     }
     if let Some(a) = agent_id {
         req_builder = req_builder.header("x-agent-id", a);
     }
     let req = req_builder.body(Body::empty()).unwrap();
     let resp = router.oneshot(req).await.unwrap();
+    signed_pull::clear();
+    drop(pullers);
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
         .await

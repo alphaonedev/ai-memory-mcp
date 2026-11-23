@@ -3095,6 +3095,7 @@ pub(super) enum GetSigOutcome {
 
 /// [`verify_get_signature`] as the refuse-or-proceed gate (the unit-test
 /// matrix below drives it; the handler matches [`GetSigOutcome`] itself).
+#[cfg(test)]
 pub(super) fn verify_get_signature_or_reject(
     method: &str,
     path: &str,
