@@ -190,11 +190,11 @@ const UNSIGNED_ATTEST_LEVEL: &str = "unsigned";
 /// import lands memories and links only, so the tasks are dropped (#10024).
 const A2A_NOT_IMPORTED: &str = "the admin import drops the a2a_tasks the export carries (#10024)";
 
-/// The admin export opens a sealed row and the import writes the plaintext
-/// back with no envelope (#10033).
-const SEALED_ROW_UNSEALED: &str = "the postgres admin export/import writes a sealed row back as plaintext with no envelope (#10033)";
-/// The main export cells seed no sealed row (#10033); the dedicated red
-/// cell seeds one and stays red until the fix lands.
+/// The admin export page has no at-rest envelope field, so it refuses a
+/// sealed row (#10033); the main cells seed none.
+const SEALED_ROW_UNSEALED: &str = "the admin export page has no at-rest envelope field, so it refuses a sealed row and the main cell seeds none (#10033)";
+/// The main export cells seed no sealed row (#10033); the dedicated cell
+/// seeds one and asserts the refusal.
 const MAIN_CELL_SEALED: Sealed = Sealed::Absent;
 /// `models::Memory` has no field for the atomisation and entity-mention
 /// columns, so the admin page never carries them (#10034). The dedicated red
@@ -1037,47 +1037,97 @@ fn assert_columns_kept(
     assert_eq!(got, want, "{table} {columns:?} not kept ({defect})");
 }
 
-/// Defect #10033, red until it lands: the admin export then import must keep
-/// a sealed row sealed (empty content, the envelope byte for byte, and it
-/// still opens to the written plaintext). The fix removes the
-/// `SEALED_ROW_UNSEALED` null-column entry and sets `MAIN_CELL_SEALED` Present.
+/// The exact refusal code the admin export answers for a store with a sealed
+/// row (#10033), written out here rather than taken from the code under test.
+const SEALED_REFUSAL_CODE: &str = "SEALED_EXPORT_REFUSED";
+
+/// Fail when the sealed-payload marker is in `bytes` (C-3).
+fn assert_no_sealed_plaintext(bytes: &[u8], what: &str) {
+    let m = SEALED_PLAINTEXT.as_bytes();
+    assert!(
+        !bytes.windows(m.len()).any(|w| w == m),
+        "{what} holds the plaintext of a sealed payload"
+    );
+}
+
+/// Every TEXT and BLOB byte of a store image, concatenated, for the marker
+/// scan.
+fn image_bytes(s: &StoreSnapshot) -> Vec<u8> {
+    let mut out = Vec::new();
+    for table in s.tables.values() {
+        for row in &table.rows {
+            for v in row.values() {
+                if let SqlValue::Text(b) | SqlValue::Blob(b) = v {
+                    out.extend_from_slice(b);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Defect #10033 (3-agent vote 71472661 V3-STD4-SCOPE C-3): the admin export
+/// page carries `models::Memory`, which has no field for the at-rest
+/// envelope, so `GET /api/v1/export` of a store that holds a sealed row
+/// answers 409 `SEALED_EXPORT_REFUSED` before any page is built. The response,
+/// the source and the destination hold no plaintext of the sealed payload,
+/// and the destination is never written.
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_router_export_keeps_a_sealed_row_sealed_10033() {
-    let Some((corpus, before, restored)) = router_run(Sealed::Present).await else {
-        return;
-    };
+    let Some(admin) = admin_url() else { return };
+    let (_src_db, src) = scratch_store(&admin).await;
+    let (_dst_db, dst) = scratch_store(&admin).await;
+    let corpus = seed(&src, Sealed::Present).await;
     let id = corpus.sealed.expect("the shape seeds a sealed row");
-    let image = |s: &StoreSnapshot| {
-        s.rows_where("memories", "id", &id).first().map(|r| {
-            (
-                r.get("content").cloned(),
-                r.get("encrypted_envelope").cloned(),
-            )
-        })
-    };
-    let want = image(&before);
+    let before = snapshot(&src).await;
     assert!(
-        matches!(&want, Some((_, Some(v))) if !v.is_null()),
+        before
+            .rows_where("memories", "id", &id)
+            .first()
+            .and_then(|r| r.get("encrypted_envelope"))
+            .is_some_and(|v| !v.is_null()),
         "the corpus sealed row holds no envelope"
     );
-    assert_eq!(
-        image(&restored),
-        want,
-        "the admin export/import unsealed a sealed row (defect #10033)"
+    let dst_before = snapshot(&dst).await;
+    enable_admin_header_trust();
+    let src_router = router_for(src.clone());
+    let uri = format!("{EXPORT_ROUTE}?limit={EXPORT_PAGE_LIMIT}");
+    let (status, page) = send(
+        &src_router,
+        admin_request("GET", &uri)
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_no_sealed_plaintext(
+        &serde_json::to_vec(&page).expect("response json"),
+        "the export response",
     );
-    let Some((_, Some(SqlValue::Text(hex)))) = image(&restored) else {
-        panic!("the restored sealed row holds no envelope (defect #10033)");
-    };
-    let hex = std::str::from_utf8(&hex).expect("bytea text");
-    let hex = hex.strip_prefix("\\x").expect("bytea hex rendering");
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
-        .collect();
-    let kp = ai_memory::encryption::get_or_create_keypair(CORPUS_AGENT).expect("x25519 keypair");
-    let parsed = ai_memory::encryption::Envelope::from_bytes(&bytes).expect("parse envelope");
-    let plain = ai_memory::encryption::decrypt(&parsed, &kp.secret).expect("decrypt envelope");
-    assert_eq!(plain, SEALED_PLAINTEXT, "the restored envelope decrypts");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the admin export of a sealed row must refuse: {page}"
+    );
+    assert_eq!(
+        page["code"].as_str(),
+        Some(SEALED_REFUSAL_CODE),
+        "not the sealed-export refusal: {page}"
+    );
+    assert!(
+        page["memories"].is_null() && page["links"].is_null(),
+        "a refused export carried rows: {page}"
+    );
+    let dst_after = snapshot(&dst).await;
+    assert_no_sealed_plaintext(&image_bytes(&dst_after), "the destination store");
+    assert_eq!(
+        dst_after, dst_before,
+        "a refused export wrote the destination"
+    );
+    assert_eq!(
+        before,
+        snapshot(&src).await,
+        "the refused export changed its SOURCE store"
+    );
 }
 
 /// Defect #10034, red until it lands: the admin export then import must keep

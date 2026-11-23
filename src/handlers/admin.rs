@@ -1341,7 +1341,12 @@ pub async fn export_memories(
             export_body(&memories, &links, ledger, &page, None, &tasks)
         }
         Ok(Err(ceiling)) => export_paging_required_response(ceiling),
-        Err(e) => crate::handlers::errors::handler_error_500(&e),
+        // #10028 — a sealed row refuses the export: 409, byte-parity with
+        // the postgres arm's `store_err_to_response`.
+        Err(e) => match e.downcast_ref::<crate::export_sealed::SealedExportRefused>() {
+            Some(refused) => crate::export_sealed::refusal_response(refused),
+            None => crate::handlers::errors::handler_error_500(&e),
+        },
     }
 }
 

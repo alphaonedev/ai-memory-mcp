@@ -35,6 +35,8 @@
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 
 mod common;
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
 
 use std::path::PathBuf;
 
@@ -63,6 +65,14 @@ fn fresh_db(tag: &str) -> (PathBuf, Connection) {
     let conn = ai_memory::db::open(&path).expect("init db");
     std::mem::forget(dir); // keep the file alive for the test's connection
     (path, conn)
+}
+
+/// The plaintext-store tests hold `ENV_LOCK` with at-rest encryption REMOVED,
+/// so the F2 test's `AI_MEMORY_ENCRYPT_AT_REST=1` cannot leak into their
+/// fixtures while they run in parallel with it (#10032: a leaked seal now
+/// refuses the export instead of round-tripping as plaintext).
+fn plaintext_store_env() -> MultiEnvVarGuard {
+    MultiEnvVarGuard::apply(&[("AI_MEMORY_ENCRYPT_AT_REST", None)])
 }
 
 fn opts() -> ImportOptions {
@@ -97,6 +107,7 @@ fn mem(id: &str, title: &str, ns: &str, content: &str) -> Memory {
 /// issue body, driven through the production code paths).
 #[test]
 fn archived_memories_and_namespace_meta_survive_export_full_round_trip() {
+    let _env = plaintext_store_env();
     let (_src_path, src) = fresh_db("src-corpus");
 
     // Seed a live memory, then archive it (a GENUINE archival, distinct
@@ -198,6 +209,7 @@ fn archived_memories_and_namespace_meta_survive_export_full_round_trip() {
 /// re-attach them.
 #[test]
 fn archived_memory_links_survive_export_full_round_trip() {
+    let _env = plaintext_store_env();
     let (_src_path, src) = fresh_db("src-links");
 
     ai_memory::storage::insert(&src, &mem("m-a", "a", "ns", "content a")).expect("seed a");
@@ -235,6 +247,7 @@ fn archived_memory_links_survive_export_full_round_trip() {
 /// defaults, never a parse refusal.
 #[test]
 fn pre_2571_envelope_missing_the_new_arrays_still_imports() {
+    let _env = plaintext_store_env();
     let old_shape_json = serde_json::json!({
         "spec_version": "2",
         "db_schema_version": 0,
@@ -274,6 +287,7 @@ fn pre_2571_envelope_missing_the_new_arrays_still_imports() {
 /// `in_place_edit` exception).
 #[test]
 fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
+    let _env = plaintext_store_env();
     let (_src_path, src) = fresh_db("src-dual");
     ai_memory::storage::insert(&src, &mem("m-dual", "t", "ns", "c")).expect("seed live");
     ai_memory::storage::archive_memory(&src, "m-dual", Some("manual")).expect("archive");
@@ -311,9 +325,12 @@ fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
 /// must be SEALED at rest exactly like every other write path, on an
 /// encryption-enabled destination.
 ///
-/// The export boundary DECRYPTS content into the JSON bundle (matching
-/// `memories[]` — the export is the portable-plaintext artifact; that part
-/// is correct and unchanged). The bug was on IMPORT: the archived-row
+/// #10032 (3-agent vote 71472661 V3-STD4-SCOPE C-3) supersedes the
+/// export half of this test: the v2 envelope has no field for the at-rest
+/// envelope, so `build_full_envelope` of a store with a SEALED archived row
+/// now REFUSES with `SEALED_EXPORT_REFUSED` (it no longer decrypts the row
+/// into the bundle). The import half is kept on a plaintext archived row:
+/// the bug was on IMPORT: the archived-row
 /// insert bound that decrypted plaintext straight into `content` with no
 /// `encrypted_envelope`, so an encryption-enabled destination stored the
 /// imported archive PLAINTEXT at rest — failing parity with BOTH native
@@ -326,7 +343,10 @@ fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
 fn archived_memory_import_seals_content_at_rest_when_encryption_enabled_2571_f2() {
     const PLAINTEXT: &str = "TOP SECRET plaintext content — must never land at rest";
 
+    // #8170 — the key dir is 0700 whatever the host umask (under umask 002
+    // `create_dir_all` alone yields 0775, which the #3198 guard refuses).
     let key_dir = scratch_root("f2-keys");
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let key_dir_str = key_dir.to_string_lossy().into_owned();
     // Batch guard (not two single-key guards — see MultiEnvVarGuard's own
     // doc comment on the self-deadlock hazard) — serialized via ENV_LOCK
@@ -375,11 +395,38 @@ fn archived_memory_import_seals_content_at_rest_when_encryption_enabled_2571_f2(
         "fixture setup: the source content column must not hold plaintext when sealed"
     );
 
+    // #10032: the sealed archived row refuses the export, exactly, and the
+    // refusal carries no plaintext.
+    let err = emit::build_full_envelope(&src, "issue-2571-f2-test", "2026-08-11T00:00:00Z")
+        .expect_err("a sealed archived row must refuse the v2 export (#10032)");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(
+            "SEALED_EXPORT_REFUSED: 1 row(s) of archived_memories are sealed at rest \
+             (first id m-sealed)"
+        ),
+        "not the sealed-export refusal: {msg}"
+    );
+    assert!(
+        !msg.contains(PLAINTEXT),
+        "the refusal carried the plaintext"
+    );
+
+    // The import half (F2) on a PLAINTEXT archived row: the source row is
+    // rewritten unsealed, so the export carries it and the import must seal
+    // it on the encryption-enabled destination.
+    let changed = src
+        .execute(
+            "UPDATE archived_memories SET content = ?1, encrypted_envelope = NULL WHERE id = ?2",
+            rusqlite::params![PLAINTEXT, "m-sealed"],
+        )
+        .expect("unseal the source archived row");
+    assert_eq!(changed, 1, "one archived row unsealed");
     let env = emit::build_full_envelope(&src, "issue-2571-f2-test", "2026-08-11T00:00:00Z")
         .expect("build full v2 envelope");
     assert_eq!(
         env.archived_memories[0].memory.content, PLAINTEXT,
-        "the export boundary must decrypt content into the JSON bundle, exactly like memories[]"
+        "a plaintext archived row is carried as written"
     );
 
     let (_dst_path, dst) = fresh_db("dst-seal");

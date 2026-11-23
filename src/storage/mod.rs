@@ -17787,9 +17787,23 @@ pub fn export_all(conn: &Connection) -> Result<Vec<Memory>> {
         "SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?1) {lifecycle_vis} ORDER BY created_at ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![now], row_to_memory)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    // #10028 / #10032 — a row sealed at rest is classified from its
+    // `encrypted_envelope` column BEFORE any decrypt and refuses the whole
+    // export: no export format carries the envelope (3-agent vote 71472661
+    // V3-STD4-SCOPE C-3).
+    let rows = stmt.query_map(params![now], |r| {
+        crate::export_sealed::classify_sqlite_row(r, row_to_memory)
+    })?;
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
+    let mut out = Vec::new();
+    for row in rows {
+        if let Some(m) = guard.take(row?) {
+            out.push(m);
+        }
+    }
+    guard.finish().map_err(anyhow::Error::new)?;
+    Ok(out)
 }
 
 /// v1.0.0 #2490 — the rows `export_all` excluded IN SQL, before any

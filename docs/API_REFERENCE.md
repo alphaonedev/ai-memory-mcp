@@ -1564,6 +1564,18 @@ across the walk. Refusals: `400 EXPORT_LIMIT_OUT_OF_RANGE` (with `max`) and
 `400 EXPORT_CURSOR_INVALID`. The Python SDK's `export_pages()` performs the
 walk.
 
+**Sealed rows refuse the export (#10028, #10033).** No export body has a
+field for a row's at-rest envelope (`encrypted_envelope`), so a row that is
+sealed at rest is never exported as plaintext and never silently skipped:
+the export answers `409 {"code":"SEALED_EXPORT_REFUSED","error":…}` on
+both backends, naming the table, the count and the least sealed id (never
+content). A paged walk refuses on its first page when the scope holds a
+sealed row at that time. A row sealed later refuses on the page that reads
+it, after earlier pages were delivered, so a client discards a walk that
+ends in `SEALED_EXPORT_REFUSED`. Move an encrypted store with `backup` /
+`restore`. The CLI
+`export` and `export --full` refuse the same way and write nothing.
+
 **Namespace scope (`?namespace=<ns>`, #3427).** Restricts the export — the
 unpaged body and every page — to one namespace, as a `WHERE` predicate on the
 same ordered query (never a post-filter, so the page bound holds and the

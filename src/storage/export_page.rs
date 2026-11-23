@@ -32,6 +32,20 @@ use crate::export_paging::{
 };
 use crate::models::{LifecycleState, MemoryLink};
 
+/// #3427 / #10028 — the namespace-scope predicate every scoped read of this
+/// module appends, bound as `:ns`. One definition so the page read, the
+/// sealed-scope pre-check and the counterpart re-read can never disagree.
+const NAMESPACE_SCOPE_PREDICATE: &str = "AND namespace = :ns";
+
+/// The namespace-scope predicate when a namespace is set, else nothing.
+fn namespace_scope(namespace: Option<&str>) -> &'static str {
+    if namespace.is_some() {
+        NAMESPACE_SCOPE_PREDICATE
+    } else {
+        ""
+    }
+}
+
 /// Expiry cutoff rendered the way [`crate::storage::export_all`] renders
 /// `now`, so the page read applies the identical TEXT comparison.
 fn as_of_text(as_of: DateTime<Utc>) -> String {
@@ -81,11 +95,7 @@ pub fn memories_page(
     // #3427 — the namespace scope is a WHERE predicate on the same query the
     // walk orders by, never a post-filter: a scoped page is exactly the
     // scoped rows in key order, and the page ceiling counts scoped rows.
-    let ns = if namespace.is_some() {
-        "AND namespace = :ns"
-    } else {
-        ""
-    };
+    let ns = namespace_scope(namespace);
     let sql = format!(
         "SELECT * FROM memories \
          WHERE (expires_at IS NULL OR expires_at > :as_of) {lv} {after} {ns} \
@@ -106,21 +116,34 @@ pub fn memories_page(
     if let Some(n) = &ns_s {
         binds.push((":ns", n));
     }
+    // #10028 — the first page of a walk refuses when ANY row of the scope is
+    // sealed at rest at that time; a row sealed later refuses on the page
+    // that reads it (the per-row guard below), so a client discards a walk
+    // that ends in SEALED_EXPORT_REFUSED.
+    if cursor.is_none() {
+        sealed_scope_precheck(conn, as_of, namespace)?;
+    }
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(binds.as_slice(), |row| {
         let created_at: String = row.get(crate::models::field_names::CREATED_AT)?;
         let id: String = row.get("id")?;
-        let mem = super::row_to_memory(row)?;
+        let mem = crate::export_sealed::classify_sqlite_row(row, super::row_to_memory)?;
         Ok((ExportKey { created_at, id }, mem))
     })?;
     let mut page = ExportMemoriesPage::default();
     let mut last: Option<ExportKey> = None;
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
     for row in rows {
         let (key, mem) = row?;
         page.scope.raw_ids.push(key.id.clone());
-        page.memories.push(mem);
+        if let Some(m) = guard.take(mem) {
+            page.memories.push(m);
+        }
         last = Some(key);
     }
+    // #10028 — a resumed page that holds a sealed row refuses too.
+    guard.finish().map_err(anyhow::Error::new)?;
     let lower = cursor.map(|c| c.after.clone());
     let (range, next) = close_page(
         lower,
@@ -136,6 +159,34 @@ pub fn memories_page(
     page.scope.namespace = namespace.map(str::to_owned);
     page.next_cursor = next;
     Ok(page)
+}
+
+/// #10028 — refuse a walk whose scope holds a row sealed at rest. The scope
+/// is exactly the page query's: the same expiry, lifecycle and namespace
+/// predicates, every page.
+fn sealed_scope_precheck(
+    conn: &Connection,
+    as_of: DateTime<Utc>,
+    namespace: Option<&str>,
+) -> Result<()> {
+    let lv = crate::models::lifecycle_visible_clause("");
+    let ns = namespace_scope(namespace);
+    let sql = format!(
+        "SELECT COUNT(*), MIN(id) FROM memories \
+         WHERE (expires_at IS NULL OR expires_at > :as_of) {lv} {ns} \
+         AND {col} IS NOT NULL",
+        col = crate::export_sealed::ENVELOPE_COLUMN,
+    );
+    let as_of_s = as_of_text(as_of);
+    let ns_s = namespace.map(str::to_owned);
+    let mut binds: Vec<(&str, &dyn ToSql)> = vec![(":as_of", &as_of_s as &dyn ToSql)];
+    if let Some(n) = &ns_s {
+        binds.push((":ns", n));
+    }
+    let (count, first): (i64, Option<String>) =
+        conn.query_row(&sql, binds.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    crate::export_sealed::refuse_scope(crate::export_sealed::tables::MEMORIES, count, first)
+        .map_err(anyhow::Error::new)
 }
 
 /// Rows inside `range` that the export's SQL filters exclude.
@@ -295,11 +346,7 @@ fn surviving_counterparts(
     let as_of_s = as_of_text(as_of);
     // #3427 — a counterpart outside the namespace scope is not carried by
     // the export, so it does not survive: its edge is withheld.
-    let ns = if namespace.is_some() {
-        "AND namespace = :ns"
-    } else {
-        ""
-    };
+    let ns = namespace_scope(namespace);
     let sql = format!(
         "SELECT * FROM memories \
          WHERE id IN (SELECT value FROM json_each(:ids)) \

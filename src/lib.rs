@@ -903,6 +903,9 @@ pub mod export_scope;
 // v1.0.0 #3288 — bounded, keyset-paged admin export: opaque cursor, page
 // ranges, and the pure edge-ownership decision shared by both backends.
 pub mod export_paging;
+// v1.0.0 #10028 / #10032 / #10033 — the export boundary refuses a row sealed
+// at rest (no export format carries the at-rest envelope).
+pub mod export_sealed;
 pub mod hooks;
 pub mod identity;
 // v1.0.0 #3465 — the in-process agent WAKE bus for `memory_notify`.
