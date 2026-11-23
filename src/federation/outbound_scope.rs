@@ -423,7 +423,7 @@ pub fn admit_counted(
             out.insert(key.clone(), value.clone());
             continue;
         }
-        let Value::Array(arr) = value else {
+        let Value::Array(values) = value else {
             // A non-array item key is kept only for an all-namespaces peer.
             offered = offered.saturating_add(1);
             if scope.is_all() {
@@ -433,8 +433,8 @@ pub fn admit_counted(
             continue;
         };
         let kept: Vec<Value> = if NAMESPACED_ITEM_KEYS.contains(&k) {
-            let mut kept = Vec::with_capacity(arr.len());
-            for it in arr {
+            let mut kept = Vec::with_capacity(values.len());
+            for it in values {
                 match item_namespace(it) {
                     Some(ns) if scope.allows(ns) => kept.push(it.clone()),
                     Some(ns) => tally.add(ns),
@@ -443,7 +443,8 @@ pub fn admit_counted(
             }
             kept
         } else if k == crate::models::field_names::EMBEDDINGS {
-            arr.iter()
+            values
+                .iter()
                 .filter(|e| {
                     e.get(KEY_MEMORY_ID)
                         .and_then(Value::as_str)
@@ -452,8 +453,8 @@ pub fn admit_counted(
                 .cloned()
                 .collect()
         } else if k == KEY_NAMESPACE_META_CLEARS {
-            let mut kept = Vec::with_capacity(arr.len());
-            for ns in arr {
+            let mut kept = Vec::with_capacity(values.len());
+            for ns in values {
                 match ns.as_str().filter(|ns| !ns.is_empty()) {
                     Some(n) if scope.allows(n) => kept.push(ns.clone()),
                     Some(n) => tally.add(n),
@@ -462,8 +463,8 @@ pub fn admit_counted(
             }
             kept
         } else {
-            let mut kept: Vec<Value> = Vec::with_capacity(arr.len());
-            for it in arr {
+            let mut kept: Vec<Value> = Vec::with_capacity(values.len());
+            for it in values {
                 if id_only_allowed(scope, it, &namespaces) {
                     kept.push(it.clone());
                 } else {
@@ -481,7 +482,7 @@ pub fn admit_counted(
         };
         if k != crate::models::field_names::EMBEDDINGS {
             items = items.saturating_add(kept.len());
-            offered = offered.saturating_add(arr.len());
+            offered = offered.saturating_add(values.len());
         }
         out.insert(key.clone(), Value::Array(kept));
     }
