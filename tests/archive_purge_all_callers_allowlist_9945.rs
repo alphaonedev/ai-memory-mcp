@@ -48,8 +48,14 @@ const SELF_PATH: &str = "tests/archive_purge_all_callers_allowlist_9945.rs";
 
 /// Root entries that are not source, with the reason each is left out.
 const SKIPPED_ROOT_ENTRIES: &[(&str, &str)] = &[
-    (".git", "git metadata (a worktree link file or the object store)"),
-    (".local-runs", "gitignored local scratch (repository hard rule)"),
+    (
+        ".git",
+        "git metadata (a worktree link file or the object store)",
+    ),
+    (
+        ".local-runs",
+        "gitignored local scratch (repository hard rule)",
+    ),
     (".codegraph", "gitignored per-developer CodeGraph index"),
     ("target", "cargo build output"),
 ];
@@ -71,11 +77,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         4,
         "the trait method, its default body, two doc links and its refusal test",
     ),
-    (
-        "src/store/postgres.rs",
-        1,
-        "the PostgresStore trait impl",
-    ),
+    ("src/store/postgres.rs", 1, "the PostgresStore trait impl"),
     (
         "src/store/postgres/archive_purge_9945.rs",
         2,
@@ -100,7 +102,10 @@ const ALLOWED: &[(&str, usize, &str)] = &[
 
 /// Every proc-macro crate in the tree: (Cargo.toml path, reason).
 const PROC_MACRO_CRATES: &[(&str, &str)] = &[
-    ("vendor/paste/Cargo.toml", "the vendored paste crate (#2050)"),
+    (
+        "vendor/paste/Cargo.toml",
+        "the vendored paste crate (#2050)",
+    ),
     (
         "vendor/paste/tests/macros/Cargo.toml",
         "the vendored paste crate's own test fixture",
@@ -277,7 +282,11 @@ fn paste_is_invoked_nowhere_outside_its_vendor_dir_9945() {
                 proc_macro.push(rel.clone());
             }
         }
-        if rel.ends_with(".rs") && !rel.starts_with(PASTE_HOME) && invokes_paste(&bytes) {
+        // Any case: a `#[path]` attribute can name a `.RS` file as a module.
+        let is_rust = Path::new(&rel)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+        if is_rust && !rel.starts_with(PASTE_HOME) && invokes_paste(&bytes) {
             paste_users.push(rel);
         }
     }
@@ -303,10 +312,16 @@ fn paste_is_invoked_nowhere_outside_its_vendor_dir_9945() {
 fn matcher_counts_every_form_and_only_the_identifier_9945() {
     let table: &[(&str, usize)] = &[
         ("app.store.archive_purge_all(&admin).await", 1),
-        ("crate::store::MemoryStore::archive_purge_all(&*app.store, admin)", 1),
+        (
+            "crate::store::MemoryStore::archive_purge_all(&*app.store, admin)",
+            1,
+        ),
         ("<dyn MemoryStore>::archive_purge_all", 1),
         ("let wipe = MemoryStore::archive_purge_all;", 1),
-        ("use crate::store::MemoryStore::archive_purge_all as wipe;", 1),
+        (
+            "use crate::store::MemoryStore::archive_purge_all as wipe;",
+            1,
+        ),
         ("s.r#archive_purge_all(&c)", 1),
         ("store\n    .archive_purge_all(\n&c)", 1),
         ("archive_purge_all", 1),
@@ -320,7 +335,11 @@ fn matcher_counts_every_form_and_only_the_identifier_9945() {
         ("", 0),
     ];
     for (src, want) in table {
-        assert_eq!(count_ident(src.as_bytes(), NAME.as_bytes()), *want, "{src:?}");
+        assert_eq!(
+            count_ident(src.as_bytes(), NAME.as_bytes()),
+            *want,
+            "{src:?}"
+        );
     }
     let paste_table: &[(&str, bool)] = &[
         ("paste::paste! { [<archive_purge _all>] }", true),
@@ -362,6 +381,9 @@ fn every_skip_and_allow_row_has_a_reason_9945() {
     for (path, n, why) in ALLOWED {
         assert!(*n > 0, "{path}: a zero row is a stale row");
         assert!(!why.trim().is_empty(), "{path}: no reason");
-        assert!(Path::new(&root().join(path)).is_file(), "{path}: not a file");
+        assert!(
+            Path::new(&root().join(path)).is_file(),
+            "{path}: not a file"
+        );
     }
 }

@@ -193,8 +193,8 @@ impl Probe<'_> {
     async fn backdate_hours(&self, id: &str, hours: i32) {
         match self {
             Self::Sqlite(path) => {
-                let at = (chrono::Utc::now() - chrono::TimeDelta::hours(i64::from(hours)))
-                    .to_rfc3339();
+                let at =
+                    (chrono::Utc::now() - chrono::TimeDelta::hours(i64::from(hours))).to_rfc3339();
                 let conn = raw_sqlite(path);
                 let n = conn
                     .execute(
@@ -644,7 +644,10 @@ async fn pg_maintenance_tick_none_keeps_all_and_one_day_purges_exactly_older_100
     let probe = Probe::Pg(&pool);
     let seeded = seed_tick(&store, &probe).await;
     let dir = scratch_dir();
-    let app = pg_app_state(&dir.path().join("audit-10009.db"), std::sync::Arc::new(store));
+    let app = pg_app_state(
+        &dir.path().join("audit-10009.db"),
+        std::sync::Arc::new(store),
+    );
     let admin = CallerContext::for_admin(ADMIN);
     ai_memory::daemon_runtime::pg_maintenance_tick(&app, &admin, false, None).await;
     assert_tick_kept_every_row("postgres", &probe, &seeded).await;

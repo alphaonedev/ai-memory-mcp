@@ -30914,7 +30914,7 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<usize> {
         // #9945 — the body (and the #936 owner gate) lives in
         // `postgres/archive_purge_9945.rs`.
-        self.archive_purge_bound(
+        self.archive_purge_bounded(
             ctx,
             crate::validate::ArchivePurgeBound::OlderThan(older_than),
         )
@@ -30922,7 +30922,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn archive_purge_all(&self, ctx: &CallerContext) -> StoreResult<usize> {
-        self.archive_purge_bound(ctx, crate::validate::ArchivePurgeBound::AllRows)
+        self.archive_purge_bounded(ctx, crate::validate::ArchivePurgeBound::AllRows)
             .await
     }
 

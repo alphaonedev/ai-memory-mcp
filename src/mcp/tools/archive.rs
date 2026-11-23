@@ -1028,6 +1028,7 @@ mod tests {
     /// row through the storage cutoff.
     #[test]
     fn archive_purge_refuses_malformed_and_non_positive_bound_9945() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let cases = [
             (json!("5"), "older_than_days must be an integer"),
             (json!(7.5), "older_than_days must be an integer"),

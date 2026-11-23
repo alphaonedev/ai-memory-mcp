@@ -10,8 +10,11 @@
 //! `archive_max_days` destroyed the whole archive on every GC tick. The bound
 //! is now an [`ArchivePurgeBound`]: [`ArchivePurgeBound::OlderThan`] carries a
 //! day count in `1..=36500` and [`ArchivePurgeBound::AllRows`] is reachable
-//! only through `archive_purge_all`. Own module for the `qual_10` budget of
-//! `postgres.rs`, wired like `parity_3064.rs`.
+//! only through `archive_purge_all`. Both trait methods delegate to
+//! `PostgresStore::archive_purge_bounded`, the same name as the SQLite twin
+//! (#10008), so the record-stop parity ratchet
+//! (`tests/qual_pg_record_stop_gate_parity_3175.rs`) pairs them. Own module
+//! for the `qual_10` budget of `postgres.rs`, wired like `parity_3064.rs`.
 //!
 //! [`RetentionDays`]: crate::validate::RetentionDays
 
@@ -37,7 +40,7 @@ impl PostgresStore {
     /// [`StoreError::Stopped`] when the record plane is stopped,
     /// [`StoreError::InvalidInput`] when the cutoff cannot be formed, and the
     /// mapped sqlx error of the DELETE.
-    pub(super) async fn archive_purge_bound(
+    pub(super) async fn archive_purge_bounded(
         &self,
         ctx: &CallerContext,
         bound: ArchivePurgeBound,
