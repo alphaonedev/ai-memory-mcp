@@ -69,7 +69,7 @@ EXPECTED_SSOT = {
     "AGE_SOURCE_COMMIT": "c6b043d1c8f4909331b9080d6640b487782fc958",
     "AGE_PATCH_UPSTREAM_COMMIT": "06ce678d74210539705c77e2dc7c9fa861e2a331",
     "AGE_PATCH_FILE": "age-2580-06ce678d.patch",
-    "AGE_PATCH_SHA256": "4d30cd91884756f281ec11dc5efd7ae2d32bcbeb9f90b44740dfec1fd2d25cc0",
+    "AGE_PATCH_SHA256": "7efe593224097d43bd6779075388e16ae793f555da0ff3c5ced951d9b906d20c",
     "AGE_PATCHED_FILE_SHA256": "3156a9b8ce13246fab82a07091303ad61a05981bdb3f88998b4e97bb778c640b",
 }
 EXPECTED_PGVECTOR_PREFIX = "0.8.7-"
@@ -557,7 +557,8 @@ class SsotTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(data).hexdigest(), EXPECTED_SSOT["AGE_PATCH_SHA256"], path)
         self.assertEqual(ssot.get("AGE_PATCH_SHA256"), hashlib.sha256(data).hexdigest())
         text = data.decode("utf-8")
-        self.assertEqual(text.splitlines()[0], f"From {EXPECTED_SSOT['AGE_PATCH_UPSTREAM_COMMIT']} Mon Sep 17 00:00:00 2001")
+        self.assertEqual(text.splitlines()[0],
+                         "diff --git a/src/backend/catalog/ag_catalog.c b/src/backend/catalog/ag_catalog.c")
         added = [line[1:].strip() for line in text.splitlines() if line.startswith("+") and not line.startswith("+++")]
         self.assertIn("if (!IsTransactionState())", added)
         self.assertIn("return false;", added)
