@@ -25,6 +25,16 @@
 #![allow(clippy::missing_panics_doc)]
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, RwLock};
+use tower::ServiceExt as _;
+
+use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
+use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 
 use ai_memory::models::{Memory, MemoryLink, MemoryLinkRelation, Tier};
 use ai_memory::store::postgres::PostgresStore;
@@ -38,7 +48,9 @@ use common::pg_barrier;
 mod restore_snapshot;
 
 use restore_snapshot::{
-    Carry, Classification, Row, SqlValue, StoreSnapshot, TableSnapshot, assert_restored,
+    Carry, Classification, ColumnEntry, Expect, MIN_SOURCE_ROWS, Rederived, Row, SchemaBaseline,
+    SchemaObject, SqlValue, StoreSnapshot, TableEntry, TableSnapshot, assert_restored,
+    source_store,
 };
 
 // ── corpus constants (the same corpus as the SQLite cells) ─────────────────
@@ -131,22 +143,28 @@ const ARCHIVED_SEED: usize = 99;
 
 // ── classification of the admin export → import path ───────────────────────
 
-const NOT_EXPORT_CLASS: &str = "the admin export carries memories and links only";
+const NOT_EXPORT_CLASS: &str = "by design: the admin export carries memories and links only";
 /// The AGE graph (`memory_graph.*`) is a regenerable projection of
 /// `memory_links`: the destination's `link()` funnel re-projects every edge
 /// with graph ids of its own sequence, so the source's ids are not carried.
-const GRAPH_PROJECTION: &str = "the AGE graph is re-projected from memory_links by the destination link() with its own graph ids";
+const GRAPH_PROJECTION: &str = "by design: the AGE graph is re-projected from memory_links by the destination link() with its own graph ids";
 const ARCHIVE_NOT_EXPORTED: &str =
-    "the admin export walks live memories; the archive is node-local";
+    "by design: the admin export walks live memories; the archive is node-local";
 const VECTOR_NOT_EXPORTED: &str =
-    "memory vectors are regenerable artifacts the destination re-embeds from the text";
+    "by design: memory vectors are regenerable artifacts the destination re-embeds from the text";
 /// The admin import lands every edge through the unsigned `link()` funnel
 /// (`src/handlers/admin.rs` postgres branch), so the signed spine is not carried.
 const CONVENIENCE_LINK_UNSIGNED: &str =
-    "the admin import re-creates each edge through link(), which carries no signature";
+    "by design: the admin import re-creates each edge through link(), which carries no signature";
 /// `link()` derives `attest_level` from the signature it does not carry.
 const CONVENIENCE_LINK_ATTEST: &str =
-    "link() stamps attest_level as unsigned on every imported edge";
+    "by design: link() stamps attest_level as unsigned on every imported edge";
+/// The attestation class `link()` writes for an edge it lands unsigned
+/// (written out here, never read from the code under test).
+const UNSIGNED_ATTEST_LEVEL: &str = "unsigned";
+/// The admin export carries the A2A task records on its final page, but the
+/// import lands memories and links only, so the tasks are dropped (#10024).
+const A2A_NOT_IMPORTED: &str = "the admin import drops the a2a_tasks the export carries (#10024)";
 
 static EXPORT_IMPORT: Classification = Classification {
     path: "postgres admin export/import",
@@ -154,7 +172,7 @@ static EXPORT_IMPORT: Classification = Classification {
         ("memories", Carry::Exact),
         ("memory_links", Carry::Exact),
         ("a2a_task_memories", Carry::NotCarried(NOT_EXPORT_CLASS)),
-        ("a2a_tasks", Carry::NotCarried(NOT_EXPORT_CLASS)),
+        ("a2a_tasks", Carry::NotCarried(A2A_NOT_IMPORTED)),
         ("action_edges", Carry::NotCarried(NOT_EXPORT_CLASS)),
         ("actions", Carry::NotCarried(NOT_EXPORT_CLASS)),
         ("agent_api_keys", Carry::NotCarried(NOT_EXPORT_CLASS)),
@@ -232,7 +250,15 @@ static EXPORT_IMPORT: Classification = Classification {
         ("memory_links", "signature", CONVENIENCE_LINK_UNSIGNED),
         ("memory_links", "observed_by", CONVENIENCE_LINK_UNSIGNED),
     ],
-    rederived: &[("memory_links", "attest_level", CONVENIENCE_LINK_ATTEST)],
+    rederived: &[Rederived {
+        table: "memory_links",
+        column: "attest_level",
+        reason: CONVENIENCE_LINK_ATTEST,
+        expect: Expect::Text(UNSIGNED_ATTEST_LEVEL),
+    }],
+    sparse: &[],
+    null_columns: &[],
+    schema: SchemaBaseline::Destination,
 };
 
 // ── scratch stores ──────────────────────────────────────────────────────────
@@ -385,12 +411,22 @@ async fn seed(store: &PostgresStore) -> Corpus {
 
 // ── typed full-store snapshot (sqlx) ────────────────────────────────────────
 
-/// One JSON value of `to_jsonb(row)`: text exactly as the server renders it.
+/// One JSON value of `to_jsonb(row)`, typed: NULL, bool, integer, real and
+/// text keep their JSON kind; a nested array or object is its JSON text.
 fn value_from_json(v: &serde_json::Value) -> SqlValue {
     match v {
         serde_json::Value::Null => SqlValue::Null,
-        serde_json::Value::String(s) => SqlValue::Text(s.clone()),
-        other => SqlValue::Text(other.to_string()),
+        serde_json::Value::String(s) => SqlValue::text(s),
+        serde_json::Value::Bool(b) => SqlValue::Bool(*b),
+        // Integer, Real and Text stay distinct (#10019): `1`, `1.0` and `"1"`
+        // are three different cells.
+        serde_json::Value::Number(n) => n.as_i64().map_or_else(
+            || SqlValue::real(n.as_f64().unwrap_or(f64::NAN)),
+            SqlValue::Integer,
+        ),
+        other @ (serde_json::Value::Array(_) | serde_json::Value::Object(_)) => {
+            SqlValue::text(&other.to_string())
+        }
     }
 }
 
@@ -452,7 +488,55 @@ async fn snapshot(store: &PostgresStore) -> StoreSnapshot {
         };
         tables.insert(key, TableSnapshot { columns, rows });
     }
-    StoreSnapshot { tables }
+    StoreSnapshot {
+        tables,
+        schema: schema_objects(pool, &current).await,
+    }
+}
+
+/// The schema of the current schema (#10017): every column with its type,
+/// default and nullability, and every index with its definition.
+async fn schema_objects(pool: &sqlx::PgPool, current: &str) -> Vec<SchemaObject> {
+    let mut schema = Vec::new();
+    let columns = sqlx::query(
+        "SELECT table_name::text AS t, column_name::text AS c, data_type::text AS d, \
+         coalesce(column_default::text, '') AS f, is_nullable::text AS n \
+         FROM information_schema.columns WHERE table_schema = $1",
+    )
+    .bind(current)
+    .fetch_all(pool)
+    .await
+    .expect("schema columns");
+    for r in columns {
+        let (table, column): (String, String) = (r.get("t"), r.get("c"));
+        let (ty, default, nullable): (String, String, String) =
+            (r.get("d"), r.get("f"), r.get("n"));
+        schema.push(SchemaObject {
+            kind: "column".to_string(),
+            name: format!("{table}.{column}"),
+            table,
+            sql: SqlValue::text(&format!("{ty}|{default}|{nullable}")),
+        });
+    }
+    let indexes = sqlx::query(
+        "SELECT tablename::text AS t, indexname::text AS i, indexdef::text AS d \
+         FROM pg_indexes WHERE schemaname = $1",
+    )
+    .bind(current)
+    .fetch_all(pool)
+    .await
+    .expect("schema indexes");
+    for r in indexes {
+        let (table, name, def): (String, String, String) = (r.get("t"), r.get("i"), r.get("d"));
+        schema.push(SchemaObject {
+            kind: "index".to_string(),
+            name,
+            table,
+            sql: SqlValue::text(&def),
+        });
+    }
+    schema.sort();
+    schema
 }
 
 /// The corpus really holds every field class, so a green compare is never vacuous.
@@ -521,13 +605,205 @@ async fn pg_export_then_import_reproduces_memories_and_links_9944() {
     seed(&src).await;
     let before = snapshot(&src).await;
     assert_corpus_is_rich(&before);
+    let dst_schema = snapshot(&dst).await.schema;
     export_import(&src, &dst).await;
     assert_eq!(
         before,
         snapshot(&src).await,
         "the export changed its SOURCE store"
     );
-    assert_restored(&EXPORT_IMPORT, &before, &snapshot(&dst).await);
+    assert_restored(
+        &EXPORT_IMPORT,
+        &source_store(&EXPORT_IMPORT, before),
+        &snapshot(&dst).await,
+        &dst_schema,
+    );
+}
+
+// ── the production router over a postgres store (the HTTP export → import) ──
+
+/// The admin the router cells present: the corpus owner, so the import's
+/// caller restamp of `metadata.agent_id` is the identity the rows already hold.
+const ROUTER_ADMIN: &str = CORPUS_AGENT;
+/// The admin's enrolled per-agent key, sent as `X-API-Key` (#8494).
+const ROUTER_ADMIN_TOKEN: &str = "fidelity-9944-admin-token-0123456789abcdef";
+const EXPORT_ROUTE: &str = "/api/v1/export";
+const IMPORT_ROUTE: &str = "/api/v1/import";
+/// The largest response body a corpus page may take.
+const BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+fn admin_enrolled_registry() -> Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys> {
+    let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
+    registry.mutate(|m| {
+        *m = std::collections::HashMap::from([(
+            ai_memory::handlers::identity_binding::api_key_sha256_hex(ROUTER_ADMIN_TOKEN),
+            ROUTER_ADMIN.to_string(),
+        )]);
+    });
+    registry
+}
+
+/// The #1570 header-trust posture, so the allowlisted admin header resolves
+/// to admin on this keyless router. Set once; it only loosens admin gating.
+fn enable_admin_header_trust() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: set once before any reader, never cleared for the life of
+        // the test binary.
+        unsafe {
+            std::env::set_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1");
+        }
+    });
+}
+
+/// The production router (`ai_memory::build_router`) over `store` with
+/// `storage_backend = Postgres`, so the handler's postgres branch runs.
+fn router_for(store: PostgresStore) -> axum::Router {
+    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
+    let db: Db = Arc::new(Mutex::new((
+        conn,
+        std::path::PathBuf::from(":memory:"),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let store: Arc<dyn MemoryStore> = Arc::new(store);
+    let app_state = AppState {
+        db,
+        embedder: Arc::new(None),
+        vector_index: Arc::new(Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(FeatureTier::Keyword.config()),
+        scoring: Arc::new(ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(RwLock::new(Some(Vec::new()))),
+        storage_backend: StorageBackend::Postgres,
+        store,
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: std::time::Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        auto_tag_queue: None,
+        atomise_queue: None,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(vec![ROUTER_ADMIN.to_string()]),
+        rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: admin_enrolled_registry(),
+        http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
+    };
+    let api_key_state = ApiKeyState {
+        key: None,
+        mtls_enforced: false,
+        enrolled_agent_keys: Arc::clone(&app_state.enrolled_agent_keys),
+        identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
+    };
+    ai_memory::build_router(api_key_state, app_state)
+}
+
+async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = router.clone().oneshot(req).await.expect("router call");
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), BODY_LIMIT)
+        .await
+        .expect("response body");
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, v)
+}
+
+fn admin_request(method: &str, uri: &str) -> axum::http::request::Builder {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-agent-id", ROUTER_ADMIN)
+        .header("x-api-key", ROUTER_ADMIN_TOKEN)
+}
+
+/// Page through `GET /api/v1/export` on the source router, then post every
+/// memory and link to `POST /api/v1/import` on the destination router: the
+/// shipped handlers end to end, not a copy of their bodies.
+async fn router_export_import(src: &PostgresStore, dst: &PostgresStore) {
+    enable_admin_header_trust();
+    let (src_router, dst_router) = (router_for(src.clone()), router_for(dst.clone()));
+    let first = format!("{EXPORT_ROUTE}?limit={EXPORT_PAGE_LIMIT}");
+    let mut uri = first.clone();
+    let (mut memories, mut links) = (Vec::new(), Vec::new());
+    let mut finished = false;
+    for _ in 0..EXPORT_PAGE_CAP {
+        let (status, page) = send(
+            &src_router,
+            admin_request("GET", &uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "export {uri}: {page}");
+        for (key, sink) in [("memories", &mut memories), ("links", &mut links)] {
+            let rows = page[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("export {uri}: no {key} array: {page}"));
+            sink.extend(rows.iter().cloned());
+        }
+        match page["next_cursor"].as_str() {
+            Some(c) => uri = format!("{first}&cursor={c}"),
+            None => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        finished,
+        "the router export walk did not finish in {EXPORT_PAGE_CAP} pages"
+    );
+    let body = json!({ "memories": memories, "links": links });
+    let (status, receipt) = send(
+        &dst_router,
+        admin_request("POST", IMPORT_ROUTE)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("import body")))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "import: {receipt}");
+}
+
+/// S3 / C3 (#10016): the shipped `/api/v1/export` and `/api/v1/import`
+/// handlers on a postgres `AppState` reproduce every carried row exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_router_export_then_import_reproduces_memories_and_links_9944() {
+    let Some(admin) = admin_url() else { return };
+    let (_src_db, src) = scratch_store(&admin).await;
+    let (_dst_db, dst) = scratch_store(&admin).await;
+    seed(&src).await;
+    let before = snapshot(&src).await;
+    assert_corpus_is_rich(&before);
+    let dst_schema = snapshot(&dst).await.schema;
+    router_export_import(&src, &dst).await;
+    assert_eq!(
+        before,
+        snapshot(&src).await,
+        "the router export changed its SOURCE store"
+    );
+    assert_restored(
+        &EXPORT_IMPORT,
+        &source_store(&EXPORT_IMPORT, before),
+        &snapshot(&dst).await,
+        &dst_schema,
+    );
 }
 
 // ── the archive → restore path ──────────────────────────────────────────────
@@ -537,7 +813,7 @@ const ARCHIVE_RESTORE_RESTAMPED: &[&str] = &["updated_at"];
 
 /// The `memories` row and the `memory_links` rows touching `id`.
 fn row_image(s: &StoreSnapshot, id: &str) -> (Vec<Row>, Vec<Row>) {
-    let want = SqlValue::Text(id.to_string());
+    let want = SqlValue::text(id);
     let mem = s.rows_where("memories", "id", id);
     let links = s.tables["memory_links"]
         .rows
@@ -615,19 +891,49 @@ async fn pg_every_live_table_is_classified_9944() {
     );
 }
 
+/// Why the probe may hold sparse tables and unset columns: it tests the
+/// comparison itself, so no restore path is under test.
+const PROBE_REASON: &str = "by design: the mutation probe compares a store with a mutated copy of itself; no restore path is under test";
+
 /// Every classified table as `Exact`: the probe compares a store with a
-/// mutated copy of itself, so nothing may be excused.
-fn exact_probe_class() -> &'static Classification {
+/// mutated copy of itself, so nothing may be excused. The tables and columns
+/// `snap` leaves sparse or unset are listed with [`PROBE_REASON`].
+fn exact_probe_class(snap: &StoreSnapshot) -> &'static Classification {
     let tables: Vec<(&'static str, Carry)> = EXPORT_IMPORT
         .tables
         .iter()
         .map(|(t, _)| (*t, Carry::Exact))
         .collect();
+    let mut sparse: Vec<TableEntry> = Vec::new();
+    let mut null_columns: Vec<ColumnEntry> = Vec::new();
+    for (table, _) in EXPORT_IMPORT.tables {
+        let Some(t) = snap.tables.get(*table) else {
+            continue;
+        };
+        if t.rows.len() < MIN_SOURCE_ROWS {
+            sparse.push((*table, PROBE_REASON));
+        }
+        if t.rows.is_empty() {
+            continue;
+        }
+        for col in &t.columns {
+            if t.rows
+                .iter()
+                .all(|r| r.get(col).is_none_or(SqlValue::is_null))
+            {
+                let col: &'static str = Box::leak(col.clone().into_boxed_str());
+                null_columns.push((*table, col, PROBE_REASON));
+            }
+        }
+    }
     Box::leak(Box::new(Classification {
         path: "postgres mutation probe",
         tables: Box::leak(tables.into_boxed_slice()),
         lossy: &[],
         rederived: &[],
+        sparse: Box::leak(sparse.into_boxed_slice()),
+        null_columns: Box::leak(null_columns.into_boxed_slice()),
+        schema: SchemaBaseline::Source,
     }))
 }
 
@@ -642,18 +948,19 @@ async fn pg_the_comparison_catches_every_mutation_class_9944() {
     let Some(admin) = admin_url() else { return };
     let (_db, store) = scratch_store(&admin).await;
     seed(&store).await;
-    let src = snapshot(&store).await;
-    assert_corpus_is_rich(&src);
-    let class = exact_probe_class();
+    let snap = snapshot(&store).await;
+    assert_corpus_is_rich(&snap);
+    let class = exact_probe_class(&snap);
+    let src = source_store(class, snap.clone());
     assert_eq!(
-        restore_snapshot::compare(class, &src, &src),
+        restore_snapshot::compare(class, &src, &snap, &[]),
         Vec::<String>::new(),
         "a store compared with itself is exact"
     );
     let mutate = |name: &str, f: &dyn Fn(&mut StoreSnapshot)| {
-        let mut m = src.clone();
+        let mut m = snap.clone();
         f(&mut m);
-        let diffs = restore_snapshot::compare(class, &src, &m);
+        let diffs = restore_snapshot::compare(class, &src, &m, &[]);
         for d in &diffs {
             eprintln!("probe {name}: {}", d.lines().next().unwrap_or_default());
         }
@@ -686,19 +993,13 @@ async fn pg_the_comparison_catches_every_mutation_class_9944() {
             .find(|r| matches!(r.get("embedding"), Some(SqlValue::Text(_))))
             .expect("an embedded row");
         if let Some(SqlValue::Text(t)) = row.get_mut("embedding") {
-            let mut bytes = std::mem::take(t).into_bytes();
-            let at = bytes.iter().rposition(u8::is_ascii_digit).expect("a digit");
-            bytes[at] = if bytes[at] == b'9' {
-                b'0'
-            } else {
-                bytes[at] + 1
-            };
-            *t = String::from_utf8(bytes).expect("ascii edit keeps utf-8");
+            let at = t.iter().rposition(u8::is_ascii_digit).expect("a digit");
+            t[at] = if t[at] == b'9' { b'0' } else { t[at] + 1 };
         }
     });
     assert_eq!(diffs.len(), 1, "one altered byte: {diffs:?}");
     let report = &diffs[0];
-    let n = src.row_count("memories");
+    let n = snap.row_count("memories");
     let head =
         format!("memories: {n} source rows, {n} restored rows, 1 source rows not reproduced");
     assert!(report.starts_with(&head), "one altered byte: {report}");

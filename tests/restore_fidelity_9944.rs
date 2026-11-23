@@ -58,7 +58,8 @@ mod key_dir_sandbox;
 mod restore_snapshot;
 
 use restore_snapshot::{
-    Carry, Classification, Row, SqlValue, StoreSnapshot, TableSnapshot, assert_restored,
+    Carry, Classification, Expect, Rederived, Row, SchemaBaseline, SchemaObject, SourceStore,
+    SqlValue, StoreSnapshot, TableSnapshot, assert_restored, source_store,
 };
 
 // ── corpus constants ────────────────────────────────────────────────────────
@@ -88,6 +89,8 @@ const ARCHIVE_REASON: &str = "fidelity-9944";
 const SINK_DIR: &str = "audit-sink";
 /// Key directory holding the operator keypair the backup manifest is signed with.
 const OPERATOR_KEY_DIR: &str = "operator-keys";
+/// The isolated HOME every CLI child runs with (#10013).
+const CHILD_HOME_DIR: &str = "child-home";
 /// Seconds-precision timestamps the corpus rows carry (fixed, so a path that
 /// rewrites a timestamp shows up as a difference rather than noise).
 const CREATED_AT: &str = "2031-04-01T10:00:00.000000+00:00";
@@ -97,9 +100,11 @@ const UPDATED_AT: &str = "2031-04-02T11:30:00.123456+00:00";
 
 /// The FTS5 shadow tables are index pages derived from `memories`; the
 /// `memories_fts` view over them is compared instead.
-const FTS_DERIVED: &str = "FTS5 shadow pages derived from memories; memories_fts is compared";
+const FTS_DERIVED: &str =
+    "by design: FTS5 shadow pages derived from memories; memories_fts is compared";
 /// Tables outside the Portability v2 record classes (docs/spec/PORTABILITY-V2.md).
-const NOT_V2_CLASS: &str = "not a Portability v2 record class; node-local or operational state";
+const NOT_V2_CLASS: &str =
+    "by design: not a Portability v2 record class; node-local or operational state";
 /// The one `memories` column an archive restore rewrites.
 const RESTAMPED_COLUMN: &str = "updated_at";
 /// The columns an archive restore may change, exactly.
@@ -110,27 +115,33 @@ const ARCHIVE_RESTORE_RESTAMPED: &[&str] = &[RESTAMPED_COLUMN];
 const ARCHIVE_RESTORE_RESTAMP_REASON: &str =
     "restore_archived stamps updated_at = now so last-writer-wins peers adopt the restore";
 /// Tables the convenience export (memories + links only) does not carry.
-const NOT_CONVENIENCE_CLASS: &str = "the convenience export carries memories and links only";
+const NOT_CONVENIENCE_CLASS: &str =
+    "by design: the convenience export carries memories and links only";
 /// Why both export paths drop the memory vectors: the vector is a derived,
 /// regenerable artifact the destination re-embeds from the durable text
 /// (`src/portability/import.rs` module doc, `embedding_space`).
 const VECTOR_NOT_EXPORTED: &str =
-    "memory vectors are regenerable artifacts the destination re-embeds from the text";
+    "by design: memory vectors are regenerable artifacts the destination re-embeds from the text";
 /// Why `export --full` drops an archived row's content address: a bundle's cid
 /// is remote-asserted, and admitting it would launder it onto a live row via
 /// archive then restore (`src/portability/import.rs`, #2385 comment).
-const ARCHIVED_CID_NOT_TRUSTED: &str =
-    "a bundle cid is remote-asserted; the archived lane leaves it NULL so restore re-mints it";
+const ARCHIVED_CID_NOT_TRUSTED: &str = "a bundle cid is remote-asserted; the archived lane leaves it NULL so restore re-mints it (#2385)";
 /// Why the convenience import loses the signed link spine: it is the
 /// memories+links convenience view (`src/export_scope.rs` EXPORT_SCOPE_WARN)
 /// and lands every edge through `create_link`, which signs nothing.
-const CONVENIENCE_LINK_UNSIGNED: &str =
-    "the convenience import re-creates each edge through create_link, which carries no signature";
+const CONVENIENCE_LINK_UNSIGNED: &str = "by design: the convenience import re-creates each edge through create_link, which carries no signature";
 /// Why the convenience import rewrites a link's timestamps and attestation:
 /// `create_link` stamps `created_at` / `valid_from` with now and derives
 /// `attest_level` from the signature it does not carry.
 const CONVENIENCE_LINK_RESTAMPED: &str =
-    "create_link stamps created_at and valid_from with now and attest_level as unsigned";
+    "by design: create_link stamps created_at and valid_from with now and attest_level as unsigned";
+/// The attestation class `create_link` writes for an edge it lands unsigned
+/// (written out here, never read from the code under test).
+const UNSIGNED_ATTEST_LEVEL: &str = "unsigned";
+/// The convenience export writes `a2a_tasks` (`src/cli/io.rs` export), but
+/// `import` never reads the key, so every task is lost with exit 0 (#10024).
+const A2A_NOT_IMPORTED: &str =
+    "the convenience export emits a2a_tasks but import never reads them (#10024)";
 /// The v2 export drops every link's `attest_level`: `export_link_from_row`
 /// leaves it `None` for the federation wire, so `export --full` never emits
 /// it and the import lands NULL. Defect #9948.
@@ -199,7 +210,7 @@ fn value_from_ref(v: ValueRef<'_>) -> SqlValue {
         ValueRef::Null => SqlValue::Null,
         ValueRef::Integer(i) => SqlValue::Integer(i),
         ValueRef::Real(f) => SqlValue::Real(f.to_bits()),
-        ValueRef::Text(t) => SqlValue::Text(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Text(t) => SqlValue::Text(t.to_vec()),
         ValueRef::Blob(b) => SqlValue::Blob(b.to_vec()),
     }
 }
@@ -246,7 +257,24 @@ fn snapshot(db: &Path) -> StoreSnapshot {
         rows.sort();
         tables.insert(name, TableSnapshot { columns, rows });
     }
-    StoreSnapshot { tables }
+    let mut schema: Vec<SchemaObject> = {
+        let mut stmt = conn
+            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")
+            .expect("list schema");
+        stmt.query_map([], |r| {
+            Ok(SchemaObject {
+                kind: r.get(0)?,
+                name: r.get(1)?,
+                table: r.get(2)?,
+                sql: value_from_ref(r.get_ref(3)?),
+            })
+        })
+        .expect("query schema")
+        .collect::<Result<_, _>>()
+        .expect("schema rows")
+    };
+    schema.sort();
+    StoreSnapshot { tables, schema }
 }
 
 // ── per-path classification (the ratchet) ───────────────────────────────────
@@ -338,6 +366,9 @@ static BACKUP_RESTORE: Classification = Classification {
     ],
     lossy: &[],
     rederived: &[],
+    sparse: &[],
+    null_columns: &[],
+    schema: SchemaBaseline::Source,
 };
 
 static EXPORT_FULL_IMPORT: Classification = Classification {
@@ -413,6 +444,9 @@ static EXPORT_FULL_IMPORT: Classification = Classification {
         ("memory_links", "attest_level", LINK_ATTEST_LEVEL_DROPPED),
     ],
     rederived: &[],
+    sparse: &[],
+    null_columns: &[],
+    schema: SchemaBaseline::Destination,
 };
 
 static EXPORT_IMPORT: Classification = Classification {
@@ -422,7 +456,7 @@ static EXPORT_IMPORT: Classification = Classification {
             "a2a_task_memories",
             Carry::NotCarried(NOT_CONVENIENCE_CLASS),
         ),
-        ("a2a_tasks", Carry::NotCarried(NOT_CONVENIENCE_CLASS)),
+        ("a2a_tasks", Carry::NotCarried(A2A_NOT_IMPORTED)),
         ("action_edges", Carry::NotCarried(NOT_CONVENIENCE_CLASS)),
         ("actions", Carry::NotCarried(NOT_CONVENIENCE_CLASS)),
         ("agent_api_keys", Carry::NotCarried(NOT_CONVENIENCE_CLASS)),
@@ -544,18 +578,42 @@ static EXPORT_IMPORT: Classification = Classification {
         ("memory_links", "observed_by", CONVENIENCE_LINK_UNSIGNED),
     ],
     rederived: &[
-        ("memory_links", "created_at", CONVENIENCE_LINK_RESTAMPED),
-        ("memory_links", "valid_from", CONVENIENCE_LINK_RESTAMPED),
-        ("memory_links", "attest_level", CONVENIENCE_LINK_RESTAMPED),
+        Rederived {
+            table: "memory_links",
+            column: "created_at",
+            reason: CONVENIENCE_LINK_RESTAMPED,
+            expect: Expect::Restamped,
+        },
+        Rederived {
+            table: "memory_links",
+            column: "valid_from",
+            reason: CONVENIENCE_LINK_RESTAMPED,
+            expect: Expect::Restamped,
+        },
+        Rederived {
+            table: "memory_links",
+            column: "attest_level",
+            reason: CONVENIENCE_LINK_RESTAMPED,
+            expect: Expect::Text(UNSIGNED_ATTEST_LEVEL),
+        },
     ],
+    sparse: &[],
+    null_columns: &[],
+    schema: SchemaBaseline::Destination,
 };
 
 // ── corpus and CLI plumbing ─────────────────────────────────────────────────
 
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
-    let sink = db.parent().expect("db has a parent").join(SINK_DIR);
-    cmd.env("AI_MEMORY_NO_CONFIG", "1")
+    let parent = db.parent().expect("db has a parent");
+    let sink = parent.join(SINK_DIR);
+    // #10013 - every child gets its own HOME, so no host config, key or
+    // cache directory can reach the outcome.
+    let home = parent.join(CHILD_HOME_DIR);
+    std::fs::create_dir_all(&home).expect("child HOME");
+    cmd.env("HOME", &home)
+        .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .env("AI_MEMORY_AUDIT_DIR", sink)
         .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())
@@ -692,7 +750,9 @@ fn backup_restore(src: &Path, dir: &Path) -> PathBuf {
     restored
 }
 
-fn export_import(src: &Path, dir: &Path, full: bool) -> PathBuf {
+/// Export `src`, import into a fresh store; returns the destination and the
+/// schema it held before the import (the [`SchemaBaseline::Destination`]).
+fn export_import(src: &Path, dir: &Path, full: bool) -> (PathBuf, Vec<SchemaObject>) {
     let mut exp = ai_memory(src);
     exp.arg("export");
     if full {
@@ -711,6 +771,7 @@ fn export_import(src: &Path, dir: &Path, full: bool) -> PathBuf {
         "imported.db"
     });
     ai_memory(&dest).args(["stats"]).assert().success();
+    let fresh_schema = snapshot(&dest).schema;
     let imp = ai_memory(&dest)
         .args(["import", "--trust-source"])
         .write_stdin(out.stdout)
@@ -723,44 +784,69 @@ fn export_import(src: &Path, dir: &Path, full: bool) -> PathBuf {
         String::from_utf8_lossy(&imp.stdout),
         String::from_utf8_lossy(&imp.stderr)
     );
-    dest
+    (dest, fresh_schema)
 }
 
-fn run_path(path: RestorePath) -> (StoreSnapshot, StoreSnapshot) {
+/// One cell's inputs: the refused-unless-rich source, the restored store and
+/// the destination's pre-import schema.
+struct Cell {
+    source: SourceStore,
+    restored: StoreSnapshot,
+    destination_schema: Vec<SchemaObject>,
+}
+
+fn run_path(path: RestorePath) -> Cell {
     let tmp = TempDir::new().expect("tempdir");
     let src = tmp.path().join("source.db");
     seed(&src);
     let before = snapshot(&src);
     assert_corpus_is_rich(&before);
-    let restored = match path {
-        RestorePath::BackupRestore => backup_restore(&src, tmp.path()),
+    // Refuse a corpus that cannot prove the path before paying for the run.
+    let source = source_store(path.class(), before);
+    let (restored, destination_schema) = match path {
+        RestorePath::BackupRestore => (backup_restore(&src, tmp.path()), Vec::new()),
         RestorePath::ExportFullImport => export_import(&src, tmp.path(), true),
         RestorePath::ExportImport => export_import(&src, tmp.path(), false),
     };
     // The source is never changed by taking the copy.
     let after = snapshot(&src);
-    assert_eq!(before, after, "{path:?} changed its SOURCE store");
-    (before, snapshot(&restored))
+    assert_eq!(
+        source.snapshot(),
+        &after,
+        "{path:?} changed its SOURCE store"
+    );
+    Cell {
+        source,
+        restored: snapshot(&restored),
+        destination_schema,
+    }
+}
+
+fn assert_cell(path: RestorePath) {
+    let cell = run_path(path);
+    assert_restored(
+        path.class(),
+        &cell.source,
+        &cell.restored,
+        &cell.destination_schema,
+    );
 }
 
 // ── the round-trip tests ────────────────────────────────────────────────────
 
 #[test]
 fn backup_then_restore_reproduces_every_table_exactly_9944() {
-    let (src, restored) = run_path(RestorePath::BackupRestore);
-    assert_restored(RestorePath::BackupRestore.class(), &src, &restored);
+    assert_cell(RestorePath::BackupRestore);
 }
 
 #[test]
 fn export_full_then_import_reproduces_the_store_9944() {
-    let (src, restored) = run_path(RestorePath::ExportFullImport);
-    assert_restored(RestorePath::ExportFullImport.class(), &src, &restored);
+    assert_cell(RestorePath::ExportFullImport);
 }
 
 #[test]
 fn convenience_export_then_import_reproduces_memories_and_links_9944() {
-    let (src, restored) = run_path(RestorePath::ExportImport);
-    assert_restored(RestorePath::ExportImport.class(), &src, &restored);
+    assert_cell(RestorePath::ExportImport);
 }
 
 /// Defect #9948, red until it lands: `export --full` then `import` must keep
@@ -770,7 +856,8 @@ fn convenience_export_then_import_reproduces_memories_and_links_9944() {
 /// `LINK_ATTEST_LEVEL_DROPPED` lossy entry above in the same commit.
 #[test]
 fn export_full_keeps_every_link_attestation_9944() {
-    let (src, restored) = run_path(RestorePath::ExportFullImport);
+    let cell = run_path(RestorePath::ExportFullImport);
+    let (src, restored) = (cell.source.snapshot(), &cell.restored);
     let key = |r: &Row| (r.get("source_id").cloned(), r.get("target_id").cloned());
     let attest = |s: &StoreSnapshot| -> BTreeMap<_, Option<SqlValue>> {
         s.tables["memory_links"]
@@ -779,7 +866,7 @@ fn export_full_keeps_every_link_attestation_9944() {
             .map(|r| (key(r), r.get("attest_level").cloned()))
             .collect()
     };
-    let (want, got) = (attest(&src), attest(&restored));
+    let (want, got) = (attest(src), attest(restored));
     assert!(
         want.values()
             .all(|v| v.as_ref().is_some_and(|v| !v.is_null())),
@@ -839,8 +926,8 @@ fn archive_then_restore_reproduces_the_row_its_embedding_and_its_links_9944() {
          only {ARCHIVE_RESTORE_RESTAMPED:?} may change ({ARCHIVE_RESTORE_RESTAMP_REASON})"
     );
     let stamp = |rows: &[Row]| match rows[0].get(RESTAMPED_COLUMN) {
-        Some(SqlValue::Text(t)) => t.clone(),
-        other => panic!("{RESTAMPED_COLUMN} is not text: {other:?}"),
+        Some(v) if v.as_str().is_some() => v.as_str().unwrap_or_default().to_string(),
+        other => panic!("{RESTAMPED_COLUMN} is not UTF-8 text: {other:?}"),
     };
     // The corpus stamps are fixed in the future (UPDATED_AT), so the restore
     // stamp (now) differs from them; it must be a valid RFC 3339 instant.
@@ -864,10 +951,10 @@ fn row_image(db: &Path, id: &str) -> (Vec<Row>, Vec<Row>) {
     let mem = s.tables["memories"]
         .rows
         .iter()
-        .filter(|r| r.get("id") == Some(&SqlValue::Text(id.to_string())))
+        .filter(|r| r.get("id") == Some(&SqlValue::text(id)))
         .cloned()
         .collect();
-    let want = SqlValue::Text(id.to_string());
+    let want = SqlValue::text(id);
     let links = s.tables["memory_links"]
         .rows
         .iter()
@@ -907,17 +994,18 @@ fn the_comparison_catches_every_mutation_class_9944() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("probe.db");
     seed(&db);
-    let src = snapshot(&db);
+    let snap = snapshot(&db);
     let class = RestorePath::BackupRestore.class();
+    let src = source_store(class, snap.clone());
     assert_eq!(
-        restore_snapshot::compare(class, &src, &src),
+        restore_snapshot::compare(class, &src, &snap, &[]),
         Vec::<String>::new(),
         "a store compared with itself is exact"
     );
     let mutate = |name: &str, f: &dyn Fn(&mut StoreSnapshot)| {
-        let mut m = src.clone();
+        let mut m = snap.clone();
         f(&mut m);
-        let diffs = restore_snapshot::compare(class, &src, &m);
+        let diffs = restore_snapshot::compare(class, &src, &m, &[]);
         for d in &diffs {
             eprintln!("probe {name}: {}", d.lines().next().unwrap_or_default());
         }
@@ -957,7 +1045,7 @@ fn the_comparison_catches_every_mutation_class_9944() {
     // Exactly one diff, naming exactly one source row and exactly one column.
     assert_eq!(diffs.len(), 1, "one altered byte: {diffs:?}");
     let report = &diffs[0];
-    let n = src.row_count("memories");
+    let n = snap.row_count("memories");
     let head =
         format!("memories: {n} source rows, {n} restored rows, 1 source rows not reproduced");
     assert!(report.starts_with(&head), "one altered byte: {report}");
