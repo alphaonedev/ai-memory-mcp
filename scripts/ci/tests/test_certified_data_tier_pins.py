@@ -1113,6 +1113,23 @@ class FailClosedMutantTest(unittest.TestCase):
         want = sorted(f"{rel}:1: {','.join(reasons)}: {text.strip()}" for rel, (text, reasons) in forms.items())
         self.assertEqual(sorted(self.scan_tree()), want)
 
+    def test_tier_word_glued_to_its_number_is_a_finding_9951(self):
+        # r2 mutant L3: "PG18." names the tier with no separator, so the
+        # digit run is glued to a letter and the stale form's lookahead
+        # refuses the trailing period. Each spelling is one row.
+        forms = {
+            "k/pg-period.md": ("Built for PG18.\n", ["uncertified-token:18"]),
+            "k/postgresql.md": ("Image postgresql17 only\n", ["uncertified-token:17"]),
+            "k/pg-v.md": ("tested on PGv20 only\n", ["uncertified-token:20"]),
+            "k/pg-underscore.txt": ("release_PG_17 tag\n", ["uncertified-token:17"]),
+            "k/age.md": ("Built with AGE1.6.0 here\n", ["uncertified-token:1.6.0"]),
+        }
+        for rel, (text, _) in forms.items():
+            self.plant(rel, text)
+        self.plant("k/clean.md", "Built for PG19 with AGE1.7.0 and pgdg13; storage2 page3 usage4.\n")
+        want = sorted(f"{rel}:1: {','.join(reasons)}: {text.strip()}" for rel, (text, reasons) in forms.items())
+        self.assertEqual(sorted(self.scan_tree()), want)
+
     def test_certified_tokens_and_untiered_lines_are_clean_9951(self):
         self.plant("g/clean.md", "\n".join([
             "PostgreSQL 19 (server_version_num 190000), AGE 1.7.0, pgvector 0.8.7.",
