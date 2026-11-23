@@ -42,7 +42,7 @@ ALL_EXIT_CODES = (EXIT_OK, EXIT_BAD_INPUT, EXIT_SOURCE_MISMATCH, EXIT_PATCH_MISM
 
 # The real patch, pinned by hand from upstream apache/age 06ce678d: its sha256
 # (equal to AGE_PATCH_SHA256 in lib.sh) and its blob line (preimage..postimage).
-REAL_PATCH_SHA256 = "e6f1d9d0e1b1b2fbc2e1d1b7a1ab5f2a8d0ad1c1e7c49c8b2b52e1e3a0f9c4d7"
+REAL_PATCH_SHA256 = "7efe593224097d43bd6779075388e16ae793f555da0ff3c5ced951d9b906d20c"
 REAL_INDEX_LINE = "index 107de370d37aebaf4f42fd084ad808df7c566231..33b087a2cdd46a7f2d949afbb8f7308b62856ac8 100644"
 
 # Written out by hand: the shape of the function at the pinned commit, and the
@@ -558,8 +558,9 @@ class GenAgePatchTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def write_ssot(self, upstream):
-        pins = {"AGE_SOURCE_COMMIT": self.root, "AGE_PATCH_UPSTREAM_COMMIT": upstream, "AGE_PATCH_FILE": PATCH_NAME,
+    def write_ssot(self, upstream, source=None):
+        source = self.root if source is None else source
+        pins = {"AGE_SOURCE_COMMIT": source, "AGE_PATCH_UPSTREAM_COMMIT": upstream, "AGE_PATCH_FILE": PATCH_NAME,
                 "AGE_PATCH_SHA256": "0" * 64, "AGE_PATCHED_FILE_SHA256": "0" * 64}
         self.ssot.write_text("".join(f'{k}="${{DOCKER_1461_{k}:-{v}}}"\n' for k, v in pins.items()))
 
@@ -600,6 +601,42 @@ class GenAgePatchTest(unittest.TestCase):
                          (3, "", f"gen_age_patch: upstream commit {self.root} is not a single-parent commit in "
                                  f"{self.clone}\n"))
         self.assertFalse(self.out.exists())
+
+    def side_branch(self, name, text):
+        """A source commit off the root on its own branch (the PG19 branch shape), its target set to text."""
+        git(self.clone, "checkout", "-q", "-b", name, self.root)
+        (self.clone / TARGET).write_text(text)
+        git(self.clone, "commit", "-q", "-am", name)
+        return git(self.clone, "rev-parse", "HEAD").stdout.strip()
+
+    def test_carries_the_upstream_change_onto_the_source_commit_9983(self):
+        # The source branch has lines the upstream parent lacks, so the plain
+        # upstream diff would apply only at an offset. The expected body is
+        # built here by hand: the guard written onto the source text, diffed.
+        prefix = "/* pg19 branch */\n/* line two */\n/* line three */\n"
+        source = self.side_branch("pg19", prefix + ORIGINAL)
+        (self.clone / TARGET).write_text(prefix + GUARDED)
+        git(self.clone, "commit", "-q", "-am", "expected")
+        expected = git(self.clone, "diff", "--full-index", source, "HEAD").stdout.encode()
+        git(self.clone, "reset", "-q", "--hard", source)
+        self.write_ssot(self.fix, source)
+        r = self.run_gen()
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(self.out.read_bytes(), expected)
+        self.assertNotEqual(expected, self.expected_body(self.fix), "the fixture must need the carry")
+        r = self.run_gen("--check")
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+
+    def test_refuses_a_change_that_does_not_apply_onto_the_source_commit_9983(self):
+        source = self.side_branch("diverged", ORIGINAL.replace("static bool callback_registered", "int other"))
+        self.write_ssot(self.fix, source)
+        r = self.run_gen()
+        self.assertEqual((r.returncode, r.stdout, r.stderr),
+                         (4, "", f"gen_age_patch: upstream commit {self.fix} does not apply onto AGE_SOURCE_COMMIT "
+                                 f"{source}\n"))
+        self.assertFalse(self.out.exists())
+        self.assertEqual([p.name for p in Path(git(self.clone, "rev-parse", "--absolute-git-dir").stdout.strip())
+                          .glob("gen-age-patch-*")], [], "the private index is removed")
 
 
 if __name__ == "__main__":

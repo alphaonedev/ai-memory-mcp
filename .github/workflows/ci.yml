@@ -848,6 +848,10 @@ jobs:
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
       - name: Target sweep unit tests (#7160)
         run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
+      # #9965 #9982 #9983 - the certified AGE patch applier and its generator
+      # (scripts/test/ is outside the discovery root above).
+      - name: AGE patch applier and generator tests (#9965, #9982, #9983)
+        run: python3 -m unittest scripts/test/test_apply_age_patch_9965.py
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
   # need to run on macOS where it just duplicates work and burns

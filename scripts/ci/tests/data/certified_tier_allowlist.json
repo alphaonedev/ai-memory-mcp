@@ -177,6 +177,8 @@
   ["porukjsikpqpirthqgnkklqj", "CONFIG"],
   ["qqmpilijtvjmirstimghrmkg", "CONFIG"],
   ["qrsuojrivhriumupnhvlqjqo", "CONFIG"],
+  ["svlrionqrinsujnkuorlluvr", "CONFIG"],
+  ["ttojohustlnjlmjrvioklstq", "CONFIG"],
   ["puojgkptsgnpqosnusgvpqkj", "CONFIG"],
   ["ukpguqqlmuknjrktuihgngtg", "CONFIG"],
   ["qnuhvomvrgmuionrhqulsjho", "CONFIG"],
@@ -1398,6 +1400,9 @@
 "changelog.d/9965.fixed.md": [
   ["lmsmvhliprqhvkojvrnsrohk", "DOC"]
 ],
+"changelog.d/9982.fixed.md": [
+  ["mrurpnmlvukhoigjjnhktjsn", "DOC"]
+],
 "cookbook/nhi-self-curation/01-any-agent.sh": [
   ["ogprhshnjpttvtijqiqjjimi", "CONFIG"]
 ],
@@ -1538,7 +1543,6 @@
   ["morsslsiksonqmpjmtjuvqgm", "CONFIG"],
   ["ojkgrgrjslltiihovlikpnqg", "CONFIG"],
   ["pohjopqgrgkiqvrlnqmgjosi", "CONFIG"],
-  ["lviqmqsuiunrqsqisqvjiihq", "CONFIG"],
   ["jjmrjkrmnoqqnupjupstliij", "CONFIG"],
   ["hhounpnnvprlghougjiutjsv", "CONFIG"],
   ["jljvrqgpsrppphsjmktgjsgp", "CONFIG"],
@@ -1784,12 +1788,16 @@
 ],
 "deploy/docker-1461/provision/apply_age_patch.py": [
   ["lhlnmnjvquruivpjuinpjqth", "CONFIG"],
-  ["qjpmmpjkggltsvgunhqulriq", "CONFIG"],
-  ["vpmjhtomstqpnlhkugmomkpi", "CONFIG"],
+  ["vtklogkskqsqkplpinouvjpo", "CONFIG"],
+  ["phpgklgoqpukiptpvglsoljn", "CONFIG"],
   ["hqittkvjksrlhnovjnjtugmh", "CONFIG"],
   ["jkposkunqsqihsuulngiopoj", "CONFIG"],
-  ["spjvigmoqjqppuppghunnoqt", "CONFIG"],
   ["hsqjhvknovgsoirjlllpjpgh", "CONFIG"]
+],
+"deploy/docker-1461/provision/gen_age_patch.py": [
+  ["qujrjtpgmnhvnmkuoukghlqu", "CONFIG"],
+  ["tsljinjprvjqotvklrskrsoi", "CONFIG"],
+  ["utktjoonnphhipirnjupjpjt", "CONFIG"]
 ],
 "deploy/docker-1461/provision/lib.sh": [
   ["juqliijjogvipqphlsqjturq", "CONFIG"],
@@ -2059,7 +2067,7 @@
   ["jsjqmotgkhirnmpmkvrulmpi", "DOC"]
 ],
 "docs/CONFIG_SCHEMA.md": [
-  ["lrggpghhpprokkqqltroiijq", "DOC"],
+  ["uopkiluupqqojhqmmsnkumlg", "DOC"],
   ["prmvtvhgiipuhgnggkjsqmvg", "DOC"],
   ["nmsiuhjsvjhtnlphqrhhrtpk", "DOC"],
   ["iqmrnkpvruvjumrvqiuqnqtu", "DOC"],
@@ -7184,6 +7192,11 @@
   ["ghvorumvqtruhuglgppprjtm", "TEST"],
   ["pmhpqvuosunqqpsujgtmrsom", "TEST"]
 ],
+"scripts/ci/tests/age_build_ledger.py": [
+  ["nnqnrukvqtuujotqvmngignn", "TEST"],
+  ["jivvqvpukqkighmrvosmgspq", "TEST"],
+  ["tttopmiuprgrpnmjhgpuiujm", "TEST"]
+],
 "scripts/ci/tests/data/certification_scope_8262_pins.json": [
   ["ijghlgkjvtssiogtqlvljkls", "TEST"],
   ["ossglrvknhgskohgsovtkllo", "TEST"],
@@ -7243,6 +7256,44 @@
   ["jtgmrnjlhkrvtsrpinhpsqov", "TEST"],
   ["jngghvkplnlhmtjhlslpomvv", "TEST"]
 ],
+"scripts/ci/tests/data/certified_tier_allowlist.json": [
+  ["vtuuhjlvpgujqlqogtsrjoil", "TEST"],
+  ["nsmjujvklhktunvivnnnkmpi", "TEST"],
+  ["mlvhhtlujrmtukhqjogguuvh", "TEST"],
+  ["gtuqvnkmrightokmgkukisir", "TEST"],
+  ["uoolusggqhgkprrktgisiuup", "TEST"],
+  ["vrjntqhsijkvstmkslstvkvr", "TEST"],
+  ["kmqplsmjirsotpiljpkskmtt", "TEST"],
+  ["kuusnupsugsiqnqnnnhilvgu", "TEST"],
+  ["imvsgrgtoitpiokqhktrmthn", "TEST"],
+  ["nqhugslvjrpintnlinrtjvok", "TEST"],
+  ["hpkkjrstpvljmuspkjlvlmtu", "TEST"],
+  ["qntrijmvqklsrqirnvrpsvgt", "TEST"],
+  ["pqpgsithslgsrskptirrmtvh", "TEST"],
+  ["puglhghlgtgmjmrqgkkgirts", "TEST"],
+  ["lhgqptqprjnrmhsruphothsj", "TEST"],
+  ["loimihkvhrjrkoskhqhikpqs", "TEST"],
+  ["vphhuukkuvghojqprgmsmujh", "TEST"],
+  ["upptokqsvottillnvihhtlij", "TEST"],
+  ["hhmumpuvnluiuutjiqtlhmkk", "TEST"],
+  ["vikhkhjllvgrqkjnhjhtngmt", "TEST"],
+  ["qgphlomjknpnipiiggqjomhn", "TEST"],
+  ["svnruhkgnmnsgholgthgvgul", "TEST"],
+  ["lgrtsmhquqlqoutimkmugvmp", "TEST"],
+  ["uphvinpusrvgijgsmrstusgl", "TEST"],
+  ["ttviihhslrrrvjvsnmjihhin", "TEST"],
+  ["qupuihmhvkgpljguoulosoiq", "TEST"],
+  ["nsnjmhrkkljutuvjpthhlhtp", "TEST"],
+  ["gsokrqgjjholhlsgqprrionq", "TEST"],
+  ["lhusuriitiruknqhirigsruh", "TEST"],
+  ["iglssilkqgjighrjpvvimgmj", "TEST"],
+  ["usqgjntghsnugotmsuggumpr", "TEST"],
+  ["imsjoknpnpigsrjsqoivimni", "TEST"],
+  ["muhkunkgvhtusoprvmhkknjk", "TEST"],
+  ["svjhiiqhpjssqorskoptvkhl", "TEST"],
+  ["vummqhspnlokmugvmkqjkiqt", "TEST"],
+  ["nuhulosmimorjnjslmrtounh", "TEST"]
+],
 "scripts/ci/tests/test_certification_scope_8262.py": [
   ["qtpvlskovtisuqrupojknoiq", "TEST"],
   ["vvhjpnqnmhrrgsmnnipskmvu", "TEST"],
@@ -7281,7 +7332,6 @@
   ["umgkqmuhnqopgrirjmshlsrq", "RECORD"],
   ["igviqnipmsqiiilqnpmoitop", "RECORD"],
   ["oslimspjintgvprqvojotpkv", "RECORD"],
-  ["mskmmniuqmvgornjghjogskq", "RECORD"],
   ["qtgqmvvuunnlmkpsqppgqvjl", "RECORD"],
   ["piukumovjpgqrtjjitogiiuv", "RECORD"],
   ["gnjmrhrotqnovuqjntllgmlv", "RECORD"],
@@ -7818,8 +7868,7 @@
   ["tqkmkststuuttljuumjsqurq", "TEST"]
 ],
 "scripts/test/test_apply_age_patch_9965.py": [
-  ["iljgorvmjssngomulknjmmrj", "TEST"],
-  ["tkgoolqugntgpujlsipsgqph", "TEST"],
+  ["qshgkvhorhhqlpolntqnshvn", "TEST"],
   ["lsjqoqnokqrkhklohovsolsg", "TEST"],
   ["iugljrvipnkgmmosqtjqoqos", "TEST"],
   ["urmvljvmjjkhislsrkgrtppg", "TEST"],
@@ -7832,7 +7881,18 @@
   ["ohlgohgtrtjmptttiskonvrk", "TEST"],
   ["khhsgkhunomhsnkirstvnqks", "TEST"],
   ["vjthgjirutqsrvrlrqrnqnnv", "TEST"],
-  ["mpvhtsrsnspirgrorhgrqghg", "TEST"]
+  ["mpvhtsrsnspirgrorhgrqghg", "TEST"],
+  ["ttikkmrjssnnvuqijttrihvg", "TEST"],
+  ["quuqthrsjknrjqqliviosggq", "TEST"],
+  ["itvthkgqhiropqigljshkqsp", "TEST"],
+  ["pjqlklgugthtotrnlnrupjvs", "TEST"],
+  ["kjtiituotmlohitgultiogii", "TEST"],
+  ["ovllivvhimojvqmvjssropuo", "TEST"],
+  ["glnrmgjtounggrvvjhlrtjps", "TEST"],
+  ["nsiglmrulkhhiqhookkumrgi", "TEST"],
+  ["nnjvqltrguiohnvkhvulgitk", "TEST"],
+  ["gpqovvgqprojmhghrhguqlrr", "TEST"],
+  ["ohtpokphjkjrpjprijskrvvt", "TEST"]
 ],
 "scripts/test/test_cert_gate_evidence_7181.py": [
   ["vqtjpkgsoohsroqmrthnrilg", "TEST"],

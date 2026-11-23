@@ -318,7 +318,7 @@ the deployment SSOT carries — `deploy/docker-1461/provision/lib.sh`
 (`PG_BASE_IMAGE=postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60`, `EXPECTED_PG_VERSION=19.0`,
 `AGE_SOURCE_COMMIT=c6b043d1c8f4909331b9080d6640b487782fc958`,
 `AGE_PATCH_UPSTREAM_COMMIT=06ce678d74210539705c77e2dc7c9fa861e2a331`,
-`AGE_PATCH_SHA256=4d30cd91884756f281ec11dc5efd7ae2d32bcbeb9f90b44740dfec1fd2d25cc0`,
+`AGE_PATCH_SHA256=7efe593224097d43bd6779075388e16ae793f555da0ff3c5ced951d9b906d20c`,
 `EXPECTED_AGE_VERSION=1.7.0`, `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+2`; the
 pgvector Rust binding is the `pgvector` crate `0.4`, `features = ["sqlx"]`)
 — set by operator directives c4f4d408 and 111f59db ([#9927](https://github.com/alphaonedev/ai-memory-mcp/issues/9927)).

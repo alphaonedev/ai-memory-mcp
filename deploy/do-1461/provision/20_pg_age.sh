@@ -48,7 +48,7 @@
 source "$(dirname "$0")/lib.sh"
 # The AGE patch pins live in the docker-1461 SSOT; the applier reads them there.
 AGE_PROVISION_DIR="$(cd "$(dirname "$0")/../../docker-1461/provision" && pwd)"
-AGE_PATCH_FILE="$(sed -n 's/^AGE_PATCH_FILE="\${DOCKER_1461_AGE_PATCH_FILE:-\([^}"]*\)}".*/\1/p' "$AGE_PROVISION_DIR/lib.sh")"
+AGE_PATCH_FILE="$(python3 "$AGE_PROVISION_DIR/apply_age_patch.py" --ssot "$AGE_PROVISION_DIR/lib.sh" --print-pin AGE_PATCH_FILE)"
 : "${AGE_PATCH_FILE:?docker-1461 SSOT did not define AGE_PATCH_FILE}"
 
 require_inventory
