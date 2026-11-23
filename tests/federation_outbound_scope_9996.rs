@@ -1247,7 +1247,9 @@ async fn underscore_stamp_cell(sink: Arc<dyn FederationDlqSink>) {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn erasure_sentinels_with_no_peer_in_scope_are_quarantined_postgres_9996() {
-    let Some(sink) = pg_sink().await else { return };
+    let Some((_scratch, sink)) = pg_sink().await else {
+        return;
+    };
     let sentinel = ai_memory::federation::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID;
     let run = uuid::Uuid::new_v4();
     let ids: Vec<String> = (0..SENTINEL_BACKLOG)
@@ -1266,34 +1268,56 @@ async fn erasure_sentinels_with_no_peer_in_scope_are_quarantined_postgres_9996()
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn underscore_stamp_is_not_redriven_postgres_9996() {
-    let Some(sink) = pg_sink().await else { return };
+    let Some((_scratch, sink)) = pg_sink().await else {
+        return;
+    };
     underscore_stamp_cell(sink).await;
 }
 
 #[cfg(feature = "sal-postgres")]
-async fn pg_sink() -> Option<Arc<dyn FederationDlqSink>> {
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
+/// Prefix of the per-cell scratch databases (swept by `ScratchDb::create`).
+#[cfg(feature = "sal-postgres")]
+const PG_SCRATCH_PREFIX: &str = "ai_memory_9996dlq";
+
+/// A DLQ sink on a FRESH scratch database, one per cell. The replay take is
+/// `ORDER BY failed_at ASC LIMIT batch` and the redrive is table-wide, so a
+/// cell sharing a database with an earlier cell (the 2049-row erasure
+/// backlog) or an earlier run would see that backlog fill its window. The
+/// guard drops the database when the cell ends, including on a panic.
+#[cfg(feature = "sal-postgres")]
+async fn pg_sink() -> Option<(pg_barrier::ScratchDb, Arc<dyn FederationDlqSink>)> {
     use ai_memory::federation::push_dlq::PostgresDlqSink;
     use ai_memory::store::postgres::PostgresStore;
     let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
         eprintln!("test skipped: AI_MEMORY_TEST_POSTGRES_URL not set");
         return None;
     };
-    let store = PostgresStore::connect(&url)
+    let scratch = pg_barrier::ScratchDb::create(&url, PG_SCRATCH_PREFIX)
         .await
-        .expect("AI_MEMORY_TEST_POSTGRES_URL is set, so the store must connect");
-    Some(Arc::new(PostgresDlqSink::new(Arc::new(store))))
+        .expect("AI_MEMORY_TEST_POSTGRES_URL is set, so the scratch database must be created");
+    let store = PostgresStore::connect(&scratch.url())
+        .await
+        .expect("the scratch database must connect");
+    Some((scratch, Arc::new(PostgresDlqSink::new(Arc::new(store)))))
 }
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn pre_seeded_out_of_scope_row_is_quarantined_kept_and_redriven_postgres_9996() {
-    let Some(sink) = pg_sink().await else { return };
+    let Some((_scratch, sink)) = pg_sink().await else {
+        return;
+    };
     pre_seeded_out_of_scope_cell(sink, None).await;
 }
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn unparseable_2xx_is_transient_and_bounded_by_the_ceiling_postgres_9996() {
-    let Some(sink) = pg_sink().await else { return };
+    let Some((_scratch, sink)) = pg_sink().await else {
+        return;
+    };
     transient_ceiling_cell(sink, None).await;
 }
