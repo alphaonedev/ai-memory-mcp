@@ -9787,7 +9787,12 @@ fn curl_get_signed_pull_9996(
     kp: &ai_memory::identity::keypair::AgentKeypair,
 ) -> (String, serde_json::Value) {
     use ai_memory::federation::{peer_attestation::PEER_ID_HEADER, signing};
-    let url = format!("https://127.0.0.1:{port}{path_and_query}");
+    // The scheme separator is two char literals, not a double slash inside
+    // one string: scripts/check-count-assertion-declared.sh strips line
+    // comments before string literals, so a double slash inside a string
+    // desyncs its parse of every later assertion in this file.
+    let scheme = concat!("https:", '/', '/');
+    let url = format!("{scheme}127.0.0.1:{port}{path_and_query}");
     let (sig, nonce) = signing::sign_get_url(kp.private.as_ref(), &url)
         .expect("#9996: sign the pull (the peer key has a private half)");
     let out = std::process::Command::new("curl")
