@@ -903,8 +903,7 @@ mod tests {
         crate::encryption::ENV_ENCRYPT_AT_REST,
         crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
         ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
-        // #2954 — check #19 append-only spine flag.
-        crate::config::ENV_APPEND_ONLY,
+        crate::config::ENV_APPEND_ONLY, // #2954 — check #19 append-only spine flag.
         // #3061 — check #15 is now backend-aware: it resolves the store URL
         // via `store_url::resolve_store_url(None)` (these two channels) and,
         // on a postgres:// DSN, reads the pg at-rest attestation. Cleared so
@@ -913,6 +912,7 @@ mod tests {
         crate::store_url::STORE_URL_ENV,
         crate::store_url::STORE_URL_FILE_ENV,
         crate::federation::outbound_scope::OUTBOUND_SCOPE_ENV, // #9996 check #23
+        crate::federation::shared_source::PEERS_ENV,           // #10059 check #23
         ENV_PG_AT_REST_ATTESTED,
     ];
 
