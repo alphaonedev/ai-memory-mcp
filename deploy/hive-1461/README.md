@@ -4,6 +4,11 @@ SPDX-License-Identifier: Apache-2.0
 -->
 # hive-1461 — peer-reproducible federated baseline
 
+> **History note (2026-11-23).** This kit is the v0.7.0 baseline and builds
+> PostgreSQL 16 + Apache AGE 1.6.0 (`apache/age:release_PG16_1.6.0`). It is not
+> the certified data tier. The certified tier is PostgreSQL 19.0 + Apache AGE
+> 1.7.0 + pgvector 0.8.7, provisioned from `deploy/docker-1461/provision/lib.sh`.
+
 A deterministic, idempotent, **0→60** build of the `ai-memory` v0.7.0 federated
 test fleet on DigitalOcean. Everything a reviewer needs to reproduce *both the
 environment and the results* lives in this directory and ships inside
