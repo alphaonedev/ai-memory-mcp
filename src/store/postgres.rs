@@ -8339,7 +8339,7 @@ impl PostgresStore {
         pattern: Option<&str>,
         tier: Option<&Tier>,
         archive: bool,
-    ) -> StoreResult<Vec<String>> {
+    ) -> StoreResult<Vec<(String, String)>> {
         self.gate_record_stop().await?;
         if namespace.is_none() && pattern.is_none() && tier.is_none() {
             return Err(StoreError::InvalidInput {
@@ -8399,8 +8399,8 @@ impl PostgresStore {
         // every attempt archives under the SAME stamp and the same filter; the
         // block below has no effect outside the transaction.
         let mut retry = tx_retry::TxRetry::new("forget archive+delete tx");
-        let deleted_ids: Vec<String> = loop {
-            let attempt: StoreResult<Vec<String>> = async {
+        let deleted_ids: Vec<(String, String)> = loop {
+            let attempt: StoreResult<Vec<(String, String)>> = async {
                 let mut tx = self
                     .pool
                     .begin()
@@ -8707,7 +8707,12 @@ impl PostgresStore {
                 pg_commit_and_emit(tx, anchor)
                     .await
                     .map_err(|e| to_store_err("forget commit tx", e))?;
-                Ok(deleted.into_iter().map(|(id, _, _)| id).collect::<Vec<String>>())
+                // #9996 — the namespace rides with each erased id so the
+                // HTTP forget admits each peer's outbound scope against it.
+                Ok(deleted
+                    .into_iter()
+                    .map(|(id, ns, _)| (id, ns))
+                    .collect::<Vec<(String, String)>>())
             }
             .await;
             match attempt {

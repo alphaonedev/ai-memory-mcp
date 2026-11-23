@@ -315,6 +315,7 @@ pub fn cmd_delete(
         crate::federation::erasure_outbox::enqueue_erasure(
             &conn,
             &target.id,
+            &target.namespace,
             crate::federation::erasure_outbox::surfaces::CLI_DELETE,
         );
         // PR-5 (issue #487): security audit trail.

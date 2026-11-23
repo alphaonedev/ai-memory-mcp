@@ -335,6 +335,8 @@ async fn exercise_quorum(mut app: AppState) {
         peers: vec![PeerEndpoint {
             id: "receipt-peer-3555".to_owned(),
             sync_push_url: format!("http://{address}/sync"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::new(),
         sender_agent_id: "receipt-agent-3555".to_owned(),

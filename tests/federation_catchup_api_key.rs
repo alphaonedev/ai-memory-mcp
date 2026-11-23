@@ -122,6 +122,8 @@ fn build_cfg(peer_url: &str, api_key: Option<String>) -> FederationConfig {
         peers: vec![PeerEndpoint {
             id: "peer-0".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client,
         sender_agent_id: "ai:catchup-api-key-test".to_string(),

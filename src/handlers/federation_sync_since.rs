@@ -39,6 +39,37 @@ const SYNC_SINCE_NO_SCOPE_REFUSAL: &str = "sync_since: no scope allowlist for pe
      as the only guarantee, and the enterprise posture check reports it as a weakening; use it \
      only for a legacy-peer migration window.";
 
+/// #9996 C-6 — keep the rows `allowed` admits and count each row left out
+/// per `(peer, namespace)` in the filtered series stats and doctor show.
+/// The peer label is the hashed stable id of the attested peer header, so
+/// the series carries no raw header text; a peer with no scope row never
+/// reaches this filter (default-deny returns first), which bounds the label
+/// set to the configured peers.
+fn scope_filter(
+    mems: Vec<Memory>,
+    allowed: impl Fn(&str) -> bool,
+    peer_header: Option<&str>,
+) -> Vec<Memory> {
+    let mut tally = crate::federation::outbound_scope::FilteredTally::default();
+    let kept: Vec<Memory> = mems
+        .into_iter()
+        .filter(|m| {
+            let ok = allowed(&m.namespace);
+            if !ok {
+                tally.add(&m.namespace);
+            }
+            ok
+        })
+        .collect();
+    if let Some(peer) = peer_header {
+        crate::federation::outbound_scope::record_filtered(
+            &crate::federation::peer::stable_peer_id(peer),
+            &tally,
+        );
+    }
+    kept
+}
+
 /// #2441 — compute the honest PULL CURSOR for one `/sync/since` page.
 ///
 /// `examined` is the row set the SQL `LIMIT` returned, **before** the
@@ -369,7 +400,7 @@ pub async fn sync_since(
         // the watermark over a straddling tie group.
         let next_since = next_since_watermark(&mems, raw_count, limit);
         warn_if_cursor_pinned(next_since.as_deref(), raw_count, limit);
-        let ns_filtered: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
+        let ns_filtered = scope_filter(mems, allowed, peer_header.as_deref());
         let after_ns = ns_filtered.len();
         let excluded = total.saturating_sub(after_ns);
         // #948 visibility post-filter (see `federation_caller`
@@ -430,7 +461,7 @@ pub async fn sync_since(
     // watermark over a straddling tie group.
     let next_since = next_since_watermark(&mems, raw_count, limit);
     warn_if_cursor_pinned(next_since.as_deref(), raw_count, limit);
-    let mems: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
+    let mems = scope_filter(mems, allowed, peer_header.as_deref());
     let excluded = total.saturating_sub(mems.len());
 
     // v0.7.0 #948 — scope=private visibility post-filter. The

@@ -74,6 +74,8 @@ fn config(peers: &[String], ack_timeout: Duration) -> FederationConfig {
             .map(|(i, url)| PeerEndpoint {
                 id: format!("peer-{i}:{url}"),
                 sync_push_url: format!("{url}/api/v1/sync/push"),
+                outbound_scope: crate::federation::outbound_scope::PeerOutboundScope::all_explicit(
+                ),
             })
             .collect(),
         client: crate::test_support::tls_test_client(ack_timeout),
@@ -97,7 +99,15 @@ async fn bulk_delete_100k_ids_is_chunked_bounded_and_timed_8741() {
     let (b, cb) = spawn_counting_peer(Duration::ZERO).await;
     let fed = config(&[a, b], Duration::from_secs(10));
     let started = Instant::now();
-    let out = deliver_batch(&fed, bulk_effects(BulkEffect::Delete, &ids(BIG_BATCH_IDS))).await;
+    let out = deliver_batch(
+        &fed,
+        bulk_effects(
+            BulkEffect::Delete,
+            &ids(BIG_BATCH_IDS),
+            &ItemNamespaces::new(),
+        ),
+    )
+    .await;
     let elapsed = started.elapsed();
     assert_eq!(out, Ok(Some(3)), "every chunk must reach quorum 3-of-3");
     let chunks = BIG_BATCH_IDS.div_ceil(MAX_BULK_SIZE);
@@ -127,7 +137,15 @@ async fn bulk_delete_past_the_batch_deadline_is_the_exact_202_8741() {
     let (slow, _c) = spawn_counting_peer(SLOW_PEER_HOLD).await;
     let fed = config(&[slow], SLOW_ACK_TIMEOUT);
     let started = Instant::now();
-    let out = deliver_batch(&fed, bulk_effects(BulkEffect::Delete, &ids(SLOW_BATCH_IDS))).await;
+    let out = deliver_batch(
+        &fed,
+        bulk_effects(
+            BulkEffect::Delete,
+            &ids(SLOW_BATCH_IDS),
+            &ItemNamespaces::new(),
+        ),
+    )
+    .await;
     let elapsed = started.elapsed();
     assert_eq!(
         out,
@@ -149,7 +167,12 @@ async fn bulk_delete_past_the_batch_deadline_is_the_exact_202_8741() {
 async fn oversized_delete_chunk_is_refused_unsent_8741() {
     let (peer, counters) = spawn_counting_peer(Duration::ZERO).await;
     let fed = config(&[peer], Duration::from_secs(10));
-    let out = crate::federation::broadcast_delete_batch_quorum(&fed, &ids(MAX_BULK_SIZE + 1)).await;
+    let out = crate::federation::broadcast_delete_batch_quorum(
+        &fed,
+        &ids(MAX_BULK_SIZE + 1),
+        &ItemNamespaces::new(),
+    )
+    .await;
     assert_eq!(
         out.err(),
         Some(QuorumError::LocalWriteFailed {
@@ -161,7 +184,12 @@ async fn oversized_delete_chunk_is_refused_unsent_8741() {
         0,
         "nothing may be sent"
     );
-    let full = crate::federation::broadcast_delete_batch_quorum(&fed, &ids(MAX_BULK_SIZE)).await;
+    let full = crate::federation::broadcast_delete_batch_quorum(
+        &fed,
+        &ids(MAX_BULK_SIZE),
+        &ItemNamespaces::new(),
+    )
+    .await;
     assert_eq!(
         full.map(|t| t.finalise(Instant::now())),
         Ok(Ok(2)),
@@ -180,26 +208,30 @@ async fn oversized_delete_chunk_is_refused_unsent_8741() {
 async fn empty_batch_reports_no_ack_count_8741() {
     let fed = config(&[], Duration::from_millis(100));
     assert_eq!(deliver_batch(&fed, Vec::new()).await, Ok(None));
-    assert!(bulk_effects(BulkEffect::Delete, &[]).is_empty());
+    assert!(bulk_effects(BulkEffect::Delete, &[], &ItemNamespaces::new()).is_empty());
 }
 
 /// F4 — erasures chunk at `MAX_BULK_SIZE`, archives stay one per id.
 #[test]
 fn bulk_effects_chunk_deletes_only_8741() {
-    let sizes: Vec<usize> = bulk_effects(BulkEffect::Delete, &ids(2 * MAX_BULK_SIZE + 7))
-        .iter()
-        .map(|e| match e {
-            OwnedEffect::DeleteChunk(c) => c.len(),
-            _ => usize::MAX,
-        })
-        .collect();
+    let sizes: Vec<usize> = bulk_effects(
+        BulkEffect::Delete,
+        &ids(2 * MAX_BULK_SIZE + 7),
+        &ItemNamespaces::new(),
+    )
+    .iter()
+    .map(|e| match e {
+        OwnedEffect::DeleteChunk(c, _) => c.len(),
+        _ => usize::MAX,
+    })
+    .collect();
     assert_eq!(sizes, vec![MAX_BULK_SIZE, MAX_BULK_SIZE, 7]);
-    let archives = bulk_effects(BulkEffect::Archive, &ids(3));
+    let archives = bulk_effects(BulkEffect::Archive, &ids(3), &ItemNamespaces::new());
     assert_eq!(archives.len(), 3);
     assert!(
         archives
             .iter()
-            .all(|e| matches!(e, OwnedEffect::Archive(_)))
+            .all(|e| matches!(e, OwnedEffect::Archive(_, _)))
     );
 }
 
@@ -316,6 +348,7 @@ async fn decision_with_an_unread_row_is_the_exact_readback_202_8741() {
     let out = fanout_decision(
         &app,
         &decision,
+        "team/a",
         &Produced::Unread("produced-8741".to_string()),
         &mut receipt,
     )

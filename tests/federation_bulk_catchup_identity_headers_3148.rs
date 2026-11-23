@@ -121,6 +121,8 @@ async fn bulk_catchup_attaches_credential_and_chain_headers() {
         peers: vec![PeerEndpoint {
             id: "peer-headers-3148".to_string(),
             sync_push_url: url,
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(5))

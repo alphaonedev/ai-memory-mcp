@@ -633,7 +633,7 @@ async fn store_forget_ids(
     ctx: &crate::store::CallerContext,
     body: &ForgetQuery,
     archive: bool,
-) -> crate::store::StoreResult<(usize, Option<Vec<String>>)> {
+) -> crate::store::StoreResult<(usize, Option<Vec<(String, String)>>)> {
     #[cfg(feature = "sal-postgres")]
     if let Some(pg) = app
         .store
@@ -778,16 +778,29 @@ pub async fn forget_memories(
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         return match store_forget_ids(&app, &ctx, &body, archive_flag).await {
             Ok((n, erased)) => {
+                // #9996 — split the erased (id, namespace) pairs: the ids
+                // travel, the namespaces admit each peer's outbound scope.
+                let erased = erased.map(|pairs| {
+                    let mut ns = crate::federation::outbound_scope::ItemNamespaces::new();
+                    for (id, namespace) in &pairs {
+                        ns.insert(id, namespace);
+                    }
+                    (
+                        pairs.into_iter().map(|(id, _)| id).collect::<Vec<String>>(),
+                        ns,
+                    )
+                });
                 // #9023 (p2-siblings-06) — the erasure travels to the peers
                 // as chunked tombstones through the bulk funnel before the
                 // response (pre-fix the PG forget never fanned out).
                 let mut receipt = json!({"deleted": n});
                 let fanned = match erased {
-                    Some(ids) => {
+                    Some((ids, ns)) => {
                         super::fed_fanout::fanout_bulk_into(
                             &app,
                             super::fed_fanout::BulkEffect::Delete,
                             &ids,
+                            &ns,
                             &mut receipt,
                         )
                         .await
@@ -822,8 +835,18 @@ pub async fn forget_memories(
         body.tier.as_ref(),
         usize::MAX,
     )
-    .map(|rows| rows.into_iter().map(|m| m.id).collect::<Vec<String>>());
-    let victim_ids: Vec<String> = victims.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
+    .map(|rows| {
+        // #9996 — each victim's namespace, so the erasure is admitted
+        // against each peer's outbound scope.
+        let mut ns = crate::federation::outbound_scope::ItemNamespaces::new();
+        for m in &rows {
+            ns.insert(&m.id, &m.namespace);
+        }
+        (rows.into_iter().map(|m| m.id).collect::<Vec<String>>(), ns)
+    });
+    let victim_ids: Vec<String> = victims
+        .as_ref()
+        .map_or_else(|_| Vec::new(), |(ids, _)| ids.clone());
     let forget_result = db::forget(
         &lock.0,
         body.namespace.as_deref(),
@@ -838,7 +861,7 @@ pub async fn forget_memories(
     // #8741 round 1 (sec-F1) — one chunked id-only `IN` probe per
     // FORGET_SURVIVOR_PROBE_CHUNK victims instead of a full-row read per id.
     let erased: Option<Vec<String>> = match (&forget_result, &victims) {
-        (Ok(_), Ok(ids)) => erased_ids(&lock.0, ids)
+        (Ok(_), Ok((ids, _))) => erased_ids(&lock.0, ids)
             .inspect_err(|e| tracing::warn!("forget: survivor probe failed: {e}"))
             .ok(),
         _ => None,
@@ -860,12 +883,14 @@ pub async fn forget_memories(
             // chunked tombstones through the bulk funnel (pre-fix the HTTP
             // forget never fanned out on either backend).
             let mut receipt = json!({"deleted": n});
+            let victim_ns = victims.map(|(_, ns)| ns).unwrap_or_default();
             let fanned = match erased {
                 Some(ids) => {
                     super::fed_fanout::fanout_bulk_into(
                         &app,
                         super::fed_fanout::BulkEffect::Delete,
                         &ids,
+                        &victim_ns,
                         &mut receipt,
                     )
                     .await

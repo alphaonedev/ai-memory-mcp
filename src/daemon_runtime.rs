@@ -6831,6 +6831,10 @@ pub async fn bootstrap_serve(
         app_config.api_key.clone(),
     )
     .context("federation config")?;
+    // #9996 — peers are deny-scoped unless AI_MEMORY_FED_PEER_OUTBOUND_SCOPE
+    // opens them (a malformed value refuses boot); one WARN per unscoped peer.
+    federation = federation::outbound_scope::install_for_serve(federation)
+        .context("federation outbound scope")?;
 
     // v1.0.0 TRACT G16 (#1830) — durability-model boot disclosure: the first
     // production consumer of `resolve_durability_model` (the #2213 audit's F6
@@ -9018,6 +9022,7 @@ pub async fn sync_cycle_once(
     peer_url: &str,
     api_key: Option<&str>,
     batch_size: usize,
+    outbound_scope: &crate::federation::outbound_scope::PeerOutboundScope,
 ) -> Result<()> {
     let peer_url = peer_url.trim_end_matches('/');
     // #3675 / #3687 / #3711 — the peer's DURABLE identity (the `sync_state`
@@ -9257,81 +9262,18 @@ pub async fn sync_cycle_once(
         }
     }
 
-    // --- PUSH --------------------------------------------------------
-    let last_pushed = {
-        let conn = db::open(db_path)?;
-        db::sync_state_last_pushed(&conn, local_agent_id, peer_key)
-    };
-    let outgoing = {
-        let conn = db::open(db_path)?;
-        db::memories_updated_since(&conn, last_pushed.as_deref(), batch_size)?
-    };
-    let push_count = outgoing.len();
-    let latest_pushed = outgoing.last().map(|m| m.updated_at.clone());
-
-    if !outgoing.is_empty() {
-        let body = serde_json::json!({
-            (field_names::SENDER_AGENT_ID): local_agent_id,
-            "sender_clock": { "entries": {} },
-            "memories": outgoing,
-            "dry_run": false,
-        });
-        // #2297 — serialise the body ONCE so the signature input matches the
-        // wire bytes the receiver sees. Sending via `.body(bytes)` + explicit
-        // content-type (rather than `.json(&body)`, which re-serialises)
-        // guarantees the signed bytes are byte-identical to what the receiver's
-        // `verify_signature_or_reject` reads — the same discipline the working
-        // /sync/push client uses (`src/federation/sync.rs`).
-        let body_bytes = serde_json::to_vec(&body)?;
-        // v0.7.0 #238 — attach `x-peer-id` so the receiver attests
-        // body.sender_agent_id against our wire-level peer identity.
-        let mut req = client
-            .post(format!("{peer_url}/api/v1/sync/push"))
-            .header(crate::HEADER_AGENT_ID, local_agent_id)
-            .header(
-                crate::federation::peer_attestation::PEER_ID_HEADER,
-                local_agent_id,
-            )
-            .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-            .body(body_bytes.clone());
-        if let Some(key) = api_key {
-            req = req.header(crate::HEADER_API_KEY, key);
-        }
-        // #2297 — sign the outbound /sync/push POST body with the daemon signing
-        // key (loaded from local_agent_id's on-disk keypair) so an ENROLLED peer
-        // accepts the push under the default AI_MEMORY_FED_REQUIRE_SIG=1 posture —
-        // the receiver's verify_signature_or_reject gate otherwise refuses an
-        // enrolled peer's unsigned POST with 401 x_memory_sig_missing. This is the
-        // PUSH sibling of the #2290/#2296 pull-side signing above: mirrors the
-        // working /sync/push client (`src/federation/sync.rs`) — signs
-        // `body_bytes || 0x00 || nonce` per the #922 nonce binding + attaches the
-        // X-Memory-Sig / X-Memory-Nonce headers. Unsigned when no key is on disk
-        // (preserves the permissive / unenrolled posture).
-        let push_signing_key = crate::governance::audit::load_daemon_signing_key(local_agent_id)
-            .ok()
-            .flatten();
-        if let Some(sk) = push_signing_key.as_ref() {
-            let nonce = uuid::Uuid::new_v4().to_string();
-            let sig_header =
-                crate::federation::signing::sign_body_with_nonce_header(sk, &body_bytes, &nonce);
-            req = req
-                .header(crate::federation::signing::SIGNATURE_HEADER, sig_header)
-                .header(crate::federation::signing::NONCE_HEADER, nonce);
-        }
-        let resp = req.send().await.map_err(|e| {
-            anyhow::anyhow!(
-                "sync-daemon: push {}",
-                crate::url_display::network_failure(&e)
-            )
-        })?;
-        if !resp.status().is_success() {
-            anyhow::bail!("sync-daemon: push status {}", resp.status());
-        }
-        if let Some(at) = latest_pushed {
-            let conn = db::open(db_path)?;
-            db::sync_state_record_push(&conn, local_agent_id, peer_key, &at)?;
-        }
-    }
+    // --- PUSH (#9996: cut to the peer's outbound scope) ---------------
+    let push_count = crate::federation::sync_daemon_push::push_window(
+        client,
+        db_path,
+        local_agent_id,
+        peer_url,
+        peer_key,
+        api_key,
+        batch_size,
+        outbound_scope,
+    )
+    .await?;
 
     tracing::info!("sync-daemon: peer={peer_key} pulled={pull_count} pushed={push_count}");
     Ok(())
@@ -9406,9 +9348,14 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     let local_agent_id_arc: Arc<str> = Arc::from(local_agent_id.as_str());
     let api_key_arc: Option<Arc<str>> = api_key.as_deref().map(Arc::from);
     let peers_arc: Vec<Arc<str>> = peers.iter().map(|s| Arc::from(s.as_str())).collect();
+    // #9996 — each peer's outbound scope (deny unless opened), one WARN per
+    // unscoped peer; a malformed value or unknown key refuses to start.
+    let scopes = crate::federation::outbound_scope::sync_daemon_scopes(&peers)
+        .context("sync-daemon outbound scope")?;
     loop {
         let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        for peer_url in &peers_arc {
+        for (peer_url, scope) in peers_arc.iter().zip(&scopes) {
+            let scope = Arc::clone(scope);
             let client = client.clone();
             let db_path = db_path_owned.clone();
             let local_agent_id = local_agent_id_arc.clone();
@@ -9422,6 +9369,7 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
                     &peer_url,
                     api_key.as_deref(),
                     batch_size,
+                    &scope,
                 )
                 .await
                 {

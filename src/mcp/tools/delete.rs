@@ -312,6 +312,7 @@ pub(super) fn handle_delete(
         crate::federation::erasure_outbox::enqueue_erasure(
             conn,
             &target.id,
+            &target.namespace,
             crate::federation::erasure_outbox::surfaces::MCP_DELETE,
         );
         if let Some(idx) = vector_index {

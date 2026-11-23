@@ -10134,7 +10134,49 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
 // HTTP mocking — the whole point is to exercise the network path.
 // ---------------------------------------------------------------------------
 
-/// Spawn a leader serve daemon with `--quorum-writes W --quorum-peers url…`.
+/// #9996 — the outbound scope a fan-out leader needs: every peer admits every
+/// namespace explicitly (`**`). Without it the leader sends nothing (deny by
+/// default), which is the contract, not what these fan-out tests exercise.
+fn all_namespaces_outbound_scope(peer_urls: &[String]) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = peer_urls
+        .iter()
+        .map(|u| {
+            (
+                u.clone(),
+                serde_json::json!({ "allowed_namespaces": ["**"] }),
+            )
+        })
+        .collect();
+    serde_json::Value::Object(map).to_string()
+}
+
+/// #9996 — an outbound scope that admits `patterns` for every peer in
+/// `peer_urls`.
+fn outbound_scope_json(peer_urls: &[String], patterns: &[&str]) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = peer_urls
+        .iter()
+        .map(|u| {
+            (
+                u.clone(),
+                serde_json::json!({ "allowed_namespaces": patterns }),
+            )
+        })
+        .collect();
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Spawn a leader serve daemon with `--quorum-writes W --quorum-peers url…`
+/// whose every peer admits every namespace (see [`spawn_leader_scoped`]).
+fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
+    spawn_leader_scoped(
+        quorum_writes,
+        peer_urls,
+        &all_namespaces_outbound_scope(peer_urls),
+    )
+}
+
+/// Spawn a leader serve daemon with `--quorum-writes W --quorum-peers url…`
+/// and the outbound scope `outbound_scope` (#9996).
 /// Extends `DaemonGuard` without modifying the existing helper.
 ///
 /// Retries up to 3 times on "leader never came up" — the only known
@@ -10143,7 +10185,11 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
 /// observation, 2026-05-13, v0.7.1-fold). Each retry gets a fresh
 /// port + DB path so a leaked listener from a stuck child can't
 /// chain-fail subsequent attempts.
-fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
+fn spawn_leader_scoped(
+    quorum_writes: usize,
+    peer_urls: &[String],
+    outbound_scope: &str,
+) -> DaemonGuard {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     let mut last_fail: Option<(u16, String, std::path::PathBuf)> = None;
     for attempt in 1..=3u8 {
@@ -10176,6 +10222,7 @@ fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
         let (stderr_file, stderr_log) = serve_stderr_log();
         let mut child = cmd(bin)
             .args(&args)
+            .env("AI_MEMORY_FED_PEER_OUTBOUND_SCOPE", outbound_scope)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(stderr_file))
             .spawn()
@@ -10392,6 +10439,183 @@ fn http_notify_fans_out_to_peers_so_target_inbox_sees_it() {
         found,
         "bob's inbox on peer never saw alice's notify within 10s"
     );
+}
+
+/// #9996 — rows of `namespace` in the SQLite db at `db` (0 while the db or
+/// its table does not exist yet).
+fn rows_in_namespace_9996(db: &std::path::Path, namespace: &str) -> i64 {
+    let Ok(conn) = rusqlite::Connection::open(db) else {
+        return 0;
+    };
+    conn.query_row(
+        "SELECT count(*) FROM memories WHERE namespace = ?1",
+        [namespace],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// #9996 — `sync_state` rows of `db` with a recorded push cursor.
+fn pushed_cursors_9996(db: &std::path::Path) -> i64 {
+    let Ok(conn) = rusqlite::Connection::open(db) else {
+        return 0;
+    };
+    conn.query_row(
+        "SELECT count(*) FROM sync_state WHERE last_pushed_at IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// #9996 — a sync-daemon over `db` pushing to `peer_url`, with the outbound
+/// scope `scope` (`None`: the variable is unset, so every peer is denied).
+fn spawn_sync_daemon_9996(db: &std::path::Path, peer_url: &str, scope: Option<&str>) -> ChildGuard {
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let mut c = cmd(bin);
+    c.args([
+        "--db",
+        db.to_str().unwrap(),
+        "--agent-id",
+        "peer-a-9996",
+        "sync-daemon",
+        "--peers",
+        peer_url,
+        "--interval",
+        "1",
+        "--ca-cert",
+        tls_cert(),
+    ]);
+    match scope {
+        Some(s) => c.env("AI_MEMORY_FED_PEER_OUTBOUND_SCOPE", s),
+        None => c.env_remove("AI_MEMORY_FED_PEER_OUTBOUND_SCOPE"),
+    };
+    let child = c
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    ChildGuard::new(child)
+}
+
+/// #9996 (vote V2-9996 C-4) — the quorum denominator is the peers the
+/// outbound scope admits. A W=2 leader whose only peer is outside the
+/// write's namespace answers 202 `quorum_met:false` with the typed reason
+/// `outbound_scope` (not `timeout`), and the peer receives no row.
+#[test]
+fn quorum_shortfall_names_outbound_scope_9996() {
+    let peer = DaemonGuard::spawn();
+    let peer_urls = vec![format!("https://127.0.0.1:{}", peer.port)];
+    let leader = spawn_leader_scoped(
+        2,
+        &peer_urls,
+        &outbound_scope_json(&peer_urls, &["c4-other-9996/**"]),
+    );
+    let (code, body) = curl_post(
+        leader.port,
+        "/api/v1/memories",
+        &serde_json::json!({
+            "tier": "long",
+            "namespace": "c4-scope-9996",
+            "title": "c4 out of scope",
+            "content": "the only peer may not receive this namespace",
+            "tags": [],
+            "priority": 5,
+            "confidence": 1.0,
+            "source": "api",
+            "metadata": {"scope": "collective"},
+        }),
+        Some("alice"),
+    );
+    // G12 contract: the local row committed, so the shortfall is a 202 with
+    // the replication state, never a 5xx — and never quorum-met.
+    assert_eq!(code, "202", "body: {body}");
+    assert_eq!(body["quorum_met"], false, "body: {body}");
+    assert_eq!(body["reason"], "outbound_scope", "body: {body}");
+    assert_ne!(body["reason"], "timeout", "body: {body}");
+    assert_eq!(body["needed"], 2, "body: {body}");
+    assert_eq!(body["acks"], 1, "body: {body}");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(rows_in_namespace_9996(&peer.db, "c4-scope-9996"), 0);
+}
+
+/// #9996 (vote V2-9996 C-7) — after a scope is granted or widened, catch-up
+/// delivers the in-scope memories written while the peer was denied or
+/// narrowed, with no manual replay. Two daemons: a sync-daemon over db A
+/// pushing to serve B. Run 1 denies B (nothing sent, no cursor); run 2
+/// narrows B to another namespace (nothing sent, the push cursor moves past
+/// the rows); run 3 widens B to the rows' namespace and B converges.
+#[test]
+fn sync_daemon_catchup_after_scope_grant_converges_9996() {
+    let bin = env!("CARGO_BIN_EXE_ai-memory");
+    let peer = DaemonGuard::spawn();
+    let peer_url = format!("https://127.0.0.1:{}", peer.port);
+    let db_a = integration_scratch_db("c7-9996-a");
+    let ns = "c7-scope-9996";
+    for title in ["c7 first", "c7 second"] {
+        let out = cmd(bin)
+            .args([
+                "--db",
+                db_a.to_str().unwrap(),
+                "--agent-id",
+                "peer-a-9996",
+                "--json",
+                "store",
+                "-t",
+                "long",
+                "-n",
+                ns,
+                "-T",
+                title,
+                "--content",
+                "written while the peer was denied",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "store failed: {out:?}");
+    }
+
+    // Run 1 — deny: the daemon cycles, B gets nothing, no push cursor.
+    let run = spawn_sync_daemon_9996(&db_a, &peer_url, None);
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    drop(run);
+    assert_eq!(rows_in_namespace_9996(&peer.db, ns), 0, "deny sent rows");
+    assert_eq!(pushed_cursors_9996(&db_a), 0, "deny moved the push cursor");
+
+    // Run 2 — narrowed to another namespace: nothing in scope, the cursor
+    // moves past the rows.
+    let narrowed = outbound_scope_json(std::slice::from_ref(&peer_url), &["c7-other-9996/**"]);
+    let run = spawn_sync_daemon_9996(&db_a, &peer_url, Some(&narrowed));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while pushed_cursors_9996(&db_a) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    drop(run);
+    assert_eq!(
+        pushed_cursors_9996(&db_a),
+        1,
+        "narrowed run never moved the cursor"
+    );
+    assert_eq!(
+        rows_in_namespace_9996(&peer.db, ns),
+        0,
+        "narrowed sent rows"
+    );
+
+    // Run 3 — widened to the rows' namespace: B converges with no replay.
+    let widened = outbound_scope_json(std::slice::from_ref(&peer_url), &["c7-scope-9996"]);
+    let run = spawn_sync_daemon_9996(&db_a, &peer_url, Some(&widened));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while rows_in_namespace_9996(&peer.db, ns) < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    drop(run);
+    assert_eq!(
+        rows_in_namespace_9996(&peer.db, ns),
+        2,
+        "widened scope never converged"
+    );
+    let _ = std::fs::remove_file(&db_a);
 }
 
 #[test]
@@ -11392,6 +11616,8 @@ fn federation_cfg_for_test(
             ai_memory::federation::PeerEndpoint {
                 id: format!("peer-{i}"),
                 sync_push_url: format!("{trimmed}/api/v1/sync/push"),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             }
         })
         .collect();
@@ -11696,6 +11922,10 @@ fn spawn_leader_with_timeout(
     let (stderr_file, stderr_log) = serve_stderr_log();
     let mut child = cmd(bin)
         .args(&args)
+        .env(
+            "AI_MEMORY_FED_PEER_OUTBOUND_SCOPE",
+            all_namespaces_outbound_scope(peer_urls),
+        )
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr_file))
         .spawn()

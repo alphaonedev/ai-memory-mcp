@@ -675,6 +675,7 @@ fn peer(id: &str, url: String) -> ai_memory::federation::PeerEndpoint {
     ai_memory::federation::PeerEndpoint {
         id: id.to_string(),
         sync_push_url: url,
+        outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     }
 }
 
@@ -694,9 +695,13 @@ async fn broadcast_archive_quorum_peer_ack_meets_quorum() {
     // is_quorum_met true (local + 1 peer == W=2) → loop break.
     let url = spawn_mock_peer("200 OK", "{}").await;
     let cfg = quorum_config_w2(vec![peer("peer-ack", url)]);
-    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(&cfg, "arch-ack")
-        .await
-        .expect("archive quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(
+        &cfg,
+        "arch-ack",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("archive quorum returns tracker");
     assert!(
         tracker.finalise(std::time::Instant::now()).is_ok(),
         "local + acking peer meet W=2 quorum"
@@ -707,9 +712,13 @@ async fn broadcast_archive_quorum_peer_ack_meets_quorum() {
 async fn broadcast_delete_quorum_peer_ack_meets_quorum() {
     let url = spawn_mock_peer("200 OK", "{}").await;
     let cfg = quorum_config_w2(vec![peer("peer-ack", url)]);
-    let tracker = ai_memory::federation::sync::broadcast_delete_quorum(&cfg, "del-ack")
-        .await
-        .expect("delete quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_delete_quorum(
+        &cfg,
+        "del-ack",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("delete quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 
@@ -718,9 +727,13 @@ async fn broadcast_link_quorum_peer_ack_meets_quorum() {
     let url = spawn_mock_peer("200 OK", "{}").await;
     let cfg = quorum_config_w2(vec![peer("peer-ack", url)]);
     let link = link("ga2-fed-src", "ga2-fed-tgt");
-    let tracker = ai_memory::federation::sync::broadcast_link_quorum(&cfg, &link)
-        .await
-        .expect("link quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_link_quorum(
+        &cfg,
+        &link,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("link quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 
@@ -745,9 +758,13 @@ async fn broadcast_quorum_peer_id_drift_does_not_meet_quorum() {
     // commit counted, finalise must fail QuorumNotMet.
     let url = spawn_mock_peer("200 OK", "{\"ids\":[\"a-different-id-entirely\"]}").await;
     let cfg = quorum_config_w2(vec![peer("peer-drift", url)]);
-    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(&cfg, "arch-drift")
-        .await
-        .expect("archive quorum returns tracker even on id-drift");
+    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(
+        &cfg,
+        "arch-drift",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("archive quorum returns tracker even on id-drift");
     let outcome = tracker.finalise(std::time::Instant::now());
     assert!(
         matches!(
@@ -763,9 +780,13 @@ async fn broadcast_link_quorum_peer_id_drift_arm() {
     let url = spawn_mock_peer("200 OK", "{\"ids\":[\"nope-not-this-link\"]}").await;
     let cfg = quorum_config_w2(vec![peer("peer-drift", url)]);
     let link = link("ga2-drift-src", "ga2-drift-tgt");
-    let tracker = ai_memory::federation::sync::broadcast_link_quorum(&cfg, &link)
-        .await
-        .expect("link quorum returns tracker on id-drift");
+    let tracker = ai_memory::federation::sync::broadcast_link_quorum(
+        &cfg,
+        &link,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("link quorum returns tracker on id-drift");
     assert!(
         matches!(
             tracker.finalise(std::time::Instant::now()),

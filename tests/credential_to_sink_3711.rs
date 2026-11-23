@@ -280,9 +280,17 @@ async fn sync_cycle_never_persists_or_logs_the_peer_credential_3675_3687_3710() 
     let sink = Capture::default();
     let err = {
         let _default = tracing::subscriber::set_default(capture_subscriber(&sink));
-        ai_memory::daemon_runtime::sync_cycle_once(&client, &db, "me-3711", &peer, None, 10)
-            .await
-            .expect_err("closed port: the cycle fails")
+        ai_memory::daemon_runtime::sync_cycle_once(
+            &client,
+            &db,
+            "me-3711",
+            &peer,
+            None,
+            10,
+            &ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
+        )
+        .await
+        .expect_err("closed port: the cycle fails")
     };
     let err_text = format!("{err:#}");
     // The path token is NOT a credential for a federation peer (it is the

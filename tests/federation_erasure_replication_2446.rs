@@ -343,6 +343,8 @@ fn build_cfg(
         peers: vec![PeerEndpoint {
             id: "peer-0".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client,
         sender_agent_id: "ai:erasure-2446".to_string(),

@@ -176,6 +176,8 @@ fn fed_cfg(
         .map(|(i, raw)| PeerEndpoint {
             id: format!("peer-{i}"),
             sync_push_url: format!("{}/api/v1/sync/push", raw.trim_end_matches('/')),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         })
         .collect();
     FederationConfig {

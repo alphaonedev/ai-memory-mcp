@@ -137,6 +137,8 @@ fn build_cfg(
             .map(|(id, url)| PeerEndpoint {
                 id: (*id).to_string(),
                 sync_push_url: format!("{url}/api/v1/sync/push"),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             })
             .collect(),
         client,
@@ -180,9 +182,13 @@ async fn peer_down_leaves_pending_delete_dlq_row_default_build_2717() {
     let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg(&[("peer-down", &peer_url)], sink.clone(), 2000, 500);
 
-    let tracker = broadcast_delete_quorum(&cfg, "del-2717-down")
-        .await
-        .expect("broadcast returns the tracker");
+    let tracker = broadcast_delete_quorum(
+        &cfg,
+        "del-2717-down",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
     assert!(
         !tracker.is_quorum_met(std::time::Instant::now()),
         "W=N=2 with the peer down cannot reach quorum"
@@ -227,9 +233,13 @@ async fn acking_peer_leaves_no_delete_dlq_row_default_build_2717() {
         1000,
     );
 
-    let _ = broadcast_delete_quorum(&cfg, "del-2717-mixed")
-        .await
-        .expect("broadcast returns the tracker");
+    let _ = broadcast_delete_quorum(
+        &cfg,
+        "del-2717-mixed",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("broadcast returns the tracker");
 
     let pending = sink.take_pending_dlq_rows(64).await.expect("take pending");
     assert_eq!(

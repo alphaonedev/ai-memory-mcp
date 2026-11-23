@@ -1234,10 +1234,16 @@ pub async fn delete_memory(
                 // #9005 / #9087 — the PG delete sends the deletion through
                 // the funnel before it returns (pre-fix it never did).
                 let deleted_id = target.as_ref().map_or(id.as_str(), |m| m.id.as_str());
+                // #9996 — the tombstone is admitted against the row's
+                // namespace; an unread row goes only to all-namespaces peers.
+                let delete_ns = target.as_ref().map_or_else(
+                    crate::federation::outbound_scope::ItemNamespaces::new,
+                    |m| crate::federation::outbound_scope::ItemNamespaces::of(&m.id, &m.namespace),
+                );
                 let mut receipt = json!({"deleted": true, "id": id, "archived": archived});
                 if let Err(resp) = super::fed_fanout::fanout_into(
                     &app,
-                    super::fed_fanout::FanoutEffect::Delete(deleted_id),
+                    super::fed_fanout::FanoutEffect::Delete(deleted_id, &delete_ns),
                     &mut receipt,
                 )
                 .await
@@ -1479,9 +1485,13 @@ pub async fn delete_memory(
             // #8741 — through the one funnel (pre-fix a broadcast `Err`
             // was a silent 200).
             let mut receipt = json!({"deleted": true, "archived": archived});
+            let delete_ns = crate::federation::outbound_scope::ItemNamespaces::of(
+                &target.id,
+                &target.namespace,
+            );
             if let Err(resp) = super::fed_fanout::fanout_into(
                 &app,
-                super::fed_fanout::FanoutEffect::Delete(&target.id),
+                super::fed_fanout::FanoutEffect::Delete(&target.id, &delete_ns),
                 &mut receipt,
             )
             .await

@@ -1209,24 +1209,33 @@ fn unreachable_peer() -> ai_memory::federation::PeerEndpoint {
         id: "peer-ga2-dead".to_string(),
         // 127.0.0.1:1 is reserved + unbound → connection refused fast.
         sync_push_url: "https://127.0.0.1:1/api/v1/sync/push".to_string(),
+        outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     }
 }
 
 #[tokio::test]
 async fn broadcast_archive_quorum_no_peers_ok() {
     let cfg = quorum_config(Vec::new());
-    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(&cfg, "arch-1")
-        .await
-        .expect("archive quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(
+        &cfg,
+        "arch-1",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("archive quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 
 #[tokio::test]
 async fn broadcast_delete_quorum_no_peers_ok() {
     let cfg = quorum_config(Vec::new());
-    let tracker = ai_memory::federation::sync::broadcast_delete_quorum(&cfg, "del-1")
-        .await
-        .expect("delete quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_delete_quorum(
+        &cfg,
+        "del-1",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("delete quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 
@@ -1234,9 +1243,13 @@ async fn broadcast_delete_quorum_no_peers_ok() {
 async fn broadcast_link_quorum_no_peers_ok() {
     let cfg = quorum_config(Vec::new());
     let link = ga2_link();
-    let tracker = ai_memory::federation::sync::broadcast_link_quorum(&cfg, &link)
-        .await
-        .expect("link quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_link_quorum(
+        &cfg,
+        &link,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("link quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 
@@ -1260,17 +1273,25 @@ async fn broadcast_quorum_with_unreachable_peer_exercises_fanout_fail_arm() {
     // drain `if !joins.is_empty()`. All four broadcast functions share
     // this loop shape; archive exercises it here.
     let cfg = quorum_config(vec![unreachable_peer()]);
-    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(&cfg, "arch-fanout")
-        .await
-        .expect("archive quorum with dead peer still returns Ok at W=1");
+    let tracker = ai_memory::federation::sync::broadcast_archive_quorum(
+        &cfg,
+        "arch-fanout",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("archive quorum with dead peer still returns Ok at W=1");
     // Only the local commit ack; no peer ack.
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 
     let cfg2 = quorum_config(vec![unreachable_peer()]);
     let link = ga2_link();
-    let t2 = ai_memory::federation::sync::broadcast_link_quorum(&cfg2, &link)
-        .await
-        .expect("link quorum with dead peer still returns Ok at W=1");
+    let t2 = ai_memory::federation::sync::broadcast_link_quorum(
+        &cfg2,
+        &link,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("link quorum with dead peer still returns Ok at W=1");
     assert!(t2.finalise(std::time::Instant::now()).is_ok());
 }
 

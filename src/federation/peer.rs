@@ -123,7 +123,7 @@ const STABLE_PEER_ID_HASH_NIBBLES: usize = 32;
 /// Deliberately NOT used to build `sync_push_url`: lowercasing is safe for
 /// scheme+host comparison but would corrupt a case-sensitive path.
 #[must_use]
-fn normalize_peer_url(raw: &str) -> String {
+pub(crate) fn normalize_peer_url(raw: &str) -> String {
     raw.trim_end_matches('/').to_ascii_lowercase()
 }
 
@@ -162,7 +162,7 @@ fn normalize_peer_url(raw: &str) -> String {
 /// collidable in milliseconds by anyone who can propose a peer URL, which
 /// disqualifies it for a routing key regardless of its speed.
 #[must_use]
-fn stable_peer_id(raw: &str) -> String {
+pub(crate) fn stable_peer_id(raw: &str) -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     hasher.update(PEER_ID_DERIVATION_DOMAIN);
@@ -378,6 +378,9 @@ impl FederationConfig {
                 PeerEndpoint {
                     id,
                     sync_push_url: format!("{trimmed}/api/v1/sync/push"),
+                    // #9996: deny by default; only the operator's
+                    // outbound scope opens a peer.
+                    outbound_scope: super::outbound_scope::PeerOutboundScope::Deny,
                 }
             })
             .collect();

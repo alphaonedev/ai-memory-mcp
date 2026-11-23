@@ -351,6 +351,11 @@ fn certified_pg_config_reaches_all_pass() {
                 ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
                 r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
             ),
+            // #9996 check #23 — a narrowed outbound scope for the one peer.
+            (
+                ai_memory::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
+                r#"{"https://peer-1.example.org:9077":{"allowed_namespaces":["public/*"]}}"#,
+            ),
             (ai_memory::store_url::STORE_URL_ENV, PG_DSN_VERIFY_FULL),
             (PG_AT_REST_ENV, "1"),
             (ai_memory::config::ENV_APPEND_ONLY, "1"),

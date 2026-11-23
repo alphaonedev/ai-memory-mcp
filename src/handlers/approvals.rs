@@ -816,6 +816,11 @@ pub async fn approval_decide(
     };
     drop(lock);
 
+    // #9996 — the decision is admitted against the pending action's namespace.
+    let pending_ns = pending_snapshot
+        .as_ref()
+        .map(|p| p.namespace.clone())
+        .unwrap_or_default();
     publish_decision_event(
         &id,
         &agent_id,
@@ -823,7 +828,7 @@ pub async fn approval_decide(
         body.remember,
         pending_snapshot,
     );
-    deliver_decision(&app, &id, &agent_id, decided, outcome).await
+    deliver_decision(&app, &id, &agent_id, &pending_ns, decided, outcome).await
 }
 
 /// #8741 (#9152) — the K10 decide route finalises the same decision as
@@ -836,6 +841,7 @@ async fn deliver_decision(
     app: &AppState,
     id: &str,
     agent_id: &str,
+    namespace: &str,
     decided: Option<(bool, Produced)>,
     mut outcome: serde_json::Value,
 ) -> axum::response::Response {
@@ -846,7 +852,8 @@ async fn deliver_decision(
             decider: agent_id.to_string(),
         };
         if let Err(resp) =
-            super::fed_fanout::fanout_decision(app, &decision, &produced, &mut outcome).await
+            super::fed_fanout::fanout_decision(app, &decision, namespace, &produced, &mut outcome)
+                .await
         {
             return resp;
         }
@@ -1008,8 +1015,12 @@ async fn approval_decide_postgres(
             }
         }
     };
+    let pending_ns = pending_snapshot
+        .as_ref()
+        .map(|p| p.namespace.clone())
+        .unwrap_or_default();
     publish_decision_event(id, agent_id, body.decision, body.remember, pending_snapshot);
-    deliver_decision(app, id, agent_id, decided, outcome).await
+    deliver_decision(app, id, agent_id, &pending_ns, decided, outcome).await
 }
 
 /// Shared post-decision fan-out for both storage-backend branches of

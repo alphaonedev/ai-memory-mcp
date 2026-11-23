@@ -244,6 +244,7 @@ fn peer(id: &str, url: String) -> ai_memory::federation::PeerEndpoint {
     ai_memory::federation::PeerEndpoint {
         id: id.to_string(),
         sync_push_url: url,
+        outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
     }
 }
 
@@ -325,9 +326,13 @@ async fn broadcast_store_partial_quorum_warns_when_one_of_two_peers_silent() {
 async fn broadcast_restore_quorum_peer_ack_meets_quorum() {
     let url = spawn_mock_peer("200 OK", "{}").await;
     let cfg = quorum_config_w2(vec![peer("peer-restore-ack", url)]);
-    let tracker = ai_memory::federation::sync::broadcast_restore_quorum(&cfg, "restore-ack")
-        .await
-        .expect("restore quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_restore_quorum(
+        &cfg,
+        "restore-ack",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("restore quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 
@@ -335,9 +340,13 @@ async fn broadcast_restore_quorum_peer_ack_meets_quorum() {
 async fn broadcast_restore_quorum_id_drift_does_not_meet_quorum() {
     let url = spawn_mock_peer("200 OK", "{\"ids\":[\"some-other-id\"]}").await;
     let cfg = quorum_config_w2(vec![peer("peer-restore-drift", url)]);
-    let tracker = ai_memory::federation::sync::broadcast_restore_quorum(&cfg, "restore-drift")
-        .await
-        .expect("restore quorum returns tracker on id-drift");
+    let tracker = ai_memory::federation::sync::broadcast_restore_quorum(
+        &cfg,
+        "restore-drift",
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("restore quorum returns tracker on id-drift");
     assert!(matches!(
         tracker.finalise(std::time::Instant::now()),
         Err(ai_memory::replication::QuorumError::QuorumNotMet { .. })
@@ -398,9 +407,13 @@ async fn broadcast_pending_decision_quorum_peer_ack_meets_quorum() {
         approved: true,
         decider: "ai:ga2-r4-sender".to_string(),
     };
-    let tracker = ai_memory::federation::sync::broadcast_pending_decision_quorum(&cfg, &decision)
-        .await
-        .expect("pending-decision quorum returns tracker");
+    let tracker = ai_memory::federation::sync::broadcast_pending_decision_quorum(
+        &cfg,
+        &decision,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("pending-decision quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 
@@ -415,9 +428,13 @@ async fn broadcast_pending_decision_quorum_peer_fail_does_not_meet_quorum() {
         approved: false,
         decider: "ai:ga2-r4-sender".to_string(),
     };
-    let tracker = ai_memory::federation::sync::broadcast_pending_decision_quorum(&cfg, &decision)
-        .await
-        .expect("pending-decision quorum returns tracker even when peer 500s");
+    let tracker = ai_memory::federation::sync::broadcast_pending_decision_quorum(
+        &cfg,
+        &decision,
+        &ai_memory::federation::outbound_scope::ItemNamespaces::new(),
+    )
+    .await
+    .expect("pending-decision quorum returns tracker even when peer 500s");
     assert!(matches!(
         tracker.finalise(std::time::Instant::now()),
         Err(ai_memory::replication::QuorumError::QuorumNotMet { .. })

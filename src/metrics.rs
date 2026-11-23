@@ -258,6 +258,17 @@ pub struct Metrics {
     /// classifier maps the free-text `last_error` to one of the six
     /// values), never the raw string.
     pub federation_push_dlq_quarantined_by_cause: IntCounterVec,
+    /// #9996 — outbound pushes the sender did not send because the
+    /// peer's outbound namespace scope (`AI_MEMORY_FED_PEER_OUTBOUND_SCOPE`)
+    /// admitted no item of the body. Permanent by construction: no
+    /// queue row is written for these.
+    pub federation_outbound_scope_refused: IntCounter,
+    /// #9996 (vote V2-9996 C-6) — items the sender filtered out of a push
+    /// or a served `/sync/since` page, labeled by the stable peer id and
+    /// the item namespace. The series set is capped
+    /// (`outbound_scope::MAX_FILTERED_SERIES`); past the cap the namespace
+    /// label is `outbound_scope::FILTERED_OVERFLOW_LABEL`.
+    pub federation_outbound_scope_filtered: IntCounterVec,
     /// v1.0.0 #3124 — caller-scoped mutations ADMITTED on an UNSTAMPED
     /// (legacy-unowned) row under `AI_MEMORY_UNSTAMPED_MUTATION=warn`,
     /// labeled by `backend` (`sqlite`|`postgres`) and `funnel` (the closed
@@ -1044,6 +1055,31 @@ impl Metrics {
             &mut err,
         );
 
+        // #9996 (C-6) — per-peer, per-namespace sender-side filter counter.
+        let federation_outbound_scope_filtered = int_counter_vec(
+            &registry,
+            "ai_memory_federation_outbound_scope_filtered_total",
+            "Monotonic counter of federation items the sender did not send \
+             to a peer because the item's namespace is outside that peer's \
+             outbound namespace scope, labeled by stable peer id and \
+             namespace (series capped; overflow namespace label \
+             _overflow).",
+            &["peer_id", "namespace"],
+            &mut err,
+        );
+
+        // #9996 — outbound scope refusals (never queued).
+        let federation_outbound_scope_refused = int_counter(
+            &registry,
+            "ai_memory_federation_outbound_scope_refused_total",
+            "Monotonic counter of federation pushes not sent to a peer \
+             because the peer's outbound namespace scope admitted no item \
+             of the push (or the peer has no outbound scope). Nothing is \
+             sent; a replayed DLQ row refused this way is quarantined with \
+             cause outbound_scope, never deleted.",
+            &mut err,
+        );
+
         // #1032 (HIGH, 2026-05-21) — federation push DLQ quarantine counter.
         let federation_push_dlq_quarantined = int_counter(
             &registry,
@@ -1593,6 +1629,8 @@ impl Metrics {
             deferred_audit_drainer_terminal_state,
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
+            federation_outbound_scope_refused,
+            federation_outbound_scope_filtered,
             unstamped_mutation_allowed_total,
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,

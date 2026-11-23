@@ -114,6 +114,8 @@ fn build_cfg(peer_url: &str, sink: Arc<dyn FederationDlqSink>) -> FederationConf
         peers: vec![PeerEndpoint {
             id: "peer-dlq-2672".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client,
         sender_agent_id: "ai:dlq-class-2672".to_string(),

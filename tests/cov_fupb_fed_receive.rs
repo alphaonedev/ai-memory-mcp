@@ -116,6 +116,8 @@ fn build_cfg(peer_url: &str) -> FederationConfig {
         peers: vec![PeerEndpoint {
             id: "peer-cov".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
+            outbound_scope: ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(
+            ),
         }],
         client,
         sender_agent_id: "ai:fed-receive-cov".to_string(),
@@ -190,10 +192,14 @@ async fn catchup_visits_every_peer_despite_one_failing() {
             PeerEndpoint {
                 id: "peer-dead".to_string(),
                 sync_push_url: format!("http://{dead_addr}/api/v1/sync/push"),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             },
             PeerEndpoint {
                 id: "peer-good".to_string(),
                 sync_push_url: format!("{good_url}/api/v1/sync/push"),
+                outbound_scope:
+                    ai_memory::federation::outbound_scope::PeerOutboundScope::all_explicit(),
             },
         ],
         client,

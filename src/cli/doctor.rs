@@ -1626,6 +1626,21 @@ fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report)
             .iter()
             .map(|e| ("observation_error".into(), e.clone())),
     );
+    // #9996 (vote V2-9996 C-5/C-6) — one row per configured peer's outbound
+    // scope and per filtered series; an unscoped peer fails under every posture.
+    let (scope_facts, alarm) = crate::federation::outbound_scope::doctor_facts(
+        &report.outbound_scope,
+        &report.outbound_scope_filtered,
+    );
+    facts.extend(scope_facts);
+    let severity = match alarm {
+        crate::federation::outbound_scope::ScopeAlarm::Unscoped => Severity::Critical,
+        crate::federation::outbound_scope::ScopeAlarm::AllNamespaces => {
+            severity_max(severity, Severity::Warning)
+        }
+        crate::federation::outbound_scope::ScopeAlarm::Clear => severity,
+    };
+    let scope_note = crate::federation::outbound_scope::doctor_note(alarm);
     let note = match report.verdict {
         Verdict::Refused | Verdict::Warning => Some(
             "#3582: peer authorization needs attention or shared key enrollment is present/unobservable. \
@@ -1641,6 +1656,10 @@ fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report)
                 .into(),
         ),
         Verdict::Allowed | Verdict::NoPeersObserved => None,
+    };
+    let note = match (note, scope_note) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
     };
     ReportSection {
         name: "Federation peer authorization".into(),

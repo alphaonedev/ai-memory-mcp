@@ -99,6 +99,7 @@ mod synchronous;
 
 /// #3199 — the backup-manifest-signing posture row (check #22) and its test.
 mod backup_signing;
+mod outbound_scope; // #9996 — the outbound scope posture row (check #23) and its test.
 
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
@@ -140,7 +141,8 @@ pub const ENV_PG_AT_REST_ATTESTED: &str = "AI_MEMORY_PG_AT_REST_ATTESTED";
 /// `synchronous=FULL` attestation, and until this row nothing in the report
 /// NAMED the level or the durability class it buys). #3199 raised it
 /// 21 → 22 (check #22: backup manifests verify against the operator key).
-pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 22;
+/// #9996 raised it 22 → 23 (check #23: every peer has a narrowed outbound scope).
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 23;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -796,6 +798,8 @@ pub fn evaluate_with_live(
 
     // ---- 22. backup manifest signing (#3199; N/A on postgres) ----------
     out.push(backup_signing::check_backup_signing(backend_is_postgres));
+    // ---- 23. federation outbound scope (#9996) -------------------------
+    out.push(outbound_scope::check_outbound_scope());
 
     debug_assert_eq!(
         out.len(),
@@ -908,6 +912,7 @@ mod tests {
         // deterministic regardless of a stray ambient store URL.
         crate::store_url::STORE_URL_ENV,
         crate::store_url::STORE_URL_FILE_ENV,
+        crate::federation::outbound_scope::OUTBOUND_SCOPE_ENV, // #9996 check #23
         ENV_PG_AT_REST_ATTESTED,
     ];
 
@@ -995,6 +1000,7 @@ mod tests {
                 r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
             );
             std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "1");
+            outbound_scope::tests::set_narrowed_scope_env(); // #9996 check #23
             // #2911 check #17 — unlike the default-ON `AI_MEMORY_FED_REQUIRE_*`
             // knobs below, the boot-refusal env defaults OFF. Unset is now
             // a FAIL (doctor must not PASS a process whose daemon would

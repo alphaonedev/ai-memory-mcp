@@ -1698,7 +1698,17 @@ pub async fn import_memories(
                 }
             }
         }
-        effects.extend(linked.into_iter().map(super::fed_fanout::OwnedEffect::Link));
+        // #9996 — each imported link carries both endpoint namespaces.
+        for link in linked {
+            let ns = super::fed_fanout::link_namespaces_store(
+                &app,
+                &ctx,
+                &link.source_id,
+                &link.target_id,
+            )
+            .await;
+            effects.push(super::fed_fanout::OwnedEffect::Link(link, ns));
+        }
         let receipt = json!({
             "imported": imported,
             "errors": errors,
@@ -1907,8 +1917,14 @@ pub async fn import_memories(
             None => unread.push(stored_id.clone()),
         }
     }
+    // #9996 — each imported link carries both endpoint namespaces, read
+    // under the lock.
+    for link in linked {
+        let ns =
+            super::fed_fanout::link_namespaces_sqlite(&lock.0, &link.source_id, &link.target_id);
+        effects.push(super::fed_fanout::OwnedEffect::Link(link, ns));
+    }
     drop(lock);
-    effects.extend(linked.into_iter().map(super::fed_fanout::OwnedEffect::Link));
     // #3456 — the sqlite envelope now carries `pending`, so an `Approve`
     // namespace standard is EXPRESSIBLE on this backend: pre-fix a caller had
     // no way to learn a row was parked awaiting consensus, because the sqlite

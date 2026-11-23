@@ -59,9 +59,18 @@ pub enum Verdict {
     Unobservable,
 }
 
-/// Public, content-free boot facts. Contains no peer IDs, paths or key material.
+/// Public, content-free boot facts. Contains no peer URLs, paths or key
+/// material; a peer appears only as its stable hashed id (#9996), the same
+/// id the operator names in `AI_MEMORY_FED_PEER_OUTBOUND_SCOPE`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Report {
+    /// #9996 (vote V2-9996 C-5) — each configured peer's outbound scope
+    /// class, recorded at boot. Empty when this process configured no peer.
+    #[serde(default)]
+    pub outbound_scope: Vec<super::outbound_scope::PeerScopeRow>,
+    /// #9996 (C-6) — items left out per `(peer, namespace)` since boot.
+    #[serde(default)]
+    pub outbound_scope_filtered: Vec<super::outbound_scope::FilteredSeries>,
     pub security_posture: String,
     pub outbound_peers: Observation,
     pub inbound_bindings: Observation,
@@ -121,6 +130,8 @@ pub fn evaluate(
         Verdict::NoPeersObserved
     };
     Report {
+        outbound_scope: Vec::new(),
+        outbound_scope_filtered: Vec::new(),
         security_posture: posture.as_str().into(),
         outbound_peers,
         inbound_bindings,
@@ -245,10 +256,14 @@ static BOOT_REPORT: RwLock<Option<Report>> = RwLock::new(None);
 
 #[must_use]
 pub fn boot_report() -> Option<Report> {
-    BOOT_REPORT
+    let mut report = BOOT_REPORT
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()
+        .clone()?;
+    // #9996 — the scope rows and filtered counts are live, read at call time.
+    report.outbound_scope = super::outbound_scope::boot_scope_rows().unwrap_or_default();
+    report.outbound_scope_filtered = super::outbound_scope::filtered_series();
+    Some(report)
 }
 
 /// Refuse asi-hard before starting workers or opening a database. Standard
