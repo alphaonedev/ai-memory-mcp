@@ -1640,6 +1640,20 @@ fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report)
         }
         crate::federation::outbound_scope::ScopeAlarm::Clear => severity,
     };
+    // #9996 (review #10026 C-F3) — one row per peer whose push-DLQ enqueues
+    // the per-peer cap refused; any refusal warns (the write reaches that peer
+    // only through its `/sync/since` catch-up).
+    facts.extend(report.push_dlq_cap_refused.iter().map(|r| {
+        (
+            format!("push_dlq_cap_refused.{}", r.peer_id),
+            r.count.to_string(),
+        )
+    }));
+    let severity = if report.push_dlq_cap_refused.is_empty() {
+        severity
+    } else {
+        severity_max(severity, Severity::Warning)
+    };
     let scope_note = crate::federation::outbound_scope::doctor_note(alarm);
     let note = match report.verdict {
         Verdict::Refused | Verdict::Warning => Some(
@@ -5568,6 +5582,43 @@ mod tests {
     use crate::cli::CliOutput;
     use crate::cli::test_utils::{TestEnv, materialize_empty_schema, seed_memory};
     use rusqlite::params;
+
+    /// #9996 (review #10026 C-F3): a push-DLQ cap refusal is a doctor row
+    /// per peer and raises the section to Warning; no refusal adds no row.
+    #[test]
+    fn push_dlq_cap_refusals_are_rows_and_warn_9996() {
+        use crate::federation::peer_posture::{Allowlist, Observation, evaluate};
+        let mut report = evaluate(
+            crate::security_profile::SecurityPosture::Standard,
+            Observation::Absent,
+            Observation::Absent,
+            Observation::Absent,
+            Observation::Absent,
+            Allowlist::Configured,
+        );
+        let clear = section_peer_allowlist_3582(&report);
+        assert_eq!(clear.severity, Severity::Info);
+        assert!(
+            !clear
+                .facts
+                .iter()
+                .any(|(k, _)| k.starts_with("push_dlq_cap_refused."))
+        );
+        report.push_dlq_cap_refused = vec![crate::federation::push_dlq_cap::CapRefusals {
+            peer_id: "peer-cap-9996".into(),
+            count: 3,
+        }];
+        let refused = section_peer_allowlist_3582(&report);
+        assert_eq!(refused.severity, Severity::Warning);
+        assert!(
+            refused
+                .facts
+                .iter()
+                .any(|(k, v)| k == "push_dlq_cap_refused.peer-cap-9996" && v == "3"),
+            "{:?}",
+            refused.facts
+        );
+    }
 
     // -------------------------------------------------------------------
     // Severity / Report helpers (pure, no DB)

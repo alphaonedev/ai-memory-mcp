@@ -71,6 +71,10 @@ pub struct Report {
     /// #9996 (C-6) — items left out per `(peer, namespace)` since boot.
     #[serde(default)]
     pub outbound_scope_filtered: Vec<super::outbound_scope::FilteredSeries>,
+    /// #9996 (review #10026 C-F3) — push-DLQ enqueues refused by the
+    /// per-peer cap since boot, per stable peer id.
+    #[serde(default)]
+    pub push_dlq_cap_refused: Vec<super::push_dlq_cap::CapRefusals>,
     pub security_posture: String,
     pub outbound_peers: Observation,
     pub inbound_bindings: Observation,
@@ -132,6 +136,7 @@ pub fn evaluate(
     Report {
         outbound_scope: Vec::new(),
         outbound_scope_filtered: Vec::new(),
+        push_dlq_cap_refused: Vec::new(),
         security_posture: posture.as_str().into(),
         outbound_peers,
         inbound_bindings,
@@ -263,6 +268,7 @@ pub fn boot_report() -> Option<Report> {
     // #9996 — the scope rows and filtered counts are live, read at call time.
     report.outbound_scope = super::outbound_scope::boot_scope_rows().unwrap_or_default();
     report.outbound_scope_filtered = super::outbound_scope::filtered_series();
+    report.push_dlq_cap_refused = super::push_dlq_cap::cap_refusals();
     Some(report)
 }
 

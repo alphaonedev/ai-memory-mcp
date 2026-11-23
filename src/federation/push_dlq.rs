@@ -458,12 +458,16 @@ pub fn replay_max_batch() -> usize {
 /// systematic-rejection footguns quickly.
 pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
 
-/// #9996 — the most pending rows one peer may hold. An enqueue for a NEW
-/// `(memory_id, peer_id)` pair past this bound is refused with
-/// [`REASON_DLQ_PEER_CAP`]; a refresh of an existing pending row still
-/// lands. Nothing is deleted: the refused write stays reachable through the
-/// peer's `/sync/since` catch-up. Concurrent enqueues on Postgres can pass
-/// the bound by at most the number of writers in flight.
+/// #9996 — the most pending rows one peer may hold. An enqueue of a
+/// non-delete payload for a NEW `(memory_id, peer_id)` pair past this bound
+/// is refused with [`REASON_DLQ_PEER_CAP`] and counted per peer in
+/// [`super::push_dlq_cap`] (review #10026 C-F3); a refresh of an existing
+/// pending row still lands. Nothing is deleted: the refused write stays
+/// reachable through the peer's `/sync/since` catch-up. A deletion-class
+/// payload (a non-empty `deletions` array) is exempt: a deletion is not
+/// recoverable through catch-up, and its rows are bounded by the corpus
+/// size. Concurrent enqueues on Postgres can pass the bound by at most the
+/// number of writers in flight.
 pub const MAX_PENDING_DLQ_ROWS_PER_PEER: i64 = 50_000;
 
 /// #9996 — the error text of an enqueue refused by
@@ -1427,8 +1431,9 @@ impl FederationDlqSink for SqliteDlqSink {
         // must not coalesce onto the stale first-failure snapshot); the
         // receiver-side LWW `insert_if_newer` makes replaying newer
         // content safe. Partial unique index from the v48 migration
-        // backs this conflict target. #9996: a NEW pair past the per-peer
-        // bound inserts nothing (n == 0) and is refused.
+        // backs this conflict target. #9996: a NEW non-delete pair past the
+        // per-peer bound inserts nothing (n == 0), is refused and counted
+        // (review #10026 C-F3); a deletion (`?7`) is exempt.
         let n = conn
             .execute(
                 "INSERT INTO federation_push_dlq \
@@ -1438,6 +1443,7 @@ impl FederationDlqSink for SqliteDlqSink {
                         WHERE peer_id = ?2 AND replayed_at IS NULL) < ?6 \
                     OR EXISTS (SELECT 1 FROM federation_push_dlq \
                         WHERE memory_id = ?1 AND peer_id = ?2 AND replayed_at IS NULL) \
+                    OR ?7 \
                  ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS NULL \
                  DO UPDATE SET \
                    attempt_count = attempt_count + 1, \
@@ -1450,11 +1456,13 @@ impl FederationDlqSink for SqliteDlqSink {
                     payload_str,
                     last_error,
                     now,
-                    MAX_PENDING_DLQ_ROWS_PER_PEER
+                    MAX_PENDING_DLQ_ROWS_PER_PEER,
+                    payload_is_delete(payload_json)
                 ],
             )
             .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
         if n == 0 {
+            super::push_dlq_cap::record_cap_refusal(peer_id);
             return Err(format!(
                 "{REASON_DLQ_PEER_CAP} ({MAX_PENDING_DLQ_ROWS_PER_PEER})"
             ));
@@ -1814,7 +1822,8 @@ impl FederationDlqSink for PostgresDlqSink {
         // never coalesces onto the stale first-failure body. `failed_at`
         // has a `DEFAULT now()` (see migrations/postgres/0030_*), so
         // `EXCLUDED.failed_at` is the fresh insert-time instant. #9996: a NEW
-        // pair past the per-peer bound inserts nothing and is refused.
+        // non-delete pair past the per-peer bound inserts nothing, is
+        // refused and counted (review #10026 C-F3); a deletion is exempt.
         let done = sqlx::query(
             "INSERT INTO federation_push_dlq \
              (memory_id, peer_id, payload_json, attempt_count, last_error) \
@@ -1823,6 +1832,7 @@ impl FederationDlqSink for PostgresDlqSink {
                     WHERE peer_id = $2 AND replayed_at IS NULL) < $5 \
                 OR EXISTS (SELECT 1 FROM federation_push_dlq \
                     WHERE memory_id = $1 AND peer_id = $2 AND replayed_at IS NULL) \
+                OR $6 \
              ON CONFLICT (memory_id, peer_id) WHERE replayed_at IS NULL \
              DO UPDATE SET \
                attempt_count = federation_push_dlq.attempt_count + 1, \
@@ -1835,10 +1845,12 @@ impl FederationDlqSink for PostgresDlqSink {
         .bind(payload_json.to_string())
         .bind(last_error)
         .bind(MAX_PENDING_DLQ_ROWS_PER_PEER)
+        .bind(payload_is_delete(payload_json))
         .execute(pool)
         .await
         .map_err(|e| format!("postgres enqueue_push_failure: {e}"))?;
         if done.rows_affected() == 0 {
+            super::push_dlq_cap::record_cap_refusal(peer_id);
             return Err(format!(
                 "{REASON_DLQ_PEER_CAP} ({MAX_PENDING_DLQ_ROWS_PER_PEER})"
             ));
