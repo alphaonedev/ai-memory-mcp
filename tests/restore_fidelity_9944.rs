@@ -340,16 +340,12 @@ impl RestorePath {
     fn seed_shape(self) -> SeedShape {
         match self {
             Self::BackupRestore => SeedShape::FULL,
-            // #10027: import refuses an enrolled lineage as forged.
-            // #10032: the full pair unseals a sealed row.
-            Self::ExportFullImport => SeedShape {
-                lineage: Lineage::Absent,
-                sealed: Sealed::Absent,
-            },
-            // #10028: the convenience pair unseals a sealed row. The
-            // convenience format carries no lineage, and an imported
-            // `_agents` key binding is stripped by design (#3464).
-            Self::ExportImport => SeedShape {
+            // ExportFullImport: #10027 (import refuses an enrolled lineage as
+            // forged) and #10032 (the full pair unseals a sealed row).
+            // ExportImport: #10028 (the convenience pair unseals a sealed
+            // row); the convenience format carries no lineage, and an
+            // imported `_agents` key binding is stripped by design (#3464).
+            Self::ExportFullImport | Self::ExportImport => SeedShape {
                 lineage: Lineage::Absent,
                 sealed: Sealed::Absent,
             },

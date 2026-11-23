@@ -200,7 +200,7 @@ const MAIN_CELL_SEALED: Sealed = Sealed::Absent;
 /// columns, so the admin page never carries them (#10034). The dedicated red
 /// cell `pg_router_export_keeps_every_atomisation_column_10034` checks them.
 const ATOM_COLUMNS_DROPPED: &str = "the admin export page has no field for this memories column, so the import lands NULL (#10034)";
-/// The admin import re-creates each edge through link(), which does not write
+/// The admin import re-creates each edge through `link()`, which does not write
 /// the carried endpoint cid mirrors (#10035). The dedicated red cell
 /// `pg_router_export_keeps_every_link_cid_mirror_10035` checks them.
 const LINK_CID_DROPPED: &str =
@@ -731,8 +731,12 @@ fn assert_corpus_is_rich(s: &StoreSnapshot) {
 
 // ── the export → import path ────────────────────────────────────────────────
 
-/// Walk the admin export exactly as the handler does, then land every row and
-/// edge through the import lane's trait calls.
+/// The SAL-adapter cell: page through the `PostgresStore` export methods the
+/// admin handler calls (`export_memories_page`, `export_links_page`), then
+/// land every row and edge through the adapter's `store()` / `link()`. It
+/// proves the postgres adapter pair; the shipped handlers themselves are
+/// proven by `pg_router_export_then_import_reproduces_memories_and_links_9944`
+/// (S3 / C3, #10016), which a handler mutant turns red.
 async fn export_import(src: &PostgresStore, dst: &PostgresStore) {
     let as_of = chrono::Utc::now();
     let mut cursor = None;
@@ -931,13 +935,11 @@ async fn router_export_import(src: &PostgresStore, dst: &PostgresStore) {
                 .unwrap_or_else(|| panic!("export {uri}: no {key} array: {page}"));
             sink.extend(rows.iter().cloned());
         }
-        match page["next_cursor"].as_str() {
-            Some(c) => uri = format!("{first}&cursor={c}"),
-            None => {
-                finished = true;
-                break;
-            }
-        }
+        let Some(c) = page["next_cursor"].as_str() else {
+            finished = true;
+            break;
+        };
+        uri = format!("{first}&cursor={c}");
     }
     assert!(
         finished,

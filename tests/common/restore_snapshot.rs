@@ -26,6 +26,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 /// The fewest source rows an `Exact` table may hold (#10014): one row cannot
 /// tell "every row carried" from "the first row carried".
@@ -93,7 +94,10 @@ impl SqlValue {
                 ),
             },
             Self::Blob(bytes) => {
-                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for b in bytes {
+                    let _ = write!(hex, "{b:02x}");
+                }
                 format!("BLOB x'{hex}'")
             }
             Self::Bool(b) => format!("BOOLEAN {b}"),
@@ -112,7 +116,7 @@ pub struct TableSnapshot {
 }
 
 /// One schema object (#10017): on SQLite one `sqlite_master` row (type, name,
-/// tbl_name, sql); on PostgreSQL one table, column or index definition.
+/// `tbl_name`, sql); on PostgreSQL one table, column or index definition.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SchemaObject {
     pub kind: String,
@@ -557,7 +561,7 @@ fn describe_row_diff(table: &str, src: &[Row], dst: &[Row]) -> String {
         for row in extra.iter().take(DIFF_ROWS_SHOWN) {
             out.push_str("\n      extra restored row:");
             for (c, v) in *row {
-                out.push_str(&format!(" {c}={}", quote(Some(v))));
+                let _ = write!(out, " {c}={}", quote(Some(v)));
             }
         }
     }
