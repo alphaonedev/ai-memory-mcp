@@ -284,6 +284,19 @@ TOKEN_RE = re.compile(
     r"|(?<![0-9A-Za-z_.])\d+(?:\.\d+)*(?:[-~+]\d[0-9A-Za-z]*(?:[.+~][0-9A-Za-z]*\d[0-9A-Za-z]*)*)?"
 )
 DIGIT_RE = re.compile(r"\d")
+# A tier word glued to its number (PG18, postgresql17, PGv20, PG_17, AGE1.6.0)
+# names the tier although the digit run is glued to a letter: the glue is cut
+# before tokenizing, so the number is a token like any other (r2 mutant L3).
+# The left boundary is CONTEXT_RE's, so storage2, page3 and pgdg13 stay glued.
+# "_" is not glue: test names end in _pg_<issue> (..._links_pg_1771), an
+# issue number and not a version.
+GLUED_TIER_RE = re.compile(r"(?i)(?<![a-z])(postgres(?:ql)?|pgvector|pg|age)(v?)(?=\d)")
+
+
+def unglue(line):
+    """The line with each tier word cut from its glued number: the one
+    funnel both the tier-context check and the token rule read."""
+    return GLUED_TIER_RE.sub(r"\1 \2 ", line)
 # The SSOT keys whose values are the certified tier.
 CERTIFIED_KEYS = ("PG_MAJOR", "EXPECTED_PG_VERSION", "EXPECTED_AGE_VERSION", "PG_APT_VERSION",
                   "PGVECTOR_APT_VERSION", "AGE_PATCH_SHA256", "AGE_PATCHED_FILE_SHA256")
@@ -332,7 +345,7 @@ def certified_tokens(ssot):
 def token_findings(line, cert):
     """`uncertified-token:<tok>` for each distinct numeric token of a tier line."""
     out, seen = [], set()
-    for m in TOKEN_RE.finditer(line):
+    for m in TOKEN_RE.finditer(unglue(line)):
         tok = m.group(0)
         if tok not in seen and tok not in cert and DIGIT_RE.search(tok):
             out.append(f"uncertified-token:{tok}")
@@ -505,7 +518,7 @@ def line_reasons(line, ssot, parent_kind, cert):
     """The named-form reasons of a line, then each uncertified token of a
     line that names the tier (a tier word, or a YAML parent of the tier)."""
     reasons = line_findings(line, ssot, parent_kind)
-    if parent_kind or CONTEXT_RE.search(line):
+    if parent_kind or CONTEXT_RE.search(unglue(line)):
         reasons += [r for r in token_findings(line, cert) if r not in reasons]
     return reasons
 
@@ -1121,12 +1134,13 @@ class FailClosedMutantTest(unittest.TestCase):
             "k/pg-period.md": ("Built for PG18.\n", ["uncertified-token:18"]),
             "k/postgresql.md": ("Image postgresql17 only\n", ["uncertified-token:17"]),
             "k/pg-v.md": ("tested on PGv20 only\n", ["uncertified-token:20"]),
-            "k/pg-underscore.txt": ("release_PG_17 tag\n", ["uncertified-token:17"]),
+            "k/pg-release.txt": ("release_PG17 tag\n", ["uncertified-token:17"]),
             "k/age.md": ("Built with AGE1.6.0 here\n", ["uncertified-token:1.6.0"]),
         }
         for rel, (text, _) in forms.items():
             self.plant(rel, text)
         self.plant("k/clean.md", "Built for PG19 with AGE1.7.0 and pgdg13; storage2 page3 usage4.\n")
+        self.plant("k/clean.rs", "async fn archive_restore_preserves_links_pg_1771() {}\n")
         want = sorted(f"{rel}:1: {','.join(reasons)}: {text.strip()}" for rel, (text, reasons) in forms.items())
         self.assertEqual(sorted(self.scan_tree()), want)
 

@@ -215,11 +215,14 @@
   ["hquutrihpthjsvgmgoltojrt", "CONFIG"],
   ["sgpqniiuvgiiiopjrsppputr", "CONFIG"],
   ["lijiultounnvtqsjsslmiulj", "CONFIG"],
-  ["lqqglvjogqmkmltkpkguvsoj", "CONFIG"]
+  ["olgtqlqqnivsgpihloplgjii", "CONFIG"],
+  ["lqqglvjogqmkmltkpkguvsoj", "CONFIG"],
+  ["qsnhroovojgmkrknjmpmvpik", "CONFIG"]
 ],
 ".github/workflows/coverage.yml": [
   ["guuksgqhunhhmvurphhvgulm", "CONFIG"],
   ["piipjljnsjvhsoiijgsimgrm", "CONFIG"],
+  ["trgvtllrnlijrkjpqgtvkmlg", "CONFIG"],
   ["joqjqrkpnsnjihsrkpqhjlli", "CONFIG"],
   ["kjpojqnkkkoktrovquoqookm", "CONFIG"],
   ["qhmuomogonnojlvssivvtkqm", "CONFIG"],
@@ -234,6 +237,7 @@
   ["rshknmjulvtujujlhpooqjqh", "CONFIG"],
   ["svtmgqpiiiqhoksmkhriqost", "CONFIG"],
   ["kngvsjtrnuookrksijjmglhp", "CONFIG"],
+  ["mvhjrrplgihpljrmvosnnivp", "CONFIG"],
   ["oitnvoultororirqohgjmhlt", "CONFIG"],
   ["sqvqqukpkklogphougiiuvsu", "CONFIG"],
   ["vgtstuvrjgpqqgggumluhvqh", "CONFIG"],
@@ -298,6 +302,7 @@
   ["tjkkgtmurnkrmmkqgtiloolh", "RECORD"],
   ["qqomtrkslnmlkrkslmnvtsvv", "RECORD"],
   ["gsllkvttlrogtoqmlvruopgu", "RECORD"],
+  ["hiohhiommmuillisgjmvrunl", "RECORD"],
   ["irnsssqphnmurqmrqsuvmikj", "RECORD"],
   ["ugoinssrsmlourinuukoqkoi", "RECORD"],
   ["julmhturukqgpsmoivrjjgkt", "RECORD"],
@@ -368,6 +373,7 @@
   ["nnjmqhjivgpkhsvjvmrhiosj", "RECORD"],
   ["glstnqtlmnsnlrsrkhutmgpg", "RECORD"],
   ["jutjkmjquporirmpstsookls", "RECORD"],
+  ["kumjokghlptimoirujpllrpo", "RECORD"],
   ["sssoiihoputogtjuqqghjmpi", "RECORD"],
   ["uurqhmtusnuqhulmjplsrrkl", "RECORD"],
   ["kusogovqrgkjhhriugoolvqr", "RECORD"],
@@ -468,10 +474,12 @@
   ["jhniqglshgqpvomsvvlloojq", "RECORD"],
   ["lmsmtiggppqpmnomvmslrqkq", "RECORD"],
   ["omsukspvsikhmsjmhoknhmjk", "RECORD"],
+  ["jqnqgmomlisvojqisouiihgh", "RECORD"],
   ["ophsqoqvjmmtuiqiujmiomvp", "RECORD"],
   ["otumnmgqgvuimnhmumkhrjhi", "RECORD"],
   ["vlhrqlvvhjolktptogouqruj", "RECORD"],
   ["soojmqvslsoqvvmhmgvjoggq", "RECORD"],
+  ["lrrporsrsthjhujguqslqnrp", "RECORD"],
   ["vmqupprsokigqmrqkpvmjslv", "RECORD"],
   ["gugrkpqghthjsilssnrmmkqp", "RECORD"],
   ["uqoqrqksvmvsvssrnotmuhnu", "RECORD"],
@@ -777,6 +785,7 @@
   ["hilqrrhspjpkprgptrhskhul", "RECORD"],
   ["urjoijmtjnhpislkrrlollsm", "RECORD"],
   ["gqogninlnpilkjqlpugoppoh", "RECORD"],
+  ["khikhosqiimtstgsoosnsnnn", "RECORD"],
   ["kuilhptosgsnigjqqovnurrl", "RECORD"],
   ["qhqhnpnrrmjgvjgvuskqmphv", "RECORD"],
   ["hlvtillugispistnjunpuvkp", "RECORD"],
@@ -795,6 +804,7 @@
   ["vqpkoslvlkgghkruntqqpjgu", "RECORD"],
   ["nqqikjjmsqpjopljsmlmqgpu", "RECORD"],
   ["iinmhksnmqnosnuhiplgpnrr", "RECORD"],
+  ["jkoojlvunorrsilhgukprsmp", "RECORD"],
   ["lohqskvnppkjqnnjrujgnhkl", "RECORD"],
   ["pnulrqrtntvgnsrthuurvvso", "RECORD"],
   ["gspompprvquivhtuqkmouthh", "RECORD"],
@@ -861,7 +871,8 @@
   ["vlosjmgqisqiinqlhkvhkmrn", "RECORD"],
   ["nrtopkikrjtplutlmuujtqqq", "RECORD"],
   ["unuotljlmjmgnpmtnmphgtll", "RECORD"],
-  ["iuopnlnlrgottmomkumllqhq", "RECORD"]
+  ["iuopnlnlrgottmomkumllqhq", "RECORD"],
+  ["lmgtujitrvgqsvmqpvvhhsup", "RECORD"]
 ],
 "CLAUDE.md": [
   ["rojnuphhqiokhqsljpriniqv", "DOC"],
@@ -1495,6 +1506,8 @@
   ["uuingsrjooknlihnliopksip", "DOC"],
   ["jovnjlhkogoupqmsknjkhlir", "DOC"],
   ["vgkmghgmjhrvoulpoguorimv", "DOC"],
+  ["qvlrsnmnitvhrmntpttvrvut", "DOC"],
+  ["rnspmsqotsjjpplqrglimuui", "DOC"],
   ["qjtuksmqopsitjrigqrijopg", "DOC"]
 ],
 "deploy/do-1461/atlas/ingest.sh": [
@@ -1932,6 +1945,7 @@
   ["niugvmitiujrognklvuvlprn", "RECORD"]
 ],
 "deploy/hive-1461/provision/20_pg_age.sh": [
+  ["uorjklmurgrnjgiiikhhkosi", "RECORD"],
   ["kvtknhmjknnsruuhhpnlkmvp", "RECORD"],
   ["igsjquggqmngohouvqungujs", "RECORD"],
   ["rpvirsjvtpijvgimouoipsko", "RECORD"],
@@ -1947,8 +1961,12 @@
   ["ntpigpjpnurhoujrvokqlplr", "RECORD"],
   ["vpjqqphmoismsnikmqgtrvit", "RECORD"]
 ],
+"deploy/hive-1461/provision/lib.sh": [
+  ["gknrqilvjhuqhjljujorqiuq", "RECORD"]
+],
 "deploy/hive-1461/provision/pg-age/Dockerfile": [
   ["lilkovitkjqutsrtmqpojkpr", "RECORD"],
+  ["gsrtutmrrjlhhnrolmjkuhgp", "RECORD"],
   ["svstsphqjrgupqvpnipjgpot", "RECORD"],
   ["jinimihijrqturoiskjknjri", "RECORD"],
   ["lpvsrtpunmmmthqjjvrruvjh", "RECORD"],
@@ -1956,7 +1974,8 @@
 ],
 "deploy/hive-1461/provision/pg-age/bootstrap.sql": [
   ["tomujvnqrmrvjhuovhmmrglo", "RECORD"],
-  ["npokpvsmlojpnunqsthosujn", "RECORD"]
+  ["npokpvsmlojpnunqsthosujn", "RECORD"],
+  ["ojspthjsurukljgtmlrvvkjr", "RECORD"]
 ],
 "deploy/hive-1461/results/verify-baseline.json": [
   ["nupgnnujhsknnhsouuivioir", "RECORD"],
@@ -2085,8 +2104,11 @@
   ["nklsvlkpuhhsqjvqosiutksm", "DOC"],
   ["mgvsoorqgtgisgkkkpiosjvt", "DOC"],
   ["ljitrnhsjhkpqsppvhululho", "DOC"],
+  ["urnupmnojhinrsnglioqkhkn", "DOC"],
   ["rpopqvmottjmhruqsqrrhugr", "DOC"],
   ["ughjnkqtvpnlmqiphvqlvnmm", "DOC"],
+  ["vukmolsoluvqvrislrlsskls", "DOC"],
+  ["rinqgnqhktlhiglggrknmjpq", "DOC"],
   ["migvpujnsoqkosqkoiqntpjn", "DOC"],
   ["osjpsgmrqsvtnugqpomnkoho", "DOC"],
   ["sksmtmolghkohiqqlkkihrtu", "DOC"],
@@ -2112,6 +2134,7 @@
 ],
 "docs/DEVELOPER_SETUP_NOTES.md": [
   ["ujrrvrphqglrhqlnmrkqplvu", "DOC"],
+  ["tmnhuljjokrvlimvirgqjonp", "DOC"],
   ["rhlqnhiuppogtktvuuigqmig", "DOC"],
   ["oglntogoigjrmkpkusmrggjp", "DOC"],
   ["rlmsimusjpsmugmojgpmgvqp", "DOC"],
@@ -2125,6 +2148,7 @@
 ],
 "docs/GOVERNANCE_HISTORY.md": [
   ["ujrrvrphqglrhqlnmrkqplvu", "DOC"],
+  ["tmnhuljjokrvlimvirgqjonp", "DOC"],
   ["knrnvrrumplkgonjthjphiiv", "DOC"],
   ["ngmigrgqroqrnvgvjjmkpsqm", "DOC"]
 ],
@@ -2232,8 +2256,12 @@
 ],
 "docs/RUNBOOK-chaos-campaign.md": [
   ["kumuhsrumjqkhrvhrqsvrlss", "DOC"],
+  ["ugrqjitrnmhprkptprjkhgpk", "DOC"],
   ["nvuhvrllnrlhgttmtlogjiij", "DOC"],
   ["kgsjrrurggnhmrutjtrhuipr", "DOC"]
+],
+"docs/RUNBOOK-curator-soak.md": [
+  ["muhsshmjjgmltvnlhjhsrqsm", "DOC"]
 ],
 "docs/RUNBOOK-digitalocean-testing.md": [
   ["vjqvlrnpprlvkjkogsgutguv", "DOC"],
@@ -2535,6 +2563,7 @@
   ["mtsgsgojormgvnjrknsmrokj", "RECORD"],
   ["mplhjokjsntqtgrqvknhskri", "RECORD"],
   ["orvkvohumonmstrupkvvipim", "RECORD"],
+  ["tlsksgnupiuuvltjhirmglgo", "RECORD"],
   ["snmqhtklulrvrmihtmtvkmvl", "RECORD"],
   ["lqtkglmllkosoqhsiphkkogq", "RECORD"],
   ["ljoulmlnkktuptsnuqqgpugo", "RECORD"],
@@ -2563,6 +2592,7 @@
   ["kvsmngvuppprqorlpukgnsjo", "RECORD"],
   ["ioilorntspvhvtvknusltgrq", "RECORD"],
   ["sghqvqvgiouvqnumulnjjsmn", "RECORD"],
+  ["sjmovtrrjrhgupntulsmmsrh", "RECORD"],
   ["tpsqnhshugqolungovtqnosp", "RECORD"],
   ["vkksilvlrpnshtgjiqvngmip", "RECORD"],
   ["uirvovothlnngnkugithsshm", "RECORD"],
@@ -3054,6 +3084,7 @@
 ],
 "docs/internal/v070-review-synthesis.md": [
   ["jpijhjijpnjthorjoljqgnoh", "DOC"],
+  ["ktivlpuinkijvklrpkripphv", "DOC"],
   ["iivuqulirjnnpsuhvgtumqvu", "DOC"],
   ["ipmomvmtogrgnkkmuqlrlpik", "DOC"],
   ["hnjmnquhgmtntoqpvvlghqht", "DOC"],
@@ -3188,7 +3219,9 @@
   ["krjltrhinrromoqimilhviji", "DOC"],
   ["grrqkuplpqgttgvgrrrqmrrp", "DOC"],
   ["suohnqqrspljnjnssuhnpmsl", "DOC"],
+  ["vjjpmmljjrlonqqntntkvvku", "DOC"],
   ["jritiisujmtljjgpmipkjhrm", "DOC"],
+  ["lqsujpkjtmmjrkrkusnrqsil", "DOC"],
   ["osoimpvlkvltogligputkojn", "DOC"],
   ["lhkpopuloiplgogqotqgspmp", "DOC"],
   ["giskrsognmqivjssmhprjkov", "DOC"],
@@ -4190,7 +4223,8 @@
   ["msigkpvnosrujljvtnnvikmg", "RECORD"]
 ],
 "docs/reviews/gpt6-astra-20260905-evidence/docs-sweep-enterprise.md": [
-  ["gilqvgtkskpkulriqrnssoio", "RECORD"]
+  ["gilqvgtkskpkulriqrnssoio", "RECORD"],
+  ["sohlgnnhtqqkmvggvnhimjov", "RECORD"]
 ],
 "docs/reviews/gpt6-astra-20260905-evidence/docs-sweep-retrieval.md": [
   ["mksjkrkjhuqptkjgtktrjust", "RECORD"],
@@ -5238,6 +5272,7 @@
   ["hnlsnqnkuvpuiprnsjkppkri", "RECORD"],
   ["hhkvntpkmnssgvnrkugihrhi", "RECORD"],
   ["sqlunrhgqoshloqkhkgsjrhg", "RECORD"],
+  ["qktolnqqthhkgnsuilgujuro", "RECORD"],
   ["mvjokuuimsnlnunsvjkunhlh", "RECORD"],
   ["vutuijrijrolnrkjjhottogk", "RECORD"],
   ["qnvokqlvnkvimrprputkhnim", "RECORD"],
@@ -5875,6 +5910,7 @@
   ["ljvnnionlluuvmngjurotgns", "DOC"],
   ["sgujpqtgjpmuqttpqrohsshq", "DOC"],
   ["oshorptopmutthpjoirjiuqo", "DOC"],
+  ["rnrsjkirqkvgpmhlgsmrkrhm", "DOC"],
   ["golgsglqviuskjuvqmukktkm", "DOC"],
   ["oihhonsnltvssjuurngviunl", "DOC"],
   ["lgmophgqjsumusplnruhrvgu", "DOC"],
@@ -5964,6 +6000,7 @@
   ["snuvljntijklvlskvjskukjr", "RECORD"],
   ["hlpprmlkivophlsmhqugqmtk", "RECORD"],
   ["ijtpkqhoinsilrpgsuomqosm", "RECORD"],
+  ["ornoglikgqsvthourqugnhhj", "RECORD"],
   ["jqjppuilnvplplmttvjrgqqs", "RECORD"],
   ["grokimikugihukolutmqsrno", "RECORD"],
   ["qvrsovtumnkuimothumorlgs", "RECORD"],
@@ -6199,6 +6236,7 @@
   ["jphpoqrrisumlkntkhismksj", "DOC"],
   ["vluvirjkknjjhovvsinkutho", "DOC"],
   ["pggjusqmtgmmhvhhpgsvhtvk", "DOC"],
+  ["itusimlqupjmjnvvtuvjiktp", "DOC"],
   ["vgqhlnisulspgkrsprinummv", "DOC"],
   ["lrgughkmopkqlpmuijnlnmtn", "DOC"],
   ["mjlirvgqjkulvtvlimrglhsj", "DOC"],
@@ -6207,6 +6245,7 @@
   ["stijmmqkguknvrlmrjolukrv", "DOC"],
   ["iuvkkgvoshsijttnvktkjrsk", "DOC"],
   ["vtrpptgtvhkoktpihgtppiuj", "DOC"],
+  ["lsjgprvsivophkhtilukntro", "DOC"],
   ["hrhgustugjtthsspguvrovvk", "DOC"],
   ["liungmgkgtnjqntshutrrgqs", "DOC"],
   ["tsmlgpsvigvrmolquvllsphp", "DOC"],
@@ -6229,6 +6268,7 @@
   ["pojvnrmvpgjtooiinrrpstqo", "RECORD"],
   ["uphjmhprivntljuvrpiknshm", "RECORD"],
   ["uhhspnogqpiglvmvjtmhpoqp", "RECORD"],
+  ["qkmorhvjghqttjmorvsuroum", "RECORD"],
   ["oopumsjkvshpnkqoqtkthnvn", "RECORD"],
   ["kjsuvmnggqkjjuhroprtrpsg", "RECORD"],
   ["qjmijpvtjmpsvnumgrkqillq", "RECORD"],
@@ -6241,6 +6281,7 @@
   ["mhgolthgphjuutuhqonutpju", "RECORD"],
   ["koktpqinnvmvihrqovjnnios", "RECORD"],
   ["gtssqghvpppgovjmlpikkhrs", "RECORD"],
+  ["gmulsittlhuikpumuktrlhlh", "RECORD"],
   ["ikppglrjprhsplmvklqhhrjq", "RECORD"],
   ["ovmjookuklrmgninjjkkiphg", "RECORD"],
   ["rqgnrpojusoonusmgmnqtjgl", "RECORD"],
@@ -6258,6 +6299,8 @@
   ["rkkohmnjrlmmvjuhqpqivgqu", "RECORD"],
   ["jqhlhiqvimprrpsitskjturi", "RECORD"],
   ["jkjgjkmrmkuhuqmolqslprrh", "RECORD"],
+  ["gvqvkurjqphgknuiuhivolnv", "RECORD"],
+  ["gusoiltoriglihvkmknuvmut", "RECORD"],
   ["mpphspnmviuhuqrirupjppjm", "RECORD"]
 ],
 "docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/track-a-nhi-results.md": [
@@ -6436,9 +6479,11 @@
 ],
 "infra/do-hive/cloud-init-memory.yaml.tpl": [
   ["vhnsmsmpktoquossiqgjkmjh", "CONFIG"],
+  ["lmmuurjmhtnvmiprrousirno", "CONFIG"],
   ["uhsshnotugvuorsipuvqpsgo", "CONFIG"],
   ["pogimvvogrimqhghohhjrpur", "CONFIG"],
   ["mglquslqpkqsrjhtopghpntk", "CONFIG"],
+  ["lnqsqvkkstlnksqusijhpnqg", "CONFIG"],
   ["lknppmnqjvlhuvhoglhpvmmk", "CONFIG"],
   ["srutksrtmskhutqvqrmgsils", "CONFIG"],
   ["ltlqjnlusmrqmvvhrpnnihlo", "CONFIG"],
@@ -6472,6 +6517,7 @@
   ["kojunuphgppmhnuplsmovjpg", "CONFIG"],
   ["pjhhmsjnrnlrlsitrgvptkjp", "CONFIG"],
   ["lntlorvuuktnplklsuujsmrk", "CONFIG"],
+  ["ivuokrguolukrkjptkhsirgj", "CONFIG"],
   ["hohvrutquritjvljrtutmhkr", "CONFIG"],
   ["ukkuvsrmsrjlvnjlmnkmqrps", "CONFIG"],
   ["ouulqshlligoigsmjlpvsktu", "CONFIG"],
@@ -6504,11 +6550,14 @@
   ["hjrgshhihshqimjolnsloqgi", "CONFIG"]
 ],
 "infra/do-hive/measurement.tfvars": [
-  ["uonmqsqpsvmqgnhjnkjjumqi", "CONFIG"]
+  ["uonmqsqpsvmqgnhjnkjjumqi", "CONFIG"],
+  ["ppnilmtuqnuulkhullinnsjs", "CONFIG"]
 ],
 "infra/lan-parity-test/Dockerfile.pg-age-vector": [
   ["onhsvhhlhqquvtmjrqmuqggu", "CONFIG"],
+  ["nmoujqmkumsmusiohlmunitg", "CONFIG"],
   ["ommhlqhklvuloitgkkpqvqvn", "CONFIG"],
+  ["nmitnqugvmnpvhthvormuogu", "CONFIG"],
   ["nisgpturhnvhviltsnnjhits", "CONFIG"],
   ["vjrgkgqlrkvothjphmjhikhi", "CONFIG"]
 ],
@@ -6588,11 +6637,13 @@
   ["mtkruplsvonqlvjohsokkhmh", "DOC"],
   ["uurhgjjggrlhjlgppjvuvptr", "DOC"],
   ["mumpqhglkqinullsutvtnilj", "DOC"],
+  ["sgnutglvmtoqkohlipglmquk", "DOC"],
   ["ktsgnrhglhntqhpjgogihotm", "DOC"]
 ],
 "infra/pgbouncer/docker-compose.yml": [
   ["mutjmppnjktokgvvgvilvtki", "CONFIG"],
   ["nmpnshjuthtkkplunvoggunh", "CONFIG"],
+  ["rriqumpshulituiurvptuthg", "CONFIG"],
   ["vtsroqitthvjgnnpmvtvphpi", "CONFIG"],
   ["kjgvsgggvhpvhsjtlpjvmoju", "CONFIG"],
   ["khvitpgnmtrkvrmvrogqjrlm", "CONFIG"],
@@ -6737,6 +6788,9 @@
   ["hntojrmrssrktopirgnoturn", "RECORD"],
   ["jjlkrunhlrgqrjjpvgsiuumq", "RECORD"]
 ],
+"migrations/postgres/0046_v89_tsv_include_tags.sql": [
+  ["tijmuroirknilrsrkmmqkglt", "CONFIG"]
+],
 "migrations/postgres/0047_v90_archived_cid.sql": [
   ["llvjohjkkvvktgjgthjglosi", "CONFIG"]
 ],
@@ -6807,6 +6861,7 @@
   ["jujuuutottqujsqtjggkqjnr", "CONFIG"],
   ["nkhijoolmjoiqsuugnvkijit", "CONFIG"],
   ["hkthlqqnnkmisggmkkngirvh", "CONFIG"],
+  ["hklhrsthjjjkukhmpquuuuup", "CONFIG"],
   ["rhrsqigsqgpjsovhtklnuhvg", "CONFIG"],
   ["gjlomrgvtvtsoipphqngmmpr", "CONFIG"],
   ["irhtpguvjrjmupgrntkhjhnj", "CONFIG"],
@@ -6900,9 +6955,11 @@
   ["svjupoittqiqsotgjvttrovs", "CONFIG"]
 ],
 "scripts/check-docs-vs-ssot.sh": [
+  ["gnkjmkptlqquvkgtsouqitro", "CONFIG"],
   ["moqposiqionjvtvjogujultn", "CONFIG"],
   ["nrnrrgglmnqmhhuuulppvssn", "CONFIG"],
   ["uhipoqrnvggjjgvhtgvvqhil", "CONFIG"],
+  ["kkksoojrjhjvvqkjvstitooi", "CONFIG"],
   ["qjkmpivnihholjmorgpstmvg", "CONFIG"],
   ["tiktjislhsijsurhvminjgtl", "CONFIG"],
   ["lsokknhohkorhnpijqnpptql", "CONFIG"],
@@ -6912,11 +6969,13 @@
   ["kskpkhrhmsomjpgsmpmtnovh", "CONFIG"],
   ["ttmvsrpmiukuhnhphsrjlnlk", "CONFIG"],
   ["pnmqmohiihsgtjhnqilvruns", "CONFIG"],
+  ["vohnjnlmgogvqsjnlmlgmgmg", "CONFIG"],
   ["hlkinnjmkksirsplkliigsht", "CONFIG"],
   ["nqmvrmtnollrvtkojhmpvihj", "CONFIG"],
   ["ijukrlmilkihsungmhurrorl", "CONFIG"],
   ["nugqtnhkgljtloruuuqiuvop", "CONFIG"],
   ["vmiprnuguruipmugqitjmqok", "CONFIG"],
+  ["unsmgpjhhpvqlhihkgsvrhrq", "CONFIG"],
   ["vilqgvhqrqunhupkkvjkrjtk", "CONFIG"],
   ["rgirlhgkthmunskgurtjuqtv", "CONFIG"],
   ["rmpgqusolsigkkkokqkihgim", "CONFIG"],
@@ -7286,6 +7345,7 @@
   ["nsnjmhrkkljutuvjpthhlhtp", "TEST"],
   ["gsokrqgjjholhlsgqprrionq", "TEST"],
   ["lhusuriitiruknqhirigsruh", "TEST"],
+  ["lkhuqjmivnprnskmvnlkqipv", "TEST"],
   ["iglssilkqgjighrjpvvimgmj", "TEST"],
   ["usqgjntghsnugotmsuggumpr", "TEST"],
   ["imsjoknpnpigsrjsqoivimni", "TEST"],
@@ -7325,6 +7385,7 @@
   ["rvnrminghrpisstjisvpppro", "RECORD"],
   ["qjqrvhgmlusmlkmluhgsrmmv", "RECORD"],
   ["isvstmillunmkjmqnhhntvth", "RECORD"],
+  ["uumipgmorilhvontjtlrooti", "RECORD"],
   ["ksvrtukkpijnohjmnprgplmh", "RECORD"],
   ["otpmrkphnjvvirhsvnrrrljq", "RECORD"],
   ["mkghokolpkljsslqsmrnmols", "RECORD"],
@@ -7425,6 +7486,12 @@
   ["sgoojtmkpisvnrntlrliqkkt", "RECORD"],
   ["qjkpooogiinorirsungjoiqi", "RECORD"],
   ["tklkmikjknmtorostgptqvku", "RECORD"],
+  ["pqunrnngkuqrihhjvjmhiopq", "RECORD"],
+  ["lohrrjukujllirpnjqospvst", "RECORD"],
+  ["tstogusnpisiuokoklnkrltp", "RECORD"],
+  ["mohhqtjipgupinqpvqqnsqpi", "RECORD"],
+  ["qnogovpprkjkpplupioguhrq", "RECORD"],
+  ["llhuklskgppnjohrumjmnhpn", "RECORD"],
   ["rhjkihhojkmlilrgqhnjirni", "RECORD"],
   ["rhjkihhojkmlilrgqhnjirni", "RECORD"],
   ["tjjinlvmiusnsokppuojohjj", "RECORD"],
@@ -7711,6 +7778,7 @@
 ],
 "scripts/coverage.sh": [
   ["mvvloprrmgqptluiqslnupmr", "CONFIG"],
+  ["isvtlrioqotmsjrhvksmqgkm", "CONFIG"],
   ["ttjjpijjmtthmjopsuhshsvm", "CONFIG"],
   ["rnmvsnopmjvsitskvhnnriup", "CONFIG"],
   ["lmgihmmojgrvjpgklgithnrs", "CONFIG"],
@@ -8174,6 +8242,9 @@
 ],
 "sdk/typescript/__tests__/webhooks.test.ts": [
   ["jjikunurpuvqjruvojgiihsp", "CONFIG"]
+],
+"sdk/typescript/package-lock.json": [
+  ["upkinnjojnltnloppkgnrrql", "CONFIG"]
 ],
 "sdk/typescript/src/webhooks.ts": [
   ["kgmlprmtpihhnmpnsovvgusu", "CONFIG"]
@@ -9266,6 +9337,7 @@
   ["sprgriigvqgnqvrshqhqgsri", "CODE"],
   ["vpoqjqnjpkjrimkrhrpnlhji", "CODE"],
   ["trvslhhglglhuquvmutvjkph", "CODE"],
+  ["monpmjikvtumikthlpsrknps", "CODE"],
   ["qighhpolonslrhvpnqlmnvug", "CODE"],
   ["gjgsvppruotsmhkrhjsihvov", "CODE"],
   ["nmnuhliqrksutnqmvvkopmpn", "CODE"],
@@ -9300,6 +9372,7 @@
   ["qsgiluololqitlgutpmsqsis", "CODE"],
   ["squqhgmkioljosllhhijlmli", "CODE"],
   ["npsqvmrsrjolnmqmspiksoog", "CODE"],
+  ["itljpsoouutihhujmgsjtjgm", "CODE"],
   ["hlshsqqtoghjjmusughhutnk", "CODE"],
   ["rqighrtphrhipkkspukvpsgu", "CODE"],
   ["mqqhjjhnmogqmngnmppvlong", "CODE"],
@@ -9405,9 +9478,13 @@
   ["tnvmlriuomnipsoupntnqikn", "CODE"],
   ["tiijlitntkogqhtlhrpqhgqn", "CODE"],
   ["shjuirjltoupnqlmmtppthlu", "CODE"],
+  ["hgjvkihuvsviluhktukorrmp", "CODE"],
+  ["uutpjtkmpuqpsurugiqnprql", "CODE"],
   ["rvsgpnhokmouptmuvpgojout", "CODE"],
   ["ujtulhljuktirorigrqtlpvv", "CODE"],
   ["vvgihrlggrmgovsoigrpoivo", "CODE"],
+  ["lgsqjpmsporqgjtpjmnkkrsg", "CODE"],
+  ["qpnthunjolvupnlhlrnpmtov", "CODE"],
   ["nlqioimnsmquvgqhovhusuus", "CODE"],
   ["ooumpnumsllpmnhqnhritkug", "CODE"],
   ["uknsslmvrukuosqukovnrmuu", "CODE"],
@@ -9438,6 +9515,7 @@
   ["lrnvopgguoprlgoohsirkpot", "CODE"],
   ["ghvkigrkmpoisoplhtgimvmi", "CODE"],
   ["ujjlvvrovshponvpgjjstusm", "CODE"],
+  ["lkvpuvvjktoislpqqnrtgjnv", "CODE"],
   ["kksrkolggngnlhmgivqgglri", "CODE"],
   ["lhhslvvpguvoprpsonjitnli", "CODE"],
   ["psuvsipjsojujlkuvgjijium", "CODE"],
@@ -9576,6 +9654,7 @@
   ["lgpqjuuqmphsmpjrvsoipurv", "CODE"],
   ["grqvrrpukkhhkpntnuqglqqu", "CODE"],
   ["jpjjrnsgpgiirlpphpoiqmvk", "CODE"],
+  ["suiogpmvkouhkgotuhjugotk", "CODE"],
   ["vupomsrilgqmrgrtkstvrhop", "CODE"],
   ["sritljjmpputmptsgrmvslgr", "CODE"],
   ["rvurususgoutlmiutjjtpupp", "CODE"],
@@ -9770,6 +9849,8 @@
   ["ovtjoourqrpsquvkptmrnpqp", "CODE"],
   ["mpqjmoukunkrmpuknttgrmqt", "CODE"],
   ["tmomkiitlgrvgmgpivkuggou", "CODE"],
+  ["lvotggkvumignvnkqpkrnttu", "CODE"],
+  ["jkqimoshonojimkqkvsrtnvi", "CODE"],
   ["guspigkhtqhtuguhjmjiosvh", "CODE"],
   ["hoiuvotrnnkrnlmijtqnklur", "CODE"],
   ["sjpprmjmmmohkgshjgomgppo", "CODE"],
@@ -9892,7 +9973,8 @@
 ],
 "src/store/postgres/pgvector_preflight_tests_3264.rs": [
   ["ikslouhvgmvlqvroiiqnlptj", "CODE"],
-  ["romsqngmsgkiqmunsnvjjmkm", "CODE"]
+  ["romsqngmsgkiqmunsnvjjmkm", "CODE"],
+  ["pmgrlnmjqrvjsustiuiiiius", "CODE"]
 ],
 "src/store/postgres/reown_3124.rs": [
   ["hlhpmohvlrtutvtnjnolrhvn", "CODE"],
@@ -9947,6 +10029,7 @@
   ["tngipsljnovgmlturikkligu", "CODE"],
   ["lsuuhkuiqklujrmpgttnhtpj", "CODE"],
   ["jruusmhrjhhnqsnkmphovrhq", "CODE"],
+  ["kspmmhnpotknkpnpiqmjpolt", "CODE"],
   ["ltpvsiilotkgkohitgitvmpp", "CODE"],
   ["qpoimrlsgojkoiglmuuqkvkj", "CODE"],
   ["ssvsomoqnjhiossgqsjqukkq", "CODE"],
@@ -10853,7 +10936,8 @@
 ],
 "tests/envelope_column_type_fail_closed_4133.rs": [
   ["hvrsiitmointghpunutgqvrq", "TEST"],
-  ["tulumlugqqqvupjgttqgggsg", "TEST"]
+  ["tulumlugqqqvupjgttqgggsg", "TEST"],
+  ["igqloivkvlihlsgnhpgigrpi", "TEST"]
 ],
 "tests/epoch_apply_s5_pg.rs": [
   ["tqtopnpgrsprjituugqminju", "TEST"]
@@ -11094,6 +11178,7 @@
   ["mjuhgktljonmvprhtilvhsgo", "TEST"]
 ],
 "tests/federation_title_slot_merge_snapshot_4206.rs": [
+  ["uhgippsiotkphlrluugrkhlq", "TEST"],
   ["mvipiljvhvmukqophnsomogh", "TEST"],
   ["mvipiljvhvmukqophnsomogh", "TEST"]
 ],
@@ -11333,8 +11418,13 @@
 ],
 "tests/inbox_wake_postgres_3465.rs": [
   ["koqvjgmsrklruhqvukuphrsu", "TEST"],
+  ["itirsnvjgkmojhtkolsuniim", "TEST"],
+  ["uttuqojvihkruljiqkhpqjng", "TEST"],
   ["ggnjoumphnmptspounhnslpo", "TEST"],
-  ["vvgopjthsuiouskkjugtpkhn", "TEST"]
+  ["qmohhkllhnvnkqhusgkttoto", "TEST"],
+  ["knqjgushsttiopnisgruvqlg", "TEST"],
+  ["vvgopjthsuiouskkjugtpkhn", "TEST"],
+  ["uttuqojvihkruljiqkhpqjng", "TEST"]
 ],
 "tests/integration.rs": [
   ["uggprmontvpsomkqjqkpkqhr", "TEST"]
@@ -11352,7 +11442,8 @@
 ],
 "tests/issue_1473_list_namespace_sargable.rs": [
   ["ohmpqmqtuivlnuitujtkrrur", "TEST"],
-  ["molomghuunkhtusujngtvukg", "TEST"]
+  ["molomghuunkhtusujngtvukg", "TEST"],
+  ["ttqqhntnjnusslsrjhronglo", "TEST"]
 ],
 "tests/issue_1481_store_batch.rs": [
   ["rgsqruthsmvurunsqnsglrqg", "TEST"],
@@ -12019,7 +12110,15 @@
 "tests/postgres_l2_rehydration_1693.rs": [
   ["klrnuvkqomihgpkotpklpmiu", "TEST"],
   ["hljjurhpmtvljvgjmikmmmnu", "TEST"],
+  ["pgmhgsltvrnionvnqsgovitl", "TEST"],
+  ["kqkrhjilokrlhnnnvorrujpp", "TEST"],
+  ["ohqpsrlikjuvlqgkpgrvgrgq", "TEST"],
+  ["itomuqkivihtuloukspvolrp", "TEST"],
+  ["oqgupomqstotrulpnhjnvqnu", "TEST"],
+  ["jrusthnrqjpvqjnhkouuqvmr", "TEST"],
   ["itvpsuguoprtroijjolknhvp", "TEST"],
+  ["mhggsggoiunsrqjinsmpllhn", "TEST"],
+  ["qmjmhumorukmuhqtlrupqnhs", "TEST"],
   ["krprmmltvkspprinhuiskoms", "TEST"]
 ],
 "tests/postgres_ladder_replay.rs": [
@@ -12794,6 +12893,7 @@
   ["ghnrlgnokikovrlkorvrpukn", "TEST"],
   ["vlknqvvghggusnmsjhlmrqjp", "TEST"],
   ["hgglkqotgingppjltnkuompi", "TEST"],
+  ["tiiqnhqppngkvjigovhprlhv", "TEST"],
   ["tqlqgqotsrvmismolstunmjg", "TEST"],
   ["mtnoivhrijrkpjtumpvvmpgo", "TEST"],
   ["plvjlgmsolltjuljkpinhljq", "TEST"]
@@ -12822,7 +12922,8 @@
   ["togsvkiipjitisqknpigssrh", "TEST"]
 ],
 "tests/wake_seq_per_recipient_4125.rs": [
-  ["uvplkhnkqshoiplvmmspiqjp", "TEST"]
+  ["uvplkhnkqshoiplvmmspiqjp", "TEST"],
+  ["iuuiotnrhqviomppukvisvro", "TEST"]
 ],
 "tests/wake_sink_postgres_3469.rs": [
   ["gmvjjmmgknohpqiohkrgrirh", "TEST"],
