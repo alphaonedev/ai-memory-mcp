@@ -71,6 +71,21 @@ fn judge_env(
     )
 }
 
+/// The `actual` text of check #23 in a process that cannot see the peer list.
+pub(super) const UNVERIFIABLE: &str = "unverifiable from this process";
+
+/// Red stub (review #10026 S-F2): keeps the env-only judgment.
+#[cfg_attr(not(test), allow(dead_code))]
+fn judge_peers(
+    _peers: Option<&[String]>,
+    parsed: Result<
+        std::collections::BTreeMap<String, PeerOutboundScope>,
+        scope::OutboundScopeConfigError,
+    >,
+) -> (bool, String) {
+    judge_env(parsed, true)
+}
+
 /// Render check #23.
 pub(super) fn check_outbound_scope() -> PostureCheck {
     let (pass, actual) = match scope::boot_scope_rows() {
@@ -169,5 +184,117 @@ pub(super) mod tests {
                 "no peer URL in the row: {actual}"
             );
         }
+    }
+
+    const PEER_A: &str = "https://user:pw@peer-a:9077/fed";
+    const PEER_B: &str = "https://peer-b:9077";
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|u| (*u).to_string()).collect()
+    }
+
+    #[test]
+    fn peers_need_a_narrowed_entry_each_9996() {
+        let a = format!(r#""{PEER_A}": {{"allowed_namespaces": ["team/*"]}}"#);
+        let b_all = format!(r#""{PEER_B}": {{"allowed_namespaces": ["**"]}}"#);
+        let b_deny = format!(r#""{PEER_B}": {{"allowed_namespaces": []}}"#);
+        let b_ok = format!(r#""{PEER_B}": {{"allowed_namespaces": ["ops"]}}"#);
+        let shown_b = crate::url_display::url_origin_and_path(PEER_B);
+        let not_narrowed = format!("peer(s) without a narrowed outbound scope: {shown_b}");
+        let cases: Vec<(String, Vec<String>, bool, String)> = vec![
+            (
+                format!("{{{a}, {b_ok}}}"),
+                urls(&[PEER_A, PEER_B]),
+                true,
+                "2 peer(s): every one narrowed".to_string(),
+            ),
+            // B omitted from the scope map.
+            (
+                format!("{{{a}}}"),
+                urls(&[PEER_A, PEER_B]),
+                false,
+                not_narrowed.clone(),
+            ),
+            (
+                format!("{{{a}, {b_all}}}"),
+                urls(&[PEER_A, PEER_B]),
+                false,
+                not_narrowed.clone(),
+            ),
+            (
+                format!("{{{a}, {b_deny}}}"),
+                urls(&[PEER_A, PEER_B]),
+                false,
+                not_narrowed,
+            ),
+            // A scope key for a peer the list does not hold.
+            (
+                format!("{{{a}, {b_ok}}}"),
+                urls(&[PEER_A]),
+                false,
+                "1 scope key(s) name no configured peer".to_string(),
+            ),
+        ];
+        for (raw, peers, want, text) in cases {
+            let (pass, actual) = judge_peers(Some(&peers), scope::parse(&raw));
+            assert_eq!((pass, actual.as_str()), (want, text.as_str()), "{raw}");
+            assert!(!actual.contains("pw"), "no credential in the row: {actual}");
+        }
+        let (pass, actual) = judge_peers(Some(&urls(&[PEER_B])), scope::parse("not json"));
+        assert!(!pass);
+        assert_eq!(
+            actual,
+            scope::parse("not json")
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn unresolvable_peer_list_fails_whatever_the_env_holds_9996() {
+        let narrowed = format!(r#"{{"{PEER_B}": {{"allowed_namespaces": ["ops"]}}}}"#);
+        let (pass, actual) = judge_peers(None, scope::parse(&narrowed));
+        assert!(!pass, "env shape alone never passes");
+        assert_eq!(
+            actual,
+            "unverifiable from this process: the peer list is the `serve --quorum-peers` \
+             argument; 1 scoped peer key(s) in the env"
+        );
+        let (pass, actual) = judge_peers(None, Ok(std::collections::BTreeMap::new()));
+        assert!(!pass);
+        assert_eq!(
+            actual,
+            "unverifiable from this process: the peer list is the `serve --quorum-peers` \
+             argument; 0 scoped peer key(s) in the env"
+        );
+    }
+
+    /// A process that recorded no boot rows (a fresh `doctor`) fails check
+    /// #23 even with a narrowed env value (review #10026 S-F2).
+    #[test]
+    fn fresh_process_with_narrowed_env_fails_unverifiable_9996() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::outbound_scope::tests::\
+             fresh_process_with_narrowed_env_fails_unverifiable_9996",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        // SAFETY: env-isolated child holding the env lock; no other thread
+        // reads the variable.
+        unsafe {
+            std::env::set_var(
+                crate::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
+                format!(r#"{{"{PEER_B}": {{"allowed_namespaces": ["ops"]}}}}"#),
+            );
+        }
+        assert!(
+            scope::boot_scope_rows().is_none(),
+            "fresh child has no boot rows"
+        );
+        let row = check_outbound_scope();
+        assert!(!row.pass, "{row:?}");
+        assert!(row.actual.starts_with(UNVERIFIABLE), "{row:?}");
     }
 }

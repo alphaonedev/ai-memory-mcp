@@ -38,9 +38,10 @@ use ai_memory::federation::outbound_scope::{
     self, ItemNamespaces, PeerOutboundScope, REASON_NO_OUTBOUND_SCOPE, REASON_NOTHING_IN_SCOPE,
 };
 use ai_memory::federation::push_dlq::{
-    FederationDlqSink, MAX_REPLAY_ATTEMPTS, SqliteDlqSink, out_of_scope_like_prefix,
-    redrive_out_of_scope_once, replay_once,
+    FederationDlqSink, MAX_PENDING_DLQ_ROWS_PER_PEER, MAX_REPLAY_ATTEMPTS, REASON_DLQ_PEER_CAP,
+    SqliteDlqSink, out_of_scope_like_prefix, redrive_out_of_scope_once, replay_once,
 };
+use ai_memory::federation::push_dlq_cap;
 use ai_memory::federation::{FederationConfig, PeerEndpoint, sync};
 use ai_memory::models::{Memory, MemoryLinkRelation};
 use ai_memory::replication::{QuorumError, QuorumFailureReason, QuorumPolicy};
@@ -268,7 +269,27 @@ fn quorum_reason(res: Result<usize, QuorumError>) -> QuorumFailureReason {
 /// The exact `last_error` of a row the sender quarantined for scope.
 fn quarantined_reason(refusal_reason: &str) -> String {
     let prefix = out_of_scope_like_prefix();
-    format!("{}{refusal_reason}", prefix.trim_end_matches('%'))
+    format!(
+        "{}{refusal_reason}",
+        unescape_like(prefix.trim_end_matches('%'))
+    )
+}
+
+/// The literal text a `LIKE ... ESCAPE '\'` pattern matches: each `\x`
+/// pair is the literal `x` (one char scan, so `\\_` is `\` then `_`).
+fn unescape_like(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(next) = chars.next()
+        {
+            out.push(next);
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -623,8 +644,21 @@ async fn erasure_expands_only_to_peers_in_scope_9996() {
 #[test]
 fn out_of_scope_like_prefix_is_the_permanent_tagged_cause_9996() {
     let prefix = out_of_scope_like_prefix();
-    assert!(prefix.ends_with("outbound_scope: %"), "{prefix}");
-    assert_eq!(prefix.matches('%').count(), 1, "{prefix}");
+    // Review #10026 L3: the stamp's `_` is escaped, so it matches only
+    // itself; the one wildcard is the trailing unescaped `%`.
+    assert!(prefix.ends_with("outbound\\_scope: %"), "{prefix}");
+    let body = prefix.strip_suffix('%').expect("trailing wildcard");
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => assert!(
+                matches!(chars.next(), Some('\\' | '%' | '_')),
+                "a lone escape in {prefix}"
+            ),
+            '%' | '_' => panic!("an unescaped wildcard {c:?} in {prefix}"),
+            _ => {}
+        }
+    }
     assert!(
         prefix.starts_with('['),
         "the class tag opens the column: {prefix}"
@@ -948,8 +982,293 @@ async fn bulk_catchup_push_sends_only_in_scope_rows_9996() {
 }
 
 // ---------------------------------------------------------------------------
+// Review #10026 C-F2: an erasure no configured peer admits is quarantined
+// ---------------------------------------------------------------------------
+
+/// One sentinel past the default replay batch, so a sentinel left pending
+/// starves every row queued after it (`take` is `ORDER BY failed_at ASC`).
+const SENTINEL_BACKLOG: usize = ai_memory::federation::push_dlq::DEFAULT_REPLAY_MAX_BATCH + 1;
+
+/// Replay ticks the cell runs: the backlog drains in two at the fix.
+const SENTINEL_TICKS: usize = 3;
+
+/// `sentinel_ids` are queued erasures of `NS_OUT` memories, all older than
+/// any row this cell seeds. Every configured peer refuses `NS_OUT`, so each
+/// sentinel is quarantined (kept, re-drivable), never left pending to
+/// starve the in-scope row behind it.
+async fn erasure_sentinel_cell(
+    sink: Arc<dyn FederationDlqSink>,
+    path: Option<&PathBuf>,
+    sentinel_ids: &[String],
+) {
+    let sentinel = ai_memory::federation::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID;
+    let id_in = format!("m-starved-{}", uuid::Uuid::new_v4());
+    let peer_deny = format!("peer-deny-{}", uuid::Uuid::new_v4());
+    let peer_in = format!("peer-in-{}", uuid::Uuid::new_v4());
+    let (url_deny, st_deny) = spawn_peer(ok_plan()).await;
+    let (url_in, st_in) = spawn_peer(ok_plan()).await;
+    let cfg = config(
+        vec![
+            peer(&peer_deny, &url_deny, PeerOutboundScope::Deny),
+            peer(&peer_in, &url_in, scope(SCOPE_IN)),
+        ],
+        3,
+        2,
+        Some(sink.clone()),
+    );
+    seed(&*sink, &memory(&id_in, NS_IN), &peer_in).await;
+    let before = sink.pending_dlq_count().await.expect("count");
+    for _ in 0..SENTINEL_TICKS {
+        replay_once(&cfg, &*sink).await;
+    }
+    assert_eq!(
+        st_in.hits(),
+        1,
+        "the in-scope row behind the backlog is sent"
+    );
+    assert_eq!(st_in.bodies()[0]["memories"][0]["id"], id_in.as_str());
+    assert_eq!(st_deny.hits(), 0, "the deny peer receives nothing");
+    let window = sink.take_pending_dlq_rows(100_000).await.expect("take");
+    assert!(
+        window
+            .iter()
+            .all(|r| !(r.peer_id == sentinel && sentinel_ids.contains(&r.memory_id))),
+        "every refused erasure left the replay window"
+    );
+    assert_eq!(
+        sink.pending_dlq_count().await.expect("count"),
+        before - 1,
+        "quarantined erasures are kept; only the delivered row left the queue"
+    );
+    if let Some(path) = path {
+        let rows = raw_rows(path);
+        let sentinels: Vec<&RawRow> = rows.iter().filter(|r| r.peer_id == sentinel).collect();
+        assert_eq!(sentinels.len(), sentinel_ids.len(), "every erasure is kept");
+        for row in sentinels {
+            assert!(
+                row.attempt_count >= i64::from(MAX_REPLAY_ATTEMPTS),
+                "{row:?}"
+            );
+            assert_eq!(row.last_error, quarantined_reason(REASON_NOTHING_IN_SCOPE));
+            assert!(!row.replayed, "{row:?}");
+        }
+        assert!(
+            rows.iter()
+                .all(|r| (r.peer_id != peer_deny && r.peer_id != peer_in) || r.memory_id == id_in),
+            "no erasure expanded to a peer that refuses it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn erasure_sentinels_with_no_peer_in_scope_are_quarantined_sqlite_9996() {
+    use ai_memory::federation::erasure_outbox::{self, ErasedMemory};
+    let (_tmp, sink, path) = sqlite_sink().await;
+    let ids: Vec<String> = (0..SENTINEL_BACKLOG)
+        .map(|i| format!("m-erase-out-{i}"))
+        .collect();
+    {
+        let conn = ai_memory::storage::open(&path).expect("open sqlite");
+        erasure_outbox::mark_federation_drainable(&conn, 2).expect("stamp drainable");
+        let erased: Vec<ErasedMemory> = ids
+            .iter()
+            .map(|id| ErasedMemory {
+                id: id.clone(),
+                namespace: NS_OUT.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            erasure_outbox::enqueue_erasures(&conn, &erased, erasure_outbox::surfaces::CLI_DELETE),
+            SENTINEL_BACKLOG
+        );
+    }
+    erasure_sentinel_cell(sink, Some(&path), &ids).await;
+}
+
+// ---------------------------------------------------------------------------
+// Review #10026 C-F3: the per-peer cap exempts deletions, counts refusals
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn per_peer_cap_exempts_deletions_and_counts_refusals_9996() {
+    let (_tmp, sink, path) = sqlite_sink().await;
+    let peer_id = format!("peer-capped-{}", uuid::Uuid::new_v4());
+    {
+        let mut conn = rusqlite::Connection::open(&path).expect("open sqlite for seeding");
+        let tx = conn.transaction().expect("begin");
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO federation_push_dlq \
+                     (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
+                     VALUES (?1, ?2, '{}', 1, 'seeded', '2026-01-01T00:00:00+00:00')",
+                )
+                .expect("prepare");
+            for i in 0..MAX_PENDING_DLQ_ROWS_PER_PEER {
+                stmt.execute(rusqlite::params![format!("m-cap-{i}"), peer_id])
+                    .expect("seed row");
+            }
+        }
+        tx.commit().expect("commit");
+    }
+    let refusals_before = push_dlq_cap::cap_refusals_for(&peer_id);
+
+    let del_id = format!("m-cap-del-{}", uuid::Uuid::new_v4());
+    sink.enqueue_push_failure(
+        &del_id,
+        &peer_id,
+        &serde_json::json!({"memories": [], "deletions": [del_id], "dry_run": false}),
+        "seeded transient failure",
+    )
+    .await
+    .expect("a deletion is never refused by the per-peer cap");
+
+    let write = memory(&format!("m-cap-write-{}", uuid::Uuid::new_v4()), NS_IN);
+    let err = sink
+        .enqueue_push_failure(&write.id, &peer_id, &push_body(&write), "transient")
+        .await
+        .expect_err("a non-delete past the cap is refused");
+    assert_eq!(
+        err,
+        format!("{REASON_DLQ_PEER_CAP} ({MAX_PENDING_DLQ_ROWS_PER_PEER})")
+    );
+    assert_eq!(
+        push_dlq_cap::cap_refusals_for(&peer_id),
+        refusals_before + 1,
+        "the refused write is counted for its peer"
+    );
+
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open sqlite read-only");
+    let count = |memory_id: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM federation_push_dlq \
+             WHERE memory_id = ?1 AND peer_id = ?2 AND replayed_at IS NULL",
+            rusqlite::params![memory_id, peer_id],
+            |r| r.get(0),
+        )
+        .expect("count")
+    };
+    assert_eq!(count(&del_id), 1, "the deletion row is queued");
+    assert_eq!(count(&write.id), 0, "the refused write queued nothing");
+}
+
+// ---------------------------------------------------------------------------
+// Review #10026 L1: a 2xx that skipped the item is no ack
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn skipped_2xx_and_400_ack_once_row_pending_9996() {
+    let (_tmp, sink, path) = sqlite_sink().await;
+    let (url_skip, st_skip) = spawn_peer(|_| (200, "{\"skipped\":1}".to_string())).await;
+    let (url_bad, st_bad) = spawn_peer(|_| (400, "{\"error\":\"bad\"}".to_string())).await;
+    let cfg = config(
+        vec![
+            peer("peer-skip", &url_skip, scope(SCOPE_IN)),
+            peer("peer-bad", &url_bad, scope(SCOPE_IN)),
+        ],
+        3,
+        3,
+        Some(sink),
+    );
+    let tracker = sync::broadcast_store_quorum(&cfg, &memory("m-skip", NS_IN))
+        .await
+        .expect("dispatch");
+    assert!(
+        tracker.acked_peer_ids().is_empty(),
+        "neither a skipped 2xx nor a 400 acks: {:?}",
+        tracker.acked_peer_ids()
+    );
+    match tracker.finalise(Instant::now()) {
+        Err(QuorumError::QuorumNotMet { got, needed, .. }) => {
+            assert_eq!((got, needed), (1, 3), "only the local commit counts");
+        }
+        other => panic!("expected QuorumNotMet, got {other:?}"),
+    }
+    assert!(st_skip.hits() >= 1);
+    assert!(st_bad.hits() >= 1);
+    let rows = raw_rows(&path);
+    let skipped = rows
+        .iter()
+        .find(|r| r.memory_id == "m-skip" && r.peer_id == "peer-skip")
+        .expect("the skipped peer's row is queued");
+    assert!(!skipped.replayed, "{skipped:?}");
+    assert!(
+        skipped.attempt_count < i64::from(MAX_REPLAY_ATTEMPTS),
+        "the row is in the replay window: {skipped:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review #10026 L3: the redrive LIKE matches the stamp literally
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn underscore_stamp_is_not_redriven_9996() {
+    let (_tmp, sink, _path) = sqlite_sink().await;
+    underscore_stamp_cell(sink).await;
+}
+
+/// A quarantine stamp that differs from the scope cause only where the
+/// cause has `_` must not match the redrive pattern (`_` is literal).
+async fn underscore_stamp_cell(sink: Arc<dyn FederationDlqSink>) {
+    let id = format!("m-underscore-{}", uuid::Uuid::new_v4());
+    let peer_id = format!("peer-underscore-{}", uuid::Uuid::new_v4());
+    seed(&*sink, &memory(&id, NS_IN), &peer_id).await;
+    let row = sink
+        .take_pending_dlq_rows(100_000)
+        .await
+        .expect("take")
+        .into_iter()
+        .find(|r| r.memory_id == id)
+        .expect("seeded row");
+    let real = quarantined_reason(REASON_NOTHING_IN_SCOPE);
+    let stamp = real.replace("outbound_scope", "outboundXscope");
+    assert_ne!(stamp, real, "the stamp differs only at the `_`");
+    sink.quarantine_dlq_row(row.id, &stamp)
+        .await
+        .expect("quarantine");
+    redrive_out_of_scope_once(&*sink).await;
+    assert!(
+        sink.take_pending_dlq_rows(100_000)
+            .await
+            .expect("take")
+            .iter()
+            .all(|r| r.memory_id != id),
+        "a stamp that is not the scope cause stays quarantined"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // PostgreSQL cells (same assertions through the trait)
 // ---------------------------------------------------------------------------
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn erasure_sentinels_with_no_peer_in_scope_are_quarantined_postgres_9996() {
+    let Some(sink) = pg_sink().await else { return };
+    let sentinel = ai_memory::federation::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID;
+    let run = uuid::Uuid::new_v4();
+    let ids: Vec<String> = (0..SENTINEL_BACKLOG)
+        .map(|i| format!("m-erase-out-{run}-{i}"))
+        .collect();
+    for id in &ids {
+        let mut body = serde_json::json!({"memories": [], "deletions": [id], "dry_run": false});
+        ItemNamespaces::of(id, NS_OUT).annotate(&mut body);
+        sink.enqueue_push_failure(id, sentinel, &body, "queued erasure")
+            .await
+            .expect("queue erasure sentinel");
+    }
+    erasure_sentinel_cell(sink, None, &ids).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn underscore_stamp_is_not_redriven_postgres_9996() {
+    let Some(sink) = pg_sink().await else { return };
+    underscore_stamp_cell(sink).await;
+}
 
 #[cfg(feature = "sal-postgres")]
 async fn pg_sink() -> Option<Arc<dyn FederationDlqSink>> {
