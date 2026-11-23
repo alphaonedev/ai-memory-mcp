@@ -1195,6 +1195,9 @@ pub fn open(path: &Path) -> Result<Connection> {
         // the bootstrap is not an optimisation: replaying an older binary's
         // `CREATE … IF NOT EXISTS` set over a newer schema is the #2424 class,
         // so a hatch that ran it would re-open the window the guard closes.
+        // #10012 — the write-seal funnel is connection-local (TEMP), so it is
+        // armed here too: a hatch connection never writes unsealed.
+        arm_session_write_seal(&conn)?;
         return Ok(conn);
     }
     conn.execute_batch(SCHEMA)
@@ -1235,7 +1238,22 @@ pub fn open(path: &Path) -> Result<Connection> {
     // check withholds (Unknown) and this is a silent no-op.
     crate::governance::audit::enforce_rollback_check_at_open(&conn)
         .context("open-time rollback-evidence check")?;
+    // #10012 — a process with an installed stdio session signer arms EVERY
+    // connection it opens with the write-seal funnel, so no memory-row write
+    // reaches storage unsealed whichever connection a tool writes through.
+    arm_session_write_seal(&conn)?;
     Ok(test_trace_on_open(conn))
+}
+
+/// #10012 — install the stdio session-signer write-seal funnel on `conn`
+/// when a signer is installed; a no-op otherwise.
+fn arm_session_write_seal(conn: &Connection) -> Result<()> {
+    match crate::identity::session_signer::install_write_seal_funnel(conn)
+        .context("mcp session signer write-seal funnel (#10012)")?
+    {
+        crate::identity::session_signer::FunnelState::Installed
+        | crate::identity::session_signer::FunnelState::NoSigner => Ok(()),
+    }
 }
 
 /// #1580 — open a **read-only** connection to an already-initialized

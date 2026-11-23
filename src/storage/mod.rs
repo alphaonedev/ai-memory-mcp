@@ -10779,18 +10779,33 @@ pub fn consolidate_with_expected_versions(
             // the FK survives because there is no delete + cascade — so
             // multi-hop store -> reflect -> consolidate lineage stays
             // navigable across the consolidation boundary.
+            // #10012 — with a session signer installed the `derived_from`
+            // edges are signed by the session key when the session covers
+            // the consolidator; under strict mode an edge the session cannot
+            // sign refuses the whole consolidation (the transaction rolls
+            // back). Without a session the legacy unsigned edge stands.
+            let link_kp =
+                match crate::identity::session_signer::side_row_signer(consolidator_agent_id)
+                    .map_err(|reason| anyhow::anyhow!(reason))?
+                {
+                    crate::identity::session_signer::SideRowSigner::Session(kp) => Some(kp),
+                    crate::identity::session_signer::SideRowSigner::NoSession
+                    | crate::identity::session_signer::SideRowSigner::NotCoveredPermissive => None,
+                };
             for (id, _cid, _version, _source_ns) in &source_rows {
-                // C -> source `derived_from`, routed through the UNSIGNED
-                // `create_link` wrapper -> `create_link_signed(.., None)`
-                // (COND 6): that path populates `source_cid`/`target_cid`.
+                // C -> source `derived_from`, through `create_link_signed`
+                // with the session key resolved above (`None` without a
+                // session, the legacy unsigned edge) (COND 6): that path
+                // populates `source_cid`/`target_cid`.
                 // The Pass-0 acyclicity guard is satisfied by construction —
                 // C's `created_at == now` is never older than a retained
                 // source's.
-                create_link(
+                create_link_signed(
                     conn,
                     &new_id,
                     id,
                     crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+                    link_kp.as_ref(),
                 )?;
                 // Logical delete: exclude the source from ordinary recall
                 // while keeping the row (and its cid) reachable as a lineage
@@ -12589,6 +12604,42 @@ pub fn invalidate_link(
     valid_until: Option<&str>,
     actor: Option<&str>,
 ) -> Result<Option<InvalidateResult>> {
+    invalidate_link_resigned(
+        conn,
+        source_id,
+        target_id,
+        relation,
+        valid_until,
+        actor,
+        None,
+    )
+}
+
+/// [`invalidate_link`], then — inside the same write transaction — re-sign the
+/// superseded row with `resign` when that key's agent is the row's
+/// `observed_by` (#10012).
+///
+/// The H5 semantics are unchanged: the prior signature is cleared and recorded
+/// on the `memory_link.invalidated` audit leaf. A session signer that owns the
+/// edge then signs the row AS STORED (its `observed_by`, `created_at`,
+/// `valid_from` and the stored `valid_until`, the exact pre-image
+/// `memory_verify` rebuilds) and persists it `self_signed`, so a stdio
+/// invalidation by the session agent never leaves its own edge unsigned. A key
+/// that does not own the edge never signs it.
+///
+/// # Errors
+///
+/// Every [`invalidate_link`] error, and a signing or persistence failure of
+/// the re-seal, which rolls the whole invalidation back.
+pub fn invalidate_link_resigned(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    valid_until: Option<&str>,
+    actor: Option<&str>,
+    resign: Option<&crate::identity::keypair::AgentKeypair>,
+) -> Result<Option<InvalidateResult>> {
     // #3203 — record-stop fence. `invalidate_link` MUTATES `memory_links`
     // (and appends a `signed_events` leaf), so it belongs behind the same
     // #1955 R45 fence every other link-plane write sits behind — the create
@@ -12783,6 +12834,44 @@ pub fn invalidate_link(
                      (rolled back signature clearing): {e}"
                 ));
             }
+        }
+    }
+
+    // #10012 — the session signer re-seals its own superseded edge inside
+    // this transaction; a failure rolls the invalidation back.
+    if let Some(kp) = resign
+        && kp.can_sign()
+        && observed_by.as_deref() == Some(kp.agent_id.as_str())
+    {
+        let link = crate::identity::sign::SignableLink {
+            src_id: source_id,
+            dst_id: target_id,
+            relation,
+            observed_by: Some(kp.agent_id.as_str()),
+            created_at: created_at.as_deref(),
+            valid_from: valid_from.as_deref(),
+            valid_until: Some(stored.as_str()),
+        };
+        let resealed = crate::identity::sign::sign(kp, &link).and_then(|sig| {
+            conn.execute(
+                "UPDATE memory_links SET signature = ?4, attest_level = ?5 \
+                  WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+                params![
+                    source_id,
+                    target_id,
+                    relation,
+                    sig,
+                    crate::models::AttestLevel::SelfSigned.as_str()
+                ],
+            )
+            .map_err(anyhow::Error::from)
+        });
+        if let Err(e) = resealed {
+            rollback();
+            return Err(anyhow::anyhow!(
+                "failed to re-seal the invalidated link with the session signer \
+                 (rolled back the invalidation): {e}"
+            ));
         }
     }
 

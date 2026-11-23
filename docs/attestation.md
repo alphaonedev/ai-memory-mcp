@@ -502,6 +502,17 @@ refused; it never lands `claimed` instead. A `signature` the caller supplies on
 exactly as before. With the variable unset nothing changes. The key is held
 only by the server process and is never logged.
 
+Every other write tool is sealed the same way (#10012): each connection the
+server opens carries a write-seal funnel, so any memory row a tool inserts or
+changes for the session agent is re-signed with the session key and lands
+`agent_attested`. The `derived_from` links of `memory_consolidate`, the
+closing write of `memory_kg_invalidate` and `memory_offload` blobs are signed
+with the session key. Under `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` a write
+the session cannot seal (a row owned by another agent, for example from
+`memory_share` or `memory_agent_register`) is refused with an
+`ATTESTATION_FAILED: mcp session signer (#10012)` reason and nothing is
+stored; the session never signs for another agent.
+
 ---
 
 ## Verify it worked
