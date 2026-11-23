@@ -12615,22 +12615,25 @@ pub fn invalidate_link(
     )
 }
 
-/// [`invalidate_link`], then — inside the same write transaction — re-sign the
-/// superseded row with `resign` when that key's agent is the row's
-/// `observed_by` (#10012).
+/// [`invalidate_link`] under the session signer `resign` (#10012): inside the
+/// same write transaction the superseded row is re-signed when, and only
+/// when, its stored signature is the session's own and verifies.
 ///
-/// The H5 semantics are unchanged: the prior signature is cleared and recorded
-/// on the `memory_link.invalidated` audit leaf. A session signer that owns the
-/// edge then signs the row AS STORED (its `observed_by`, `created_at`,
-/// `valid_from` and the stored `valid_until`, the exact pre-image
-/// `memory_verify` rebuilds) and persists it `self_signed`, so a stdio
-/// invalidation by the session agent never leaves its own edge unsigned. A key
-/// that does not own the edge never signs it.
+/// Without a session signer (`resign` `None`) the H5 semantics are
+/// unchanged: the prior signature is cleared and recorded on the
+/// `memory_link.invalidated` audit leaf. With one, the decision is
+/// [`crate::identity::session_signer::edge_invalidation_decision`] on the row
+/// as read in this transaction: the session's own verifying edge is signed
+/// AS STORED (its `observed_by`, `created_at`, `valid_from` and the stored
+/// `valid_until`, the exact pre-image `memory_verify` rebuilds) and persisted
+/// `self_signed`; a broken or foreign signature is refused with nothing
+/// changed; an unsigned edge stays unsigned (strict mode refuses it).
 ///
 /// # Errors
 ///
-/// Every [`invalidate_link`] error, and a signing or persistence failure of
-/// the re-seal, which rolls the whole invalidation back.
+/// Every [`invalidate_link`] error, the exact refusal of the decision above,
+/// and a signing or persistence failure of the re-seal, which rolls the whole
+/// invalidation back.
 pub fn invalidate_link_resigned(
     conn: &Connection,
     source_id: &str,
@@ -12728,6 +12731,34 @@ pub fn invalidate_link_resigned(
     };
     let (prior, prior_signature, _prior_attest, observed_by, valid_from, created_at) = prior_row;
     let was_signed = prior_signature.is_some();
+    // #10012 — under a session signer, decide on the link AS READ inside this
+    // transaction (no window between the check and the write): re-sign only
+    // the session's own link whose stored signature verifies; refuse a
+    // broken or foreign signature in both postures; leave an unsigned link
+    // unsigned (permissive) or refuse it (strict).
+    let reseal = crate::identity::session_signer::edge_invalidation_decision(
+        resign,
+        &crate::identity::sign::SignableLink {
+            src_id: source_id,
+            dst_id: target_id,
+            relation,
+            observed_by: observed_by.as_deref(),
+            created_at: created_at.as_deref(),
+            valid_from: valid_from.as_deref(),
+            valid_until: prior.as_deref(),
+        },
+        prior_signature.as_deref(),
+        crate::identity::attest::require_agent_attestation_for(
+            crate::identity::attest::WriteSurface::Mcp,
+        ),
+    );
+    let reseal = match reseal {
+        Ok(decision) => decision,
+        Err(text) => {
+            rollback();
+            return Err(crate::errors::refusal(text));
+        }
+    };
 
     let update_result = if was_signed {
         // v0.7.0 #628 H5 — clear the signing surface so a future
@@ -12840,8 +12871,7 @@ pub fn invalidate_link_resigned(
     // #10012 — the session signer re-seals its own superseded edge inside
     // this transaction; a failure rolls the invalidation back.
     if let Some(kp) = resign
-        && kp.can_sign()
-        && observed_by.as_deref() == Some(kp.agent_id.as_str())
+        && reseal == crate::identity::session_signer::EdgeReseal::Reseal
     {
         let link = crate::identity::sign::SignableLink {
             src_id: source_id,

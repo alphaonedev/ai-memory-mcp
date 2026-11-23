@@ -644,8 +644,7 @@ const UNSEALED_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#
 
 /// Refusal of a write over a row whose stored seal no longer verifies, both
 /// postures (`RowRefusal::Tampered`, head before the row tag).
-const TAMPERED_REFUSAL: &str =
-    "ATTESTATION_FAILED: mcp session signer (#10012): stored seal does not verify; refusing to re-sign";
+const TAMPERED_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): stored seal does not verify; refusing to re-sign";
 
 /// The exact strict refusal naming row `id` (`RowRefusal::Foreign.text`).
 fn foreign_refusal(id: &str) -> String {
@@ -1561,8 +1560,11 @@ fn signed_row_verifies(
                 cell_opt(row, "content_sha256"),
                 cell_opt(row, "namespace"),
                 cell_opt(row, "stored_at").and_then(|v| v.parse::<i64>().ok()),
-                cell_opt(row, "signature_b64")
-                    .and_then(|v| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v).ok()),
+                cell_opt(row, "signature_b64").and_then(|v| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(v)
+                        .ok()
+                }),
             ) else {
                 return false;
             };
@@ -1571,7 +1573,10 @@ fn signed_row_verifies(
                 (text("content_sha256"), text(sha)),
                 (text("namespace"), text(namespace)),
                 (text("ref_id"), text(ref_id)),
-                (text("stored_at"), ciborium::Value::Integer(stored_at.into())),
+                (
+                    text("stored_at"),
+                    ciborium::Value::Integer(stored_at.into()),
+                ),
             ]);
             let mut payload = Vec::new();
             ciborium::into_writer(&envelope, &mut payload).expect("encode offload envelope");
@@ -1945,7 +1950,12 @@ fn unsigned_session_row_defects(require: &str) -> Vec<String> {
         },
     ];
     for case in &cases {
-        defects.extend(run_seeded(&sb, &mut mcp, case, &format!("REQUIRE={require}")));
+        defects.extend(run_seeded(
+            &sb,
+            &mut mcp,
+            case,
+            &format!("REQUIRE={require}"),
+        ));
     }
     // Consolidate folds A (unsigned) into a new row the session seals over
     // content it supplied in this call; A itself is never resealed.
@@ -2029,7 +2039,9 @@ fn tampered_row_defects(require: &str) -> Vec<String> {
     // bytes: it still names the session and still does not verify.
     let tampered_still_fails = memory_row_defects(&sb, &a, require);
     if tampered_still_fails.is_empty() {
-        defects.push(format!("{label}: tampered row {a} verifies; the tamper was resealed"));
+        defects.push(format!(
+            "{label}: tampered row {a} verifies; the tamper was resealed"
+        ));
     }
     defects
 }
@@ -2064,7 +2076,10 @@ fn foreign_row_defects(require: &str) -> Vec<String> {
     let mut defects = Vec::new();
     for (tool, args) in [
         ("memory_update", json!({"id": f, "priority": 9})),
-        ("memory_update", json!({"id": f, "content": body("foreign rewrite")})),
+        (
+            "memory_update",
+            json!({"id": f, "content": body("foreign rewrite")}),
+        ),
         ("memory_promote", json!({"id": f, "target_tier": "long"})),
     ] {
         let case = SeededCase {
@@ -2112,7 +2127,9 @@ fn foreign_row_defects(require: &str) -> Vec<String> {
             if !EXEMPT_TABLES.iter().any(|(t, _)| t == table)
                 && !changed(&before, &after, table).is_empty()
             {
-                defects.push(format!("{label} memory_share: refused call changed {table}"));
+                defects.push(format!(
+                    "{label} memory_share: refused call changed {table}"
+                ));
             }
         }
     }
@@ -2229,7 +2246,9 @@ fn edge_defects(require: &str) -> Vec<String> {
         match (seed.refusal(strict), is_error) {
             (Some(want), true) if text == want => {
                 if after != before {
-                    defects.push(format!("{label}: refused but the link changed:\n  {before:?}\n  {after:?}"));
+                    defects.push(format!(
+                        "{label}: refused but the link changed:\n  {before:?}\n  {after:?}"
+                    ));
                 }
             }
             (Some(want), _) => defects.push(format!(
@@ -2245,7 +2264,9 @@ fn edge_defects(require: &str) -> Vec<String> {
                 let signed = !after.ends_with("\u{1f}NULL");
                 match (seed, key) {
                     (EdgeSeed::Intact, Some(k)) => {
-                        if let Some(d) = signed_row_defect(&sb, &snap, "memory_links", "signature", &k) {
+                        if let Some(d) =
+                            signed_row_defect(&sb, &snap, "memory_links", "signature", &k)
+                        {
                             defects.push(format!("{label}: {d}"));
                         }
                     }
@@ -2278,8 +2299,8 @@ fn kg_invalidate_seeded_edges_strict_10012() {
 
 // --- Smart-tier tools against a loopback stub LLM (Code LOW-3) ---
 
-/// The stub's chat answer: a tag list for auto_tag, "no" contradiction, a
-/// persona body for persona_generate.
+/// The stub's chat answer: a tag list for `auto_tag`, "no" contradiction, a
+/// persona body for `persona_generate`.
 const STUB_CHAT_ANSWER: &str = "seal-tag-one, seal-tag-two";
 const STUB_MODEL: &str = "seal-stub-10012";
 
@@ -2290,9 +2311,10 @@ fn stub_llm(rt: &tokio::runtime::Runtime) -> wiremock::MockServer {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"models": [{"name": format!("{STUB_MODEL}:latest")}]}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"models": [{"name": format!("{STUB_MODEL}:latest")}]})),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -2448,8 +2470,10 @@ fn smart_tier_defects(require: &str) -> Vec<String> {
     // text and changes nothing.
     {
         let before = snapshot(&sb);
-        let (is_error, text) =
-            mcp.call_raw("memory_detect_contradiction", &json!({"id_a": a, "id_b": f}));
+        let (is_error, text) = mcp.call_raw(
+            "memory_detect_contradiction",
+            &json!({"id_a": a, "id_b": f}),
+        );
         let after = snapshot(&sb);
         if !is_error || text != "memory B not found" {
             defects.push(format!(
@@ -2466,22 +2490,24 @@ fn smart_tier_defects(require: &str) -> Vec<String> {
             }
         }
         if attest_level(&sb, &f).as_deref() == Some(ATTESTED) {
-            defects.push(format!("{label} memory_detect_contradiction(foreign): row {f} became {ATTESTED}"));
+            defects.push(format!(
+                "{label} memory_detect_contradiction(foreign): row {f} became {ATTESTED}"
+            ));
         }
     }
     // The unsigned columns the smart tools wrote (written out, not derived).
     let unsigned = |id: &str| -> (String, String) {
         sb.conn()
-            .query_row(
-                "SELECT tags, tier FROM memories WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT tags, tier FROM memories WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .expect("read unsigned columns")
     };
     let (tags_a, tier_a) = unsigned(&a);
     if !tags_a.contains(STUB_CHAT_ANSWER) {
-        defects.push(format!("{label} memory_auto_tag: tags of {a} are {tags_a:?}"));
+        defects.push(format!(
+            "{label} memory_auto_tag: tags of {a} are {tags_a:?}"
+        ));
     }
     if tier_a != "long" {
         defects.push(format!(
@@ -2490,7 +2516,9 @@ fn smart_tier_defects(require: &str) -> Vec<String> {
     }
     let (_, tier_b) = unsigned(&b);
     if tier_b == "long" {
-        defects.push(format!("{label} memory_pending_reject: rejected promote of {b} was applied"));
+        defects.push(format!(
+            "{label} memory_pending_reject: rejected promote of {b} was applied"
+        ));
     }
     for id in [&a, &b] {
         for d in memory_row_defects(&sb, id, require) {

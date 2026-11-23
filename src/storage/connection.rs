@@ -1241,6 +1241,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     // #10012 — a process with an installed stdio session signer arms EVERY
     // connection it opens with the write-seal funnel, so no memory-row write
     // reaches storage unsealed whichever connection a tool writes through.
+    // Pin: `identity::session_signer::tests::every_later_db_open_seals_session_rows_10012`
+    // opens its own connection through this function and is red without this
+    // line (the stdio integration tests reach it only through the server's
+    // own opens).
     arm_session_write_seal(&conn)?;
     Ok(test_trace_on_open(conn))
 }

@@ -67,45 +67,6 @@ impl McpTool for KgInvalidateTool {
     }
 }
 
-/// #10012 — the key that re-seals the edge `(source, target, relation)` after
-/// its invalidation: the session key when the session agent is the edge's
-/// `observed_by`, `None` without a session signer or (permissive) for an edge
-/// the session does not own. A missing edge resolves to `None`; the
-/// invalidation then reports it as not found.
-///
-/// # Errors
-///
-/// [`crate::identity::session_signer::SIDE_ROW_STRICT_REFUSAL`] under strict
-/// mode for an edge the session cannot re-seal; a read failure.
-fn edge_resign_key(
-    conn: &rusqlite::Connection,
-    source_id: &str,
-    target_id: &str,
-    relation: &str,
-) -> Result<Option<crate::identity::keypair::AgentKeypair>, String> {
-    use crate::identity::session_signer::{SideRowSigner, side_row_signer};
-    use rusqlite::OptionalExtension as _;
-    if crate::identity::session_signer::session_keypair().is_none() {
-        return Ok(None);
-    }
-    let observed_by: Option<Option<String>> = conn
-        .query_row(
-            "SELECT observed_by FROM memory_links \
-             WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
-            rusqlite::params![source_id, target_id, relation],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
-    let Some(observed_by) = observed_by else {
-        return Ok(None);
-    };
-    match side_row_signer(observed_by.as_deref().unwrap_or_default())? {
-        SideRowSigner::Session(kp) => Ok(Some(kp)),
-        SideRowSigner::NoSession | SideRowSigner::NotCoveredPermissive => Ok(None),
-    }
-}
-
 /// SEC-2 / COV-8 (Cluster D, issue #767) — `pub` so the integration
 /// test fleet can drive the handler directly. The function is still
 /// only registered as the MCP `memory_kg_invalidate` tool; visibility
@@ -218,11 +179,12 @@ pub fn handle_kg_invalidate(
     // identity configured) records the `system` sentinel rather than
     // borrowing the edge's original attester, which is what this used to do.
     let actor = crate::identity::resolve_read_visibility_caller();
-    // #10012 — with a session signer installed, the superseded edge is
-    // re-sealed by the session key when the session agent observed it; under
-    // strict mode an edge the session cannot re-seal is refused before
-    // anything changes (a session never signs for another agent).
-    let resign = edge_resign_key(conn, source_id, target_id, relation)?;
+    // #10012 — with a session signer installed, storage decides on the edge
+    // as read inside the invalidation's own transaction: the session's own
+    // verifying edge is re-sealed, a broken or foreign signature is refused,
+    // an unsigned edge stays unsigned (strict mode refuses it). A session
+    // never signs for another agent or over bytes it did not seal.
+    let resign = crate::identity::session_signer::session_keypair();
     match db::invalidate_link_resigned(
         conn,
         source_id,
