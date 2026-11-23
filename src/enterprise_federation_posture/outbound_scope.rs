@@ -22,7 +22,10 @@ use std::collections::BTreeMap;
 pub(super) const CONTROL_OUTBOUND_SCOPE: &str = "federation outbound scope";
 
 /// The `actual` text of check #23 in a process that cannot see the peer list.
-pub(super) const UNVERIFIABLE: &str = "unverifiable from this process";
+/// It names the reason (the scope is not provable from a fresh process) and
+/// the live-check issue that gives the row a source of truth.
+pub(super) const UNVERIFIABLE: &str =
+    "the daemon outbound scope is not provable from a fresh process (live check #10059)";
 
 /// The pass verdict and `actual` text for the rows a daemon recorded.
 fn judge_rows(rows: &[PeerScopeRow]) -> (bool, String) {
@@ -234,15 +237,17 @@ pub(super) mod tests {
         assert!(!pass, "env shape alone never passes");
         assert_eq!(
             actual,
-            "unverifiable from this process: the peer list is the `serve --quorum-peers` \
-             argument; 1 scoped peer key(s) in the env"
+            "the daemon outbound scope is not provable from a fresh process (live check \
+             #10059): the peer list is the `serve --quorum-peers` argument; 1 scoped peer \
+             key(s) in the env"
         );
         let (pass, actual) = judge_peers(None, Ok(BTreeMap::new()));
         assert!(!pass);
         assert_eq!(
             actual,
-            "unverifiable from this process: the peer list is the `serve --quorum-peers` \
-             argument; 0 scoped peer key(s) in the env"
+            "the daemon outbound scope is not provable from a fresh process (live check \
+             #10059): the peer list is the `serve --quorum-peers` argument; 0 scoped peer \
+             key(s) in the env"
         );
     }
 

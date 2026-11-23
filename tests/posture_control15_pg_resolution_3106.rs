@@ -418,7 +418,8 @@ const OUTBOUND_SCOPE_CONTROL: &str = "federation outbound scope";
 /// The `actual` text check #23 carries in a process that cannot see the
 /// peer list (review #10026 S-F2).
 #[cfg(feature = "sal-postgres")]
-const OUTBOUND_SCOPE_UNVERIFIABLE: &str = "unverifiable from this process";
+const OUTBOUND_SCOPE_UNVERIFIABLE: &str =
+    "the daemon outbound scope is not provable from a fresh process (live check #10059)";
 
 /// The `actual` text of the one row named exactly `control`.
 #[cfg(feature = "sal-postgres")]
