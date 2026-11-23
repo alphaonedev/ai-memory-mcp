@@ -154,11 +154,10 @@ const LINK_ATTEST_LEVEL_DROPPED: &str = "export_link_from_row leaves attest_leve
 /// `export_full_keeps_an_enrolled_identity_lineage_10027` seeds one.
 const LINEAGE_IMPORT_REFUSED: &str = "import strips the agent_pubkey binding before its lineage gate and refuses every enrolled lineage as forged (#10027)";
 /// The main convenience cell seeds no sealed live row: the convenience
-/// export/import writes it back as plaintext with no envelope (#10028). The
-/// dedicated red cell `convenience_export_keeps_a_sealed_row_sealed_10028`
-/// seeds one.
-const SEALED_ROW_UNSEALED: &str =
-    "the convenience export/import writes a sealed row back as plaintext with no envelope (#10028)";
+/// format has no envelope field, so its export refuses a sealed row (#10028).
+/// The dedicated cell `convenience_export_keeps_a_sealed_row_sealed_10028`
+/// seeds one and asserts the refusal.
+const SEALED_ROW_UNSEALED: &str = "the convenience format has no envelope field, so its export refuses a sealed row and the main cell seeds none (#10028)";
 /// The convenience wire row (`models::Memory`) has no field for the
 /// atomisation, kind-provenance and entity-mention columns (#10029).
 const ATOM_COLUMNS_DROPPED: &str =
@@ -171,10 +170,11 @@ const LINK_VALID_UNTIL_DROPPED: &str = "the convenience import re-creates each e
 /// the atomisation, kind-provenance and entity-mention columns (#10031).
 const FULL_ATOM_COLUMNS_DROPPED: &str = "export --full emits live rows as Memory, which drops atomised_into, atom_of, kind_provenance and mentioned_entity_id (#10031)";
 
-/// `export --full` emits plaintext and the import re-seals against the
-/// destination policy, so a sealed row lands in plaintext on a node with
-/// at-rest encryption off; the main cell seeds no sealed row (#10032).
-const FULL_SEALED_ROW_UNSEALED: &str = "export --full then import unseals a sealed row on a destination with at-rest encryption off (#10032)";
+/// The v2 envelope has no at-rest envelope field, so `export --full` refuses
+/// a sealed live or archived row; the main cell seeds none (#10032). The
+/// dedicated cell `export_full_keeps_a_sealed_row_sealed_10032` seeds both and
+/// asserts the refusal.
+const FULL_SEALED_ROW_UNSEALED: &str = "the v2 envelope has no at-rest envelope field, so export --full refuses a sealed row and the main cell seeds none (#10032)";
 
 /// One live corpus row: `(title, namespace, tier, content, tags, with_embedding)`.
 type CorpusRow = (
@@ -341,8 +341,8 @@ impl RestorePath {
         match self {
             Self::BackupRestore => SeedShape::FULL,
             // ExportFullImport: #10027 (import refuses an enrolled lineage as
-            // forged) and #10032 (the full pair unseals a sealed row).
-            // ExportImport: #10028 (the convenience pair unseals a sealed
+            // forged) and #10032 (the full export refuses a sealed row).
+            // ExportImport: #10028 (the convenience export refuses a sealed
             // row); the convenience format carries no lineage, and an
             // imported `_agents` key binding is stripped by design (#3464).
             Self::ExportFullImport | Self::ExportImport => SeedShape {
@@ -1279,6 +1279,111 @@ fn export_import(src: &Path, dir: &Path, full: bool) -> (PathBuf, Vec<SchemaObje
     (dest, fresh_schema)
 }
 
+/// The exact refusal code an export prints for a store with a sealed row
+/// (#10028), written out here rather than taken from the code under test.
+const SEALED_REFUSAL_CODE: &str = "SEALED_EXPORT_REFUSED: ";
+
+/// The refusal names the live table the sealed row is in (#10028).
+const SEALED_REFUSAL_TEXT: &str = "of memories are sealed at rest";
+
+/// The plaintexts the sealed corpus rows were sealed from: none of them may
+/// appear in an export artifact, a destination store or an error (C-3).
+const SEALED_MARKERS: [&str; 2] = [SEALED_PLAINTEXT, ARCHIVED_SECOND_CONTENT];
+
+/// Fail when any sealed-payload marker is in `bytes`.
+fn assert_no_sealed_plaintext(bytes: &[u8], what: &str) {
+    for marker in SEALED_MARKERS {
+        let m = marker.as_bytes();
+        assert!(
+            !bytes.windows(m.len()).any(|w| w == m),
+            "{what} holds the plaintext of a sealed payload ({marker:?})"
+        );
+    }
+}
+
+/// Every byte of a SQLite store on disk: the file and its WAL / SHM.
+fn store_bytes(db: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = db.as_os_str().to_owned();
+        p.push(suffix);
+        if let Ok(b) = std::fs::read(PathBuf::from(p)) {
+            out.extend(b);
+        }
+    }
+    out
+}
+
+/// C-3 on `path`: seed a store with a sealed live row and a sealed archived
+/// row, run `export | import` into a fresh store, and require that the export
+/// refused with the exact code, wrote no artifact, and that no sealed
+/// plaintext is in the artifact, the destination or any error.
+fn assert_sealed_export_refused(path: RestorePath) {
+    let tmp = TempDir::new().expect("tempdir");
+    let src = tmp.path().join("source.db");
+    let corpus = seed(
+        &src,
+        SeedShape {
+            lineage: Lineage::Absent,
+            sealed: Sealed::Present,
+        },
+    );
+    let id = corpus.encrypted.expect("the shape seeds a sealed row");
+    let before = snapshot(&src);
+    let sealed_rows = |table: &str| {
+        before.tables[table]
+            .rows
+            .iter()
+            .filter(|r| matches!(r.get("encrypted_envelope"), Some(SqlValue::Blob(_))))
+            .count()
+    };
+    assert!(sealed_rows("memories") > 0, "the corpus seals a live row");
+    assert!(
+        sealed_rows("archived_memories") > 0,
+        "the corpus seals an archived row"
+    );
+    let mut exp = ai_memory(&src);
+    exp.arg("export");
+    if path == RestorePath::ExportFullImport {
+        exp.arg("--full");
+    }
+    let out = exp.output().expect("export runs");
+    let dest = tmp.path().join("destination.db");
+    ai_memory(&dest).args(["stats"]).assert().success();
+    let imp = ai_memory(&dest)
+        .args(["import", "--trust-source"])
+        .write_stdin(out.stdout.clone())
+        .output()
+        .expect("import runs");
+    // C-3: no plaintext of a sealed payload in the artifact, the destination
+    // or any report or error the pipeline printed.
+    assert_no_sealed_plaintext(&out.stdout, "the export artifact");
+    assert_no_sealed_plaintext(&out.stderr, "the export error");
+    assert_no_sealed_plaintext(&imp.stdout, "the import report");
+    assert_no_sealed_plaintext(&imp.stderr, "the import error");
+    assert_no_sealed_plaintext(&store_bytes(&dest), "the destination store");
+    // The export refused, exactly, and wrote nothing.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "{path:?}: the export of a sealed row must refuse; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(SEALED_REFUSAL_CODE) && stderr.contains(SEALED_REFUSAL_TEXT),
+        "{path:?}: not the sealed-export refusal: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "{path:?}: a refused export wrote an artifact"
+    );
+    assert!(
+        snapshot(&dest).rows_where("memories", "id", &id).is_empty(),
+        "{path:?}: the sealed row reached the destination"
+    );
+    assert_eq!(before, snapshot(&src), "{path:?} changed its SOURCE store");
+}
+
 /// One cell's inputs: the refused-unless-rich source, the restored store and
 /// the destination's pre-import schema.
 struct Cell {
@@ -1456,40 +1561,15 @@ fn export_full_keeps_an_enrolled_identity_lineage_10027() {
     );
 }
 
-/// Defect #10028, red until it lands: the convenience export then import must
-/// keep a sealed row sealed (empty content, the envelope byte for byte). The
-/// fix removes the `SEALED_ROW_UNSEALED` null-column entry above.
+/// Defect #10028 (3-agent vote 71472661 V3-STD4-SCOPE C-3): the convenience
+/// format has no field for the at-rest envelope, so `export` of a store that
+/// holds a sealed row REFUSES before it writes a byte. The pipeline
+/// `export | import` then leaves the destination without the row, and no
+/// plaintext of a sealed payload reaches the artifact, the destination or the
+/// error.
 #[test]
 fn convenience_export_keeps_a_sealed_row_sealed_10028() {
-    let shape = SeedShape {
-        lineage: Lineage::Absent,
-        sealed: Sealed::Present,
-    };
-    let run = run_raw(RestorePath::ExportImport, shape);
-    let id = run
-        .corpus
-        .encrypted
-        .clone()
-        .expect("the shape seeds a sealed row");
-    assert_columns_kept(
-        &run,
-        "memories",
-        &["id"],
-        &["encrypted_envelope"],
-        "defect #10028",
-    );
-    let content = |s: &StoreSnapshot| {
-        s.tables["memories"]
-            .rows
-            .iter()
-            .find(|r| r.get("id") == Some(&SqlValue::Text(id.as_bytes().to_vec())))
-            .and_then(|r| r.get("content").cloned())
-    };
-    assert_eq!(
-        content(&run.restored),
-        content(&run.before),
-        "the convenience export unsealed a sealed row's content (defect #10028)"
-    );
+    assert_sealed_export_refused(RestorePath::ExportImport);
 }
 
 /// Defect #10029, red until it lands: the convenience export then import must
@@ -1550,51 +1630,81 @@ fn export_full_keeps_every_atomisation_column_10031() {
     );
 }
 
-/// Defect #10032, red until it lands: `export --full` then `import` must keep
-/// a sealed live row and a sealed archived row sealed (empty live content,
-/// each envelope present). The fix removes the `FULL_SEALED_ROW_UNSEALED`
-/// null-column entries above.
+/// Defect #10032 (3-agent vote 71472661 V3-STD4-SCOPE C-3): the v2 envelope
+/// (`spec_version` "2", `deny_unknown_fields`) has no field for the at-rest
+/// envelope of a live or an archived row, so `export --full` of a store that
+/// holds a sealed row REFUSES before it writes a byte, whatever the
+/// destination's at-rest policy. No plaintext reaches the artifact, the
+/// destination or the error.
 #[test]
 fn export_full_keeps_a_sealed_row_sealed_10032() {
-    let shape = SeedShape {
-        lineage: Lineage::Absent,
-        sealed: Sealed::Present,
-    };
-    let run = run_raw(RestorePath::ExportFullImport, shape);
-    let id = run
-        .corpus
-        .encrypted
-        .clone()
-        .expect("the shape seeds a sealed row");
-    let content = |s: &StoreSnapshot| {
-        s.rows_where("memories", "id", &id)
-            .first()
-            .and_then(|r| r.get("content").cloned())
-    };
-    assert_eq!(
-        content(&run.restored),
-        content(&run.before),
-        "export --full unsealed a sealed row's content (defect #10032)"
-    );
-    for table in ["memories", "archived_memories"] {
-        let sealed_rows = |s: &StoreSnapshot| {
-            s.tables[table]
-                .rows
-                .iter()
-                .filter(|r| matches!(r.get("encrypted_envelope"), Some(SqlValue::Blob(_))))
-                .count()
+    assert_sealed_export_refused(RestorePath::ExportFullImport);
+}
+
+/// The `sync` sibling of #10028 (3-agent vote 71472661 V3-STD4-SCOPE C-3):
+/// `sync` moves rows between two SQLite stores through the same decrypting
+/// `export_all` read, so a sealed row would land in the other store as
+/// plaintext (or under a new envelope). Every direction, and the dry run,
+/// refuses with the exact code, and the store it would have written holds no
+/// sealed plaintext and no copy of the row.
+#[test]
+fn sync_refuses_a_sealed_row_in_every_direction_10028() {
+    for (direction, dry_run) in [
+        ("pull", false),
+        ("push", false),
+        ("merge", false),
+        ("merge", true),
+    ] {
+        let tmp = TempDir::new().expect("tempdir");
+        let sealed = tmp.path().join("sealed.db");
+        let corpus = seed(
+            &sealed,
+            SeedShape {
+                lineage: Lineage::Absent,
+                sealed: Sealed::Present,
+            },
+        );
+        let id = corpus.encrypted.expect("the shape seeds a sealed row");
+        let other = tmp.path().join("other.db");
+        ai_memory(&other).args(["stats"]).assert().success();
+        let before = snapshot(&sealed);
+        // pull and merge read the sealed store as the remote; push reads it
+        // as the local store.
+        let (local, remote) = if direction == "push" {
+            (&sealed, &other)
+        } else {
+            (&other, &sealed)
         };
+        let mut cmd = ai_memory(local);
+        cmd.arg("sync")
+            .arg(remote)
+            .args(["--direction", direction, "--trust-source"]);
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        let out = cmd.output().expect("sync runs");
+        let what = format!("sync --direction {direction} (dry run {dry_run})");
+        assert_no_sealed_plaintext(&out.stdout, &format!("{what} report"));
+        assert_no_sealed_plaintext(&out.stderr, &format!("{what} error"));
+        assert_no_sealed_plaintext(&store_bytes(&other), &format!("{what} other store"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{what}: a sync over a sealed row must refuse; stderr: {stderr}"
+        );
         assert!(
-            sealed_rows(&run.before) > 0,
-            "{table}: the corpus seals a row"
+            stderr.contains(SEALED_REFUSAL_CODE) && stderr.contains(SEALED_REFUSAL_TEXT),
+            "{what}: not the sealed-export refusal: {stderr}"
         );
-        assert_eq!(
-            sealed_rows(&run.restored),
-            sealed_rows(&run.before),
-            "{table}: export --full dropped an envelope (defect #10032)"
+        assert!(
+            snapshot(&other)
+                .rows_where("memories", "id", &id)
+                .is_empty(),
+            "{what}: the sealed row reached the other store"
         );
+        assert_eq!(before, snapshot(&sealed), "{what} changed the sealed store");
     }
-    assert_sealed_row_decrypts(&run.restored, &id);
 }
 
 /// Archive then restore: the memory row, its embedding and its edges come

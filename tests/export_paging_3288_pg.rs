@@ -13,9 +13,10 @@
 //!
 //! * every page returns at most `limit` rows and a walk visits every live row
 //!   of the probe namespace exactly once, `created_at` ties included;
-//! * an undecryptable row is SKIPPED and COUNTED in its page's
-//!   `undecryptable` (the machine-readable count the issue asks for), while
-//!   the cursor still advances past it;
+//! * a row that holds an at-rest envelope (sealed, openable or not) REFUSES
+//!   the page with `SEALED_EXPORT_REFUSED` (#10033, 3-agent vote 71472661
+//!   V3-STD4-SCOPE C-3): the page format has no envelope field, so the row is
+//!   never decrypted onto the wire and never silently skipped;
 //! * pages taken in order never carry an edge before both endpoints are
 //!   carried, and every carriable edge is emitted exactly once.
 //!
@@ -146,44 +147,68 @@ async fn pg_export_walk_is_bounded_and_complete_3288() {
         .expect("cleanup");
 }
 
+/// The exact refusal code, written out here rather than taken from the code
+/// under test.
+const SEALED_REFUSAL_CODE: &str = "SEALED_EXPORT_REFUSED";
+
+/// #10033 on the store surface: a row with an at-rest envelope refuses the
+/// export page, on the first page of a scoped walk (whatever page the row
+/// would fall on) and on a page resumed from a cursor just before it. The
+/// envelope is garbage, so the refusal is proven to be decided from the
+/// column, before any decrypt. The probe rows are dated 2030, before the
+/// 2031 window the other cells of this binary walk, so a parallel cell never
+/// meets the sealed row.
 #[tokio::test]
-async fn pg_export_counts_undecryptable_rows_instead_of_hiding_them_3288() {
+async fn pg_export_refuses_a_sealed_row_instead_of_skipping_it_10033() {
     let Some(url) = postgres_url() else {
         return;
     };
     let store = PostgresStore::connect(&url)
         .await
         .expect("connect postgres");
-    let ns = format!("export-3288-dec-{}", uuid::Uuid::new_v4());
-    let ids = seed(&store, &ns, 3).await;
-    // A garbage envelope: the scheme byte is not a known envelope version, so
-    // the scan mapper cannot open it — the shape a lost keypair leaves behind.
+    let ns = format!("export-10033-sealed-{}", uuid::Uuid::new_v4());
+    let ctx = CallerContext::for_agent("ai:3288");
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let id = format!("{ns}-{i:03}");
+        let ts = format!("2030-06-01T00:00:{i:02}.000000Z");
+        store
+            .store(&ctx, &mem(&id, &ns, &ts))
+            .await
+            .expect("seed row");
+        ids.push(id);
+    }
     sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
         .bind(vec![0_u8; 96])
-        .bind(&ids[1])
+        .bind(&ids[4])
         .execute(store.pool())
         .await
-        .expect("plant an undecryptable envelope");
-
-    let pages = walk(&store, 50).await;
-    let carried: HashSet<String> = pages
-        .iter()
-        .flat_map(|p| p.memories.iter())
-        .filter(|m| m.namespace == ns)
-        .map(|m| m.id.clone())
-        .collect();
+        .expect("plant an at-rest envelope");
+    let as_of = chrono::Utc::now();
+    let first = store
+        .export_memories_page(None, 2, as_of, Some(&ns))
+        .await
+        .expect_err("the first page of a walk over a sealed row must refuse");
+    let msg = first.to_string();
     assert!(
-        !carried.contains(&ids[1]),
-        "the undecryptable row is not carried"
+        msg.contains(SEALED_REFUSAL_CODE) && msg.contains(&ids[4]),
+        "not the sealed-export refusal naming the row: {msg}"
     );
-    assert!(carried.contains(&ids[0]) && carried.contains(&ids[2]));
-    let page_of_poison = pages
-        .iter()
-        .find(|p| p.scope.raw_ids.contains(&ids[1]))
-        .expect("the walk returned the poisoned row's raw id (the cursor passed it)");
+    let resumed = ExportCursor {
+        after: ai_memory::export_paging::ExportKey {
+            created_at: "2030-06-01T00:00:03.000000Z".to_string(),
+            id: ids[3].clone(),
+        },
+        as_of,
+        namespace: Some(ns.clone()),
+    };
+    let later = store
+        .export_memories_page(Some(&resumed), 2, as_of, Some(&ns))
+        .await
+        .expect_err("a page that holds the sealed row must refuse");
     assert!(
-        page_of_poison.undecryptable >= 1,
-        "the skipped row is COUNTED on its page, not only logged"
+        later.to_string().contains(SEALED_REFUSAL_CODE),
+        "not the sealed-export refusal: {later}"
     );
     sqlx::query("DELETE FROM memories WHERE namespace = $1")
         .bind(&ns)

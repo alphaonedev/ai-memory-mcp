@@ -547,3 +547,67 @@ async fn export_live_scan_semantics_are_declared_and_pinned_3288() {
         "{rest:?}"
     );
 }
+
+/// The plaintext the sealed fixture row is sealed from (#10028 / #10033 on
+/// SQLite): it must never appear in an admin export response.
+const SEALED_MARKER_10028: &str = "sealed admin export marker 10028 \u{1f512}";
+
+/// The exact refusal code, written out here rather than taken from the code
+/// under test.
+const SEALED_REFUSAL_CODE_10028: &str = "SEALED_EXPORT_REFUSED";
+
+/// The admin export on SQLite (3-agent vote 71472661 V3-STD4-SCOPE C-3): a
+/// store with a row sealed at rest answers 409 `SEALED_EXPORT_REFUSED` on the
+/// unpaged body AND on the first page of every paged walk, whatever page the
+/// sealed row would fall on, so no partial artifact is ever handed out. No
+/// response carries the sealed plaintext.
+#[tokio::test]
+async fn admin_export_refuses_a_sealed_row_on_every_page_shape_10028() {
+    let (_dir, path) = fixture();
+    let conn = ai_memory::db::open(&path).expect("open");
+    let ids = seed(&conn, 7);
+    ai_memory::identity::test_key_dir::install();
+    let kp = ai_memory::encryption::get_or_create_keypair("ai:3288").expect("x25519 keypair");
+    let envelope =
+        ai_memory::encryption::encrypt(SEALED_MARKER_10028, &kp.public).expect("seal marker");
+    // The sealed row is the last in walk order, so a check of the rows of
+    // page 1 alone would miss it.
+    let sealed_id = ids.last().expect("seeded rows").clone();
+    let changed = conn
+        .execute(
+            "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+            rusqlite::params![envelope.to_bytes(), sealed_id],
+        )
+        .expect("seal a row");
+    assert_eq!(changed, 1, "one row sealed");
+    drop(conn);
+    let r = router(&path, 10);
+    let marker = SEALED_MARKER_10028.as_bytes();
+    let refused = |uri: String, status: StatusCode, page: &Value| {
+        let body = serde_json::to_vec(page).expect("json");
+        assert!(
+            !body.windows(marker.len()).any(|w| w == marker),
+            "{uri}: an export response carried the sealed plaintext"
+        );
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{uri}: the admin export of a sealed row must refuse: {page}"
+        );
+        assert_eq!(
+            page["code"].as_str(),
+            Some(SEALED_REFUSAL_CODE_10028),
+            "{uri}: not the sealed-export refusal: {page}"
+        );
+        assert!(page["memories"].is_null(), "{uri}: a refusal carried rows");
+    };
+    for uri in [
+        "/api/v1/export".to_string(),
+        "/api/v1/export?limit=1".to_string(),
+        "/api/v1/export?limit=3".to_string(),
+        "/api/v1/export?limit=10".to_string(),
+    ] {
+        let (status, page) = get(&r, &uri).await;
+        refused(uri, status, &page);
+    }
+}

@@ -311,9 +311,12 @@ fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
 /// must be SEALED at rest exactly like every other write path, on an
 /// encryption-enabled destination.
 ///
-/// The export boundary DECRYPTS content into the JSON bundle (matching
-/// `memories[]` — the export is the portable-plaintext artifact; that part
-/// is correct and unchanged). The bug was on IMPORT: the archived-row
+/// #10032 (3-agent vote 71472661 V3-STD4-SCOPE C-3) supersedes the
+/// export half of this test: the v2 envelope has no field for the at-rest
+/// envelope, so `build_full_envelope` of a store with a SEALED archived row
+/// now REFUSES with `SEALED_EXPORT_REFUSED` (it no longer decrypts the row
+/// into the bundle). The import half is kept on a plaintext archived row:
+/// the bug was on IMPORT: the archived-row
 /// insert bound that decrypted plaintext straight into `content` with no
 /// `encrypted_envelope`, so an encryption-enabled destination stored the
 /// imported archive PLAINTEXT at rest — failing parity with BOTH native
@@ -375,11 +378,38 @@ fn archived_memory_import_seals_content_at_rest_when_encryption_enabled_2571_f2(
         "fixture setup: the source content column must not hold plaintext when sealed"
     );
 
+    // #10032: the sealed archived row refuses the export, exactly, and the
+    // refusal carries no plaintext.
+    let err = emit::build_full_envelope(&src, "issue-2571-f2-test", "2026-08-11T00:00:00Z")
+        .expect_err("a sealed archived row must refuse the v2 export (#10032)");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(
+            "SEALED_EXPORT_REFUSED: 1 row(s) of archived_memories are sealed at rest \
+             (first id m-sealed)"
+        ),
+        "not the sealed-export refusal: {msg}"
+    );
+    assert!(
+        !msg.contains(PLAINTEXT),
+        "the refusal carried the plaintext"
+    );
+
+    // The import half (F2) on a PLAINTEXT archived row: the source row is
+    // rewritten unsealed, so the export carries it and the import must seal
+    // it on the encryption-enabled destination.
+    let changed = src
+        .execute(
+            "UPDATE archived_memories SET content = ?1, encrypted_envelope = NULL WHERE id = ?2",
+            rusqlite::params![PLAINTEXT, "m-sealed"],
+        )
+        .expect("unseal the source archived row");
+    assert_eq!(changed, 1, "one archived row unsealed");
     let env = emit::build_full_envelope(&src, "issue-2571-f2-test", "2026-08-11T00:00:00Z")
         .expect("build full v2 envelope");
     assert_eq!(
         env.archived_memories[0].memory.content, PLAINTEXT,
-        "the export boundary must decrypt content into the JSON bundle, exactly like memories[]"
+        "a plaintext archived row is carried as written"
     );
 
     let (_dst_path, dst) = fresh_db("dst-seal");
