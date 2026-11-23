@@ -312,6 +312,7 @@ Pinned by [`tests/federation_b2_hardening.rs`](../tests/federation_b2_hardening.
 
 | Var | Default | Effect |
 |---|---|---|
+| `AI_MEMORY_FED_PEER_OUTBOUND_SCOPE` | unset → every peer denied | Sender-side per-peer namespace scope (#9996): JSON keyed by peer URL, `{"allowed_namespaces":[...]}` per peer. A peer with no key is sent nothing on any outbound path; `["**"]` is the explicit all-scope and fails `doctor --posture enterprise-federation`. Malformed or unknown keys refuse boot. |
 | `AI_MEMORY_FED_PEER_ATTESTATION` | unset → empty allowlist | When set to JSON, populates the per-peer `PeerScope` allowlist. Unset = absent authorization: default-deny on `/sync/since` and default-required inbound writes. With configured peers, Standard warns and `asi-hard` refuses boot. Key enrollment is separate. |
 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (deny) | When set to `"1"`, widens "no scope row" cases on `/sync/since` to legacy full-dump behavior. Once a scope row exists for a peer, its namespace list is the authoritative gate and the bypass is ignored. |
 | `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` | unset (deny) | When set to `"1"`, the substrate trusts the wire body's `agent_id` claim instead of the authenticated peer-id. Default: header wins. |
@@ -546,6 +547,48 @@ leaves all three at their secure defaults:
   the map is configured. Distinct from the OUTBOUND server-cert pinning
   `AI_MEMORY_FED_PEER_FINGERPRINTS` above — this binds the peer's CLIENT
   cert to its claimed identity.
+
+### Outbound namespace scope (#9996)
+
+**`AI_MEMORY_FED_PEER_OUTBOUND_SCOPE`** (unset → every peer is sent
+nothing) is the sender-side twin of `AI_MEMORY_FED_PEER_ATTESTATION`. It
+uses the same entry shape and the same glob matcher:
+
+```bash
+export AI_MEMORY_FED_PEER_OUTBOUND_SCOPE='{
+  "https://peer-a.example:9077": {"allowed_namespaces": ["team-x/*"]},
+  "https://peer-b.example:9077": {"allowed_namespaces": ["shared", "ops/*"]}
+}'
+```
+
+- Each key is a configured `--quorum-peers` (or `sync-daemon --peers`)
+  URL; it is keyed internally by the stable hashed peer id. A key that
+  names no configured peer, two keys for one peer, a malformed value or
+  an over-long pattern refuses boot.
+- A peer with no key, or an empty list, is **denied**: no memory, link,
+  deletion, archive, namespace-meta or checkpoint item is sent to it on
+  any path (fan-out, quorum write, bulk catch-up, DLQ replay, the
+  sync-daemon push, erasure outbox). `["**"]` is the explicit all-scope.
+- Every path re-admits the body at send time, so a row queued before a
+  scope was narrowed is never sent outside the current scope. A refused
+  DLQ row is quarantined (cause label `outbound_scope` in
+  `ai_memory_federation_push_dlq_quarantined_by_cause_total`); it is never
+  deleted. The replay worker re-drives those rows once at each start, so
+  widening the scope and restarting the daemon delivers the rows the new
+  scope admits; the rest return to quarantine.
+- The quorum denominator is the set of peers whose scope admits the
+  write; when that set is smaller than the quorum minimum the write fails
+  with the typed `outbound_scope` error, distinct from a timeout.
+- Boot logs one WARN per unscoped peer. `doctor` shows a failing
+  `outbound_scope.<peer id>` row per unscoped peer under every posture,
+  and `doctor --posture enterprise-federation` check #23 fails on an
+  unscoped peer or an explicit `**` scope.
+- Items left out are counted per peer and namespace in
+  `ai_memory_federation_outbound_scope_filtered_total{peer_id,namespace}`
+  (Prometheus `/metrics`) and in the capabilities `federation_security`
+  report. The `/sync/since` serve-side namespace filter counts into the
+  same series. Peer labels are hashed ids, never URLs; namespace labels are
+  cut at 128 bytes and the series set is capped at 1024 (`_overflow`).
 
 ## Federation subcollection coverage on a PostgreSQL receiver
 
