@@ -16,8 +16,9 @@ use super::{PostureCheck, check};
 
 /// Render the backup-manifest-signing posture row (check #22).
 ///
-/// `backup` is SQLite-only, so a postgres node has nothing to check and the
-/// row passes as `N/A`.
+/// A `sal-postgres` build backs up a postgres store natively with the same
+/// operator keys (#10021), so the row checks them there; in any other build a
+/// postgres node has nothing to check and the row passes as `N/A`.
 pub(super) fn check_backup_signing(backend_is_postgres: bool) -> PostureCheck {
     let (pass, actual) = crate::cli::backup::signing_posture(backend_is_postgres);
     check(
@@ -55,5 +56,29 @@ mod tests {
         assert!(!c.pass, "{c:?}");
         assert!(c.actual.contains("no operator public key"), "{c:?}");
         assert!(!all_pass(&checks));
+    }
+
+    /// #10021 — a postgres node in a `sal-postgres` build takes signed
+    /// PostgreSQL-native backups, so a missing operator public key FAILs the
+    /// row; any other build keeps the N/A pass.
+    #[test]
+    fn postgres_backend_backup_signing_row_10021() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::backup_signing::tests::postgres_backend_backup_signing_row_10021",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe { clear_all() };
+        let _cleanup = EnvGuard;
+        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let (pass, actual) = crate::cli::backup::signing_posture(true);
+        if crate::cli::backup::PG_NATIVE_BACKUP_BUILD {
+            assert!(!pass, "{actual}");
+            assert!(actual.contains("no operator public key"), "{actual}");
+        } else {
+            assert!(pass, "{actual}");
+            assert_eq!(actual, "N/A (postgres: `ai-memory backup` is SQLite-only)");
+        }
     }
 }

@@ -13,112 +13,210 @@ pub const VEC384: &str = "[0,0.25,0.5,0.75,0,0.25,0.5,0.75,0,0.25,0.5,0.75,0,0.2
 
 /// Corpus rows in FK-safe insert order: `(table, rows)`.
 pub const CORPUS: &[(&str, &[&[Cell]])] = &[
-    ("memories", &[
+    (
+        "memories",
         &[
-            ("id", Some("m1-10021"), "m1-10021"),
-            ("atom_of", Some("m1-10021"), "m1-10021"),
-            ("content", Some("corpus content one"), "corpus content one"),
-            ("title", Some("corpus title one"), "corpus title one"),
-            ("namespace", Some("ns-10021"), "ns-10021"),
-            ("metadata", Some("{\"scope\": \"private\", \"agent_id\": \"ai:pgnb\", \"target_agent_id\": \"ai:pgnb-peer\"}"), "{\"scope\": \"private\", \"agent_id\": \"ai:pgnb\", \"target_agent_id\": \"ai:pgnb-peer\"}"),
-            ("access_count", Some("7"), "7"),
-            ("atomised_into", Some("2"), "2"),
-            ("cid_genesis", Some("\\x0102ab"), "\\x0102ab"),
-            ("cid", Some("bafy10021"), "bafy10021"),
-            ("citations", Some("[\"c1\"]"), "[\"c1\"]"),
-            ("confidence_decayed_at", Some("2026-01-05T00:00:00Z"), "2026-01-05T00:00:00Z"),
-            ("confidence_signals", Some("{\"s\":1}"), "{\"s\":1}"),
-            ("confidence_source", Some("caller"), "caller"),
-            ("confidence", Some("0.625"), "0.625"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-            ("embedding_dim", Some("384"), "384"),
-            ("embedding_space", Some("minilm-384"), "minilm-384"),
-            ("embedding", Some(VEC384), VEC384),
-            ("encrypted_envelope", Some("\\xdeadbeef"), "\\xdeadbeef"),
-            ("entity_id", Some("ent-10021"), "ent-10021"),
-            ("expires_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("kind_provenance", Some("caller"), "caller"),
-            ("last_accessed_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("lifecycle_state", Some("open"), "open"),
-            ("memory_kind", Some("observation"), "observation"),
-            ("mentioned_entity_id", Some("ent-m-10021"), "ent-m-10021"),
-            ("persona_version", Some("3"), "3"),
-            ("priority", Some("9"), "9"),
-            ("reflection_depth", Some("1"), "1"),
-            ("source_span", Some("1-2"), "1-2"),
-            ("source_uri", Some("file:///corpus/10021"), "file:///corpus/10021"),
-            ("source", Some("api"), "api"),
-            ("tags", Some("[\"a\", \"b\"]"), "[\"a\", \"b\"]"),
-            ("tier", Some("long"), "long"),
-            ("updated_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("valid_from", Some("2026-01-01T00:00:00Z"), "2026-01-01T00:00:00Z"),
-            ("valid_until", Some("2027-01-01T00:00:00Z"), "2027-01-01T00:00:00Z"),
-            ("version", Some("4"), "4"),
+            &[
+                ("id", Some("m1-10021"), "m1-10021"),
+                ("atom_of", Some("m1-10021"), "m1-10021"),
+                ("content", Some("corpus content one"), "corpus content one"),
+                ("title", Some("corpus title one"), "corpus title one"),
+                ("namespace", Some("ns-10021"), "ns-10021"),
+                (
+                    "metadata",
+                    Some(
+                        "{\"scope\": \"private\", \"agent_id\": \"ai:pgnb\", \"target_agent_id\": \"ai:pgnb-peer\"}",
+                    ),
+                    "{\"scope\": \"private\", \"agent_id\": \"ai:pgnb\", \"target_agent_id\": \"ai:pgnb-peer\"}",
+                ),
+                ("access_count", Some("7"), "7"),
+                ("atomised_into", Some("2"), "2"),
+                ("cid_genesis", Some("\\x0102ab"), "\\x0102ab"),
+                ("cid", Some("bafy10021"), "bafy10021"),
+                ("citations", Some("[\"c1\"]"), "[\"c1\"]"),
+                (
+                    "confidence_decayed_at",
+                    Some("2026-01-05T00:00:00Z"),
+                    "2026-01-05T00:00:00Z",
+                ),
+                ("confidence_signals", Some("{\"s\":1}"), "{\"s\":1}"),
+                ("confidence_source", Some("caller"), "caller"),
+                ("confidence", Some("0.625"), "0.625"),
+                (
+                    "created_at",
+                    Some("2026-01-02 03:04:05.123456+00"),
+                    "2026-01-02 03:04:05.123456+00",
+                ),
+                ("embedding_dim", Some("384"), "384"),
+                ("embedding_space", Some("minilm-384"), "minilm-384"),
+                ("embedding", Some(VEC384), VEC384),
+                ("encrypted_envelope", Some("\\xdeadbeef"), "\\xdeadbeef"),
+                ("entity_id", Some("ent-10021"), "ent-10021"),
+                (
+                    "expires_at",
+                    Some("2026-02-03 04:05:06.654321+00"),
+                    "2026-02-03 04:05:06.654321+00",
+                ),
+                ("kind_provenance", Some("caller"), "caller"),
+                (
+                    "last_accessed_at",
+                    Some("2026-02-03 04:05:06.654321+00"),
+                    "2026-02-03 04:05:06.654321+00",
+                ),
+                ("lifecycle_state", Some("open"), "open"),
+                ("memory_kind", Some("observation"), "observation"),
+                ("mentioned_entity_id", Some("ent-m-10021"), "ent-m-10021"),
+                ("persona_version", Some("3"), "3"),
+                ("priority", Some("9"), "9"),
+                ("reflection_depth", Some("1"), "1"),
+                ("source_span", Some("1-2"), "1-2"),
+                (
+                    "source_uri",
+                    Some("file:///corpus/10021"),
+                    "file:///corpus/10021",
+                ),
+                ("source", Some("api"), "api"),
+                ("tags", Some("[\"a\", \"b\"]"), "[\"a\", \"b\"]"),
+                ("tier", Some("long"), "long"),
+                (
+                    "updated_at",
+                    Some("2026-02-03 04:05:06.654321+00"),
+                    "2026-02-03 04:05:06.654321+00",
+                ),
+                (
+                    "valid_from",
+                    Some("2026-01-01T00:00:00Z"),
+                    "2026-01-01T00:00:00Z",
+                ),
+                (
+                    "valid_until",
+                    Some("2027-01-01T00:00:00Z"),
+                    "2027-01-01T00:00:00Z",
+                ),
+                ("version", Some("4"), "4"),
+            ],
+            &[
+                ("id", Some("m2-10021"), "m2-10021"),
+                ("atom_of", Some("m1-10021"), "m1-10021"),
+                (
+                    "content",
+                    Some("{\"agent_pubkey\": \"STALE-KEY\"}"),
+                    "{\"agent_pubkey\": \"STALE-KEY\"}",
+                ),
+                ("title", Some("agent:ai:pgnb-agent"), "agent:ai:pgnb-agent"),
+                ("namespace", Some("_agents"), "_agents"),
+                (
+                    "metadata",
+                    Some(
+                        "{\"scope\": \"private\", \"agent_id\": \"ai:pgnb-agent\", \"agent_pubkey\": \"STALE-KEY\", \"target_agent_id\": \"ai:pgnb\"}",
+                    ),
+                    "{\"scope\": \"private\", \"agent_id\": \"ai:pgnb-agent\", \"agent_pubkey\": \"STALE-KEY\", \"target_agent_id\": \"ai:pgnb\"}",
+                ),
+                ("access_count", Some("7"), "7"),
+                ("atomised_into", Some("2"), "2"),
+                ("cid_genesis", Some("\\x0102ab"), "\\x0102ab"),
+                ("cid", Some("bafy10021"), "bafy10021"),
+                ("citations", Some("[\"c1\"]"), "[\"c1\"]"),
+                (
+                    "confidence_decayed_at",
+                    Some("2026-01-05T00:00:00Z"),
+                    "2026-01-05T00:00:00Z",
+                ),
+                ("confidence_signals", Some("{\"s\":1}"), "{\"s\":1}"),
+                ("confidence_source", Some("caller"), "caller"),
+                ("confidence", Some("0.625"), "0.625"),
+                (
+                    "created_at",
+                    Some("2026-01-02 03:04:05.123456+00"),
+                    "2026-01-02 03:04:05.123456+00",
+                ),
+                ("embedding_dim", Some("384"), "384"),
+                ("embedding_space", Some("minilm-384"), "minilm-384"),
+                ("embedding", Some(VEC384), VEC384),
+                ("encrypted_envelope", Some("\\xdeadbeef"), "\\xdeadbeef"),
+                ("entity_id", Some("ent-10021"), "ent-10021"),
+                (
+                    "expires_at",
+                    Some("2026-02-03 04:05:06.654321+00"),
+                    "2026-02-03 04:05:06.654321+00",
+                ),
+                ("kind_provenance", Some("caller"), "caller"),
+                (
+                    "last_accessed_at",
+                    Some("2026-02-03 04:05:06.654321+00"),
+                    "2026-02-03 04:05:06.654321+00",
+                ),
+                ("lifecycle_state", Some("open"), "open"),
+                ("memory_kind", Some("observation"), "observation"),
+                ("mentioned_entity_id", Some("ent-m-10021"), "ent-m-10021"),
+                ("persona_version", Some("3"), "3"),
+                ("priority", Some("9"), "9"),
+                ("reflection_depth", Some("1"), "1"),
+                ("source_span", Some("1-2"), "1-2"),
+                (
+                    "source_uri",
+                    Some("file:///corpus/10021"),
+                    "file:///corpus/10021",
+                ),
+                ("source", Some("api"), "api"),
+                ("tags", Some("[\"a\", \"b\"]"), "[\"a\", \"b\"]"),
+                ("tier", Some("long"), "long"),
+                (
+                    "updated_at",
+                    Some("2026-02-03 04:05:06.654321+00"),
+                    "2026-02-03 04:05:06.654321+00",
+                ),
+                (
+                    "valid_from",
+                    Some("2026-01-01T00:00:00Z"),
+                    "2026-01-01T00:00:00Z",
+                ),
+                (
+                    "valid_until",
+                    Some("2027-01-01T00:00:00Z"),
+                    "2027-01-01T00:00:00Z",
+                ),
+                ("version", Some("4"), "4"),
+            ],
         ],
-        &[
-            ("id", Some("m2-10021"), "m2-10021"),
-            ("atom_of", Some("m1-10021"), "m1-10021"),
-            ("content", Some("{\"agent_pubkey\": \"STALE-KEY\"}"), "{\"agent_pubkey\": \"STALE-KEY\"}"),
-            ("title", Some("agent:ai:pgnb-agent"), "agent:ai:pgnb-agent"),
-            ("namespace", Some("_agents"), "_agents"),
-            ("metadata", Some("{\"scope\": \"private\", \"agent_id\": \"ai:pgnb-agent\", \"agent_pubkey\": \"STALE-KEY\", \"target_agent_id\": \"ai:pgnb\"}"), "{\"scope\": \"private\", \"agent_id\": \"ai:pgnb-agent\", \"agent_pubkey\": \"STALE-KEY\", \"target_agent_id\": \"ai:pgnb\"}"),
-            ("access_count", Some("7"), "7"),
-            ("atomised_into", Some("2"), "2"),
-            ("cid_genesis", Some("\\x0102ab"), "\\x0102ab"),
-            ("cid", Some("bafy10021"), "bafy10021"),
-            ("citations", Some("[\"c1\"]"), "[\"c1\"]"),
-            ("confidence_decayed_at", Some("2026-01-05T00:00:00Z"), "2026-01-05T00:00:00Z"),
-            ("confidence_signals", Some("{\"s\":1}"), "{\"s\":1}"),
-            ("confidence_source", Some("caller"), "caller"),
-            ("confidence", Some("0.625"), "0.625"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-            ("embedding_dim", Some("384"), "384"),
-            ("embedding_space", Some("minilm-384"), "minilm-384"),
-            ("embedding", Some(VEC384), VEC384),
-            ("encrypted_envelope", Some("\\xdeadbeef"), "\\xdeadbeef"),
-            ("entity_id", Some("ent-10021"), "ent-10021"),
-            ("expires_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("kind_provenance", Some("caller"), "caller"),
-            ("last_accessed_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("lifecycle_state", Some("open"), "open"),
-            ("memory_kind", Some("observation"), "observation"),
-            ("mentioned_entity_id", Some("ent-m-10021"), "ent-m-10021"),
-            ("persona_version", Some("3"), "3"),
-            ("priority", Some("9"), "9"),
-            ("reflection_depth", Some("1"), "1"),
-            ("source_span", Some("1-2"), "1-2"),
-            ("source_uri", Some("file:///corpus/10021"), "file:///corpus/10021"),
-            ("source", Some("api"), "api"),
-            ("tags", Some("[\"a\", \"b\"]"), "[\"a\", \"b\"]"),
-            ("tier", Some("long"), "long"),
-            ("updated_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("valid_from", Some("2026-01-01T00:00:00Z"), "2026-01-01T00:00:00Z"),
-            ("valid_until", Some("2027-01-01T00:00:00Z"), "2027-01-01T00:00:00Z"),
-            ("version", Some("4"), "4"),
-        ],
-    ]),
-    ("a2a_tasks", &[
-        &[
+    ),
+    (
+        "a2a_tasks",
+        &[&[
             ("id", Some("task-10021"), "task-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("artifacts_json", Some("[{\"a\":1}]"), "[{\"a\":1}]"),
             ("context_id", Some("ctx-10021"), "ctx-10021"),
-            ("created_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "created_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("history_json", Some("[{\"h\":1}]"), "[{\"h\":1}]"),
             ("metadata_json", Some("{\"m\":1}"), "{\"m\":1}"),
             ("state", Some("working"), "working"),
-            ("status_timestamp", Some("2026-01-02T03:04:06Z"), "2026-01-02T03:04:06Z"),
-            ("updated_at", Some("2026-01-02T03:04:07Z"), "2026-01-02T03:04:07Z"),
-        ],
-    ]),
-    ("a2a_task_memories", &[
-        &[
+            (
+                "status_timestamp",
+                Some("2026-01-02T03:04:06Z"),
+                "2026-01-02T03:04:06Z",
+            ),
+            (
+                "updated_at",
+                Some("2026-01-02T03:04:07Z"),
+                "2026-01-02T03:04:07Z",
+            ),
+        ]],
+    ),
+    (
+        "a2a_task_memories",
+        &[&[
             ("task_id", Some("task-10021"), "task-10021"),
             ("memory_id", Some("m1-10021"), "m1-10021"),
-        ],
-    ]),
-    ("actions", &[
-        &[
+        ]],
+    ),
+    (
+        "actions",
+        &[&[
             ("id", Some("act-10021"), "act-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("claimed_by", Some("ai:pgnb-worker"), "ai:pgnb-worker"),
@@ -132,133 +230,266 @@ pub const CORPUS: &[(&str, &[&[Cell]])] = &[
             ("title", Some("corpus action"), "corpus action"),
             ("updated_at", Some("1767323046"), "1767323046"),
             ("vector_clock", Some("{\"n\":2}"), "{\"n\":2}"),
-        ],
-    ]),
-    ("action_edges", &[
-        &[
+        ]],
+    ),
+    (
+        "action_edges",
+        &[&[
             ("from_action", Some("act-10021"), "act-10021"),
             ("to_action", Some("act-10021"), "act-10021"),
             ("edge_type", Some("blocks"), "blocks"),
             ("created_at", Some("1767323047"), "1767323047"),
-        ],
-    ]),
-    ("leases", &[
-        &[
+        ]],
+    ),
+    (
+        "leases",
+        &[&[
             ("action_id", Some("act-10021"), "act-10021"),
             ("holder", Some("ai:pgnb-worker"), "ai:pgnb-worker"),
             ("acquired_at", Some("1700000000"), "1700000000"),
             ("expires_at", Some("1700000300"), "1700000300"),
             ("heartbeat_at", Some("1700000100"), "1700000100"),
-        ],
-    ]),
-    ("agent_api_keys", &[
-        &[
+        ]],
+    ),
+    (
+        "agent_api_keys",
+        &[&[
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("bound_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
-            ("token_sha256", Some("0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"), "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"),
-        ],
-    ]),
-    ("agent_lineage", &[
-        &[
+            (
+                "bound_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
+            (
+                "token_sha256",
+                Some("0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"),
+                "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+            ),
+        ]],
+    ),
+    (
+        "agent_lineage",
+        &[&[
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("created_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "created_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("custody_class", Some("hsm"), "hsm"),
             ("epoch", Some("1"), "1"),
             ("guardian_set_id", Some("\\x0a0b"), "\\x0a0b"),
-            ("not_before", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
-            ("predecessor_pubkey", Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
-            ("prev_record_hash", Some("\\x1111111111111111111111111111111111111111111111111111111111111111"), "\\x1111111111111111111111111111111111111111111111111111111111111111"),
+            (
+                "not_before",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
+            (
+                "predecessor_pubkey",
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE",
+            ),
+            (
+                "prev_record_hash",
+                Some("\\x1111111111111111111111111111111111111111111111111111111111111111"),
+                "\\x1111111111111111111111111111111111111111111111111111111111111111",
+            ),
             ("reason", Some("genesis"), "genesis"),
             ("record_bytes", Some("\\x7b7d"), "\\x7b7d"),
-            ("recovery_pubkey", Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
+            (
+                "recovery_pubkey",
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE",
+            ),
             ("recovery_threshold", Some("2"), "2"),
-            ("signature", Some("\\x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"), "\\x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"),
-            ("successor_pubkey", Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
+            (
+                "signature",
+                Some(
+                    "\\x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+                ),
+                "\\x22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+            ),
+            (
+                "successor_pubkey",
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE",
+            ),
             ("suspected_compromise_from_seq", Some("3"), "3"),
-        ],
-    ]),
-    ("agent_pubkey_challenges", &[
-        &[
+        ]],
+    ),
+    (
+        "agent_pubkey_challenges",
+        &[&[
             ("challenge_id", Some("chal-10021"), "chal-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("consumed_at", Some("2026-01-02T03:05:00Z"), "2026-01-02T03:05:00Z"),
-            ("expires_at", Some("2026-01-02T03:10:00Z"), "2026-01-02T03:10:00Z"),
-            ("issued_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "consumed_at",
+                Some("2026-01-02T03:05:00Z"),
+                "2026-01-02T03:05:00Z",
+            ),
+            (
+                "expires_at",
+                Some("2026-01-02T03:10:00Z"),
+                "2026-01-02T03:10:00Z",
+            ),
+            (
+                "issued_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("issuer_daemon_id", Some("daemon-10021"), "daemon-10021"),
             ("nonce", Some("nonce-10021"), "nonce-10021"),
-            ("pubkey_b64", Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
-        ],
-    ]),
-    ("agent_pubkey_history", &[
-        &[
+            (
+                "pubkey_b64",
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE",
+            ),
+        ]],
+    ),
+    (
+        "agent_pubkey_history",
+        &[&[
             ("agent_id", Some("ai:pgnb-agent"), "ai:pgnb-agent"),
             ("bind_authority", Some("self"), "self"),
-            ("bound_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "bound_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("proof_nonce", Some("nonce-h-10021"), "nonce-h-10021"),
-            ("pubkey_b64", Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
-            ("superseded_at", Some("2026-01-03T00:00:00Z"), "2026-01-03T00:00:00Z"),
+            (
+                "pubkey_b64",
+                Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE",
+            ),
+            (
+                "superseded_at",
+                Some("2026-01-03T00:00:00Z"),
+                "2026-01-03T00:00:00Z",
+            ),
             ("version", Some("1"), "1"),
-        ],
-    ]),
-    ("agent_quotas", &[
-        &[
+        ]],
+    ),
+    (
+        "agent_quotas",
+        &[&[
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("current_links_today", Some("3"), "3"),
             ("current_memories_today", Some("4"), "4"),
             ("current_storage_bytes", Some("5000"), "5000"),
-            ("day_started_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "day_started_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("max_links_per_day", Some("300"), "300"),
             ("max_memories_per_day", Some("400"), "400"),
             ("max_storage_bytes", Some("900000"), "900000"),
             ("namespace", Some("ns-10021"), "ns-10021"),
-            ("updated_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-        ],
-    ]),
-    ("agent_subkey_certs", &[
-        &[
+            (
+                "updated_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
+        ]],
+    ),
+    (
+        "agent_subkey_certs",
+        &[&[
             ("id", Some("cert-10021"), "cert-10021"),
             ("cert_bytes", Some("\\x0c0d"), "\\x0c0d"),
-            ("created_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "created_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("instance_key_id", Some("\\x0e0f"), "\\x0e0f"),
             ("model_version_ref", Some("\\x1011"), "\\x1011"),
-            ("not_after", Some("2027-01-02T03:04:05Z"), "2027-01-02T03:04:05Z"),
-            ("not_before", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "not_after",
+                Some("2027-01-02T03:04:05Z"),
+                "2027-01-02T03:04:05Z",
+            ),
+            (
+                "not_before",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("principal", Some("ai:pgnb"), "ai:pgnb"),
             ("revoked", Some("true"), "true"),
-            ("signature", Some("\\x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333"), "\\x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333"),
-        ],
-    ]),
-    ("archived_memories", &[
-        &[
+            (
+                "signature",
+                Some(
+                    "\\x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+                ),
+                "\\x33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+            ),
+        ]],
+    ),
+    (
+        "archived_memories",
+        &[&[
             ("id", Some("arch-10021"), "arch-10021"),
             ("archive_reason", Some("ttl"), "ttl"),
-            ("archived_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "archived_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("atom_of", Some("m1-10021"), "m1-10021"),
             ("content", Some("archived content"), "archived content"),
             ("title", Some("archived title"), "archived title"),
             ("namespace", Some("ns-10021"), "ns-10021"),
-            ("metadata", Some("{\"agent_id\": \"ai:pgnb\"}"), "{\"agent_id\": \"ai:pgnb\"}"),
-            ("original_expires_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "metadata",
+                Some("{\"agent_id\": \"ai:pgnb\"}"),
+                "{\"agent_id\": \"ai:pgnb\"}",
+            ),
+            (
+                "original_expires_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("original_tier", Some("mid"), "mid"),
             ("access_count", Some("7"), "7"),
             ("atomised_into", Some("2"), "2"),
             ("cid_genesis", Some("\\x0102ab"), "\\x0102ab"),
             ("cid", Some("bafy10021"), "bafy10021"),
             ("citations", Some("[\"c1\"]"), "[\"c1\"]"),
-            ("confidence_decayed_at", Some("2026-01-05T00:00:00Z"), "2026-01-05T00:00:00Z"),
+            (
+                "confidence_decayed_at",
+                Some("2026-01-05T00:00:00Z"),
+                "2026-01-05T00:00:00Z",
+            ),
             ("confidence_signals", Some("{\"s\":1}"), "{\"s\":1}"),
             ("confidence_source", Some("caller"), "caller"),
             ("confidence", Some("0.625"), "0.625"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("embedding_dim", Some("384"), "384"),
             ("embedding_space", Some("minilm-384"), "minilm-384"),
             ("embedding", Some(VEC384), VEC384),
             ("encrypted_envelope", Some("\\xdeadbeef"), "\\xdeadbeef"),
             ("entity_id", Some("ent-10021"), "ent-10021"),
-            ("expires_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "expires_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("kind_provenance", Some("caller"), "caller"),
-            ("last_accessed_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "last_accessed_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("lifecycle_state", Some("open"), "open"),
             ("memory_kind", Some("observation"), "observation"),
             ("mentioned_entity_id", Some("ent-m-10021"), "ent-m-10021"),
@@ -266,53 +497,107 @@ pub const CORPUS: &[(&str, &[&[Cell]])] = &[
             ("priority", Some("9"), "9"),
             ("reflection_depth", Some("1"), "1"),
             ("source_span", Some("1-2"), "1-2"),
-            ("source_uri", Some("file:///corpus/10021"), "file:///corpus/10021"),
+            (
+                "source_uri",
+                Some("file:///corpus/10021"),
+                "file:///corpus/10021",
+            ),
             ("source", Some("api"), "api"),
             ("tags", Some("[\"a\", \"b\"]"), "[\"a\", \"b\"]"),
             ("tier", Some("long"), "long"),
-            ("updated_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("valid_from", Some("2026-01-01T00:00:00Z"), "2026-01-01T00:00:00Z"),
-            ("valid_until", Some("2027-01-01T00:00:00Z"), "2027-01-01T00:00:00Z"),
+            (
+                "updated_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
+            (
+                "valid_from",
+                Some("2026-01-01T00:00:00Z"),
+                "2026-01-01T00:00:00Z",
+            ),
+            (
+                "valid_until",
+                Some("2027-01-01T00:00:00Z"),
+                "2027-01-01T00:00:00Z",
+            ),
             ("version", Some("4"), "4"),
-        ],
-    ]),
-    ("archived_memory_links", &[
-        &[
+        ]],
+    ),
+    (
+        "archived_memory_links",
+        &[&[
             ("source_id", Some("m1-10021"), "m1-10021"),
             ("target_id", Some("m2-10021"), "m2-10021"),
-            ("archived_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "archived_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("attest_level", Some("self_signed"), "self_signed"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("observed_by", Some("ai:pgnb"), "ai:pgnb"),
             ("relation", Some("supersedes"), "supersedes"),
-            ("signature", Some("\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"), "\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"),
+            (
+                "signature",
+                Some(
+                    "\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+                ),
+                "\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+            ),
             ("source_cid", Some("bafy-s"), "bafy-s"),
             ("target_cid", Some("bafy-t"), "bafy-t"),
-            ("valid_from", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-            ("valid_until", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-        ],
-    ]),
-    ("attested_write_ledger", &[
-        &[
+            (
+                "valid_from",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+            (
+                "valid_until",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
+        ]],
+    ),
+    (
+        "attested_write_ledger",
+        &[&[
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("created_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
-            ("fingerprint", Some("\\x4444444444444444444444444444444444444444444444444444444444444444"), "\\x4444444444444444444444444444444444444444444444444444444444444444"),
+            (
+                "created_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
+            (
+                "fingerprint",
+                Some("\\x4444444444444444444444444444444444444444444444444444444444444444"),
+                "\\x4444444444444444444444444444444444444444444444444444444444444444",
+            ),
             ("seen_at", Some("1767323045"), "1767323045"),
-        ],
-    ]),
-    ("audit_log", &[
-        &[
+        ]],
+    ),
+    (
+        "audit_log",
+        &[&[
             ("id", Some("audit-10021"), "audit-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("attestation_tier", Some("self_signed"), "self_signed"),
             ("event_type", Some("store"), "store"),
             ("granted", Some("false"), "false"),
             ("requested_family", Some("core"), "core"),
-            ("timestamp", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-        ],
-    ]),
-    ("checkpoints", &[
-        &[
+            (
+                "timestamp",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+        ]],
+    ),
+    (
+        "checkpoints",
+        &[&[
             ("id", Some("cp-10021"), "cp-10021"),
             ("condition_type", Some("manual"), "manual"),
             ("condition", Some("{\"c\":1}"), "{\"c\":1}"),
@@ -325,199 +610,350 @@ pub const CORPUS: &[(&str, &[&[Cell]])] = &[
             ("resolution", Some("approved"), "approved"),
             ("resolved_at", Some("1767323999"), "1767323999"),
             ("resolved_by", Some("ai:pgnb-peer"), "ai:pgnb-peer"),
-            ("resolver_pubkey", Some("\\x5555555555555555555555555555555555555555555555555555555555555555"), "\\x5555555555555555555555555555555555555555555555555555555555555555"),
-            ("signature", Some("\\x66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666"), "\\x66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666"),
+            (
+                "resolver_pubkey",
+                Some("\\x5555555555555555555555555555555555555555555555555555555555555555"),
+                "\\x5555555555555555555555555555555555555555555555555555555555555555",
+            ),
+            (
+                "signature",
+                Some(
+                    "\\x66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666",
+                ),
+                "\\x66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666",
+            ),
             ("state", Some("resolved"), "resolved"),
             ("title", Some("corpus checkpoint"), "corpus checkpoint"),
-        ],
-    ]),
-    ("confidence_shadow_observations", &[
-        &[
+        ]],
+    ),
+    (
+        "confidence_shadow_observations",
+        &[&[
             ("id", None, "1"),
             ("caller_confidence", Some("0.75"), "0.75"),
             ("derived_confidence", Some("0.5"), "0.5"),
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("namespace", Some("ns-10021"), "ns-10021"),
-            ("observed_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "observed_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("recall_outcome", Some("hit"), "hit"),
             ("signals", Some("{\"x\":1}"), "{\"x\":1}"),
             ("source", Some("shadow"), "shadow"),
-        ],
-    ]),
-    ("embed_skip", &[
-        &[
+        ]],
+    ),
+    (
+        "embed_skip",
+        &[&[
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("key_fingerprint", Some("fp-10021"), "fp-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("reason", Some("oversize"), "oversize"),
-        ],
-    ]),
-    ("entity_aliases", &[
-        &[
+        ]],
+    ),
+    (
+        "entity_aliases",
+        &[&[
             ("alias", Some("alias-10021"), "alias-10021"),
             ("entity_id", Some("ent-10021"), "ent-10021"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-        ],
-    ]),
-    ("federation_push_dlq", &[
-        &[
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+        ]],
+    ),
+    (
+        "federation_push_dlq",
+        &[&[
             ("id", None, "1"),
             ("attempt_count", Some("4"), "4"),
-            ("failed_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "failed_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("last_error", Some("peer down"), "peer down"),
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("payload_json", Some("{\"p\": 1}"), "{\"p\": 1}"),
             ("peer_id", Some("peer-10021"), "peer-10021"),
-            ("replayed_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-        ],
-    ]),
-    ("forget_tombstones", &[
-        &[
+            (
+                "replayed_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
+        ]],
+    ),
+    (
+        "forget_tombstones",
+        &[&[
             ("memory_id", Some("gone-10021"), "gone-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("forgotten_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "forgotten_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("namespace", Some("ns-10021"), "ns-10021"),
-            ("signature", Some("\\x77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777"), "\\x77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777"),
-        ],
-    ]),
-    ("kg_projection_outbox", &[
-        &[
+            (
+                "signature",
+                Some(
+                    "\\x77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777",
+                ),
+                "\\x77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777",
+            ),
+        ]],
+    ),
+    (
+        "kg_projection_outbox",
+        &[&[
             ("id", None, "1"),
             ("attempt_count", Some("2"), "2"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("last_error", Some("age busy"), "age busy"),
-            ("projected_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "projected_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("relation", Some("related_to"), "related_to"),
             ("source_id", Some("m1-10021"), "m1-10021"),
             ("target_id", Some("m2-10021"), "m2-10021"),
-        ],
-    ]),
-    ("lineage_integrity_watermark", &[
-        &[
+        ]],
+    ),
+    (
+        "lineage_integrity_watermark",
+        &[&[
             ("relation", Some("memory_links"), "memory_links"),
             ("high_water", Some("42"), "42"),
-            ("observed_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-        ],
-    ]),
-    ("memory_links", &[
-        &[
+            (
+                "observed_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+        ]],
+    ),
+    (
+        "memory_links",
+        &[&[
             ("source_id", Some("m1-10021"), "m1-10021"),
             ("target_id", Some("m2-10021"), "m2-10021"),
             ("attest_level", Some("self_signed"), "self_signed"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("observed_by", Some("ai:pgnb"), "ai:pgnb"),
             ("relation", Some("related_to"), "related_to"),
-            ("signature", Some("\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"), "\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"),
+            (
+                "signature",
+                Some(
+                    "\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+                ),
+                "\\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+            ),
             ("source_cid", Some("bafy-s"), "bafy-s"),
             ("target_cid", Some("bafy-t"), "bafy-t"),
-            ("valid_from", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-            ("valid_until", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-        ],
-    ]),
-    ("memory_revisions", &[
-        &[
+            (
+                "valid_from",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+            (
+                "valid_until",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
+        ]],
+    ),
+    (
+        "memory_revisions",
+        &[&[
             ("id", Some("rev-10021"), "rev-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("created_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "created_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("kind", Some("SUPERSEDE"), "SUPERSEDE"),
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("namespace", Some("ns-10021"), "ns-10021"),
-            ("prev_hash", Some("\\x8888888888888888888888888888888888888888888888888888888888888888"), "\\x8888888888888888888888888888888888888888888888888888888888888888"),
+            (
+                "prev_hash",
+                Some("\\x8888888888888888888888888888888888888888888888888888888888888888"),
+                "\\x8888888888888888888888888888888888888888888888888888888888888888",
+            ),
             ("prior_version", Some("3"), "3"),
             ("sequence", Some("1"), "1"),
-            ("signature", Some("\\x99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"), "\\x99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999"),
-        ],
-    ]),
-    ("memory_transcripts", &[
-        &[
+            (
+                "signature",
+                Some(
+                    "\\x99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+                ),
+                "\\x99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+            ),
+        ]],
+    ),
+    (
+        "memory_transcripts",
+        &[&[
             ("id", Some("tr-10021"), "tr-10021"),
-            ("archived_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "archived_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("compressed_size", Some("12"), "12"),
             ("content_blob", Some("\\x28b52ffd"), "\\x28b52ffd"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-            ("expires_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+            (
+                "expires_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("namespace", Some("ns-10021"), "ns-10021"),
             ("original_size", Some("40"), "40"),
             ("zstd_level", Some("5"), "5"),
-        ],
-    ]),
-    ("memory_transcript_links", &[
-        &[
+        ]],
+    ),
+    (
+        "memory_transcript_links",
+        &[&[
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("transcript_id", Some("tr-10021"), "tr-10021"),
             ("span_start", Some("1"), "1"),
             ("span_end", Some("9"), "9"),
-        ],
-    ]),
-    ("model_attestations", &[
-        &[
+        ]],
+    ),
+    (
+        "model_attestations",
+        &[&[
             ("id", Some("att-10021"), "att-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("attest_level", Some("operator_signed"), "operator_signed"),
-            ("created_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "created_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("model_digest", Some("sha256:abc"), "sha256:abc"),
             ("model_family", Some("fam"), "fam"),
             ("model_ref", Some("ref-1"), "ref-1"),
             ("provider", Some("prov"), "prov"),
-            ("signature", Some("\\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "\\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        ],
-    ]),
-    ("namespace_meta", &[
-        &[
+            (
+                "signature",
+                Some(
+                    "\\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+                "\\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ]],
+    ),
+    (
+        "namespace_meta",
+        &[&[
             ("namespace", Some("ns-10021"), "ns-10021"),
             ("parent_namespace", Some("ns"), "ns"),
             ("standard_id", Some("m1-10021"), "m1-10021"),
-            ("updated_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-        ],
-    ]),
-    ("offloaded_blobs", &[
-        &[
+            (
+                "updated_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+        ]],
+    ),
+    (
+        "offloaded_blobs",
+        &[&[
             ("ref_id", Some("blob-10021"), "blob-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("content_sha256", Some("abababababababababababababababababababababababababababababababab"), "abababababababababababababababababababababababababababababababab"),
+            (
+                "content_sha256",
+                Some("abababababababababababababababababababababababababababababababab"),
+                "abababababababababababababababababababababababababababababababab",
+            ),
             ("content_zstd", Some("\\x28b52ffd00"), "\\x28b52ffd00"),
             ("namespace", Some("ns-10021"), "ns-10021"),
             ("signature_b64", Some("c2lnbmF0dXJl"), "c2lnbmF0dXJl"),
             ("stored_at", Some("1767323045"), "1767323045"),
             ("ttl_seconds", Some("3600"), "3600"),
-        ],
-    ]),
-    ("pending_actions", &[
-        &[
+        ]],
+    ),
+    (
+        "pending_actions",
+        &[&[
             ("id", Some("pa-10021"), "pa-10021"),
             ("action_type", Some("delete"), "delete"),
             ("approvals", Some("[\"ai:a\"]"), "[\"ai:a\"]"),
-            ("decided_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "decided_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("decided_by", Some("ai:pgnb-peer"), "ai:pgnb-peer"),
             ("default_timeout_seconds", Some("600"), "600"),
-            ("expired_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "expired_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("namespace", Some("ns-10021"), "ns-10021"),
             ("payload", Some("{\"x\": 2}"), "{\"x\": 2}"),
-            ("requested_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "requested_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("requested_by", Some("ai:pgnb"), "ai:pgnb"),
             ("status", Some("approved"), "approved"),
-        ],
-    ]),
-    ("recall_observations", &[
-        &[
+        ]],
+    ),
+    (
+        "recall_observations",
+        &[&[
             ("recall_id", Some("rc-10021"), "rc-10021"),
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
-            ("consumed_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "consumed_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("consumed_by_memory_id", Some("m2-10021"), "m2-10021"),
             ("consumed", Some("true"), "true"),
             ("folded", Some("true"), "true"),
             ("namespace", Some("ns-10021"), "ns-10021"),
-            ("observed_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "observed_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("rank", Some("1"), "1"),
             ("retriever", Some("hybrid"), "hybrid"),
             ("score", Some("0.875"), "0.875"),
-        ],
-    ]),
-    ("routines", &[
-        &[
+        ]],
+    ),
+    (
+        "routines",
+        &[&[
             ("id", Some("rt-10021"), "rt-10021"),
             ("created_at", Some("1767323045"), "1767323045"),
             ("created_by", Some("ai:pgnb"), "ai:pgnb"),
@@ -526,17 +962,32 @@ pub const CORPUS: &[(&str, &[&[Cell]])] = &[
             ("namespace", Some("ns-10021"), "ns-10021"),
             ("name", Some("corpus-routine"), "corpus-routine"),
             ("parameters", Some("[\"p\"]"), "[\"p\"]"),
-            ("signature", Some("\\xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "\\xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            ("signer_pubkey", Some("\\xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "\\xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+            (
+                "signature",
+                Some(
+                    "\\xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ),
+                "\\xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            (
+                "signer_pubkey",
+                Some("\\xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                "\\xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
             ("state", Some("frozen"), "frozen"),
             ("template", Some("{\"t\":1}"), "{\"t\":1}"),
-        ],
-    ]),
-    ("routine_runs", &[
-        &[
+        ]],
+    ),
+    (
+        "routine_runs",
+        &[&[
             ("id", Some("rr-10021"), "rr-10021"),
             ("arguments", Some("{\"a\":1}"), "{\"a\":1}"),
-            ("created_action_ids", Some("[\"act-10021\"]"), "[\"act-10021\"]"),
+            (
+                "created_action_ids",
+                Some("[\"act-10021\"]"),
+                "[\"act-10021\"]",
+            ),
             ("error", Some("none"), "none"),
             ("finished_at", Some("1767323050"), "1767323050"),
             ("metadata", Some("{\"z\":1}"), "{\"z\":1}"),
@@ -544,10 +995,11 @@ pub const CORPUS: &[(&str, &[&[Cell]])] = &[
             ("routine_id", Some("rt-10021"), "rt-10021"),
             ("started_at", Some("1767323049"), "1767323049"),
             ("state", Some("done"), "done"),
-        ],
-    ]),
-    ("signals", &[
-        &[
+        ]],
+    ),
+    (
+        "signals",
+        &[&[
             ("id", Some("sig-10021"), "sig-10021"),
             ("acknowledged_at", Some("1767323050"), "1767323050"),
             ("body", Some("hello"), "hello"),
@@ -560,118 +1012,237 @@ pub const CORPUS: &[(&str, &[&[Cell]])] = &[
             ("namespace", Some("ns-10021"), "ns-10021"),
             ("read_at", Some("1767323047"), "1767323047"),
             ("reference_ids", Some("[\"m1-10021\"]"), "[\"m1-10021\"]"),
-            ("sender_pubkey", Some("\\xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), "\\xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+            (
+                "sender_pubkey",
+                Some("\\xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+                "\\xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            ),
             ("signal_type", Some("notify"), "notify"),
-            ("signature", Some("\\xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), "\\xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+            (
+                "signature",
+                Some(
+                    "\\xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                ),
+                "\\xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            ),
             ("subject", Some("subj"), "subj"),
             ("to_agent", Some("ai:pgnb-peer"), "ai:pgnb-peer"),
-        ],
-    ]),
-    ("signed_events", &[
-        &[
+        ]],
+    ),
+    (
+        "signed_events",
+        &[&[
             ("id", Some("se-10021"), "se-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("attest_level", Some("self_signed"), "self_signed"),
-            ("cause_hash", Some("\\x0101010101010101010101010101010101010101010101010101010101010101"), "\\x0101010101010101010101010101010101010101010101010101010101010101"),
+            (
+                "cause_hash",
+                Some("\\x0101010101010101010101010101010101010101010101010101010101010101"),
+                "\\x0101010101010101010101010101010101010101010101010101010101010101",
+            ),
             ("event_type", Some("memory.store"), "memory.store"),
-            ("payload_hash", Some("\\x0202020202020202020202020202020202020202020202020202020202020202"), "\\x0202020202020202020202020202020202020202020202020202020202020202"),
-            ("prev_hash", Some("\\x0303030303030303030303030303030303030303030303030303030303030303"), "\\x0303030303030303030303030303030303030303030303030303030303030303"),
+            (
+                "payload_hash",
+                Some("\\x0202020202020202020202020202020202020202020202020202020202020202"),
+                "\\x0202020202020202020202020202020202020202020202020202020202020202",
+            ),
+            (
+                "prev_hash",
+                Some("\\x0303030303030303030303030303030303030303030303030303030303030303"),
+                "\\x0303030303030303030303030303030303030303030303030303030303030303",
+            ),
             ("sequence", Some("1"), "1"),
-            ("signature", Some("\\x04040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404"), "\\x04040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404"),
-            ("timestamp", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-        ],
-    ]),
-    ("signed_events_dlq", &[
-        &[
+            (
+                "signature",
+                Some(
+                    "\\x04040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404",
+                ),
+                "\\x04040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404",
+            ),
+            (
+                "timestamp",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+        ]],
+    ),
+    (
+        "signed_events_dlq",
+        &[&[
             ("dlq_id", None, "1"),
             ("id", Some("sedlq-10021"), "sedlq-10021"),
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("attest_level", Some("self_signed"), "self_signed"),
             ("event_type", Some("memory.store"), "memory.store"),
-            ("failed_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
+            (
+                "failed_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
             ("failure_reason", Some("disk"), "disk"),
-            ("payload_hash", Some("\\x0505050505050505050505050505050505050505050505050505050505050505"), "\\x0505050505050505050505050505050505050505050505050505050505050505"),
-            ("signature", Some("\\x06060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606"), "\\x06060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606"),
-            ("timestamp", Some("2026-01-02T03:04:04Z"), "2026-01-02T03:04:04Z"),
-        ],
-    ]),
-    ("subscriptions", &[
-        &[
+            (
+                "payload_hash",
+                Some("\\x0505050505050505050505050505050505050505050505050505050505050505"),
+                "\\x0505050505050505050505050505050505050505050505050505050505050505",
+            ),
+            (
+                "signature",
+                Some(
+                    "\\x06060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606",
+                ),
+                "\\x06060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606",
+            ),
+            (
+                "timestamp",
+                Some("2026-01-02T03:04:04Z"),
+                "2026-01-02T03:04:04Z",
+            ),
+        ]],
+    ),
+    (
+        "subscriptions",
+        &[&[
             ("id", Some("sub-10021"), "sub-10021"),
             ("agent_filter", Some("ai:pgnb"), "ai:pgnb"),
-            ("created_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "created_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("created_by", Some("ai:pgnb"), "ai:pgnb"),
             ("dispatch_count", Some("6"), "6"),
-            ("event_types", Some("[\"memory.store\"]"), "[\"memory.store\"]"),
+            (
+                "event_types",
+                Some("[\"memory.store\"]"),
+                "[\"memory.store\"]",
+            ),
             ("events", Some("memory.store"), "memory.store"),
             ("failure_count", Some("1"), "1"),
-            ("last_dispatched_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "last_dispatched_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("namespace_filter", Some("ns-10021"), "ns-10021"),
-            ("secret_hash", Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
-            ("url", Some("https://hooks.invalid/10021"), "https://hooks.invalid/10021"),
-        ],
-    ]),
-    ("subscription_events", &[
-        &[
+            (
+                "secret_hash",
+                Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+            (
+                "url",
+                Some("https://hooks.invalid/10021"),
+                "https://hooks.invalid/10021",
+            ),
+        ]],
+    ),
+    (
+        "subscription_events",
+        &[&[
             ("id", None, "1"),
             ("correlation_id", Some("corr-e-10021"), "corr-e-10021"),
-            ("delivered_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "delivered_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("delivery_status", Some("delivered"), "delivered"),
             ("event_type", Some("memory.store"), "memory.store"),
             ("payload", Some("{\"e\": 1}"), "{\"e\": 1}"),
             ("subscription_id", Some("sub-10021"), "sub-10021"),
-        ],
-    ]),
-    ("subscription_dlq", &[
-        &[
+        ]],
+    ),
+    (
+        "subscription_dlq",
+        &[&[
             ("id", None, "1"),
             ("correlation_id", Some("corr-d-10021"), "corr-d-10021"),
             ("event_type", Some("memory.store"), "memory.store"),
-            ("first_failed_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "first_failed_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("last_error", Some("503"), "503"),
-            ("last_failed_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
+            (
+                "last_failed_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
             ("payload", Some("{\"d\": 1}"), "{\"d\": 1}"),
             ("retry_count", Some("3"), "3"),
             ("subscription_id", Some("sub-10021"), "sub-10021"),
-        ],
-    ]),
-    ("sync_peer_contact", &[
-        &[
+        ]],
+    ),
+    (
+        "sync_peer_contact",
+        &[&[
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("peer_id", Some("peer-10021"), "peer-10021"),
             ("catchup_interval_secs", Some("60"), "60"),
-            ("last_contact_at", Some("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z"),
-        ],
-    ]),
-    ("sync_state", &[
-        &[
+            (
+                "last_contact_at",
+                Some("2026-01-02T03:04:05Z"),
+                "2026-01-02T03:04:05Z",
+            ),
+        ]],
+    ),
+    (
+        "sync_state",
+        &[&[
             ("agent_id", Some("ai:pgnb"), "ai:pgnb"),
             ("peer_id", Some("peer-10021"), "peer-10021"),
-            ("last_pulled_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
-            ("last_pushed_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-            ("last_seen_at", Some("2026-02-03 04:05:06.654321+00"), "2026-02-03 04:05:06.654321+00"),
-        ],
-    ]),
-    ("token_cost_counters", &[
-        &[
+            (
+                "last_pulled_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
+            (
+                "last_pushed_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
+            (
+                "last_seen_at",
+                Some("2026-02-03 04:05:06.654321+00"),
+                "2026-02-03 04:05:06.654321+00",
+            ),
+        ]],
+    ),
+    (
+        "token_cost_counters",
+        &[&[
             ("scope_kind", Some("namespace"), "namespace"),
             ("scope_key", Some("ns-10021"), "ns-10021"),
             ("recall_events", Some("2"), "2"),
             ("tokens_recalled", Some("300"), "300"),
             ("tokens_written", Some("400"), "400"),
-            ("updated_at", Some("2026-01-02 03:04:05.123456+00"), "2026-01-02 03:04:05.123456+00"),
+            (
+                "updated_at",
+                Some("2026-01-02 03:04:05.123456+00"),
+                "2026-01-02 03:04:05.123456+00",
+            ),
             ("write_events", Some("5"), "5"),
-        ],
-    ]),
-    ("transcript_line_dedup", &[
-        &[
-            ("sha256", Some("\\x0707070707070707070707070707070707070707070707070707070707070707"), "\\x0707070707070707070707070707070707070707070707070707070707070707"),
+        ]],
+    ),
+    (
+        "transcript_line_dedup",
+        &[&[
+            (
+                "sha256",
+                Some("\\x0707070707070707070707070707070707070707070707070707070707070707"),
+                "\\x0707070707070707070707070707070707070707070707070707070707070707",
+            ),
             ("host_kind", Some("claude"), "claude"),
             ("host_session_id", Some("sess-10021"), "sess-10021"),
             ("host_turn_index", Some("12"), "12"),
             ("memory_id", Some("m1-10021"), "m1-10021"),
             ("recovered_at", Some("1767323045"), "1767323045"),
-            ("transcript_path", Some("/corpus/10021.jsonl"), "/corpus/10021.jsonl"),
-        ],
-    ]),
+            (
+                "transcript_path",
+                Some("/corpus/10021.jsonl"),
+                "/corpus/10021.jsonl",
+            ),
+        ]],
+    ),
 ];

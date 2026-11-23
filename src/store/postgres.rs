@@ -132,6 +132,8 @@ mod lifecycle_tx_3152;
 mod forensic_outage_4199;
 // v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
 mod lock_order_4209;
+// v1.0.0 #10021 — PostgreSQL-native exact backup and restore (qual_10 budget).
+mod native_backup;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -21480,6 +21482,20 @@ impl PostgresStore {
 
 #[async_trait]
 impl MemoryStore for PostgresStore {
+    async fn native_backup(
+        &self,
+        data: std::fs::File,
+    ) -> StoreResult<crate::store::native_backup::NativeDumpBody> {
+        native_backup::native_backup_pg(&self.pool, data).await
+    }
+
+    async fn native_restore(
+        &self,
+        backup: crate::store::native_backup::VerifiedPgBackup,
+    ) -> StoreResult<crate::store::native_backup::NativeRestoreReport> {
+        native_backup::native_restore_pg(&self.pool, backup).await
+    }
+
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
         let (fsync, synchronous_commit): (String, String) = sqlx::query_as(
             "SELECT current_setting('fsync'), current_setting('synchronous_commit')",

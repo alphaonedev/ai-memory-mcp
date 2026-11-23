@@ -16,9 +16,12 @@
 //! Every cell needs a live PostgreSQL (+ AGE + pgvector): `AI_MEMORY_TEST_POSTGRES_URL`. The
 //! cells do not self-skip: an unset URL fails the cell.
 #![cfg(feature = "sal-postgres")]
-#![allow(clippy::missing_panics_doc, clippy::too_many_lines, clippy::similar_names)]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    clippy::similar_names
+)]
 
-#[allow(dead_code)]
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
 
@@ -50,8 +53,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 /// The agent every signed write in these cells is attributed to.
 const AGENT: &str = "ai:pgnb";
 
-/// The operator trust anchor's secret seed (test-only).
-const ANCHOR_SEED: [u8; 32] = [7u8; 32];
+/// The operator trust anchor's secret seed (test-only). Not a repeated byte: the corpus
+/// holds a `\x07` x 32 bytea value, and the C-8 secret scan must not match table content.
+const ANCHOR_SEED: [u8; 32] = *b"anchor-seed/pgnb-10021/v1-------";
 
 /// A key embedded by an attacker in a re-signed artifact (test-only).
 const EMBEDDED_SEED: [u8; 32] = [9u8; 32];
@@ -210,7 +214,9 @@ async fn fresh(prefix: &str) -> Db {
         .max_connections(2)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
-                sqlx::query("SET TIME ZONE 'UTC'").execute(&mut *conn).await?;
+                sqlx::query("SET TIME ZONE 'UTC'")
+                    .execute(&mut *conn)
+                    .await?;
                 Ok(())
             })
         })
@@ -230,11 +236,7 @@ fn sql_lit(v: &str) -> String {
 
 async fn insert_rows(conn: &mut sqlx::PgConnection, table: &str, rows: &[&[corpus::Cell]]) {
     for row in rows {
-        let cols: Vec<&str> = row
-            .iter()
-            .filter(|c| c.1.is_some())
-            .map(|c| c.0)
-            .collect();
+        let cols: Vec<&str> = row.iter().filter(|c| c.1.is_some()).map(|c| c.0).collect();
         let vals: Vec<String> = row.iter().filter_map(|c| c.1).map(sql_lit).collect();
         let sql = format!(
             "INSERT INTO public.{table} ({}) VALUES ({})",
@@ -294,7 +296,10 @@ async fn count_rows(pool: &PgPool, qualified: &str) -> i64 {
 async fn assert_empty(pool: &PgPool, why: &str) {
     for t in EXPECTED_TABLES {
         let n = count_rows(pool, &format!("public.{t}")).await;
-        assert_eq!(n, 0, "#10021 {why}: public.{t} holds {n} rows; target must stay empty");
+        assert_eq!(
+            n, 0,
+            "#10021 {why}: public.{t} holds {n} rows; target must stay empty"
+        );
     }
 }
 
@@ -446,16 +451,31 @@ async fn round_trip_is_byte_exact_10021() {
     seed_corpus(&src.pool).await;
     let art = dump(&src, "rt").await;
 
-    let names: Vec<String> = art.body.tables.iter().map(nb::TableSegment::qualified).collect();
+    let names: Vec<String> = art
+        .body
+        .tables
+        .iter()
+        .map(nb::TableSegment::qualified)
+        .collect();
     let got: BTreeSet<&str> = names.iter().map(String::as_str).collect();
-    let want: BTreeSet<String> = EXPECTED_TABLES.iter().map(|t| format!("public.{t}")).collect();
+    let want: BTreeSet<String> = EXPECTED_TABLES
+        .iter()
+        .map(|t| format!("public.{t}"))
+        .collect();
     let want: BTreeSet<&str> = want.iter().map(String::as_str).collect();
-    assert_eq!(got, want, "#10021 backup must dump exactly the 45 public tables");
+    assert_eq!(
+        got, want,
+        "#10021 backup must dump exactly the 45 public tables"
+    );
     assert_eq!(art.body.tables.len(), 45, "#10021 catalog table count");
     assert_eq!(art.body.tables[0].qualified(), FIRST_RESTORE_TABLE);
     for t in EXPECTED_TABLES {
         let rows = u64::try_from(corpus_rows(t).len()).expect("len");
-        assert_eq!(segment(&art.body, &format!("public.{t}")).rows, rows, "rows of {t}");
+        assert_eq!(
+            segment(&art.body, &format!("public.{t}")).rows,
+            rows,
+            "rows of {t}"
+        );
     }
     let seqs: Vec<SequenceValue> = EXPECTED_SEQUENCES
         .iter()
@@ -466,7 +486,10 @@ async fn round_trip_is_byte_exact_10021() {
             is_called: true,
         })
         .collect();
-    assert_eq!(art.body.sequences, seqs, "#10021 sequence values in the artifact");
+    assert_eq!(
+        art.body.sequences, seqs,
+        "#10021 sequence values in the artifact"
+    );
     assert_eq!(art.body.backend, nb::PG_BACKUP_BACKEND);
     assert_eq!(art.body.layout_version, nb::PG_BACKUP_LAYOUT_VERSION);
 
@@ -490,7 +513,7 @@ async fn round_trip_is_byte_exact_10021() {
     assert_eq!(compared, 45, "#10021 compared table count");
 
     // Generated columns are recomputed on the target, equal to the hand-written values.
-    let gen: (String, String, String) = sqlx::query_as(
+    let generated: (String, String, String) = sqlx::query_as(
         "SELECT agent_id_idx, scope_idx, target_agent_id_idx FROM public.memories \
          WHERE id = 'm1-10021'",
     )
@@ -498,7 +521,7 @@ async fn round_trip_is_byte_exact_10021() {
     .await
     .expect("generated cols");
     assert_eq!(
-        gen,
+        generated,
         (
             "ai:pgnb".to_string(),
             "private".to_string(),
@@ -512,7 +535,10 @@ async fn round_trip_is_byte_exact_10021() {
             .fetch_one(&tgt.pool)
             .await
             .expect("nextval");
-        assert_eq!(next, 2, "#10021 sequence public.{s} must continue past the restored max");
+        assert_eq!(
+            next, 2,
+            "#10021 sequence public.{s} must continue past the restored max"
+        );
     }
 }
 
@@ -540,7 +566,12 @@ async fn catalog_ratchet_every_relation_dumped_or_excluded_10021() {
         .collect();
     assert_eq!(excl, want, "#10021 the named exclusion list");
 
-    let dumped: BTreeSet<String> = art.body.tables.iter().map(nb::TableSegment::qualified).collect();
+    let dumped: BTreeSet<String> = art
+        .body
+        .tables
+        .iter()
+        .map(nb::TableSegment::qualified)
+        .collect();
     let seqs: BTreeSet<String> = art
         .body
         .sequences
@@ -562,10 +593,16 @@ async fn catalog_ratchet_every_relation_dumped_or_excluded_10021() {
     let mut accounted = 0usize;
     for (rel, kind) in &rels {
         let ok = dumped.contains(rel) || seqs.contains(rel) || excluded.contains(rel.as_str());
-        assert!(ok, "#10021 relation {rel} (relkind {kind}) is neither dumped nor excluded");
+        assert!(
+            ok,
+            "#10021 relation {rel} (relkind {kind}) is neither dumped nor excluded"
+        );
         accounted += 1;
     }
-    assert_eq!(accounted, 62, "#10021 catalog relation count (45 + 6 + 11 excluded)");
+    assert_eq!(
+        accounted, 62,
+        "#10021 catalog relation count (45 + 6 + 11 excluded)"
+    );
     assert_eq!(dumped.len() + seqs.len(), 51);
 
     let gens: Vec<String> = sqlx::query_scalar(
@@ -578,7 +615,10 @@ async fn catalog_ratchet_every_relation_dumped_or_excluded_10021() {
     .await
     .expect("generated");
     for g in &gens {
-        assert!(excluded.contains(g.as_str()), "#10021 generated column {g} not excluded");
+        assert!(
+            excluded.contains(g.as_str()),
+            "#10021 generated column {g} not excluded"
+        );
     }
 
     let cols: Vec<(String, String, String)> = sqlx::query_as(
@@ -594,7 +634,10 @@ async fn catalog_ratchet_every_relation_dumped_or_excluded_10021() {
     .expect("columns");
     let types: BTreeSet<&str> = cols.iter().map(|c| c.2.as_str()).collect();
     let want_types: BTreeSet<&str> = EXPECTED_TYPES.iter().copied().collect();
-    assert_eq!(types, want_types, "#10021 every column type has a backup handler");
+    assert_eq!(
+        types, want_types,
+        "#10021 every column type has a backup handler"
+    );
     for seg in &art.body.tables {
         let catalog: Vec<(String, String)> = cols
             .iter()
@@ -610,7 +653,11 @@ async fn catalog_ratchet_every_relation_dumped_or_excluded_10021() {
         for row in corpus_rows(&seg.name) {
             let have: BTreeSet<&str> = row.iter().map(|c| c.0).collect();
             for (c, _) in &catalog {
-                assert!(have.contains(c.as_str()), "corpus misses {}.{c}", seg.qualified());
+                assert!(
+                    have.contains(c.as_str()),
+                    "corpus misses {}.{c}",
+                    seg.qualified()
+                );
             }
         }
     }
@@ -626,7 +673,11 @@ async fn backup_refuses_a_column_type_with_no_handler_10021() {
         .expect("add inet column");
     let dir = unique_dir("typ");
     let file = nb::create_private_file(&dir.join("t.pgdata")).expect("file");
-    let err = src.store.native_backup(file).await.expect_err("must refuse");
+    let err = src
+        .store
+        .native_backup(file)
+        .await
+        .expect_err("must refuse");
     assert_eq!(
         integrity_detail(err),
         NativeBackupError::CatalogMismatch {
@@ -730,7 +781,10 @@ async fn verifier_refuses_every_bad_artifact_exactly_10021() {
     let p = write_signed(&art.dir, "embedded", &art.body, &embedded);
     let parsed: SignedPgManifest =
         serde_json::from_slice(&std::fs::read(&p).expect("read")).expect("json");
-    assert_eq!(parsed.signer, hex::encode(embedded.verifying_key().to_bytes()));
+    assert_eq!(
+        parsed.signer,
+        hex::encode(embedded.verifying_key().to_bytes())
+    );
     assert_eq!(
         verify(&p, &art.data).expect_err("embedded key"),
         NativeBackupError::BadSignature
@@ -794,7 +848,8 @@ async fn verifier_refuses_every_bad_artifact_exactly_10021() {
     // Over the manifest cap.
     let big = art.dir.join("big.json");
     let f = std::fs::File::create(&big).expect("big");
-    f.set_len(nb::PG_BACKUP_MAX_MANIFEST_BYTES + 1).expect("set_len");
+    f.set_len(nb::PG_BACKUP_MAX_MANIFEST_BYTES + 1)
+        .expect("set_len");
     assert_eq!(
         nb::read_manifest_capped(&big).expect_err("cap"),
         NativeBackupError::ManifestTooLarge {
@@ -923,7 +978,9 @@ async fn mid_restore_failure_leaves_target_empty_and_retryable_10021() {
     let m = write_signed(&art.dir, "rows", &body, &anchor());
 
     let tgt = fresh("pgnb10021mrt").await;
-    let err = restore(&tgt, &m, &art.data).await.expect_err("injected failure");
+    let err = restore(&tgt, &m, &art.data)
+        .await
+        .expect_err("injected failure");
     assert_eq!(
         integrity_detail(err),
         NativeBackupError::RowCountMismatch {
@@ -958,7 +1015,7 @@ async fn dump_beside_concurrent_writers_restores_consistent_10021() {
                 let mut tx = pool.begin().await.expect("writer tx");
                 sqlx::query(
                     "INSERT INTO public.memories (id, tier, namespace, title, content, source) \
-                     VALUES ($1, 'short', 'ns-cw-10021', 'cw', 'cw', 'test')",
+                     VALUES ($1, 'short', 'ns-cw-10021', $1, 'cw', 'test')",
                 )
                 .bind(&id)
                 .execute(&mut *tx)
@@ -978,6 +1035,10 @@ async fn dump_beside_concurrent_writers_restores_consistent_10021() {
         })
     };
     while written.load(Ordering::Acquire) < 5 {
+        assert!(
+            !writer.is_finished(),
+            "#10021 the writer stopped before 5 commits"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let art = dump(&src, "cw").await;
@@ -988,18 +1049,16 @@ async fn dump_beside_concurrent_writers_restores_consistent_10021() {
     restore(&tgt, &art.manifest, &art.data)
         .await
         .expect("a snapshot dump restores with every FK satisfied");
-    let mems: i64 = sqlx::query_scalar(
-        "SELECT count(1) FROM public.memories WHERE namespace = 'ns-cw-10021'",
-    )
-    .fetch_one(&tgt.pool)
-    .await
-    .expect("mems");
-    let links: i64 = sqlx::query_scalar(
-        "SELECT count(1) FROM public.memory_links WHERE source_id LIKE 'cw-%'",
-    )
-    .fetch_one(&tgt.pool)
-    .await
-    .expect("links");
+    let mems: i64 =
+        sqlx::query_scalar("SELECT count(1) FROM public.memories WHERE namespace = 'ns-cw-10021'")
+            .fetch_one(&tgt.pool)
+            .await
+            .expect("mems");
+    let links: i64 =
+        sqlx::query_scalar("SELECT count(1) FROM public.memory_links WHERE source_id LIKE 'cw-%'")
+            .fetch_one(&tgt.pool)
+            .await
+            .expect("links");
     let orphans: i64 = sqlx::query_scalar(
         "SELECT count(1) FROM public.memory_links l WHERE NOT EXISTS \
          (SELECT 1 FROM public.memories m WHERE m.id = l.source_id) OR NOT EXISTS \
@@ -1009,7 +1068,10 @@ async fn dump_beside_concurrent_writers_restores_consistent_10021() {
     .await
     .expect("orphans");
     assert!(mems >= 5, "the dump saw the committed writers ({mems})");
-    assert_eq!(mems, links, "#10021 every snapshot memory has its link and vice versa");
+    assert_eq!(
+        mems, links,
+        "#10021 every snapshot memory has its link and vice versa"
+    );
     assert_eq!(orphans, 0, "#10021 no link without its memory");
     let seg = segment(&art.body, "public.memories");
     assert_eq!(seg.rows, u64::try_from(mems + 2).expect("rows"));
@@ -1020,7 +1082,7 @@ async fn dump_beside_concurrent_writers_restores_consistent_10021() {
 // ---------------------------------------------------------------------------------------
 
 /// After restore: triggers did not alter restored rows, a stored link signature still
-/// verifies, the audit_log / attested_write_ledger chains are byte-identical, delivered
+/// verifies, the `audit_log` / `attested_write_ledger` chains are byte-identical, delivered
 /// outbox / DLQ rows stay delivered, and no restored lease is live.
 #[tokio::test(flavor = "multi_thread")]
 async fn restored_state_has_no_side_effect_and_signatures_verify_10021() {
@@ -1052,7 +1114,13 @@ async fn restored_state_has_no_side_effect_and_signatures_verify_10021() {
         target_id: Some("m1-10021".to_string()),
         link_id: None,
     };
-    assert!(src.store.verify_link(filter.clone()).await.expect("verify src").verified);
+    assert!(
+        src.store
+            .verify_link(filter.clone())
+            .await
+            .expect("verify src")
+            .verified
+    );
 
     // One live lease on the source.
     let live_until = now_epoch(&src.pool).await + 86_400;
@@ -1065,7 +1133,9 @@ async fn restored_state_has_no_side_effect_and_signatures_verify_10021() {
     let art = dump(&src, "c7").await;
     let tgt = fresh("pgnb10021c7t").await;
     let before = now_epoch(&tgt.pool).await;
-    let report = restore(&tgt, &art.manifest, &art.data).await.expect("restore");
+    let report = restore(&tgt, &art.manifest, &art.data)
+        .await
+        .expect("restore");
     let after = now_epoch(&tgt.pool).await;
     assert_eq!(report.leases_clamped, 1, "#10021 the live lease is clamped");
     assert_eq!(report.age_edges_projected, 2);
@@ -1077,9 +1147,18 @@ async fn restored_state_has_no_side_effect_and_signatures_verify_10021() {
     // Triggers did not rewrite the restored _agents row.
     for col in ["content", "metadata", "title", "namespace"] {
         let q = format!("SELECT {col}::text FROM public.memories WHERE id = 'm2-10021'");
-        let a: String = sqlx::query_scalar(&q).fetch_one(&src.pool).await.expect("src");
-        let b: String = sqlx::query_scalar(&q).fetch_one(&tgt.pool).await.expect("tgt");
-        assert_eq!(a, b, "#10021 memories.{col} of m2-10021 changed by a trigger");
+        let a: String = sqlx::query_scalar(&q)
+            .fetch_one(&src.pool)
+            .await
+            .expect("src");
+        let b: String = sqlx::query_scalar(&q)
+            .fetch_one(&tgt.pool)
+            .await
+            .expect("tgt");
+        assert_eq!(
+            a, b,
+            "#10021 memories.{col} of m2-10021 changed by a trigger"
+        );
     }
     let m2 = corpus_rows("memories")[1];
     for (col, _, expected) in m2 {
@@ -1093,20 +1172,38 @@ async fn restored_state_has_no_side_effect_and_signatures_verify_10021() {
     }
 
     // Chains and every other table are byte-identical; leases differ only by the clamp.
-    assert_eq!(assert_tables_equal(&src.pool, &tgt.pool, &["leases"]).await, 44);
+    assert_eq!(
+        assert_tables_equal(&src.pool, &tgt.pool, &["leases"]).await,
+        44
+    );
     for t in ["audit_log", "attested_write_ledger", "memory_links"] {
         let q = format!("public.{t}");
-        assert_eq!(table_digest(&src.pool, &q).await, table_digest(&tgt.pool, &q).await);
+        assert_eq!(
+            table_digest(&src.pool, &q).await,
+            table_digest(&tgt.pool, &q).await
+        );
     }
 
     // Delivered outbox / DLQ rows stay delivered (no redelivery).
     let probes = [
-        ("SELECT projected_at::text FROM public.kg_projection_outbox WHERE id = 1", "2026-02-03 04:05:06.654321+00"),
-        ("SELECT delivery_status FROM public.subscription_events WHERE id = 1", "delivered"),
-        ("SELECT replayed_at::text FROM public.federation_push_dlq WHERE id = 1", "2026-02-03 04:05:06.654321+00"),
+        (
+            "SELECT projected_at::text FROM public.kg_projection_outbox WHERE id = 1",
+            "2026-02-03 04:05:06.654321+00",
+        ),
+        (
+            "SELECT delivery_status FROM public.subscription_events WHERE id = 1",
+            "delivered",
+        ),
+        (
+            "SELECT replayed_at::text FROM public.federation_push_dlq WHERE id = 1",
+            "2026-02-03 04:05:06.654321+00",
+        ),
     ];
     for (q, want) in probes {
-        let got: String = sqlx::query_scalar(q).fetch_one(&tgt.pool).await.expect("probe");
+        let got: String = sqlx::query_scalar(q)
+            .fetch_one(&tgt.pool)
+            .await
+            .expect("probe");
         assert_eq!(got, want, "#10021 {q}");
     }
 
@@ -1149,10 +1246,12 @@ async fn artifact_is_0600_and_holds_no_secret_10021() {
     keypair::save(&kp, key_dir_sandbox::pin()).expect("save");
     let token_hash = sha256_hex(API_KEY_CANARY.as_bytes());
     let ctx = CallerContext::for_agent(AGENT);
-    src.store
+    let bound = src
+        .store
         .bind_agent_api_key(&ctx, "ai:pgnb-c8", &token_hash)
         .await
         .expect("bind api key");
+    assert_eq!(bound, ai_memory::storage::BindApiKeyOutcome::Bound);
     let art = dump(&src, "c8").await;
 
     #[cfg(unix)]
@@ -1177,16 +1276,26 @@ async fn artifact_is_0600_and_holds_no_secret_10021() {
         needles.push(b64.encode(secret).into_bytes());
         needles.push(b64url.encode(secret).into_bytes());
     }
-    for hay in [&data, &manifest] {
-        for n in &needles {
+    for (file, hay) in [("data", &data), ("manifest", &manifest)] {
+        for (idx, n) in needles.iter().enumerate() {
+            let hit = hay.windows(n.len()).position(|w| w == n.as_slice());
+            let table = hit.and_then(|at| {
+                let at = u64::try_from(at).ok()?;
+                art.body
+                    .tables
+                    .iter()
+                    .find(|t| at >= t.offset && at < t.offset + t.len)
+                    .map(|t| format!("{}.{}", t.schema, t.name))
+            });
             assert!(
-                !hay.windows(n.len()).any(|w| w == n.as_slice()),
-                "#10021 artifact holds a secret"
+                hit.is_none(),
+                "#10021 the {file} file holds secret form #{idx} (segment {table:?})"
             );
         }
     }
     assert!(
-        data.windows(token_hash.len()).any(|w| w == token_hash.as_bytes()),
+        data.windows(token_hash.len())
+            .any(|w| w == token_hash.as_bytes()),
         "the bound key hash (table content) is in the artifact"
     );
 }

@@ -65,7 +65,9 @@ pub struct ExportArgs {
     /// class (audit chain, revisions, tombstones, lineage, attestations,
     /// governance rules + trust anchors) byte-preserved and re-verifiable at
     /// import, with a computed `conformance_level` (L1/L2/L3) marker. This is
-    /// the integrity portability path. Without `--full`, `export` stays the
+    /// the integrity portability path. It carries 12 record classes and is
+    /// NOT a full backup: offloaded blobs and the key history are omitted
+    /// (use `ai-memory backup`, #10021). Without `--full`, `export` stays the
     /// memories+links convenience view.
     #[arg(long, default_value_t = false)]
     pub full: bool,

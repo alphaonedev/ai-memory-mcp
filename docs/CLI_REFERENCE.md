@@ -607,8 +607,10 @@ deployment it created an empty SQLite file, snapshotted that, wrote a
 the DR restore. Both verbs now resolve the configured store first and
 refuse what they cannot capture:
 
-- a `postgres://` store (naming `pg_dump` / `pg_basebackup`; the DSN
-  password is redacted from the message),
+- a `postgres://` store in a build without the `sal-postgres` feature
+  (naming `pg_dump` / `pg_basebackup`; the DSN password is redacted from
+  the message). A `sal-postgres` build takes a PostgreSQL-native backup
+  instead (see "PostgreSQL-native backup and restore" below),
 - an unrecognised store-URL scheme (no silent fallback to `--db`),
 - a `--store-url` that disagrees with `AI_MEMORY_STORE_URL`,
 - for `backup`, a `--db` path where no database exists — it will not
@@ -849,8 +851,47 @@ elsewhere, its location adds no integrity: someone who can write the
 directory can delete a backup but cannot make an altered one restore.
 Keep copies off-host. See SECURITY.md, "Backup and restore trust model".
 
-`restore` is SQLite-only. A Postgres-backed deployment is restored
-with Postgres' own tooling — see
+### PostgreSQL-native backup and restore (v1.0.0 #10021)
+
+In a build with the `sal-postgres` feature, `backup` and `restore` act
+on a Postgres store when `--store-url` (or `AI_MEMORY_STORE_URL_FILE` /
+`AI_MEMORY_STORE_URL`) names one. There is no separate verb.
+
+- `backup --store-url postgres://… --to <dir>` writes
+  `ai-memory-<ts>.pgdata` and `ai-memory-<ts>.pgmanifest.json`, both
+  mode 0600. The dump reads every table of every non-system schema
+  (Apache AGE graphs included) and every sequence in one
+  `READ ONLY REPEATABLE READ` transaction, in a stable catalog order,
+  keeping typed values, `bytea` and JSON exact. The manifest records the
+  backend, the layout version, the schema version, and a row count and
+  SHA-256 digest per table, and it is always signed with the operator
+  key. With no usable operator signing key the command refuses and
+  writes nothing (`a PostgreSQL backup is always signed`).
+- The artifact holds every table verbatim, **including API-key hashes,
+  the key history and session transcripts**. It holds no private signing
+  key and no plaintext API key. The command prints this notice on every
+  backup. Keep the files as private as the database itself.
+- `restore --store-url postgres://… --from <dir> --snapshot ai-memory-<ts>`
+  (or `--from <file>.pgdata`) verifies the signature against the
+  operator public key resolved on this host (never a key inside the
+  artifact), then every per-table digest, the data-file digest and its
+  length, all before the first write. It then loads the rows in one
+  transaction that holds exclusive locks, checks inside that transaction
+  that the target is empty (freshly migrated, seeded rows only), resets
+  every sequence, and checks every row count. Any failure rolls the whole
+  load back and leaves the target empty and retryable. Unexpired leases
+  are restored as expired, so no restored lease is live.
+- Refusals, each with nothing written: an unsigned manifest; a signature
+  that does not verify; a digest, length or row-count mismatch; an
+  unknown layout version; a backup of another backend (cross-backend
+  restore is not supported); a schema version other than the target's;
+  a table or column set other than the target's; a target that is not
+  empty (`restore target is not empty`); no operator public key; and
+  `--skip-verify`, `--allow-unsigned-manifest` or `--latest`, which are
+  not accepted on this path.
+
+A build without `sal-postgres` refuses a Postgres store as described
+above; such a deployment is restored with Postgres' own tooling — see
 [`production-deployment.md` §"PostgreSQL recovery"](production-deployment.html#postgresql-recovery).
 
 ## Autonomy (v0.6.1)

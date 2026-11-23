@@ -415,16 +415,20 @@ pub enum Command {
     /// revision log, forget tombstones, derivation lineage, per-write
     /// attestations, the signed-events audit chain), so it is NOT the
     /// portability path (#1944). For integrity-preserving, lossless
-    /// portability use `ai-memory backup` (SQLite VACUUM INTO); the signed
+    /// portability use `ai-memory backup` (SQLite VACUUM INTO, or a signed
+    /// PostgreSQL-native backup with `--store-url`, #10021); the signed
     /// crypto spine is separately exportable via
     /// `ai-memory export-forensic-bundle`. The export payload carries
     /// additive `export_scope` / `portability_complete` / `excludes` markers
     /// and a stderr WARN naming this scope. `--full` (v1.0.0 #2006) instead
-    /// emits the integrity-complete Portability-v2 envelope (every signed
-    /// record class byte-preserved + re-verifiable, with a computed
-    /// `conformance_level` marker).
+    /// emits the Portability-v2 envelope (12 signed record classes, byte-
+    /// preserved, with a `conformance_level` marker); it is NOT a full
+    /// backup: offloaded blobs and the key history are omitted (#10021).
     Export(cli::io::ExportArgs),
     /// Import memories from JSON (stdin)
+    ///
+    /// At most the 12 Portability-v2 record classes; NOT a full restore (no
+    /// offloaded blobs, no key history; use `ai-memory restore`, #10021).
     Import(ImportArgs),
     /// Resolve a contradiction — mark one memory as superseding another
     Resolve(ResolveArgs),

@@ -115,9 +115,16 @@ fn backup_on_a_postgres_store_refuses_and_writes_no_artifact_2444() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // The refusal must name the supported path so the operator is not left
-    // guessing what to run instead.
+    // guessing what to run instead. #10021: a sal-postgres build takes the
+    // PostgreSQL-native backup, which is always signed, and this isolated HOME
+    // has no operator key, so it refuses before connecting.
+    let want = if cfg!(feature = "sal-postgres") {
+        "a PostgreSQL backup is always signed"
+    } else {
+        "pg_dump"
+    };
     assert!(
-        stderr.contains("pg_dump"),
+        stderr.contains(want),
         "refusal must name the supported Postgres backup path; stderr was: {stderr}"
     );
     // #1579 A3 — a mistyped/echoed store URL must never carry the credential.
@@ -218,8 +225,15 @@ fn restore_on_a_postgres_store_refuses_2444() {
         !stdout.contains("Restored"),
         "a refused restore must never report success; stdout was: {stdout}"
     );
+    // #10021: a sal-postgres build verifies a PostgreSQL-native backup
+    // against the operator key, and this isolated HOME has none.
+    let want = if cfg!(feature = "sal-postgres") {
+        "a PostgreSQL restore verifies the backup's signature"
+    } else {
+        "pg_dump"
+    };
     assert!(
-        stderr.contains("pg_dump"),
+        stderr.contains(want),
         "refusal must name the supported Postgres path; stderr was: {stderr}"
     );
     assert!(
