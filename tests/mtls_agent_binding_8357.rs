@@ -777,7 +777,11 @@ async fn allowlisted_client_config() -> rustls::ClientConfig {
     let chain = tls::rustls_pki_pem_iter_certs(&leaf_pem).expect("parse server leaf");
     let leaf = chain.first().expect("fixture carries a leaf");
     let pin: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
-    let pins = HashMap::from([(SERVER_NAME.to_string(), HashSet::from([pin]))]);
+    let pins = tls::PinnedFingerprints::try_from_map(HashMap::from([(
+        SERVER_NAME.to_string(),
+        HashSet::from([pin]),
+    )]))
+    .expect("one host, one pin");
     tls::build_rustls_pinning_client_config(
         pins,
         Some(&fixture("valid_cert.pem")),

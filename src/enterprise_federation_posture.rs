@@ -100,6 +100,9 @@ mod synchronous;
 /// #3199 — the backup-manifest-signing posture row (check #22) and its test.
 mod backup_signing;
 
+/// #9954 — the peer server-cert pin-file posture row (check #10) and its tests.
+mod peer_pins;
+
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
 /// name here — deliberately not a free-form string so a typo in
@@ -447,22 +450,7 @@ pub fn evaluate_with_live(
     ));
 
     // ---- 10. AI_MEMORY_FED_PEER_FINGERPRINTS=<set> -----------------
-    let fp_path = std::env::var(crate::tls::FED_PEER_FINGERPRINTS_ENV).unwrap_or_default();
-    let fp_set = !fp_path.trim().is_empty();
-    let fp_readable = fp_set && std::path::Path::new(fp_path.trim()).is_file();
-    out.push(check(
-        crate::tls::FED_PEER_FINGERPRINTS_ENV,
-        "<set> to a readable peer server-cert pin file",
-        if !fp_set {
-            "(unset)".to_string()
-        } else if fp_readable {
-            fp_path.clone()
-        } else {
-            format!("{fp_path} (not a readable file)")
-        },
-        fp_readable,
-        "set AI_MEMORY_FED_PEER_FINGERPRINTS to a `<host> <sha256-hex>` pin file (#1678)",
-    ));
+    out.push(peer_pins::check_peer_fingerprints());
 
     // ---- 11 + 12. AI_MEMORY_FED_PEER_ATTESTATION -------------------
     let attestation_raw = std::env::var(PEER_ATTESTATION_ENV).unwrap_or_default();
@@ -982,7 +970,8 @@ mod tests {
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
 
         let fp_file = tempfile::NamedTempFile::new().expect("tempfile");
-        std::fs::write(fp_file.path(), "example.org abc123\n").expect("write fp file");
+        std::fs::write(fp_file.path(), crate::tls::pin_file_cases::valid_pin_line())
+            .expect("write fp");
 
         unsafe {
             std::env::set_var(TRUST_DOMAIN_ENV_FOR_TEST, "test-fleet");

@@ -415,7 +415,15 @@ const RAW_WRITE_CENSUS_8950: &[(&str, usize)] = &[
     ("src/storage/sqlite_integrity.rs", 1),
     ("src/store_url.rs", 1),
     ("src/test_support.rs", 6),
-    ("src/tls.rs", 7),
+    // #9954: 7 -> 8. The new site is the READ-only pin-file open of
+    // `read_pin_file_capped` (`.read(true)` + O_NONBLOCK, no create/truncate/
+    // write flag): it creates and replaces nothing. Guard:
+    // `tls::tests::pin_file_open_is_read_only_8950_9954`.
+    ("src/tls.rs", 8),
+    // #9954: the one site is the `std::fs::write` of the cfg(test)-only
+    // fixture writer `write` (the module is `#[cfg(test)]` in tls.rs; its
+    // name does not end in `_tests`, so the walk counts it).
+    ("src/tls/pin_file_cases.rs", 1),
     ("src/tls_bootstrap.rs", 1),
     ("src/wake_client/bundle.rs", 4),
     ("src/wake_client/session.rs", 1),
