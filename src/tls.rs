@@ -1004,14 +1004,23 @@ impl PinnedFingerprints {
 /// `AI_MEMORY_FED_PEER_FINGERPRINTS`. `Ok(None)` ⇒ pinning OFF (env unset
 /// or empty), so callers leave the pre-#1678 client path byte-identical.
 pub fn peer_fingerprint_map_from_env() -> Result<Option<PinnedFingerprints>> {
-    let Some(raw) = std::env::var_os(FED_PEER_FINGERPRINTS_ENV) else {
+    peer_fingerprint_map_from_value(std::env::var_os(FED_PEER_FINGERPRINTS_ENV).as_deref())
+}
+
+/// The resolver behind [`peer_fingerprint_map_from_env`], given the env
+/// value as read once (#9954). `None` or an exactly-empty value ⇒ pinning
+/// OFF; any other value is a path used as written (no trimming). The doctor
+/// row calls this with the same single read it displays.
+pub fn peer_fingerprint_map_from_value(
+    raw: Option<&std::ffi::OsStr>,
+) -> Result<Option<PinnedFingerprints>> {
+    let Some(raw) = raw else {
         return Ok(None);
     };
-    let path = std::path::PathBuf::from(raw);
-    if path.as_os_str().is_empty() {
+    if raw.is_empty() {
         return Ok(None);
     }
-    Ok(Some(load_peer_fingerprint_map(&path)?))
+    Ok(Some(load_peer_fingerprint_map(Path::new(raw))?))
 }
 
 /// Disposition for a peer host with NO pin entry (mixed-mode rollout).

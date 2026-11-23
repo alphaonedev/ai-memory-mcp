@@ -25,22 +25,8 @@ const ACTUAL_UNSET: &str = "(unset)";
 /// Check #10 — `AI_MEMORY_FED_PEER_FINGERPRINTS` names a pin file whose
 /// content the runtime accepts (#9954).
 pub(super) fn check_peer_fingerprints() -> PostureCheck {
-    let (actual, pass) = match crate::tls::peer_fingerprint_map_from_env() {
-        Ok(Some(pins)) => {
-            let path = std::env::var_os(FED_PEER_FINGERPRINTS_ENV).unwrap_or_default();
-            (
-                format!(
-                    "{}: {} host(s), {} pin(s)",
-                    std::path::Path::new(&path).display(),
-                    pins.len(),
-                    pins.pin_count()
-                ),
-                true,
-            )
-        }
-        Ok(None) => (ACTUAL_UNSET.to_string(), false),
-        Err(e) => (format!("{e:#}"), false),
-    };
+    let raw = std::env::var_os(FED_PEER_FINGERPRINTS_ENV);
+    let (actual, pass) = peer_pin_row(raw.as_deref());
     check(
         FED_PEER_FINGERPRINTS_ENV,
         REQUIRED,
@@ -50,39 +36,67 @@ pub(super) fn check_peer_fingerprints() -> PostureCheck {
     )
 }
 
+/// The row's `(actual, pass)` for one env value, read once by the caller:
+/// the runtime resolver decides, and the path shown is the value it loaded.
+fn peer_pin_row(raw: Option<&std::ffi::OsStr>) -> (String, bool) {
+    match crate::tls::peer_fingerprint_map_from_value(raw) {
+        Ok(Some(pins)) => (
+            format!(
+                "{}: {} host(s), {} pin(s)",
+                std::path::Path::new(raw.unwrap_or_default()).display(),
+                pins.len(),
+                pins.pin_count()
+            ),
+            true,
+        ),
+        Ok(None) => (ACTUAL_UNSET.to_string(), false),
+        Err(e) => (format!("{e:#}"), false),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::super::evaluate;
     use super::super::tests::{EnvGuard, clear_all, env_lock, find, set_fully_hardened_env};
+    use super::peer_pin_row;
     use crate::config::AppConfig;
     use crate::tls::FED_PEER_FINGERPRINTS_ENV;
     use crate::tls::pin_file_cases::{
         DEADLINE_MISS, Expect, build_cases, loader_verdict, with_deadline,
     };
 
-    /// The doctor row's (pass, actual) with the env var set to `value`,
-    /// bounded by the row deadline.
+    /// The doctor row's (pass, actual) for the env value `value`, bounded by
+    /// the row deadline. The row takes the value its caller read once, so
+    /// the table needs no process-environment mutation.
     fn doctor_row(value: &std::ffi::OsStr) -> (bool, String) {
-        // SAFETY: every caller holds `env_lock()` in an env-isolated child.
-        unsafe {
-            std::env::set_var(FED_PEER_FINGERPRINTS_ENV, value);
-        }
+        let value = value.to_os_string();
+        with_deadline(move || {
+            let (actual, pass) = peer_pin_row(Some(&value));
+            (pass, actual)
+        })
+        .unwrap_or_else(|| (false, DEADLINE_MISS.to_string()))
+    }
+
+    /// The runtime resolver's acceptance of the env value `value`.
+    fn runtime_accepts(value: &std::ffi::OsStr) -> Result<bool, String> {
+        let value = value.to_os_string();
+        with_deadline(move || {
+            crate::tls::peer_fingerprint_map_from_value(Some(&value))
+                .map(|o| o.is_some())
+                .map_err(|e| format!("{e:#}"))
+        })
+        .unwrap_or_else(|| Err(DEADLINE_MISS.to_string()))
+    }
+
+    /// The doctor row's (pass, actual) through the full posture evaluation
+    /// under the env as it stands.
+    fn doctor_row_current() -> (bool, String) {
         with_deadline(|| {
             let checks = evaluate(&AppConfig::default());
             let c = find(&checks, FED_PEER_FINGERPRINTS_ENV);
             (c.pass, c.actual.clone())
         })
         .unwrap_or_else(|| (false, DEADLINE_MISS.to_string()))
-    }
-
-    /// The runtime env resolver's acceptance with the env var already set.
-    fn runtime_accepts() -> Result<bool, String> {
-        with_deadline(|| {
-            crate::tls::peer_fingerprint_map_from_env()
-                .map(|o| o.is_some())
-                .map_err(|e| format!("{e:#}"))
-        })
-        .unwrap_or_else(|| Err(DEADLINE_MISS.to_string()))
     }
 
     /// #9954 — the doctor row passes only on content the runtime accepts,
@@ -92,17 +106,6 @@ mod tests {
     /// FIFO, bad UTF-8 and an oversized file are each FAIL.
     #[test]
     fn peer_pin_row_degenerate_table_9954() {
-        if crate::config::run_env_isolated_child_or_spawn(
-            "enterprise_federation_posture::peer_pins::tests::peer_pin_row_degenerate_table_9954",
-        ) {
-            return;
-        }
-        let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
-        let _fp_file = set_fully_hardened_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut wrong = Vec::new();
         for case in build_cases(dir.path()) {
@@ -157,42 +160,18 @@ mod tests {
                 wrong.push(format!("{name}: got {got:?}, want {want:?}"));
             }
         }
-        unsafe {
-            std::env::remove_var(FED_PEER_FINGERPRINTS_ENV);
-        }
-        let got = doctor_row_current();
-        if got != (false, "(unset)".to_string()) {
-            wrong.push(format!("unset: got {got:?}"));
+        let (actual, pass) = peer_pin_row(None);
+        if (pass, actual.clone()) != (false, "(unset)".to_string()) {
+            wrong.push(format!("unset: got ({pass}, {actual:?})"));
         }
         assert!(wrong.is_empty(), "doctor rows wrong:\n{}", wrong.join("\n"));
     }
 
-    /// The doctor row's (pass, actual) under the env as it stands.
-    fn doctor_row_current() -> (bool, String) {
-        with_deadline(|| {
-            let checks = evaluate(&AppConfig::default());
-            let c = find(&checks, FED_PEER_FINGERPRINTS_ENV);
-            (c.pass, c.actual.clone())
-        })
-        .unwrap_or_else(|| (false, DEADLINE_MISS.to_string()))
-    }
-
     /// #9954 — agreement: over the same table, the doctor verdict equals
-    /// the runtime loader's verdict equals the runtime env resolver's
-    /// verdict, row by row. Doctor and runtime never disagree.
+    /// the runtime loader's verdict equals the runtime resolver's verdict,
+    /// row by row. Doctor and runtime never disagree.
     #[test]
     fn peer_pin_row_agrees_with_runtime_9954() {
-        if crate::config::run_env_isolated_child_or_spawn(
-            "enterprise_federation_posture::peer_pins::tests::peer_pin_row_agrees_with_runtime_9954",
-        ) {
-            return;
-        }
-        let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
-        let _fp_file = set_fully_hardened_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut cases: Vec<(String, std::ffi::OsString)> = build_cases(dir.path())
             .into_iter()
@@ -207,7 +186,7 @@ mod tests {
         let mut disagree = Vec::new();
         for (name, value) in cases {
             let (doctor_pass, actual) = doctor_row(&value);
-            let runtime = runtime_accepts();
+            let runtime = runtime_accepts(&value);
             let loader = loader_verdict(std::path::Path::new(&value));
             let runtime_pass = runtime == Ok(true);
             let loader_pass = matches!(loader, Expect::Accept { .. });
@@ -224,9 +203,10 @@ mod tests {
         );
     }
 
-    /// #9954 — the hardened fixture's pin file is itself valid content
-    /// (a generated fingerprint), so the fully-hardened posture passes on
-    /// content, not on file existence.
+    /// #9954 — wiring through the full evaluation: the hardened fixture's
+    /// pin file is itself valid content (a generated fingerprint), so the
+    /// fully-hardened posture passes on content, not on file existence;
+    /// and with the knob cleared the same row reads `(unset)` and fails.
     #[test]
     fn hardened_fixture_pin_file_is_valid_9954() {
         if crate::config::run_env_isolated_child_or_spawn(
@@ -244,13 +224,17 @@ mod tests {
             loader_verdict(fp_file.path()),
             Expect::Accept { hosts: 1, pins: 1 }
         );
-        let got = doctor_row_current();
         assert_eq!(
-            got,
+            doctor_row_current(),
             (
                 true,
                 format!("{}: 1 host(s), 1 pin(s)", fp_file.path().display())
             )
         );
+        // SAFETY: env_lock() is held in an env-isolated child.
+        unsafe {
+            clear_all();
+        }
+        assert_eq!(doctor_row_current(), (false, "(unset)".to_string()));
     }
 }
