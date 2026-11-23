@@ -19,7 +19,12 @@
 //! - no row the call inserted or changed is sealed for another agent; under
 //!   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` no such row is stored at all;
 //! - every row the call inserted or changed in a table with a signature
-//!   column carries a non-empty signature;
+//!   column carries a signature that VERIFIES against the key bound to the
+//!   session agent over that table's signed fields (a non-empty check is not
+//!   a proof);
+//! - a `ReadOnly` tool changes no row in any table outside `EXEMPT_TABLES`
+//!   (for `memories`, the signed columns), except a `READONLY_ALLOWANCES`
+//!   row naming the tool, the table and the reason;
 //! - every other table the call changed is a table the tool's classification
 //!   row names (the `needs-format` tables, which have no signature carrier).
 //!
@@ -627,10 +632,49 @@ enum Expect {
     ForeignRow,
 }
 
-/// The session signer's strict refusal for a memories row it does not own
-/// (`ai_memory::identity::session_signer::FOREIGN_ROW_STRICT_REFUSAL`, written
-/// out so this test also compiles on the base, where it is red).
-const FOREIGN_ROW_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a write to a memory row the session agent does not own cannot be sealed; refused";
+/// The session signer's strict refusal for a memories row it does not own,
+/// before the row tag (`RowRefusal::Foreign`, written out so this test also
+/// compiles on the base, where it is red). The full text is
+/// `<head> (row <id>); refused`: [`foreign_refusal`].
+const FOREIGN_ROW_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a write to a memory row the session agent does not own cannot be sealed";
+
+/// Strict refusal of a write over memory content the session did not seal
+/// (`RowRefusal::Unsealed`, head before the row tag).
+const UNSEALED_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a write over memory content the session did not seal cannot be sealed";
+
+/// Refusal of a write over a row whose stored seal no longer verifies, both
+/// postures (`RowRefusal::Tampered`, head before the row tag).
+const TAMPERED_REFUSAL: &str =
+    "ATTESTATION_FAILED: mcp session signer (#10012): stored seal does not verify; refusing to re-sign";
+
+/// The exact strict refusal naming row `id` (`RowRefusal::Foreign.text`).
+fn foreign_refusal(id: &str) -> String {
+    format!("{FOREIGN_ROW_STRICT_REFUSAL} (row {id}); refused")
+}
+
+/// The exact unsealed-content refusal naming row `id`.
+fn unsealed_refusal(id: &str) -> String {
+    format!("{UNSEALED_STRICT_REFUSAL} (row {id}); refused")
+}
+
+/// The exact tampered-seal refusal naming row `id`.
+fn tampered_refusal(id: &str) -> String {
+    format!("{TAMPERED_REFUSAL} (row {id})")
+}
+
+/// Whether `text` is exactly the foreign-row refusal for SOME row id of the
+/// row-id alphabet (the sweep does not know which row a tool touched).
+fn is_foreign_refusal(text: &str) -> bool {
+    text.strip_prefix(FOREIGN_ROW_STRICT_REFUSAL)
+        .and_then(|t| t.strip_prefix(" (row "))
+        .and_then(|t| t.strip_suffix("); refused"))
+        .is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
 
 /// Rows a create step stores unsigned BY DESIGN: the row is signed when it
 /// is frozen or resolved, and the sweep checks the signature at that step.
@@ -1133,6 +1177,18 @@ impl Sandbox {
     }
 
     fn start(&self, require: &str, key_file: &Path) -> Mcp {
+        self.start_with(require, key_file, "keyword", &[])
+    }
+
+    /// The stdio MCP server at `tier`, with `extra_env` on top of the
+    /// sandbox environment.
+    fn start_with(
+        &self,
+        require: &str,
+        key_file: &Path,
+        tier: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Mcp {
         let mut cmd = self.base_command(AGENT, require);
         cmd.args([
             "--db",
@@ -1141,13 +1197,23 @@ impl Sandbox {
             "--profile",
             "full",
             "--tier",
-            "keyword",
+            tier,
         ])
         .env(ENV_KEY_FILE, key_file)
+        .envs(extra_env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
         Mcp::spawn(cmd)
+    }
+
+    /// A raw read-write connection with no seal triggers: the tests use it
+    /// to seed rows the session did not seal (strip, tamper, re-attribute).
+    fn seed_conn(&self) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(self.db()).expect("open sandbox db");
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .expect("busy timeout");
+        conn
     }
 
     /// A READ-ONLY connection: the sweep never migrates or takes a write lock.
@@ -1403,23 +1469,166 @@ fn memory_row_defects(sb: &Sandbox, id: &str, require: &str) -> Vec<String> {
     }
 }
 
-fn signed_row_defect(after: &Snapshot, table: &str, column: &str, key: &str) -> Option<String> {
-    let row = &after[table][key];
-    let needle = format!("{column}=");
-    let value = row
-        .split('\u{1f}')
-        .find_map(|cell| cell.strip_prefix(needle.as_str()))
-        .unwrap_or("NULL");
-    (value == "NULL" || value.is_empty()).then(|| format!("{table} row {key} has no {column}"))
+/// The cells of one snapshot row, by column name.
+fn cells(row: &str) -> BTreeMap<&str, &str> {
+    row.split('\u{1f}')
+        .filter_map(|cell| cell.split_once('='))
+        .collect()
 }
+
+/// The public key bound to the session agent in the sandbox database.
+fn session_public_key(conn: &rusqlite::Connection) -> ed25519_dalek::VerifyingKey {
+    let b64 = ai_memory::db::agent_pubkey(conn, AGENT)
+        .expect("bound key lookup")
+        .expect("the session agent has a bound key");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(b64)
+        .expect("bound key is url-safe base64");
+    let raw: [u8; 32] = raw.as_slice().try_into().expect("bound key is 32 bytes");
+    ed25519_dalek::VerifyingKey::from_bytes(&raw).expect("bound key is a point")
+}
+
+fn cell_opt<'a>(row: &BTreeMap<&str, &'a str>, col: &str) -> Option<&'a str> {
+    row.get(col).copied().filter(|v| *v != "NULL")
+}
+
+fn cell_blob(row: &BTreeMap<&str, &str>, col: &str) -> Option<Vec<u8>> {
+    cell_opt(row, col).and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
+}
+
+/// Whether the stored signature of one signed side row verifies with the
+/// session agent's bound key over that table's signed fields.
+fn signed_row_verifies(
+    conn: &rusqlite::Connection,
+    public: &ed25519_dalek::VerifyingKey,
+    table: &str,
+    row: &BTreeMap<&str, &str>,
+) -> bool {
+    let id = cell_opt(row, "id").unwrap_or_default();
+    match table {
+        "memory_links" => {
+            let (Some(src), Some(dst), Some(relation), Some(sig)) = (
+                cell_opt(row, "source_id"),
+                cell_opt(row, "target_id"),
+                cell_opt(row, "relation"),
+                cell_blob(row, "signature"),
+            ) else {
+                return false;
+            };
+            let link = ai_memory::identity::sign::SignableLink {
+                src_id: src,
+                dst_id: dst,
+                relation,
+                observed_by: cell_opt(row, "observed_by"),
+                created_at: cell_opt(row, "created_at"),
+                valid_from: cell_opt(row, "valid_from"),
+                valid_until: cell_opt(row, "valid_until"),
+            };
+            cell_opt(row, "observed_by") == Some(AGENT)
+                && ai_memory::identity::verify::verify(public, &link, &sig).is_ok()
+        }
+        "signals" => ai_memory::signals::get(conn, id)
+            .expect("signal read")
+            .is_some_and(|sig| {
+                sig.from_agent == AGENT
+                    && ai_memory::signals::verify_with_key(&sig, public.as_bytes())
+            }),
+        "checkpoints" => ai_memory::checkpoints::get(conn, id)
+            .expect("checkpoint read")
+            .is_some_and(|cp| {
+                cp.resolver_pubkey == public.as_bytes() && ai_memory::checkpoints::verify(&cp)
+            }),
+        "routines" => ai_memory::routines::routine_get(conn, id)
+            .expect("routine read")
+            .is_some_and(|r| {
+                r.signer_pubkey == public.as_bytes() && ai_memory::routines::verify(&r)
+            }),
+        "skills" => {
+            let (Some(digest), Some(sig)) = (cell_blob(row, "digest"), cell_blob(row, "signature"))
+            else {
+                return false;
+            };
+            cell_opt(row, "signing_agent") == Some(AGENT)
+                && ed25519_dalek::Signature::from_slice(&sig)
+                    .is_ok_and(|sig| public.verify_strict(&digest, &sig).is_ok())
+        }
+        "offloaded_blobs" => {
+            // The blob envelope, rebuilt here independently of the product
+            // code: deterministic CBOR over {content_sha256, namespace,
+            // ref_id, stored_at} (keys in sorted order), Ed25519 over it.
+            let (Some(ref_id), Some(sha), Some(namespace), Some(stored_at), Some(sig)) = (
+                cell_opt(row, "ref_id"),
+                cell_opt(row, "content_sha256"),
+                cell_opt(row, "namespace"),
+                cell_opt(row, "stored_at").and_then(|v| v.parse::<i64>().ok()),
+                cell_opt(row, "signature_b64")
+                    .and_then(|v| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v).ok()),
+            ) else {
+                return false;
+            };
+            let text = |v: &str| ciborium::Value::Text(v.to_string());
+            let envelope = ciborium::Value::Map(vec![
+                (text("content_sha256"), text(sha)),
+                (text("namespace"), text(namespace)),
+                (text("ref_id"), text(ref_id)),
+                (text("stored_at"), ciborium::Value::Integer(stored_at.into())),
+            ]);
+            let mut payload = Vec::new();
+            ciborium::into_writer(&envelope, &mut payload).expect("encode offload envelope");
+            cell_opt(row, "agent_id") == Some(AGENT)
+                && ed25519_dalek::Signature::from_slice(&sig)
+                    .is_ok_and(|sig| public.verify_strict(&payload, &sig).is_ok())
+        }
+        other => panic!("{other} is in SIGNED_TABLES with no verifier"),
+    }
+}
+
+/// The exact defect of one changed signed side row, or none when its stored
+/// signature verifies with the session key (#10054: presence is no proof).
+fn signed_row_defect(
+    sb: &Sandbox,
+    after: &Snapshot,
+    table: &str,
+    column: &str,
+    key: &str,
+) -> Option<String> {
+    let row = cells(&after[table][key]);
+    if cell_opt(&row, column).is_none_or(str::is_empty) {
+        return Some(format!("{table} row {key} has no {column}"));
+    }
+    let conn = sb.conn();
+    let public = session_public_key(&conn);
+    (!signed_row_verifies(&conn, &public, table, &row)).then(|| {
+        format!("{table} row {key}: {column} does not verify with the key bound to {AGENT}")
+    })
+}
+
+/// The ONLY changes a `ReadOnly` tool may make outside `EXEMPT_TABLES`:
+/// `(tool, table, reason)`. Every other change by a `ReadOnly` tool is a
+/// defect (#10054).
+const READONLY_ALLOWANCES: [(&str, &str, &str); 1] = [(
+    "memory_signal_read",
+    "signals",
+    "read receipt: sets read_at on the recipient's signal; read_at is outside the signed signal fields and the row still verifies",
+)];
 
 /// The exact mismatch between a step's outcome and its [`Expect`], if any.
 fn outcome_defect(expect: Expect, require: &str, is_error: bool, text: &str) -> Option<String> {
     let strict = require == "1";
+    if matches!(expect, Expect::ForeignRow) && strict {
+        return match (is_error, is_foreign_refusal(text)) {
+            (true, true) => None,
+            (true, false) => Some(format!(
+                "expected refusal {FOREIGN_ROW_STRICT_REFUSAL:?} (row <id>); refused, got error {text:?}"
+            )),
+            (false, _) => Some(format!(
+                "expected refusal {FOREIGN_ROW_STRICT_REFUSAL:?}, got success {text:?}"
+            )),
+        };
+    }
     let refused_with = match expect {
-        Expect::Ok => None,
+        Expect::Ok | Expect::ForeignRow => None,
         Expect::Refused(prefix) => Some(prefix),
-        Expect::ForeignRow => strict.then_some(FOREIGN_ROW_STRICT_REFUSAL),
     };
     match (refused_with, is_error) {
         (None, false) => None,
@@ -1461,7 +1670,7 @@ fn sweep_all_tools(require: &str) -> Vec<String> {
         }
         let after = snapshot(&sb);
         let label = format!("step {n} {} REQUIRE={require}", s.tool);
-        let (_class, side) = class_of(s.tool);
+        let (class, side) = class_of(s.tool);
         if let Some(d) = outcome_defect(s.expect, require, is_error, &text) {
             defects.push(format!("{label}: {d}"));
         }
@@ -1478,8 +1687,22 @@ fn sweep_all_tools(require: &str) -> Vec<String> {
                 continue;
             }
             for k in changed(&before, &after, table) {
-                if let Some(d) = signed_row_defect(&after, table, column, &k) {
+                if let Some(d) = signed_row_defect(&sb, &after, table, column, &k) {
                     defects.push(format!("{label}: {d}"));
+                }
+            }
+        }
+        if class == Class::ReadOnly {
+            for table in after.keys() {
+                let allowed = EXEMPT_TABLES.iter().any(|(t, _)| t == table)
+                    || READONLY_ALLOWANCES
+                        .iter()
+                        .any(|(tool, t, _)| *tool == s.tool && t == table);
+                let rows = changed(&before, &after, table);
+                if !allowed && !rows.is_empty() {
+                    defects.push(format!(
+                        "{label}: read-only tool changed {table} rows {rows:?}"
+                    ));
                 }
             }
         }
@@ -1583,4 +1806,710 @@ fn every_registered_tool_is_classified_and_driven_10012() {
             );
         }
     }
+}
+
+// --- Seeded rows: unsigned, tampered, foreign (#10053, #10054, #10055) ---
+//
+// A raw connection has no seal triggers, so these tests can strip, tamper
+// or re-attribute a row the session sealed, then drive one tool over stdio
+// and compare the row's signed fields and seal byte for byte.
+
+/// The signed columns and the seal of one memories row, read raw.
+fn seal_state(sb: &Sandbox, id: &str) -> String {
+    sb.conn()
+        .query_row(
+            "SELECT namespace || char(31) || title || char(31) || content || char(31) || \
+             memory_kind || char(31) || created_at || char(31) || \
+             COALESCE(json_extract(metadata, '$.agent_id'), 'NULL') || char(31) || \
+             COALESCE(json_extract(metadata, '$.attest_level'), 'NULL') || char(31) || \
+             COALESCE(json_extract(metadata, '$.write_signature'), 'NULL') \
+             FROM memories WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .expect("read seal state")
+}
+
+fn attest_level(sb: &Sandbox, id: &str) -> Option<String> {
+    sb.conn()
+        .query_row(
+            "SELECT json_extract(metadata, '$.attest_level') FROM memories WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .expect("read attest_level")
+}
+
+/// One raw write on the sandbox store (no seal triggers), exactly one row.
+fn raw_write(sb: &Sandbox, sql: &str, id: &str) {
+    let conn = sb.seed_conn();
+    let n = conn.execute(sql, [id]).expect("raw seed write");
+    assert_eq!(n, 1, "{sql}: rows changed");
+}
+
+/// Strip the seal of the session's row: a claimed, unsigned session row.
+const STRIP_SEAL_SQL: &str = "UPDATE memories SET metadata = json_set(json_remove(metadata, '$.write_signature'), '$.attest_level', 'claimed') WHERE id = ?1";
+
+/// Change sealed content behind the signer's back.
+const TAMPER_SQL: &str = "UPDATE memories SET content = content || ' tampered' WHERE id = ?1";
+
+/// Re-attribute a row to another agent with no seal: a foreign claimed row.
+const FOREIGN_SQL: &str = "UPDATE memories SET metadata = json_set(json_remove(metadata, '$.write_signature'), '$.attest_level', 'claimed', '$.agent_id', 'ai:other-10012') WHERE id = ?1";
+
+fn store_id(mcp: &mut Mcp, title: &str) -> String {
+    let (is_error, text) = mcp.call_raw("memory_store", &store_args(title));
+    assert!(!is_error, "store {title}: {text}");
+    let v: Value = serde_json::from_str(&text).expect("store json");
+    v["id"].as_str().expect("store id").to_string()
+}
+
+/// Session writes over a seeded row. `refusal` is the exact error text the
+/// posture must return (`None`: the write succeeds); `ids` the rows whose
+/// signed fields and seal must stay byte for byte as seeded.
+struct SeededCase {
+    tool: &'static str,
+    args: Value,
+    refusal: Option<String>,
+    ids: Vec<String>,
+}
+
+fn run_seeded(sb: &Sandbox, mcp: &mut Mcp, case: &SeededCase, label: &str) -> Vec<String> {
+    let mut defects = Vec::new();
+    let before: Vec<String> = case.ids.iter().map(|id| seal_state(sb, id)).collect();
+    let attested_before: Vec<bool> = case
+        .ids
+        .iter()
+        .map(|id| attest_level(sb, id).as_deref() == Some(ATTESTED))
+        .collect();
+    let (is_error, text) = mcp.call_raw(case.tool, &case.args);
+    match (&case.refusal, is_error) {
+        (Some(want), true) if text == *want => {}
+        (Some(want), _) => defects.push(format!(
+            "{label} {}: expected refusal {want:?}, got is_error={is_error} {text:?}",
+            case.tool
+        )),
+        (None, false) => {}
+        (None, true) => defects.push(format!(
+            "{label} {}: expected success, got error {text:?}",
+            case.tool
+        )),
+    }
+    for ((id, prior), was_attested) in case.ids.iter().zip(&before).zip(attested_before) {
+        let now = seal_state(sb, id);
+        if now != *prior {
+            defects.push(format!(
+                "{label} {}: row {id} signed fields or seal changed:\n  before {prior:?}\n  after  {now:?}",
+                case.tool
+            ));
+        }
+        if !was_attested && attest_level(sb, id).as_deref() == Some(ATTESTED) {
+            defects.push(format!(
+                "{label} {}: row {id} carries {ATTESTED} over bytes the session did not seal",
+                case.tool
+            ));
+        }
+    }
+    defects
+}
+
+/// #10053: a claimed, unsigned session row is never resealed by a tags or
+/// priority update, a promote or a consolidate; strict refuses exactly.
+fn unsigned_session_row_defects(require: &str) -> Vec<String> {
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(require, &key);
+    let strict = require == "1";
+    let mut defects = Vec::new();
+    let a = store_id(&mut mcp, "seal unsigned a 10053");
+    let b = store_id(&mut mcp, "seal unsigned b 10053");
+    raw_write(&sb, STRIP_SEAL_SQL, &a);
+    let unsealed = |id: &str| strict.then(|| unsealed_refusal(id));
+    let cases = [
+        SeededCase {
+            tool: "memory_update",
+            args: json!({"id": a, "priority": 9}),
+            refusal: unsealed(&a),
+            ids: vec![a.clone()],
+        },
+        SeededCase {
+            tool: "memory_update",
+            args: json!({"id": a, "tags": ["seal-10053"]}),
+            refusal: unsealed(&a),
+            ids: vec![a.clone()],
+        },
+        SeededCase {
+            tool: "memory_promote",
+            args: json!({"id": a, "target_tier": "long"}),
+            refusal: unsealed(&a),
+            ids: vec![a.clone()],
+        },
+    ];
+    for case in &cases {
+        defects.extend(run_seeded(&sb, &mut mcp, case, &format!("REQUIRE={require}")));
+    }
+    // Consolidate folds A (unsigned) into a new row the session seals over
+    // content it supplied in this call; A itself is never resealed.
+    let before_a = seal_state(&sb, &a);
+    let (is_error, text) = mcp.call_raw(
+        "memory_consolidate",
+        &json!({"ids": [a, b], "title": "seal consolidation 10053", "summary": body("consolidation 10053"), "namespace": NAMESPACE}),
+    );
+    let label = format!("REQUIRE={require} memory_consolidate");
+    if is_error {
+        defects.push(format!("{label}: expected success, got error {text:?}"));
+    } else {
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        match v["id"].as_str() {
+            Some(new_id) => {
+                for d in memory_row_defects(&sb, new_id, require) {
+                    defects.push(format!("{label}: {d}"));
+                }
+            }
+            None => defects.push(format!("{label}: no id in {text:?}")),
+        }
+        let row_left: bool = sb
+            .conn()
+            .query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [&a], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("count a")
+            == 1;
+        if row_left && seal_state(&sb, &a) != before_a {
+            defects.push(format!("{label}: unsigned source row {a} changed"));
+        }
+        if row_left && attest_level(&sb, &a).as_deref() == Some(ATTESTED) {
+            defects.push(format!("{label}: unsigned source row {a} was resealed"));
+        }
+    }
+    defects
+}
+
+#[test]
+fn unsigned_session_row_is_never_resealed_permissive_10053() {
+    let defects = unsigned_session_row_defects(POSTURES[0]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+#[test]
+fn unsigned_session_row_is_never_resealed_strict_10053() {
+    let defects = unsigned_session_row_defects(POSTURES[1]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+/// #10055: content changed behind the signer, then a metadata-only update:
+/// refused in both postures with the exact text, and nothing changes.
+fn tampered_row_defects(require: &str) -> Vec<String> {
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(require, &key);
+    let a = store_id(&mut mcp, "seal tampered a 10055");
+    raw_write(&sb, TAMPER_SQL, &a);
+    let label = format!("REQUIRE={require}");
+    let mut defects = Vec::new();
+    for args in [
+        json!({"id": a, "priority": 9}),
+        json!({"id": a, "tags": ["seal-10055"]}),
+    ] {
+        let case = SeededCase {
+            tool: "memory_update",
+            args,
+            refusal: Some(tampered_refusal(&a)),
+            ids: vec![a.clone()],
+        };
+        defects.extend(run_seeded(&sb, &mut mcp, &case, &label));
+    }
+    let promote = SeededCase {
+        tool: "memory_promote",
+        args: json!({"id": a, "target_tier": "long"}),
+        refusal: Some(tampered_refusal(&a)),
+        ids: vec![a.clone()],
+    };
+    defects.extend(run_seeded(&sb, &mut mcp, &promote, &label));
+    // The stored seal is the one the session wrote over the untampered
+    // bytes: it still names the session and still does not verify.
+    let tampered_still_fails = memory_row_defects(&sb, &a, require);
+    if tampered_still_fails.is_empty() {
+        defects.push(format!("{label}: tampered row {a} verifies; the tamper was resealed"));
+    }
+    defects
+}
+
+#[test]
+fn tampered_row_is_refused_not_resealed_permissive_10055() {
+    let defects = tampered_row_defects(POSTURES[0]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+#[test]
+fn tampered_row_is_refused_not_resealed_strict_10055() {
+    let defects = tampered_row_defects(POSTURES[1]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+/// The ownership gate's refusal of a write to a row another agent owns.
+const NOT_OWNER_REFUSAL: &str = "caller does not own this memory";
+
+/// Code LOW-1: a session write to a row attributed to another agent is
+/// refused before any seal is computed, in both postures, and the foreign
+/// signed fields and seal stay byte for byte; under strict mode a write
+/// that would create a row attributed to another agent (`memory_share`) is
+/// refused with the exact text naming that row, and the row does not exist.
+fn foreign_row_defects(require: &str) -> Vec<String> {
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(require, &key);
+    let f = store_id(&mut mcp, "seal foreign f 10012");
+    raw_write(&sb, FOREIGN_SQL, &f);
+    let label = format!("REQUIRE={require}");
+    let mut defects = Vec::new();
+    for (tool, args) in [
+        ("memory_update", json!({"id": f, "priority": 9})),
+        ("memory_update", json!({"id": f, "content": body("foreign rewrite")})),
+        ("memory_promote", json!({"id": f, "target_tier": "long"})),
+    ] {
+        let case = SeededCase {
+            tool,
+            args,
+            refusal: Some(NOT_OWNER_REFUSAL.to_string()),
+            ids: vec![f.clone()],
+        };
+        defects.extend(run_seeded(&sb, &mut mcp, &case, &label));
+    }
+    if require == "1" {
+        let own = store_id(&mut mcp, "seal foreign share 10012");
+        let before = snapshot(&sb);
+        let (is_error, text) = mcp.call_raw(
+            "memory_share",
+            &json!({"source_memory_id": own, "target_agent_id": OTHER_AGENT}),
+        );
+        let after = snapshot(&sb);
+        let named = text
+            .strip_prefix(FOREIGN_ROW_STRICT_REFUSAL)
+            .and_then(|t| t.strip_prefix(" (row "))
+            .and_then(|t| t.strip_suffix("); refused"))
+            .map(str::to_string);
+        match (is_error, named) {
+            (true, Some(id)) => {
+                if text != foreign_refusal(&id) {
+                    defects.push(format!("{label} memory_share: refusal {text:?}"));
+                }
+                if sb
+                    .conn()
+                    .query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [&id], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .expect("count shared")
+                    != 0
+                {
+                    defects.push(format!("{label} memory_share: refused row {id} was stored"));
+                }
+            }
+            _ => defects.push(format!(
+                "{label} memory_share: expected {FOREIGN_ROW_STRICT_REFUSAL:?} (row <id>); refused, got is_error={is_error} {text:?}"
+            )),
+        }
+        for table in after.keys() {
+            if !EXEMPT_TABLES.iter().any(|(t, _)| t == table)
+                && !changed(&before, &after, table).is_empty()
+            {
+                defects.push(format!("{label} memory_share: refused call changed {table}"));
+            }
+        }
+    }
+    defects
+}
+
+#[test]
+fn foreign_row_write_is_refused_by_row_strict_10012() {
+    let defects = foreign_row_defects(POSTURES[1]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+#[test]
+fn foreign_row_write_keeps_its_bytes_permissive_10012() {
+    let defects = foreign_row_defects(POSTURES[0]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+// --- kg_invalidate over seeded edges (Code LOW-2, #10054) ---
+
+const EDGE_PREFIX: &str = "ATTESTATION_FAILED: mcp session signer (#10012): ";
+const EDGE_TAMPERED: &str = "ATTESTATION_FAILED: mcp session signer (#10012): stored link signature does not verify; refusing to re-sign";
+const EDGE_FOREIGN_SEAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): the invalidation changes a link signed by another agent; refused";
+const EDGE_NO_OBSERVER_STRICT: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a link with no observer cannot be sealed: no observer; the session does not re-sign; refused";
+const EDGE_UNSIGNED_STRICT: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 an unsigned link the session did not seal cannot be sealed; refused";
+
+/// How one seeded edge differs from the session's sealed edge.
+#[derive(Debug, Clone, Copy)]
+enum EdgeSeed {
+    NoObserver,
+    UnsignedOwn,
+    Tampered,
+    SignedForeign,
+    Intact,
+}
+
+impl EdgeSeed {
+    const ALL: [Self; 5] = [
+        Self::NoObserver,
+        Self::UnsignedOwn,
+        Self::Tampered,
+        Self::SignedForeign,
+        Self::Intact,
+    ];
+
+    const fn sql(self) -> Option<&'static str> {
+        match self {
+            Self::NoObserver => Some(
+                "UPDATE memory_links SET observed_by = NULL, signature = NULL, attest_level = 'unsigned' WHERE source_id = ?1",
+            ),
+            Self::UnsignedOwn => Some(
+                "UPDATE memory_links SET signature = NULL, attest_level = 'unsigned' WHERE source_id = ?1",
+            ),
+            Self::Tampered => Some(
+                "UPDATE memory_links SET created_at = '2020-01-01T00:00:00+00:00' WHERE source_id = ?1",
+            ),
+            Self::SignedForeign => {
+                Some("UPDATE memory_links SET observed_by = 'ai:other-10012' WHERE source_id = ?1")
+            }
+            Self::Intact => None,
+        }
+    }
+
+    /// The expected refusal, written out per posture (`None`: success).
+    const fn refusal(self, strict: bool) -> Option<&'static str> {
+        match (self, strict) {
+            (Self::NoObserver, true) => Some(EDGE_NO_OBSERVER_STRICT),
+            (Self::UnsignedOwn, true) => Some(EDGE_UNSIGNED_STRICT),
+            (Self::Tampered, _) => Some(EDGE_TAMPERED),
+            (Self::SignedForeign, _) => Some(EDGE_FOREIGN_SEAL),
+            (Self::NoObserver | Self::UnsignedOwn | Self::Intact, _) => None,
+        }
+    }
+}
+
+fn link_row(sb: &Sandbox, source: &str) -> String {
+    sb.conn()
+        .query_row(
+            "SELECT COALESCE(observed_by, 'NULL') || char(31) || created_at || char(31) || \
+             COALESCE(valid_until, 'NULL') || char(31) || COALESCE(attest_level, 'NULL') || \
+             char(31) || CASE WHEN signature IS NULL THEN 'NULL' ELSE hex(signature) END \
+             FROM memory_links WHERE source_id = ?1",
+            [source],
+            |r| r.get(0),
+        )
+        .expect("read link")
+}
+
+fn edge_defects(require: &str) -> Vec<String> {
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let mut mcp = sb.start(require, &key);
+    let strict = require == "1";
+    let b = store_id(&mut mcp, "seal edge b 10012");
+    let relation = "related_to";
+    let mut defects = Vec::new();
+    for seed in EdgeSeed::ALL {
+        let a = store_id(&mut mcp, &format!("seal edge {seed:?} 10012"));
+        let label = format!("REQUIRE={require} {seed:?}");
+        let (is_error, text) = mcp.call_raw(
+            "memory_link",
+            &json!({"source_id": a, "target_id": b, "relation": relation}),
+        );
+        assert!(!is_error, "{label} link: {text}");
+        if let Some(sql) = seed.sql() {
+            raw_write(&sb, sql, &a);
+        }
+        let before = link_row(&sb, &a);
+        let (is_error, text) = mcp.call_raw(
+            "memory_kg_invalidate",
+            &json!({"source_id": a, "target_id": b, "relation": relation, "valid_until": "2030-01-01T00:00:00+00:00"}),
+        );
+        let after = link_row(&sb, &a);
+        match (seed.refusal(strict), is_error) {
+            (Some(want), true) if text == want => {
+                if after != before {
+                    defects.push(format!("{label}: refused but the link changed:\n  {before:?}\n  {after:?}"));
+                }
+            }
+            (Some(want), _) => defects.push(format!(
+                "{label}: expected refusal {want:?}, got is_error={is_error} {text:?}"
+            )),
+            (None, true) => defects.push(format!("{label}: expected success, got error {text:?}")),
+            (None, false) => {
+                let snap = snapshot(&sb);
+                let key = snap["memory_links"]
+                    .iter()
+                    .find(|(_, row)| cells(row).get("source_id") == Some(&a.as_str()))
+                    .map(|(k, _)| k.clone());
+                let signed = !after.ends_with("\u{1f}NULL");
+                match (seed, key) {
+                    (EdgeSeed::Intact, Some(k)) => {
+                        if let Some(d) = signed_row_defect(&sb, &snap, "memory_links", "signature", &k) {
+                            defects.push(format!("{label}: {d}"));
+                        }
+                    }
+                    (EdgeSeed::Intact, None) => defects.push(format!("{label}: link row gone")),
+                    (_, _) if signed => defects.push(format!(
+                        "{label}: an unsigned link left the invalidation signed: {after:?}"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        if text.starts_with(EDGE_PREFIX) && !is_error {
+            defects.push(format!("{label}: refusal text on a success: {text:?}"));
+        }
+    }
+    defects
+}
+
+#[test]
+fn kg_invalidate_seeded_edges_permissive_10012() {
+    let defects = edge_defects(POSTURES[0]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+#[test]
+fn kg_invalidate_seeded_edges_strict_10012() {
+    let defects = edge_defects(POSTURES[1]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+// --- Smart-tier tools against a loopback stub LLM (Code LOW-3) ---
+
+/// The stub's chat answer: a tag list for auto_tag, "no" contradiction, a
+/// persona body for persona_generate.
+const STUB_CHAT_ANSWER: &str = "seal-tag-one, seal-tag-two";
+const STUB_MODEL: &str = "seal-stub-10012";
+
+fn stub_llm(rt: &tokio::runtime::Runtime) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"models": [{"name": format!("{STUB_MODEL}:latest")}]}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "success"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": STUB_MODEL,
+                "message": {"role": "assistant", "content": STUB_CHAT_ANSWER},
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": STUB_MODEL, "response": STUB_CHAT_ANSWER, "done": true
+            })))
+            .mount(&server)
+            .await;
+        server
+    })
+}
+
+/// One smart-tier step: the tool, its args and the exact change it must
+/// commit (`changes`: the tables whose rows must change).
+fn smart_tier_defects(require: &str) -> Vec<String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let server = stub_llm(&rt);
+    let uri = server.uri();
+    let sb = Sandbox::new();
+    let key = sb.bound_key_file();
+    let extra = [
+        ("AI_MEMORY_LLM_BACKEND", "ollama"),
+        ("AI_MEMORY_LLM_BASE_URL", uri.as_str()),
+        ("AI_MEMORY_LLM_MODEL", STUB_MODEL),
+        ("AI_MEMORY_EMBED_BASE_URL", uri.as_str()),
+        ("AI_MEMORY_EMBED_OFFLINE", "1"),
+        ("AI_MEMORY_INFERENCE_EGRESS", "loopback-only"),
+    ];
+    let mut mcp = sb.start_with(require, &key, "smart", &extra);
+    let label = format!("REQUIRE={require}");
+    let mut defects = Vec::new();
+    let a = store_id(&mut mcp, "seal smart a 10012");
+    let b = store_id(&mut mcp, "seal smart b 10012");
+    let f = store_id(&mut mcp, "seal smart foreign 10012");
+    raw_write(&sb, FOREIGN_SQL, &f);
+    let entity = "seal-persona-10012";
+    for i in 0..2 {
+        let (is_error, text) = mcp.call_raw(
+            "memory_store",
+            &json!({"title": format!("seal persona obs {i} 10012"), "content": body(&format!("persona obs {i}")), "namespace": NAMESPACE, "kind": "reflection", "tags": ["reflection"], "metadata": {"entity_id": entity}}),
+        );
+        assert!(!is_error, "{label} persona seed {i}: {text}");
+    }
+    let promote_pending = {
+        let conn = sb.seed_conn();
+        ai_memory::storage::queue_pending_action(
+            &conn,
+            ai_memory::models::GovernedAction::Promote,
+            NAMESPACE,
+            Some(&a),
+            OTHER_AGENT,
+            &json!({}),
+        )
+        .expect("queue pending promote")
+    };
+    let reject_pending = {
+        let conn = sb.seed_conn();
+        ai_memory::storage::queue_pending_action(
+            &conn,
+            ai_memory::models::GovernedAction::Promote,
+            NAMESPACE,
+            Some(&b),
+            OTHER_AGENT,
+            &json!({}),
+        )
+        .expect("queue pending reject")
+    };
+    // (tool, args, the tables the call must change; empty: none). The
+    // `memories` snapshot keeps only the signed columns, so a change to the
+    // unsigned `tags` or `tier` columns is checked on its own below.
+    let steps: [(&str, Value, &[&str]); 5] = [
+        ("memory_auto_tag", json!({"id": a}), &[]),
+        (
+            "memory_detect_contradiction",
+            json!({"id_a": a, "id_b": b}),
+            &[],
+        ),
+        (
+            "memory_persona_generate",
+            json!({"entity_id": entity, "namespace": NAMESPACE}),
+            &["memories", "memory_links"],
+        ),
+        (
+            "memory_pending_approve",
+            json!({"id": promote_pending}),
+            &["pending_actions"],
+        ),
+        (
+            "memory_pending_reject",
+            json!({"id": reject_pending}),
+            &["pending_actions"],
+        ),
+    ];
+    for (tool, args, must_change) in steps {
+        let before = snapshot(&sb);
+        let (is_error, text) = mcp.call_raw(tool, &args);
+        let after = snapshot(&sb);
+        let step = format!("{label} {tool}");
+        eprintln!(
+            "seal-10012 smart {step}: is_error={is_error} {}",
+            text.chars().take(160).collect::<String>()
+        );
+        if is_error {
+            defects.push(format!("{step}: expected success, got error {text:?}"));
+            continue;
+        }
+        let changed_tables: BTreeSet<&str> = after
+            .keys()
+            .filter(|t| !EXEMPT_TABLES.iter().any(|(e, _)| e == *t))
+            .filter(|t| !changed(&before, &after, t).is_empty())
+            .map(String::as_str)
+            .collect();
+        let want: BTreeSet<&str> = must_change.iter().copied().collect();
+        if changed_tables != want {
+            defects.push(format!(
+                "{step}: changed tables {changed_tables:?}, expected {want:?}"
+            ));
+        }
+        for id in changed(&before, &after, "memories") {
+            for d in memory_row_defects(&sb, &id, require) {
+                defects.push(format!("{step}: {d}"));
+            }
+        }
+        for (table, column) in SIGNED_TABLES {
+            for k in changed(&before, &after, table) {
+                if let Some(d) = signed_row_defect(&sb, &after, table, column, &k) {
+                    defects.push(format!("{step}: {d}"));
+                }
+            }
+        }
+    }
+    // Code LOW-1: a row attributed to another agent is not visible to the
+    // session, so the contradiction check over it is refused with the exact
+    // text and changes nothing.
+    {
+        let before = snapshot(&sb);
+        let (is_error, text) =
+            mcp.call_raw("memory_detect_contradiction", &json!({"id_a": a, "id_b": f}));
+        let after = snapshot(&sb);
+        if !is_error || text != "memory B not found" {
+            defects.push(format!(
+                "{label} memory_detect_contradiction(foreign): expected \"memory B not found\", got is_error={is_error} {text:?}"
+            ));
+        }
+        for table in after.keys() {
+            if !EXEMPT_TABLES.iter().any(|(t, _)| t == table)
+                && !changed(&before, &after, table).is_empty()
+            {
+                defects.push(format!(
+                    "{label} memory_detect_contradiction(foreign): refused call changed {table}"
+                ));
+            }
+        }
+        if attest_level(&sb, &f).as_deref() == Some(ATTESTED) {
+            defects.push(format!("{label} memory_detect_contradiction(foreign): row {f} became {ATTESTED}"));
+        }
+    }
+    // The unsigned columns the smart tools wrote (written out, not derived).
+    let unsigned = |id: &str| -> (String, String) {
+        sb.conn()
+            .query_row(
+                "SELECT tags, tier FROM memories WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read unsigned columns")
+    };
+    let (tags_a, tier_a) = unsigned(&a);
+    if !tags_a.contains(STUB_CHAT_ANSWER) {
+        defects.push(format!("{label} memory_auto_tag: tags of {a} are {tags_a:?}"));
+    }
+    if tier_a != "long" {
+        defects.push(format!(
+            "{label} memory_pending_approve: tier of {a} is {tier_a:?}, expected \"long\""
+        ));
+    }
+    let (_, tier_b) = unsigned(&b);
+    if tier_b == "long" {
+        defects.push(format!("{label} memory_pending_reject: rejected promote of {b} was applied"));
+    }
+    for id in [&a, &b] {
+        for d in memory_row_defects(&sb, id, require) {
+            defects.push(format!("{label} after smart steps: {d}"));
+        }
+    }
+    drop(mcp);
+    drop(server);
+    defects
+}
+
+#[test]
+fn smart_tier_tools_commit_sealed_writes_permissive_10012() {
+    let defects = smart_tier_defects(POSTURES[0]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+}
+
+#[test]
+fn smart_tier_tools_commit_sealed_writes_strict_10012() {
+    let defects = smart_tier_defects(POSTURES[1]);
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
 }
