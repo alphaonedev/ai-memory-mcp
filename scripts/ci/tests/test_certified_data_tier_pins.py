@@ -224,6 +224,9 @@ HISTORY_PREFIXES = {
     "scripts/ci/tests/test_certified_data_tier_pins.py": "this ratchet names the stale and drifted forms",
     "scripts/test/test_ensure_age_extension_6161.py":
         "tests of the helper's refusal of the stock 1.8.0 build and of its own F4 ratchet name the refused forms",
+    "deploy/docker-1461/provision/apply_age_patch.py":
+        "the applier every AGE build must run (#9965, #9982): its docstring names AGE_SOURCE_COMMIT and the "
+        "make step it sits between, so the age-build-without-patch rule cannot hold for the applier itself",
     "deploy/hive-1461/":
         "the v0.7.0 PG 16 federated baseline and the results it reproduces; it builds no v1.0.0 tier",
 }
@@ -343,6 +346,12 @@ LINE_ALLOW = {
     ('scripts/ci/tests/test_pg_env_preflight_9235.py',
      'SERVER_VERSION = "16.16 (Debian 16.16-1.pgdg13+1)"'):
         'fixture of the hosted-runner PostgreSQL 16 that the coverage preflight diagnoses (#9235), not the tier',
+    ('scripts/test/test_apply_age_patch_9965.py',
+     'self.write_ssot(dict(self.pins, AGE_SOURCE_COMMIT="0" * 40))'):
+        'applier test plants an all-zero AGE_SOURCE_COMMIT to prove the applier refuses a wrong pin (#9982)',
+    ('scripts/test/test_apply_age_patch_9965.py',
+     '"AGE_PATCH_SHA256": "0" * 64, "AGE_PATCHED_FILE_SHA256": "0" * 64}'):
+        'applier test plants all-zero digests to prove the applier refuses a wrong pin (#9982)',
 }
 
 
