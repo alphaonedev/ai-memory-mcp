@@ -197,6 +197,13 @@ pub mod error_codes {
     /// v1.0.0 #3288 — an export `limit` outside `1..=max_page_size`. Refused
     /// rather than clamped so the caller learns the real ceiling.
     pub const EXPORT_LIMIT_OUT_OF_RANGE: &str = "EXPORT_LIMIT_OUT_OF_RANGE";
+
+    /// v1.0.0 #10028 / #10032 / #10033 — an export over a store that holds a
+    /// row sealed at rest (`encrypted_envelope` set). No export format carries
+    /// the envelope, so the export is refused (409) and nothing is written,
+    /// rather than the row being decrypted into the artifact (3-agent vote
+    /// 71472661 V3-STD4-SCOPE C-3).
+    pub const SEALED_EXPORT_REFUSED: &str = "SEALED_EXPORT_REFUSED";
 }
 
 // ---------------------------------------------------------------------------
@@ -770,6 +777,11 @@ mod arch_9_slug_tests {
             StoreError::SchemaVersionPoisoned { detail: "d".into() },
             StoreError::TraversalBudgetExceeded { detail: "d".into() },
             StoreError::AuditTrailUnavailable { reason: "r".into() },
+            StoreError::SealedExportRefused(crate::export_sealed::SealedExportRefused {
+                table: crate::export_sealed::tables::MEMORIES,
+                count: 1,
+                first_id: "x".into(),
+            }),
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -788,6 +800,7 @@ mod arch_9_slug_tests {
             SCHEMA_VERSION_POISONED,
             TRAVERSAL_BUDGET_EXCEEDED,
             AUDIT_TRAIL_UNAVAILABLE,
+            SEALED_EXPORT_REFUSED,
             DATABASE_ERROR,
         ];
         // #2445 — `zip` TRUNCATES to the shorter side, so a variant added to

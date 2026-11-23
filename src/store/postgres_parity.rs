@@ -142,6 +142,8 @@ pub(crate) async fn export_memories_keyset(
     let mut out: Vec<Memory> = Vec::new();
     let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
     let mut skipped = 0_usize;
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
     loop {
         let rows = sqlx::query(&sql)
             .bind(cursor.as_ref().map(|(ts, _)| *ts))
@@ -167,7 +169,12 @@ pub(crate) async fn export_memories_keyset(
         cursor = Some((last_created, last_id));
         let page_len = rows.len();
         for r in &rows {
-            match map_row(r)? {
+            // #10033 — classify from the envelope column BEFORE the
+            // projection decrypts: a sealed row refuses the export.
+            let Some(row) = guard.take(crate::export_sealed::classify_pg_row(r, map_row)?) else {
+                continue;
+            };
+            match row {
                 Some(m) => out.push(m),
                 None => skipped += 1,
             }
@@ -176,6 +183,7 @@ pub(crate) async fn export_memories_keyset(
             break;
         }
     }
+    guard.finish().map_err(StoreError::SealedExportRefused)?;
     if skipped > 0 {
         // Honesty over silence: the bundle is INCOMPLETE by exactly this many
         // rows. The projection's skip-row policy is deliberate (one

@@ -1546,10 +1546,18 @@ fn export_full_keeps_every_link_attestation_9944() {
 /// must land every lineage row. Today `import` strips the `_agents` key
 /// binding before its lineage gate, the gate reads the stripped head as a
 /// forgery, and the import exits non-zero. The fix removes the
-/// `LINEAGE_IMPORT_REFUSED` sparse entry above in the same commit.
+/// `LINEAGE_IMPORT_REFUSED` sparse entry above in the same commit. The cell
+/// seeds no sealed row: a sealed row refuses the full export first (#10032),
+/// which `export_full_keeps_a_sealed_row_sealed_10032` proves on its own.
 #[test]
 fn export_full_keeps_an_enrolled_identity_lineage_10027() {
-    let run = run_raw(RestorePath::ExportFullImport, SeedShape::FULL);
+    let run = run_raw(
+        RestorePath::ExportFullImport,
+        SeedShape {
+            lineage: Lineage::Enrolled,
+            sealed: Sealed::Absent,
+        },
+    );
     let src = &run.before.tables["agent_lineage"];
     assert!(
         src.rows.len() >= MIN_LINEAGE_ROWS,

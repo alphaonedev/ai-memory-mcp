@@ -248,11 +248,20 @@ pub struct ArchivedMemoryRow {
 pub fn read_all_archived_memories(conn: &Connection) -> Result<Vec<ArchivedMemoryRow>> {
     let mut stmt =
         conn.prepare("SELECT * FROM archived_memories ORDER BY archived_at ASC, id ASC")?;
-    let rows = stmt.query_map([], row_to_archived_memory)?;
+    // #10032 — a sealed archived row refuses the export before any decrypt
+    // (the v2 envelope has no field for the at-rest envelope).
+    let rows = stmt.query_map([], |r| {
+        crate::export_sealed::classify_sqlite_row(r, row_to_archived_memory)
+    })?;
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::ARCHIVED_MEMORIES);
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        if let Some(a) = guard.take(row?) {
+            out.push(a);
+        }
     }
+    guard.finish().map_err(anyhow::Error::new)?;
     Ok(out)
 }
 

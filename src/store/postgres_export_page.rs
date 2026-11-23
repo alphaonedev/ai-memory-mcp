@@ -15,11 +15,13 @@
 //! cursor carries it as RFC 3339 with microseconds, which is postgres's
 //! resolution, so the cursor round-trips the stored instant exactly.
 //!
-//! Decrypt posture: the page read uses the scan mapper
-//! (`DecryptFailurePolicy::SkipRow`, as the pre-#3288 pg export did), so an
-//! unopenable row is skipped and COUNTED in the page's `undecryptable`
-//! rather than denying the whole backup. `AI_MEMORY_STRICT_DECRYPT_READS=1`
-//! makes the mapper fail closed instead.
+//! Sealed posture (#10033): a row whose `encrypted_envelope` is set is
+//! classified from the column BEFORE any decrypt and REFUSES the export
+//! (`SEALED_EXPORT_REFUSED`, 409), because the page format has no field to
+//! carry the envelope; the first page of a walk refuses when the scope holds
+//! any sealed row. The scan mapper (`DecryptFailurePolicy::SkipRow`) still
+//! counts a row it cannot open in `undecryptable`, which the sealed guard
+//! now makes unreachable for an export walk.
 
 use std::collections::HashSet;
 
@@ -110,10 +112,17 @@ pub(crate) async fn export_memories_page(
     if let Some(n) = namespace {
         q = q.bind(n);
     }
+    // #10033 — the first page of a walk refuses when ANY row of the scope is
+    // sealed at rest, so no partial walk is ever handed out.
+    if lower.is_none() {
+        sealed_scope_precheck(pool, as_of, namespace).await?;
+    }
     let rows = q
         .fetch_all(pool)
         .await
         .map_err(|e| to_store_err("export page", e))?;
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
     let mut page = ExportMemoriesPage::default();
     let mut last: Option<ExportKey> = None;
     for r in &rows {
@@ -127,15 +136,20 @@ pub(crate) async fn export_memories_page(
         // cursor, even when the projection skips it: a skipped row must still
         // advance the walk or the next page would re-read it forever.
         page.scope.raw_ids.push(id.clone());
-        match map_row(r)? {
-            Some(m) => page.memories.push(m),
-            None => page.undecryptable += 1,
+        // #10033 — a sealed row is classified from its envelope column
+        // BEFORE the projection decrypts, and refuses the page (it is never
+        // skipped and counted, and never decrypted onto the wire).
+        match guard.take(crate::export_sealed::classify_pg_row(r, map_row)?) {
+            Some(Some(m)) => page.memories.push(m),
+            Some(None) => page.undecryptable += 1,
+            None => {}
         }
         last = Some(ExportKey {
             created_at: key_ts(created),
             id,
         });
     }
+    guard.finish().map_err(StoreError::SealedExportRefused)?;
     if page.undecryptable > 0 {
         tracing::warn!(
             undecryptable = page.undecryptable,
@@ -156,6 +170,36 @@ pub(crate) async fn export_memories_page(
     page.scope.namespace = namespace.map(str::to_owned);
     page.next_cursor = next;
     Ok(page)
+}
+
+/// #10033 — refuse a walk whose scope holds a row sealed at rest; the scope
+/// is exactly the page query's (expiry, lifecycle, namespace).
+async fn sealed_scope_precheck(
+    pool: &PgPool,
+    as_of: DateTime<Utc>,
+    namespace: Option<&str>,
+) -> StoreResult<()> {
+    let sql = format!(
+        "SELECT COUNT(*) AS n, MIN(id COLLATE \"C\") AS first FROM memories \
+         WHERE (expires_at IS NULL OR expires_at > $1) {lv} \
+         AND ($2::text IS NULL OR namespace = $2) AND {col} IS NOT NULL",
+        lv = crate::models::lifecycle_visible_clause(""),
+        col = crate::export_sealed::ENVELOPE_COLUMN,
+    );
+    let row = sqlx::query(&sql)
+        .bind(as_of)
+        .bind(namespace)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err("export sealed precheck", e))?;
+    let count: i64 = row
+        .try_get("n")
+        .map_err(|e| to_store_err("export sealed precheck count", e))?;
+    let first: Option<String> = row
+        .try_get("first")
+        .map_err(|e| to_store_err("export sealed precheck id", e))?;
+    crate::export_sealed::refuse_scope(crate::export_sealed::tables::MEMORIES, count, first)
+        .map_err(StoreError::SealedExportRefused)
 }
 
 async fn excluded_in_range(

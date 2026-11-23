@@ -470,6 +470,15 @@ pub enum StoreError {
     #[error("{reason}")]
     AuditTrailUnavailable { reason: String },
 
+    /// v1.0.0 #10028 / #10033 — an export read met a row sealed at rest. No
+    /// export format carries the at-rest envelope, so the export refuses
+    /// before writing anything; the message names the table, the count and
+    /// the first id, never content.
+    ///
+    /// Wire shape (HTTP): `409` with code `SEALED_EXPORT_REFUSED`.
+    #[error("{0}")]
+    SealedExportRefused(crate::export_sealed::SealedExportRefused),
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -554,6 +563,8 @@ impl StoreError {
             Self::TraversalBudgetExceeded { .. } => error_codes::TRAVERSAL_BUDGET_EXCEEDED,
             // #4400 — retryable and self-clearing: its own slug.
             Self::AuditTrailUnavailable { .. } => error_codes::AUDIT_TRAIL_UNAVAILABLE,
+            // #10028 — a refusal by design, not a backend fault: its own slug.
+            Self::SealedExportRefused(_) => error_codes::SEALED_EXPORT_REFUSED,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }

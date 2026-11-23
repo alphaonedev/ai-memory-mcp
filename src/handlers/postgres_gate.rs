@@ -872,6 +872,12 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
     // code, byte-parity with the sqlite chokepoint's `record_stopped_response`
     // body (`{code, error}`), so a client tells it from an operator's stop.
     // The message names only the knob, so it is emitted unsanitised.
+    // #10033 — the sealed-row export refusal: 409 with its own code, the
+    // same body the sqlite admin export returns (one builder). The message
+    // names a table, a count and a row id, never content.
+    if let StoreError::SealedExportRefused(refused) = &e {
+        return crate::export_sealed::refusal_response(refused);
+    }
     if let StoreError::AuditTrailUnavailable { .. } = &e {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1043,6 +1049,10 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // arm; the status mirrors the early return so the two can never
         // disagree if that guard is ever refactored away.
         StoreError::QuotaExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, e.to_string()),
+        // #10033 — UNREACHABLE in practice (the early return above sends the
+        // full 409 body); named so the match stays exhaustive and the status
+        // cannot drift from the early return.
+        StoreError::SealedExportRefused(_) => (StatusCode::CONFLICT, e.to_string()),
         // v1.0.0 #2445 — EXPLICIT terminal arm, not `_`. A bare wildcard let
         // every FUTURE `StoreError` variant land silently in a generic 500;
         // naming the variant makes the next one a compile error instead.
@@ -2067,6 +2077,16 @@ mod transport_postgres_gate_tests {
             reason: "r".to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        // #10033 — the sealed-row export refusal maps to 409 CONFLICT.
+        let r = store_err_to_response(StoreError::SealedExportRefused(
+            crate::export_sealed::SealedExportRefused {
+                table: crate::export_sealed::tables::MEMORIES,
+                count: 1,
+                first_id: "x".to_string(),
+            },
+        ));
+        assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
 
         // #3196 — a find_paths traversal-budget refusal maps to 400 BAD_REQUEST.
         let r = store_err_to_response(StoreError::TraversalBudgetExceeded {

@@ -566,7 +566,7 @@ async fn admin_export_refuses_a_sealed_row_on_every_page_shape_10028() {
     let (_dir, path) = fixture();
     let conn = ai_memory::db::open(&path).expect("open");
     let ids = seed(&conn, 7);
-    ai_memory::identity::test_key_dir::install();
+    let _ = ai_memory::identity::test_key_dir::install();
     let kp = ai_memory::encryption::get_or_create_keypair("ai:3288").expect("x25519 keypair");
     let envelope =
         ai_memory::encryption::encrypt(SEALED_MARKER_10028, &kp.public).expect("seal marker");

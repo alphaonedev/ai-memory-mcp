@@ -65,6 +65,14 @@ fn fresh_db(tag: &str) -> (PathBuf, Connection) {
     (path, conn)
 }
 
+/// The plaintext-store tests hold `ENV_LOCK` with at-rest encryption REMOVED,
+/// so the F2 test's `AI_MEMORY_ENCRYPT_AT_REST=1` cannot leak into their
+/// fixtures while they run in parallel with it (#10032: a leaked seal now
+/// refuses the export instead of round-tripping as plaintext).
+fn plaintext_store_env() -> MultiEnvVarGuard {
+    MultiEnvVarGuard::apply(&[("AI_MEMORY_ENCRYPT_AT_REST", None)])
+}
+
 fn opts() -> ImportOptions {
     ImportOptions {
         caller_agent_id: "ai:importer".into(),
@@ -97,6 +105,7 @@ fn mem(id: &str, title: &str, ns: &str, content: &str) -> Memory {
 /// issue body, driven through the production code paths).
 #[test]
 fn archived_memories_and_namespace_meta_survive_export_full_round_trip() {
+    let _env = plaintext_store_env();
     let (_src_path, src) = fresh_db("src-corpus");
 
     // Seed a live memory, then archive it (a GENUINE archival, distinct
@@ -198,6 +207,7 @@ fn archived_memories_and_namespace_meta_survive_export_full_round_trip() {
 /// re-attach them.
 #[test]
 fn archived_memory_links_survive_export_full_round_trip() {
+    let _env = plaintext_store_env();
     let (_src_path, src) = fresh_db("src-links");
 
     ai_memory::storage::insert(&src, &mem("m-a", "a", "ns", "content a")).expect("seed a");
@@ -235,6 +245,7 @@ fn archived_memory_links_survive_export_full_round_trip() {
 /// defaults, never a parse refusal.
 #[test]
 fn pre_2571_envelope_missing_the_new_arrays_still_imports() {
+    let _env = plaintext_store_env();
     let old_shape_json = serde_json::json!({
         "spec_version": "2",
         "db_schema_version": 0,
@@ -274,6 +285,7 @@ fn pre_2571_envelope_missing_the_new_arrays_still_imports() {
 /// `in_place_edit` exception).
 #[test]
 fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
+    let _env = plaintext_store_env();
     let (_src_path, src) = fresh_db("src-dual");
     ai_memory::storage::insert(&src, &mem("m-dual", "t", "ns", "c")).expect("seed live");
     ai_memory::storage::archive_memory(&src, "m-dual", Some("manual")).expect("archive");
