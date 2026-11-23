@@ -51,6 +51,12 @@
 
 pub mod sqlite;
 
+/// v1.0.0 #10021 — the PostgreSQL-native backup artifact: signed manifest,
+/// the verifier that is the only constructor of a restorable backup, and the
+/// 0600 artifact file helper. Backend-agnostic so the CLI can verify before
+/// it opens a store.
+pub mod native_backup;
+
 #[cfg(feature = "sal-postgres")]
 pub mod postgres;
 
@@ -1298,6 +1304,39 @@ pub trait MemoryStore: Send + Sync {
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
         Err(StoreError::UnsupportedCapability {
             capability: "write_durability".to_owned(),
+        })
+    }
+
+    /// v1.0.0 #10021 — dump every table of the store into `data` (binary
+    /// COPY segments in a stable order, one snapshot) and return the manifest
+    /// body to sign. Only the PostgreSQL adapter implements it; SQLite keeps
+    /// its file-level backup.
+    ///
+    /// # Errors
+    /// Adapters without a native dump fail closed with `UnsupportedCapability`.
+    async fn native_backup(
+        &self,
+        data: std::fs::File,
+    ) -> StoreResult<native_backup::NativeDumpBody> {
+        drop(data);
+        Err(StoreError::UnsupportedCapability {
+            capability: "NATIVE_BACKUP".to_owned(),
+        })
+    }
+
+    /// v1.0.0 #10021 — load a verified native backup into an empty, freshly
+    /// migrated store in one transaction. The argument can only come from
+    /// [`native_backup::verify_pg_backup`], so no unverified byte is written.
+    ///
+    /// # Errors
+    /// Adapters without a native restore fail closed with `UnsupportedCapability`.
+    async fn native_restore(
+        &self,
+        backup: native_backup::VerifiedPgBackup,
+    ) -> StoreResult<native_backup::NativeRestoreReport> {
+        drop(backup);
+        Err(StoreError::UnsupportedCapability {
+            capability: "NATIVE_RESTORE".to_owned(),
         })
     }
 

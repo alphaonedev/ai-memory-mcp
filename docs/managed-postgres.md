@@ -36,6 +36,16 @@ Then start ai-memory as the ordinary application role. Verified result with a `N
 
 With `age` installed but without `USAGE` on `ag_catalog`, `schema-init` reports `age_projection: skipped` while the daemon still advertises `kg_backend = age` (its probe only looks at `pg_extension`). Grant the schema usage and re-run `schema-init`: `age_projection: created`. #3264 adds a preflight row for this too.
 
+## Native restore needs the replication-role privilege
+
+`ai-memory restore --store-url postgres://…` (a `sal-postgres` build, #10021) loads the rows with user triggers off, through `SET LOCAL session_replication_role = replica`. PostgreSQL allows that only to a superuser or to a role granted `SET` on the parameter. An ordinary application role is refused with the exact error `native restore needs a role that may SET session_replication_role (a superuser or a role granted SET on it); the connecting role lacks it, restore refused` (SQLSTATE `42501`), and the target stays empty and retryable. Either run the restore as the platform's superuser account (table above), or grant the one parameter once, as a superuser:
+
+```sql
+GRANT SET ON PARAMETER session_replication_role TO <application_role>;
+```
+
+Backup (`ai-memory backup`) needs no such privilege.
+
 ## What ai-memory will not do
 
 It will not fall back to a pgvector-less storage mode. A proposal to store embeddings as raw bytes and score in-process (PR #3260) was declined after a 3×7 adversarial vote and a live assessment: any first-boot error would have silently and permanently switched the on-disk format and dropped eight correctness/data-integrity protections. See the [PR #3260 audit record](audit/pr-3260-3x7-vote-and-nhi-assessment-2026-08-26.md).

@@ -647,7 +647,8 @@ fn both_fsyncs_failing_leaves_the_orphan_and_says_so_3550() {
 /// is a whole, verified database — the old one before the rename, the
 /// snapshot after it — with no sidecar that could replay foreign frames
 /// into it, and the rollback copy is intact once it has been taken.
-/// (Restore is SQLite-only; there is no Postgres leg.)
+/// (This is the SQLite file-publish leg; the PostgreSQL leg of #10021 loads
+/// rows in one transaction and publishes no file.)
 #[test]
 fn a_crash_at_any_publish_step_leaves_old_or_new_never_a_mix_3550() {
     let _g = crate::store_url::store_url_env_lock()

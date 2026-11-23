@@ -12,6 +12,12 @@ use clap::Args;
 use std::path::{Path, PathBuf};
 
 mod manifest;
+#[cfg(feature = "sal-postgres")]
+mod pg_native;
+
+/// True in a build that carries the PostgreSQL-native `backup` / `restore`
+/// leg (#10021). The one place the feature is read as a value.
+pub(crate) const PG_NATIVE_BACKUP_BUILD: bool = cfg!(feature = "sal-postgres");
 
 /// `<stem>.manifest.json` — sidecar manifest name for a snapshot stem
 /// (#1558 batch 6).
@@ -958,8 +964,9 @@ pub struct BackupManifest {
 /// #2444 — resolve the local SQLite file a `backup` / `restore` invocation is
 /// allowed to act on, or REFUSE.
 ///
-/// `ai-memory backup` is a SQLite-only control: it snapshots via SQLite's
-/// `VACUUM INTO`. Before #2444 it took the `--db` path unconditionally, and
+/// This SQLite leg of `ai-memory backup` snapshots via SQLite's
+/// `VACUUM INTO` (a `sal-postgres` build routes a Postgres `--store-url` to
+/// the PostgreSQL-native leg before this runs, #10021). Before #2444 it took the `--db` path unconditionally, and
 /// [`crate::db::open`] CREATES a missing file (running the full bootstrap +
 /// migration ladder on it), so on a Postgres-backed deployment the command
 /// manufactured an empty SQLite database, VACUUMed it into a timestamped
@@ -1063,6 +1070,37 @@ pub(crate) fn refuse_pg_store(
     )
 }
 
+/// v1.0.0 #10021 — the configured store URL, with an argv/env disagreement
+/// REFUSED. Shared by the SQLite gate below and the PostgreSQL leg of
+/// `backup` / `restore`, so both apply the one ambiguity rule.
+///
+/// # Errors
+/// An argv/env store-URL disagreement, or an unreadable env channel.
+fn unambiguous_store_url(store_url_arg: Option<&str>, verb: &str) -> Result<Option<String>> {
+    use crate::daemon_runtime::resolve_store_url;
+    use crate::url_display::store_url_display;
+    // Ambiguity is REFUSED, never silently resolved. `resolve_store_url` gives
+    // the env channels precedence over the argv flag (#1927), so an explicit
+    // `--store-url` that DISAGREES with an exported AI_MEMORY_STORE_URL would
+    // otherwise capture a store the operator did not name — on a durability
+    // command "which store did I actually snapshot?" must never be a guess.
+    if let Some(arg) = store_url_arg {
+        if let Some(env_url) = resolve_store_url(None)? {
+            if env_url.trim() != arg.trim() {
+                anyhow::bail!(
+                    "ambiguous store: --store-url names {} but the environment \
+                     (AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE) names {}. \
+                     Refusing to guess which store `{verb}` should act on — \
+                     unset one of them (#2444).",
+                    store_url_display(arg),
+                    store_url_display(&env_url),
+                );
+            }
+        }
+    }
+    resolve_store_url(store_url_arg)
+}
+
 /// v1.0.0 #2490 — the shared store-resolution gate, reused verbatim by
 /// `export` / `export --full` / `import` so the refusal SET cannot drift
 /// between the durability verbs.
@@ -1087,30 +1125,10 @@ pub(crate) fn resolve_sqlite_store(
     pg_alternative: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<PathBuf> {
-    use crate::daemon_runtime::{SQLITE_URL_SCHEME, is_postgres_url, resolve_store_url};
+    use crate::daemon_runtime::{SQLITE_URL_SCHEME, is_postgres_url};
     use crate::url_display::store_url_display;
 
-    // Ambiguity is REFUSED, never silently resolved. `resolve_store_url` gives
-    // the env channels precedence over the argv flag (#1927), so an explicit
-    // `--store-url` that DISAGREES with an exported AI_MEMORY_STORE_URL would
-    // otherwise capture a store the operator did not name — on a durability
-    // command "which store did I actually snapshot?" must never be a guess.
-    if let Some(arg) = store_url_arg {
-        if let Some(env_url) = resolve_store_url(None)? {
-            if env_url.trim() != arg.trim() {
-                anyhow::bail!(
-                    "ambiguous store: --store-url names {} but the environment \
-                     (AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE) names {}. \
-                     Refusing to guess which store `{verb}` should act on — \
-                     unset one of them (#2444).",
-                    store_url_display(arg),
-                    store_url_display(&env_url),
-                );
-            }
-        }
-    }
-
-    let Some(url) = resolve_store_url(store_url_arg)? else {
+    let Some(url) = unambiguous_store_url(store_url_arg, verb)? else {
         // No store URL on any channel: the configured store IS the local
         // sqlite `--db` path. Unchanged pre-#2444 behaviour.
         return Ok(db_path.to_path_buf());
@@ -1251,11 +1269,14 @@ fn local_signing_key() -> std::result::Result<ed25519_dalek::SigningKey, String>
 /// PASS when the operator public key `restore` verifies against resolves and
 /// any local operator signing key is its private half. A node that only
 /// restores never needs the private key, so its absence passes; a key that
-/// does not match would sign backups this node's `restore` refuses. A
-/// postgres node passes as N/A: `backup` / `restore` are SQLite-only.
+/// does not match would sign backups this node's `restore` refuses. #10021:
+/// a `sal-postgres` build signs and verifies PostgreSQL-native backups with
+/// the same keys, so a postgres node gets the same check there; in any other
+/// build `backup` / `restore` cannot capture a postgres store and the row
+/// passes as N/A.
 #[must_use]
 pub fn signing_posture(backend_is_postgres: bool) -> (bool, String) {
-    if backend_is_postgres {
+    if backend_is_postgres && !PG_NATIVE_BACKUP_BUILD {
         return (
             true,
             "N/A (postgres: `ai-memory backup` is SQLite-only)".to_string(),
@@ -1362,6 +1383,15 @@ fn run_backup_with(
     out: &mut CliOutput<'_>,
     policy: &BackupPolicy,
 ) -> Result<()> {
+    // v1.0.0 #10021 — a Postgres store gets the PostgreSQL-native backup
+    // (3-agent vote 71472661 option 2); the SQLite refusal below stays for
+    // `export` / `import`.
+    #[cfg(feature = "sal-postgres")]
+    {
+        if let Some(url) = pg_native::configured_pg_url(args.store_url.as_deref(), VERB_BACKUP)? {
+            return pg_native::run_pg_backup(&url, args, json_out, out, policy);
+        }
+    }
     // #2444 — resolve (and where necessary REFUSE) the configured store BEFORE
     // anything is created on disk. A backup that cannot capture the configured
     // store must ERROR, never produce an artifact.
@@ -1525,8 +1555,9 @@ fn run_backup_with(
             out.stderr,
             "WARNING: this snapshot contains 0 memories (source {}). If this \
              deployment's corpus lives in Postgres, `ai-memory backup` did NOT \
-             capture it — use pg_dump / pg_basebackup, and pass --store-url so \
-             the command can refuse instead of guessing. See \
+             capture it — pass --store-url naming that Postgres store so the \
+             command takes a PostgreSQL-native backup (sal-postgres builds, \
+             #10021) or refuses instead of guessing. See \
              docs/production-deployment.md (#2444).",
             source_db.display()
         )?;
@@ -2224,6 +2255,15 @@ fn run_restore_with(
                 "--allow-unsigned-manifest"
             }
         );
+    }
+    // v1.0.0 #10021 — a Postgres store is restored from a PostgreSQL-native
+    // backup only: signature and digests verified first, an empty target, one
+    // transaction.
+    #[cfg(feature = "sal-postgres")]
+    {
+        if let Some(url) = pg_native::configured_pg_url(args.store_url.as_deref(), VERB_RESTORE)? {
+            return pg_native::run_pg_restore(&url, args, json_out, out, policy);
+        }
     }
     // #2444 — a restore onto a Postgres-backed deployment would copy a SQLite
     // snapshot to a placeholder path, print "Restored", and exit 0 while the
@@ -3302,14 +3342,28 @@ mod tests {
         let args = BackupArgs {
             to: db.parent().unwrap().join("backups-2444-pg"),
             keep: 48,
-            store_url: Some("postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory".to_string()),
+            // Port 1: nothing listens, so the PostgreSQL leg of a sal-postgres
+            // build fails at connect and never reaches a real server (#10021).
+            store_url: Some("postgres://ai_memory:hunter2@127.0.0.1:1/ai_memory".to_string()),
         };
         let mut out = env.output();
         let err = run_backup(&db, &args, false, &mut out)
             .expect_err("a postgres store must be refused")
             .to_string();
-        assert!(err.contains("pg_dump"), "got: {err}");
+        // #10021 — a sal-postgres build takes the PostgreSQL-native backup,
+        // which fails at connect here and writes nothing; any other build
+        // keeps the #2444 refusal naming pg_dump.
+        let want = if PG_NATIVE_BACKUP_BUILD {
+            "PostgreSQL backup failed; no partial file was kept (#10021)"
+        } else {
+            "pg_dump"
+        };
+        assert!(err.contains(want), "got: {err}");
         assert!(!err.contains("hunter2"), "DSN password leaked: {err}");
+        assert!(
+            !args.to.exists(),
+            "a refused backup must not create its directory"
+        );
     }
 
     /// `restore` refuses the same store — the false-assurance half of #2444.
@@ -3327,14 +3381,21 @@ mod tests {
             skip_verify: false,
             latest: false,
             allow_unsigned_manifest: false,
-            store_url: Some("postgresql://ai_memory:hunter2@127.0.0.1:5432/ai".to_string()),
+            store_url: Some("postgresql://ai_memory:hunter2@127.0.0.1:1/ai".to_string()),
             yes: true,
         };
         let mut out = env.output();
         let err = run_restore(&db, &args, false, &mut out)
             .expect_err("restoring onto a postgres store must be refused")
             .to_string();
-        assert!(err.contains("pg_dump"), "got: {err}");
+        // #10021 — a sal-postgres build reads only a PostgreSQL-native backup
+        // and refuses this path before any connection.
+        let want = if PG_NATIVE_BACKUP_BUILD {
+            "is not a PostgreSQL backup file"
+        } else {
+            "pg_dump"
+        };
+        assert!(err.contains(want), "got: {err}");
         assert!(!err.contains("hunter2"), "DSN password leaked: {err}");
     }
 

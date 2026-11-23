@@ -954,8 +954,10 @@ rather than parking a forever-un-approvable pending — then **20 → 21 when
 #3553 landed check #21**, the `PRAGMA synchronous` durability posture, and
 **21 → 22 when #3199 landed check #22 backup-manifest-signing**: the operator public key
 `restore` verifies backup manifests against resolves, and any local operator
-signing key matches it; `N/A` PASS on a postgres backend, where `ai-memory
-backup` is SQLite-only). The four-leg capture
+signing key matches it; in a `sal-postgres` build a postgres backend is checked
+the same way, because its PostgreSQL-native backups are signed with the same
+keys (#10021); in any other build a postgres backend is `N/A` PASS, where
+`ai-memory backup` is SQLite-only). The four-leg capture
 below was taken 2026-08-13 on the release-built binary at the
 post-remediation tree (the merged cert wave: #2915-#2920, #2925-#2927,
 #2929); raw output in `docs/compliance/evidence/cert-54/` (see that

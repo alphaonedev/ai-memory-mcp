@@ -132,6 +132,8 @@ mod lifecycle_tx_3152;
 mod forensic_outage_4199;
 // v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
 mod lock_order_4209;
+// v1.0.0 #10021 — PostgreSQL-native exact backup and restore (qual_10 budget).
+mod native_backup;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -12996,7 +12998,12 @@ impl PostgresStore {
         // That is the #2511 follow-up regression; NULL means "no previous
         // valid_until", which is exactly `None`.
         let prior_raw = age_cell_text_opt(&prior_rows[0], "prior", "read prior valid_until")?;
-        let previous_valid_until = prior_raw.as_deref().and_then(agtype_optional_string);
+        // #10049 — the graph stores the AGE stamp form (`+00:00`); the wire
+        // value is the canonical `Z` form, as for `valid_until` below.
+        let previous_valid_until = prior_raw
+            .as_deref()
+            .and_then(agtype_optional_string)
+            .map(|p| crate::storage::canonicalize_valid_until_stamp(Some(&p)));
 
         // Step 2: SET r.valid_until = $now and count the affected
         // edge. We rely on AGE's identity to atomically rewrite the
@@ -13019,11 +13026,18 @@ impl PostgresStore {
         // rejected the statement and the dispatcher re-ran the whole
         // invalidation through `kg_invalidate_cte`, leaving the AGE-side
         // edge property un-invalidated while the relational mirror moved.
+        // #10049 — the AGE edge stores the instant in the one AGE stamp form
+        // ([`age_stamp`], `+00:00`) that every other AGE writer and a native
+        // restore's re-projection use; the canonical `Z` form `stamp` stays the
+        // relational value and the returned wire value. A stamp that does not
+        // parse is bound unchanged (the relational write below refuses it).
+        let age_now = chrono::DateTime::parse_from_rfc3339(&stamp)
+            .map_or_else(|_| stamp.clone(), |dt| age_stamp(dt.with_timezone(&Utc)));
         let write_params = age_params_jsonb(&[
             ("src", source_id),
             ("dst", target_id),
             ("rel", relation),
-            ("now", &stamp),
+            ("now", &age_now),
         ]);
         let write_sql = format!(
             "SELECT affected FROM cypher('memory_graph', $$ {write_cypher} $$, $1) AS \
@@ -13905,8 +13919,8 @@ impl PostgresStore {
                     &link.target_id,
                     link.relation.as_str(),
                     // #2377 (FIX #9) — the just-bound relational validity.
-                    Some(valid_from_str.as_str()),
-                    valid_until_str.as_deref(),
+                    Some(valid_from_dt),
+                    valid_until_dt,
                 )
                 .await
                 {
@@ -14140,15 +14154,13 @@ impl PostgresStore {
                         .map_err(|e| to_store_err("commit drop deleted-link outbox row", e))?;
                     continue;
                 };
-                let valid_from_str = valid_from.map(|t| t.to_rfc3339());
-                let valid_until_str = valid_until.map(|t| t.to_rfc3339());
                 project_link_into_age(
                     &mut tx,
                     &source_id,
                     &target_id,
                     &relation,
-                    valid_from_str.as_deref(),
-                    valid_until_str.as_deref(),
+                    valid_from,
+                    valid_until,
                 )
                 .await
             };
@@ -19755,8 +19767,8 @@ fn age_vertex_ids(entities: &[serde_json::Value]) -> Vec<String> {
 /// The comparison is a lexicographic string compare against an RFC3339
 /// `+00:00` stamp, which orders chronologically because the invalidate
 /// write path (`kg_invalidate_cypher`) and the projection
-/// (`project_link_into_age`, #2377) both store `valid_until` in the same
-/// `to_rfc3339()` form byte-for-byte.
+/// (`project_link_into_age`, #2377) both store `valid_until` through the one
+/// stamp SSOT [`age_stamp`] (#10049), byte-for-byte.
 ///
 /// Fail-CLOSED on a malformed stamp: a `valid_until` that is present but
 /// not a string is treated as INVALIDATING the path. A derived-graph read
@@ -20254,15 +20266,21 @@ async fn project_link_into_age(
     source_id: &str,
     target_id: &str,
     relation: &str,
-    // #2377 (FIX #9) — the relational row's temporal-validity, already in
-    // `to_rfc3339()` form so the agtype STRING comparison in the current-view
-    // Cypher filter (`e.valid_until IS NULL OR e.valid_until > $now`,
-    // `build_kg_query_current_view_cypher`) matches the dual-written mirror
-    // BYTE-for-byte. `None` => the property is not set on the MERGEd edge (so
-    // `e.valid_until IS NULL` keeps a never-invalidated edge visible).
-    valid_from: Option<&str>,
-    valid_until: Option<&str>,
+    // #2377 (FIX #9) — the relational row's temporal-validity. #10049: the
+    // instants are typed and rendered HERE through the one stamp SSOT
+    // [`age_stamp`] (microsecond-truncated `to_rfc3339()`, `+00:00`), so every
+    // writer (link, outbox drainer, consolidate, federation, archive restore,
+    // native restore) stores the byte-identical text the current-view Cypher
+    // filter (`e.valid_until IS NULL OR e.valid_until > $now`,
+    // `build_kg_query_current_view_cypher`) compares, and a native restore
+    // re-projects exactly the text the live writer stored. `None` => the
+    // property is not set on the MERGEd edge (so `e.valid_until IS NULL` keeps
+    // a never-invalidated edge visible).
+    valid_from: Option<DateTime<Utc>>,
+    valid_until: Option<DateTime<Utc>>,
 ) -> StoreResult<()> {
+    let valid_from = valid_from.map(age_stamp);
+    let valid_until = valid_until.map(age_stamp);
     // Defence-in-depth: confirm the relation is in the
     // validator's accepted shape before interpolating it into the
     // Cypher body. Upstream validators already gate this, but the
@@ -20402,11 +20420,11 @@ async fn project_link_into_age(
     let mut set_clauses: Vec<&str> = Vec::new();
     let mut edge_pairs: Vec<(&str, &str)> =
         vec![("src", source_id), ("dst", target_id), ("rel", relation)];
-    if let Some(vf) = valid_from {
+    if let Some(vf) = valid_from.as_deref() {
         set_clauses.push("r.valid_from = $valid_from");
         edge_pairs.push(("valid_from", vf));
     }
-    if let Some(vu) = valid_until {
+    if let Some(vu) = valid_until.as_deref() {
         set_clauses.push("r.valid_until = $valid_until");
         edge_pairs.push(("valid_until", vu));
     }
@@ -20706,6 +20724,16 @@ fn parse_rfc3339_required(s: &str) -> StoreResult<DateTime<Utc>> {
         .map_err(|e| StoreError::IntegrityFailed {
             detail: format!("invalid rfc3339 timestamp {s}: {e}"),
         })
+}
+
+/// #10049 — the one AGE edge stamp SSOT: the microsecond-truncated
+/// `to_rfc3339()` text (`...+00:00`) every AGE writer stores in an edge's
+/// `valid_from` / `valid_until` property and binds as the current-view `$now`.
+/// PostgreSQL `timestamptz` keeps microseconds, so a stamp re-rendered from
+/// the relational row (outbox drain, native restore) is byte-identical to the
+/// one the live writer stored.
+pub(crate) fn age_stamp(t: DateTime<Utc>) -> String {
+    truncate_to_microseconds(t).to_rfc3339()
 }
 
 /// v0.7.0.1 G3 — clamp a `DateTime<Utc>` to microsecond precision.
@@ -21480,6 +21508,20 @@ impl PostgresStore {
 
 #[async_trait]
 impl MemoryStore for PostgresStore {
+    async fn native_backup(
+        &self,
+        data: std::fs::File,
+    ) -> StoreResult<crate::store::native_backup::NativeDumpBody> {
+        native_backup::native_backup_pg(&self.pool, data).await
+    }
+
+    async fn native_restore(
+        &self,
+        backup: crate::store::native_backup::VerifiedPgBackup,
+    ) -> StoreResult<crate::store::native_backup::NativeRestoreReport> {
+        native_backup::native_restore_pg(&self.pool, backup).await
+    }
+
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
         let (fsync, synchronous_commit): (String, String) = sqlx::query_as(
             "SELECT current_setting('fsync'), current_setting('synchronous_commit')",
@@ -28794,13 +28836,12 @@ impl MemoryStore for PostgresStore {
                         // #2377 (FIX #9) — the consolidate lineage edge is
                         // born at `now` with no `valid_until` (unbounded); pass
                         // the same validity the relational INSERT bound above.
-                        let consolidate_vf = now.to_rfc3339();
                         match project_link_into_age(
                             &mut tx,
                             &new_id,
                             id,
                             crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
-                            Some(consolidate_vf.as_str()),
+                            Some(now),
                             None,
                         )
                         .await

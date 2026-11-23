@@ -63,9 +63,24 @@ const PG_STORE_URL: &str = "postgres://ai_memory:hunter2@127.0.0.1:1/ai_memory";
 /// The literal secret inside [`PG_STORE_URL`]; must never appear in output.
 const PG_PASSWORD: &str = "hunter2";
 
+/// An isolated HOME under `<repo>/.local-runs/` (never the operator's HOME and
+/// never /tmp), so the spawned binary cannot read or write a real config, key
+/// directory or database beside the one the test names.
+fn isolated_home() -> std::path::PathBuf {
+    let home = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".local-runs")
+        .join("backup_fail_closed_2444")
+        .join(format!("home-{}", std::process::id()));
+    std::fs::create_dir_all(home.join(".config")).expect("isolated HOME");
+    home
+}
+
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
-    cmd.env("AI_MEMORY_NO_CONFIG", "1")
+    let home = isolated_home();
+    cmd.env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .args(["--db", db.to_str().expect("utf-8 db path")]);
     cmd
@@ -115,9 +130,16 @@ fn backup_on_a_postgres_store_refuses_and_writes_no_artifact_2444() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // The refusal must name the supported path so the operator is not left
-    // guessing what to run instead.
+    // guessing what to run instead. #10021: a sal-postgres build takes the
+    // PostgreSQL-native backup, which is always signed, and this isolated HOME
+    // has no operator key, so it refuses before connecting.
+    let want = if cfg!(feature = "sal-postgres") {
+        "a PostgreSQL backup is always signed"
+    } else {
+        "pg_dump"
+    };
     assert!(
-        stderr.contains("pg_dump"),
+        stderr.contains(want),
         "refusal must name the supported Postgres backup path; stderr was: {stderr}"
     );
     // #1579 A3 — a mistyped/echoed store URL must never carry the credential.
@@ -218,8 +240,15 @@ fn restore_on_a_postgres_store_refuses_2444() {
         !stdout.contains("Restored"),
         "a refused restore must never report success; stdout was: {stdout}"
     );
+    // #10021: a sal-postgres build verifies a PostgreSQL-native backup
+    // against the operator key, and this isolated HOME has none.
+    let want = if cfg!(feature = "sal-postgres") {
+        "a PostgreSQL restore verifies the backup's signature"
+    } else {
+        "pg_dump"
+    };
     assert!(
-        stderr.contains("pg_dump"),
+        stderr.contains(want),
         "refusal must name the supported Postgres path; stderr was: {stderr}"
     );
     assert!(

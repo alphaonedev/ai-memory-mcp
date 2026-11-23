@@ -80,7 +80,7 @@ mTLS-authenticated federation peers bypass the api-key check on `/api/v1/sync/*`
 
 ## 4. Backup and restore
 
-SQLite deployments use `ai-memory backup` (a `VACUUM INTO` wrapper that emits a defragmented snapshot plus a manifest signed with the operator key). It is SQLite-only and **refuses** a store it cannot capture — see the Postgres note below ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)):
+SQLite deployments use `ai-memory backup` (a `VACUUM INTO` wrapper that emits a defragmented snapshot plus a manifest signed with the operator key). It **refuses** a store it cannot capture; a Postgres store is captured natively only in a `sal-postgres` build — see the Postgres section below ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)):
 
 ```bash
 ai-memory backup --to /var/backups/ai-memory --keep 48
@@ -96,7 +96,7 @@ Since v1.0.0 [#3550](https://github.com/alphaonedev/ai-memory-mcp/issues/3550) t
 
 ### PostgreSQL recovery
 
-`ai-memory restore` is SQLite-only; a Postgres-backed deployment is recovered with Postgres' own tooling. Native Postgres recovery orchestration inside `ai-memory` is not part of v1.0.0. The procedure below is the supported one ([#3550](https://github.com/alphaonedev/ai-memory-mcp/issues/3550)).
+A build with the `sal-postgres` feature backs up and restores a Postgres store natively through the same verbs: `ai-memory backup --store-url postgres://… --to <dir>` writes a signed, mode-0600 `ai-memory-<ts>.pgdata` + `.pgmanifest.json` pair, and `ai-memory restore --store-url postgres://… --from <dir> --snapshot ai-memory-<ts>` verifies the signature against the operator public key and every digest before the first write, then loads an empty, freshly migrated store in one transaction ([#10021](https://github.com/alphaonedev/ai-memory-mcp/issues/10021)). The artifact holds every table verbatim, including API-key hashes, the key history and session transcripts, so store it as privately as the database. A restore refuses a non-empty target, a schema-version mismatch and a backup of another backend; the full refusal list is in [`CLI_REFERENCE.md`](CLI_REFERENCE.html). A cross-backend full restore (SQLite to Postgres or back) is not supported. The `pg_dump` / `pg_basebackup` procedure below remains the supported path in a build without `sal-postgres`, and for point-in-time recovery in any build ([#3550](https://github.com/alphaonedev/ai-memory-mcp/issues/3550)).
 
 **Logical backups (`pg_dump`).** Take them on a schedule; they are the simplest restore and are portable across Postgres minor versions:
 
@@ -136,7 +136,7 @@ Plus a periodic base backup: `pg_basebackup --pgdata=/backups/base-$(date -u +%Y
 5. Start Postgres and let it replay to the target. Check the result, then run `SELECT pg_wal_replay_resume();` or promote as your runbook prescribes.
 6. Start one `ai-memory` daemon, verify, then the rest of the fleet.
 
-`ai-memory backup` is **not** an alternative to the above on a Postgres host, and since v1.0.0 it says so instead of failing open ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)). Pointed at a Postgres deployment it used to create an empty SQLite file, snapshot it, write a valid sha256 manifest and exit 0 — the operator learned the truth at the restore. It now resolves the configured store (`--store-url`, or `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`) and errors, naming `pg_dump` / `pg_basebackup`, without writing any artifact. `ai-memory restore` refuses the same store for the same reason. **Pass `--store-url` (or export `AI_MEMORY_STORE_URL`) in the backup cron on every Postgres host** — a daemon started with `--store-url` on argv alone leaves the separate cron process no channel to learn the backend, and the guard cannot fire on a store it cannot see.
+In a build without `sal-postgres`, `ai-memory backup` is **not** an alternative to the above on a Postgres host, and since v1.0.0 it says so instead of failing open ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)). Pointed at a Postgres deployment it used to create an empty SQLite file, snapshot it, write a valid sha256 manifest and exit 0 — the operator learned the truth at the restore. It now resolves the configured store (`--store-url`, or `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`) and errors, naming `pg_dump` / `pg_basebackup`, without writing any artifact. `ai-memory restore` refuses the same store for the same reason. A `sal-postgres` build resolves the store the same way and takes the PostgreSQL-native backup described above ([#10021](https://github.com/alphaonedev/ai-memory-mcp/issues/10021)). **Pass `--store-url` (or export `AI_MEMORY_STORE_URL`) in the backup cron on every Postgres host** — a daemon started with `--store-url` on argv alone leaves the separate cron process no channel to learn the backend, and the guard cannot fire on a store it cannot see.
 
 One thing `pg_dump` does not cover: a Postgres-backed daemon still keeps a local SQLite sidecar at `--db` holding the governance audit spine (`signed_events`, `governance_rules`, hook consultation state). Back that file up out-of-band alongside the `pg_dump`.
 
