@@ -66,7 +66,10 @@ psql -h 100.70.167.11 -U fed_user fed_meta
 ```
 
 On the Postgres side, allow the CGNAT tailnet range in `pg_hba.conf`
-alongside (not instead of) the LAN range:
+alongside (not instead of) the LAN range. In the examples below,
+`<pg-major>` stands for the PostgreSQL major version of the certified tier
+(19); check the package name for your platform before copying a path or
+package name:
 
 ```text
 # /etc/postgresql/<pg-major>/main/pg_hba.conf
@@ -96,7 +99,7 @@ If you suspect this is what you're hitting, the quickest check is:
 nc -zv 192.168.50.1 5432   # or whatever LAN-IP:port
 
 # Non-Apple-signed binary — should fail with EHOSTUNREACH:
-/opt/homebrew/opt/postgresql@<pg-major>/bin/psql -h 192.168.50.1 -U fed_user -c 'SELECT 1' fed_meta
+/opt/homebrew/opt/postgresql@<pg-major>/bin/psql -h 192.0.2.1 -U fed_user -c 'SELECT 1' fed_meta
 ```
 
 If `nc` succeeds and `psql` fails with `No route to host`, you have a
