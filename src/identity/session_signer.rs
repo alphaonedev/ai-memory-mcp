@@ -90,6 +90,11 @@ pub const REFUSE_ALREADY_INSTALLED: &str =
 pub const SEAL_REFUSAL_PREFIX: &str =
     "ATTESTATION_FAILED: mcp session signer (#9926) refused to sign this write";
 
+/// The one spelling of a per-write refusal: [`SEAL_REFUSAL_PREFIX`], then the reason.
+fn seal_refusal(reason: impl std::fmt::Display) -> String {
+    format!("{SEAL_REFUSAL_PREFIX}: {reason}")
+}
+
 /// The process-global signer. Set at most once, by [`install_from_env`].
 static SESSION_SIGNER: OnceLock<SessionSigner> = OnceLock::new();
 
@@ -479,7 +484,7 @@ fn seal_stored_row(
     }
     reseal_with(conn, id, signer)
         .map(StoredSeal::Sealed)
-        .map_err(|reason| format!("{SEAL_REFUSAL_PREFIX}: {reason}"))
+        .map_err(seal_refusal)
 }
 
 /// Whether `row` carries `agent_attested` and a `write_signature` that
@@ -612,7 +617,7 @@ pub fn seal_sync(conn: &rusqlite::Connection, mem: &mut Memory, agent_id: &str) 
     };
     match seal_with(conn, mem, signer) {
         Ok(Sealed) => SealOutcome::Signed,
-        Err(reason) => SealOutcome::Refused(format!("{SEAL_REFUSAL_PREFIX}: {reason}")),
+        Err(reason) => SealOutcome::Refused(seal_refusal(reason)),
     }
 }
 
@@ -712,7 +717,7 @@ pub fn reseal_row_sync(
     let Some(signer) = session_signer().filter(|signer| signer.covers(agent_id)) else {
         return Err(MERGE_RESEAL_REFUSAL.to_string());
     };
-    reseal_with(conn, id, signer).map_err(|reason| format!("{SEAL_REFUSAL_PREFIX}: {reason}"))
+    reseal_with(conn, id, signer).map_err(seal_refusal)
 }
 
 fn reseal_with(
