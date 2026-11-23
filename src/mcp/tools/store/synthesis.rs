@@ -397,6 +397,8 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     outcome: &SynthesisOutcome,
     active_keypair: Option<&AgentKeypair>,
     caller: Option<&str>,
+    incoming: super::IncomingAttestation,
+    agent_id: &str,
 ) -> Result<Option<Value>, String> {
     let primary_update = outcome.updates.first().cloned();
     let Some((primary_id, _)) = primary_update.as_ref() else {
@@ -473,6 +475,10 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                 return Ok(None);
             }
         };
+        // #10011 — a signed store re-seals the merged candidate inside this
+        // transaction; a refusal rolls the whole merge back (the guard drops
+        // armed) and refuses the store, never committing it as `claimed`.
+        incoming.reseal_merged_row(conn, cand_id, agent_id)?;
         if content_changed && let Some(emb) = embedder {
             let text = crate::embeddings::embedding_document(&target.title, &merged_content);
             if let Ok(embedding) = emb.embed(&text) {
@@ -534,6 +540,10 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         provenance_row.title = format!("{} (sup ⟶ {})", mem.title, &target.id);
         match db::insert(conn, &provenance_row) {
             Ok(provenance_id) => {
+                // #10011 — the provenance row carries the incoming row's
+                // metadata but a new title and the merged content, so the
+                // incoming seal does not cover it: re-seal it in this txn.
+                incoming.reseal_merged_row(conn, &provenance_id, agent_id)?;
                 if let Err(e) = db::create_link_signed(
                     conn,
                     &provenance_id,
@@ -799,5 +809,168 @@ mod tests {
             .is_ok(),
             "None caller is the single-operator trust-all default"
         );
+    }
+
+    /// The agent the lib-test session signer covers, and one it does not.
+    const KEYED_OWNER_10011: &str = "ai:keyed-synthesis-10011";
+    const UNKEYED_OWNER_10011: &str = "ai:unkeyed-synthesis-10011";
+    const STORED_BODY_10011: &str = "the stored body before the synthesis merge";
+    const MERGED_BODY_10011: &str = "the merged body the synthesiser elected";
+    const INCOMING_TITLE_10011: &str = "incoming fact 10011";
+    const AGENT_ATTESTED_10011: &str = "agent_attested";
+
+    /// What one synthesis Update verdict must leave behind.
+    #[derive(Debug, Clone, Copy)]
+    enum Expect10011 {
+        /// Merged; the candidate AND the provenance row are re-sealed by the
+        /// session key (`agent_attested`, signature over the stored row).
+        Attested,
+        /// Merged unsigned: the `db::update` outcome, no seal minted.
+        MergedUnsigned,
+        /// Refused with this exact reason; the whole merge rolled back.
+        Refused(&'static str),
+    }
+
+    /// `(owner, incoming, expected)`: every incoming attestation against an
+    /// owner the session signer covers and one it does not.
+    const SYNTHESIS_RESEAL_ROWS: [(&str, super::super::IncomingAttestation, Expect10011); 6] = [
+        (
+            KEYED_OWNER_10011,
+            super::super::IncomingAttestation::SessionSealed,
+            Expect10011::Attested,
+        ),
+        (
+            KEYED_OWNER_10011,
+            super::super::IncomingAttestation::CallerSigned,
+            Expect10011::Attested,
+        ),
+        (
+            KEYED_OWNER_10011,
+            super::super::IncomingAttestation::Unsigned,
+            Expect10011::MergedUnsigned,
+        ),
+        (
+            UNKEYED_OWNER_10011,
+            super::super::IncomingAttestation::SessionSealed,
+            Expect10011::Refused(crate::identity::session_signer::MERGE_RESEAL_REFUSAL),
+        ),
+        (
+            UNKEYED_OWNER_10011,
+            super::super::IncomingAttestation::CallerSigned,
+            Expect10011::Refused(crate::identity::session_signer::MERGE_RESEAL_REFUSAL),
+        ),
+        (
+            UNKEYED_OWNER_10011,
+            super::super::IncomingAttestation::Unsigned,
+            Expect10011::MergedUnsigned,
+        ),
+    ];
+
+    fn row_titled(conn: &rusqlite::Connection, title: &str) -> Option<Memory> {
+        let id: Option<String> = conn
+            .query_row("SELECT id FROM memories WHERE title = ?1", [title], |r| {
+                r.get(0)
+            })
+            .ok();
+        id.and_then(|id| db::get(conn, &id).expect("read"))
+    }
+
+    /// The row is `agent_attested` and its stored signature is the session
+    /// key's (deterministic Ed25519) signature over the row as stored.
+    fn assert_resealed(row: &Memory, kp: &crate::identity::keypair::AgentKeypair, what: &str) {
+        use base64::Engine as _;
+        assert_eq!(
+            row.metadata[crate::models::field_names::ATTEST_LEVEL].as_str(),
+            Some(AGENT_ATTESTED_10011),
+            "{what}: attest_level"
+        );
+        let stored = row.metadata[crate::models::field_names::WRITE_SIGNATURE]
+            .as_str()
+            .expect("write_signature");
+        let stored = base64::engine::general_purpose::STANDARD
+            .decode(stored)
+            .expect("base64 signature");
+        let expected = crate::identity::attest::sign_memory_write(kp, row, KEYED_OWNER_10011)
+            .expect("re-sign stored row");
+        assert_eq!(stored, expected, "{what}: signature over the stored row");
+    }
+
+    /// #10011 synthesis sibling: a signed store re-seals the merged candidate
+    /// and the provenance row inside the merge txn; with no signer for the
+    /// owner it is refused and nothing of the merge is committed.
+    #[test]
+    fn synthesis_update_reseals_or_refuses_and_rolls_back_10011() {
+        crate::identity::attest::permissive_attestation_for_lib_tests();
+        let kp = crate::identity::keypair::generate(KEYED_OWNER_10011).expect("keypair");
+        assert_eq!(
+            crate::identity::session_signer::install_for_lib_test(KEYED_OWNER_10011, kp.clone()),
+            KEYED_OWNER_10011,
+            "the lib-test session signer covers the keyed owner"
+        );
+        for (owner, incoming, expected) in SYNTHESIS_RESEAL_ROWS {
+            let what = format!("{owner} {incoming:?}");
+            let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+            db::register_agent(&conn, KEYED_OWNER_10011, "nhi", &[]).expect("register");
+            db::bind_agent_pubkey_with_keypair(&conn, KEYED_OWNER_10011, &kp).expect("bind");
+            let now = crate::identity::attest::now_attestable_rfc3339();
+            let stored = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                namespace: "synthesis-10011".to_string(),
+                title: "synthesis candidate 10011".to_string(),
+                content: STORED_BODY_10011.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                metadata: json!({ crate::META_KEY_AGENT_ID: owner }),
+                ..Memory::default()
+            };
+            let id = db::insert(&conn, &stored).expect("seed candidate");
+            let candidate = db::get(&conn, &id).expect("read").expect("candidate");
+            let incoming_mem = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                title: INCOMING_TITLE_10011.to_string(),
+                ..candidate.clone()
+            };
+            let outcome = SynthesisOutcome {
+                updates: vec![(id.clone(), MERGED_BODY_10011.to_string())],
+                ..SynthesisOutcome::empty()
+            };
+            let got = apply_synthesis_updates_and_deletes(
+                &conn,
+                &incoming_mem,
+                std::slice::from_ref(&candidate),
+                None,
+                None,
+                &outcome,
+                None,
+                Some(owner),
+                incoming,
+                owner,
+            );
+            let after = db::get(&conn, &id).expect("read").expect("candidate");
+            let provenance = row_titled(&conn, &format!("{INCOMING_TITLE_10011} (sup ⟶ {id})"));
+            match expected {
+                Expect10011::Refused(reason) => {
+                    assert_eq!(got.expect_err("refused"), reason, "{what}");
+                    assert_eq!(after.content, STORED_BODY_10011, "{what}: rolled back");
+                    assert!(provenance.is_none(), "{what}: no provenance row committed");
+                }
+                Expect10011::MergedUnsigned => {
+                    assert!(got.expect("merged").is_some(), "{what}");
+                    assert_eq!(after.content, MERGED_BODY_10011, "{what}: merged");
+                    assert_ne!(
+                        after.metadata[crate::models::field_names::ATTEST_LEVEL].as_str(),
+                        Some(AGENT_ATTESTED_10011),
+                        "{what}: an unsigned merge mints no seal"
+                    );
+                }
+                Expect10011::Attested => {
+                    assert!(got.expect("merged").is_some(), "{what}");
+                    assert_eq!(after.content, MERGED_BODY_10011, "{what}: merged");
+                    assert_resealed(&after, &kp, &format!("{what}: candidate"));
+                    let provenance = provenance.expect("provenance row");
+                    assert_resealed(&provenance, &kp, &format!("{what}: provenance"));
+                }
+            }
+        }
     }
 }

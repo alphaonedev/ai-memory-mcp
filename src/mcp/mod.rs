@@ -4548,9 +4548,19 @@ pub fn run_mcp_server(
     crate::mcp::stdio_guard::enforce_stdin_is_inherited_channel()?;
 
     // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
-    let _ = crate::identity::resolve_mcp_read_visibility_caller()?;
+    let session_agent = crate::identity::resolve_mcp_read_visibility_caller()?;
 
     let mut conn = db::open(db_path)?;
+
+    // #9926 — install the stdio session signer when
+    // AI_MEMORY_MCP_SIGNING_KEY_FILE is set (a no-op when unset). Every
+    // refusal (unsafe key file, drift from the bound key, unbound agent)
+    // aborts boot before the stdio loop opens, under both REQUIRE settings.
+    crate::identity::session_signer::install_from_env(
+        &conn,
+        session_agent.as_deref(),
+        app_config.mcp_federation_forward_url.is_some(),
+    )?;
 
     // #1775 — boot WARN when archive_on_gc is explicitly false (the GC
     // sweep + memory_forget become permanent hard-delete with no archive

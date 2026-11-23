@@ -558,7 +558,14 @@ pub fn reflect_with_hooks_for_caller(
     // Build the system-generated reflection_metadata block. The caller-
     // supplied object wins on key collisions — if `reflection_metadata`
     // is already set, we leave it alone.
-    let now = Utc::now().to_rfc3339();
+    // #9926 — a reflection the stdio session signer will seal needs the
+    // canonical storage-stable `created_at` the signature covers.
+    let session_sealed = crate::identity::session_signer::covers(&input.agent_id);
+    let now = if session_sealed {
+        crate::identity::attest::now_attestable_rfc3339()
+    } else {
+        Utc::now().to_rfc3339()
+    };
     let mut metadata = match input.metadata.clone() {
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),
@@ -589,17 +596,15 @@ pub fn reflect_with_hooks_for_caller(
     // land `attest_level` on the durable row — closing the census hole a
     // gated (pending-approval) reflection would otherwise re-open now that the
     // stamp is kept OUT of the pending payload (#1176 caller-intent purity).
-    // A reflection is never cryptographically signed, so `claimed` is its
-    // only legitimate level; insert-if-absent (never overwrite) preserves an
-    // upstream `claimed` (the SAL reflect gate already stamped it on its
-    // clone) and structurally cannot downgrade an `agent_attested` value.
+    // A reflection presents no caller signature, so `claimed` is its level
+    // unless the stdio session signer seals it below (#9926), which
+    // OVERWRITES the stamp with `agent_attested` after verifying its own
+    // signature; insert-if-absent (never overwrite) preserves an upstream
+    // `claimed` (the SAL reflect gate already stamped it on its clone) and
+    // structurally cannot downgrade an `agent_attested` value.
     crate::identity::attest::stamp_claimed_if_absent(&mut metadata_value);
-    // Re-validate the merged metadata so an oversized splice surfaces
-    // here (vs. a confusing DB constraint error later).
-    validate::validate_metadata(&metadata_value)
-        .map_err(|e| ReflectError::Validation(e.to_string()))?;
 
-    let new_mem = Memory {
+    let mut new_mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         valid_from: None,
         valid_until: None,
@@ -635,6 +640,23 @@ pub fn reflect_with_hooks_for_caller(
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
     };
+
+    // #9926 — the stdio session signer seals a reflection of its own agent
+    // (sign, verify against the bound key, stamp `agent_attested`, admit to
+    // the replay ledger, persist the signature). A refusal refuses the
+    // reflection; there is no fallback to `claimed`. No signer (HTTP, CLI)
+    // or another agent leaves the row exactly as before.
+    {
+        use crate::identity::session_signer::{SealOutcome, seal_sync};
+        match seal_sync(conn, &mut new_mem, &input.agent_id) {
+            SealOutcome::Signed | SealOutcome::UnsignedOtherAgent => {}
+            SealOutcome::Refused(reason) => return Err(ReflectError::Validation(reason)),
+        }
+    }
+    // Re-validate the merged metadata so an oversized splice surfaces
+    // here (vs. a confusing DB constraint error later).
+    validate::validate_metadata(&new_mem.metadata)
+        .map_err(|e| ReflectError::Validation(e.to_string()))?;
 
     // Atomic boundary: insert the reflection row + N `reflects_on`
     // links inside a single BEGIN IMMEDIATE ... COMMIT block. If any
