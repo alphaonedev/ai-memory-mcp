@@ -673,11 +673,17 @@ fn mutating_ssot_funnels_refuse_under_record_stop_b6() {
     });
     check_any!(
         "purge_archive",
-        ai_memory::db::purge_archive(&conn, None).map(|_| ())
+        ai_memory::db::purge_archive(&conn, ai_memory::validate::ArchivePurgeBound::AllRows)
+            .map(|_| ())
     );
     check_any!(
         "purge_archive_for_caller",
-        ai_memory::db::purge_archive_for_caller(&conn, "ai:x", None).map(|_| ())
+        ai_memory::db::purge_archive_for_caller(
+            &conn,
+            "ai:x",
+            ai_memory::validate::ArchivePurgeBound::AllRows
+        )
+        .map(|_| ())
     );
     check_any!(
         "set_embedding",

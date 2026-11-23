@@ -4263,7 +4263,7 @@ where
 #[must_use]
 pub fn spawn_gc_loop(
     state: Db,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
     interval: Duration,
 ) -> JoinHandle<()> {
     spawn_gc_loop_with_shadow_retention(
@@ -4328,6 +4328,12 @@ fn spawn_postgres_fold_loop_if_enabled(
     }
 }
 
+#[path = "daemon_runtime_maintenance_tick_10009.rs"]
+mod maintenance_tick_10009;
+#[cfg(feature = "sal")]
+pub use maintenance_tick_10009::pg_maintenance_tick;
+pub use maintenance_tick_10009::sqlite_gc_tick;
+
 /// FBL-22 (v1.0.0) — postgres-backed `serve` had NO periodic maintenance: the
 /// gc / archive-purge / lease-sweep loops spawned by `bootstrap_serve` all bind
 /// the local sqlite `Db` mutex and call rusqlite free-functions, so on a
@@ -4340,9 +4346,11 @@ fn spawn_postgres_fold_loop_if_enabled(
 /// This spawns the pg maintenance loop (mirroring the sqlite serve bootstrap)
 /// so the SAL trait methods that already exist —
 /// [`crate::store::MemoryStore::run_gc`],
-/// [`crate::store::MemoryStore::archive_purge`], and
+/// [`crate::store::MemoryStore::retention_purge`] (an unset bound deletes no
+/// archived row, #9945), and
 /// [`crate::store::MemoryStore::lease_sweep_expired`] — are driven on the
-/// `GC_INTERVAL_SECS` cadence. Paced + resumable (one chunked pass per tick per
+/// `GC_INTERVAL_SECS` cadence, one [`pg_maintenance_tick`] per interval
+/// (#10009). Paced + resumable (one chunked pass per tick per
 /// the fleet-manageability doctrine); a failure of any leg is WARNed and never
 /// aborts the loop (degrade, never corrupt). Fold-before-gc parity with the
 /// sqlite loop + the admin HTTP path (`handlers::admin`): the recall-access
@@ -4357,7 +4365,7 @@ fn spawn_postgres_maintenance_loop_if_enabled(
     backend: crate::handlers::StorageBackend,
     app: &AppState,
     archive_on_gc: bool,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
 ) {
     if !matches!(backend, crate::handlers::StorageBackend::Postgres) {
         return;
@@ -4376,63 +4384,7 @@ fn spawn_postgres_maintenance_loop_if_enabled(
             crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
         loop {
             tokio::time::sleep(interval).await;
-            // Fold-before-gc (pg twin of the sqlite loop): apply pending
-            // recall-access TTL extensions before evaluating eviction.
-            if let Err(e) = app.store.fold_recall_accesses().await {
-                tracing::warn!("pg-maint: recall-access fold failed (pre-gc): {e}");
-            }
-            match app.store.run_gc(archive_on_gc).await {
-                Ok(n) if n > 0 => tracing::info!("pg-maint: expired {n} memories"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!("pg-maint: run_gc failed: {e}"),
-            }
-            match app.store.archive_purge(&admin, archive_max_days).await {
-                Ok(n) if n > 0 => {
-                    tracing::info!("pg-maint: purged {n} old archived memories");
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("pg-maint: archive_purge failed: {e}"),
-            }
-            let now = chrono::Utc::now().timestamp();
-            match app.store.lease_sweep_expired(now).await {
-                Ok(n) if n > 0 => tracing::info!("pg-maint: reclaimed {n} expired leases"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!("pg-maint: lease_sweep_expired failed: {e}"),
-            }
-            // FBL-22 residual — K2 pending-timeout sweep on the pg corpus. The
-            // sqlite `spawn_pending_timeout_sweep_loop` binds the LOCAL sqlite
-            // `Db` mutex + the rusqlite free fn, so a postgres daemon never
-            // expired its governance `pending_actions` (approvable forever +
-            // unbounded queue growth). Drive the SAL trait method here and fan
-            // out the SAME `pending_action_expired` lifecycle event the sqlite
-            // loop dispatches — both backends fire the identical event shape.
-            match app
-                .store
-                .sweep_pending_action_timeouts(PENDING_TIMEOUT_DEFAULT_SECS)
-                .await
-            {
-                Ok(expired) if !expired.is_empty() => {
-                    tracing::info!(
-                        "pg-maint: expired {} stale pending_action(s)",
-                        expired.len()
-                    );
-                    for (id, namespace) in expired {
-                        crate::handlers::dispatch_event_postgres(
-                            &app,
-                            "pending_action_expired",
-                            &id,
-                            &namespace,
-                            None,
-                            None,
-                        )
-                        .await;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("pg-maint: sweep_pending_action_timeouts failed: {e}");
-                }
-            }
+            pg_maintenance_tick(&app, &admin, archive_on_gc, archive_max_days).await;
         }
     }));
 }
@@ -4540,7 +4492,7 @@ fn spawn_family_embedding_precompute_if_enabled(
 #[must_use]
 pub fn spawn_gc_loop_with_shadow_retention(
     state: Db,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
     shadow_retention_days: i64,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -4555,7 +4507,7 @@ pub fn spawn_gc_loop_with_shadow_retention(
 
 fn spawn_gc_loop_with_shadow_retention_tracked(
     state: Db,
-    archive_max_days: Option<i64>,
+    archive_max_days: Option<crate::validate::RetentionDays>,
     shadow_retention_days: i64,
     interval: Duration,
     blocking_tasks: Arc<AtomicUsize>,
@@ -4573,34 +4525,9 @@ fn spawn_gc_loop_with_shadow_retention_tracked(
         loop {
             tokio::time::sleep(interval).await;
             let lock = state.lock().await;
-            // v0.9.0 P0-1 (#1869) — fold-before-gc is LOAD-BEARING:
-            // with recall pure by default, a recalled row's TTL
-            // extension lives in unfolded `recall_observations` rows
-            // until a fold applies it. Folding at the TOP of every gc
-            // tick guarantees a recalled row is extended before
-            // eviction is evaluated — including when
-            // AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0 disables the
-            // dedicated fold loop (the fold then rides this tick).
-            match db::fold_recall_accesses(
-                &lock.0,
-                lock.2.short_extend_secs,
-                lock.2.mid_extend_secs,
-            ) {
-                Ok(n) if n > 0 => {
-                    tracing::info!("gc: folded recall accesses for {n} memories (pre-gc)");
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("recall-access fold failed (pre-gc): {e}"),
-            }
-            match db::gc(&lock.0, lock.3) {
-                Ok(n) if n > 0 => tracing::info!("gc: expired {n} memories"),
-                _ => {}
-            }
-            // Auto-purge old archives if configured
-            match db::auto_purge_archive(&lock.0, archive_max_days) {
-                Ok(n) if n > 0 => tracing::info!("gc: purged {n} old archived memories"),
-                _ => {}
-            }
+            // #10009 — fold, gc and the archive retention purge are one
+            // tick function the cells drive directly; same order as before.
+            sqlite_gc_tick(&lock.0, &lock.2, lock.3, archive_max_days);
             // #2064 — erasure cold-tier sweep: bundle committed archived
             // rows into (k, m) Reed-Solomon shard bundles, paced at
             // SWEEP_LIMIT_PER_TICK oldest-first per tick. No-op unless
@@ -4888,7 +4815,7 @@ pub struct ServeBootstrap {
     pub app_state: AppState,
     pub api_key_state: ApiKeyState,
     pub db_state: Db,
-    pub archive_max_days: Option<i64>,
+    pub archive_max_days: Option<crate::validate::RetentionDays>,
     pub task_handles: Vec<JoinHandle<()>>,
     /// Round-3 F12 — lifecycle outcome of the daemon's signing-keypair
     /// auto-gen path, captured by [`ensure_and_load_daemon_keypair`].
@@ -7775,7 +7702,7 @@ pub async fn bootstrap_serve(
     );
     task_handles.push(spawn_gc_loop_with_shadow_retention_tracked(
         db_state.clone(),
-        app_config.archive_max_days,
+        app_config.archive_retention(),
         shadow_retention_days,
         Duration::from_secs(GC_INTERVAL_SECS),
         Arc::clone(&blocking_tasks),
@@ -7871,7 +7798,7 @@ pub async fn bootstrap_serve(
             app_state.storage_backend,
             &app_state,
             pg_archive_on_gc,
-            app_config.archive_max_days,
+            app_config.archive_retention(),
         );
     }
 
@@ -8008,7 +7935,7 @@ pub async fn bootstrap_serve(
         app_state,
         api_key_state,
         db_state,
-        archive_max_days: app_config.archive_max_days,
+        archive_max_days: app_config.archive_retention(),
         task_handles,
         daemon_keypair_outcome,
         // H7 (v0.7.0 round-2) — per-request HTTP timeout (default 60s).
@@ -11649,7 +11576,7 @@ mod tests {
             crate::handlers::StorageBackend::Postgres,
             &app,
             true,
-            Some(90),
+            90_i64.try_into().ok(),
         );
         assert_eq!(
             handles.len(),
@@ -12072,9 +11999,9 @@ mod tests {
             ResolvedTtl::default(),
             true,
         )));
-        // archive_max_days=Some(1) lets the auto_purge_archive arm
-        // execute too (covers the second match in the loop body).
-        let h = spawn_gc_loop(state.clone(), Some(1), Duration::from_secs(60));
+        // A one-day archive bound also runs the auto_purge_archive arm.
+        let one_day = 1_i64.try_into().ok();
+        let h = spawn_gc_loop(state.clone(), one_day, Duration::from_secs(60));
         // Advance past two full intervals to give both branches multiple
         // chances to log under paused time.
         tokio::time::advance(Duration::from_secs(61)).await;
@@ -13321,8 +13248,8 @@ decision = "allow"
             ResolvedTtl::default(),
             true,
         )));
-        // Long interval — we just want the spawn + abort cycle.
-        let h = spawn_gc_loop_with_shadow_retention(state, Some(30), 7, Duration::from_secs(60));
+        let days = 30_i64.try_into().ok(); // long interval: spawn + abort only
+        let h = spawn_gc_loop_with_shadow_retention(state, days, 7, Duration::from_secs(60));
         // Give it a brief moment to enter the loop body.
         tokio::time::sleep(Duration::from_millis(20)).await;
         h.abort();
@@ -14405,8 +14332,8 @@ decision = "allow"
             ResolvedTtl::default(),
             true, // archive_on_gc
         )));
-        let h = spawn_gc_loop(state.clone(), Some(30), Duration::from_millis(1));
-        // Let several sweep ticks fire.
+        let days = 30_i64.try_into().ok(); // 30-day bound; several sweep ticks fire
+        let h = spawn_gc_loop(state.clone(), days, Duration::from_millis(1));
         tokio::time::sleep(Duration::from_millis(40)).await;
         h.abort();
         let _ = h.await;

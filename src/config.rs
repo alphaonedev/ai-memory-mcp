@@ -9250,6 +9250,37 @@ impl AppConfig {
         section.or(legacy).unwrap_or(DEFAULT_ARCHIVE_ON_GC)
     }
 
+    /// #9945 — the archive retention bound as configured: the documented
+    /// `[storage].archive_max_days` wins over the DEPRECATED flat key (the
+    /// [`AppConfig::effective_archive_on_gc`] precedence). Before #9945 the
+    /// serve loops read the flat key alone, so the `[storage]` key was dead.
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn effective_archive_max_days(&self) -> Option<i64> {
+        let section = self.storage.as_ref().and_then(|s| s.archive_max_days);
+        section.or(self.archive_max_days)
+    }
+
+    /// #9945 (GA standard 1) — the typed retention bound the maintenance
+    /// loops purge with. `None` (unset, zero, negative or past
+    /// [`crate::validate::MAX_DURATION_DAYS`]) disables the purge; a set
+    /// value that is refused WARNs once, so the operator sees why.
+    #[must_use]
+    pub fn archive_retention(&self) -> Option<crate::validate::RetentionDays> {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let days = self.effective_archive_max_days()?;
+        crate::validate::RetentionDays::new(days)
+            .inspect_err(|_| {
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "archive purge disabled: archive_max_days = {days} is outside 1..={}",
+                        crate::validate::MAX_DURATION_DAYS
+                    );
+                });
+            })
+            .ok()
+    }
+
     /// v1.0.0 #3385 — provenance of the [`AppConfig::effective_archive_on_gc`]
     /// value, reported by `ai-memory doctor` so an operator can see WHICH
     /// layer decided whether expiry is reversible.
@@ -10088,9 +10119,7 @@ impl AppConfig {
 
         let archive_on_gc = self.effective_archive_on_gc();
 
-        let archive_max_days = cfg
-            .and_then(|s| s.archive_max_days)
-            .or(self.archive_max_days);
+        let archive_max_days = self.effective_archive_max_days();
 
         let max_memory_mb = cfg.and_then(|s| s.max_memory_mb).or(self.max_memory_mb);
         // FBL-13 — `max_memory_mb` is DEAD config: it is parsed, migrated, and

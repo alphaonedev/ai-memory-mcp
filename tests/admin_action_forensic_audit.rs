@@ -24,9 +24,9 @@
 //!    with `actor` matching the authenticated caller, `decision=allow`,
 //!    and `payload.new_agent_id` matching the request body.
 //! 2. `purge_archive_emits_forensic_audit_entry` — DELETE to
-//!    `/api/v1/archive?older_than_days=0` lands a `kind=archive_purge`
-//!    row with `payload.older_than_days = 0`, even when the query
-//!    yields zero rows.
+//!    `/api/v1/archive?older_than_days=30` lands a `kind=archive_purge`
+//!    row with `payload.older_than_days = 30`, even when the query
+//!    yields zero rows (#9945: `0` is not a bound and is refused).
 
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 // `await_holding_lock` mirrors the discipline used in `tests/
@@ -328,7 +328,7 @@ async fn purge_archive_emits_forensic_audit_entry() {
     // the one wired in `src/lib.rs:352`.
     let req = Request::builder()
         .method("DELETE")
-        .uri("/api/v1/archive?older_than_days=0")
+        .uri("/api/v1/archive?older_than_days=30")
         .header("x-agent-id", "operator-alice")
         .body(Body::empty())
         .unwrap();
@@ -367,7 +367,7 @@ async fn purge_archive_emits_forensic_audit_entry() {
         row.get("payload")
             .and_then(|p| p.get("older_than_days"))
             .and_then(serde_json::Value::as_i64),
-        Some(0),
-        "payload.older_than_days must equal the query param (0); got row={row}"
+        Some(30),
+        "payload.older_than_days must equal the query param (30); got row={row}"
     );
 }

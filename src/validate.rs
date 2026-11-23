@@ -30,6 +30,11 @@ const MAX_METADATA_DEPTH: usize = 32;
 /// Keeps `chrono` duration construction and timestamp subtraction bounded.
 pub const MAX_DURATION_DAYS: i64 = 36_500;
 
+/// #9945 — the typed archive retention bound (`RetentionDays`) and the
+/// operator purge bound (`ArchivePurgeBound`).
+pub mod retention_days;
+pub use retention_days::{ArchivePurgeBound, RetentionDays, RetentionDaysError};
+
 /// Canonical role-categorical source values accepted by the substrate.
 ///
 /// **v0.7.x (issue #1175) — heterogeneous-NHI design:** the substrate is
@@ -821,8 +826,9 @@ pub fn validate_ttl_secs(ttl: Option<i64>) -> Result<()> {
 /// Validate a caller-controlled day count and subtract it from `now` using
 /// checked `chrono` operations.
 ///
-/// `minimum` expresses the surface contract: calibration passes `1`, while
-/// archive purge passes `0`. The upper bound is always
+/// `minimum` expresses the surface contract: confidence calibration passes
+/// `0`, while the archive retention bound ([`RetentionDays`], #9945) passes
+/// `1`. The upper bound is always
 /// [`MAX_DURATION_DAYS`].
 ///
 /// # Errors

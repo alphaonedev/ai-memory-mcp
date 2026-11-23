@@ -975,7 +975,7 @@ Permanently delete archived memories. Optionally only those older than N days. T
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `older_than_days` | integer | No | -- | Only purge entries archived more than N days ago. Omit to purge all |
+| `older_than_days` | integer | No | -- | Only purge entries archived more than N days ago (`1..=36500`; `0`, a negative or a malformed value is refused and deletes nothing). Omit to purge all |
 
 **Example request:**
 

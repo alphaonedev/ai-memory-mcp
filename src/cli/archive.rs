@@ -41,7 +41,7 @@ pub enum ArchiveAction {
     /// `forget` already required `--confirm-global` for a cross-namespace
     /// blast radius. It now mirrors `forget`'s guard.
     Purge {
-        /// Delete archive entries older than N days (all ages if omitted).
+        /// Delete archive entries older than N days, 1..=36500 (all ages if omitted).
         #[arg(long)]
         older_than_days: Option<i64>,
         /// #3013 — bound the purge to ONE namespace. Omit for the
@@ -153,6 +153,10 @@ pub fn run(
             confirm_global,
             dry_run,
         } => {
+            // #9945 — a present bound is `1..=36500`; refused before the
+            // dry run and the audit emit, so `--older-than-days 0` never
+            // reaches the storage cutoff. Absent stays the explicit purge-all.
+            let bound = crate::validate::ArchivePurgeBound::from_request(older_than_days)?;
             // #3013 — DRY-RUN first: query-only, destroys nothing, and is
             // therefore reachable WITHOUT `--confirm-global` so an operator
             // can measure the blast radius before opting into it. It
@@ -161,11 +165,8 @@ pub fn run(
             // a destructive decision and must not pollute the forensic chain
             // with an `allow` for a purge that never happened.
             if dry_run {
-                let would_purge = db::count_archive_purge_candidates(
-                    &conn,
-                    namespace.as_deref(),
-                    older_than_days,
-                )?;
+                let would_purge =
+                    db::count_archive_purge_candidates(&conn, namespace.as_deref(), bound)?;
                 if json_out {
                     writeln!(
                         out.stdout,
@@ -217,7 +218,7 @@ pub fn run(
                     .opt_ident_or_commit("namespace", namespace.as_deref()),
             );
 
-            let purged = db::purge_archive_scoped(&conn, namespace.as_deref(), older_than_days)?;
+            let purged = db::purge_archive_scoped(&conn, namespace.as_deref(), bound)?;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -668,27 +669,50 @@ mod tests {
         assert_eq!(archived_count(&db), 3);
     }
 
+    /// #9945 — `--older-than-days 0`, a negative and an over-cap bound are
+    /// refused with the exact reason, on the real and the dry run, and
+    /// destroy nothing. Pre-#9945 `0` swept every archived row.
     #[test]
-    fn test_archive_purge_clears_with_filter() {
-        // Seed + archive, then purge with older_than_days=0 — sweeps everything.
+    fn purge_refuses_non_positive_and_over_cap_bounds_9945() {
+        const CASES: [(i64, &str); 4] = [
+            (0, "older_than_days must be at least 1 day (got 0)"),
+            (-1, "older_than_days must be at least 1 day (got -1)"),
+            (
+                i64::MIN,
+                "older_than_days must be at least 1 day (got -9223372036854775808)",
+            ),
+            (
+                36_501,
+                "older_than_days must not exceed 36500 days (got 36501)",
+            ),
+        ];
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_and_archive(&db, "ns-purge", 2);
-        let args = ArchiveArgs {
-            action: ArchiveAction::Purge {
-                older_than_days: Some(0),
-                namespace: None,
-                confirm_global: true,
-                dry_run: false,
-            },
-        };
+        for (days, want) in CASES {
+            for dry_run in [false, true] {
+                let res = {
+                    let mut out = env.output();
+                    run(&db, purge(Some(days), None, true, dry_run), false, &mut out)
+                };
+                let err = res.expect_err("invalid bound must refuse").to_string();
+                assert_eq!(err, want, "days={days} dry_run={dry_run}");
+                assert_eq!(archived_count(&db), 2, "a refused purge destroys nothing");
+            }
+        }
+    }
+
+    /// #9945 — a positive bound keeps rows archived inside the window.
+    #[test]
+    fn purge_positive_bound_keeps_fresh_rows_9945() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_and_archive(&db, "ns-purge", 2);
         {
             let mut out = env.output();
-            run(&db, args, false, &mut out).unwrap();
+            run(&db, purge(Some(1), None, true, false), false, &mut out).unwrap();
         }
-        let s = env.stdout_str();
-        // Anything from 0 to 2 — depends on archive_age semantics on this
-        // SQLite build. The line itself must surface.
-        assert!(s.contains("purged"));
+        assert!(env.stdout_str().contains("purged 0 archived memories"));
+        assert_eq!(archived_count(&db), 2);
     }
 }

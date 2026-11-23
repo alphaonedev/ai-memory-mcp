@@ -316,6 +316,20 @@ pub async fn purge_archive(
         return resp;
     }
 
+    // #9945 (GA standard 1) — absent `older_than_days` is the explicit
+    // purge-all; a present bound is `1..=36500` or a 400 with the exact
+    // reason (pre-#9945 `0` and negatives reached the storage cutoff).
+    let bound = match validate::ArchivePurgeBound::from_request(q.older_than_days) {
+        Ok(bound) => bound,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
     // #911 (security-medium / SOC2, 2026-05-19) — admin action audit.
     // `archive_purge` permanently deletes archived memories; SOC2-grade
     // deployments must prove "who deleted what when". Forensic-chain
@@ -352,7 +366,7 @@ pub async fn purge_archive(
         crate::governance::action_labels::ARCHIVE_PURGE,
         "",
         crate::governance::audit::ForensicPayload::new()
-            .opt_number(field_names::OLDER_THAN_DAYS, q.older_than_days)
+            .opt_number(field_names::OLDER_THAN_DAYS, bound.days())
             .label(
                 field_names::OWNER_SCOPE,
                 if is_admin { "admin" } else { "caller" },
@@ -371,7 +385,13 @@ pub async fn purge_archive(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_admin_checked(caller.clone(), is_admin);
-        return match app.store.archive_purge(&ctx, q.older_than_days).await {
+        let purged = match bound {
+            validate::ArchivePurgeBound::OlderThan(days) => {
+                app.store.archive_purge(&ctx, days).await
+            }
+            validate::ArchivePurgeBound::AllRows => app.store.archive_purge_all(&ctx).await,
+        };
+        return match purged {
             Ok(n) => Json(json!({
                 "purged": n,
                 (field_names::OWNER_SCOPE): if is_admin { "admin" } else { "caller" },
@@ -386,13 +406,12 @@ pub async fn purge_archive(
     // can touch tens of thousands of archived rows; running it on the
     // tokio worker pinned the runtime for the whole DELETE.
     let caller_for_purge = caller.clone();
-    let older_than_days = q.older_than_days;
     let purge_result = super::transport::flatten_db_op(
         super::db_op(app.db.clone(), move |guard| {
             if is_admin {
-                db::purge_archive(&guard.0, older_than_days)
+                db::purge_archive(&guard.0, bound)
             } else {
-                db::purge_archive_for_caller(&guard.0, &caller_for_purge, older_than_days)
+                db::purge_archive_for_caller(&guard.0, &caller_for_purge, bound)
             }
         })
         .await,
