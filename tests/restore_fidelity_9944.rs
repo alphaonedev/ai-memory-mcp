@@ -54,6 +54,8 @@ use tempfile::TempDir;
 mod key_dir_sandbox;
 
 // #9944 - the one shared snapshot comparison (also used by the PG twin).
+#[path = "common/restore_seed.rs"]
+mod restore_seed;
 #[path = "common/restore_snapshot.rs"]
 mod restore_snapshot;
 
@@ -146,6 +148,33 @@ const A2A_NOT_IMPORTED: &str =
 /// leaves it `None` for the federation wire, so `export --full` never emits
 /// it and the import lands NULL. Defect #9948.
 const LINK_ATTEST_LEVEL_DROPPED: &str = "export_link_from_row leaves attest_level None, so export --full never carries it (defect #9948)";
+/// The main `export --full` cell seeds no identity lineage: `import` strips
+/// the `_agents` key binding before its lineage gate and then refuses every
+/// enrolled lineage as forged (#10027). The dedicated red cell
+/// `export_full_keeps_an_enrolled_identity_lineage_10027` seeds one.
+const LINEAGE_IMPORT_REFUSED: &str = "import strips the agent_pubkey binding before its lineage gate and refuses every enrolled lineage as forged (#10027)";
+/// The main convenience cell seeds no sealed live row: the convenience
+/// export/import writes it back as plaintext with no envelope (#10028). The
+/// dedicated red cell `convenience_export_keeps_a_sealed_row_sealed_10028`
+/// seeds one.
+const SEALED_ROW_UNSEALED: &str =
+    "the convenience export/import writes a sealed row back as plaintext with no envelope (#10028)";
+/// The convenience wire row (`models::Memory`) has no field for the
+/// atomisation, kind-provenance and entity-mention columns (#10029).
+const ATOM_COLUMNS_DROPPED: &str =
+    "the convenience wire row has no field for this memories column, so import lands NULL (#10029)";
+/// The convenience import lands every edge through `create_link`, which
+/// takes no validity window (#10030).
+const LINK_VALID_UNTIL_DROPPED: &str = "the convenience import re-creates each edge through create_link, which drops valid_until (#10030)";
+
+/// The v2 envelope carries live rows as `Memory`, which has no field for
+/// the atomisation, kind-provenance and entity-mention columns (#10031).
+const FULL_ATOM_COLUMNS_DROPPED: &str = "export --full emits live rows as Memory, which drops atomised_into, atom_of, kind_provenance and mentioned_entity_id (#10031)";
+
+/// `export --full` emits plaintext and the import re-seals against the
+/// destination policy, so a sealed row lands in plaintext on a node with
+/// at-rest encryption off; the main cell seeds no sealed row (#10032).
+const FULL_SEALED_ROW_UNSEALED: &str = "export --full then import unseals a sealed row on a destination with at-rest encryption off (#10032)";
 
 /// One live corpus row: `(title, namespace, tier, content, tags, with_embedding)`.
 type CorpusRow = (
@@ -304,6 +333,58 @@ impl RestorePath {
             Self::ExportImport => &EXPORT_IMPORT,
         }
     }
+
+    /// The corpus this path's main cell is proven on. Each `Absent` names
+    /// the tracked defect that makes the path lose that class; its dedicated
+    /// red cell seeds the class and stays red until the fix lands.
+    fn seed_shape(self) -> SeedShape {
+        match self {
+            Self::BackupRestore => SeedShape::FULL,
+            // #10027: import refuses an enrolled lineage as forged.
+            // #10032: the full pair unseals a sealed row.
+            Self::ExportFullImport => SeedShape {
+                lineage: Lineage::Absent,
+                sealed: Sealed::Absent,
+            },
+            // #10028: the convenience pair unseals a sealed row. The
+            // convenience format carries no lineage, and an imported
+            // `_agents` key binding is stripped by design (#3464).
+            Self::ExportImport => SeedShape {
+                lineage: Lineage::Absent,
+                sealed: Sealed::Absent,
+            },
+        }
+    }
+}
+
+/// Whether the corpus enrols an identity lineage (enrol, succession and a
+/// guardian recovery) for `LINEAGE_AGENT` (CBC-02: an enum, not a bool).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lineage {
+    Enrolled,
+    Absent,
+}
+
+/// Whether the corpus holds a sealed live row (#10015).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sealed {
+    Present,
+    Absent,
+}
+
+/// The classes a corpus seeds beyond the fixed rows.
+#[derive(Clone, Copy, Debug)]
+struct SeedShape {
+    lineage: Lineage,
+    sealed: Sealed,
+}
+
+impl SeedShape {
+    /// Every class seeded.
+    const FULL: Self = Self {
+        lineage: Lineage::Enrolled,
+        sealed: Sealed::Present,
+    };
 }
 
 static BACKUP_RESTORE: Classification = Classification {
@@ -366,7 +447,16 @@ static BACKUP_RESTORE: Classification = Classification {
     ],
     lossy: &[],
     rederived: &[],
-    sparse: &[],
+    sparse: &[
+        (
+            "schema_version",
+            "by design: one row, the store's schema version; a second row is an invalid store",
+        ),
+        (
+            "memories_fts_config",
+            "by design: FTS5 writes one config row (the version key) per index",
+        ),
+    ],
     null_columns: &[],
     schema: SchemaBaseline::Source,
 };
@@ -442,10 +532,21 @@ static EXPORT_FULL_IMPORT: Classification = Classification {
         ("archived_memories", "cid", ARCHIVED_CID_NOT_TRUSTED),
         ("archived_memories", "cid_genesis", ARCHIVED_CID_NOT_TRUSTED),
         ("memory_links", "attest_level", LINK_ATTEST_LEVEL_DROPPED),
+        ("memories", "atomised_into", FULL_ATOM_COLUMNS_DROPPED),
+        ("memories", "atom_of", FULL_ATOM_COLUMNS_DROPPED),
+        ("memories", "kind_provenance", FULL_ATOM_COLUMNS_DROPPED),
+        ("memories", "mentioned_entity_id", FULL_ATOM_COLUMNS_DROPPED),
     ],
     rederived: &[],
-    sparse: &[],
-    null_columns: &[],
+    sparse: &[("agent_lineage", LINEAGE_IMPORT_REFUSED)],
+    null_columns: &[
+        ("memories", "encrypted_envelope", FULL_SEALED_ROW_UNSEALED),
+        (
+            "archived_memories",
+            "encrypted_envelope",
+            FULL_SEALED_ROW_UNSEALED,
+        ),
+    ],
     schema: SchemaBaseline::Destination,
 };
 
@@ -576,6 +677,11 @@ static EXPORT_IMPORT: Classification = Classification {
         ("memories", "embedding_space", VECTOR_NOT_EXPORTED),
         ("memory_links", "signature", CONVENIENCE_LINK_UNSIGNED),
         ("memory_links", "observed_by", CONVENIENCE_LINK_UNSIGNED),
+        ("memories", "atomised_into", ATOM_COLUMNS_DROPPED),
+        ("memories", "atom_of", ATOM_COLUMNS_DROPPED),
+        ("memories", "kind_provenance", ATOM_COLUMNS_DROPPED),
+        ("memories", "mentioned_entity_id", ATOM_COLUMNS_DROPPED),
+        ("memory_links", "valid_until", LINK_VALID_UNTIL_DROPPED),
     ],
     rederived: &[
         Rederived {
@@ -598,7 +704,7 @@ static EXPORT_IMPORT: Classification = Classification {
         },
     ],
     sparse: &[],
-    null_columns: &[],
+    null_columns: &[("memories", "encrypted_envelope", SEALED_ROW_UNSEALED)],
     schema: SchemaBaseline::Destination,
 };
 
@@ -654,12 +760,14 @@ fn corpus_memory(title: &str, ns: &str, tier: Tier, content: &str, tags: &[&str]
 struct Corpus {
     live: Vec<String>,
     archived: String,
+    /// The sealed row's id, when the shape seeds one.
+    encrypted: Option<String>,
 }
 
 /// Build the corpus in `db` through the storage funnels the product writes
 /// with: insert, set_embedding, create_link (one unsigned, one signed),
 /// set_namespace_standard, archive_memory.
-fn seed(db: &Path) -> Corpus {
+fn seed(db: &Path, shape: SeedShape) -> Corpus {
     // Initialise the schema through the binary, exactly as a deployment does.
     ai_memory(db).args(["stats"]).assert().success();
     // The binary boots with the lineage DAG on (compiled default, config.rs
@@ -669,7 +777,10 @@ fn seed(db: &Path) -> Corpus {
     let conn = ai_memory::db::open(db).expect("open corpus db");
     let mut live = Vec::new();
     for (i, (title, ns, tier, content, tags, with_emb)) in LIVE_ROWS.iter().enumerate() {
-        let mem = corpus_memory(title, ns, tier.clone(), content, tags);
+        let mut mem = corpus_memory(title, ns, tier.clone(), content, tags);
+        if i == EDGE_ROW {
+            set_edge_fields(&mut mem);
+        }
         let id = ai_memory::db::insert(&conn, &mem).expect("insert corpus row");
         if *with_emb {
             ai_memory::db::set_embedding(&conn, &id, &embedding(i), EMBEDDING_SPACE)
@@ -692,19 +803,396 @@ fn seed(db: &Path) -> Corpus {
         .expect("namespace standard A");
     ai_memory::db::set_namespace_standard(&conn, NAMESPACE_B, &live[3], Some(NAMESPACE_A))
         .expect("namespace standard B");
-    assert!(
-        ai_memory::db::archive_memory(&conn, &archived, Some(ARCHIVE_REASON)).expect("archive"),
-        "the archived corpus row must move to the archive"
+    // #10014 - a second archived row with links on both sides, so the
+    // archive tables hold two rows each.
+    let mut second = corpus_memory(
+        ARCHIVED_SECOND_TITLE,
+        NAMESPACE_B,
+        Tier::Mid,
+        ARCHIVED_SECOND_CONTENT,
+        &["archived", "second"],
     );
-    Corpus { live, archived }
+    set_edge_fields(&mut second);
+    let archived_second = ai_memory::db::insert(&conn, &second).expect("insert archived row 2");
+    ai_memory::db::create_link(&conn, &live[1], &archived_second, LINK_RELATION)
+        .expect("link to archived 2");
+    ai_memory::db::create_link(&conn, &archived_second, &live[2], LINK_RELATION)
+        .expect("link from archived 2");
+    set_raw_edge_columns(&conn, &live, &archived_second, shape.sealed);
+    for id in [&archived, &archived_second] {
+        assert!(
+            ai_memory::db::archive_memory(&conn, id, Some(ARCHIVE_REASON)).expect("archive"),
+            "the archived corpus row must move to the archive"
+        );
+    }
+    let encrypted = match shape.sealed {
+        Sealed::Present => Some(seed_encrypted_row(&conn)),
+        Sealed::Absent => None,
+    };
+    seed_signed_spine(&conn, db, &live, shape.lineage);
+    restore_seed::seed_node_local(&conn, &live);
+    // A store at rest has been opened by the binary since its last write:
+    // boot records the lineage high-water marks (`schema_integrity::
+    // enforce_lineage_watermarks`), so the export path's own open cannot
+    // be mistaken for a change to the source.
+    ai_memory(db).args(["stats"]).assert().success();
+    Corpus {
+        live,
+        archived,
+        encrypted,
+    }
 }
+
+/// The live row that carries every optional column (#10015).
+const EDGE_ROW: usize = 2;
+const ARCHIVED_SECOND_TITLE: &str = "fidelity 9944 archived second";
+const ARCHIVED_SECOND_CONTENT: &str = "the second archived row, linked both ways";
+/// The plaintext the encrypted corpus row seals (#10015).
+const SEALED_PLAINTEXT: &str = "sealed fidelity 9944 plaintext ✓";
+const SEALED_TITLE: &str = "fidelity 9944 encrypted";
+const LINEAGE_AGENT: &str = "ai:fidelity-9944-lineage";
+const SPINE_TS: [&str; 2] = [
+    "2031-04-05T08:00:00.000000+00:00",
+    "2031-04-06T09:15:00.250000+00:00",
+];
+
+/// Set every optional `Memory` field the struct carries (#10015).
+fn set_edge_fields(mem: &mut Memory) {
+    use ai_memory::models::{Citation, ConfidenceSignals, SourceSpan};
+    mem.last_accessed_at = Some("2031-04-03T09:00:00.000000+00:00".to_string());
+    mem.expires_at = Some("2099-01-01T00:00:00.000000+00:00".to_string());
+    mem.entity_id = Some("entity-fidelity-9944".to_string());
+    mem.persona_version = Some(3);
+    mem.citations = vec![Citation {
+        uri: "uri:https://example.invalid/fidelity-9944".to_string(),
+        accessed_at: "2031-04-01T00:00:00.000000+00:00".to_string(),
+        hash: Some("ab".repeat(32)),
+        span: Some(SourceSpan { start: 1, end: 4 }),
+    }];
+    mem.source_uri = Some("uri:https://example.invalid/fidelity-9944/source".to_string());
+    mem.source_span = Some(SourceSpan { start: 2, end: 9 });
+    mem.confidence_signals = Some(ConfidenceSignals {
+        source_age_days: 1.5,
+        atom_derivation: true,
+        prior_corroboration_count: 2,
+        freshness_factor: 0.75,
+        baseline_per_source: 0.625,
+    });
+    mem.confidence_decayed_at = Some("2031-04-04T00:00:00.000000+00:00".to_string());
+    mem.valid_from = Some("2031-01-01T00:00:00.000000+00:00".to_string());
+    mem.valid_until = Some("2098-12-31T23:59:59.000000+00:00".to_string());
+    if let Some(obj) = mem.metadata.as_object_mut() {
+        obj.insert("target_agent_id".into(), serde_json::json!(LINEAGE_AGENT));
+    }
+}
+
+/// The edge columns no `Memory` field writes (atom lineage, the mentioned
+/// entity, kind provenance), set with the product's own column values.
+///
+/// Runs before the archive step, so the second archived row and its links
+/// carry every column into the archive tables.
+fn set_raw_edge_columns(
+    conn: &rusqlite::Connection,
+    live: &[String],
+    archived_second: &str,
+    sealed: Sealed,
+) {
+    conn.execute(
+        "UPDATE memories SET atomised_into = 1 WHERE id = ?1",
+        rusqlite::params![&live[0]],
+    )
+    .expect("atomised_into");
+    for (id, atomised) in [
+        (&live[EDGE_ROW], None),
+        (&archived_second.to_string(), Some(2_i64)),
+    ] {
+        conn.execute(
+            "UPDATE memories SET atom_of = ?1, mentioned_entity_id = ?2, \
+             kind_provenance = 'declared', atomised_into = COALESCE(?3, atomised_into) \
+             WHERE id = ?4",
+            rusqlite::params![&live[0], "entity-fidelity-9944", atomised, id],
+        )
+        .expect("atom_of");
+    }
+    if sealed == Sealed::Present {
+        let kp =
+            ai_memory::encryption::get_or_create_keypair(CORPUS_AGENT).expect("x25519 keypair");
+        let envelope = ai_memory::encryption::encrypt(ARCHIVED_SECOND_CONTENT, &kp.public)
+            .expect("seal archived row");
+        conn.execute(
+            "UPDATE memories SET encrypted_envelope = ?1 WHERE id = ?2",
+            rusqlite::params![envelope.to_bytes(), archived_second],
+        )
+        .expect("archived envelope");
+    }
+    // Every optional link column, on a live link and on an archived one. The
+    // live link stays unsigned (the signed corpus link carries a real
+    // signature); the archived link's signature bytes are copied verbatim.
+    let archived_target = archived_second.to_string();
+    for (source, target, signature) in [
+        (&live[0], &live[1], None),
+        (&live[1], &archived_target, Some(vec![0x55_u8; 64])),
+    ] {
+        let changed = conn
+            .execute(
+                "UPDATE memory_links SET valid_from = ?1, valid_until = ?2, observed_by = ?3, \
+                 signature = COALESCE(?4, signature) WHERE source_id = ?5 AND target_id = ?6",
+                rusqlite::params![
+                    "2031-02-01T00:00:00.000000+00:00",
+                    "2097-02-01T00:00:00.000000+00:00",
+                    LINEAGE_AGENT,
+                    signature,
+                    source,
+                    target
+                ],
+            )
+            .expect("link edge columns");
+        assert_eq!(changed, 1, "one link {source} -> {target}");
+    }
+}
+
+/// One row whose content is sealed (#10015): empty content, the envelope in
+/// `encrypted_envelope`.
+fn seed_encrypted_row(conn: &rusqlite::Connection) -> String {
+    let kp = ai_memory::encryption::get_or_create_keypair(CORPUS_AGENT).expect("x25519 keypair");
+    let envelope =
+        ai_memory::encryption::encrypt(SEALED_PLAINTEXT, &kp.public).expect("seal plaintext");
+    let mem = corpus_memory(SEALED_TITLE, NAMESPACE_A, Tier::Long, "", &["sealed"]);
+    let id = ai_memory::db::insert(conn, &mem).expect("insert sealed row");
+    conn.execute(
+        "UPDATE memories SET encrypted_envelope = ?1 WHERE id = ?2",
+        rusqlite::params![envelope.to_bytes(), &id],
+    )
+    .expect("store envelope");
+    id
+}
+
+/// Assert the restored sealed row holds an envelope that decrypts to the
+/// written plaintext (#10015).
+fn assert_sealed_row_decrypts(s: &StoreSnapshot, id: &str) {
+    let rows = s.rows_where("memories", "id", id);
+    assert_eq!(rows.len(), 1, "the sealed row is restored");
+    let Some(SqlValue::Blob(bytes)) = rows[0].get("encrypted_envelope") else {
+        panic!("the restored sealed row holds no envelope BLOB");
+    };
+    let kp = ai_memory::encryption::get_or_create_keypair(CORPUS_AGENT).expect("x25519 keypair");
+    let parsed = ai_memory::encryption::Envelope::from_bytes(bytes).expect("parse envelope");
+    let plain = ai_memory::encryption::decrypt(&parsed, &kp.secret).expect("decrypt envelope");
+    assert_eq!(plain, SEALED_PLAINTEXT, "the restored envelope decrypts");
+}
+
+/// The Portability v2 record classes, two rows each, through the product
+/// funnels (#10014).
+fn seed_signed_spine(conn: &rusqlite::Connection, db: &Path, live: &[String], lineage: Lineage) {
+    use ai_memory::governance::rules_store::{self, Rule};
+    use ai_memory::revisions::{RecordKind, RevisionLeaf, append_revision_leaf};
+    use ai_memory::signed_events::{SignedEvent, append_signed_event, payload_hash};
+    use ai_memory::storage::model_attest;
+    for (k, ts) in SPINE_TS.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at, agent_id, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                format!("fidelity-9944-forgotten-{k}"),
+                NAMESPACE_A,
+                ts,
+                CORPUS_AGENT,
+                vec![0x11_u8.wrapping_add(u8::try_from(k).expect("small")); 64]
+            ],
+        )
+        .expect("tombstone");
+        let leaf = RevisionLeaf::new(
+            format!("fidelity-9944-rev-{k}"),
+            &live[k],
+            RecordKind::Supersede,
+            Some(i64::try_from(k).expect("small").saturating_add(1)),
+            NAMESPACE_A,
+            Some(CORPUS_AGENT.to_string()),
+            *ts,
+        );
+        append_revision_leaf(conn, &leaf).expect("revision leaf");
+        conn.execute(
+            "INSERT INTO model_attestations (id, provider, model_ref, model_digest, model_family, \
+             attest_level, agent_id, signature, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                format!("fidelity-9944-ma-{k}"),
+                "openrouter",
+                format!("google/gemma-4-31b-{k}"),
+                format!("sha256:{}", "cd".repeat(32)),
+                "gemma",
+                model_attest::ATTEST_LEVEL_LOADER_OBSERVED,
+                CORPUS_AGENT,
+                vec![0x22_u8; 64],
+                ts
+            ],
+        )
+        .expect("model attestation");
+        rules_store::insert(
+            conn,
+            &Rule {
+                id: format!("FID-9944-{k}"),
+                kind: "namespace_deny".into(),
+                matcher: format!("secret-{k}/*"),
+                severity: "warn".into(),
+                reason: format!("fidelity 9944 rule {k}"),
+                namespace: NAMESPACE_A.into(),
+                created_by: CORPUS_AGENT.into(),
+                created_at: 1_700_000_000_i64.saturating_add(i64::try_from(k).expect("small")),
+                enabled: k == 0,
+                signature: Some(vec![0x33_u8; 64]),
+                attest_level: "unsigned".into(),
+            },
+        )
+        .expect("governance rule");
+        let ev = SignedEvent {
+            id: format!("fidelity-9944-ev-{k}"),
+            agent_id: CORPUS_AGENT.into(),
+            event_type: "memory_link.created".into(),
+            payload_hash: payload_hash(format!("payload-{k}").as_bytes()),
+            signature: Some(vec![0x44_u8; 64]),
+            attest_level: "unsigned".into(),
+            timestamp: (*ts).into(),
+            cause_hash: Some(payload_hash(format!("cause-{k}").as_bytes())),
+            ..SignedEvent::default()
+        };
+        append_signed_event(conn, &ev).expect("signed event");
+    }
+    ai_memory::db::register_agent(conn, LINEAGE_AGENT, "ai:test", &[]).expect("register agent");
+    if lineage == Lineage::Enrolled {
+        let k0 = ai_memory::identity::keypair::generate(LINEAGE_AGENT).expect("k0");
+        let recovery = ai_memory::identity::keypair::generate(LINEAGE_AGENT).expect("recovery");
+        ai_memory::db::enroll_lineage(conn, LINEAGE_AGENT, &k0, Some(&recovery.public_base64()))
+            .expect("enroll lineage");
+        let k1 = ai_memory::identity::keypair::generate(LINEAGE_AGENT).expect("k1");
+        ai_memory::db::append_succession(conn, LINEAGE_AGENT, &k0, &k1.public_base64(), None)
+            .expect("append succession");
+        seed_recovery_record(conn, db);
+    }
+    conn.execute(
+        "UPDATE memory_revisions SET signature = ?1 WHERE id = 'fidelity-9944-rev-1'",
+        rusqlite::params![vec![0x77_u8; 64]],
+    )
+    .expect("revision signature");
+}
+
+/// A genuine 2-of-2 guardian-quorum recovery record at epoch 2, so the
+/// recovery-only lineage columns (`suspected_compromise_from_seq`,
+/// `guardian_set_id`, `recovery_threshold`) hold values. The guardians sign
+/// the product's own `LineageRecord::recovery` signing input, and the record
+/// is persisted by the shipped `identity recover` verb (`append_recovery`),
+/// which verifies the quorum and writes the append-only witness in the same
+/// transaction. The guardian env goes to that child process only.
+fn seed_recovery_record(conn: &rusqlite::Connection, db: &Path) {
+    use ai_memory::identity::lineage::{LineageRecord, guardian_set_id_digest};
+    use base64::Engine as _;
+    use ed25519_dalek::Signer;
+    let (head, _) = ai_memory::db::lineage_head(conn, LINEAGE_AGENT)
+        .expect("lineage head")
+        .expect("enrolled lineage");
+    let guardians = guardian_keys();
+    let set_id = guardian_set_id_digest(
+        &guardians
+            .iter()
+            .map(ed25519_dalek::SigningKey::verifying_key)
+            .collect::<Vec<_>>(),
+    );
+    let k2 = ai_memory::identity::keypair::generate(LINEAGE_AGENT).expect("k2");
+    let successor = k2.public_base64();
+    let record = LineageRecord::recovery(
+        &head,
+        &successor,
+        Some(RECOVERY_COMPROMISE_SEQ),
+        head.recovery_pubkey_b64.clone(),
+        set_id,
+        RECOVERY_THRESHOLD,
+        RECOVERY_NOT_BEFORE,
+    )
+    .expect("recovery record");
+    let input = record.signing_input().expect("recovery signing input");
+    let mut cmd = ai_memory(db);
+    cmd.env(
+        ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV,
+        guardian_pubkeys_env(),
+    )
+    .env(
+        ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV,
+        RECOVERY_THRESHOLD.to_string(),
+    )
+    .args([
+        "identity",
+        "recover",
+        "--agent-id",
+        LINEAGE_AGENT,
+        "--successor-pubkey",
+        &successor,
+        "--not-before",
+        RECOVERY_NOT_BEFORE,
+        "--from-seq",
+        &RECOVERY_COMPROMISE_SEQ.to_string(),
+    ]);
+    for g in &guardians {
+        let attestation = format!(
+            "{}:{}",
+            ai_memory::identity::keypair::encode_public_base64(&g.verifying_key()),
+            base64::engine::general_purpose::STANDARD.encode(g.sign(&input).to_bytes())
+        );
+        cmd.args(["--attestation", &attestation]);
+    }
+    cmd.assert().success();
+}
+
+/// The two recovery guardians, from fixed seeds so the importing process can
+/// enrol the same set through the guardian env.
+fn guardian_keys() -> [ed25519_dalek::SigningKey; 2] {
+    [
+        ed25519_dalek::SigningKey::from_bytes(&[0xA1_u8; 32]),
+        ed25519_dalek::SigningKey::from_bytes(&[0xA2_u8; 32]),
+    ]
+}
+
+/// The guardian env value (comma-joined public keys) for an importer.
+fn guardian_pubkeys_env() -> String {
+    guardian_keys()
+        .iter()
+        .map(|g| ai_memory::identity::keypair::encode_public_base64(&g.verifying_key()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The compromise window a recovery record commits (#10015).
+const RECOVERY_COMPROMISE_SEQ: u64 = 7;
+/// The M of the 2-of-2 guardian quorum (#10015).
+const RECOVERY_THRESHOLD: u64 = 2;
+/// An enrolled corpus writes at least the enrol, succession and recovery
+/// lineage rows.
+const MIN_LINEAGE_ROWS: usize = 3;
+/// The recovery record's `not_before`, after the succession's.
+const RECOVERY_NOT_BEFORE: &str = "2099-01-01T00:00:00Z";
 
 /// Assert the corpus really holds every field class the paths must carry, so
 /// a green comparison is never vacuous.
-fn assert_corpus_is_rich(s: &StoreSnapshot) {
+fn assert_corpus_is_rich(s: &StoreSnapshot, shape: SeedShape) {
     let rows = |t: &str| s.tables.get(t).map_or(0, |t| t.rows.len());
-    assert_eq!(rows("memories"), LIVE_ROWS.len(), "live rows");
-    assert_eq!(rows("archived_memories"), 1, "archived rows");
+    // The live rows, the `_agents` registration row and, when seeded, the
+    // sealed row.
+    let sealed_rows = match shape.sealed {
+        Sealed::Present => 1,
+        Sealed::Absent => 0,
+    };
+    assert_eq!(
+        rows("memories"),
+        LIVE_ROWS.len() + 1 + sealed_rows,
+        "live rows"
+    );
+    let lineage_rows = rows("agent_lineage");
+    match shape.lineage {
+        Lineage::Enrolled => assert!(
+            lineage_rows >= MIN_LINEAGE_ROWS,
+            "an enrolled lineage holds enrol, succession and recovery rows, got {lineage_rows}"
+        ),
+        Lineage::Absent => assert_eq!(lineage_rows, 0, "no lineage seeded"),
+    }
+    assert_eq!(rows("archived_memories"), 2, "archived rows");
     assert!(rows("namespace_meta") >= 2, "namespace_meta rows");
     assert!(rows("memory_links") >= 2, "live links");
     let mem = &s.tables["memories"];
@@ -773,6 +1261,14 @@ fn export_import(src: &Path, dir: &Path, full: bool) -> (PathBuf, Vec<SchemaObje
     ai_memory(&dest).args(["stats"]).assert().success();
     let fresh_schema = snapshot(&dest).schema;
     let imp = ai_memory(&dest)
+        .env(
+            ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV,
+            guardian_pubkeys_env(),
+        )
+        .env(
+            ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV,
+            RECOVERY_THRESHOLD.to_string(),
+        )
         .args(["import", "--trust-source"])
         .write_stdin(out.stdout)
         .output()
@@ -793,32 +1289,64 @@ struct Cell {
     source: SourceStore,
     restored: StoreSnapshot,
     destination_schema: Vec<SchemaObject>,
+    /// The id of the sealed row (#10015), when the shape seeds one.
+    encrypted: Option<String>,
 }
 
-fn run_path(path: RestorePath) -> Cell {
+/// One run of `path` over a corpus of `shape`, with no classification: the
+/// source and restored snapshots, the destination's pre-import schema and
+/// the corpus ids. The red cells read it directly.
+struct RawRun {
+    before: StoreSnapshot,
+    restored: StoreSnapshot,
+    destination_schema: Vec<SchemaObject>,
+    corpus: Corpus,
+}
+
+/// Seed a corpus of `shape`, run `path`, and check the source is unchanged.
+/// `refuse` runs on the source snapshot before the path does, so a corpus
+/// that cannot prove the path is refused before paying for the run.
+fn run_raw_checked(
+    path: RestorePath,
+    shape: SeedShape,
+    refuse: impl FnOnce(&StoreSnapshot),
+) -> RawRun {
     let tmp = TempDir::new().expect("tempdir");
     let src = tmp.path().join("source.db");
-    seed(&src);
+    let corpus = seed(&src, shape);
     let before = snapshot(&src);
-    assert_corpus_is_rich(&before);
-    // Refuse a corpus that cannot prove the path before paying for the run.
-    let source = source_store(path.class(), before);
+    assert_corpus_is_rich(&before, shape);
+    refuse(&before);
     let (restored, destination_schema) = match path {
         RestorePath::BackupRestore => (backup_restore(&src, tmp.path()), Vec::new()),
         RestorePath::ExportFullImport => export_import(&src, tmp.path(), true),
         RestorePath::ExportImport => export_import(&src, tmp.path(), false),
     };
     // The source is never changed by taking the copy.
-    let after = snapshot(&src);
-    assert_eq!(
-        source.snapshot(),
-        &after,
-        "{path:?} changed its SOURCE store"
-    );
-    Cell {
-        source,
+    assert_eq!(before, snapshot(&src), "{path:?} changed its SOURCE store");
+    RawRun {
+        before,
         restored: snapshot(&restored),
         destination_schema,
+        corpus,
+    }
+}
+
+fn run_raw(path: RestorePath, shape: SeedShape) -> RawRun {
+    run_raw_checked(path, shape, |_| {})
+}
+
+/// The main cell of `path`: its own seed shape, and a source that
+/// [`source_store`] accepts for the path's classification.
+fn run_path(path: RestorePath) -> Cell {
+    let run = run_raw_checked(path, path.seed_shape(), |before| {
+        drop(source_store(path.class(), before.clone()));
+    });
+    Cell {
+        source: source_store(path.class(), run.before),
+        restored: run.restored,
+        destination_schema: run.destination_schema,
+        encrypted: run.corpus.encrypted,
     }
 }
 
@@ -830,6 +1358,39 @@ fn assert_cell(path: RestorePath) {
         &cell.restored,
         &cell.destination_schema,
     );
+    match (path.seed_shape().sealed, &cell.encrypted) {
+        (Sealed::Present, Some(id)) => assert_sealed_row_decrypts(&cell.restored, id),
+        (Sealed::Absent, None) => {}
+        (sealed, id) => panic!("seed shape {sealed:?} disagrees with the sealed id {id:?}"),
+    }
+}
+
+/// The key and value columns a red cell compares, per row.
+type KeyedColumns = BTreeMap<Vec<Option<SqlValue>>, Vec<Option<SqlValue>>>;
+
+/// The rows of `table` keyed by `key`, each projected to `columns`.
+fn keyed_columns(s: &StoreSnapshot, table: &str, key: &[&str], columns: &[&str]) -> KeyedColumns {
+    let pick = |r: &Row, cols: &[&str]| cols.iter().map(|c| r.get(*c).cloned()).collect();
+    s.tables[table]
+        .rows
+        .iter()
+        .map(|r| (pick(r, key), pick(r, columns)))
+        .collect()
+}
+
+/// Some source row of `table` sets each of `columns` (the red cell is not
+/// vacuous), and the restore keeps them row for row.
+fn assert_columns_kept(run: &RawRun, table: &str, key: &[&str], columns: &[&str], defect: &str) {
+    let want = keyed_columns(&run.before, table, key, columns);
+    for (idx, col) in columns.iter().enumerate() {
+        assert!(
+            want.values()
+                .any(|v| v[idx].as_ref().is_some_and(|v| !v.is_null())),
+            "{table}.{col}: the corpus never sets it, so the cell would be vacuous"
+        );
+    }
+    let got = keyed_columns(&run.restored, table, key, columns);
+    assert_eq!(got, want, "{table} {columns:?} not kept ({defect})");
 }
 
 // ── the round-trip tests ────────────────────────────────────────────────────
@@ -856,8 +1417,9 @@ fn convenience_export_then_import_reproduces_memories_and_links_9944() {
 /// `LINK_ATTEST_LEVEL_DROPPED` lossy entry above in the same commit.
 #[test]
 fn export_full_keeps_every_link_attestation_9944() {
-    let cell = run_path(RestorePath::ExportFullImport);
-    let (src, restored) = (cell.source.snapshot(), &cell.restored);
+    let path = RestorePath::ExportFullImport;
+    let run = run_raw(path, path.seed_shape());
+    let (src, restored) = (&run.before, &run.restored);
     let key = |r: &Row| (r.get("source_id").cloned(), r.get("target_id").cloned());
     let attest = |s: &StoreSnapshot| -> BTreeMap<_, Option<SqlValue>> {
         s.tables["memory_links"]
@@ -878,13 +1440,174 @@ fn export_full_keeps_every_link_attestation_9944() {
     );
 }
 
+/// Defect #10027, red until it lands: `export --full` then `import` of a store
+/// with an enrolled identity lineage (enrol, succession, guardian recovery)
+/// must land every lineage row. Today `import` strips the `_agents` key
+/// binding before its lineage gate, the gate reads the stripped head as a
+/// forgery, and the import exits non-zero. The fix removes the
+/// `LINEAGE_IMPORT_REFUSED` sparse entry above in the same commit.
+#[test]
+fn export_full_keeps_an_enrolled_identity_lineage_10027() {
+    let run = run_raw(RestorePath::ExportFullImport, SeedShape::FULL);
+    let src = &run.before.tables["agent_lineage"];
+    assert!(
+        src.rows.len() >= MIN_LINEAGE_ROWS,
+        "the corpus enrols a lineage"
+    );
+    assert_eq!(
+        run.restored.tables["agent_lineage"].rows, src.rows,
+        "export --full lost the identity lineage (defect #10027)"
+    );
+}
+
+/// Defect #10028, red until it lands: the convenience export then import must
+/// keep a sealed row sealed (empty content, the envelope byte for byte). The
+/// fix removes the `SEALED_ROW_UNSEALED` null-column entry above.
+#[test]
+fn convenience_export_keeps_a_sealed_row_sealed_10028() {
+    let shape = SeedShape {
+        lineage: Lineage::Absent,
+        sealed: Sealed::Present,
+    };
+    let run = run_raw(RestorePath::ExportImport, shape);
+    let id = run
+        .corpus
+        .encrypted
+        .clone()
+        .expect("the shape seeds a sealed row");
+    assert_columns_kept(
+        &run,
+        "memories",
+        &["id"],
+        &["encrypted_envelope"],
+        "defect #10028",
+    );
+    let content = |s: &StoreSnapshot| {
+        s.tables["memories"]
+            .rows
+            .iter()
+            .find(|r| r.get("id") == Some(&SqlValue::Text(id.as_bytes().to_vec())))
+            .and_then(|r| r.get("content").cloned())
+    };
+    assert_eq!(
+        content(&run.restored),
+        content(&run.before),
+        "the convenience export unsealed a sealed row's content (defect #10028)"
+    );
+}
+
+/// Defect #10029, red until it lands: the convenience export then import must
+/// keep every atomisation, kind-provenance and entity-mention column. The fix
+/// removes the `ATOM_COLUMNS_DROPPED` lossy entries above.
+#[test]
+fn convenience_export_keeps_every_atomisation_column_10029() {
+    let path = RestorePath::ExportImport;
+    let run = run_raw(path, path.seed_shape());
+    assert_columns_kept(
+        &run,
+        "memories",
+        &["id"],
+        &[
+            "atomised_into",
+            "atom_of",
+            "kind_provenance",
+            "mentioned_entity_id",
+        ],
+        "defect #10029",
+    );
+}
+
+/// Defect #10030, red until it lands: the convenience export then import must
+/// keep every link's validity window. The fix removes the
+/// `LINK_VALID_UNTIL_DROPPED` lossy entry above.
+#[test]
+fn convenience_export_keeps_every_link_validity_window_10030() {
+    let path = RestorePath::ExportImport;
+    let run = run_raw(path, path.seed_shape());
+    assert_columns_kept(
+        &run,
+        "memory_links",
+        &["source_id", "target_id", "relation"],
+        &["valid_until"],
+        "defect #10030",
+    );
+}
+
+/// Defect #10031, red until it lands: `export --full` then `import` must keep
+/// every live row's atomisation, kind-provenance and entity-mention column.
+/// The fix removes the `FULL_ATOM_COLUMNS_DROPPED` lossy entries above.
+#[test]
+fn export_full_keeps_every_atomisation_column_10031() {
+    let path = RestorePath::ExportFullImport;
+    let run = run_raw(path, path.seed_shape());
+    assert_columns_kept(
+        &run,
+        "memories",
+        &["id"],
+        &[
+            "atomised_into",
+            "atom_of",
+            "kind_provenance",
+            "mentioned_entity_id",
+        ],
+        "defect #10031",
+    );
+}
+
+/// Defect #10032, red until it lands: `export --full` then `import` must keep
+/// a sealed live row and a sealed archived row sealed (empty live content,
+/// each envelope present). The fix removes the `FULL_SEALED_ROW_UNSEALED`
+/// null-column entries above.
+#[test]
+fn export_full_keeps_a_sealed_row_sealed_10032() {
+    let shape = SeedShape {
+        lineage: Lineage::Absent,
+        sealed: Sealed::Present,
+    };
+    let run = run_raw(RestorePath::ExportFullImport, shape);
+    let id = run
+        .corpus
+        .encrypted
+        .clone()
+        .expect("the shape seeds a sealed row");
+    let content = |s: &StoreSnapshot| {
+        s.rows_where("memories", "id", &id)
+            .first()
+            .and_then(|r| r.get("content").cloned())
+    };
+    assert_eq!(
+        content(&run.restored),
+        content(&run.before),
+        "export --full unsealed a sealed row's content (defect #10032)"
+    );
+    for table in ["memories", "archived_memories"] {
+        let sealed_rows = |s: &StoreSnapshot| {
+            s.tables[table]
+                .rows
+                .iter()
+                .filter(|r| matches!(r.get("encrypted_envelope"), Some(SqlValue::Blob(_))))
+                .count()
+        };
+        assert!(
+            sealed_rows(&run.before) > 0,
+            "{table}: the corpus seals a row"
+        );
+        assert_eq!(
+            sealed_rows(&run.restored),
+            sealed_rows(&run.before),
+            "{table}: export --full dropped an envelope (defect #10032)"
+        );
+    }
+    assert_sealed_row_decrypts(&run.restored, &id);
+}
+
 /// Archive then restore: the memory row, its embedding and its edges come
 /// back exactly as they were before the archive.
 #[test]
 fn archive_then_restore_reproduces_the_row_its_embedding_and_its_links_9944() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("source.db");
-    let corpus = seed(&db);
+    let corpus = seed(&db, SeedShape::FULL);
     // Restore the archived row first so the pre-image below is a LIVE row.
     ai_memory(&db)
         .args(["archive", "restore", &corpus.archived])
@@ -972,7 +1695,7 @@ fn row_image(db: &Path, id: &str) -> (Vec<Row>, Vec<Row>) {
 fn every_live_table_is_classified_for_every_path_9944() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("schema.db");
-    seed(&db);
+    seed(&db, SeedShape::FULL);
     let s = snapshot(&db);
     let problems: Vec<String> = RestorePath::ALL
         .iter()
@@ -993,7 +1716,7 @@ fn every_live_table_is_classified_for_every_path_9944() {
 fn the_comparison_catches_every_mutation_class_9944() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("probe.db");
-    seed(&db);
+    seed(&db, SeedShape::FULL);
     let snap = snapshot(&db);
     let class = RestorePath::BackupRestore.class();
     let src = source_store(class, snap.clone());
