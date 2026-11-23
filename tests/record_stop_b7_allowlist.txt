@@ -79,7 +79,7 @@ src/quotas.rs	reset_daily
 # B9 (2026-08-28): postgres.rs methods that write record-plane tables now
 # GATE (reflect_with_hooks, update_embedding, link_internal, charge_update_growth,
 # revoke_*, adopt_legacy_embedding_space, entity_register, backfill_memory_cids,
-# apply_lifecycle_patch, update_with_archive_on_supersede, migrate_embedding_dim,
+# apply_lifecycle_patch, update_with_archive_on_supersede, migrate_embedding_dim_for,
 # kg_invalidate_{cypher,cte}). Remaining postgres.rs rows:
 #   (a) genuine read-bookkeeping (touch/fold/decay/recall-obs)
 #   (b) in-tx FREE FNS with no &self — cannot call gate_record_stop; gated

@@ -796,7 +796,7 @@ async fn schema_init_run_postgres_enumerates_live_catalog() {
         force_reembed: false,
     };
     // Drives run → init_and_enumerate_postgres → connect_with_dim →
-    // migrate_embedding_dim → enumerate_postgres (+ bootstrap_memory_graph
+    // migrate_embedding_dim_for → enumerate_postgres (+ bootstrap_memory_graph
     // when AGE is present) → current_embedding_dim.
     ai_memory::cli::schema_init::run(&args, None, &mut out)
         .await

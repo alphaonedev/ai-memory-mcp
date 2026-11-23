@@ -4976,11 +4976,11 @@ pub struct ServeBootstrap {
 ///   > legacy flat `embedding_model` > tier preset). Keyword tier (no
 ///   preset, no constructible model) → `None`.
 ///
-/// Returns `None` when no embedder is active (keyword tier / embeddings
-/// disabled). The postgres bootstrap then falls back to
-/// `DEFAULT_EMBEDDING_DIM` (via `build_store_handle`'s
-/// `connect_with_dim` arm — which does NOT auto-migrate), so a keyword
-/// daemon never ALTERs the embedding column.
+/// Returns `None` when no embedder is active (keyword tier); the postgres
+/// bootstrap then uses `connect_with_dim` (no auto-migrate). #9933/#9952 —
+/// the dim carries its source: `Configured` for an operator pin (API:
+/// `[embeddings].dim` / env; local: an honoured configured model), else
+/// `Defaulted`; never `Explicit`, which only the schema-init argv makes.
 ///
 /// # \#1882 — root-cause fix
 ///
@@ -5002,18 +5002,23 @@ pub struct ServeBootstrap {
 fn resolve_configured_embedding_dim(
     app_config: &crate::config::AppConfig,
     tier_config: &crate::config::TierConfig,
-) -> Option<u32> {
+) -> Option<crate::store::embedding_dim_policy::EmbeddingDimIntent> {
+    use crate::store::embedding_dim_policy as policy;
     let resolved = app_config.resolve_embeddings();
     if crate::config::is_api_embed_backend(&resolved.backend) {
         // API backend: gated by the tier preset (Some/None), dim from the
         // resolver (explicit override or canonical lookup).
-        return tier_config.embedding_model.and(resolved.embedding_dim);
+        let chosen = policy::api_dim_is_configured(resolved.dim_source);
+        let dim = tier_config.embedding_model.and(resolved.embedding_dim);
+        return dim.map(|d| policy::intent_for(d, chosen));
     }
     // Ollama backend: the produced dim is whatever `resolve_boot_embedder_model`
     // — the SAME precedence `build_embedder` loads — resolves to.
-    resolve_boot_embedder_model(tier_config, app_config)
-        .model
-        .map(|m| u32::try_from(m.dim()).unwrap_or(384))
+    let boot = resolve_boot_embedder_model(tier_config, app_config);
+    let chosen =
+        boot.unhonoured_config_model.is_none() && policy::config_names_embedder_model(app_config);
+    let dim = boot.model.and_then(|m| u32::try_from(m.dim()).ok());
+    dim.map(|d| policy::intent_for(d, chosen))
 }
 
 /// v0.7.0 #1548 — resolve the curator's SAL store handle from the same
@@ -5061,14 +5066,11 @@ async fn build_store_handle(
     store_url: Option<&str>,
     db_path: &Path,
     postgres_statement_timeout_secs: Option<u64>,
-    // Issue #877: configured embedder dim. `None` keeps the legacy
-    // `DEFAULT_EMBEDDING_DIM` (384, MiniLM) behaviour for callers that
-    // explicitly do not load an embedder (keyword-only deployments).
-    // When `Some(dim)` is passed, the postgres adapter takes the
-    // auto-migrate path so a fresh-container schema bootstrapped at the
-    // default 384 is converted in-place to match the configured
-    // embedder's actual dimension (e.g. 768 for `nomic_embed_v15`).
-    configured_embedding_dim: Option<u32>,
+    // Issue #877 / #9933: the embedder dim and its source. `None` keeps
+    // `DEFAULT_EMBEDDING_DIM` (keyword-only). `Some(intent)` takes the
+    // auto-migrate path: an EMPTY column at another dim is converted, a
+    // populated one refuses the boot (never NULLed).
+    configured_embedding_dim: Option<crate::store::embedding_dim_policy::EmbeddingDimIntent>,
     // #2567 — the caller's TRUTHFUL runtime embedder-constructibility
     // signal (in `serve` this is `build_embedder(...).is_some()`), NOT the
     // config-derived `configured_embedding_dim.is_some()` proxy. Only when
@@ -5118,7 +5120,8 @@ async fn build_store_handle(
                     // `--store-url` (credential included) to journald
                     // at INFO.
                     let display_url = crate::url_display::store_url_display(url);
-                    let store = if let Some(dim) = configured_embedding_dim {
+                    let store = if let Some(intent) = configured_embedding_dim {
+                        let dim = intent.dim();
                         tracing::info!(
                             "Wave-3 (issue #877): opening Postgres SAL store at {display_url} \
                              (statement_timeout={timeout}s, embedding_dim={dim}, auto_migrate=on, \
@@ -5128,7 +5131,7 @@ async fn build_store_handle(
                             pool.acquire_timeout_secs
                         );
                         crate::store::postgres::PostgresStore::connect_with_dim_and_timeout_auto_migrate(
-                            url, dim, timeout, pool, embedder_available,
+                            url, intent, timeout, pool, embedder_available,
                         )
                         .await
                         .context("connect postgres adapter (auto-migrate dim)")?
@@ -7043,8 +7046,7 @@ pub async fn bootstrap_serve(
     // pick, with no log signal because the parse arm silently fell
     // through to the preset.
     #[cfg(feature = "sal")]
-    let configured_embedding_dim: Option<u32> =
-        resolve_configured_embedding_dim(app_config, &tier_config);
+    let configured_embedding_dim = resolve_configured_embedding_dim(app_config, &tier_config);
     #[cfg(feature = "sal")]
     let (storage_backend, store_handle) = build_store_handle(
         args.store_url.as_deref(),
@@ -9630,6 +9632,8 @@ mod tests {
     use super::*;
     use crate::cli::test_utils::TestEnv;
     use crate::config::ResolvedTtl;
+    #[cfg(feature = "sal")]
+    use crate::store::embedding_dim_policy::EmbeddingDimIntent as Edi;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
@@ -13593,7 +13597,7 @@ decision = "allow"
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
         assert_eq!(
             dim,
-            Some(768),
+            Some(Edi::Defaulted(768)),
             "ollama can't construct bge-large-en; the live embedder is the \
              Autonomous preset (Nomic, 768) — the schema dim must track it"
         );
@@ -13619,7 +13623,7 @@ decision = "allow"
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
         assert_eq!(
             dim,
-            Some(768),
+            Some(Edi::Configured(768)),
             "legacy alias nomic_embed_v15 canonicalises to nomic-embed-text-v1.5 (768)"
         );
     }
@@ -13635,11 +13639,9 @@ decision = "allow"
         let cfg = AppConfig::default();
         let tier_config = FeatureTier::Autonomous.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
-        // Autonomous tier preset is NomicEmbedV15 (768). The resolver
-        // also defaults to nomic-embed-text-v1.5 → 768 via the
-        // KNOWN_EMBEDDING_DIMS table, so either arm gives the same
-        // answer for the no-config case.
-        assert_eq!(dim, Some(768));
+        // Autonomous tier preset NomicEmbedV15 (768); either arm gives
+        // 768 for the no-config case. #9933: a preset is Defaulted.
+        assert_eq!(dim, Some(Edi::Defaulted(768)));
     }
 
     /// \#1882 — keyword tier has no embedder, so the resolver returns
@@ -13689,8 +13691,8 @@ decision = "allow"
         };
         let tier_config = FeatureTier::Autonomous.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
-        // Autonomous tier preset (NomicEmbedV15) → 768.
-        assert_eq!(dim, Some(768));
+        // Autonomous tier preset (NomicEmbedV15) → 768, Defaulted (#9933).
+        assert_eq!(dim, Some(Edi::Defaulted(768)));
     }
 
     // ===========================================================================
@@ -14287,7 +14289,7 @@ decision = "allow"
         let tier_cfg = FeatureTier::Semantic.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
         assert!(
-            matches!(dim, Some(d) if d == 768),
+            dim == Some(Edi::Configured(768)),
             "canonical lookup MUST return 768 for nomic-embed-text-v1.5; got: {dim:?}"
         );
     }
@@ -14310,7 +14312,7 @@ decision = "allow"
         let tier_cfg = FeatureTier::Semantic.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
         assert!(
-            matches!(dim, Some(d) if d == 384),
+            dim == Some(Edi::Configured(384)),
             "legacy flat-field path MUST resolve mini_lm_l6_v2 to 384; got: {dim:?}"
         );
     }
@@ -14332,9 +14334,10 @@ decision = "allow"
         // function comment.
         let tier_cfg = FeatureTier::Semantic.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_cfg);
-        assert!(
-            dim.is_some(),
-            "Semantic tier preset MUST yield a dim via the fallback arm"
+        assert_eq!(
+            dim,
+            Some(Edi::Defaulted(384)),
+            "Semantic tier preset MUST yield a Defaulted dim via the fallback arm"
         );
     }
 
@@ -14360,10 +14363,11 @@ decision = "allow"
         // semantic tier has an embedding model preset). The test pins
         // the silent-drop behaviour: the function does NOT panic /
         // bail on an unparseable legacy override.
-        assert!(
-            dim.is_some(),
+        assert_eq!(
+            dim,
+            Some(Edi::Defaulted(384)),
             "unparseable legacy embedding_model MUST be dropped silently \
-             (the .ok() arm), preset fallback fires"
+             (the .ok() arm), preset fallback fires, Defaulted (#9933)"
         );
     }
 

@@ -8,7 +8,7 @@
 //!
 //! The live behavioural proof lives in `tests/embedding_dim_migration.rs`
 //! (`auto_migrate_preserves_embeddings_without_embedder_2567` /
-//! `auto_migrate_nulls_embeddings_with_embedder_2567`), gated behind
+//! `auto_migrate_refuses_populated_with_embedder_2567_9933`), gated behind
 //! `feature = "sal-postgres"` + `AI_MEMORY_TEST_POSTGRES_URL`, so on a host
 //! with no live `Postgres` they self-skip and the fix is effectively
 //! uncovered. This file closes that gap the way the `qual_*` family already
@@ -16,10 +16,14 @@
 //! adapter source off disk and asserts, on EVERY `cargo test` run with zero
 //! infrastructure, that
 //!
-//! 1. the destructive `migrate_embedding_dim(dim, true)` in the
-//!    `connect_with_dim_and_timeout_auto_migrate` funnel is GATED behind an
-//!    `embedder_available` check that PRESERVES the vectors + WARNs when no
-//!    embedder exists (the #2567 fix, defense-in-depth AT the funnel), and
+//! 1. the only conversion in the `connect_with_dim_and_timeout_auto_migrate`
+//!    funnel is the order-less `migrate_embedding_dim_for(intent, None)`
+//!    (#9933/#9952: boot never NULLs a stored vector), the decision comes from
+//!    `decide_auto_migrate(..., embedder_available)`, and its no-embedder
+//!    arm PRESERVES the vectors + WARNs before any conversion (#2567). The
+//!    decision table itself is pinned behaviourally by the
+//!    `store::embedding_dim_policy` lib tests, which also run with no
+//!    infrastructure, and
 //! 2. the `SQLite` adapter has NO destructive embedding-dim-migrate path at
 //!    all — the cross-backend invariant (#2488 "assert both backends"):
 //!    `SQLite` stores embeddings dim-agnostically as a BLOB and must never
@@ -51,11 +55,18 @@ const AUTO_MIGRATE_FN: &str = "connect_with_dim_and_timeout_auto_migrate";
 /// The new #2567 gate parameter.
 const EMBEDDER_AVAILABLE_PARAM: &str = "embedder_available";
 
-/// The destructive call the gate must guard.
-const DESTRUCTIVE_CALL: &str = "migrate_embedding_dim(dim, true)";
+/// The one conversion the funnel may make: with no `ForceReembedOrder`, so a
+/// populated column refuses inside the conversion's own lock (#9933/#9952).
+const CONVERSION_CALL: &str = "migrate_embedding_dim_for(intent, None)";
 
-/// The early-return guard that skips the destructive migrate.
-const PRESERVE_GUARD: &str = "if !embedder_available";
+/// The forced conversion that NULLs stored vectors; never in the funnel.
+const FORCED_CALL_PREFIX: &str = "migrate_embedding_dim";
+
+/// The decision the funnel must consult, with the #2567 signal.
+const DECISION_CALL: &str = "decide_auto_migrate(current, intent, at_risk, embedder_available)";
+
+/// The no-embedder arm that skips every conversion.
+const PRESERVE_GUARD: &str = "AutoMigrateDecision::PreserveNoEmbedder";
 
 /// A distinctive token from the preserve WARN so the degrade path stays
 /// loud (an operator MUST see WHY recall degraded).
@@ -109,10 +120,28 @@ fn fn_span_extracts_the_auto_migrate_funnel() {
         panic!("#2567: could not locate `{AUTO_MIGRATE_FN}` in {PG_ADAPTER_PATH} — renamed?")
     });
     assert!(
-        span.contains(DESTRUCTIVE_CALL),
-        "#2567: the extracted `{AUTO_MIGRATE_FN}` span must still contain the destructive \
-         `{DESTRUCTIVE_CALL}` call; if not, the span bounds are wrong and every gate assertion \
+        span.contains(CONVERSION_CALL),
+        "#2567: the extracted `{AUTO_MIGRATE_FN}` span must still contain the \
+         `{CONVERSION_CALL}` call; if not, the span bounds are wrong and every gate assertion \
          below is vacuous"
+    );
+}
+
+/// #9933 — every conversion call in the funnel is the unforced one: the span
+/// holds exactly as many `migrate_embedding_dim` calls as `CONVERSION_CALL`
+/// occurrences, so no `(.., true)` or other forced form can hide in it.
+#[test]
+fn pg_auto_migrate_never_forces_a_conversion_9933() {
+    let pg = read_source(PG_ADAPTER_PATH);
+    let span = fn_span(&pg, AUTO_MIGRATE_FN)
+        .unwrap_or_else(|| panic!("#9933: `{AUTO_MIGRATE_FN}` not found in {PG_ADAPTER_PATH}"));
+    let calls = span.matches(FORCED_CALL_PREFIX).count();
+    let unforced = span.matches(CONVERSION_CALL).count();
+    assert_eq!(
+        (calls, unforced),
+        (1, 1),
+        "#9933: `{AUTO_MIGRATE_FN}` must convert only through `{CONVERSION_CALL}` (one call, \
+         unforced); a forced or second conversion would NULL stored vectors at boot"
     );
 }
 
@@ -131,8 +160,12 @@ fn pg_auto_migrate_gates_destructive_null_on_embedder_available_2567() {
         "#2567: `{AUTO_MIGRATE_FN}` must take/consult `{EMBEDDER_AVAILABLE_PARAM}` — the gate is gone"
     );
     assert!(
+        span.contains(DECISION_CALL),
+        "#2567: `{AUTO_MIGRATE_FN}` must decide through `{DECISION_CALL}`"
+    );
+    assert!(
         span.contains(PRESERVE_GUARD),
-        "#2567: `{AUTO_MIGRATE_FN}` must carry the `{PRESERVE_GUARD}` preserve guard"
+        "#2567: `{AUTO_MIGRATE_FN}` must carry the `{PRESERVE_GUARD}` preserve arm"
     );
     assert!(
         span.contains(PRESERVE_WARN_TOKEN),
@@ -140,21 +173,19 @@ fn pg_auto_migrate_gates_destructive_null_on_embedder_available_2567() {
          an operator sees why recall degraded"
     );
 
-    // Ordering: the preserve guard MUST precede the destructive call, i.e.
-    // the code checks `!embedder_available` and returns BEFORE it could ever
-    // reach `migrate_embedding_dim(dim, true)`. A guard that sits AFTER the
-    // destructive call would be no guard at all.
+    // Ordering: the preserve arm MUST precede the conversion call, so the
+    // no-embedder path returns before it could reach any conversion.
     let guard_at = span
         .find(PRESERVE_GUARD)
         .expect("guard token presence already asserted");
-    let destructive_at = span
-        .find(DESTRUCTIVE_CALL)
-        .expect("destructive call presence already asserted (fn_span probe)");
+    let conversion_at = span
+        .find(CONVERSION_CALL)
+        .expect("conversion call presence already asserted (fn_span probe)");
     assert!(
-        guard_at < destructive_at,
-        "#2567: the `{PRESERVE_GUARD}` guard (offset {guard_at}) MUST precede the destructive \
-         `{DESTRUCTIVE_CALL}` (offset {destructive_at}) so the no-embedder path returns before it \
-         can NULL any vector"
+        guard_at < conversion_at,
+        "#2567: the `{PRESERVE_GUARD}` arm (offset {guard_at}) MUST precede \
+         `{CONVERSION_CALL}` (offset {conversion_at}) so the no-embedder path returns before it \
+         can convert anything"
     );
 }
 

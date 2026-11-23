@@ -74,6 +74,12 @@ pub(crate) mod postgres_export_page;
 #[cfg(feature = "sal-postgres")]
 pub(crate) mod pg_migration_lock;
 
+/// #9933 — the embedding-dimension migrate decision as a pure function of
+/// the live column, the requested dimension and its source
+/// ([`embedding_dim_policy::EmbeddingDimIntent`]). Backend-agnostic so the
+/// daemon resolves the intent in every `sal` build.
+pub mod embedding_dim_policy;
+
 /// #1955 [P1][R45] — substrate record-stop actuator + signed
 /// stop-attestation. Backend-agnostic flag/attestation logic + the
 /// per-DB sqlite flag registry.
