@@ -29,7 +29,11 @@ without a statistically-rigorous model; it is a campaign summary.
 1. Three hosts (physical or VM), each with:
    - 4 vCPU, 8 GB RAM minimum
    - Docker 20+ with compose v2
-   - Outbound network to pull `pgvector/pgvector:pg16` and
+   - Outbound network to pull a PostgreSQL + pgvector container image. The
+     certified data tier is PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector
+     0.8.7; the stock `pgvector/pgvector:pg16` image this runbook was written
+     against is a tested alternate, not the certified tier (certification on
+     19 is in progress), and
      `ghcr.io/alphaonedev/ai-memory:v0.7.0-alpha`
    - Port 5433/tcp open inbound from the other two
    - Port 9077/tcp open inbound from the chaos-client host

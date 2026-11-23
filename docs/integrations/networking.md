@@ -69,7 +69,7 @@ On the Postgres side, allow the CGNAT tailnet range in `pg_hba.conf`
 alongside (not instead of) the LAN range:
 
 ```text
-# /etc/postgresql/16/main/pg_hba.conf
+# /etc/postgresql/<pg-major>/main/pg_hba.conf
 host  fed_meta  fed_user  192.168.50.0/24   scram-sha-256
 host  fed_meta  fed_user  100.64.0.0/10     scram-sha-256
 ```
@@ -96,7 +96,7 @@ If you suspect this is what you're hitting, the quickest check is:
 nc -zv 192.168.50.1 5432   # or whatever LAN-IP:port
 
 # Non-Apple-signed binary — should fail with EHOSTUNREACH:
-/opt/homebrew/opt/postgresql@16/bin/psql -h 192.168.50.1 -U fed_user -c 'SELECT 1' fed_meta
+/opt/homebrew/opt/postgresql@<pg-major>/bin/psql -h 192.168.50.1 -U fed_user -c 'SELECT 1' fed_meta
 ```
 
 If `nc` succeeds and `psql` fails with `No route to host`, you have a

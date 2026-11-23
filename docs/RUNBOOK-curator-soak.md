@@ -33,7 +33,10 @@ autonomous" with a measured activity + reversal + cost profile.
    - 4 vCPU, 16 GB RAM minimum
    - Ollama running with an embedding-capable model (default: Gemma
      4 E2B for `feature_tier = smart`)
-   - Outbound network to pull pgvector/pgvector:pg16 and the
+   - Outbound network to pull a PostgreSQL + pgvector container image (the
+     certified data tier is PostgreSQL 19.0 + Apache AGE 1.7.0 + pgvector
+     0.8.7; the stock pgvector/pgvector:pg16 image this runbook was written
+     against is a tested alternate; certification on 19 is in progress) and the
      ai-memory release binary
 3. A snapshot pinned to the soak commit SHA so the audit trail is
    reproducible.
