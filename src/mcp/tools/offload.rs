@@ -38,10 +38,12 @@ fn resolve_namespace(params: &Value) -> String {
 
 /// `memory_offload(content, namespace?, ttl_seconds?)`.
 ///
-/// The handler is intentionally signer-free at v0.7.0 — the daemon
-/// composes the agent's [`crate::identity::keypair::AgentKeypair`]
-/// when v0.8.0 wires this through the MCP dispatcher. Substrate
-/// plumbing only.
+/// With a stdio session signer installed (#9926) the blob is signed by
+/// the session key when the session covers `agent_id`
+/// (`session_signer::side_row_signer`, #10012); under strict mode a blob
+/// the session cannot sign is refused with
+/// `session_signer::SIDE_ROW_STRICT_REFUSAL` and nothing is stored.
+/// Without a session the blob stays unsigned (the v0.7.0 behaviour).
 pub fn handle_offload(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -89,7 +91,15 @@ pub fn handle_offload(
         }
     }
 
-    let off = ContextOffloader::new(conn, None, OffloadConfig::default());
+    // #10012 — with a session signer installed the blob is signed by the
+    // session key when the session covers its agent; under strict mode a blob
+    // the session cannot sign is refused before anything is stored.
+    let session_kp = match crate::identity::session_signer::side_row_signer(agent_id)? {
+        crate::identity::session_signer::SideRowSigner::Session(kp) => Some(kp),
+        crate::identity::session_signer::SideRowSigner::NoSession
+        | crate::identity::session_signer::SideRowSigner::NotCoveredPermissive => None,
+    };
+    let off = ContextOffloader::new(conn, session_kp.as_ref(), OffloadConfig::default());
     let result = off
         .offload(content, &namespace, ttl_seconds, agent_id)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("offload", e))?;

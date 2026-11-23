@@ -90,6 +90,11 @@ pub const REFUSE_ALREADY_INSTALLED: &str =
 pub const SEAL_REFUSAL_PREFIX: &str =
     "ATTESTATION_FAILED: mcp session signer (#9926) refused to sign this write";
 
+/// The one spelling of a per-write refusal: [`SEAL_REFUSAL_PREFIX`], then the reason.
+fn seal_refusal(reason: impl std::fmt::Display) -> String {
+    format!("{SEAL_REFUSAL_PREFIX}: {reason}")
+}
+
 /// The process-global signer. Set at most once, by [`install_from_env`].
 static SESSION_SIGNER: OnceLock<SessionSigner> = OnceLock::new();
 
@@ -148,6 +153,136 @@ pub(crate) fn install_for_lib_test(agent_id: &str, keypair: AgentKeypair) -> &'s
         })
         .agent_id
         .as_str()
+}
+
+/// #10012 — the session signer's keypair, for the signed-row surfaces that
+/// carry their own signature column (links, signals, checkpoints, routines,
+/// skills): with a session signer installed they sign with the session key,
+/// never with a key-directory key that may belong to another agent.
+#[must_use]
+pub fn session_keypair() -> Option<AgentKeypair> {
+    session_signer().map(|signer| signer.keypair.clone())
+}
+
+/// Refusal for a strict-mode write to a signed side row (offload blob, link)
+/// attributed to an agent the session signer does not cover (#10012).
+pub const SIDE_ROW_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a signed row attributed to an agent other than the session agent cannot be signed; refused";
+
+/// Which key signs a side row (offload blob, link) attributed to an agent
+/// (#10012, CBC-02/05).
+#[must_use]
+#[derive(Debug, Clone)]
+pub enum SideRowSigner {
+    /// No session signer is installed: the caller keeps its own key choice.
+    NoSession,
+    /// The session signer covers the agent: sign with this key.
+    Session(AgentKeypair),
+    /// A session signer is installed but does not cover the agent and strict
+    /// mode is off: the row is written unsigned (a session never signs for
+    /// another agent).
+    NotCoveredPermissive,
+}
+
+/// Resolve the signer of a side row attributed to `agent_id` (#10012).
+///
+/// # Errors
+///
+/// [`SIDE_ROW_STRICT_REFUSAL`] when a session signer is installed, does not
+/// cover `agent_id`, and strict MCP attestation is on.
+pub fn side_row_signer(agent_id: &str) -> std::result::Result<SideRowSigner, String> {
+    use crate::identity::attest;
+    side_row_decision(
+        session_signer(),
+        agent_id,
+        attest::require_agent_attestation_for(attest::WriteSurface::Mcp),
+    )
+}
+
+/// The pure decision behind [`side_row_signer`]: the installed signer (if
+/// any), the agent the side row is attributed to, and whether strict MCP
+/// attestation is on (#10012).
+fn side_row_decision(
+    signer: Option<&SessionSigner>,
+    agent_id: &str,
+    strict: bool,
+) -> std::result::Result<SideRowSigner, String> {
+    let Some(signer) = signer else {
+        return Ok(SideRowSigner::NoSession);
+    };
+    if signer.covers(agent_id) {
+        return Ok(SideRowSigner::Session(signer.keypair.clone()));
+    }
+    if strict {
+        Err(SIDE_ROW_STRICT_REFUSAL.to_string())
+    } else {
+        Ok(SideRowSigner::NotCoveredPermissive)
+    }
+}
+
+/// Refusal for an invalidation of a link whose stored signature does not
+/// verify against the session key over its stored fields (#10012): the
+/// session never re-signs over bytes it did not seal.
+pub const EDGE_TAMPERED_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): stored link signature does not verify; refusing to re-sign";
+
+/// Refusal for an invalidation of a link signed by, or attributed to,
+/// another agent (#10012): `valid_until` is a signed field, so the write
+/// would change bytes the session did not seal.
+pub const EDGE_FOREIGN_SEAL_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): the invalidation changes a link signed by another agent; refused";
+
+/// Strict-mode refusal for an invalidation of a link with no `observed_by`
+/// (#10012): no observer; the session does not re-sign.
+pub const EDGE_NO_OBSERVER_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a link with no observer cannot be sealed: no observer; the session does not re-sign; refused";
+
+/// Strict-mode refusal for an invalidation of the session agent's own link
+/// that carries no signature (#10012): the session did not seal its bytes.
+pub const EDGE_UNSIGNED_STRICT_REFUSAL: &str = "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 an unsigned link the session did not seal cannot be sealed; refused";
+
+/// What an invalidation does with the signature of the superseded link
+/// under a session signer (#10012, CBC-02/05).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeReseal {
+    /// No session signer: the H5 semantics are unchanged.
+    NoSession,
+    /// The prior signature is the session's own and verifies: re-sign.
+    Reseal,
+    /// The link carries no signature and strict mode is off: it stays
+    /// unsigned (a session never signs bytes it did not seal).
+    LeaveUnsigned,
+}
+
+/// The decision behind a link invalidation under a session signer
+/// (#10012). `prior` is the link as stored before the invalidation (its
+/// `valid_until` the stored one), `signature` its stored signature.
+///
+/// # Errors
+///
+/// [`EDGE_TAMPERED_REFUSAL`] for the session agent's link whose signature
+/// does not verify under the session key; [`EDGE_FOREIGN_SEAL_REFUSAL`] for
+/// a signed link of another agent or of no agent (both postures). Under
+/// strict mode, for an unsigned link: [`EDGE_NO_OBSERVER_STRICT_REFUSAL`]
+/// (no observer), [`EDGE_UNSIGNED_STRICT_REFUSAL`] (the session agent's) or
+/// [`SIDE_ROW_STRICT_REFUSAL`] (another agent's).
+pub fn edge_invalidation_decision(
+    session: Option<&AgentKeypair>,
+    prior: &crate::identity::sign::SignableLink<'_>,
+    signature: Option<&[u8]>,
+    strict: bool,
+) -> std::result::Result<EdgeReseal, String> {
+    let Some(session) = session else {
+        return Ok(EdgeReseal::NoSession);
+    };
+    let owned = prior.observed_by == Some(session.agent_id.as_str());
+    match (signature, prior.observed_by) {
+        (Some(sig), _) if owned => crate::identity::verify::verify(&session.public, prior, sig)
+            .map(|()| EdgeReseal::Reseal)
+            .map_err(|_| EDGE_TAMPERED_REFUSAL.to_string()),
+        (Some(_), _) => Err(EDGE_FOREIGN_SEAL_REFUSAL.to_string()),
+        (None, _) if !strict => Ok(EdgeReseal::LeaveUnsigned),
+        (None, None) => Err(EDGE_NO_OBSERVER_STRICT_REFUSAL.to_string()),
+        (None, Some(_)) if owned => Err(EDGE_UNSIGNED_STRICT_REFUSAL.to_string()),
+        (None, Some(_)) => Err(SIDE_ROW_STRICT_REFUSAL.to_string()),
+    }
 }
 
 /// Whether the installed signer covers writes attributed to `agent_id`.
@@ -234,7 +369,587 @@ pub fn install_from_env(
         agent_id,
         "mcp session signer (#9926): installed; covered stdio writes are signed server-side"
     );
-    Ok(())
+    // #10012 — the boot connection opened before the signer existed, so it
+    // gets the write-seal funnel here; every later `db::open` installs it.
+    match install_write_seal_funnel(conn)? {
+        FunnelState::Installed => Ok(()),
+        FunnelState::NoSigner => Err(crate::errors::refusal(REFUSE_FUNNEL_NOT_INSTALLED)),
+    }
+}
+
+/// The write-seal funnel could not be installed on the boot connection right
+/// after the signer was (#10012); boot refuses rather than run unsealed.
+pub const REFUSE_FUNNEL_NOT_INSTALLED: &str =
+    "mcp session signer (#10012): the write-seal funnel did not install; refusing to start";
+
+/// A refusal of the #10012 write-seal funnel that names the memory row it
+/// refused (CBC-02: one variant per reason, the text is a `match`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowRefusal {
+    /// Strict mode, a row the session agent does not own: a session never
+    /// signs for another agent.
+    Foreign,
+    /// Strict mode, a row of the session agent whose stored content the
+    /// session did not seal (an unsigned row written outside this session,
+    /// a restored unsigned row, a copy of unverified bytes).
+    Unsealed,
+    /// Both modes: the stored seal of the row does not verify against its
+    /// current bytes; re-signing would erase the tamper evidence.
+    Tampered,
+    /// Both modes: the row carries another agent's verifying seal and the
+    /// write changes the bytes that seal covers.
+    ForeignSeal,
+}
+
+impl RowRefusal {
+    /// Every variant, for exhaustive tables.
+    pub const ALL: [Self; 4] = [
+        Self::Foreign,
+        Self::Unsealed,
+        Self::Tampered,
+        Self::ForeignSeal,
+    ];
+
+    /// The text before the row tag.
+    #[must_use]
+    pub const fn head(self) -> &'static str {
+        match self {
+            Self::Foreign => {
+                "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a write to a memory row the session agent does not own cannot be sealed"
+            }
+            Self::Unsealed => {
+                "ATTESTATION_FAILED: mcp session signer (#10012): under AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 a write over memory content the session did not seal cannot be sealed"
+            }
+            Self::Tampered => {
+                "ATTESTATION_FAILED: mcp session signer (#10012): stored seal does not verify; refusing to re-sign"
+            }
+            Self::ForeignSeal => {
+                "ATTESTATION_FAILED: mcp session signer (#10012): the write changes bytes sealed by another agent"
+            }
+        }
+    }
+
+    /// The text after the row tag.
+    #[must_use]
+    pub const fn tail(self) -> &'static str {
+        match self {
+            Self::Foreign | Self::Unsealed | Self::ForeignSeal => "; refused",
+            Self::Tampered => "",
+        }
+    }
+
+    /// The exact refusal for row `id`: `<head> (row <tag>)<tail>`.
+    #[must_use]
+    pub fn text(self, id: &str) -> String {
+        format!("{} (row {}){}", self.head(), row_tag(id), self.tail())
+    }
+
+    /// The row tag `text` carries when it is exactly this refusal.
+    fn parse(self, text: &str) -> Option<&str> {
+        let tag = text
+            .strip_prefix(self.head())?
+            .strip_prefix(" (row ")?
+            .strip_suffix(self.tail())?
+            .strip_suffix(')')?;
+        (tag == INVALID_ROW_TAG || is_row_tag(tag)).then_some(tag)
+    }
+}
+
+/// The tag a refusal carries for a row id outside the tag alphabet.
+pub const INVALID_ROW_TAG: &str = "<invalid id>";
+
+/// Longest row id a refusal echoes.
+const ROW_TAG_MAX: usize = 64;
+
+fn is_row_tag(id: &str) -> bool {
+    (1..=ROW_TAG_MAX).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A row id as a refusal echoes it: ids are minted UUIDs, so anything outside
+/// `[A-Za-z0-9_-]{1,64}` is replaced, never echoed (no injection into the
+/// refusal text).
+fn row_tag(id: &str) -> &str {
+    if is_row_tag(id) { id } else { INVALID_ROW_TAG }
+}
+
+/// The closed-vocabulary refusal behind the text SQLite carries back from a
+/// funnel trigger (#10012).
+///
+/// The seal function fails the statement with its refusal reason, which
+/// reaches the caller as a driver error. This maps that text back to OUR
+/// refusal so the caller sees the exact refusal instead of the storage
+/// class: a [`RowRefusal`] text or [`SIDE_ROW_STRICT_REFUSAL`] returns
+/// itself, and any other per-write seal failure returns
+/// [`SEAL_REFUSAL_PREFIX`] alone (its tail may carry driver text, which never
+/// reaches a caller). Every other text is `None`.
+#[must_use]
+pub fn funnel_refusal(text: &str) -> Option<String> {
+    if text == SIDE_ROW_STRICT_REFUSAL {
+        return Some(SIDE_ROW_STRICT_REFUSAL.to_string());
+    }
+    if RowRefusal::ALL
+        .into_iter()
+        .any(|refusal| refusal.parse(text).is_some())
+    {
+        return Some(text.to_string());
+    }
+    text.starts_with(SEAL_REFUSAL_PREFIX)
+        .then(|| SEAL_REFUSAL_PREFIX.to_string())
+}
+
+/// The SQL function the TEMP AFTER triggers call (#10012).
+const SEAL_FN: &str = "ai_memory_session_seal_10012";
+
+/// The SQL function the TEMP BEFORE UPDATE trigger calls: it records whether
+/// the row's seal is intact BEFORE the statement changes it (#10012).
+const PRIOR_FN: &str = "ai_memory_session_prior_10012";
+
+/// TEMP triggers of the write-seal funnel (#10012). TEMP: they live only in
+/// this connection, so nothing is added to the stored schema, and they exist
+/// only on connections of a process that installed a session signer.
+///
+/// - BEFORE UPDATE records the seal state of the row as it was.
+/// - AFTER INSERT seals a new memory row the session authored.
+/// - AFTER UPDATE seals a change to a signed-envelope column (namespace,
+///   title, content, kind, `created_at`) or to `metadata` (owner and seal)
+///   only when the row's prior seal was the session's own and intact.
+///
+/// The function aborts the triggering statement on a refusal, so a refused
+/// write is rolled back with it: nothing is stored or changed.
+const SEAL_TRIGGERS_SQL: &str = "\
+CREATE TEMP TRIGGER IF NOT EXISTS ai_memory_session_seal_insert_10012 \
+AFTER INSERT ON main.memories BEGIN \
+SELECT ai_memory_session_seal_10012(NEW.id, 1); END;\
+CREATE TEMP TRIGGER IF NOT EXISTS ai_memory_session_prior_update_10012 \
+BEFORE UPDATE OF namespace, title, content, memory_kind, created_at, metadata \
+ON main.memories BEGIN \
+SELECT ai_memory_session_prior_10012(OLD.id); END;\
+CREATE TEMP TRIGGER IF NOT EXISTS ai_memory_session_seal_update_10012 \
+AFTER UPDATE OF namespace, title, content, memory_kind, created_at, metadata \
+ON main.memories BEGIN \
+SELECT ai_memory_session_seal_10012(NEW.id, 0); END;";
+
+/// The seal state of a row before a covered UPDATE changed it (#10012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorSeal {
+    /// The row is being minted by this session's own insert (the
+    /// `created_at` restamp of a fresh row).
+    Fresh,
+    /// The row is the session agent's and its stored seal verifies.
+    Intact,
+    /// The row's stored seal verifies under another agent's key.
+    VerifiesForeign,
+    /// The row carries a seal (`write_signature` or `agent_attested`) that
+    /// does not verify against its bytes.
+    SignatureBroken,
+    /// The row carries no seal at all.
+    Unsigned,
+}
+
+/// Per-connection state shared by the funnel's SQL functions (#10012).
+#[derive(Debug, Default)]
+struct FunnelLedger {
+    /// Prior seal state per row id, pushed by BEFORE UPDATE and popped by
+    /// the matching AFTER UPDATE (a stack: a nested write of the same row
+    /// pushes and pops inside its parent's AFTER).
+    prior: std::collections::HashMap<String, Vec<PriorSeal>>,
+    /// Rows this session's own AFTER INSERT is restamping right now.
+    fresh: std::collections::HashSet<String>,
+}
+
+type SharedLedger = std::sync::Arc<std::sync::Mutex<FunnelLedger>>;
+
+/// Run `f` on the ledger; the guard never outlives `f`, so no nested
+/// statement runs while it is held (CONCURRENCY-03).
+fn with_ledger<T>(
+    ledger: &SharedLedger,
+    f: impl FnOnce(&mut FunnelLedger) -> T,
+) -> std::result::Result<T, String> {
+    let mut guard = ledger
+        .lock()
+        .map_err(|_| seal_refusal("the funnel ledger is poisoned"))?;
+    Ok(f(&mut guard))
+}
+
+/// Proof that the bytes about to be signed by [`reseal_with`] were supplied
+/// by this session in this call (#10012). Private, no public constructor:
+/// only the funnel classifications ([`decide_update`], [`decide_insert`])
+/// build one, and only for a fresh insert, a consolidated summary, a copy of
+/// a source that carries the session's own verifying seal, or a change to a
+/// row whose prior seal was the session's own and intact.
+#[must_use]
+struct SessionAuthored(());
+
+/// Whether [`install_write_seal_funnel`] armed the connection (CBC-02/05).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunnelState {
+    /// A session signer is installed and this connection now seals every
+    /// memory-row write through the TEMP triggers.
+    Installed,
+    /// No session signer: the connection is unchanged.
+    NoSigner,
+}
+
+/// Arm `conn` with the #10012 write-seal funnel when a session signer is
+/// installed.
+///
+/// Every memory row any MCP tool inserts or changes on this connection then
+/// passes [`seal_stored_row`] inside the same statement. The session signs
+/// only bytes it authored in this call (a fresh row, a consolidated summary,
+/// a copy of its own verifying row, a change to its own intact row); a row
+/// whose prior seal is absent, foreign or broken is never given a session
+/// seal: the write is left as written or refused, and a failure aborts the
+/// statement.
+///
+/// # Errors
+///
+/// Registering the SQL functions or creating the TEMP triggers failed.
+pub fn install_write_seal_funnel(conn: &rusqlite::Connection) -> Result<FunnelState> {
+    use rusqlite::functions::FunctionFlags;
+    if session_signer().is_none() {
+        return Ok(FunnelState::NoSigner);
+    }
+    let ledger = SharedLedger::default();
+    let prior_ledger = std::sync::Arc::clone(&ledger);
+    conn.create_scalar_function(PRIOR_FN, 1, FunctionFlags::SQLITE_UTF8, move |ctx| {
+        let id: String = ctx.get(0)?;
+        // SAFETY: the connection reference is used only for the duration of
+        // this call, on the thread that runs the statement, and is never
+        // closed or stored (rusqlite `Context::get_connection` contract).
+        let conn = unsafe { ctx.get_connection() }?;
+        record_prior_seal(&conn, &prior_ledger, &id)
+            .map(|_recorded| 0_i64)
+            .map_err(|reason| rusqlite::Error::UserFunctionError(reason.into()))
+    })?;
+    conn.create_scalar_function(SEAL_FN, 2, FunctionFlags::SQLITE_UTF8, move |ctx| {
+        let id: String = ctx.get(0)?;
+        let inserted: i64 = ctx.get(1)?;
+        // SAFETY: as above (rusqlite `Context::get_connection` contract).
+        let conn = unsafe { ctx.get_connection() }?;
+        let phase = if inserted == 1 {
+            RowWrite::Inserted
+        } else {
+            RowWrite::Updated
+        };
+        match seal_stored_row(&conn, &ledger, &id, phase) {
+            Ok(StoredSeal::AlreadySealed | StoredSeal::LeftAsWritten) => Ok(0_i64),
+            Ok(StoredSeal::Sealed(Resealed)) => Ok(1_i64),
+            Err(reason) => Err(rusqlite::Error::UserFunctionError(reason.into())),
+        }
+    })?;
+    conn.execute_batch(SEAL_TRIGGERS_SQL)?;
+    Ok(FunnelState::Installed)
+}
+
+/// Which write fired the funnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowWrite {
+    Inserted,
+    Updated,
+}
+
+/// What [`seal_stored_row`] did with one row.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredSeal {
+    /// The stored seal already verifies against the owner's bound key.
+    AlreadySealed,
+    /// The session signer sealed bytes the session authored.
+    Sealed(Resealed),
+    /// Strict mode is off and the session did not author the row's signed
+    /// bytes: left exactly as written, never given a session seal.
+    LeftAsWritten,
+}
+
+/// What the funnel does with one written row (#10012), before any signing.
+#[must_use]
+enum SealDecision {
+    /// The stored seal already verifies.
+    AlreadySealed,
+    /// The session authored the signed bytes: seal them.
+    Seal(SessionAuthored),
+    /// Leave the row as written (permissive) or refuse with this reason
+    /// (strict); [`Self::resolve`] picks by the posture.
+    NotSessionBytes(RowRefusal),
+    /// Refuse in both postures.
+    Refuse(RowRefusal),
+}
+
+/// The owner (`metadata.agent_id`) of `row`.
+fn row_owner(row: &Memory) -> Option<&str> {
+    row.metadata
+        .get(crate::mcp::param_names::AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Whether `row` carries any seal material (an `agent_attested` level or a
+/// `write_signature`).
+fn carries_seal(row: &Memory) -> bool {
+    use crate::identity::verify::AttestLevel;
+    let level = row
+        .metadata
+        .get(crate::models::field_names::ATTEST_LEVEL)
+        .and_then(serde_json::Value::as_str);
+    level == Some(AttestLevel::AgentAttested.as_str())
+        || row
+            .metadata
+            .get(crate::models::field_names::WRITE_SIGNATURE)
+            .is_some_and(|value| !value.is_null())
+}
+
+fn read_row(conn: &rusqlite::Connection, id: &str) -> std::result::Result<Memory, String> {
+    crate::db::get_any(conn, id)
+        .map_err(|e| format!("{SEAL_REFUSAL_PREFIX}: written row read failed: {e}"))?
+        .ok_or_else(|| format!("{SEAL_REFUSAL_PREFIX}: the written row is gone"))
+}
+
+/// Classify the seal of `row` as it is now.
+fn classify_seal(
+    conn: &rusqlite::Connection,
+    signer: &SessionSigner,
+    row: &Memory,
+) -> std::result::Result<PriorSeal, String> {
+    let owner = row_owner(row);
+    if stored_seal_verifies(conn, row, owner)? {
+        return Ok(if owner.is_some_and(|agent| signer.covers(agent)) {
+            PriorSeal::Intact
+        } else {
+            PriorSeal::VerifiesForeign
+        });
+    }
+    Ok(if carries_seal(row) {
+        PriorSeal::SignatureBroken
+    } else {
+        PriorSeal::Unsigned
+    })
+}
+
+/// BEFORE UPDATE body: record the seal state of row `id` as it is now.
+/// Returns the state recorded, or `None` when no session signer is
+/// installed (nothing is recorded).
+fn record_prior_seal(
+    conn: &rusqlite::Connection,
+    ledger: &SharedLedger,
+    id: &str,
+) -> std::result::Result<Option<PriorSeal>, String> {
+    let Some(signer) = session_signer() else {
+        return Ok(None);
+    };
+    let fresh = with_ledger(ledger, |state| state.fresh.contains(id))?;
+    let prior = if fresh {
+        PriorSeal::Fresh
+    } else {
+        classify_seal(conn, signer, &read_row(conn, id)?)?
+    };
+    with_ledger(ledger, |state| {
+        state.prior.entry(id.to_string()).or_default().push(prior);
+    })?;
+    Ok(Some(prior))
+}
+
+/// The #10012 funnel body: seal row `id` when the session authored its
+/// signed bytes, else leave it or refuse.
+fn seal_stored_row(
+    conn: &rusqlite::Connection,
+    ledger: &SharedLedger,
+    id: &str,
+    phase: RowWrite,
+) -> std::result::Result<StoredSeal, String> {
+    use crate::identity::attest;
+    let Some(signer) = session_signer() else {
+        return Ok(StoredSeal::LeftAsWritten);
+    };
+    let prior = match phase {
+        RowWrite::Updated => Some(
+            with_ledger(ledger, |state| {
+                let popped = state.prior.get_mut(id).and_then(Vec::pop);
+                if state.prior.get(id).is_some_and(Vec::is_empty) {
+                    state.prior.remove(id);
+                }
+                popped
+            })?
+            .ok_or_else(|| seal_refusal("no prior seal state was recorded for the row"))?,
+        ),
+        RowWrite::Inserted => None,
+    };
+    let row = read_row(conn, id)?;
+    let strict = attest::require_agent_attestation_for(attest::WriteSurface::Mcp);
+    let decision = match prior {
+        Some(prior) => decide_update(conn, signer, &row, prior)?,
+        None => decide_insert(conn, signer, &row)?,
+    };
+    let proof = match decision {
+        SealDecision::AlreadySealed => return Ok(StoredSeal::AlreadySealed),
+        SealDecision::Refuse(refusal) => return Err(refusal.text(id)),
+        SealDecision::NotSessionBytes(refusal) => {
+            return if strict {
+                Err(refusal.text(id))
+            } else {
+                Ok(StoredSeal::LeftAsWritten)
+            };
+        }
+        SealDecision::Seal(proof) => proof,
+    };
+    // A row minted now with a sub-microsecond `created_at` is restamped, the
+    // same as `seal_with` does before an insert; a changed row keeps its
+    // `created_at` (its identity) and `reseal_with` refuses an unstable one.
+    if phase == RowWrite::Inserted && !attest::created_at_is_storage_stable(&row.created_at) {
+        with_ledger(ledger, |state| state.fresh.insert(id.to_string()))?;
+        let restamp = conn.execute(
+            "UPDATE memories SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![attest::now_attestable_rfc3339(), id],
+        );
+        with_ledger(ledger, |state| state.fresh.remove(id))?;
+        restamp.map_err(|e| format!("{SEAL_REFUSAL_PREFIX}: restamping created_at failed: {e}"))?;
+        // The restamp is itself a covered write: its own trigger has sealed
+        // the row already (classified fresh), so only re-check it.
+        let restamped = read_row(conn, id)?;
+        if stored_seal_verifies(conn, &restamped, row_owner(&restamped))? {
+            return Ok(StoredSeal::Sealed(Resealed));
+        }
+    }
+    reseal_with(conn, id, signer, proof)
+        .map(StoredSeal::Sealed)
+        .map_err(seal_refusal)
+}
+
+/// The refusal for a write over bytes the session did not seal: `Unsealed`
+/// for the session agent's row, `Foreign` for any other owner.
+fn not_session_bytes(signer: &SessionSigner, row: &Memory) -> SealDecision {
+    if row_owner(row).is_some_and(|agent| signer.covers(agent)) {
+        SealDecision::NotSessionBytes(RowRefusal::Unsealed)
+    } else {
+        SealDecision::NotSessionBytes(RowRefusal::Foreign)
+    }
+}
+
+/// AFTER UPDATE: seal only a change to a row whose prior seal was the
+/// session's own and intact (or a fresh row's restamp).
+fn decide_update(
+    conn: &rusqlite::Connection,
+    signer: &SessionSigner,
+    row: &Memory,
+    prior: PriorSeal,
+) -> std::result::Result<SealDecision, String> {
+    if stored_seal_verifies(conn, row, row_owner(row))? {
+        return Ok(SealDecision::AlreadySealed);
+    }
+    let owned = row_owner(row).is_some_and(|agent| signer.covers(agent));
+    Ok(match prior {
+        PriorSeal::Fresh | PriorSeal::Intact if owned => SealDecision::Seal(SessionAuthored(())),
+        PriorSeal::Fresh | PriorSeal::Intact => SealDecision::NotSessionBytes(RowRefusal::Foreign),
+        PriorSeal::SignatureBroken => SealDecision::Refuse(RowRefusal::Tampered),
+        PriorSeal::VerifiesForeign => SealDecision::Refuse(RowRefusal::ForeignSeal),
+        PriorSeal::Unsigned => not_session_bytes(signer, row),
+    })
+}
+
+/// AFTER INSERT: seal a row the session authored in this call; a restored
+/// row or a copy of bytes the session did not seal is never sealed.
+fn decide_insert(
+    conn: &rusqlite::Connection,
+    signer: &SessionSigner,
+    row: &Memory,
+) -> std::result::Result<SealDecision, String> {
+    use crate::identity::attest::ReownKind;
+    if stored_seal_verifies(conn, row, row_owner(row))? {
+        return Ok(SealDecision::AlreadySealed);
+    }
+    if !row_owner(row).is_some_and(|agent| signer.covers(agent)) {
+        return Ok(SealDecision::NotSessionBytes(RowRefusal::Foreign));
+    }
+    // A restore re-inserts archived bytes while the archive row still exists.
+    let restored = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = ?1)",
+            rusqlite::params![row.id],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(|e| seal_refusal(format!("archive lookup failed: {e}")))?;
+    if restored {
+        return Ok(if carries_seal(row) {
+            SealDecision::Refuse(RowRefusal::Tampered)
+        } else {
+            SealDecision::NotSessionBytes(RowRefusal::Unsealed)
+        });
+    }
+    let reason = row
+        .metadata
+        .get(crate::models::field_names::ATTEST_RESET_REASON)
+        .and_then(serde_json::Value::as_str);
+    let Some(reason) = reason else {
+        return Ok(SealDecision::Seal(SessionAuthored(())));
+    };
+    let source_key = match ReownKind::from_reason(reason) {
+        // The summary is the text this call supplied (caller or LLM tier).
+        Some(ReownKind::Consolidate) => return Ok(SealDecision::Seal(SessionAuthored(()))),
+        Some(kind) => kind.provenance_key(),
+        // An unknown reset reason names no clone path: not provably authored.
+        None => return Ok(SealDecision::NotSessionBytes(RowRefusal::Unsealed)),
+    };
+    let source = source_key
+        .and_then(|key| row.metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(|source_id| crate::db::get_any(conn, source_id))
+        .transpose()
+        .map_err(|e| seal_refusal(format!("clone source read failed: {e}")))?
+        .flatten();
+    let source_intact = match &source {
+        Some(source) => classify_seal(conn, signer, source)? == PriorSeal::Intact,
+        None => false,
+    };
+    Ok(if source_intact {
+        SealDecision::Seal(SessionAuthored(()))
+    } else {
+        SealDecision::NotSessionBytes(RowRefusal::Unsealed)
+    })
+}
+
+/// Whether `row` carries `agent_attested` and a `write_signature` that
+/// verifies over its stored envelope against the owner's CURRENT bound key.
+fn stored_seal_verifies(
+    conn: &rusqlite::Connection,
+    row: &Memory,
+    owner: Option<&str>,
+) -> std::result::Result<bool, String> {
+    use crate::identity::verify::AttestLevel;
+    use base64::Engine as _;
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    let level = row
+        .metadata
+        .get(crate::models::field_names::ATTEST_LEVEL)
+        .and_then(serde_json::Value::as_str);
+    if level != Some(AttestLevel::AgentAttested.as_str()) {
+        return Ok(false);
+    }
+    let Some(signature) = row
+        .metadata
+        .get(crate::models::field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+    else {
+        return Ok(false);
+    };
+    let bound = crate::db::agent_pubkey(conn, owner)
+        .map_err(|e| format!("{SEAL_REFUSAL_PREFIX}: bound key lookup failed: {e}"))?;
+    // A forged or stale signature is an Err here: it does not verify, so the
+    // funnel re-seals (own row) or refuses / leaves it (foreign row).
+    Ok(matches!(
+        crate::identity::attest::resolve_write_attest_level(
+            row,
+            owner,
+            bound.as_deref(),
+            Some(&signature),
+            true,
+        ),
+        Ok(AttestLevel::AgentAttested)
+    ))
 }
 
 /// Open `path` once with `O_NOFOLLOW`, check the descriptor with `fstat` and
@@ -324,7 +1039,7 @@ pub fn seal_sync(conn: &rusqlite::Connection, mem: &mut Memory, agent_id: &str) 
     };
     match seal_with(conn, mem, signer) {
         Ok(Sealed) => SealOutcome::Signed,
-        Err(reason) => SealOutcome::Refused(format!("{SEAL_REFUSAL_PREFIX}: {reason}")),
+        Err(reason) => SealOutcome::Refused(seal_refusal(reason)),
     }
 }
 
@@ -383,39 +1098,38 @@ fn seal_with(
 /// re-sealed: no session signer covers the agent (#10011).
 pub const MERGE_RESEAL_REFUSAL: &str = "ATTESTATION_FAILED: a signed memory_store that merges into an existing row needs the session signer of its agent to re-sign the merged row (#10011); retry with on_conflict \"version\" or a new title";
 
-/// Proof that [`reseal_row_sync`] signed the stored row, verified it as
-/// `agent_attested` against the bound key and persisted the seal (CBC-05).
+/// Refusal for a signed `memory_store` whose merge target did not carry the
+/// session's own intact seal before the merge, so the merged row mixes bytes
+/// the session never sealed (#10012): it is never re-signed.
+pub const MERGE_UNSEALED_PRIOR_REFUSAL: &str = "ATTESTATION_FAILED: a signed memory_store that merges into an existing row needs that row to carry the session's own intact seal (#10012); retry with on_conflict \"version\" or a new title";
+
+/// Proof that the stored row carries a session seal that verifies as
+/// `agent_attested` against the bound key (CBC-05).
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resealed;
 
-/// Re-seal row `id` after a merge rewrote its content (#10011).
+/// Check that row `id` is sealed by the session after a merge rewrote its
+/// content (#10011, #10012).
 ///
-/// `db::update` never mints an attestation (#3420), so the merge detour of a
-/// signed `memory_store` lands the merged row `claimed`. This signs the row
-/// AS STORED (its id, namespace, title, kind and `created_at`, plus the
-/// merged content) with the session signer of `agent_id`, verifies the
-/// signature against the agent's CURRENT bound key, records it in the replay
-/// ledger and persists `attest_level` + `write_signature` through
-/// [`crate::storage::row_attestation::set_row_attestation`].
+/// The merge runs on a connection armed with the write-seal funnel
+/// ([`install_write_seal_funnel`]), whose AFTER UPDATE trigger already
+/// re-sealed the merged row when, and only when, its prior seal was the
+/// session's own and intact. This never signs: it proves the stored row now
+/// verifies under the session key. A merge into a row whose prior seal was
+/// absent, foreign or broken is refused here (or by the trigger, under strict
+/// mode), never re-signed.
 ///
 /// The caller runs this inside the write transaction that wrote the content,
 /// so an `Err` rolls the merge back: a merged row is never committed as
 /// claimed when its write was signed.
 ///
-/// A ledger `Replay` is admitted here. decision: admit over refuse because
-/// the signature is minted by the session key over this row's own envelope
-/// (no presented envelope is being replayed), and Ed25519 is deterministic,
-/// so a merge back to an earlier body re-derives an already-spent
-/// fingerprint; refusing it would lose a legitimate write.
-///
 /// # Errors
 ///
-/// [`MERGE_RESEAL_REFUSAL`] when no session signer covers `agent_id`; a
-/// reason starting with [`SEAL_REFUSAL_PREFIX`] for every other failure
-/// (row missing, owner mismatch, unstable `created_at`, stored bytes that
-/// redaction would change, signing, a key rebound after boot, ledger
-/// unavailable, persistence).
+/// [`MERGE_RESEAL_REFUSAL`] when no session signer covers `agent_id`;
+/// [`MERGE_UNSEALED_PRIOR_REFUSAL`] when the stored row does not verify under
+/// the session key; a reason starting with [`SEAL_REFUSAL_PREFIX`] when the
+/// row or the bound key cannot be read.
 pub fn reseal_row_sync(
     conn: &rusqlite::Connection,
     id: &str,
@@ -424,19 +1138,31 @@ pub fn reseal_row_sync(
     let Some(signer) = session_signer().filter(|signer| signer.covers(agent_id)) else {
         return Err(MERGE_RESEAL_REFUSAL.to_string());
     };
-    reseal_with(conn, id, signer).map_err(|reason| format!("{SEAL_REFUSAL_PREFIX}: {reason}"))
+    let row = read_row(conn, id)?;
+    if row_owner(&row).is_some_and(|agent| signer.covers(agent))
+        && stored_seal_verifies(conn, &row, row_owner(&row))?
+    {
+        Ok(Resealed)
+    } else {
+        Err(MERGE_UNSEALED_PRIOR_REFUSAL.to_string())
+    }
 }
 
+/// Sign row `id` as stored with the session key. Only the funnel calls it,
+/// and only with a [`SessionAuthored`] proof that the bytes are this call's.
 fn reseal_with(
     conn: &rusqlite::Connection,
     id: &str,
     signer: &SessionSigner,
+    _authored: SessionAuthored,
 ) -> std::result::Result<Resealed, String> {
     use crate::identity::attest;
     use crate::identity::verify::AttestLevel;
     use base64::Engine as _;
 
-    let mut row = crate::db::get(conn, id)
+    // `get_any`: a quarantined or tombstoned row still has an owner and a
+    // stored envelope to seal (#10012); `get` would hide it.
+    let mut row = crate::db::get_any(conn, id)
         .map_err(|e| format!("merged row read failed: {e}"))?
         .ok_or_else(|| "the merged row is gone".to_string())?;
     let owner = row
@@ -565,5 +1291,145 @@ mod tests {
         }
         assert!(read_session_key(&ok).is_ok());
         assert_eq!(read_session_key(dir.path()).err(), Some(REFUSE_NOT_REGULAR));
+    }
+
+    const SIDE_SESSION_AGENT_10012: &str = "agent-side-session-10012";
+    const SIDE_OTHER_AGENT_10012: &str = "agent-side-other-10012";
+
+    /// The decision a side-row signer test row expects (#10012).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SideExpect {
+        NoSession,
+        SessionKey,
+        NotCoveredPermissive,
+        Refused,
+    }
+
+    /// #10012: the full truth table of the side-row signer decision over
+    /// (signer installed?, side row's agent, strict mode). The expected column
+    /// is written by hand; the refusal is the exact text.
+    #[test]
+    fn side_row_decision_truth_table_10012() {
+        const ROWS: [(bool, &str, bool, SideExpect); 8] = [
+            (
+                false,
+                SIDE_SESSION_AGENT_10012,
+                false,
+                SideExpect::NoSession,
+            ),
+            (false, SIDE_SESSION_AGENT_10012, true, SideExpect::NoSession),
+            (false, SIDE_OTHER_AGENT_10012, false, SideExpect::NoSession),
+            (false, SIDE_OTHER_AGENT_10012, true, SideExpect::NoSession),
+            (
+                true,
+                SIDE_SESSION_AGENT_10012,
+                false,
+                SideExpect::SessionKey,
+            ),
+            (true, SIDE_SESSION_AGENT_10012, true, SideExpect::SessionKey),
+            (
+                true,
+                SIDE_OTHER_AGENT_10012,
+                false,
+                SideExpect::NotCoveredPermissive,
+            ),
+            (true, SIDE_OTHER_AGENT_10012, true, SideExpect::Refused),
+        ];
+        let kp = crate::identity::keypair::generate(SIDE_SESSION_AGENT_10012).expect("keypair");
+        let signer = SessionSigner {
+            agent_id: SIDE_SESSION_AGENT_10012.to_string(),
+            keypair: kp.clone(),
+        };
+        let session_public = encode_public_base64(&kp.public);
+        for (installed, agent, strict, expected) in ROWS {
+            let what = format!("installed={installed} agent={agent} strict={strict}");
+            let got = side_row_decision(installed.then_some(&signer), agent, strict);
+            let observed = match got {
+                Ok(SideRowSigner::NoSession) => SideExpect::NoSession,
+                Ok(SideRowSigner::Session(used)) => {
+                    assert_eq!(
+                        encode_public_base64(&used.public),
+                        session_public,
+                        "{what}: signs with the session key"
+                    );
+                    SideExpect::SessionKey
+                }
+                Ok(SideRowSigner::NotCoveredPermissive) => SideExpect::NotCoveredPermissive,
+                Err(text) => {
+                    assert_eq!(text, SIDE_ROW_STRICT_REFUSAL, "{what}: exact refusal");
+                    SideExpect::Refused
+                }
+            };
+            assert_eq!(observed, expected, "{what}");
+        }
+    }
+
+    const OPEN_ARM_AGENT_10012: &str = "agent-open-arm-10012";
+
+    /// #10012: a connection opened AFTER the signer is installed (the
+    /// governance and backfill connections of the stdio server, any later
+    /// `db::open`) is armed by `storage::connection::open` itself, so a
+    /// session-agent row written through it is stored sealed. Runs alone in a
+    /// child process because the signer is process-wide.
+    #[test]
+    fn every_later_db_open_seals_session_rows_10012() {
+        use base64::Engine as _;
+        if crate::test_support::run_env_isolated_child_or_spawn_home(
+            "identity::session_signer::tests::every_later_db_open_seals_session_rows_10012",
+        ) {
+            return;
+        }
+        // Security LOW-1: the child never sees the operator's home.
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        let config =
+            std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("child XDG"));
+        assert!(
+            home.starts_with(std::env::temp_dir()) && config == home.join(".config"),
+            "child HOME {home:?} / XDG_CONFIG_HOME {config:?} are not the isolated per-run dir"
+        );
+        crate::identity::attest::permissive_attestation_for_lib_tests();
+        let kp = crate::identity::keypair::generate(OPEN_ARM_AGENT_10012).expect("keypair");
+        // Registered and bound before the signer exists, as the stdio boot
+        // requires (REFUSE_UNBOUND); the write goes through a LATER open.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("open-arm-10012.db");
+        {
+            let boot = crate::db::open(&path).expect("boot open");
+            crate::db::register_agent(&boot, OPEN_ARM_AGENT_10012, "nhi", &[]).expect("register");
+            crate::db::bind_agent_pubkey_with_keypair(&boot, OPEN_ARM_AGENT_10012, &kp)
+                .expect("bind");
+        }
+        assert_eq!(
+            install_for_lib_test(OPEN_ARM_AGENT_10012, kp.clone()),
+            OPEN_ARM_AGENT_10012
+        );
+        let conn = crate::db::open(&path).expect("open after install");
+        let now = crate::identity::attest::now_attestable_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: "open-arm-10012".to_string(),
+            title: "open arm 10012".to_string(),
+            content: "written through a later connection".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({ crate::META_KEY_AGENT_ID: OPEN_ARM_AGENT_10012 }),
+            ..Memory::default()
+        };
+        let id = crate::db::insert(&conn, &mem).expect("insert");
+        let row = crate::db::get(&conn, &id).expect("read").expect("row");
+        assert_eq!(
+            row.metadata[crate::models::field_names::ATTEST_LEVEL].as_str(),
+            Some("agent_attested"),
+            "attest_level of a row written through a later db::open"
+        );
+        let stored = row.metadata[crate::models::field_names::WRITE_SIGNATURE]
+            .as_str()
+            .expect("write_signature");
+        let stored = base64::engine::general_purpose::STANDARD
+            .decode(stored)
+            .expect("base64 signature");
+        let expected = crate::identity::attest::sign_memory_write(&kp, &row, OPEN_ARM_AGENT_10012)
+            .expect("re-sign stored row");
+        assert_eq!(stored, expected, "signature over the stored row");
     }
 }

@@ -624,6 +624,45 @@ pub(crate) fn run_env_isolated_child_or_spawn_scrubbing(exact_path: &str, scrub:
     if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
         return false; // caller runs the real body in this isolated child
     }
+    spawn_env_isolated_child(exact_path, scrub, &[])
+}
+
+/// The environment variable names [`run_env_isolated_child_or_spawn_home`]
+/// points at a fresh per-run directory in the child (#10012 security LOW-1).
+#[cfg(test)]
+pub(crate) const ISOLATED_HOME_VARS: [&str; 2] = ["HOME", "XDG_CONFIG_HOME"];
+
+/// [`run_env_isolated_child_or_spawn`] for a test that writes through code
+/// which may resolve the user's home or config directory: the child runs with
+/// `HOME` and `XDG_CONFIG_HOME` set to a fresh temporary directory (removed
+/// after the child exits), so it can never read or write the operator's real
+/// home (#10012 security LOW-1).
+#[cfg(test)]
+pub(crate) fn run_env_isolated_child_or_spawn_home(exact_path: &str) -> bool {
+    let _ = crate::identity::test_key_dir::install();
+    if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
+        return false; // caller runs the real body in this isolated child
+    }
+    let home = tempfile::tempdir().expect("isolated child HOME");
+    let config = home.path().join(".config");
+    std::fs::create_dir_all(&config).expect("isolated child XDG_CONFIG_HOME");
+    let [home_var, config_var] = ISOLATED_HOME_VARS;
+    spawn_env_isolated_child(
+        exact_path,
+        &[],
+        &[(home_var, home.path()), (config_var, config.as_path())],
+    )
+}
+
+/// Spawn `exact_path` alone in a child test process with `scrub` removed
+/// from and `set` added to its environment; panics unless exactly one test
+/// ran and passed.
+#[cfg(test)]
+fn spawn_env_isolated_child(
+    exact_path: &str,
+    scrub: &[&str],
+    set: &[(&str, &std::path::Path)],
+) -> bool {
     // The child inherits the parent's environment (incl. AI_MEMORY_NO_CONFIG
     // and TMPDIR), so we only add the role marker.
     // Route the spawn through the #1937 audited chokepoint (never a raw
@@ -638,6 +677,9 @@ pub(crate) fn run_env_isolated_child_or_spawn_scrubbing(exact_path: &str, scrub:
         .env(TEST_ENV_ISOLATION_ROLE_ENV, "child");
     for name in scrub {
         cmd.env_remove(name);
+    }
+    for (name, value) in set {
+        cmd.env(name, value);
     }
     let output = cmd.output().expect("spawn env-isolated child test");
     let stdout = String::from_utf8_lossy(&output.stdout);

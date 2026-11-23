@@ -1213,8 +1213,29 @@ impl std::fmt::Display for ReflectionNotFound {
 
 impl std::error::Error for ReflectionNotFound {}
 
+/// #10012 — the session write-seal funnel refuses inside a SQL trigger, so
+/// its refusal arrives as a driver error. Map it back to our own refusal.
+fn funnel_refusal_of(e: &rusqlite::Error) -> Option<String> {
+    match e {
+        rusqlite::Error::SqliteFailure(_, Some(text)) => {
+            crate::identity::session_signer::funnel_refusal(text)
+        }
+        rusqlite::Error::UserFunctionError(inner) => {
+            crate::identity::session_signer::funnel_refusal(&inner.to_string())
+        }
+        _ => None,
+    }
+}
+
 impl From<anyhow::Error> for MemoryError {
     fn from(e: anyhow::Error) -> Self {
+        if let Some(refusal) = e
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+            .and_then(funnel_refusal_of)
+        {
+            return Self::Refused(refusal);
+        }
         // #3713 — a chain whose root was planted by `refusal` /
         // `invalid_input` is our own text; nothing to classify.
         if let Some(own) = e.downcast_ref::<OwnText>() {
@@ -1324,6 +1345,9 @@ impl From<anyhow::Error> for MemoryError {
 
 impl From<rusqlite::Error> for MemoryError {
     fn from(e: rusqlite::Error) -> Self {
+        if let Some(refusal) = funnel_refusal_of(&e) {
+            return Self::Refused(refusal);
+        }
         Self::DatabaseError(e.to_string())
     }
 }

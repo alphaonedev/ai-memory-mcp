@@ -5121,8 +5121,9 @@ pub fn run_mcp_server(
     // active agent's Ed25519 keypair from the default key dir. Missing
     // keypair = unsigned link writes (preserves v0.6.4 behaviour);
     // operator opts in by running `ai-memory identity generate`.
+    // #10012 — an installed session signer wins: its key is the bound key.
     let active_keypair: Option<crate::identity::keypair::AgentKeypair> =
-        load_active_keypair_for_mcp();
+        crate::identity::session_signer::session_keypair().or_else(load_active_keypair_for_mcp);
     if active_keypair.is_some() {
         eprintln!("ai-memory: link signing enabled (Ed25519)");
     }

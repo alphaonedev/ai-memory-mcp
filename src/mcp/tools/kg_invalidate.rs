@@ -179,13 +179,20 @@ pub fn handle_kg_invalidate(
     // identity configured) records the `system` sentinel rather than
     // borrowing the edge's original attester, which is what this used to do.
     let actor = crate::identity::resolve_read_visibility_caller();
-    match db::invalidate_link(
+    // #10012 — with a session signer installed, storage decides on the edge
+    // as read inside the invalidation's own transaction: the session's own
+    // verifying edge is re-sealed, a broken or foreign signature is refused,
+    // an unsigned edge stays unsigned (strict mode refuses it). A session
+    // never signs for another agent or over bytes it did not seal.
+    let resign = crate::identity::session_signer::session_keypair();
+    match db::invalidate_link_resigned(
         conn,
         source_id,
         target_id,
         relation,
         valid_until,
         actor.as_deref(),
+        resign.as_ref(),
     )
     .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
     {

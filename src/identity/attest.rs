@@ -315,9 +315,19 @@ pub enum ReownKind {
 }
 
 impl ReownKind {
+    /// Every variant, for exhaustive tables.
+    pub const ALL: [Self; 4] = [Self::Share, Self::Atomise, Self::Promote, Self::Consolidate];
+
+    /// The clone path an `attest_reset_reason` value names, or `None` for
+    /// any other text (#10012: the write-seal funnel reads it back).
+    #[must_use]
+    pub fn from_reason(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.reason() == text)
+    }
+
     /// Provenance key naming the source row. `None` for consolidate: its
     /// lineage already lives in `derived_from` / `consolidated_from_agents`.
-    const fn provenance_key(self) -> Option<&'static str> {
+    pub(crate) const fn provenance_key(self) -> Option<&'static str> {
         match self {
             Self::Share => Some(crate::models::field_names::SHARED_FROM),
             Self::Atomise => Some(crate::models::field_names::ATOMISED_FROM),
@@ -336,7 +346,7 @@ impl ReownKind {
         }
     }
 
-    const fn reason(self) -> &'static str {
+    pub(crate) const fn reason(self) -> &'static str {
         match self {
             Self::Share => "reowned_by_share",
             Self::Atomise => "reowned_by_atomise",
