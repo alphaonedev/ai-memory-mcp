@@ -611,3 +611,53 @@ async fn admin_export_refuses_a_sealed_row_on_every_page_shape_10028() {
         refused(uri, status, &page);
     }
 }
+
+/// A row sealed AFTER the first page of a walk (#10028, the per-row guard
+/// behind the first-page scope pre-check): the walk's next page refuses with
+/// 409 `SEALED_EXPORT_REFUSED` rather than handing out the row as plaintext
+/// or skipping it, and no response carries the sealed plaintext.
+#[tokio::test]
+async fn admin_export_refuses_a_row_sealed_mid_walk_10028() {
+    let (_dir, path) = fixture();
+    let conn = ai_memory::db::open(&path).expect("open");
+    let ids = seed(&conn, 4);
+    drop(conn);
+    let r = router(&path, 10);
+    let (status, first) = get(&r, "/api/v1/export?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "an unsealed store pages: {first}");
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("a second page")
+        .to_string();
+
+    let _ = ai_memory::identity::test_key_dir::install();
+    let kp = ai_memory::encryption::get_or_create_keypair("ai:3288").expect("x25519 keypair");
+    let envelope =
+        ai_memory::encryption::encrypt(SEALED_MARKER_10028, &kp.public).expect("seal marker");
+    let sealed_id = ids.last().expect("seeded rows").clone();
+    let conn = ai_memory::db::open(&path).expect("reopen");
+    let changed = conn
+        .execute(
+            "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+            rusqlite::params![envelope.to_bytes(), sealed_id],
+        )
+        .expect("seal a row after the cursor");
+    assert_eq!(changed, 1, "one row sealed");
+    drop(conn);
+
+    let uri = format!("/api/v1/export?limit=2&cursor={cursor}");
+    let (status, page) = get(&r, &uri).await;
+    let body = serde_json::to_vec(&page).expect("json");
+    let marker = SEALED_MARKER_10028.as_bytes();
+    assert!(
+        !body.windows(marker.len()).any(|w| w == marker),
+        "{uri}: an export response carried the sealed plaintext"
+    );
+    assert_eq!(status, StatusCode::CONFLICT, "{uri}: must refuse: {page}");
+    assert_eq!(
+        page["code"].as_str(),
+        Some(SEALED_REFUSAL_CODE_10028),
+        "{uri}: not the sealed-export refusal: {page}"
+    );
+    assert!(page["memories"].is_null(), "{uri}: a refusal carried rows");
+}

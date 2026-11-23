@@ -217,6 +217,48 @@ async fn pg_export_refuses_a_sealed_row_instead_of_skipping_it_10033() {
         .expect("cleanup");
 }
 
+/// #10033 on the one-shot keyset walk (`MemoryStore::export_memories` on
+/// PostgreSQL): a row with an at-rest envelope refuses the whole export with
+/// `SEALED_EXPORT_REFUSED` naming the row, instead of being decrypted into
+/// the bundle or skipped and counted. The garbage envelope proves the refusal
+/// is decided from the column, before any decrypt.
+#[tokio::test]
+async fn pg_export_memories_walk_refuses_a_sealed_row_10033() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    let ns = format!("export-10033-keyset-{}", uuid::Uuid::new_v4());
+    let ctx = CallerContext::for_agent("ai:3288");
+    let id = format!("{ns}-sealed");
+    store
+        .store(&ctx, &mem(&id, &ns, "2030-07-01T00:00:00.000000Z"))
+        .await
+        .expect("seed row");
+    sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
+        .bind(vec![0_u8; 96])
+        .bind(&id)
+        .execute(store.pool())
+        .await
+        .expect("plant an at-rest envelope");
+    let refused = store
+        .export_memories()
+        .await
+        .expect_err("a keyset export over a sealed row must refuse");
+    let msg = refused.to_string();
+    sqlx::query("DELETE FROM memories WHERE namespace = $1")
+        .bind(&ns)
+        .execute(store.pool())
+        .await
+        .expect("cleanup");
+    assert!(
+        msg.contains(SEALED_REFUSAL_CODE) && msg.contains(&id),
+        "not the sealed-export refusal naming the row: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn pg_export_links_page_never_dangles_in_import_order_3288() {
     let Some(url) = postgres_url() else {
