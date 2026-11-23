@@ -35,6 +35,8 @@
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 
 mod common;
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
 
 use std::path::PathBuf;
 
@@ -341,7 +343,10 @@ fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
 fn archived_memory_import_seals_content_at_rest_when_encryption_enabled_2571_f2() {
     const PLAINTEXT: &str = "TOP SECRET plaintext content — must never land at rest";
 
+    // #8170 — the key dir is 0700 whatever the host umask (under umask 002
+    // `create_dir_all` alone yields 0775, which the #3198 guard refuses).
     let key_dir = scratch_root("f2-keys");
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let key_dir_str = key_dir.to_string_lossy().into_owned();
     // Batch guard (not two single-key guards — see MultiEnvVarGuard's own
     // doc comment on the self-deadlock hazard) — serialized via ENV_LOCK
