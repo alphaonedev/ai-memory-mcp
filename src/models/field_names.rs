@@ -204,6 +204,8 @@ pub const CONFIDENCE_SOURCE: &str = "confidence_source";
 pub const CONFIRMED_CONTRADICTIONS: &str = "confirmed_contradictions";
 /// `consolidated` — wire/row field name.
 pub const CONSOLIDATED: &str = "consolidated";
+/// `consumed_at` - row field name (#10040 row attestation column).
+pub const CONSUMED_AT: &str = "consumed_at";
 /// `content_sha256` — wire/row field name.
 pub const CONTENT_SHA256: &str = "content_sha256";
 /// v0.9.0 G7 (#1824) — `contradiction_conserved` metadata JSON key.
@@ -225,6 +227,8 @@ pub const CONTRADICTION_SOFT_LOSER: &str = "contradiction_soft_loser";
 pub const CONTRADICTION_WINNER_ID: &str = "contradiction_winner_id";
 /// `correlation_id` — wire/row field name.
 pub const CORRELATION_ID: &str = "correlation_id";
+/// `created_action_ids` - row field name (#10040 row attestation column).
+pub const CREATED_ACTION_IDS: &str = "created_action_ids";
 /// `created_at` — wire/row field name.
 pub const CREATED_AT: &str = "created_at";
 /// `created_by` — wire/row field name.
@@ -239,8 +243,12 @@ pub const DECIDED_AT: &str = "decided_at";
 pub const DECIDED_BY: &str = "decided_by";
 /// `default_timeout_seconds` — wire/row field name.
 pub const DEFAULT_TIMEOUT_SECONDS: &str = "default_timeout_seconds";
+/// `delivered_at` - row field name (#10040 row attestation column).
+pub const DELIVERED_AT: &str = "delivered_at";
 /// `description` — wire/row field name.
 pub const DESCRIPTION: &str = "description";
+/// `dispatch_count` - row field name (#10040 row attestation column).
+pub const DISPATCH_COUNT: &str = "dispatch_count";
 /// `dependents` — MCP/HTTP `memory_dependents_of_invalidated` list key.
 /// #3714 — the `[deployment]` config block.
 pub const DEPLOYMENT: &str = "deployment";
@@ -266,6 +274,8 @@ pub const EMBEDDING_SPACE: &str = "embedding_space";
 /// [`MENTIONED_ENTITY_ID`] column). Canonical spelling SSOT; the MCP
 /// param `crate::mcp::param_names::ENTITY_ID` aliases this const (#1665).
 pub const ENTITY_ID: &str = "entity_id";
+/// `event_type` - row field name (#10040 row attestation column).
+pub const EVENT_TYPE: &str = "event_type";
 /// `event_types` — wire/row field name.
 pub const EVENT_TYPES: &str = "event_types";
 /// `excluded_for_scope` — wire/row field name.
@@ -283,6 +293,8 @@ pub const EXPIRED_AT: &str = "expired_at";
 pub const EXPIRED_DELETED: &str = "expired_deleted";
 /// `expires_at` — wire/row field name.
 pub const EXPIRES_AT: &str = "expires_at";
+/// `failure_count` - row field name (#10040 row attestation column).
+pub const FAILURE_COUNT: &str = "failure_count";
 /// `exported_at` — wire/row field name.
 pub const EXPORTED_AT: &str = "exported_at";
 /// `export_scope` — additive `ai-memory export` marker (#1944): names the
@@ -352,6 +364,8 @@ pub const SNAPSHOT: &str = "snapshot";
 pub const NAMESPACE: &str = "namespace";
 /// `forged_signature_skipped` — import/sync report field name.
 pub const FORGED_SIGNATURE_SKIPPED: &str = "forged_signature_skipped";
+/// `from_action` - row field name (#10040 row attestation column).
+pub const FROM_ACTION: &str = "from_action";
 /// `from_agent_id` — wire/row field name.
 pub const FROM_AGENT_ID: &str = "from_agent_id";
 /// `generated_at` — wire/row field name.
@@ -490,6 +504,8 @@ pub const RETIRED: &str = "retired";
 pub const RETIRED_AT: &str = "retired_at";
 /// `retired_by` — #2024 skill-retire lifecycle wire/row field name.
 pub const RETIRED_BY: &str = "retired_by";
+/// `routine_id` - row field name (#10040 row attestation column).
+pub const ROUTINE_ID: &str = "routine_id";
 /// `ruling_key` — #3587 U1 swarm anti-drift metadata key: a store carrying
 /// `metadata.ruling_key = K` in namespace N archives the previous live
 /// memory with the same `(N, K)` via `archive_as_superseded`. Write-once
@@ -501,6 +517,8 @@ pub const RULING_KEY: &str = "ruling_key";
 pub const SCHEMA_VERSION: &str = "schema_version";
 /// `scope_status` — wire/row field name.
 pub const SCOPE_STATUS: &str = "scope_status";
+/// `secret_hash` - row field name (#10040 row attestation column).
+pub const SECRET_HASH: &str = "secret_hash";
 /// `sender_agent_id` — wire/row field name.
 pub const SENDER_AGENT_ID: &str = "sender_agent_id";
 /// `sender_policy_digest_hex` — FED-RQ-03 (#1947) federation `/sync/push`

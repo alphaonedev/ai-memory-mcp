@@ -18,6 +18,8 @@
 
 pub mod sqlite;
 
+use crate::models::field_names;
+use crate::storage::schema_integrity;
 use sha2::{Digest, Sha256};
 
 /// Domain tag of every attestation preimage (C-1).
@@ -126,7 +128,7 @@ pub const TABLES: &[TableSpec] = &[
             // Canonical byte form: `canonical_json` (sorted keys, no
             // whitespace, serde_json scalar spelling); NULL keeps TAG_NULL.
             ("metadata", Json),
-            ("expires_at", Ts),
+            (field_names::EXPIRES_AT, Ts),
             ("confidence", Real),
         ],
         key: &["id"],
@@ -135,17 +137,21 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         table: "entity_aliases",
-        cols: &[("entity_id", Text), ("alias", Text), ("created_at", Ts)],
+        cols: &[
+            ("entity_id", Text),
+            ("alias", Text),
+            (field_names::CREATED_AT, Ts),
+        ],
         key: &["entity_id", "alias"],
         transition: None,
         retention: Append,
     },
     TableSpec {
-        table: "namespace_meta",
+        table: schema_integrity::TABLE_NAMESPACE_META,
         cols: &[
             ("namespace", Text),
             ("standard_id", Text),
-            ("updated_at", Ts),
+            (field_names::UPDATED_AT, Ts),
             ("parent_namespace", Text),
         ],
         key: &["namespace"],
@@ -153,7 +159,7 @@ pub const TABLES: &[TableSpec] = &[
         retention: Append,
     },
     TableSpec {
-        table: "pending_actions",
+        table: schema_integrity::TABLE_PENDING_ACTIONS,
         cols: &[
             ("id", Text),
             ("action_type", Text),
@@ -179,14 +185,14 @@ pub const TABLES: &[TableSpec] = &[
             ("id", Text),
             ("url", Text),
             ("events", Text),
-            ("secret_hash", Text),
+            (field_names::SECRET_HASH, Text),
             ("namespace_filter", Text),
             ("agent_filter", Text),
             ("created_by", Text),
-            ("created_at", Ts),
+            (field_names::CREATED_AT, Ts),
             ("last_dispatched_at", Ts),
-            ("dispatch_count", Int),
-            ("failure_count", Int),
+            (field_names::DISPATCH_COUNT, Int),
+            (field_names::FAILURE_COUNT, Int),
             ("event_types", Json),
         ],
         key: &["id"],
@@ -198,10 +204,10 @@ pub const TABLES: &[TableSpec] = &[
         cols: &[
             ("id", Int),
             ("subscription_id", Text),
-            ("correlation_id", Text),
-            ("event_type", Text),
+            (field_names::CORRELATION_ID, Text),
+            (field_names::EVENT_TYPE, Text),
             ("payload", Json),
-            ("delivered_at", Ts),
+            (field_names::DELIVERED_AT, Ts),
             ("delivery_status", Text),
         ],
         key: &["id"],
@@ -213,8 +219,8 @@ pub const TABLES: &[TableSpec] = &[
         cols: &[
             ("id", Int),
             ("subscription_id", Text),
-            ("correlation_id", Text),
-            ("event_type", Text),
+            (field_names::CORRELATION_ID, Text),
+            (field_names::EVENT_TYPE, Text),
             ("payload", Json),
             ("retry_count", Int),
             ("last_error", Text),
@@ -230,8 +236,8 @@ pub const TABLES: &[TableSpec] = &[
         cols: &[
             ("id", Text),
             ("namespace", Text),
-            ("created_at", Ts),
-            ("expires_at", Ts),
+            (field_names::CREATED_AT, Ts),
+            (field_names::EXPIRES_AT, Ts),
             ("compressed_size", Int),
             ("original_size", Int),
             ("zstd_level", Int),
@@ -264,7 +270,7 @@ pub const TABLES: &[TableSpec] = &[
             ("score", Real),
             ("consumed", Bool),
             ("observed_at", Ts),
-            ("consumed_at", Ts),
+            (field_names::CONSUMED_AT, Ts),
             ("consumed_by_memory_id", Text),
             ("folded", Bool),
             ("agent_id", Text),
@@ -288,8 +294,8 @@ pub const TABLES: &[TableSpec] = &[
             ("claimed_by", Text),
             ("vector_clock", Json),
             ("metadata", Json),
-            ("created_at", Int),
-            ("updated_at", Int),
+            (field_names::CREATED_AT, Int),
+            (field_names::UPDATED_AT, Int),
         ],
         key: &["id"],
         transition: Some("state"),
@@ -298,12 +304,12 @@ pub const TABLES: &[TableSpec] = &[
     TableSpec {
         table: "action_edges",
         cols: &[
-            ("from_action", Text),
+            (field_names::FROM_ACTION, Text),
             ("to_action", Text),
             ("edge_type", Text),
-            ("created_at", Int),
+            (field_names::CREATED_AT, Int),
         ],
-        key: &["from_action", "to_action", "edge_type"],
+        key: &[field_names::FROM_ACTION, "to_action", "edge_type"],
         transition: None,
         retention: Append,
     },
@@ -313,7 +319,7 @@ pub const TABLES: &[TableSpec] = &[
             ("action_id", Text),
             ("holder", Text),
             ("acquired_at", Int),
-            ("expires_at", Int),
+            (field_names::EXPIRES_AT, Int),
             ("heartbeat_at", Int),
         ],
         key: &["action_id"],
@@ -324,11 +330,11 @@ pub const TABLES: &[TableSpec] = &[
         table: "routine_runs",
         cols: &[
             ("id", Text),
-            ("routine_id", Text),
+            (field_names::ROUTINE_ID, Text),
             ("namespace", Text),
             ("arguments", Json),
             ("state", Text),
-            ("created_action_ids", Json),
+            (field_names::CREATED_ACTION_IDS, Json),
             ("started_at", Int),
             ("finished_at", Int),
             ("error", Text),
