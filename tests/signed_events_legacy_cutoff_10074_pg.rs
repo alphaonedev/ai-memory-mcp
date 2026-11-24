@@ -80,7 +80,7 @@ enum Tamper {
     /// A second row of the reserved cutoff type, a copy of the first.
     DuplicateCutoff,
     /// The cutoff row's payload hash is changed.
-    TamperCutoffPayload,
+    CutoffPayload,
 }
 
 struct Scenario {
@@ -136,7 +136,7 @@ const SCENARIOS: &[Scenario] = &[
         before_mint: &[P, I, T],
         mint: true,
         after_mint: &[],
-        tamper: Tamper::TamperCutoffPayload,
+        tamper: Tamper::CutoffPayload,
         failures: &[1, 2, 4],
     },
     Scenario {
@@ -252,7 +252,7 @@ fn tampered(rows: &[SignedEvent], tamper: Tamper) -> Option<Vec<SignedEvent>> {
             copy.sequence = rows.last().map_or(1, |r| r.sequence + 1);
             rows.push(copy);
         }
-        Tamper::TamperCutoffPayload => {
+        Tamper::CutoffPayload => {
             let c = rows
                 .iter_mut()
                 .find(|r| r.event_type == LEGACY_CUTOFF_EVENT_TYPE)

@@ -1708,6 +1708,9 @@ pub fn mint_legacy_cutoff(conn: &Connection) -> Result<LegacyCutoffMint> {
     }
 }
 
+/// #10074 — counts the rows of one event type (the mint's cutoff-exists probe).
+const COUNT_EVENT_TYPE_ROWS_SQL: &str = "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1";
+
 fn mint_legacy_cutoff_in_tx(
     conn: &Connection,
     vk: &ed25519_dalek::VerifyingKey,
@@ -1715,7 +1718,7 @@ fn mint_legacy_cutoff_in_tx(
     use crate::governance::{audit, daemon_signer};
     let existing: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+            COUNT_EVENT_TYPE_ROWS_SQL,
             params![LEGACY_CUTOFF_EVENT_TYPE],
             |r| r.get(0),
         )

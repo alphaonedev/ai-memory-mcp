@@ -1682,7 +1682,11 @@ prints the command that resolves it (#3709 item 5). Not in v1.0.0:
 ### `verify-signed-events-chain` — V-4 closeout verifier
 
 Walks the `signed_events` cross-row hash chain end-to-end. Supports
-`--since N` (skip the first N rows) and `--format text|json`. See
+`--since N` (skip the first N rows) and `--format text|json`.
+`--mint-legacy-cutoff` (#10074) is the one explicit operator order that
+mints the single legacy cutoff row (once per database; with
+`--store-url <URL>` on a PostgreSQL store). It refuses when a cutoff row
+or its anchor already exists. See
 [`docs/signed-events-v4.md`](signed-events-v4.html).
 
 ### `schema-init` — postgres + AGE bootstrap (`--features sal`)
