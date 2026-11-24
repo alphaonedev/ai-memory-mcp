@@ -1377,7 +1377,7 @@ fn snapshot_in(dir: &Path) -> PathBuf {
         .map(|e| e.expect("entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "db"))
         .collect();
-    assert_eq!(dbs.len(), 1, "one snapshot in {dir:?}: {dbs:?}");
+    assert_eq!(dbs.len(), 1, "one snapshot in {}: {dbs:?}", dir.display());
     dbs.remove(0)
 }
 
