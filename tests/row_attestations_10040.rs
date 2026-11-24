@@ -494,10 +494,7 @@ fn scope_metadata_expiry_confidence_are_attested_10040() {
     let id = mcp.store("attest added fields 10040");
     let mut seq = latest(&sb, &id).seq;
     let changes = [
-        (
-            "scope",
-            json!({"id": id, "metadata": {"scope": "team"}}),
-        ),
+        ("scope", json!({"id": id, "metadata": {"scope": "team"}})),
         (
             "metadata",
             json!({"id": id, "metadata": {"scope": "team", "k10040": "v"}}),
@@ -511,7 +508,11 @@ fn scope_metadata_expiry_confidence_are_attested_10040() {
     for (field, args) in &changes {
         let before = row_state(&sb, &id);
         mcp.ok("memory_update", args);
-        assert_ne!(row_state(&sb, &id), before, "{field}: the update changed the row");
+        assert_ne!(
+            row_state(&sb, &id),
+            before,
+            "{field}: the update changed the row"
+        );
         let att = latest(&sb, &id);
         seq += 1;
         assert_eq!(att.seq, seq, "{field}: one new attestation");
@@ -534,9 +535,18 @@ fn scope_metadata_expiry_confidence_are_attested_10040() {
             "expires_at",
             "UPDATE memories SET expires_at = '2098-01-01T00:00:00Z' WHERE id = ?1",
         ),
-        ("expires_at null", "UPDATE memories SET expires_at = NULL WHERE id = ?1"),
-        ("expires_at empty", "UPDATE memories SET expires_at = '' WHERE id = ?1"),
-        ("confidence", "UPDATE memories SET confidence = 0.75 WHERE id = ?1"),
+        (
+            "expires_at null",
+            "UPDATE memories SET expires_at = NULL WHERE id = ?1",
+        ),
+        (
+            "expires_at empty",
+            "UPDATE memories SET expires_at = '' WHERE id = ?1",
+        ),
+        (
+            "confidence",
+            "UPDATE memories SET confidence = 0.75 WHERE id = ?1",
+        ),
     ];
     let saved = sb
         .conn()
@@ -562,7 +572,11 @@ fn scope_metadata_expiry_confidence_are_attested_10040() {
                 rusqlite::params![id, saved.0, saved.1, saved.2],
             )
             .expect("restore fields");
-        assert_eq!(row_state(&sb, &id), before, "{field}: restored byte for byte");
+        assert_eq!(
+            row_state(&sb, &id),
+            before,
+            "{field}: restored byte for byte"
+        );
         assert_ok(&sb.report(), &format!("raw {field} restored"));
     }
 
@@ -1010,8 +1024,11 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
 
     let copy = vacuum_copy(&sb, "verify-raw-priority.db");
     let conn = rusqlite::Connection::open(&copy).expect("open copy");
-    conn.execute("UPDATE memories SET priority = priority + 1 WHERE id = ?1", [&id])
-        .expect("raw priority change");
+    conn.execute(
+        "UPDATE memories SET priority = priority + 1 WHERE id = ?1",
+        [&id],
+    )
+    .expect("raw priority change");
     drop(conn);
     assert!(
         !store_verdict(&copy, &id),

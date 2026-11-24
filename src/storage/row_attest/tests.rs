@@ -199,7 +199,10 @@ fn each_memory_field_changes_the_digest_e1() {
 #[test]
 fn added_fields_null_differs_from_empty_and_metadata_is_canonical_4a() {
     let s = spec("memories");
-    let at = |col: &str| s.index_of(col).unwrap_or_else(|| panic!("{col} not covered"));
+    let at = |col: &str| {
+        s.index_of(col)
+            .unwrap_or_else(|| panic!("{col} not covered"))
+    };
     let mut row: Vec<Cell> = vec![Cell::Null; s.cols.len()];
     row[0] = t("m1");
     for (col, empty) in [
