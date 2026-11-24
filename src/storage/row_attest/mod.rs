@@ -6,8 +6,9 @@
 //! backends, ONE seal funnel, ONE verifier; insert, update, state transition
 //! and delete are each attested and no base table gets a signature column.
 //! 3-agent vote (71472661) V1-10052-ENVELOPE: memory rows are attested over
-//! (id, tags, priority, tier, content digest), with a `baseline` attestation
-//! for rows that exist at cutover.
+//! (id, tags, priority, tier, content digest, and per NOTICE 4a metadata
+//! (which carries scope), `expires_at` and confidence), with a `baseline`
+//! attestation for rows that exist at cutover.
 //!
 //! Backend-neutral by construction: the encoder takes [`Cell`] values (the
 //! storage class a backend read), the verifier takes [`LiveRow`] and
@@ -120,6 +121,13 @@ pub const TABLES: &[TableSpec] = &[
             ("priority", Int),
             ("tier", Text),
             ("content", Sha),
+            // NOTICE 4a: scope rides in `metadata.scope` (`scope_idx` is its
+            // generated projection), so covering metadata covers scope.
+            // Canonical byte form: `canonical_json` (sorted keys, no
+            // whitespace, serde_json scalar spelling); NULL keeps TAG_NULL.
+            ("metadata", Json),
+            ("expires_at", Ts),
+            ("confidence", Real),
         ],
         key: &["id"],
         transition: None,
