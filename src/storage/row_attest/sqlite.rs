@@ -54,6 +54,26 @@ fn refusal(reason: &str) -> String {
     format!("{ROW_ATTEST_REFUSAL_PREFIX}: {reason}")
 }
 
+/// Why the attestation funnel refused a write. Its text is exactly the
+/// refusal the SQL function reports and the write's caller sees (QUAL-7: a
+/// typed error, not a bare string error).
+#[derive(Debug)]
+struct FunnelRefusal(String);
+
+impl From<String> for FunnelRefusal {
+    fn from(reason: String) -> Self {
+        Self(reason)
+    }
+}
+
+impl std::fmt::Display for FunnelRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FunnelRefusal {}
+
 fn cell_of(v: ValueRef<'_>) -> Cell {
     match v {
         ValueRef::Null => Cell::Null,
@@ -303,7 +323,12 @@ fn seal_refusal_first(conn: &Connection, ch: &Change<'_>) -> Option<String> {
         .flatten()
 }
 
-fn append(conn: &Connection, who: &Signer, store: &str, ch: &Change<'_>) -> Result<(), String> {
+fn append(
+    conn: &Connection,
+    who: &Signer,
+    store: &str,
+    ch: &Change<'_>,
+) -> Result<(), FunnelRefusal> {
     let db = |e: rusqlite::Error| refusal(&e.to_string());
     let (head_seq, head_acc) = head_for(conn, ch.spec.table)
         .map_err(db)?
@@ -313,7 +338,9 @@ fn append(conn: &Connection, who: &Signer, store: &str, ch: &Change<'_>) -> Resu
     let mut old = ch.old;
     match (old, live_latest) {
         (Some(o), Some(l)) if l.row_digest.as_deref() != Some(&o[..]) => {
-            return Err(seal_refusal_first(conn, ch).unwrap_or_else(|| refusal(REFUSE_ROW_DRIFT)));
+            return Err(seal_refusal_first(conn, ch)
+                .unwrap_or_else(|| refusal(REFUSE_ROW_DRIFT))
+                .into());
         }
         // An insert over a live attested key (REPLACE without delete
         // triggers): the replaced row is the attested one.
@@ -439,9 +466,9 @@ fn changes<'a>(spec: &'a TableSpec, kind: &str, vals: &[Cell]) -> Result<Vec<Cha
     }
 }
 
-fn attest_call(conn: &Connection, args: &[Cell]) -> Result<(), String> {
+fn attest_call(conn: &Connection, args: &[Cell]) -> Result<(), FunnelRefusal> {
     let (Some(Cell::Text(table)), Some(Cell::Text(kind))) = (args.first(), args.get(1)) else {
-        return Err(refusal("malformed trigger call"));
+        return Err(refusal("malformed trigger call").into());
     };
     let spec = spec_for(table).ok_or_else(|| refusal("unknown attested table"))?;
     let todo = changes(spec, kind, &args[2..])?;
