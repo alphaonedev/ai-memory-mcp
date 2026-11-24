@@ -21,11 +21,16 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use std::collections::BTreeMap;
+
 use ai_memory::storage::row_attest::sqlite::{
     REFUSE_KEY_MISMATCH, REFUSE_ROW_DRIFT, ROW_ATTEST_REFUSAL_PREFIX, SNAPSHOT_REFUSAL_PREFIX,
-    read_attestations, verify_sqlite,
+    read_attestations, read_rows, verify_sqlite,
 };
-use ai_memory::storage::row_attest::{Attestation, Report, memory_id_of_key};
+use ai_memory::storage::row_attest::{
+    Attestation, Report, TABLES, acc_add, acc_sub, acc_term, encode_key, key_id_of,
+    memory_id_of_key, row_digest, sign,
+};
 use serde_json::{Value, json};
 
 #[path = "common/child_stdin_report.rs"]
@@ -216,7 +221,12 @@ impl Sandbox {
     }
 
     fn report(&self) -> Report {
-        verify_sqlite(&self.conn()).expect("verifier reads the store")
+        self.report_of(&self.conn())
+    }
+
+    /// The verifier's report on `conn` (a copy of this sandbox's store).
+    fn report_of(&self, conn: &rusqlite::Connection) -> Report {
+        verify_sqlite(conn).expect("verifier reads the store")
     }
 
     fn raw(&self, sql: &str, id: &str) {
@@ -1462,4 +1472,134 @@ fn backup_restore_round_trip_and_catalog_ratchet_10040() {
     );
     assert_eq!(row_state(&sb, &id), live_before, "restored byte for byte");
     assert_ok(&sb.report(), "after the restore");
+}
+
+// ---------------------------------------------------------------------------
+// #10086 A-1: the trust anchor is outside the database
+// ---------------------------------------------------------------------------
+
+/// Delta of one table's accumulator when a row digest changes.
+fn acc_delta(
+    delta: &[u8; 32],
+    table: &str,
+    key: &[u8],
+    old: &[u8; 32],
+    new: &[u8; 32],
+) -> [u8; 32] {
+    let d = acc_add(delta, &acc_term(table, key, new));
+    acc_sub(&d, &acc_term(table, key, old))
+}
+
+/// The direct file writer of the threat model with its own key: rebinds the
+/// agent's key in the `_agents` row of the database, then rewrites every
+/// attestation so the whole log chains, accumulates and verifies against
+/// that rebound key (live row digests, table accumulators, prior digests,
+/// key ids and signatures). It holds no key the anchor trusts.
+fn forge_with_rebound_db_key(conn: &rusqlite::Connection, attacker: &ed25519_dalek::SigningKey) {
+    let rebound = ai_memory::identity::keypair::encode_public_base64(&attacker.verifying_key());
+    let n = conn
+        .execute(
+            "UPDATE agent_pubkey_history SET pubkey_b64 = ?1 \
+             WHERE agent_id = ?2 AND superseded_at IS NULL",
+            [rebound.as_str(), AGENT],
+        )
+        .expect("rebind the key history row");
+    assert_eq!(n, 1, "one open history row rebound");
+    let n = conn
+        .execute(
+            "UPDATE memories SET metadata = json_set(metadata, '$.agent_pubkey', ?1), \
+             content = json_set(content, '$.agent_pubkey', ?1) \
+             WHERE namespace = '_agents' AND title = ?2",
+            [
+                rebound.as_str(),
+                &ai_memory::models::agent_registration_title(AGENT),
+            ],
+        )
+        .expect("rebind the in-database key");
+    assert_eq!(n, 1, "one _agents row rebound");
+    let mut live: BTreeMap<(String, Vec<u8>), [u8; 32]> = BTreeMap::new();
+    for spec in TABLES {
+        for cells in read_rows(conn, spec).expect("live rows") {
+            live.insert(
+                (spec.table.to_string(), encode_key(spec, &cells)),
+                row_digest(spec, &cells),
+            );
+        }
+    }
+    let atts = read_attestations(conn).expect("attestations");
+    let mut latest: BTreeMap<(String, Vec<u8>), i64> = BTreeMap::new();
+    for a in atts.iter().filter(|a| a.row_digest.is_some()) {
+        latest.insert((a.table.clone(), a.row_key.clone()), a.id);
+    }
+    let mut delta: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    let mut renamed: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let key_id = key_id_of(&attacker.verifying_key());
+    for mut a in atts {
+        let k = (a.table.clone(), a.row_key.clone());
+        if latest.get(&k) == Some(&a.id)
+            && let (Some(old), Some(new)) = (a.row_digest.clone(), live.get(&k))
+            && old.as_slice() != new.as_slice()
+        {
+            let old: [u8; 32] = old.as_slice().try_into().expect("32-byte digest");
+            let d = delta.entry(a.table.clone()).or_insert([0_u8; 32]);
+            *d = acc_delta(d, &a.table, &a.row_key, &old, new);
+            a.row_digest = Some(new.to_vec());
+        }
+        if let Some(d) = delta.get(&a.table) {
+            let acc: [u8; 32] = a.table_acc.as_slice().try_into().expect("32-byte acc");
+            a.table_acc = acc_add(&acc, d).to_vec();
+        }
+        if let Some(p) = renamed.get(&a.prior_digest) {
+            a.prior_digest = p.clone();
+        }
+        let old_digest = a.attestation_digest.clone();
+        a.key_id = key_id.clone();
+        sign(&mut a, attacker);
+        renamed.insert(old_digest, a.attestation_digest.clone());
+        conn.execute(
+            "UPDATE row_attestations SET row_digest = ?1, table_acc = ?2, prior_digest = ?3, \
+             key_id = ?4, signature = ?5, attestation_digest = ?6 WHERE id = ?7",
+            rusqlite::params![
+                a.row_digest,
+                a.table_acc,
+                a.prior_digest,
+                a.key_id,
+                a.signature,
+                a.attestation_digest,
+                a.id
+            ],
+        )
+        .expect("rewrite attestation");
+    }
+}
+
+/// A-1 (#10086, 3-agent vote (71472661) V2-ROW-ATTEST-ANCHOR): a raw
+/// rebind of the agent's key inside the database plus a fully re-chained,
+/// re-signed attestation log is a defect. The verifier's key comes from the
+/// key directory, so the forged key is not trusted, whatever the database
+/// says about it.
+#[test]
+fn rebound_db_key_with_forged_chain_is_a_defect_10086() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("anchor forge 10086");
+    drop(mcp);
+    assert_ok(&sb.report(), "control");
+    let forged = vacuum_copy(&sb, "forged.db");
+    let conn = rusqlite::Connection::open(&forged).expect("open copy");
+    let attacker = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+    conn.execute(
+        "UPDATE memories SET content = 'forged 10086' WHERE id = ?1",
+        [&id],
+    )
+    .expect("forge the content");
+    forge_with_rebound_db_key(&conn, &attacker);
+    let report = sb.report_of(&conn);
+    let attacker_id = key_id_of(&attacker.verifying_key());
+    let needle = format!("key_id {attacker_id} of agent {AGENT} is not in the trust anchor");
+    assert!(
+        report.defects.iter().any(|d| d.contains(&needle)),
+        "expected {needle:?}, got {:?}",
+        report.defects
+    );
+    assert!(!report.ok(), "a forged store is never clean");
 }
