@@ -72,6 +72,8 @@ fn expected_copy_refusal(id: &str) -> String {
 }
 
 /// The exact #10060 census refusal (the early refusal the census keeps).
+/// Only the Postgres census cell uses it.
+#[cfg(feature = "sal-postgres")]
 fn expected_census_refusal(id: &str) -> String {
     format!(
         "source census refused before any write: SEALED_EXPORT_REFUSED: 1 row(s) of memories \
@@ -154,6 +156,12 @@ enum SourceHandle {
 }
 
 impl SourceHandle {
+    // Without `sal-postgres` only the SQLite arm is compiled and it does not
+    // await; the function stays async so both builds share one call shape.
+    #[cfg_attr(
+        not(feature = "sal-postgres"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn seal(&self, id: &str) {
         match self {
             Self::Sqlite(path) => {
