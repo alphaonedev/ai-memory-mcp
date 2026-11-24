@@ -980,6 +980,7 @@ fn decide_insert(
 /// # Errors
 ///
 /// The bound-key lookup failed; the caller fails closed.
+#[cfg(feature = "sal")]
 pub(crate) fn row_seal_verifies(
     conn: &rusqlite::Connection,
     row: &Memory,
