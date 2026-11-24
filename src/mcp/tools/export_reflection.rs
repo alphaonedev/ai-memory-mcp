@@ -87,7 +87,7 @@ pub(crate) fn handle_export_reflection_for_caller(
     // `SEALED_EXPORT_REFUSED` instead of being rendered as plaintext. The
     // row is classified BEFORE any decrypting read, and the refusal comes
     // after the visibility gate so a hidden row stays hidden.
-    refuse_if_visible_and_sealed(conn, memory_id, caller)?;
+    refuse_if_visible_and_sealed(conn, memory_id, memory_id, caller)?;
     let mem = read_reflection_member(conn, memory_id, memory_id, caller)?;
     export_reflections::refuse_if_sealed(conn, &mem.id)?;
     if !matches!(mem.memory_kind, MemoryKind::Reflection) {
@@ -98,8 +98,17 @@ pub(crate) fn handle_export_reflection_for_caller(
 
     let edges =
         collect_outbound_reflects_on(conn, memory_id).context("reading reflects_on links")?;
+    // #10064 (security review r1 F3) — every source the reflection reflects
+    // on is classified the same way BEFORE the decrypting read: a sealed
+    // source hidden from the caller answers exactly as a hidden plain source
+    // does (`reflection not found: <reflection id>`), and a visible sealed
+    // source refuses naming that source, never decrypted. The source is
+    // re-classified after the visibility read, as the reflection is above,
+    // so a source sealed between the two reads still refuses.
     for edge in &edges {
+        refuse_if_visible_and_sealed(conn, &edge.target_id, memory_id, caller)?;
         read_reflection_member(conn, &edge.target_id, memory_id, caller)?;
+        export_reflections::refuse_if_sealed(conn, &edge.target_id)?;
     }
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let content = export_reflections::render_payload(&mem, &edges, attest_level, format);
@@ -123,16 +132,23 @@ pub(super) fn read_reflection_member(
         .ok_or_else(|| anyhow::Error::new(crate::errors::ReflectionNotFound::new(reflection_id)))
 }
 
-/// #10061 — classify the reflection row without decrypting it. An absent or
-/// unsealed row is left to [`read_reflection_member`]. A sealed row is never
-/// passed to the decrypting read: hidden from `caller`, not recall-visible or
-/// with metadata that does not parse (fail closed), it is reported as not
-/// found exactly as [`read_reflection_member`] reports a hidden row; visible,
-/// it is refused with `SEALED_EXPORT_REFUSED`. The visibility gate reads only
-/// the row's namespace and metadata, which are never sealed.
+/// #10061 / #10064 — classify one member row (`id`: the reflection itself or
+/// a source it reflects on) without decrypting it. An absent or unsealed row
+/// is left to [`read_reflection_member`]. A sealed row is never passed to the
+/// decrypting read: hidden from `caller`, not recall-visible or with metadata
+/// that does not parse (fail closed), it is reported as not found under
+/// `reflection_id`, exactly as [`read_reflection_member`] reports a hidden
+/// member, so a sealed hidden source is indistinguishable from a hidden
+/// plain one; visible, it is refused with `SEALED_EXPORT_REFUSED` naming
+/// `id`. The visibility gate reads only the row's namespace, metadata and
+/// lifecycle, which are never sealed. A lifecycle value that does not parse
+/// falls back to the default state through `unwrap_or_default`, the same
+/// fallback the row decoder applies, so the gate judges the row exactly as
+/// the decrypting read would.
 fn refuse_if_visible_and_sealed(
     conn: &rusqlite::Connection,
     id: &str,
+    reflection_id: &str,
     caller: Option<&str>,
 ) -> anyhow::Result<()> {
     use rusqlite::OptionalExtension as _;
@@ -158,7 +174,7 @@ fn refuse_if_visible_and_sealed(
     if !sealed {
         return Ok(());
     }
-    let not_found = || anyhow::Error::new(crate::errors::ReflectionNotFound::new(id));
+    let not_found = || anyhow::Error::new(crate::errors::ReflectionNotFound::new(reflection_id));
     let Ok(metadata) = serde_json::from_str::<Value>(&metadata) else {
         return Err(not_found());
     };
