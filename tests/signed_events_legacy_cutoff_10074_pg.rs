@@ -73,7 +73,14 @@ enum Row {
     Tagged(DaemonDomain),
     /// A signature that verifies under no form.
     Garbage,
+    /// #10101 — the forensic sink's form: the daemon key's untagged signature
+    /// over a JSON record, the record bytes stored as the payload hash.
+    Sink,
 }
+
+/// #10101 — a forensic-sink-shaped record (JSON, never a 32-byte digest).
+const SINK_RECORD: &[u8] =
+    br#"{"ts":"2026-11-24T00:00:00.000Z","actor":"daemon","decision":"allow","kind":"10101"}"#;
 
 /// A tamper applied after the rows and the mint.
 #[derive(Clone, Copy, Debug)]
@@ -205,6 +212,10 @@ fn make_row(kind: Row, sequence: i64, timestamp: String) -> SignedEvent {
                 .0
         }
         Row::Garbage => vec![7u8; 64],
+        Row::Sink => {
+            ev.payload_hash = SINK_RECORD.to_vec();
+            legacy_key().sign(SINK_RECORD).to_bytes().to_vec()
+        }
     };
     ev.signature = Some(sig);
     ev
@@ -575,4 +586,156 @@ async fn s7_mint_refusals_agree_10074() {
         store.mint_legacy_cutoff().await.expect("mint runs"),
         Err(LegacyCutoffMintRefusal::UnverifiableRow(2))
     );
+}
+
+/// What the mint must do over one prefix.
+#[derive(Debug)]
+enum MintOutcome {
+    /// The mint succeeds; the certified legacy prefix is rows `1..=legacy_end`
+    /// (0 = no legacy row), which ends before the first tagged row.
+    Certified { legacy_end: i64 },
+    /// The mint refuses with exactly this reason and writes nothing.
+    Refused(LegacyCutoffMintRefusal),
+}
+
+struct MintCase {
+    name: &'static str,
+    rows: &'static [Row],
+    outcome: MintOutcome,
+}
+
+/// #10101 / #10102 — every case, with the expected outcome written out.
+const MINT_CASES: &[MintCase] = &[
+    MintCase {
+        name: "legacy prefix then a tagged row",
+        rows: &[P, I, T],
+        outcome: MintOutcome::Certified { legacy_end: 2 },
+    },
+    MintCase {
+        name: "legacy rows only",
+        rows: &[P, P],
+        outcome: MintOutcome::Certified { legacy_end: 2 },
+    },
+    MintCase {
+        name: "tagged rows only",
+        rows: &[T, T],
+        outcome: MintOutcome::Certified { legacy_end: 0 },
+    },
+    MintCase {
+        name: "#10102 payload-only row after one tagged row",
+        rows: &[P, T, P],
+        outcome: MintOutcome::Refused(LegacyCutoffMintRefusal::LegacyAfterTagged {
+            sequence: 3,
+            first_tagged: 2,
+        }),
+    },
+    MintCase {
+        name: "#10102 identity row after two tagged rows",
+        rows: &[I, T, T, I],
+        outcome: MintOutcome::Refused(LegacyCutoffMintRefusal::LegacyAfterTagged {
+            sequence: 4,
+            first_tagged: 2,
+        }),
+    },
+    MintCase {
+        name: "#10102 legacy row after a tagged genesis",
+        rows: &[T, P],
+        outcome: MintOutcome::Refused(LegacyCutoffMintRefusal::LegacyAfterTagged {
+            sequence: 2,
+            first_tagged: 1,
+        }),
+    },
+    MintCase {
+        name: "#10101 sink signature after a legacy row",
+        rows: &[P, Row::Sink],
+        outcome: MintOutcome::Refused(LegacyCutoffMintRefusal::ForeignSignatureForm(2)),
+    },
+    MintCase {
+        name: "#10101 sink signature at genesis",
+        rows: &[Row::Sink, P],
+        outcome: MintOutcome::Refused(LegacyCutoffMintRefusal::ForeignSignatureForm(1)),
+    },
+    MintCase {
+        name: "#10101 sink signature after a tagged row",
+        rows: &[P, T, Row::Sink],
+        outcome: MintOutcome::Refused(LegacyCutoffMintRefusal::ForeignSignatureForm(3)),
+    },
+    MintCase {
+        name: "unverifiable row after a tagged row",
+        rows: &[P, T, Row::Garbage],
+        outcome: MintOutcome::Refused(LegacyCutoffMintRefusal::UnverifiableRow(3)),
+    },
+];
+
+/// Rows of the reserved cutoff type in the sqlite table.
+fn sqlite_cutoff_rows(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+        rusqlite::params![LEGACY_CUTOFF_EVENT_TYPE],
+        |r| r.get(0),
+    )
+    .expect("count")
+}
+
+/// #10101 / #10102 (S-7) — the mint certifies as legacy only rows that are
+/// legacy by construction, in a contiguous prefix that ends before the first
+/// tagged row, or refuses with the exact reason; SQLite and PostgreSQL agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn c2_mint_certifies_only_a_contiguous_legacy_prefix_10101_10102() {
+    let vk = sink();
+    for case in MINT_CASES {
+        let (_d, _p, conn) = sqlite::open();
+        sqlite::append(&conn, case.rows);
+        let head = i64::try_from(case.rows.len()).expect("small");
+        let minted = ai_memory::signed_events::mint_legacy_cutoff(&conn).expect("mint runs");
+        match &case.outcome {
+            MintOutcome::Certified { legacy_end } => {
+                assert_eq!(minted, Ok(head + 1), "{}: sqlite mint", case.name);
+                let cutoff =
+                    ai_memory::signed_events::resolve_sqlite_legacy_cutoff(&conn, Some(&vk))
+                        .expect("resolve");
+                assert_eq!(cutoff.sequence(), *legacy_end, "{}: legacy end", case.name);
+                assert_eq!(cutoff.row_sequence(), Some(head + 1), "{}: row", case.name);
+                let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("verify");
+                assert_eq!(trail.signature_failures, Vec::<i64>::new(), "{}", case.name);
+            }
+            MintOutcome::Refused(reason) => {
+                assert_eq!(minted, Err(reason.clone()), "{}: sqlite refusal", case.name);
+                assert_eq!(
+                    sqlite_cutoff_rows(&conn),
+                    0,
+                    "{}: nothing written",
+                    case.name
+                );
+            }
+        }
+    }
+    let Some(url) = pg_url() else { return };
+    for case in MINT_CASES {
+        let (_scratch, store) = fresh_pg(&url).await;
+        pg::append(&store, case.rows).await;
+        let head = i64::try_from(case.rows.len()).expect("small");
+        let minted = store.mint_legacy_cutoff().await.expect("pg mint runs");
+        let cutoffs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
+                .bind(LEGACY_CUTOFF_EVENT_TYPE)
+                .fetch_one(store.pool())
+                .await
+                .expect("count");
+        match &case.outcome {
+            MintOutcome::Certified { .. } => {
+                assert_eq!(minted, Ok(head + 1), "{}: pg mint", case.name);
+                assert_eq!(cutoffs, 1, "{}: one cutoff row", case.name);
+                let trail = store
+                    .verify_audit_trail(None, Some(&vk))
+                    .await
+                    .expect("pg verify");
+                assert_eq!(trail.signature_failures, Vec::<i64>::new(), "{}", case.name);
+            }
+            MintOutcome::Refused(reason) => {
+                assert_eq!(minted, Err(reason.clone()), "{}: pg refusal", case.name);
+                assert_eq!(cutoffs, 0, "{}: nothing written", case.name);
+            }
+        }
+    }
 }

@@ -21,10 +21,11 @@ use std::sync::OnceLock;
 
 use ai_memory::governance::daemon_signer::{self, DaemonDomain};
 use ai_memory::signed_events::{
-    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoffMintRefusal, RowSignatureVerdict, SignatureFailure,
-    SignedEvent, ZERO_HASH, append_signed_event, canonical_chain_bytes, classify_row_signature,
-    daemon_row_signing_input, legacy_cutoff_payload_hash, mint_legacy_cutoff, payload_hash,
-    resolve_sqlite_legacy_cutoff, verify_audit_trail, verify_chain,
+    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMintRefusal, RowSignatureVerdict,
+    SignatureFailure, SignedEvent, ZERO_HASH, append_signed_event, canonical_chain_bytes,
+    classify_row_signature, daemon_row_signing_input, legacy_cutoff_payload_hash,
+    mint_legacy_cutoff, payload_hash, resolve_sqlite_legacy_cutoff, verify_audit_trail,
+    verify_chain,
 };
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rusqlite::params;
@@ -822,4 +823,78 @@ fn s8_cli_mint_once_on_explicit_flag_10074() {
         "walk after mint: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// #10101 — the forensic sink's record shape (JSON, never a 32-byte digest).
+const SINK_RECORD: &[u8] =
+    br#"{"ts":"2026-11-24T00:00:00.000Z","actor":"daemon","decision":"allow","kind":"10101"}"#;
+
+/// #10101 — a head row carrying the forensic sink's form: the daemon key's
+/// untagged signature over a JSON record, the record stored as payload hash.
+fn insert_sink_form(conn: &rusqlite::Connection) -> i64 {
+    let seq = insert_head_row(conn, "sink", |_| Vec::new());
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1, signature = ?2 WHERE sequence = ?3",
+        params![
+            SINK_RECORD,
+            legacy_key().sign(SINK_RECORD).to_bytes().to_vec(),
+            seq
+        ],
+    )
+    .expect("sink form");
+    relink(conn);
+    seq
+}
+
+/// #10101 — the sink's untagged signature is never a legacy form: the row
+/// fails as a plain daemon-signature failure (not as a legacy row above the
+/// cutoff), and the mint refuses it with the exact reason and writes nothing.
+#[test]
+fn c2_sink_signature_is_never_a_legacy_form_10101() {
+    let (_d, _p, conn) = open_db();
+    insert_legacy(&conn, Legacy::PayloadOnly);
+    let sink_seq = insert_sink_form(&conn);
+    let vk = sink();
+    let row = row_at(&conn, sink_seq);
+    assert_eq!(
+        classify_row_signature(&row, Some(&vk), None, &LegacyCutoff::none()),
+        RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature),
+        "the sink form is no daemon form"
+    );
+    assert_eq!(
+        mint_legacy_cutoff(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::ForeignSignatureForm(sink_seq))
+    );
+    assert_eq!(cutoff_rows(&conn), 0, "nothing written");
+}
+
+/// #10102 — no legacy row is certified after the first tagged row, and the
+/// certified legacy prefix ends before it.
+#[test]
+fn c2_legacy_prefix_is_contiguous_and_ends_before_first_tagged_10102() {
+    let (_d, _p, conn) = open_db();
+    insert_legacy(&conn, Legacy::Identity);
+    let first_tagged = append_genuine(&conn);
+    let late = insert_legacy(&conn, Legacy::PayloadOnly);
+    assert_eq!(
+        mint_legacy_cutoff(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::LegacyAfterTagged {
+            sequence: late,
+            first_tagged
+        })
+    );
+    assert_eq!(cutoff_rows(&conn), 0, "nothing written");
+
+    let (_d2, _p2, conn) = open_db();
+    insert_legacy(&conn, Legacy::PayloadOnly);
+    insert_legacy(&conn, Legacy::Identity);
+    append_genuine(&conn);
+    append_genuine(&conn);
+    let cutoff_row = mint_legacy_cutoff(&conn)
+        .expect("mint runs")
+        .expect("a contiguous legacy prefix is certified");
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&sink())).expect("resolve");
+    assert_eq!(cutoff.sequence(), 2, "the legacy prefix is rows 1..=2");
+    assert_eq!(cutoff.row_sequence(), Some(cutoff_row));
+    assert_clean(&conn, "a contiguous legacy prefix");
 }

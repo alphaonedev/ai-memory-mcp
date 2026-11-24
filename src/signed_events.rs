@@ -1639,6 +1639,18 @@ pub enum LegacyCutoffMintRefusal {
     ChainBreak(i64),
     /// A daemon-signed row carries a signature that verifies under no form.
     UnverifiableRow(i64),
+    /// #10101 — a daemon-signed row carries an untagged daemon signature over
+    /// bytes that are not a payload digest (the forensic sink's form): it is
+    /// not legacy by construction, so the mint never certifies it.
+    ForeignSignatureForm(i64),
+    /// #10102 — a legacy-form row sits after the first tagged row: the
+    /// certified legacy prefix must be contiguous and end before it.
+    LegacyAfterTagged {
+        /// The legacy-form row.
+        sequence: i64,
+        /// The first `EventRow`-tagged row of the chain.
+        first_tagged: i64,
+    },
     /// The anchor was written but could not be read back, so the mint rolled
     /// back rather than commit a cutoff with no off-table witness.
     AnchorNotDurable,
@@ -1661,6 +1673,19 @@ impl std::fmt::Display for LegacyCutoffMintRefusal {
                     "the daemon signature at sequence {s} verifies under no form"
                 )
             }
+            Self::ForeignSignatureForm(s) => write!(
+                f,
+                "the daemon signature at sequence {s} is an untagged signature over a \
+                 non-digest payload, not a legacy form"
+            ),
+            Self::LegacyAfterTagged {
+                sequence,
+                first_tagged,
+            } => write!(
+                f,
+                "the legacy-form row at sequence {sequence} follows the first tagged row at \
+                 sequence {first_tagged}"
+            ),
             Self::AnchorNotDurable => f.write_str("the off-table anchor could not be read back"),
         }
     }
