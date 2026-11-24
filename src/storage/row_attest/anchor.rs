@@ -36,6 +36,14 @@ pub const ANCHOR_MARKER_FILE: &str = "row-attest-anchor.version";
 const PUB_SUFFIX: &str = ".pub";
 /// The archive infix: `<agent>.pub.<unix_ts>[-N]`.
 const ARCHIVE_INFIX: &str = ".pub.";
+/// The governance operator key written by `rules keygen` as base64 text
+/// (A-5): it shares the key directory but is not a row signer, so the
+/// loader skips it at the top level. Any other `.pub` that is not 32 raw
+/// bytes stays a malformed anchor (fail closed).
+const OPERATOR_KEYGEN_PUB_FILE: &str = crate::governance::rules_store::OPERATOR_PUBKEY_KEYGEN_FILE;
+/// Stem suffix of an X25519 (encryption, escrow) public key such as
+/// `recovery.x25519.pub` (A-5): never an Ed25519 row signer.
+const X25519_STEM_SUFFIX: &str = ".x25519";
 /// Ed25519 public key length in bytes.
 const PUBLIC_KEY_LEN: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
 /// Directory entries the loader reads before it refuses the anchor as
@@ -181,6 +189,14 @@ enum KeyName {
     Retired(String, i64, u32),
 }
 
+impl KeyName {
+    fn agent(&self) -> &str {
+        match self {
+            Self::Current(agent) | Self::Retired(agent, _, _) => agent,
+        }
+    }
+}
+
 fn parse_key_name(name: &str) -> Result<Option<KeyName>, String> {
     if let Some(agent) = name.strip_suffix(PUB_SUFFIX) {
         if agent.is_empty() {
@@ -282,10 +298,14 @@ fn scan(
             }
             continue;
         }
+        if depth == 0 && name == OPERATOR_KEYGEN_PUB_FILE {
+            continue;
+        }
         let parsed = parse_key_name(&name).map_err(|why| Unanchored::Malformed {
             path: path.clone(),
             why,
         })?;
+        let parsed = parsed.filter(|k| !k.agent().ends_with(X25519_STEM_SUFFIX));
         match parsed {
             None => {}
             Some(KeyName::Current(agent)) => {

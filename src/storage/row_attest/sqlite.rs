@@ -517,8 +517,28 @@ fn trigger_sql(spec: &TableSpec) -> String {
 /// Sign every unsigned cutover with the session key (the watermark records
 /// the live state this first signing session observed) and write a signed
 /// `baseline` attestation for each memory row that has none (E-1).
+/// A-8: the first unsigned cutover that is not the pristine watermark the
+/// migration wrote. A cutover that names a signer or a sequence, or that a
+/// signed row follows, was signed once and then stripped.
+const STRIPPED_CUTOVER_SQL: &str = "SELECT c.table_name FROM row_attestations c \
+     WHERE c.op = 'cutover' AND c.signature IS NULL \
+     AND (c.agent_id <> '' OR c.key_id <> '' OR c.table_seq <> 0 \
+          OR EXISTS (SELECT 1 FROM row_attestations s \
+                     WHERE s.id > c.id AND s.signature IS NOT NULL)) \
+     ORDER BY c.id LIMIT 1";
+
 fn sign_cutovers(conn: &Connection, who: &Signer) -> Result<()> {
     let store = store_id(conn).map_err(anyhow::Error::msg)?;
+    // A-8: checked for every table before any row is signed (the memories
+    // baselines signed below must not make a later pristine cutover look
+    // stripped). A stripped cutover is never signed again: signing it
+    // would bless whatever live state a direct writer left (fail closed).
+    let stripped: Option<String> = conn
+        .query_row(STRIPPED_CUTOVER_SQL, [], |r| r.get(0))
+        .optional()?;
+    if let Some(table) = stripped {
+        anyhow::bail!("{}: {table}", refusal(REFUSE_STRIPPED_CUTOVER));
+    }
     for spec in TABLES {
         let unsigned: Option<i64> = conn
             .query_row(
