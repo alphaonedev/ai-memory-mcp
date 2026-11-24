@@ -60,11 +60,13 @@ pub(super) async fn resolve_pg_legacy_cutoff(
     .fetch_all(pool)
     .await
     .map_err(|e| to_store_err("legacy_cutoff.rows", e))?;
-    let mut cutoffs: Vec<SignedEvent> = cutoffs.into_iter().map(to_event).collect();
+    // #10107: a second cutoff-type row means no cutoff. The candidate is the
+    // lowest-sequence row, the one the sqlite resolver takes, so both
+    // backends judge the same row.
     if cutoffs.len() != 1 {
         return Ok(LegacyCutoff::none());
     }
-    let Some(cutoff_row) = cutoffs.pop() else {
+    let Some(cutoff_row) = cutoffs.into_iter().next().map(to_event) else {
         return Ok(LegacyCutoff::none());
     };
     let prefix: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
