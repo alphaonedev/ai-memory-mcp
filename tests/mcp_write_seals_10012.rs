@@ -26,7 +26,11 @@
 //!   (for `memories`, the signed columns), except a `READONLY_ALLOWANCES`
 //!   row naming the tool, the table and the reason;
 //! - every other table the call changed is a table the tool's classification
-//!   row names (the `needs-format` tables, which have no signature carrier).
+//!   row names (the row-attested tables, which have no signature column);
+//! - after every call the `row_attestations` verifier (#10040) reports no
+//!   defect: every row key of `memories` and of every row-attested table has
+//!   a latest attestation that verifies against the bound key and the live
+//!   row, and the signed per-table watermark covers the whole table.
 //!
 //! The ratchet (`every_registered_tool_is_classified_and_driven_10012`)
 //! fails on any registered tool that has no classification row or no drive
@@ -63,7 +67,11 @@ const POSTURES: [&str; 2] = ["0", "1"];
 
 /// Tables the attestation and bookkeeping machinery writes on every path;
 /// they are never a tool's stored state (reason per entry).
-const EXEMPT_TABLES: [(&str, &str); 14] = [
+const EXEMPT_TABLES: [(&str, &str); 15] = [
+    (
+        "row_attestations",
+        "the signed row-attestation ledger of the write (#10040); verified after every step",
+    ),
     (
         "audit_log",
         "hash-chained audit trail of the write, not the write",
@@ -105,8 +113,9 @@ const SIGNED_TABLES: [(&str, &str); 6] = [
     ("offloaded_blobs", "signature_b64"),
 ];
 
-/// Side tables with no signature carrier (`needs-format`, #10012 STOP rule).
-const NEEDS_FORMAT_TABLES: [&str; 13] = [
+/// Side tables with no signature column, attested row by row in
+/// `row_attestations` (#10040, 3-agent vote (71472661) V1-10040).
+const ROW_ATTESTED_TABLES: [&str; 13] = [
     "actions",
     "action_edges",
     "leases",
@@ -131,8 +140,9 @@ enum Class {
     /// Writes `memories` rows (sealed by the funnel) and/or signature-column
     /// rows (signed with the session key).
     Sealed,
-    /// Also writes a side table with no signature carrier (named per row).
-    NeedsFormat,
+    /// Also writes a side table with no signature column; every changed row
+    /// key there carries a verifying `row_attestations` entry (#10040).
+    Attested,
 }
 
 /// One classification row per registered tool: `(tool, class, side tables
@@ -141,7 +151,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ("memory_store", Class::Sealed, &[], "inserts memories rows"),
     (
         "memory_recall",
-        Class::NeedsFormat,
+        Class::Attested,
         &["recall_observations"],
         "logs a recall observation row",
     ),
@@ -179,7 +189,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_entity_register",
-        Class::NeedsFormat,
+        Class::Attested,
         &["entity_aliases"],
         "entity memory plus alias rows",
     ),
@@ -287,21 +297,21 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ("memory_share", Class::Sealed, &[], "inserts a shared copy"),
     (
         "memory_action_create",
-        Class::NeedsFormat,
+        Class::Attested,
         &["actions"],
         "action row, no signature column",
     ),
     ("memory_action_get", Class::ReadOnly, &[], "reads an action"),
     (
         "memory_action_transition",
-        Class::NeedsFormat,
+        Class::Attested,
         &["actions"],
         "action state, no signature column",
     ),
     ("memory_action_list", Class::ReadOnly, &[], "lists actions"),
     (
         "memory_action_add_edge",
-        Class::NeedsFormat,
+        Class::Attested,
         &["action_edges"],
         "edge row, no signature column",
     ),
@@ -320,19 +330,19 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_lease_acquire",
-        Class::NeedsFormat,
+        Class::Attested,
         &["leases"],
         "lease row, no signature column",
     ),
     (
         "memory_lease_renew",
-        Class::NeedsFormat,
+        Class::Attested,
         &["leases"],
         "lease row, no signature column",
     ),
     (
         "memory_lease_release",
-        Class::NeedsFormat,
+        Class::Attested,
         &["leases"],
         "lease row, no signature column",
     ),
@@ -395,7 +405,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_routine_run",
-        Class::NeedsFormat,
+        Class::Attested,
         &["routine_runs"],
         "run row, no signature column",
     ),
@@ -420,7 +430,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_capture_turn",
-        Class::NeedsFormat,
+        Class::Attested,
         &["memory_transcripts", "memory_transcript_links"],
         "transcript rows, no signature column",
     ),
@@ -463,7 +473,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ("memory_archive_stats", Class::ReadOnly, &[], "counts"),
     (
         "memory_gc",
-        Class::NeedsFormat,
+        Class::Attested,
         &["recall_observations"],
         "removes expired rows, prunes recall observations",
     ),
@@ -475,7 +485,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_namespace_set_standard",
-        Class::NeedsFormat,
+        Class::Attested,
         &["namespace_meta"],
         "standard pointer row, no signature column",
     ),
@@ -487,7 +497,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_namespace_clear_standard",
-        Class::NeedsFormat,
+        Class::Attested,
         &["namespace_meta"],
         "standard pointer row, no signature column",
     ),
@@ -499,13 +509,13 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_pending_approve",
-        Class::NeedsFormat,
+        Class::Attested,
         &["pending_actions"],
         "pending row, no signature column",
     ),
     (
         "memory_pending_reject",
-        Class::NeedsFormat,
+        Class::Attested,
         &["pending_actions"],
         "pending row, no signature column",
     ),
@@ -525,13 +535,13 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ("memory_inbox", Class::ReadOnly, &[], "lists the inbox"),
     (
         "memory_subscribe",
-        Class::NeedsFormat,
+        Class::Attested,
         &["subscriptions"],
         "subscription row, no signature column",
     ),
     (
         "memory_unsubscribe",
-        Class::NeedsFormat,
+        Class::Attested,
         &["subscriptions"],
         "subscription row, no signature column",
     ),
@@ -543,7 +553,7 @@ const TOOL_CLASS: [(&str, Class, &[&str], &str); 104] = [
     ),
     (
         "memory_subscription_replay",
-        Class::NeedsFormat,
+        Class::Attested,
         &["subscription_events", "subscription_dlq"],
         "replay rows, no signature column",
     ),
@@ -1711,6 +1721,18 @@ fn sweep_all_tools(require: &str) -> Vec<String> {
                 }
             }
         }
+        // #10040: every row key of every attested table (memories and the
+        // 13 side tables) carries a latest attestation that verifies against
+        // the bound key and the live row, and the signed watermark covers
+        // the whole table (C-5 completeness).
+        match ai_memory::storage::row_attest::sqlite::verify_sqlite(&sb.conn()) {
+            Ok(report) => {
+                for d in report.defects {
+                    defects.push(format!("{label}: row attestation: {d}"));
+                }
+            }
+            Err(e) => defects.push(format!("{label}: row attestation verifier: {e:#}")),
+        }
         for table in after.keys() {
             let known = table == "memories"
                 || EXEMPT_TABLES.iter().any(|(t, _)| t == table)
@@ -1757,8 +1779,9 @@ fn every_tool_write_is_sealed_strict_10012() {
 }
 
 /// The ratchet: the registry, `TOOL_CLASS` and `STEPS` name the same tools,
-/// each `TOOL_CLASS` name once, every side table a known `needs-format`
-/// table, and only `NeedsFormat` rows name side tables.
+/// each `TOOL_CLASS` name once, every side table a known row-attested
+/// table, only `Attested` rows name side tables, and the row-attested
+/// tables plus `memories` are exactly `row_attest::TABLES` (#10040).
 #[test]
 fn every_registered_tool_is_classified_and_driven_10012() {
     let defs = ai_memory::mcp::tool_definitions();
@@ -1800,17 +1823,30 @@ fn every_registered_tool_is_classified_and_driven_10012() {
     for (name, class, side, reason) in TOOL_CLASS {
         assert!(!reason.is_empty(), "{name}: reason");
         assert_eq!(
-            class == Class::NeedsFormat,
+            class == Class::Attested,
             !side.is_empty(),
-            "{name}: NeedsFormat iff side tables"
+            "{name}: Attested iff side tables"
         );
         for t in side {
             assert!(
-                NEEDS_FORMAT_TABLES.contains(t),
-                "{name}: {t} is not a needs-format table"
+                ROW_ATTESTED_TABLES.contains(t),
+                "{name}: {t} is not a row-attested table"
             );
         }
     }
+    // #10040: the attested side tables plus `memories` are exactly the
+    // tables the row-attestation funnel covers, so no side table can be
+    // classified without a verifier behind it.
+    let mut expected: BTreeSet<&str> = ROW_ATTESTED_TABLES.iter().copied().collect();
+    expected.insert("memories");
+    let funnel: BTreeSet<&str> = ai_memory::storage::row_attest::TABLES
+        .iter()
+        .map(|s| s.table)
+        .collect();
+    assert_eq!(
+        funnel, expected,
+        "row_attest::TABLES vs ROW_ATTESTED_TABLES"
+    );
 }
 
 // --- Seeded rows: unsigned, tampered, foreign (#10053, #10054, #10055) ---
