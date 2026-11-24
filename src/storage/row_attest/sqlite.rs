@@ -590,14 +590,14 @@ pub fn install(conn: &Connection) -> Result<ArmState> {
             return Ok(ArmState::Armed);
         }
     };
-    conn.execute_batch("SAVEPOINT ra10040_arm")?;
-    match sign_cutovers(conn, &who) {
-        Ok(()) => conn.execute_batch("RELEASE ra10040_arm")?,
-        Err(e) => {
-            conn.execute_batch("ROLLBACK TO ra10040_arm; RELEASE ra10040_arm")?;
-            return Err(e.context("row attestation cutover signing (#10040)"));
-        }
-    }
+    // The cutover read and its signed insert run in one BEGIN IMMEDIATE
+    // write transaction (#5084): a DEFERRED one read the watermarks under
+    // a shared lock and could fail its write upgrade against a concurrent
+    // opener. Inside a caller's transaction the work joins it, and an
+    // error is returned for that caller to roll back; either way the
+    // connection is not armed (fail closed).
+    crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, &who))
+        .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
     register(conn)?;
     Ok(ArmState::Armed)
 }
