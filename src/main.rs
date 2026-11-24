@@ -248,6 +248,10 @@ fn main() -> Result<()> {
                 ai_memory::tls::validate_peer_url_scheme(peer)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            announce_peer_binding(
+                ai_memory::federation::shared_source::SERVE_PEERS_FLAG,
+                &args.quorum_peers,
+            )?;
         }
         daemon_runtime::Command::SyncDaemon(args) => {
             ai_memory::federation::peer_posture::enforce_at_boot(!args.peers.is_empty(), None)?;
@@ -255,6 +259,10 @@ fn main() -> Result<()> {
                 ai_memory::tls::validate_peer_url_scheme(peer)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            announce_peer_binding(
+                ai_memory::federation::shared_source::SYNC_DAEMON_PEERS_FLAG,
+                &args.peers,
+            )?;
         }
         _ => {}
     }
@@ -496,6 +504,21 @@ fn main() -> Result<()> {
         std::process::exit(75);
     }
     result
+}
+
+/// #10059 — bind a daemon's argv peer list to the shared source before any
+/// worker starts. Outside the enterprise-federation posture this is a no-op
+/// (the flag is used unchanged); under it the flag must name exactly the
+/// `AI_MEMORY_FED_QUORUM_PEERS` peers or boot refuses with the key and the
+/// fix, and a bound boot prints the source digest a fresh doctor prints.
+/// `flag_name` is the entry point's own flag, named in a refusal (#10065).
+fn announce_peer_binding(flag_name: &'static str, flag: &[String]) -> Result<()> {
+    use ai_memory::federation::shared_source::{ServePeerSet, boot_line, resolve_peers};
+    match resolve_peers(flag_name, flag).map_err(|e| anyhow::anyhow!("{e}"))? {
+        ServePeerSet::Bound(source) => eprintln!("{}", boot_line(&source)),
+        ServePeerSet::Unbound(_) => {}
+    }
+    Ok(())
 }
 
 /// #3166 — the ONLY subcommands allowed to keep running on compiled defaults

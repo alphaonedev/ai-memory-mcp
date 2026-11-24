@@ -1161,7 +1161,7 @@ pub struct ServeArgs {
     /// Comma-separated list of peer base URLs. Each peer is assumed to
     /// expose `POST /api/v1/sync/push` — the same endpoint the
     /// sync-daemon already uses.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = crate::federation::shared_source::SERVE_PEERS_FLAG, value_delimiter = ',')]
     pub quorum_peers: Vec<String>,
     /// Deadline for quorum-ack collection. After this many ms a
     /// locally-durable write returns **202 Accepted** with the
@@ -6359,6 +6359,11 @@ pub async fn bootstrap_serve(
     for peer in &args.quorum_peers {
         crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    // #10059 — under the posture the peers and scopes are the shared source's.
+    let peer_set = federation::shared_source::resolve_peers(
+        federation::shared_source::SERVE_PEERS_FLAG,
+        &args.quorum_peers,
+    )?;
     if let Some(scopes) = &app_config.monitoring
         && !scopes.peer_ids.is_empty()
     {
@@ -6812,7 +6817,7 @@ pub async fn bootstrap_serve(
     // v0.6.0 in that case.
     let mut federation = federation::FederationConfig::build(
         args.quorum_writes,
-        &args.quorum_peers,
+        peer_set.peers(),
         std::time::Duration::from_millis(args.quorum_timeout_ms),
         args.quorum_client_cert.as_deref(),
         args.quorum_client_key.as_deref(),
@@ -6833,7 +6838,7 @@ pub async fn bootstrap_serve(
     .context("federation config")?;
     // #9996 — peers are deny-scoped unless AI_MEMORY_FED_PEER_OUTBOUND_SCOPE
     // opens them (a malformed value refuses boot); one WARN per unscoped peer.
-    federation = federation::outbound_scope::install_for_serve(federation)
+    federation = federation::shared_source::install_for_serve(federation, &peer_set)
         .context("federation outbound scope")?;
 
     // v1.0.0 TRACT G16 (#1830) — durability-model boot disclosure: the first
@@ -9336,6 +9341,12 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     for peer in &peers {
         crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    // #10059; #10065: a refusal names this entry point's own flag.
+    let peer_set = crate::federation::shared_source::resolve_peers(
+        crate::federation::shared_source::SYNC_DAEMON_PEERS_FLAG,
+        &peers,
+    )?;
+    let peers = peer_set.peers().to_vec();
     let interval = interval_secs.max(1);
     let batch_size = batch_size.max(1);
     // #3655 — publish this loop's cadence (the #3654 guard: the series and
@@ -9350,7 +9361,7 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     let peers_arc: Vec<Arc<str>> = peers.iter().map(|s| Arc::from(s.as_str())).collect();
     // #9996 — each peer's outbound scope (deny unless opened), one WARN per
     // unscoped peer; a malformed value or unknown key refuses to start.
-    let scopes = crate::federation::outbound_scope::sync_daemon_scopes(&peers)
+    let scopes = crate::federation::shared_source::sync_daemon_scopes(&peer_set)
         .context("sync-daemon outbound scope")?;
     loop {
         let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();

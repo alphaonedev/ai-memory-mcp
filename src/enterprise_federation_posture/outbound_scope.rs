@@ -8,14 +8,19 @@
 //! submodule-over-bump rule (the #3553 `synchronous.rs` precedent). In a
 //! daemon that configured peers the row reads the scope rows recorded at boot
 //! (`federation::outbound_scope::boot_scope_rows`). A process that configured
-//! no peer (the `doctor --posture` CLI) cannot see the daemon's peer list (the
-//! `serve --quorum-peers` argument), so the env value alone never passes the
-//! row (review #10026 S-F2): it FAILs with [`UNVERIFIABLE`].
+//! no peer (the `doctor --posture` CLI) judges the shared source the daemon is
+//! bound to under the posture (#10059, `federation::shared_source`): the peer
+//! list `AI_MEMORY_FED_QUORUM_PEERS` and the outbound scope, parsed by the
+//! same function `serve` uses. An absent posture signal or an absent,
+//! malformed, oversized or empty source FAILs with [`UNVERIFIABLE`] and the
+//! reason; the outbound scope env alone never passes the row (review #10026
+//! S-F2).
 
 use super::{PostureCheck, check};
 use crate::federation::outbound_scope::{
     self as scope, OutboundScopeConfigError, PeerOutboundScope, PeerScopeRow, ScopePosture,
 };
+use crate::federation::shared_source::{self, BoundFederationSource, SharedSourceError};
 use std::collections::BTreeMap;
 
 /// Control name of check #23.
@@ -26,6 +31,12 @@ pub(super) const CONTROL_OUTBOUND_SCOPE: &str = "federation outbound scope";
 /// the live-check issue that gives the row a source of truth.
 pub(super) const UNVERIFIABLE: &str =
     "the daemon outbound scope is not provable from a fresh process (live check #10059)";
+
+/// What a passing fresh-process row proves, appended after the digest
+/// (#10059 C-6): the boot configuration, not the live process.
+pub(super) const PROVES_BOOT_CONFIGURATION: &str = "proves the boot configuration the daemon \
+     is bound to (it prints the same digest at boot); an edit applies only after a daemon \
+     restart";
 
 /// The pass verdict and `actual` text for the rows a daemon recorded.
 fn judge_rows(rows: &[PeerScopeRow]) -> (bool, String) {
@@ -60,7 +71,9 @@ fn judge_peers(
         };
         return (
             false,
-            format!("{UNVERIFIABLE}: the peer list is the `serve --quorum-peers` argument; {env}"),
+            format!(
+                "{UNVERIFIABLE}: the peer list is the `serve --quorum-peers` / `sync-daemon --peers` argument; {env}"
+            ),
         );
     };
     let map = match parsed {
@@ -97,12 +110,34 @@ fn judge_peers(
     (true, format!("{} peer(s): every one narrowed", peers.len()))
 }
 
+/// The pass verdict and `actual` text for the shared source a fresh process
+/// loaded (#10059). Every refusal of the source FAILs with [`UNVERIFIABLE`]
+/// and its exact reason; a loaded source is judged peer by peer, and a pass
+/// names the source digest the daemon printed at boot.
+fn judge_source(source: Result<BoundFederationSource, SharedSourceError>) -> (bool, String) {
+    let source = match source {
+        Ok(source) => source,
+        Err(e) => return (false, format!("{UNVERIFIABLE}: {e}")),
+    };
+    let (pass, actual) = judge_peers(Some(source.peers()), Ok(source.scopes().clone()));
+    if !pass {
+        return (false, actual);
+    }
+    (
+        true,
+        format!(
+            "{actual}; digest {}; {PROVES_BOOT_CONFIGURATION}",
+            source.digest_line()
+        ),
+    )
+}
+
 /// Render check #23.
 pub(super) fn check_outbound_scope() -> PostureCheck {
     let (pass, actual) = match scope::boot_scope_rows() {
         Some(rows) => judge_rows(&rows),
-        // No process but `serve` holds the peer list (review #10026 S-F2).
-        None => judge_peers(None, scope::from_env()),
+        // A fresh process judges the source the daemon is bound to (#10059).
+        None => judge_source(shared_source::load_for_doctor()),
     };
     check(
         CONTROL_OUTBOUND_SCOPE,
@@ -110,9 +145,11 @@ pub(super) fn check_outbound_scope() -> PostureCheck {
          no explicit all-namespaces `**` scope)",
         actual,
         pass,
-        "set AI_MEMORY_FED_PEER_OUTBOUND_SCOPE to a JSON object naming, for each peer URL, \
-         the namespaces it may receive (`{\"<peer url>\": {\"allowed_namespaces\": [...]}}`); \
-         do not use `**`; judge it in the running daemon (its boot rows)",
+        "arm AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, set AI_MEMORY_FED_QUORUM_PEERS \
+         to the comma-separated peer URLs (the exact `serve --quorum-peers` / `sync-daemon --peers` value) and \
+         AI_MEMORY_FED_PEER_OUTBOUND_SCOPE to a JSON object naming, for each peer URL, the \
+         namespaces it may receive (`{\"<peer url>\": {\"allowed_namespaces\": [...]}}`); \
+         do not use `**`; restart the daemon after an edit",
     )
 }
 
@@ -136,6 +173,7 @@ pub(super) mod tests {
                 crate::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
                 format!(r#"{{"{NARROWED_PEER_URL}":{{"allowed_namespaces":["public/*"]}}}}"#),
             );
+            std::env::set_var(shared_source::PEERS_ENV, NARROWED_PEER_URL); // #10059
         }
         let narrowed = PeerOutboundScope::Namespaces(vec!["public/*".to_string()]);
         let id = crate::federation::peer::stable_peer_id(NARROWED_PEER_URL);
@@ -238,7 +276,7 @@ pub(super) mod tests {
         assert_eq!(
             actual,
             "the daemon outbound scope is not provable from a fresh process (live check \
-             #10059): the peer list is the `serve --quorum-peers` argument; 1 scoped peer \
+             #10059): the peer list is the `serve --quorum-peers` / `sync-daemon --peers` argument; 1 scoped peer \
              key(s) in the env"
         );
         let (pass, actual) = judge_peers(None, Ok(BTreeMap::new()));
@@ -246,7 +284,7 @@ pub(super) mod tests {
         assert_eq!(
             actual,
             "the daemon outbound scope is not provable from a fresh process (live check \
-             #10059): the peer list is the `serve --quorum-peers` argument; 0 scoped peer \
+             #10059): the peer list is the `serve --quorum-peers` / `sync-daemon --peers` argument; 0 scoped peer \
              key(s) in the env"
         );
     }
@@ -277,5 +315,150 @@ pub(super) mod tests {
         let row = check_outbound_scope();
         assert!(!row.pass, "{row:?}");
         assert!(row.actual.starts_with(UNVERIFIABLE), "{row:?}");
+    }
+
+    fn os(value: &str) -> Option<std::ffi::OsString> {
+        Some(value.into())
+    }
+
+    /// #10059 C-5 — every degenerate shared source FAILs check #23 with its
+    /// exact text; a wildcard, deny or missing scope FAILs as not narrowed.
+    #[test]
+    fn degenerate_shared_source_fails_with_exact_text_10059() {
+        use crate::federation::shared_source::PEERS_ENV;
+        let fix = "set it to the comma-separated https peer URLs (the exact --quorum-peers \
+                   / --peers value) and restart";
+        let shown_b = crate::url_display::url_origin_and_path(PEER_B);
+        let not_narrowed = format!("peer(s) without a narrowed outbound scope: {shown_b}");
+        let scope_b = |ns: &str| format!(r#"{{"{PEER_B}": {{"allowed_namespaces": {ns}}}}}"#);
+        let cases: Vec<(Option<std::ffi::OsString>, Option<String>, String)> = vec![
+            // absent
+            (
+                None,
+                None,
+                format!(
+                    "{UNVERIFIABLE}: {PEERS_ENV} is not set: under the enterprise-federation \
+                     posture the peer list is read from it; {fix}"
+                ),
+            ),
+            // empty while federating
+            (
+                os(" , ,"),
+                None,
+                format!("{UNVERIFIABLE}: {PEERS_ENV} names no peer; {fix}"),
+            ),
+            // malformed (plaintext peer)
+            (
+                os("http://peer-b:9077"),
+                None,
+                format!(
+                    "{UNVERIFIABLE}: {PEERS_ENV}: {}; {fix}",
+                    crate::tls::validate_peer_url_scheme("http://peer-b:9077").unwrap_err()
+                ),
+            ),
+            // wildcard
+            (os(PEER_B), Some(scope_b(r#"["**"]"#)), not_narrowed.clone()),
+            // deny-scoped and unscoped peers are not narrowed
+            (os(PEER_B), Some(scope_b("[]")), not_narrowed.clone()),
+            (os(PEER_B), None, not_narrowed),
+        ];
+        for (peers, scope_raw, want) in cases {
+            let source = BoundFederationSource::from_values(peers, scope_raw.map(Into::into));
+            assert_eq!(judge_source(source), (false, want));
+        }
+        // unreadable (not UTF-8)
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let bad = std::ffi::OsString::from_vec(vec![0x68, 0xff, 0x70]);
+            let source = BoundFederationSource::from_values(Some(bad), None);
+            assert_eq!(
+                judge_source(source),
+                (
+                    false,
+                    format!("{UNVERIFIABLE}: {PEERS_ENV} is not valid UTF-8; {fix}")
+                )
+            );
+        }
+        // posture signal absent
+        assert_eq!(
+            judge_source(Err(SharedSourceError::PostureAbsent)),
+            (
+                false,
+                format!(
+                    "{UNVERIFIABLE}: AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE is not \
+                     armed: the federation peer list and outbound scope bind to {PEERS_ENV} \
+                     only under the enterprise-federation posture; arm it, set {PEERS_ENV} \
+                     and restart"
+                )
+            )
+        );
+    }
+
+    /// #10059 C-5/C-6 — a valid source passes with its digest and the text
+    /// that the row proves the boot configuration.
+    #[test]
+    fn valid_shared_source_passes_with_digest_10059() {
+        let raw = format!(
+            r#"{{"{PEER_A}": {{"allowed_namespaces": ["team/*"]}}, "{PEER_B}": {{"allowed_namespaces": ["ops"]}}}}"#
+        );
+        let source =
+            BoundFederationSource::from_values(os(&format!("{PEER_A},{PEER_B}")), os(&raw))
+                .expect("valid source");
+        let digest = source.digest_line();
+        let (pass, actual) = judge_source(Ok(source));
+        assert!(pass, "{actual}");
+        assert_eq!(
+            actual,
+            format!(
+                "2 peer(s): every one narrowed; digest {digest}; proves the boot \
+                 configuration the daemon is bound to (it prints the same digest at boot); \
+                 an edit applies only after a daemon restart"
+            )
+        );
+        assert!(!actual.contains("pw"), "no credential in the row: {actual}");
+    }
+
+    /// #10059 C-3/C-5 — a fresh process (no boot rows) with the posture armed
+    /// and a valid shared source PASSes check #23; without the posture signal
+    /// the same source FAILs.
+    #[test]
+    fn fresh_process_with_shared_source_passes_10059() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::outbound_scope::tests::\
+             fresh_process_with_shared_source_passes_10059",
+        ) {
+            return;
+        }
+        let _g = crate::config::test_env_lock();
+        let posture =
+            crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE;
+        // SAFETY: env-isolated child holding the env lock; no other thread
+        // reads these variables.
+        unsafe {
+            std::env::set_var(
+                crate::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
+                format!(r#"{{"{PEER_B}": {{"allowed_namespaces": ["ops"]}}}}"#),
+            );
+            std::env::set_var(shared_source::PEERS_ENV, PEER_B);
+            std::env::remove_var(posture);
+        }
+        assert!(scope::boot_scope_rows().is_none(), "fresh child");
+        let row = check_outbound_scope();
+        assert!(!row.pass, "posture signal absent must FAIL: {row:?}");
+        assert!(
+            row.actual
+                .starts_with(&format!("{UNVERIFIABLE}: {posture} is not armed")),
+            "{row:?}"
+        );
+        // SAFETY: as above.
+        unsafe { std::env::set_var(posture, "1") };
+        let row = check_outbound_scope();
+        assert!(row.pass, "{row:?}");
+        assert!(
+            row.actual
+                .starts_with("1 peer(s): every one narrowed; digest sha256:"),
+            "{row:?}"
+        );
     }
 }

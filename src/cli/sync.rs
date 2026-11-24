@@ -35,7 +35,7 @@ pub struct SyncArgs {
 #[derive(Args)]
 pub struct SyncDaemonArgs {
     /// Comma-separated list of peer HTTP endpoints to mesh with.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = crate::federation::shared_source::SYNC_DAEMON_PEERS_FLAG, value_delimiter = ',')]
     pub peers: Vec<String>,
     /// Seconds between sync cycles. Minimum 1.
     #[arg(long, default_value_t = 2)]

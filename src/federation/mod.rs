@@ -72,6 +72,8 @@ pub mod outbound_scope_serve;
 pub mod peer;
 pub mod peer_attestation;
 pub mod peer_posture;
+/// #10059 — the shared peer-list and outbound-scope source of the posture.
+pub mod shared_source;
 // #3654 — per-peer fan-out task set that keeps its peer on a JoinError.
 mod peer_tasks;
 // v0.7.0 Track D #933 — federation push DLQ + replay worker.

@@ -34,10 +34,10 @@
 //!    otherwise. Asserted INDEPENDENTLY of every other control, so a future
 //!    control addition can never again masquerade as a #15 failure.
 //! 2. The certified pg config satisfies every control a `doctor` process can
-//!    judge: of the `ENTERPRISE_FEDERATION_CHECK_COUNT` rows only check #23
-//!    (outbound scope, judged against the daemon's peer list) fails, as
-//!    unverifiable, and the exit is nonzero (review #10026 S-F2). A control
-//!    added without extending the certified env turns THIS red, in the adding PR.
+//!    judge: every one of the `ENTERPRISE_FEDERATION_CHECK_COUNT` rows passes,
+//!    check #23 included (it judges the shared peer-list source the daemon is
+//!    bound to, #10059), and the exit is 0. A control added without extending
+//!    the certified env turns THIS red, in the adding PR.
 //!
 //! Driven through the real binary (`CARGO_BIN_EXE_ai-memory`) so the
 //! assertions are over the same rendered `--json` payload the cert gate
@@ -268,10 +268,10 @@ fn sqlite_control_15_is_still_the_sqlcipher_predicate() {
 }
 
 /// LEG 4 (the #3106 regression guard) — the certified pg config satisfies
-/// every control a `doctor` process can judge. Check #23 (outbound scope) is
-/// the one exception: the peer list is the `serve --quorum-peers` argument,
-/// invisible here, so the row FAILs as unverifiable and the exit is nonzero
-/// (review #10026 S-F2).
+/// every control a `doctor` process can judge, check #23 (outbound scope)
+/// included: it judges the shared peer-list source
+/// (`AI_MEMORY_FED_QUORUM_PEERS`) the daemon is bound to under the posture
+/// (#10059), so every row passes and the exit is 0.
 ///
 /// The in-tree twin of `scripts/check-bootstrap-cert-gate.sh` LEG A, and the
 /// assertion that actually broke. A control added to `evaluate()` without
@@ -360,6 +360,13 @@ fn certified_pg_config_reaches_all_pass() {
                 ai_memory::federation::outbound_scope::OUTBOUND_SCOPE_ENV,
                 r#"{"https://peer-1.example.org:9077":{"allowed_namespaces":["public/*"]}}"#,
             ),
+            // #10059 check #23 — the shared peer-list source the daemon binds
+            // to under the posture (the exact `serve --quorum-peers` /
+            // `sync-daemon --peers` value).
+            (
+                ai_memory::federation::shared_source::PEERS_ENV,
+                "https://peer-1.example.org:9077",
+            ),
             (ai_memory::store_url::STORE_URL_ENV, PG_DSN_VERIFY_FULL),
             (PG_AT_REST_ENV, "1"),
             (ai_memory::config::ENV_APPEND_ONLY, "1"),
@@ -373,25 +380,22 @@ fn certified_pg_config_reaches_all_pass() {
     );
 
     let rows = control_rows(&out);
-    // Review #10026 S-F2: check #23 is judged against the daemon's peer list
-    // (the `serve --quorum-peers` argument), which a fresh `doctor` process
-    // cannot see, so it is the ONE failing row and it says why. Every other
-    // control is satisfied by the certified env.
+    // #10059: check #23 judges the shared source the daemon is bound to, so
+    // the certified env satisfies EVERY control — a control added without
+    // extending the certified env shows up here.
     let failing: Vec<&String> = rows
         .iter()
         .filter(|(_, pass)| !*pass)
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(
-        failing,
-        vec![OUTBOUND_SCOPE_CONTROL],
-        "the certified pg config must satisfy every control but the outbound \
-         scope row — a control added without extending the certified env shows up here"
+    assert!(
+        failing.is_empty(),
+        "the certified pg config must satisfy every control; failing={failing:?}"
     );
     let actual = check_actual(&out, OUTBOUND_SCOPE_CONTROL);
     assert!(
-        actual.contains(OUTBOUND_SCOPE_UNVERIFIABLE),
-        "check #23 fails as unverifiable from a fresh process: {actual}"
+        actual.contains(OUTBOUND_SCOPE_DIGEST) && actual.contains(OUTBOUND_SCOPE_PROVES),
+        "check #23 passes with the source digest and what it proves: {actual}"
     );
     assert_eq!(
         rows.len(),
@@ -403,10 +407,10 @@ fn certified_pg_config_reaches_all_pass() {
         Some(true),
         "#15 must be the pg compensating control in the certified pg config"
     );
-    assert_ne!(
+    assert_eq!(
         out.status.code(),
         Some(0),
-        "a failing check #23 must not exit 0; stderr={}",
+        "an all-pass posture must exit 0; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -415,11 +419,13 @@ fn certified_pg_config_reaches_all_pass() {
 #[cfg(feature = "sal-postgres")]
 const OUTBOUND_SCOPE_CONTROL: &str = "federation outbound scope";
 
-/// The `actual` text check #23 carries in a process that cannot see the
-/// peer list (review #10026 S-F2).
+/// The digest prefix a passing fresh-process check #23 names (#10059 C-6).
 #[cfg(feature = "sal-postgres")]
-const OUTBOUND_SCOPE_UNVERIFIABLE: &str =
-    "the daemon outbound scope is not provable from a fresh process (live check #10059)";
+const OUTBOUND_SCOPE_DIGEST: &str = "; digest sha256:";
+
+/// What a passing fresh-process check #23 says it proves (#10059 C-6).
+#[cfg(feature = "sal-postgres")]
+const OUTBOUND_SCOPE_PROVES: &str = "proves the boot configuration the daemon is bound to";
 
 /// The `actual` text of the one row named exactly `control`.
 #[cfg(feature = "sal-postgres")]
