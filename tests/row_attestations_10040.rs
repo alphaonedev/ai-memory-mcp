@@ -339,7 +339,8 @@ fn row_state(sb: &Sandbox, id: &str) -> String {
     sb.conn()
         .query_row(
             "SELECT quote(tags) || '|' || quote(priority) || '|' || quote(tier) || '|' || \
-             quote(content) || '|' || quote(metadata) FROM memories WHERE id = ?1",
+             quote(content) || '|' || quote(metadata) || '|' || quote(expires_at) || '|' || \
+             quote(confidence) FROM memories WHERE id = ?1",
             [id],
             |r| r.get(0),
         )
@@ -479,6 +480,115 @@ fn tags_priority_tier_changes_are_attested_and_raw_changes_fail_10040() {
         );
         assert_ok(&sb.report(), &format!("raw {field} restored"));
     }
+}
+
+/// NOTICE 4a: scope (carried in `metadata.scope`), metadata, `expires_at`
+/// and confidence are covered columns. An MCP change of each leaves one
+/// verifying attestation naming the writer; a raw change of each (and NULL
+/// written over an empty `expires_at`) fails the verifier; a raw rewrite of
+/// `metadata` into the same JSON with other key order and whitespace keeps
+/// verifying (one canonical byte form: sorted keys, no whitespace).
+#[test]
+fn scope_metadata_expiry_confidence_are_attested_10040() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("attest added fields 10040");
+    let mut seq = latest(&sb, &id).seq;
+    let changes = [
+        (
+            "scope",
+            json!({"id": id, "metadata": {"scope": "team"}}),
+        ),
+        (
+            "metadata",
+            json!({"id": id, "metadata": {"scope": "team", "k10040": "v"}}),
+        ),
+        (
+            "expires_at",
+            json!({"id": id, "expires_at": "2099-01-01T00:00:00Z"}),
+        ),
+        ("confidence", json!({"id": id, "confidence": 0.25})),
+    ];
+    for (field, args) in &changes {
+        let before = row_state(&sb, &id);
+        mcp.ok("memory_update", args);
+        assert_ne!(row_state(&sb, &id), before, "{field}: the update changed the row");
+        let att = latest(&sb, &id);
+        seq += 1;
+        assert_eq!(att.seq, seq, "{field}: one new attestation");
+        assert_eq!(att.op, OP_UPDATE, "{field}");
+        assert_eq!(att.agent_id, AGENT, "{field}");
+        assert_ok(&sb.report(), field);
+    }
+    drop(mcp);
+
+    let raw = [
+        (
+            "scope",
+            "UPDATE memories SET metadata = json_set(metadata, '$.scope', 'org') WHERE id = ?1",
+        ),
+        (
+            "metadata",
+            "UPDATE memories SET metadata = json_set(metadata, '$.k10040', 'w') WHERE id = ?1",
+        ),
+        (
+            "expires_at",
+            "UPDATE memories SET expires_at = '2098-01-01T00:00:00Z' WHERE id = ?1",
+        ),
+        ("expires_at null", "UPDATE memories SET expires_at = NULL WHERE id = ?1"),
+        ("expires_at empty", "UPDATE memories SET expires_at = '' WHERE id = ?1"),
+        ("confidence", "UPDATE memories SET confidence = 0.75 WHERE id = ?1"),
+    ];
+    let saved = sb
+        .conn()
+        .query_row(
+            "SELECT metadata, expires_at, confidence FROM memories WHERE id = ?1",
+            [&id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            },
+        )
+        .expect("saved fields");
+    for (field, change) in raw {
+        let before = row_state(&sb, &id);
+        sb.raw(change, &id);
+        assert_unverified(&sb.report(), &id, &format!("raw {field} change"));
+        sb.seed_conn()
+            .execute(
+                "UPDATE memories SET metadata = ?2, expires_at = ?3, confidence = ?4 WHERE id = ?1",
+                rusqlite::params![id, saved.0, saved.1, saved.2],
+            )
+            .expect("restore fields");
+        assert_eq!(row_state(&sb, &id), before, "{field}: restored byte for byte");
+        assert_ok(&sb.report(), &format!("raw {field} restored"));
+    }
+
+    // One canonical byte form: the same object, reordered and spaced.
+    let value: serde_json::Value = serde_json::from_str(&saved.0).expect("metadata json");
+    let obj = value.as_object().expect("metadata object");
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    keys.reverse();
+    let spaced = format!(
+        "{{ {} }}",
+        keys.iter()
+            .map(|k| format!("{} : {}", json!(k), obj[k.as_str()]))
+            .collect::<Vec<_>>()
+            .join(" , ")
+    );
+    assert_ne!(spaced, saved.0, "the rewrite differs byte for byte");
+    let n = sb
+        .seed_conn()
+        .execute(
+            "UPDATE memories SET metadata = ?2 WHERE id = ?1",
+            rusqlite::params![id, spaced],
+        )
+        .expect("raw metadata rewrite");
+    assert_eq!(n, 1, "metadata rewrite changed one row");
+    assert_ok(&sb.report(), "metadata rewritten in another byte form");
 }
 
 /// A write over a row changed behind the funnel is refused with the exact

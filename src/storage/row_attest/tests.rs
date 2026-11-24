@@ -7,7 +7,10 @@ use super::*;
 /// Golden digests computed by an independent reference encoder written from
 /// the format description (`.local-runs` scratch `golden.py`, Python
 /// `hashlib`), never from this module.
-const GOLDEN_MEMORIES: &str = "10e70cfb08c15303348ff27500cef8e2e0f91eb0f3bd7eaa028197081ad29b25";
+/// Eight covered columns (NOTICE 4a adds metadata, `expires_at`,
+/// confidence; scope rides in `metadata.scope`), computed independently by
+/// `.local-runs/lane/golden.py` from the written spec.
+const GOLDEN_MEMORIES: &str = "eae7d1588770bfd17819619f1a0e1b8ebab4197fc8651df9c9222c845a4ddb45";
 const GOLDEN_RECALL_OBS: &str = "96acbd93e3ed42c41e11f190f069f52df0cdd50be787fe9275f5c591004a8cfc";
 const GOLDEN_ACTION_EDGES: &str =
     "e6067df81f1117e9bfa5b0dfd56c19c457513d923f619242119f97b4ec66401b";
@@ -74,6 +77,9 @@ fn golden_memories_digest_sqlite_and_pg_forms_c2() {
         Cell::Int(5),
         t("long"),
         t("hello"),
+        t(r#"{"scope": "team", "b": 1}"#),
+        t("2026-11-23T10:00:00+02:00"),
+        Cell::Real(0.5),
     ];
     let pg = [
         t("m1"),
@@ -81,6 +87,9 @@ fn golden_memories_digest_sqlite_and_pg_forms_c2() {
         Cell::Int(5),
         t("long"),
         t("hello"),
+        Cell::Json(serde_json::json!({"b": 1, "scope": "team"})),
+        t("2026-11-23 08:00:00"),
+        Cell::Real(0.5),
     ];
     assert_eq!(hex::encode(row_digest(s, &sqlite)), GOLDEN_MEMORIES);
     assert_eq!(hex::encode(row_digest(s, &pg)), GOLDEN_MEMORIES);
@@ -152,19 +161,63 @@ fn null_differs_from_empty_and_tags_order_is_canonical_e4() {
 #[test]
 fn each_memory_field_changes_the_digest_e1() {
     let s = spec("memories");
-    let base = [t("m1"), t(r#"["a"]"#), Cell::Int(5), t("long"), t("x")];
-    let mutants: [(&str, usize, Cell); 5] = [
-        ("id", 0, t("m2")),
-        ("tags", 1, t(r#"["a","c"]"#)),
-        ("priority", 2, Cell::Int(6)),
-        ("tier", 3, t("mid")),
-        ("content", 4, t("y")),
+    // Expected covered set written out (NOTICE 4a): not derived from TABLES.
+    let base = [
+        t("m1"),
+        t(r#"["a"]"#),
+        Cell::Int(5),
+        t("long"),
+        t("x"),
+        t(r#"{"scope":"team"}"#),
+        t("2099-01-01T00:00:00Z"),
+        Cell::Real(1.0),
     ];
-    for (name, i, cell) in mutants {
+    let mutants: [(&str, Cell); 10] = [
+        ("id", t("m2")),
+        ("tags", t(r#"["a","c"]"#)),
+        ("priority", Cell::Int(6)),
+        ("tier", t("mid")),
+        ("content", t("y")),
+        ("metadata", t(r#"{"scope":"other"}"#)),
+        ("metadata", t(r#"{"scope":"team","k":1}"#)),
+        ("expires_at", t("2098-01-01T00:00:00Z")),
+        ("expires_at", Cell::Null),
+        ("confidence", Cell::Real(0.5)),
+    ];
+    for (name, cell) in mutants {
+        let i = s
+            .index_of(name)
+            .unwrap_or_else(|| panic!("memories: {name} is not a covered column"));
         let mut row = base.clone();
         row[i] = cell;
         assert_ne!(row_digest(s, &row), row_digest(s, &base), "{name}");
     }
+}
+
+/// NOTICE 4a / E-4: NULL is distinct from empty for every added field, and
+/// metadata has one canonical byte form (sorted keys, no whitespace).
+#[test]
+fn added_fields_null_differs_from_empty_and_metadata_is_canonical_4a() {
+    let s = spec("memories");
+    let at = |col: &str| s.index_of(col).unwrap_or_else(|| panic!("{col} not covered"));
+    let mut row: Vec<Cell> = vec![Cell::Null; s.cols.len()];
+    row[0] = t("m1");
+    for (col, empty) in [
+        ("metadata", t("{}")),
+        ("expires_at", t("")),
+        ("confidence", Cell::Real(0.0)),
+    ] {
+        let mut null = row.clone();
+        null[at(col)] = Cell::Null;
+        let mut filled = row.clone();
+        filled[at(col)] = empty;
+        assert_ne!(row_digest(s, &null), row_digest(s, &filled), "{col}");
+    }
+    let mut a = row.clone();
+    a[at("metadata")] = t(r#"{ "scope" : "team", "b" : [1, 2] }"#);
+    let mut b = row.clone();
+    b[at("metadata")] = Cell::Json(serde_json::json!({"b": [1, 2], "scope": "team"}));
+    assert_eq!(row_digest(s, &a), row_digest(s, &b));
 }
 
 #[test]
