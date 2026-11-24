@@ -2177,19 +2177,31 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
     let archives = retired_archives(&sb);
     assert_eq!(archives.len(), 1, "the rotation archives the retired key");
     assert_ok(&sb.report(), "after the rotation");
+    let rotated = read_attestations(&sb.conn()).expect("read attestations");
+    assert_eq!(
+        &rotated[..before.len()],
+        &before[..],
+        "a rotation never re-signs or rewrites an old attestation"
+    );
+    let rebind = &rotated[before.len()..];
+    assert!(
+        !rebind.is_empty() && rebind.iter().all(|a| a.key_id == old_key_id),
+        "the rotation write is attested by the retired key inside its window: {rebind:?}"
+    );
 
     let key = current_key_file(&sb, "rotated.key");
     let mut mcp = sb.start(&key);
     let second = mcp.store("attest rotation 10089 new key");
-    mcp.ok("memory_update", &json!({"id": id, "priority": 8}));
+    mcp.ok("memory_update", &json!({"id": second, "priority": 8}));
     drop(mcp);
     let after = read_attestations(&sb.conn()).expect("read attestations");
     assert_eq!(
-        &after[..before.len()],
-        &before[..],
-        "a rotation never re-signs or rewrites an old attestation"
+        &after[..rotated.len()],
+        &rotated[..],
+        "a new-key session never re-signs or rewrites an old attestation"
     );
-    let new_rows = &after[before.len()..];
+    let old_rows: Vec<&Attestation> = rotated.iter().filter(|a| a.key_id == old_key_id).collect();
+    let new_rows = &after[rotated.len()..];
     assert!(!new_rows.is_empty(), "the new session wrote attestations");
     assert!(
         new_rows.iter().all(|a| a.key_id != old_key_id),
@@ -2202,16 +2214,20 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
     assert_ok(&sb.report(), "history and new writes after the rotation");
 
     let archive = &archives[0];
-    let archived = std::fs::read(archive).expect("read the archive");
-    let expected =
-        |a: &Attestation, tail: &str| format!("attestation {} key_id {} {tail}", a.id, a.key_id);
+    let retired_bytes = std::fs::read(archive).expect("read the archive");
+    let expected = |a: &Attestation, tail: &str| {
+        format!(
+            "{}: attestation {} key_id {} {tail}",
+            a.table, a.id, a.key_id
+        )
+    };
 
     // The retired key missing from the anchor: a named defect per old
     // attestation, never a fallback to the agent's current key.
     std::fs::remove_file(archive).expect("remove the archive");
     let report = sb.report();
     assert!(!report.ok(), "a missing retired key is never clean");
-    for a in &before {
+    for a in &old_rows {
         let want = expected(a, &format!("of agent {AGENT} is not in the trust anchor"));
         assert!(
             report.defects.contains(&want),
@@ -2225,9 +2241,9 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
         .root
         .join("keys")
         .join(format!("{AGENT}.pub.{EARLY_ARCHIVE_TS}"));
-    std::fs::write(&early, &archived).expect("write the early archive");
+    std::fs::write(&early, &retired_bytes).expect("write the early archive");
     let report = sb.report();
-    for a in &before {
+    for a in &old_rows {
         let want = expected(
             a,
             &format!("used outside its anchored validity (from None to Some({EARLY_ARCHIVE_TS}))"),
@@ -2239,7 +2255,7 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
         );
     }
     for a in new_rows {
-        let own = format!("attestation {} ", a.id);
+        let own = format!("{}: attestation {} ", a.table, a.id);
         assert!(
             !report.defects.iter().any(|d| d.starts_with(&own)),
             "a new-key attestation stays inside the current key's window: {:?}",
@@ -2249,6 +2265,6 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
 
     // Restored at its real instant, the history verifies again.
     std::fs::remove_file(&early).expect("remove the early archive");
-    std::fs::write(archive, &archived).expect("restore the archive");
+    std::fs::write(archive, &retired_bytes).expect("restore the archive");
     assert_ok(&sb.report(), "after the archive is restored");
 }

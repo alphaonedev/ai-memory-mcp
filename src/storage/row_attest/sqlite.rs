@@ -233,6 +233,7 @@ fn blank(table: &str, op: Op, store_id: &str, covered: &str) -> Attestation {
 }
 
 /// The signing identity of this session, checked against the bound key.
+#[derive(Clone)]
 struct Signer {
     agent_id: String,
     key_id: String,
@@ -245,8 +246,17 @@ fn session_identity(conn: &Connection) -> Result<Signer, String> {
     let keypair = crate::identity::session_signer::session_keypair()
         .ok_or_else(|| refusal(REFUSE_NO_SIGNER))?;
     let signing = keypair.private.ok_or_else(|| refusal(REFUSE_NO_SIGNER))?;
-    let agent_id = signer.agent_id().to_string();
-    let bound = crate::db::agent_pubkey(conn, &agent_id)
+    bound_identity(conn, signer.agent_id(), signing)
+}
+
+/// `signing` as the identity of `agent_id`, refused unless it is the key
+/// the store binds to that agent right now.
+fn bound_identity(
+    conn: &Connection,
+    agent_id: &str,
+    signing: ed25519_dalek::SigningKey,
+) -> Result<Signer, String> {
+    let bound = crate::db::agent_pubkey(conn, agent_id)
         .map_err(|_| refusal(REFUSE_KEY_MISMATCH))?
         .ok_or_else(|| refusal(REFUSE_KEY_MISMATCH))?;
     let bound = crate::identity::keypair::decode_public_base64(&bound)
@@ -255,10 +265,31 @@ fn session_identity(conn: &Connection) -> Result<Signer, String> {
         return Err(refusal(REFUSE_KEY_MISMATCH));
     }
     Ok(Signer {
-        agent_id,
+        agent_id: agent_id.to_string(),
         key_id: key_id_of(&bound),
         signing,
     })
+}
+
+/// Who signs the attestations a connection's triggers append.
+#[derive(Clone)]
+enum SignerSource {
+    /// The process session signer, re-checked against the bound key at
+    /// every write.
+    Session,
+    /// One key, checked against the bound key once when the connection was
+    /// armed (#10089: the rotation connection, whose own write re-binds the
+    /// agent to the successor key inside the succession transaction).
+    Fixed(Signer),
+}
+
+impl SignerSource {
+    fn identity(&self, conn: &Connection) -> Result<Signer, String> {
+        match self {
+            Self::Session => session_identity(conn),
+            Self::Fixed(who) => Ok(who.clone()),
+        }
+    }
 }
 
 fn store_id(conn: &Connection) -> Result<String, String> {
@@ -485,7 +516,11 @@ fn changes<'a>(spec: &'a TableSpec, kind: &str, vals: &[Cell]) -> Result<Vec<Cha
     }
 }
 
-fn attest_call(conn: &Connection, args: &[Cell]) -> Result<(), FunnelRefusal> {
+fn attest_call(
+    conn: &Connection,
+    source: &SignerSource,
+    args: &[Cell],
+) -> Result<(), FunnelRefusal> {
     let (Some(Cell::Text(table)), Some(Cell::Text(kind))) = (args.first(), args.get(1)) else {
         return Err(refusal("malformed trigger call").into());
     };
@@ -494,7 +529,7 @@ fn attest_call(conn: &Connection, args: &[Cell]) -> Result<(), FunnelRefusal> {
     if todo.is_empty() {
         return Ok(());
     }
-    let who = session_identity(conn)?;
+    let who = source.identity(conn)?;
     let store = store_id(conn)?;
     for ch in &todo {
         append(conn, &who, &store, ch)?;
@@ -648,15 +683,43 @@ pub fn install(conn: &Connection) -> Result<ArmState> {
     if crate::identity::session_signer::session_signer().is_none() {
         return Ok(ArmState::NoSigner);
     }
-    let who = match session_identity(conn) {
-        Ok(who) => who,
+    match session_identity(conn) {
+        Ok(who) => arm(conn, &who, SignerSource::Session),
         // An unbound or mismatched key refuses every write at write time
         // with the exact reason; arming still installs the triggers.
         Err(_) => {
-            register(conn)?;
-            return Ok(ArmState::Armed);
+            register(conn, SignerSource::Session)?;
+            Ok(ArmState::Armed)
         }
-    };
+    }
+}
+
+/// #10089 — arm `conn` with `signing`, the key the store binds to
+/// `agent_id` right now, for a process that holds that key but runs no
+/// session signer (`identity succeed`). The rotation write re-binds the
+/// agent to its successor inside the succession transaction, so the key is
+/// checked once here, before that write, and every attestation the
+/// connection appends is signed by it (inside its anchored validity: the
+/// key is archived only after the transaction commits). Nothing already
+/// signed is signed again.
+///
+/// # Errors
+///
+/// `REFUSE_KEY_MISMATCH` when `signing` is not the bound key, and every
+/// error of [`install`]; the caller refuses the write (fail closed).
+pub fn arm_with_key(
+    conn: &Connection,
+    agent_id: &str,
+    signing: &ed25519_dalek::SigningKey,
+) -> Result<()> {
+    let who = bound_identity(conn, agent_id, signing.clone()).map_err(anyhow::Error::msg)?;
+    match arm(conn, &who, SignerSource::Fixed(who.clone()))? {
+        ArmState::Armed => Ok(()),
+        ArmState::NoSigner => anyhow::bail!("{}", refusal(REFUSE_NO_SIGNER)),
+    }
+}
+
+fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState> {
     // The cutover read and its signed insert run in one BEGIN IMMEDIATE
     // write transaction (#5084): a DEFERRED one read the watermarks under
     // a shared lock and could fail its write upgrade against a concurrent
@@ -668,7 +731,7 @@ pub fn install(conn: &Connection) -> Result<ArmState> {
     let sealed = seal_file
         .as_deref()
         .map_or(SealState::NotSealed, seal::read);
-    crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, &who, &sealed))
+    crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, who, &sealed))
         .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
     // #10087, #10088: record in the anchor that this file is armed, at the
     // marks it holds now. Only once the signing committed (inside a caller's
@@ -679,17 +742,17 @@ pub fn install(conn: &Connection) -> Result<ArmState> {
         seal::advance(path, &SealRecord::of(&read_attestations(conn)?))
             .map_err(|e| e.context("row attestation seal (#10087)"))?;
     }
-    register(conn)?;
+    register(conn, source)?;
     Ok(ArmState::Armed)
 }
 
-fn register(conn: &Connection) -> Result<()> {
+fn register(conn: &Connection, source: SignerSource) -> Result<()> {
     conn.create_scalar_function(ATTEST_FN, -1, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let args: Vec<Cell> = (0..ctx.len()).map(|i| cell_of(ctx.get_raw(i))).collect();
         // SAFETY: the connection handle is used only inside this call, on
         // the thread that runs the triggering statement, and is not kept.
         let inner = unsafe { ctx.get_connection() }?;
-        attest_call(&inner, &args)
+        attest_call(&inner, &source, &args)
             .map_err(|reason| rusqlite::Error::UserFunctionError(reason.into()))?;
         Ok(rusqlite::types::Null)
     })?;

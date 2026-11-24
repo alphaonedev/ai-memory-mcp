@@ -668,6 +668,17 @@ fn succeed(
     // durably persisted (body + pubkey sync + witness, one tx) BEFORE
     // `save` destroys K_old on disk.
     let outcome = keypair::rotate_with_succession(&id, dir, |k_old, k_new| {
+        // #10089: the succession re-binds the agent row of `memories`, an
+        // attested table. This process runs no session signer, so the row
+        // funnel is armed with K_old (the bound key, checked here) before
+        // the write: the rebind is attested inside K_old's window and never
+        // lands as drift. A refusal aborts the rotation with keys untouched.
+        let signing = k_old
+            .private
+            .as_ref()
+            .context("succession: K_old carries no private key")?;
+        crate::storage::row_attest::sqlite::arm_with_key(&conn, &id, signing)
+            .context("succession: row attestation could not be armed with K_old (#10089)")?;
         let record = crate::db::append_succession(&conn, &id, k_old, &k_new.public_base64(), None)?;
         recorded.replace(Some(record));
         Ok(())
