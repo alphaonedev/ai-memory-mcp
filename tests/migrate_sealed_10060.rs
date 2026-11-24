@@ -229,6 +229,113 @@ async fn migrate_of_an_unsealed_store_is_unchanged_10060() {
     assert_eq!(got, want, "every row landed");
 }
 
+/// #10064 (security review r1 F2) — a namespace outside every scope below.
+const OTHER_NS: &str = "sealed-migrate-10064-other";
+
+/// #10064 F2 — the canonical inbox namespace of one agent, and its legacy
+/// alias, written out rather than built from the crate constants.
+const INBOX_NS: &str = "_inbox/ai:scope-10064";
+const LEGACY_INBOX_NS: &str = "_messages/ai:scope-10064";
+
+/// #10064 F2 — the ids of the scope rows.
+const OTHER_ID: &str = "m10064-other";
+const INBOX_ID: &str = "m10064-inbox";
+const LEGACY_ID: &str = "m10064-legacy";
+
+/// #10064 F2 — the base rows plus one row in [`OTHER_NS`], one in
+/// [`INBOX_NS`] and one in its legacy alias [`LEGACY_INBOX_NS`].
+async fn seed_scope(store: &dyn MemoryStore) {
+    seed(store).await;
+    let ctx = CallerContext::for_agent(KEY_AGENT);
+    for (id, ns) in [
+        (OTHER_ID, OTHER_NS),
+        (INBOX_ID, INBOX_NS),
+        (LEGACY_ID, LEGACY_INBOX_NS),
+    ] {
+        let mut mem = memory(0);
+        mem.id = id.to_string();
+        mem.namespace = ns.to_string();
+        mem.title = format!("title {id}");
+        mem.content = format!("content for {id}");
+        store.store(&ctx, &mem).await.expect("seed scope row");
+    }
+}
+
+/// Migrate `scope` from `src` into a fresh SQLite destination and return the
+/// report and the sorted ids that landed.
+async fn migrate_scope(
+    src: &dyn MemoryStore,
+    scope: Option<&str>,
+) -> (ai_memory::migrate::MigrationReport, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dst = SqliteStore::open(dir.path().join("dest.db")).expect("open destination");
+    let report = migrate(src, &dst, BATCH, scope.map(str::to_string), false).await;
+    let mut got: Vec<String> = admin_rows(&dst).await.into_iter().map(|m| m.id).collect();
+    got.sort();
+    (report, got)
+}
+
+/// #10064 F2, the unsealed half: a scoped run copies exactly its scope, and
+/// a canonical inbox scope includes its legacy alias.
+async fn assert_scope_unsealed(src: &dyn MemoryStore, cell: &str) {
+    let (report, got) = migrate_scope(src, Some(INBOX_NS)).await;
+    assert!(report.errors.is_empty(), "{cell}: {:?}", report.errors);
+    assert_eq!(
+        got,
+        vec![INBOX_ID.to_string(), LEGACY_ID.to_string()],
+        "{cell}: an inbox scope copies the inbox and its legacy alias"
+    );
+    let (report, got) = migrate_scope(src, Some(NS)).await;
+    assert!(report.errors.is_empty(), "{cell}: {:?}", report.errors);
+    let want: Vec<String> = (0..ROWS).map(row_id).collect();
+    assert_eq!(got, want, "{cell}: a namespace scope copies only its rows");
+}
+
+/// #10064 F2, with [`OTHER_ID`] sealed: a run scoped elsewhere is not refused
+/// by it and copies its scope; the store-wide run is refused naming it.
+async fn assert_scope_sealed_outside(src: &dyn MemoryStore, cell: &str) {
+    let (report, got) = migrate_scope(src, Some(NS)).await;
+    assert!(
+        report.errors.is_empty(),
+        "{cell}: a sealed row outside the scope refused it: {:?}",
+        report.errors
+    );
+    let want: Vec<String> = (0..ROWS).map(row_id).collect();
+    assert_eq!(got, want, "{cell}: the scope copied");
+    let (report, got) = migrate_scope(src, Some(INBOX_NS)).await;
+    assert!(report.errors.is_empty(), "{cell}: {:?}", report.errors);
+    assert_eq!(
+        got,
+        vec![INBOX_ID.to_string(), LEGACY_ID.to_string()],
+        "{cell}: the inbox scope copied"
+    );
+    let planned = plan(src, BATCH, None).await;
+    assert_refused(&planned, OTHER_ID, &format!("{cell} (store-wide)"));
+}
+
+/// #10064 F2, with [`LEGACY_ID`] sealed as well: the canonical inbox scope
+/// is refused naming the legacy-alias row, and nothing lands.
+async fn assert_scope_sealed_alias(src: &dyn MemoryStore, cell: &str) {
+    let (report, got) = migrate_scope(src, Some(INBOX_NS)).await;
+    assert_refused(&report, LEGACY_ID, &format!("{cell} (inbox scope)"));
+    assert!(got.is_empty(), "{cell}: the inbox scope wrote a row");
+}
+
+/// #10064 F2, SQLite: the census, the copy walk and the cap cover exactly the
+/// migrate scope, including the legacy inbox alias.
+#[tokio::test]
+async fn migrate_scope_is_exactly_the_namespace_and_its_inbox_alias_sqlite_10064() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src_path = dir.path().join("source.db");
+    let src = SqliteStore::open(&src_path).expect("open source");
+    seed_scope(&src).await;
+    assert_scope_unsealed(&src, "sqlite").await;
+    seal_sqlite_row(&src_path, OTHER_ID);
+    assert_scope_sealed_outside(&src, "sqlite").await;
+    seal_sqlite_row(&src_path, LEGACY_ID);
+    assert_scope_sealed_alias(&src, "sqlite").await;
+}
+
 #[cfg(feature = "sal-postgres")]
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
@@ -240,9 +347,42 @@ mod pg_barrier;
 #[cfg(feature = "sal-postgres")]
 mod postgres_cells {
     use super::{
-        BATCH, NS, ROWS, SEALED_MARKER, admin_rows, assert_refused, file_holds_marker, pg_barrier,
-        row_id, seal_sqlite_row, sealed_envelope, seed,
+        BATCH, LEGACY_ID, NS, OTHER_ID, ROWS, SEALED_MARKER, admin_rows, assert_refused,
+        assert_scope_sealed_alias, assert_scope_sealed_outside, assert_scope_unsealed,
+        file_holds_marker, pg_barrier, row_id, seal_sqlite_row, sealed_envelope, seed, seed_scope,
     };
+
+    /// Seal one Postgres row in place with the real envelope.
+    async fn seal_pg_row(pg: &PostgresStore, id: &str) {
+        let changed =
+            sqlx::query("UPDATE memories SET content = '', encrypted_envelope = $1 WHERE id = $2")
+                .bind(sealed_envelope())
+                .bind(id)
+                .execute(pg.pool())
+                .await
+                .expect("seal a pg row")
+                .rows_affected();
+        assert_eq!(changed, 1, "one pg row sealed");
+    }
+
+    /// #10064 F2, Postgres source: the same scope cells as the SQLite cell.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrate_scope_is_exactly_the_namespace_and_its_inbox_alias_postgres_10064() {
+        let Some(url) = pg_url() else { return };
+        let scratch = pg_barrier::ScratchDb::create(&url, SCRATCH_PREFIX)
+            .await
+            .expect("create scratch database");
+        let pg = PostgresStore::connect(&scratch.url())
+            .await
+            .expect("connect scratch database");
+        seed_scope(&pg).await;
+        assert_scope_unsealed(&pg, "postgres").await;
+        seal_pg_row(&pg, OTHER_ID).await;
+        assert_scope_sealed_outside(&pg, "postgres").await;
+        seal_pg_row(&pg, LEGACY_ID).await;
+        assert_scope_sealed_alias(&pg, "postgres").await;
+        pg.pool().close().await;
+    }
     use ai_memory::migrate::{migrate, plan};
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::sqlite::SqliteStore;

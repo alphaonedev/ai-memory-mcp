@@ -867,6 +867,27 @@ mod tests {
     use crate::models::{Memory, Tier};
     use crate::store::Filter;
 
+    /// #10064 F2 — the exact namespaces each migrate scope reads, written out.
+    #[test]
+    fn scope_namespaces_is_the_namespace_and_its_inbox_alias_10064() {
+        let rows: [(Option<&str>, Vec<Option<&str>>); 6] = [
+            (None, vec![None]),
+            (Some("work"), vec![Some("work")]),
+            (
+                Some("_inbox/alice"),
+                vec![Some("_inbox/alice"), Some("_messages/alice")],
+            ),
+            (Some("_messages/alice"), vec![Some("_messages/alice")]),
+            (Some("_inbox/"), vec![Some("_inbox/"), Some("_messages/")]),
+            (Some("x/_inbox/alice"), vec![Some("x/_inbox/alice")]),
+        ];
+        for (input, want) in rows {
+            let want: Vec<Option<String>> =
+                want.into_iter().map(|w| w.map(str::to_string)).collect();
+            assert_eq!(scope_namespaces(input), want, "scope of {input:?}");
+        }
+    }
+
     fn sample_memory(id: &str, ns: &str, title: &str) -> Memory {
         sample_memory_at(id, ns, title, chrono::Utc::now())
     }
