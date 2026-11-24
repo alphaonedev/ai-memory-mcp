@@ -974,6 +974,19 @@ fn decide_insert(
     })
 }
 
+/// Whether the in-row seal of `row` verifies against its owner's CURRENT
+/// bound key (NOTICE 4c / E-3: the seal half of `MemoryStore::verify`).
+///
+/// # Errors
+///
+/// The bound-key lookup failed; the caller fails closed.
+pub(crate) fn row_seal_verifies(
+    conn: &rusqlite::Connection,
+    row: &Memory,
+) -> std::result::Result<bool, String> {
+    stored_seal_verifies(conn, row, row_owner(row))
+}
+
 /// Whether `row` carries `agent_attested` and a `write_signature` that
 /// verifies over its stored envelope against the owner's CURRENT bound key.
 fn stored_seal_verifies(

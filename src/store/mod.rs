@@ -5945,7 +5945,10 @@ pub struct VerifyReport {
     pub integrity_ok: bool,
     pub findings: Vec<String>,
     /// True iff the adapter performed a real cryptographic signature
-    /// verification. Always false pre-Task-1.4.
+    /// verification and it passed. `SQLite` (#10040 NOTICE 4c / E-3): the
+    /// in-row seal verifies against the owner's bound key AND the one
+    /// row-attestation verifier finds no defect in the store. `PostgreSQL`
+    /// reports false until its attestation funnel lands (#10040 C-9).
     pub signature_verified: bool,
     /// v0.9.0 G8 (#1825) — `Some(true)` when the row's `cid` was verified
     /// against its stored `cid_genesis` pre-image and matched; `Some(false)`

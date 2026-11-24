@@ -982,6 +982,8 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
             .iter()
             .filter(|r| r.table == spec.table)
             .collect();
+        let live_keys: std::collections::BTreeSet<&[u8]> =
+            live.iter().map(|r| r.key.as_slice()).collect();
         let mut acc = ZERO_DIGEST;
         for row in &live {
             acc = acc_add(&acc, &acc_term(spec.table, &row.key, &row.digest));
@@ -1012,9 +1014,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         }
         for (key, chain) in &by_key {
             let latest = chain.last();
-            if latest.is_some_and(|l| l.op != Op::Delete.as_str())
-                && !live.iter().any(|r| r.key.as_slice() == *key)
-            {
+            if latest.is_some_and(|l| l.op != Op::Delete.as_str()) && !live_keys.contains(*key) {
                 d.push(format!(
                     "{}: attested row is gone without a delete attestation",
                     spec.table
