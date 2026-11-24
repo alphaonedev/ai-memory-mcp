@@ -182,6 +182,25 @@ impl Sandbox {
         Mcp::spawn(cmd)
     }
 
+    /// An MCP session with no session key (the funnel is not armed); the
+    /// C-8 baseline for the overhead budgets.
+    fn start_unsigned(&self) -> Mcp {
+        let mut cmd = self.base_command(AGENT, "0");
+        cmd.args([
+            "--db",
+            self.db().to_str().expect("utf-8 db path"),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        Mcp::spawn(cmd)
+    }
+
     /// A raw read-write connection with no attestation triggers.
     fn seed_conn(&self) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open(self.db()).expect("open sandbox db");
@@ -1068,6 +1087,171 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     assert!(
         !store_verdict(&copy, &id),
         "any store defect must make every row report signature_verified false"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C-8: retention bound and overhead budgets of the operational tables
+// ---------------------------------------------------------------------------
+
+/// Memories stored before the recall rounds (C-8).
+const C8_MEMORIES: usize = 10;
+/// `memory_recall` calls per round; two rounds are driven (C-8).
+const C8_RECALLS_PER_ROUND: usize = 100;
+/// Lease renews timed per session (C-8).
+const C8_RENEWS: usize = 100;
+/// Rows above the live key count a supersede table may hold: its signed
+/// cutover plus at most one delete attestation (`sqlite.rs` keeps only the
+/// newest delete of the table).
+const C8_SUPERSEDE_EXTRA_ROWS: i64 = 2;
+/// Renews made more than a second apart, so each changes the lease row.
+const C8_SPACED_RENEWS: usize = 3;
+const C8_RENEW_SPACING: std::time::Duration = std::time::Duration::from_millis(1_100);
+
+fn table_attestations(sb: &Sandbox, table: &str) -> i64 {
+    sb.conn()
+        .query_row(
+            "SELECT count(*) FROM row_attestations WHERE table_name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .expect("count table attestations")
+}
+
+fn live_rows(sb: &Sandbox, table: &str) -> i64 {
+    sb.conn()
+        .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| {
+            r.get(0)
+        })
+        .expect("count live rows")
+}
+
+/// p95 (microseconds) of `n` calls of one tool in each of two sessions; the
+/// calls alternate so host load falls on both sessions alike.
+fn p95_pair(pair: [(&mut Mcp, &Value); 2], n: usize, tool: &str) -> (u64, u64) {
+    let [(a, a_args), (b, b_args)] = pair;
+    let mut ta = Vec::with_capacity(n);
+    let mut tb = Vec::with_capacity(n);
+    let time = |mcp: &mut Mcp, args: &Value| {
+        let t0 = std::time::Instant::now();
+        mcp.ok(tool, args);
+        u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX)
+    };
+    for _ in 0..n {
+        ta.push(time(a, a_args));
+        tb.push(time(b, b_args));
+    }
+    let at = (n * 95).div_ceil(100).saturating_sub(1);
+    ta.sort_unstable();
+    tb.sort_unstable();
+    (ta[at], tb[at])
+}
+
+/// Seed `C8_MEMORIES` memories and one acquired lease; returns the lease
+/// arguments.
+fn c8_seed(mcp: &mut Mcp) -> Value {
+    for n in 0..C8_MEMORIES {
+        mcp.store(&format!("c8 retention memory {n} 10040"));
+    }
+    let text = mcp.ok(
+        "memory_action_create",
+        &json!({"namespace": NAMESPACE, "kind": "task", "title": "c8 lease action 10040"}),
+    );
+    let v: Value = serde_json::from_str(&text).expect("action json");
+    let act = v["id"].as_str().expect("action id").to_string();
+    let lease = json!({"action_id": act, "holder": AGENT});
+    mcp.ok("memory_lease_acquire", &lease);
+    lease
+}
+
+/// C-8: the supersede rule keeps the attestation rows of `recall_observations`
+/// and `leases` at the live key count (plus the cutover and one delete): a
+/// lease renewed `C8_RENEWS` times keeps one attestation, and a round of
+/// recalls adds no more than `MAX_ATTESTATIONS_PER_10K_RECALLS` per 10,000;
+/// the two p95 overhead budgets (signed session minus an unsigned one) hold.
+#[test]
+fn operational_tables_supersede_and_stay_in_budget_10040() {
+    use ai_memory::storage::row_attest::{
+        LEASE_RENEW_ATTEST_P95_BUDGET_US, MAX_ATTESTATIONS_PER_10K_RECALLS,
+        RECALL_ATTEST_P95_BUDGET_US,
+    };
+    let (sb, _key, mut mcp) = armed();
+    let plain = Sandbox::new();
+    let mut unsigned = plain.start_unsigned();
+    let lease = c8_seed(&mut mcp);
+    let plain_lease = c8_seed(&mut unsigned);
+    let recall = json!({"context": "retention memory", "namespace": NAMESPACE, "limit": 10});
+    let (armed_recall, plain_recall) = p95_pair(
+        [(&mut mcp, &recall), (&mut unsigned, &recall)],
+        C8_RECALLS_PER_ROUND,
+        "memory_recall",
+    );
+    let (armed_renew, plain_renew) = p95_pair(
+        [(&mut mcp, &lease), (&mut unsigned, &plain_lease)],
+        C8_RENEWS,
+        "memory_lease_renew",
+    );
+    drop(unsigned);
+    // Lease times have second resolution: space a few renews so each one
+    // changes the row and writes an attestation.
+    for _ in 0..C8_SPACED_RENEWS {
+        std::thread::sleep(C8_RENEW_SPACING);
+        mcp.ok("memory_lease_renew", &lease);
+    }
+    let obs = "recall_observations";
+    let after_one = table_attestations(&sb, obs);
+    for _ in 0..C8_RECALLS_PER_ROUND {
+        mcp.ok("memory_recall", &recall);
+    }
+    let after_two = table_attestations(&sb, obs);
+    assert_ok(&sb.report(), "after the recall rounds");
+    let live = live_rows(&sb, obs);
+    assert!(live > 0, "the recalls wrote observations");
+    // Each recall writes one observation per returned memory (a new key per
+    // recall id), so attestations grow by at most the live rows it adds.
+    assert!(
+        after_two <= live + C8_SUPERSEDE_EXTRA_ROWS,
+        "{obs}: {after_two} attestations for {live} live rows"
+    );
+    let added = u64::try_from(after_two - after_one).expect("non-negative growth");
+    let rounds = u64::try_from(C8_RECALLS_PER_ROUND).expect("round size");
+    assert!(
+        added * 10_000 <= MAX_ATTESTATIONS_PER_10K_RECALLS * rounds,
+        "{added} attestation rows per {rounds} recalls exceed {MAX_ATTESTATIONS_PER_10K_RECALLS} per 10,000"
+    );
+    let leases = table_attestations(&sb, "leases");
+    // The per-row sequence counts every attestation ever written for the
+    // lease key, so the spaced renews were each attested.
+    let lease_seq = read_attestations(&sb.conn())
+        .expect("read attestations")
+        .iter()
+        .filter(|a| a.table == "leases" && !a.row_key.is_empty())
+        .map(|a| a.seq)
+        .max()
+        .expect("the lease has an attestation");
+    assert!(
+        lease_seq > i64::try_from(C8_SPACED_RENEWS).expect("renews"),
+        "the spaced renews were attested (latest seq {lease_seq})"
+    );
+    assert!(
+        leases <= live_rows(&sb, "leases") + C8_SUPERSEDE_EXTRA_ROWS,
+        "leases: {leases} attestations after {C8_RENEWS} renews"
+    );
+    drop(mcp);
+    let recall_over = armed_recall.saturating_sub(plain_recall);
+    let renew_over = armed_renew.saturating_sub(plain_renew);
+    assert!(
+        recall_over <= RECALL_ATTEST_P95_BUDGET_US,
+        "memory_recall p95 overhead {recall_over}us (armed {armed_recall}us, unsigned {plain_recall}us)"
+    );
+    assert!(
+        renew_over <= LEASE_RENEW_ATTEST_P95_BUDGET_US,
+        "lease renew p95 overhead {renew_over}us (armed {armed_renew}us, unsigned {plain_renew}us)"
+    );
+    eprintln!(
+        "c8: recall p95 armed {armed_recall}us unsigned {plain_recall}us; \
+         renew p95 armed {armed_renew}us unsigned {plain_renew}us; \
+         {obs} attestations {after_two} for {live} live rows"
     );
 }
 
