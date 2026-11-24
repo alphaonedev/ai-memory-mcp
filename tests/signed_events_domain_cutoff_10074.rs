@@ -28,6 +28,9 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
+#[path = "common/home_sandbox.rs"]
+mod home_sandbox;
+
 /// Deterministic seed for the one daemon key this test binary installs. The
 /// process-wide signer is first-install-wins, so every test shares it.
 const TEST_DAEMON_SEED: [u8; 32] = [0x5a; 32];
@@ -49,6 +52,15 @@ fn daemon_key() -> &'static SigningKey {
 
 fn verifying_key() -> VerifyingKey {
     daemon_key().verifying_key()
+}
+
+/// #10007 — no path this test process can write resolves under the real HOME
+/// (witness key directory and head-anchor log, key directory, temporary root).
+#[test]
+fn test_process_resolves_no_path_under_the_real_home_10007() {
+    let _ = home_sandbox::real_home();
+    let _ = daemon_key();
+    home_sandbox::assert_process_isolated();
 }
 
 fn open_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {

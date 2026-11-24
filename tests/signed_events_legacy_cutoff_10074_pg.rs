@@ -25,6 +25,8 @@ use ai_memory::store::postgres::PostgresStore;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+#[path = "common/home_sandbox.rs"]
+mod home_sandbox;
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
 
@@ -52,6 +54,15 @@ fn sink() -> VerifyingKey {
         dir
     });
     daemon_signer::verifying_key().expect("daemon key installed")
+}
+
+/// #10007 — no path this test process can write resolves under the real HOME
+/// (witness key directory and head-anchor log, key directory, temporary root).
+#[test]
+fn test_process_resolves_no_path_under_the_real_home_10007() {
+    let _ = home_sandbox::real_home();
+    let _ = sink();
+    home_sandbox::assert_process_isolated();
 }
 
 /// One row of a scenario, in chain order.
