@@ -91,6 +91,7 @@ pub mod bind_chain_depth;
 // `check_agent_action_no_audit` (no chain-log emit) to avoid a
 // re-entrant `Connection` deadlock. See `deferred_audit.rs` for the
 // architecture.
+pub mod daemon_signer;
 pub mod deferred_audit;
 // v0.7.0 #991 — per-instance cache for enabled-rule lists keyed by
 // `AgentAction::kind`. Owned by the Connection-bearing context

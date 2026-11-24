@@ -6108,9 +6108,12 @@ fn purge_and_tombstone_forget(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (id, ns, agent_id) in &victims_detail {
-        let signable = forget_tombstone_signable_bytes(id, ns, now);
-        let signature: Option<Vec<u8>> =
-            crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+        let signable = forget_tombstone_signing_body(id, ns, now);
+        let signature: Option<Vec<u8>> = crate::governance::daemon_signer::sign(
+            crate::governance::daemon_signer::DaemonDomain::Tombstone,
+            &signable,
+        )
+        .map(|(sig, _)| sig);
         conn.execute(
             "INSERT OR IGNORE INTO forget_tombstones \
                  (memory_id, namespace, forgotten_at, agent_id, signature) \
@@ -6171,11 +6174,23 @@ pub fn forget_tombstone_signable_bytes(
     namespace: &str,
     forgotten_at: &str,
 ) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"forget-tombstone-v1\x00";
-    let mut bytes = Vec::with_capacity(
-        DOMAIN.len() + memory_id.len() + namespace.len() + forgotten_at.len() + 2,
-    );
-    bytes.extend_from_slice(DOMAIN);
+    crate::governance::daemon_signer::preimage(
+        crate::governance::daemon_signer::DaemonDomain::Tombstone,
+        &forget_tombstone_signing_body(memory_id, namespace, forgotten_at),
+    )
+}
+
+/// #10074 — the tombstone body the daemon signs under
+/// [`crate::governance::daemon_signer::DaemonDomain::Tombstone`]; tag plus body is byte-identical to
+/// [`forget_tombstone_signable_bytes`], so every stored tombstone signature
+/// still verifies.
+#[must_use]
+pub fn forget_tombstone_signing_body(
+    memory_id: &str,
+    namespace: &str,
+    forgotten_at: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(memory_id.len() + namespace.len() + forgotten_at.len() + 2);
     bytes.extend_from_slice(memory_id.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(namespace.as_bytes());
@@ -6692,9 +6707,12 @@ fn tombstone_and_erase(
     let actor = agent_id.filter(|s| !s.is_empty()).unwrap_or(fallback_actor);
     crypto_erase_and_attest(conn, id, actor, now)?;
     // Mandatory signed tombstone (federation resurrection guard).
-    let signable = forget_tombstone_signable_bytes(id, namespace, now);
-    let signature: Option<Vec<u8>> =
-        crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    let signable = forget_tombstone_signing_body(id, namespace, now);
+    let signature: Option<Vec<u8>> = crate::governance::daemon_signer::sign(
+        crate::governance::daemon_signer::DaemonDomain::Tombstone,
+        &signable,
+    )
+    .map(|(sig, _)| sig);
     conn.execute(
         "INSERT OR IGNORE INTO forget_tombstones \
              (memory_id, namespace, forgotten_at, agent_id, signature) \

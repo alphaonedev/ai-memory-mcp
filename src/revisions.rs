@@ -166,15 +166,25 @@ impl RevisionLeaf {
     }
 
     /// Attach the Ed25519 signature using the same daemon audit key the
-    /// `signed_events` + `forget_tombstones` paths use
-    /// ([`crate::governance::audit::try_sign_audit_payload`]). When the
+    /// `signed_events` + `forget_tombstones` paths use, under
+    /// [`crate::governance::daemon_signer::DaemonDomain::RevisionLeaf`]. When the
     /// daemon has no audit key the leaf stays unsigned (`signature =
     /// None`), exactly as the audit chain does.
     #[must_use]
     pub fn signed(mut self) -> Self {
-        let bytes = self.signable_bytes();
-        self.signature =
-            crate::governance::audit::try_sign_audit_payload(&bytes).map(|(sig, _)| sig);
+        let body = revision_leaf_signing_body(
+            &self.memory_id,
+            self.kind,
+            self.prior_version,
+            &self.namespace,
+            self.agent_id.as_deref(),
+            &self.created_at,
+        );
+        self.signature = crate::governance::daemon_signer::sign(
+            crate::governance::daemon_signer::DaemonDomain::RevisionLeaf,
+            &body,
+        )
+        .map(|(sig, _)| sig);
         self
     }
 }
@@ -194,12 +204,36 @@ pub fn revision_leaf_signable_bytes(
     agent_id: Option<&str>,
     created_at: &str,
 ) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"memory-revision-v1\x00";
+    crate::governance::daemon_signer::preimage(
+        crate::governance::daemon_signer::DaemonDomain::RevisionLeaf,
+        &revision_leaf_signing_body(
+            memory_id,
+            kind,
+            prior_version,
+            namespace,
+            agent_id,
+            created_at,
+        ),
+    )
+}
+
+/// #10074 — the revision-leaf body the daemon signs under
+/// [`crate::governance::daemon_signer::DaemonDomain::RevisionLeaf`]; tag plus body is byte-identical to
+/// [`revision_leaf_signable_bytes`], so every stored leaf signature still
+/// verifies.
+#[must_use]
+pub fn revision_leaf_signing_body(
+    memory_id: &str,
+    kind: RecordKind,
+    prior_version: Option<i64>,
+    namespace: &str,
+    agent_id: Option<&str>,
+    created_at: &str,
+) -> Vec<u8> {
     let prior = prior_version.map(|v| v.to_string()).unwrap_or_default();
     let agent = agent_id.unwrap_or("");
     let mut bytes = Vec::with_capacity(
-        DOMAIN.len()
-            + memory_id.len()
+        memory_id.len()
             + kind.as_str().len()
             + prior.len()
             + namespace.len()
@@ -207,7 +241,6 @@ pub fn revision_leaf_signable_bytes(
             + created_at.len()
             + 5,
     );
-    bytes.extend_from_slice(DOMAIN);
     bytes.extend_from_slice(memory_id.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(kind.as_str().as_bytes());

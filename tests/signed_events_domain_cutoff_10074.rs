@@ -182,7 +182,10 @@ fn forge_head_row(conn: &rusqlite::Connection, payload: &[u8], signature: &[u8])
 fn assert_convicted(conn: &rusqlite::Connection, seq: i64, what: &str) {
     let vk = verifying_key();
     let chain = verify_chain(conn, None, Some(&vk)).expect("verify_chain");
-    assert_eq!(chain.chain_break, None, "{what}: the relinked chain is intact");
+    assert_eq!(
+        chain.chain_break, None,
+        "{what}: the relinked chain is intact"
+    );
     assert!(
         chain.signature_failures.contains(&seq),
         "{what}: row {seq} must be a signature failure; got {:?}",
@@ -230,7 +233,10 @@ fn revision_leaf_signature_transplant_is_dirty_10074() {
         chrono::Utc::now().to_rfc3339(),
     )
     .signed();
-    let sig = leaf.signature.clone().expect("leaf signed by the daemon key");
+    let sig = leaf
+        .signature
+        .clone()
+        .expect("leaf signed by the daemon key");
     let seq = forge_head_row(&conn, &leaf.signable_bytes(), &sig);
     assert_convicted(&conn, seq, "revision-leaf transplant");
 }
@@ -378,8 +384,7 @@ fn cli_verify_signed_events_chain_convicts_forged_row_10074() {
     let donor_sig = donor.signature.clone().expect("signed");
     forge_row_at(&conn, 2, &daemon_row_signing_input(donor), &donor_sig);
     drop(conn);
-    let pin =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifying_key().to_bytes());
+    let pin = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifying_key().to_bytes());
     let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("HOME", dir.path())

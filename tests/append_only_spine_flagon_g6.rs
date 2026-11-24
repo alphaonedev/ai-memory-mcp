@@ -74,7 +74,8 @@ use rand_core::OsRng;
 static FLAG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Keeps the audit sink's temp dir alive for the whole process so the
-/// installed `DAEMON_AUDIT_KEY` (an `OnceLock`, first-install-wins) stays
+/// installed daemon audit key (`governance::daemon_signer`, an `OnceLock`,
+/// first-install-wins) stays
 /// valid for signature verification across every test.
 static AUDIT_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 

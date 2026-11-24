@@ -2507,14 +2507,16 @@ impl SqliteSignedEventsSink {
         // sink and this SQL sink share the same key (installed by
         // `audit::init`); a downstream auditor with the daemon's
         // verifying key validates both chains uniformly.
-        let (signature, attest_level) =
-            match crate::governance::audit::try_sign_audit_payload(&hash) {
-                Some((sig, level)) => (Some(sig), level.to_string()),
-                None => (
-                    None,
-                    crate::models::AttestLevel::Unsigned.as_str().to_string(),
-                ),
-            };
+        let (signature, attest_level) = match crate::governance::daemon_signer::sign(
+            crate::governance::daemon_signer::DaemonDomain::Governance,
+            &hash,
+        ) {
+            Some((sig, level)) => (Some(sig), level.to_string()),
+            None => (
+                None,
+                crate::models::AttestLevel::Unsigned.as_str().to_string(),
+            ),
+        };
         let signed = SignedEvent {
             id: event
                 .occurrence_id

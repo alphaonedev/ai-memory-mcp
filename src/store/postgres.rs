@@ -81,6 +81,7 @@ mod pubkey_history;
 // it rolled the whole transaction back for, and must never grow a `23505`
 // arm. The two funnels answer different questions and stay separate.
 mod chain_append;
+mod legacy_cutoff_10074; // #10074 pg cutoff resolver + mint (qual_10 budget)
 // v1.0.0 #3520 — the shared bounded-retry funnel for a transaction PostgreSQL
 // aborted as a concurrency victim (40P01 / 40001). Own module for the same
 // qual_10 budget reason as `parity_3064` above.
@@ -8614,8 +8615,8 @@ impl PostgresStore {
                     let signatures: Vec<Option<Vec<u8>>> = deleted
                         .iter()
                         .map(|(id, ns, _)| {
-                            let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now);
-                            crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
+                            let signable = crate::storage::forget_tombstone_signing_body(id, ns, &now);
+                            crate::governance::daemon_signer::sign(crate::governance::daemon_signer::DaemonDomain::Tombstone, &signable).map(|(s, _)| s)
                         })
                         .collect();
                     sqlx::query(
@@ -16516,6 +16517,13 @@ impl PostgresStore {
         let in_process = crate::governance::audit::resolve_daemon_verifying_key();
         let daemon_verifier: Option<&ed25519_dalek::VerifyingKey> =
             audit_pubkey.or(in_process.as_ref());
+        // #10074 (S-2, S-7) — the whole-table cutoff, as on sqlite.
+        let cutoff = legacy_cutoff_10074::resolve_pg_legacy_cutoff(
+            &self.pool,
+            daemon_verifier,
+            watermark_db_id.as_deref(),
+        )
+        .await?;
         let recorder_verifier = crate::governance::audit::load_enrolled_recorder_pubkey()
             .ok()
             .flatten();
@@ -16552,6 +16560,7 @@ impl PostgresStore {
                 &ev,
                 daemon_verifier,
                 recorder_verifier.as_ref(),
+                &cutoff,
             );
             if rv.is_verified() {
                 rows_positively_verified += 1;
@@ -17112,9 +17121,12 @@ async fn pg_tombstone_and_erase_in_tx(
     let purge_victim = [id.to_owned()];
     pg_purge_dlq_dedup_in_tx(tx, &purge_victim).await?;
 
-    let signable = crate::storage::forget_tombstone_signable_bytes(id, &ns, &now_str);
-    let signature: Option<Vec<u8>> =
-        crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s);
+    let signable = crate::storage::forget_tombstone_signing_body(id, &ns, &now_str);
+    let signature: Option<Vec<u8>> = crate::governance::daemon_signer::sign(
+        crate::governance::daemon_signer::DaemonDomain::Tombstone,
+        &signable,
+    )
+    .map(|(s, _)| s);
     sqlx::query(SQL_INSERT_FORGET_TOMBSTONE)
         .bind(id)
         .bind(&ns)
@@ -17214,7 +17226,7 @@ async fn pg_emit_revision_leaf_if_enabled(
     if !crate::config::append_only_enabled() {
         return Ok(());
     }
-    let signable = crate::revisions::revision_leaf_signable_bytes(
+    let signable = crate::revisions::revision_leaf_signing_body(
         memory_id,
         kind,
         prior_version,
@@ -17222,7 +17234,11 @@ async fn pg_emit_revision_leaf_if_enabled(
         agent_id,
         created_at,
     );
-    let signature = crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    let signature = crate::governance::daemon_signer::sign(
+        crate::governance::daemon_signer::DaemonDomain::RevisionLeaf,
+        &signable,
+    )
+    .map(|(sig, _)| sig);
     let id = uuid::Uuid::new_v4().to_string();
     pg_append_revision_leaf_in_tx(
         tx,
@@ -17643,7 +17659,7 @@ async fn pg_emit_consolidate_leaf_if_enabled(
         return Ok(());
     }
     let kind = crate::revisions::RecordKind::Consolidate;
-    let signable = crate::revisions::revision_leaf_signable_bytes(
+    let signable = crate::revisions::revision_leaf_signing_body(
         memory_id,
         kind,
         prior_version,
@@ -17651,7 +17667,11 @@ async fn pg_emit_consolidate_leaf_if_enabled(
         agent_id,
         created_at,
     );
-    let signature = crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    let signature = crate::governance::daemon_signer::sign(
+        crate::governance::daemon_signer::DaemonDomain::RevisionLeaf,
+        &signable,
+    )
+    .map(|(sig, _)| sig);
     let id = uuid::Uuid::new_v4().to_string();
     pg_append_revision_leaf_in_tx(
         tx,
