@@ -157,7 +157,10 @@ pub async fn push_window(
     // v0.7.0 #238 — attach `x-peer-id` so the receiver attests
     // body.sender_agent_id against our wire-level peer identity.
     let mut req = client
-        .post(format!("{peer_url}/api/v1/sync/push"))
+        // #10065 — the same trimmed URL + SYNC_PUSH_PATH the posture
+        // binding key (`shared_source::BindingUrl`) is built from, so the
+        // URL the boot line binds is the URL this request dials.
+        .post(format!("{peer_url}{}", super::peer::SYNC_PUSH_PATH))
         .header(crate::HEADER_AGENT_ID, local_agent_id)
         .header(super::peer_attestation::PEER_ID_HEADER, local_agent_id)
         .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
