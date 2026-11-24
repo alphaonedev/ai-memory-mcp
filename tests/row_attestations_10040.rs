@@ -2096,3 +2096,159 @@ fn duplicate_key_that_changes_scope_is_refused_and_a_defect_10092() {
     assert_eq!(row_state(&sb, &id), before, "the row is unchanged");
     assert_eq!(sb.attestation_count(), count, "no attestation written");
 }
+
+// ---------------------------------------------------------------------------
+// #10089: key rotation keeps history verifiable (A-6, A-7)
+// ---------------------------------------------------------------------------
+
+/// Unix second the class-D test moves the retired key's window end to: before
+/// any attestation the test writes, so every one of them is out of range.
+const EARLY_ARCHIVE_TS: i64 = 1;
+
+/// The retired-key archives of `AGENT` in the sandbox key directory.
+fn retired_archives(sb: &Sandbox) -> Vec<PathBuf> {
+    let prefix = format!("{AGENT}.pub.");
+    let mut found: Vec<PathBuf> = std::fs::read_dir(sb.root.join("keys"))
+        .expect("read the key dir")
+        .map(|e| e.expect("key dir entry").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// A 0600 session key file holding `AGENT`'s CURRENT private key.
+fn current_key_file(sb: &Sandbox, name: &str) -> PathBuf {
+    let bytes = std::fs::read(sb.root.join("keys").join(format!("{AGENT}.priv")))
+        .expect("read the current key");
+    let path = sb.root.join(name);
+    std::fs::write(&path, bytes).expect("write the session key file");
+    set_mode(&path, 0o600);
+    path
+}
+
+/// #10089 (A-6, A-7): a signed lineage succession rotates `AGENT`'s key.
+/// History signed by the retired key still verifies inside its anchored
+/// window, the rotation re-signs nothing (every old attestation is byte
+/// identical after the next arm), and a session on the new key writes
+/// verifying attestations. With the retired key's archive removed every old
+/// attestation is the exact named `UnknownKey` defect (never a fallback to
+/// the current key); with its window end moved before the writes every old
+/// attestation is the exact `OutOfRange` defect.
+#[test]
+fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("attest rotation 10089");
+    mcp.ok("memory_update", &json!({"id": id, "priority": 7}));
+    drop(mcp);
+    assert_ok(&sb.report(), "before the rotation");
+    let before = read_attestations(&sb.conn()).expect("read attestations");
+    let old_key_id = latest(&sb, &id).key_id;
+    let signers: BTreeMap<&str, (&str, usize)> = before.iter().fold(BTreeMap::new(), |mut m, a| {
+        m.entry(a.key_id.as_str())
+            .or_insert((a.agent_id.as_str(), 0))
+            .1 += 1;
+        m
+    });
+    assert!(
+        signers
+            .iter()
+            .all(|(k, (agent, _))| *k == old_key_id || *agent != AGENT),
+        "AGENT signed the history with one key: {signers:?}"
+    );
+
+    let recovery = sb.generate(EXTRA_AGENT);
+    sb.cli_ok(
+        AGENT,
+        &[
+            "identity",
+            "enroll-lineage",
+            "--agent-id",
+            AGENT,
+            "--recovery-pubkey",
+            &recovery,
+        ],
+    );
+    sb.cli_ok(AGENT, &["identity", "succeed", "--agent-id", AGENT]);
+    let archives = retired_archives(&sb);
+    assert_eq!(archives.len(), 1, "the rotation archives the retired key");
+    assert_ok(&sb.report(), "after the rotation");
+
+    let key = current_key_file(&sb, "rotated.key");
+    let mut mcp = sb.start(&key);
+    let second = mcp.store("attest rotation 10089 new key");
+    mcp.ok("memory_update", &json!({"id": id, "priority": 8}));
+    drop(mcp);
+    let after = read_attestations(&sb.conn()).expect("read attestations");
+    assert_eq!(
+        &after[..before.len()],
+        &before[..],
+        "a rotation never re-signs or rewrites an old attestation"
+    );
+    let new_rows = &after[before.len()..];
+    assert!(!new_rows.is_empty(), "the new session wrote attestations");
+    assert!(
+        new_rows.iter().all(|a| a.key_id != old_key_id),
+        "the new session signs with the new key: {new_rows:?}"
+    );
+    assert!(
+        !memory_chain(&sb.conn(), &second).is_empty(),
+        "the new memory is attested"
+    );
+    assert_ok(&sb.report(), "history and new writes after the rotation");
+
+    let archive = &archives[0];
+    let archived = std::fs::read(archive).expect("read the archive");
+    let expected =
+        |a: &Attestation, tail: &str| format!("attestation {} key_id {} {tail}", a.id, a.key_id);
+
+    // The retired key missing from the anchor: a named defect per old
+    // attestation, never a fallback to the agent's current key.
+    std::fs::remove_file(archive).expect("remove the archive");
+    let report = sb.report();
+    assert!(!report.ok(), "a missing retired key is never clean");
+    for a in &before {
+        let want = expected(a, &format!("of agent {AGENT} is not in the trust anchor"));
+        assert!(
+            report.defects.contains(&want),
+            "missing retired key: expected {want:?}, got {:?}",
+            report.defects
+        );
+    }
+
+    // The retired key's window ends before the writes it signed.
+    let early = sb
+        .root
+        .join("keys")
+        .join(format!("{AGENT}.pub.{EARLY_ARCHIVE_TS}"));
+    std::fs::write(&early, &archived).expect("write the early archive");
+    let report = sb.report();
+    for a in &before {
+        let want = expected(
+            a,
+            &format!("used outside its anchored validity (from None to Some({EARLY_ARCHIVE_TS}))"),
+        );
+        assert!(
+            report.defects.contains(&want),
+            "out-of-range retired key: expected {want:?}, got {:?}",
+            report.defects
+        );
+    }
+    for a in new_rows {
+        let own = format!("attestation {} ", a.id);
+        assert!(
+            !report.defects.iter().any(|d| d.starts_with(&own)),
+            "a new-key attestation stays inside the current key's window: {:?}",
+            report.defects
+        );
+    }
+
+    // Restored at its real instant, the history verifies again.
+    std::fs::remove_file(&early).expect("remove the early archive");
+    std::fs::write(archive, &archived).expect("restore the archive");
+    assert_ok(&sb.report(), "after the archive is restored");
+}
