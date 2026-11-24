@@ -17,6 +17,7 @@
 //! lives in [`sqlite`].
 
 pub mod anchor;
+pub mod seal;
 pub mod sqlite;
 
 use crate::models::field_names;
@@ -1072,7 +1073,15 @@ pub struct VerifyInput<'a> {
     /// Live rows with no canonical form (#10092): each is a defect, and its
     /// [`LiveRow`] carries [`ZERO_DIGEST`] so it never matches an attestation.
     pub non_canonical: &'a [NonCanonical],
+    /// The anchored seal of this database (#10087, #10088): marks a direct
+    /// file writer cannot lower.
+    pub seal: &'a seal::SealState,
 }
+
+/// The defect prefix when the newest attestation id is below the seal.
+pub const DEFECT_SEAL_ROLLED_BACK: &str = "row_attestations rolled back below the anchored seal";
+/// The defect text after `<table>: ` when a table head is below the seal.
+pub const DEFECT_SEAL_HEAD_ROLLED_BACK: &str = "table sequence rolled back below the anchored seal";
 
 fn sig_defect(a: &Attestation, anchor: &anchor::AnchorLoad) -> Option<String> {
     let Some(sig) = a.signature.as_deref() else {
@@ -1186,6 +1195,25 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
             input.id_high_water
         ));
     }
+    let sealed = match input.seal {
+        seal::SealState::NotSealed => None,
+        seal::SealState::Sealed(rec) => Some(rec),
+        seal::SealState::Unreadable { path, why } => {
+            d.push(format!(
+                "the anchored seal {} cannot be read: {why}",
+                path.display()
+            ));
+            None
+        }
+    };
+    if let Some(rec) = sealed
+        && max_id.unwrap_or(0) < rec.high_water
+    {
+        d.push(format!(
+            "{DEFECT_SEAL_ROLLED_BACK}: newest id {max_id:?}, sealed {}",
+            rec.high_water
+        ));
+    }
     for spec in TABLES {
         let mut atts: Vec<&Attestation> = input
             .attestations
@@ -1235,6 +1263,15 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
                 d.push(format!(
                     "{}: table sequence breaks between attestations {} and {}",
                     spec.table, w[0].id, w[1].id
+                ));
+            }
+        }
+        if let Some(&sealed_head) = sealed.and_then(|rec| rec.heads.get(spec.table)) {
+            let head = atts.last().map_or(0, |a| a.table_seq);
+            if head < sealed_head {
+                d.push(format!(
+                    "{}: {DEFECT_SEAL_HEAD_ROLLED_BACK}: head {head}, sealed {sealed_head}",
+                    spec.table
                 ));
             }
         }

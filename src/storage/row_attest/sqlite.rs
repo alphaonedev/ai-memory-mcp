@@ -9,6 +9,7 @@
 //! statement aborts (the scalar function returns an error) and nothing is
 //! stored (C-4).
 
+use super::seal::{self, SealRecord, SealState};
 use super::{
     Attestation, CanonicalRow, Cell, FORMAT_VERSION, LiveRow, Op, Report, Retention,
     STORE_ROW_TABLE, TABLES, TableSpec, VerifyInput, ZERO_DIGEST, acc_add, acc_sub, acc_term,
@@ -40,6 +41,14 @@ pub const REFUSE_NO_SIGNER: &str = "no session signer is installed";
 /// is never signed again at arm time.
 pub const REFUSE_STRIPPED_CUTOVER: &str =
     "a signed cutover watermark lost its signature and is not signed again";
+/// Refusal (#10088): the trust anchor holds a seal for this database file,
+/// so it was armed, and a cutover in it is unsigned. An unsigned cutover in a
+/// sealed file is a removed signature (however pristine it looks) and is
+/// never signed: nothing unsigned decides what must be signed.
+pub const REFUSE_SEALED_UNSIGNED_CUTOVER: &str = "the trust anchor records this database as \
+     armed, so an unsigned cutover is a removed signature and is never signed";
+/// Refusal (#10087): the anchored seal of this database cannot be read.
+pub const REFUSE_SEAL_UNREADABLE: &str = "the anchored seal of this database cannot be read";
 /// Refusal: the row changed outside the funnel since its last attestation.
 pub const REFUSE_ROW_DRIFT: &str =
     "the row changed outside the funnel since its latest attestation";
@@ -533,7 +542,7 @@ const STRIPPED_CUTOVER_SQL: &str = "SELECT c.table_name FROM row_attestations c 
                      WHERE s.id > c.id AND s.signature IS NOT NULL)) \
      ORDER BY c.id LIMIT 1";
 
-fn sign_cutovers(conn: &Connection, who: &Signer) -> Result<()> {
+fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<()> {
     let store = store_id(conn).map_err(anyhow::Error::msg)?;
     // A-8: checked for every table before any row is signed (the memories
     // baselines signed below must not make a later pristine cutover look
@@ -544,6 +553,33 @@ fn sign_cutovers(conn: &Connection, who: &Signer) -> Result<()> {
         .optional()?;
     if let Some(table) = stripped {
         anyhow::bail!("{}: {table}", refusal(REFUSE_STRIPPED_CUTOVER));
+    }
+    // #10088: the anchor, not the file, says whether this database was
+    // armed. A sealed file with any unsigned cutover had a signature removed,
+    // even when every unsigned watermark looks pristine (signed rows deleted,
+    // signer columns blanked, a new store identity): refused, nothing signed.
+    match sealed {
+        SealState::NotSealed => {}
+        SealState::Unreadable { path, why } => {
+            anyhow::bail!(
+                "{} ({}: {why})",
+                refusal(REFUSE_SEAL_UNREADABLE),
+                path.display()
+            );
+        }
+        SealState::Sealed(_) => {
+            let unsigned: Option<String> = conn
+                .query_row(
+                    "SELECT table_name FROM row_attestations WHERE op = 'cutover' \
+                     AND signature IS NULL ORDER BY id LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(table) = unsigned {
+                anyhow::bail!("{}: {table}", refusal(REFUSE_SEALED_UNSIGNED_CUTOVER));
+            }
+        }
     }
     for spec in TABLES {
         let unsigned: Option<i64> = conn
@@ -627,8 +663,22 @@ pub fn install(conn: &Connection) -> Result<ArmState> {
     // opener. Inside a caller's transaction the work joins it, and an
     // error is returned for that caller to roll back; either way the
     // connection is not armed (fail closed).
-    crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, &who))
+    let anchor = super::anchor::TrustAnchor::from_key_dir();
+    let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
+    let sealed = seal_file
+        .as_deref()
+        .map_or(SealState::NotSealed, seal::read);
+    crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, &who, &sealed))
         .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
+    // #10087, #10088: record in the anchor that this file is armed, at the
+    // marks it holds now. Only once the signing committed (inside a caller's
+    // transaction a rollback could undo it); a failure refuses the arm.
+    if let Some(path) = seal_file.as_deref()
+        && conn.is_autocommit()
+    {
+        seal::advance(path, &SealRecord::of(&read_attestations(conn)?))
+            .map_err(|e| e.context("row attestation seal (#10087)"))?;
+    }
     register(conn)?;
     Ok(ArmState::Armed)
 }
@@ -692,7 +742,24 @@ pub fn read_attestations(conn: &Connection) -> Result<Vec<Attestation>> {
 /// Surfaces read failures (a missing `row_attestations` table included);
 /// defects in the data are reported in the [`Report`], not as errors.
 pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
-    verify_sqlite_with(conn, &super::anchor::TrustAnchor::from_key_dir())
+    let anchor = super::anchor::TrustAnchor::from_key_dir();
+    let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
+    let sealed = seal_file
+        .as_deref()
+        .map_or(SealState::NotSealed, seal::read);
+    let (report, attestations) = verify_inner(conn, &anchor, &sealed)?;
+    // #10087: a clean verify moves the seal up to what it verified, so a
+    // later rollback of those writes is seen. Not inside a transaction (its
+    // rollback could undo what was verified); a failed write only leaves the
+    // seal lower, never a clean verdict that should not be.
+    if let Some(path) = seal_file.as_deref()
+        && matches!(report.outcome(), super::Outcome::Clean)
+        && conn.is_autocommit()
+        && let Err(e) = seal::advance(path, &SealRecord::of(&attestations))
+    {
+        tracing::warn!("row attestation seal (#10087) not advanced: {e:#}");
+    }
+    Ok(report)
 }
 
 /// [`verify_sqlite`] against an explicit out-of-database anchor (#10086):
@@ -702,6 +769,15 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
 ///
 /// As [`verify_sqlite`].
 pub fn verify_sqlite_with(conn: &Connection, anchor: &super::anchor::AnchorLoad) -> Result<Report> {
+    let sealed = seal::state_for(anchor, seal::db_of(conn).as_deref());
+    Ok(verify_inner(conn, anchor, &sealed)?.0)
+}
+
+fn verify_inner(
+    conn: &Connection,
+    anchor: &super::anchor::AnchorLoad,
+    sealed: &SealState,
+) -> Result<(Report, Vec<Attestation>)> {
     let mut live = Vec::new();
     let mut non_canonical = Vec::new();
     for spec in TABLES {
@@ -730,30 +806,46 @@ pub fn verify_sqlite_with(conn: &Connection, anchor: &super::anchor::AnchorLoad)
             |r| r.get(0),
         )
         .optional()?;
-    Ok(super::verify(&VerifyInput {
+    let report = super::verify(&VerifyInput {
         live: &live,
         attestations: &attestations,
         anchor,
         id_high_water,
         memory_id_of_key: &super::memory_id_of_key,
         non_canonical: &non_canonical,
-    }))
+        seal: sealed,
+    });
+    Ok((report, attestations))
 }
 
 /// Refusal prefix of [`check_snapshot`] (C-7, E-6).
 pub const SNAPSHOT_REFUSAL_PREFIX: &str = "row attestation (#10040): snapshot refused because";
 
+/// What [`check_snapshot`] found in a snapshot it accepts.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotVerdict {
+    /// Every attestation verified against the out-of-database anchor; the
+    /// marks become the restored file's seal once it is published.
+    Verified(SealRecord),
+    /// No attestation carries a signature and the target holds no seal: a
+    /// store no session signer armed, checked for shape alone.
+    NeverArmed,
+}
+
 /// The restore catalog ratchet (C-7, E-6): a snapshot stamped v103 or later
 /// must carry `row_attestations` with its store-identity row and one cutover
-/// watermark per attested table. A snapshot whose watermarks are all signed
-/// (a store a session signer armed) must also pass [`verify_sqlite`] in full;
-/// a store no signer ever armed holds unsigned watermarks only and is checked
-/// for shape alone.
+/// watermark per attested table. A snapshot in which any attestation is
+/// signed, or restored over a `target` the anchor has sealed (#10088: an
+/// armed store), must pass the verifier in full against the
+/// out-of-database anchor: a removed signature is a defect, never a
+/// never-armed store. Only a snapshot with no signature at all, restored over
+/// an unsealed target, is checked for shape alone.
 ///
 /// # Errors
 ///
 /// The exact reason, prefixed with [`SNAPSHOT_REFUSAL_PREFIX`].
-pub fn check_snapshot(conn: &Connection) -> Result<()> {
+pub fn check_snapshot(conn: &Connection, target: &std::path::Path) -> Result<SnapshotVerdict> {
     let refuse = |why: &str| anyhow::anyhow!("{SNAPSHOT_REFUSAL_PREFIX} {why}");
     let present: Option<String> = conn
         .query_row(
@@ -775,33 +867,72 @@ pub fn check_snapshot(conn: &Connection) -> Result<()> {
             "it holds {stores} store-identity rows, not one"
         )));
     }
-    let mut all_signed = true;
     for spec in TABLES {
         let cut = attestations
             .iter()
             .find(|a| a.table == spec.table && a.op == Op::Cutover.as_str());
-        let Some(cut) = cut else {
+        if cut.is_none() {
             return Err(refuse(&format!("{} has no cutover watermark", spec.table)));
-        };
-        all_signed &= cut.signature.is_some();
-    }
-    if all_signed {
-        let report = verify_sqlite(conn)?;
-        match report.outcome() {
-            super::Outcome::Clean => {}
-            super::Outcome::Unanchored(why) => {
-                // #10086 A-3: a signed snapshot with no out-of-database key
-                // cannot be verified; it is refused, never let through.
-                return Err(refuse(&format!(
-                    "its row attestations cannot be verified: unanchored ({why})"
-                )));
-            }
-            super::Outcome::Defective { count, first } => {
-                return Err(refuse(&format!(
-                    "its row attestations do not verify ({count} defects; first: {first})"
-                )));
-            }
         }
     }
-    Ok(())
+    let anchor = super::anchor::TrustAnchor::from_key_dir();
+    let target_seal = seal::state_for(&anchor, Some(target));
+    let any_signed = attestations.iter().any(|a| a.signature.is_some());
+    if !any_signed && target_seal == SealState::NotSealed {
+        return Ok(SnapshotVerdict::NeverArmed);
+    }
+    // The snapshot is judged on its own marks: restoring an older verified
+    // store is an explicit order, and the target's seal is replaced by the
+    // snapshot's once it is published.
+    let (report, attestations) = verify_inner(conn, &anchor, &SealState::NotSealed)?;
+    match report.outcome() {
+        super::Outcome::Clean => Ok(SnapshotVerdict::Verified(SealRecord::of(&attestations))),
+        super::Outcome::Unanchored(why) => {
+            // #10086 A-3: a signed snapshot with no out-of-database key
+            // cannot be verified; it is refused, never let through.
+            Err(refuse(&format!(
+                "its row attestations cannot be verified: unanchored ({why})"
+            )))
+        }
+        super::Outcome::Defective { count, first } => Err(refuse(&format!(
+            "its row attestations do not verify ({count} defects; first: {first})"
+        ))),
+    }
+}
+
+/// #10088: a snapshot older than row attestations restored over a `target`
+/// the anchor has sealed would publish unsigned state over an armed store
+/// (and its cutovers, written unsigned at migration, would look pristine).
+///
+/// # Errors
+///
+/// The exact reason, prefixed with [`SNAPSHOT_REFUSAL_PREFIX`], when the
+/// target is sealed or its seal cannot be read.
+pub fn check_pre_attestation_snapshot(target: &std::path::Path) -> Result<()> {
+    let anchor = super::anchor::TrustAnchor::from_key_dir();
+    match seal::state_for(&anchor, Some(target)) {
+        SealState::NotSealed => Ok(()),
+        SealState::Sealed(_) => Err(anyhow::anyhow!(
+            "{SNAPSHOT_REFUSAL_PREFIX} it predates row attestations and the target is an \
+             armed store (the trust anchor holds its seal); restore it to a new path"
+        )),
+        SealState::Unreadable { path, why } => Err(anyhow::anyhow!(
+            "{SNAPSHOT_REFUSAL_PREFIX} the anchored seal {} of the target cannot be read: {why}",
+            path.display()
+        )),
+    }
+}
+
+/// Record a published verified restore in the anchor (#10087): the seal of
+/// `target` becomes the snapshot's marks.
+///
+/// # Errors
+///
+/// A write failure.
+pub fn seal_restored(target: &std::path::Path, rec: &SealRecord) -> Result<()> {
+    let anchor = super::anchor::TrustAnchor::from_key_dir();
+    match seal::path_for(&anchor, Some(target)) {
+        Some(path) => seal::replace(&path, rec),
+        None => Ok(()),
+    }
 }

@@ -1834,7 +1834,10 @@ fn stripped_cutover_snapshot_is_never_restored_10088() {
     drop(pristine);
 
     let live_before = row_state(&sb, &id);
-    for (dir, label) in [(&dirs[0], "cutover signature removed"), (&dirs[1], "pristine")] {
+    for (dir, label) in [
+        (&dirs[0], "cutover signature removed"),
+        (&dirs[1], "pristine"),
+    ] {
         let out = restore(&sb, dir);
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{label}: restore must refuse: {err}");
@@ -1876,7 +1879,10 @@ fn pristine_downgrade_of_an_armed_store_is_never_signed_at_arm_10088() {
     let out = run_arm(&sb, &key);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "the arm must refuse: {err}");
-    assert!(err.contains(ARM_SEALED_UNSIGNED), "exact arm refusal, got: {err}");
+    assert!(
+        err.contains(ARM_SEALED_UNSIGNED),
+        "exact arm refusal, got: {err}"
+    );
     let (count, signed): (i64, i64) = sb
         .conn()
         .query_row(
@@ -1905,10 +1911,7 @@ fn counter_rolled_back_is_a_defect_10087() {
     drop(mcp);
     arm_ok(&sb, &key);
     assert_ok(&sb.report(), "control");
-    let newest = memory_chain(&sb.conn(), &id)
-        .last()
-        .expect("newest")
-        .id;
+    let newest = memory_chain(&sb.conn(), &id).last().expect("newest").id;
     let conn = sb.seed_conn();
     assert_eq!(max_attestation_id(&conn), newest, "the update is the tail");
     conn.execute(
@@ -1944,10 +1947,7 @@ fn table_head_rolled_back_under_another_tables_write_is_a_defect_10087() {
     drop(mcp);
     arm_ok(&sb, &key);
     assert_ok(&sb.report(), "control");
-    let update = memory_chain(&sb.conn(), &id)
-        .last()
-        .expect("update")
-        .id;
+    let update = memory_chain(&sb.conn(), &id).last().expect("update").id;
     let conn = sb.seed_conn();
     let memories_tail: i64 = conn
         .query_row(

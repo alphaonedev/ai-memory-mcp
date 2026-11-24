@@ -467,6 +467,7 @@ impl Fixture {
             id_high_water: high,
             memory_id_of_key: &memory_id_of_key,
             non_canonical: &[],
+            seal: &super::seal::SealState::NotSealed,
         })
     }
 }
@@ -573,8 +574,56 @@ fn verify_detects_tail_truncation_e2() {
         id_high_water: high,
         memory_id_of_key: &memory_id_of_key,
         non_canonical: &[],
+        seal: &super::seal::SealState::NotSealed,
     });
     assert_defect(&r, "row_attestations tail truncated");
+}
+
+/// #10087: the anchored seal catches a self-consistent rollback (counter
+/// lowered with the tail) and a per-table head moved back; a seal at the
+/// current marks adds no defect; an unreadable seal is a defect.
+#[test]
+fn verify_checks_the_anchored_seal_10087() {
+    use super::seal::{SealRecord, SealState};
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let public = f.signing.verifying_key();
+    let anchor = anchored(&[(AGENT, public, None, None)]);
+    let current = SealRecord::of(&f.atts);
+    let run = |seal: &SealState| {
+        verify(&VerifyInput {
+            live: &f.live,
+            attestations: &f.atts,
+            anchor: &anchor,
+            id_high_water: f.atts.iter().map(|a| a.id).max(),
+            memory_id_of_key: &memory_id_of_key,
+            non_canonical: &[],
+            seal,
+        })
+    };
+    assert!(
+        run(&SealState::Sealed(current.clone())).ok(),
+        "current seal"
+    );
+    let mut ahead = current.clone();
+    ahead.high_water += 1;
+    assert_defect(
+        &run(&SealState::Sealed(ahead)),
+        super::DEFECT_SEAL_ROLLED_BACK,
+    );
+    let mut head = current;
+    *head.heads.get_mut("memories").expect("memories head") += 1;
+    assert_defect(
+        &run(&SealState::Sealed(head)),
+        &format!("memories: {}", super::DEFECT_SEAL_HEAD_ROLLED_BACK),
+    );
+    assert_defect(
+        &run(&SealState::Unreadable {
+            path: std::path::PathBuf::from("seal-x"),
+            why: "bad".to_string(),
+        }),
+        "the anchored seal seal-x cannot be read: bad",
+    );
 }
 
 #[test]
