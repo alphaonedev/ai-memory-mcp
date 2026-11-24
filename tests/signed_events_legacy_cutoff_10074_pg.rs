@@ -739,3 +739,47 @@ async fn c2_mint_certifies_only_a_contiguous_legacy_prefix_10101_10102() {
         }
     }
 }
+
+/// #10106 — the `DaemonDomain::LegacyCutoff` tag, written out.
+const LEGACY_CUTOFF_TAG_BYTES: &[u8] = b"ai-memory/daemon-sig/v2/legacy-cutoff\0";
+
+/// #10106 (S-7) — the PostgreSQL mint signs the cutoff row over the
+/// written-out domain bytes, and a cutoff row the test signs over those bytes
+/// is the one the PostgreSQL verify accepts (a swap of both sides is red).
+#[tokio::test(flavor = "multi_thread")]
+async fn c3_pg_cutoff_domain_bytes_are_pinned_10106() {
+    let vk = sink();
+    let Some(url) = pg_url() else { return };
+    let (_scratch, store) = fresh_pg(&url).await;
+    pg::append(&store, &[P, I, T]).await;
+    let minted = store.mint_legacy_cutoff().await.expect("pg mint runs");
+    assert_eq!(minted, Ok(4), "pg mint");
+    let mut rows = pg::load(&store).await;
+    let cutoff = rows
+        .iter_mut()
+        .find(|r| r.event_type == LEGACY_CUTOFF_EVENT_TYPE)
+        .expect("the cutoff row");
+    let preimage = [LEGACY_CUTOFF_TAG_BYTES, &daemon_row_signing_input(cutoff)].concat();
+    let sig = ed25519_dalek::Signature::from_slice(cutoff.signature.as_deref().expect("signed"))
+        .expect("64-byte signature");
+    assert!(
+        vk.verify_strict(&preimage, &sig).is_ok(),
+        "the pg cutoff row is signed over the pinned domain bytes"
+    );
+    // Verify side: the test's own signature over the pinned bytes (fresh id,
+    // so the bytes are not the mint's) is accepted.
+    cutoff.id = uuid::Uuid::new_v4().to_string();
+    let preimage = [LEGACY_CUTOFF_TAG_BYTES, &daemon_row_signing_input(cutoff)].concat();
+    cutoff.signature = Some(legacy_key().sign(&preimage).to_bytes().to_vec());
+    pg::replace_all(&store, &relinked(rows)).await;
+    let trail = store
+        .verify_audit_trail(None, Some(&vk))
+        .await
+        .expect("pg verify");
+    assert!(trail.chain_intact, "pg chain intact");
+    assert_eq!(
+        trail.signature_failures,
+        Vec::<i64>::new(),
+        "the pinned-domain cutoff certifies the legacy prefix on pg"
+    );
+}

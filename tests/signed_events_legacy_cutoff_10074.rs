@@ -904,3 +904,168 @@ fn c2_legacy_prefix_is_contiguous_and_ends_before_first_tagged_10102() {
     assert_eq!(cutoff.row_sequence(), Some(cutoff_row));
     assert_clean(&conn, "a contiguous legacy prefix");
 }
+
+/// #10106 — the `DaemonDomain::LegacyCutoff` tag, written out (not taken from
+/// the code under test).
+const LEGACY_CUTOFF_TAG_BYTES: &[u8] = b"ai-memory/daemon-sig/v2/legacy-cutoff\0";
+/// #10106 — the `DaemonDomain::EventRow` tag, written out.
+const EVENT_ROW_TAG_BYTES: &[u8] = b"ai-memory/daemon-sig/v2/event-row\0";
+
+/// `tag || body`, built here independently of `daemon_signer::preimage`.
+fn pinned_preimage(tag: &[u8], body: &[u8]) -> Vec<u8> {
+    [tag, body].concat()
+}
+
+/// One way to alter only the cutoff row after a valid mint: its signature,
+/// its `event_type` or its `prev_hash`, never its `payload_hash`.
+#[derive(Clone, Copy, Debug)]
+enum CutoffTamper {
+    /// Re-signed over the same identity input under another domain.
+    SignatureUnder(DaemonDomain),
+    /// The pre-#10074 untagged signature over the same identity input.
+    SignatureUntagged,
+    /// 64 zero bytes.
+    SignatureZeroed,
+    /// No signature at all.
+    SignatureAbsent,
+    /// The signed `event_type` changed, signature kept.
+    EventType,
+    /// Only `prev_hash` changed (it is under no row signature).
+    PrevHashOnly,
+}
+
+/// #10107 — every signature-only (and `event_type`, `prev_hash`) tamper of a
+/// cutoff row, written out.
+const CUTOFF_TAMPERS: &[CutoffTamper] = &[
+    CutoffTamper::SignatureUnder(DaemonDomain::EventRow),
+    CutoffTamper::SignatureUnder(DaemonDomain::EventPayload),
+    CutoffTamper::SignatureUnder(DaemonDomain::Governance),
+    CutoffTamper::SignatureUnder(DaemonDomain::Tombstone),
+    CutoffTamper::SignatureUnder(DaemonDomain::RevisionLeaf),
+    CutoffTamper::SignatureUntagged,
+    CutoffTamper::SignatureZeroed,
+    CutoffTamper::SignatureAbsent,
+    CutoffTamper::EventType,
+    CutoffTamper::PrevHashOnly,
+];
+
+fn apply_cutoff_tamper(conn: &rusqlite::Connection, seq: i64, tamper: CutoffTamper) {
+    let row = row_at(conn, seq);
+    let input = daemon_row_signing_input(&row);
+    let set_sig = |sig: Option<Vec<u8>>| {
+        conn.execute(
+            "UPDATE signed_events SET signature = ?1 WHERE sequence = ?2",
+            params![sig, seq],
+        )
+        .expect("tamper signature");
+    };
+    match tamper {
+        CutoffTamper::SignatureUnder(d) => {
+            set_sig(Some(daemon_signer::sign(d, &input).expect("signer").0));
+        }
+        CutoffTamper::SignatureUntagged => {
+            set_sig(Some(legacy_key().sign(&input).to_bytes().to_vec()));
+        }
+        CutoffTamper::SignatureZeroed => set_sig(Some(vec![0u8; 64])),
+        CutoffTamper::SignatureAbsent => set_sig(None),
+        CutoffTamper::EventType => {
+            conn.execute(
+                "UPDATE signed_events SET event_type = ?1 WHERE sequence = ?2",
+                params![FIXTURE_EVENT_TYPE, seq],
+            )
+            .expect("tamper event_type");
+        }
+        CutoffTamper::PrevHashOnly => {
+            conn.execute(
+                "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = ?2",
+                params![vec![0xABu8; 32], seq],
+            )
+            .expect("tamper prev_hash");
+        }
+    }
+}
+
+/// #10107 — a cutoff row altered only in its signature, its `event_type` or
+/// its `prev_hash` (payload hash intact) resolves to no cutoff. Each check of
+/// `LegacyCutoffResolver::finish` has a row here that needs it.
+#[test]
+fn c3_cutoff_row_signature_only_tamper_means_no_cutoff_10107() {
+    let vk = sink();
+    for &tamper in CUTOFF_TAMPERS {
+        let (_d, _p, conn) = open_db();
+        let cutoff_row = legacy_prefix_and_mint(&conn);
+        let before = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+        assert_eq!(
+            before.row_sequence(),
+            Some(cutoff_row),
+            "{tamper:?}: control"
+        );
+        apply_cutoff_tamper(&conn, cutoff_row, tamper);
+        let after = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+        assert_eq!(after, LegacyCutoff::none(), "{tamper:?}: no cutoff");
+        assert!(trail_dirty(&conn), "{tamper:?}: the trail is dirty");
+    }
+}
+
+/// #10106 — the cutoff and event-row domains are the written-out bytes on the
+/// sign side (the mint and the append path) AND on the verify side (the
+/// resolver and the row classifier), so a swap of both sides is red.
+#[test]
+fn c3_cutoff_and_event_row_domain_bytes_are_pinned_10106() {
+    for (domain, bytes) in [
+        (DaemonDomain::LegacyCutoff, LEGACY_CUTOFF_TAG_BYTES),
+        (DaemonDomain::EventRow, EVENT_ROW_TAG_BYTES),
+    ] {
+        assert_eq!(domain.tag(), bytes, "{domain:?} tag bytes");
+    }
+    let vk = sink();
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+
+    // Sign side: the stored signatures are over the pinned bytes.
+    let cutoff = row_at(&conn, cutoff_row);
+    let tagged = row_at(&conn, 3);
+    for (row, tag, what) in [
+        (&cutoff, LEGACY_CUTOFF_TAG_BYTES, "the minted cutoff row"),
+        (&tagged, EVENT_ROW_TAG_BYTES, "the appended tagged row"),
+    ] {
+        let sig = ed25519_dalek::Signature::from_slice(row.signature.as_deref().expect("signed"))
+            .expect("64-byte signature");
+        assert!(
+            vk.verify_strict(&pinned_preimage(tag, &daemon_row_signing_input(row)), &sig)
+                .is_ok(),
+            "{what} is signed over the pinned domain bytes"
+        );
+    }
+
+    // Verify side: rows signed here over the pinned bytes are accepted.
+    let cutoff_sig = legacy_key()
+        .sign(&pinned_preimage(
+            LEGACY_CUTOFF_TAG_BYTES,
+            &daemon_row_signing_input(&cutoff),
+        ))
+        .to_bytes()
+        .to_vec();
+    conn.execute(
+        "UPDATE signed_events SET signature = ?1 WHERE sequence = ?2",
+        params![cutoff_sig, cutoff_row],
+    )
+    .expect("re-sign the cutoff row");
+    let resolved = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(resolved.row_sequence(), Some(cutoff_row), "pinned cutoff");
+    let pinned_row = insert_head_row(&conn, "pinned", |ev| {
+        legacy_key()
+            .sign(&pinned_preimage(
+                EVENT_ROW_TAG_BYTES,
+                &daemon_row_signing_input(ev),
+            ))
+            .to_bytes()
+            .to_vec()
+    });
+    assert_eq!(
+        classify_row_signature(&row_at(&conn, pinned_row), Some(&vk), None, &resolved),
+        RowSignatureVerdict::Verified,
+        "a row signed over the pinned event-row bytes verifies"
+    );
+    assert_clean(&conn, "pinned-domain rows");
+}
