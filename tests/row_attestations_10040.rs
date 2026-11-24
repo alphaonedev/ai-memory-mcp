@@ -1730,6 +1730,304 @@ fn stripped_cutover_signature_is_never_re_signed_at_arm_10086() {
 }
 
 // ---------------------------------------------------------------------------
+// #10088 / #10087 (class B): no signed element can be removed, replayed or
+// rolled back unseen; the anchor, not the file, says what must be signed
+// ---------------------------------------------------------------------------
+
+/// The arm refusal when the anchor's seal says this database was armed and
+/// the file holds an unsigned cutover (#10088 b, c).
+const ARM_SEALED_UNSIGNED: &str = "the trust anchor records this database as armed";
+/// The defect when the newest attestation id is below the anchored seal.
+const DEFECT_ROLLED_BACK: &str = "row_attestations rolled back below the anchored seal";
+/// The defect suffix when a table's newest table sequence is below the seal.
+const DEFECT_HEAD_ROLLED_BACK: &str = "table sequence rolled back below the anchored seal";
+/// Tags a direct file writer plants.
+const TAMPERED_TAGS: &str = "[\"tampered-10088\"]";
+/// Make the attestations of `conn` look like a store no signer ever armed:
+/// every signed row but the cutovers and the store row deleted, every
+/// cutover unsigned with no signer named, and a new store identity.
+const MAKE_PRISTINE_SQL: &str = "DELETE FROM row_attestations WHERE op NOT IN ('cutover', 'store'); \
+     UPDATE row_attestations SET signature = NULL, agent_id = '', key_id = '' WHERE op = 'cutover'; \
+     UPDATE row_attestations SET store_id = 'forged-store-10088';";
+
+/// One arming process on the sandbox store: the `mcp` server with the bound
+/// key and no input, which arms at open and exits.
+fn run_arm(sb: &Sandbox, key: &Path) -> Output {
+    let mut cmd = sb.base_command(AGENT, "0");
+    cmd.args([
+        "--db",
+        sb.db().to_str().expect("utf-8 db path"),
+        "mcp",
+        "--profile",
+        "full",
+        "--tier",
+        "keyword",
+    ])
+    .env(ENV_KEY_FILE, key)
+    .stdin(Stdio::null());
+    cmd.output().expect("run mcp")
+}
+
+fn arm_ok(sb: &Sandbox, key: &Path) {
+    let out = run_arm(sb, key);
+    assert!(
+        out.status.success(),
+        "arm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn tags_of(sb: &Sandbox, id: &str) -> String {
+    sb.conn()
+        .query_row("SELECT tags FROM memories WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .expect("tags")
+}
+
+fn max_attestation_id(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("SELECT MAX(id) FROM row_attestations", [], |r| r.get(0))
+        .expect("max id")
+}
+
+/// #10088 (a), from the attacker's side: a snapshot of an armed store is
+/// tampered and its cutover signature removed (or the whole catalog made to
+/// look never armed); restoring it is refused with the exact reason and the
+/// live store is unchanged.
+#[test]
+fn stripped_cutover_snapshot_is_never_restored_10088() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("strip snapshot 10088");
+    drop(mcp);
+    assert_ok(&sb.report(), "control");
+    let mut dirs = Vec::new();
+    for name in ["strip", "pristine"] {
+        let dir = sb.root.join(format!("backups-{name}-10088"));
+        sb.cli_ok(AGENT, &["backup", "--to", dir.to_str().expect("utf-8")]);
+        dirs.push(dir);
+    }
+    let strip = rusqlite::Connection::open(snapshot_in(&dirs[0])).expect("open snapshot");
+    strip
+        .execute(
+            "UPDATE memories SET tags = ?1 WHERE id = ?2",
+            [TAMPERED_TAGS, &id],
+        )
+        .expect("tamper");
+    strip
+        .execute(
+            "UPDATE row_attestations SET signature = NULL \
+             WHERE op = 'cutover' AND table_name = 'memories'",
+            [],
+        )
+        .expect("strip the cutover signature");
+    drop(strip);
+    let pristine = rusqlite::Connection::open(snapshot_in(&dirs[1])).expect("open snapshot");
+    pristine
+        .execute(
+            "UPDATE memories SET tags = ?1 WHERE id = ?2",
+            [TAMPERED_TAGS, &id],
+        )
+        .expect("tamper");
+    pristine
+        .execute_batch(MAKE_PRISTINE_SQL)
+        .expect("make the snapshot look never armed");
+    drop(pristine);
+
+    let live_before = row_state(&sb, &id);
+    for (dir, label) in [(&dirs[0], "cutover signature removed"), (&dirs[1], "pristine")] {
+        let out = restore(&sb, dir);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{label}: restore must refuse: {err}");
+        assert!(
+            err.contains(&format!(
+                "{SNAPSHOT_REFUSAL_PREFIX} its row attestations do not verify"
+            )),
+            "{label}: exact reason, got: {err}"
+        );
+        assert_eq!(row_state(&sb, &id), live_before, "{label}: live unchanged");
+    }
+    assert_ok(&sb.report(), "after the refused restores");
+}
+
+/// #10088 (b, c), from the attacker's side: the live file of an armed store
+/// is tampered and made to look never armed (signed rows deleted, cutovers
+/// unsigned, a new store identity). The next arm refuses with the exact
+/// reason and signs nothing: no cutover and no baseline over the tampered
+/// state.
+#[test]
+fn pristine_downgrade_of_an_armed_store_is_never_signed_at_arm_10088() {
+    let (sb, key, mut mcp) = armed();
+    let id = mcp.store("pristine downgrade 10088");
+    drop(mcp);
+    assert_ok(&sb.report(), "control");
+    let conn = sb.seed_conn();
+    conn.execute(
+        "UPDATE memories SET tags = ?1 WHERE id = ?2",
+        [TAMPERED_TAGS, &id],
+    )
+    .expect("tamper");
+    conn.execute_batch(MAKE_PRISTINE_SQL)
+        .expect("make the store look never armed");
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM row_attestations", [], |r| r.get(0))
+        .expect("count");
+    drop(conn);
+
+    let out = run_arm(&sb, &key);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the arm must refuse: {err}");
+    assert!(err.contains(ARM_SEALED_UNSIGNED), "exact arm refusal, got: {err}");
+    let (count, signed): (i64, i64) = sb
+        .conn()
+        .query_row(
+            "SELECT COUNT(*), COUNT(signature) FROM row_attestations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("counts");
+    assert_eq!(count, before, "the refused arm wrote no attestation");
+    assert_eq!(signed, 0, "the refused arm signed nothing");
+    assert!(!sb.report().ok(), "the downgraded store never verifies");
+}
+
+/// #10087, from the attacker's side: the newest change is rolled back with
+/// its attestation and `sqlite_sequence` lowered to match, so the file is
+/// self-consistent. The anchored seal still records the higher mark.
+#[test]
+fn counter_rolled_back_is_a_defect_10087() {
+    let (sb, key, mut mcp) = armed();
+    let id = mcp.store("counter rollback 10087");
+    let original = tags_of(&sb, &id);
+    mcp.ok(
+        "memory_update",
+        &json!({"id": id, "tags": ["counter-10087"]}),
+    );
+    drop(mcp);
+    arm_ok(&sb, &key);
+    assert_ok(&sb.report(), "control");
+    let newest = memory_chain(&sb.conn(), &id)
+        .last()
+        .expect("newest")
+        .id;
+    let conn = sb.seed_conn();
+    assert_eq!(max_attestation_id(&conn), newest, "the update is the tail");
+    conn.execute(
+        "UPDATE memories SET tags = ?1 WHERE id = ?2",
+        [&original, &id],
+    )
+    .expect("restore older tags");
+    conn.execute("DELETE FROM row_attestations WHERE id = ?1", [newest])
+        .expect("delete the newest attestation");
+    conn.execute(
+        "UPDATE sqlite_sequence SET seq = (SELECT MAX(id) FROM row_attestations) \
+         WHERE name = 'row_attestations'",
+        [],
+    )
+    .expect("lower the counter");
+    drop(conn);
+    assert_defect(&sb.report(), DEFECT_ROLLED_BACK, "counter rolled back");
+}
+
+/// #10087: a table's newest change rolled back under a later write to
+/// another table (the id counter and the other table are untouched) is a
+/// defect against the anchored per-table head.
+#[test]
+fn table_head_rolled_back_under_another_tables_write_is_a_defect_10087() {
+    let (sb, key, mut mcp) = armed();
+    let id = mcp.store("head rollback 10087");
+    let original = tags_of(&sb, &id);
+    mcp.ok("memory_update", &json!({"id": id, "tags": ["head-10087"]}));
+    mcp.ok(
+        "memory_action_create",
+        &json!({"namespace": NAMESPACE, "kind": "task", "title": "head rollback action 10087"}),
+    );
+    drop(mcp);
+    arm_ok(&sb, &key);
+    assert_ok(&sb.report(), "control");
+    let update = memory_chain(&sb.conn(), &id)
+        .last()
+        .expect("update")
+        .id;
+    let conn = sb.seed_conn();
+    let memories_tail: i64 = conn
+        .query_row(
+            "SELECT id FROM row_attestations WHERE table_name = 'memories' \
+             ORDER BY table_seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("memories tail");
+    assert_eq!(memories_tail, update, "the update is the memories head");
+    assert!(
+        max_attestation_id(&conn) > update,
+        "another table was attested after the update"
+    );
+    conn.execute(
+        "UPDATE memories SET tags = ?1 WHERE id = ?2",
+        [&original, &id],
+    )
+    .expect("restore older tags");
+    conn.execute("DELETE FROM row_attestations WHERE id = ?1", [update])
+        .expect("delete the update attestation");
+    drop(conn);
+    assert_defect(
+        &sb.report(),
+        &format!("memories: {DEFECT_HEAD_ROLLED_BACK}"),
+        "memories head rolled back",
+    );
+}
+
+/// #10087, from the attacker's side: a superseded lease attestation, saved
+/// before the renew, is replayed with the lease row it signed after the
+/// renew's attestation is deleted. Every signature verifies and the
+/// supersede sequence still increases; the anchored per-table head does not
+/// move back.
+#[test]
+fn replayed_superseded_attestation_is_a_defect_10087() {
+    let (sb, key, mut mcp) = armed();
+    let text = mcp.ok(
+        "memory_action_create",
+        &json!({"namespace": NAMESPACE, "kind": "task", "title": "replay lease action 10087"}),
+    );
+    let v: Value = serde_json::from_str(&text).expect("action json");
+    let lease = json!({"action_id": v["id"].as_str().expect("action id"), "holder": AGENT});
+    mcp.ok("memory_lease_acquire", &lease);
+    drop(mcp);
+    sb.seed_conn()
+        .execute_batch(
+            "CREATE TABLE saved_lease_10087 AS SELECT * FROM leases; \
+             CREATE TABLE saved_att_10087 AS SELECT * FROM row_attestations \
+             WHERE table_name = 'leases' AND op <> 'cutover';",
+        )
+        .expect("save the acquired lease and its attestation");
+    // Renews made more than a second apart change the lease row.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let mut mcp = sb.start(&key);
+    mcp.ok("memory_lease_renew", &lease);
+    drop(mcp);
+    arm_ok(&sb, &key);
+    assert_ok(&sb.report(), "control");
+    sb.seed_conn()
+        .execute_batch(
+            "DELETE FROM row_attestations WHERE table_name = 'leases' AND op <> 'cutover'; \
+             INSERT INTO row_attestations (table_name, row_key, seq, op, row_digest, \
+             prior_digest, agent_id, key_id, attested_at, format_version, covered_columns, \
+             store_id, table_seq, table_acc, signature, attestation_digest) \
+             SELECT table_name, row_key, seq, op, row_digest, prior_digest, agent_id, key_id, \
+             attested_at, format_version, covered_columns, store_id, table_seq, table_acc, \
+             signature, attestation_digest FROM saved_att_10087; \
+             DELETE FROM leases; INSERT INTO leases SELECT * FROM saved_lease_10087; \
+             DROP TABLE saved_att_10087; DROP TABLE saved_lease_10087;",
+        )
+        .expect("replay the superseded attestation");
+    assert_defect(
+        &sb.report(),
+        &format!("leases: {DEFECT_HEAD_ROLLED_BACK}"),
+        "superseded attestation replayed",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #10092 (class C): the digest covers the bytes the product acts on
 // ---------------------------------------------------------------------------
 
