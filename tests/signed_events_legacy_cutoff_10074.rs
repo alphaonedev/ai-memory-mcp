@@ -15,7 +15,7 @@
 //! own copy of the daemon key; every post-fix row comes from the production
 //! append path and the production mint.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -33,6 +33,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "common/home_sandbox.rs"]
 mod home_sandbox;
+#[path = "common/legacy_cutoff_cli.rs"]
+mod cli;
 
 /// Deterministic seed for the one daemon key this test binary installs.
 const TEST_DAEMON_SEED: [u8; 32] = [0x3c; 32];
@@ -829,6 +831,160 @@ fn s8_cli_mint_once_on_explicit_flag_10074() {
         "walk after mint: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// #10104 — one stored-then-hard-deleted memory through the CLI under agent
+/// `agent`, sink `sink`: a short chain with nothing above it.
+fn cli_seed(root: &Path, db: &Path, agent: &str, sink: &Path) {
+    let out = cli::run(
+        root,
+        db,
+        agent,
+        sink,
+        &[],
+        &["--json", "store", "-T", "row", "--content", "a ledger row (#10104)"],
+    );
+    assert_eq!(out.code, Some(0), "store: {}", out.text);
+    let start = out.text.find('{').expect("store json");
+    let stored: serde_json::Value =
+        serde_json::Deserializer::from_str(&out.text[start..])
+            .into_iter()
+            .next()
+            .expect("one json value")
+            .expect("store json");
+    let id = stored["id"].as_str().expect("id").to_string();
+    let out = cli::run(root, db, agent, sink, &[], &["delete", "--hard", &id]);
+    assert_eq!(out.code, Some(0), "delete: {}", out.text);
+}
+
+/// `verify-signed-events-chain --mint-legacy-cutoff` as a CLI child.
+fn cli_mint(root: &Path, db: &Path, agent: &str, sink: &Path) -> cli::CliRun {
+    cli::run(
+        root,
+        db,
+        agent,
+        sink,
+        &[],
+        &["verify-signed-events-chain", "--mint-legacy-cutoff"],
+    )
+}
+
+fn cli_cutoff_rows(db: &Path) -> i64 {
+    cutoff_rows(&rusqlite::Connection::open(db).expect("open sqlite"))
+}
+
+/// #10104 — a crash between the database commit and the anchor write leaves a
+/// committed cutoff row with no anchor. Two children share the key and the
+/// database but not the sink: the second sees exactly that state, detects it
+/// and repairs the anchor (exit 0, still one cutoff row, the same anchor
+/// fields); a third mint is the plain exact refusal.
+#[test]
+fn c4_crash_between_commit_and_anchor_is_repaired_10104() {
+    let root = home_sandbox::per_test_dir("cli-repair-10104-");
+    let (root, db, agent) = (root.path(), root.path().join("store.db"), "cli-repair-10104");
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+    cli_seed(root, &db, agent, &a);
+
+    let out = cli_mint(root, &db, agent, &a);
+    assert_eq!(out.code, Some(0), "mint: {}", out.text);
+    assert!(
+        out.text.contains("minted the legacy cutoff row at sequence="),
+        "{}",
+        out.text
+    );
+    let anchors_a = cli::anchor_lines(&a);
+    assert_eq!(anchors_a.len(), 1, "one anchor in sink A");
+    assert!(cli::anchor_lines(&b).is_empty(), "sink B holds no anchor");
+
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(0), "repair: {}", out.text);
+    assert!(
+        out.text
+            .contains("repaired the off-table anchor of the legacy cutoff row at sequence="),
+        "{}",
+        out.text
+    );
+    assert_eq!(cli_cutoff_rows(&db), 1, "the repair adds no row");
+    let anchors_b = cli::anchor_lines(&b);
+    assert_eq!(anchors_b.len(), 1, "one repaired anchor in sink B");
+    assert_eq!(
+        cli::anchor_fields(&anchors_b[0]),
+        cli::anchor_fields(&anchors_a[0]),
+        "the repaired anchor binds the committed row"
+    );
+
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(1), "third mint: {}", out.text);
+    assert!(
+        out.text
+            .contains("legacy cutoff mint refused: a legacy cutoff row already exists"),
+        "{}",
+        out.text
+    );
+    assert_eq!(cli_cutoff_rows(&db), 1);
+    assert_eq!(cli::anchor_lines(&b).len(), 1, "no second anchor");
+}
+
+/// #10103 — an anchor line is used only after its signature verified: a
+/// forged anchor line (unsigned, a changed signature, a changed field under
+/// the genuine signature) beside the genuine one is an exact refusal naming
+/// the defect, with the cutoff row present (never a repair, never "exists")
+/// and with it removed (never "anchor exists" from the forged line); nothing
+/// is written. The genuine sink alone keeps its plain refusal.
+#[test]
+fn c4_unverified_anchor_line_is_an_exact_refusal_10103() {
+    for &forgery in cli::FORGERIES {
+        let root = home_sandbox::per_test_dir("cli-anchor-10103-");
+        let (root, db, agent) = (root.path(), root.path().join("store.db"), "cli-anchor-10103");
+        let a = cli::sink_dir(root, "sink-a");
+        cli_seed(root, &db, agent, &a);
+        let out = cli_mint(root, &db, agent, &a);
+        assert_eq!(out.code, Some(0), "{forgery:?}: mint: {}", out.text);
+
+        for (row_present, name) in [(true, "sink-row"), (false, "sink-gone")] {
+            if !row_present {
+                rusqlite::Connection::open(&db)
+                    .expect("open sqlite")
+                    .execute(
+                        "DELETE FROM signed_events WHERE event_type = ?1",
+                        params![LEGACY_CUTOFF_EVENT_TYPE],
+                    )
+                    .expect("delete the cutoff row");
+            }
+            let rows = cli_cutoff_rows(&db);
+            let forged = cli::forged_sink(root, name, &a, forgery);
+            let out = cli_mint(root, &db, agent, &forged);
+            assert_eq!(out.code, Some(1), "{forgery:?} row={row_present}: {}", out.text);
+            assert!(
+                out.text.contains(
+                    "legacy cutoff mint refused: the off-table legacy cutoff anchor is not trusted"
+                ),
+                "{forgery:?} row={row_present}: {}",
+                out.text
+            );
+            assert!(
+                out.text.contains(forgery.reason()),
+                "{forgery:?} row={row_present}: {}",
+                out.text
+            );
+            assert_eq!(cli_cutoff_rows(&db), rows, "{forgery:?}: no row written");
+            assert_eq!(
+                cli::anchor_lines(&forged).len(),
+                2,
+                "{forgery:?}: no anchor written"
+            );
+        }
+        let out = cli_mint(root, &db, agent, &a);
+        assert_eq!(out.code, Some(1), "{forgery:?}: genuine: {}", out.text);
+        assert!(
+            out.text.contains(
+                "legacy cutoff mint refused: a legacy cutoff anchor for this database already exists"
+            ),
+            "{forgery:?}: genuine: {}",
+            out.text
+        );
+    }
 }
 
 /// #10101 — the forensic sink's record shape (JSON, never a 32-byte digest).

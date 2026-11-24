@@ -29,6 +29,8 @@ use sha2::{Digest, Sha256};
 mod home_sandbox;
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
+#[path = "common/legacy_cutoff_cli.rs"]
+mod cli;
 
 /// Deterministic seed for the one daemon key this test binary installs.
 const TEST_DAEMON_SEED: [u8; 32] = [0x5a; 32];
@@ -782,4 +784,118 @@ async fn c3_pg_cutoff_domain_bytes_are_pinned_10106() {
         Vec::<i64>::new(),
         "the pinned-domain cutoff certifies the legacy prefix on pg"
     );
+}
+
+/// Agent id of the CLI children of the #10104 pg test.
+const CLI_AGENT: &str = "pg-mint-10104";
+
+/// #10104 — the test daemon key installed as the agent key of the CLI child,
+/// so the child mints over rows this process signed.
+fn install_child_key(root: &std::path::Path) {
+    let keys = home_sandbox::child_env(root)
+        .into_iter()
+        .find(|(k, _)| *k == "AI_MEMORY_KEY_DIR")
+        .map(|(_, v)| v)
+        .expect("child key dir");
+    let key = legacy_key();
+    ai_memory::identity::keypair::save(
+        &ai_memory::identity::keypair::AgentKeypair {
+            agent_id: CLI_AGENT.to_string(),
+            public: key.verifying_key(),
+            private: Some(key),
+        },
+        std::path::Path::new(&keys),
+    )
+    .expect("save the child key");
+}
+
+async fn pg_cutoff_rows(store: &PostgresStore) -> usize {
+    pg::load(store)
+        .await
+        .iter()
+        .filter(|r| r.event_type == LEGACY_CUTOFF_EVENT_TYPE)
+        .count()
+}
+
+/// #10104 / #10103 (S-7) — the pg twin of the sqlite crash-between test: the
+/// row committed by a child whose sink kept the anchor is repaired by a child
+/// whose sink lost it (exit 0, one cutoff row, the same anchor fields); a
+/// third mint is the exact refusal; a forged anchor line beside the genuine
+/// one is the exact "not trusted" refusal, never a repair.
+#[tokio::test(flavor = "multi_thread")]
+async fn c4_pg_crash_between_commit_and_anchor_is_repaired_10104() {
+    let _ = sink();
+    let Some(url) = pg_url() else { return };
+    let (scratch, store) = fresh_pg(&url).await;
+    pg::append(&store, &[P, I, T]).await;
+    let dir = home_sandbox::per_test_dir("cli-pg-repair-10104-");
+    let root = dir.path();
+    install_child_key(root);
+    let db = root.join("unused.db");
+    let store_url = scratch.url();
+    let mint = |sink: &std::path::Path| {
+        cli::run(
+            root,
+            &db,
+            CLI_AGENT,
+            sink,
+            &[],
+            &[
+                "verify-signed-events-chain",
+                "--mint-legacy-cutoff",
+                "--store-url",
+                &store_url,
+            ],
+        )
+    };
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+
+    let out = mint(&a);
+    assert_eq!(out.code, Some(0), "pg mint: {}", out.text);
+    assert!(
+        out.text.contains("minted the legacy cutoff row at sequence=4"),
+        "{}",
+        out.text
+    );
+    let anchors_a = cli::anchor_lines(&a);
+    assert_eq!(anchors_a.len(), 1, "one anchor in sink A");
+
+    let forged = cli::forged_sink(root, "sink-forged", &a, cli::Forgery::Unsigned);
+    let out = mint(&forged);
+    assert_eq!(out.code, Some(1), "pg forged: {}", out.text);
+    assert!(
+        out.text.contains(
+            "legacy cutoff mint refused: the off-table legacy cutoff anchor is not trusted"
+        ) && out.text.contains(cli::Forgery::Unsigned.reason()),
+        "{}",
+        out.text
+    );
+
+    let out = mint(&b);
+    assert_eq!(out.code, Some(0), "pg repair: {}", out.text);
+    assert!(
+        out.text
+            .contains("repaired the off-table anchor of the legacy cutoff row at sequence=4"),
+        "{}",
+        out.text
+    );
+    assert_eq!(pg_cutoff_rows(&store).await, 1, "the repair adds no row");
+    let anchors_b = cli::anchor_lines(&b);
+    assert_eq!(anchors_b.len(), 1, "one repaired anchor in sink B");
+    assert_eq!(
+        cli::anchor_fields(&anchors_b[0]),
+        cli::anchor_fields(&anchors_a[0]),
+        "the repaired anchor binds the committed row"
+    );
+
+    let out = mint(&b);
+    assert_eq!(out.code, Some(1), "pg third mint: {}", out.text);
+    assert!(
+        out.text
+            .contains("legacy cutoff mint refused: a legacy cutoff row already exists"),
+        "{}",
+        out.text
+    );
+    assert_eq!(pg_cutoff_rows(&store).await, 1);
 }
