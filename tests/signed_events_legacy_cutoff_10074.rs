@@ -23,8 +23,8 @@ use ai_memory::governance::daemon_signer::{self, DaemonDomain};
 use ai_memory::signed_events::{
     LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoffMintRefusal, RowSignatureVerdict, SignatureFailure,
     SignedEvent, ZERO_HASH, append_signed_event, canonical_chain_bytes, classify_row_signature,
-    daemon_row_signing_input, mint_legacy_cutoff, payload_hash, resolve_sqlite_legacy_cutoff,
-    verify_audit_trail, verify_chain,
+    daemon_row_signing_input, legacy_cutoff_payload_hash, mint_legacy_cutoff, payload_hash,
+    resolve_sqlite_legacy_cutoff, verify_audit_trail, verify_chain,
 };
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rusqlite::params;
@@ -356,6 +356,116 @@ fn s1_prefix_row_removed_or_added_voids_cutoff_10074() {
     let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
     assert_eq!(cutoff.sequence(), 0, "an added prefix row voids the cutoff");
     assert!(trail_dirty(&conn));
+}
+
+/// Replace prefix row 2 (the legacy identity-form row, not the genesis row
+/// the db identity derives from) with another identity-form row the same key
+/// signed: a new id and payload, the same sequence, form and count.
+fn substitute_identity_row_2(conn: &rusqlite::Connection) {
+    let mut ev = row_at(conn, 2);
+    ev.id = uuid::Uuid::new_v4().to_string();
+    ev.payload_hash = payload_hash(b"another legacy identity-form row, 10074");
+    let sig = legacy_key()
+        .sign(&daemon_row_signing_input(&ev))
+        .to_bytes()
+        .to_vec();
+    conn.execute(
+        "UPDATE signed_events SET id = ?1, payload_hash = ?2, signature = ?3 WHERE sequence = 2",
+        params![ev.id, ev.payload_hash, sig],
+    )
+    .expect("substitute");
+}
+
+/// S-1 — a prefix row swapped for another validly signed legacy row of the
+/// SAME form keeps the payload-only count, the db identity and every row
+/// signature valid, and `prev_hash` is under no signature. The swap voids the
+/// cutoff and the full verify is dirty.
+#[test]
+fn s1_same_form_substitution_in_prefix_voids_cutoff_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let vk = sink();
+    assert_clean(&conn, "the minted prefix");
+    let before = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(before.sequence(), 3);
+
+    substitute_identity_row_2(&conn);
+    relink(&conn);
+    assert_eq!(
+        classify_row_signature(&row_at(&conn, 2), Some(&vk), None, &before),
+        RowSignatureVerdict::Verified,
+        "precondition: on its own the substitute is a valid legacy prefix row"
+    );
+
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(
+        cutoff.sequence(),
+        0,
+        "a substituted prefix row voids the cutoff"
+    );
+    assert_eq!(cutoff.row_sequence(), None);
+    let failed = failures(&conn, None);
+    assert_eq!(
+        failed,
+        vec![1, 2, cutoff_row],
+        "exact failures after the swap"
+    );
+    assert!(trail_dirty(&conn), "the full verify is dirty");
+}
+
+/// S-1 — the same swap WITHOUT a relink leaves the last prefix row, its hash,
+/// the count and the db identity untouched, so only the cutoff's digest over
+/// every prefix row binds row 2: the cutoff is void, not merely the chain
+/// link reported broken.
+#[test]
+fn s1_unrelinked_substitution_in_prefix_voids_cutoff_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let vk = sink();
+    assert_clean(&conn, "the minted prefix");
+    substitute_identity_row_2(&conn);
+
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(
+        cutoff.sequence(),
+        0,
+        "an unrelinked substitution voids the cutoff"
+    );
+    assert_eq!(cutoff.row_sequence(), None);
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, Some(3), "row 3 no longer links to row 2");
+    assert!(cutoff_row > 3, "the cutoff row sits above the swapped row");
+    assert!(trail_dirty(&conn), "the full verify is dirty");
+}
+
+/// S-1 — known-answer vectors for the cutoff payload hash, computed
+/// independently (Python `hashlib` over the documented layout), and each bound
+/// field changes the hash.
+#[test]
+fn s1_cutoff_payload_hash_known_answer_10074() {
+    let h = |last: u8, prefix: u8| {
+        hex::encode(legacy_cutoff_payload_hash(
+            3,
+            &[last; 32],
+            &[prefix; 32],
+            1,
+            "db-10074",
+        ))
+    };
+    assert_eq!(
+        h(0x11, 0x22),
+        "c8f2eca952c54c1989ce682b8c9502f86913204b3a9a821354532e62703cd7f3"
+    );
+    assert_eq!(
+        h(0x33, 0x22),
+        "5d84c2e32baecf9c83a5c905a45d0a2f8ef0a9a8e711905afd40536b358b734f",
+        "the last prefix chain hash is bound"
+    );
+    assert_eq!(
+        h(0x11, 0x44),
+        "2e8528847daabd55164bfbfd195fa1ee7483ab001997b9a45340ab3ed0687f1d",
+        "the prefix digest is bound"
+    );
 }
 
 /// S-2 — a duplicated cutoff row means cutoff zero: every legacy row fails.

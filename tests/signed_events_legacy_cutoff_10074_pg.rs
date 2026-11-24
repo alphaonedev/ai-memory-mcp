@@ -1,0 +1,571 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! Issue #10074 (S-7, `3-agent vote (71472661) V1-SIGNED-EVENTS-FALLBACK`) —
+//! SQLite and PostgreSQL give identical results for the legacy cutoff.
+//!
+//! Each scenario builds the same row shape on both backends (legacy
+//! payload-only and identity rows signed the way a pre-#10074 binary signed
+//! them, domain-tagged rows, the operator mint), applies the same tamper, and
+//! asserts the audit-trail signature failures and the mint refusals equal a
+//! WRITTEN-OUT expected value on each backend, so the two can only agree by
+//! both being right. The PostgreSQL cell runs under
+//! `AI_MEMORY_TEST_POSTGRES_URL` on a scratch database and skips otherwise.
+
+#![cfg(feature = "sal-postgres")]
+
+use std::sync::OnceLock;
+
+use ai_memory::governance::daemon_signer::{self, DaemonDomain};
+use ai_memory::signed_events::{
+    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoffMintRefusal, SignedEvent, ZERO_HASH,
+    canonical_chain_bytes, daemon_row_signing_input, payload_hash, verify_audit_trail,
+};
+use ai_memory::store::postgres::PostgresStore;
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
+
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
+/// Deterministic seed for the one daemon key this test binary installs.
+const TEST_DAEMON_SEED: [u8; 32] = [0x5a; 32];
+/// Event type of the fixture rows.
+const FIXTURE_EVENT_TYPE: &str = "governance.test";
+/// Prefix of this binary's scratch databases (swept when stale).
+const SCRATCH_PREFIX: &str = "legacy_cutoff_10074";
+const PG_URL_ENV: &str = "AI_MEMORY_TEST_POSTGRES_URL";
+
+fn legacy_key() -> SigningKey {
+    SigningKey::from_bytes(&TEST_DAEMON_SEED)
+}
+
+/// Start the forensic sink once (the mint needs it and the daemon key).
+fn sink() -> VerifyingKey {
+    static SINK: OnceLock<tempfile::TempDir> = OnceLock::new();
+    SINK.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("forensic-10074-pg-")
+            .tempdir()
+            .expect("forensic tempdir");
+        ai_memory::governance::audit::init(dir.path(), Some(legacy_key())).expect("init sink");
+        dir
+    });
+    daemon_signer::verifying_key().expect("daemon key installed")
+}
+
+/// One row of a scenario, in chain order.
+#[derive(Clone, Copy, Debug)]
+enum Row {
+    /// Untagged signature over `payload_hash` (pre-#10074 payload-only form).
+    PayloadOnly,
+    /// Untagged signature over the identity digest (pre-#10074 #1925 form).
+    Identity,
+    /// Typed-signer signature over the identity digest under this domain.
+    Tagged(DaemonDomain),
+    /// A signature that verifies under no form.
+    Garbage,
+}
+
+/// A tamper applied after the rows and the mint.
+#[derive(Clone, Copy, Debug)]
+enum Tamper {
+    None,
+    /// Row 1 takes row 2's identity digest as payload hash and row 2's
+    /// signature; the chain is relinked.
+    TransplantIntoPrefix,
+    /// Row 2 (identity form) is replaced by another validly signed
+    /// identity-form row: same form, count and db identity.
+    SameFormSubstitution,
+    /// A second row of the reserved cutoff type, a copy of the first.
+    DuplicateCutoff,
+    /// The cutoff row's payload hash is changed.
+    TamperCutoffPayload,
+}
+
+struct Scenario {
+    name: &'static str,
+    before_mint: &'static [Row],
+    mint: bool,
+    after_mint: &'static [Row],
+    tamper: Tamper,
+    /// Expected `signature_failures`, written out.
+    failures: &'static [i64],
+}
+
+const P: Row = Row::PayloadOnly;
+const I: Row = Row::Identity;
+const T: Row = Row::Tagged(DaemonDomain::EventRow);
+
+/// Every scenario; sequences start at 1 on a fresh store.
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "minted prefix is clean",
+        before_mint: &[P, I, T],
+        mint: true,
+        after_mint: &[T],
+        tamper: Tamper::None,
+        failures: &[],
+    },
+    Scenario {
+        name: "S-1 transplant into the prefix voids the cutoff",
+        before_mint: &[P, I, T],
+        mint: true,
+        after_mint: &[],
+        tamper: Tamper::TransplantIntoPrefix,
+        failures: &[1, 2, 4],
+    },
+    Scenario {
+        name: "S-1 same-form substitution in the prefix voids the cutoff",
+        before_mint: &[P, I, T],
+        mint: true,
+        after_mint: &[],
+        tamper: Tamper::SameFormSubstitution,
+        failures: &[1, 2, 4],
+    },
+    Scenario {
+        name: "S-2 duplicated cutoff row means cutoff zero",
+        before_mint: &[P, I, T],
+        mint: true,
+        after_mint: &[],
+        tamper: Tamper::DuplicateCutoff,
+        failures: &[1, 2, 4, 5],
+    },
+    Scenario {
+        name: "S-2 tampered cutoff row means cutoff zero",
+        before_mint: &[P, I, T],
+        mint: true,
+        after_mint: &[],
+        tamper: Tamper::TamperCutoffPayload,
+        failures: &[1, 2, 4],
+    },
+    Scenario {
+        name: "S-2 no cutoff row refuses every legacy row",
+        before_mint: &[T, P, I],
+        mint: false,
+        after_mint: &[],
+        tamper: Tamper::None,
+        failures: &[2, 3],
+    },
+    Scenario {
+        name: "S-5/S-6 legacy rows above the cutoff fail",
+        before_mint: &[P, I, T],
+        mint: true,
+        after_mint: &[I, P, T],
+        tamper: Tamper::None,
+        failures: &[5, 6],
+    },
+    Scenario {
+        name: "S-4 every other domain in a ledger row fails",
+        before_mint: &[
+            T,
+            Row::Tagged(DaemonDomain::EventPayload),
+            Row::Tagged(DaemonDomain::Governance),
+            Row::Tagged(DaemonDomain::Tombstone),
+            Row::Tagged(DaemonDomain::RevisionLeaf),
+            Row::Tagged(DaemonDomain::LegacyCutoff),
+        ],
+        mint: false,
+        after_mint: &[],
+        tamper: Tamper::None,
+        failures: &[2, 3, 4, 5, 6],
+    },
+];
+
+fn make_row(kind: Row, sequence: i64, timestamp: String) -> SignedEvent {
+    let mut ev = SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "daemon".to_string(),
+        event_type: FIXTURE_EVENT_TYPE.to_string(),
+        payload_hash: payload_hash(uuid::Uuid::new_v4().as_bytes()),
+        signature: None,
+        attest_level: "daemon_signed".to_string(),
+        timestamp,
+        prev_hash: ZERO_HASH.to_vec(),
+        sequence,
+        cause_hash: None,
+    };
+    let sig = match kind {
+        Row::PayloadOnly => legacy_key().sign(&ev.payload_hash).to_bytes().to_vec(),
+        Row::Identity => legacy_key()
+            .sign(&daemon_row_signing_input(&ev))
+            .to_bytes()
+            .to_vec(),
+        Row::Tagged(d) => {
+            daemon_signer::sign(d, &daemon_row_signing_input(&ev))
+                .expect("signer installed")
+                .0
+        }
+        Row::Garbage => vec![7u8; 64],
+    };
+    ev.signature = Some(sig);
+    ev
+}
+
+/// The PostgreSQL-safe timestamp (TIMESTAMPTZ keeps microseconds), as the
+/// RFC 3339 string the row is signed over and read back as.
+fn micros_now() -> chrono::DateTime<chrono::Utc> {
+    let now = chrono::Utc::now();
+    chrono::DateTime::from_timestamp_micros(now.timestamp_micros()).expect("in range")
+}
+
+/// The canonical chain hash of `row` (the next row's `prev_hash`).
+fn chain_hash(row: &SignedEvent) -> Vec<u8> {
+    Sha256::digest(canonical_chain_bytes(row)).to_vec()
+}
+
+fn relinked(mut rows: Vec<SignedEvent>) -> Vec<SignedEvent> {
+    let mut prev = ZERO_HASH.to_vec();
+    for r in &mut rows {
+        r.prev_hash.clone_from(&prev);
+        prev = Sha256::digest(canonical_chain_bytes(r)).to_vec();
+    }
+    rows
+}
+
+/// The rows a tamper rewrites (relinked), or `None` for no rewrite.
+fn tampered(rows: &[SignedEvent], tamper: Tamper) -> Option<Vec<SignedEvent>> {
+    let mut rows = rows.to_vec();
+    match tamper {
+        Tamper::None => return None,
+        Tamper::TransplantIntoPrefix => {
+            let donor = rows[1].clone();
+            rows[0].id = uuid::Uuid::new_v4().to_string();
+            rows[0].payload_hash = daemon_row_signing_input(&donor);
+            rows[0].signature.clone_from(&donor.signature);
+        }
+        Tamper::SameFormSubstitution => {
+            // Row 2 (identity form), not the genesis row the db id derives from.
+            rows[1].id = uuid::Uuid::new_v4().to_string();
+            rows[1].payload_hash = payload_hash(b"another legacy identity-form row, 10074");
+            let sig = legacy_key().sign(&daemon_row_signing_input(&rows[1]));
+            rows[1].signature = Some(sig.to_bytes().to_vec());
+        }
+        Tamper::DuplicateCutoff => {
+            let cutoff = rows
+                .iter()
+                .find(|r| r.event_type == LEGACY_CUTOFF_EVENT_TYPE)
+                .expect("a cutoff row")
+                .clone();
+            let mut copy = cutoff;
+            copy.id = uuid::Uuid::new_v4().to_string();
+            copy.sequence = rows.last().map_or(1, |r| r.sequence + 1);
+            rows.push(copy);
+        }
+        Tamper::TamperCutoffPayload => {
+            let c = rows
+                .iter_mut()
+                .find(|r| r.event_type == LEGACY_CUTOFF_EVENT_TYPE)
+                .expect("a cutoff row");
+            c.payload_hash = payload_hash(b"not the prefix");
+        }
+    }
+    Some(relinked(rows))
+}
+
+// ----- SQLite cell -------------------------------------------------------
+
+mod sqlite {
+    use super::{Row, SignedEvent, micros_now};
+    use rusqlite::params;
+
+    pub fn open() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
+        let dir = tempfile::Builder::new()
+            .prefix("legacy-cutoff-10074-pg-twin-")
+            .tempdir()
+            .expect("tempdir");
+        let path = dir.path().join("twin.db");
+        let conn = ai_memory::db::open(&path).expect("open db");
+        (dir, path, conn)
+    }
+
+    pub fn load(conn: &rusqlite::Connection) -> Vec<SignedEvent> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                        timestamp, prev_hash, sequence, cause_hash \
+                 FROM signed_events ORDER BY sequence ASC",
+            )
+            .expect("prepare");
+        stmt.query_map([], |r| {
+            Ok(SignedEvent {
+                id: r.get(0)?,
+                agent_id: r.get(1)?,
+                event_type: r.get(2)?,
+                payload_hash: r.get(3)?,
+                signature: r.get(4)?,
+                attest_level: r.get(5)?,
+                timestamp: r.get(6)?,
+                prev_hash: r.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(),
+                sequence: r.get(8)?,
+                cause_hash: r.get(9)?,
+            })
+        })
+        .expect("query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect")
+    }
+
+    pub fn replace_all(conn: &rusqlite::Connection, rows: &[SignedEvent]) {
+        conn.execute("DELETE FROM signed_events", [])
+            .expect("clear");
+        for r in rows {
+            insert(conn, r);
+        }
+    }
+
+    fn insert(conn: &rusqlite::Connection, r: &SignedEvent) {
+        conn.execute(
+            "INSERT INTO signed_events \
+                (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
+                 prev_hash, sequence, cause_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            params![
+                r.id,
+                r.agent_id,
+                r.event_type,
+                r.payload_hash,
+                r.signature,
+                r.attest_level,
+                r.timestamp,
+                r.prev_hash,
+                r.sequence
+            ],
+        )
+        .expect("insert");
+    }
+
+    pub fn append(conn: &rusqlite::Connection, kinds: &[Row]) {
+        for &k in kinds {
+            let rows = load(conn);
+            let seq = rows.last().map_or(1, |r| r.sequence + 1);
+            let mut row = super::make_row(k, seq, micros_now().to_rfc3339());
+            if let Some(last) = rows.last() {
+                row.prev_hash = super::chain_hash(last);
+            }
+            insert(conn, &row);
+        }
+    }
+}
+
+// ----- PostgreSQL cell ---------------------------------------------------
+
+mod pg {
+    use super::{Row, SignedEvent, micros_now};
+    use ai_memory::store::postgres::PostgresStore;
+
+    type WalkRow = (
+        String,
+        String,
+        String,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        String,
+        chrono::DateTime<chrono::Utc>,
+        Vec<u8>,
+        i64,
+        Option<Vec<u8>>,
+    );
+
+    pub async fn load(store: &PostgresStore) -> Vec<SignedEvent> {
+        let rows: Vec<WalkRow> = sqlx::query_as(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, prev_hash, sequence, cause_hash \
+             FROM signed_events ORDER BY sequence ASC",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load rows");
+        rows.into_iter()
+            .map(
+                |(id, agent_id, event_type, ph, sig, attest, ts, prev, seq, cause)| SignedEvent {
+                    id,
+                    agent_id,
+                    event_type,
+                    payload_hash: ph,
+                    signature: sig,
+                    attest_level: attest,
+                    timestamp: ts.to_rfc3339(),
+                    prev_hash: prev,
+                    sequence: seq,
+                    cause_hash: cause,
+                },
+            )
+            .collect()
+    }
+
+    async fn insert(store: &PostgresStore, r: &SignedEvent) {
+        let ts = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc);
+        sqlx::query(
+            "INSERT INTO signed_events \
+                (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
+                 prev_hash, sequence, cause_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)",
+        )
+        .bind(&r.id)
+        .bind(&r.agent_id)
+        .bind(&r.event_type)
+        .bind(&r.payload_hash)
+        .bind(&r.signature)
+        .bind(&r.attest_level)
+        .bind(ts)
+        .bind(&r.prev_hash)
+        .bind(r.sequence)
+        .execute(store.pool())
+        .await
+        .expect("insert");
+    }
+
+    pub async fn replace_all(store: &PostgresStore, rows: &[SignedEvent]) {
+        sqlx::query("DELETE FROM signed_events")
+            .execute(store.pool())
+            .await
+            .expect("clear");
+        for r in rows {
+            insert(store, r).await;
+        }
+    }
+
+    pub async fn append(store: &PostgresStore, kinds: &[Row]) {
+        for &k in kinds {
+            let rows = load(store).await;
+            let seq = rows.last().map_or(1, |r| r.sequence + 1);
+            let mut row = super::make_row(k, seq, micros_now().to_rfc3339());
+            if let Some(last) = rows.last() {
+                row.prev_hash = super::chain_hash(last);
+            }
+            insert(store, &row).await;
+        }
+    }
+}
+
+fn pg_url() -> Option<String> {
+    match std::env::var(PG_URL_ENV) {
+        Ok(u) if !u.trim().is_empty() => Some(u),
+        _ => {
+            eprintln!("SKIP signed_events_legacy_cutoff_10074_pg: {PG_URL_ENV} unset");
+            None
+        }
+    }
+}
+
+async fn fresh_pg(url: &str) -> (pg_barrier::ScratchDb, PostgresStore) {
+    let scratch = pg_barrier::ScratchDb::create(url, SCRATCH_PREFIX)
+        .await
+        .expect("create scratch database");
+    let store = PostgresStore::connect(&scratch.url())
+        .await
+        .expect("connect scratch database");
+    (scratch, store)
+}
+
+/// S-7 — every scenario gives the written-out failures on SQLite AND on
+/// PostgreSQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn s7_backends_agree_on_every_cutoff_scenario_10074() {
+    let vk = sink();
+    let Some(url) = pg_url() else { return };
+    for sc in SCENARIOS {
+        // SQLite.
+        let (_d, _p, conn) = sqlite::open();
+        sqlite::append(&conn, sc.before_mint);
+        if sc.mint {
+            let minted = ai_memory::signed_events::mint_legacy_cutoff(&conn).expect("mint runs");
+            assert!(minted.is_ok(), "{}: sqlite mint {minted:?}", sc.name);
+        }
+        sqlite::append(&conn, sc.after_mint);
+        if let Some(rows) = tampered(&sqlite::load(&conn), sc.tamper) {
+            sqlite::replace_all(&conn, &rows);
+        }
+        let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("sqlite verify");
+        assert!(trail.chain_intact, "{}: sqlite chain intact", sc.name);
+        assert_eq!(trail.signature_failures, sc.failures, "{}: sqlite", sc.name);
+
+        // PostgreSQL.
+        let (_scratch, store) = fresh_pg(&url).await;
+        pg::append(&store, sc.before_mint).await;
+        if sc.mint {
+            let minted = store.mint_legacy_cutoff().await.expect("pg mint runs");
+            assert!(minted.is_ok(), "{}: pg mint {minted:?}", sc.name);
+        }
+        pg::append(&store, sc.after_mint).await;
+        if let Some(rows) = tampered(&pg::load(&store).await, sc.tamper) {
+            pg::replace_all(&store, &rows).await;
+        }
+        let trail = store
+            .verify_audit_trail(None, Some(&vk))
+            .await
+            .expect("pg verify");
+        assert!(trail.chain_intact, "{}: pg chain intact", sc.name);
+        assert_eq!(trail.signature_failures, sc.failures, "{}: pg", sc.name);
+    }
+}
+
+/// S-3 / S-7 — the mint refusals are the same on both backends: a second
+/// mint, a re-mint after the cutoff row is deleted (the off-table anchor),
+/// an unverifiable prefix row.
+#[tokio::test(flavor = "multi_thread")]
+async fn s7_mint_refusals_agree_10074() {
+    let _ = sink();
+    let Some(url) = pg_url() else { return };
+
+    // SQLite.
+    let (_d, path, conn) = sqlite::open();
+    sqlite::append(&conn, &[P, I, T]);
+    let mint = ai_memory::signed_events::mint_legacy_cutoff;
+    assert_eq!(mint(&conn).expect("mint runs"), Ok(4));
+    assert_eq!(
+        mint(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::CutoffRowExists)
+    );
+    conn.execute("DELETE FROM signed_events WHERE sequence = 4", [])
+        .expect("delete cutoff");
+    drop(conn);
+    let conn = ai_memory::db::open(&path).expect("re-open runs migrations");
+    assert_eq!(
+        mint(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::AnchorExists)
+    );
+    let (_d2, _p2, conn) = sqlite::open();
+    sqlite::append(&conn, &[T, Row::Garbage]);
+    assert_eq!(
+        mint(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::UnverifiableRow(2))
+    );
+
+    // PostgreSQL.
+    let (scratch, store) = fresh_pg(&url).await;
+    pg::append(&store, &[P, I, T]).await;
+    assert_eq!(store.mint_legacy_cutoff().await.expect("mint runs"), Ok(4));
+    assert_eq!(
+        store.mint_legacy_cutoff().await.expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::CutoffRowExists)
+    );
+    sqlx::query("DELETE FROM signed_events WHERE sequence = 4")
+        .execute(store.pool())
+        .await
+        .expect("delete cutoff");
+    drop(store);
+    let store = PostgresStore::connect(&scratch.url())
+        .await
+        .expect("re-connect runs migrations");
+    let cutoffs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
+            .bind(LEGACY_CUTOFF_EVENT_TYPE)
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+    assert_eq!(cutoffs, 0, "no boot or migration path mints");
+    assert_eq!(
+        store.mint_legacy_cutoff().await.expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::AnchorExists)
+    );
+    let (_scratch2, store) = fresh_pg(&url).await;
+    pg::append(&store, &[T, Row::Garbage]).await;
+    assert_eq!(
+        store.mint_legacy_cutoff().await.expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::UnverifiableRow(2))
+    );
+}
