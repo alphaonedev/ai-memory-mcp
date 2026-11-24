@@ -1008,18 +1008,84 @@ fn deleting_a_row_with_its_attestations_fails_the_verifier_10040() {
     assert_unverified(&report, &id, "attestation deleted");
 }
 
-/// `signature_verified` of `MemoryStore::verify` on a copy of the store.
+/// The child helper [`store_verdict`] re-runs this test binary into.
 #[cfg(feature = "sal")]
-fn store_verdict(db: &Path, id: &str) -> bool {
+const STORE_VERDICT_CHILD: &str = "store_verdict_child_10040";
+/// Environment the child reads its store copy and memory id from.
+#[cfg(feature = "sal")]
+const ENV_VERDICT_DB: &str = "ROW_ATTEST_10040_VERDICT_DB";
+#[cfg(feature = "sal")]
+const ENV_VERDICT_ID: &str = "ROW_ATTEST_10040_VERDICT_ID";
+/// The line the child prints its verdict on.
+#[cfg(feature = "sal")]
+const VERDICT_LINE: &str = "STORE_VERDICT_10040=";
+
+/// `signature_verified` of `MemoryStore::verify` on a copy of the store.
+///
+/// `MemoryStore::verify` takes its trust anchor from the process key
+/// directory (#10086), so it runs in a child copy of this test binary whose
+/// environment is the sandbox's (key directory, HOME, no config): the
+/// verdict is the sandbox anchor's, and the run never reads or appends the
+/// operator's real HOME (umbrella #8175). No process-global environment of
+/// this test process is changed.
+#[cfg(feature = "sal")]
+fn store_verdict(sb: &Sandbox, db: &Path, id: &str) -> bool {
+    let out = Command::new(std::env::current_exe().expect("test binary path"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", sb.root.join("home"))
+        .env("XDG_CONFIG_HOME", sb.root.join("home/.config"))
+        .env("TMPDIR", &sb.root)
+        .env("AI_MEMORY_KEY_DIR", sb.root.join("keys"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env(ENV_VERDICT_DB, db)
+        .env(ENV_VERDICT_ID, id)
+        .args([
+            "--exact",
+            STORE_VERDICT_CHILD,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the store-verdict child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "store-verdict child failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let verdict = stdout
+        .lines()
+        .find_map(|l| l.split_once(VERDICT_LINE).map(|(_, v)| v))
+        .unwrap_or_else(|| panic!("store-verdict child printed no verdict: {stdout}"));
+    match verdict.trim() {
+        "true" => true,
+        "false" => false,
+        other => panic!("store-verdict child printed {other:?}"),
+    }
+}
+
+/// Child half of [`store_verdict`]: run only by it, in the sandbox
+/// environment it sets.
+#[cfg(feature = "sal")]
+#[test]
+#[ignore = "child helper of store_verdict; run only with its sandbox environment"]
+fn store_verdict_child_10040() {
     use ai_memory::store::sqlite::SqliteStore;
     use ai_memory::store::{CallerContext, MemoryStore as _};
-    let store = SqliteStore::open(db.to_path_buf()).expect("open store copy");
+    let db = std::env::var_os(ENV_VERDICT_DB).expect("store-verdict child: no store path");
+    let id = std::env::var(ENV_VERDICT_ID).expect("store-verdict child: no memory id");
+    let store = SqliteStore::open(PathBuf::from(db)).expect("open store copy");
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
-    rt.block_on(store.verify(&CallerContext::for_agent(AGENT), id))
+    let verified = rt
+        .block_on(store.verify(&CallerContext::for_agent(AGENT), &id))
         .expect("verify")
-        .signature_verified
+        .signature_verified;
+    println!("{VERDICT_LINE}{verified}");
 }
 
 /// NOTICE 4c / E-3: `MemoryStore::verify` on `SQLite` returns the one
@@ -1039,7 +1105,7 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
 
     let copy = vacuum_copy(&sb, "verify-valid.db");
     assert!(
-        store_verdict(&copy, &id),
+        store_verdict(&sb, &copy, &id),
         "a valid seal with a valid attestation must report signature_verified"
     );
 
@@ -1049,7 +1115,7 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
         .expect("delete attestation");
     drop(conn);
     assert!(
-        !store_verdict(&copy, &id),
+        !store_verdict(&sb, &copy, &id),
         "a valid seal with a deleted attestation must not report signature_verified"
     );
 
@@ -1062,7 +1128,7 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     .expect("raw priority change");
     drop(conn);
     assert!(
-        !store_verdict(&copy, &id),
+        !store_verdict(&sb, &copy, &id),
         "a raw change of a covered column must not report signature_verified"
     );
 
@@ -1078,7 +1144,7 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     assert_ok(&sb.report_of(&conn), "raw title");
     drop(conn);
     assert!(
-        !store_verdict(&copy, &id),
+        !store_verdict(&sb, &copy, &id),
         "a row whose seal does not verify must not report signature_verified"
     );
 
@@ -1097,7 +1163,7 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     );
     drop(conn);
     assert!(
-        !store_verdict(&copy, &id),
+        !store_verdict(&sb, &copy, &id),
         "any store defect must make every row report signature_verified false"
     );
 }
