@@ -228,6 +228,37 @@ fn token_at(content: &str, start: usize) -> &str {
     &content[start..end]
 }
 
+/// ASCII whitespace bytes that end a word run: space, tab, CR, LF, form feed
+/// and vertical tab.
+fn is_run_break(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b)
+}
+
+/// True when the prefix at byte offset `pfx_start` begins a token (#8452).
+/// The prefix is glued inside a plain word, and the detector is suppressed,
+/// only when the byte before it is an ASCII letter or digit and every byte
+/// of the run back to the previous whitespace byte (or the start of the
+/// text) is an ASCII letter, digit, hyphen or underscore (`task-` carries
+/// `sk-`, `v2sk-` carries `sk-`). Every other lead is a boundary and the
+/// detector runs (fail closed): start of text, whitespace, a hyphen or
+/// underscore right before the prefix (the #1844 contract: `tag-sk-...` is
+/// masked), and any other ASCII or non-ASCII byte anywhere in the run, so an
+/// escape, percent code, colour code or entity before a key is never
+/// enumerated and never missed (3-agent vote 6def5ab6).
+fn at_token_boundary(content: &str, pfx_start: usize) -> bool {
+    let head = content.as_bytes().get(..pfx_start).unwrap_or_default();
+    let run_start = head
+        .iter()
+        .rposition(|&b| is_run_break(b))
+        .map_or(0, |i| i.saturating_add(1));
+    let run = head.get(run_start..).unwrap_or_default();
+    let glued = run.last().is_some_and(u8::is_ascii_alphanumeric)
+        && run
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    !glued
+}
+
 /// Redact every `<prefix><token>` whose token clears the length + entropy
 /// floor. Returns the rewritten string when at least one was redacted (and
 /// pushes `kind`), else `None`.
@@ -245,7 +276,8 @@ fn redact_prefixed_tokens(
         let token_start = pfx_start + prefix.len();
         let token = token_at(content, token_start);
         // Bearer's prefix includes the space; its token starts after it.
-        if token.len() >= MIN_PREFIXED_TOKEN_LEN
+        if at_token_boundary(content, pfx_start)
+            && token.len() >= MIN_PREFIXED_TOKEN_LEN
             && shannon_entropy_bits(token) >= MIN_TOKEN_ENTROPY_BITS
         {
             out.push_str(&content[search_from..pfx_start]);
@@ -276,7 +308,8 @@ fn redact_aws_keys(content: &str, kinds: &mut Vec<&'static str>) -> Option<Strin
         let start = search_from + rel;
         let body_start = start + AWS_AKIA_PREFIX.len();
         let body = token_at(content, body_start);
-        let is_key = body.len() >= AWS_KEY_BODY_LEN
+        let is_key = at_token_boundary(content, start)
+            && body.len() >= AWS_KEY_BODY_LEN
             && body[..AWS_KEY_BODY_LEN]
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
@@ -1600,5 +1633,280 @@ mod tests {
         );
         assert_eq!(out.resolver_pubkey, cp.resolver_pubkey);
         assert_eq!(out.resolution, cp.resolution);
+    }
+
+    /// Deterministic base62 body of `len` chars from a fixed seed (xorshift),
+    /// so entropy clears the floor without a random source.
+    fn seeded_body(seed: u64, len: usize) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state % ALPHABET.len() as u64) as usize] as char
+            })
+            .collect()
+    }
+
+    fn seeded_upper_alnum(seed: u64, len: usize) -> String {
+        seeded_body(seed, len * 8)
+            .chars()
+            .filter(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            .take(len)
+            .collect()
+    }
+
+    #[test]
+    fn prefix_inside_a_word_is_not_a_secret_8452() {
+        let aws_tail = seeded_upper_alnum(11, AWS_KEY_BODY_LEN);
+        let ghp_tail = seeded_body(12, 24);
+        let xai_tail = seeded_body(13, 24);
+        // The issue reproductions (task-, disk-, kiosk-, whisk-) carry `sk-`
+        // inside a plain word: the byte before the prefix is a letter and
+        // the whole run is letters, digits, hyphens and underscores.
+        let cases = [
+            "task-ownership-scoping-r3".to_string(),
+            "disk-partition-layout-v2-main".to_string(),
+            "kiosk-provisioning-2026-rollout".to_string(),
+            "whisk-ingestion-pipeline-run".to_string(),
+            "foo-bar-task-ownership-scoping-r3".to_string(),
+            format!("xAKIA{aws_tail}"),
+            format!("pAKIA{aws_tail}"),
+            format!("fooxai-{xai_tail}"),
+            format!("fooghp_{ghp_tail}"),
+            format!("xgithub_pat_{ghp_tail}"),
+            format!("fooBearer {xai_tail}"),
+            // A digit before the prefix is part of the word (version tag).
+            format!("v2sk-{xai_tail}"),
+            format!("9AKIA{aws_tail}"),
+            format!("build2ghp_{ghp_tail}"),
+            format!("foo-bar2xai-{xai_tail}"),
+        ];
+        for text in &cases {
+            assert_eq!(
+                screen(text),
+                ScreenOutcome::Clean,
+                "mid-word prefix flagged: {text}"
+            );
+            assert!(
+                screen_for_caller(text).is_ok(),
+                "caller screen refused: {text}"
+            );
+            assert_eq!(
+                redact_for_storage(text),
+                None,
+                "storage redact changed: {text}"
+            );
+        }
+    }
+
+    /// The run is the text since the last whitespace byte: each of the five
+    /// whitespace bytes ends it, an underscore stays inside it and a slash
+    /// ends the "plain word" property.
+    #[test]
+    fn run_structure_whitespace_underscore_slash_8452() {
+        let body = seeded_body(21, 40);
+        // A hyphen-joined word before a whitespace byte does not make the
+        // run after it glued: `task-<key>` after the break is a plain word.
+        for ws in ["\t", "\r", "\n", "\u{c}", "\u{b}", " "] {
+            let text = format!("a/b{ws}task-ownership-scoping-r3");
+            assert_eq!(screen(&text), ScreenOutcome::Clean, "ws break: {text:?}");
+            let glued = format!("a/b{ws}xsk-{body}");
+            assert_eq!(
+                screen(&glued),
+                ScreenOutcome::Clean,
+                "ws run glued: {glued:?}"
+            );
+        }
+        // An underscore inside the plain word keeps the run glued.
+        let under = format!("my_xsk-{body}");
+        assert_eq!(screen(&under), ScreenOutcome::Clean, "underscore: {under}");
+        // A slash anywhere in the run makes the key a boundary.
+        let slash = format!("path/xsk-{body}");
+        assert!(
+            matches!(screen(&slash), ScreenOutcome::Hit { .. }),
+            "slash run must be detected: {slash}"
+        );
+        // Without the whitespace break the same word stays a boundary.
+        let no_break = format!("a/bxsk-{body}");
+        assert!(
+            matches!(screen(&no_break), ScreenOutcome::Hit { .. }),
+            "slash run must be detected: {no_break}"
+        );
+    }
+
+    /// Fail-closed run rule (#8452, 3-agent vote 6def5ab6, memory 21ac4df1):
+    /// the detector is suppressed only for a plain word run. The leads below
+    /// include the six shapes earlier rounds pinned as benign (50%zz, a
+    /// backslash-xzz, a backslash-uwxyz, a backslash-q, a backslash-U with
+    /// non-hex digits, =zz): the rule now treats every one as a boundary.
+    #[test]
+    fn real_keys_after_a_separator_still_detected_8452() {
+        let body = seeded_body(7, 40);
+        let aws = format!("AKIA{}", seeded_upper_alnum(9, AWS_KEY_BODY_LEN));
+        let secrets = [
+            (format!("sk-{body}"), KIND_OPENAI_KEY),
+            (format!("xai-{body}"), KIND_XAI_KEY),
+            (format!("ghp_{body}"), KIND_GITHUB_TOKEN),
+            (format!("github_pat_{body}"), KIND_GITHUB_TOKEN),
+            (format!("Bearer {body}"), KIND_BEARER_TOKEN),
+            (aws, KIND_AWS_ACCESS_KEY),
+        ];
+        let leads = [
+            // separators and whitespace
+            " ",
+            "\t",
+            "\r\n",
+            "\"",
+            "=",
+            ":",
+            "\n",
+            "(",
+            // hyphen and underscore are boundaries (#1844 contract)
+            "-",
+            "_",
+            "tag-",
+            "my_",
+            "foo-bar-",
+            // C, JSON and shell escapes
+            "\\n",
+            "\\t",
+            "\\r",
+            "\\f",
+            "\\b",
+            "\\0",
+            "\\v",
+            "\\a",
+            "\\e",
+            "\\042",
+            "\\x22",
+            "\\x1",
+            "\\u0022",
+            "\\U00000022",
+            "\\3D",
+            "\\N{ESC}",
+            "\\",
+            "\\q",
+            // percent codes, quoted-printable, entities
+            "%3D",
+            "%22",
+            "%2F",
+            "%253D",
+            "%2520",
+            "%25253D",
+            "%u0022",
+            "%3",
+            "%",
+            "=3D",
+            "=3d",
+            "=20",
+            "&#61",
+            "&equals;",
+            // terminal control sequences, raw, spelled out and caret form
+            "\u{1b}[1m",
+            "\u{1b}[0;32m",
+            "\u{1b}[K",
+            "\u{1b}[2K",
+            "\u{1b}[?25l",
+            "\u{1b}[H",
+            "\r\u{1b}[2K",
+            "\u{1b}[38:5:196m",
+            "\u{1b}(B",
+            "\\033[1m",
+            "\\033[2K",
+            "\\e[1m",
+            "\\x1b[1m",
+            "\\u001b[1m",
+            "[1m",
+            "^[[K",
+            // base64 padding, non-ASCII, and the former benign spellings
+            "AAAA==",
+            "caf\u{e9}",
+            "50%zz",
+            "\\xzz",
+            "\\uwxyz",
+            "\\U0000zzzz",
+            "=zz",
+        ];
+        for lead in leads {
+            for (secret, kind) in &secrets {
+                let text = format!("note{lead}{secret}");
+                assert_eq!(kinds_of(&text), vec![*kind], "lead {lead:?} missed {kind}");
+                assert!(!redacted_of(&text).contains(&body), "body leaked: {lead:?}");
+            }
+        }
+        // Line start (no preceding byte at all).
+        for (secret, kind) in &secrets {
+            assert_eq!(kinds_of(secret), vec![*kind], "start of text missed {kind}");
+        }
+        // Whole-run property: a trigger byte far back in the run counts, a
+        // word-only run does not.
+        for far in [
+            format!("a=bcdefg-task-{}", &secrets[0].0),
+            format!("path/to/task-{}", &secrets[0].0),
+            format!("a.b.c.d.e.f.xtask{}", &secrets[2].0),
+        ] {
+            assert!(!kinds_of(&far).is_empty(), "far trigger missed: {far}");
+        }
+    }
+
+    /// Golden pin of the screened output (it feeds the cid and v2 attestation
+    /// preimages): representative fixtures, one per boundary class the
+    /// changelog names (#8452).
+    #[test]
+    fn screened_output_golden_per_boundary_class_8452() {
+        let body = seeded_body(7, 40);
+        let ph = "[REDACTED:secret]";
+        let mut golden = vec![
+            (format!("sk-{body}"), ph.to_string()),
+            (format!("note sk-{body}"), format!("note {ph}")),
+            (format!("KEY=ghp_{body}"), format!("KEY={ph}")),
+            (format!("tag-sk-{body}"), format!("tag-{ph}")),
+            (format!("my_ghp_{body}"), format!("my_{ph}")),
+            (format!("a\u{1b}[1msk-{body}"), format!("a\u{1b}[1m{ph}")),
+            (format!("[1msk-{body}"), format!("[1m{ph}")),
+        ];
+        // escapes, percent codes, quoted-printable, spelled colour codes and
+        // a non-ASCII lead: `a<lead>sk-<body>` becomes `a<lead><placeholder>`
+        for lead in [
+            "\\n",
+            "\\t",
+            "\\r",
+            "\\b",
+            "\\f",
+            "\\v",
+            "\\0",
+            "\\a",
+            "\\e",
+            "\\042",
+            "\\x22",
+            "\\u0022",
+            "\\U00000022",
+            "%3D",
+            "%253D",
+            "%2520",
+            "%u0022",
+            "=3D",
+            "=20",
+            "\\033[1m",
+            "\\e[1m",
+            "caf\u{e9}",
+        ] {
+            golden.push((format!("a{lead}sk-{body}"), format!("a{lead}{ph}")));
+        }
+        for (input, want) in &golden {
+            assert_eq!(&redacted_of(input), want, "golden drifted for {input}");
+        }
+        // Mid-word: passes through byte-identical.
+        for benign in [
+            format!("task-{body} and fooxai-{body}"),
+            format!("v2sk-{body}"),
+            format!("build2ghp_{body}"),
+        ] {
+            assert_eq!(screen(&benign), ScreenOutcome::Clean, "{benign}");
+            assert_eq!(redacted_of(&benign), benign);
+        }
     }
 }
