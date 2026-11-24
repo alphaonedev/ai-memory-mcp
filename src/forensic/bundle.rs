@@ -439,93 +439,98 @@ pub fn build_files(
     } else {
         vec![args.memory_id.clone()]
     };
-    for mid in &memory_ids_to_emit {
-        if let Some(mem) = crate::db::get(conn, mid).context("db::get for bundle")? {
-            let path = format!("memories/{}.json", mem.id);
-            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed),
-            // FIRST + on the UN-redacted row so a class hit is always a DROP
-            // (never softened to a mask by the secret screen redacting a PEM
-            // block out first), unified with the CLI + HTTP export siblings.
-            // A whole envelope whose content/metadata classifies as private
-            // key material / master-threshold secret / governance signing key
-            // / a producer-tagged biometric embedding is SKIPPED (never
-            // bundled in the clear) and a signed refusal is emitted.
-            // Structurally these live in the key-dir, not the DB, so a hit
-            // means a mis-stored secret rode a memory row.
-            // Fail-CLOSED on a serialize failure, mirroring `classify_memory`'s
-            // `Err => PrivateKeyMaterial` DROP disposition in the CLI/HTTP
-            // corpus screen (#2008 unification): an un-serializable row cannot
-            // be screened for a forbidden export class, so it must never be
-            // bundled in the clear. Practically unreachable (`Memory` carries no
-            // fallible serializers — a non-finite f64 confidence serializes to
-            // `null`, not an error), but the prior `unwrap_or(Null)` fail-OPENED
-            // (Null classifies as clean → bundled), the opposite of both siblings.
-            let record = match serde_json::to_value(&mem) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        memory_id = %mem.id,
-                        error = %e,
-                        "forensic export: row failed to serialize for export-class screening — dropping (fail-closed)"
-                    );
-                    continue;
-                }
-            };
-            if crate::export_taxonomy::screen_export_value_audited(
-                conn,
-                &path,
-                crate::identity::sentinels::DAEMON_PRINCIPAL,
-                &record,
-            )
-            .is_some()
-            {
+    // v1.0.0 #10063 — classify EVERY in-scope row on its at-rest envelope
+    // before any projection, and refuse the whole bundle with
+    // `SEALED_EXPORT_REFUSED` when one is sealed: no bundle format carries
+    // the envelope, so a sealed row is never decrypted into the tar and
+    // never skipped. The refusal returns before `write_ustar` creates the
+    // output file, so nothing partial is written.
+    let in_scope = read_classified_for_bundle(conn, &memory_ids_to_emit)?;
+    for mem in in_scope {
+        let path = format!("memories/{}.json", mem.id);
+        // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed),
+        // FIRST + on the UN-redacted row so a class hit is always a DROP
+        // (never softened to a mask by the secret screen redacting a PEM
+        // block out first), unified with the CLI + HTTP export siblings.
+        // A whole envelope whose content/metadata classifies as private
+        // key material / master-threshold secret / governance signing key
+        // / a producer-tagged biometric embedding is SKIPPED (never
+        // bundled in the clear) and a signed refusal is emitted.
+        // Structurally these live in the key-dir, not the DB, so a hit
+        // means a mis-stored secret rode a memory row.
+        // Fail-CLOSED on a serialize failure, mirroring `classify_memory`'s
+        // `Err => PrivateKeyMaterial` DROP disposition in the CLI/HTTP
+        // corpus screen (#2008 unification): an un-serializable row cannot
+        // be screened for a forbidden export class, so it must never be
+        // bundled in the clear. Practically unreachable (`Memory` carries no
+        // fallible serializers — a non-finite f64 confidence serializes to
+        // `null`, not an error), but the prior `unwrap_or(Null)` fail-OPENED
+        // (Null classifies as clean → bundled), the opposite of both siblings.
+        let record = match serde_json::to_value(&mem) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    memory_id = %mem.id,
+                    error = %e,
+                    "forensic export: row failed to serialize for export-class screening — dropping (fail-closed)"
+                );
                 continue;
             }
-            // v0.8.1 W1.3 (#1821 / gap G29) → v1.0.0 Gate-3 (#1844) — egress
-            // credential screen (defense-in-depth) on the SURVIVOR. A secret
-            // that PRE-DATES the write screen must not leak through a forensic
-            // export; mask credential VALUES on the way out across EVERY
-            // cleartext field — `content` AND `title` AND `tags` AND
-            // non-carve-out `metadata` leaves — not `content` alone (the
-            // pre-#1844 gap that cloned title/metadata verbatim). One
-            // `redact_memory_for_storage` call = the same helper the CLI/HTTP
-            // corpus screen uses. No-op unless screening was seeded non-`off`.
-            let mem = crate::secret_screen::redact_memory_for_storage(&mem).unwrap_or(mem);
-            let atomisation = if args.include_atomisation_chain {
-                build_atomisation_envelope(conn, &mem)?
-            } else {
-                None
-            };
-            let env = MemoryEnvelope {
-                id: mem.id.clone(),
-                namespace: mem.namespace.clone(),
-                title: mem.title.clone(),
-                content: mem.content.clone(),
-                tier: mem.tier.as_str().to_string(),
-                memory_kind: format!("{:?}", mem.memory_kind).to_ascii_lowercase(),
-                reflection_depth: mem.reflection_depth,
-                created_at: mem.created_at.clone(),
-                updated_at: mem.updated_at.clone(),
-                metadata: mem.metadata.clone(),
-                atomisation,
-                // v0.7.0 Form 4 (issue #757) — fact-provenance fields
-                // ride alongside the existing envelope shape. Citations
-                // always lands (defaults to empty); source_uri /
-                // source_span emit only when populated.
-                citations: mem.citations.clone(),
-                source_uri: mem.source_uri.clone(),
-                source_span: mem.source_span,
-                // v0.7.0 Form 5 (issue #758) — confidence-provenance
-                // fields round-trip into the bundle so an auditor can
-                // verify whether the `confidence` value was caller-
-                // provided, auto-derived, calibrated, or decayed.
-                confidence_source: mem.confidence_source,
-                confidence_signals: mem.confidence_signals.clone(),
-                confidence_decayed_at: mem.confidence_decayed_at.clone(),
-            };
-            let bytes = serde_json::to_vec_pretty(&env).context("serialise MemoryEnvelope")?;
-            files.insert(path, bytes);
+        };
+        if crate::export_taxonomy::screen_export_value_audited(
+            conn,
+            &path,
+            crate::identity::sentinels::DAEMON_PRINCIPAL,
+            &record,
+        )
+        .is_some()
+        {
+            continue;
         }
+        // v0.8.1 W1.3 (#1821 / gap G29) → v1.0.0 Gate-3 (#1844) — egress
+        // credential screen (defense-in-depth) on the SURVIVOR. A secret
+        // that PRE-DATES the write screen must not leak through a forensic
+        // export; mask credential VALUES on the way out across EVERY
+        // cleartext field — `content` AND `title` AND `tags` AND
+        // non-carve-out `metadata` leaves — not `content` alone (the
+        // pre-#1844 gap that cloned title/metadata verbatim). One
+        // `redact_memory_for_storage` call = the same helper the CLI/HTTP
+        // corpus screen uses. No-op unless screening was seeded non-`off`.
+        let mem = crate::secret_screen::redact_memory_for_storage(&mem).unwrap_or(mem);
+        let atomisation = if args.include_atomisation_chain {
+            build_atomisation_envelope(conn, &mem)?
+        } else {
+            None
+        };
+        let env = MemoryEnvelope {
+            id: mem.id.clone(),
+            namespace: mem.namespace.clone(),
+            title: mem.title.clone(),
+            content: mem.content.clone(),
+            tier: mem.tier.as_str().to_string(),
+            memory_kind: format!("{:?}", mem.memory_kind).to_ascii_lowercase(),
+            reflection_depth: mem.reflection_depth,
+            created_at: mem.created_at.clone(),
+            updated_at: mem.updated_at.clone(),
+            metadata: mem.metadata.clone(),
+            atomisation,
+            // v0.7.0 Form 4 (issue #757) — fact-provenance fields
+            // ride alongside the existing envelope shape. Citations
+            // always lands (defaults to empty); source_uri /
+            // source_span emit only when populated.
+            citations: mem.citations.clone(),
+            source_uri: mem.source_uri.clone(),
+            source_span: mem.source_span,
+            // v0.7.0 Form 5 (issue #758) — confidence-provenance
+            // fields round-trip into the bundle so an auditor can
+            // verify whether the `confidence` value was caller-
+            // provided, auto-derived, calibrated, or decayed.
+            confidence_source: mem.confidence_source,
+            confidence_signals: mem.confidence_signals.clone(),
+            confidence_decayed_at: mem.confidence_decayed_at.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&env).context("serialise MemoryEnvelope")?;
+        files.insert(path, bytes);
     }
 
     // 3) Edge envelopes — every reflects_on / supersedes / derived_from
@@ -760,6 +765,39 @@ fn sign_manifest_if_keyed(manifest: &Manifest) -> Result<Option<(String, String)
 // ─────────────────────────────────────────────────────────────────────
 // Substrate readers
 // ─────────────────────────────────────────────────────────────────────
+
+/// v1.0.0 #10063 — the one read of the rows a bundle emits. Each row is
+/// classified on its at-rest envelope BEFORE the decrypting projection runs
+/// (`classify_sqlite_row`), so a sealed row is counted by the
+/// [`SealedRowGuard`](crate::export_sealed::SealedRowGuard) and never
+/// decrypted; `finish` then refuses the whole bundle with
+/// `SEALED_EXPORT_REFUSED` (table, count and first id only, never content).
+/// A missing or non-recall-visible row is left out, exactly as `db::get`
+/// answered before this change.
+fn read_classified_for_bundle(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<crate::models::Memory>> {
+    use rusqlite::OptionalExtension as _;
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
+    let mut plain = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row = conn
+            .query_row("SELECT * FROM memories WHERE id = ?1", params![id], |row| {
+                crate::export_sealed::classify_sqlite_row(row, crate::storage::row_to_memory)
+            })
+            .optional()
+            .context("classified read for bundle")?;
+        if let Some(mem) = row.and_then(|classified| guard.take(classified)) {
+            if mem.lifecycle_state.is_recall_visible() {
+                plain.push(mem);
+            }
+        }
+    }
+    guard.finish().map_err(anyhow::Error::new)?;
+    Ok(plain)
+}
 
 /// Walk `reflects_on` edges backward from `root` and return the
 /// visited memory ids in BFS order. Mirrors the walk in

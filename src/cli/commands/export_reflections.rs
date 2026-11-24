@@ -289,39 +289,122 @@ pub(crate) fn sanitise_namespace_for_path(ns: &str) -> Result<PathBuf> {
     Ok(buf)
 }
 
+/// #10061 — the exact error a reflection export gives when the classified
+/// read and the independent count of the same scope disagree.
+pub(crate) fn reflection_count_mismatch(collected: usize, counted: i64) -> String {
+    format!(
+        "incomplete reflection export: read {collected} reflection(s) but the \
+         independent count of the same scope is {counted}; refusing to write"
+    )
+}
+
+/// #10061 — refuse one memory with `SEALED_EXPORT_REFUSED` when its row is
+/// sealed at rest (non-NULL envelope). A missing row is not this check's
+/// answer; the caller's own read reports it.
+///
+/// # Errors
+///
+/// The typed [`crate::export_sealed::SealedExportRefused`] for a sealed row,
+/// or the store read error.
+pub(crate) fn refuse_if_sealed(conn: &rusqlite::Connection, id: &str) -> Result<()> {
+    use rusqlite::OptionalExtension as _;
+    let sealed: Option<bool> = conn
+        .query_row(
+            &format!(
+                "SELECT {} IS NOT NULL FROM memories WHERE id = ?1",
+                crate::export_sealed::ENVELOPE_COLUMN
+            ),
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if sealed == Some(true) {
+        return Err(anyhow::Error::new(
+            crate::export_sealed::SealedExportRefused {
+                table: crate::export_sealed::tables::MEMORIES,
+                count: 1,
+                first_id: id.to_owned(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// One row of the reflection scan: a row of another kind is passed over
+/// without being projected (so never decrypted); a reflection row is
+/// classified on its at-rest envelope before any projection.
+enum ReflectionScan {
+    OtherKind,
+    Reflection(crate::export_sealed::ExportRow<Memory>),
+}
+
 /// Read every reflection-kind memory matching the supplied filters.
 ///
-/// The query is namespace-scoped on the SQL side (cheap) and
-/// memory-kind / since-filtered in Rust (correct over `Memory`'s
-/// model-level fields rather than column-level oddities).
+/// The query is the substrate's `list` shape (namespace, since, expiry and
+/// lifecycle filters from [`crate::storage::build_list_query`]), but each row
+/// is CLASSIFIED before it is projected (#10061): a reflection sealed at
+/// rest refuses the whole export with `SEALED_EXPORT_REFUSED` (no format
+/// carries the envelope) instead of being decrypted into a plaintext file
+/// or silently skipped. The rows read are then checked against an
+/// independent `COUNT(*)` of the same scope.
 fn collect_reflections(
     conn: &rusqlite::Connection,
     namespace: Option<&str>,
     since: Option<&str>,
 ) -> Result<Vec<Memory>> {
-    // The substrate's `db::list` already understands the namespace +
-    // since filters; we layer the memory_kind filter on top in Rust so
-    // we don't need to thread a new column-filter into the substrate
-    // signature for a CLI-side cosmetic export.
     let now = Utc::now().to_rfc3339();
-    let _ = now; // future: time-bounded resume
-    let rows = db::list(
-        conn,
+    let (sql, params_vec) = crate::storage::build_list_query(
         namespace,
         None,
-        i32::MAX as usize,
-        0,
         None,
+        &now,
         since,
         None,
         None,
         None,
         None, // #1834 valid_at (no as-of)
+        None,
+        i32::MAX as usize,
+        0,
+    );
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
+    let reflection = MemoryKind::Reflection.as_str();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        let kind: Option<String> = row.get(crate::models::field_names::MEMORY_KIND)?;
+        if kind.as_deref() != Some(reflection) {
+            return Ok(ReflectionScan::OtherKind);
+        }
+        crate::export_sealed::classify_sqlite_row(row, crate::storage::row_to_memory)
+            .map(ReflectionScan::Reflection)
+    })?;
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
+    let mut reflections = Vec::new();
+    for row in rows {
+        if let ReflectionScan::Reflection(classified) = row?
+            && let Some(mem) = guard.take(classified)
+        {
+            reflections.push(mem);
+        }
+    }
+    guard.finish().map_err(anyhow::Error::new)?;
+    // The independent count runs the same scope as a second query.
+    let counted: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM ({sql}) WHERE memory_kind = ?"),
+        rusqlite::params_from_iter(
+            params_refs
+                .iter()
+                .copied()
+                .chain(std::iter::once(&reflection as &dyn rusqlite::types::ToSql)),
+        ),
+        |r| r.get(0),
     )?;
-    Ok(rows
-        .into_iter()
-        .filter(|m| matches!(m.memory_kind, MemoryKind::Reflection))
-        .collect())
+    if i64::try_from(reflections.len()).ok() != Some(counted) {
+        anyhow::bail!(reflection_count_mismatch(reflections.len(), counted));
+    }
+    Ok(reflections)
 }
 
 /// Read all `reflects_on` outbound edges (this memory → its sources)
@@ -786,5 +869,17 @@ mod tests {
         let mut mem = make_reflection("n", 1, "t", "c", "");
         mem.metadata = serde_json::json!({});
         assert_eq!(agent_id_of(&mem), "");
+    }
+
+    /// #10061 — the independent-count mismatch refusal is a contract string:
+    /// pin its exact text (the walk and the count run on one connection, so
+    /// the injected behaviour cell is the migrate census twin).
+    #[test]
+    fn reflection_count_mismatch_text_is_exact_10061() {
+        assert_eq!(
+            reflection_count_mismatch(2, 3),
+            "incomplete reflection export: read 2 reflection(s) but the independent count of \
+             the same scope is 3; refusing to write"
+        );
     }
 }

@@ -234,7 +234,7 @@ pub fn run_auto_export(
         // touch the filesystem unless the policy itself blesses it.
         return Ok(());
     }
-    let mem = match db::get(&conn, memory_id)? {
+    let mem = match read_classified(&conn, memory_id)? {
         Some(m) => m,
         None => {
             // Race: the reflection was deleted between commit and
@@ -259,6 +259,33 @@ pub fn run_auto_export(
         payload.as_bytes(),
     )?;
     Ok(())
+}
+
+/// #10061 — the one read of the reflection the hook exports, classified on
+/// its at-rest envelope BEFORE any projection: a sealed row refuses with
+/// `SEALED_EXPORT_REFUSED` (no export format carries the envelope) and is
+/// never decrypted into a plaintext file. `Ok(None)` for a missing row or
+/// one that is not recall-visible, exactly as `db::get` answers.
+fn read_classified(
+    conn: &rusqlite::Connection,
+    memory_id: &str,
+) -> anyhow::Result<Option<crate::models::Memory>> {
+    use rusqlite::OptionalExtension as _;
+    let row = conn
+        .query_row(
+            "SELECT * FROM memories WHERE id = ?1",
+            rusqlite::params![memory_id],
+            |row| crate::export_sealed::classify_sqlite_row(row, crate::storage::row_to_memory),
+        )
+        .optional()?;
+    let Some(classified) = row else {
+        return Ok(None);
+    };
+    let mut guard =
+        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
+    let plain = guard.take(classified);
+    guard.finish().map_err(anyhow::Error::new)?;
+    Ok(plain.filter(|m| m.lifecycle_state.is_recall_visible()))
 }
 
 fn collect_outbound_reflects_on(

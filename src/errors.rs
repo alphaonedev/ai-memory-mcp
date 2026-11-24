@@ -1248,6 +1248,13 @@ impl From<anyhow::Error> for MemoryError {
         if let Some(r) = e.downcast_ref::<crate::mcp::RegisterMetadataRefusal>() {
             return Self::Refused(r.message().to_owned());
         }
+        // #10061 - a sealed-at-rest export refusal is our own typed root
+        // (table, count and first id only, never content): it reaches the
+        // MCP caller as itself, `SEALED_EXPORT_REFUSED: ...`, not as the
+        // foreign storage constant.
+        if let Some(r) = e.downcast_ref::<crate::export_sealed::SealedExportRefused>() {
+            return Self::Refused(r.to_string());
+        }
         // #3713 — the optimistic-concurrency conflict (`memory_update`'s
         // `expected_version`) is our own typed root; keep its text.
         if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {
