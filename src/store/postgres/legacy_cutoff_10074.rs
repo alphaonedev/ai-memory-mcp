@@ -12,9 +12,7 @@ use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
 use super::{PgSignedEventWalkRow, PostgresStore, to_store_err, truncate_to_microseconds};
-use crate::signed_events::legacy_cutoff::{
-    DaemonForm, LEGACY_CUTOFF_AGENT_ID, daemon_signature_form,
-};
+use crate::signed_events::legacy_cutoff::LEGACY_CUTOFF_AGENT_ID;
 use crate::signed_events::{
     LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMint, LegacyCutoffMintRefusal,
     LegacyCutoffResolver, SignedEvent, ZERO_HASH, canonical_chain_bytes, daemon_row_signing_input,
@@ -149,19 +147,13 @@ impl PostgresStore {
         if head < 1 {
             return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
         }
-        // The same structural and signature checks the sqlite mint runs
-        // through `verify_chain` + its unverifiable-row scan.
+        // The same structural check the sqlite mint runs through
+        // `verify_chain`; the row forms are the resolver's (#10101 / #10102).
         let mut expected_prev = ZERO_HASH.to_vec();
         let mut expected_seq = 1_i64;
         for r in &rows {
             if r.sequence != expected_seq || r.prev_hash != expected_prev {
                 return Ok(Err(LegacyCutoffMintRefusal::ChainBreak(r.sequence)));
-            }
-            if r.attest_level == crate::models::AttestLevel::DaemonSigned.as_str()
-                && r.signature.as_deref().is_some_and(|s| !s.is_empty())
-                && daemon_signature_form(&vk, r) == DaemonForm::NoMatch
-            {
-                return Ok(Err(LegacyCutoffMintRefusal::UnverifiableRow(r.sequence)));
             }
             expected_prev = Sha256::digest(canonical_chain_bytes(r)).to_vec();
             expected_seq = expected_seq.saturating_add(1);
@@ -185,8 +177,9 @@ impl PostgresStore {
         for r in &rows {
             resolver.feed(r);
         }
-        let Some((payload_hash, last_hash)) = resolver.mint_payload_hash() else {
-            return Ok(Err(LegacyCutoffMintRefusal::ChainBreak(head)));
+        let (payload_hash, last_hash) = match resolver.mint_payload_hash() {
+            Ok(v) => v,
+            Err(refusal) => return Ok(Err(refusal.into())),
         };
         row.payload_hash = payload_hash;
         row.prev_hash = last_hash;

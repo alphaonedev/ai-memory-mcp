@@ -45,11 +45,22 @@ const LEGACY_CUTOFF_PREIMAGE_DOMAIN: &[u8] = b"ai-memory/signed-events/legacy-cu
 /// #10074 — the domain of the running prefix digest.
 const LEGACY_CUTOFF_PREFIX_DOMAIN: &[u8] = b"ai-memory/signed-events/legacy-prefix-v1\0";
 
+/// #10101 — the length of a `payload_hash` written by [`super::payload_hash`]
+/// (SHA-256). A pre-#1925 payload-only signature signed exactly these bytes
+/// when no cause was bound, so an untagged signature over anything else is not
+/// a legacy form by construction (the forensic sink signs JSON records).
+pub(crate) const PAYLOAD_DIGEST_LEN: usize = 32;
+
 /// #10074 — the validated legacy cutoff. Rows with `sequence <= sequence()`
 /// may verify under a legacy untagged form; every other row may not.
 /// [`LegacyCutoff::none`] (sequence 0) accepts no legacy form. Only
 /// [`LegacyCutoffResolver::finish`] builds a non-zero value, after the cutoff
 /// row passed every check, so a caller cannot construct an unvalidated one.
+///
+/// #10102 — `sequence()` is the end of the certified legacy prefix: the last
+/// legacy-form row, which lies before the first `EventRow`-tagged row. It is
+/// not the chain head the cutoff row binds; tagged rows between the two verify
+/// under their own form only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LegacyCutoff {
     sequence: i64,
@@ -121,8 +132,13 @@ pub(crate) enum DaemonForm {
     EventRowTagged,
     /// Untagged `daemon_row_signing_input` (#1925 legacy).
     LegacyIdentity,
-    /// Untagged `signing_input_bytes(payload, cause)` (pre-#1925 legacy).
+    /// Untagged `signing_input_bytes(payload, cause)` (pre-#1925 legacy) over
+    /// a [`PAYLOAD_DIGEST_LEN`]-byte payload digest.
     LegacyPayloadOnly,
+    /// #10101 — an untagged daemon signature over the row's `payload_hash`
+    /// bytes where those bytes are not a payload digest (the forensic sink's
+    /// form). Never a legacy form, never accepted.
+    UntaggedForeign,
     /// The `DaemonDomain::LegacyCutoff` form over `daemon_row_signing_input`;
     /// valid only on the cutoff row itself.
     CutoffTagged,
@@ -158,15 +174,121 @@ pub(crate) fn daemon_signature_form(vk: &VerifyingKey, event: &SignedEvent) -> D
     }
     let pay_input = signing_input_bytes(&event.payload_hash, event.cause_hash.as_deref());
     if vk.verify_strict(&pay_input, &sig).is_ok() {
-        return DaemonForm::LegacyPayloadOnly;
+        // #10101 — legacy by construction only over a payload digest; any
+        // other byte string is another signer's untagged form.
+        return if event.payload_hash.len() == PAYLOAD_DIGEST_LEN {
+            DaemonForm::LegacyPayloadOnly
+        } else {
+            DaemonForm::UntaggedForeign
+        };
     }
     DaemonForm::NoMatch
+}
+
+/// #10101 / #10102 — the form of one row below the cutoff row, one variant
+/// per form. The resolver's contiguity check is a function of this alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixRowForm {
+    /// The row is not daemon-signed: it carries no daemon form to certify.
+    NotDaemonSigned,
+    /// Daemon-signed level with no signature (withheld, never certified).
+    DaemonUnsigned,
+    /// The #1925 untagged identity-bound form.
+    LegacyIdentity,
+    /// The pre-#1925 untagged payload-only form over a payload digest.
+    LegacyPayloadOnly,
+    /// The current `DaemonDomain::EventRow` form.
+    EventRowTagged,
+    /// An untagged daemon signature that is no legacy form (#10101).
+    Foreign,
+    /// A row of the reserved cutoff type below the cutoff row.
+    CutoffRow,
+    /// A signature that verifies under no form.
+    Unverifiable,
+}
+
+/// #10101 / #10102 — classify one prefix row under `vk`.
+pub(crate) fn prefix_row_form(vk: &VerifyingKey, row: &SignedEvent) -> PrefixRowForm {
+    if row.event_type == LEGACY_CUTOFF_EVENT_TYPE {
+        return PrefixRowForm::CutoffRow;
+    }
+    if row.attest_level != crate::models::AttestLevel::DaemonSigned.as_str() {
+        return PrefixRowForm::NotDaemonSigned;
+    }
+    if row.signature.as_deref().is_none_or(<[u8]>::is_empty) {
+        return PrefixRowForm::DaemonUnsigned;
+    }
+    match daemon_signature_form(vk, row) {
+        DaemonForm::EventRowTagged => PrefixRowForm::EventRowTagged,
+        DaemonForm::LegacyIdentity => PrefixRowForm::LegacyIdentity,
+        DaemonForm::LegacyPayloadOnly => PrefixRowForm::LegacyPayloadOnly,
+        DaemonForm::UntaggedForeign => PrefixRowForm::Foreign,
+        // A cutoff-domain form is reachable only on the cutoff type (above).
+        DaemonForm::CutoffTagged | DaemonForm::NoMatch => PrefixRowForm::Unverifiable,
+    }
+}
+
+/// #10101 / #10102 — why a prefix cannot be certified, naming the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixRefusal {
+    /// No daemon verifying key: no row form can be decided.
+    NoVerifier,
+    /// The database identity is unknown.
+    NoDatabaseIdentity,
+    /// No row lies below the cutoff row.
+    EmptyPrefix,
+    /// The rows fed are not `1, 2, ..` up to the cutoff row (first bad one).
+    ChainBreak(i64),
+    /// A daemon signature verifies under no form.
+    UnverifiableRow(i64),
+    /// An untagged daemon signature that is no legacy form (#10101).
+    ForeignSignatureForm(i64),
+    /// A reserved cutoff-type row below the cutoff row.
+    CutoffRowInPrefix(i64),
+    /// A legacy-form row after the first tagged row (#10102).
+    LegacyAfterTagged {
+        /// The legacy-form row.
+        sequence: i64,
+        /// The first `EventRow`-tagged row.
+        first_tagged: i64,
+    },
+}
+
+/// #10101 / #10102 — a prefix that passed the contiguity check: every row
+/// below the cutoff row has one accepted form, the legacy rows are
+/// `1..=legacy_end` (with neutral rows among them) and lie before the first
+/// tagged row. Built only by [`LegacyCutoffResolver::certify`].
+#[derive(Debug)]
+pub(crate) struct CertifiedPrefix {
+    cutoff_sequence: i64,
+    legacy_end: i64,
+    last_hash: Vec<u8>,
+    prefix_digest: Vec<u8>,
+    payload_only: u64,
+    db_id: String,
+}
+
+impl CertifiedPrefix {
+    /// The cutoff row's `payload_hash` for this prefix.
+    fn payload_hash(&self) -> Vec<u8> {
+        legacy_cutoff_payload_hash(
+            self.cutoff_sequence,
+            &self.last_hash,
+            &self.prefix_digest,
+            self.payload_only,
+            &self.db_id,
+        )
+    }
 }
 
 /// #10074 — streaming validator of one cutoff row against the rows below it.
 /// Feed every row with `sequence < cutoff_row.sequence` in ascending order,
 /// then call [`LegacyCutoffResolver::finish`]. Any check that fails yields
 /// [`LegacyCutoff::none`].
+///
+/// #10101 / #10102 — every fed row is classified ([`prefix_row_form`]); the
+/// first row that is no accepted form, or a legacy row after the first tagged
+/// row, records the exact [`PrefixRefusal`] and nothing after it is folded.
 pub struct LegacyCutoffResolver<'a> {
     cutoff_row: &'a SignedEvent,
     vk: Option<&'a VerifyingKey>,
@@ -175,7 +297,9 @@ pub struct LegacyCutoffResolver<'a> {
     expected_next: i64,
     payload_only: u64,
     last_hash: Option<Vec<u8>>,
-    broken: bool,
+    legacy_end: i64,
+    first_tagged: Option<i64>,
+    refusal: Option<PrefixRefusal>,
 }
 
 impl<'a> LegacyCutoffResolver<'a> {
@@ -196,87 +320,122 @@ impl<'a> LegacyCutoffResolver<'a> {
             expected_next: 1,
             payload_only: 0,
             last_hash: None,
-            broken: false,
+            legacy_end: 0,
+            first_tagged: None,
+            refusal: None,
         }
     }
 
     /// Fold the next prefix row (ascending `sequence`, starting at 1).
     pub fn feed(&mut self, row: &SignedEvent) {
-        if self.broken {
+        if self.refusal.is_some() {
             return;
         }
         if row.sequence != self.expected_next || row.sequence >= self.cutoff_row.sequence {
-            self.broken = true;
+            self.refusal = Some(PrefixRefusal::ChainBreak(row.sequence));
+            return;
+        }
+        let Some(vk) = self.vk else {
+            self.refusal = Some(PrefixRefusal::NoVerifier);
+            return;
+        };
+        let seq = row.sequence;
+        let refusal = match (prefix_row_form(vk, row), self.first_tagged) {
+            (PrefixRowForm::LegacyIdentity | PrefixRowForm::LegacyPayloadOnly, Some(first)) => {
+                Some(PrefixRefusal::LegacyAfterTagged {
+                    sequence: seq,
+                    first_tagged: first,
+                })
+            }
+            (PrefixRowForm::LegacyIdentity, None) => {
+                self.legacy_end = seq;
+                None
+            }
+            (PrefixRowForm::LegacyPayloadOnly, None) => {
+                self.legacy_end = seq;
+                self.payload_only = self.payload_only.saturating_add(1);
+                None
+            }
+            (PrefixRowForm::EventRowTagged, _) => {
+                self.first_tagged.get_or_insert(seq);
+                None
+            }
+            (PrefixRowForm::NotDaemonSigned | PrefixRowForm::DaemonUnsigned, _) => None,
+            (PrefixRowForm::Foreign, _) => Some(PrefixRefusal::ForeignSignatureForm(seq)),
+            (PrefixRowForm::CutoffRow, _) => Some(PrefixRefusal::CutoffRowInPrefix(seq)),
+            (PrefixRowForm::Unverifiable, _) => Some(PrefixRefusal::UnverifiableRow(seq)),
+        };
+        if refusal.is_some() {
+            self.refusal = refusal;
             return;
         }
         let hash = Sha256::digest(canonical_chain_bytes(row)).to_vec();
         self.prefix.update(&hash);
-        if let Some(vk) = self.vk
-            && row.attest_level == crate::models::AttestLevel::DaemonSigned.as_str()
-            && daemon_signature_form(vk, row) == DaemonForm::LegacyPayloadOnly
-        {
-            self.payload_only = self.payload_only.saturating_add(1);
-        }
         self.last_hash = Some(hash);
         self.expected_next = self.expected_next.saturating_add(1);
+    }
+
+    /// #10101 / #10102 — the contiguity check, the only constructor of a
+    /// [`CertifiedPrefix`]: every row `1..cutoff_row.sequence` was fed and has
+    /// an accepted form, and no legacy row follows the first tagged row.
+    pub(crate) fn certify(self) -> Result<CertifiedPrefix, PrefixRefusal> {
+        if let Some(refusal) = self.refusal {
+            return Err(refusal);
+        }
+        if self.vk.is_none() {
+            return Err(PrefixRefusal::NoVerifier);
+        }
+        let db_id = self.db_id.ok_or(PrefixRefusal::NoDatabaseIdentity)?;
+        let last_hash = self.last_hash.ok_or(PrefixRefusal::EmptyPrefix)?;
+        if self.expected_next != self.cutoff_row.sequence {
+            return Err(PrefixRefusal::ChainBreak(self.expected_next));
+        }
+        Ok(CertifiedPrefix {
+            cutoff_sequence: self.cutoff_row.sequence.saturating_sub(1),
+            legacy_end: self.legacy_end,
+            last_hash,
+            prefix_digest: self.prefix.finalize().to_vec(),
+            payload_only: self.payload_only,
+            db_id: db_id.to_owned(),
+        })
     }
 
     /// The validated cutoff, or [`LegacyCutoff::none`] on any failed check.
     #[must_use]
     pub fn finish(self) -> LegacyCutoff {
         let c = self.cutoff_row;
-        let (Some(vk), Some(db_id), Some(last_hash)) = (self.vk, self.db_id, self.last_hash) else {
+        let Some(vk) = self.vk else {
             return LegacyCutoff::none();
         };
-        let cutoff_sequence = c.sequence.saturating_sub(1);
-        if self.broken
-            || cutoff_sequence < 1
-            || self.expected_next != c.sequence
+        let Ok(prefix) = self.certify() else {
+            return LegacyCutoff::none();
+        };
+        if prefix.cutoff_sequence < 1
             || c.event_type != LEGACY_CUTOFF_EVENT_TYPE
             || c.attest_level != crate::models::AttestLevel::DaemonSigned.as_str()
             || c.cause_hash.is_some()
-            || c.prev_hash.as_slice() != last_hash.as_slice()
+            || c.prev_hash.as_slice() != prefix.last_hash.as_slice()
         {
             return LegacyCutoff::none();
         }
-        let prefix_digest = self.prefix.finalize();
-        let expected = legacy_cutoff_payload_hash(
-            cutoff_sequence,
-            &last_hash,
-            &prefix_digest,
-            self.payload_only,
-            db_id,
-        );
-        if c.payload_hash != expected {
+        if c.payload_hash != prefix.payload_hash() {
             return LegacyCutoff::none();
         }
         if daemon_signature_form(vk, c) != DaemonForm::CutoffTagged {
             return LegacyCutoff::none();
         }
         LegacyCutoff {
-            sequence: cutoff_sequence,
+            sequence: prefix.legacy_end,
             row_sequence: Some(c.sequence),
         }
     }
 
-    /// The cutoff row's `payload_hash` the mint writes for the prefix fed so
-    /// far, with the cutoff row placed at `prefix_len + 1`. `None` when the
-    /// prefix is empty, broken or no database identity is known.
-    #[must_use]
-    pub(crate) fn mint_payload_hash(self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let db_id = self.db_id?;
-        let last_hash = self.last_hash?;
-        if self.broken || self.expected_next != self.cutoff_row.sequence {
-            return None;
-        }
-        let prefix_digest = self.prefix.finalize();
-        let ph = legacy_cutoff_payload_hash(
-            self.cutoff_row.sequence.saturating_sub(1),
-            &last_hash,
-            &prefix_digest,
-            self.payload_only,
-            db_id,
-        );
-        Some((ph, last_hash))
+    /// The cutoff row's `payload_hash` and `prev_hash` the mint writes for the
+    /// prefix fed so far, with the cutoff row placed at `prefix_len + 1`, or
+    /// the exact reason the prefix cannot be certified.
+    pub(crate) fn mint_payload_hash(self) -> Result<(Vec<u8>, Vec<u8>), PrefixRefusal> {
+        let prefix = self.certify()?;
+        let ph = prefix.payload_hash();
+        Ok((ph, prefix.last_hash))
     }
 }

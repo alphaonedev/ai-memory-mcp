@@ -285,7 +285,9 @@ fn s1_transplant_below_minted_cutoff_is_dirty_10074() {
     let cutoff_row = legacy_prefix_and_mint(&conn);
     let vk = sink();
     let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
-    assert_eq!(cutoff.sequence(), 3, "the prefix is rows 1..=3");
+    // #10102 — rows [P, I, T]: the certified legacy prefix is rows 1..=2 and
+    // ends before the first tagged row.
+    assert_eq!(cutoff.sequence(), 2, "the legacy prefix is rows 1..=2");
     assert_eq!(cutoff.row_sequence(), Some(cutoff_row));
     assert_clean(&conn, "the minted prefix");
 
@@ -398,7 +400,11 @@ fn s1_same_form_substitution_in_prefix_voids_cutoff_10074() {
     let vk = sink();
     assert_clean(&conn, "the minted prefix");
     let before = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
-    assert_eq!(before.sequence(), 3);
+    assert_eq!(
+        before.sequence(),
+        2,
+        "#10102: the legacy prefix is rows 1..=2"
+    );
 
     substitute_identity_row_2(&conn);
     relink(&conn);

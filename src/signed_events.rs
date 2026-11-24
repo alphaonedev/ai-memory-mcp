@@ -1691,6 +1691,29 @@ impl std::fmt::Display for LegacyCutoffMintRefusal {
     }
 }
 
+/// #10101 / #10102 — the mint's refusal for a prefix the resolver's
+/// contiguity check did not certify (shared by both backends).
+impl From<legacy_cutoff::PrefixRefusal> for LegacyCutoffMintRefusal {
+    fn from(r: legacy_cutoff::PrefixRefusal) -> Self {
+        use legacy_cutoff::PrefixRefusal as P;
+        match r {
+            P::NoVerifier => Self::NoDaemonKey,
+            P::NoDatabaseIdentity | P::EmptyPrefix => Self::EmptyChain,
+            P::ChainBreak(s) => Self::ChainBreak(s),
+            P::UnverifiableRow(s) => Self::UnverifiableRow(s),
+            P::ForeignSignatureForm(s) => Self::ForeignSignatureForm(s),
+            P::CutoffRowInPrefix(_) => Self::CutoffRowExists,
+            P::LegacyAfterTagged {
+                sequence,
+                first_tagged,
+            } => Self::LegacyAfterTagged {
+                sequence,
+                first_tagged,
+            },
+        }
+    }
+}
+
 /// #10074 — the outcome of a mint: the cutoff row's sequence on success.
 pub type LegacyCutoffMint = std::result::Result<i64, LegacyCutoffMintRefusal>;
 
@@ -1765,11 +1788,6 @@ fn mint_legacy_cutoff_in_tx(
     if head < 1 {
         return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
     }
-    // Every daemon-signed row must verify under SOME form before the operator
-    // blesses the prefix: the mint never vouches for an unverifiable row.
-    if let Some(bad) = first_unverifiable_daemon_row(conn, vk)? {
-        return Ok(Err(LegacyCutoffMintRefusal::UnverifiableRow(bad)));
-    }
     let mut row = SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: legacy_cutoff::LEGACY_CUTOFF_AGENT_ID.to_string(),
@@ -1784,10 +1802,14 @@ fn mint_legacy_cutoff_in_tx(
         sequence: head.saturating_add(1),
         cause_hash: None,
     };
+    // #10101 / #10102 — the resolver classifies every prefix row and certifies
+    // only a contiguous legacy prefix before the first tagged row; the mint
+    // never vouches for an unverifiable, foreign or late legacy row.
     let mut resolver = LegacyCutoffResolver::new(&row, Some(vk), Some(&db_id));
     feed_sqlite_prefix(conn, row.sequence, &mut resolver)?;
-    let Some((payload_hash, last_hash)) = resolver.mint_payload_hash() else {
-        return Ok(Err(LegacyCutoffMintRefusal::ChainBreak(head)));
+    let (payload_hash, last_hash) = match resolver.mint_payload_hash() {
+        Ok(v) => v,
+        Err(refusal) => return Ok(Err(refusal.into())),
     };
     row.payload_hash = payload_hash;
     row.prev_hash = last_hash;
@@ -1827,32 +1849,6 @@ fn mint_legacy_cutoff_in_tx(
         return Ok(Err(LegacyCutoffMintRefusal::AnchorNotDurable));
     }
     Ok(Ok(row.sequence))
-}
-
-/// #10074 — the first daemon-signed row (with a signature) whose signature
-/// verifies under no daemon form, or `None`.
-fn first_unverifiable_daemon_row(
-    conn: &Connection,
-    vk: &ed25519_dalek::VerifyingKey,
-) -> Result<Option<i64>> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {SIGNED_EVENT_ROW_COLUMNS} FROM signed_events \
-             WHERE attest_level = ?1 ORDER BY COALESCE(sequence, 0) ASC"
-        ))
-        .context("mint legacy cutoff: prepare scan")?;
-    let mut rows = stmt
-        .query(params![crate::models::AttestLevel::DaemonSigned.as_str()])
-        .context("mint legacy cutoff: scan")?;
-    while let Some(row) = rows.next().context("mint legacy cutoff: scan row")? {
-        let ev = read_signed_event_row(row).context("mint legacy cutoff: scan map")?;
-        if ev.signature.as_deref().is_some_and(|s| !s.is_empty())
-            && daemon_signature_form(vk, &ev) == DaemonForm::NoMatch
-        {
-            return Ok(Some(ev.sequence));
-        }
-    }
-    Ok(None)
 }
 
 /// Operator-facing end-to-end report over the append-only
