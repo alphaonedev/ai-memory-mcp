@@ -766,10 +766,6 @@ fn sign_manifest_if_keyed(manifest: &Manifest) -> Result<Option<(String, String)
 // Substrate readers
 // ─────────────────────────────────────────────────────────────────────
 
-/// Walk `reflects_on` edges backward from `root` and return the
-/// visited memory ids in BFS order. Mirrors the walk in
-/// [`crate::cli::verify::build_chain_report`] but returns only the id
-/// set (no per-edge verification).
 /// v1.0.0 #10063 — the one read of the rows a bundle emits. Each row is
 /// classified on its at-rest envelope BEFORE the decrypting projection runs
 /// (`classify_sqlite_row`), so a sealed row is counted by the
@@ -803,6 +799,10 @@ fn read_classified_for_bundle(
     Ok(plain)
 }
 
+/// Walk `reflects_on` edges backward from `root` and return the
+/// visited memory ids in BFS order. Mirrors the walk in
+/// [`crate::cli::verify::build_chain_report`] but returns only the id
+/// set (no per-edge verification).
 fn walk_reflection_chain(conn: &Connection, root: &str) -> Result<Vec<String>> {
     use std::collections::{HashSet, VecDeque};
     let mut visited: HashSet<String> = HashSet::new();
