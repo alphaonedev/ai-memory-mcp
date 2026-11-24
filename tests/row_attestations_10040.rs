@@ -1662,3 +1662,74 @@ fn stripped_cutover_signature_is_never_re_signed_at_arm_10086() {
     assert_eq!(sig, None, "the stripped cutover is never signed again");
     assert_defect(&sb.report(), &needle, "after the refused arm");
 }
+
+// ---------------------------------------------------------------------------
+// #10092 (class C): the digest covers the bytes the product acts on
+// ---------------------------------------------------------------------------
+
+/// The scope the forged first key carries (`SQLite` reads the first one).
+const DUP_SCOPE: &str = "org";
+/// The exact defect and refusal reason for a duplicated `scope` key.
+const NON_CANONICAL_SCOPE: &str =
+    "memories.metadata is not canonical: duplicate JSON key \"scope\"";
+
+/// #10092, from the attacker's side: a direct file write prepends a second
+/// `scope` key to an attested memory's metadata. `SQLite` (and so
+/// visibility) reads the first key; a last-key-wins parse would keep the
+/// attested digest. The verifier reports the exact defect and the memory as
+/// unverified, and the next write over the row is refused with the exact
+/// reason and changes nothing.
+#[test]
+fn duplicate_key_that_changes_scope_is_refused_and_a_defect_10092() {
+    let (sb, key, mut mcp) = armed();
+    let id = mcp.store("attest duplicate key 10092");
+    mcp.ok(
+        "memory_update",
+        &json!({"id": id, "metadata": {"scope": "team"}}),
+    );
+    drop(mcp);
+    assert_ok(&sb.report(), "control");
+    let stored: String = sb
+        .conn()
+        .query_row("SELECT metadata FROM memories WHERE id = ?1", [&id], |r| {
+            r.get(0)
+        })
+        .expect("metadata");
+    let body = stored.strip_prefix('{').expect("metadata is an object");
+    let forged = format!("{{\"scope\":\"{DUP_SCOPE}\",{body}");
+    let n = sb
+        .seed_conn()
+        .execute(
+            "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+            [&forged, &id],
+        )
+        .expect("raw write");
+    assert_eq!(n, 1, "one row forged");
+    let read: String = sb
+        .conn()
+        .query_row(
+            "SELECT json_extract(metadata, '$.scope') FROM memories WHERE id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .expect("scope");
+    assert_eq!(read, DUP_SCOPE, "the product reads the forged scope");
+
+    let report = sb.report();
+    assert_defect(&report, NON_CANONICAL_SCOPE, "duplicate key at verify");
+    assert_unverified(&report, &id, "duplicate key at verify");
+
+    let before = row_state(&sb, &id);
+    let count = sb.attestation_count();
+    let mut mcp = sb.start(&key);
+    let (is_error, text) =
+        mcp.call_raw("memory_update", &json!({"id": id, "tags": ["dup-10092"]}));
+    drop(mcp);
+    assert!(is_error, "the write must be refused: {text}");
+    assert!(
+        text.contains(&refusal(NON_CANONICAL_SCOPE)),
+        "exact refusal, got: {text}"
+    );
+    assert_eq!(row_state(&sb, &id), before, "the row is unchanged");
+    assert_eq!(sb.attestation_count(), count, "no attestation written");
+}

@@ -1121,3 +1121,131 @@ fn no_verify_path_reads_a_key_from_the_database_ratchet_10086() {
         "DB key reader in row_attest: {readers:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #10092 (class C): one canonical preimage, the bytes the product acts on
+// ---------------------------------------------------------------------------
+
+/// The exact reason a duplicated `scope` key is refused for (#10092).
+const DUP_SCOPE_REASON: &str = "duplicate JSON key \"scope\"";
+
+/// One expected canonical cell: tag byte, then the big-endian u32 length
+/// and the bytes, all WRITTEN OUT here from the format description, never
+/// produced by the encoder under test.
+fn framed(tag: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend_from_slice(&u32::try_from(bytes.len()).expect("short").to_be_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// #10092: the canonical encoding of each logical type, as bytes. A
+/// timestamp keeps its exact stored spelling (`SQLite` compares `expires_at`
+/// as text, so two spellings of one instant are two different values to the
+/// product); JSON keys are sorted and whitespace dropped; a duplicated JSON
+/// key has no canonical form and is refused with its exact reason.
+#[test]
+fn canonical_cell_bytes_are_written_out_10092() {
+    let ok: [(Ty, Cell, Vec<u8>); 12] = [
+        (Ty::Text, Cell::Null, vec![0x00]),
+        (Ty::Text, t("hi"), vec![0x03, 0, 0, 0, 2, b'h', b'i']),
+        (Ty::Int, Cell::Int(5), vec![0x01, 0, 0, 0, 0, 0, 0, 0, 5]),
+        (
+            Ty::Real,
+            Cell::Int(1),
+            vec![0x02, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0],
+        ),
+        (
+            Ty::Ts,
+            t("2026-11-23T10:00:00+02:00"),
+            framed(0x05, b"2026-11-23T10:00:00+02:00"),
+        ),
+        (
+            Ty::Ts,
+            t("2026-11-23T08:00:00Z"),
+            framed(0x05, b"2026-11-23T08:00:00Z"),
+        ),
+        (
+            Ty::Ts,
+            t("2026-11-23 08:00:00"),
+            framed(0x05, b"2026-11-23 08:00:00"),
+        ),
+        (Ty::Ts, t("soon"), framed(0x09, b"t:soon")),
+        (
+            Ty::Json,
+            t(r#"{ "scope" : "team", "b" : [1, 2.5, null] }"#),
+            framed(0x06, br#"{"b":[1,2.5,null],"scope":"team"}"#),
+        ),
+        (Ty::Json, t("{not json"), framed(0x09, b"t:{not json")),
+        (
+            Ty::Tags,
+            t(r#"[ "b", "a" ]"#),
+            framed(0x07, br#"["a","b"]"#),
+        ),
+        (Ty::Tags, t(r#"{"a":1}"#), framed(0x09, br#"t:{"a":1}"#)),
+    ];
+    for (ty, cell, want) in ok {
+        let mut got = Vec::new();
+        let r = encode_cell(ty, &cell, &mut got);
+        assert_eq!(r, Ok(()), "{ty:?} {cell:?}");
+        assert_eq!(hex::encode(&got), hex::encode(&want), "{ty:?} {cell:?}");
+    }
+    let refused: [(Ty, Cell, &str); 4] = [
+        (
+            Ty::Json,
+            t(r#"{"scope":"org","scope":"team"}"#),
+            DUP_SCOPE_REASON,
+        ),
+        (
+            Ty::Json,
+            t(r#"{"a":{"scope":1,"b":2,"scope":3}}"#),
+            DUP_SCOPE_REASON,
+        ),
+        (
+            Ty::Json,
+            t(r#"[{"k":1},{"k":2,"k":2}]"#),
+            "duplicate JSON key \"k\"",
+        ),
+        (
+            Ty::Tags,
+            t(r#"[{"k":1,"k":2}]"#),
+            "duplicate JSON key \"k\"",
+        ),
+    ];
+    for (ty, cell, want) in refused {
+        let mut got = Vec::new();
+        assert_eq!(
+            encode_cell(ty, &cell, &mut got),
+            Err(want.to_string()),
+            "{ty:?} {cell:?}"
+        );
+    }
+}
+
+/// #10092: a row whose metadata repeats `scope` has no canonical form: the
+/// canonicalising parser refuses it naming the table, column and reason, so
+/// no digest (and no signature) can ever be computed over it.
+#[test]
+fn duplicate_key_row_has_no_canonical_row_10092() {
+    let s = spec("memories");
+    let mut row: Vec<Cell> = vec![Cell::Null; s.cols.len()];
+    row[0] = t("m1");
+    let at = s.index_of("metadata").expect("metadata covered");
+    row[at] = t(r#"{"scope":"org","agent_id":"ai:a","scope":"team"}"#);
+    let err = CanonicalRow::parse(s, &row).expect_err("a duplicated key is refused");
+    assert_eq!(
+        err,
+        NonCanonical {
+            table: "memories",
+            column: "metadata",
+            reason: DUP_SCOPE_REASON.to_string(),
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "memories.metadata is not canonical: duplicate JSON key \"scope\""
+    );
+    row[at] = t(r#"{"agent_id":"ai:a","scope":"team"}"#);
+    let ok = CanonicalRow::parse(s, &row).expect("canonical");
+    assert_eq!(ok.key(), encode_key(s, &row).as_slice());
+}
