@@ -9,9 +9,11 @@ use super::*;
 /// `hashlib`), never from this module.
 /// Eight covered columns (NOTICE 4a adds metadata, `expires_at`,
 /// confidence; scope rides in `metadata.scope`), computed independently by
-/// `.local-runs/lane/golden.py` from the written spec.
-const GOLDEN_MEMORIES: &str = "eae7d1588770bfd17819619f1a0e1b8ebab4197fc8651df9c9222c845a4ddb45";
-const GOLDEN_RECALL_OBS: &str = "96acbd93e3ed42c41e11f190f069f52df0cdd50be787fe9275f5c591004a8cfc";
+/// `.local-runs/lane/golden.py` from the written spec. #10092: a timestamp
+/// is digested as its exact stored text (`.local-runs/lane/golden10092.py`,
+/// which first reproduces the earlier normalised goldens as a self-check).
+const GOLDEN_MEMORIES: &str = "349167ea4fed8fdd3ef74fc16234c8ad2f051b0cf94d7f48662123e5d5a222cc";
+const GOLDEN_RECALL_OBS: &str = "802b98db419706ffeafd221138eea9fe128aefb408c7bf795fa6b0dd15a89816";
 const GOLDEN_ACTION_EDGES: &str =
     "e6067df81f1117e9bfa5b0dfd56c19c457513d923f619242119f97b4ec66401b";
 const GOLDEN_ACTION_EDGES_KEY: &str = "03000000026131030000000261320300000006626c6f636b73";
@@ -22,6 +24,12 @@ fn spec(table: &str) -> &'static TableSpec {
 
 fn t(s: &str) -> Cell {
     Cell::Text(s.to_string())
+}
+
+/// The digest of a canonical row (#10092: [`super::row_digest`] takes only a
+/// [`CanonicalRow`]); panics on a row with no canonical form.
+fn row_digest(s: &TableSpec, cells: &[Cell]) -> [u8; 32] {
+    super::row_digest(&CanonicalRow::parse(s, cells).expect("canonical row"))
 }
 
 #[test]
@@ -88,7 +96,7 @@ fn golden_memories_digest_sqlite_and_pg_forms_c2() {
         t("long"),
         t("hello"),
         Cell::Json(serde_json::json!({"b": 1, "scope": "team"})),
-        t("2026-11-23 08:00:00"),
+        t("2026-11-23T10:00:00+02:00"),
         Cell::Real(0.5),
     ];
     assert_eq!(hex::encode(row_digest(s, &sqlite)), GOLDEN_MEMORIES);
@@ -119,7 +127,7 @@ fn golden_composite_key_nulls_timestamps_bools_c2() {
         Cell::Int(1),
         Cell::Real(0.5),
         Cell::Bool(false),
-        t("2026-11-23 08:00:00"),
+        t("2026-11-23T10:00:00+02:00"),
         Cell::Null,
         Cell::Null,
         Cell::Bool(true),
@@ -458,6 +466,7 @@ impl Fixture {
             anchor,
             id_high_water: high,
             memory_id_of_key: &memory_id_of_key,
+            non_canonical: &[],
         })
     }
 }
@@ -563,6 +572,7 @@ fn verify_detects_tail_truncation_e2() {
         anchor: &anchor,
         id_high_water: high,
         memory_id_of_key: &memory_id_of_key,
+        non_canonical: &[],
     });
     assert_defect(&r, "row_attestations tail truncated");
 }

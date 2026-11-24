@@ -29,7 +29,7 @@ use ai_memory::storage::row_attest::sqlite::{
     SNAPSHOT_REFUSAL_PREFIX, read_attestations, read_rows, verify_sqlite_with,
 };
 use ai_memory::storage::row_attest::{
-    Attestation, Report, TABLES, acc_add, acc_sub, acc_term, encode_key, key_id_of,
+    Attestation, CanonicalRow, Report, TABLES, acc_add, acc_sub, acc_term, encode_key, key_id_of,
     memory_id_of_key, row_digest, sign,
 };
 use serde_json::{Value, json};
@@ -1524,7 +1524,7 @@ fn forge_with_rebound_db_key(conn: &rusqlite::Connection, attacker: &ed25519_dal
         for cells in read_rows(conn, spec).expect("live rows") {
             live.insert(
                 (spec.table.to_string(), encode_key(spec, &cells)),
-                row_digest(spec, &cells),
+                row_digest(&CanonicalRow::parse(spec, &cells).expect("canonical row")),
             );
         }
     }
@@ -1722,8 +1722,7 @@ fn duplicate_key_that_changes_scope_is_refused_and_a_defect_10092() {
     let before = row_state(&sb, &id);
     let count = sb.attestation_count();
     let mut mcp = sb.start(&key);
-    let (is_error, text) =
-        mcp.call_raw("memory_update", &json!({"id": id, "tags": ["dup-10092"]}));
+    let (is_error, text) = mcp.call_raw("memory_update", &json!({"id": id, "tags": ["dup-10092"]}));
     drop(mcp);
     assert!(is_error, "the write must be refused: {text}");
     assert!(

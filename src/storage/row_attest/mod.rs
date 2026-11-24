@@ -445,19 +445,183 @@ fn write_json(v: &serde_json::Value, out: &mut String) {
     }
 }
 
-fn json_of(cell: &Cell) -> Option<serde_json::Value> {
+/// A JSON parse that refuses a repeated object key (#10092). serde's own
+/// `Value` keeps the last of two equal keys while `SQLite` `json_extract`
+/// (and so `scope_idx`) takes the first: a parse that silently picks one
+/// would give two texts the product reads differently one digest.
+struct StrictJson<'a> {
+    dup: &'a std::cell::RefCell<Option<String>>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for StrictJson<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for StrictJson<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+        // serde_json never yields a non-finite number from text.
+        Ok(serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(v) = seq.next_element_seed(StrictJson { dup: self.dup })? {
+            items.push(v);
+        }
+        Ok(serde_json::Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut obj = serde_json::Map::new();
+        while let Some(k) = map.next_key::<String>()? {
+            if obj.contains_key(&k) {
+                let reason = format!("duplicate JSON key {k:?}");
+                *self.dup.borrow_mut() = Some(reason.clone());
+                return Err(serde::de::Error::custom(reason));
+            }
+            let v = map.next_value_seed(StrictJson { dup: self.dup })?;
+            obj.insert(k, v);
+        }
+        Ok(serde_json::Value::Object(obj))
+    }
+}
+
+/// The typed JSON value of `cell` (#10092): `Ok(None)` when the cell is not
+/// JSON at all (encoded raw, byte for byte), `Err(reason)` when it is JSON
+/// with no single meaning (a repeated key).
+fn json_of(cell: &Cell) -> Result<Option<serde_json::Value>, String> {
+    use serde::de::DeserializeSeed as _;
     match cell {
-        Cell::Text(t) => serde_json::from_str(t).ok(),
-        Cell::Json(v) => Some(v.clone()),
-        _ => None,
+        Cell::Text(t) => {
+            let dup = std::cell::RefCell::new(None);
+            let mut de = serde_json::Deserializer::from_str(t);
+            let parsed = StrictJson { dup: &dup }
+                .deserialize(&mut de)
+                .and_then(|v| de.end().map(|()| v));
+            match (parsed, dup.into_inner()) {
+                (_, Some(reason)) => Err(reason),
+                (Ok(v), None) => Ok(Some(v)),
+                (Err(_), None) => Ok(None),
+            }
+        }
+        Cell::Json(v) => Ok(Some(v.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Why a stored row has no canonical encoding (#10092): it is refused at
+/// write and reported as a defect at verify, never digested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonCanonical {
+    /// Table.
+    pub table: &'static str,
+    /// The column with no canonical form.
+    pub column: &'static str,
+    /// The exact reason.
+    pub reason: String,
+}
+
+impl std::fmt::Display for NonCanonical {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}.{} is not canonical: {}",
+            self.table, self.column, self.reason
+        )
+    }
+}
+
+impl std::error::Error for NonCanonical {}
+
+/// A row in its one canonical encoding (#10092). Built only by
+/// [`CanonicalRow::parse`], the canonicalising parser; the only input of
+/// [`row_digest`], so no digest is ever computed over stored bytes that
+/// were not parsed into their typed value first.
+#[derive(Debug, Clone)]
+pub struct CanonicalRow<'s> {
+    spec: &'s TableSpec,
+    key: Vec<u8>,
+    enc: Vec<u8>,
+}
+
+impl<'s> CanonicalRow<'s> {
+    /// Parse `cells` (spec order) once into the canonical encoding.
+    ///
+    /// # Errors
+    ///
+    /// [`NonCanonical`] naming the first column with no canonical form.
+    pub fn parse(spec: &'s TableSpec, cells: &[Cell]) -> Result<Self, NonCanonical> {
+        let mut enc = Vec::new();
+        for (i, (col, ty)) in spec.cols.iter().enumerate() {
+            encode_cell(*ty, cells.get(i).unwrap_or(&Cell::Null), &mut enc).map_err(|reason| {
+                NonCanonical {
+                    table: spec.table,
+                    column: col,
+                    reason,
+                }
+            })?;
+        }
+        Ok(Self {
+            spec,
+            key: encode_key(spec, cells),
+            enc,
+        })
+    }
+
+    /// The canonical key encoding.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// The canonical encoding of every covered column, in spec order.
+    #[must_use]
+    pub fn encoding(&self) -> &[u8] {
+        &self.enc
     }
 }
 
 /// Append the canonical encoding of `cell` read as logical type `ty`.
-pub fn encode_cell(ty: Ty, cell: &Cell, out: &mut Vec<u8>) {
+///
+/// `Err(reason)` when the stored value has no single meaning (#10092).
+fn encode_cell(ty: Ty, cell: &Cell, out: &mut Vec<u8>) -> Result<(), String> {
     if matches!(cell, Cell::Null) {
         out.push(TAG_NULL);
-        return;
+        return Ok(());
     }
     match ty {
         Ty::Text => match cell {
@@ -499,24 +663,24 @@ pub fn encode_cell(ty: Ty, cell: &Cell, out: &mut Vec<u8>) {
             }
             other => encode_raw(other, out),
         },
+        // #10092: the exact stored spelling. `SQLite` compares timestamps as
+        // text (`expires_at > ?now`), so two spellings of one instant are two
+        // values to the product and never share a digest.
         Ty::Ts => match cell {
-            Cell::Text(t) => match canonical_ts(t) {
-                Some(ts) => {
-                    out.push(TAG_TS);
-                    put_len_bytes(out, ts.as_bytes());
-                }
-                None => encode_raw(cell, out),
-            },
+            Cell::Text(t) if canonical_ts(t).is_some() => {
+                out.push(TAG_TS);
+                put_len_bytes(out, t.as_bytes());
+            }
             other => encode_raw(other, out),
         },
-        Ty::Json => match json_of(cell) {
+        Ty::Json => match json_of(cell)? {
             Some(v) => {
                 out.push(TAG_JSON);
                 put_len_bytes(out, canonical_json(&v).as_bytes());
             }
             None => encode_raw(cell, out),
         },
-        Ty::Tags => match json_of(cell) {
+        Ty::Tags => match json_of(cell)? {
             Some(serde_json::Value::Array(items))
                 if items.iter().all(serde_json::Value::is_string) =>
             {
@@ -541,6 +705,7 @@ pub fn encode_cell(ty: Ty, cell: &Cell, out: &mut Vec<u8>) {
             other => encode_raw(other, out),
         },
     }
+    Ok(())
 }
 
 /// A cell whose storage class does not match its logical type.
@@ -565,26 +730,31 @@ pub fn encode_key(spec: &TableSpec, cells: &[Cell]) -> Vec<u8> {
     for k in spec.key {
         if let Some(i) = spec.index_of(k) {
             let (_, ty) = spec.cols[i];
-            encode_cell(ty, cells.get(i).unwrap_or(&Cell::Null), &mut out);
+            let cell = cells.get(i).unwrap_or(&Cell::Null);
+            let mark = out.len();
+            // A key column is never JSON-typed; should one ever fail to
+            // encode, its exact bytes stand in (injective, never merged).
+            if encode_cell(ty, cell, &mut out).is_err() {
+                out.truncate(mark);
+                encode_raw(cell, &mut out);
+            }
         }
     }
     out
 }
 
-/// Canonical digest of a full row (`cells` in spec order, C-2).
+/// Canonical digest of a full row (C-2). The only input is a
+/// [`CanonicalRow`], so a row with no canonical form has no digest (#10092).
 #[must_use]
-pub fn row_digest(spec: &TableSpec, cells: &[Cell]) -> [u8; 32] {
-    let mut enc = Vec::new();
-    for (i, (_, ty)) in spec.cols.iter().enumerate() {
-        encode_cell(*ty, cells.get(i).unwrap_or(&Cell::Null), &mut enc);
-    }
+pub fn row_digest(row: &CanonicalRow<'_>) -> [u8; 32] {
+    let spec = row.spec;
     let mut h = Sha256::new();
     h.update(DOMAIN_TAG);
     h.update(b"row\0");
     let mut framed = Vec::new();
     put_len_bytes(&mut framed, spec.table.as_bytes());
     put_len_bytes(&mut framed, spec.covered().as_bytes());
-    put_len_bytes(&mut framed, &enc);
+    put_len_bytes(&mut framed, &row.enc);
     h.update(&framed);
     h.finalize().into()
 }
@@ -899,6 +1069,9 @@ pub struct VerifyInput<'a> {
     pub id_high_water: Option<i64>,
     /// Decode a memories key to its id (for [`Report::unverified_memories`]).
     pub memory_id_of_key: &'a dyn Fn(&[u8]) -> Option<String>,
+    /// Live rows with no canonical form (#10092): each is a defect, and its
+    /// [`LiveRow`] carries [`ZERO_DIGEST`] so it never matches an attestation.
+    pub non_canonical: &'a [NonCanonical],
 }
 
 fn sig_defect(a: &Attestation, anchor: &anchor::AnchorLoad) -> Option<String> {
@@ -972,7 +1145,11 @@ fn key_refusal_defect(a: &Attestation, why: &anchor::KeyRefusal) -> String {
 #[must_use]
 pub fn verify(input: &VerifyInput<'_>) -> Report {
     use std::collections::BTreeMap;
-    let mut defects: Vec<String> = Vec::new();
+    let mut defects: Vec<String> = input
+        .non_canonical
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     let mut tables: BTreeMap<String, TableVerdict> = BTreeMap::new();
     let mut unverified = std::collections::BTreeSet::new();
     let d = &mut defects;

@@ -10,9 +10,9 @@
 //! stored (C-4).
 
 use super::{
-    Attestation, Cell, FORMAT_VERSION, LiveRow, Op, Report, Retention, STORE_ROW_TABLE, TABLES,
-    TableSpec, VerifyInput, ZERO_DIGEST, acc_add, acc_sub, acc_term, attestation_digest,
-    encode_key, key_id_of, row_digest, sign, spec_for,
+    Attestation, CanonicalRow, Cell, FORMAT_VERSION, LiveRow, Op, Report, Retention,
+    STORE_ROW_TABLE, TABLES, TableSpec, VerifyInput, ZERO_DIGEST, acc_add, acc_sub, acc_term,
+    attestation_digest, encode_key, key_id_of, row_digest, sign, spec_for,
 };
 use anyhow::{Context as _, Result};
 use rusqlite::functions::FunctionFlags;
@@ -128,8 +128,8 @@ pub fn read_rows(conn: &Connection, spec: &TableSpec) -> Result<Vec<Vec<Cell>>> 
 fn live_acc(conn: &Connection, spec: &TableSpec) -> Result<[u8; 32]> {
     let mut acc = ZERO_DIGEST;
     for cells in read_rows(conn, spec)? {
-        let key = encode_key(spec, &cells);
-        acc = acc_add(&acc, &acc_term(spec.table, &key, &row_digest(spec, &cells)));
+        let row = CanonicalRow::parse(spec, &cells)?;
+        acc = acc_add(&acc, &acc_term(spec.table, row.key(), &row_digest(&row)));
     }
     Ok(acc)
 }
@@ -402,10 +402,16 @@ fn append(
 /// Translate one trigger call into the row-key changes it attests.
 fn changes<'a>(spec: &'a TableSpec, kind: &str, vals: &[Cell]) -> Result<Vec<Change<'a>>, String> {
     let n = spec.cols.len();
-    let one = |cells: &[Cell]| (encode_key(spec, cells), row_digest(spec, cells));
+    // #10092: a row with no canonical form is never digested, so never
+    // signed: the write is refused with the exact reason.
+    let one = |cells: &[Cell]| {
+        CanonicalRow::parse(spec, cells)
+            .map(|row| (row.key().to_vec(), row_digest(&row)))
+            .map_err(|nc| refusal(&nc.to_string()))
+    };
     match (kind, vals.len()) {
         ("I", len) if len == n => {
-            let (key, d) = one(vals);
+            let (key, d) = one(vals)?;
             Ok(vec![Change {
                 spec,
                 key,
@@ -415,7 +421,7 @@ fn changes<'a>(spec: &'a TableSpec, kind: &str, vals: &[Cell]) -> Result<Vec<Cha
             }])
         }
         ("D", len) if len == n => {
-            let (key, d) = one(vals);
+            let (key, d) = one(vals)?;
             Ok(vec![Change {
                 spec,
                 key,
@@ -426,8 +432,8 @@ fn changes<'a>(spec: &'a TableSpec, kind: &str, vals: &[Cell]) -> Result<Vec<Cha
         }
         ("U", len) if len == 2 * n => {
             let (old_cells, new_cells) = vals.split_at(n);
-            let (ok, od) = one(old_cells);
-            let (nk, nd) = one(new_cells);
+            let (ok, od) = one(old_cells)?;
+            let (nk, nd) = one(new_cells)?;
             if ok != nk {
                 return Ok(vec![
                     Change {
@@ -574,15 +580,16 @@ fn sign_cutovers(conn: &Connection, who: &Signer) -> Result<()> {
         }
         let mut table_seq = 0_i64;
         for cells in read_rows(conn, spec)? {
-            let key = encode_key(spec, &cells);
-            if latest_for(conn, spec.table, &key)?.is_some() {
+            // #10092: a baseline is never signed over a non-canonical row.
+            let row = CanonicalRow::parse(spec, &cells)?;
+            if latest_for(conn, spec.table, row.key())?.is_some() {
                 continue;
             }
             table_seq = table_seq.saturating_add(1);
             let mut b = blank(spec.table, Op::Baseline, &store, &spec.covered());
-            b.row_key = key;
+            b.row_key = row.key().to_vec();
             b.seq = 1;
-            b.row_digest = Some(row_digest(spec, &cells).to_vec());
+            b.row_digest = Some(row_digest(&row).to_vec());
             b.agent_id.clone_from(&who.agent_id);
             b.key_id.clone_from(&who.key_id);
             b.table_seq = table_seq;
@@ -696,12 +703,22 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
 /// As [`verify_sqlite`].
 pub fn verify_sqlite_with(conn: &Connection, anchor: &super::anchor::AnchorLoad) -> Result<Report> {
     let mut live = Vec::new();
+    let mut non_canonical = Vec::new();
     for spec in TABLES {
         for cells in read_rows(conn, spec)? {
+            // #10092: a row with no canonical form is a defect and matches
+            // no attestation (its digest is the zero digest, never signed).
+            let digest = match CanonicalRow::parse(spec, &cells) {
+                Ok(row) => row_digest(&row),
+                Err(nc) => {
+                    non_canonical.push(nc);
+                    ZERO_DIGEST
+                }
+            };
             live.push(LiveRow {
                 table: spec.table.to_string(),
                 key: encode_key(spec, &cells),
-                digest: row_digest(spec, &cells),
+                digest,
             });
         }
     }
@@ -719,6 +736,7 @@ pub fn verify_sqlite_with(conn: &Connection, anchor: &super::anchor::AnchorLoad)
         anchor,
         id_high_water,
         memory_id_of_key: &super::memory_id_of_key,
+        non_canonical: &non_canonical,
     }))
 }
 
