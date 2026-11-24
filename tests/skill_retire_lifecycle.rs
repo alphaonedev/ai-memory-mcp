@@ -332,7 +332,8 @@ fn migration_v82_applies_and_is_idempotent() {
     // v82 retire columns present.
     let conn = db::open(&path).unwrap();
     // #8341: tip pin moved 101 -> 102 with the FTS projection guard.
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 102);
+    // #10040: tip pin moved 102 -> 103 with the row_attestations side table.
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 103);
     assert!(
         conn.prepare("SELECT retired_at, retired_by, retire_reason FROM skills LIMIT 0")
             .is_ok(),

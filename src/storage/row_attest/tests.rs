@@ -1,0 +1,648 @@
+//! Unit tests for the #10040 row-attestation core (3-agent vote (71472661)
+//! V1-10040): golden vectors (C-2), the accumulator, preimage binding (C-1)
+//! and the completeness verifier (C-5, E-2, E-3).
+
+use super::*;
+
+/// Golden digests computed by an independent reference encoder written from
+/// the format description (`.local-runs` scratch `golden.py`, Python
+/// `hashlib`), never from this module.
+const GOLDEN_MEMORIES: &str = "10e70cfb08c15303348ff27500cef8e2e0f91eb0f3bd7eaa028197081ad29b25";
+const GOLDEN_RECALL_OBS: &str = "96acbd93e3ed42c41e11f190f069f52df0cdd50be787fe9275f5c591004a8cfc";
+const GOLDEN_ACTION_EDGES: &str =
+    "e6067df81f1117e9bfa5b0dfd56c19c457513d923f619242119f97b4ec66401b";
+const GOLDEN_ACTION_EDGES_KEY: &str = "03000000026131030000000261320300000006626c6f636b73";
+
+fn spec(table: &str) -> &'static TableSpec {
+    spec_for(table).unwrap_or_else(|| panic!("no spec for {table}"))
+}
+
+fn t(s: &str) -> Cell {
+    Cell::Text(s.to_string())
+}
+
+#[test]
+fn every_attested_table_has_a_spec_and_its_key_columns() {
+    let expected = [
+        "memories",
+        "entity_aliases",
+        "namespace_meta",
+        "pending_actions",
+        "subscriptions",
+        "subscription_events",
+        "subscription_dlq",
+        "memory_transcripts",
+        "memory_transcript_links",
+        "recall_observations",
+        "actions",
+        "action_edges",
+        "leases",
+        "routine_runs",
+    ];
+    let names: Vec<&str> = TABLES.iter().map(|s| s.table).collect();
+    assert_eq!(names, expected);
+    for s in TABLES {
+        for k in s.key {
+            assert!(s.index_of(k).is_some(), "{}: key {k} not covered", s.table);
+        }
+        if let Some(col) = s.transition {
+            assert!(s.index_of(col).is_some(), "{}: transition {col}", s.table);
+        }
+    }
+}
+
+#[test]
+fn retention_rule_per_table_c8() {
+    // Hand-written: only the three operational tables supersede.
+    let supersede = ["subscription_dlq", "recall_observations", "leases"];
+    for s in TABLES {
+        let want = if supersede.contains(&s.table) {
+            Retention::Supersede
+        } else {
+            Retention::Append
+        };
+        assert_eq!(s.retention, want, "{}", s.table);
+    }
+}
+
+#[test]
+fn golden_memories_digest_sqlite_and_pg_forms_c2() {
+    let s = spec("memories");
+    let sqlite = [
+        t("m1"),
+        t(r#"["b","a"]"#),
+        Cell::Int(5),
+        t("long"),
+        t("hello"),
+    ];
+    let pg = [
+        t("m1"),
+        Cell::Json(serde_json::json!(["a", "b"])),
+        Cell::Int(5),
+        t("long"),
+        t("hello"),
+    ];
+    assert_eq!(hex::encode(row_digest(s, &sqlite)), GOLDEN_MEMORIES);
+    assert_eq!(hex::encode(row_digest(s, &pg)), GOLDEN_MEMORIES);
+}
+
+#[test]
+fn golden_composite_key_nulls_timestamps_bools_c2() {
+    let s = spec("recall_observations");
+    let sqlite = [
+        t("r1"),
+        t("m1"),
+        t("fts"),
+        Cell::Int(1),
+        Cell::Real(0.5),
+        Cell::Int(0),
+        t("2026-11-23T10:00:00+02:00"),
+        Cell::Null,
+        Cell::Null,
+        Cell::Int(1),
+        t("ai:a"),
+        t("ns"),
+    ];
+    let pg = [
+        t("r1"),
+        t("m1"),
+        t("fts"),
+        Cell::Int(1),
+        Cell::Real(0.5),
+        Cell::Bool(false),
+        t("2026-11-23 08:00:00"),
+        Cell::Null,
+        Cell::Null,
+        Cell::Bool(true),
+        t("ai:a"),
+        t("ns"),
+    ];
+    assert_eq!(hex::encode(row_digest(s, &sqlite)), GOLDEN_RECALL_OBS);
+    assert_eq!(hex::encode(row_digest(s, &pg)), GOLDEN_RECALL_OBS);
+}
+
+#[test]
+fn golden_three_column_key_c2() {
+    let s = spec("action_edges");
+    let row = [t("a1"), t("a2"), t("blocks"), Cell::Int(1_700_000_000)];
+    assert_eq!(hex::encode(encode_key(s, &row)), GOLDEN_ACTION_EDGES_KEY);
+    assert_eq!(hex::encode(row_digest(s, &row)), GOLDEN_ACTION_EDGES);
+}
+
+#[test]
+fn null_differs_from_empty_and_tags_order_is_canonical_e4() {
+    let s = spec("memories");
+    let base = [t("m1"), t("[]"), Cell::Int(5), t("long"), t("x")];
+    let null_tags = [t("m1"), Cell::Null, Cell::Int(5), t("long"), t("x")];
+    let empty_text = [t("m1"), t(""), Cell::Int(5), t("long"), t("x")];
+    assert_ne!(row_digest(s, &base), row_digest(s, &null_tags));
+    assert_ne!(row_digest(s, &base), row_digest(s, &empty_text));
+    assert_ne!(row_digest(s, &null_tags), row_digest(s, &empty_text));
+    let ab = [t("m1"), t(r#"["a","b"]"#), Cell::Int(5), t("long"), t("x")];
+    let ba = [
+        t("m1"),
+        t(r#"[ "b", "a" ]"#),
+        Cell::Int(5),
+        t("long"),
+        t("x"),
+    ];
+    assert_eq!(row_digest(s, &ab), row_digest(s, &ba));
+}
+
+#[test]
+fn each_memory_field_changes_the_digest_e1() {
+    let s = spec("memories");
+    let base = [t("m1"), t(r#"["a"]"#), Cell::Int(5), t("long"), t("x")];
+    let mutants: [(&str, usize, Cell); 5] = [
+        ("id", 0, t("m2")),
+        ("tags", 1, t(r#"["a","c"]"#)),
+        ("priority", 2, Cell::Int(6)),
+        ("tier", 3, t("mid")),
+        ("content", 4, t("y")),
+    ];
+    for (name, i, cell) in mutants {
+        let mut row = base.clone();
+        row[i] = cell;
+        assert_ne!(row_digest(s, &row), row_digest(s, &base), "{name}");
+    }
+}
+
+#[test]
+fn mistyped_cell_never_collides_with_well_typed() {
+    let s = spec("memories");
+    let int_prio = [t("m1"), t("[]"), Cell::Int(5), t("long"), t("x")];
+    let text_prio = [t("m1"), t("[]"), t("5"), t("long"), t("x")];
+    assert_ne!(row_digest(s, &int_prio), row_digest(s, &text_prio));
+}
+
+#[test]
+fn json_key_order_and_whitespace_are_canonical() {
+    let s = spec("pending_actions");
+    let mut a: Vec<Cell> = vec![Cell::Null; s.cols.len()];
+    a[0] = t("p1");
+    let mut b = a.clone();
+    a[4] = t(r#"{"b":1,"a":[1,2]}"#);
+    b[4] = Cell::Json(serde_json::json!({"a": [1, 2], "b": 1}));
+    assert_eq!(row_digest(s, &a), row_digest(s, &b));
+}
+
+#[test]
+fn accumulator_add_sub_inverse_and_wrap() {
+    let a = [0xff_u8; 32];
+    let mut one = [0_u8; 32];
+    one[31] = 1;
+    assert_eq!(acc_add(&a, &one), ZERO_DIGEST);
+    assert_eq!(acc_sub(&ZERO_DIGEST, &one), a);
+    let x = acc_term("memories", b"k1", &[7_u8; 32]);
+    let y = acc_term("memories", b"k2", &[9_u8; 32]);
+    let sum = acc_add(&acc_add(&ZERO_DIGEST, &x), &y);
+    assert_eq!(acc_sub(&sum, &x), y);
+    assert_eq!(acc_add(&x, &y), acc_add(&y, &x));
+    assert_ne!(
+        acc_term("memories", b"k1", &[7_u8; 32]),
+        acc_term("leases", b"k1", &[7_u8; 32])
+    );
+}
+
+#[test]
+fn op_spelling_table() {
+    let want = [
+        (Op::Insert, "insert"),
+        (Op::Update, "update"),
+        (Op::Transition, "transition"),
+        (Op::Delete, "delete"),
+        (Op::Cutover, "cutover"),
+        (Op::Baseline, "baseline"),
+        (Op::Store, "store"),
+    ];
+    assert_eq!(want.len(), Op::ALL.len());
+    for (op, s) in want {
+        assert_eq!(op.as_str(), s);
+        assert_eq!(Op::parse(s), Some(op));
+    }
+    assert_eq!(Op::parse("INSERT"), None);
+    assert_eq!(Op::parse(""), None);
+}
+
+#[test]
+fn memory_id_of_key_round_trip() {
+    let s = spec("memories");
+    let key = encode_key(s, &[t("abc-1")]);
+    assert_eq!(memory_id_of_key(&key).as_deref(), Some("abc-1"));
+    assert_eq!(memory_id_of_key(&[]), None);
+    assert_eq!(memory_id_of_key(&[TAG_INT, 0, 0, 0, 1, b'a']), None);
+    assert_eq!(memory_id_of_key(&[TAG_TEXT, 0, 0, 0, 5, b'a']), None);
+}
+
+// ---- verifier fixtures -------------------------------------------------
+
+const STORE: &str = "store-a";
+const AGENT: &str = "ai:attester";
+
+fn keypair() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[42_u8; 32])
+}
+
+struct Fixture {
+    signing: ed25519_dalek::SigningKey,
+    atts: Vec<Attestation>,
+    live: Vec<LiveRow>,
+    next_id: i64,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let mut f = Self {
+            signing: keypair(),
+            atts: Vec::new(),
+            live: Vec::new(),
+            next_id: 1,
+        };
+        let store = f.att(
+            STORE_ROW_TABLE,
+            Vec::new(),
+            0,
+            Op::Store,
+            None,
+            0,
+            ZERO_DIGEST,
+        );
+        f.atts.push(store);
+        for s in TABLES {
+            let c = f.att(s.table, Vec::new(), 0, Op::Cutover, None, 0, ZERO_DIGEST);
+            f.atts.push(c);
+        }
+        f
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn att(
+        &mut self,
+        table: &str,
+        key: Vec<u8>,
+        seq: i64,
+        op: Op,
+        digest: Option<[u8; 32]>,
+        table_seq: i64,
+        acc: [u8; 32],
+    ) -> Attestation {
+        let covered = spec_for(table).map(TableSpec::covered).unwrap_or_default();
+        let prior = self
+            .atts
+            .iter()
+            .filter(|a| a.table == table && a.row_key == key && a.seq > 0)
+            .max_by_key(|a| a.seq)
+            .map_or_else(|| ZERO_DIGEST.to_vec(), |a| a.attestation_digest.clone());
+        let mut a = Attestation {
+            id: self.next_id,
+            table: table.to_string(),
+            row_key: key,
+            seq,
+            op: op.as_str().to_string(),
+            row_digest: digest.map(|d| d.to_vec()),
+            prior_digest: if seq > 0 { prior } else { ZERO_DIGEST.to_vec() },
+            agent_id: AGENT.to_string(),
+            key_id: key_id_of(&self.signing.verifying_key()),
+            attested_at: "2026-11-23T00:00:00.000000Z".to_string(),
+            format_version: FORMAT_VERSION,
+            covered_columns: covered,
+            store_id: STORE.to_string(),
+            table_seq,
+            table_acc: acc.to_vec(),
+            signature: None,
+            attestation_digest: Vec::new(),
+        };
+        self.next_id += 1;
+        sign(&mut a, &self.signing);
+        a
+    }
+
+    /// Write memory row `id` (insert or update) with `content`.
+    fn put_memory(&mut self, id: &str, content: &str) {
+        let s = spec("memories");
+        let cells = [t(id), t("[]"), Cell::Int(5), t("long"), t(content)];
+        let key = encode_key(s, &cells);
+        let digest = row_digest(s, &cells);
+        let old = self
+            .live
+            .iter()
+            .position(|r| r.table == "memories" && r.key == key);
+        let mut acc = self.head_acc("memories");
+        if let Some(i) = old {
+            acc = acc_sub(&acc, &acc_term("memories", &key, &self.live[i].digest));
+            self.live.remove(i);
+        }
+        acc = acc_add(&acc, &acc_term("memories", &key, &digest));
+        let seq = self.next_seq("memories", &key);
+        let table_seq = self.head_seq("memories") + 1;
+        let op = if old.is_some() {
+            Op::Update
+        } else {
+            Op::Insert
+        };
+        let a = self.att(
+            "memories",
+            key.clone(),
+            seq,
+            op,
+            Some(digest),
+            table_seq,
+            acc,
+        );
+        self.atts.push(a);
+        self.live.push(LiveRow {
+            table: "memories".to_string(),
+            key,
+            digest,
+        });
+    }
+
+    fn head_acc(&self, table: &str) -> [u8; 32] {
+        self.atts
+            .iter()
+            .filter(|a| a.table == table)
+            .max_by_key(|a| a.table_seq)
+            .and_then(|a| <[u8; 32]>::try_from(a.table_acc.as_slice()).ok())
+            .unwrap_or(ZERO_DIGEST)
+    }
+
+    fn head_seq(&self, table: &str) -> i64 {
+        self.atts
+            .iter()
+            .filter(|a| a.table == table)
+            .map(|a| a.table_seq)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn next_seq(&self, table: &str, key: &[u8]) -> i64 {
+        self.atts
+            .iter()
+            .filter(|a| a.table == table && a.row_key == key)
+            .map(|a| a.seq)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    fn report(&self) -> Report {
+        let public = self.signing.verifying_key();
+        let pubkey = move |agent: &str| (agent == AGENT).then_some(public);
+        let high = self.atts.iter().map(|a| a.id).max();
+        verify(&VerifyInput {
+            live: &self.live,
+            attestations: &self.atts,
+            pubkey: &pubkey,
+            id_high_water: high,
+            memory_id_of_key: &memory_id_of_key,
+        })
+    }
+}
+
+fn assert_defect(report: &Report, needle: &str) {
+    assert!(
+        report.defects.iter().any(|d| d.contains(needle)),
+        "no defect containing {needle:?} in {:?}",
+        report.defects
+    );
+}
+
+#[test]
+fn verify_clean_store_passes_c5() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m2", "two");
+    f.put_memory("m1", "one-b");
+    let r = f.report();
+    assert!(r.ok(), "{:?}", r.defects);
+    assert_eq!(r.tables["memories"].verified, 2);
+    assert_eq!(r.tables["memories"].attestations, 4);
+    assert!(r.unverified_memories.is_empty());
+}
+
+#[test]
+fn verify_append_keeps_every_attestation_e2() {
+    let mut f = Fixture::new();
+    for n in 0..5 {
+        f.put_memory("m1", &format!("v{n}"));
+    }
+    let r = f.report();
+    assert!(r.ok(), "{:?}", r.defects);
+    // 1 cutover + 5 changes of one row: append retention keeps all.
+    assert_eq!(r.tables["memories"].attestations, 6);
+}
+
+#[test]
+fn verify_detects_deleted_attestation_c5() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m2", "two");
+    // Raw delete of m1's attestation (id is not the newest, so the
+    // high-water check alone cannot be what fails).
+    let idx = f
+        .atts
+        .iter()
+        .position(|a| a.table == "memories" && a.op == "insert")
+        .unwrap_or(usize::MAX);
+    f.atts.remove(idx);
+    let r = f.report();
+    assert!(!r.ok());
+    assert_defect(&r, "memories: live row has no attestation");
+    assert_defect(&r, "table sequence breaks");
+    assert!(r.unverified_memories.contains("m1"));
+}
+
+#[test]
+fn verify_detects_mutated_base_row_c5_e1() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let s = spec("memories");
+    f.live[0].digest = row_digest(
+        s,
+        &[t("m1"), t(r#"["evil"]"#), Cell::Int(5), t("long"), t("one")],
+    );
+    let r = f.report();
+    assert_defect(&r, "memories: live row differs from its latest attestation");
+    assert_defect(&r, "memories: live rows do not match the signed table head");
+    assert!(r.unverified_memories.contains("m1"));
+}
+
+#[test]
+fn verify_detects_row_and_attestations_deleted_together_c5() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m2", "two");
+    f.live
+        .retain(|r| memory_id_of_key(&r.key).as_deref() != Some("m1"));
+    let k = encode_key(spec("memories"), &[t("m1")]);
+    f.atts
+        .retain(|a| !(a.table == "memories" && a.row_key == k));
+    let r = f.report();
+    assert!(!r.ok());
+    assert_defect(&r, "table sequence breaks");
+}
+
+#[test]
+fn verify_detects_tail_truncation_e2() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m1", "two");
+    let public = f.signing.verifying_key();
+    let high = f.atts.iter().map(|a| a.id).max();
+    f.atts.pop();
+    // Roll the live row back too: only the high-water mark can tell.
+    let s = spec("memories");
+    f.live[0].digest = row_digest(s, &[t("m1"), t("[]"), Cell::Int(5), t("long"), t("one")]);
+    let pubkey = move |agent: &str| (agent == AGENT).then_some(public);
+    let r = verify(&VerifyInput {
+        live: &f.live,
+        attestations: &f.atts,
+        pubkey: &pubkey,
+        id_high_water: high,
+        memory_id_of_key: &memory_id_of_key,
+    });
+    assert_defect(&r, "row_attestations tail truncated");
+}
+
+#[test]
+fn verify_detects_replay_of_older_attestation_c1_e2() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m1", "two");
+    // Restore the old row content: the latest attestation names "two".
+    let s = spec("memories");
+    f.live[0].digest = row_digest(s, &[t("m1"), t("[]"), Cell::Int(5), t("long"), t("one")]);
+    let r = f.report();
+    assert_defect(&r, "memories: live row differs from its latest attestation");
+}
+
+#[test]
+fn verify_detects_transplant_to_other_row_table_store_c1() {
+    let cases: [(&str, fn(&mut Attestation)); 3] = [
+        ("row", |a| {
+            a.row_key = encode_key(spec("memories"), &[t("m9")])
+        }),
+        ("table", |a| a.table = "leases".to_string()),
+        ("store", |a| a.store_id = "store-b".to_string()),
+    ];
+    for (name, mutate) in cases {
+        let mut f = Fixture::new();
+        f.put_memory("m1", "one");
+        let i = f.atts.len() - 1;
+        mutate(&mut f.atts[i]);
+        let r = f.report();
+        assert_defect(&r, "signature does not verify");
+        assert!(!r.ok(), "{name}");
+    }
+}
+
+#[test]
+fn verify_detects_unsigned_and_unknown_agent() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let i = f.atts.len() - 1;
+    f.atts[i].signature = None;
+    assert_defect(&f.report(), "is unsigned");
+    let mut g = Fixture::new();
+    g.put_memory("m1", "one");
+    let j = g.atts.len() - 1;
+    g.atts[j].agent_id = "ai:other".to_string();
+    assert_defect(&g.report(), "with no bound key");
+}
+
+#[test]
+fn verify_detects_missing_store_and_cutover_c6() {
+    let mut f = Fixture::new();
+    f.atts.retain(|a| a.table != STORE_ROW_TABLE);
+    assert_defect(&f.report(), "no store-identity row");
+    let mut g = Fixture::new();
+    g.atts
+        .retain(|a| !(a.table == "leases" && a.op == "cutover"));
+    assert_defect(&g.report(), "leases: no cutover watermark");
+}
+
+#[test]
+fn verify_legacy_side_rows_report_as_legacy_c6() {
+    let mut f = Fixture::new();
+    // A pre-existing leases row: covered by the cutover accumulator.
+    let s = spec("leases");
+    let cells = [t("act1"), t("h"), Cell::Int(1), Cell::Int(2), Cell::Int(1)];
+    let key = encode_key(s, &cells);
+    let digest = row_digest(s, &cells);
+    let acc = acc_add(&ZERO_DIGEST, &acc_term("leases", &key, &digest));
+    let idx = f
+        .atts
+        .iter()
+        .position(|a| a.table == "leases")
+        .unwrap_or(usize::MAX);
+    let id = f.atts[idx].id;
+    let mut c = f.att("leases", Vec::new(), 0, Op::Cutover, None, 0, acc);
+    c.id = id;
+    sign(&mut c, &keypair());
+    f.atts[idx] = c;
+    f.live.push(LiveRow {
+        table: "leases".to_string(),
+        key,
+        digest,
+    });
+    let r = f.report();
+    assert!(r.ok(), "{:?}", r.defects);
+    assert_eq!(r.tables["leases"].legacy, 1);
+}
+
+#[test]
+fn preimage_binds_every_field_c1() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let base = f.atts[f.atts.len() - 1].clone();
+    let mutants: [(&str, fn(&mut Attestation)); 14] = [
+        ("format_version", |a| a.format_version += 1),
+        ("covered_columns", |a| a.covered_columns.push('x')),
+        ("store_id", |a| a.store_id.push('x')),
+        ("table", |a| a.table.push('x')),
+        ("row_key", |a| a.row_key.push(0)),
+        ("op", |a| a.op = "update".to_string()),
+        ("row_digest", |a| a.row_digest = None),
+        ("agent_id", |a| a.agent_id.push('x')),
+        ("key_id", |a| a.key_id.push('x')),
+        ("attested_at", |a| a.attested_at.push('x')),
+        ("seq", |a| a.seq += 1),
+        ("prior_digest", |a| a.prior_digest[0] ^= 1),
+        ("table_seq", |a| a.table_seq += 1),
+        ("table_acc", |a| a.table_acc[0] ^= 1),
+    ];
+    for (name, mutate) in mutants {
+        let mut a = base.clone();
+        mutate(&mut a);
+        assert_ne!(preimage(&a), preimage(&base), "{name} not bound");
+    }
+}
+
+/// NOTICE 4b: the verifier uses `verify_strict`. A small-order bound key
+/// (the identity point) with `R` = identity and `S` = 0 passes the plain
+/// cofactorless `verify` for every message; the strict check refuses it.
+#[test]
+fn small_order_key_signature_is_refused_by_strict_verify_10040() {
+    // The identity point, compressed: y = 1, sign bit 0.
+    let mut identity = [0_u8; 32];
+    identity[0] = 1;
+    let weak = ed25519_dalek::VerifyingKey::from_bytes(&identity).expect("identity decompresses");
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let honest = f.atts[f.atts.len() - 1].clone();
+    let mut a = honest.clone();
+    a.key_id = key_id_of(&weak);
+    let mut forged = [0_u8; 64];
+    forged[0] = 1; // R = identity, S = 0
+    a.signature = Some(forged.to_vec());
+    a.attestation_digest = attestation_digest(&a);
+    let expected = format!("attestation {} signature does not verify", a.id);
+    assert_eq!(
+        sig_defect(&a, &|_: &str| Some(weak)).as_deref(),
+        Some(expected.as_str()),
+        "a small-order key signature must be refused"
+    );
+    // Control: the honest signature by the fixture key still verifies.
+    let good = f.signing.verifying_key();
+    assert_eq!(sig_defect(&honest, &|_: &str| Some(good)), None);
+}

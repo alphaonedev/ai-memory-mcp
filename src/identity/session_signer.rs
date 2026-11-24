@@ -369,6 +369,18 @@ pub fn install_from_env(
         agent_id,
         "mcp session signer (#9926): installed; covered stdio writes are signed server-side"
     );
+    // #10040 — the boot connection gets the row-attestation funnel (every
+    // later `db::open` arms it too); boot refuses when it cannot arm. It is
+    // installed before the seal triggers so the seal check fires first
+    // (SQLite fires the most recently created trigger first).
+    match crate::storage::row_attest::sqlite::install(conn)
+        .map_err(|e| crate::errors::refusal(format!("{REFUSE_ROW_ATTEST_NOT_INSTALLED}: {e:#}")))?
+    {
+        crate::storage::row_attest::sqlite::ArmState::Armed => {}
+        crate::storage::row_attest::sqlite::ArmState::NoSigner => {
+            return Err(crate::errors::refusal(REFUSE_ROW_ATTEST_NOT_INSTALLED));
+        }
+    }
     // #10012 — the boot connection opened before the signer existed, so it
     // gets the write-seal funnel here; every later `db::open` installs it.
     match install_write_seal_funnel(conn)? {
@@ -376,6 +388,10 @@ pub fn install_from_env(
         FunnelState::NoSigner => Err(crate::errors::refusal(REFUSE_FUNNEL_NOT_INSTALLED)),
     }
 }
+
+/// The row-attestation funnel could not be armed on the boot connection
+/// right after the signer was installed (#10040); boot refuses.
+pub const REFUSE_ROW_ATTEST_NOT_INSTALLED: &str = "row attestation (#10040): the funnel did not install on the boot connection; refusing to start";
 
 /// The write-seal funnel could not be installed on the boot connection right
 /// after the signer was (#10012); boot refuses rather than run unsealed.
@@ -494,6 +510,10 @@ pub fn funnel_refusal(text: &str) -> Option<String> {
         .into_iter()
         .any(|refusal| refusal.parse(text).is_some())
     {
+        return Some(text.to_string());
+    }
+    // #10040 — a row-attestation refusal keeps its exact reason (C-4).
+    if text.starts_with(crate::storage::row_attest::sqlite::ROW_ATTEST_REFUSAL_PREFIX) {
         return Some(text.to_string());
     }
     text.starts_with(SEAL_REFUSAL_PREFIX)
@@ -625,6 +645,14 @@ pub fn install_write_seal_funnel(conn: &rusqlite::Connection) -> Result<FunnelSt
             .map(|_recorded| 0_i64)
             .map_err(|reason| rusqlite::Error::UserFunctionError(reason.into()))
     })?;
+    let peek_ledger = std::sync::Arc::clone(&ledger);
+    conn.create_scalar_function(PEEK_FN, 1, FunctionFlags::SQLITE_UTF8, move |ctx| {
+        let id: String = ctx.get(0)?;
+        // SAFETY: as above (rusqlite `Context::get_connection` contract).
+        let conn = unsafe { ctx.get_connection() }?;
+        pending_seal_refusal(&conn, &peek_ledger, &id)
+            .map_err(|reason| rusqlite::Error::UserFunctionError(reason.into()))
+    })?;
     conn.create_scalar_function(SEAL_FN, 2, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let id: String = ctx.get(0)?;
         let inserted: i64 = ctx.get(1)?;
@@ -749,6 +777,43 @@ fn record_prior_seal(
         state.prior.entry(id.to_string()).or_default().push(prior);
     })?;
     Ok(Some(prior))
+}
+
+/// The SQL function the #10040 row-attestation funnel calls when a memory
+/// row it is about to attest changed outside the funnel: it returns the
+/// refusal the pending AFTER UPDATE seal check of row `id` will return, or
+/// NULL. SQLite does not fix the order TEMP triggers of one table fire in,
+/// so this makes the refusal of a tampered row the same whichever fires
+/// first.
+pub const PEEK_FN: &str = "ai_memory_session_seal_peek_10012";
+
+/// [`PEEK_FN`] body: the refusal [`seal_stored_row`] would return for the
+/// update of row `id` now in flight (its prior state is peeked, not popped),
+/// or `None` when it would not refuse or no update of `id` is in flight.
+fn pending_seal_refusal(
+    conn: &rusqlite::Connection,
+    ledger: &SharedLedger,
+    id: &str,
+) -> std::result::Result<Option<String>, String> {
+    use crate::identity::attest;
+    let Some(signer) = session_signer() else {
+        return Ok(None);
+    };
+    let Some(prior) = with_ledger(ledger, |state| {
+        state.prior.get(id).and_then(|stack| stack.last().copied())
+    })?
+    else {
+        return Ok(None);
+    };
+    let row = read_row(conn, id)?;
+    let strict = attest::require_agent_attestation_for(attest::WriteSurface::Mcp);
+    Ok(match decide_update(conn, signer, &row, prior)? {
+        SealDecision::Refuse(refusal) => Some(refusal.text(id)),
+        SealDecision::NotSessionBytes(refusal) if strict => Some(refusal.text(id)),
+        SealDecision::AlreadySealed | SealDecision::Seal(_) | SealDecision::NotSessionBytes(_) => {
+            None
+        }
+    })
 }
 
 /// The #10012 funnel body: seal row `id` when the session authored its

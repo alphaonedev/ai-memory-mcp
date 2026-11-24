@@ -134,7 +134,8 @@ async fn pg_schema_tip_carries_the_partial_title_slot_index_3690() {
         .await
         .expect("schema_version");
     // #8341: tip pin moved 101 -> 102 with the FTS projection guard.
-    assert_eq!(version, 102);
+    // #10040: tip pin moved 102 -> 103 with the row_attestations side table.
+    assert_eq!(version, 103);
     let indexdef: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'memories_title_ns_uidx'",
     )
@@ -839,7 +840,10 @@ const TSV_SCRATCH_PREFIX: &str = "ai_memory_tsv8341_";
 /// The v101 shape: v102 is stamp-only on postgres, so dropping its stamp is
 /// the whole of the v101-equivalent rewind.
 const V101_EQUIVALENT: i32 = 101;
-const V102_TIP: i32 = 102;
+/// The ladder tip. #10040: moved 102 -> 103 with the `row_attestations`
+/// side table; v103 DDL is `IF NOT EXISTS`, so the rewind drops every stamp
+/// above v101 and the re-run replays v102 and v103.
+const V102_TIP: i32 = 103;
 const TSV_AMENDED_TITLE: &str = "plain ascii";
 /// `(title, content)`; titles are unique so they key the snapshot.
 const TSV_CORPUS: [(&str, &str); 5] = [
@@ -957,8 +961,8 @@ async fn pg_tsv_rows_are_identical_at_v101_equivalent_and_v102_8341() {
     assert_eq!(max_version(&pool).await, V102_TIP);
     let catalog_v102 = tsv_catalog(&pool).await;
 
-    sqlx::query("DELETE FROM schema_version WHERE version = $1")
-        .bind(V102_TIP)
+    sqlx::query("DELETE FROM schema_version WHERE version > $1")
+        .bind(V101_EQUIVALENT)
         .execute(&pool)
         .await
         .expect("rewind to v101");

@@ -1758,6 +1758,13 @@ const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
 const MIGRATION_V101_A2A_TASKS: &str =
     include_str!("../../migrations/postgres/0058_v101_a2a_tasks.sql");
 
+/// v103 (#10040, 3-agent vote (71472661) V1-10040): the additive
+/// `row_attestations` side table. The sqlite twin is
+/// `crate::storage::row_attest::sqlite::MIGRATION_V103_SQLITE`
+/// (`migrations/sqlite/0087_v103_row_attestations.sql`).
+const MIGRATION_V103_ROW_ATTESTATIONS: &str =
+    include_str!("../../migrations/postgres/0060_v103_row_attestations.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2150,7 +2157,9 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
 // v102: #8341 SQLite FTS projection guard; postgres version-stamp only
 //       (doc twin migrations/postgres/0059_v102_fts_projection_guard_noop.sql).
-const CURRENT_SCHEMA_VERSION: i32 = 102;
+// v103: #10040 additive `row_attestations` side table, column parity with
+//       the sqlite 0087 twin (migrations/postgres/0060_v103_row_attestations.sql).
+const CURRENT_SCHEMA_VERSION: i32 = 103;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4326,8 +4335,11 @@ impl PostgresStore {
         if current_version < 101 {
             self.migrate_v101().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 102 {
             self.migrate_v102().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v103().await?;
         }
 
         Ok(())
@@ -7548,6 +7560,33 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v102 applied (#8341: FTS projection guard is sqlite-only; no-op postgres DDL)"
+        );
+        Ok(())
+    }
+
+    /// v103 (#10040) - the additive `row_attestations` side table (schema
+    /// parity with sqlite v103; idempotent DDL, NoLoss: no existing table or
+    /// row is touched). The store-identity row and the signed cutover
+    /// watermarks are written by the postgres row-attestation funnel when it
+    /// arms (#10040 C-9 lane); until then the completeness verifier reports
+    /// the missing identity as a defect, never as verified.
+    async fn migrate_v103(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v103 row-attestations migration tx", e))?;
+        sqlx::raw_sql(MIGRATION_V103_ROW_ATTESTATIONS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v103 row-attestations migration", e))?;
+        record_schema_version(&mut tx, 103).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v103 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v103 applied (#10040: row_attestations side table)"
         );
         Ok(())
     }

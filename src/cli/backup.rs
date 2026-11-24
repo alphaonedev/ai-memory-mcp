@@ -2473,6 +2473,12 @@ fn run_restore_with(
             crate::storage::schema_guard::BACKEND_SQLITE,
             &snapshot_path.display().to_string(),
         )?;
+        // #10040 (C-7, E-6) — the catalog ratchet: a v103+ snapshot without
+        // its row attestations, or whose signed attestations do not verify,
+        // is refused before anything is published.
+        if observed >= crate::storage::row_attest::ROW_ATTEST_SCHEMA_VERSION {
+            crate::storage::row_attest::sqlite::check_snapshot(&probe)?;
+        }
     }
 
     // #3508/#3510 — the whole-database integrity verdict (PRAGMA

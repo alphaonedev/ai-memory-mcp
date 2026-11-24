@@ -1252,6 +1252,19 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// #10012 — install the stdio session-signer write-seal funnel on `conn`
 /// when a signer is installed; a no-op otherwise.
 fn arm_session_write_seal(conn: &Connection) -> Result<()> {
+    // #10040 — the same connections carry the row-attestation funnel: every
+    // insert, covered update, transition and delete of an attested table
+    // writes its signed `row_attestations` row in the same statement, or
+    // the statement aborts. Fails closed: an arm failure refuses the open.
+    // Installed BEFORE the #10012 seal triggers: SQLite fires the most
+    // recently created trigger first, so the seal check (the more specific
+    // refusal for a tampered memory row) runs before the attestation.
+    match crate::storage::row_attest::sqlite::install(conn)
+        .context("row attestation funnel (#10040)")?
+    {
+        crate::storage::row_attest::sqlite::ArmState::Armed
+        | crate::storage::row_attest::sqlite::ArmState::NoSigner => {}
+    }
     match crate::identity::session_signer::install_write_seal_funnel(conn)
         .context("mcp session signer write-seal funnel (#10012)")?
     {
