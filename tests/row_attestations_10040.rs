@@ -963,6 +963,62 @@ fn deleting_a_row_with_its_attestations_fails_the_verifier_10040() {
     assert_unverified(&report, &id, "attestation deleted");
 }
 
+/// `signature_verified` of `MemoryStore::verify` on a copy of the store.
+#[cfg(feature = "sal")]
+fn store_verdict(db: &Path, id: &str) -> bool {
+    use ai_memory::store::sqlite::SqliteStore;
+    use ai_memory::store::{CallerContext, MemoryStore as _};
+    let store = SqliteStore::open(db.to_path_buf()).expect("open store copy");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(store.verify(&CallerContext::for_agent(AGENT), id))
+        .expect("verify")
+        .signature_verified
+}
+
+/// NOTICE 4c / E-3: `MemoryStore::verify` on `SQLite` returns the one
+/// verifier's verdict. A sealed row with a verifying attestation reports
+/// `signature_verified: true`; the same sealed row with its attestation
+/// deleted, or with a covered column changed behind the funnel, reports
+/// false.
+#[cfg(feature = "sal")]
+#[test]
+fn memory_verify_returns_the_one_verifiers_verdict_10040() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("attest verify 10040");
+    mcp.store("attest verify keep 10040");
+    drop(mcp);
+    assert_ok(&sb.report(), "before verify");
+    let chain = memory_chain(&sb.conn(), &id);
+
+    let copy = vacuum_copy(&sb, "verify-valid.db");
+    assert!(
+        store_verdict(&copy, &id),
+        "a valid seal with a valid attestation must report signature_verified"
+    );
+
+    let copy = vacuum_copy(&sb, "verify-att-deleted.db");
+    let conn = rusqlite::Connection::open(&copy).expect("open copy");
+    conn.execute("DELETE FROM row_attestations WHERE id = ?1", [chain[0].id])
+        .expect("delete attestation");
+    drop(conn);
+    assert!(
+        !store_verdict(&copy, &id),
+        "a valid seal with a deleted attestation must not report signature_verified"
+    );
+
+    let copy = vacuum_copy(&sb, "verify-raw-priority.db");
+    let conn = rusqlite::Connection::open(&copy).expect("open copy");
+    conn.execute("UPDATE memories SET priority = priority + 1 WHERE id = ?1", [&id])
+        .expect("raw priority change");
+    drop(conn);
+    assert!(
+        !store_verdict(&copy, &id),
+        "a raw change of a covered column must not report signature_verified"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // C-3: additive columns
 // ---------------------------------------------------------------------------
