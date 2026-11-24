@@ -896,6 +896,42 @@ fn unusable_anchor_dirs_are_each_a_named_unanchored_reason_10086() {
     }
 }
 
+/// A-5: a real deployment's key directory also holds the governance
+/// operator key (`rules keygen`, base64 text), X25519 escrow keys and
+/// private keys. They are not row signers: the directory loads anchored
+/// with exactly the agent's key, and a corrupt agent `.pub` stays a
+/// malformed anchor (fail closed).
+#[test]
+fn populated_key_dir_with_non_signer_files_loads_anchored_10086() {
+    let d = anchor_dir();
+    let agent = write_key(d.path(), "ai:a.pub", 1);
+    std::fs::write(
+        d.path()
+            .join(crate::governance::rules_store::OPERATOR_PUBKEY_KEYGEN_FILE),
+        "bm90IGEgcmF3IGVkMjU1MTkga2V5IGF0IGFsbA==\n",
+    )
+    .expect("operator key");
+    std::fs::write(d.path().join("recovery.x25519.pub"), [7u8; 32]).expect("x25519");
+    std::fs::write(d.path().join("daemon.x25519.pub"), b"short").expect("x25519 short");
+    std::fs::write(d.path().join("ai:a.priv"), [9u8; 32]).expect("priv");
+    let anchor::AnchorLoad::Anchored(a) = anchor::TrustAnchor::load_dir(d.path()) else {
+        panic!("a populated key dir must load anchored");
+    };
+    assert_eq!(
+        a.fingerprints(),
+        vec![("ai:a".to_string(), key_id_of(&agent), false)],
+        "only the agent key is anchored"
+    );
+    let d = anchor_dir();
+    write_key(d.path(), "ai:a.pub", 1);
+    std::fs::write(d.path().join("ai:b.pub"), "not raw\n").expect("corrupt");
+    assert_eq!(
+        unanchored_kind(&anchor::TrustAnchor::load_dir(d.path())),
+        "malformed",
+        "a corrupt agent key is never skipped"
+    );
+}
+
 /// A-6, A-9: archives become retired keys with validity windows, the
 /// output names the source, the layout version and every fingerprint, and
 /// a nested (slashed) agent id is followed.

@@ -36,6 +36,10 @@ pub const REFUSE_NO_CUTOVER: &str = "the table has no cutover watermark";
 pub const REFUSE_KEY_MISMATCH: &str = "the session key is not the agent's bound key";
 /// Refusal: no session signer is installed.
 pub const REFUSE_NO_SIGNER: &str = "no session signer is installed";
+/// Refusal (A-8): a cutover watermark lost the signature it was given; it
+/// is never signed again at arm time.
+pub const REFUSE_STRIPPED_CUTOVER: &str =
+    "a signed cutover watermark lost its signature and is not signed again";
 /// Refusal: the row changed outside the funnel since its last attestation.
 pub const REFUSE_ROW_DRIFT: &str =
     "the row changed outside the funnel since its latest attestation";

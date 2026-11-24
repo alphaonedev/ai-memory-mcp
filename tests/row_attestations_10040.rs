@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 
 use ai_memory::storage::row_attest::anchor::TrustAnchor;
 use ai_memory::storage::row_attest::sqlite::{
-    REFUSE_KEY_MISMATCH, REFUSE_ROW_DRIFT, ROW_ATTEST_REFUSAL_PREFIX, SNAPSHOT_REFUSAL_PREFIX,
-    read_attestations, read_rows, verify_sqlite_with,
+    REFUSE_KEY_MISMATCH, REFUSE_ROW_DRIFT, REFUSE_STRIPPED_CUTOVER, ROW_ATTEST_REFUSAL_PREFIX,
+    SNAPSHOT_REFUSAL_PREFIX, read_attestations, read_rows, verify_sqlite_with,
 };
 use ai_memory::storage::row_attest::{
     Attestation, Report, TABLES, acc_add, acc_sub, acc_term, encode_key, key_id_of,
@@ -1604,4 +1604,61 @@ fn rebound_db_key_with_forged_chain_is_a_defect_10086() {
         report.defects
     );
     assert!(!report.ok(), "a forged store is never clean");
+}
+
+/// A-8 (3-agent vote (71472661)): when anchored, a cutover watermark whose
+/// signature was stripped by a direct writer is a defect, and the next arm
+/// refuses to sign it again (re-signing would bless the tampered state).
+#[test]
+fn stripped_cutover_signature_is_never_re_signed_at_arm_10086() {
+    let (sb, key, mut mcp) = armed();
+    mcp.store("strip cutover 10086");
+    drop(mcp);
+    assert_ok(&sb.report(), "control");
+    let conn = sb.seed_conn();
+    let cut: i64 = conn
+        .query_row(
+            "SELECT id FROM row_attestations WHERE op = 'cutover' AND table_name = 'memories'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("memories cutover");
+    conn.execute(
+        "UPDATE row_attestations SET signature = NULL WHERE id = ?1",
+        [cut],
+    )
+    .expect("strip the cutover signature");
+    drop(conn);
+    let needle = format!("memories: attestation {cut} (memories) is unsigned");
+    assert_defect(&sb.report(), &needle, "stripped");
+
+    let mut cmd = sb.base_command(AGENT, "0");
+    cmd.args([
+        "--db",
+        sb.db().to_str().expect("utf-8 db path"),
+        "mcp",
+        "--profile",
+        "full",
+        "--tier",
+        "keyword",
+    ])
+    .env(ENV_KEY_FILE, &key)
+    .stdin(Stdio::null());
+    let out = cmd.output().expect("run mcp");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the arm must refuse: {err}");
+    assert!(
+        err.contains(REFUSE_STRIPPED_CUTOVER),
+        "exact arm refusal, got: {err}"
+    );
+    let sig: Option<Vec<u8>> = sb
+        .conn()
+        .query_row(
+            "SELECT signature FROM row_attestations WHERE id = ?1",
+            [cut],
+            |r| r.get(0),
+        )
+        .expect("cutover row");
+    assert_eq!(sig, None, "the stripped cutover is never signed again");
+    assert_defect(&sb.report(), &needle, "after the refused arm");
 }
