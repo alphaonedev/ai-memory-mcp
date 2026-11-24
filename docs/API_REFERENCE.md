@@ -1569,9 +1569,11 @@ field for a row's at-rest envelope (`encrypted_envelope`), so a row that is
 sealed at rest is never exported as plaintext and never silently skipped:
 the export answers `409 {"code":"SEALED_EXPORT_REFUSED","error":…}` on
 both backends, naming the table, the count and the least sealed id (never
-content). A paged walk refuses on its FIRST page when the scope holds any
-sealed row, so a client never keeps pages of a walk that a later page
-refuses. Move an encrypted store with `backup` / `restore`. The CLI
+content). A paged walk refuses on its first page when the scope holds a
+sealed row at that time. A row sealed later refuses on the page that reads
+it, after earlier pages were delivered, so a client discards a walk that
+ends in `SEALED_EXPORT_REFUSED`. Move an encrypted store with `backup` /
+`restore`. The CLI
 `export` and `export --full` refuse the same way and write nothing.
 
 **Namespace scope (`?namespace=<ns>`, #3427).** Restricts the export — the

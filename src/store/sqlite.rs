@@ -241,6 +241,17 @@ fn by_id_refusal(e: anyhow::Error, action: &str) -> StoreError {
     }
 }
 
+/// #10062 — keep the typed sealed-row export refusal typed across this
+/// adapter: [`StoreError::SealedExportRefused`] (code
+/// `SEALED_EXPORT_REFUSED`, HTTP 409), exactly what the postgres adapter
+/// returns (backend parity). Anything else stays a backend detail.
+fn export_refusal(e: anyhow::Error) -> StoreError {
+    match e.downcast::<crate::export_sealed::SealedExportRefused>() {
+        Ok(refused) => StoreError::SealedExportRefused(refused),
+        Err(other) => box_err(other),
+    }
+}
+
 /// Map the typed coordination-guard refusal onto the SAL error: quota and
 /// validation keep their structural variants (the postgres twin maps
 /// `prepare_action` to `IntegrityFailed` the same way); a driver fault
@@ -3418,7 +3429,7 @@ impl MemoryStore for SqliteStore {
         // metadata.scope. Admin-only by contract; documented at the
         // trait level.
         let conn = self.state.lock().await;
-        db::export_all(&conn).map_err(box_err)
+        db::export_all(&conn).map_err(export_refusal)
     }
 
     async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
@@ -3434,16 +3445,8 @@ impl MemoryStore for SqliteStore {
         namespace: Option<&str>,
     ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
         let conn = self.state.lock().await;
-        // #10060 — keep the typed sealed-row refusal instead of flattening it
-        // into `Backend` ("underlying backend error: ..."), so the SQLite page
-        // reports `SEALED_EXPORT_REFUSED` exactly as the Postgres page does
-        // (`postgres_export_page.rs` maps it to the same variant).
-        db::export_page::memories_page(&conn, cursor, limit, as_of, namespace).map_err(|e| {
-            match e.downcast::<crate::export_sealed::SealedExportRefused>() {
-                Ok(refused) => StoreError::SealedExportRefused(refused),
-                Err(other) => box_err(other),
-            }
-        })
+        db::export_page::memories_page(&conn, cursor, limit, as_of, namespace)
+            .map_err(export_refusal)
     }
 
     async fn export_links_page(

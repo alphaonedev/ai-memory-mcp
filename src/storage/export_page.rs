@@ -117,8 +117,9 @@ pub fn memories_page(
         binds.push((":ns", n));
     }
     // #10028 — the first page of a walk refuses when ANY row of the scope is
-    // sealed at rest, so a client never stores pages 1..k of a walk that a
-    // later page would refuse.
+    // sealed at rest at that time; a row sealed later refuses on the page
+    // that reads it (the per-row guard below), so a client discards a walk
+    // that ends in SEALED_EXPORT_REFUSED.
     if cursor.is_none() {
         sealed_scope_precheck(conn, as_of, namespace)?;
     }
