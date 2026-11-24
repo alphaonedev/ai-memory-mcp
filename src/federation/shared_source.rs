@@ -646,6 +646,213 @@ mod tests {
         }
     }
 
+    /// The source peer of the #10065 tables: userinfo and a path, both with
+    /// case that the daemon sends as written.
+    const CASED: &str = "https://user:pw@peer-a.example.org:9077/fed";
+
+    /// The binding (sorted patterns or `None` for deny, sorted peer ids) of
+    /// the one peer of a source.
+    fn only_binding(source: &BoundFederationSource) -> (Option<Vec<&str>>, Vec<&str>) {
+        assert_eq!(source.key.peers.len(), 1, "one peer");
+        let binding = source.key.peers.values().next().expect("one peer");
+        (
+            binding
+                .patterns
+                .as_ref()
+                .map(|set| set.iter().map(String::as_str).collect()),
+            binding.peer_ids.iter().map(String::as_str).collect(),
+        )
+    }
+
+    /// #10067: the binding URL is the URL the daemon dials. Scheme and host
+    /// fold case (DNS and the URL parser fold them); userinfo and path keep
+    /// it. Expected forms are written out, not computed.
+    #[test]
+    fn binding_url_folds_scheme_and_host_only_10065() {
+        let cases: [(&str, &str); 6] = [
+            (CASED, "https://user:pw@peer-a.example.org:9077/fed/api/v1/sync/push"),
+            (
+                "HTTPS://user:pw@PEER-A.Example.ORG:9077/fed",
+                "https://user:pw@peer-a.example.org:9077/fed/api/v1/sync/push",
+            ),
+            (
+                "https://User:pw@peer-a.example.org:9077/fed",
+                "https://User:pw@peer-a.example.org:9077/fed/api/v1/sync/push",
+            ),
+            (
+                "https://user:PW@peer-a.example.org:9077/fed",
+                "https://user:PW@peer-a.example.org:9077/fed/api/v1/sync/push",
+            ),
+            (
+                "https://user:pw@peer-a.example.org:9077/FED/",
+                "https://user:pw@peer-a.example.org:9077/FED/api/v1/sync/push",
+            ),
+            (
+                "https://peer-b.example.org:443//",
+                "https://peer-b.example.org/api/v1/sync/push",
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(BindingUrl::new(raw).unwrap().0, want, "{raw}");
+        }
+        // The Debug form never holds the credential.
+        let shown = format!("{:?}", BindingUrl::new(CASED).unwrap());
+        assert!(!shown.contains("pw") && !shown.contains("user"), "{shown}");
+    }
+
+    /// #10067: a flag that differs from the source only in path or userinfo
+    /// case dials a different URL, so it is Divergent; a scheme, host or
+    /// trailing-slash spelling dials the same URL and binds.
+    #[test]
+    fn case_only_path_and_userinfo_variants_are_divergent_10065() {
+        let divergent = SharedSourceError::Divergent {
+            flag_name: SERVE_PEERS_FLAG,
+            flag: 1,
+            source: 1,
+        };
+        let cases: [(&str, Option<&SharedSourceError>); 7] = [
+            (CASED, None),
+            ("HTTPS://user:pw@PEER-A.EXAMPLE.ORG:9077/fed", None),
+            ("https://user:pw@peer-a.example.org:9077/fed/", None),
+            ("https://user:pw@peer-a.example.org:9077/FED", Some(&divergent)),
+            ("https://user:pw@peer-a.example.org:9077/Fed", Some(&divergent)),
+            ("https://User:pw@peer-a.example.org:9077/fed", Some(&divergent)),
+            ("https://user:PW@peer-a.example.org:9077/fed", Some(&divergent)),
+        ];
+        for (flag, want) in cases {
+            let got = resolve_with(true, SERVE_PEERS_FLAG, &list(&[flag]), os(CASED), None);
+            match want {
+                None => assert!(matches!(got, Ok(ServePeerSet::Bound(_))), "{flag}: {got:?}"),
+                Some(err) => assert_eq!(got.as_ref().err(), Some(*err), "{flag}"),
+            }
+        }
+        // The source side too: a path-case edit of the source changes the
+        // digest, a host-case edit does not.
+        let base = BoundFederationSource::from_values(os(CASED), None).unwrap();
+        let path = BoundFederationSource::from_values(
+            os("https://user:pw@peer-a.example.org:9077/FED"),
+            None,
+        )
+        .unwrap();
+        let host = BoundFederationSource::from_values(
+            os("https://user:pw@PEER-A.example.org:9077/fed"),
+            None,
+        )
+        .unwrap();
+        assert_ne!(base.digest_line(), path.digest_line());
+        assert_eq!(base.digest_line(), host.digest_line());
+        // A flag that repeats a peer is not the source's set.
+        assert_eq!(
+            resolve_with(true, SERVE_PEERS_FLAG, &list(&[CASED, CASED]), os(CASED), None)
+                .unwrap_err(),
+            SharedSourceError::Divergent {
+                flag_name: SERVE_PEERS_FLAG,
+                flag: 2,
+                source: 1
+            }
+        );
+    }
+
+    /// #10077: reordered and duplicated pattern lists are one set, so one
+    /// binding and one digest; a different set is a different digest.
+    #[test]
+    fn reordered_and_duplicated_patterns_give_one_digest_10065() {
+        let same: [(&str, &[&str]); 4] = [
+            (r#""a","b""#, &["a", "b"]),
+            (r#""b","a""#, &["a", "b"]),
+            (r#""a","a","b""#, &["a", "b"]),
+            (r#""b","a","b","a""#, &["a", "b"]),
+        ];
+        let mut digests = BTreeSet::new();
+        for (patterns, want) in same {
+            let source =
+                BoundFederationSource::from_values(os(PEER_B), os(&scope_for(PEER_B, patterns)))
+                    .unwrap();
+            assert_eq!(only_binding(&source), (Some(want.to_vec()), vec![]), "{patterns}");
+            digests.insert(source.digest_line());
+        }
+        assert_eq!(digests.len(), 1, "{digests:?}");
+        for other in [r#""a""#, r#""a","c""#, r#""a","b","c""#] {
+            let source =
+                BoundFederationSource::from_values(os(PEER_B), os(&scope_for(PEER_B, other)))
+                    .unwrap();
+            assert!(!digests.contains(&source.digest_line()), "{other}");
+        }
+    }
+
+    /// #10076: `peer_ids` select the pull scope a peer is served, so a
+    /// change of them is a different binding and a different digest; an
+    /// order change is not.
+    #[test]
+    fn peer_ids_change_gives_a_different_digest_10065() {
+        let with_ids = |ids: &str| {
+            format!(r#"{{"{PEER_B}": {{"allowed_namespaces": ["ops"], "peer_ids": [{ids}]}}}}"#)
+        };
+        let cases: [(String, &[&str]); 5] = [
+            (scope_for(PEER_B, r#""ops""#), &[]),
+            (with_ids(r#""node-x""#), &["node-x"]),
+            (with_ids(r#""node-y""#), &["node-y"]),
+            (with_ids(r#""node-x","node-y""#), &["node-x", "node-y"]),
+            (with_ids(r#""node-y","node-x""#), &["node-x", "node-y"]),
+        ];
+        let mut keys = Vec::new();
+        for (scope_raw, want) in &cases {
+            let source = BoundFederationSource::from_values(os(PEER_B), os(scope_raw)).unwrap();
+            assert_eq!(
+                only_binding(&source),
+                (Some(vec!["ops"]), want.to_vec()),
+                "{scope_raw}"
+            );
+            keys.push((source.key.clone(), source.digest_line()));
+        }
+        // Rows 0..=3 are four different bindings: each pair is Divergent.
+        for i in 0..4 {
+            for j in (i + 1)..4 {
+                assert_ne!(keys[i].0, keys[j].0, "rows {i} {j}");
+                assert_ne!(keys[i].1, keys[j].1, "rows {i} {j}");
+            }
+        }
+        // Row 4 is row 3 reordered: the same binding.
+        assert_eq!(keys[3], keys[4]);
+    }
+
+    /// #10079: the divergence text names the flag of the entry point that
+    /// refused, written out here so it cannot drift from the clap spelling.
+    #[test]
+    fn divergence_names_the_flag_of_each_entry_point_10065() {
+        let text = |flag: &str| {
+            format!(
+                "{flag} names 1 peer(s) that differ from the 1 peer(s) of \
+                 AI_MEMORY_FED_QUORUM_PEERS: under the enterprise-federation posture the daemon \
+                 federates only with that key's peers; set {flag} to exactly the \
+                 AI_MEMORY_FED_QUORUM_PEERS value and restart"
+            )
+        };
+        let cases: [(&'static str, &str); 2] = [
+            (SERVE_PEERS_FLAG, "--quorum-peers"),
+            (SYNC_DAEMON_PEERS_FLAG, "--peers"),
+        ];
+        for (flag_name, shown) in cases {
+            let err =
+                resolve_with(true, flag_name, &list(&[PEER_A]), os(PEER_B), None).unwrap_err();
+            assert_eq!(err.to_string(), text(shown), "{flag_name}");
+        }
+        // The clap definitions take their long names from the same constants.
+        use clap::Args as _;
+        let longs = |cmd: clap::Command| -> Vec<String> {
+            cmd.get_arguments()
+                .filter_map(|a| a.get_long().map(str::to_string))
+                .collect()
+        };
+        let sync = longs(crate::cli::sync::SyncDaemonArgs::augment_args(clap::Command::new(
+            "sync-daemon",
+        )));
+        assert!(sync.contains(&"peers".to_string()), "{sync:?}");
+        let serve =
+            longs(crate::daemon_runtime::ServeArgs::augment_args(clap::Command::new("serve")));
+        assert!(serve.contains(&"quorum-peers".to_string()), "{serve:?}");
+    }
+
     #[test]
     fn posture_absent_text_names_the_signal_and_the_key_10059() {
         assert_eq!(
