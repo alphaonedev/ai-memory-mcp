@@ -14,8 +14,10 @@ use sha2::{Digest, Sha256};
 use super::{PgSignedEventWalkRow, PostgresStore, to_store_err, truncate_to_microseconds};
 use crate::signed_events::legacy_cutoff::LEGACY_CUTOFF_AGENT_ID;
 use crate::signed_events::{
-    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMint, LegacyCutoffMintRefusal,
-    LegacyCutoffResolver, SignedEvent, ZERO_HASH, canonical_chain_bytes, daemon_row_signing_input,
+    AnchorDue, ExistingCutoff, LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMint,
+    LegacyCutoffMintRefusal, LegacyCutoffMinted, LegacyCutoffResolver, MintStep, SignedEvent,
+    ZERO_HASH, canonical_chain_bytes, commit_pg_mint, cutoff_row_certifies,
+    daemon_row_signing_input, finish_mint, mint_step,
 };
 use crate::store::StoreResult;
 
@@ -84,19 +86,65 @@ pub(super) async fn resolve_pg_legacy_cutoff(
     Ok(resolver.finish())
 }
 
+/// #10104 — the cutoff-type rows of the table (lowest sequence first, at
+/// most two) inside the mint transaction, judged by the shared resolver.
+async fn pg_existing_cutoff(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    vk: &VerifyingKey,
+    db_id: &str,
+) -> StoreResult<ExistingCutoff> {
+    let cutoffs: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
+        "SELECT {PG_ROW_COLUMNS} FROM signed_events WHERE event_type = $1 \
+         ORDER BY sequence ASC LIMIT 2"
+    ))
+    .bind(LEGACY_CUTOFF_EVENT_TYPE)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("mint_legacy_cutoff.cutoff_rows", e))?;
+    let row = match <[PgSignedEventWalkRow; 1]>::try_from(cutoffs) {
+        Ok([row]) => to_event(row),
+        Err(rows) if rows.is_empty() => return Ok(ExistingCutoff::None),
+        Err(_) => return Ok(ExistingCutoff::Uncertified),
+    };
+    let prefix: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
+        "SELECT {PG_ROW_COLUMNS} FROM signed_events \
+         WHERE COALESCE(sequence, 0) < $1 ORDER BY COALESCE(sequence, 0) ASC"
+    ))
+    .bind(row.sequence)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("mint_legacy_cutoff.cutoff_prefix", e))?;
+    let prefix: Vec<SignedEvent> = prefix.into_iter().map(to_event).collect();
+    if cutoff_row_certifies(&row, &prefix, vk, db_id) {
+        Ok(ExistingCutoff::Certified(row))
+    } else {
+        Ok(ExistingCutoff::Uncertified)
+    }
+}
+
+/// Map a forensic-sink error of the post-commit anchor write.
+fn anchor_store_err(e: &anyhow::Error) -> crate::store::StoreError {
+    crate::store::StoreError::Backend(crate::store::BoxBackendError::new(format!(
+        "mint_legacy_cutoff.anchor: {e:#}"
+    )))
+}
+
 impl PostgresStore {
     /// #10074 (S-3) — postgres twin of
     /// [`crate::signed_events::mint_legacy_cutoff`]: mint the single legacy
     /// cutoff row under an explicit operator order. One transaction holds an
-    /// `EXCLUSIVE` lock on `signed_events` (no append can interleave), refuses
-    /// on any existing cutoff row or off-table anchor, an empty or broken
-    /// chain, or an unverifiable daemon row, appends the cutoff at `head + 1`,
-    /// writes and reads back the off-table anchor, and only then commits.
-    /// Stored rows are never rewritten.
+    /// `EXCLUSIVE` lock on `signed_events` (no append can interleave) and
+    /// decides with the shared [`mint_step`]: an untrusted off-table anchor
+    /// (#10103), an existing cutoff row with its anchor, an anchor with no
+    /// row, an empty or broken chain, or an unverifiable daemon row refuses;
+    /// else it appends the cutoff at `head + 1` and COMMITS. Only after the
+    /// commit is the anchor written and read back verified (#10104); a crash
+    /// between the two leaves a certified row with no anchor, which the next
+    /// run repairs (anchor only). Stored rows are never rewritten.
     ///
     /// # Errors
-    /// Propagates a pg or forensic-sink error (the transaction rolls back on
-    /// drop). A policy refusal is `Ok(Err(refusal))`.
+    /// Propagates a pg or forensic-sink error (an open transaction rolls back
+    /// on drop). A policy refusal is `Ok(Err(refusal))`.
     pub async fn mint_legacy_cutoff(&self) -> StoreResult<LegacyCutoffMint> {
         use crate::governance::{audit, daemon_signer};
         let Some(vk) = daemon_signer::verifying_key() else {
@@ -114,15 +162,6 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("mint_legacy_cutoff.lock", e))?;
-        let existing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
-                .bind(LEGACY_CUTOFF_EVENT_TYPE)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("mint_legacy_cutoff.count", e))?;
-        if existing > 0 {
-            return Ok(Err(LegacyCutoffMintRefusal::CutoffRowExists));
-        }
         let genesis: Option<(String, String, Vec<u8>)> =
             sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
                 .fetch_optional(&mut *tx)
@@ -133,8 +172,26 @@ impl PostgresStore {
         }) else {
             return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
         };
-        if audit::legacy_cutoff_anchor(&db_id).is_some() {
-            return Ok(Err(LegacyCutoffMintRefusal::AnchorExists));
+        let existing = pg_existing_cutoff(&mut tx, &vk, &db_id).await?;
+        match mint_step(&existing, audit::legacy_cutoff_anchor(&db_id, &vk)) {
+            Err(refusal) => return Ok(Err(refusal)),
+            Ok(MintStep::Repair {
+                row_sequence,
+                payload_hash_hex,
+            }) => {
+                // Nothing was written: end the read transaction (its commit
+                // writes nothing), then repair.
+                let due = AnchorDue {
+                    db_id,
+                    outcome: LegacyCutoffMinted::AnchorRepaired(row_sequence),
+                    payload_hash_hex,
+                };
+                let committed = commit_pg_mint(tx, due)
+                    .await
+                    .map_err(|e| to_store_err("mint_legacy_cutoff.commit", e))?;
+                return finish_mint(&committed, &vk).map_err(|e| anchor_store_err(&e));
+            }
+            Ok(MintStep::Mint) => {}
         }
         let rows: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
             "SELECT {PG_ROW_COLUMNS} FROM signed_events ORDER BY COALESCE(sequence, 0) ASC"
@@ -209,24 +266,15 @@ impl PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("mint_legacy_cutoff.insert", e))?;
-        let ph_hex = crate::signed_events::hex_lower(&row.payload_hash);
-        audit::try_record_integrity(audit::IntegrityRow::LegacyCutoff {
-            cutoff_sequence: head,
-            cutoff_payload_hash: &ph_hex,
-            db_id: &db_id,
-        })
-        .map_err(|e| {
-            crate::store::StoreError::Backend(crate::store::BoxBackendError::new(format!(
-                "mint_legacy_cutoff.anchor: {e:#}"
-            )))
-        })?;
-        audit::flush_blocking();
-        if audit::legacy_cutoff_anchor(&db_id) != Some((head, ph_hex)) {
-            return Ok(Err(LegacyCutoffMintRefusal::AnchorNotDurable));
-        }
-        tx.commit()
+        // #10104 — the row is committed BEFORE the anchor is written.
+        let due = AnchorDue {
+            db_id,
+            outcome: LegacyCutoffMinted::Minted(row.sequence),
+            payload_hash_hex: crate::signed_events::hex_lower(&row.payload_hash),
+        };
+        let committed = commit_pg_mint(tx, due)
             .await
             .map_err(|e| to_store_err("mint_legacy_cutoff.commit", e))?;
-        Ok(Ok(row.sequence))
+        finish_mint(&committed, &vk).map_err(|e| anchor_store_err(&e))
     }
 }

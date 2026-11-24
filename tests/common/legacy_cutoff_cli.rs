@@ -71,9 +71,11 @@ pub fn forensic_files(dir: &Path) -> Vec<PathBuf> {
         .expect("read sink dir")
         .map(|e| e.expect("dir entry").path())
         .filter(|p| {
-            p.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|n| n.starts_with("forensic-") && n.ends_with(".jsonl"))
+            let jsonl = p.extension().and_then(OsStr::to_str) == Some("jsonl");
+            jsonl
+                && p.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|n| n.starts_with("forensic-"))
         })
         .collect();
     files.sort();
@@ -100,7 +102,9 @@ pub fn anchor_lines(dir: &Path) -> Vec<serde_json::Value> {
 /// `(cutoff_sequence, cutoff_payload_hash)` of an anchor line.
 pub fn anchor_fields(v: &serde_json::Value) -> (i64, String) {
     (
-        v["payload"]["cutoff_sequence"].as_i64().expect("cutoff_sequence"),
+        v["payload"]["cutoff_sequence"]
+            .as_i64()
+            .expect("cutoff_sequence"),
         v["payload"]["cutoff_payload_hash"]
             .as_str()
             .expect("cutoff_payload_hash")

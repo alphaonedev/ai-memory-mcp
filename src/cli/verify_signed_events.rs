@@ -51,7 +51,7 @@ use serde::Serialize;
 use std::path::Path;
 
 use crate::cli::CliOutput;
-use crate::signed_events::LegacyCutoffMint;
+use crate::signed_events::{LegacyCutoffMint, LegacyCutoffMinted};
 
 /// Shared `.context` label for the chain-report write paths (#1558 batch 6).
 const CTX_WRITE_CHAIN_REPORT: &str = "write chain report";
@@ -158,13 +158,23 @@ async fn mint_postgres(
     )
 }
 
-/// Render a mint outcome; exit 0 on a minted cutoff, 1 on a refusal.
+/// Render a mint outcome; exit 0 on a minted cutoff or a repaired anchor
+/// (#10104), 1 on a refusal.
 fn render_mint(minted: LegacyCutoffMint, out: &mut CliOutput<'_>) -> Result<i32> {
     match minted {
-        Ok(seq) => {
+        Ok(LegacyCutoffMinted::Minted(seq)) => {
             writeln!(
                 out.stdout,
                 "verify-signed-events-chain: minted the legacy cutoff row at sequence={seq}"
+            )
+            .context(CTX_WRITE_CHAIN_REPORT)?;
+            Ok(0)
+        }
+        Ok(LegacyCutoffMinted::AnchorRepaired(seq)) => {
+            writeln!(
+                out.stdout,
+                "verify-signed-events-chain: repaired the off-table anchor of the legacy cutoff \
+                 row at sequence={seq}"
             )
             .context(CTX_WRITE_CHAIN_REPORT)?;
             Ok(0)

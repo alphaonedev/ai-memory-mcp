@@ -1394,47 +1394,184 @@ impl IntegrityRow<'_> {
     }
 }
 
-/// #10074 (S-3) — the most recent legacy cutoff anchor for `db_id` in ANY
-/// forensic file of the live sink: `(cutoff_sequence, cutoff_payload_hash)`.
-/// `None` when the sink is down or no anchor for this database exists. Every
+/// #10103 — what the forensic log says about the legacy cutoff anchor of one
+/// database. A line is used only after its signature verified under the
+/// daemon key; any anchor line for the database that does not verify, or a
+/// log that cannot be read, is [`LegacyCutoffAnchor::Unverified`] with the
+/// exact defect, never a fallback to another line and never `Absent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyCutoffAnchor {
+    /// The log was read in full and holds no anchor line for the database.
+    Absent,
+    /// Every anchor line for the database verified and they agree.
+    Verified {
+        /// Highest sequence the cutoff covers (the cutoff row is one above).
+        cutoff_sequence: i64,
+        /// Lower-hex `payload_hash` of the cutoff row.
+        cutoff_payload_hash: String,
+    },
+    /// The anchor cannot be trusted; the reason is exact.
+    Unverified(LegacyCutoffAnchorDefect),
+}
+
+/// #10103 — the exact reason a legacy cutoff anchor is not trusted. `line`
+/// is 1-based within `file`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyCutoffAnchorDefect {
+    /// The sink directory, its listing, a file or a line could not be read.
+    Unreadable(String),
+    /// An anchor line for the database carries no signature.
+    Unsigned { file: PathBuf, line: usize },
+    /// The signature of an anchor line for the database does not verify.
+    BadSignature { file: PathBuf, line: usize },
+    /// A line names the anchor kind but is not a well-formed anchor.
+    Malformed { file: PathBuf, line: usize },
+    /// Two verified anchor lines for the database disagree.
+    Conflicting,
+}
+
+impl std::fmt::Display for LegacyCutoffAnchorDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(detail) => write!(f, "the forensic log cannot be read: {detail}"),
+            Self::Unsigned { file, line } => {
+                write!(f, "line {line} of {} is unsigned", file.display())
+            }
+            Self::BadSignature { file, line } => write!(
+                f,
+                "line {line} of {}: its signature does not verify",
+                file.display()
+            ),
+            Self::Malformed { file, line } => {
+                write!(f, "line {line} of {} is a malformed anchor", file.display())
+            }
+            Self::Conflicting => f.write_str("two signed anchors disagree"),
+        }
+    }
+}
+
+/// #10103 — verify the forensic signature of `row` under `vk`.
+fn anchor_signature_verifies(row: &ForensicDecision, vk: &VerifyingKey) -> bool {
+    let Ok(bytes) = B64.decode(row.sig.as_bytes()) else {
+        return false;
+    };
+    let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice()) else {
+        return false;
+    };
+    vk.verify_strict(&row.canonical_bytes(), &Signature::from_bytes(&arr))
+        .is_ok()
+}
+
+/// #10103 — classify one parsed anchor line of `db_id`: `None` for a line of
+/// another database, else the verified fields or the exact defect.
+fn classify_anchor_line(
+    row: &ForensicDecision,
+    db_id: &str,
+    vk: &VerifyingKey,
+    file: &Path,
+    line: usize,
+) -> Option<Result<(i64, String), LegacyCutoffAnchorDefect>> {
+    let malformed = || LegacyCutoffAnchorDefect::Malformed {
+        file: file.to_path_buf(),
+        line,
+    };
+    let Some(line_db) = row.payload.get("db_id").and_then(serde_json::Value::as_str) else {
+        return Some(Err(malformed()));
+    };
+    if line_db != db_id {
+        return None;
+    }
+    if row.sig.is_empty() {
+        return Some(Err(LegacyCutoffAnchorDefect::Unsigned {
+            file: file.to_path_buf(),
+            line,
+        }));
+    }
+    if !anchor_signature_verifies(row, vk) {
+        return Some(Err(LegacyCutoffAnchorDefect::BadSignature {
+            file: file.to_path_buf(),
+            line,
+        }));
+    }
+    let version = row.payload.get("v").and_then(serde_json::Value::as_i64);
+    let seq = row
+        .payload
+        .get("cutoff_sequence")
+        .and_then(serde_json::Value::as_i64);
+    let hash = row
+        .payload
+        .get("cutoff_payload_hash")
+        .and_then(serde_json::Value::as_str);
+    match (version, seq, hash) {
+        (Some(LEGACY_CUTOFF_ANCHOR_PAYLOAD_VERSION), Some(seq), Some(hash)) => {
+            Some(Ok((seq, hash.to_string())))
+        }
+        _ => Some(Err(malformed())),
+    }
+}
+
+/// #10074 (S-3), #10103 — the legacy cutoff anchor for `db_id` in ANY
+/// forensic file of the live sink, each line used only after its signature
+/// verified under `vk` (the daemon key, which also signs the sink). Every
 /// file is scanned (not only the newest two) because a cutoff is minted once
 /// per database lifetime and its anchor must refuse a re-mint for as long as
-/// the forensic log keeps it.
+/// the forensic log keeps it. Fail-closed: a sink that is down or unreadable
+/// is `Unverified(Unreadable)`, never `Absent`.
 #[must_use]
-pub fn legacy_cutoff_anchor(db_id: &str) -> Option<(i64, String)> {
-    let dir = live_sink_dir()?;
-    let files = list_forensic_files(&dir).ok()?;
-    let mut found = None;
+pub fn legacy_cutoff_anchor(db_id: &str, vk: &VerifyingKey) -> LegacyCutoffAnchor {
+    let unreadable =
+        |d: String| LegacyCutoffAnchor::Unverified(LegacyCutoffAnchorDefect::Unreadable(d));
+    let Some(dir) = live_sink_dir() else {
+        return unreadable("the forensic sink is not running".to_string());
+    };
+    let files = match list_forensic_files(&dir) {
+        Ok(files) => files,
+        Err(e) => return unreadable(format!("{}: {e:#}", dir.display())),
+    };
+    let mut found: Option<(i64, String)> = None;
     for file in &files {
-        let Ok(f) = open_forensic_file_for_read(file) else {
-            continue;
+        let f = match open_forensic_file_for_read(file) {
+            Ok(f) => f,
+            Err(e) => return unreadable(format!("{}: {e}", file.display())),
         };
-        for line in BufReader::new(f).lines() {
-            let Ok(line) = line else { continue };
-            let Ok(row) = serde_json::from_str::<ForensicDecision>(&line) else {
-                continue;
+        for (idx, line) in BufReader::new(f).lines().enumerate() {
+            let line_no = idx + 1;
+            let line = match line {
+                Ok(line) => line,
+                Err(e) => return unreadable(format!("line {line_no} of {}: {e}", file.display())),
             };
-            if row.kind != LEGACY_CUTOFF_ANCHOR_KIND
-                || row.payload.get("v").and_then(serde_json::Value::as_i64)
-                    != Some(LEGACY_CUTOFF_ANCHOR_PAYLOAD_VERSION)
-                || row.payload.get("db_id").and_then(serde_json::Value::as_str) != Some(db_id)
-            {
-                continue;
-            }
-            let seq = row
-                .payload
-                .get("cutoff_sequence")
-                .and_then(serde_json::Value::as_i64);
-            let hash = row
-                .payload
-                .get("cutoff_payload_hash")
-                .and_then(serde_json::Value::as_str);
-            if let (Some(seq), Some(hash)) = (seq, hash) {
-                found = Some((seq, hash.to_string()));
+            let row = match serde_json::from_str::<ForensicDecision>(&line) {
+                Ok(row) if row.kind == LEGACY_CUTOFF_ANCHOR_KIND => row,
+                Ok(_) => continue,
+                Err(_) if line.contains(LEGACY_CUTOFF_ANCHOR_KIND) => {
+                    return LegacyCutoffAnchor::Unverified(LegacyCutoffAnchorDefect::Malformed {
+                        file: file.clone(),
+                        line: line_no,
+                    });
+                }
+                Err(_) => continue,
+            };
+            match classify_anchor_line(&row, db_id, vk, file, line_no) {
+                None => {}
+                Some(Err(defect)) => return LegacyCutoffAnchor::Unverified(defect),
+                Some(Ok(fields)) => match &found {
+                    Some(prev) if *prev != fields => {
+                        return LegacyCutoffAnchor::Unverified(
+                            LegacyCutoffAnchorDefect::Conflicting,
+                        );
+                    }
+                    _ => found = Some(fields),
+                },
             }
         }
     }
-    found
+    match found {
+        Some((cutoff_sequence, cutoff_payload_hash)) => LegacyCutoffAnchor::Verified {
+            cutoff_sequence,
+            cutoff_payload_hash,
+        },
+        None => LegacyCutoffAnchor::Absent,
+    }
 }
 
 /// Install database audit signers independently of forensic file enablement.

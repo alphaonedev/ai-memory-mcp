@@ -21,20 +21,20 @@ use std::sync::OnceLock;
 
 use ai_memory::governance::daemon_signer::{self, DaemonDomain};
 use ai_memory::signed_events::{
-    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMintRefusal, RowSignatureVerdict,
-    SignatureFailure, SignedEvent, ZERO_HASH, append_signed_event, canonical_chain_bytes,
-    classify_row_signature, daemon_row_signing_input, legacy_cutoff_payload_hash,
-    mint_legacy_cutoff, payload_hash, resolve_sqlite_legacy_cutoff, verify_audit_trail,
-    verify_chain,
+    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMintRefusal, LegacyCutoffMinted,
+    RowSignatureVerdict, SignatureFailure, SignedEvent, ZERO_HASH, append_signed_event,
+    canonical_chain_bytes, classify_row_signature, daemon_row_signing_input,
+    legacy_cutoff_payload_hash, mint_legacy_cutoff, payload_hash, resolve_sqlite_legacy_cutoff,
+    verify_audit_trail, verify_chain,
 };
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
-#[path = "common/home_sandbox.rs"]
-mod home_sandbox;
 #[path = "common/legacy_cutoff_cli.rs"]
 mod cli;
+#[path = "common/home_sandbox.rs"]
+mod home_sandbox;
 
 /// Deterministic seed for the one daemon key this test binary installs.
 const TEST_DAEMON_SEED: [u8; 32] = [0x3c; 32];
@@ -233,8 +233,12 @@ fn legacy_prefix_and_mint(conn: &rusqlite::Connection) -> i64 {
     append_genuine(conn);
     let minted = mint_legacy_cutoff(conn).expect("mint runs");
     let row = minted.expect("the first mint over a verifiable prefix succeeds");
-    assert_eq!(row, 4, "the cutoff row follows the three prefix rows");
-    row
+    assert_eq!(
+        row,
+        LegacyCutoffMinted::Minted(4),
+        "the cutoff row follows the three prefix rows"
+    );
+    row.sequence()
 }
 
 fn assert_clean(conn: &rusqlite::Connection, what: &str) {
@@ -842,16 +846,22 @@ fn cli_seed(root: &Path, db: &Path, agent: &str, sink: &Path) {
         agent,
         sink,
         &[],
-        &["--json", "store", "-T", "row", "--content", "a ledger row (#10104)"],
+        &[
+            "--json",
+            "store",
+            "-T",
+            "row",
+            "--content",
+            "a ledger row (#10104)",
+        ],
     );
     assert_eq!(out.code, Some(0), "store: {}", out.text);
     let start = out.text.find('{').expect("store json");
-    let stored: serde_json::Value =
-        serde_json::Deserializer::from_str(&out.text[start..])
-            .into_iter()
-            .next()
-            .expect("one json value")
-            .expect("store json");
+    let stored: serde_json::Value = serde_json::Deserializer::from_str(&out.text[start..])
+        .into_iter()
+        .next()
+        .expect("one json value")
+        .expect("store json");
     let id = stored["id"].as_str().expect("id").to_string();
     let out = cli::run(root, db, agent, sink, &[], &["delete", "--hard", &id]);
     assert_eq!(out.code, Some(0), "delete: {}", out.text);
@@ -881,7 +891,11 @@ fn cli_cutoff_rows(db: &Path) -> i64 {
 #[test]
 fn c4_crash_between_commit_and_anchor_is_repaired_10104() {
     let root = home_sandbox::per_test_dir("cli-repair-10104-");
-    let (root, db, agent) = (root.path(), root.path().join("store.db"), "cli-repair-10104");
+    let (root, db, agent) = (
+        root.path(),
+        root.path().join("store.db"),
+        "cli-repair-10104",
+    );
     let a = cli::sink_dir(root, "sink-a");
     let b = cli::sink_dir(root, "sink-b");
     cli_seed(root, &db, agent, &a);
@@ -889,7 +903,8 @@ fn c4_crash_between_commit_and_anchor_is_repaired_10104() {
     let out = cli_mint(root, &db, agent, &a);
     assert_eq!(out.code, Some(0), "mint: {}", out.text);
     assert!(
-        out.text.contains("minted the legacy cutoff row at sequence="),
+        out.text
+            .contains("minted the legacy cutoff row at sequence="),
         "{}",
         out.text
     );
@@ -936,7 +951,11 @@ fn c4_crash_between_commit_and_anchor_is_repaired_10104() {
 fn c4_unverified_anchor_line_is_an_exact_refusal_10103() {
     for &forgery in cli::FORGERIES {
         let root = home_sandbox::per_test_dir("cli-anchor-10103-");
-        let (root, db, agent) = (root.path(), root.path().join("store.db"), "cli-anchor-10103");
+        let (root, db, agent) = (
+            root.path(),
+            root.path().join("store.db"),
+            "cli-anchor-10103",
+        );
         let a = cli::sink_dir(root, "sink-a");
         cli_seed(root, &db, agent, &a);
         let out = cli_mint(root, &db, agent, &a);
@@ -955,7 +974,12 @@ fn c4_unverified_anchor_line_is_an_exact_refusal_10103() {
             let rows = cli_cutoff_rows(&db);
             let forged = cli::forged_sink(root, name, &a, forgery);
             let out = cli_mint(root, &db, agent, &forged);
-            assert_eq!(out.code, Some(1), "{forgery:?} row={row_present}: {}", out.text);
+            assert_eq!(
+                out.code,
+                Some(1),
+                "{forgery:?} row={row_present}: {}",
+                out.text
+            );
             assert!(
                 out.text.contains(
                     "legacy cutoff mint refused: the off-table legacy cutoff anchor is not trusted"
@@ -985,6 +1009,67 @@ fn c4_unverified_anchor_line_is_an_exact_refusal_10103() {
             out.text
         );
     }
+}
+
+/// #10103 — two anchor lines of this database, each genuinely signed, that
+/// disagree are an exact refusal ("two signed anchors disagree"), never the
+/// first or the last one taken. Built without the key: a mint into sink A,
+/// the cutoff row deleted, a second mint into sink B, then B's anchor line
+/// appended to a copy of A.
+#[test]
+fn c4_two_signed_anchors_that_disagree_are_an_exact_refusal_10103() {
+    let root = home_sandbox::per_test_dir("cli-conflict-10103-");
+    let (root, db, agent) = (
+        root.path(),
+        root.path().join("store.db"),
+        "cli-conflict-10103",
+    );
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+    cli_seed(root, &db, agent, &a);
+    let out = cli_mint(root, &db, agent, &a);
+    assert_eq!(out.code, Some(0), "mint A: {}", out.text);
+    rusqlite::Connection::open(&db)
+        .expect("open sqlite")
+        .execute(
+            "DELETE FROM signed_events WHERE event_type = ?1",
+            params![LEGACY_CUTOFF_EVENT_TYPE],
+        )
+        .expect("delete the cutoff row");
+    cli_seed(root, &db, agent, &b);
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(0), "mint B: {}", out.text);
+    let (anchor_a, anchor_b) = (cli::anchor_lines(&a), cli::anchor_lines(&b));
+    assert_eq!((anchor_a.len(), anchor_b.len()), (1, 1));
+    assert_ne!(
+        cli::anchor_fields(&anchor_a[0]),
+        cli::anchor_fields(&anchor_b[0]),
+        "the two signed anchors disagree"
+    );
+
+    let c = cli::sink_dir(root, "sink-c");
+    let files = cli::forensic_files(&a);
+    for file in &files {
+        std::fs::copy(file, c.join(file.file_name().expect("file name"))).expect("copy");
+    }
+    let newest = c.join(files.last().expect("a file").file_name().expect("name"));
+    let mut text = std::fs::read_to_string(&newest).expect("read");
+    text.push_str(&serde_json::to_string(&anchor_b[0]).expect("json"));
+    text.push('\n');
+    std::fs::write(&newest, text).expect("write");
+
+    let rows = cli_cutoff_rows(&db);
+    let out = cli_mint(root, &db, agent, &c);
+    assert_eq!(out.code, Some(1), "conflict: {}", out.text);
+    assert!(
+        out.text.contains(
+            "legacy cutoff mint refused: the off-table legacy cutoff anchor is not trusted: two signed anchors disagree"
+        ),
+        "{}",
+        out.text
+    );
+    assert_eq!(cli_cutoff_rows(&db), rows, "no row written");
+    assert_eq!(cli::anchor_lines(&c).len(), 2, "no anchor written");
 }
 
 /// #10101 — the forensic sink's record shape (JSON, never a 32-byte digest).
@@ -1055,9 +1140,13 @@ fn c2_legacy_prefix_is_contiguous_and_ends_before_first_tagged_10102() {
     let cutoff_row = mint_legacy_cutoff(&conn)
         .expect("mint runs")
         .expect("a contiguous legacy prefix is certified");
+    assert!(
+        matches!(cutoff_row, LegacyCutoffMinted::Minted(_)),
+        "a first mint is a new row: {cutoff_row:?}"
+    );
     let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&sink())).expect("resolve");
     assert_eq!(cutoff.sequence(), 2, "the legacy prefix is rows 1..=2");
-    assert_eq!(cutoff.row_sequence(), Some(cutoff_row));
+    assert_eq!(cutoff.row_sequence(), Some(cutoff_row.sequence()));
     assert_clean(&conn, "a contiguous legacy prefix");
 }
 

@@ -1620,7 +1620,9 @@ fn feed_sqlite_prefix(
     Ok(())
 }
 
-/// #10074 (S-3) — why [`mint_legacy_cutoff`] refused. Nothing was written.
+/// #10074 (S-3) — why [`mint_legacy_cutoff`] refused. Nothing was written,
+/// except for [`Self::AnchorNotDurable`]: the row is committed and the next
+/// mint repairs its anchor (#10104).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LegacyCutoffMintRefusal {
@@ -1651,9 +1653,24 @@ pub enum LegacyCutoffMintRefusal {
         /// The first `EventRow`-tagged row of the chain.
         first_tagged: i64,
     },
-    /// The anchor was written but could not be read back, so the mint rolled
-    /// back rather than commit a cutoff with no off-table witness.
+    /// #10104 — the cutoff row is committed but the anchor written after the
+    /// commit could not be read back verified; the next mint repairs it.
     AnchorNotDurable,
+    /// #10103 — the off-table anchor exists but is not trusted (a line for
+    /// this database is unsigned, its signature does not verify, it is
+    /// malformed, two signed lines disagree, or the log cannot be read).
+    AnchorUnverified(crate::governance::audit::LegacyCutoffAnchorDefect),
+    /// #10104 — the verified anchor and the certified cutoff row disagree.
+    AnchorMismatch {
+        /// `cutoff_sequence` of the anchor.
+        anchored_sequence: i64,
+        /// `cutoff_payload_hash` of the anchor.
+        anchored_payload_hash: String,
+        /// `sequence` of the cutoff row.
+        row_sequence: i64,
+        /// Lower-hex `payload_hash` of the cutoff row.
+        row_payload_hash: String,
+    },
 }
 
 impl std::fmt::Display for LegacyCutoffMintRefusal {
@@ -1686,7 +1703,27 @@ impl std::fmt::Display for LegacyCutoffMintRefusal {
                 "the legacy-form row at sequence {sequence} follows the first tagged row at \
                  sequence {first_tagged}"
             ),
-            Self::AnchorNotDurable => f.write_str("the off-table anchor could not be read back"),
+            Self::AnchorNotDurable => f.write_str(
+                "the cutoff row is committed but its off-table anchor could not be read back; \
+                 re-run the mint to repair the anchor",
+            ),
+            Self::AnchorUnverified(defect) => {
+                write!(
+                    f,
+                    "the off-table legacy cutoff anchor is not trusted: {defect}"
+                )
+            }
+            Self::AnchorMismatch {
+                anchored_sequence,
+                anchored_payload_hash,
+                row_sequence,
+                row_payload_hash,
+            } => write!(
+                f,
+                "the off-table anchor binds cutoff_sequence={anchored_sequence} \
+                 payload_hash={anchored_payload_hash} but the cutoff row at \
+                 sequence={row_sequence} has payload_hash={row_payload_hash}"
+            ),
         }
     }
 }
@@ -1714,23 +1751,243 @@ impl From<legacy_cutoff::PrefixRefusal> for LegacyCutoffMintRefusal {
     }
 }
 
-/// #10074 — the outcome of a mint: the cutoff row's sequence on success.
-pub type LegacyCutoffMint = std::result::Result<i64, LegacyCutoffMintRefusal>;
+/// #10074 / #10104 — what a successful mint did, with the cutoff row's
+/// sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyCutoffMinted {
+    /// A new cutoff row was committed, then its anchor written and verified.
+    Minted(i64),
+    /// The certified cutoff row was already committed with no anchor (a crash
+    /// between the commit and the anchor write); its anchor was written and
+    /// verified. No row was written.
+    AnchorRepaired(i64),
+}
+
+/// #10074 — the outcome of a mint.
+pub type LegacyCutoffMint = std::result::Result<LegacyCutoffMinted, LegacyCutoffMintRefusal>;
+
+/// #10104 — the cutoff rows a mint finds in the table, judged by the shared
+/// [`LegacyCutoffResolver`] (both backends).
+pub(crate) enum ExistingCutoff {
+    /// No cutoff-type row.
+    None,
+    /// One or more cutoff-type rows, none of which certifies its prefix.
+    Uncertified,
+    /// Exactly one cutoff row, and it certifies its prefix.
+    Certified(SignedEvent),
+}
+
+/// #10104 — what the mint does next.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MintStep {
+    /// Append a new cutoff row, commit, then write the anchor.
+    Mint,
+    /// Write the missing anchor of the committed cutoff row.
+    Repair {
+        /// `sequence` of the committed cutoff row.
+        row_sequence: i64,
+        /// Lower-hex `payload_hash` of the committed cutoff row.
+        payload_hash_hex: String,
+    },
+}
+
+/// #10103 / #10104 — the decision both mints share. An untrusted anchor is
+/// an exact refusal before anything else; a certified row with no anchor is
+/// the crash-between state and is repaired; a row with a matching anchor, an
+/// uncertified row, or an anchor without a row refuses; a verified anchor
+/// that disagrees with the row is a mismatch.
+pub(crate) fn mint_step(
+    existing: &ExistingCutoff,
+    anchor: crate::governance::audit::LegacyCutoffAnchor,
+) -> std::result::Result<MintStep, LegacyCutoffMintRefusal> {
+    use crate::governance::audit::LegacyCutoffAnchor as A;
+    let anchored = match anchor {
+        A::Unverified(defect) => return Err(LegacyCutoffMintRefusal::AnchorUnverified(defect)),
+        A::Absent => None,
+        A::Verified {
+            cutoff_sequence,
+            cutoff_payload_hash,
+        } => Some((cutoff_sequence, cutoff_payload_hash)),
+    };
+    match (existing, anchored) {
+        (ExistingCutoff::None, None) => Ok(MintStep::Mint),
+        (ExistingCutoff::None, Some(_)) => Err(LegacyCutoffMintRefusal::AnchorExists),
+        (ExistingCutoff::Uncertified, _) => Err(LegacyCutoffMintRefusal::CutoffRowExists),
+        (ExistingCutoff::Certified(row), None) => Ok(MintStep::Repair {
+            row_sequence: row.sequence,
+            payload_hash_hex: hex_lower(&row.payload_hash),
+        }),
+        (ExistingCutoff::Certified(row), Some((seq, hash))) => {
+            let row_hash = hex_lower(&row.payload_hash);
+            if seq == row.sequence.saturating_sub(1) && hash == row_hash {
+                Err(LegacyCutoffMintRefusal::CutoffRowExists)
+            } else {
+                Err(LegacyCutoffMintRefusal::AnchorMismatch {
+                    anchored_sequence: seq,
+                    anchored_payload_hash: hash,
+                    row_sequence: row.sequence,
+                    row_payload_hash: row_hash,
+                })
+            }
+        }
+    }
+}
+
+/// #10104 — `true` when `cutoff_row` certifies `prefix` (every row below it,
+/// ascending) under `vk` for `db_id` (the postgres mint; sqlite streams its
+/// prefix).
+#[cfg(feature = "sal-postgres")]
+pub(crate) fn cutoff_row_certifies<'r>(
+    cutoff_row: &SignedEvent,
+    prefix: impl IntoIterator<Item = &'r SignedEvent>,
+    vk: &ed25519_dalek::VerifyingKey,
+    db_id: &str,
+) -> bool {
+    let mut resolver = LegacyCutoffResolver::new(cutoff_row, Some(vk), Some(db_id));
+    for row in prefix {
+        resolver.feed(row);
+    }
+    resolver.finish().row_sequence() == Some(cutoff_row.sequence)
+}
+
+/// #10104 — write the anchor of the cutoff row at `row_sequence`, AFTER the
+/// row is committed (both backends), and read it back verified under `vk`.
+/// A crash before this leaves a committed row with no anchor, which the next
+/// mint detects and repairs ([`MintStep::Repair`]).
+///
+/// # Errors
+/// Propagates a forensic-sink write error.
+pub(crate) fn write_anchor_after_commit(
+    db_id: &str,
+    row_sequence: i64,
+    payload_hash_hex: &str,
+    vk: &ed25519_dalek::VerifyingKey,
+) -> Result<std::result::Result<(), LegacyCutoffMintRefusal>> {
+    use crate::governance::audit;
+    let cutoff_sequence = row_sequence.saturating_sub(1);
+    audit::try_record_integrity(audit::IntegrityRow::LegacyCutoff {
+        cutoff_sequence,
+        cutoff_payload_hash: payload_hash_hex,
+        db_id,
+    })?;
+    audit::flush_blocking();
+    let expected = audit::LegacyCutoffAnchor::Verified {
+        cutoff_sequence,
+        cutoff_payload_hash: payload_hash_hex.to_string(),
+    };
+    if audit::legacy_cutoff_anchor(db_id, vk) == expected {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(LegacyCutoffMintRefusal::AnchorNotDurable))
+    }
+}
+
+/// #10104 — what a mint's transaction leaves for after its commit: the anchor
+/// of a committed cutoff row (new, or found with no anchor) still to write.
+#[derive(Debug)]
+pub(crate) struct AnchorDue {
+    /// The database identity the anchor binds.
+    pub(crate) db_id: String,
+    /// The outcome reported once the anchor verified.
+    pub(crate) outcome: LegacyCutoffMinted,
+    /// Lower-hex `payload_hash` of the committed cutoff row.
+    pub(crate) payload_hash_hex: String,
+}
+
+impl LegacyCutoffMinted {
+    /// The cutoff row's `sequence`.
+    #[must_use]
+    pub fn sequence(self) -> i64 {
+        match self {
+            Self::Minted(seq) | Self::AnchorRepaired(seq) => seq,
+        }
+    }
+}
+
+/// #10104 — the commit token. It lives in its own module so that nothing,
+/// not even the rest of this file, can build a [`Committed`] except the two
+/// functions here, each of which commits the open transaction first.
+mod mint_commit {
+    use super::AnchorDue;
+    use anyhow::{Context, Result};
+    use rusqlite::Connection;
+
+    /// #10104 — an [`AnchorDue`] whose transaction COMMITTED; [`super::finish_mint`]
+    /// takes only this, so no mint can write the anchor before its commit.
+    #[derive(Debug)]
+    pub(crate) struct Committed(AnchorDue);
+
+    impl Committed {
+        /// The due anchor of the committed transaction.
+        pub(crate) fn due(&self) -> &AnchorDue {
+            &self.0
+        }
+    }
+
+    /// #10104 — COMMIT the sqlite mint transaction, then hand out its due
+    /// anchor.
+    pub(crate) fn commit_sqlite_mint(conn: &Connection, due: AnchorDue) -> Result<Committed> {
+        conn.execute_batch("COMMIT")
+            .context("mint legacy cutoff: commit")?;
+        Ok(Committed(due))
+    }
+
+    /// #10104 — commit the postgres mint transaction (consumed), then hand
+    /// out its due anchor.
+    ///
+    /// # Errors
+    /// The commit's `sqlx` error; the anchor is then not due.
+    #[cfg(feature = "sal-postgres")]
+    pub(crate) async fn commit_pg_mint(
+        tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        due: AnchorDue,
+    ) -> std::result::Result<Committed, sqlx::Error> {
+        tx.commit().await?;
+        Ok(Committed(due))
+    }
+}
+#[cfg(feature = "sal-postgres")]
+pub(crate) use mint_commit::commit_pg_mint;
+use mint_commit::{Committed, commit_sqlite_mint};
+
+/// #10104 — the shared tail of both mints, run only after the transaction
+/// COMMITTED: write the due anchor, read it back verified, name the outcome.
+///
+/// # Errors
+/// Propagates a forensic-sink write error.
+pub(crate) fn finish_mint(
+    committed: &Committed,
+    vk: &ed25519_dalek::VerifyingKey,
+) -> Result<LegacyCutoffMint> {
+    let due = committed.due();
+    Ok(write_anchor_after_commit(
+        &due.db_id,
+        due.outcome.sequence(),
+        &due.payload_hash_hex,
+        vk,
+    )?
+    .map(|()| due.outcome))
+}
 
 /// #10074 (S-3, `3-agent vote (71472661) V1-SIGNED-EVENTS-FALLBACK`) — mint
 /// the single legacy cutoff row, under an explicit operator order
 /// (`ai-memory verify-signed-events-chain --mint-legacy-cutoff`). No boot,
 /// migration, upgrade or config path calls this.
 ///
-/// Inside one `BEGIN IMMEDIATE` transaction it refuses when any cutoff row or
-/// off-table anchor of one exists, the chain is empty or broken, or a
-/// daemon-signed row verifies under no form; it then appends the cutoff row at
-/// `head + 1`, writes the off-table anchor, waits for the anchor to be durable
-/// and readable, and only then commits. Stored rows are never rewritten.
+/// Inside one `BEGIN IMMEDIATE` transaction it reads the off-table anchor
+/// (each line used only after its signature verified, #10103) and the cutoff
+/// rows, and decides with [`mint_step`]: an untrusted anchor, an existing
+/// cutoff row with its anchor, an anchor with no row, an empty or broken
+/// chain, or a daemon-signed row that verifies under no form refuses; else it
+/// appends the cutoff row at `head + 1` and COMMITS. Only after the commit
+/// does it write the anchor and read it back verified (#10104). A crash
+/// between the two leaves a certified row with no anchor, which the next run
+/// detects and repairs (anchor only, no row). Stored rows are never
+/// rewritten.
 ///
 /// # Errors
-/// Propagates a `rusqlite` or forensic-sink error (the transaction is rolled
-/// back). A policy refusal is `Ok(Err(refusal))`.
+/// Propagates a `rusqlite` or forensic-sink error (an open transaction is
+/// rolled back). A policy refusal is `Ok(Err(refusal))`.
 pub fn mint_legacy_cutoff(conn: &Connection) -> Result<LegacyCutoffMint> {
     use crate::governance::{audit, daemon_signer};
     let Some(vk) = daemon_signer::verifying_key() else {
@@ -1741,44 +1998,87 @@ pub fn mint_legacy_cutoff(conn: &Connection) -> Result<LegacyCutoffMint> {
     }
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("mint legacy cutoff: begin")?;
-    match mint_legacy_cutoff_in_tx(conn, &vk) {
-        Ok(Ok(seq)) => {
-            conn.execute_batch("COMMIT")
-                .context("mint legacy cutoff: commit")?;
-            Ok(Ok(seq))
+    let due = match mint_legacy_cutoff_in_tx(conn, &vk) {
+        Ok(Ok(due)) => due,
+        Ok(Err(refusal)) => {
+            rollback_mint(conn);
+            return Ok(Err(refusal));
         }
-        other => {
-            if let Err(e) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("mint legacy cutoff: rollback failed: {e}");
-            }
-            other
+        Err(e) => {
+            rollback_mint(conn);
+            return Err(e);
         }
+    };
+    // #10104 — the row (if any) is committed BEFORE the anchor is written.
+    let committed = commit_sqlite_mint(conn, due)?;
+    finish_mint(&committed, &vk)
+}
+
+/// Roll back the mint transaction; a failed rollback is logged (the
+/// connection drops the transaction when it closes).
+fn rollback_mint(conn: &Connection) {
+    if let Err(e) = conn.execute_batch("ROLLBACK") {
+        tracing::error!("mint legacy cutoff: rollback failed: {e}");
     }
 }
 
-/// #10074 — counts the rows of one event type (the mint's cutoff-exists probe).
-const COUNT_EVENT_TYPE_ROWS_SQL: &str = "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1";
+/// #10104 — the cutoff-type rows of the table (lowest sequence first, at
+/// most two), judged by the shared resolver.
+fn sqlite_existing_cutoff(
+    conn: &Connection,
+    vk: &ed25519_dalek::VerifyingKey,
+    db_id: &str,
+) -> Result<ExistingCutoff> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SIGNED_EVENT_ROW_COLUMNS} FROM signed_events WHERE event_type = ?1 \
+             ORDER BY COALESCE(sequence, 0) ASC LIMIT 2"
+        ))
+        .context("mint legacy cutoff: prepare cutoff rows")?;
+    let cutoffs: Vec<SignedEvent> = stmt
+        .query_map(params![LEGACY_CUTOFF_EVENT_TYPE], read_signed_event_row)
+        .context("mint legacy cutoff: cutoff rows")?
+        .collect::<rusqlite::Result<_>>()
+        .context("mint legacy cutoff: collect cutoff rows")?;
+    let row = match <[SignedEvent; 1]>::try_from(cutoffs) {
+        Ok([row]) => row,
+        Err(rows) if rows.is_empty() => return Ok(ExistingCutoff::None),
+        Err(_) => return Ok(ExistingCutoff::Uncertified),
+    };
+    let mut resolver = LegacyCutoffResolver::new(&row, Some(vk), Some(db_id));
+    feed_sqlite_prefix(conn, row.sequence, &mut resolver)?;
+    if resolver.finish().row_sequence() == Some(row.sequence) {
+        Ok(ExistingCutoff::Certified(row))
+    } else {
+        Ok(ExistingCutoff::Uncertified)
+    }
+}
 
+/// #10103 / #10104 — the in-transaction half of the sqlite mint: decide with
+/// [`mint_step`], and for a mint insert the row (the caller commits, then
+/// writes the anchor).
 fn mint_legacy_cutoff_in_tx(
     conn: &Connection,
     vk: &ed25519_dalek::VerifyingKey,
-) -> Result<LegacyCutoffMint> {
+) -> Result<std::result::Result<AnchorDue, LegacyCutoffMintRefusal>> {
     use crate::governance::{audit, daemon_signer};
-    let existing: i64 = conn
-        .query_row(
-            COUNT_EVENT_TYPE_ROWS_SQL,
-            params![LEGACY_CUTOFF_EVENT_TYPE],
-            |r| r.get(0),
-        )
-        .context("mint legacy cutoff: count")?;
-    if existing > 0 {
-        return Ok(Err(LegacyCutoffMintRefusal::CutoffRowExists));
-    }
     let Some(db_id) = genesis_db_id(conn)? else {
         return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
     };
-    if audit::legacy_cutoff_anchor(&db_id).is_some() {
-        return Ok(Err(LegacyCutoffMintRefusal::AnchorExists));
+    let existing = sqlite_existing_cutoff(conn, vk, &db_id)?;
+    match mint_step(&existing, audit::legacy_cutoff_anchor(&db_id, vk)) {
+        Err(refusal) => return Ok(Err(refusal)),
+        Ok(MintStep::Repair {
+            row_sequence,
+            payload_hash_hex,
+        }) => {
+            return Ok(Ok(AnchorDue {
+                db_id,
+                outcome: LegacyCutoffMinted::AnchorRepaired(row_sequence),
+                payload_hash_hex,
+            }));
+        }
+        Ok(MintStep::Mint) => {}
     }
     let report = verify_chain(conn, None, Some(vk))?;
     if let Some(at) = report.chain_break {
@@ -1838,17 +2138,11 @@ fn mint_legacy_cutoff_in_tx(
         ],
     )
     .context("mint legacy cutoff: insert")?;
-    let ph_hex = hex_lower(&row.payload_hash);
-    audit::try_record_integrity(audit::IntegrityRow::LegacyCutoff {
-        cutoff_sequence: head,
-        cutoff_payload_hash: &ph_hex,
-        db_id: &db_id,
-    })?;
-    audit::flush_blocking();
-    if audit::legacy_cutoff_anchor(&db_id) != Some((head, ph_hex)) {
-        return Ok(Err(LegacyCutoffMintRefusal::AnchorNotDurable));
-    }
-    Ok(Ok(row.sequence))
+    Ok(Ok(AnchorDue {
+        db_id,
+        outcome: LegacyCutoffMinted::Minted(row.sequence),
+        payload_hash_hex: hex_lower(&row.payload_hash),
+    }))
 }
 
 /// Operator-facing end-to-end report over the append-only

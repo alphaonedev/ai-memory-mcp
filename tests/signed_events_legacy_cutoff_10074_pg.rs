@@ -18,19 +18,19 @@ use std::sync::OnceLock;
 
 use ai_memory::governance::daemon_signer::{self, DaemonDomain};
 use ai_memory::signed_events::{
-    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoffMintRefusal, SignedEvent, ZERO_HASH,
+    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoffMintRefusal, LegacyCutoffMinted, SignedEvent, ZERO_HASH,
     canonical_chain_bytes, daemon_row_signing_input, payload_hash, verify_audit_trail,
 };
 use ai_memory::store::postgres::PostgresStore;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+#[path = "common/legacy_cutoff_cli.rs"]
+mod cli;
 #[path = "common/home_sandbox.rs"]
 mod home_sandbox;
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
-#[path = "common/legacy_cutoff_cli.rs"]
-mod cli;
 
 /// Deterministic seed for the one daemon key this test binary installs.
 const TEST_DAEMON_SEED: [u8; 32] = [0x5a; 32];
@@ -535,7 +535,10 @@ async fn s7_mint_refusals_agree_10074() {
     let (_d, path, conn) = sqlite::open();
     sqlite::append(&conn, &[P, I, T]);
     let mint = ai_memory::signed_events::mint_legacy_cutoff;
-    assert_eq!(mint(&conn).expect("mint runs"), Ok(4));
+    assert_eq!(
+        mint(&conn).expect("mint runs"),
+        Ok(LegacyCutoffMinted::Minted(4))
+    );
     assert_eq!(
         mint(&conn).expect("mint runs"),
         Err(LegacyCutoffMintRefusal::CutoffRowExists)
@@ -558,7 +561,10 @@ async fn s7_mint_refusals_agree_10074() {
     // PostgreSQL.
     let (scratch, store) = fresh_pg(&url).await;
     pg::append(&store, &[P, I, T]).await;
-    assert_eq!(store.mint_legacy_cutoff().await.expect("mint runs"), Ok(4));
+    assert_eq!(
+        store.mint_legacy_cutoff().await.expect("mint runs"),
+        Ok(LegacyCutoffMinted::Minted(4))
+    );
     assert_eq!(
         store.mint_legacy_cutoff().await.expect("mint runs"),
         Err(LegacyCutoffMintRefusal::CutoffRowExists)
@@ -692,7 +698,12 @@ async fn c2_mint_certifies_only_a_contiguous_legacy_prefix_10101_10102() {
         let minted = ai_memory::signed_events::mint_legacy_cutoff(&conn).expect("mint runs");
         match &case.outcome {
             MintOutcome::Certified { legacy_end } => {
-                assert_eq!(minted, Ok(head + 1), "{}: sqlite mint", case.name);
+                assert_eq!(
+                    minted,
+                    Ok(LegacyCutoffMinted::Minted(head + 1)),
+                    "{}: sqlite mint",
+                    case.name
+                );
                 let cutoff =
                     ai_memory::signed_events::resolve_sqlite_legacy_cutoff(&conn, Some(&vk))
                         .expect("resolve");
@@ -726,7 +737,12 @@ async fn c2_mint_certifies_only_a_contiguous_legacy_prefix_10101_10102() {
                 .expect("count");
         match &case.outcome {
             MintOutcome::Certified { .. } => {
-                assert_eq!(minted, Ok(head + 1), "{}: pg mint", case.name);
+                assert_eq!(
+                    minted,
+                    Ok(LegacyCutoffMinted::Minted(head + 1)),
+                    "{}: pg mint",
+                    case.name
+                );
                 assert_eq!(cutoffs, 1, "{}: one cutoff row", case.name);
                 let trail = store
                     .verify_audit_trail(None, Some(&vk))
@@ -755,7 +771,7 @@ async fn c3_pg_cutoff_domain_bytes_are_pinned_10106() {
     let (_scratch, store) = fresh_pg(&url).await;
     pg::append(&store, &[P, I, T]).await;
     let minted = store.mint_legacy_cutoff().await.expect("pg mint runs");
-    assert_eq!(minted, Ok(4), "pg mint");
+    assert_eq!(minted, Ok(LegacyCutoffMinted::Minted(4)), "pg mint");
     let mut rows = pg::load(&store).await;
     let cutoff = rows
         .iter_mut()
@@ -854,7 +870,8 @@ async fn c4_pg_crash_between_commit_and_anchor_is_repaired_10104() {
     let out = mint(&a);
     assert_eq!(out.code, Some(0), "pg mint: {}", out.text);
     assert!(
-        out.text.contains("minted the legacy cutoff row at sequence=4"),
+        out.text
+            .contains("minted the legacy cutoff row at sequence=4"),
         "{}",
         out.text
     );
