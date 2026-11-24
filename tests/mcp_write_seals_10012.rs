@@ -1888,9 +1888,6 @@ fn raw_write(sb: &Sandbox, sql: &str, id: &str) {
     assert_eq!(n, 1, "{sql}: rows changed");
 }
 
-/// Strip the seal of the session's row: a claimed, unsigned session row.
-const STRIP_SEAL_SQL: &str = "UPDATE memories SET metadata = json_set(json_remove(metadata, '$.write_signature'), '$.attest_level', 'claimed') WHERE id = ?1";
-
 /// Change sealed content behind the signer's back.
 const TAMPER_SQL: &str = "UPDATE memories SET content = content || ' tampered' WHERE id = ?1";
 
@@ -1958,12 +1955,33 @@ fn run_seeded(sb: &Sandbox, mcp: &mut Mcp, case: &SeededCase, label: &str) -> Ve
 fn unsigned_session_row_defects(require: &str) -> Vec<String> {
     let sb = Sandbox::new();
     let key = sb.bound_key_file();
+    // A is written by a session with no signer (the CLI, before the signed
+    // MCP session opens): a real claimed row. Stripping a seal with raw SQL
+    // instead is a write outside the #10040 funnel, which refuses it.
+    let out = sb.cli_ok(
+        AGENT,
+        &[
+            "store",
+            "-T",
+            "seal unsigned a 10053",
+            "-c",
+            &body("unsigned a 10053"),
+            "--namespace",
+            NAMESPACE,
+            "--tier",
+            "mid",
+            "--json",
+        ],
+    );
+    let stored: Value = serde_json::from_str(&out).expect("store json");
+    let a = stored["id"].as_str().expect("id").to_string();
     let mut mcp = sb.start(require, &key);
     let strict = require == "1";
     let mut defects = Vec::new();
-    let a = store_id(&mut mcp, "seal unsigned a 10053");
     let b = store_id(&mut mcp, "seal unsigned b 10053");
-    raw_write(&sb, STRIP_SEAL_SQL, &a);
+    if attest_level(&sb, &a).as_deref() == Some(ATTESTED) {
+        defects.push(format!("REQUIRE={require}: the CLI row {a} is sealed"));
+    }
     let unsealed = |id: &str| strict.then(|| unsealed_refusal(id));
     let cases = [
         SeededCase {
