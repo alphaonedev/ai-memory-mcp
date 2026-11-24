@@ -1120,6 +1120,13 @@ pub struct ChainVerificationReport {
     /// row DEMOTED because a recorder key is now enrolled (C2). Empty in the
     /// legacy posture (no recorder key enrolled).
     pub role_separation_failures: Vec<i64>,
+    /// #10105 — rows classified `Skipped(AgentSignedDomainObject)`: agent-signed
+    /// domain objects whose chain linkage this walk checked but whose signature
+    /// it did NOT verify. Never counted in `rows_positively_verified`.
+    pub agent_signed_rows_not_verified: u64,
+    /// #10105 — agent-signed rows with a missing or malformed signature, each
+    /// with its exact failure. Their sequences are also in `signature_failures`.
+    pub agent_signature_defects: Vec<(i64, SignatureFailure)>,
 }
 
 impl ChainVerificationReport {
@@ -1177,6 +1184,63 @@ pub enum SkipReason {
     /// A by-design legacy `unsigned` row with a verifier installed but no
     /// signature to check (#1452 — never a failure for the `unsigned` class).
     UnsignedByDesign,
+    /// #10105 — an AGENT-signed domain object (`self_signed`,
+    /// `signed_by_peer`, `peer_attested`). Its signature is by the agent's
+    /// (or peer's) own key over that domain's bytes, never by the daemon key,
+    /// so the daemon verifier would ALWAYS false-fail it. This walk checks its
+    /// chain linkage and that a signature of the right length is present; it
+    /// does NOT verify the signature. Reported apart from `Verified` as
+    /// [`ChainVerificationReport::agent_signed_rows_not_verified`].
+    AgentSignedDomainObject,
+}
+
+/// #10105 — the agent-signed attestation forms of [`SignerIdentity::Agent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAttestation {
+    /// `self_signed`: the writing agent's own key.
+    SelfSigned,
+    /// `signed_by_peer`: a peer or host key that is not the daemon key.
+    SignedByPeer,
+    /// `peer_attested`: a peer's attestation key.
+    PeerAttested,
+}
+
+/// #10105 — who signed a `signed_events` row, as its stored `attest_level`
+/// names it. One variant per signer form; [`classify_row_signature`] matches
+/// on it exhaustively, so a new form cannot fall through to a default arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerIdentity {
+    /// `daemon_signed`: the daemon (or audit-pin) key.
+    Daemon,
+    /// `recorder_signed`: the separately held recorder key (G9).
+    Recorder,
+    /// `lineage_signed`: an identity-lineage witness row (G13).
+    LineageWitness,
+    /// An agent-signed domain object, never verified against the daemon key.
+    Agent(AgentAttestation),
+    /// `unsigned`: the by-design legacy unsigned class (#1452).
+    Unsigned,
+    /// Any other `attest_level` string: routed to the daemon verifier, so it
+    /// fails closed when a verifier is installed.
+    Unrecognised,
+}
+
+impl SignerIdentity {
+    /// Map a stored `attest_level` to its signer form.
+    #[must_use]
+    pub fn of(attest_level: &str) -> Self {
+        use crate::models::AttestLevel;
+        match AttestLevel::from_str(attest_level) {
+            Some(AttestLevel::DaemonSigned) => Self::Daemon,
+            Some(AttestLevel::RecorderSigned) => Self::Recorder,
+            Some(AttestLevel::LineageSigned) => Self::LineageWitness,
+            Some(AttestLevel::SelfSigned) => Self::Agent(AgentAttestation::SelfSigned),
+            Some(AttestLevel::SignedByPeer) => Self::Agent(AgentAttestation::SignedByPeer),
+            Some(AttestLevel::PeerAttested) => Self::Agent(AgentAttestation::PeerAttested),
+            Some(AttestLevel::Unsigned) => Self::Unsigned,
+            None => Self::Unrecognised,
+        }
+    }
 }
 
 /// v1.0.0 L4 (PR-3) — the failing axis a `Failed` row belongs to.
@@ -1197,6 +1261,26 @@ pub enum SignatureFailure {
     /// fails that row and lands in [`AuditTrailReport::signature_failures`];
     /// it never blocks a later append.
     LegacyPayloadOnlyAfterCutoff,
+    /// #10105 — an agent-signed row with NO signature (NULL column).
+    AgentSignatureMissing,
+    /// #10105 — an agent-signed row whose signature is not exactly
+    /// [`ed25519_dalek::SIGNATURE_LENGTH`] bytes (an empty blob included).
+    AgentSignatureMalformed,
+}
+
+impl SignatureFailure {
+    /// The exact, stable reason string the verify CLIs print for this failure.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::DaemonSignature => "daemon_signature_invalid",
+            Self::RecorderVerification => "recorder_signature_invalid",
+            Self::DaemonRoleDemotion => "daemon_role_demoted",
+            Self::LegacyPayloadOnlyAfterCutoff => "legacy_payload_only_after_cutoff",
+            Self::AgentSignatureMissing => "agent_signature_missing",
+            Self::AgentSignatureMalformed => "agent_signature_malformed",
+        }
+    }
 }
 
 /// v1.0.0 L4 (PR-3) — TRI-STATE per-row Ed25519 verdict. Every row the chain
@@ -1238,9 +1322,35 @@ impl RowSignatureVerdict {
         matches!(
             self,
             RowSignatureVerdict::Failed(
-                SignatureFailure::DaemonSignature | SignatureFailure::LegacyPayloadOnlyAfterCutoff
+                SignatureFailure::DaemonSignature
+                    | SignatureFailure::LegacyPayloadOnlyAfterCutoff
+                    | SignatureFailure::AgentSignatureMissing
+                    | SignatureFailure::AgentSignatureMalformed
             )
         )
+    }
+
+    /// #10105 — `true` iff the row is an agent-signed domain object this walk
+    /// did not verify (its own counter, never `Verified`).
+    #[must_use]
+    pub fn is_agent_signed_skip(self) -> bool {
+        matches!(
+            self,
+            RowSignatureVerdict::Skipped(SkipReason::AgentSignedDomainObject)
+        )
+    }
+
+    /// #10105 — the exact failure of an agent-signed row whose signature is
+    /// missing or malformed, else `None`.
+    #[must_use]
+    pub fn agent_signature_defect(self) -> Option<SignatureFailure> {
+        match self {
+            RowSignatureVerdict::Failed(
+                f @ (SignatureFailure::AgentSignatureMissing
+                | SignatureFailure::AgentSignatureMalformed),
+            ) => Some(f),
+            _ => None,
+        }
     }
 
     /// v0.9.0 G9 role-separation axis — a recorder-verify failure OR a C2
@@ -1431,6 +1541,8 @@ pub fn verify_chain(
     let mut signature_failures: Vec<i64> = Vec::new();
     let mut role_separation_failures: Vec<i64> = Vec::new();
     let mut rows_positively_verified: u64 = 0;
+    let mut agent_signed_rows_not_verified: u64 = 0;
+    let mut agent_signature_defects: Vec<(i64, SignatureFailure)> = Vec::new();
 
     let mut expected_seq = lower + 1;
     let mut prev_canonical_hash: [u8; 32] = ZERO_HASH;
@@ -1528,6 +1640,13 @@ pub fn verify_chain(
         if rv.role_separation_failure() {
             role_separation_failures.push(event.sequence);
         }
+        // #10105 — agent-signed rows: their own counter and exact defects.
+        if rv.is_agent_signed_skip() {
+            agent_signed_rows_not_verified += 1;
+        }
+        if let Some(f) = rv.agent_signature_defect() {
+            agent_signature_defects.push((event.sequence, f));
+        }
 
         // Recompute the canonical hash for the NEXT iteration.
         let canon = canonical_chain_bytes(&event);
@@ -1544,6 +1663,8 @@ pub fn verify_chain(
         chain_break,
         signature_failures,
         role_separation_failures,
+        agent_signed_rows_not_verified,
+        agent_signature_defects,
     })
 }
 
@@ -2887,6 +3008,11 @@ pub struct AuditTrailReport {
     /// (that preserves the byte-identical legacy verdict); the security-bearing
     /// recorder/judge/stopper forgeries land in `role_separation`.
     pub signature_failures: Vec<i64>,
+    /// #10105 — agent-signed domain-object rows in the window whose chain
+    /// linkage was checked but whose signature this walk did NOT verify (their
+    /// per-domain verifier owns them). Never part of a positive verification.
+    /// Populated IDENTICALLY by both backends.
+    pub agent_signed_rows_not_verified: u64,
     /// v0.9.0 G9 (#1826) — three-key Recorder/Judge/Stopper signing-layer
     /// SEPARATION verdict (K1 pin of the judge/stopper checkpoints + per-row
     /// recorder verification + C3 distinctness + C2 daemon-demotion).
@@ -3378,6 +3504,7 @@ pub fn verify_audit_trail(
         head_hash,
         cause_binding,
         signature_failures: report.signature_failures.clone(),
+        agent_signed_rows_not_verified: report.agent_signed_rows_not_verified,
         role_separation,
         lineage,
         rollback,
@@ -4205,6 +4332,7 @@ mod tests {
             head_hash: HeadHashCheck::NotDetected,
             cause_binding: CauseBinding::Unknown,
             signature_failures: Vec::new(),
+            agent_signed_rows_not_verified: 0,
             role_separation: RoleSeparationCheck::Unknown,
             lineage: crate::identity::lineage::LineageCheck::Unknown,
             rollback: RollbackCheck::Unknown,

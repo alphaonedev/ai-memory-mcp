@@ -21,11 +21,11 @@ use std::sync::OnceLock;
 
 use ai_memory::governance::daemon_signer::{self, DaemonDomain};
 use ai_memory::signed_events::{
-    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMintRefusal, LegacyCutoffMinted,
-    RowSignatureVerdict, SignatureFailure, SignedEvent, ZERO_HASH, append_signed_event,
-    canonical_chain_bytes, classify_row_signature, daemon_row_signing_input,
-    legacy_cutoff_payload_hash, mint_legacy_cutoff, payload_hash, resolve_sqlite_legacy_cutoff,
-    verify_audit_trail, verify_chain,
+    AgentAttestation, LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMintRefusal,
+    LegacyCutoffMinted, RowSignatureVerdict, SignatureFailure, SignedEvent, SignerIdentity,
+    SkipReason, ZERO_HASH, append_signed_event, canonical_chain_bytes, classify_row_signature,
+    daemon_row_signing_input, legacy_cutoff_payload_hash, mint_legacy_cutoff, payload_hash,
+    resolve_sqlite_legacy_cutoff, verify_audit_trail, verify_chain,
 };
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rusqlite::params;
@@ -1313,4 +1313,313 @@ fn c3_cutoff_and_event_row_domain_bytes_are_pinned_10106() {
         "a row signed over the pinned event-row bytes verifies"
     );
     assert_clean(&conn, "pinned-domain rows");
+}
+
+// ----- #10105 (option C): agent-signed rows ------------------------------
+
+/// #10105 — the agent fixture key (distinct from the daemon key).
+const TEST_AGENT_SEED: [u8; 32] = [0x6b; 32];
+/// #10105 — length of the wrong-length signature blob.
+const SHORT_SIG_LEN: usize = 10;
+/// #10105 — every agent-signed `attest_level`, written out.
+const AGENT_ATTEST_LEVELS: [&str; 3] = ["self_signed", "signed_by_peer", "peer_attested"];
+
+/// #10105 — a row of `attest_level` signed by the agent key (never the daemon
+/// key), or carrying `sig` verbatim; the chain is relinked afterwards.
+fn insert_agent_row(conn: &rusqlite::Connection, attest: &str, sig: AgentSig) -> i64 {
+    let ev = agent_event(attest, sig, next_sequence(conn));
+    conn.execute(
+        "INSERT INTO signed_events \
+            (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
+             prev_hash, sequence, cause_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            ev.id,
+            ev.agent_id,
+            ev.event_type,
+            ev.payload_hash,
+            ev.signature,
+            ev.attest_level,
+            ev.timestamp,
+            ev.prev_hash,
+            ev.sequence
+        ],
+    )
+    .expect("insert agent row");
+    relink(conn);
+    ev.sequence
+}
+
+/// #10105 — the signature an agent-signed fixture row carries.
+#[derive(Clone, Copy, Debug)]
+enum AgentSig {
+    /// A 64-byte Ed25519 signature by the agent key.
+    Valid,
+    /// No signature (NULL column).
+    Missing,
+    /// A blob of the wrong length.
+    Short,
+    /// An empty blob.
+    Empty,
+}
+
+fn agent_event(attest: &str, sig: AgentSig, sequence: i64) -> SignedEvent {
+    let payload = payload_hash(format!("agent-{}", uuid::Uuid::new_v4()).as_bytes());
+    let signature = match sig {
+        AgentSig::Valid => Some(
+            SigningKey::from_bytes(&TEST_AGENT_SEED)
+                .sign(&payload)
+                .to_bytes()
+                .to_vec(),
+        ),
+        AgentSig::Missing => None,
+        AgentSig::Short => Some(vec![1u8; SHORT_SIG_LEN]),
+        AgentSig::Empty => Some(Vec::new()),
+    };
+    SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "ai:agent-10105".to_string(),
+        event_type: FIXTURE_EVENT_TYPE.to_string(),
+        payload_hash: payload,
+        signature,
+        attest_level: attest.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        prev_hash: ZERO_HASH.to_vec(),
+        sequence,
+        cause_hash: None,
+    }
+}
+
+/// #10105 — every stored `attest_level` maps to exactly one signer form
+/// (expected set written out, never derived from the code under test).
+#[test]
+fn signer_identity_of_every_attest_level_10105() {
+    let table: [(&str, SignerIdentity); 8] = [
+        ("daemon_signed", SignerIdentity::Daemon),
+        ("recorder_signed", SignerIdentity::Recorder),
+        ("lineage_signed", SignerIdentity::LineageWitness),
+        (
+            "self_signed",
+            SignerIdentity::Agent(AgentAttestation::SelfSigned),
+        ),
+        (
+            "signed_by_peer",
+            SignerIdentity::Agent(AgentAttestation::SignedByPeer),
+        ),
+        (
+            "peer_attested",
+            SignerIdentity::Agent(AgentAttestation::PeerAttested),
+        ),
+        ("unsigned", SignerIdentity::Unsigned),
+        ("Self_Signed", SignerIdentity::Unrecognised),
+    ];
+    for (attest, want) in table {
+        assert_eq!(SignerIdentity::of(attest), want, "{attest}");
+    }
+}
+
+/// #10105 — the per-row verdict of an agent-signed row: a 64-byte signature
+/// is `Skipped(AgentSignedDomainObject)` (never `Verified`, never checked
+/// against the daemon key), a missing one and a wrong-length one are exact
+/// failures, with or without a daemon verifier. Daemon-labelled and
+/// unrecognised rows with the same agent signature stay fail-closed.
+#[test]
+fn agent_signed_row_verdict_table_10105() {
+    let vk = sink();
+    let none = LegacyCutoff::none();
+    let table: [(AgentSig, RowSignatureVerdict); 4] = [
+        (
+            AgentSig::Valid,
+            RowSignatureVerdict::Skipped(SkipReason::AgentSignedDomainObject),
+        ),
+        (
+            AgentSig::Missing,
+            RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMissing),
+        ),
+        (
+            AgentSig::Short,
+            RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMalformed),
+        ),
+        (
+            AgentSig::Empty,
+            RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMalformed),
+        ),
+    ];
+    for attest in AGENT_ATTEST_LEVELS {
+        for (sig, want) in table {
+            let ev = agent_event(attest, sig, 1);
+            for verifier in [Some(&vk), None] {
+                assert_eq!(
+                    classify_row_signature(&ev, verifier, None, &none),
+                    want,
+                    "{attest} {sig:?} verifier={}",
+                    verifier.is_some()
+                );
+            }
+        }
+    }
+    for attest in ["daemon_signed", "Self_Signed"] {
+        let ev = agent_event(attest, AgentSig::Valid, 1);
+        assert_eq!(
+            classify_row_signature(&ev, Some(&vk), None, &none),
+            RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature),
+            "{attest}: an agent signature under a daemon label fails closed"
+        );
+    }
+    let reasons: [(SignatureFailure, &str); 2] = [
+        (
+            SignatureFailure::AgentSignatureMissing,
+            "agent_signature_missing",
+        ),
+        (
+            SignatureFailure::AgentSignatureMalformed,
+            "agent_signature_malformed",
+        ),
+    ];
+    for (f, want) in reasons {
+        assert_eq!(f.reason(), want);
+    }
+}
+
+/// #10105 — the chain walk counts agent-signed rows apart from verified
+/// rows, fails exactly the missing and malformed signatures, and the audit
+/// trail carries the same count.
+#[test]
+fn agent_signed_rows_counted_not_verified_10105() {
+    let (_d, _p, conn) = open_db();
+    let vk = sink();
+    append_genuine(&conn);
+    insert_agent_row(&conn, "self_signed", AgentSig::Valid);
+    insert_agent_row(&conn, "signed_by_peer", AgentSig::Valid);
+    insert_agent_row(&conn, "peer_attested", AgentSig::Valid);
+    insert_agent_row(&conn, "self_signed", AgentSig::Missing);
+    insert_agent_row(&conn, "self_signed", AgentSig::Short);
+    insert_agent_row(&conn, "self_signed", AgentSig::Empty);
+    append_genuine(&conn);
+
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, None);
+    assert_eq!(chain.rows_checked, 8);
+    assert_eq!(chain.rows_positively_verified, 2);
+    assert_eq!(chain.agent_signed_rows_not_verified, 3);
+    assert_eq!(chain.signature_failures, vec![5, 6, 7]);
+    assert_eq!(
+        chain.agent_signature_defects,
+        vec![
+            (5, SignatureFailure::AgentSignatureMissing),
+            (6, SignatureFailure::AgentSignatureMalformed),
+            (7, SignatureFailure::AgentSignatureMalformed),
+        ]
+    );
+
+    let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("verify_audit_trail");
+    assert!(trail.chain_intact);
+    assert_eq!(trail.signature_failures, vec![5, 6, 7]);
+    assert_eq!(trail.agent_signed_rows_not_verified, 3);
+}
+
+/// #10105 — valid agent-signed rows alone never make the walk report a
+/// failure, and their linkage is still checked: a broken `prev_hash` on an
+/// agent row is a chain break at that row.
+#[test]
+fn agent_signed_rows_alone_are_clean_and_linkage_checked_10105() {
+    let (_d, _p, conn) = open_db();
+    let vk = sink();
+    append_genuine(&conn);
+    for attest in AGENT_ATTEST_LEVELS {
+        insert_agent_row(&conn, attest, AgentSig::Valid);
+    }
+    append_genuine(&conn);
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, None);
+    assert_eq!(chain.signature_failures, Vec::<i64>::new());
+    assert_eq!(chain.agent_signature_defects, Vec::new());
+    assert_eq!(chain.agent_signed_rows_not_verified, 3);
+    assert_eq!(chain.rows_positively_verified, 2);
+
+    conn.execute(
+        "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = 3",
+        params![vec![0xeeu8; 32]],
+    )
+    .expect("break link");
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(
+        chain.chain_break,
+        Some(3),
+        "a broken agent-row link is found"
+    );
+}
+
+/// #10105 — the CLI walk over a chain holding agent-signed rows exits 0, says
+/// in text that they were NOT verified, and in JSON counts them apart and
+/// never reports the chain fully verified.
+#[test]
+fn cli_reports_agent_signed_rows_not_verified_10105() {
+    let root = home_sandbox::per_test_dir("cli-agent-10105-");
+    let child_env = home_sandbox::child_env(root.path());
+    let db = root.path().join("store.db");
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(child_env.iter().map(|(k, v)| (*k, v.as_os_str())))
+            .env("AI_MEMORY_DB", &db)
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_AGENT_ID", "cli-agent-10105")
+            .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+            .args(args)
+            .output()
+            .expect("run ai-memory");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, stdout, stderr) = run(&[
+        "--json",
+        "store",
+        "-T",
+        "row",
+        "--content",
+        "a ledger row (#10105)",
+    ]);
+    assert_eq!(code, Some(0), "store: {stderr}");
+    let stored: serde_json::Value = serde_json::from_str(&stdout).expect("store json");
+    let id = stored["id"].as_str().expect("id").to_string();
+    let (code, _, stderr) = run(&["delete", "--hard", &id]);
+    assert_eq!(code, Some(0), "delete: {stderr}");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open sqlite");
+        for attest in AGENT_ATTEST_LEVELS {
+            insert_agent_row(&conn, attest, AgentSig::Valid);
+        }
+    }
+
+    let (code, stdout, stderr) = run(&["verify-signed-events-chain", "--format", "json"]);
+    assert_eq!(code, Some(0), "json walk: {stdout}{stderr}");
+    let start = stdout.find('{').expect("report json");
+    let report: serde_json::Value = serde_json::from_str(&stdout[start..]).expect("report json");
+    assert_eq!(report["agent_signed_rows_not_verified"], 3, "{report}");
+    assert_eq!(report["fully_verified"], false, "{report}");
+    assert_eq!(
+        report["agent_signature_defects"],
+        serde_json::json!([]),
+        "{report}"
+    );
+    let checked = report["rows_checked"].as_u64().expect("rows_checked");
+    let verified = report["rows_positively_verified"]
+        .as_u64()
+        .expect("rows_positively_verified");
+    assert_eq!(verified + 3, checked, "{report}");
+
+    let (code, stdout, stderr) = run(&["verify-signed-events-chain"]);
+    let text = stdout + &stderr;
+    assert_eq!(code, Some(0), "text walk: {text}");
+    assert!(
+        text.contains(
+            "verify-signed-events-chain NOTE: 3 agent-signed row(s) NOT verified by this walk"
+        ),
+        "{text}"
+    );
 }

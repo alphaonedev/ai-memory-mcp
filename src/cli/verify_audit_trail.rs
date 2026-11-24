@@ -328,6 +328,17 @@ pub fn render(
             }
         }
     }
+    // #10105 — agent-signed rows are linkage-checked but their signatures are
+    // not verified by this walk; say so whatever the verdict.
+    if !json && report.agent_signed_rows_not_verified > 0 {
+        writeln!(
+            out.stdout,
+            "  note: {} agent-signed row(s) NOT verified by this walk (chain linkage \
+             checked; the signature is owned by its domain verifier)",
+            report.agent_signed_rows_not_verified,
+        )
+        .context(CTX_WRITE_AUDIT_REPORT)?;
+    }
 
     Ok(i32::from(!clean))
 }

@@ -616,6 +616,7 @@ mod bring_up_remaining_tests {
             witness: WitnessCheck::NotDetected,
             cause_binding: CauseBinding::NotDetected,
             signature_failures: vec![],
+            agent_signed_rows_not_verified: 0,
             role_separation: RoleSeparationCheck::NotDetected,
             lineage: LineageCheck::NotDetected,
             rollback: RollbackCheck::NotDetected,

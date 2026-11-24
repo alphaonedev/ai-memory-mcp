@@ -16530,6 +16530,7 @@ impl PostgresStore {
         let mut signature_failures: Vec<i64> = Vec::new();
         let mut role_separation_failures: Vec<i64> = Vec::new();
         let mut rows_positively_verified: u64 = 0;
+        let mut agent_signed_rows_not_verified: u64 = 0;
 
         let total_events = rows.len();
         let mut chain_intact = true;
@@ -16570,6 +16571,10 @@ impl PostgresStore {
             }
             if rv.role_separation_failure() {
                 role_separation_failures.push(seq);
+            }
+            // #10105 — K3 parity with the sqlite walk's agent-signed counter.
+            if rv.is_agent_signed_skip() {
+                agent_signed_rows_not_verified += 1;
             }
             let mut h = Sha256::new();
             h.update(canonical_chain_bytes(&ev));
@@ -16813,6 +16818,7 @@ impl PostgresStore {
             head_hash,
             cause_binding,
             signature_failures,
+            agent_signed_rows_not_verified,
             role_separation,
             lineage,
             rollback,

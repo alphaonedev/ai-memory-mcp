@@ -78,7 +78,26 @@ enum Row {
     /// #10101 — the forensic sink's form: the daemon key's untagged signature
     /// over a JSON record, the record bytes stored as the payload hash.
     Sink,
+    /// #10105 — an agent-signed row of this `attest_level`, signed by an
+    /// agent key (never the daemon key) in the given form.
+    Agent(&'static str, AgentSig),
 }
+
+/// #10105 — the signature an agent-signed fixture row carries.
+#[derive(Clone, Copy, Debug)]
+enum AgentSig {
+    /// A 64-byte Ed25519 signature by the agent key.
+    Valid,
+    /// No signature (NULL column).
+    Missing,
+    /// A blob of the wrong length.
+    Short,
+}
+
+/// #10105 — the agent fixture key (distinct from the daemon key).
+const TEST_AGENT_SEED: [u8; 32] = [0x6b; 32];
+/// #10105 — length of the wrong-length signature blob.
+const SHORT_SIG_LEN: usize = 10;
 
 /// #10101 — a forensic-sink-shaped record (JSON, never a 32-byte digest).
 const SINK_RECORD: &[u8] =
@@ -217,6 +236,21 @@ fn make_row(kind: Row, sequence: i64, timestamp: String) -> SignedEvent {
         Row::Sink => {
             ev.payload_hash = SINK_RECORD.to_vec();
             legacy_key().sign(SINK_RECORD).to_bytes().to_vec()
+        }
+        Row::Agent(attest, form) => {
+            ev.agent_id = "ai:agent-10105".to_string();
+            attest.clone_into(&mut ev.attest_level);
+            ev.signature = match form {
+                AgentSig::Valid => Some(
+                    SigningKey::from_bytes(&TEST_AGENT_SEED)
+                        .sign(&ev.payload_hash)
+                        .to_bytes()
+                        .to_vec(),
+                ),
+                AgentSig::Missing => None,
+                AgentSig::Short => Some(vec![1u8; SHORT_SIG_LEN]),
+            };
+            return ev;
         }
     };
     ev.signature = Some(sig);
@@ -915,4 +949,59 @@ async fn c4_pg_crash_between_commit_and_anchor_is_repaired_10104() {
         out.text
     );
     assert_eq!(pg_cutoff_rows(&store).await, 1);
+}
+
+/// #10105 — the agent-signed chain of the parity test: genuine daemon rows
+/// around one valid row per agent form, then a missing and a short signature.
+const AGENT_CHAIN: &[Row] = &[
+    T,
+    Row::Agent("self_signed", AgentSig::Valid),
+    Row::Agent("signed_by_peer", AgentSig::Valid),
+    Row::Agent("peer_attested", AgentSig::Valid),
+    Row::Agent("self_signed", AgentSig::Missing),
+    Row::Agent("self_signed", AgentSig::Short),
+    T,
+];
+/// #10105 — expected `signature_failures` of [`AGENT_CHAIN`], written out.
+const AGENT_CHAIN_FAILURES: &[i64] = &[5, 6];
+/// #10105 — expected agent-signed rows not verified of [`AGENT_CHAIN`].
+const AGENT_CHAIN_NOT_VERIFIED: u64 = 3;
+
+/// #10105 (option C) — both backends linkage-check agent-signed rows, never
+/// verify them against the daemon key, count them apart from verified rows,
+/// and fail exactly the missing and malformed signatures. Under the enrolled
+/// pin the skipped rows stay unverified (L4).
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_signed_rows_agree_on_both_backends_10105() {
+    let vk = sink();
+    let expected_check = ai_memory::signed_events::SignatureCheck::Unverified {
+        checked: 7,
+        unverified: 5,
+    };
+
+    let (_d, _p, conn) = sqlite::open();
+    sqlite::append(&conn, AGENT_CHAIN);
+    let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("sqlite verify");
+    assert!(trail.chain_intact, "sqlite chain intact");
+    assert_eq!(trail.signature_failures, AGENT_CHAIN_FAILURES, "sqlite");
+    assert_eq!(
+        trail.agent_signed_rows_not_verified, AGENT_CHAIN_NOT_VERIFIED,
+        "sqlite"
+    );
+    assert_eq!(trail.signature_check, expected_check, "sqlite");
+
+    let Some(url) = pg_url() else { return };
+    let (_scratch, store) = fresh_pg(&url).await;
+    pg::append(&store, AGENT_CHAIN).await;
+    let trail = store
+        .verify_audit_trail(None, Some(&vk))
+        .await
+        .expect("pg verify");
+    assert!(trail.chain_intact, "pg chain intact");
+    assert_eq!(trail.signature_failures, AGENT_CHAIN_FAILURES, "pg");
+    assert_eq!(
+        trail.agent_signed_rows_not_verified, AGENT_CHAIN_NOT_VERIFIED,
+        "pg"
+    );
+    assert_eq!(trail.signature_check, expected_check, "pg");
 }

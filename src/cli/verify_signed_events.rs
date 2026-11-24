@@ -36,9 +36,15 @@
 //!
 //! ## Exit codes
 //!
-//! - `0` — chain fully verified (or the cutoff was minted).
+//! - `0` — the chain holds and no row failed its signature check (or the
+//!   cutoff was minted). Exit 0 is NOT "fully verified": agent-signed rows
+//!   (#10105) are linkage-checked but their signatures are not verified by
+//!   this walk; they are counted in `agent_signed_rows_not_verified`, and the
+//!   JSON `fully_verified` field is `true` only when every walked row
+//!   positively verified.
 //! - `1` — chain break, or at least one row failed its signature check
-//!   (or the mint refused).
+//!   (an agent-signed row with a missing or malformed signature included),
+//!   or the mint refused.
 //!
 //! ## Output formats
 //!
@@ -97,6 +103,30 @@ pub struct ChainVerifyReportJson {
     pub chain_break: Option<i64>,
     pub signature_failures: Vec<i64>,
     pub chain_holds: bool,
+    /// Rows whose signature positively verified against an enrolled key.
+    pub rows_positively_verified: u64,
+    /// #10105 — agent-signed rows the walk linkage-checked but did NOT verify.
+    pub agent_signed_rows_not_verified: u64,
+    /// #10105 — agent-signed rows with a missing or malformed signature.
+    pub agent_signature_defects: Vec<AgentSignatureDefectJson>,
+    /// `true` only when the chain holds, no row failed, and EVERY walked row
+    /// positively verified (so never while `agent_signed_rows_not_verified > 0`).
+    pub fully_verified: bool,
+}
+
+/// #10105 — one agent-signed row defect on the JSON wire.
+#[derive(Debug, Serialize)]
+pub struct AgentSignatureDefectJson {
+    pub sequence: i64,
+    pub reason: &'static str,
+}
+
+/// #10105 — the text note for agent-signed rows this walk did not verify.
+fn agent_rows_note(count: u64) -> String {
+    format!(
+        "verify-signed-events-chain NOTE: {count} agent-signed row(s) NOT verified by this \
+         walk (chain linkage checked; the signature is owned by its domain verifier)"
+    )
 }
 
 /// #10074 — the dispatch entry: the postgres mint when `--store-url` names a
@@ -220,6 +250,7 @@ pub fn run(
         .context("verify_chain over signed_events")?;
     let holds = report.chain_holds();
     let clean = holds && report.signature_failures.is_empty();
+    let fully_verified = clean && report.rows_positively_verified == report.rows_checked;
 
     match args.format.as_str() {
         "json" => {
@@ -228,6 +259,17 @@ pub fn run(
                 chain_break: report.chain_break,
                 signature_failures: report.signature_failures.clone(),
                 chain_holds: holds,
+                rows_positively_verified: report.rows_positively_verified,
+                agent_signed_rows_not_verified: report.agent_signed_rows_not_verified,
+                agent_signature_defects: report
+                    .agent_signature_defects
+                    .iter()
+                    .map(|&(sequence, f)| AgentSignatureDefectJson {
+                        sequence,
+                        reason: f.reason(),
+                    })
+                    .collect(),
+                fully_verified,
             };
             let json = serde_json::to_string_pretty(&wire).context("serialize chain report")?;
             writeln!(out.stdout, "{json}").context(CTX_WRITE_CHAIN_REPORT)?;
@@ -260,6 +302,22 @@ pub fn run(
                     "verify-signed-events-chain FAIL: chain break at sequence={where_} \
                      ({} row(s) walked)",
                     report.rows_checked,
+                )
+                .context(CTX_WRITE_CHAIN_REPORT)?;
+            }
+            if report.agent_signed_rows_not_verified > 0 {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    agent_rows_note(report.agent_signed_rows_not_verified)
+                )
+                .context(CTX_WRITE_CHAIN_REPORT)?;
+            }
+            for &(seq, f) in &report.agent_signature_defects {
+                writeln!(
+                    out.stdout,
+                    "verify-signed-events-chain DEFECT: sequence={seq} {}",
+                    f.reason()
                 )
                 .context(CTX_WRITE_CHAIN_REPORT)?;
             }
