@@ -661,6 +661,16 @@ pub fn read_attestations(conn: &Connection) -> Result<Vec<Attestation>> {
 /// Surfaces read failures (a missing `row_attestations` table included);
 /// defects in the data are reported in the [`Report`], not as errors.
 pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
+    verify_sqlite_with(conn, &super::anchor::TrustAnchor::from_key_dir())
+}
+
+/// [`verify_sqlite`] against an explicit out-of-database anchor (#10086):
+/// the only key source; no key is read from `conn`.
+///
+/// # Errors
+///
+/// As [`verify_sqlite`].
+pub fn verify_sqlite_with(conn: &Connection, anchor: &super::anchor::AnchorLoad) -> Result<Report> {
     let mut live = Vec::new();
     for spec in TABLES {
         for cells in read_rows(conn, spec)? {
@@ -679,14 +689,10 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
             |r| r.get(0),
         )
         .optional()?;
-    let pubkey = |agent: &str| -> Option<ed25519_dalek::VerifyingKey> {
-        let b64 = crate::db::agent_pubkey(conn, agent).ok()??;
-        crate::identity::keypair::decode_public_base64(&b64).ok()
-    };
     Ok(super::verify(&VerifyInput {
         live: &live,
         attestations: &attestations,
-        pubkey: &pubkey,
+        anchor,
         id_high_water,
         memory_id_of_key: &super::memory_id_of_key,
     }))
@@ -739,11 +745,20 @@ pub fn check_snapshot(conn: &Connection) -> Result<()> {
     }
     if all_signed {
         let report = verify_sqlite(conn)?;
-        if let Some(first) = report.defects.first() {
-            return Err(refuse(&format!(
-                "its row attestations do not verify ({} defects; first: {first})",
-                report.defects.len()
-            )));
+        match report.outcome() {
+            super::Outcome::Clean => {}
+            super::Outcome::Unanchored(why) => {
+                // #10086 A-3: a signed snapshot with no out-of-database key
+                // cannot be verified; it is refused, never let through.
+                return Err(refuse(&format!(
+                    "its row attestations cannot be verified: unanchored ({why})"
+                )));
+            }
+            super::Outcome::Defective { count, first } => {
+                return Err(refuse(&format!(
+                    "its row attestations do not verify ({count} defects; first: {first})"
+                )));
+            }
         }
     }
     Ok(())

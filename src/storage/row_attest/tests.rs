@@ -442,13 +442,20 @@ impl Fixture {
     }
 
     fn report(&self) -> Report {
-        let public = self.signing.verifying_key();
-        let pubkey = move |agent: &str| (agent == AGENT).then_some(public);
+        self.report_with(&anchored(&[(
+            AGENT,
+            self.signing.verifying_key(),
+            None,
+            None,
+        )]))
+    }
+
+    fn report_with(&self, anchor: &anchor::AnchorLoad) -> Report {
         let high = self.atts.iter().map(|a| a.id).max();
         verify(&VerifyInput {
             live: &self.live,
             attestations: &self.atts,
-            pubkey: &pubkey,
+            anchor,
             id_high_water: high,
             memory_id_of_key: &memory_id_of_key,
         })
@@ -549,11 +556,11 @@ fn verify_detects_tail_truncation_e2() {
     // Roll the live row back too: only the high-water mark can tell.
     let s = spec("memories");
     f.live[0].digest = row_digest(s, &[t("m1"), t("[]"), Cell::Int(5), t("long"), t("one")]);
-    let pubkey = move |agent: &str| (agent == AGENT).then_some(public);
+    let anchor = anchored(&[(AGENT, public, None, None)]);
     let r = verify(&VerifyInput {
         live: &f.live,
         attestations: &f.atts,
-        pubkey: &pubkey,
+        anchor: &anchor,
         id_high_water: high,
         memory_id_of_key: &memory_id_of_key,
     });
@@ -603,7 +610,15 @@ fn verify_detects_unsigned_and_unknown_agent() {
     g.put_memory("m1", "one");
     let j = g.atts.len() - 1;
     g.atts[j].agent_id = "ai:other".to_string();
-    assert_defect(&g.report(), "with no bound key");
+    assert_defect(
+        &g.report(),
+        "is anchored to agent ai:attester, not ai:other",
+    );
+    g.atts[j].key_id = key_id_of(&other_key());
+    assert_defect(
+        &g.report(),
+        "names agent ai:other with no key in the trust anchor",
+    );
 }
 
 #[test]
@@ -694,11 +709,379 @@ fn small_order_key_signature_is_refused_by_strict_verify_10040() {
     a.attestation_digest = attestation_digest(&a);
     let expected = format!("attestation {} signature does not verify", a.id);
     assert_eq!(
-        sig_defect(&a, &|_: &str| Some(weak)).as_deref(),
+        sig_defect(&a, &anchored(&[(AGENT, weak, None, None)])).as_deref(),
         Some(expected.as_str()),
         "a small-order key signature must be refused"
     );
     // Control: the honest signature by the fixture key still verifies.
     let good = f.signing.verifying_key();
-    assert_eq!(sig_defect(&honest, &|_: &str| Some(good)), None);
+    assert_eq!(
+        sig_defect(&honest, &anchored(&[(AGENT, good, None, None)])),
+        None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #10086: the out-of-database trust anchor (3-agent vote (71472661)
+// V2-ROW-ATTEST-ANCHOR, conditions A-3, A-6, A-7, A-9)
+// ---------------------------------------------------------------------------
+
+/// The fixture's attestation instant, unix seconds.
+fn fixture_at() -> i64 {
+    chrono::DateTime::parse_from_rfc3339("2026-11-23T00:00:00.000000Z")
+        .expect("fixture timestamp")
+        .timestamp()
+}
+
+fn anchored(
+    keys: &[(&str, ed25519_dalek::VerifyingKey, Option<i64>, Option<i64>)],
+) -> anchor::AnchorLoad {
+    anchor::AnchorLoad::Anchored(anchor::TrustAnchor::for_test("test-anchor", keys))
+}
+
+fn other_key() -> ed25519_dalek::VerifyingKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key()
+}
+
+/// A-3: no anchor is the distinct `Unanchored` outcome, never clean, and
+/// a defect still outranks it.
+#[test]
+fn unanchored_is_never_clean_and_defects_outrank_it_10086() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let why = anchor::Unanchored::Missing {
+        path: "/nonexistent-10086".into(),
+    };
+    let r = f.report_with(&anchor::AnchorLoad::Unanchored(why.clone()));
+    assert_eq!(r.outcome(), Outcome::Unanchored(why.clone()));
+    assert_eq!(r.outcome().kind(), "unanchored");
+    assert!(!r.ok(), "unanchored is never ok");
+    assert_eq!(r.anchor, AnchorStatus::Unanchored(why.clone()));
+    // An unsigned attestation is a defect even without an anchor.
+    let i = f.atts.len() - 1;
+    f.atts[i].signature = None;
+    let r = f.report_with(&anchor::AnchorLoad::Unanchored(why));
+    assert_eq!(r.outcome().kind(), "defective");
+    // Control: anchored and untouched is Clean.
+    let mut g = Fixture::new();
+    g.put_memory("m1", "one");
+    assert_eq!(g.report().outcome(), Outcome::Clean);
+}
+
+/// A-6: a retired key verifies inside its validity window and is a named
+/// defect outside it.
+#[test]
+fn retired_key_verifies_only_inside_its_window_10086() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let key = f.signing.verifying_key();
+    let at = fixture_at();
+    let inside = f.report_with(&anchored(&[
+        (AGENT, key, None, Some(at + 1)),
+        (AGENT, other_key(), Some(at + 1), None),
+    ]));
+    assert_eq!(inside.outcome(), Outcome::Clean, "{:?}", inside.defects);
+    let after = f.report_with(&anchored(&[
+        (AGENT, key, None, Some(at - 1)),
+        (AGENT, other_key(), Some(at - 1), None),
+    ]));
+    assert_defect(&after, "used outside its anchored validity");
+    let before = f.report_with(&anchored(&[(AGENT, key, Some(at + 1), None)]));
+    assert_defect(&before, "used outside its anchored validity");
+}
+
+/// A-7: a key missing from the anchor is a named defect, with no fallback;
+/// a key anchored to another agent is a named defect.
+#[test]
+fn key_missing_from_anchor_or_owned_by_another_agent_is_named_10086() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    let key = f.signing.verifying_key();
+    let missing = f.report_with(&anchored(&[(AGENT, other_key(), None, None)]));
+    let kid = key_id_of(&key);
+    assert_defect(
+        &missing,
+        &format!("key_id {kid} of agent {AGENT} is not in the trust anchor"),
+    );
+    let foreign = f.report_with(&anchored(&[("ai:other", key, None, None)]));
+    assert_defect(
+        &foreign,
+        &format!("key_id {kid} is anchored to agent ai:other, not {AGENT}"),
+    );
+}
+
+/// Scratch directory for the loader tests (never /tmp).
+fn anchor_dir() -> tempfile::TempDir {
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs/anchor_10086");
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let mut b = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        b.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    b.prefix("anchor-")
+        .tempdir_in(&scratch)
+        .expect("anchor dir")
+}
+
+fn write_key(dir: &std::path::Path, name: &str, seed: u8) -> ed25519_dalek::VerifyingKey {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key();
+    std::fs::write(dir.join(name), key.to_bytes()).expect("write key");
+    key
+}
+
+fn unanchored_kind(load: &anchor::AnchorLoad) -> &'static str {
+    match load {
+        anchor::AnchorLoad::Anchored(_) => "anchored",
+        anchor::AnchorLoad::Unanchored(why) => why.kind(),
+    }
+}
+
+/// A-3: every unusable anchor is its own reason, never a fallback.
+#[test]
+fn unusable_anchor_dirs_are_each_a_named_unanchored_reason_10086() {
+    let d = anchor_dir();
+    let missing = d.path().join("absent");
+    assert_eq!(
+        anchor::TrustAnchor::load_dir(&missing),
+        anchor::AnchorLoad::Unanchored(anchor::Unanchored::Missing { path: missing })
+    );
+    assert_eq!(
+        unanchored_kind(&anchor::TrustAnchor::load_dir(d.path())),
+        "empty"
+    );
+    let cases: [(&str, &[u8]); 4] = [
+        ("ai:a.pub", b"short"),
+        ("ai:a.pub.notatime", &[1; 32]),
+        ("ai:a.pub.100-x", &[1; 32]),
+        ("ai:a.pub.-1", &[1; 32]),
+    ];
+    for (name, bytes) in cases {
+        let d = anchor_dir();
+        std::fs::write(d.path().join(name), bytes).expect("write");
+        assert_eq!(
+            unanchored_kind(&anchor::TrustAnchor::load_dir(d.path())),
+            "malformed",
+            "{name}"
+        );
+    }
+    let d = anchor_dir();
+    write_key(d.path(), "ai:a.pub", 1);
+    std::fs::write(d.path().join(anchor::ANCHOR_MARKER_FILE), "2\n").expect("marker");
+    assert_eq!(
+        unanchored_kind(&anchor::TrustAnchor::load_dir(d.path())),
+        "malformed",
+        "marker 2"
+    );
+    let d = anchor_dir();
+    write_key(d.path(), "ai:a.pub", 1);
+    write_key(d.path(), "ai:a.pub.100", 1);
+    assert_eq!(
+        unanchored_kind(&anchor::TrustAnchor::load_dir(d.path())),
+        "malformed",
+        "duplicate"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = anchor_dir();
+        write_key(d.path(), "ai:a.pub", 1);
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert_eq!(
+            unanchored_kind(&anchor::TrustAnchor::load_dir(d.path())),
+            "unreadable",
+            "0777"
+        );
+    }
+}
+
+/// A-6, A-9: archives become retired keys with validity windows, the
+/// output names the source, the layout version and every fingerprint, and
+/// a nested (slashed) agent id is followed.
+#[test]
+fn key_dir_archives_load_as_retired_windows_10086() {
+    let d = anchor_dir();
+    let first = write_key(d.path(), "ai:a.pub.100", 1);
+    let second = write_key(d.path(), "ai:a.pub.200-1", 2);
+    let current = write_key(d.path(), "ai:a.pub", 3);
+    std::fs::create_dir(d.path().join("ns")).expect("nested");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(d.path().join("ns"), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod nested");
+    }
+    let nested = write_key(&d.path().join("ns"), "b.pub", 4);
+    std::fs::write(d.path().join(anchor::ANCHOR_MARKER_FILE), "1\n").expect("marker");
+    std::fs::write(d.path().join("ai:a.priv"), [9; 32]).expect("private file ignored");
+    let a = match anchor::TrustAnchor::load_dir(d.path()) {
+        anchor::AnchorLoad::Anchored(a) => a,
+        anchor::AnchorLoad::Unanchored(why) => panic!("anchored, got {why}"),
+    };
+    assert_eq!(a.source(), d.path());
+    let mut want = vec![
+        ("ai:a".to_string(), key_id_of(&first), true),
+        ("ai:a".to_string(), key_id_of(&second), true),
+        ("ai:a".to_string(), key_id_of(&current), false),
+        ("ns/b".to_string(), key_id_of(&nested), false),
+    ];
+    want.sort_by(|x, y| x.1.cmp(&y.1));
+    assert_eq!(a.fingerprints(), want);
+    let at = |s: i64| {
+        chrono::DateTime::from_timestamp(s, 0)
+            .expect("ts")
+            .to_rfc3339()
+    };
+    assert_eq!(a.key_for("ai:a", &key_id_of(&first), &at(50)), Ok(&first));
+    assert_eq!(a.key_for("ai:a", &key_id_of(&first), &at(100)), Ok(&first));
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&first), &at(101)),
+        Err(anchor::KeyRefusal::OutOfRange {
+            valid_from: None,
+            valid_to: Some(100)
+        })
+    );
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&second), &at(150)),
+        Ok(&second)
+    );
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&second), &at(99)),
+        Err(anchor::KeyRefusal::OutOfRange {
+            valid_from: Some(100),
+            valid_to: Some(200)
+        })
+    );
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&current), &at(300)),
+        Ok(&current)
+    );
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&current), &at(150)),
+        Err(anchor::KeyRefusal::OutOfRange {
+            valid_from: Some(200),
+            valid_to: None
+        })
+    );
+    assert_eq!(a.key_for("ns/b", &key_id_of(&nested), &at(1)), Ok(&nested));
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&nested), &at(1)),
+        Err(anchor::KeyRefusal::OtherAgent("ns/b".to_string()))
+    );
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&other_key()), &at(1)),
+        Err(anchor::KeyRefusal::UnknownKey)
+    );
+    assert_eq!(
+        a.key_for("ai:z", &key_id_of(&other_key()), &at(1)),
+        Err(anchor::KeyRefusal::UnknownAgent)
+    );
+    assert_eq!(
+        a.key_for("ai:a", &key_id_of(&current), "not a time"),
+        Err(anchor::KeyRefusal::BadTime)
+    );
+    let r = Fixture::new().report_with(&anchor::AnchorLoad::Anchored(a));
+    let AnchorStatus::Anchored {
+        source,
+        layout_version,
+        keys,
+    } = r.anchor
+    else {
+        panic!("anchored status");
+    };
+    assert_eq!(source, d.path());
+    assert_eq!(layout_version, anchor::ANCHOR_LAYOUT_VERSION);
+    assert_eq!(keys.len(), 4);
+}
+
+/// A-2 source ratchet (allowlist over the whole source tree): `VerifyInput`
+/// is built only in the allowlisted files, and nothing under
+/// `src/storage/row_attest/` reads a key from the database except the
+/// allowlisted arm-time identity check (which compares the session key it
+/// signs with; it is not a verify path).
+#[test]
+fn no_verify_path_reads_a_key_from_the_database_ratchet_10086() {
+    const CONSTRUCTS_VERIFY_INPUT: &[&str] = &[
+        "src/storage/row_attest/sqlite.rs",
+        "src/storage/row_attest/tests.rs",
+    ];
+    /// The DB key readers: `agent_pubkey` (both backends), the base64 key
+    /// decoder and the key history table reader.
+    const DB_KEY_READERS: &[&str] = &["agent_pubkey", "decode_public_base64", "pubkey_history"];
+    /// `(file, reader, count)` allowed under row_attest/: the arm-time
+    /// `session_identity`.
+    const ARM_SITE: &[(&str, &str, usize)] = &[
+        ("src/storage/row_attest/sqlite.rs", "agent_pubkey", 1),
+        (
+            "src/storage/row_attest/sqlite.rs",
+            "decode_public_base64",
+            1,
+        ),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    let mut stack = vec![
+        root.join("src"),
+        root.join("tests"),
+        root.join("benches"),
+        root.join("examples"),
+    ];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    assert!(
+        files.len() > 100,
+        "the scan saw the tree ({} files)",
+        files.len()
+    );
+    let mut builders = Vec::new();
+    let mut readers = Vec::new();
+    for path in &files {
+        let rel = path
+            .strip_prefix(root)
+            .expect("under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(path).expect("read source");
+        let code: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.contains("VerifyInput{") && !CONSTRUCTS_VERIFY_INPUT.contains(&rel.as_str()) {
+            builders.push(rel.clone());
+        }
+        if rel.starts_with("src/storage/row_attest/") && rel != "src/storage/row_attest/tests.rs" {
+            for reader in DB_KEY_READERS {
+                let n = compact.matches(reader).count();
+                let allowed = ARM_SITE
+                    .iter()
+                    .find(|(f, r, _)| *f == rel && r == reader)
+                    .map_or(0, |(_, _, c)| *c);
+                if n != allowed {
+                    readers.push(format!("{rel}: {reader} x{n} (allowed {allowed})"));
+                }
+            }
+        }
+    }
+    assert!(
+        builders.is_empty(),
+        "VerifyInput built outside the allowlist: {builders:?}"
+    );
+    assert!(
+        readers.is_empty(),
+        "DB key reader in row_attest: {readers:?}"
+    );
 }

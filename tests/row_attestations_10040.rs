@@ -23,9 +23,10 @@ use std::process::{Command, Output, Stdio};
 
 use std::collections::BTreeMap;
 
+use ai_memory::storage::row_attest::anchor::TrustAnchor;
 use ai_memory::storage::row_attest::sqlite::{
     REFUSE_KEY_MISMATCH, REFUSE_ROW_DRIFT, ROW_ATTEST_REFUSAL_PREFIX, SNAPSHOT_REFUSAL_PREFIX,
-    read_attestations, read_rows, verify_sqlite,
+    read_attestations, read_rows, verify_sqlite_with,
 };
 use ai_memory::storage::row_attest::{
     Attestation, Report, TABLES, acc_add, acc_sub, acc_term, encode_key, key_id_of,
@@ -226,7 +227,8 @@ impl Sandbox {
 
     /// The verifier's report on `conn` (a copy of this sandbox's store).
     fn report_of(&self, conn: &rusqlite::Connection) -> Report {
-        verify_sqlite(conn).expect("verifier reads the store")
+        verify_sqlite_with(conn, &TrustAnchor::load_dir(&self.root.join("keys")))
+            .expect("verifier reads the store")
     }
 
     fn raw(&self, sql: &str, id: &str) {
@@ -929,7 +931,7 @@ fn rollback_and_truncation_fail_the_verifier_10040() {
         conn.execute("DELETE FROM row_attestations WHERE id = ?1", [a.id])
             .expect("delete newer attestation");
     }
-    let report = verify_sqlite(&conn).expect("verify copy");
+    let report = sb.report_of(&conn);
     assert_defect(&report, DEFECT_TAIL, "rollback at the tail");
 
     // Truncation: drop only the newest attestation.
@@ -938,7 +940,7 @@ fn rollback_and_truncation_fail_the_verifier_10040() {
     let newest = chain.last().expect("newest");
     conn.execute("DELETE FROM row_attestations WHERE id = ?1", [newest.id])
         .expect("delete newest");
-    let report = verify_sqlite(&conn).expect("verify copy");
+    let report = sb.report_of(&conn);
     assert_unverified(&report, &id, "newest attestation truncated");
     assert_defect(&report, DEFECT_TAIL, "newest attestation truncated");
 }
@@ -970,7 +972,7 @@ fn rollback_under_a_later_write_breaks_the_table_sequence_10040() {
     .expect("restore older tags");
     conn.execute("DELETE FROM row_attestations WHERE id = ?1", [chain[1].id])
         .expect("delete the newer attestation");
-    let report = verify_sqlite(&conn).expect("verify copy");
+    let report = sb.report_of(&conn);
     assert_defect(&report, DEFECT_TABLE_SEQ, "rollback under a later write");
 }
 
@@ -992,7 +994,7 @@ fn deleting_a_row_with_its_attestations_fails_the_verifier_10040() {
         conn.execute("DELETE FROM row_attestations WHERE id = ?1", [a.id])
             .expect("delete attestation");
     }
-    let report = verify_sqlite(&conn).expect("verify copy");
+    let report = sb.report_of(&conn);
     assert!(
         !report.ok(),
         "a row deleted with its attestations must fail"
@@ -1002,7 +1004,7 @@ fn deleting_a_row_with_its_attestations_fails_the_verifier_10040() {
     let conn = rusqlite::Connection::open(&copy).expect("open copy");
     conn.execute("DELETE FROM row_attestations WHERE id = ?1", [chain[0].id])
         .expect("delete attestation");
-    let report = verify_sqlite(&conn).expect("verify copy");
+    let report = sb.report_of(&conn);
     assert_unverified(&report, &id, "attestation deleted");
 }
 
@@ -1073,7 +1075,7 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
         [&id],
     )
     .expect("raw title change");
-    assert_ok(&verify_sqlite(&conn).expect("verify copy"), "raw title");
+    assert_ok(&sb.report_of(&conn), "raw title");
     drop(conn);
     assert!(
         !store_verdict(&copy, &id),
@@ -1087,7 +1089,7 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     let newest = memory_chain(&conn, &keep)[0].id;
     conn.execute("DELETE FROM row_attestations WHERE id = ?1", [newest])
         .expect("delete the other memory's attestation");
-    let report = verify_sqlite(&conn).expect("verify copy");
+    let report = sb.report_of(&conn);
     assert!(
         !report.ok() && !report.unverified_memories.contains(&id),
         "the defect is not pinned on {id}: {:?}",
@@ -1553,7 +1555,7 @@ fn forge_with_rebound_db_key(conn: &rusqlite::Connection, attacker: &ed25519_dal
             a.prior_digest = p.clone();
         }
         let old_digest = a.attestation_digest.clone();
-        a.key_id = key_id.clone();
+        a.key_id.clone_from(&key_id);
         sign(&mut a, attacker);
         renamed.insert(old_digest, a.attestation_digest.clone());
         conn.execute(

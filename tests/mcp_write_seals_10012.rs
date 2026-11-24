@@ -1724,9 +1724,19 @@ fn sweep_all_tools(require: &str) -> Vec<String> {
         // #10040: every row key of every attested table (memories and the
         // 13 side tables) carries a latest attestation that verifies against
         // the bound key and the live row, and the signed watermark covers
-        // the whole table (C-5 completeness).
-        match ai_memory::storage::row_attest::sqlite::verify_sqlite(&sb.conn()) {
+        // the whole table (C-5 completeness). #10086: the key comes from
+        // the sandbox key directory (the trust anchor), never the database;
+        // an unanchored run is a defect, not a silent pass.
+        let anchor =
+            ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&sb.root.join("keys"));
+        match ai_memory::storage::row_attest::sqlite::verify_sqlite_with(&sb.conn(), &anchor) {
             Ok(report) => {
+                if !report.ok() && report.defects.is_empty() {
+                    defects.push(format!(
+                        "{label}: row attestation outcome {}",
+                        report.outcome().kind()
+                    ));
+                }
                 for d in report.defects {
                     defects.push(format!("{label}: row attestation: {d}"));
                 }

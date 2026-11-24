@@ -16,6 +16,7 @@
 //! the format. The `SQLite` funnel (TEMP triggers plus one scalar function)
 //! lives in [`sqlite`].
 
+pub mod anchor;
 pub mod sqlite;
 
 use crate::models::field_names;
@@ -790,9 +791,69 @@ pub struct TableVerdict {
     pub attestations: u64,
 }
 
+/// The anchor the verifier ran against, named in its output (A-9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorStatus {
+    /// Signatures were checked against this out-of-database anchor.
+    Anchored {
+        /// The key directory.
+        source: std::path::PathBuf,
+        /// [`anchor::ANCHOR_LAYOUT_VERSION`].
+        layout_version: u32,
+        /// `(agent_id, key_id, retired)` of every anchored key.
+        keys: Vec<(String, String, bool)>,
+    },
+    /// No anchor: no signature could be checked (A-3).
+    Unanchored(anchor::Unanchored),
+}
+
+impl AnchorStatus {
+    fn of(load: &anchor::AnchorLoad) -> Self {
+        match load {
+            anchor::AnchorLoad::Anchored(a) => Self::Anchored {
+                source: a.source().to_path_buf(),
+                layout_version: anchor::ANCHOR_LAYOUT_VERSION,
+                keys: a.fingerprints(),
+            },
+            anchor::AnchorLoad::Unanchored(why) => Self::Unanchored(why.clone()),
+        }
+    }
+}
+
+/// The one verify outcome (A-3, C-5). Precedence: a defect outranks an
+/// unanchored run, which is never clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Anchored, every signature and the completeness checks pass.
+    Clean,
+    /// No trust anchor: signatures could not be checked.
+    Unanchored(anchor::Unanchored),
+    /// At least one defect; `first` is the first one found.
+    Defective {
+        /// Number of defects.
+        count: usize,
+        /// The first defect.
+        first: String,
+    },
+}
+
+impl Outcome {
+    /// Stable machine name of the outcome (the JSON field value, A-3).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Unanchored(_) => "unanchored",
+            Self::Defective { .. } => "defective",
+        }
+    }
+}
+
 /// The completeness verifier's report (C-5, E-3).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
+    /// The anchor the run used (A-9).
+    pub anchor: AnchorStatus,
     /// Per-table counts, keyed by table name.
     pub tables: std::collections::BTreeMap<String, TableVerdict>,
     /// Every defect found, one line each; empty means the store verifies.
@@ -802,10 +863,25 @@ pub struct Report {
 }
 
 impl Report {
-    /// True when no defect was found.
+    /// The one outcome of the run (A-3).
+    #[must_use]
+    pub fn outcome(&self) -> Outcome {
+        if let Some(first) = self.defects.first() {
+            return Outcome::Defective {
+                count: self.defects.len(),
+                first: first.clone(),
+            };
+        }
+        match &self.anchor {
+            AnchorStatus::Anchored { .. } => Outcome::Clean,
+            AnchorStatus::Unanchored(why) => Outcome::Unanchored(why.clone()),
+        }
+    }
+
+    /// True only for [`Outcome::Clean`]: an unanchored run is never ok.
     #[must_use]
     pub fn ok(&self) -> bool {
-        self.defects.is_empty()
+        self.outcome() == Outcome::Clean
     }
 }
 
@@ -815,8 +891,8 @@ pub struct VerifyInput<'a> {
     pub live: &'a [LiveRow],
     /// Every `row_attestations` row, any order.
     pub attestations: &'a [Attestation],
-    /// Resolve an agent id to its bound public key (`None` = unbound).
-    pub pubkey: &'a dyn Fn(&str) -> Option<ed25519_dalek::VerifyingKey>,
+    /// The out-of-database trust anchor (A-2): the only key source.
+    pub anchor: &'a anchor::AnchorLoad,
     /// The id high-water mark of `row_attestations` (`SQLite`
     /// `sqlite_sequence`, `PostgreSQL` sequence `last_value`); `None` when
     /// the table never held a row.
@@ -825,22 +901,23 @@ pub struct VerifyInput<'a> {
     pub memory_id_of_key: &'a dyn Fn(&[u8]) -> Option<String>,
 }
 
-fn sig_defect(
-    a: &Attestation,
-    pubkey: &dyn Fn(&str) -> Option<ed25519_dalek::VerifyingKey>,
-) -> Option<String> {
+fn sig_defect(a: &Attestation, anchor: &anchor::AnchorLoad) -> Option<String> {
     let Some(sig) = a.signature.as_deref() else {
         return Some(format!("attestation {} ({}) is unsigned", a.id, a.table));
     };
-    let Some(public) = pubkey(&a.agent_id) else {
-        return Some(format!(
-            "attestation {} names agent {} with no bound key",
-            a.id, a.agent_id
-        ));
+    // Unanchored: no key is trusted, so no signature is checked; the run's
+    // outcome is `Unanchored`, never clean (A-3). No fallback to a key the
+    // database holds.
+    let anchor::AnchorLoad::Anchored(anchor) = anchor else {
+        return None;
     };
-    if key_id_of(&public) != a.key_id {
+    let public = match anchor.key_for(&a.agent_id, &a.key_id, &a.attested_at) {
+        Ok(k) => k,
+        Err(why) => return Some(key_refusal_defect(a, &why)),
+    };
+    if key_id_of(public) != a.key_id {
         return Some(format!(
-            "attestation {} key_id is not {}'s bound key",
+            "attestation {} key_id is not {}'s anchored key",
             a.id, a.agent_id
         ));
     }
@@ -856,6 +933,36 @@ fn sig_defect(
         return Some(format!("attestation {} digest does not recompute", a.id));
     }
     None
+}
+
+/// The exact defect line of an anchor refusal (A-6, A-7).
+fn key_refusal_defect(a: &Attestation, why: &anchor::KeyRefusal) -> String {
+    match why {
+        anchor::KeyRefusal::UnknownAgent => format!(
+            "attestation {} names agent {} with no key in the trust anchor",
+            a.id, a.agent_id
+        ),
+        anchor::KeyRefusal::UnknownKey => format!(
+            "attestation {} key_id {} of agent {} is not in the trust anchor",
+            a.id, a.key_id, a.agent_id
+        ),
+        anchor::KeyRefusal::OtherAgent(owner) => format!(
+            "attestation {} key_id {} is anchored to agent {owner}, not {}",
+            a.id, a.key_id, a.agent_id
+        ),
+        anchor::KeyRefusal::BadTime => format!(
+            "attestation {} attested_at {:?} is not a timestamp",
+            a.id, a.attested_at
+        ),
+        anchor::KeyRefusal::OutOfRange {
+            valid_from,
+            valid_to,
+        } => format!(
+            "attestation {} key_id {} used outside its anchored validity (from {valid_from:?} \
+             to {valid_to:?})",
+            a.id, a.key_id
+        ),
+    }
 }
 
 /// The ONE completeness verifier (C-5): every attestation signature, the
@@ -879,6 +986,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         [] => {
             d.push("row_attestations has no store-identity row".to_string());
             return Report {
+                anchor: AnchorStatus::of(input.anchor),
                 tables,
                 defects,
                 unverified_memories: unverified,
@@ -887,6 +995,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         _ => {
             d.push("row_attestations has more than one store-identity row".to_string());
             return Report {
+                anchor: AnchorStatus::of(input.anchor),
                 tables,
                 defects,
                 unverified_memories: unverified,
@@ -916,7 +1025,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         };
         // Signatures, store and format binding.
         for a in &atts {
-            if let Some(defect) = sig_defect(a, input.pubkey) {
+            if let Some(defect) = sig_defect(a, input.anchor) {
                 d.push(format!("{}: {defect}", spec.table));
             }
             if a.store_id != store_id {
@@ -1037,6 +1146,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         }
     }
     Report {
+        anchor: AnchorStatus::of(input.anchor),
         tables,
         defects,
         unverified_memories: unverified,
