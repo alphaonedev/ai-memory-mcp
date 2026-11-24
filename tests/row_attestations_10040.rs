@@ -1001,7 +1001,7 @@ fn store_verdict(db: &Path, id: &str) -> bool {
 fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     let (sb, _key, mut mcp) = armed();
     let id = mcp.store("attest verify 10040");
-    mcp.store("attest verify keep 10040");
+    let keep = mcp.store("attest verify keep 10040");
     drop(mcp);
     assert_ok(&sb.report(), "before verify");
     let chain = memory_chain(&sb.conn(), &id);
@@ -1033,6 +1033,41 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     assert!(
         !store_verdict(&copy, &id),
         "a raw change of a covered column must not report signature_verified"
+    );
+
+    // The seal half: the title is under the in-row seal, not the row
+    // attestation, so the attestation still verifies and the seal does not.
+    let copy = vacuum_copy(&sb, "verify-raw-title.db");
+    let conn = rusqlite::Connection::open(&copy).expect("open copy");
+    conn.execute(
+        "UPDATE memories SET title = title || ' (raw)' WHERE id = ?1",
+        [&id],
+    )
+    .expect("raw title change");
+    assert_ok(&verify_sqlite(&conn).expect("verify copy"), "raw title");
+    drop(conn);
+    assert!(
+        !store_verdict(&copy, &id),
+        "a row whose seal does not verify must not report signature_verified"
+    );
+
+    // Fail closed on a store defect that names another row: the newest
+    // attestation (the other memory's insert) is deleted.
+    let copy = vacuum_copy(&sb, "verify-other-truncated.db");
+    let conn = rusqlite::Connection::open(&copy).expect("open copy");
+    let newest = memory_chain(&conn, &keep)[0].id;
+    conn.execute("DELETE FROM row_attestations WHERE id = ?1", [newest])
+        .expect("delete the other memory's attestation");
+    let report = verify_sqlite(&conn).expect("verify copy");
+    assert!(
+        !report.ok() && !report.unverified_memories.contains(&id),
+        "the defect is not pinned on {id}: {:?}",
+        report.defects
+    );
+    drop(conn);
+    assert!(
+        !store_verdict(&copy, &id),
+        "any store defect must make every row report signature_verified false"
     );
 }
 
