@@ -36,6 +36,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+#[path = "common/home_sandbox.rs"]
+mod home_sandbox;
+
+/// #10007 — the `git` child this ratchet spawns runs under the sandbox HOME
+/// (no global git config of the real HOME is read), and the process itself
+/// resolves no writable path under the real HOME.
+#[test]
+fn test_process_resolves_no_path_under_the_real_home_10007() {
+    let _ = home_sandbox::real_home();
+    let sandbox = home_sandbox::install();
+    home_sandbox::assert_outside_real_home("git child HOME", &sandbox.home());
+    home_sandbox::assert_process_isolated();
+}
+
 /// The tree listing must be at least this large, so an empty or broken git
 /// listing cannot pass vacuously.
 const MIN_TREE_FILES: usize = 1000;
@@ -131,7 +145,11 @@ fn root() -> PathBuf {
 /// new, not yet committed file is held too). Fails closed when git cannot
 /// list the tree.
 fn tracked_files() -> Vec<String> {
+    let sandbox = home_sandbox::install();
     let out = Command::new("git")
+        .env("HOME", sandbox.home())
+        .env("XDG_CONFIG_HOME", sandbox.home().join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .arg("-C")
         .arg(root())
         .args([

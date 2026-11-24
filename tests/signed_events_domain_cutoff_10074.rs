@@ -44,6 +44,7 @@ const FIXTURE_EVENT_TYPE: &str = "governance.test";
 fn daemon_key() -> &'static SigningKey {
     static KEY: OnceLock<SigningKey> = OnceLock::new();
     KEY.get_or_init(|| {
+        let _ = home_sandbox::install();
         let key = SigningKey::from_bytes(&TEST_DAEMON_SEED);
         ai_memory::governance::audit::init_audit_signers(Some(&key));
         key
@@ -64,10 +65,8 @@ fn test_process_resolves_no_path_under_the_real_home_10007() {
 }
 
 fn open_db() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
-    let dir = tempfile::Builder::new()
-        .prefix("signed-events-10074-")
-        .tempdir()
-        .expect("tempdir");
+    let _ = daemon_key();
+    let dir = home_sandbox::per_test_dir("signed-events-10074-");
     let path = dir.path().join("audit-10074.db");
     let conn = ai_memory::db::open(&path).expect("open db");
     (dir, path, conn)
@@ -399,7 +398,11 @@ fn cli_verify_signed_events_chain_convicts_forged_row_10074() {
     let pin = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifying_key().to_bytes());
     let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")
-        .env("HOME", dir.path())
+        .envs(
+            home_sandbox::child_env(dir.path())
+                .into_iter()
+                .map(|(k, v)| (k, v.into_os_string())),
+        )
         .env("AI_MEMORY_AUDIT_PUBKEY", &pin)
         .args([
             "--db",

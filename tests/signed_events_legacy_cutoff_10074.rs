@@ -51,10 +51,7 @@ fn legacy_key() -> SigningKey {
 fn sink() -> VerifyingKey {
     static SINK: OnceLock<tempfile::TempDir> = OnceLock::new();
     SINK.get_or_init(|| {
-        let dir = tempfile::Builder::new()
-            .prefix("forensic-10074-")
-            .tempdir()
-            .expect("forensic tempdir");
+        let dir = home_sandbox::per_test_dir("forensic-10074-");
         ai_memory::governance::audit::init(dir.path(), Some(legacy_key())).expect("init sink");
         dir
     });
@@ -74,14 +71,15 @@ fn test_process_resolves_no_path_under_the_real_home_10007() {
     let _ = home_sandbox::real_home();
     let _ = sink();
     home_sandbox::assert_process_isolated();
+    let child = home_sandbox::per_test_dir("child-env-10007-");
+    for (key, path) in home_sandbox::child_env(child.path()) {
+        home_sandbox::assert_outside_real_home(key, &path);
+    }
 }
 
 fn open_db() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
     let _ = sink();
-    let dir = tempfile::Builder::new()
-        .prefix("legacy-cutoff-10074-")
-        .tempdir()
-        .expect("tempdir");
+    let dir = home_sandbox::per_test_dir("legacy-cutoff-10074-");
     let path = dir.path().join("cutoff-10074.db");
     let conn = ai_memory::db::open(&path).expect("open db");
     (dir, path, conn)
@@ -752,27 +750,14 @@ fn s6_legacy_rows_above_cutoff_fail_exactly_10074() {
 /// (exit 1), and the walk is clean afterwards (exit 0).
 #[test]
 fn s8_cli_mint_once_on_explicit_flag_10074() {
-    let root = tempfile::Builder::new()
-        .prefix("cli-mint-10074-")
-        .tempdir()
-        .expect("tempdir");
-    let home = root.path().join("home");
-    let keys = root.path().join("keys");
-    std::fs::create_dir_all(home.join(".config")).expect("home");
-    std::fs::create_dir_all(&keys).expect("keys");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
+    let root = home_sandbox::per_test_dir("cli-mint-10074-");
+    let child_env = home_sandbox::child_env(root.path());
     let db = root.path().join("store.db");
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_ai-memory"))
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("AI_MEMORY_KEY_DIR", &keys)
+            .envs(child_env.iter().map(|(k, v)| (*k, v.as_os_str())))
             .env("AI_MEMORY_DB", &db)
             .env("AI_MEMORY_NO_CONFIG", "1")
             .env("AI_MEMORY_AGENT_ID", "cli-mint-10074")

@@ -46,10 +46,7 @@ fn legacy_key() -> SigningKey {
 fn sink() -> VerifyingKey {
     static SINK: OnceLock<tempfile::TempDir> = OnceLock::new();
     SINK.get_or_init(|| {
-        let dir = tempfile::Builder::new()
-            .prefix("forensic-10074-pg-")
-            .tempdir()
-            .expect("forensic tempdir");
+        let dir = home_sandbox::per_test_dir("forensic-10074-pg-");
         ai_memory::governance::audit::init(dir.path(), Some(legacy_key())).expect("init sink");
         dir
     });
@@ -281,10 +278,8 @@ mod sqlite {
     use rusqlite::params;
 
     pub fn open() -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
-        let dir = tempfile::Builder::new()
-            .prefix("legacy-cutoff-10074-pg-twin-")
-            .tempdir()
-            .expect("tempdir");
+        let _ = super::sink();
+        let dir = super::home_sandbox::per_test_dir("legacy-cutoff-10074-pg-twin-");
         let path = dir.path().join("twin.db");
         let conn = ai_memory::db::open(&path).expect("open db");
         (dir, path, conn)
@@ -463,6 +458,7 @@ fn pg_url() -> Option<String> {
 }
 
 async fn fresh_pg(url: &str) -> (pg_barrier::ScratchDb, PostgresStore) {
+    let _ = sink();
     let scratch = pg_barrier::ScratchDb::create(url, SCRATCH_PREFIX)
         .await
         .expect("create scratch database");
