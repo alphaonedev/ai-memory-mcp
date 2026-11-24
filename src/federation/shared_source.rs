@@ -29,11 +29,21 @@
 //!
 //! The source proves the BOOT configuration: an edit after boot applies only
 //! after a restart. The daemon logs [`BoundFederationSource::digest_line`] at
-//! boot and the doctor prints the same digest, so an edit is detectable. The
-//! digest input is peer ids (a hash of the normalised URL) and scope patterns,
-//! never a URL or a credential.
+//! boot and the doctor prints the same digest, so an edit is detectable.
+//!
+//! #10065 — the digest and the flag comparison take one canonical value,
+//! [`BindingKey`], built only by its constructor. It holds exactly what the
+//! daemon acts on, per peer: the URL it dials ([`BindingUrl`]: the push URL in
+//! the URL parser's form, so scheme and host fold case and userinfo and path
+//! keep it), the outbound patterns as a sorted, de-duplicated set (`None` for
+//! deny), and the `peer_ids` that select the pull scope, as a sorted set. Two
+//! sources have one digest if and only if they dial the same URLs and serve
+//! the same push and pull scopes. The digest is SHA-256 over that key; it is
+//! printed as hex only, so no URL or credential is ever shown.
 
-use super::outbound_scope::{self as scope, OutboundScopeConfigError, PeerOutboundScope};
+use super::outbound_scope::{
+    self as scope, OutboundScopeConfigEntry, OutboundScopeConfigError, PeerOutboundScope,
+};
 use crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -49,8 +59,17 @@ pub const MAX_PEERS_ENV_BYTES: usize = 64 * 1024;
 /// Most peers [`PEERS_ENV`] may name.
 pub const MAX_PEERS: usize = 256;
 
-/// Domain separator of the source digest (version 1 of its input layout).
-const DIGEST_DOMAIN: &[u8] = b"ai-memory/federation-shared-source/v1\n";
+/// The long name of the `serve` peer-list flag; the clap definition
+/// (`daemon_runtime::ServeArgs::quorum_peers`) takes it from here.
+pub const SERVE_PEERS_FLAG: &str = "quorum-peers";
+
+/// The long name of the `sync-daemon` peer-list flag; the clap definition
+/// (`cli::sync::SyncDaemonArgs::peers`) takes it from here.
+pub const SYNC_DAEMON_PEERS_FLAG: &str = "peers";
+
+/// Domain separator of the source digest (version 2 of its input layout:
+/// dialled URL, pattern set and pull-side peer ids, #10065).
+const DIGEST_DOMAIN: &[u8] = b"ai-memory/federation-shared-source/v2\n";
 
 /// Digest input tag of a denied (unscoped) peer.
 const DIGEST_TAG_DENY: u8 = 0;
@@ -58,12 +77,24 @@ const DIGEST_TAG_DENY: u8 = 0;
 /// Digest input tag of a peer with namespace patterns.
 const DIGEST_TAG_NAMESPACES: u8 = 1;
 
-/// The fix every peer-list refusal names.
-const PEERS_FIX: &str = "set it to the comma-separated https peer URLs (the exact \
-                         --quorum-peers value) and restart";
+/// The fix every peer-list refusal names (rendered through [`fmt::Display`]
+/// so the flag names come from the same constants as the clap definitions).
+struct PeersFix;
+
+impl fmt::Display for PeersFix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "set it to the comma-separated https peer URLs (the exact --{SERVE_PEERS_FLAG} / \
+             --{SYNC_DAEMON_PEERS_FLAG} value) and restart"
+        )
+    }
+}
+
+const PEERS_FIX: PeersFix = PeersFix;
 
 /// Split peer list items on `,`, trim each part and drop empty parts. The one
-/// splitter for both the [`PEERS_ENV`] value and the `--quorum-peers` value
+/// splitter for both the [`PEERS_ENV`] value and the daemon's peer flag value
 /// when the two are compared.
 #[must_use]
 pub fn canonical_peer_list(items: &[String]) -> Vec<String> {
@@ -96,8 +127,12 @@ pub enum SharedSourceError {
     Scope(OutboundScopeConfigError),
     /// An outbound scope key (a stable peer id) names no peer of the list.
     UnknownScopeKey(String),
-    /// `--quorum-peers` names a different peer set from the source.
+    /// The daemon's peer flag names a different set of dialled URLs from the
+    /// source.
     Divergent {
+        /// The long name of the flag that diverged ([`SERVE_PEERS_FLAG`] or
+        /// [`SYNC_DAEMON_PEERS_FLAG`]).
+        flag_name: &'static str,
         /// Peers the flag names.
         flag: usize,
         /// Peers the source names.
@@ -133,11 +168,15 @@ impl fmt::Display for SharedSourceError {
                  key, then restart",
                 scope::OUTBOUND_SCOPE_ENV
             ),
-            Self::Divergent { flag, source } => write!(
+            Self::Divergent {
+                flag_name,
+                flag,
+                source,
+            } => write!(
                 f,
-                "--quorum-peers names {flag} peer(s) that differ from the {source} peer(s) of \
+                "--{flag_name} names {flag} peer(s) that differ from the {source} peer(s) of \
                  {PEERS_ENV}: under the enterprise-federation posture the daemon federates only \
-                 with that key's peers; set --quorum-peers to exactly the {PEERS_ENV} value and \
+                 with that key's peers; set --{flag_name} to exactly the {PEERS_ENV} value and \
                  restart"
             ),
         }
@@ -146,16 +185,157 @@ impl fmt::Display for SharedSourceError {
 
 impl std::error::Error for SharedSourceError {}
 
+/// The URL the daemon dials for one peer: the peer URL with its trailing
+/// slashes trimmed and the push path appended (as `peer::build` forms it),
+/// in the URL parser's serialisation (the form the HTTP client sends:
+/// scheme and host lowercased, a default port dropped, userinfo and path
+/// as written). Private field; the only constructor is [`Self::new`].
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BindingUrl(String);
+
+impl BindingUrl {
+    /// The dialled URL of the peer URL `raw`.
+    ///
+    /// # Errors
+    ///
+    /// [`SharedSourceError::Malformed`], naming the peer by origin and path
+    /// only, when the push URL does not parse.
+    pub fn new(raw: &str) -> Result<Self, SharedSourceError> {
+        let trimmed = raw.trim_end_matches('/');
+        let push = format!("{trimmed}{}", super::peer::SYNC_PUSH_PATH);
+        reqwest::Url::parse(&push)
+            .map(|url| Self(url.into()))
+            .map_err(|_| {
+                SharedSourceError::Malformed(format!(
+                    "peer {} is not a URL",
+                    crate::url_display::url_origin_and_path(raw)
+                ))
+            })
+    }
+}
+
+impl fmt::Debug for BindingUrl {
+    /// Origin and path only: the URL may carry a credential.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("BindingUrl")
+            .field(&crate::url_display::url_origin_and_path(&self.0))
+            .finish()
+    }
+}
+
+/// What the daemon serves one peer: the outbound patterns as a sorted,
+/// de-duplicated set (`None` = denied) and the pull-side `peer_ids` as a
+/// sorted set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerBinding {
+    patterns: Option<BTreeSet<String>>,
+    peer_ids: BTreeSet<String>,
+}
+
+/// The canonical binding of a shared source: per dialled URL, what the
+/// daemon serves that peer. The digest and the flag comparison take only
+/// this value. Private field; the only constructor is [`Self::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingKey {
+    peers: BTreeMap<BindingUrl, PeerBinding>,
+}
+
+impl BindingKey {
+    /// The key of `peers` (already scheme-validated, unique by stable id)
+    /// under the parsed scope `entries` (keyed by stable peer id).
+    ///
+    /// # Errors
+    ///
+    /// [`SharedSourceError::Malformed`] when a peer URL does not parse or two
+    /// peers dial the same URL.
+    fn new(
+        peers: &[String],
+        entries: &BTreeMap<String, OutboundScopeConfigEntry>,
+    ) -> Result<Self, SharedSourceError> {
+        let mut out = BTreeMap::new();
+        for peer in peers {
+            let url = BindingUrl::new(peer)?;
+            let binding = match entries.get(&super::peer::stable_peer_id(peer)) {
+                None => PeerBinding {
+                    patterns: None,
+                    peer_ids: BTreeSet::new(),
+                },
+                Some(entry) => PeerBinding {
+                    patterns: match &entry.scope {
+                        PeerOutboundScope::Deny => None,
+                        PeerOutboundScope::Namespaces(list) => Some(list.iter().cloned().collect()),
+                    },
+                    peer_ids: entry.peer_ids.iter().cloned().collect(),
+                },
+            };
+            if out.insert(url, binding).is_some() {
+                return Err(SharedSourceError::Malformed(format!(
+                    "peer {} is listed twice",
+                    crate::url_display::url_origin_and_path(peer)
+                )));
+            }
+        }
+        Ok(Self { peers: out })
+    }
+
+    /// SHA-256 over the domain, then per dialled URL in sorted order: the
+    /// URL, a tag, the pattern set and the peer id set, every string and
+    /// every count length-prefixed (so no two keys share an input).
+    fn digest(&self) -> String {
+        use sha2::Digest as _;
+        // A length always fits u64 on every supported target; saturate
+        // rather than truncate if it ever did not (per PERF-07).
+        fn count(hasher: &mut sha2::Sha256, len: usize) {
+            hasher.update(u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+        }
+        fn put(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+            count(hasher, bytes.len());
+            hasher.update(bytes);
+        }
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(DIGEST_DOMAIN);
+        for (url, binding) in &self.peers {
+            put(&mut hasher, url.0.as_bytes());
+            match &binding.patterns {
+                Some(patterns) => {
+                    hasher.update([DIGEST_TAG_NAMESPACES]);
+                    count(&mut hasher, patterns.len());
+                    for pattern in patterns {
+                        put(&mut hasher, pattern.as_bytes());
+                    }
+                }
+                None => hasher.update([DIGEST_TAG_DENY]),
+            }
+            count(&mut hasher, binding.peer_ids.len());
+            for id in &binding.peer_ids {
+                put(&mut hasher, id.as_bytes());
+            }
+        }
+        hex::encode(hasher.finalize())
+    }
+}
+
 /// The peer list and outbound scope a posture daemon federates with, as the
 /// shared source names them. Private fields; the only constructor is
 /// [`Self::from_values`] (and its env reader [`Self::load`]), so holding one
 /// means the source parsed, every scope key names a listed peer, and the
-/// digest is of exactly this value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// digest is of exactly its [`BindingKey`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct BoundFederationSource {
     peers: Vec<String>,
     scopes: BTreeMap<String, PeerOutboundScope>,
+    key: BindingKey,
     digest: String,
+}
+
+impl fmt::Debug for BoundFederationSource {
+    /// Peer count and digest only: a peer URL may carry a credential.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundFederationSource")
+            .field("peers", &self.peers.len())
+            .field("digest", &self.digest)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BoundFederationSource {
@@ -196,22 +376,28 @@ impl BoundFederationSource {
                 )));
             }
         }
-        let scopes = match scope_raw {
+        let entries = match scope_raw {
             None => BTreeMap::new(),
             Some(value) => {
                 let text = value
                     .into_string()
                     .map_err(|_| SharedSourceError::Scope(OutboundScopeConfigError::NotUnicode))?;
-                scope::parse(&text).map_err(SharedSourceError::Scope)?
+                scope::parse_entries(&text).map_err(SharedSourceError::Scope)?
             }
         };
-        if let Some(key) = scopes.keys().find(|key| !ids.contains(*key)) {
+        if let Some(key) = entries.keys().find(|key| !ids.contains(*key)) {
             return Err(SharedSourceError::UnknownScopeKey(key.clone()));
         }
-        let digest = digest_of(&ids, &scopes);
+        let key = BindingKey::new(&peers, &entries)?;
+        let digest = key.digest();
+        let scopes = entries
+            .into_iter()
+            .map(|(id, entry)| (id, entry.scope))
+            .collect();
         Ok(Self {
             peers,
             scopes,
+            key,
             digest,
         })
     }
@@ -250,32 +436,8 @@ impl BoundFederationSource {
     }
 }
 
-/// SHA-256 over the domain, then per peer id in sorted order: the id, a tag
-/// and each pattern length-prefixed (so no two sources share an input).
-fn digest_of(ids: &BTreeSet<String>, scopes: &BTreeMap<String, PeerOutboundScope>) -> String {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(DIGEST_DOMAIN);
-    for id in ids {
-        hasher.update((id.len() as u64).to_le_bytes());
-        hasher.update(id.as_bytes());
-        match scopes.get(id) {
-            Some(PeerOutboundScope::Namespaces(patterns)) => {
-                hasher.update([DIGEST_TAG_NAMESPACES]);
-                hasher.update((patterns.len() as u64).to_le_bytes());
-                for pattern in patterns {
-                    hasher.update((pattern.len() as u64).to_le_bytes());
-                    hasher.update(pattern.as_bytes());
-                }
-            }
-            Some(PeerOutboundScope::Deny) | None => hasher.update([DIGEST_TAG_DENY]),
-        }
-    }
-    hex::encode(hasher.finalize())
-}
-
 /// The peer set a daemon starts federation with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[must_use]
 pub enum ServePeerSet {
     /// Outside the posture: the flag value, unchanged, and the outbound
@@ -296,9 +458,20 @@ impl ServePeerSet {
     }
 }
 
+impl fmt::Debug for ServePeerSet {
+    /// Peer counts and the digest only: a peer URL may carry a credential.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unbound(peers) => f.debug_tuple("Unbound").field(&peers.len()).finish(),
+            Self::Bound(source) => f.debug_tuple("Bound").field(source).finish(),
+        }
+    }
+}
+
 /// Bind the daemon's peer list: outside the posture (`posture` false) the
-/// flag value unchanged; under it the shared source, which the flag must name
-/// exactly (as sets of stable peer ids).
+/// flag value unchanged; under it the shared source, which the flag (named
+/// `flag_name` in a refusal) must name exactly: the same dialled URLs
+/// ([`BindingUrl`]), each once.
 ///
 /// # Errors
 ///
@@ -306,6 +479,7 @@ impl ServePeerSet {
 /// [`SharedSourceError::Divergent`] when the flag differs from it.
 pub fn resolve_with(
     posture: bool,
+    flag_name: &'static str,
     flag: &[String],
     peers_raw: Option<OsString>,
     scope_raw: Option<OsString>,
@@ -314,35 +488,40 @@ pub fn resolve_with(
         return Ok(ServePeerSet::Unbound(flag.to_vec()));
     }
     let source = BoundFederationSource::from_values(peers_raw, scope_raw)?;
-    let mut flag_ids: Vec<String> = canonical_peer_list(flag)
+    let flag_peers = canonical_peer_list(flag);
+    let divergent = SharedSourceError::Divergent {
+        flag_name,
+        flag: flag_peers.len(),
+        source: source.key.peers.len(),
+    };
+    // A flag entry that does not parse dials no source URL: divergent. The
+    // list is sorted, not de-duplicated, so a repeated peer diverges too.
+    let mut flag_urls = flag_peers
         .iter()
-        .map(|url| super::peer::stable_peer_id(url))
-        .collect();
-    flag_ids.sort_unstable();
-    let mut source_ids: Vec<String> = source
-        .peers()
-        .iter()
-        .map(|url| super::peer::stable_peer_id(url))
-        .collect();
-    source_ids.sort_unstable();
-    if flag_ids != source_ids {
-        return Err(SharedSourceError::Divergent {
-            flag: flag_ids.len(),
-            source: source_ids.len(),
-        });
+        .map(|url| BindingUrl::new(url))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| divergent.clone())?;
+    flag_urls.sort_unstable();
+    if !flag_urls.iter().eq(source.key.peers.keys()) {
+        return Err(divergent);
     }
     Ok(ServePeerSet::Bound(source))
 }
 
 /// [`resolve_with`] over this process's posture signal and environment; the
-/// entry `serve` and `sync-daemon` call before federation starts.
+/// entry `serve` and `sync-daemon` call before federation starts, each with
+/// its own flag name ([`SERVE_PEERS_FLAG`], [`SYNC_DAEMON_PEERS_FLAG`]).
 ///
 /// # Errors
 ///
 /// As [`resolve_with`].
-pub fn resolve_peers(flag: &[String]) -> Result<ServePeerSet, SharedSourceError> {
+pub fn resolve_peers(
+    flag_name: &'static str,
+    flag: &[String],
+) -> Result<ServePeerSet, SharedSourceError> {
     resolve_with(
         crate::enterprise_federation_posture::enterprise_federation_posture_required(),
+        flag_name,
         flag,
         std::env::var_os(PEERS_ENV),
         std::env::var_os(scope::OUTBOUND_SCOPE_ENV),
@@ -437,7 +616,7 @@ mod tests {
     const PEER_A: &str = "https://user:pw@peer-a.example.org:9077/fed";
     const PEER_B: &str = "https://peer-b.example.org:9077";
     const FIX: &str = "set it to the comma-separated https peer URLs (the exact --quorum-peers \
-                       value) and restart";
+                       / --peers value) and restart";
 
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
@@ -608,13 +787,14 @@ mod tests {
             (None, list(&[])),
         ] {
             assert_eq!(
-                resolve_with(false, &flag, peers_raw, os(&scopes)).unwrap(),
+                resolve_with(false, SERVE_PEERS_FLAG, &flag, peers_raw, os(&scopes)).unwrap(),
                 ServePeerSet::Unbound(flag.clone())
             );
         }
         // C-9: a matching flag binds (order and spelling free).
         let bound = resolve_with(
             true,
+            SERVE_PEERS_FLAG,
             &list(&[&format!("{PEER_B}/")]),
             os(PEER_B),
             os(&scopes),
@@ -641,7 +821,8 @@ mod tests {
             (list(&[PEER_B]), None, SharedSourceError::Absent.to_string()),
         ];
         for (flag, peers_raw, want) in cases {
-            let err = resolve_with(true, &flag, peers_raw, os(&scopes)).unwrap_err();
+            let err =
+                resolve_with(true, SERVE_PEERS_FLAG, &flag, peers_raw, os(&scopes)).unwrap_err();
             assert_eq!(err.to_string(), want, "{flag:?}");
         }
     }
@@ -670,7 +851,10 @@ mod tests {
     #[test]
     fn binding_url_folds_scheme_and_host_only_10065() {
         let cases: [(&str, &str); 6] = [
-            (CASED, "https://user:pw@peer-a.example.org:9077/fed/api/v1/sync/push"),
+            (
+                CASED,
+                "https://user:pw@peer-a.example.org:9077/fed/api/v1/sync/push",
+            ),
             (
                 "HTTPS://user:pw@PEER-A.Example.ORG:9077/fed",
                 "https://user:pw@peer-a.example.org:9077/fed/api/v1/sync/push",
@@ -714,16 +898,28 @@ mod tests {
             (CASED, None),
             ("HTTPS://user:pw@PEER-A.EXAMPLE.ORG:9077/fed", None),
             ("https://user:pw@peer-a.example.org:9077/fed/", None),
-            ("https://user:pw@peer-a.example.org:9077/FED", Some(&divergent)),
-            ("https://user:pw@peer-a.example.org:9077/Fed", Some(&divergent)),
-            ("https://User:pw@peer-a.example.org:9077/fed", Some(&divergent)),
-            ("https://user:PW@peer-a.example.org:9077/fed", Some(&divergent)),
+            (
+                "https://user:pw@peer-a.example.org:9077/FED",
+                Some(&divergent),
+            ),
+            (
+                "https://user:pw@peer-a.example.org:9077/Fed",
+                Some(&divergent),
+            ),
+            (
+                "https://User:pw@peer-a.example.org:9077/fed",
+                Some(&divergent),
+            ),
+            (
+                "https://user:PW@peer-a.example.org:9077/fed",
+                Some(&divergent),
+            ),
         ];
         for (flag, want) in cases {
             let got = resolve_with(true, SERVE_PEERS_FLAG, &list(&[flag]), os(CASED), None);
             match want {
                 None => assert!(matches!(got, Ok(ServePeerSet::Bound(_))), "{flag}: {got:?}"),
-                Some(err) => assert_eq!(got.as_ref().err(), Some(*err), "{flag}"),
+                Some(err) => assert_eq!(got.as_ref().err(), Some(err), "{flag}"),
             }
         }
         // The source side too: a path-case edit of the source changes the
@@ -743,8 +939,14 @@ mod tests {
         assert_eq!(base.digest_line(), host.digest_line());
         // A flag that repeats a peer is not the source's set.
         assert_eq!(
-            resolve_with(true, SERVE_PEERS_FLAG, &list(&[CASED, CASED]), os(CASED), None)
-                .unwrap_err(),
+            resolve_with(
+                true,
+                SERVE_PEERS_FLAG,
+                &list(&[CASED, CASED]),
+                os(CASED),
+                None
+            )
+            .unwrap_err(),
             SharedSourceError::Divergent {
                 flag_name: SERVE_PEERS_FLAG,
                 flag: 2,
@@ -768,7 +970,11 @@ mod tests {
             let source =
                 BoundFederationSource::from_values(os(PEER_B), os(&scope_for(PEER_B, patterns)))
                     .unwrap();
-            assert_eq!(only_binding(&source), (Some(want.to_vec()), vec![]), "{patterns}");
+            assert_eq!(
+                only_binding(&source),
+                (Some(want.to_vec()), vec![]),
+                "{patterns}"
+            );
             digests.insert(source.digest_line());
         }
         assert_eq!(digests.len(), 1, "{digests:?}");
@@ -844,12 +1050,13 @@ mod tests {
                 .filter_map(|a| a.get_long().map(str::to_string))
                 .collect()
         };
-        let sync = longs(crate::cli::sync::SyncDaemonArgs::augment_args(clap::Command::new(
-            "sync-daemon",
-        )));
+        let sync = longs(crate::cli::sync::SyncDaemonArgs::augment_args(
+            clap::Command::new("sync-daemon"),
+        ));
         assert!(sync.contains(&"peers".to_string()), "{sync:?}");
-        let serve =
-            longs(crate::daemon_runtime::ServeArgs::augment_args(clap::Command::new("serve")));
+        let serve = longs(crate::daemon_runtime::ServeArgs::augment_args(
+            clap::Command::new("serve"),
+        ));
         assert!(serve.contains(&"quorum-peers".to_string()), "{serve:?}");
     }
 

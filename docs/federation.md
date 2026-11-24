@@ -595,6 +595,17 @@ export AI_MEMORY_FED_PEER_OUTBOUND_SCOPE='{
   the daemon is bound to, and an edit applies only after a restart. The
   digest carries no credential. A fresh doctor without the posture signal
   FAILs check #23.
+- The flag matches the key, and the digest is taken, over the binding
+  key (#10065): per peer, the URL the daemon dials (the peer URL with
+  trailing slashes trimmed plus `/api/v1/sync/push`, with the scheme and
+  host lowercased and a default port dropped; the path and userinfo keep
+  their case), its outbound patterns as a sorted set without repeats (or
+  deny) and its `peer_ids` as a sorted set. A flag that differs only in
+  path or userinfo case, or that lists a peer twice, is a different peer
+  set; reordered or repeated patterns give the same digest; a `peer_ids`
+  change gives a different one. A divergence refusal names the flag of
+  the entry point: `--quorum-peers` for `serve`, `--peers` for
+  `sync-daemon`.
 - **Upgrade note (#10059).** A deployment that ran under the
   enterprise-federation posture with `--quorum-peers` alone must set
   `AI_MEMORY_FED_QUORUM_PEERS` to the same comma-separated value before

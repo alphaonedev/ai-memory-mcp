@@ -40,6 +40,11 @@ const FED_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 /// pm-v3.1 no-hardcoded-literal discipline), referenced by name everywhere.
 const FED_LOG_TARGET: &str = "federation";
 
+/// The path the daemon appends to a peer URL (trailing slashes trimmed) to
+/// form the push URL it dials. #10065: the shared-source binding builds its
+/// comparison key from the same constant, so the key is the dialled URL.
+pub(crate) const SYNC_PUSH_PATH: &str = "/api/v1/sync/push";
+
 /// #2442 — prefix of the stable, identity-derived [`PeerEndpoint::id`].
 ///
 /// Two characters are load-bearing, neither is decoration:
@@ -277,8 +282,11 @@ impl FederationConfig {
         // Ultrareview #341: reject duplicate peer URLs at build time.
         // If the same peer URL appears twice under different indices,
         // both would count as distinct ack sources and the quorum
-        // guarantee is violated. Normalize (trim trailing slash,
-        // lowercase scheme+host) before comparing.
+        // guarantee is violated. Normalize (trim trailing slashes,
+        // lowercase the whole URL: `normalize_peer_url`) before comparing,
+        // so two spellings that differ only in case are refused as one
+        // peer (#10065: the dialled URL keeps its path and userinfo case;
+        // the shared-source binding compares that URL, not this key).
         //
         // #2442 — the normalisation is now the shared [`normalize_peer_url`]
         // helper rather than an inline expression, because `stable_peer_id`
@@ -377,7 +385,7 @@ impl FederationConfig {
                 );
                 PeerEndpoint {
                     id,
-                    sync_push_url: format!("{trimmed}/api/v1/sync/push"),
+                    sync_push_url: format!("{trimmed}{SYNC_PUSH_PATH}"),
                     // #9996: deny by default; only the operator's
                     // outbound scope opens a peer.
                     outbound_scope: super::outbound_scope::PeerOutboundScope::Deny,

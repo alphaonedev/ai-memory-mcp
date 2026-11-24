@@ -71,7 +71,9 @@ fn judge_peers(
         };
         return (
             false,
-            format!("{UNVERIFIABLE}: the peer list is the `serve --quorum-peers` argument; {env}"),
+            format!(
+                "{UNVERIFIABLE}: the peer list is the `serve --quorum-peers` / `sync-daemon --peers` argument; {env}"
+            ),
         );
     };
     let map = match parsed {
@@ -144,7 +146,7 @@ pub(super) fn check_outbound_scope() -> PostureCheck {
         actual,
         pass,
         "arm AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, set AI_MEMORY_FED_QUORUM_PEERS \
-         to the comma-separated peer URLs (the exact `serve --quorum-peers` value) and \
+         to the comma-separated peer URLs (the exact `serve --quorum-peers` / `sync-daemon --peers` value) and \
          AI_MEMORY_FED_PEER_OUTBOUND_SCOPE to a JSON object naming, for each peer URL, the \
          namespaces it may receive (`{\"<peer url>\": {\"allowed_namespaces\": [...]}}`); \
          do not use `**`; restart the daemon after an edit",
@@ -274,7 +276,7 @@ pub(super) mod tests {
         assert_eq!(
             actual,
             "the daemon outbound scope is not provable from a fresh process (live check \
-             #10059): the peer list is the `serve --quorum-peers` argument; 1 scoped peer \
+             #10059): the peer list is the `serve --quorum-peers` / `sync-daemon --peers` argument; 1 scoped peer \
              key(s) in the env"
         );
         let (pass, actual) = judge_peers(None, Ok(BTreeMap::new()));
@@ -282,7 +284,7 @@ pub(super) mod tests {
         assert_eq!(
             actual,
             "the daemon outbound scope is not provable from a fresh process (live check \
-             #10059): the peer list is the `serve --quorum-peers` argument; 0 scoped peer \
+             #10059): the peer list is the `serve --quorum-peers` / `sync-daemon --peers` argument; 0 scoped peer \
              key(s) in the env"
         );
     }
@@ -325,7 +327,7 @@ pub(super) mod tests {
     fn degenerate_shared_source_fails_with_exact_text_10059() {
         use crate::federation::shared_source::PEERS_ENV;
         let fix = "set it to the comma-separated https peer URLs (the exact --quorum-peers \
-                   value) and restart";
+                   / --peers value) and restart";
         let shown_b = crate::url_display::url_origin_and_path(PEER_B);
         let not_narrowed = format!("peer(s) without a narrowed outbound scope: {shown_b}");
         let scope_b = |ns: &str| format!(r#"{{"{PEER_B}": {{"allowed_namespaces": {ns}}}}}"#);

@@ -361,7 +361,8 @@ fn certified_pg_config_reaches_all_pass() {
                 r#"{"https://peer-1.example.org:9077":{"allowed_namespaces":["public/*"]}}"#,
             ),
             // #10059 check #23 — the shared peer-list source the daemon binds
-            // to under the posture (the exact `serve --quorum-peers` value).
+            // to under the posture (the exact `serve --quorum-peers` /
+            // `sync-daemon --peers` value).
             (
                 ai_memory::federation::shared_source::PEERS_ENV,
                 "https://peer-1.example.org:9077",

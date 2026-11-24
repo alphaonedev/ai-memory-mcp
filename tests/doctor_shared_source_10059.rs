@@ -17,7 +17,7 @@ use ai_memory::enterprise_federation_posture::{
 };
 use ai_memory::federation::outbound_scope::OUTBOUND_SCOPE_ENV;
 use ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV;
-use ai_memory::federation::shared_source::{PEERS_ENV, SharedSourceError};
+use ai_memory::federation::shared_source::{PEERS_ENV, SERVE_PEERS_FLAG, SharedSourceError};
 
 /// The key name operators write in the deploy env file
 /// (`docs/deploy/enterprise-federation.env`). Spelled out, not taken from
@@ -158,7 +158,12 @@ fn divergent_or_absent_source_refuses_serve_with_exact_text_10059() {
     );
     let err = stderr(&out);
     assert!(!out.status.success(), "{err}");
-    let want = SharedSourceError::Divergent { flag: 2, source: 1 }.to_string();
+    let want = SharedSourceError::Divergent {
+        flag_name: SERVE_PEERS_FLAG,
+        flag: 2,
+        source: 1,
+    }
+    .to_string();
     assert!(err.contains(&want), "want {want:?} in {err}");
     assert!(!sb.path().join("store.db").exists());
 

@@ -1161,7 +1161,7 @@ pub struct ServeArgs {
     /// Comma-separated list of peer base URLs. Each peer is assumed to
     /// expose `POST /api/v1/sync/push` — the same endpoint the
     /// sync-daemon already uses.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long = crate::federation::shared_source::SERVE_PEERS_FLAG, value_delimiter = ',')]
     pub quorum_peers: Vec<String>,
     /// Deadline for quorum-ack collection. After this many ms a
     /// locally-durable write returns **202 Accepted** with the
@@ -6360,7 +6360,10 @@ pub async fn bootstrap_serve(
         crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     // #10059 — under the posture the peers and scopes are the shared source's.
-    let peer_set = federation::shared_source::resolve_peers(&args.quorum_peers)?;
+    let peer_set = federation::shared_source::resolve_peers(
+        federation::shared_source::SERVE_PEERS_FLAG,
+        &args.quorum_peers,
+    )?;
     if let Some(scopes) = &app_config.monitoring
         && !scopes.peer_ids.is_empty()
     {
@@ -9338,7 +9341,11 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     for peer in &peers {
         crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    let peer_set = crate::federation::shared_source::resolve_peers(&peers)?; // #10059
+    // #10059; #10065: a refusal names this entry point's own flag.
+    let peer_set = crate::federation::shared_source::resolve_peers(
+        crate::federation::shared_source::SYNC_DAEMON_PEERS_FLAG,
+        &peers,
+    )?;
     let peers = peer_set.peers().to_vec();
     let interval = interval_secs.max(1);
     let batch_size = batch_size.max(1);
