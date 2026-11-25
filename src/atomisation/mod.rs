@@ -941,7 +941,7 @@ fn archive_source(
 /// v0.7.0 (issue #1244) — `curator_model` is threaded in from the
 /// caller's resolved LLM model name (via [`Atomiser::with_curator_model`])
 /// rather than hardcoded to `"gemma4"`. Default fallback is `"unknown"`.
-fn emit_atomisation_complete_event(
+pub(crate) fn emit_atomisation_complete_event(
     conn: &Connection,
     source_id: &str,
     atom_ids: &[String],
