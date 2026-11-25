@@ -1622,4 +1622,11 @@ fn cli_reports_agent_signed_rows_not_verified_10105() {
         ),
         "{text}"
     );
+
+    let (_, stdout, stderr) = run(&["verify-audit-trail"]);
+    let text = stdout + &stderr;
+    assert!(
+        text.contains("note: 3 agent-signed row(s) NOT verified by this walk"),
+        "{text}"
+    );
 }

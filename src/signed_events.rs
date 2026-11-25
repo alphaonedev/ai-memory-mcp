@@ -1369,15 +1369,24 @@ impl RowSignatureVerdict {
 
 /// v0.9.0 G9 (#1826) — classify ONE row's per-row Ed25519 verification. The
 /// SHARED verification core so the sqlite [`verify_chain`] walk and the
-/// postgres verify twin (C7) surface IDENTICAL failure sets (K3 parity):
+/// postgres verify twin (C7) surface IDENTICAL failure sets (K3 parity).
+/// It matches EXHAUSTIVELY on the row's [`SignerIdentity`]:
 ///
+/// - a `lineage_signed` witness row is `Skipped(LineageWitness)` (G13);
 /// - a `recorder_signed` row is verified against `recorder_verifier` over
 ///   `DOMAIN_RECORDER || signing_input_bytes(payload, cause)`; when NO recorder
 ///   pubkey is enrolled the row is SKIPPED (C6 — never false-failed vs daemon);
+/// - #10105 — an agent-signed row (`self_signed`, `signed_by_peer`,
+///   `peer_attested`) is NEVER checked against the daemon key: a signature of
+///   exactly [`ed25519_dalek::SIGNATURE_LENGTH`] bytes is
+///   `Skipped(AgentSignedDomainObject)` (never `Verified`), a missing one is
+///   `Failed(AgentSignatureMissing)` and any other length is
+///   `Failed(AgentSignatureMalformed)`, with or without a daemon verifier;
 /// - a `daemon_signed` governance row is DEMOTED to a role-separation failure
 ///   once a recorder key is enrolled (C2);
-/// - every other row routes to the legacy daemon verifier (#1071 / #1452),
-///   byte-identical to the pre-G9 behaviour.
+/// - every other row (`daemon_signed`, `unsigned`, an unrecognised level)
+///   routes to the legacy daemon verifier (#1071 / #1452), so an unrecognised
+///   level fails closed when a verifier is installed.
 #[must_use]
 pub fn classify_row_signature(
     event: &SignedEvent,
@@ -1385,8 +1394,7 @@ pub fn classify_row_signature(
     recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
     cutoff: &LegacyCutoff,
 ) -> RowSignatureVerdict {
-    use crate::models::AttestLevel;
-    if event.attest_level == AttestLevel::LineageSigned.as_str() {
+    match SignerIdentity::of(&event.attest_level) {
         // v0.9.0 G13 (#1828) — identity-lineage WITNESS row. Its
         // `signature` is the succession signature by the record's
         // PREDECESSOR key over the `LINEAGE_DOMAIN`-tagged bytes, not a
@@ -1402,43 +1410,74 @@ pub fn classify_row_signature(
         // DOWNGRADED into this skip class (attest relabeled, signature stripped)
         // stops being a free pass — it is `unverified` → dirty. See
         // [`SignatureCheck`].
-        return RowSignatureVerdict::Skipped(SkipReason::LineageWitness);
+        SignerIdentity::LineageWitness => RowSignatureVerdict::Skipped(SkipReason::LineageWitness),
+        SignerIdentity::Recorder => classify_recorder_row(event, recorder_verifier),
+        // #10105 (option C, the lineage precedent) — an agent-signed domain
+        // object is signed by the agent's (or peer's) own key over that
+        // domain's bytes, so the daemon verifier would ALWAYS false-fail it.
+        // The walk checks its chain linkage (in the caller) and that a
+        // signature of the right length is present; it never verifies it.
+        SignerIdentity::Agent(_) => match event.signature.as_deref() {
+            None => RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMissing),
+            Some(sig) if sig.len() == ed25519_dalek::SIGNATURE_LENGTH => {
+                RowSignatureVerdict::Skipped(SkipReason::AgentSignedDomainObject)
+            }
+            Some(_) => RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMalformed),
+        },
+        SignerIdentity::Daemon
+            if recorder_verifier.is_some()
+                && event.event_type
+                    == crate::governance::agent_action::GOVERNANCE_CHECK_EVENT_TYPE =>
+        {
+            // C2 DAEMON DEMOTION — a daemon-signed governance row is no longer an
+            // acceptable recorder attestation once a recorder key is enrolled.
+            RowSignatureVerdict::Failed(SignatureFailure::DaemonRoleDemotion)
+        }
+        SignerIdentity::Daemon | SignerIdentity::Unsigned | SignerIdentity::Unrecognised => {
+            classify_daemon_row(event, daemon_verifier, cutoff)
+        }
     }
-    if event.attest_level == AttestLevel::RecorderSigned.as_str() {
-        // RECORDER-signed row (C6: withhold when no recorder pubkey enrolled).
-        let Some(rk) = recorder_verifier else {
-            // v1.0.0 L4 — COUNTED as `Skipped(RecorderUnenrolled)`, not
-            // discarded (closes the same downgrade class as the lineage arm).
-            return RowSignatureVerdict::Skipped(SkipReason::RecorderUnenrolled);
-        };
-        let ok = match event.signature.as_deref() {
-            Some(sig_bytes) if !sig_bytes.is_empty() => match <[u8; 64]>::try_from(sig_bytes) {
-                Ok(arr) => {
-                    let sig = ed25519_dalek::Signature::from_bytes(&arr);
-                    let preimage = crate::governance::audit::recorder_signing_preimage(
-                        &event.payload_hash,
-                        event.cause_hash.as_deref(),
-                    );
-                    rk.verify_strict(&preimage, &sig).is_ok()
-                }
-                Err(_) => false,
-            },
-            _ => false,
-        };
-        return if ok {
-            RowSignatureVerdict::Verified
-        } else {
-            RowSignatureVerdict::Failed(SignatureFailure::RecorderVerification)
-        };
+}
+
+/// v0.9.0 G9 (#1826) — a `recorder_signed` row (C6: withheld when no recorder
+/// pubkey is enrolled).
+fn classify_recorder_row(
+    event: &SignedEvent,
+    recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
+) -> RowSignatureVerdict {
+    let Some(rk) = recorder_verifier else {
+        // v1.0.0 L4 — COUNTED as `Skipped(RecorderUnenrolled)`, not
+        // discarded (closes the same downgrade class as the lineage arm).
+        return RowSignatureVerdict::Skipped(SkipReason::RecorderUnenrolled);
+    };
+    let ok = match event.signature.as_deref() {
+        Some(sig_bytes) if !sig_bytes.is_empty() => match <[u8; 64]>::try_from(sig_bytes) {
+            Ok(arr) => {
+                let sig = ed25519_dalek::Signature::from_bytes(&arr);
+                let preimage = crate::governance::audit::recorder_signing_preimage(
+                    &event.payload_hash,
+                    event.cause_hash.as_deref(),
+                );
+                rk.verify_strict(&preimage, &sig).is_ok()
+            }
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    if ok {
+        RowSignatureVerdict::Verified
+    } else {
+        RowSignatureVerdict::Failed(SignatureFailure::RecorderVerification)
     }
-    if recorder_verifier.is_some()
-        && event.attest_level == AttestLevel::DaemonSigned.as_str()
-        && event.event_type == crate::governance::agent_action::GOVERNANCE_CHECK_EVENT_TYPE
-    {
-        // C2 DAEMON DEMOTION — a daemon-signed governance row is no longer an
-        // acceptable recorder attestation once a recorder key is enrolled.
-        return RowSignatureVerdict::Failed(SignatureFailure::DaemonRoleDemotion);
-    }
+}
+
+/// The legacy daemon verifier for `daemon_signed`, `unsigned` and
+/// unrecognised rows.
+fn classify_daemon_row(
+    event: &SignedEvent,
+    daemon_verifier: Option<&ed25519_dalek::VerifyingKey>,
+    cutoff: &LegacyCutoff,
+) -> RowSignatureVerdict {
     // Legacy daemon verifier (#1071 / #1452), unchanged — the caller resolves
     // the EFFECTIVE verifier (the out-of-band `AI_MEMORY_AUDIT_PUBKEY` pin when
     // enrolled, else the in-process daemon key), so this arm is pin-agnostic.
