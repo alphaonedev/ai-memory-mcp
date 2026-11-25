@@ -100,6 +100,9 @@ mod synchronous;
 /// #3199 — the backup-manifest-signing posture row (check #22) and its test.
 mod backup_signing;
 
+/// #10086 A-4 — the row-attestation trust-anchor posture row (check #23).
+mod row_attest_anchor;
+
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
 /// name here — deliberately not a free-form string so a typo in
