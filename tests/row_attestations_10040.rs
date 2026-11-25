@@ -1896,6 +1896,45 @@ fn pristine_downgrade_of_an_armed_store_is_never_signed_at_arm_10088() {
     assert!(!sb.report().ok(), "the downgraded store never verifies");
 }
 
+/// #10093, from the attacker's side: the live file of an armed store is
+/// tampered, the attestation side table is dropped and the schema stamped
+/// back below v103, so the next open re-runs the v103 migration and mints a
+/// fresh store identity over the tampered rows. The anchored seal still
+/// records the store as armed: the arm refuses with the exact reason, no
+/// cutover or baseline is signed, and the store never verifies.
+#[test]
+fn dropped_side_table_and_lowered_schema_are_never_re_minted_10093() {
+    let (sb, key, mut mcp) = armed();
+    let id = mcp.store("re-mint 10093");
+    drop(mcp);
+    assert_ok(&sb.report(), "control");
+    sb.seed_conn()
+        .execute_batch(&format!(
+            "UPDATE memories SET tags = '{TAMPERED_TAGS}' WHERE id = '{id}'; \
+             DROP TABLE row_attestations; \
+             DELETE FROM sqlite_sequence WHERE name = 'row_attestations'; \
+             DELETE FROM schema_version; \
+             INSERT INTO schema_version (version) VALUES (102);"
+        ))
+        .expect("tamper, drop the side table and lower the schema");
+
+    let out = run_arm(&sb, &key);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the arm must refuse: {err}");
+    assert!(
+        err.contains(ARM_SEALED_UNSIGNED),
+        "exact arm refusal, got: {err}"
+    );
+    let signed: i64 = sb
+        .conn()
+        .query_row("SELECT COUNT(signature) FROM row_attestations", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    assert_eq!(signed, 0, "the refused arm signed nothing");
+    assert!(!sb.report().ok(), "the re-minted store never verifies");
+}
+
 /// #10087, from the attacker's side: the newest change is rolled back with
 /// its attestation and `sqlite_sequence` lowered to match, so the file is
 /// self-consistent. The anchored seal still records the higher mark.
