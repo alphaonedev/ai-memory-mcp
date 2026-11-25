@@ -23,7 +23,6 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
-use rusqlite::Connection;
 
 use crate::cli::CliOutput;
 use crate::confidence::calibrate::{
@@ -122,7 +121,7 @@ pub fn run(
     // `db::open`, so the guard is applied at the raw-open site. See `refuse_pg_store`.
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "calibrate confidence", out)?;
     let db_path = db_path.as_path();
-    let conn = Connection::open(db_path)?;
+    let conn = crate::storage::open_armed(db_path)?;
     // v1.0.0 #2445 — raw-open WRITE funnel (`calibrate_from_shadow` UPDATEs
     // `confidence_shadow_observations`).
     crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;

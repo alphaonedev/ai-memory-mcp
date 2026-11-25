@@ -1176,7 +1176,7 @@ pub fn dispatch_event_to_subs(
             // failure.
             // #2445 — raw open, ORDERING-covered only; see the disposition +
             // pinned count in tests/db_open_funnel_ceiling_2445.rs.
-            let worker_conn = match Connection::open(&db_path) {
+            let worker_conn = match crate::storage::open_armed(&db_path) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     tracing::warn!(
@@ -2434,7 +2434,7 @@ fn is_private(ip: IpAddr) -> bool {
 /// [`load_secret_hash_with_conn`] to reuse the caller's connection.
 #[allow(dead_code)]
 fn load_secret_hash(db_path: &std::path::Path, sub_id: &str) -> Result<Option<String>> {
-    let conn = Connection::open(db_path).context("load_secret_hash open")?;
+    let conn = crate::storage::open_armed(db_path).context("load_secret_hash open")?;
     load_secret_hash_with_conn(&conn, sub_id)
 }
 
@@ -2466,7 +2466,7 @@ pub fn record_subscription_event(
     event_type: &str,
     payload: &str,
 ) -> Result<()> {
-    let conn = Connection::open(db_path).context("subscription_events open")?;
+    let conn = crate::storage::open_armed(db_path).context("subscription_events open")?;
     record_subscription_event_with_conn(&conn, sub_id, correlation_id, event_type, payload)
 }
 
@@ -2498,7 +2498,7 @@ pub fn record_subscription_event_with_conn(
 /// `open` (`audit_status`), so the persisted history can no longer
 /// disagree with the wire without anyone knowing.
 fn update_event_status(db_path: &std::path::Path, sub_id: &str, correlation_id: &str, ok: bool) {
-    match Connection::open(db_path) {
+    match crate::storage::open_armed(db_path) {
         Ok(conn) => {
             update_event_status_with_conn(&conn, sub_id, correlation_id, ok);
         }
@@ -2533,7 +2533,7 @@ pub fn record_dlq(
     first_failed_at: &str,
     last_failed_at: &str,
 ) -> Result<()> {
-    let conn = Connection::open(db_path).context("subscription_dlq open")?;
+    let conn = crate::storage::open_armed(db_path).context("subscription_dlq open")?;
     record_dlq_with_conn(
         &conn,
         sub_id,
@@ -2826,7 +2826,7 @@ pub fn memory_subscription_replay(
 }
 
 fn record_dispatch(db_path: &std::path::Path, sub_id: &str, correlation_id: &str, ok: bool) {
-    match Connection::open(db_path) {
+    match crate::storage::open_armed(db_path) {
         Ok(conn) => record_dispatch_with_conn(&conn, sub_id, correlation_id, ok),
         Err(e) => audit_status::note_failure(
             audit_status::AuditStage::Open,

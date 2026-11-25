@@ -180,7 +180,9 @@ fn symlink_entries_and_roots_are_never_followed() {
 #[test]
 fn missing_and_malformed_registries_refuse_deletion() {
     let f = Fixture::new();
-    let conn = ai_memory::db::open_unmigrated(&f.db).unwrap();
+    // A fixture write to `memories`: the armed funnel (#10091), since the
+    // unmigrated handle refuses attested writes.
+    let conn = ai_memory::db::open_armed(&f.db).unwrap();
     conn.execute(
         "UPDATE memories SET metadata = '{}' WHERE namespace = '_agents'",
         [],
@@ -227,7 +229,9 @@ fn doctor_names_orphans_and_the_preview_command() {
 #[test]
 fn expired_nested_and_ambiguous_registered_names_are_protected() {
     let f = Fixture::new();
-    let conn = ai_memory::db::open_unmigrated(&f.db).unwrap();
+    // A fixture write to `memories`: the armed funnel (#10091), since the
+    // unmigrated handle refuses attested writes.
+    let conn = ai_memory::db::open_armed(&f.db).unwrap();
     ai_memory::db::register_agent(&conn, "nested/agent", "system", &[]).unwrap();
     ai_memory::db::register_agent(&conn, "ambiguous.x25519", "system", &[]).unwrap();
     conn.execute(

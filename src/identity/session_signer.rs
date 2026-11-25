@@ -377,7 +377,8 @@ pub fn install_from_env(
         .map_err(|e| crate::errors::refusal(format!("{REFUSE_ROW_ATTEST_NOT_INSTALLED}: {e:#}")))?
     {
         crate::storage::row_attest::sqlite::ArmState::Armed => {}
-        crate::storage::row_attest::sqlite::ArmState::NoSigner => {
+        crate::storage::row_attest::sqlite::ArmState::NoSigner
+        | crate::storage::row_attest::sqlite::ArmState::Refusing => {
             return Err(crate::errors::refusal(REFUSE_ROW_ATTEST_NOT_INSTALLED));
         }
     }

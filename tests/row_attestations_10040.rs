@@ -25,8 +25,9 @@ use std::collections::BTreeMap;
 
 use ai_memory::storage::row_attest::anchor::TrustAnchor;
 use ai_memory::storage::row_attest::sqlite::{
-    REFUSE_KEY_MISMATCH, REFUSE_NO_SIGNER, REFUSE_ROW_DRIFT, REFUSE_STRIPPED_CUTOVER, ROW_ATTEST_REFUSAL_PREFIX,
-    SNAPSHOT_REFUSAL_PREFIX, read_attestations, read_rows, verify_sqlite_with,
+    REFUSE_KEY_MISMATCH, REFUSE_NO_SIGNER, REFUSE_ROW_DRIFT, REFUSE_STRIPPED_CUTOVER,
+    ROW_ATTEST_REFUSAL_PREFIX, SNAPSHOT_REFUSAL_PREFIX, read_attestations, read_rows,
+    verify_sqlite_with,
 };
 use ai_memory::storage::row_attest::{
     Attestation, CanonicalRow, Report, TABLES, acc_add, acc_sub, acc_term, encode_key, key_id_of,
@@ -2375,7 +2376,10 @@ fn the_unmigrated_handle_refuses_every_attested_write_10091() {
             "update",
             "UPDATE memories SET content = ?2 WHERE id = ?1".to_string(),
         ),
-        ("delete", "DELETE FROM memories WHERE id = ?1".to_string()),
+        (
+            "delete",
+            "DELETE FROM memories WHERE id = ?1 AND ?2 IS NOT NULL".to_string(),
+        ),
         (
             "insert",
             "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
@@ -2389,7 +2393,8 @@ fn the_unmigrated_handle_refuses_every_attested_write_10091() {
             .execute(sql, [id.as_str(), TAMPERED_10091])
             .expect_err("the unarmed handle must refuse the write");
         assert!(
-            err.to_string().contains(&refusal(REFUSE_UNARMED_HANDLE_TEXT)),
+            err.to_string()
+                .contains(&refusal(REFUSE_UNARMED_HANDLE_TEXT)),
             "{label}: exact unarmed refusal, got: {err}"
         );
     }

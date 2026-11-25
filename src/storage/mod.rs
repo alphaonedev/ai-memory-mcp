@@ -1006,6 +1006,8 @@ pub use doctor::{
 // is re-published at `crate::storage::*` (and therefore `crate::db::*`
 // via the lib.rs shim) so callsites keep resolving without churn.
 pub use connection::open;
+// #10091 — the arming constructor for an existing store (no ladder).
+pub use connection::open_armed;
 // #1580 — read-only connection opener for the HTTP WAL read-pool.
 pub use connection::open_read_only;
 // #3411 / #3434 — missing-path refusal for advertised-read-only verbs.

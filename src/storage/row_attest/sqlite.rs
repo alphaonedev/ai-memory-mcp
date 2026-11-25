@@ -59,8 +59,86 @@ pub const REFUSE_ROW_DRIFT: &str =
 pub enum ArmState {
     /// Triggers and function installed; cutovers signed.
     Armed,
-    /// No session signer: nothing installed (writes are not attested).
+    /// No session signer on a never-armed store: nothing installed (writes
+    /// are not attested; there is no history they could break).
     NoSigner,
+    /// #10091 — no session signer on a store that was armed (the trust
+    /// anchor holds its seal, or a cutover is signed): the funnel is
+    /// installed with the session source, so every attested write refuses
+    /// with [`REFUSE_NO_SIGNER`] instead of landing as permanent drift.
+    Refusing,
+}
+
+/// Refusal (#10091): a connection opened without the arming constructor
+/// tried to write an attested table.
+pub const REFUSE_UNARMED_HANDLE: &str = "this connection is not armed for attested writes";
+
+/// #10091 — refuse every write to an attested table on `conn`, for a handle
+/// that is never armed (`open_unmigrated`). Each present table gets TEMP
+/// BEFORE triggers that abort with [`REFUSE_UNARMED_HANDLE`]; they name no
+/// column, so a store at any schema still opens. A table created later on
+/// this handle is not covered: such a handle never runs the ladder.
+///
+/// # Errors
+///
+/// The `sqlite_master` read or a trigger creation failed; the caller refuses
+/// the open (fail closed).
+pub fn refuse_attested_writes(conn: &Connection) -> Result<()> {
+    let reason = refusal(REFUSE_UNARMED_HANDLE).replace('\'', "''");
+    for spec in TABLES {
+        let present: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [spec.table],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if present.is_none() {
+            continue;
+        }
+        let t = spec.table;
+        let mut sql = String::new();
+        for (tag, op) in [("ins", "INSERT"), ("upd", "UPDATE"), ("del", "DELETE")] {
+            sql.push_str(&format!(
+                "CREATE TEMP TRIGGER IF NOT EXISTS ra10091_{t}_{tag} BEFORE {op} ON main.\"{t}\" \
+                 BEGIN SELECT RAISE(ABORT, '{reason}'); END;"
+            ));
+        }
+        conn.execute_batch(&sql)
+            .with_context(|| format!("unarmed-handle refusal triggers on {t}"))?;
+    }
+    Ok(())
+}
+
+/// #10091 — whether the store behind `conn` was ever armed: the trust anchor
+/// holds a seal for it (or one it cannot read, which fails closed), or a
+/// cutover in it carries a signature.
+fn was_armed(conn: &Connection) -> Result<bool> {
+    let anchor = super::anchor::TrustAnchor::from_key_dir();
+    let sealed = seal::path_for(&anchor, seal::db_of(conn).as_deref())
+        .as_deref()
+        .map_or(SealState::NotSealed, seal::read);
+    if !matches!(sealed, SealState::NotSealed) {
+        return Ok(true);
+    }
+    let present: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'row_attestations'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if present.is_none() {
+        return Ok(false);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM row_attestations WHERE op = 'cutover' AND signature IS NOT NULL LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn refusal(reason: &str) -> String {
@@ -681,6 +759,13 @@ fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<
 /// connection (fail closed).
 pub fn install(conn: &Connection) -> Result<ArmState> {
     if crate::identity::session_signer::session_signer().is_none() {
+        // decision: refuse writes from a no-signer process on an armed store
+        // over silent unattested writes because drift becomes a permanent
+        // REFUSE_ROW_DRIFT (#10091).
+        if was_armed(conn)? {
+            register(conn, SignerSource::Session)?;
+            return Ok(ArmState::Refusing);
+        }
         return Ok(ArmState::NoSigner);
     }
     match session_identity(conn) {
@@ -715,7 +800,9 @@ pub fn arm_with_key(
     let who = bound_identity(conn, agent_id, signing.clone()).map_err(anyhow::Error::msg)?;
     match arm(conn, &who, SignerSource::Fixed(who.clone()))? {
         ArmState::Armed => Ok(()),
-        ArmState::NoSigner => anyhow::bail!("{}", refusal(REFUSE_NO_SIGNER)),
+        ArmState::NoSigner | ArmState::Refusing => {
+            anyhow::bail!("{}", refusal(REFUSE_NO_SIGNER))
+        }
     }
 }
 
