@@ -2481,3 +2481,104 @@ fn the_unmigrated_handle_refuses_every_attested_write_10091() {
     assert_eq!(sb.attestation_count(), count, "no attestation written");
     assert_ok(&sb.report(), "after the refused writes");
 }
+
+// ---------------------------------------------------------------------------
+// A-3 (vote V2-ROW-ATTEST-ANCHOR): the unanchored outcome on the CLI surface
+// ---------------------------------------------------------------------------
+
+/// Exit code of `audit verify-rows` for a clean store, written out (A-3).
+const VERIFY_ROWS_EXIT_CLEAN: i32 = 0;
+/// Exit code for a store with a defect, written out (A-3).
+const VERIFY_ROWS_EXIT_DEFECTIVE: i32 = 2;
+/// Exit code for a run with no trust anchor, written out (A-3).
+const VERIFY_ROWS_EXIT_UNANCHORED: i32 = 3;
+/// The anchor layout marker file name, written out (A-3).
+const MARKER_FILE: &str = "row-attest-anchor.version";
+
+/// `ai-memory audit verify-rows --json` on the sandbox store with `key_dir`
+/// as the anchor; returns the exit code and the JSON report.
+fn verify_rows(sb: &Sandbox, key_dir: &Path) -> (i32, Value) {
+    let out = sb
+        .base_command(AGENT, "0")
+        .env("AI_MEMORY_KEY_DIR", key_dir)
+        .args([
+            "--db",
+            sb.db().to_str().expect("utf-8 db path"),
+            "audit",
+            "verify-rows",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run audit verify-rows");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "verify-rows printed no JSON ({e}): {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().expect("verify-rows exit code"), report)
+}
+
+/// Attacker side, A-3: a missing, empty, unreadable or malformed anchor
+/// gives `unanchored` with its own exit code and JSON value, never clean
+/// and never verified against the key the database holds (this store has a
+/// bound key in its own rows). An anchored clean run is exit 0 and an
+/// anchored defect has its own exit code.
+#[test]
+fn audit_verify_rows_reports_unanchored_distinct_from_clean_10086() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("verify rows 10086");
+    drop(mcp);
+    let keys = sb.root.join("keys");
+    let (code, report) = verify_rows(&sb, &keys);
+    assert_eq!(code, VERIFY_ROWS_EXIT_CLEAN, "anchored clean run: {report}");
+    assert_eq!(report["outcome"], "clean", "anchored clean run: {report}");
+    assert_eq!(report["anchor"]["status"], "anchored", "{report}");
+    assert_eq!(report["signatures_checked"], true, "{report}");
+
+    let missing = sb.root.join("no-such-key-dir");
+    let empty = sb.root.join("empty-keys");
+    std::fs::create_dir_all(&empty).expect("empty key dir");
+    set_mode(&empty, 0o700);
+    let malformed = sb.root.join("malformed-keys");
+    std::fs::create_dir_all(&malformed).expect("malformed key dir");
+    set_mode(&malformed, 0o700);
+    std::fs::write(malformed.join(MARKER_FILE), "999\n").expect("bad marker");
+    let unreadable = sb.root.join("unreadable-keys");
+    std::fs::create_dir_all(&unreadable).expect("unreadable key dir");
+    set_mode(&unreadable, 0o000);
+    let cases = [
+        (&missing, "missing"),
+        (&empty, "empty"),
+        (&unreadable, "unreadable"),
+        (&malformed, "malformed"),
+    ];
+    for (dir, reason) in cases {
+        let (code, report) = verify_rows(&sb, dir);
+        assert_eq!(code, VERIFY_ROWS_EXIT_UNANCHORED, "{reason}: {report}");
+        assert_eq!(report["outcome"], "unanchored", "{reason}: {report}");
+        assert_eq!(
+            report["anchor"]["status"], "unanchored",
+            "{reason}: {report}"
+        );
+        assert_eq!(report["anchor"]["reason"], reason, "{reason}: {report}");
+        assert_eq!(report["signatures_checked"], false, "{reason}: {report}");
+    }
+    set_mode(&unreadable, 0o700);
+
+    sb.raw(
+        "UPDATE memories SET priority = priority + 1 WHERE id = ?1",
+        &id,
+    );
+    let (code, report) = verify_rows(&sb, &keys);
+    assert_eq!(code, VERIFY_ROWS_EXIT_DEFECTIVE, "raw change: {report}");
+    assert_eq!(report["outcome"], "defective", "raw change: {report}");
+    assert!(
+        report["first_defect"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "a defect names itself: {report}"
+    );
+}
