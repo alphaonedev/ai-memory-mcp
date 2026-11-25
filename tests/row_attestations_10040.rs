@@ -2685,3 +2685,63 @@ fn audit_verify_rows_reports_unanchored_distinct_from_clean_10086() {
         "pg node reported clean: {stdout}"
     );
 }
+
+/// L-4 (PR 10083): arming a store whose cutovers are all signed takes no
+/// write lock. A keyed stdio `mcp` session (the open that arms the funnel)
+/// boots and answers `initialize` and `tools/list` while another connection
+/// holds `BEGIN IMMEDIATE`; before the fix every armed open ran
+/// `sign_cutovers` under `BEGIN IMMEDIATE` and the boot refused busy.
+#[test]
+fn armed_open_with_signed_cutovers_takes_no_write_lock_l4() {
+    let (sb, key, mut mcp) = armed();
+    mcp.store("no write lock on an armed open l4");
+    drop(mcp);
+    let holder = sb.seed_conn();
+    holder
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold the write lock");
+    let mut child = sb
+        .base_command(AGENT, "0")
+        .args([
+            "--db",
+            sb.db().to_str().expect("utf-8 db path"),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ])
+        .env(ENV_KEY_FILE, &key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn keyed mcp");
+    {
+        let mut input = child.stdin.take().expect("stdin");
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "attest-10040-l4", "version": "1"}}});
+        let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        for req in [init, list] {
+            // A refused boot has closed stdin already; the assertion below
+            // reports its stderr.
+            let _ = writeln!(input, "{req}");
+        }
+    }
+    let out = child.wait_with_output().expect("wait for mcp");
+    holder.execute_batch("ROLLBACK").expect("release the lock");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let answered: Vec<i64> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v.get("error").is_none() && v.get("result").is_some())
+        .filter_map(|v| v.get("id").and_then(Value::as_i64))
+        .collect();
+    let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
+    assert_eq!(
+        answered,
+        vec![1, 2],
+        "keyed mcp boot under a held write lock; stderr tail: {}",
+        tail.join(" | ")
+    );
+}
