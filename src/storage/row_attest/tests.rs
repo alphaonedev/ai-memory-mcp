@@ -691,8 +691,50 @@ fn verify_detects_missing_store_and_cutover_c6() {
     assert_defect(&g.report(), "leases: no cutover watermark");
 }
 
+/// #10095: a live row of a side table (Supersede retention) whose
+/// attestation was removed is a defect with the exact reason, never a
+/// silent `legacy` count: attribution of every attested row is checked.
 #[test]
-fn verify_legacy_side_rows_report_as_legacy_c6() {
+fn stripped_non_head_supersede_attestation_is_a_defect_10095() {
+    let mut f = Fixture::new();
+    let s = spec("leases");
+    let mut acc = f.head_acc("leases");
+    for (n, act) in ["act1", "act2"].into_iter().enumerate() {
+        let cells = [t(act), t("h"), Cell::Int(1), Cell::Int(2), Cell::Int(1)];
+        let key = encode_key(s, &cells);
+        let digest = row_digest(s, &cells);
+        acc = acc_add(&acc, &acc_term("leases", &key, &digest));
+        let table_seq = i64::try_from(n).unwrap_or(i64::MAX) + 1;
+        let a = f.att("leases", key.clone(), 1, Op::Insert, Some(digest), table_seq, acc);
+        f.atts.push(a);
+        f.live.push(LiveRow {
+            table: "leases".to_string(),
+            key,
+            digest,
+        });
+    }
+    assert!(f.report().ok(), "{:?}", f.report().defects);
+    // The attacker deletes the first (non-head) lease attestation.
+    let first = f
+        .atts
+        .iter()
+        .position(|a| a.table == "leases" && a.op == Op::Insert.as_str())
+        .unwrap_or(usize::MAX);
+    f.atts.remove(first);
+    let r = f.report();
+    assert_eq!(
+        r.defects,
+        vec!["leases: live row has no attestation".to_string()],
+        "{r:?}"
+    );
+    assert!(!r.ok());
+}
+
+/// #10095: a side-table row with no attestation of its own is a defect
+/// even when the cutover accumulator covers it (the arm baselines every
+/// pre-existing row of every attested table, so none is left `legacy`).
+#[test]
+fn a_side_row_covered_only_by_the_cutover_is_a_defect_10095() {
     let mut f = Fixture::new();
     // A pre-existing leases row: covered by the cutover accumulator.
     let s = spec("leases");
@@ -716,8 +758,11 @@ fn verify_legacy_side_rows_report_as_legacy_c6() {
         digest,
     });
     let r = f.report();
-    assert!(r.ok(), "{:?}", r.defects);
-    assert_eq!(r.tables["leases"].legacy, 1);
+    assert_eq!(
+        r.defects,
+        vec!["leases: live row has no attestation".to_string()],
+        "{r:?}"
+    );
 }
 
 #[test]
