@@ -25,9 +25,9 @@ use std::collections::BTreeMap;
 
 use ai_memory::storage::row_attest::anchor::TrustAnchor;
 use ai_memory::storage::row_attest::sqlite::{
-    REFUSE_KEY_MISMATCH, REFUSE_NO_SIGNER, REFUSE_ROW_DRIFT, REFUSE_STRIPPED_CUTOVER,
-    ROW_ATTEST_REFUSAL_PREFIX, SNAPSHOT_REFUSAL_PREFIX, read_attestations, read_rows,
-    verify_sqlite_with,
+    REFUSE_KEY_MISMATCH, REFUSE_NO_SIGNER, REFUSE_ROW_DRIFT, REFUSE_SEAL_UNREADABLE,
+    REFUSE_STRIPPED_CUTOVER, ROW_ATTEST_REFUSAL_PREFIX, SNAPSHOT_REFUSAL_PREFIX, read_attestations,
+    read_rows, verify_sqlite_with,
 };
 use ai_memory::storage::row_attest::{
     Attestation, CanonicalRow, Report, TABLES, acc_add, acc_sub, acc_term, encode_key, key_id_of,
@@ -2700,6 +2700,49 @@ fn armed_open_with_signed_cutovers_takes_no_write_lock_l4() {
     holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("hold the write lock");
+    let (answered, stderr) = boot_and_list(&sb, &key);
+    holder.execute_batch("ROLLBACK").expect("release the lock");
+    let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
+    assert_eq!(
+        answered,
+        vec![1, 2],
+        "keyed mcp boot under a held write lock; stderr tail: {}",
+        tail.join(" | ")
+    );
+}
+
+/// L-4 (PR 10083) fail-closed half: the no-lock probe never arms past an
+/// unreadable seal. With every cutover signed and the anchored seal of the
+/// store replaced by a directory, a keyed boot still refuses with the exact
+/// seal reason.
+#[test]
+fn armed_open_with_an_unreadable_seal_still_refuses_l4() {
+    let (sb, key, mut mcp) = armed();
+    mcp.store("unreadable seal l4");
+    drop(mcp);
+    let seals = sb
+        .root
+        .join("keys")
+        .join(ai_memory::storage::row_attest::seal::SEAL_DIR);
+    let files: Vec<PathBuf> = std::fs::read_dir(&seals)
+        .expect("seal dir")
+        .map(|e| e.expect("seal entry").path())
+        .collect();
+    assert_eq!(files.len(), 1, "one seal for the one store: {files:?}");
+    std::fs::remove_file(&files[0]).expect("remove the seal");
+    std::fs::create_dir(&files[0]).expect("a directory where the seal was");
+    let (answered, stderr) = boot_and_list(&sb, &key);
+    assert!(answered.is_empty(), "boot armed past an unreadable seal");
+    assert!(
+        stderr.contains(REFUSE_SEAL_UNREADABLE),
+        "exact seal refusal: {stderr}"
+    );
+}
+
+/// Boot a keyed stdio `mcp` session on `sb`, send `initialize` and
+/// `tools/list`, close stdin and return the ids answered without error,
+/// with the session's stderr.
+fn boot_and_list(sb: &Sandbox, key: &Path) -> (Vec<i64>, String) {
     let mut child = sb
         .base_command(AGENT, "0")
         .args([
@@ -2711,7 +2754,7 @@ fn armed_open_with_signed_cutovers_takes_no_write_lock_l4() {
             "--tier",
             "keyword",
         ])
-        .env(ENV_KEY_FILE, &key)
+        .env(ENV_KEY_FILE, key)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2728,20 +2771,11 @@ fn armed_open_with_signed_cutovers_takes_no_write_lock_l4() {
         }
     }
     let out = child.wait_with_output().expect("wait for mcp");
-    holder.execute_batch("ROLLBACK").expect("release the lock");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let answered: Vec<i64> = stdout
+    let answered = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter(|v| v.get("error").is_none() && v.get("result").is_some())
         .filter_map(|v| v.get("id").and_then(Value::as_i64))
         .collect();
-    let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
-    assert_eq!(
-        answered,
-        vec![1, 2],
-        "keyed mcp boot under a held write lock; stderr tail: {}",
-        tail.join(" | ")
-    );
+    (answered, String::from_utf8_lossy(&out.stderr).into_owned())
 }
