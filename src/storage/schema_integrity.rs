@@ -107,6 +107,8 @@ pub const TABLE_SIGNED_EVENTS: &str = "signed_events";
 pub const TABLE_AGENT_QUOTAS: &str = "agent_quotas";
 /// See [`TABLE_ARCHIVED_MEMORIES`].
 pub const TABLE_GOVERNANCE_RULES: &str = "governance_rules";
+/// See [`TABLE_ARCHIVED_MEMORIES`].
+pub const TABLE_PENDING_ACTIONS: &str = "pending_actions";
 
 /// One ladder-created relation whose presence is implied by a schema stamp.
 ///

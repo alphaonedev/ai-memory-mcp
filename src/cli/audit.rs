@@ -42,6 +42,10 @@ pub struct AuditArgs {
 pub enum AuditAction {
     /// Verify the hash chain. Exits 0 on success, 2 on mismatch.
     Verify(VerifyArgs),
+    /// #10040 A-3 — verify the row attestations of the store against the
+    /// out-of-database trust anchor. Exits 0 clean, 2 defective, 3
+    /// unanchored (no signature could be checked; never clean).
+    VerifyRows(crate::cli::audit_verify_rows::VerifyRowsArgs),
     /// Print the most recent N events (default 50).
     Tail(TailArgs),
     /// Print the resolved audit log path.
@@ -249,6 +253,7 @@ pub fn run(
     let audit_dir = args.audit_dir.clone();
     match args.action {
         AuditAction::Verify(v) => run_verify(&v, audit_dir.as_deref(), app_config, out),
+        AuditAction::VerifyRows(v) => crate::cli::audit_verify_rows::run(&v, db_path, out),
         AuditAction::Tail(t) => run_tail(&t, audit_dir.as_deref(), app_config, out),
         AuditAction::Path => run_path(audit_dir.as_deref(), app_config, out),
         AuditAction::Show(s) => run_show(&s, db_path, out),

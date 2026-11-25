@@ -41,45 +41,13 @@ mod cfg_test_modules;
 const ALLOWLIST: &[(&str, usize, &str)] = &[
     (
         "src/storage/connection.rs",
-        3,
-        "THE funnel itself — `open`, `open_read_only`, `open_unmigrated`. \
-         Everything below is a bypass OF this file, which is why it is listed \
-         first and why its own count is pinned.",
-    ),
-    (
-        "src/cli/governance_check_action.rs",
-        2,
-        "GUARDED at both sites via `assert_schema_not_ahead` (#2445). Kept off \
-         `db::open` deliberately: the `--from-pretool-stdin` arm is the \
-         PreToolUse hook and sits on the agent's critical path, so it must not \
-         pay the bootstrap + ladder cost on every tool call.",
-    ),
-    (
-        "src/cli/governance_install_defaults.rs",
-        1,
-        "GUARDED via `assert_schema_not_ahead` (#2445). Enables the seeded \
-         governance rules — through `rules_store::set_enabled_signed` for \
-         operator-signed rows (#3430), which also writes `signed_events` and \
-         the policy-version row.",
-    ),
-    (
-        "src/cli/commands/calibrate_confidence.rs",
-        1,
-        "GUARDED via `assert_schema_not_ahead` (#2445). Writes \
-         `confidence_shadow_observations` through `calibrate_from_shadow`.",
-    ),
-    (
-        "src/subscriptions.rs",
-        6,
-        "ORDERING-COVERED, not structurally covered — and that distinction is \
-         the whole reason this entry exists. Every one of these six is reached \
-         only from the webhook dispatcher, which is spawned by a `serve` \
-         process whose `bootstrap_serve` already crossed `db::open`. They write \
-         `subscription_events` / `subscription_dlq` / `subscriptions`, never \
-         `memories`. The coverage is a property of ONE call graph, so the day \
-         someone adds a standalone dispatcher or a `--dispatch-only` mode it \
-         stops holding — at which point this count moves and this test fails, \
-         which is the signal to guard them.",
+        4,
+        "THE funnel itself — `open`, `open_armed`, `open_read_only`, \
+         `open_unmigrated`. Everything below is a bypass OF this file, which \
+         is why it is listed first and why its own count is pinned. #10091: \
+         the governance, calibrate, subscription and curator re-opens that \
+         were listed here now go through `open_armed`, which runs the \
+         downgrade guard and arms the attestation funnel.",
     ),
     (
         "src/vectorlite.rs",
@@ -93,18 +61,10 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
          mechanical.)",
     ),
     (
-        "src/curator/mod.rs",
-        1,
-        "GUARDED via `assert_schema_not_ahead` (#2445). The curator daemon \
-         re-opens the file each cycle off `db::open` so it does not pay \
-         bootstrap + ladder on every interval tick. Hidden until B15 stopped \
-         cutting production at the first interior `#[cfg(test)]` (`use crate::db` \
-         near the top of this file).",
-    ),
-    (
         "src/cli/schema_init.rs",
         1,
         "READ-ONLY catalog enumeration (`sqlite_master` + `schema_version`), \
+         opened with `SQLITE_OPEN_READ_ONLY` (#10091) so it can never write, \
          and it runs only after `migrate::open_store` has already opened and \
          guarded the same file in-process.",
     ),

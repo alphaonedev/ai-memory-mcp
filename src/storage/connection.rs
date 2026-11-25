@@ -1134,18 +1134,45 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
 ///
 /// It is NOT a read-only connection: `VACUUM INTO` is refused under
 /// `PRAGMA query_only = ON` (verified), so [`open_read_only`] cannot serve the
-/// backup path. Callers MUST NOT use this funnel to write memory rows.
+/// backup path. Callers MUST NOT use this funnel to write memory rows, and
+/// since #10091 they cannot: the handle is never armed, so every insert,
+/// update and delete of an attested table through it is refused before it
+/// writes, with the exact reason
+/// [`crate::storage::row_attest::sqlite::REFUSE_UNARMED_HANDLE`].
 ///
 /// # Errors
 ///
-/// Propagates connection-open failures, the SQLCipher unlock failure, or any
-/// PRAGMA failure.
+/// Propagates connection-open failures, the SQLCipher unlock failure, any
+/// PRAGMA failure, or a failure to install the refusal triggers.
 pub fn open_unmigrated(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     apply_writer_pragmas(&conn)?;
+    crate::storage::row_attest::sqlite::refuse_attested_writes(&conn)
+        .context("row attestation refusal funnel (#10091)")?;
     Ok(test_trace_on_open(conn))
+}
+
+/// #10091 — the arming constructor for a writable connection that runs off
+/// [`open`] (no bootstrap, no ladder): the webhook dispatcher, the governance
+/// hook, the curator cycle, confidence calibration. It carries the same
+/// funnels every [`open`] connection carries, so a write to an attested table
+/// through it is attested by the session signer or refused with the exact
+/// reason; no raw handle writes an attested table unseen.
+///
+/// # Errors
+///
+/// Propagates connection-open failures, the SQLCipher unlock failure, the
+/// #2445 downgrade refusal (checked before anything is armed or written), or
+/// the arm failure (fail closed: the caller gets no handle).
+pub fn open_armed(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).context("failed to open database")?;
+    apply_sqlcipher_key(&conn)?;
+    apply_writer_pragmas(&conn)?;
+    assert_schema_not_ahead(&conn, &path.display().to_string())?;
+    arm_session_write_seal(&conn)?;
+    Ok(conn)
 }
 
 // Test seam (#5243): lets a race test trace a connection that a function under
@@ -1252,6 +1279,20 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// #10012 — install the stdio session-signer write-seal funnel on `conn`
 /// when a signer is installed; a no-op otherwise.
 fn arm_session_write_seal(conn: &Connection) -> Result<()> {
+    // #10040 — the same connections carry the row-attestation funnel: every
+    // insert, covered update, transition and delete of an attested table
+    // writes its signed `row_attestations` row in the same statement, or
+    // the statement aborts. Fails closed: an arm failure refuses the open.
+    // Installed BEFORE the #10012 seal triggers: SQLite fires the most
+    // recently created trigger first, so the seal check (the more specific
+    // refusal for a tampered memory row) runs before the attestation.
+    match crate::storage::row_attest::sqlite::install(conn)
+        .context("row attestation funnel (#10040)")?
+    {
+        crate::storage::row_attest::sqlite::ArmState::Armed
+        | crate::storage::row_attest::sqlite::ArmState::NoSigner
+        | crate::storage::row_attest::sqlite::ArmState::Refusing => {}
+    }
     match crate::identity::session_signer::install_write_seal_funnel(conn)
         .context("mcp session signer write-seal funnel (#10012)")?
     {

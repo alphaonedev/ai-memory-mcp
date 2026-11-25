@@ -223,6 +223,22 @@ impl SqliteStore {
     }
 }
 
+/// NOTICE 4c / E-3 — the one verdict for a memory row: its in-row seal
+/// verifies against the owner's bound key AND the one completeness verifier
+/// (`row_attest::sqlite::verify_sqlite`) finds no defect in the store and
+/// does not name this id. #10094: a row drift (a live row with no, a stale or
+/// a delete attestation, and a table head those drifts explain) fails only
+/// the rows it names; any store-wide defect makes every row unverified (fail
+/// closed: a broken signature, chain, seal or unexplained head cannot be
+/// pinned on one row). The rule is `Report::memory_verified`.
+fn memory_signature_verdict(conn: &rusqlite::Connection, mem: &Memory) -> StoreResult<bool> {
+    if !crate::identity::session_signer::row_seal_verifies(conn, mem).map_err(box_err)? {
+        return Ok(false);
+    }
+    let report = crate::storage::row_attest::sqlite::verify_sqlite(conn).map_err(box_err)?;
+    Ok(report.memory_verified(&mem.id))
+}
+
 fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
@@ -1375,13 +1391,12 @@ impl MemoryStore for SqliteStore {
         let genesis = db::read_cid_genesis(&conn, id).map_err(box_err)?;
         let (cid_ok, cid_mismatch) =
             super::cid_verify_fields(mem.cid.as_deref(), genesis.as_deref());
+        let signature_verified = memory_signature_verdict(&conn, &mem)?;
         Ok(VerifyReport {
             memory_id: id.to_string(),
             integrity_ok: findings.is_empty(),
             findings,
-            // v0.6.0 does NOT perform signature verification; real
-            // cryptographic verify lands with Task 1.4. See #302.
-            signature_verified: false,
+            signature_verified,
             cid_ok,
             cid_mismatch,
         })

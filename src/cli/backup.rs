@@ -2424,7 +2424,7 @@ fn run_restore_with(
     // to apply it, so a file that is not SQLite AT ALL is refused by the open
     // itself (`not a readable SQLite database`); a SQLite file with no
     // `memories` table is refused by the query (`not an ai-memory database`).
-    {
+    let attest_verdict = {
         let probe = db::open_read_only(&staged_path).with_context(|| {
             format!(
                 "snapshot {} is not a readable SQLite database — refusing to restore \
@@ -2473,7 +2473,19 @@ fn run_restore_with(
             crate::storage::schema_guard::BACKEND_SQLITE,
             &snapshot_path.display().to_string(),
         )?;
-    }
+        // #10040 (C-7, E-6) — the catalog ratchet: a v103+ snapshot without
+        // its row attestations, or whose attestations do not verify, is
+        // refused before anything is published. #10088: so is one with a
+        // removed signature, and any unsigned snapshot over an armed target.
+        if observed >= crate::storage::row_attest::ROW_ATTEST_SCHEMA_VERSION {
+            Some(crate::storage::row_attest::sqlite::check_snapshot(
+                &probe, &target_db,
+            )?)
+        } else {
+            crate::storage::row_attest::sqlite::check_pre_attestation_snapshot(&target_db)?;
+            None
+        }
+    };
 
     // #3508/#3510 — the whole-database integrity verdict (PRAGMA
     // integrity_check plus the page census that pragma skips on this schema).
@@ -2719,6 +2731,22 @@ fn run_restore_with(
     }
     staged.armed = false;
     io.at(PublishStep::Published, &target_db);
+
+    // #10087: the anchor's seal of the target becomes the verified
+    // snapshot's marks (an older store restored by explicit order). On a
+    // failure the old, higher seal stays and verify reports the rollback, so
+    // the restore is re-run rather than trusted.
+    if let Some(crate::storage::row_attest::sqlite::SnapshotVerdict::Verified(rec)) =
+        attest_verdict.as_ref()
+        && let Err(e) = crate::storage::row_attest::sqlite::seal_restored(&target_db, rec)
+    {
+        writeln!(
+            out.stderr,
+            "warning: restored {} but could not record it in the trust anchor ({e:#}); \
+             verify reports it as rolled back until the restore is run again (#10087)",
+            target_db.display()
+        )?;
+    }
 
     let post_sync = io.sync_dir(dir);
     if let Err(e) = post_sync.as_ref() {

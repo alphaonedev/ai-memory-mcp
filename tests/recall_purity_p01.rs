@@ -1261,7 +1261,8 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     // with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
     // #8341: tip pin moved 101 -> 102 with the FTS projection guard.
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 102);
+    // #10040: tip pin moved 102 -> 103 with the row_attestations side table.
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 103);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",

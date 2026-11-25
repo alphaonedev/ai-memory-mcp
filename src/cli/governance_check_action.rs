@@ -169,7 +169,7 @@ pub fn run(
         return run_from_pretool_stdin(db_path, args, out);
     }
 
-    let conn = rusqlite::Connection::open(db_path)
+    let conn = crate::storage::open_armed(db_path)
         .with_context(|| format!("governance check-action: open db at {}", db_path.display()))?;
     // v1.0.0 #2445 — this funnel does NOT cross `db::open`, and it WRITES (the
     // rule check appends a signed `signed_events` row). Appending to the audit
@@ -529,7 +529,7 @@ fn run_from_pretool_stdin(
         Err(_) => return Ok(()),
     };
 
-    let conn = rusqlite::Connection::open(db_path)
+    let conn = crate::storage::open_armed(db_path)
         .with_context(|| format!("governance check-action: open db at {}", db_path.display()))?;
     // Tolerate brief write-lock contention with the curator/MCP writers
     // (the rule check emits a signed audit row).

@@ -395,8 +395,11 @@ fn sqlite_path_from_url(url: &str) -> &str {
 /// work, but read-only is the smallest blast radius.
 fn enumerate_sqlite(url: &str) -> Result<SchemaInitReport> {
     let path = sqlite_path_from_url(url);
-    let conn = rusqlite::Connection::open(path)
-        .with_context(|| format!("open sqlite for enumeration: {path}"))?;
+    // #10091 — READ-ONLY flags, so this raw handle can never write an
+    // attested table (the enumeration only reads the catalog).
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open sqlite for enumeration: {path}"))?;
 
     let tables = list_sqlite_objects(&conn, "table")?;
     let views = list_sqlite_objects(&conn, "view")?;

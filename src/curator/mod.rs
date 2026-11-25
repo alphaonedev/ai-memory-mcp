@@ -1071,7 +1071,7 @@ pub fn run_daemon(
     );
 
     while !shutdown.load(Ordering::Relaxed) {
-        match Connection::open(&db_path) {
+        match crate::storage::open_armed(&db_path) {
             Ok(conn) => {
                 // #2445 — this cycle-loop open is off `db::open` so the
                 // daemon does not pay bootstrap + ladder every interval.

@@ -108,7 +108,8 @@ fn conflict(err: &anyhow::Error) -> &ConflictError {
 fn sqlite_schema_tip_carries_the_partial_title_slot_index_3690() {
     let (_dir, conn) = open();
     // #8341: tip pin moved 101 -> 102 with the FTS projection guard.
-    assert_eq!(ai_memory::storage::current_schema_version_for_tests(), 102);
+    // #10040: tip pin moved 102 -> 103 with the row_attestations side table.
+    assert_eq!(ai_memory::storage::current_schema_version_for_tests(), 103);
     let ddl: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_title_ns'",

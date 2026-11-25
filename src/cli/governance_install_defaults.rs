@@ -161,7 +161,7 @@ pub fn run(
     args: InstallDefaultsArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+    let conn = crate::storage::open_armed(db_path).with_context(|| {
         format!(
             "governance install-defaults: open db at {}",
             db_path.display()
