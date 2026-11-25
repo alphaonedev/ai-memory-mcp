@@ -1059,3 +1059,58 @@ async fn c6_cutoff_over_a_multi_page_prefix_agrees_10106() {
         .expect("pg verify");
     assert_eq!(trail.signature_failures, Vec::<i64>::new(), "pg");
 }
+
+/// #10106 — the postgres check of an EXISTING cutoff row reads its prefix in
+/// pages too: over a prefix longer than one page, a mint with a fresh sink
+/// (no anchor) finds the committed row certified and REPAIRS the anchor. A
+/// check that saw only the first page would call the row uncertified and
+/// refuse with "a legacy cutoff row already exists".
+#[tokio::test]
+async fn c6_pg_repair_over_a_multi_page_prefix_10106() {
+    let _ = sink();
+    let Some(url) = pg_url() else { return };
+    let (scratch, store) = fresh_pg(&url).await;
+    pg::replace_all(&store, &long_legacy_prefix()).await;
+    let dir = home_sandbox::per_test_dir("cli-pg-repair-pages-10106-");
+    let root = dir.path();
+    install_child_key(root);
+    let db = root.join("unused.db");
+    let store_url = scratch.url();
+    let mint = |sink: &std::path::Path| {
+        cli::run(
+            root,
+            &db,
+            CLI_AGENT,
+            sink,
+            &[],
+            &[
+                "verify-signed-events-chain",
+                "--mint-legacy-cutoff",
+                "--store-url",
+                &store_url,
+            ],
+        )
+    };
+    let cutoff = LONG_PREFIX_ROWS + 1;
+
+    let out = mint(&cli::sink_dir(root, "sink-a"));
+    assert_eq!(out.code, Some(0), "pg mint: {}", out.text);
+    assert!(
+        out.text.contains(&format!(
+            "minted the legacy cutoff row at sequence={cutoff}"
+        )),
+        "{}",
+        out.text
+    );
+
+    let out = mint(&cli::sink_dir(root, "sink-b"));
+    assert_eq!(out.code, Some(0), "pg repair: {}", out.text);
+    assert!(
+        out.text.contains(&format!(
+            "repaired the off-table anchor of the legacy cutoff row at sequence={cutoff}"
+        )),
+        "{}",
+        out.text
+    );
+    assert_eq!(pg_cutoff_rows(&store).await, 1, "the repair adds no row");
+}
