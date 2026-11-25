@@ -622,9 +622,8 @@ fn unexplained_head_mismatch_beside_a_row_drift_fails_every_row_10094() {
         &[t("m1"), t(r#"["evil"]"#), Cell::Int(5), t("long"), t("one")],
     );
     let r = f.report();
-    let head_defect = format!(
-        "memories: live rows do not match the signed table head (table_seq {table_seq})"
-    );
+    let head_defect =
+        format!("memories: live rows do not match the signed table head (table_seq {table_seq})");
     assert_eq!(
         r.store_defects,
         vec![head_defect],
@@ -1458,4 +1457,80 @@ fn duplicate_key_row_has_no_canonical_row_10092() {
     row[at] = t(r#"{"agent_id":"ai:a","scope":"team"}"#);
     let ok = CanonicalRow::parse(s, &row).expect("canonical");
     assert_eq!(ok.key(), encode_key(s, &row).as_slice());
+}
+
+/// L-3 (PR 10083): the `EXPLAIN QUERY PLAN` detail rows of `sql` on `conn`.
+fn query_plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare plan");
+    let mut rows = stmt.raw_query();
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().expect("plan row") {
+        out.push(r.get::<_, String>(3).expect("plan detail"));
+    }
+    out
+}
+
+/// L-3 (PR 10083): every statement that filters `row_attestations` on `op`
+/// is an index search on the v103 schema, never a scan of the side table
+/// (the Supersede prunes run on every attested write, the cutover probes on
+/// every arm). The expected plans are written out, not derived.
+#[test]
+fn query_plans_of_op_filters_are_index_searches_l3() {
+    use super::sqlite::{
+        MIGRATION_V103_SQLITE, PRUNE_SUPERSEDED_SQL, PRUNE_TOMBSTONES_SQL, SIGNED_CUTOVER_SQL,
+        TABLE_UNSIGNED_CUTOVER_SQL, UNSIGNED_CUTOVER_SQL,
+    };
+    const AUTO: &str = "sqlite_autoindex_row_attestations_1";
+    const OP_TABLE: &str = "idx_row_attestations_op_table";
+    let dir = anchor_dir();
+    let conn = crate::storage::open_unmigrated(&dir.path().join("plan_l3.db")).expect("open");
+    conn.execute_batch(MIGRATION_V103_SQLITE).expect("v103 ddl");
+    let cases: [(&str, &str, Vec<String>); 5] = [
+        (
+            "prune superseded",
+            PRUNE_SUPERSEDED_SQL,
+            vec![format!(
+                "SEARCH row_attestations USING INDEX {AUTO} (table_name=? AND row_key=? AND seq<?)"
+            )],
+        ),
+        (
+            "prune tombstones",
+            PRUNE_TOMBSTONES_SQL,
+            vec![format!(
+                "SEARCH row_attestations USING INDEX {OP_TABLE} (op=? AND table_name=?)"
+            )],
+        ),
+        (
+            "signed cutover",
+            SIGNED_CUTOVER_SQL,
+            vec![format!(
+                "SEARCH row_attestations USING INDEX {OP_TABLE} (op=?)"
+            )],
+        ),
+        (
+            "unsigned cutover",
+            UNSIGNED_CUTOVER_SQL,
+            vec![
+                format!("SEARCH row_attestations USING INDEX {OP_TABLE} (op=?)"),
+                "USE TEMP B-TREE FOR ORDER BY".to_string(),
+            ],
+        ),
+        (
+            "table unsigned cutover",
+            TABLE_UNSIGNED_CUTOVER_SQL,
+            vec![format!(
+                "SEARCH row_attestations USING INDEX {OP_TABLE} (op=? AND table_name=?)"
+            )],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, sql, want) in cases {
+        let got = query_plan(&conn, sql);
+        if got.iter().any(|d| d.starts_with("SCAN row_attestations")) || got != want {
+            wrong.push(format!("{name}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "plans: {wrong:#?}");
 }

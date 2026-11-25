@@ -20,9 +20,30 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// The v103 DDL (additive: one new table and its index).
+/// The v103 DDL (additive: one new table and its indexes).
 pub const MIGRATION_V103_SQLITE: &str =
     include_str!("../../../migrations/sqlite/0087_v103_row_attestations.sql");
+
+// L-3 (PR 10083): every statement that filters `row_attestations` on `op`.
+// Each one must be an index search, never a table scan: the Supersede
+// prunes run on every attested write, and the cutover probes on every arm.
+// `query_plans_of_op_filters_are_index_searches_l3` pins their plans.
+
+/// Supersede prune 1: the older attestations of the row just written.
+pub(super) const PRUNE_SUPERSEDED_SQL: &str =
+    "DELETE FROM row_attestations WHERE table_name = ?1 AND row_key = ?2 AND seq < ?3";
+/// Supersede prune 2: the delete tombstones of every other row of the table.
+pub(super) const PRUNE_TOMBSTONES_SQL: &str =
+    "DELETE FROM row_attestations WHERE table_name = ?1 AND op = 'delete' AND row_key <> ?2";
+/// Any signed cutover (the database was armed once).
+pub(super) const SIGNED_CUTOVER_SQL: &str =
+    "SELECT 1 FROM row_attestations WHERE op = 'cutover' AND signature IS NOT NULL LIMIT 1";
+/// The first unsigned cutover of any table.
+pub(super) const UNSIGNED_CUTOVER_SQL: &str = "SELECT table_name FROM row_attestations \
+     WHERE op = 'cutover' AND signature IS NULL ORDER BY id LIMIT 1";
+/// The unsigned cutover of one table.
+pub(super) const TABLE_UNSIGNED_CUTOVER_SQL: &str = "SELECT id FROM row_attestations \
+     WHERE table_name = ?1 AND op = 'cutover' AND signature IS NULL";
 
 /// Name of the scalar function the TEMP triggers call.
 pub const ATTEST_FN: &str = "ai_memory_row_attest_10040";
@@ -132,11 +153,7 @@ fn was_armed(conn: &Connection) -> Result<bool> {
         return Ok(false);
     }
     Ok(conn
-        .query_row(
-            "SELECT 1 FROM row_attestations WHERE op = 'cutover' AND signature IS NOT NULL LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
+        .query_row(SIGNED_CUTOVER_SQL, [], |_| Ok(()))
         .optional()?
         .is_some())
 }
@@ -502,17 +519,10 @@ fn append(
     sign(&mut a, &who.signing);
     insert_row(conn, &a).map_err(db)?;
     if ch.spec.retention == Retention::Supersede {
-        conn.execute(
-            "DELETE FROM row_attestations WHERE table_name = ?1 AND row_key = ?2 AND seq < ?3",
-            params![a.table, a.row_key, a.seq],
-        )
-        .map_err(db)?;
-        conn.execute(
-            "DELETE FROM row_attestations WHERE table_name = ?1 AND op = 'delete' \
-             AND row_key <> ?2",
-            params![a.table, a.row_key],
-        )
-        .map_err(db)?;
+        conn.execute(PRUNE_SUPERSEDED_SQL, params![a.table, a.row_key, a.seq])
+            .map_err(db)?;
+        conn.execute(PRUNE_TOMBSTONES_SQL, params![a.table, a.row_key])
+            .map_err(db)?;
     }
     Ok(())
 }
@@ -682,12 +692,7 @@ fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<
         }
         SealState::Sealed(_) => {
             let unsigned: Option<String> = conn
-                .query_row(
-                    "SELECT table_name FROM row_attestations WHERE op = 'cutover' \
-                     AND signature IS NULL ORDER BY id LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row(UNSIGNED_CUTOVER_SQL, [], |r| r.get(0))
                 .optional()?;
             if let Some(table) = unsigned {
                 anyhow::bail!("{}: {table}", refusal(REFUSE_SEALED_UNSIGNED_CUTOVER));
@@ -696,12 +701,7 @@ fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<
     }
     for spec in TABLES {
         let unsigned: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM row_attestations WHERE table_name = ?1 AND op = 'cutover' \
-                 AND signature IS NULL",
-                [spec.table],
-                |r| r.get(0),
-            )
+            .query_row(TABLE_UNSIGNED_CUTOVER_SQL, [spec.table], |r| r.get(0))
             .optional()?;
         let Some(id) = unsigned else { continue };
         let mut cut = blank(spec.table, Op::Cutover, &store, &spec.covered());
