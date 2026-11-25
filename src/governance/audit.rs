@@ -707,7 +707,7 @@ pub(crate) fn enqueue_append_for_test(path: PathBuf, line: String) {
 // `src/signed_events.rs:53` documents as defense-in-depth was missing.
 //
 // Closing #1035: stash the daemon's signing key in a lock-free
-// `OnceLock` at `init` time and expose `try_sign_audit_payload` so
+// `OnceLock` at `init` time and expose a signer so
 // the four production audit-row writers can sign without taking the
 // `ForensicSink` mutex on the hot path. The key MUST be the same
 // `SigningKey` the forensic JSONL sink uses (resolved via
@@ -716,41 +716,20 @@ pub(crate) fn enqueue_append_for_test(path: PathBuf, line: String) {
 // gets consistent results.
 //
 // When `init` is called with `signing_key: None`, the OnceLock stays
-// empty and `try_sign_audit_payload` returns `None`; the call sites
+// empty and the signer returns `None`; the call sites
 // fall back to `signature: None, attest_level: "unsigned"` so the
 // chain stays consistent with the legacy posture (cross-row hash
 // chain still pins tamper evidence).
 
-static DAEMON_AUDIT_KEY: OnceLock<SigningKey> = OnceLock::new();
-
-/// Sign `payload_hash` with the daemon's process-wide audit key.
-///
-/// Returns `Some((sig_bytes, "daemon_signed"))` when a key is
-/// installed (i.e. `init` was called with `signing_key: Some(_)`),
-/// `None` otherwise. The caller writes the returned `sig_bytes` to
-/// `signed_events.signature` and the attestation tag to
-/// `signed_events.attest_level`; on `None` the caller writes
-/// `signature: None, attest_level: "unsigned"`.
-///
-/// Lock-free — the underlying `OnceLock` is `Sync` and `.get()` is
-/// non-blocking. The function is called on every governance audit
-/// row write, so contention on this path is load-bearing.
-#[must_use]
-pub fn try_sign_audit_payload(payload_hash: &[u8]) -> Option<(Vec<u8>, &'static str)> {
-    let key = DAEMON_AUDIT_KEY.get()?;
-    let sig: Signature = key.sign(payload_hash);
-    Some((
-        sig.to_bytes().to_vec(),
-        crate::models::AttestLevel::DaemonSigned.as_str(),
-    ))
-}
+// #10074: the key and the only signer live in
+// `crate::governance::daemon_signer`; every signature there is made under a
+// `DaemonDomain` tag. There is no bytes-only signer.
 
 /// `true` when the daemon has installed a process-wide audit-row
-/// signing key via `init` or `init_audit_signers`. Used by tests + diagnostics; production
-/// code paths use `try_sign_audit_payload` directly.
+/// signing key via `init` or `init_audit_signers`.
 #[must_use]
 pub fn audit_key_is_installed() -> bool {
-    DAEMON_AUDIT_KEY.get().is_some()
+    crate::governance::daemon_signer::is_installed()
 }
 
 /// v1.0.0 #3354 — the issue tag every "ledger is unsigned" line carries, so
@@ -769,7 +748,7 @@ pub fn signing_key_provisioning_command(agent_id: &str) -> String {
 /// #3354 — the ONE spelling of the operator-visible warning a process emits
 /// when it will write UNSIGNED `signed_events` rows: no `<agent_id>.priv`
 /// under the key directory matches the resolved agent id, so
-/// [`try_sign_audit_payload`] has nothing to sign with and every row lands
+/// [`crate::governance::daemon_signer::sign`] has nothing to sign with and every row lands
 /// `attest_level=unsigned`. Shared by the boot line, the MCP
 /// `memory_session_start` response and the tests so the spelling cannot
 /// drift.
@@ -1311,7 +1290,27 @@ pub(crate) enum IntegrityRow<'a> {
         snapshot: &'a Path,
         target: &'a Path,
     },
+    /// #10074 (S-3) — the off-table anchor of the single legacy cutoff row
+    /// (see [`crate::signed_events::mint_legacy_cutoff`]). Read back by
+    /// [`legacy_cutoff_anchor`]; its presence refuses a second mint.
+    LegacyCutoff {
+        cutoff_sequence: i64,
+        cutoff_payload_hash: &'a str,
+        db_id: &'a str,
+    },
 }
+
+/// #10074 — `ForensicDecision.kind` of the legacy cutoff anchor.
+pub const LEGACY_CUTOFF_ANCHOR_KIND: &str = "signed_events_legacy_cutoff";
+
+/// #10074 — reserved pseudo-actor of the legacy cutoff anchor.
+const LEGACY_CUTOFF_ANCHOR_ACTOR: &str = "audit:legacy-cutoff";
+
+/// #10074 — `ForensicDecision.decision` of the legacy cutoff anchor.
+const LEGACY_CUTOFF_ANCHOR_DECISION: &str = "legacy_cutoff";
+
+/// #10074 — schema version of the legacy cutoff anchor payload.
+const LEGACY_CUTOFF_ANCHOR_PAYLOAD_VERSION: i64 = 1;
 
 impl IntegrityRow<'_> {
     /// `(actor, decision, kind, payload)` for the signed row; integrity rows
@@ -1373,7 +1372,205 @@ impl IntegrityRow<'_> {
                     .path("snapshot", snapshot)
                     .path("target", target),
             ),
+            Self::LegacyCutoff {
+                cutoff_sequence,
+                cutoff_payload_hash,
+                db_id,
+            } => (
+                LEGACY_CUTOFF_ANCHOR_ACTOR.to_string(),
+                LEGACY_CUTOFF_ANCHOR_DECISION,
+                LEGACY_CUTOFF_ANCHOR_KIND,
+                ForensicPayload::new()
+                    .number("v", LEGACY_CUTOFF_ANCHOR_PAYLOAD_VERSION)
+                    .number("cutoff_sequence", cutoff_sequence)
+                    // System-computed hex; written verbatim for the reader.
+                    .push(
+                        "cutoff_payload_hash",
+                        ForensicField::Value(cutoff_payload_hash.into()),
+                    )
+                    .push("db_id", ForensicField::Value(db_id.into())),
+            ),
         }
+    }
+}
+
+/// #10103 — what the forensic log says about the legacy cutoff anchor of one
+/// database. A line is used only after its signature verified under the
+/// daemon key; any anchor line for the database that does not verify, or a
+/// log that cannot be read, is [`LegacyCutoffAnchor::Unverified`] with the
+/// exact defect, never a fallback to another line and never `Absent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyCutoffAnchor {
+    /// The log was read in full and holds no anchor line for the database.
+    Absent,
+    /// Every anchor line for the database verified and they agree.
+    Verified {
+        /// Highest sequence the cutoff covers (the cutoff row is one above).
+        cutoff_sequence: i64,
+        /// Lower-hex `payload_hash` of the cutoff row.
+        cutoff_payload_hash: String,
+    },
+    /// The anchor cannot be trusted; the reason is exact.
+    Unverified(LegacyCutoffAnchorDefect),
+}
+
+/// #10103 — the exact reason a legacy cutoff anchor is not trusted. `line`
+/// is 1-based within `file`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyCutoffAnchorDefect {
+    /// The sink directory, its listing, a file or a line could not be read.
+    Unreadable(String),
+    /// An anchor line for the database carries no signature.
+    Unsigned { file: PathBuf, line: usize },
+    /// The signature of an anchor line for the database does not verify.
+    BadSignature { file: PathBuf, line: usize },
+    /// A line names the anchor kind but is not a well-formed anchor.
+    Malformed { file: PathBuf, line: usize },
+    /// Two verified anchor lines for the database disagree.
+    Conflicting,
+}
+
+impl std::fmt::Display for LegacyCutoffAnchorDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(detail) => write!(f, "the forensic log cannot be read: {detail}"),
+            Self::Unsigned { file, line } => {
+                write!(f, "line {line} of {} is unsigned", file.display())
+            }
+            Self::BadSignature { file, line } => write!(
+                f,
+                "line {line} of {}: its signature does not verify",
+                file.display()
+            ),
+            Self::Malformed { file, line } => {
+                write!(f, "line {line} of {} is a malformed anchor", file.display())
+            }
+            Self::Conflicting => f.write_str("two signed anchors disagree"),
+        }
+    }
+}
+
+/// #10103 — verify the forensic signature of `row` under `vk`.
+fn anchor_signature_verifies(row: &ForensicDecision, vk: &VerifyingKey) -> bool {
+    let Ok(bytes) = B64.decode(row.sig.as_bytes()) else {
+        return false;
+    };
+    let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice()) else {
+        return false;
+    };
+    vk.verify_strict(&row.canonical_bytes(), &Signature::from_bytes(&arr))
+        .is_ok()
+}
+
+/// #10103 — classify one parsed anchor line of `db_id`: `None` for a line of
+/// another database, else the verified fields or the exact defect.
+fn classify_anchor_line(
+    row: &ForensicDecision,
+    db_id: &str,
+    vk: &VerifyingKey,
+    file: &Path,
+    line: usize,
+) -> Option<Result<(i64, String), LegacyCutoffAnchorDefect>> {
+    let malformed = || LegacyCutoffAnchorDefect::Malformed {
+        file: file.to_path_buf(),
+        line,
+    };
+    let Some(line_db) = row.payload.get("db_id").and_then(serde_json::Value::as_str) else {
+        return Some(Err(malformed()));
+    };
+    if line_db != db_id {
+        return None;
+    }
+    if row.sig.is_empty() {
+        return Some(Err(LegacyCutoffAnchorDefect::Unsigned {
+            file: file.to_path_buf(),
+            line,
+        }));
+    }
+    if !anchor_signature_verifies(row, vk) {
+        return Some(Err(LegacyCutoffAnchorDefect::BadSignature {
+            file: file.to_path_buf(),
+            line,
+        }));
+    }
+    let version = row.payload.get("v").and_then(serde_json::Value::as_i64);
+    let seq = row
+        .payload
+        .get("cutoff_sequence")
+        .and_then(serde_json::Value::as_i64);
+    let hash = row
+        .payload
+        .get("cutoff_payload_hash")
+        .and_then(serde_json::Value::as_str);
+    match (version, seq, hash) {
+        (Some(LEGACY_CUTOFF_ANCHOR_PAYLOAD_VERSION), Some(seq), Some(hash)) => {
+            Some(Ok((seq, hash.to_string())))
+        }
+        _ => Some(Err(malformed())),
+    }
+}
+
+/// #10074 (S-3), #10103 — the legacy cutoff anchor for `db_id` in ANY
+/// forensic file of the live sink, each line used only after its signature
+/// verified under `vk` (the daemon key, which also signs the sink). Every
+/// file is scanned (not only the newest two) because a cutoff is minted once
+/// per database lifetime and its anchor must refuse a re-mint for as long as
+/// the forensic log keeps it. Fail-closed: a sink that is down or unreadable
+/// is `Unverified(Unreadable)`, never `Absent`.
+#[must_use]
+pub fn legacy_cutoff_anchor(db_id: &str, vk: &VerifyingKey) -> LegacyCutoffAnchor {
+    let unreadable =
+        |d: String| LegacyCutoffAnchor::Unverified(LegacyCutoffAnchorDefect::Unreadable(d));
+    let Some(dir) = live_sink_dir() else {
+        return unreadable("the forensic sink is not running".to_string());
+    };
+    let files = match list_forensic_files(&dir) {
+        Ok(files) => files,
+        Err(e) => return unreadable(format!("{}: {e:#}", dir.display())),
+    };
+    let mut found: Option<(i64, String)> = None;
+    for file in &files {
+        let f = match open_forensic_file_for_read(file) {
+            Ok(f) => f,
+            Err(e) => return unreadable(format!("{}: {e}", file.display())),
+        };
+        for (idx, line) in BufReader::new(f).lines().enumerate() {
+            let line_no = idx + 1;
+            let line = match line {
+                Ok(line) => line,
+                Err(e) => return unreadable(format!("line {line_no} of {}: {e}", file.display())),
+            };
+            let row = match serde_json::from_str::<ForensicDecision>(&line) {
+                Ok(row) if row.kind == LEGACY_CUTOFF_ANCHOR_KIND => row,
+                Ok(_) => continue,
+                Err(_) if line.contains(LEGACY_CUTOFF_ANCHOR_KIND) => {
+                    return LegacyCutoffAnchor::Unverified(LegacyCutoffAnchorDefect::Malformed {
+                        file: file.clone(),
+                        line: line_no,
+                    });
+                }
+                Err(_) => continue,
+            };
+            match classify_anchor_line(&row, db_id, vk, file, line_no) {
+                None => {}
+                Some(Err(defect)) => return LegacyCutoffAnchor::Unverified(defect),
+                Some(Ok(fields)) => match &found {
+                    Some(prev) if *prev != fields => {
+                        return LegacyCutoffAnchor::Unverified(
+                            LegacyCutoffAnchorDefect::Conflicting,
+                        );
+                    }
+                    _ => found = Some(fields),
+                },
+            }
+        }
+    }
+    match found {
+        Some((cutoff_sequence, cutoff_payload_hash)) => LegacyCutoffAnchor::Verified {
+            cutoff_sequence,
+            cutoff_payload_hash,
+        },
+        None => LegacyCutoffAnchor::Absent,
     }
 }
 
@@ -1396,11 +1593,11 @@ pub fn init_audit_signers(signing_key: Option<&SigningKey>) {
     // first-installed key, which is the documented v0.7 posture
     // (one daemon == one signing identity per process lifetime).
     if let Some(key) = signing_key {
-        let _ = DAEMON_AUDIT_KEY.set(key.clone());
+        let _ = crate::governance::daemon_signer::install(key);
     }
     // v0.9.0 G9 (#1826) — co-install the process-static RECORDER signer
     // alongside the daemon key so the per-row recorder signature stays off the
-    // key-file I/O path (mirrors DAEMON_AUDIT_KEY). Opt-in: absent recorder key
+    // key-file I/O path (mirrors the daemon key). Opt-in: absent recorder key
     // → RECORDER_KEY stays empty → try_sign_recorder_payload returns None →
     // emit falls back to the daemon signer (byte-identical legacy).
     if let Ok(Some(kp)) = load_recorder_signing_key() {
@@ -2862,7 +3059,7 @@ pub fn load_daemon_verifying_key(agent_id: &str) -> Result<Option<VerifyingKey>>
 
 /// v0.7.0 #1071 (SR-2 #1, HIGH) — resolve the daemon-side verifying
 /// key matching the process-installed audit signer. Mirrors
-/// [`try_sign_audit_payload`]: returns `Some` when a daemon audit
+/// [`crate::governance::daemon_signer::sign`]: returns `Some` when a daemon audit
 /// signing key is installed (via [`init`]) and its public half is
 /// available; `None` otherwise.
 ///
@@ -2874,7 +3071,7 @@ pub fn load_daemon_verifying_key(agent_id: &str) -> Result<Option<VerifyingKey>>
 /// passed the chain check silently.
 #[must_use]
 pub fn resolve_daemon_verifying_key() -> Option<VerifyingKey> {
-    DAEMON_AUDIT_KEY.get().map(SigningKey::verifying_key)
+    crate::governance::daemon_signer::verifying_key()
 }
 
 // ---------------------------------------------------------------------------
@@ -3823,7 +4020,7 @@ pub const REQUIRE_ROLE_SEPARATION_ENV: &str = "AI_MEMORY_REQUIRE_ROLE_SEPARATION
 pub const DOMAIN_RECORDER: &[u8] = b"ai-memory:gov-recorder:v1\x1f";
 
 /// Process-static RECORDER signing key, installed by [`init_audit_signers`] (co-located
-/// with [`DAEMON_AUDIT_KEY`]) so the per-row recorder signature stays off the
+/// with the daemon key in `daemon_signer`) so the per-row recorder signature stays off the
 /// key-file I/O path. Empty until a recorder key is enrolled (opt-in).
 static RECORDER_KEY: OnceLock<SigningKey> = OnceLock::new();
 
@@ -3989,7 +4186,7 @@ pub(crate) fn recorder_signing_preimage(payload_hash: &[u8], cause_hash: Option<
 /// Sign a governance row's `(payload_hash, cause_hash)` with the process-static
 /// RECORDER key when one is enrolled. Returns `None` when no recorder key is
 /// installed — the caller then falls back to the daemon signer (byte-identical
-/// legacy). Mirrors [`try_sign_audit_payload`] but over the domain-separated
+/// legacy). Mirrors [`crate::governance::daemon_signer::sign`] but over the domain-separated
 /// recorder preimage.
 #[must_use]
 pub fn try_sign_recorder_payload(
@@ -5719,12 +5916,18 @@ mod tests {
         init_audit_signers(Some(&key));
         assert!(!is_enabled());
         let content_hash = Sha256::digest(b"issue-3647-database-audit");
-        let (signature, _) =
-            try_sign_audit_payload(&content_hash).expect("database signer installed");
+        let (signature, _) = crate::governance::daemon_signer::sign(
+            crate::governance::daemon_signer::DaemonDomain::Governance,
+            &content_hash,
+        )
+        .expect("database signer installed");
         let verifier = resolve_daemon_verifying_key().expect("installed verifier");
         verifier
             .verify_strict(
-                &content_hash,
+                &crate::governance::daemon_signer::preimage(
+                    crate::governance::daemon_signer::DaemonDomain::Governance,
+                    &content_hash,
+                ),
                 &Signature::from_slice(&signature).expect("signature"),
             )
             .expect("database signature verifies while file sink is disabled");

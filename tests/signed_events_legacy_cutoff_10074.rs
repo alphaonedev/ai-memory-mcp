@@ -1,0 +1,1893 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! Issue #10074 — the legacy cutoff (3-agent vote (71472661)
+//! V1-SIGNED-EVENTS-FALLBACK, S-1 .. S-6, S-8).
+//!
+//! Invariant: an untagged legacy daemon signature verifies only for a row at
+//! or below ONE validated cutoff row; the cutoff binds its whole prefix, so no
+//! prefix row can be replaced, added or removed without a full verify going
+//! dirty; a missing, duplicated or invalid cutoff means cutoff zero; and the
+//! cutoff is minted once, by the explicit operator order only.
+//!
+//! The legacy prefix rows are built the way a pre-#10074 binary signed them
+//! (the untagged payload-only and untagged identity forms) with the test's
+//! own copy of the daemon key; every post-fix row comes from the production
+//! append path and the production mint.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+
+use ai_memory::governance::daemon_signer::{self, DaemonDomain};
+use ai_memory::signed_events::{
+    AgentAttestation, LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMintRefusal,
+    LegacyCutoffMinted, RowSignatureVerdict, SignatureFailure, SignedEvent, SignerIdentity,
+    SkipReason, ZERO_HASH, append_signed_event, canonical_chain_bytes, classify_row_signature,
+    daemon_row_signing_input, legacy_cutoff_payload_hash, mint_legacy_cutoff, payload_hash,
+    resolve_sqlite_legacy_cutoff, verify_audit_trail, verify_chain,
+};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use rusqlite::params;
+use sha2::{Digest, Sha256};
+
+#[path = "common/legacy_cutoff_cli.rs"]
+mod cli;
+#[path = "common/home_sandbox.rs"]
+mod home_sandbox;
+
+/// Deterministic seed for the one daemon key this test binary installs.
+const TEST_DAEMON_SEED: [u8; 32] = [0x3c; 32];
+/// Event type of the fixture rows.
+const FIXTURE_EVENT_TYPE: &str = "governance.test";
+/// Rounds of the S-5 property test.
+const PROPERTY_ROUNDS: usize = 64;
+
+/// The test's copy of the daemon key (a fixture: it signs the legacy prefix
+/// the way a pre-#10074 binary did). Built on demand, never held in a static.
+fn legacy_key() -> SigningKey {
+    SigningKey::from_bytes(&TEST_DAEMON_SEED)
+}
+
+/// Start the forensic sink once, in an isolated directory, with the daemon
+/// key installed (the mint needs both). The directory lives for the process.
+fn sink() -> VerifyingKey {
+    static SINK: OnceLock<tempfile::TempDir> = OnceLock::new();
+    SINK.get_or_init(|| {
+        let dir = home_sandbox::per_test_dir("forensic-10074-");
+        ai_memory::governance::audit::init(dir.path(), Some(legacy_key())).expect("init sink");
+        dir
+    });
+    let vk = daemon_signer::verifying_key().expect("daemon key installed");
+    assert_eq!(
+        vk,
+        legacy_key().verifying_key(),
+        "one daemon key per process"
+    );
+    vk
+}
+
+/// #10007 — no path this test process can write resolves under the real HOME
+/// (witness key directory and head-anchor log, key directory, temporary root).
+#[test]
+fn test_process_resolves_no_path_under_the_real_home_10007() {
+    let _ = home_sandbox::real_home();
+    let _ = sink();
+    home_sandbox::assert_process_isolated();
+    let child = home_sandbox::per_test_dir("child-env-10007-");
+    for (key, path) in home_sandbox::child_env(child.path()) {
+        home_sandbox::assert_outside_real_home(key, &path);
+    }
+}
+
+fn open_db() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
+    let _ = sink();
+    let dir = home_sandbox::per_test_dir("legacy-cutoff-10074-");
+    let path = dir.path().join("cutoff-10074.db");
+    let conn = ai_memory::db::open(&path).expect("open db");
+    (dir, path, conn)
+}
+
+fn load_rows(conn: &rusqlite::Connection) -> Vec<SignedEvent> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, prev_hash, sequence, cause_hash \
+             FROM signed_events ORDER BY sequence ASC",
+        )
+        .expect("prepare");
+    stmt.query_map([], |r| {
+        Ok(SignedEvent {
+            id: r.get(0)?,
+            agent_id: r.get(1)?,
+            event_type: r.get(2)?,
+            payload_hash: r.get(3)?,
+            signature: r.get(4)?,
+            attest_level: r.get(5)?,
+            timestamp: r.get(6)?,
+            prev_hash: r.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(),
+            sequence: r.get(8)?,
+            cause_hash: r.get(9)?,
+        })
+    })
+    .expect("query")
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .expect("collect")
+}
+
+fn row_at(conn: &rusqlite::Connection, seq: i64) -> SignedEvent {
+    load_rows(conn)
+        .into_iter()
+        .find(|r| r.sequence == seq)
+        .expect("row at sequence")
+}
+
+/// Rewrite every `prev_hash` so the cross-row hash chain is intact again.
+/// `prev_hash` is under no row signature, so signatures survive the relink.
+fn relink(conn: &rusqlite::Connection) {
+    let mut prev = ZERO_HASH.to_vec();
+    for row in load_rows(conn) {
+        conn.execute(
+            "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = ?2",
+            params![prev, row.sequence],
+        )
+        .expect("relink");
+        let mut linked = row;
+        linked.prev_hash.clone_from(&prev);
+        prev = Sha256::digest(canonical_chain_bytes(&linked)).to_vec();
+    }
+}
+
+fn next_sequence(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM signed_events",
+        [],
+        |r| r.get(0),
+    )
+    .expect("next seq")
+}
+
+/// How a pre-#10074 binary signed a row.
+#[derive(Clone, Copy, Debug)]
+enum Legacy {
+    /// The untagged signature over `payload_hash` alone.
+    PayloadOnly,
+    /// The untagged signature over the #1925 identity digest.
+    Identity,
+}
+
+/// A daemon-signed head row whose signature is made by `sign` over the row as
+/// it will be stored; the chain is relinked afterwards.
+fn insert_head_row(
+    conn: &rusqlite::Connection,
+    tag: &str,
+    sign: impl FnOnce(&SignedEvent) -> Vec<u8>,
+) -> i64 {
+    let mut ev = SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "daemon".to_string(),
+        event_type: FIXTURE_EVENT_TYPE.to_string(),
+        payload_hash: payload_hash(format!("{tag}-{}", uuid::Uuid::new_v4()).as_bytes()),
+        signature: None,
+        attest_level: "daemon_signed".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        prev_hash: ZERO_HASH.to_vec(),
+        sequence: next_sequence(conn),
+        cause_hash: None,
+    };
+    ev.signature = Some(sign(&ev));
+    conn.execute(
+        "INSERT INTO signed_events \
+            (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
+             prev_hash, sequence, cause_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            ev.id,
+            ev.agent_id,
+            ev.event_type,
+            ev.payload_hash,
+            ev.signature,
+            ev.attest_level,
+            ev.timestamp,
+            ev.prev_hash,
+            ev.sequence
+        ],
+    )
+    .expect("insert head row");
+    relink(conn);
+    ev.sequence
+}
+
+fn insert_legacy(conn: &rusqlite::Connection, form: Legacy) -> i64 {
+    insert_head_row(conn, "legacy", |ev| {
+        let key = legacy_key();
+        let msg = match form {
+            Legacy::PayloadOnly => ev.payload_hash.clone(),
+            Legacy::Identity => daemon_row_signing_input(ev),
+        };
+        key.sign(&msg).to_bytes().to_vec()
+    })
+}
+
+/// One genuine row through the production append path (EventRow-tagged).
+fn append_genuine(conn: &rusqlite::Connection) -> i64 {
+    let ev = SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "daemon".to_string(),
+        event_type: FIXTURE_EVENT_TYPE.to_string(),
+        payload_hash: payload_hash(uuid::Uuid::new_v4().as_bytes()),
+        signature: Some(vec![0u8; 64]),
+        attest_level: "daemon_signed".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..SignedEvent::default()
+    };
+    append_signed_event(conn, &ev).expect("append genuine row");
+    next_sequence(conn) - 1
+}
+
+/// A legacy prefix (payload-only, identity, one tagged row), then the mint.
+/// Returns the cutoff row's sequence.
+fn legacy_prefix_and_mint(conn: &rusqlite::Connection) -> i64 {
+    insert_legacy(conn, Legacy::PayloadOnly);
+    insert_legacy(conn, Legacy::Identity);
+    append_genuine(conn);
+    let minted = mint_legacy_cutoff(conn).expect("mint runs");
+    let row = minted.expect("the first mint over a verifiable prefix succeeds");
+    assert_eq!(
+        row,
+        LegacyCutoffMinted::Minted(4),
+        "the cutoff row follows the three prefix rows"
+    );
+    row.sequence()
+}
+
+fn assert_clean(conn: &rusqlite::Connection, what: &str) {
+    let vk = sink();
+    let chain = verify_chain(conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, None, "{what}: chain intact");
+    assert_eq!(
+        chain.signature_failures,
+        Vec::<i64>::new(),
+        "{what}: no failure"
+    );
+    let trail = verify_audit_trail(conn, None, Some(&vk)).expect("verify_audit_trail");
+    assert_eq!(
+        trail.signature_failures,
+        Vec::<i64>::new(),
+        "{what}: trail failures"
+    );
+}
+
+fn failures(conn: &rusqlite::Connection, since: Option<i64>) -> Vec<i64> {
+    let vk = sink();
+    let chain = verify_chain(conn, since, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, None, "the relinked chain is intact");
+    chain.signature_failures
+}
+
+fn trail_dirty(conn: &rusqlite::Connection) -> bool {
+    let vk = sink();
+    !verify_audit_trail(conn, None, Some(&vk))
+        .expect("verify_audit_trail")
+        .is_clean()
+}
+
+fn cutoff_rows(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+        params![LEGACY_CUTOFF_EVENT_TYPE],
+        |r| r.get(0),
+    )
+    .expect("count cutoff rows")
+}
+
+/// S-1 — a minted cutoff validates its prefix; replacing one prefix row with a
+/// transplanted row (the identity digest of another row as its payload hash,
+/// that row's signature) and relinking leaves the hash chain intact but voids
+/// the cutoff, so the full verify is dirty — with no witness enrolled.
+#[test]
+fn s1_transplant_below_minted_cutoff_is_dirty_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let vk = sink();
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    // #10102 — rows [P, I, T]: the certified legacy prefix is rows 1..=2 and
+    // ends before the first tagged row.
+    assert_eq!(cutoff.sequence(), 2, "the legacy prefix is rows 1..=2");
+    assert_eq!(cutoff.row_sequence(), Some(cutoff_row));
+    assert_clean(&conn, "the minted prefix");
+
+    let donor = row_at(&conn, 2);
+    conn.execute(
+        "UPDATE signed_events SET id = ?1, payload_hash = ?2, signature = ?3 WHERE sequence = 1",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            daemon_row_signing_input(&donor),
+            donor.signature
+        ],
+    )
+    .expect("transplant");
+    relink(&conn);
+
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(cutoff.sequence(), 0, "a changed prefix voids the cutoff");
+    assert_eq!(cutoff.row_sequence(), None);
+    let failed = failures(&conn, None);
+    for seq in [1, 2, cutoff_row] {
+        assert!(failed.contains(&seq), "row {seq} fails; got {failed:?}");
+    }
+    assert!(trail_dirty(&conn), "the full verify is dirty");
+}
+
+/// S-1 — a prefix row removed, or one added below the cutoff, voids it too.
+#[test]
+fn s1_prefix_row_removed_or_added_voids_cutoff_10074() {
+    let vk = sink();
+    // Removed: delete row 2, renumber nothing (a gap is a chain break), so
+    // instead delete and shift the later rows down, then relink.
+    let (_d, _p, conn) = open_db();
+    legacy_prefix_and_mint(&conn);
+    conn.execute("DELETE FROM signed_events WHERE sequence = 2", [])
+        .expect("delete");
+    conn.execute(
+        "UPDATE signed_events SET sequence = sequence - 1 WHERE sequence > 2",
+        [],
+    )
+    .expect("shift");
+    relink(&conn);
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(
+        cutoff.sequence(),
+        0,
+        "a removed prefix row voids the cutoff"
+    );
+    assert!(failures(&conn, None).contains(&1));
+    assert!(trail_dirty(&conn));
+
+    // Added: one more legacy row placed below the cutoff row.
+    let (_d2, _p2, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    conn.execute(
+        "UPDATE signed_events SET sequence = sequence + 1 WHERE sequence >= ?1",
+        params![cutoff_row],
+    )
+    .expect("make room");
+    let extra = row_at(&conn, 1);
+    conn.execute(
+        "INSERT INTO signed_events \
+            (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
+             prev_hash, sequence, cause_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            extra.agent_id,
+            extra.event_type,
+            extra.payload_hash,
+            extra.signature,
+            extra.attest_level,
+            extra.timestamp,
+            ZERO_HASH.to_vec(),
+            cutoff_row
+        ],
+    )
+    .expect("insert extra prefix row");
+    relink(&conn);
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(cutoff.sequence(), 0, "an added prefix row voids the cutoff");
+    assert!(trail_dirty(&conn));
+}
+
+/// Replace prefix row 2 (the legacy identity-form row, not the genesis row
+/// the db identity derives from) with another identity-form row the same key
+/// signed: a new id and payload, the same sequence, form and count.
+fn substitute_identity_row_2(conn: &rusqlite::Connection) {
+    let mut ev = row_at(conn, 2);
+    ev.id = uuid::Uuid::new_v4().to_string();
+    ev.payload_hash = payload_hash(b"another legacy identity-form row, 10074");
+    let sig = legacy_key()
+        .sign(&daemon_row_signing_input(&ev))
+        .to_bytes()
+        .to_vec();
+    conn.execute(
+        "UPDATE signed_events SET id = ?1, payload_hash = ?2, signature = ?3 WHERE sequence = 2",
+        params![ev.id, ev.payload_hash, sig],
+    )
+    .expect("substitute");
+}
+
+/// S-1 — a prefix row swapped for another validly signed legacy row of the
+/// SAME form keeps the payload-only count, the db identity and every row
+/// signature valid, and `prev_hash` is under no signature. The swap voids the
+/// cutoff and the full verify is dirty.
+#[test]
+fn s1_same_form_substitution_in_prefix_voids_cutoff_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let vk = sink();
+    assert_clean(&conn, "the minted prefix");
+    let before = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(
+        before.sequence(),
+        2,
+        "#10102: the legacy prefix is rows 1..=2"
+    );
+
+    substitute_identity_row_2(&conn);
+    relink(&conn);
+    assert_eq!(
+        classify_row_signature(&row_at(&conn, 2), Some(&vk), None, &before),
+        RowSignatureVerdict::Verified,
+        "precondition: on its own the substitute is a valid legacy prefix row"
+    );
+
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(
+        cutoff.sequence(),
+        0,
+        "a substituted prefix row voids the cutoff"
+    );
+    assert_eq!(cutoff.row_sequence(), None);
+    let failed = failures(&conn, None);
+    assert_eq!(
+        failed,
+        vec![1, 2, cutoff_row],
+        "exact failures after the swap"
+    );
+    assert!(trail_dirty(&conn), "the full verify is dirty");
+}
+
+/// S-1 — the same swap WITHOUT a relink leaves the last prefix row, its hash,
+/// the count and the db identity untouched, so only the cutoff's digest over
+/// every prefix row binds row 2: the cutoff is void, not merely the chain
+/// link reported broken.
+#[test]
+fn s1_unrelinked_substitution_in_prefix_voids_cutoff_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let vk = sink();
+    assert_clean(&conn, "the minted prefix");
+    substitute_identity_row_2(&conn);
+
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(
+        cutoff.sequence(),
+        0,
+        "an unrelinked substitution voids the cutoff"
+    );
+    assert_eq!(cutoff.row_sequence(), None);
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, Some(3), "row 3 no longer links to row 2");
+    assert!(cutoff_row > 3, "the cutoff row sits above the swapped row");
+    assert!(trail_dirty(&conn), "the full verify is dirty");
+}
+
+/// S-1 — known-answer vectors for the cutoff payload hash, computed
+/// independently (Python `hashlib` over the documented layout), and each bound
+/// field changes the hash.
+#[test]
+fn s1_cutoff_payload_hash_known_answer_10074() {
+    let h = |last: u8, prefix: u8| {
+        hex::encode(legacy_cutoff_payload_hash(
+            3,
+            &[last; 32],
+            &[prefix; 32],
+            1,
+            "db-10074",
+        ))
+    };
+    assert_eq!(
+        h(0x11, 0x22),
+        "c8f2eca952c54c1989ce682b8c9502f86913204b3a9a821354532e62703cd7f3"
+    );
+    assert_eq!(
+        h(0x33, 0x22),
+        "5d84c2e32baecf9c83a5c905a45d0a2f8ef0a9a8e711905afd40536b358b734f",
+        "the last prefix chain hash is bound"
+    );
+    assert_eq!(
+        h(0x11, 0x44),
+        "2e8528847daabd55164bfbfd195fa1ee7483ab001997b9a45340ab3ed0687f1d",
+        "the prefix digest is bound"
+    );
+}
+
+/// S-2 — a duplicated cutoff row means cutoff zero: every legacy row fails.
+#[test]
+fn s2_duplicated_cutoff_row_means_no_cutoff_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let copy = row_at(&conn, cutoff_row);
+    insert_head_row(&conn, "dup", |_| copy.signature.clone().unwrap_or_default());
+    let head = next_sequence(&conn) - 1;
+    conn.execute(
+        "UPDATE signed_events SET event_type = ?1, agent_id = ?2, payload_hash = ?3 \
+         WHERE sequence = ?4",
+        params![
+            LEGACY_CUTOFF_EVENT_TYPE,
+            copy.agent_id,
+            copy.payload_hash,
+            head
+        ],
+    )
+    .expect("duplicate the cutoff row");
+    relink(&conn);
+    assert_eq!(cutoff_rows(&conn), 2);
+    let vk = sink();
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(cutoff.sequence(), 0, "two cutoff rows mean none");
+    let failed = failures(&conn, None);
+    for seq in [1, 2, cutoff_row, head] {
+        assert!(failed.contains(&seq), "row {seq} fails; got {failed:?}");
+    }
+    assert!(!failed.contains(&3), "the tagged row still verifies");
+}
+
+/// S-2 — a cutoff row whose payload hash was altered is not a cutoff.
+#[test]
+fn s2_tampered_cutoff_row_means_no_cutoff_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1 WHERE sequence = ?2",
+        params![payload_hash(b"not the prefix"), cutoff_row],
+    )
+    .expect("tamper");
+    relink(&conn);
+    let vk = sink();
+    assert_eq!(
+        resolve_sqlite_legacy_cutoff(&conn, Some(&vk))
+            .expect("resolve")
+            .sequence(),
+        0
+    );
+    let failed = failures(&conn, None);
+    for seq in [1, 2, cutoff_row] {
+        assert!(failed.contains(&seq), "row {seq} fails; got {failed:?}");
+    }
+}
+
+/// S-2 — with no cutoff row, a windowed walk that starts above every legacy
+/// row's predecessor still refuses the legacy rows inside the window.
+#[test]
+fn s2_since_window_without_cutoff_refuses_legacy_10074() {
+    let (_d, _p, conn) = open_db();
+    append_genuine(&conn);
+    let payload_only = insert_legacy(&conn, Legacy::PayloadOnly);
+    let identity = insert_legacy(&conn, Legacy::Identity);
+    let failed = failures(&conn, Some(1));
+    assert_eq!(
+        failed,
+        vec![payload_only, identity],
+        "both legacy rows fail"
+    );
+}
+
+/// S-2 — with a valid cutoff, a windowed walk that starts above it still
+/// refuses a legacy row above the cutoff (the cutoff is resolved over the
+/// whole table, not the window).
+#[test]
+fn s2_since_window_above_cutoff_refuses_legacy_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let identity = insert_legacy(&conn, Legacy::Identity);
+    let failed = failures(&conn, Some(cutoff_row));
+    assert_eq!(failed, vec![identity]);
+}
+
+/// S-2 — a second cutoff row is refused at write: the append path refuses
+/// the reserved event type.
+#[test]
+fn s2_append_refuses_the_reserved_event_type_10074() {
+    let (_d, _p, conn) = open_db();
+    legacy_prefix_and_mint(&conn);
+    let ev = SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "daemon".to_string(),
+        event_type: LEGACY_CUTOFF_EVENT_TYPE.to_string(),
+        payload_hash: payload_hash(b"second cutoff"),
+        signature: Some(vec![0u8; 64]),
+        attest_level: "daemon_signed".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..SignedEvent::default()
+    };
+    let err = append_signed_event(&conn, &ev).expect_err("the reserved type is refused");
+    assert!(
+        format!("{err:#}").contains("is reserved"),
+        "the refusal names the reserved type: {err:#}"
+    );
+    assert_eq!(cutoff_rows(&conn), 1);
+}
+
+/// S-3 — the mint runs once: a second mint is refused while the row exists;
+/// with the row deleted, a re-run of the migrations signs nothing and a
+/// re-mint is refused by the off-table anchor.
+#[test]
+fn s3_cutoff_is_minted_once_10074() {
+    let (_d, path, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    assert_eq!(
+        mint_legacy_cutoff(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::CutoffRowExists)
+    );
+    conn.execute(
+        "DELETE FROM signed_events WHERE sequence = ?1",
+        params![cutoff_row],
+    )
+    .expect("delete the cutoff row");
+    drop(conn);
+    let conn = ai_memory::db::open(&path).expect("re-open runs the migrations");
+    assert_eq!(cutoff_rows(&conn), 0, "no boot or migration path mints");
+    assert_eq!(
+        mint_legacy_cutoff(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::AnchorExists)
+    );
+    assert_eq!(cutoff_rows(&conn), 0, "no second cutoff is signed");
+    let failed = failures(&conn, None);
+    assert!(failed.contains(&1) && failed.contains(&2), "{failed:?}");
+}
+
+/// S-3 — the mint refuses an empty chain and a prefix holding a row that
+/// verifies under no form; it never vouches for an unverifiable row.
+#[test]
+fn s3_mint_refuses_empty_and_unverifiable_prefix_10074() {
+    let (_d, _p, conn) = open_db();
+    if next_sequence(&conn) == 1 {
+        assert_eq!(
+            mint_legacy_cutoff(&conn).expect("mint runs"),
+            Err(LegacyCutoffMintRefusal::EmptyChain)
+        );
+    }
+    append_genuine(&conn);
+    let bad = insert_head_row(&conn, "bad", |_| vec![7u8; 64]);
+    assert_eq!(
+        mint_legacy_cutoff(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::UnverifiableRow(bad))
+    );
+    assert_eq!(cutoff_rows(&conn), 0);
+}
+
+/// S-4 — for every ordered pair of daemon domains, a signature made under one
+/// verifies under that one only; and a signature of any domain other than
+/// `EventRow` over a row's identity bytes, placed in that row, fails it.
+#[test]
+fn s4_every_domain_pair_is_disjoint_10074() {
+    let vk = sink();
+    let body = b"one body, six meanings";
+    for a in DaemonDomain::ALL {
+        let (sig, _) = daemon_signer::sign(a, body).expect("signer installed");
+        for b in DaemonDomain::ALL {
+            assert_eq!(
+                daemon_signer::verify(&vk, b, body, &sig),
+                a == b,
+                "signed under {a:?}, verified under {b:?}"
+            );
+        }
+    }
+    let (_d, _p, conn) = open_db();
+    append_genuine(&conn);
+    for d in DaemonDomain::ALL {
+        let seq = insert_head_row(&conn, "domain", |ev| {
+            daemon_signer::sign(d, &daemon_row_signing_input(ev))
+                .expect("signer installed")
+                .0
+        });
+        let failed = failures(&conn, None);
+        assert_eq!(
+            failed.contains(&seq),
+            d != DaemonDomain::EventRow,
+            "a {d:?} signature in a signed_events row; failures {failed:?}"
+        );
+    }
+}
+
+/// S-5 — no signature the typed signer produces, under any domain, verifies
+/// under either untagged legacy form (property over many rows).
+#[test]
+fn s5_no_tagged_signature_verifies_as_legacy_10074() {
+    let vk = sink();
+    for round in 0..PROPERTY_ROUNDS {
+        let ev = SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: format!("agent-{round}"),
+            event_type: FIXTURE_EVENT_TYPE.to_string(),
+            payload_hash: payload_hash(uuid::Uuid::new_v4().as_bytes()),
+            signature: None,
+            attest_level: "daemon_signed".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            prev_hash: ZERO_HASH.to_vec(),
+            sequence: i64::try_from(round).expect("small") + 1,
+            cause_hash: None,
+        };
+        let identity = daemon_row_signing_input(&ev);
+        for d in DaemonDomain::ALL {
+            for body in [&identity, &ev.payload_hash] {
+                let (sig, _) = daemon_signer::sign(d, body).expect("signer installed");
+                let sig = ed25519_dalek::Signature::from_slice(&sig).expect("64 bytes");
+                assert!(
+                    vk.verify_strict(&identity, &sig).is_err(),
+                    "{d:?}: verifies as the untagged identity form"
+                );
+                assert!(
+                    vk.verify_strict(&ev.payload_hash, &sig).is_err(),
+                    "{d:?}: verifies as the untagged payload-only form"
+                );
+            }
+        }
+    }
+}
+
+/// S-5 / S-6 — above the minted cutoff an untagged identity row fails as a
+/// daemon signature failure and a payload-only row fails with exactly
+/// `LegacyPayloadOnlyAfterCutoff`; both land in `signature_failures`, dirty
+/// the report, and never block a later append.
+#[test]
+fn s6_legacy_rows_above_cutoff_fail_exactly_10074() {
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    let vk = sink();
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    let identity = insert_legacy(&conn, Legacy::Identity);
+    let payload_only = insert_legacy(&conn, Legacy::PayloadOnly);
+
+    let verdict = |seq| classify_row_signature(&row_at(&conn, seq), Some(&vk), None, &cutoff);
+    assert_eq!(
+        verdict(payload_only),
+        RowSignatureVerdict::Failed(SignatureFailure::LegacyPayloadOnlyAfterCutoff)
+    );
+    assert_eq!(
+        verdict(identity),
+        RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature)
+    );
+    for seq in [1, 2] {
+        assert_eq!(
+            verdict(seq),
+            RowSignatureVerdict::Verified,
+            "prefix row {seq}"
+        );
+    }
+    assert!(verdict(payload_only).signature_failure());
+
+    let later = append_genuine(&conn);
+    assert_eq!(later, payload_only + 1, "a later append is not blocked");
+    let failed = failures(&conn, None);
+    assert_eq!(failed, vec![identity, payload_only]);
+    let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("verify_audit_trail");
+    assert_eq!(trail.signature_failures, vec![identity, payload_only]);
+    assert_eq!(trail.head_sequence, later);
+    assert!(!trail.is_clean());
+    assert!(cutoff_row < identity);
+}
+
+/// S-8 — the CLI mints on the explicit operator flag only: the plain walk
+/// signs nothing, the flag mints once (exit 0), a second order is refused
+/// (exit 1), and the walk is clean afterwards (exit 0).
+#[test]
+fn s8_cli_mint_once_on_explicit_flag_10074() {
+    let root = home_sandbox::per_test_dir("cli-mint-10074-");
+    let child_env = home_sandbox::child_env(root.path());
+    let db = root.path().join("store.db");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(child_env.iter().map(|(k, v)| (*k, v.as_os_str())))
+            .env("AI_MEMORY_DB", &db)
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_AGENT_ID", "cli-mint-10074")
+            .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+            .args(args)
+            .output()
+            .expect("run ai-memory")
+    };
+    let out = run(&[
+        "--json",
+        "store",
+        "-T",
+        "row",
+        "--content",
+        "a ledger row (#10074)",
+    ]);
+    assert!(
+        out.status.success(),
+        "store: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&out.stdout).expect("store json");
+    let id = stored["id"].as_str().expect("id").to_string();
+    let out = run(&["delete", "--hard", &id]);
+    assert!(
+        out.status.success(),
+        "delete: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let count = || {
+        let conn = rusqlite::Connection::open(&db).expect("open sqlite");
+        cutoff_rows(&conn)
+    };
+    let out = run(&["verify-signed-events-chain"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "walk: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(count(), 0, "the plain walk mints nothing");
+
+    let out = run(&["verify-signed-events-chain", "--mint-legacy-cutoff"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "mint: {text}");
+    assert!(text.contains("minted the legacy cutoff row"), "{text}");
+    assert_eq!(count(), 1);
+
+    let out = run(&["verify-signed-events-chain", "--mint-legacy-cutoff"]);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "second mint: {text}");
+    assert!(text.contains("legacy cutoff mint refused"), "{text}");
+    assert_eq!(count(), 1, "no second cutoff row");
+
+    let out = run(&["verify-signed-events-chain"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "walk after mint: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #10104 — one stored-then-hard-deleted memory through the CLI under agent
+/// `agent`, sink `sink`: a short chain with nothing above it.
+fn cli_seed(root: &Path, db: &Path, agent: &str, sink: &Path) {
+    let out = cli::run(
+        root,
+        db,
+        agent,
+        sink,
+        &[],
+        &[
+            "--json",
+            "store",
+            "-T",
+            "row",
+            "--content",
+            "a ledger row (#10104)",
+        ],
+    );
+    assert_eq!(out.code, Some(0), "store: {}", out.text);
+    let start = out.text.find('{').expect("store json");
+    let stored: serde_json::Value = serde_json::Deserializer::from_str(&out.text[start..])
+        .into_iter()
+        .next()
+        .expect("one json value")
+        .expect("store json");
+    let id = stored["id"].as_str().expect("id").to_string();
+    let out = cli::run(root, db, agent, sink, &[], &["delete", "--hard", &id]);
+    assert_eq!(out.code, Some(0), "delete: {}", out.text);
+}
+
+/// `verify-signed-events-chain --mint-legacy-cutoff` as a CLI child.
+fn cli_mint(root: &Path, db: &Path, agent: &str, sink: &Path) -> cli::CliRun {
+    cli::run(
+        root,
+        db,
+        agent,
+        sink,
+        &[],
+        &["verify-signed-events-chain", "--mint-legacy-cutoff"],
+    )
+}
+
+fn cli_cutoff_rows(db: &Path) -> i64 {
+    cutoff_rows(&rusqlite::Connection::open(db).expect("open sqlite"))
+}
+
+/// #10104 — a crash between the database commit and the anchor write leaves a
+/// committed cutoff row with no anchor. Two children share the key and the
+/// database but not the sink: the second sees exactly that state, detects it
+/// and repairs the anchor (exit 0, still one cutoff row, the same anchor
+/// fields); a third mint is the plain exact refusal.
+#[test]
+fn c4_crash_between_commit_and_anchor_is_repaired_10104() {
+    let root = home_sandbox::per_test_dir("cli-repair-10104-");
+    let (root, db, agent) = (
+        root.path(),
+        root.path().join("store.db"),
+        "cli-repair-10104",
+    );
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+    cli_seed(root, &db, agent, &a);
+
+    let out = cli_mint(root, &db, agent, &a);
+    assert_eq!(out.code, Some(0), "mint: {}", out.text);
+    assert!(
+        out.text
+            .contains("minted the legacy cutoff row at sequence="),
+        "{}",
+        out.text
+    );
+    let anchors_a = cli::anchor_lines(&a);
+    assert_eq!(anchors_a.len(), 1, "one anchor in sink A");
+    assert!(cli::anchor_lines(&b).is_empty(), "sink B holds no anchor");
+
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(0), "repair: {}", out.text);
+    assert!(
+        out.text
+            .contains("repaired the off-table anchor of the legacy cutoff row at sequence="),
+        "{}",
+        out.text
+    );
+    assert_eq!(cli_cutoff_rows(&db), 1, "the repair adds no row");
+    let anchors_b = cli::anchor_lines(&b);
+    assert_eq!(anchors_b.len(), 1, "one repaired anchor in sink B");
+    assert_eq!(
+        cli::anchor_fields(&anchors_b[0]),
+        cli::anchor_fields(&anchors_a[0]),
+        "the repaired anchor binds the committed row"
+    );
+
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(1), "third mint: {}", out.text);
+    assert!(
+        out.text
+            .contains("legacy cutoff mint refused: a legacy cutoff row already exists"),
+        "{}",
+        out.text
+    );
+    assert_eq!(cli_cutoff_rows(&db), 1);
+    assert_eq!(cli::anchor_lines(&b).len(), 1, "no second anchor");
+}
+
+/// #10103 — an anchor line is used only after its signature verified: a
+/// forged anchor line (unsigned, a changed signature, a changed field under
+/// the genuine signature) beside the genuine one is an exact refusal naming
+/// the defect, with the cutoff row present (never a repair, never "exists")
+/// and with it removed (never "anchor exists" from the forged line); nothing
+/// is written. The genuine sink alone keeps its plain refusal.
+#[test]
+fn c4_unverified_anchor_line_is_an_exact_refusal_10103() {
+    for &forgery in cli::FORGERIES {
+        let root = home_sandbox::per_test_dir("cli-anchor-10103-");
+        let (root, db, agent) = (
+            root.path(),
+            root.path().join("store.db"),
+            "cli-anchor-10103",
+        );
+        let a = cli::sink_dir(root, "sink-a");
+        cli_seed(root, &db, agent, &a);
+        let out = cli_mint(root, &db, agent, &a);
+        assert_eq!(out.code, Some(0), "{forgery:?}: mint: {}", out.text);
+
+        for (row_present, name) in [(true, "sink-row"), (false, "sink-gone")] {
+            if !row_present {
+                rusqlite::Connection::open(&db)
+                    .expect("open sqlite")
+                    .execute(
+                        "DELETE FROM signed_events WHERE event_type = ?1",
+                        params![LEGACY_CUTOFF_EVENT_TYPE],
+                    )
+                    .expect("delete the cutoff row");
+            }
+            let rows = cli_cutoff_rows(&db);
+            let forged = cli::forged_sink(root, name, &a, forgery);
+            let out = cli_mint(root, &db, agent, &forged);
+            assert_eq!(
+                out.code,
+                Some(1),
+                "{forgery:?} row={row_present}: {}",
+                out.text
+            );
+            assert!(
+                out.text.contains(
+                    "legacy cutoff mint refused: the off-table legacy cutoff anchor is not trusted"
+                ),
+                "{forgery:?} row={row_present}: {}",
+                out.text
+            );
+            assert!(
+                out.text.contains(forgery.reason()),
+                "{forgery:?} row={row_present}: {}",
+                out.text
+            );
+            assert_eq!(cli_cutoff_rows(&db), rows, "{forgery:?}: no row written");
+            assert_eq!(
+                cli::anchor_lines(&forged).len(),
+                2,
+                "{forgery:?}: no anchor written"
+            );
+        }
+        let out = cli_mint(root, &db, agent, &a);
+        assert_eq!(out.code, Some(1), "{forgery:?}: genuine: {}", out.text);
+        assert!(
+            out.text.contains(
+                "legacy cutoff mint refused: a legacy cutoff anchor for this database already exists"
+            ),
+            "{forgery:?}: genuine: {}",
+            out.text
+        );
+    }
+}
+
+/// #10103 — two anchor lines of this database, each genuinely signed, that
+/// disagree are an exact refusal ("two signed anchors disagree"), never the
+/// first or the last one taken. Built without the key: a mint into sink A,
+/// the cutoff row deleted, a second mint into sink B, then B's anchor line
+/// appended to a copy of A.
+#[test]
+fn c4_two_signed_anchors_that_disagree_are_an_exact_refusal_10103() {
+    let root = home_sandbox::per_test_dir("cli-conflict-10103-");
+    let (root, db, agent) = (
+        root.path(),
+        root.path().join("store.db"),
+        "cli-conflict-10103",
+    );
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+    cli_seed(root, &db, agent, &a);
+    let out = cli_mint(root, &db, agent, &a);
+    assert_eq!(out.code, Some(0), "mint A: {}", out.text);
+    rusqlite::Connection::open(&db)
+        .expect("open sqlite")
+        .execute(
+            "DELETE FROM signed_events WHERE event_type = ?1",
+            params![LEGACY_CUTOFF_EVENT_TYPE],
+        )
+        .expect("delete the cutoff row");
+    cli_seed(root, &db, agent, &b);
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(0), "mint B: {}", out.text);
+    let (anchor_a, anchor_b) = (cli::anchor_lines(&a), cli::anchor_lines(&b));
+    assert_eq!((anchor_a.len(), anchor_b.len()), (1, 1));
+    assert_ne!(
+        cli::anchor_fields(&anchor_a[0]),
+        cli::anchor_fields(&anchor_b[0]),
+        "the two signed anchors disagree"
+    );
+
+    let c = cli::sink_dir(root, "sink-c");
+    let files = cli::forensic_files(&a);
+    for file in &files {
+        std::fs::copy(file, c.join(file.file_name().expect("file name"))).expect("copy");
+    }
+    let newest = c.join(files.last().expect("a file").file_name().expect("name"));
+    let mut text = std::fs::read_to_string(&newest).expect("read");
+    text.push_str(&serde_json::to_string(&anchor_b[0]).expect("json"));
+    text.push('\n');
+    std::fs::write(&newest, text).expect("write");
+
+    let rows = cli_cutoff_rows(&db);
+    let out = cli_mint(root, &db, agent, &c);
+    assert_eq!(out.code, Some(1), "conflict: {}", out.text);
+    assert!(
+        out.text.contains(
+            "legacy cutoff mint refused: the off-table legacy cutoff anchor is not trusted: two signed anchors disagree"
+        ),
+        "{}",
+        out.text
+    );
+    assert_eq!(cli_cutoff_rows(&db), rows, "no row written");
+    assert_eq!(cli::anchor_lines(&c).len(), 2, "no anchor written");
+}
+
+/// #10101 — the forensic sink's record shape (JSON, never a 32-byte digest).
+const SINK_RECORD: &[u8] =
+    br#"{"ts":"2026-11-24T00:00:00.000Z","actor":"daemon","decision":"allow","kind":"10101"}"#;
+
+/// #10101 — a head row carrying the forensic sink's form: the daemon key's
+/// untagged signature over a JSON record, the record stored as payload hash.
+fn insert_sink_form(conn: &rusqlite::Connection) -> i64 {
+    let seq = insert_head_row(conn, "sink", |_| Vec::new());
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1, signature = ?2 WHERE sequence = ?3",
+        params![
+            SINK_RECORD,
+            legacy_key().sign(SINK_RECORD).to_bytes().to_vec(),
+            seq
+        ],
+    )
+    .expect("sink form");
+    relink(conn);
+    seq
+}
+
+/// #10101 — the sink's untagged signature is never a legacy form: the row
+/// fails as a plain daemon-signature failure (not as a legacy row above the
+/// cutoff), and the mint refuses it with the exact reason and writes nothing.
+#[test]
+fn c2_sink_signature_is_never_a_legacy_form_10101() {
+    let (_d, _p, conn) = open_db();
+    insert_legacy(&conn, Legacy::PayloadOnly);
+    let sink_seq = insert_sink_form(&conn);
+    let vk = sink();
+    let row = row_at(&conn, sink_seq);
+    assert_eq!(
+        classify_row_signature(&row, Some(&vk), None, &LegacyCutoff::none()),
+        RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature),
+        "the sink form is no daemon form"
+    );
+    assert_eq!(
+        mint_legacy_cutoff(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::ForeignSignatureForm(sink_seq))
+    );
+    assert_eq!(cutoff_rows(&conn), 0, "nothing written");
+}
+
+/// #10102 — no legacy row is certified after the first tagged row, and the
+/// certified legacy prefix ends before it.
+#[test]
+fn c2_legacy_prefix_is_contiguous_and_ends_before_first_tagged_10102() {
+    let (_d, _p, conn) = open_db();
+    insert_legacy(&conn, Legacy::Identity);
+    let first_tagged = append_genuine(&conn);
+    let late = insert_legacy(&conn, Legacy::PayloadOnly);
+    assert_eq!(
+        mint_legacy_cutoff(&conn).expect("mint runs"),
+        Err(LegacyCutoffMintRefusal::LegacyAfterTagged {
+            sequence: late,
+            first_tagged
+        })
+    );
+    assert_eq!(cutoff_rows(&conn), 0, "nothing written");
+
+    let (_d2, _p2, conn) = open_db();
+    insert_legacy(&conn, Legacy::PayloadOnly);
+    insert_legacy(&conn, Legacy::Identity);
+    append_genuine(&conn);
+    append_genuine(&conn);
+    let cutoff_row = mint_legacy_cutoff(&conn)
+        .expect("mint runs")
+        .expect("a contiguous legacy prefix is certified");
+    assert!(
+        matches!(cutoff_row, LegacyCutoffMinted::Minted(_)),
+        "a first mint is a new row: {cutoff_row:?}"
+    );
+    let cutoff = resolve_sqlite_legacy_cutoff(&conn, Some(&sink())).expect("resolve");
+    assert_eq!(cutoff.sequence(), 2, "the legacy prefix is rows 1..=2");
+    assert_eq!(cutoff.row_sequence(), Some(cutoff_row.sequence()));
+    assert_clean(&conn, "a contiguous legacy prefix");
+}
+
+/// #10106 — the `DaemonDomain::LegacyCutoff` tag, written out (not taken from
+/// the code under test).
+const LEGACY_CUTOFF_TAG_BYTES: &[u8] = b"ai-memory/daemon-sig/v2/legacy-cutoff\0";
+/// #10106 — the `DaemonDomain::EventRow` tag, written out.
+const EVENT_ROW_TAG_BYTES: &[u8] = b"ai-memory/daemon-sig/v2/event-row\0";
+
+/// `tag || body`, built here independently of `daemon_signer::preimage`.
+fn pinned_preimage(tag: &[u8], body: &[u8]) -> Vec<u8> {
+    [tag, body].concat()
+}
+
+/// One way to alter only the cutoff row after a valid mint: its signature,
+/// its `event_type` or its `prev_hash`, never its `payload_hash`.
+#[derive(Clone, Copy, Debug)]
+enum CutoffTamper {
+    /// Re-signed over the same identity input under another domain.
+    SignatureUnder(DaemonDomain),
+    /// The pre-#10074 untagged signature over the same identity input.
+    SignatureUntagged,
+    /// 64 zero bytes.
+    SignatureZeroed,
+    /// No signature at all.
+    SignatureAbsent,
+    /// The signed `event_type` changed, signature kept.
+    EventType,
+    /// Only `prev_hash` changed (it is under no row signature).
+    PrevHashOnly,
+}
+
+/// #10107 — every signature-only (and `event_type`, `prev_hash`) tamper of a
+/// cutoff row, written out.
+const CUTOFF_TAMPERS: &[CutoffTamper] = &[
+    CutoffTamper::SignatureUnder(DaemonDomain::EventRow),
+    CutoffTamper::SignatureUnder(DaemonDomain::EventPayload),
+    CutoffTamper::SignatureUnder(DaemonDomain::Governance),
+    CutoffTamper::SignatureUnder(DaemonDomain::Tombstone),
+    CutoffTamper::SignatureUnder(DaemonDomain::RevisionLeaf),
+    CutoffTamper::SignatureUntagged,
+    CutoffTamper::SignatureZeroed,
+    CutoffTamper::SignatureAbsent,
+    CutoffTamper::EventType,
+    CutoffTamper::PrevHashOnly,
+];
+
+fn apply_cutoff_tamper(conn: &rusqlite::Connection, seq: i64, tamper: CutoffTamper) {
+    let row = row_at(conn, seq);
+    let input = daemon_row_signing_input(&row);
+    let set_sig = |sig: Option<Vec<u8>>| {
+        conn.execute(
+            "UPDATE signed_events SET signature = ?1 WHERE sequence = ?2",
+            params![sig, seq],
+        )
+        .expect("tamper signature");
+    };
+    match tamper {
+        CutoffTamper::SignatureUnder(d) => {
+            set_sig(Some(daemon_signer::sign(d, &input).expect("signer").0));
+        }
+        CutoffTamper::SignatureUntagged => {
+            set_sig(Some(legacy_key().sign(&input).to_bytes().to_vec()));
+        }
+        CutoffTamper::SignatureZeroed => set_sig(Some(vec![0u8; 64])),
+        CutoffTamper::SignatureAbsent => set_sig(None),
+        CutoffTamper::EventType => {
+            conn.execute(
+                "UPDATE signed_events SET event_type = ?1 WHERE sequence = ?2",
+                params![FIXTURE_EVENT_TYPE, seq],
+            )
+            .expect("tamper event_type");
+        }
+        CutoffTamper::PrevHashOnly => {
+            conn.execute(
+                "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = ?2",
+                params![vec![0xABu8; 32], seq],
+            )
+            .expect("tamper prev_hash");
+        }
+    }
+}
+
+/// #10107 — a cutoff row altered only in its signature, its `event_type` or
+/// its `prev_hash` (payload hash intact) resolves to no cutoff. Each check of
+/// `LegacyCutoffResolver::finish` has a row here that needs it.
+#[test]
+fn c3_cutoff_row_signature_only_tamper_means_no_cutoff_10107() {
+    let vk = sink();
+    for &tamper in CUTOFF_TAMPERS {
+        let (_d, _p, conn) = open_db();
+        let cutoff_row = legacy_prefix_and_mint(&conn);
+        let before = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+        assert_eq!(
+            before.row_sequence(),
+            Some(cutoff_row),
+            "{tamper:?}: control"
+        );
+        apply_cutoff_tamper(&conn, cutoff_row, tamper);
+        let after = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+        assert_eq!(after, LegacyCutoff::none(), "{tamper:?}: no cutoff");
+        assert!(trail_dirty(&conn), "{tamper:?}: the trail is dirty");
+    }
+}
+
+/// #10106 — the cutoff and event-row domains are the written-out bytes on the
+/// sign side (the mint and the append path) AND on the verify side (the
+/// resolver and the row classifier), so a swap of both sides is red.
+#[test]
+fn c3_cutoff_and_event_row_domain_bytes_are_pinned_10106() {
+    for (domain, bytes) in [
+        (DaemonDomain::LegacyCutoff, LEGACY_CUTOFF_TAG_BYTES),
+        (DaemonDomain::EventRow, EVENT_ROW_TAG_BYTES),
+    ] {
+        assert_eq!(domain.tag(), bytes, "{domain:?} tag bytes");
+    }
+    let vk = sink();
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+
+    // Sign side: the stored signatures are over the pinned bytes.
+    let cutoff = row_at(&conn, cutoff_row);
+    let tagged = row_at(&conn, 3);
+    for (row, tag, what) in [
+        (&cutoff, LEGACY_CUTOFF_TAG_BYTES, "the minted cutoff row"),
+        (&tagged, EVENT_ROW_TAG_BYTES, "the appended tagged row"),
+    ] {
+        let sig = ed25519_dalek::Signature::from_slice(row.signature.as_deref().expect("signed"))
+            .expect("64-byte signature");
+        assert!(
+            vk.verify_strict(&pinned_preimage(tag, &daemon_row_signing_input(row)), &sig)
+                .is_ok(),
+            "{what} is signed over the pinned domain bytes"
+        );
+    }
+
+    // Verify side: rows signed here over the pinned bytes are accepted.
+    let cutoff_sig = legacy_key()
+        .sign(&pinned_preimage(
+            LEGACY_CUTOFF_TAG_BYTES,
+            &daemon_row_signing_input(&cutoff),
+        ))
+        .to_bytes()
+        .to_vec();
+    conn.execute(
+        "UPDATE signed_events SET signature = ?1 WHERE sequence = ?2",
+        params![cutoff_sig, cutoff_row],
+    )
+    .expect("re-sign the cutoff row");
+    let resolved = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(resolved.row_sequence(), Some(cutoff_row), "pinned cutoff");
+    let pinned_row = insert_head_row(&conn, "pinned", |ev| {
+        legacy_key()
+            .sign(&pinned_preimage(
+                EVENT_ROW_TAG_BYTES,
+                &daemon_row_signing_input(ev),
+            ))
+            .to_bytes()
+            .to_vec()
+    });
+    assert_eq!(
+        classify_row_signature(&row_at(&conn, pinned_row), Some(&vk), None, &resolved),
+        RowSignatureVerdict::Verified,
+        "a row signed over the pinned event-row bytes verifies"
+    );
+    assert_clean(&conn, "pinned-domain rows");
+}
+
+// ----- #10105 (option C): agent-signed rows ------------------------------
+
+/// #10105 — the agent fixture key (distinct from the daemon key).
+const TEST_AGENT_SEED: [u8; 32] = [0x6b; 32];
+/// #10105 — length of the wrong-length signature blob.
+const SHORT_SIG_LEN: usize = 10;
+/// #10105 — every agent-signed `attest_level`, written out.
+const AGENT_ATTEST_LEVELS: [&str; 3] = ["self_signed", "signed_by_peer", "peer_attested"];
+
+/// #10105 — a row of `attest_level` signed by the agent key (never the daemon
+/// key), or carrying `sig` verbatim; the chain is relinked afterwards.
+fn insert_agent_row(conn: &rusqlite::Connection, attest: &str, sig: AgentSig) -> i64 {
+    let ev = agent_event(attest, sig, next_sequence(conn));
+    conn.execute(
+        "INSERT INTO signed_events \
+            (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
+             prev_hash, sequence, cause_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            ev.id,
+            ev.agent_id,
+            ev.event_type,
+            ev.payload_hash,
+            ev.signature,
+            ev.attest_level,
+            ev.timestamp,
+            ev.prev_hash,
+            ev.sequence
+        ],
+    )
+    .expect("insert agent row");
+    relink(conn);
+    ev.sequence
+}
+
+/// #10105 — the signature an agent-signed fixture row carries.
+#[derive(Clone, Copy, Debug)]
+enum AgentSig {
+    /// A 64-byte Ed25519 signature by the agent key.
+    Valid,
+    /// No signature (NULL column).
+    Missing,
+    /// A blob of the wrong length.
+    Short,
+    /// An empty blob.
+    Empty,
+}
+
+fn agent_event(attest: &str, sig: AgentSig, sequence: i64) -> SignedEvent {
+    let payload = payload_hash(format!("agent-{}", uuid::Uuid::new_v4()).as_bytes());
+    let signature = match sig {
+        AgentSig::Valid => Some(
+            SigningKey::from_bytes(&TEST_AGENT_SEED)
+                .sign(&payload)
+                .to_bytes()
+                .to_vec(),
+        ),
+        AgentSig::Missing => None,
+        AgentSig::Short => Some(vec![1u8; SHORT_SIG_LEN]),
+        AgentSig::Empty => Some(Vec::new()),
+    };
+    SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "ai:agent-10105".to_string(),
+        event_type: FIXTURE_EVENT_TYPE.to_string(),
+        payload_hash: payload,
+        signature,
+        attest_level: attest.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        prev_hash: ZERO_HASH.to_vec(),
+        sequence,
+        cause_hash: None,
+    }
+}
+
+/// #10105 — every stored `attest_level` maps to exactly one signer form
+/// (expected set written out, never derived from the code under test).
+#[test]
+fn signer_identity_of_every_attest_level_10105() {
+    let table: [(&str, SignerIdentity); 8] = [
+        ("daemon_signed", SignerIdentity::Daemon),
+        ("recorder_signed", SignerIdentity::Recorder),
+        ("lineage_signed", SignerIdentity::LineageWitness),
+        (
+            "self_signed",
+            SignerIdentity::Agent(AgentAttestation::SelfSigned),
+        ),
+        (
+            "signed_by_peer",
+            SignerIdentity::Agent(AgentAttestation::SignedByPeer),
+        ),
+        (
+            "peer_attested",
+            SignerIdentity::Agent(AgentAttestation::PeerAttested),
+        ),
+        ("unsigned", SignerIdentity::Unsigned),
+        ("Self_Signed", SignerIdentity::Unrecognised),
+    ];
+    for (attest, want) in table {
+        assert_eq!(SignerIdentity::of(attest), want, "{attest}");
+    }
+}
+
+/// #10105 — the per-row verdict of an agent-signed row: a 64-byte signature
+/// is `Skipped(AgentSignedDomainObject)` (never `Verified`, never checked
+/// against the daemon key), a missing one and a wrong-length one are exact
+/// failures, with or without a daemon verifier. Daemon-labelled and
+/// unrecognised rows with the same agent signature stay fail-closed.
+#[test]
+fn agent_signed_row_verdict_table_10105() {
+    let vk = sink();
+    let none = LegacyCutoff::none();
+    let table: [(AgentSig, RowSignatureVerdict); 4] = [
+        (
+            AgentSig::Valid,
+            RowSignatureVerdict::Skipped(SkipReason::AgentSignedDomainObject),
+        ),
+        (
+            AgentSig::Missing,
+            RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMissing),
+        ),
+        (
+            AgentSig::Short,
+            RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMalformed),
+        ),
+        (
+            AgentSig::Empty,
+            RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMalformed),
+        ),
+    ];
+    for attest in AGENT_ATTEST_LEVELS {
+        for (sig, want) in table {
+            let ev = agent_event(attest, sig, 1);
+            for verifier in [Some(&vk), None] {
+                assert_eq!(
+                    classify_row_signature(&ev, verifier, None, &none),
+                    want,
+                    "{attest} {sig:?} verifier={}",
+                    verifier.is_some()
+                );
+            }
+        }
+    }
+    for attest in ["daemon_signed", "Self_Signed"] {
+        let ev = agent_event(attest, AgentSig::Valid, 1);
+        assert_eq!(
+            classify_row_signature(&ev, Some(&vk), None, &none),
+            RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature),
+            "{attest}: an agent signature under a daemon label fails closed"
+        );
+    }
+    let reasons: [(SignatureFailure, &str); 2] = [
+        (
+            SignatureFailure::AgentSignatureMissing,
+            "agent_signature_missing",
+        ),
+        (
+            SignatureFailure::AgentSignatureMalformed,
+            "agent_signature_malformed",
+        ),
+    ];
+    for (f, want) in reasons {
+        assert_eq!(f.reason(), want);
+    }
+}
+
+/// #10105 — the chain walk counts agent-signed rows apart from verified
+/// rows, fails exactly the missing and malformed signatures, and the audit
+/// trail carries the same count.
+#[test]
+fn agent_signed_rows_counted_not_verified_10105() {
+    let (_d, _p, conn) = open_db();
+    let vk = sink();
+    append_genuine(&conn);
+    insert_agent_row(&conn, "self_signed", AgentSig::Valid);
+    insert_agent_row(&conn, "signed_by_peer", AgentSig::Valid);
+    insert_agent_row(&conn, "peer_attested", AgentSig::Valid);
+    insert_agent_row(&conn, "self_signed", AgentSig::Missing);
+    insert_agent_row(&conn, "self_signed", AgentSig::Short);
+    insert_agent_row(&conn, "self_signed", AgentSig::Empty);
+    append_genuine(&conn);
+
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, None);
+    assert_eq!(chain.rows_checked, 8);
+    assert_eq!(chain.rows_positively_verified, 2);
+    assert_eq!(chain.agent_signed_rows_not_verified, 3);
+    assert_eq!(chain.signature_failures, vec![5, 6, 7]);
+    assert_eq!(
+        chain.agent_signature_defects,
+        vec![
+            (5, SignatureFailure::AgentSignatureMissing),
+            (6, SignatureFailure::AgentSignatureMalformed),
+            (7, SignatureFailure::AgentSignatureMalformed),
+        ]
+    );
+
+    let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("verify_audit_trail");
+    assert!(trail.chain_intact);
+    assert_eq!(trail.signature_failures, vec![5, 6, 7]);
+    assert_eq!(trail.agent_signed_rows_not_verified, 3);
+}
+
+/// #10105 — valid agent-signed rows alone never make the walk report a
+/// failure, and their linkage is still checked: a broken `prev_hash` on an
+/// agent row is a chain break at that row.
+#[test]
+fn agent_signed_rows_alone_are_clean_and_linkage_checked_10105() {
+    let (_d, _p, conn) = open_db();
+    let vk = sink();
+    append_genuine(&conn);
+    for attest in AGENT_ATTEST_LEVELS {
+        insert_agent_row(&conn, attest, AgentSig::Valid);
+    }
+    append_genuine(&conn);
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(chain.chain_break, None);
+    assert_eq!(chain.signature_failures, Vec::<i64>::new());
+    assert_eq!(chain.agent_signature_defects, Vec::new());
+    assert_eq!(chain.agent_signed_rows_not_verified, 3);
+    assert_eq!(chain.rows_positively_verified, 2);
+
+    conn.execute(
+        "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = 3",
+        params![vec![0xeeu8; 32]],
+    )
+    .expect("break link");
+    let chain = verify_chain(&conn, None, Some(&vk)).expect("verify_chain");
+    assert_eq!(
+        chain.chain_break,
+        Some(3),
+        "a broken agent-row link is found"
+    );
+}
+
+/// #10105 — the CLI walk over a chain holding agent-signed rows exits 0, says
+/// in text that they were NOT verified, and in JSON counts them apart and
+/// never reports the chain fully verified.
+#[test]
+fn cli_reports_agent_signed_rows_not_verified_10105() {
+    let root = home_sandbox::per_test_dir("cli-agent-10105-");
+    let child_env = home_sandbox::child_env(root.path());
+    let db = root.path().join("store.db");
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(child_env.iter().map(|(k, v)| (*k, v.as_os_str())))
+            .env("AI_MEMORY_DB", &db)
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_AGENT_ID", "cli-agent-10105")
+            .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+            .args(args)
+            .output()
+            .expect("run ai-memory");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, stdout, stderr) = run(&[
+        "--json",
+        "store",
+        "-T",
+        "row",
+        "--content",
+        "a ledger row (#10105)",
+    ]);
+    assert_eq!(code, Some(0), "store: {stderr}");
+    let stored: serde_json::Value = serde_json::from_str(&stdout).expect("store json");
+    let id = stored["id"].as_str().expect("id").to_string();
+    let (code, _, stderr) = run(&["delete", "--hard", &id]);
+    assert_eq!(code, Some(0), "delete: {stderr}");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open sqlite");
+        for attest in AGENT_ATTEST_LEVELS {
+            insert_agent_row(&conn, attest, AgentSig::Valid);
+        }
+    }
+
+    let (code, stdout, stderr) = run(&["verify-signed-events-chain", "--format", "json"]);
+    assert_eq!(code, Some(0), "json walk: {stdout}{stderr}");
+    let start = stdout.find('{').expect("report json");
+    let report: serde_json::Value = serde_json::from_str(&stdout[start..]).expect("report json");
+    assert_eq!(report["agent_signed_rows_not_verified"], 3, "{report}");
+    assert_eq!(report["fully_verified"], false, "{report}");
+    assert_eq!(
+        report["agent_signature_defects"],
+        serde_json::json!([]),
+        "{report}"
+    );
+    let checked = report["rows_checked"].as_u64().expect("rows_checked");
+    let verified = report["rows_positively_verified"]
+        .as_u64()
+        .expect("rows_positively_verified");
+    assert_eq!(verified + 3, checked, "{report}");
+
+    let (code, stdout, stderr) = run(&["verify-signed-events-chain"]);
+    let text = stdout + &stderr;
+    assert_eq!(code, Some(0), "text walk: {text}");
+    assert!(
+        text.contains(
+            "verify-signed-events-chain NOTE: 3 agent-signed row(s) NOT verified by this walk"
+        ),
+        "{text}"
+    );
+
+    let (_, stdout, stderr) = run(&["verify-audit-trail"]);
+    let text = stdout + &stderr;
+    assert!(
+        text.contains("note: 3 agent-signed row(s) NOT verified by this walk"),
+        "{text}"
+    );
+}
+
+/// #10106 — with a postgres store URL resolved from the environment, the
+/// sqlite chain walk refuses with the exact pointer to `verify-audit-trail`
+/// instead of reporting on the local sqlite file. The URL names a closed
+/// port, so nothing is ever connected to.
+#[test]
+fn chain_walk_refuses_a_postgres_store_10106() {
+    const CLOSED_PG_URL: &str = "postgres://nobody@127.0.0.1:1/none";
+    let root = home_sandbox::per_test_dir("cli-pgwalk-10106-");
+    let child_env = home_sandbox::child_env(root.path());
+    let db = root.path().join("store.db");
+    let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .envs(child_env.iter().map(|(k, v)| (*k, v.as_os_str())))
+        .env("AI_MEMORY_DB", &db)
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_STORE_URL", CLOSED_PG_URL)
+        .args(["verify-signed-events-chain", "--format", "json"])
+        .output()
+        .expect("run ai-memory");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    let want = ai_memory::cli::verify_signed_events::postgres_walk_refusal(
+        &ai_memory::url_display::store_url_display(CLOSED_PG_URL),
+    );
+    assert!(stderr.contains(&want), "want {want:?} in {stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).find('{').is_none(),
+        "no report is printed for the wrong table"
+    );
+}
+
+/// #10106 — a cutoff row whose `prev_hash` column is not the canonical hash
+/// of the last prefix row is no cutoff, even when the row is re-signed under
+/// the cutoff domain over the rewritten bytes (the `payload_hash` still binds
+/// the true last hash, so only the column check catches it).
+#[test]
+fn c6_resigned_cutoff_with_a_foreign_prev_hash_is_no_cutoff_10106() {
+    const FOREIGN_PREV_HASH: [u8; 32] = [0x5a; 32];
+    let vk = sink();
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    conn.execute(
+        "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = ?2",
+        params![FOREIGN_PREV_HASH.to_vec(), cutoff_row],
+    )
+    .expect("rewrite prev_hash");
+    let cutoff = row_at(&conn, cutoff_row);
+    let resigned = legacy_key()
+        .sign(&pinned_preimage(
+            LEGACY_CUTOFF_TAG_BYTES,
+            &daemon_row_signing_input(&cutoff),
+        ))
+        .to_bytes()
+        .to_vec();
+    conn.execute(
+        "UPDATE signed_events SET signature = ?1 WHERE sequence = ?2",
+        params![resigned, cutoff_row],
+    )
+    .expect("re-sign the cutoff row");
+    let resolved = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(resolved, LegacyCutoff::none());
+}
+
+/// #10106 — a minimal v2 envelope carrying `rows` as its signed events.
+fn envelope_of(rows: &[SignedEvent]) -> ai_memory::portability::emit::ExportEnvelope {
+    use ai_memory::portability::emit::{ExportEnvelope, SPEC_VERSION_V2};
+    ExportEnvelope {
+        spec_version: SPEC_VERSION_V2.to_string(),
+        db_schema_version: 0,
+        source: "issue-10106-test".into(),
+        exported_at: "2026-11-25T00:00:00Z".into(),
+        memories: Vec::new(),
+        links: Vec::new(),
+        signed_events: rows
+            .iter()
+            .map(ai_memory::portability::dto::SignedEventDto::from)
+            .collect(),
+        memory_revisions: Vec::new(),
+        forget_tombstones: Vec::new(),
+        agent_lineage: Vec::new(),
+        model_attestations: Vec::new(),
+        governance_rules: Vec::new(),
+        trust_anchors: Vec::new(),
+        archived_memories: Vec::new(),
+        namespace_meta: Vec::new(),
+        archived_memory_links: Vec::new(),
+        portability_complete: false,
+        conformance_level: "L1".into(),
+        conformance_by_class: std::collections::BTreeMap::new(),
+        count: 0,
+    }
+}
+
+/// #10106 — the import guard (`src/portability/import.rs`): a bundle that
+/// carries a DIFFERENT cutoff row into a database that already holds one is
+/// refused with the exact reason and writes no second cutoff; the same
+/// cutoff row (a restore of this database) is accepted.
+#[test]
+fn c6_import_refuses_a_second_legacy_cutoff_10106() {
+    use ai_memory::portability::import::{ImportOptions, import_full_envelope};
+    let opts = ImportOptions {
+        caller_agent_id: "ai:importer-10106".into(),
+        ..ImportOptions::default()
+    };
+    let (_da, _pa, dst) = open_db();
+    let dst_cutoff = legacy_prefix_and_mint(&dst);
+    let (_db, _pb, src) = open_db();
+    let src_cutoff = row_at(&src, legacy_prefix_and_mint(&src));
+    assert_ne!(row_at(&dst, dst_cutoff).id, src_cutoff.id, "control");
+
+    let err = import_full_envelope(&dst, &envelope_of(std::slice::from_ref(&src_cutoff)), &opts)
+        .expect_err("a second cutoff is refused");
+    let want = format!(
+        "import signed_event {} (sequence {}): a different legacy cutoff row already \
+         exists; refusing a second cutoff",
+        src_cutoff.id, src_cutoff.sequence
+    );
+    assert!(format!("{err:#}").contains(&want), "{err:#}");
+    assert_eq!(cutoff_rows(&dst), 1, "no second cutoff row was written");
+
+    let own = row_at(&dst, dst_cutoff);
+    import_full_envelope(&dst, &envelope_of(&[own]), &opts).expect("the same cutoff restores");
+    assert_eq!(cutoff_rows(&dst), 1);
+}
+
+/// Count and content digest of one SQLite table: every row rendered as text,
+/// the rendered rows sorted, then hashed (independent of row order).
+fn sqlite_table_digest(conn: &rusqlite::Connection, table: &str) -> (usize, String) {
+    use std::fmt::Write as _;
+    let mut stmt = conn
+        .prepare(&format!("SELECT * FROM \"{table}\""))
+        .expect("select table");
+    let cols = stmt.column_count();
+    let mut rendered: Vec<String> = stmt
+        .query_map([], |r| {
+            let mut line = String::new();
+            for i in 0..cols {
+                let v: rusqlite::types::Value = r.get(i)?;
+                let _ = write!(line, "{v:?}\u{1f}");
+            }
+            Ok(line)
+        })
+        .expect("query rows")
+        .collect::<Result<_, _>>()
+        .expect("read rows");
+    rendered.sort();
+    let mut h = Sha256::new();
+    for line in &rendered {
+        h.update(line.as_bytes());
+        h.update(b"\n");
+    }
+    (rendered.len(), hex::encode(h.finalize()))
+}
+
+/// Every stored table of the database (virtual tables are read through their
+/// shadow tables, which hold their rows), each with its count and digest.
+fn sqlite_db_digest(db: &Path) -> std::collections::BTreeMap<String, (usize, String)> {
+    let conn = rusqlite::Connection::open(db).expect("open sqlite");
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND COALESCE(sql, '') NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name",
+        )
+        .expect("list tables");
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .expect("tables")
+        .collect::<Result<_, _>>()
+        .expect("table names");
+    names
+        .into_iter()
+        .map(|t| {
+            let d = sqlite_table_digest(&conn, &t);
+            (t, d)
+        })
+        .collect()
+}
+
+/// GA standard 1 (no data destruction) on a POPULATED SQLite database: the
+/// chain walk, the mint and the anchor repair alter no stored memory. Every
+/// table other than `signed_events` keeps its exact row count and content
+/// digest; `signed_events` keeps every earlier row byte-identical and gains
+/// exactly the one cutoff row (the walk and the repair add none).
+#[test]
+fn std1_mint_verify_repair_alter_no_stored_memory_10074() {
+    const MEMORIES: i64 = 6;
+    let root = home_sandbox::per_test_dir("cli-std1-10074-");
+    let (root, db, agent) = (root.path(), root.path().join("store.db"), "cli-std1-10074");
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+    for i in 0..MEMORIES {
+        let title = format!("std1 row {i}");
+        let content = format!("standard 1 populated memory {i} (#10074)");
+        let out = cli::run(
+            root,
+            &db,
+            agent,
+            &a,
+            &[],
+            &["--json", "store", "-T", &title, "--content", &content],
+        );
+        assert_eq!(out.code, Some(0), "store {i}: {}", out.text);
+    }
+    let memories = |db: &Path| {
+        rusqlite::Connection::open(db)
+            .expect("open sqlite")
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+            .expect("count memories")
+    };
+    assert_eq!(memories(&db), MEMORIES, "the database is populated");
+
+    let before = sqlite_db_digest(&db);
+    let events_before = load_rows(&rusqlite::Connection::open(&db).expect("open sqlite"));
+    assert!(!events_before.is_empty(), "the store wrote signed events");
+
+    let out = cli::run(root, &db, agent, &a, &[], &["verify-signed-events-chain"]);
+    assert_eq!(out.code, Some(0), "walk: {}", out.text);
+    assert_eq!(sqlite_db_digest(&db), before, "the walk alters no table");
+
+    let out = cli_mint(root, &db, agent, &a);
+    assert_eq!(out.code, Some(0), "mint: {}", out.text);
+    let after_mint = sqlite_db_digest(&db);
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(0), "repair: {}", out.text);
+    assert!(
+        out.text.contains("repaired the off-table anchor"),
+        "{}",
+        out.text
+    );
+    let out = cli::run(root, &db, agent, &b, &[], &["verify-signed-events-chain"]);
+    assert_eq!(out.code, Some(0), "walk after mint: {}", out.text);
+    let after = sqlite_db_digest(&db);
+    assert_eq!(after, after_mint, "the repair and the walk alter no table");
+
+    let mut changed: Vec<&String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|t| before.get(*t) != after.get(*t))
+        .collect();
+    changed.dedup();
+    assert_eq!(changed, vec!["signed_events"], "only signed_events changes");
+    let events_after = load_rows(&rusqlite::Connection::open(&db).expect("open sqlite"));
+    assert_eq!(
+        events_after.len(),
+        events_before.len() + 1,
+        "exactly one row added"
+    );
+    assert_eq!(
+        &events_after[..events_before.len()],
+        &events_before[..],
+        "every earlier signed event is unchanged"
+    );
+    assert_eq!(
+        events_after.last().map(|r| r.event_type.as_str()),
+        Some(LEGACY_CUTOFF_EVENT_TYPE),
+        "the added row is the cutoff row"
+    );
+    assert_eq!(memories(&db), MEMORIES, "no memory lost");
+}

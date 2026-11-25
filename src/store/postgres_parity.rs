@@ -325,8 +325,12 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     let signatures: Vec<Option<Vec<u8>>> = victims
         .iter()
         .map(|(id, ns, _)| {
-            let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &ts);
-            crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
+            let signable = crate::storage::forget_tombstone_signing_body(id, ns, &ts);
+            crate::governance::daemon_signer::sign(
+                crate::governance::daemon_signer::DaemonDomain::Tombstone,
+                &signable,
+            )
+            .map(|(s, _)| s)
         })
         .collect();
     sqlx::query(

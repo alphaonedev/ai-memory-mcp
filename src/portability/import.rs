@@ -1359,6 +1359,26 @@ fn apply_all_classes(
     // (3) signed_events — RAW (byte-preserve prev_hash/sequence/cause_hash).
     for dto in &env.signed_events {
         let ev: crate::signed_events::SignedEvent = dto.clone().into();
+        // #10074 (S-2) — a restore carries its one cutoff row byte-for-byte
+        // (standard 4), but never a SECOND cutoff row next to a different one.
+        if ev.event_type == crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE {
+            let other: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM signed_events \
+                     WHERE event_type = ?1 AND id <> ?2)",
+                    params![crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE, ev.id],
+                    |r| r.get(0),
+                )
+                .with_context(|| format!("import: cutoff probe for signed_event {}", ev.id))?;
+            if other {
+                anyhow::bail!(
+                    "import signed_event {} (sequence {}): a different legacy cutoff row \
+                     already exists; refusing a second cutoff",
+                    ev.id,
+                    ev.sequence
+                );
+            }
+        }
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO signed_events \

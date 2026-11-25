@@ -358,6 +358,14 @@ pub(super) async fn append_signed_event_row(
         timestamp: _,
         cause_hash,
     } = row;
+    // #10074 (S-2, S-3) — the cutoff row is written only by the operator mint.
+    if event_type == crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE {
+        return Err(sqlx::Error::Protocol(format!(
+            "append signed_event: event_type {} is reserved for the operator \
+             legacy-cutoff mint",
+            crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE
+        )));
+    }
 
     let mut retry = SequenceRetry::new(SequenceChain::SignedEvents);
     loop {
@@ -415,10 +423,9 @@ pub(super) async fn append_signed_event_row(
         // Signing over the truncated timestamp makes signed-bytes == stored-bytes by
         // construction. Only when a daemon key is installed AND the row is
         // daemon-signed; recorder/lineage/unsigned rows keep their distinct-role
-        // signatures untouched. A verify-only pg process with no key keeps the
-        // caller's payload-only signature (the verifier's payload-only fallback still
-        // validates it), so this is additive + fail-closed, closing the pg half of
-        // the #1925 head-identity-tamper gap the audit pin now makes load-bearing.
+        // signatures untouched. #10074: the signature is made under
+        // `DaemonDomain::EventRow`; a process with no key keeps the caller's
+        // `EventPayload` signature, which no row verifier accepts (fail closed).
         //
         // #3527 — re-signed INSIDE the attempt, because the pre-image commits
         // to `sequence`: a signature computed for a sequence this attempt then
@@ -440,9 +447,12 @@ pub(super) async fn append_signed_event_row(
                 cause_hash: cause_hash.map(<[u8]>::to_vec),
             };
             let input = crate::signed_events::daemon_row_signing_input(&row_view);
-            crate::governance::audit::try_sign_audit_payload(&input)
-                .map(|(sig, _)| sig)
-                .or_else(|| signature.map(<[u8]>::to_vec))
+            crate::governance::daemon_signer::sign(
+                crate::governance::daemon_signer::DaemonDomain::EventRow,
+                &input,
+            )
+            .map(|(sig, _)| sig)
+            .or_else(|| signature.map(<[u8]>::to_vec))
         } else {
             signature.map(<[u8]>::to_vec)
         };

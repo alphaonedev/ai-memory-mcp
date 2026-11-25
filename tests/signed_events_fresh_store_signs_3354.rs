@@ -170,7 +170,7 @@ fn fresh_store_generates_the_signing_key_at_boot_3354() {
 /// THE regression (review round 3): the property #3354 delivers is that a
 /// fresh store's first DAEMON-SIGNED row is actually signed under the key
 /// ensured at boot. `delete --hard` is such a writer: its forget tombstone is
-/// signed through `try_sign_audit_payload` with the daemon audit key. The
+/// signed through `daemon_signer::sign` with the daemon audit key. The
 /// plain `delete <id>` is ARCHIVE-FIRST since #3012 (`delete_archive_first`
 /// snapshots into `archived_memories` and writes NO tombstone), so it is not
 /// a tombstone writer and would leave nothing to verify (review round 4). On the pre-fix

@@ -450,6 +450,8 @@ fn main() -> Result<()> {
     // (or `None`), which is inert for them.
     let audit_pubkey_flag = match &cli.command {
         daemon_runtime::Command::VerifyAuditTrail(a) => a.audit_pubkey.as_deref(),
+        // #10074 (S-8) — the same pin for the signed_events chain walk.
+        daemon_runtime::Command::VerifySignedEventsChain(a) => a.audit_pubkey.as_deref(),
         _ => None,
     };
     let audit_pubkey = ai_memory::governance::audit::resolve_audit_pubkey(audit_pubkey_flag)?;
@@ -695,6 +697,12 @@ fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
     if let daemon_runtime::Command::WakeHub(args) = cmd {
         // #9562, 3-agent vote (71472661): per mode, via the dispatch derivation.
         return ai_memory::cli::wake_hub::WakeHubMode::of(args).writes_ledger();
+    }
+    // #10074 (S-3, S-8) — the explicit legacy cutoff mint writes one signed
+    // row and one forensic anchor, so it boots as a writer (daemon key
+    // installed, forensic sink up); the plain chain walk stays read-only.
+    if let daemon_runtime::Command::VerifySignedEventsChain(a) = cmd {
+        return a.mint_legacy_cutoff;
     }
     !(is_egress_verb(cmd)
         || is_remediation_verb(cmd)
@@ -1062,9 +1070,17 @@ mod tests {
                 "{argv:?} is remediation / read-only, never refused"
             );
         }
+        // #10074 — the chain walk is read-only; the explicit mint writes.
+        let walk = parse(&["ai-memory", "verify-signed-events-chain"]);
+        assert!(!ledger_writer(&walk), "the chain walk is read-only");
         for argv in [
             &["ai-memory", "serve"][..],
             &["ai-memory", "capture-turn"][..],
+            &[
+                "ai-memory",
+                "verify-signed-events-chain",
+                "--mint-legacy-cutoff",
+            ][..],
         ] {
             let cmd = parse(argv);
             assert!(

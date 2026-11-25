@@ -1564,7 +1564,10 @@ fn emit_check_event(
     let (signature, attest_level) =
         match crate::governance::audit::try_sign_recorder_payload(&hash, None) {
             Some((sig, level)) => (Some(sig), level.to_string()),
-            None => match crate::governance::audit::try_sign_audit_payload(&hash) {
+            None => match crate::governance::daemon_signer::sign(
+                crate::governance::daemon_signer::DaemonDomain::Governance,
+                &hash,
+            ) {
                 Some((sig, level)) => (Some(sig), level.to_string()),
                 None => (
                     None,

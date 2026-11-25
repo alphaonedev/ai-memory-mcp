@@ -2650,7 +2650,15 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::verify_signed_events::run(&db_path, &a, &mut out)? {
+            // #10074 (S-8) — the pin verifies; `--mint-legacy-cutoff` mints.
+            let r = cli::verify_signed_events::dispatch(
+                &db_path,
+                &a,
+                app_config,
+                audit_pubkey,
+                &mut out,
+            );
+            match r.await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }

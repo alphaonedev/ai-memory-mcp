@@ -30,7 +30,7 @@
 use std::process::Command;
 
 use ai_memory::signed_events::{
-    SignatureCheck, SignedEvent, ZERO_HASH, canonical_chain_bytes, daemon_row_signing_input,
+    SignatureCheck, SignedEvent, ZERO_HASH, canonical_chain_bytes, daemon_row_signing_preimage,
     payload_hash, verify_audit_trail,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -82,7 +82,11 @@ fn insert_daemon_row(
         sequence: seq,
         cause_hash: None,
     };
-    let sig = key.sign(&daemon_row_signing_input(&ev)).to_bytes().to_vec();
+    // #10074: the daemon signs the EventRow tag, then daemon_row_signing_input.
+    let sig = key
+        .sign(&daemon_row_signing_preimage(&ev))
+        .to_bytes()
+        .to_vec();
     ev.signature = Some(sig);
     insert_raw(conn, &ev);
     ev
@@ -306,7 +310,7 @@ fn recorder_unenrolled_child_l4() {
 #[tokio::test]
 #[ignore = "requires a live postgres (AI_MEMORY_TEST_POSTGRES_URL); run with --include-ignored"]
 async fn pg_daemon_row_signed_over_truncated_timestamp_verifies_l4() {
-    use ai_memory::signed_events::{RowSignatureVerdict, classify_row_signature};
+    use ai_memory::signed_events::{LegacyCutoff, RowSignatureVerdict, classify_row_signature};
 
     let url = match std::env::var("AI_MEMORY_TEST_POSTGRES_URL") {
         Ok(u) if !u.is_empty() => u,
@@ -374,14 +378,14 @@ async fn pg_daemon_row_signed_over_truncated_timestamp_verifies_l4() {
     let sig_bytes = ev.signature.as_deref().expect("daemon row has a signature");
     let sig_arr: [u8; 64] = sig_bytes.try_into().expect("64-byte ed25519 signature");
     let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-    pin.verify_strict(&daemon_row_signing_input(&ev), &sig)
+    pin.verify_strict(&daemon_row_signing_preimage(&ev), &sig)
         .expect(
             "pg daemon row must verify under the pin over the IDENTITY-BOUND, \
              truncated-timestamp pre-image (signed bytes == stored bytes)",
         );
 
     // Secondary: the shared per-row classifier also lands `Verified` under the pin.
-    let verdict = classify_row_signature(&ev, Some(&pin), None);
+    let verdict = classify_row_signature(&ev, Some(&pin), None, &LegacyCutoff::none());
     assert_eq!(
         verdict,
         RowSignatureVerdict::Verified,

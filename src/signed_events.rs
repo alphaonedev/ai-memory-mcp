@@ -135,6 +135,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+pub mod legacy_cutoff;
+use legacy_cutoff::{DaemonForm, daemon_signature_form};
+pub use legacy_cutoff::{
+    LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffResolver, daemon_row_signing_preimage,
+    legacy_cutoff_payload_hash,
+};
+
 /// Tracing target for signed-events chain emission/verification log
 /// lines across the storage backends (#1558 tracing-target SSOT).
 /// Distinct from the `signed_events` SQL table name, which stays
@@ -623,14 +630,16 @@ impl SignedEvent {
         cause_hash: Option<&[u8]>,
     ) -> Self {
         let signing_input = signing_input_bytes(&payload_hash, cause_hash);
-        let (signature, attest_level) =
-            match crate::governance::audit::try_sign_audit_payload(&signing_input) {
-                Some((sig_bytes, tag)) => (Some(sig_bytes), tag.to_string()),
-                None => (
-                    None,
-                    crate::models::AttestLevel::Unsigned.as_str().to_string(),
-                ),
-            };
+        let (signature, attest_level) = match crate::governance::daemon_signer::sign(
+            crate::governance::daemon_signer::DaemonDomain::EventPayload,
+            &signing_input,
+        ) {
+            Some((sig_bytes, tag)) => (Some(sig_bytes), tag.to_string()),
+            None => (
+                None,
+                crate::models::AttestLevel::Unsigned.as_str().to_string(),
+            ),
+        };
         SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id,
@@ -1111,6 +1120,13 @@ pub struct ChainVerificationReport {
     /// row DEMOTED because a recorder key is now enrolled (C2). Empty in the
     /// legacy posture (no recorder key enrolled).
     pub role_separation_failures: Vec<i64>,
+    /// #10105 — rows classified `Skipped(AgentSignedDomainObject)`: agent-signed
+    /// domain objects whose chain linkage this walk checked but whose signature
+    /// it did NOT verify. Never counted in `rows_positively_verified`.
+    pub agent_signed_rows_not_verified: u64,
+    /// #10105 — agent-signed rows with a missing or malformed signature, each
+    /// with its exact failure. Their sequences are also in `signature_failures`.
+    pub agent_signature_defects: Vec<(i64, SignatureFailure)>,
 }
 
 impl ChainVerificationReport {
@@ -1168,6 +1184,63 @@ pub enum SkipReason {
     /// A by-design legacy `unsigned` row with a verifier installed but no
     /// signature to check (#1452 — never a failure for the `unsigned` class).
     UnsignedByDesign,
+    /// #10105 — an AGENT-signed domain object (`self_signed`,
+    /// `signed_by_peer`, `peer_attested`). Its signature is by the agent's
+    /// (or peer's) own key over that domain's bytes, never by the daemon key,
+    /// so the daemon verifier would ALWAYS false-fail it. This walk checks its
+    /// chain linkage and that a signature of the right length is present; it
+    /// does NOT verify the signature. Reported apart from `Verified` as
+    /// [`ChainVerificationReport::agent_signed_rows_not_verified`].
+    AgentSignedDomainObject,
+}
+
+/// #10105 — the agent-signed attestation forms of [`SignerIdentity::Agent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAttestation {
+    /// `self_signed`: the writing agent's own key.
+    SelfSigned,
+    /// `signed_by_peer`: a peer or host key that is not the daemon key.
+    SignedByPeer,
+    /// `peer_attested`: a peer's attestation key.
+    PeerAttested,
+}
+
+/// #10105 — who signed a `signed_events` row, as its stored `attest_level`
+/// names it. One variant per signer form; [`classify_row_signature`] matches
+/// on it exhaustively, so a new form cannot fall through to a default arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerIdentity {
+    /// `daemon_signed`: the daemon (or audit-pin) key.
+    Daemon,
+    /// `recorder_signed`: the separately held recorder key (G9).
+    Recorder,
+    /// `lineage_signed`: an identity-lineage witness row (G13).
+    LineageWitness,
+    /// An agent-signed domain object, never verified against the daemon key.
+    Agent(AgentAttestation),
+    /// `unsigned`: the by-design legacy unsigned class (#1452).
+    Unsigned,
+    /// Any other `attest_level` string: routed to the daemon verifier, so it
+    /// fails closed when a verifier is installed.
+    Unrecognised,
+}
+
+impl SignerIdentity {
+    /// Map a stored `attest_level` to its signer form.
+    #[must_use]
+    pub fn of(attest_level: &str) -> Self {
+        use crate::models::AttestLevel;
+        match AttestLevel::from_str(attest_level) {
+            Some(AttestLevel::DaemonSigned) => Self::Daemon,
+            Some(AttestLevel::RecorderSigned) => Self::Recorder,
+            Some(AttestLevel::LineageSigned) => Self::LineageWitness,
+            Some(AttestLevel::SelfSigned) => Self::Agent(AgentAttestation::SelfSigned),
+            Some(AttestLevel::SignedByPeer) => Self::Agent(AgentAttestation::SignedByPeer),
+            Some(AttestLevel::PeerAttested) => Self::Agent(AgentAttestation::PeerAttested),
+            Some(AttestLevel::Unsigned) => Self::Unsigned,
+            None => Self::Unrecognised,
+        }
+    }
 }
 
 /// v1.0.0 L4 (PR-3) — the failing axis a `Failed` row belongs to.
@@ -1183,6 +1256,31 @@ pub enum SignatureFailure {
     /// v0.9.0 G9 (C2) — a `daemon_signed` governance row DEMOTED once a recorder
     /// key is enrolled. A role-separation failure.
     DaemonRoleDemotion,
+    /// #10074 (S-6) — a daemon-signed row ABOVE the legacy cutoff carries a
+    /// signature that verifies only under the untagged payload-only form. It
+    /// fails that row and lands in [`AuditTrailReport::signature_failures`];
+    /// it never blocks a later append.
+    LegacyPayloadOnlyAfterCutoff,
+    /// #10105 — an agent-signed row with NO signature (NULL column).
+    AgentSignatureMissing,
+    /// #10105 — an agent-signed row whose signature is not exactly
+    /// [`ed25519_dalek::SIGNATURE_LENGTH`] bytes (an empty blob included).
+    AgentSignatureMalformed,
+}
+
+impl SignatureFailure {
+    /// The exact, stable reason string the verify CLIs print for this failure.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::DaemonSignature => "daemon_signature_invalid",
+            Self::RecorderVerification => "recorder_signature_invalid",
+            Self::DaemonRoleDemotion => "daemon_role_demoted",
+            Self::LegacyPayloadOnlyAfterCutoff => "legacy_payload_only_after_cutoff",
+            Self::AgentSignatureMissing => "agent_signature_missing",
+            Self::AgentSignatureMalformed => "agent_signature_malformed",
+        }
+    }
 }
 
 /// v1.0.0 L4 (PR-3) — TRI-STATE per-row Ed25519 verdict. Every row the chain
@@ -1223,8 +1321,36 @@ impl RowSignatureVerdict {
     pub fn signature_failure(self) -> bool {
         matches!(
             self,
-            RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature)
+            RowSignatureVerdict::Failed(
+                SignatureFailure::DaemonSignature
+                    | SignatureFailure::LegacyPayloadOnlyAfterCutoff
+                    | SignatureFailure::AgentSignatureMissing
+                    | SignatureFailure::AgentSignatureMalformed
+            )
         )
+    }
+
+    /// #10105 — `true` iff the row is an agent-signed domain object this walk
+    /// did not verify (its own counter, never `Verified`).
+    #[must_use]
+    pub fn is_agent_signed_skip(self) -> bool {
+        matches!(
+            self,
+            RowSignatureVerdict::Skipped(SkipReason::AgentSignedDomainObject)
+        )
+    }
+
+    /// #10105 — the exact failure of an agent-signed row whose signature is
+    /// missing or malformed, else `None`.
+    #[must_use]
+    pub fn agent_signature_defect(self) -> Option<SignatureFailure> {
+        match self {
+            RowSignatureVerdict::Failed(
+                f @ (SignatureFailure::AgentSignatureMissing
+                | SignatureFailure::AgentSignatureMalformed),
+            ) => Some(f),
+            _ => None,
+        }
     }
 
     /// v0.9.0 G9 role-separation axis — a recorder-verify failure OR a C2
@@ -1243,23 +1369,32 @@ impl RowSignatureVerdict {
 
 /// v0.9.0 G9 (#1826) — classify ONE row's per-row Ed25519 verification. The
 /// SHARED verification core so the sqlite [`verify_chain`] walk and the
-/// postgres verify twin (C7) surface IDENTICAL failure sets (K3 parity):
+/// postgres verify twin (C7) surface IDENTICAL failure sets (K3 parity).
+/// It matches EXHAUSTIVELY on the row's [`SignerIdentity`]:
 ///
+/// - a `lineage_signed` witness row is `Skipped(LineageWitness)` (G13);
 /// - a `recorder_signed` row is verified against `recorder_verifier` over
 ///   `DOMAIN_RECORDER || signing_input_bytes(payload, cause)`; when NO recorder
 ///   pubkey is enrolled the row is SKIPPED (C6 — never false-failed vs daemon);
+/// - #10105 — an agent-signed row (`self_signed`, `signed_by_peer`,
+///   `peer_attested`) is NEVER checked against the daemon key: a signature of
+///   exactly [`ed25519_dalek::SIGNATURE_LENGTH`] bytes is
+///   `Skipped(AgentSignedDomainObject)` (never `Verified`), a missing one is
+///   `Failed(AgentSignatureMissing)` and any other length is
+///   `Failed(AgentSignatureMalformed)`, with or without a daemon verifier;
 /// - a `daemon_signed` governance row is DEMOTED to a role-separation failure
 ///   once a recorder key is enrolled (C2);
-/// - every other row routes to the legacy daemon verifier (#1071 / #1452),
-///   byte-identical to the pre-G9 behaviour.
+/// - every other row (`daemon_signed`, `unsigned`, an unrecognised level)
+///   routes to the legacy daemon verifier (#1071 / #1452), so an unrecognised
+///   level fails closed when a verifier is installed.
 #[must_use]
 pub fn classify_row_signature(
     event: &SignedEvent,
     daemon_verifier: Option<&ed25519_dalek::VerifyingKey>,
     recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
+    cutoff: &LegacyCutoff,
 ) -> RowSignatureVerdict {
-    use crate::models::AttestLevel;
-    if event.attest_level == AttestLevel::LineageSigned.as_str() {
+    match SignerIdentity::of(&event.attest_level) {
         // v0.9.0 G13 (#1828) — identity-lineage WITNESS row. Its
         // `signature` is the succession signature by the record's
         // PREDECESSOR key over the `LINEAGE_DOMAIN`-tagged bytes, not a
@@ -1275,43 +1410,74 @@ pub fn classify_row_signature(
         // DOWNGRADED into this skip class (attest relabeled, signature stripped)
         // stops being a free pass — it is `unverified` → dirty. See
         // [`SignatureCheck`].
-        return RowSignatureVerdict::Skipped(SkipReason::LineageWitness);
+        SignerIdentity::LineageWitness => RowSignatureVerdict::Skipped(SkipReason::LineageWitness),
+        SignerIdentity::Recorder => classify_recorder_row(event, recorder_verifier),
+        // #10105 (option C, the lineage precedent) — an agent-signed domain
+        // object is signed by the agent's (or peer's) own key over that
+        // domain's bytes, so the daemon verifier would ALWAYS false-fail it.
+        // The walk checks its chain linkage (in the caller) and that a
+        // signature of the right length is present; it never verifies it.
+        SignerIdentity::Agent(_) => match event.signature.as_deref() {
+            None => RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMissing),
+            Some(sig) if sig.len() == ed25519_dalek::SIGNATURE_LENGTH => {
+                RowSignatureVerdict::Skipped(SkipReason::AgentSignedDomainObject)
+            }
+            Some(_) => RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMalformed),
+        },
+        SignerIdentity::Daemon
+            if recorder_verifier.is_some()
+                && event.event_type
+                    == crate::governance::agent_action::GOVERNANCE_CHECK_EVENT_TYPE =>
+        {
+            // C2 DAEMON DEMOTION — a daemon-signed governance row is no longer an
+            // acceptable recorder attestation once a recorder key is enrolled.
+            RowSignatureVerdict::Failed(SignatureFailure::DaemonRoleDemotion)
+        }
+        SignerIdentity::Daemon | SignerIdentity::Unsigned | SignerIdentity::Unrecognised => {
+            classify_daemon_row(event, daemon_verifier, cutoff)
+        }
     }
-    if event.attest_level == AttestLevel::RecorderSigned.as_str() {
-        // RECORDER-signed row (C6: withhold when no recorder pubkey enrolled).
-        let Some(rk) = recorder_verifier else {
-            // v1.0.0 L4 — COUNTED as `Skipped(RecorderUnenrolled)`, not
-            // discarded (closes the same downgrade class as the lineage arm).
-            return RowSignatureVerdict::Skipped(SkipReason::RecorderUnenrolled);
-        };
-        let ok = match event.signature.as_deref() {
-            Some(sig_bytes) if !sig_bytes.is_empty() => match <[u8; 64]>::try_from(sig_bytes) {
-                Ok(arr) => {
-                    let sig = ed25519_dalek::Signature::from_bytes(&arr);
-                    let preimage = crate::governance::audit::recorder_signing_preimage(
-                        &event.payload_hash,
-                        event.cause_hash.as_deref(),
-                    );
-                    rk.verify_strict(&preimage, &sig).is_ok()
-                }
-                Err(_) => false,
-            },
-            _ => false,
-        };
-        return if ok {
-            RowSignatureVerdict::Verified
-        } else {
-            RowSignatureVerdict::Failed(SignatureFailure::RecorderVerification)
-        };
+}
+
+/// v0.9.0 G9 (#1826) — a `recorder_signed` row (C6: withheld when no recorder
+/// pubkey is enrolled).
+fn classify_recorder_row(
+    event: &SignedEvent,
+    recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
+) -> RowSignatureVerdict {
+    let Some(rk) = recorder_verifier else {
+        // v1.0.0 L4 — COUNTED as `Skipped(RecorderUnenrolled)`, not
+        // discarded (closes the same downgrade class as the lineage arm).
+        return RowSignatureVerdict::Skipped(SkipReason::RecorderUnenrolled);
+    };
+    let ok = match event.signature.as_deref() {
+        Some(sig_bytes) if !sig_bytes.is_empty() => match <[u8; 64]>::try_from(sig_bytes) {
+            Ok(arr) => {
+                let sig = ed25519_dalek::Signature::from_bytes(&arr);
+                let preimage = crate::governance::audit::recorder_signing_preimage(
+                    &event.payload_hash,
+                    event.cause_hash.as_deref(),
+                );
+                rk.verify_strict(&preimage, &sig).is_ok()
+            }
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    if ok {
+        RowSignatureVerdict::Verified
+    } else {
+        RowSignatureVerdict::Failed(SignatureFailure::RecorderVerification)
     }
-    if recorder_verifier.is_some()
-        && event.attest_level == AttestLevel::DaemonSigned.as_str()
-        && event.event_type == crate::governance::agent_action::GOVERNANCE_CHECK_EVENT_TYPE
-    {
-        // C2 DAEMON DEMOTION — a daemon-signed governance row is no longer an
-        // acceptable recorder attestation once a recorder key is enrolled.
-        return RowSignatureVerdict::Failed(SignatureFailure::DaemonRoleDemotion);
-    }
+}
+
+/// The legacy daemon verifier for `daemon_signed`, `unsigned` and
+/// unrecognised rows.
+fn classify_daemon_row(
+    event: &SignedEvent,
+    daemon_verifier: Option<&ed25519_dalek::VerifyingKey>,
+    cutoff: &LegacyCutoff,
+) -> RowSignatureVerdict {
     // Legacy daemon verifier (#1071 / #1452), unchanged — the caller resolves
     // the EFFECTIVE verifier (the out-of-band `AI_MEMORY_AUDIT_PUBKEY` pin when
     // enrolled, else the in-process daemon key), so this arm is pin-agnostic.
@@ -1322,30 +1488,31 @@ pub fn classify_row_signature(
     };
     match event.signature.as_ref() {
         Some(sig_bytes) if !sig_bytes.is_empty() => {
-            match <[u8; 64]>::try_from(sig_bytes.as_slice()) {
-                Ok(arr) => {
-                    let sig = ed25519_dalek::Signature::from_bytes(&arr);
-                    // #1925 (CWE-347) — accept EITHER the identity-bound input
-                    // (sqlite/postgres rows re-signed at append over the full
-                    // attribution tuple) OR the legacy payload-only input
-                    // (pre-#1925 rows). A row tampered in any identity column
-                    // fails the identity check; the payload-only fallback never
-                    // re-validates a tampered identity because a payload-only
-                    // signature is not over the identity pre-image at all. So the
-                    // head-row identity-tamper attack is caught fail-closed while
-                    // legitimate legacy rows still verify.
-                    let id_input = daemon_row_signing_input(event);
-                    let pay_input =
-                        signing_input_bytes(&event.payload_hash, event.cause_hash.as_deref());
-                    let ok = vk.verify_strict(&id_input, &sig).is_ok()
-                        || vk.verify_strict(&pay_input, &sig).is_ok();
-                    if ok {
-                        RowSignatureVerdict::Verified
-                    } else {
-                        RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature)
-                    }
+            // #10074 (CWE-347, 3-agent vote (71472661) V1-SIGNED-EVENTS-FALLBACK)
+            // — the signature verifies under exactly ONE form
+            // ([`daemon_signature_form`]), and the verdict is a function of
+            // that form and the row's place relative to the validated
+            // [`LegacyCutoff`]. There is no accept-either: an untagged legacy
+            // form is accepted only at or below the cutoff (S-5), the cutoff
+            // row only when it IS the validated cutoff row, and every other
+            // daemon domain's signature (tombstone, revision leaf, governance,
+            // event payload) matches no form here (S-4).
+            let form = daemon_signature_form(vk, event);
+            let in_prefix = event.sequence >= 1 && event.sequence <= cutoff.sequence();
+            match form {
+                DaemonForm::EventRowTagged if event.event_type != LEGACY_CUTOFF_EVENT_TYPE => {
+                    RowSignatureVerdict::Verified
                 }
-                Err(_) => RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature),
+                DaemonForm::CutoffTagged if cutoff.row_sequence() == Some(event.sequence) => {
+                    RowSignatureVerdict::Verified
+                }
+                DaemonForm::LegacyIdentity | DaemonForm::LegacyPayloadOnly if in_prefix => {
+                    RowSignatureVerdict::Verified
+                }
+                DaemonForm::LegacyPayloadOnly => {
+                    RowSignatureVerdict::Failed(SignatureFailure::LegacyPayloadOnlyAfterCutoff)
+                }
+                _ => RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature),
             }
         }
         // #1452 — fail-closed on a missing signature when a verifier IS
@@ -1406,9 +1573,15 @@ pub fn verify_chain(
         crate::governance::audit::load_enrolled_recorder_pubkey()
             .ok()
             .flatten();
+    // #10074 (S-2) — the cutoff is resolved over the WHOLE table, whatever
+    // `since_sequence` is, so a windowed walk that starts above the cutoff
+    // still refuses every legacy form when the cutoff is missing or invalid.
+    let cutoff = resolve_sqlite_legacy_cutoff(conn, verifier)?;
     let mut signature_failures: Vec<i64> = Vec::new();
     let mut role_separation_failures: Vec<i64> = Vec::new();
     let mut rows_positively_verified: u64 = 0;
+    let mut agent_signed_rows_not_verified: u64 = 0;
+    let mut agent_signature_defects: Vec<(i64, SignatureFailure)> = Vec::new();
 
     let mut expected_seq = lower + 1;
     let mut prev_canonical_hash: [u8; 32] = ZERO_HASH;
@@ -1496,7 +1669,7 @@ pub fn verify_chain(
         // the postgres verify twin (C7) surface IDENTICAL signature_failures +
         // role_separation_failures (K3 parity). A signature failure is disjoint
         // from a chain break by design (per-row forgery vs substrate tamper).
-        let rv = classify_row_signature(&event, verifier, recorder_verifier.as_ref());
+        let rv = classify_row_signature(&event, verifier, recorder_verifier.as_ref(), &cutoff);
         if rv.is_verified() {
             rows_positively_verified += 1;
         }
@@ -1505,6 +1678,13 @@ pub fn verify_chain(
         }
         if rv.role_separation_failure() {
             role_separation_failures.push(event.sequence);
+        }
+        // #10105 — agent-signed rows: their own counter and exact defects.
+        if rv.is_agent_signed_skip() {
+            agent_signed_rows_not_verified += 1;
+        }
+        if let Some(f) = rv.agent_signature_defect() {
+            agent_signature_defects.push((event.sequence, f));
         }
 
         // Recompute the canonical hash for the NEXT iteration.
@@ -1522,7 +1702,590 @@ pub fn verify_chain(
         chain_break,
         signature_failures,
         role_separation_failures,
+        agent_signed_rows_not_verified,
+        agent_signature_defects,
     })
+}
+
+/// #10074 — the full-row projection shared by the cutoff resolver and the
+/// mint, in [`read_signed_event_row`] column order.
+const SIGNED_EVENT_ROW_COLUMNS: &str = "id, agent_id, event_type, payload_hash, signature, \
+     attest_level, timestamp, prev_hash, COALESCE(sequence, 0), cause_hash";
+
+/// #10074 — map one [`SIGNED_EVENT_ROW_COLUMNS`] row.
+fn read_signed_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignedEvent> {
+    Ok(SignedEvent {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        event_type: row.get(2)?,
+        payload_hash: row.get(3)?,
+        signature: row.get(4)?,
+        attest_level: row.get(5)?,
+        timestamp: row.get(6)?,
+        prev_hash: row.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(),
+        sequence: row.get(8)?,
+        cause_hash: row.get::<_, Option<Vec<u8>>>(9)?,
+    })
+}
+
+/// #10074 (S-2) — resolve the sqlite legacy cutoff. Exactly one row of type
+/// [`LEGACY_CUTOFF_EVENT_TYPE`] must exist and validate against every row
+/// below it ([`LegacyCutoffResolver`]); zero, two or more, or an invalid one
+/// yields [`LegacyCutoff::none`].
+///
+/// # Errors
+/// Propagates a `rusqlite` read error.
+pub fn resolve_sqlite_legacy_cutoff(
+    conn: &Connection,
+    verifier: Option<&ed25519_dalek::VerifyingKey>,
+) -> Result<LegacyCutoff> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SIGNED_EVENT_ROW_COLUMNS} FROM signed_events WHERE event_type = ?1 \
+             ORDER BY COALESCE(sequence, 0) ASC LIMIT 2"
+        ))
+        .context("legacy cutoff: prepare")?;
+    let cutoffs: Vec<SignedEvent> = stmt
+        .query_map(params![LEGACY_CUTOFF_EVENT_TYPE], read_signed_event_row)
+        .context("legacy cutoff: query")?
+        .collect::<rusqlite::Result<_>>()
+        .context("legacy cutoff: collect")?;
+    let [cutoff_row] = cutoffs.as_slice() else {
+        return Ok(LegacyCutoff::none());
+    };
+    let db_id = genesis_db_id(conn)?;
+    let mut resolver = LegacyCutoffResolver::new(cutoff_row, verifier, db_id.as_deref());
+    feed_sqlite_prefix(conn, cutoff_row.sequence, &mut resolver)?;
+    Ok(resolver.finish())
+}
+
+/// #10074 — feed every row with `sequence < below` to `resolver`, ascending.
+fn feed_sqlite_prefix(
+    conn: &Connection,
+    below: i64,
+    resolver: &mut LegacyCutoffResolver<'_>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SIGNED_EVENT_ROW_COLUMNS} FROM signed_events \
+             WHERE COALESCE(sequence, 0) < ?1 ORDER BY COALESCE(sequence, 0) ASC"
+        ))
+        .context("legacy cutoff: prepare prefix")?;
+    let mut rows = stmt
+        .query(params![below])
+        .context("legacy cutoff: prefix")?;
+    while let Some(row) = rows.next().context("legacy cutoff: prefix row")? {
+        resolver.feed(&read_signed_event_row(row).context("legacy cutoff: prefix map")?);
+    }
+    Ok(())
+}
+
+/// #10074 (S-3) — why [`mint_legacy_cutoff`] refused. Nothing was written,
+/// except for [`Self::AnchorNotDurable`]: the row is committed and the next
+/// mint repairs its anchor (#10104).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LegacyCutoffMintRefusal {
+    /// No daemon signing key is installed in this process.
+    NoDaemonKey,
+    /// The forensic sink is down, so the off-table anchor cannot be written.
+    ForensicSinkDown,
+    /// A cutoff row already exists in the table.
+    CutoffRowExists,
+    /// An off-table cutoff anchor for this database already exists (a cutoff
+    /// row was minted once and has since been removed).
+    AnchorExists,
+    /// The chain is empty: there is no legacy prefix to bound.
+    EmptyChain,
+    /// The chain has a sequence or `prev_hash` break at this sequence.
+    ChainBreak(i64),
+    /// A daemon-signed row carries a signature that verifies under no form.
+    UnverifiableRow(i64),
+    /// #10101 — a daemon-signed row carries an untagged daemon signature over
+    /// bytes that are not a payload digest (the forensic sink's form): it is
+    /// not legacy by construction, so the mint never certifies it.
+    ForeignSignatureForm(i64),
+    /// #10102 — a legacy-form row sits after the first tagged row: the
+    /// certified legacy prefix must be contiguous and end before it.
+    LegacyAfterTagged {
+        /// The legacy-form row.
+        sequence: i64,
+        /// The first `EventRow`-tagged row of the chain.
+        first_tagged: i64,
+    },
+    /// #10104 — the cutoff row is committed but the anchor written after the
+    /// commit could not be read back verified; the next mint repairs it.
+    AnchorNotDurable,
+    /// #10103 — the off-table anchor exists but is not trusted (a line for
+    /// this database is unsigned, its signature does not verify, it is
+    /// malformed, two signed lines disagree, or the log cannot be read).
+    AnchorUnverified(crate::governance::audit::LegacyCutoffAnchorDefect),
+    /// #10104 — the verified anchor and the certified cutoff row disagree.
+    AnchorMismatch {
+        /// `cutoff_sequence` of the anchor.
+        anchored_sequence: i64,
+        /// `cutoff_payload_hash` of the anchor.
+        anchored_payload_hash: String,
+        /// `sequence` of the cutoff row.
+        row_sequence: i64,
+        /// Lower-hex `payload_hash` of the cutoff row.
+        row_payload_hash: String,
+    },
+}
+
+impl std::fmt::Display for LegacyCutoffMintRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDaemonKey => f.write_str("no daemon signing key is installed"),
+            Self::ForensicSinkDown => f.write_str("the forensic audit sink is not enabled"),
+            Self::CutoffRowExists => f.write_str("a legacy cutoff row already exists"),
+            Self::AnchorExists => {
+                f.write_str("a legacy cutoff anchor for this database already exists")
+            }
+            Self::EmptyChain => f.write_str("the signed_events chain is empty"),
+            Self::ChainBreak(s) => write!(f, "the chain breaks at sequence {s}"),
+            Self::UnverifiableRow(s) => {
+                write!(
+                    f,
+                    "the daemon signature at sequence {s} verifies under no form"
+                )
+            }
+            Self::ForeignSignatureForm(s) => write!(
+                f,
+                "the daemon signature at sequence {s} is an untagged signature over a \
+                 non-digest payload, not a legacy form"
+            ),
+            Self::LegacyAfterTagged {
+                sequence,
+                first_tagged,
+            } => write!(
+                f,
+                "the legacy-form row at sequence {sequence} follows the first tagged row at \
+                 sequence {first_tagged}"
+            ),
+            Self::AnchorNotDurable => f.write_str(
+                "the cutoff row is committed but its off-table anchor could not be read back; \
+                 re-run the mint to repair the anchor",
+            ),
+            Self::AnchorUnverified(defect) => {
+                write!(
+                    f,
+                    "the off-table legacy cutoff anchor is not trusted: {defect}"
+                )
+            }
+            Self::AnchorMismatch {
+                anchored_sequence,
+                anchored_payload_hash,
+                row_sequence,
+                row_payload_hash,
+            } => write!(
+                f,
+                "the off-table anchor binds cutoff_sequence={anchored_sequence} \
+                 payload_hash={anchored_payload_hash} but the cutoff row at \
+                 sequence={row_sequence} has payload_hash={row_payload_hash}"
+            ),
+        }
+    }
+}
+
+/// #10101 / #10102 — the mint's refusal for a prefix the resolver's
+/// contiguity check did not certify (shared by both backends).
+impl From<legacy_cutoff::PrefixRefusal> for LegacyCutoffMintRefusal {
+    fn from(r: legacy_cutoff::PrefixRefusal) -> Self {
+        use legacy_cutoff::PrefixRefusal as P;
+        match r {
+            P::NoVerifier => Self::NoDaemonKey,
+            P::NoDatabaseIdentity | P::EmptyPrefix => Self::EmptyChain,
+            P::ChainBreak(s) => Self::ChainBreak(s),
+            P::UnverifiableRow(s) => Self::UnverifiableRow(s),
+            P::ForeignSignatureForm(s) => Self::ForeignSignatureForm(s),
+            P::CutoffRowInPrefix(_) => Self::CutoffRowExists,
+            P::LegacyAfterTagged {
+                sequence,
+                first_tagged,
+            } => Self::LegacyAfterTagged {
+                sequence,
+                first_tagged,
+            },
+        }
+    }
+}
+
+/// #10074 / #10104 — what a successful mint did, with the cutoff row's
+/// sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyCutoffMinted {
+    /// A new cutoff row was committed, then its anchor written and verified.
+    Minted(i64),
+    /// The certified cutoff row was already committed with no anchor (a crash
+    /// between the commit and the anchor write); its anchor was written and
+    /// verified. No row was written.
+    AnchorRepaired(i64),
+}
+
+/// #10074 — the outcome of a mint.
+pub type LegacyCutoffMint = std::result::Result<LegacyCutoffMinted, LegacyCutoffMintRefusal>;
+
+/// #10104 — the cutoff rows a mint finds in the table, judged by the shared
+/// [`LegacyCutoffResolver`] (both backends).
+pub(crate) enum ExistingCutoff {
+    /// No cutoff-type row.
+    None,
+    /// One or more cutoff-type rows, none of which certifies its prefix.
+    Uncertified,
+    /// Exactly one cutoff row, and it certifies its prefix.
+    Certified(SignedEvent),
+}
+
+/// #10104 — what the mint does next.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MintStep {
+    /// Append a new cutoff row, commit, then write the anchor.
+    Mint,
+    /// Write the missing anchor of the committed cutoff row.
+    Repair {
+        /// `sequence` of the committed cutoff row.
+        row_sequence: i64,
+        /// Lower-hex `payload_hash` of the committed cutoff row.
+        payload_hash_hex: String,
+    },
+}
+
+/// #10103 / #10104 — the decision both mints share. An untrusted anchor is
+/// an exact refusal before anything else; a certified row with no anchor is
+/// the crash-between state and is repaired; a row with a matching anchor, an
+/// uncertified row, or an anchor without a row refuses; a verified anchor
+/// that disagrees with the row is a mismatch.
+pub(crate) fn mint_step(
+    existing: &ExistingCutoff,
+    anchor: crate::governance::audit::LegacyCutoffAnchor,
+) -> std::result::Result<MintStep, LegacyCutoffMintRefusal> {
+    use crate::governance::audit::LegacyCutoffAnchor as A;
+    let anchored = match anchor {
+        A::Unverified(defect) => return Err(LegacyCutoffMintRefusal::AnchorUnverified(defect)),
+        A::Absent => None,
+        A::Verified {
+            cutoff_sequence,
+            cutoff_payload_hash,
+        } => Some((cutoff_sequence, cutoff_payload_hash)),
+    };
+    match (existing, anchored) {
+        (ExistingCutoff::None, None) => Ok(MintStep::Mint),
+        (ExistingCutoff::None, Some(_)) => Err(LegacyCutoffMintRefusal::AnchorExists),
+        (ExistingCutoff::Uncertified, _) => Err(LegacyCutoffMintRefusal::CutoffRowExists),
+        (ExistingCutoff::Certified(row), None) => Ok(MintStep::Repair {
+            row_sequence: row.sequence,
+            payload_hash_hex: hex_lower(&row.payload_hash),
+        }),
+        (ExistingCutoff::Certified(row), Some((seq, hash))) => {
+            let row_hash = hex_lower(&row.payload_hash);
+            if seq == row.sequence.saturating_sub(1) && hash == row_hash {
+                Err(LegacyCutoffMintRefusal::CutoffRowExists)
+            } else {
+                Err(LegacyCutoffMintRefusal::AnchorMismatch {
+                    anchored_sequence: seq,
+                    anchored_payload_hash: hash,
+                    row_sequence: row.sequence,
+                    row_payload_hash: row_hash,
+                })
+            }
+        }
+    }
+}
+
+/// #10104 — write the anchor of the cutoff row at `row_sequence`, AFTER the
+/// row is committed (both backends), and read it back verified under `vk`.
+/// A crash before this leaves a committed row with no anchor, which the next
+/// mint detects and repairs ([`MintStep::Repair`]).
+///
+/// # Errors
+/// Propagates a forensic-sink write error.
+pub(crate) fn write_anchor_after_commit(
+    db_id: &str,
+    row_sequence: i64,
+    payload_hash_hex: &str,
+    vk: &ed25519_dalek::VerifyingKey,
+) -> Result<std::result::Result<(), LegacyCutoffMintRefusal>> {
+    use crate::governance::audit;
+    let cutoff_sequence = row_sequence.saturating_sub(1);
+    audit::try_record_integrity(audit::IntegrityRow::LegacyCutoff {
+        cutoff_sequence,
+        cutoff_payload_hash: payload_hash_hex,
+        db_id,
+    })?;
+    audit::flush_blocking();
+    let expected = audit::LegacyCutoffAnchor::Verified {
+        cutoff_sequence,
+        cutoff_payload_hash: payload_hash_hex.to_string(),
+    };
+    if audit::legacy_cutoff_anchor(db_id, vk) == expected {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(LegacyCutoffMintRefusal::AnchorNotDurable))
+    }
+}
+
+/// #10104 — what a mint's transaction leaves for after its commit: the anchor
+/// of a committed cutoff row (new, or found with no anchor) still to write.
+#[derive(Debug)]
+pub(crate) struct AnchorDue {
+    /// The database identity the anchor binds.
+    pub(crate) db_id: String,
+    /// The outcome reported once the anchor verified.
+    pub(crate) outcome: LegacyCutoffMinted,
+    /// Lower-hex `payload_hash` of the committed cutoff row.
+    pub(crate) payload_hash_hex: String,
+}
+
+impl LegacyCutoffMinted {
+    /// The cutoff row's `sequence`.
+    #[must_use]
+    pub fn sequence(self) -> i64 {
+        match self {
+            Self::Minted(seq) | Self::AnchorRepaired(seq) => seq,
+        }
+    }
+}
+
+/// #10104 — the commit token. It lives in its own module so that nothing,
+/// not even the rest of this file, can build a [`Committed`] except the two
+/// functions here, each of which commits the open transaction first.
+mod mint_commit {
+    use super::AnchorDue;
+    use anyhow::{Context, Result};
+    use rusqlite::Connection;
+
+    /// #10104 — an [`AnchorDue`] whose transaction COMMITTED; [`super::finish_mint`]
+    /// takes only this, so no mint can write the anchor before its commit.
+    #[derive(Debug)]
+    pub(crate) struct Committed(AnchorDue);
+
+    impl Committed {
+        /// The due anchor of the committed transaction.
+        pub(crate) fn due(&self) -> &AnchorDue {
+            &self.0
+        }
+    }
+
+    /// #10104 — COMMIT the sqlite mint transaction, then hand out its due
+    /// anchor.
+    pub(crate) fn commit_sqlite_mint(conn: &Connection, due: AnchorDue) -> Result<Committed> {
+        conn.execute_batch("COMMIT")
+            .context("mint legacy cutoff: commit")?;
+        Ok(Committed(due))
+    }
+
+    /// #10104 — commit the postgres mint transaction (consumed), then hand
+    /// out its due anchor.
+    ///
+    /// # Errors
+    /// The commit's `sqlx` error; the anchor is then not due.
+    #[cfg(feature = "sal-postgres")]
+    pub(crate) async fn commit_pg_mint(
+        tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        due: AnchorDue,
+    ) -> std::result::Result<Committed, sqlx::Error> {
+        tx.commit().await?;
+        Ok(Committed(due))
+    }
+}
+#[cfg(feature = "sal-postgres")]
+pub(crate) use mint_commit::commit_pg_mint;
+use mint_commit::{Committed, commit_sqlite_mint};
+
+/// #10104 — the shared tail of both mints, run only after the transaction
+/// COMMITTED: write the due anchor, read it back verified, name the outcome.
+///
+/// # Errors
+/// Propagates a forensic-sink write error.
+pub(crate) fn finish_mint(
+    committed: &Committed,
+    vk: &ed25519_dalek::VerifyingKey,
+) -> Result<LegacyCutoffMint> {
+    let due = committed.due();
+    Ok(write_anchor_after_commit(
+        &due.db_id,
+        due.outcome.sequence(),
+        &due.payload_hash_hex,
+        vk,
+    )?
+    .map(|()| due.outcome))
+}
+
+/// #10074 (S-3, `3-agent vote (71472661) V1-SIGNED-EVENTS-FALLBACK`) — mint
+/// the single legacy cutoff row, under an explicit operator order
+/// (`ai-memory verify-signed-events-chain --mint-legacy-cutoff`). No boot,
+/// migration, upgrade or config path calls this.
+///
+/// Inside one `BEGIN IMMEDIATE` transaction it reads the off-table anchor
+/// (each line used only after its signature verified, #10103) and the cutoff
+/// rows, and decides with [`mint_step`]: an untrusted anchor, an existing
+/// cutoff row with its anchor, an anchor with no row, an empty or broken
+/// chain, or a daemon-signed row that verifies under no form refuses; else it
+/// appends the cutoff row at `head + 1` and COMMITS. Only after the commit
+/// does it write the anchor and read it back verified (#10104). A crash
+/// between the two leaves a certified row with no anchor, which the next run
+/// detects and repairs (anchor only, no row). Stored rows are never
+/// rewritten.
+///
+/// # Errors
+/// Propagates a `rusqlite` or forensic-sink error (an open transaction is
+/// rolled back). A policy refusal is `Ok(Err(refusal))`.
+pub fn mint_legacy_cutoff(conn: &Connection) -> Result<LegacyCutoffMint> {
+    use crate::governance::{audit, daemon_signer};
+    let Some(vk) = daemon_signer::verifying_key() else {
+        return Ok(Err(LegacyCutoffMintRefusal::NoDaemonKey));
+    };
+    if !audit::is_enabled() {
+        return Ok(Err(LegacyCutoffMintRefusal::ForensicSinkDown));
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .context("mint legacy cutoff: begin")?;
+    let due = match mint_legacy_cutoff_in_tx(conn, &vk) {
+        Ok(Ok(due)) => due,
+        Ok(Err(refusal)) => {
+            rollback_mint(conn);
+            return Ok(Err(refusal));
+        }
+        Err(e) => {
+            rollback_mint(conn);
+            return Err(e);
+        }
+    };
+    // #10104 — the row (if any) is committed BEFORE the anchor is written.
+    let committed = commit_sqlite_mint(conn, due)?;
+    finish_mint(&committed, &vk)
+}
+
+/// Roll back the mint transaction; a failed rollback is logged (the
+/// connection drops the transaction when it closes).
+fn rollback_mint(conn: &Connection) {
+    if let Err(e) = conn.execute_batch("ROLLBACK") {
+        tracing::error!("mint legacy cutoff: rollback failed: {e}");
+    }
+}
+
+/// #10104 — the cutoff-type rows of the table (lowest sequence first, at
+/// most two), judged by the shared resolver.
+fn sqlite_existing_cutoff(
+    conn: &Connection,
+    vk: &ed25519_dalek::VerifyingKey,
+    db_id: &str,
+) -> Result<ExistingCutoff> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SIGNED_EVENT_ROW_COLUMNS} FROM signed_events WHERE event_type = ?1 \
+             ORDER BY COALESCE(sequence, 0) ASC LIMIT 2"
+        ))
+        .context("mint legacy cutoff: prepare cutoff rows")?;
+    let cutoffs: Vec<SignedEvent> = stmt
+        .query_map(params![LEGACY_CUTOFF_EVENT_TYPE], read_signed_event_row)
+        .context("mint legacy cutoff: cutoff rows")?
+        .collect::<rusqlite::Result<_>>()
+        .context("mint legacy cutoff: collect cutoff rows")?;
+    let row = match <[SignedEvent; 1]>::try_from(cutoffs) {
+        Ok([row]) => row,
+        Err(rows) if rows.is_empty() => return Ok(ExistingCutoff::None),
+        Err(_) => return Ok(ExistingCutoff::Uncertified),
+    };
+    let mut resolver = LegacyCutoffResolver::new(&row, Some(vk), Some(db_id));
+    feed_sqlite_prefix(conn, row.sequence, &mut resolver)?;
+    if resolver.finish().row_sequence() == Some(row.sequence) {
+        Ok(ExistingCutoff::Certified(row))
+    } else {
+        Ok(ExistingCutoff::Uncertified)
+    }
+}
+
+/// #10103 / #10104 — the in-transaction half of the sqlite mint: decide with
+/// [`mint_step`], and for a mint insert the row (the caller commits, then
+/// writes the anchor).
+fn mint_legacy_cutoff_in_tx(
+    conn: &Connection,
+    vk: &ed25519_dalek::VerifyingKey,
+) -> Result<std::result::Result<AnchorDue, LegacyCutoffMintRefusal>> {
+    use crate::governance::{audit, daemon_signer};
+    let Some(db_id) = genesis_db_id(conn)? else {
+        return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
+    };
+    let existing = sqlite_existing_cutoff(conn, vk, &db_id)?;
+    match mint_step(&existing, audit::legacy_cutoff_anchor(&db_id, vk)) {
+        Err(refusal) => return Ok(Err(refusal)),
+        Ok(MintStep::Repair {
+            row_sequence,
+            payload_hash_hex,
+        }) => {
+            return Ok(Ok(AnchorDue {
+                db_id,
+                outcome: LegacyCutoffMinted::AnchorRepaired(row_sequence),
+                payload_hash_hex,
+            }));
+        }
+        Ok(MintStep::Mint) => {}
+    }
+    let report = verify_chain(conn, None, Some(vk))?;
+    if let Some(at) = report.chain_break {
+        return Ok(Err(LegacyCutoffMintRefusal::ChainBreak(at)));
+    }
+    let (head, _) = read_chain_head(conn).context("mint legacy cutoff: head")?;
+    if head < 1 {
+        return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
+    }
+    let mut row = SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: legacy_cutoff::LEGACY_CUTOFF_AGENT_ID.to_string(),
+        event_type: LEGACY_CUTOFF_EVENT_TYPE.to_string(),
+        payload_hash: Vec::new(),
+        signature: None,
+        attest_level: crate::models::AttestLevel::DaemonSigned
+            .as_str()
+            .to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        prev_hash: Vec::new(),
+        sequence: head.saturating_add(1),
+        cause_hash: None,
+    };
+    // #10101 / #10102 — the resolver classifies every prefix row and certifies
+    // only a contiguous legacy prefix before the first tagged row; the mint
+    // never vouches for an unverifiable, foreign or late legacy row.
+    let mut resolver = LegacyCutoffResolver::new(&row, Some(vk), Some(&db_id));
+    feed_sqlite_prefix(conn, row.sequence, &mut resolver)?;
+    let (payload_hash, last_hash) = match resolver.mint_payload_hash() {
+        Ok(v) => v,
+        Err(refusal) => return Ok(Err(refusal.into())),
+    };
+    row.payload_hash = payload_hash;
+    row.prev_hash = last_hash;
+    let Some((sig, _)) = daemon_signer::sign(
+        daemon_signer::DaemonDomain::LegacyCutoff,
+        &daemon_row_signing_input(&row),
+    ) else {
+        return Ok(Err(LegacyCutoffMintRefusal::NoDaemonKey));
+    };
+    row.signature = Some(sig);
+    conn.execute(
+        "INSERT INTO signed_events \
+            (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
+             prev_hash, sequence, cause_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            row.id,
+            row.agent_id,
+            row.event_type,
+            row.payload_hash,
+            row.signature,
+            row.attest_level,
+            row.timestamp,
+            row.prev_hash,
+            row.sequence,
+        ],
+    )
+    .context("mint legacy cutoff: insert")?;
+    Ok(Ok(AnchorDue {
+        db_id,
+        outcome: LegacyCutoffMinted::Minted(row.sequence),
+        payload_hash_hex: hex_lower(&row.payload_hash),
+    }))
 }
 
 /// Operator-facing end-to-end report over the append-only
@@ -2267,6 +3030,11 @@ pub struct AuditTrailReport {
     /// (that preserves the byte-identical legacy verdict); the security-bearing
     /// recorder/judge/stopper forgeries land in `role_separation`.
     pub signature_failures: Vec<i64>,
+    /// #10105 — agent-signed domain-object rows in the window whose chain
+    /// linkage was checked but whose signature this walk did NOT verify (their
+    /// per-domain verifier owns them). Never part of a positive verification.
+    /// Populated IDENTICALLY by both backends.
+    pub agent_signed_rows_not_verified: u64,
     /// v0.9.0 G9 (#1826) — three-key Recorder/Judge/Stopper signing-layer
     /// SEPARATION verdict (K1 pin of the judge/stopper checkpoints + per-row
     /// recorder verification + C3 distinctness + C2 daemon-demotion).
@@ -2758,6 +3526,7 @@ pub fn verify_audit_trail(
         head_hash,
         cause_binding,
         signature_failures: report.signature_failures.clone(),
+        agent_signed_rows_not_verified: report.agent_signed_rows_not_verified,
         role_separation,
         lineage,
         rollback,
@@ -2981,6 +3750,13 @@ pub fn append_signed_event_no_tx(
     conn: &Connection,
     event: &SignedEvent,
 ) -> Result<crate::governance::audit::PendingAuditAnchor> {
+    // #10074 (S-2, S-3) — the cutoff row is written only by the operator mint.
+    if event.event_type == LEGACY_CUTOFF_EVENT_TYPE {
+        anyhow::bail!(
+            "append signed_event: event_type {LEGACY_CUTOFF_EVENT_TYPE} is reserved for the \
+             operator legacy-cutoff mint"
+        );
+    }
     let (max_seq, prev_hash) = read_chain_head(conn).context("append signed_event: read head")?;
     let next_seq = max_seq + 1;
 
@@ -2994,8 +3770,8 @@ pub fn append_signed_event_no_tx(
     // decentralised signing call sites. Only when a daemon key is installed AND
     // the row is daemon-signed; recorder/lineage/unsigned rows are left
     // untouched (their signatures carry a distinct role and MUST NOT be
-    // replaced). `verify_chain`'s payload-only fallback keeps postgres and
-    // pre-#1925 rows verifying, so this is additive and fail-closed.
+    // replaced). #10074: the row signature is made under
+    // `DaemonDomain::EventRow` and verifies under that one form only.
     let signature: Option<Vec<u8>> = if event.attest_level
         == crate::models::AttestLevel::DaemonSigned.as_str()
         && event.signature.is_some()
@@ -3005,11 +3781,16 @@ pub fn append_signed_event_no_tx(
             ..event.clone()
         };
         let input = daemon_row_signing_input(&row_view);
-        match crate::governance::audit::try_sign_audit_payload(&input) {
+        match crate::governance::daemon_signer::sign(
+            crate::governance::daemon_signer::DaemonDomain::EventRow,
+            &input,
+        ) {
             Some((sig, _)) => Some(sig),
             // No daemon key installed at append time — keep the caller's
-            // signature verbatim (the verifier's payload-only fallback validates
-            // it). Vanishingly rare: a daemon-signed row implies the key existed
+            // signature verbatim. #10074: it was made under
+            // `DaemonDomain::EventPayload`, which no row verifier accepts, so
+            // such a row reads as a daemon-signature failure (fail closed).
+            // Vanishingly rare: a daemon-signed row implies the key existed
             // when it was minted.
             None => event.signature.clone(),
         }
@@ -3573,6 +4354,7 @@ mod tests {
             head_hash: HeadHashCheck::NotDetected,
             cause_binding: CauseBinding::Unknown,
             signature_failures: Vec::new(),
+            agent_signed_rows_not_verified: 0,
             role_separation: RoleSeparationCheck::Unknown,
             lineage: crate::identity::lineage::LineageCheck::Unknown,
             rollback: RollbackCheck::Unknown,
@@ -3717,26 +4499,31 @@ mod tests {
             sequence: 1,
             cause_hash: None,
         };
-        // Sign over the identity-bound input, as `append_signed_event` now does.
-        let input = daemon_row_signing_input(&ev);
+        // Sign the EventRow-tagged identity-bound input, as
+        // `append_signed_event` does since #10074.
+        let input = daemon_row_signing_preimage(&ev);
         ev.signature = Some(sk.sign(&input).to_bytes().to_vec());
         assert!(
-            !classify_row_signature(&ev, Some(&vk), None).signature_failure(),
+            !classify_row_signature(&ev, Some(&vk), None, &LegacyCutoff::none())
+                .signature_failure(),
             "a genuine identity-bound row must verify"
         );
         // ADVERSARIAL tamper.
         ev.agent_id = "attacker".into();
         assert!(
-            classify_row_signature(&ev, Some(&vk), None).signature_failure(),
+            classify_row_signature(&ev, Some(&vk), None, &LegacyCutoff::none()).signature_failure(),
             "identity tamper must invalidate the per-row signature (#1925)"
         );
     }
 
-    /// #1925 — a LEGACY / postgres daemon row signed over the payload-only
-    /// pre-image (not re-signed at a sqlite append) must STILL verify via the
-    /// fallback, so the fix is additive and breaks no legitimate row.
+    /// #1925 / #10074 (S-5, S-6, `3-agent vote (71472661)
+    /// V1-SIGNED-EVENTS-FALLBACK`) — a daemon row signed over the legacy
+    /// payload-only pre-image verifies ONLY at or below a valid legacy cutoff
+    /// (tests/signed_events_domain_cutoff_10074.rs proves the accepted side).
+    /// With no cutoff it is refused with the exact
+    /// `LegacyPayloadOnlyAfterCutoff` failure, which is a signature failure.
     #[test]
-    fn issue_1925_payload_only_signature_still_verifies() {
+    fn issue_1925_payload_only_signature_refused_without_cutoff_10074() {
         use ed25519_dalek::{Signer, SigningKey};
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let vk = sk.verifying_key();
@@ -3756,10 +4543,13 @@ mod tests {
         };
         let pay = signing_input_bytes(&ev.payload_hash, None);
         ev.signature = Some(sk.sign(&pay).to_bytes().to_vec());
-        assert!(
-            !classify_row_signature(&ev, Some(&vk), None).signature_failure(),
-            "a legacy payload-only daemon signature must still verify (no false-fail)"
+        let verdict = classify_row_signature(&ev, Some(&vk), None, &LegacyCutoff::none());
+        assert_eq!(
+            verdict,
+            RowSignatureVerdict::Failed(SignatureFailure::LegacyPayloadOnlyAfterCutoff),
+            "a payload-only daemon signature with no cutoff is refused (#10074 S-6)"
         );
+        assert!(verdict.signature_failure(), "it dirties signature_failures");
     }
 
     /// #1925 — END-TO-END: `append_signed_event` re-signs the row over the

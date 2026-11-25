@@ -159,6 +159,41 @@ signatures fail.
 
 Pinned by [`tests/cli_verify_chain.rs`](../tests/cli_verify_chain.rs).
 
+### Daemon signature domains and the legacy cutoff (#10074)
+
+Every daemon signature is made under one domain tag (ledger row, event
+payload, governance, tombstone, revision leaf, legacy cutoff), so a
+signature made for one meaning never verifies as another. A ledger row
+verifies only under the ledger-row tag.
+
+Rows written before the tag existed carry one of two untagged legacy
+forms. They verify only at or below one **legacy cutoff row**, a ledger
+row of a reserved type signed under its own tag. That row binds the
+cutoff sequence, the chain hash of the last prefix row, a digest over the
+chain hash of every prefix row, the count of payload-only prefix rows and
+the database identity. A cutoff row that is missing, duplicated or
+invalid means cutoff zero, so no legacy form is accepted. Above the
+cutoff, a payload-only row is listed in `signature_failures` (class
+`LegacyPayloadOnlyAfterCutoff`) and never blocks a later append. The
+cutoff is resolved over the whole table, so `--since` cannot skip it.
+
+The cutoff is minted once, and only on an explicit operator order:
+
+```bash
+# SQLite store (the --db path)
+ai-memory verify-signed-events-chain --mint-legacy-cutoff
+# PostgreSQL store
+ai-memory verify-signed-events-chain --mint-legacy-cutoff --store-url postgres://...
+```
+
+The mint refuses when a cutoff row or its off-table anchor already
+exists, when the chain is empty or broken, or when a prefix row verifies
+under no form. No boot, migration, upgrade or config path mints. Stored
+signatures are never rewritten. Pinned by
+`tests/signed_events_domain_cutoff_10074.rs`,
+`tests/signed_events_legacy_cutoff_10074.rs` and
+`tests/signed_events_legacy_cutoff_10074_pg.rs`.
+
 ## Three complementary verifiers
 
 The substrate ships three verifier surfaces, each pinning a distinct

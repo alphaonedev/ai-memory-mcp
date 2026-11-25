@@ -259,7 +259,7 @@ fn ledger_levels(rt: &tokio::runtime::Runtime, url: &str) -> Vec<(String, String
 /// says nothing about the daemon key. The capture cell below proves key
 /// generation + that the writer appends its row; the signed property is
 /// proved on a writer that daemon-signs: `DELETE /api/v1/memories/{id}`
-/// writes a forget tombstone signed through `try_sign_audit_payload`, so
+/// writes a forget tombstone signed through `daemon_signer::sign`, so
 /// `signature IS NOT NULL` and it verifies under `<id>.pub`.
 #[test]
 fn pg_daemon_generates_the_key_at_boot_and_signs_the_first_tombstone_3354() {
