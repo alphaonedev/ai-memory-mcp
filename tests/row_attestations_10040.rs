@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use ai_memory::storage::row_attest::anchor::TrustAnchor;
 use ai_memory::storage::row_attest::sqlite::{
-    REFUSE_KEY_MISMATCH, REFUSE_ROW_DRIFT, REFUSE_STRIPPED_CUTOVER, ROW_ATTEST_REFUSAL_PREFIX,
+    REFUSE_KEY_MISMATCH, REFUSE_NO_SIGNER, REFUSE_ROW_DRIFT, REFUSE_STRIPPED_CUTOVER, ROW_ATTEST_REFUSAL_PREFIX,
     SNAPSHOT_REFUSAL_PREFIX, read_attestations, read_rows, verify_sqlite_with,
 };
 use ai_memory::storage::row_attest::{
@@ -2267,4 +2267,162 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
     std::fs::remove_file(&early).expect("remove the early archive");
     std::fs::write(archive, &retired_bytes).expect("restore the archive");
     assert_ok(&sb.report(), "after the archive is restored");
+}
+
+// ---------------------------------------------------------------------------
+// #10091: every connection that can write an attested table is armed
+// ---------------------------------------------------------------------------
+
+/// The exact reason an unarmed (diagnostic or egress) handle refuses an
+/// attested write. Written out here, not imported, so a change to the text
+/// in the code under test is a red test.
+const REFUSE_UNARMED_HANDLE_TEXT: &str = "this connection is not armed for attested writes";
+const TAMPERED_10091: &str = "tampered 10091";
+
+/// A CLI `store` with the given agent; returns the process output.
+fn cli_store(sb: &Sandbox, agent: &str, title: &str) -> Output {
+    sb.cli(
+        agent,
+        &[
+            "store",
+            "-T",
+            title,
+            "-c",
+            "A body written by a process with no session signer.",
+            "--namespace",
+            NAMESPACE,
+            "--json",
+        ],
+    )
+}
+
+fn memory_count(sb: &Sandbox) -> i64 {
+    sb.conn()
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+        .expect("count memories")
+}
+
+/// Attacker side: after a signed session armed the store, a second process
+/// with no session signer (the plain CLI) tries to store. Before #10091 its
+/// connection carried no attestation funnel, so it wrote an unattested row
+/// and the store failed verification for good. Now the write is refused
+/// with the exact no-signer reason, nothing is written, and the store still
+/// verifies.
+#[test]
+fn a_no_signer_process_cannot_write_an_armed_store_10091() {
+    let (sb, _key, mut mcp) = armed();
+    let _ = mcp.store("armed 10091");
+    drop(mcp);
+    assert_ok(&sb.report(), "armed store before the attempt");
+    let memories = memory_count(&sb);
+    let count = sb.attestation_count();
+
+    for agent in [AGENT, OTHER_AGENT] {
+        let out = cli_store(&sb, agent, "unattested 10091");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{agent}: the write must be refused");
+        assert!(
+            err.contains(&refusal(REFUSE_NO_SIGNER)),
+            "{agent}: exact no-signer refusal, got: {err}"
+        );
+    }
+    assert_eq!(memory_count(&sb), memories, "no memory row written");
+    assert_eq!(sb.attestation_count(), count, "no attestation written");
+    assert_ok(&sb.report(), "armed store after the refused writes");
+}
+
+/// The guard on the other side: a store that no signed session ever armed
+/// keeps accepting the plain CLI (pre-cutover writes fold into the
+/// watermark when a signer first arms it), so the refusal is never a
+/// blanket outage.
+#[test]
+fn a_never_armed_store_still_accepts_the_plain_cli_10091() {
+    let sb = Sandbox::new();
+    let memories = memory_count_or_zero(&sb);
+    let out = cli_store(&sb, AGENT, "never armed 10091");
+    assert!(
+        out.status.success(),
+        "a never-armed store accepts a no-signer write: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(memory_count(&sb), memories + 1, "one memory row written");
+}
+
+fn memory_count_or_zero(sb: &Sandbox) -> i64 {
+    if sb.db().exists() {
+        memory_count(sb)
+    } else {
+        0
+    }
+}
+
+/// Attacker side: the unmigrated egress / diagnostic handle (backup,
+/// doctor repair, keys prune, the FTS checker, the forensic recorder) is
+/// never armed, so an insert, update or delete of an attested table through
+/// it is refused before it writes, with the exact reason, on every attested
+/// table the store holds.
+#[test]
+fn the_unmigrated_handle_refuses_every_attested_write_10091() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("unmigrated 10091");
+    drop(mcp);
+    let before = row_state(&sb, &id);
+    let count = sb.attestation_count();
+
+    let conn = ai_memory::storage::open_unmigrated(&sb.db()).expect("open unmigrated");
+    let writes = [
+        (
+            "update",
+            "UPDATE memories SET content = ?2 WHERE id = ?1".to_string(),
+        ),
+        ("delete", "DELETE FROM memories WHERE id = ?1".to_string()),
+        (
+            "insert",
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+             SELECT ?2, tier, namespace, ?2, content, created_at, updated_at FROM memories \
+             WHERE id = ?1"
+                .to_string(),
+        ),
+    ];
+    for (label, sql) in &writes {
+        let err = conn
+            .execute(sql, [id.as_str(), TAMPERED_10091])
+            .expect_err("the unarmed handle must refuse the write");
+        assert!(
+            err.to_string().contains(&refusal(REFUSE_UNARMED_HANDLE_TEXT)),
+            "{label}: exact unarmed refusal, got: {err}"
+        );
+    }
+    for spec in TABLES {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [spec.table],
+                |r| r.get(0),
+            )
+            .expect("catalog");
+        if present == 0 {
+            continue;
+        }
+        let err = conn
+            .execute(&format!("DELETE FROM \"{}\"", spec.table), [])
+            .map(|_| ())
+            .and_then(|()| {
+                conn.execute(
+                    &format!("INSERT INTO \"{}\" DEFAULT VALUES", spec.table),
+                    [],
+                )
+                .map(|_| ())
+            });
+        let text = err.map_or_else(|e| e.to_string(), |()| String::new());
+        assert!(
+            text.contains(&refusal(REFUSE_UNARMED_HANDLE_TEXT)),
+            "{}: an attested table must refuse an unarmed write, got: {text:?}",
+            spec.table
+        );
+    }
+    drop(conn);
+    assert_eq!(row_state(&sb, &id), before, "the row is unchanged");
+    assert_eq!(sb.attestation_count(), count, "no attestation written");
+    assert_ok(&sb.report(), "after the refused writes");
 }
