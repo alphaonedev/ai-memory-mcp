@@ -16,8 +16,8 @@ use crate::signed_events::legacy_cutoff::LEGACY_CUTOFF_AGENT_ID;
 use crate::signed_events::{
     AnchorDue, ExistingCutoff, LEGACY_CUTOFF_EVENT_TYPE, LegacyCutoff, LegacyCutoffMint,
     LegacyCutoffMintRefusal, LegacyCutoffMinted, LegacyCutoffResolver, MintStep, SignedEvent,
-    ZERO_HASH, canonical_chain_bytes, commit_pg_mint, cutoff_row_certifies,
-    daemon_row_signing_input, finish_mint, mint_step,
+    ZERO_HASH, canonical_chain_bytes, commit_pg_mint, daemon_row_signing_input, finish_mint,
+    mint_step,
 };
 use crate::store::StoreResult;
 
@@ -174,16 +174,18 @@ async fn pg_existing_cutoff(
         Err(rows) if rows.is_empty() => return Ok(ExistingCutoff::None),
         Err(_) => return Ok(ExistingCutoff::Uncertified),
     };
-    let prefix: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
-        "SELECT {PG_ROW_COLUMNS} FROM signed_events \
-         WHERE COALESCE(sequence, 0) < $1 ORDER BY COALESCE(sequence, 0) ASC"
-    ))
-    .bind(row.sequence)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(|e| to_store_err("mint_legacy_cutoff.cutoff_prefix", e))?;
-    let prefix: Vec<SignedEvent> = prefix.into_iter().map(to_event).collect();
-    if cutoff_row_certifies(&row, &prefix, vk, db_id) {
+    // #10106 — the prefix below the existing cutoff row, one page at a time.
+    let mut resolver = LegacyCutoffResolver::new(&row, Some(vk), Some(db_id));
+    let mut pages = PrefixPages::below(row.sequence);
+    while let Some(page) = pages
+        .next(&mut **tx, "mint_legacy_cutoff.cutoff_prefix")
+        .await?
+    {
+        for r in &page {
+            resolver.feed(r);
+        }
+    }
+    if resolver.finish().row_sequence() == Some(row.sequence) {
         Ok(ExistingCutoff::Certified(row))
     } else {
         Ok(ExistingCutoff::Uncertified)

@@ -1993,23 +1993,6 @@ pub(crate) fn mint_step(
     }
 }
 
-/// #10104 — `true` when `cutoff_row` certifies `prefix` (every row below it,
-/// ascending) under `vk` for `db_id` (the postgres mint; sqlite streams its
-/// prefix).
-#[cfg(feature = "sal-postgres")]
-pub(crate) fn cutoff_row_certifies<'r>(
-    cutoff_row: &SignedEvent,
-    prefix: impl IntoIterator<Item = &'r SignedEvent>,
-    vk: &ed25519_dalek::VerifyingKey,
-    db_id: &str,
-) -> bool {
-    let mut resolver = LegacyCutoffResolver::new(cutoff_row, Some(vk), Some(db_id));
-    for row in prefix {
-        resolver.feed(row);
-    }
-    resolver.finish().row_sequence() == Some(cutoff_row.sequence)
-}
-
 /// #10104 — write the anchor of the cutoff row at `row_sequence`, AFTER the
 /// row is committed (both backends), and read it back verified under `vk`.
 /// A crash before this leaves a committed row with no anchor, which the next
