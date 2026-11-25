@@ -445,3 +445,63 @@ impl<'a> LegacyCutoffResolver<'a> {
         Ok((ph, prefix.last_hash))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{LegacyCutoffResolver, PrefixRefusal, SignedEvent};
+
+    /// The cutoff row's sequence in the truncated-prefix case.
+    const CUTOFF_AT: i64 = 5;
+    /// The rows fed: a contiguous run that stops before the cutoff row.
+    const FED: [i64; 3] = [1, 2, 3];
+    /// The first row below the cutoff row that was never fed.
+    const FIRST_MISSING: i64 = 4;
+    const DB_ID: &str = "db-prefix-end-10102";
+
+    /// A row that is not daemon-signed: an accepted prefix form, so only the
+    /// end-of-prefix check can refuse the prefix.
+    fn row(sequence: i64) -> SignedEvent {
+        SignedEvent {
+            id: format!("prefix-end-{sequence}"),
+            agent_id: "prefix-end-10102".to_string(),
+            event_type: "memory.store".to_string(),
+            payload_hash: vec![0u8; 32],
+            signature: None,
+            attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+            timestamp: "2026-11-25T00:00:00Z".to_string(),
+            prev_hash: Vec::new(),
+            sequence,
+            cause_hash: None,
+        }
+    }
+
+    /// #10101 / #10102 — a prefix fed only up to row 3 under a cutoff row at
+    /// 5 is a chain break at row 4, for the resolver and for the mint (which
+    /// would otherwise sign a cutoff over a truncated prefix); feeding row 4
+    /// certifies the same prefix.
+    #[test]
+    fn prefix_that_ends_before_the_cutoff_row_is_a_chain_break_10102() {
+        let vk = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]).verifying_key();
+        let cutoff = row(CUTOFF_AT);
+        let rows: Vec<SignedEvent> = FED.iter().map(|&s| row(s)).collect();
+        let missing = row(FIRST_MISSING);
+        let fed = || {
+            let mut r = LegacyCutoffResolver::new(&cutoff, Some(&vk), Some(DB_ID));
+            for x in &rows {
+                r.feed(x);
+            }
+            r
+        };
+        assert_eq!(
+            fed().certify().map(|_| ()),
+            Err(PrefixRefusal::ChainBreak(FIRST_MISSING))
+        );
+        assert_eq!(
+            fed().mint_payload_hash().map(|_| ()),
+            Err(PrefixRefusal::ChainBreak(FIRST_MISSING))
+        );
+        let mut whole = fed();
+        whole.feed(&missing);
+        assert_eq!(whole.certify().map(|_| ()), Ok(()));
+    }
+}
