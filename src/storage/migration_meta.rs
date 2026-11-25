@@ -480,9 +480,13 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // v103 (#10040, v1.0.0, GA standard 3): additive `row_attestations` side
     // table, its store-identity row and one cutover watermark per attested
     // table; no existing row is touched. Re-runnable (`IF NOT EXISTS` DDL and
-    // the identity/cutover rows are written only when absent). Rollback drops
-    // the table, NoLoss (the table is new). Postgres twin is
-    // `PostgresStore::migrate_v103`.
+    // the identity/cutover rows are written only when absent). Reversible: a
+    // revert lowers the version and leaves `row_attestations` in place, so no
+    // attestation is lost and no code path drops the table. NoLoss holds only
+    // for that revert: dropping the table by hand would destroy every signed
+    // attestation, which cannot be regenerated without the signing key, and
+    // verify then reports each attested row as having no attestation. Postgres
+    // twin is `PostgresStore::migrate_v103`.
     meta(103, "ROW_ATTESTATIONS", true, true, NoLoss, Sqlite),
 ];
 
