@@ -817,8 +817,18 @@ fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState
     let sealed = seal_file
         .as_deref()
         .map_or(SealState::NotSealed, seal::read);
-    crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, who, &sealed))
-        .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
+    // L-4 (PR 10083): with every cutover signed and the seal readable,
+    // `sign_cutovers` writes nothing and refuses nothing beyond a missing
+    // store identity, so that check runs alone and the open takes no write
+    // lock. Any other state, and any probe error, keeps the IMMEDIATE path.
+    if cutovers_all_signed(conn, &sealed) {
+        store_id(conn)
+            .map_err(anyhow::Error::msg)
+            .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
+    } else {
+        crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, who, &sealed))
+            .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
+    }
     // #10087, #10088: record in the anchor that this file is armed, at the
     // marks it holds now. Only once the signing committed (inside a caller's
     // transaction a rollback could undo it); a failure refuses the arm.
@@ -830,6 +840,22 @@ fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState
     }
     register(conn, source)?;
     Ok(ArmState::Armed)
+}
+
+/// Whether [`sign_cutovers`] has nothing to sign or refuse on `conn`: no
+/// cutover lacks a signature and the seal is not unreadable. Its stripped
+/// and sealed-unsigned refusals and its signing loop all match only
+/// `signature IS NULL` cutovers. A read error answers `false`, which keeps
+/// the write-transaction path (fail closed).
+fn cutovers_all_signed(conn: &Connection, sealed: &SealState) -> bool {
+    if matches!(sealed, SealState::Unreadable { .. }) {
+        return false;
+    }
+    matches!(
+        conn.query_row(UNSIGNED_CUTOVER_SQL, [], |r| r.get::<_, String>(0))
+            .optional(),
+        Ok(None)
+    )
 }
 
 fn register(conn: &Connection, source: SignerSource) -> Result<()> {
