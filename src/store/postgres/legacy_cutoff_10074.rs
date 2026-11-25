@@ -43,9 +43,70 @@ fn to_event(row: PgSignedEventWalkRow) -> SignedEvent {
     }
 }
 
+/// #10106 — the most prefix rows one page of the resolver or the mint holds
+/// in memory.
+pub const PG_PREFIX_PAGE_ROWS: i64 = 512;
+
+/// #10106 — the rows below a sequence bound, read in keyset pages of
+/// [`PG_PREFIX_PAGE_ROWS`] over `(COALESCE(sequence, 0), id)` inside the
+/// caller's transaction, so every row is returned exactly once (NULL-sequence
+/// rows sort as 0, first) and memory stays bounded whatever the table size.
+struct PrefixPages {
+    below: i64,
+    after: Option<(i64, String)>,
+    done: bool,
+}
+
+impl PrefixPages {
+    fn below(below: i64) -> Self {
+        Self {
+            below,
+            after: None,
+            done: false,
+        }
+    }
+
+    /// The next page in chain order, or `None` once the prefix is exhausted.
+    async fn next(
+        &mut self,
+        conn: &mut sqlx::PgConnection,
+        op: &'static str,
+    ) -> StoreResult<Option<Vec<SignedEvent>>> {
+        if self.done {
+            return Ok(None);
+        }
+        let page: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
+            "SELECT {PG_ROW_COLUMNS} FROM signed_events \
+             WHERE COALESCE(sequence, 0) < $1 \
+               AND ($2::BIGINT IS NULL OR (COALESCE(sequence, 0), id) > ($2, $3)) \
+             ORDER BY COALESCE(sequence, 0) ASC, id ASC LIMIT $4"
+        ))
+        .bind(self.below)
+        .bind(self.after.as_ref().map(|(s, _)| *s))
+        .bind(self.after.as_ref().map(|(_, id)| id.clone()))
+        .bind(PG_PREFIX_PAGE_ROWS)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| to_store_err(op, e))?;
+        self.done = i64::try_from(page.len()).unwrap_or(i64::MAX) < PG_PREFIX_PAGE_ROWS;
+        let page: Vec<SignedEvent> = page.into_iter().map(to_event).collect();
+        match page.last() {
+            Some(last) => self.after = Some((last.sequence, last.id.clone())),
+            None => return Ok(None),
+        }
+        Ok(Some(page))
+    }
+}
+
 /// #10074 (S-2) — resolve the postgres legacy cutoff over the WHOLE table,
 /// whatever window the caller walks. Zero, two or more cutoff rows, or one
 /// that fails any check, yields [`LegacyCutoff::none`].
+///
+/// #10106 — the cutoff query and the prefix read run in ONE `REPEATABLE READ
+/// READ ONLY` transaction, so they judge the same snapshot (no append or
+/// rewrite can land between them), and the prefix is read in keyset pages of
+/// [`PG_PREFIX_PAGE_ROWS`] fed to the streaming resolver, so memory stays
+/// bounded whatever the table size.
 ///
 /// # Errors
 /// Propagates a pg read error.
@@ -54,12 +115,20 @@ pub(super) async fn resolve_pg_legacy_cutoff(
     verifier: Option<&VerifyingKey>,
     db_id: Option<&str>,
 ) -> StoreResult<LegacyCutoff> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| to_store_err("legacy_cutoff.begin", e))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("legacy_cutoff.snapshot", e))?;
     let cutoffs: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
         "SELECT {PG_ROW_COLUMNS} FROM signed_events WHERE event_type = $1 \
          ORDER BY sequence ASC LIMIT 2"
     ))
     .bind(LEGACY_CUTOFF_EVENT_TYPE)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| to_store_err("legacy_cutoff.rows", e))?;
     // #10107: a second cutoff-type row means no cutoff. The candidate is the
@@ -71,18 +140,17 @@ pub(super) async fn resolve_pg_legacy_cutoff(
     let Some(cutoff_row) = cutoffs.into_iter().next().map(to_event) else {
         return Ok(LegacyCutoff::none());
     };
-    let prefix: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
-        "SELECT {PG_ROW_COLUMNS} FROM signed_events \
-         WHERE COALESCE(sequence, 0) < $1 ORDER BY COALESCE(sequence, 0) ASC"
-    ))
-    .bind(cutoff_row.sequence)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| to_store_err("legacy_cutoff.prefix", e))?;
     let mut resolver = LegacyCutoffResolver::new(&cutoff_row, verifier, db_id);
-    for row in prefix {
-        resolver.feed(&to_event(row));
+    let mut pages = PrefixPages::below(cutoff_row.sequence);
+    while let Some(page) = pages.next(&mut tx, "legacy_cutoff.prefix").await? {
+        for ev in &page {
+            resolver.feed(ev);
+        }
     }
+    // Read only: ending the transaction writes nothing.
+    tx.rollback()
+        .await
+        .map_err(|e| to_store_err("legacy_cutoff.end", e))?;
     Ok(resolver.finish())
 }
 
@@ -193,29 +261,19 @@ impl PostgresStore {
             }
             Ok(MintStep::Mint) => {}
         }
-        let rows: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
-            "SELECT {PG_ROW_COLUMNS} FROM signed_events ORDER BY COALESCE(sequence, 0) ASC"
-        ))
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("mint_legacy_cutoff.walk", e))?;
-        let rows: Vec<SignedEvent> = rows.into_iter().map(to_event).collect();
-        let Some(head) = rows.last().map(|r| r.sequence) else {
+        // #10106 — the head (the last row in chain order) first, then ONE
+        // paged pass, under the EXCLUSIVE lock taken above, so the mint holds
+        // at most one page of rows in memory.
+        let head: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(COALESCE(sequence, 0)) FROM signed_events")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("mint_legacy_cutoff.head", e))?;
+        let Some(head) = head else {
             return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
         };
         if head < 1 {
             return Ok(Err(LegacyCutoffMintRefusal::EmptyChain));
-        }
-        // The same structural check the sqlite mint runs through
-        // `verify_chain`; the row forms are the resolver's (#10101 / #10102).
-        let mut expected_prev = ZERO_HASH.to_vec();
-        let mut expected_seq = 1_i64;
-        for r in &rows {
-            if r.sequence != expected_seq || r.prev_hash != expected_prev {
-                return Ok(Err(LegacyCutoffMintRefusal::ChainBreak(r.sequence)));
-            }
-            expected_prev = Sha256::digest(canonical_chain_bytes(r)).to_vec();
-            expected_seq = expected_seq.saturating_add(1);
         }
         let ts = truncate_to_microseconds(chrono::Utc::now());
         let mut row = SignedEvent {
@@ -233,8 +291,20 @@ impl PostgresStore {
             cause_hash: None,
         };
         let mut resolver = LegacyCutoffResolver::new(&row, Some(&vk), Some(&db_id));
-        for r in &rows {
-            resolver.feed(r);
+        // The same structural check the sqlite mint runs through
+        // `verify_chain`; the row forms are the resolver's (#10101 / #10102).
+        let mut expected_prev = ZERO_HASH.to_vec();
+        let mut expected_seq = 1_i64;
+        let mut pages = PrefixPages::below(head.saturating_add(1));
+        while let Some(page) = pages.next(&mut tx, "mint_legacy_cutoff.walk").await? {
+            for r in &page {
+                if r.sequence != expected_seq || r.prev_hash != expected_prev {
+                    return Ok(Err(LegacyCutoffMintRefusal::ChainBreak(r.sequence)));
+                }
+                expected_prev = Sha256::digest(canonical_chain_bytes(r)).to_vec();
+                expected_seq = expected_seq.saturating_add(1);
+                resolver.feed(r);
+            }
         }
         let (payload_hash, last_hash) = match resolver.mint_payload_hash() {
             Ok(v) => v,

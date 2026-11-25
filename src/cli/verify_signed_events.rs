@@ -141,16 +141,32 @@ pub async fn dispatch(
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
-    if args.mint_legacy_cutoff {
-        let resolved = crate::store_url::resolve_store_url(args.store_url.as_deref())?;
-        if let Some(url) = resolved.as_deref()
-            && crate::store_url::is_postgres_url(url)
-        {
+    let resolved = crate::store_url::resolve_store_url(args.store_url.as_deref())?;
+    if let Some(url) = resolved.as_deref()
+        && crate::store_url::is_postgres_url(url)
+    {
+        if args.mint_legacy_cutoff {
             let minted = mint_postgres(url, app_config).await?;
             return render_mint(minted, out);
         }
+        // #10106 — this walk reads only the local sqlite file; reporting on it
+        // while the resolved store is postgres would describe the wrong table.
+        anyhow::bail!(
+            "{}",
+            postgres_walk_refusal(&crate::url_display::store_url_display(url))
+        );
     }
     run(db_path, args, audit_pubkey, out)
+}
+
+/// #10106 — the exact refusal when the resolved store is postgres and no
+/// mint was asked for.
+#[must_use]
+pub fn postgres_walk_refusal(store: &str) -> String {
+    format!(
+        "verify-signed-events-chain walks the local sqlite signed_events table, but the \
+         resolved store is postgres ({store}); verify it with `verify-audit-trail`"
+    )
 }
 
 #[cfg(feature = "sal-postgres")]

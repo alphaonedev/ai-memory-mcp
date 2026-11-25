@@ -1742,7 +1742,7 @@ fn c6_import_refuses_a_second_legacy_cutoff_10106() {
     let src_cutoff = row_at(&src, legacy_prefix_and_mint(&src));
     assert_ne!(row_at(&dst, dst_cutoff).id, src_cutoff.id, "control");
 
-    let err = import_full_envelope(&dst, &envelope_of(&[src_cutoff.clone()]), &opts)
+    let err = import_full_envelope(&dst, &envelope_of(std::slice::from_ref(&src_cutoff)), &opts)
         .expect_err("a second cutoff is refused");
     let want = format!(
         "import signed_event {} (sequence {}): a different legacy cutoff row already \

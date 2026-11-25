@@ -94,7 +94,6 @@ impl LegacyCutoff {
 /// `SHA-256(domain || u64be(cutoff_seq) || lp(last_hash) || lp(prefix_digest)
 /// || u64be(payload_only_count) || lp(db_id))`.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)] // field lengths fit u64 on every supported target
 pub fn legacy_cutoff_payload_hash(
     cutoff_sequence: i64,
     last_hash: &[u8],
@@ -106,13 +105,20 @@ pub fn legacy_cutoff_payload_hash(
     h.update(LEGACY_CUTOFF_PREIMAGE_DOMAIN);
     h.update(cutoff_sequence.to_be_bytes());
     for field in [last_hash, prefix_digest] {
-        h.update((field.len() as u64).to_be_bytes());
+        h.update(len_prefix(field.len()));
         h.update(field);
     }
     h.update(payload_only_count.to_be_bytes());
-    h.update((db_id.len() as u64).to_be_bytes());
+    h.update(len_prefix(db_id.len()));
     h.update(db_id.as_bytes());
     h.finalize().to_vec()
+}
+
+/// #10106 — the big-endian `u64` length prefix of a preimage field. A `usize`
+/// always fits `u64` on the supported targets; `try_from` keeps the
+/// conversion checked (rust-1-98 PERF-07) and saturates where it could not.
+fn len_prefix(len: usize) -> [u8; 8] {
+    u64::try_from(len).unwrap_or(u64::MAX).to_be_bytes()
 }
 
 /// #10074 — the exact bytes the daemon key signs for a `signed_events` row:
