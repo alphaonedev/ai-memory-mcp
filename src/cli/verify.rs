@@ -1665,7 +1665,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = TempDir::new().unwrap();
-        let keys_tmp = TempDir::new().unwrap();
+        let keys_tmp = crate::identity::test_key_dir::private_tempdir();
         let (conn, _) = open_test_db(&tmp);
 
         let agent = kp_mod::generate("tester-l13").expect("gen");
@@ -1852,7 +1852,7 @@ mod tests {
         let _g = kp_mod::key_dir_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let keys_tmp = TempDir::new().unwrap();
+        let keys_tmp = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: this test mutates a process-wide env var; the helper
         // chain assumes no concurrent test relies on the previous value
         // during this assertion.

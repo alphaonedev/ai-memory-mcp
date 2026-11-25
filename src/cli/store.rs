@@ -1285,7 +1285,7 @@ mod tests {
     #[test]
     fn test_store_sign_with_bound_key_stamps_agent_attested() {
         let _lock = locked_env();
-        let key_dir = tempfile::tempdir().unwrap();
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         let _kd = bind_key_dir(key_dir.path());
         // #1751 — pin "0" (never clear): clearing would open a strict
         // required-default window that leaks into concurrent unsigned
@@ -1331,7 +1331,7 @@ mod tests {
     #[test]
     fn store_sign_without_bound_key_refuses_3409() {
         let _lock = locked_env();
-        let key_dir = tempfile::tempdir().unwrap();
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         let _kd = bind_key_dir(key_dir.path());
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
@@ -1378,7 +1378,7 @@ mod tests {
     #[test]
     fn store_sign_with_allow_claimed_stores_claimed_and_warns_3409() {
         let _lock = locked_env();
-        let key_dir = tempfile::tempdir().unwrap();
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         let _kd = bind_key_dir(key_dir.path());
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
@@ -1410,7 +1410,7 @@ mod tests {
     #[test]
     fn store_sign_with_bound_key_is_agent_attested_3409() {
         let _lock = locked_env();
-        let key_dir = tempfile::tempdir().unwrap();
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         let _kd = bind_key_dir(key_dir.path());
         let _req = EnvVarGuard::set(
             "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
@@ -1456,7 +1456,7 @@ mod tests {
     fn test_store_sign_without_local_keypair_errors() {
         let _lock = locked_env();
         // Empty key dir — no `<agent_id>.priv` to load.
-        let key_dir = tempfile::tempdir().unwrap();
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         let _kd = bind_key_dir(key_dir.path());
         // #1751 — pin "0" (never clear); see the sibling test above.
         let _req = EnvVarGuard::set(
