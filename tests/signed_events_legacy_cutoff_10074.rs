@@ -1756,3 +1756,138 @@ fn c6_import_refuses_a_second_legacy_cutoff_10106() {
     import_full_envelope(&dst, &envelope_of(&[own]), &opts).expect("the same cutoff restores");
     assert_eq!(cutoff_rows(&dst), 1);
 }
+
+/// Count and content digest of one SQLite table: every row rendered as text,
+/// the rendered rows sorted, then hashed (independent of row order).
+fn sqlite_table_digest(conn: &rusqlite::Connection, table: &str) -> (usize, String) {
+    use std::fmt::Write as _;
+    let mut stmt = conn
+        .prepare(&format!("SELECT * FROM \"{table}\""))
+        .expect("select table");
+    let cols = stmt.column_count();
+    let mut rendered: Vec<String> = stmt
+        .query_map([], |r| {
+            let mut line = String::new();
+            for i in 0..cols {
+                let v: rusqlite::types::Value = r.get(i)?;
+                let _ = write!(line, "{v:?}\u{1f}");
+            }
+            Ok(line)
+        })
+        .expect("query rows")
+        .collect::<Result<_, _>>()
+        .expect("read rows");
+    rendered.sort();
+    let mut h = Sha256::new();
+    for line in &rendered {
+        h.update(line.as_bytes());
+        h.update(b"\n");
+    }
+    (rendered.len(), hex::encode(h.finalize()))
+}
+
+/// Every stored table of the database (virtual tables are read through their
+/// shadow tables, which hold their rows), each with its count and digest.
+fn sqlite_db_digest(db: &Path) -> std::collections::BTreeMap<String, (usize, String)> {
+    let conn = rusqlite::Connection::open(db).expect("open sqlite");
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND COALESCE(sql, '') NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name",
+        )
+        .expect("list tables");
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .expect("tables")
+        .collect::<Result<_, _>>()
+        .expect("table names");
+    names
+        .into_iter()
+        .map(|t| {
+            let d = sqlite_table_digest(&conn, &t);
+            (t, d)
+        })
+        .collect()
+}
+
+/// GA standard 1 (no data destruction) on a POPULATED SQLite database: the
+/// chain walk, the mint and the anchor repair alter no stored memory. Every
+/// table other than `signed_events` keeps its exact row count and content
+/// digest; `signed_events` keeps every earlier row byte-identical and gains
+/// exactly the one cutoff row (the walk and the repair add none).
+#[test]
+fn std1_mint_verify_repair_alter_no_stored_memory_10074() {
+    const MEMORIES: i64 = 6;
+    let root = home_sandbox::per_test_dir("cli-std1-10074-");
+    let (root, db, agent) = (root.path(), root.path().join("store.db"), "cli-std1-10074");
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+    for i in 0..MEMORIES {
+        let title = format!("std1 row {i}");
+        let content = format!("standard 1 populated memory {i} (#10074)");
+        let out = cli::run(
+            root,
+            &db,
+            agent,
+            &a,
+            &[],
+            &["--json", "store", "-T", &title, "--content", &content],
+        );
+        assert_eq!(out.code, Some(0), "store {i}: {}", out.text);
+    }
+    let memories = |db: &Path| {
+        rusqlite::Connection::open(db)
+            .expect("open sqlite")
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+            .expect("count memories")
+    };
+    assert_eq!(memories(&db), MEMORIES, "the database is populated");
+
+    let before = sqlite_db_digest(&db);
+    let events_before = load_rows(&rusqlite::Connection::open(&db).expect("open sqlite"));
+    assert!(!events_before.is_empty(), "the store wrote signed events");
+
+    let out = cli::run(root, &db, agent, &a, &[], &["verify-signed-events-chain"]);
+    assert_eq!(out.code, Some(0), "walk: {}", out.text);
+    assert_eq!(sqlite_db_digest(&db), before, "the walk alters no table");
+
+    let out = cli_mint(root, &db, agent, &a);
+    assert_eq!(out.code, Some(0), "mint: {}", out.text);
+    let after_mint = sqlite_db_digest(&db);
+    let out = cli_mint(root, &db, agent, &b);
+    assert_eq!(out.code, Some(0), "repair: {}", out.text);
+    assert!(
+        out.text.contains("repaired the off-table anchor"),
+        "{}",
+        out.text
+    );
+    let out = cli::run(root, &db, agent, &b, &[], &["verify-signed-events-chain"]);
+    assert_eq!(out.code, Some(0), "walk after mint: {}", out.text);
+    let after = sqlite_db_digest(&db);
+    assert_eq!(after, after_mint, "the repair and the walk alter no table");
+
+    let mut changed: Vec<&String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|t| before.get(*t) != after.get(*t))
+        .collect();
+    changed.dedup();
+    assert_eq!(changed, vec!["signed_events"], "only signed_events changes");
+    let events_after = load_rows(&rusqlite::Connection::open(&db).expect("open sqlite"));
+    assert_eq!(
+        events_after.len(),
+        events_before.len() + 1,
+        "exactly one row added"
+    );
+    assert_eq!(
+        &events_after[..events_before.len()],
+        &events_before[..],
+        "every earlier signed event is unchanged"
+    );
+    assert_eq!(
+        events_after.last().map(|r| r.event_type.as_str()),
+        Some(LEGACY_CUTOFF_EVENT_TYPE),
+        "the added row is the cutoff row"
+    );
+    assert_eq!(memories(&db), MEMORIES, "no memory lost");
+}

@@ -1114,3 +1114,158 @@ async fn c6_pg_repair_over_a_multi_page_prefix_10106() {
     );
     assert_eq!(pg_cutoff_rows(&store).await, 1, "the repair adds no row");
 }
+
+/// Count and content digest of every base table in every user schema of the
+/// scratch database: each row rendered with `row::text`, the rendered rows
+/// sorted, then md5 (independent of physical row order).
+async fn pg_db_digest(store: &PostgresStore) -> std::collections::BTreeMap<String, (i64, String)> {
+    let tables: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_schema::text, table_name::text FROM information_schema.tables \
+         WHERE table_type = 'BASE TABLE' \
+           AND table_schema NOT IN ('pg_catalog', 'information_schema') \
+           AND table_schema NOT LIKE 'pg\\_%' \
+         ORDER BY 1, 2",
+    )
+    .fetch_all(store.pool())
+    .await
+    .expect("list tables");
+    let mut out = std::collections::BTreeMap::new();
+    for (schema, table) in tables {
+        let sql = format!(
+            "SELECT COUNT(*)::bigint, \
+                    md5(COALESCE(string_agg(t::text, E'\\n' ORDER BY t::text), '')) \
+             FROM \"{schema}\".\"{table}\" t"
+        );
+        let row: (i64, String) = sqlx::query_as(&sql)
+            .fetch_one(store.pool())
+            .await
+            .expect("digest table");
+        out.insert(format!("{schema}.{table}"), row);
+    }
+    out
+}
+
+/// GA standard 1 (no data destruction) on a POPULATED PostgreSQL database:
+/// the chain walk, the mint and the anchor repair alter no stored memory.
+/// Every table other than `signed_events` keeps its exact row count and
+/// content digest; `signed_events` keeps every earlier row identical and gains
+/// exactly the one cutoff row.
+#[tokio::test(flavor = "multi_thread")]
+async fn std1_pg_mint_verify_repair_alter_no_stored_memory_10074() {
+    use ai_memory::store::MemoryStore as _;
+    const MEMORIES: i64 = 6;
+    let _ = sink();
+    let Some(url) = pg_url() else { return };
+    let (scratch, store) = fresh_pg(&url).await;
+    pg::append(&store, &[P, I, T]).await;
+    let ctx = ai_memory::store::CallerContext::for_agent(CLI_AGENT);
+    for i in 0..MEMORIES {
+        let now = chrono::Utc::now().to_rfc3339();
+        let memory = ai_memory::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: ai_memory::models::Tier::Long,
+            namespace: "std1-10074".to_string(),
+            title: format!("std1 row {i}"),
+            content: format!("standard 1 populated memory {i} (#10074)"),
+            priority: 5,
+            confidence: 0.9,
+            source: "test".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({ "agent_id": CLI_AGENT }),
+            version: 1,
+            ..ai_memory::models::Memory::default()
+        };
+        store.store(&ctx, &memory).await.expect("store memory");
+    }
+    let memories = || async {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*)::bigint FROM memories")
+            .fetch_one(store.pool())
+            .await
+            .expect("count memories")
+            .0
+    };
+    assert_eq!(memories().await, MEMORIES, "the database is populated");
+
+    let dir = home_sandbox::per_test_dir("cli-pg-std1-10074-");
+    let root = dir.path();
+    install_child_key(root);
+    let db = root.join("unused.db");
+    let store_url = scratch.url();
+    // The CLI chain walk refuses a PostgreSQL store (#10106), so the walk is
+    // the store's own verifier; the mint and the repair run as CLI children.
+    let mint = |sink: &std::path::Path| {
+        cli::run(
+            root,
+            &db,
+            CLI_AGENT,
+            sink,
+            &[],
+            &[
+                "verify-signed-events-chain",
+                "--mint-legacy-cutoff",
+                "--store-url",
+                &store_url,
+            ],
+        )
+    };
+    let walk = || async {
+        let trail = store
+            .verify_audit_trail(None, Some(&sink()))
+            .await
+            .expect("pg verify");
+        assert!(trail.chain_intact, "pg chain intact");
+    };
+    let a = cli::sink_dir(root, "sink-a");
+    let b = cli::sink_dir(root, "sink-b");
+
+    let before = pg_db_digest(&store).await;
+    let events_before = pg::load(&store).await;
+    walk().await;
+    assert_eq!(
+        pg_db_digest(&store).await,
+        before,
+        "the walk alters no table"
+    );
+
+    let out = mint(&a);
+    assert_eq!(out.code, Some(0), "pg mint: {}", out.text);
+    let after_mint = pg_db_digest(&store).await;
+    let out = mint(&b);
+    assert_eq!(out.code, Some(0), "pg repair: {}", out.text);
+    assert!(
+        out.text.contains("repaired the off-table anchor"),
+        "{}",
+        out.text
+    );
+    walk().await;
+    let after = pg_db_digest(&store).await;
+    assert_eq!(after, after_mint, "the repair and the walk alter no table");
+
+    let mut changed: Vec<&String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|t| before.get(*t) != after.get(*t))
+        .collect();
+    changed.sort();
+    changed.dedup();
+    assert_eq!(changed.len(), 1, "only signed_events changes: {changed:?}");
+    assert!(changed[0].ends_with(".signed_events"), "{changed:?}");
+    let events_after = pg::load(&store).await;
+    assert_eq!(
+        events_after.len(),
+        events_before.len() + 1,
+        "exactly one row added"
+    );
+    assert_eq!(
+        &events_after[..events_before.len()],
+        &events_before[..],
+        "every earlier signed event is unchanged"
+    );
+    assert_eq!(
+        pg_cutoff_rows(&store).await,
+        1,
+        "the added row is the cutoff row"
+    );
+    assert_eq!(memories().await, MEMORIES, "no memory lost");
+}
