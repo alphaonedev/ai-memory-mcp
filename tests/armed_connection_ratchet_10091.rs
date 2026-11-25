@@ -404,7 +404,10 @@ const ALLOWLIST: &[(&str, usize, usize, &str)] = &[
         1,
         WHY_TEST_FIXTURE,
     ),
-    ("tests/row_attestations_10040.rs", 16, 16, WHY_TEST_FIXTURE),
+    // 17 = the 16 pinned with #10091 plus the raw attacker write of
+    // `unattested_writes_mark_only_the_written_rows_10094` (#10094): it
+    // tampers a vacuum copy of the sandbox store, never the shipped path.
+    ("tests/row_attestations_10040.rs", 17, 17, WHY_TEST_FIXTURE),
     ("tests/rules_store_isolation_pin.rs", 1, 1, WHY_TEST_FIXTURE),
     (
         "tests/schema_downgrade_guard_parent_probe_2445.rs",
