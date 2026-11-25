@@ -1180,6 +1180,74 @@ fn memory_verify_returns_the_one_verifiers_verdict_10040() {
     );
 }
 
+/// The id of the memory row a raw writer inserts in [`drift_10094`].
+#[cfg(feature = "sal")]
+const RAW_ID_10094: &str = "raw-unattested-10094";
+
+/// #10094: writes no armed connection attested (a covered column changed,
+/// a memory row inserted) are pinned on exactly the rows they wrote. The
+/// untouched memory still verifies; the written ones do not; the report
+/// stays defective and names no store-wide defect.
+#[cfg(feature = "sal")]
+#[test]
+fn unattested_writes_mark_only_the_written_rows_10094() {
+    let (sb, _key, mut mcp) = armed();
+    let id = mcp.store("drifted 10094");
+    let keep = mcp.store("untouched 10094");
+    drop(mcp);
+    let copy = vacuum_copy(&sb, "drift-10094.db");
+    let conn = rusqlite::Connection::open(&copy).expect("open copy");
+    conn.execute(
+        "UPDATE memories SET priority = priority + 1 WHERE id = ?1",
+        [&id],
+    )
+    .expect("raw priority change");
+    // A copy of `keep` under a new id and title, stored columns only.
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('memories')")
+        .expect("columns")
+        .query_map([], |r| r.get(0))
+        .expect("columns")
+        .collect::<Result<_, _>>()
+        .expect("columns");
+    let select: Vec<String> = cols
+        .iter()
+        .map(|c| match c.as_str() {
+            "id" => "?1".to_string(),
+            "title" => "title || ' raw'".to_string(),
+            other => format!("\"{other}\""),
+        })
+        .collect();
+    let sql = format!(
+        "INSERT INTO memories ({}) SELECT {} FROM memories WHERE id = ?2",
+        cols.iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        select.join(", ")
+    );
+    conn.execute(&sql, [RAW_ID_10094, keep.as_str()])
+        .expect("raw insert");
+    let report = sb.report_of(&conn);
+    assert!(!report.ok(), "drift is a defect: {:?}", report.defects);
+    let want: std::collections::BTreeSet<String> =
+        [id.clone(), RAW_ID_10094.to_string()].into_iter().collect();
+    assert_eq!(
+        report.unverified_memories, want,
+        "exactly the written rows: {:?}",
+        report.defects
+    );
+    drop(conn);
+    assert!(
+        store_verdict(&sb, &copy, &keep),
+        "an untouched memory still reports signature_verified"
+    );
+    assert!(
+        !store_verdict(&sb, &copy, &id),
+        "the drifted memory reports signature_verified false"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // C-8: retention bound and overhead budgets of the operational tables
 // ---------------------------------------------------------------------------
