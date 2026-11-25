@@ -833,6 +833,14 @@ fn v102_store_migrates_with_a_baseline_for_every_memory_10040() {
         let v: Value = serde_json::from_str(&out).expect("store json");
         ids.push(v["id"].as_str().expect("id").to_string());
     }
+    // #10095: a pre-existing side-table row is baselined too.
+    sb.seed_conn()
+        .execute(
+            "INSERT INTO entity_aliases (entity_id, alias, created_at) \
+             VALUES (?1, 'legacy alias 10095', '2026-01-01T00:00:00+00:00')",
+            [&ids[0]],
+        )
+        .expect("seed a legacy side-table row");
     sb.seed_conn()
         .execute_batch(
             "DROP TABLE row_attestations; \
@@ -866,6 +874,10 @@ fn v102_store_migrates_with_a_baseline_for_every_memory_10040() {
         i64::try_from(verdict.verified).expect("count"),
         total,
         "every memory row verifies"
+    );
+    assert_eq!(
+        report.tables["entity_aliases"].verified, 1,
+        "#10095: the side-table row is baselined and verifies"
     );
     for (id, seal) in ids.iter().zip(&seals) {
         let chain = memory_chain(&sb.conn(), id);
