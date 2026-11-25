@@ -125,7 +125,7 @@ impl TestEnv {
         // exercising their actual subject matter (same Once discipline
         // as `ensure_no_config_env` above).
         crate::identity::attest::permissive_attestation_for_lib_tests();
-        let _tmp = tempfile::tempdir().expect("tempdir");
+        let _tmp = crate::identity::test_key_dir::private_tempdir();
         let db_path = _tmp.path().join("ai-memory.db");
         Self {
             db_path,

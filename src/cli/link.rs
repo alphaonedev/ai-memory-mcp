@@ -271,7 +271,7 @@ mod tests {
         let id1 = seed_memory(&db, "ns", "a", "ca");
         let id2 = seed_memory(&db, "ns", "b", "cb");
 
-        let key_dir = tempfile::tempdir().unwrap();
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         let kp = crate::identity::keypair::generate("ai:linker").unwrap();
         crate::identity::keypair::save(&kp, key_dir.path()).unwrap();
 
@@ -341,7 +341,7 @@ mod tests {
         let id1 = seed_memory(&db, "ns", "a", "ca");
         let id2 = seed_memory(&db, "ns", "b", "cb");
 
-        let key_dir = tempfile::tempdir().unwrap();
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         let kp = crate::identity::keypair::generate("ai:linker").unwrap();
         crate::identity::keypair::save(&kp, key_dir.path()).unwrap();
         // Widen the `.priv` mode so `keypair::load` refuses it (S4-LOW1).

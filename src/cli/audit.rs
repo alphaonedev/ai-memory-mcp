@@ -2365,25 +2365,28 @@ mod tests {
 /// the fixture's whole life (the env vars are process-global); declare the
 /// lock guard BEFORE the fixture so the fixture drops first.
 #[cfg(test)]
-mod witness_isolation_10117 {
+pub(crate) mod witness_isolation_10117 {
     use crate::governance::audit as witness;
     use std::path::Path;
 
-    pub(super) struct IsolatedWitnessCustody {
+    pub(crate) struct IsolatedWitnessCustody {
         dir: tempfile::TempDir,
     }
 
     impl IsolatedWitnessCustody {
-        pub(super) fn arm() -> Self {
-            let dir = tempfile::tempdir().expect("custody tempdir");
+        pub(crate) fn arm() -> Self {
+            // 0700 under any umask (the #3198 refusal never fires) and the
+            // custody env points HERE, so the default resolution is never
+            // reached.
+            let dir = crate::identity::test_key_dir::private_tempdir();
             unsafe {
-                std::env::remove_var(witness::WITNESS_KEY_DIR_ENV);
+                std::env::set_var(witness::WITNESS_KEY_DIR_ENV, dir.path());
                 std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
             }
             Self { dir }
         }
 
-        pub(super) fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             self.dir.path()
         }
     }
@@ -2599,7 +2602,7 @@ mod restore_attest_1946_tests {
         let mut env = TestEnv::fresh();
         seed_anchor_above_head(&env, custody.path());
         let db_path = env.db_path.clone();
-        let empty_keys = tempfile::tempdir().expect("tmp2");
+        let empty_keys = crate::identity::test_key_dir::private_tempdir();
         let mut out = env.output();
         let err = run_restore_attest(
             &args(true, false, Some(empty_keys.path().to_path_buf())),
@@ -2618,7 +2621,7 @@ mod restore_attest_1946_tests {
         let custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
         seed_anchor_above_head(&env, custody.path());
-        let op_dir = tempfile::tempdir().expect("tmp2");
+        let op_dir = crate::identity::test_key_dir::private_tempdir();
         let op = crate::identity::keypair::generate(crate::cli::rules::OPERATOR_KEY_ID)
             .expect("gen operator");
         crate::identity::keypair::save(&op, op_dir.path()).expect("save operator");

@@ -1811,7 +1811,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn tmp_dir() -> TempDir {
-        TempDir::new().expect("tempdir")
+        crate::identity::test_key_dir::private_tempdir()
     }
 
     #[cfg(unix)]
@@ -2516,6 +2516,13 @@ mod tests {
         let dir = tmp_dir();
         let file = dir.path().join("not-a-dir");
         fs::write(&file, b"x").unwrap();
+        // #10117 - pin the mode so the #3198 loose-dir refusal (umask 0002
+        // makes the file 0664) never pre-empts the read_dir failure under test.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let err = list(&file).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("reading key directory"), "got: {msg}");

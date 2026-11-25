@@ -273,7 +273,7 @@ mod tests {
         const TTL_SECS: i64 = 60;
         const AGENT: &str = "ai:delegate-stamp-3511";
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let db = dir.path().join("identity.db");
         let keys = dir.path().join("keys");
         let conn = crate::db::open(&db).expect("open db");

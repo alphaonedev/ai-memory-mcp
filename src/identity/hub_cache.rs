@@ -350,7 +350,7 @@ mod tests {
 
     fn key_dir_with_daemon_key() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod 0700");
         let kp = crate::identity::keypair::generate(crate::identity::keypair::DAEMON_KEYPAIR_LABEL)

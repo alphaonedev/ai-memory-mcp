@@ -412,7 +412,7 @@ mod tests {
     /// Stage an enrolled key plus a freshly minted, in-window bundle — the
     /// exact artefacts `identity delegate` leaves behind.
     fn staged(hub_id: &str) -> Staged {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let agent_id = "ai:listener-3470".to_owned();
         let enrolled = keypair::generate(&agent_id).expect("generate");
         keypair::save(&enrolled, dir.path()).expect("save");

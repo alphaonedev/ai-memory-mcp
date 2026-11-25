@@ -12860,7 +12860,7 @@ legacy_scoring = false
         // (byte-identical to a pre-R9 deployment); present custody ⇒ an
         // Admin-ceiling issuer.
         use crate::governance::capability as cap;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::identity::test_key_dir::private_tempdir();
         let dir = tmp.path();
         assert!(
             load_owner_issuer_config(dir).is_none(),
@@ -12886,7 +12886,7 @@ legacy_scoring = false
         // (4) an owner token attenuated to Read cannot cover a Write Pending.
         use crate::governance::capability as cap;
         use crate::models::{GovernanceDecision, GovernanceLevel, GovernedAction};
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::identity::test_key_dir::private_tempdir();
         let dir = tmp.path();
         let kp = crate::identity::keypair::generate(cap::OWNER_ISSUER).unwrap();
         crate::identity::keypair::save(&kp, dir).unwrap();
@@ -12980,7 +12980,7 @@ legacy_scoring = false
         let _env = crate::identity::keypair::key_dir_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::identity::test_key_dir::private_tempdir();
         let prior = std::env::var("AI_MEMORY_KEY_DIR").ok();
         unsafe {
             std::env::set_var("AI_MEMORY_KEY_DIR", tmp.path());

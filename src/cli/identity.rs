@@ -946,7 +946,7 @@ mod tests {
 
     fn fresh_env() -> (TestEnv, tempfile::TempDir) {
         let env = TestEnv::fresh();
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         (env, dir)
     }
 

@@ -335,6 +335,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::audit::witness_isolation_10117::IsolatedWitnessCustody;
     use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
 
     fn fixture_event(payload: &[u8]) -> SignedEvent {
@@ -362,6 +363,12 @@ mod tests {
 
     #[test]
     fn empty_db_exits_zero_intact() {
+        // #10117 - `run` reads the witness custody (head-anchor high water);
+        // never the host default.
+        let _lock = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _custody = IsolatedWitnessCustody::arm();
         let (_dir, path) = temp_db();
         let args = VerifyAuditTrailArgs {
             since: None,
@@ -381,6 +388,12 @@ mod tests {
 
     #[test]
     fn clean_chain_exits_zero_text() {
+        // #10117 - `run` reads the witness custody (head-anchor high water);
+        // never the host default.
+        let _lock = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _custody = IsolatedWitnessCustody::arm();
         let (_dir, path) = temp_db();
         {
             let conn = crate::db::open(&path).expect("open");
@@ -415,6 +428,12 @@ mod tests {
     /// note the operator would see only "stripped / downgraded / forged".
     #[test]
     fn unsigned_prefix_under_pin_prints_the_limitation_note_3354() {
+        // #10117 - `run` reads the witness custody (head-anchor high water);
+        // never the host default.
+        let _lock = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _custody = IsolatedWitnessCustody::arm();
         let (_dir, path) = temp_db();
         {
             let conn = crate::db::open(&path).expect("open");

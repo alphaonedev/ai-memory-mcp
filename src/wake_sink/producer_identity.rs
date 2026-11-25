@@ -318,7 +318,7 @@ mod tests {
     /// names the remediation rather than failing later at the socket.
     #[test]
     fn a_public_only_daemon_key_is_refused_with_an_actionable_message_3469() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let kp = keypair::generate(keypair::DAEMON_KEYPAIR_LABEL).expect("generate");
         keypair::save(&kp, dir.path()).expect("save");
         std::fs::remove_file(

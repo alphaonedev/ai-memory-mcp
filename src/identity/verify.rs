@@ -661,7 +661,6 @@ mod tests {
         }
     }
     use crate::identity::sign;
-    use tempfile::TempDir;
 
     fn link_fixture() -> SignableLink<'static> {
         SignableLink {
@@ -759,14 +758,14 @@ mod tests {
 
     #[test]
     fn lookup_peer_public_key_in_returns_none_for_unknown() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         // Empty key dir → no enrolled peer.
         assert!(lookup_peer_public_key_in("alice", dir.path()).is_none());
     }
 
     #[test]
     fn lookup_peer_public_key_in_returns_none_for_empty_id() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         assert!(lookup_peer_public_key_in("", dir.path()).is_none());
     }
 
@@ -774,7 +773,7 @@ mod tests {
     fn lookup_peer_public_key_in_finds_enrolled_pubkey() {
         // Mirror an `identity import` for a peer: write only the .pub
         // file under the key dir. lookup must return the same key.
-        let dir = TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let alice = kp_mod::generate("alice").unwrap();
         let pub_only = kp_mod::AgentKeypair {
             agent_id: "alice".to_string(),
@@ -791,7 +790,7 @@ mod tests {
         // A self-generated agent (with both .pub and .priv on disk) is
         // also a valid lookup target — useful in single-host loopback
         // tests where the same agent both signs and verifies.
-        let dir = TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let alice = kp_mod::generate("alice").unwrap();
         kp_mod::save(&alice, dir.path()).unwrap();
         let found = lookup_peer_public_key_in("alice", dir.path()).expect("lookup hit");
@@ -802,7 +801,7 @@ mod tests {
     fn lookup_peer_public_key_in_skips_invalid_agent_id() {
         // `keypair::load_public` validates the agent_id; lookup should not
         // panic and should report `None` for invalid input.
-        let dir = TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         assert!(lookup_peer_public_key_in("has space", dir.path()).is_none());
         assert!(lookup_peer_public_key_in("has\0null", dir.path()).is_none());
     }
@@ -815,7 +814,7 @@ mod tests {
         // refused the loose `.priv` and `.ok()` made lookup return None,
         // so a forged signature landed unsigned instead of Tampered.
         use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let alice = kp_mod::generate("alice").unwrap();
         kp_mod::save(&alice, dir.path()).unwrap();
         let priv_path = dir.path().join("alice.priv");
@@ -842,7 +841,7 @@ mod tests {
         // Two-host simulation: alice signs on host A; host B has only
         // alice.pub enrolled (no .priv). Host B looks up alice's pubkey
         // and verifies — passes.
-        let host_b_keys = TempDir::new().unwrap();
+        let host_b_keys = crate::identity::test_key_dir::private_tempdir();
         let alice = kp_mod::generate("alice").unwrap();
 
         // Host B operator imports alice's public key.
@@ -868,7 +867,7 @@ mod tests {
         // Host B has no key enrolled for alice → lookup returns None.
         // The caller (federation inbound) is responsible for the
         // accept-and-flag-as-unsigned posture; verify() is not invoked.
-        let host_b_keys = TempDir::new().unwrap();
+        let host_b_keys = crate::identity::test_key_dir::private_tempdir();
         assert!(lookup_peer_public_key_in("alice", host_b_keys.path()).is_none());
     }
 
