@@ -818,7 +818,8 @@ pub enum Op {
     Delete,
     /// The signed per-table watermark at cutover (C-6).
     Cutover,
-    /// State observed at cutover for a memory row (E-1), never authorship.
+    /// State observed at cutover for a pre-existing row of any attested
+    /// table (E-1, #10095), never authorship.
     Baseline,
     /// The store-identity row.
     Store,
@@ -956,8 +957,6 @@ pub struct LiveRow {
 pub struct TableVerdict {
     /// Live rows whose latest attestation verifies.
     pub verified: u64,
-    /// Live rows covered only by the signed cutover watermark (side tables).
-    pub legacy: u64,
     /// Attestation rows held.
     pub attestations: u64,
 }
@@ -1334,11 +1333,12 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
                     ));
                     mark_memory(&mut unverified, spec, row, input);
                 }
-                None if spec.table == "memories" => {
+                // #10095: every attested table, side tables included. The
+                // arm baselines each pre-existing row, so none is legacy.
+                None => {
                     d.push(format!("{}: live row has no attestation", spec.table));
                     mark_memory(&mut unverified, spec, row, input);
                 }
-                None => verdict.legacy += 1,
             }
         }
         for (key, chain) in &by_key {

@@ -705,7 +705,15 @@ fn stripped_non_head_supersede_attestation_is_a_defect_10095() {
         let digest = row_digest(s, &cells);
         acc = acc_add(&acc, &acc_term("leases", &key, &digest));
         let table_seq = i64::try_from(n).unwrap_or(i64::MAX) + 1;
-        let a = f.att("leases", key.clone(), 1, Op::Insert, Some(digest), table_seq, acc);
+        let a = f.att(
+            "leases",
+            key.clone(),
+            1,
+            Op::Insert,
+            Some(digest),
+            table_seq,
+            acc,
+        );
         f.atts.push(a);
         f.live.push(LiveRow {
             table: "leases".to_string(),

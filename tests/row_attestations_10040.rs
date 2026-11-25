@@ -867,7 +867,6 @@ fn v102_store_migrates_with_a_baseline_for_every_memory_10040() {
         total,
         "every memory row verifies"
     );
-    assert_eq!(verdict.legacy, 0, "no memory row is left legacy");
     for (id, seal) in ids.iter().zip(&seals) {
         let chain = memory_chain(&sb.conn(), id);
         assert_eq!(chain.len(), 1, "{id}: exactly one baseline");

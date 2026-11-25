@@ -724,9 +724,8 @@ fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<
                 id
             ],
         )?;
-        if spec.table != "memories" {
-            continue;
-        }
+        // #10095: every attested table is baselined, so a live row with no
+        // attestation is a defect on every table, never a legacy count.
         let mut table_seq = 0_i64;
         for cells in read_rows(conn, spec)? {
             // #10092: a baseline is never signed over a non-canonical row.
