@@ -1630,3 +1630,129 @@ fn cli_reports_agent_signed_rows_not_verified_10105() {
         "{text}"
     );
 }
+
+/// #10106 — with a postgres store URL resolved from the environment, the
+/// sqlite chain walk refuses with the exact pointer to `verify-audit-trail`
+/// instead of reporting on the local sqlite file. The URL names a closed
+/// port, so nothing is ever connected to.
+#[test]
+fn chain_walk_refuses_a_postgres_store_10106() {
+    const CLOSED_PG_URL: &str = "postgres://nobody@127.0.0.1:1/none";
+    let root = home_sandbox::per_test_dir("cli-pgwalk-10106-");
+    let child_env = home_sandbox::child_env(root.path());
+    let db = root.path().join("store.db");
+    let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .envs(child_env.iter().map(|(k, v)| (*k, v.as_os_str())))
+        .env("AI_MEMORY_DB", &db)
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_STORE_URL", CLOSED_PG_URL)
+        .args(["verify-signed-events-chain", "--format", "json"])
+        .output()
+        .expect("run ai-memory");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    let want = ai_memory::cli::verify_signed_events::postgres_walk_refusal(
+        &ai_memory::url_display::store_url_display(CLOSED_PG_URL),
+    );
+    assert!(stderr.contains(&want), "want {want:?} in {stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).find('{').is_none(),
+        "no report is printed for the wrong table"
+    );
+}
+
+/// #10106 — a cutoff row whose `prev_hash` column is not the canonical hash
+/// of the last prefix row is no cutoff, even when the row is re-signed under
+/// the cutoff domain over the rewritten bytes (the `payload_hash` still binds
+/// the true last hash, so only the column check catches it).
+#[test]
+fn c6_resigned_cutoff_with_a_foreign_prev_hash_is_no_cutoff_10106() {
+    const FOREIGN_PREV_HASH: [u8; 32] = [0x5a; 32];
+    let vk = sink();
+    let (_d, _p, conn) = open_db();
+    let cutoff_row = legacy_prefix_and_mint(&conn);
+    conn.execute(
+        "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = ?2",
+        params![FOREIGN_PREV_HASH.to_vec(), cutoff_row],
+    )
+    .expect("rewrite prev_hash");
+    let cutoff = row_at(&conn, cutoff_row);
+    let resigned = legacy_key()
+        .sign(&pinned_preimage(
+            LEGACY_CUTOFF_TAG_BYTES,
+            &daemon_row_signing_input(&cutoff),
+        ))
+        .to_bytes()
+        .to_vec();
+    conn.execute(
+        "UPDATE signed_events SET signature = ?1 WHERE sequence = ?2",
+        params![resigned, cutoff_row],
+    )
+    .expect("re-sign the cutoff row");
+    let resolved = resolve_sqlite_legacy_cutoff(&conn, Some(&vk)).expect("resolve");
+    assert_eq!(resolved, LegacyCutoff::none());
+}
+
+/// #10106 — a minimal v2 envelope carrying `rows` as its signed events.
+fn envelope_of(rows: &[SignedEvent]) -> ai_memory::portability::emit::ExportEnvelope {
+    use ai_memory::portability::emit::{ExportEnvelope, SPEC_VERSION_V2};
+    ExportEnvelope {
+        spec_version: SPEC_VERSION_V2.to_string(),
+        db_schema_version: 0,
+        source: "issue-10106-test".into(),
+        exported_at: "2026-11-25T00:00:00Z".into(),
+        memories: Vec::new(),
+        links: Vec::new(),
+        signed_events: rows
+            .iter()
+            .map(ai_memory::portability::dto::SignedEventDto::from)
+            .collect(),
+        memory_revisions: Vec::new(),
+        forget_tombstones: Vec::new(),
+        agent_lineage: Vec::new(),
+        model_attestations: Vec::new(),
+        governance_rules: Vec::new(),
+        trust_anchors: Vec::new(),
+        archived_memories: Vec::new(),
+        namespace_meta: Vec::new(),
+        archived_memory_links: Vec::new(),
+        portability_complete: false,
+        conformance_level: "L1".into(),
+        conformance_by_class: std::collections::BTreeMap::new(),
+        count: 0,
+    }
+}
+
+/// #10106 — the import guard (`src/portability/import.rs`): a bundle that
+/// carries a DIFFERENT cutoff row into a database that already holds one is
+/// refused with the exact reason and writes no second cutoff; the same
+/// cutoff row (a restore of this database) is accepted.
+#[test]
+fn c6_import_refuses_a_second_legacy_cutoff_10106() {
+    use ai_memory::portability::import::{ImportOptions, import_full_envelope};
+    let opts = ImportOptions {
+        caller_agent_id: "ai:importer-10106".into(),
+        ..ImportOptions::default()
+    };
+    let (_da, _pa, dst) = open_db();
+    let dst_cutoff = legacy_prefix_and_mint(&dst);
+    let (_db, _pb, src) = open_db();
+    let src_cutoff = row_at(&src, legacy_prefix_and_mint(&src));
+    assert_ne!(row_at(&dst, dst_cutoff).id, src_cutoff.id, "control");
+
+    let err = import_full_envelope(&dst, &envelope_of(&[src_cutoff.clone()]), &opts)
+        .expect_err("a second cutoff is refused");
+    let want = format!(
+        "import signed_event {} (sequence {}): a different legacy cutoff row already \
+         exists; refusing a second cutoff",
+        src_cutoff.id, src_cutoff.sequence
+    );
+    assert!(format!("{err:#}").contains(&want), "{err:#}");
+    assert_eq!(cutoff_rows(&dst), 1, "no second cutoff row was written");
+
+    let own = row_at(&dst, dst_cutoff);
+    import_full_envelope(&dst, &envelope_of(&[own]), &opts).expect("the same cutoff restores");
+    assert_eq!(cutoff_rows(&dst), 1);
+}

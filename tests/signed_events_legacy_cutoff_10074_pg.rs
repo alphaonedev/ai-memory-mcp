@@ -1005,3 +1005,57 @@ async fn agent_signed_rows_agree_on_both_backends_10105() {
     );
     assert_eq!(trail.signature_check, expected_check, "pg");
 }
+
+/// #10106 — a legacy prefix longer than two pages of the postgres resolver
+/// (`PG_PREFIX_PAGE_ROWS` = 512 in `src/store/postgres/legacy_cutoff_10074.rs`).
+/// Written out here, not read from the code under test.
+const LONG_PREFIX_ROWS: i64 = 1100;
+
+/// `LONG_PREFIX_ROWS` payload-only (legacy) rows, linked from the zero hash.
+fn long_legacy_prefix() -> Vec<SignedEvent> {
+    let ts = micros_now().to_rfc3339();
+    relinked(
+        (1..=LONG_PREFIX_ROWS)
+            .map(|seq| make_row(P, seq, ts.clone()))
+            .collect(),
+    )
+}
+
+/// #10106 — the cutoff over a prefix longer than one page resolves on both
+/// backends: every legacy row verifies under it (none is a failure), and
+/// without the cutoff every row is a failure (control). A resolver that reads
+/// only the first page, skips or repeats a row at a page edge, sees a prefix
+/// hash that does not match the cutoff and resolves no cutoff.
+#[tokio::test(flavor = "multi_thread")]
+async fn c6_cutoff_over_a_multi_page_prefix_agrees_10106() {
+    let vk = sink();
+    let rows = long_legacy_prefix();
+    let all: Vec<i64> = (1..=LONG_PREFIX_ROWS).collect();
+
+    let (_d, _p, conn) = sqlite::open();
+    sqlite::replace_all(&conn, &rows);
+    let before = verify_audit_trail(&conn, None, Some(&vk)).expect("sqlite verify");
+    assert_eq!(before.signature_failures, all, "sqlite control");
+    let minted = ai_memory::signed_events::mint_legacy_cutoff(&conn).expect("mint runs");
+    assert_eq!(minted, Ok(LegacyCutoffMinted::Minted(LONG_PREFIX_ROWS + 1)));
+    let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("sqlite verify");
+    assert_eq!(trail.signature_failures, Vec::<i64>::new(), "sqlite");
+
+    let Some(url) = pg_url() else { return };
+    let (_scratch, store) = fresh_pg(&url).await;
+    // Its own rows (fresh ids), as every other test builds each backend's
+    // chain: the mint anchor is keyed by the chain's identity.
+    pg::replace_all(&store, &long_legacy_prefix()).await;
+    let before = store
+        .verify_audit_trail(None, Some(&vk))
+        .await
+        .expect("pg verify");
+    assert_eq!(before.signature_failures, all, "pg control");
+    let minted = store.mint_legacy_cutoff().await.expect("pg mint runs");
+    assert_eq!(minted, Ok(LegacyCutoffMinted::Minted(LONG_PREFIX_ROWS + 1)));
+    let trail = store
+        .verify_audit_trail(None, Some(&vk))
+        .await
+        .expect("pg verify");
+    assert_eq!(trail.signature_failures, Vec::<i64>::new(), "pg");
+}

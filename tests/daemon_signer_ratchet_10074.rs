@@ -242,19 +242,45 @@ fn char_literal_end(src: &str, i: usize) -> Option<usize> {
 /// unterminated literal keeps the rest of the file (fail closed: more text is
 /// matched, never less).
 fn strip_comments(src: &str) -> String {
+    strip_comments_with(src, Lexer::FULL)
+}
+
+/// Which literal forms the comment stripper knows. Only [`Lexer::FULL`] is
+/// used by the ratchet; each other value is one deliberately broken copy for
+/// the stripper's mutation proof.
+#[derive(Clone, Copy, Debug)]
+#[allow(clippy::struct_excessive_bools)] // one switch per lexer feature, for the mutants
+struct Lexer {
+    raw_strings: bool,
+    strings: bool,
+    chars: bool,
+    nested_blocks: bool,
+}
+
+impl Lexer {
+    const FULL: Self = Self {
+        raw_strings: true,
+        strings: true,
+        chars: true,
+        nested_blocks: true,
+    };
+}
+
+fn strip_comments_with(src: &str, lx: Lexer) -> String {
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
-        if (c == b'r' || c == b'b')
+        if lx.raw_strings
+            && (c == b'r' || c == b'b')
             && let Some(end) = raw_string_end(b, i)
         {
             out.push_str(&src[i..end]);
             i = end;
             continue;
         }
-        if c == b'"' {
+        if lx.strings && c == b'"' {
             let mut j = i + 1;
             while j < b.len() && b[j] != b'"' {
                 j += if b[j] == b'\\' { 2 } else { 1 };
@@ -264,7 +290,8 @@ fn strip_comments(src: &str) -> String {
             i = end;
             continue;
         }
-        if c == b'\''
+        if lx.chars
+            && c == b'\''
             && let Some(end) = char_literal_end(src, i)
         {
             out.push_str(&src[i..end]);
@@ -280,7 +307,7 @@ fn strip_comments(src: &str) -> String {
         if c == b'/' && b.get(i + 1) == Some(&b'*') {
             let mut depth = 0usize;
             while i < b.len() {
-                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') && (lx.nested_blocks || depth == 0) {
                     depth += 1;
                     i += 2;
                 } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
@@ -557,50 +584,105 @@ fn typed_signer_signs_once_over_the_domain_preimage_10074() {
 /// opener, so no literal form can hide code as a "comment" (fail open).
 #[test]
 fn comment_stripper_never_hides_code_behind_a_literal_10074() {
-    let cases: &[(&str, &str)] = &[
-        (
-            "char literal quote",
-            "let q = '\"'; let k = &DAEMON_AUDIT_KEY; // \"\n",
-        ),
-        (
-            "escaped char quote",
-            "let q = '\\''; let s = \"//\"; DAEMON_AUDIT_KEY\n",
-        ),
-        (
-            "raw string with quote",
-            "let s = r#\"a\"b//\"#; DAEMON_AUDIT_KEY\n",
-        ),
-        (
-            "byte raw string",
-            "let s = br##\"\"#/*\"##; DAEMON_AUDIT_KEY\n",
-        ),
-        (
-            "comment opener in string",
-            "let s = \"/*\"; DAEMON_AUDIT_KEY; let e = \"*/\";\n",
-        ),
-        (
-            "lifetime then quote",
-            "fn f<'a>(x: &'a str) -> char { '\"' } DAEMON_AUDIT_KEY\n",
-        ),
-        ("unicode escape", "let c = '\\u{1F600}'; DAEMON_AUDIT_KEY\n"),
-        (
-            "non-ascii char",
-            "let c = 'é'; let d = \"//\"; DAEMON_AUDIT_KEY\n",
-        ),
-    ];
-    for (label, src) in cases {
+    for (label, src) in STRIPPER_CORPUS {
         assert!(
             has_word(&strip_comments(src), KEY_STATIC),
             "`{label}`: code after the literal was stripped: {:?}",
             strip_comments(src)
         );
     }
-    let commented = "// DAEMON_AUDIT_KEY\n/* outer /* DAEMON_AUDIT_KEY */ still */ x\n";
     assert!(
-        !has_word(&strip_comments(commented), KEY_STATIC),
+        !has_word(&strip_comments(STRIPPER_COMMENTED), KEY_STATIC),
         "line and nested block comments are stripped"
     );
 }
+
+/// The stripper corpus tells a correct lexer from a broken one: with each
+/// literal form (or the nested-comment depth) switched off, at least one case
+/// of [`STRIPPER_CORPUS`] or [`STRIPPER_COMMENTED`] gives the wrong answer.
+/// This is the red-on-a-broken-copy proof of the helper the ratchet rests on
+/// (the helper is new in this PR, so no base copy exists to be red on).
+#[test]
+fn comment_stripper_corpus_is_red_on_every_broken_lexer_10074() {
+    let full = Lexer::FULL;
+    let mutants: [(&str, Lexer); 4] = [
+        (
+            "no raw strings",
+            Lexer {
+                raw_strings: false,
+                ..full
+            },
+        ),
+        (
+            "no strings",
+            Lexer {
+                strings: false,
+                ..full
+            },
+        ),
+        (
+            "no char literals",
+            Lexer {
+                chars: false,
+                ..full
+            },
+        ),
+        (
+            "flat block comments",
+            Lexer {
+                nested_blocks: false,
+                ..full
+            },
+        ),
+    ];
+    for (name, lx) in mutants {
+        let code_lost = STRIPPER_CORPUS
+            .iter()
+            .any(|(_, src)| !has_word(&strip_comments_with(src, lx), KEY_STATIC));
+        let comment_kept = has_word(&strip_comments_with(STRIPPER_COMMENTED, lx), KEY_STATIC);
+        assert!(
+            code_lost || comment_kept,
+            "mutant `{name}` passes the whole stripper corpus"
+        );
+    }
+}
+
+/// Comments only: the stripper must leave no `DAEMON_AUDIT_KEY` word.
+const STRIPPER_COMMENTED: &str = "// DAEMON_AUDIT_KEY\n/* outer /* DAEMON_AUDIT_KEY */ still DAEMON_AUDIT_KEY */ x\n\
+     let q = '\"'; // DAEMON_AUDIT_KEY \"\n";
+
+/// Code after a literal: the stripper must keep the `DAEMON_AUDIT_KEY` word.
+const STRIPPER_CORPUS: &[(&str, &str)] = &[
+    (
+        "char literal quote",
+        "let q = '\"'; let k = &DAEMON_AUDIT_KEY; // \"\n",
+    ),
+    (
+        "escaped char quote",
+        "let q = '\\''; let s = \"//\"; DAEMON_AUDIT_KEY\n",
+    ),
+    (
+        "raw string with quote",
+        "let s = r#\"a\"b//\"#; DAEMON_AUDIT_KEY\n",
+    ),
+    (
+        "byte raw string",
+        "let s = br##\"\"#/*\"##; DAEMON_AUDIT_KEY\n",
+    ),
+    (
+        "comment opener in string",
+        "let s = \"/*\"; DAEMON_AUDIT_KEY; let e = \"*/\";\n",
+    ),
+    (
+        "lifetime then quote",
+        "fn f<'a>(x: &'a str) -> char { '\"' } DAEMON_AUDIT_KEY\n",
+    ),
+    ("unicode escape", "let c = '\\u{1F600}'; DAEMON_AUDIT_KEY\n"),
+    (
+        "non-ascii char",
+        "let c = 'é'; let d = \"//\"; DAEMON_AUDIT_KEY\n",
+    ),
+];
 
 /// Mutation proof of the scanner: each form the construct can take, placed in
 /// a synthetic file, is a violation. Run against the real tree's scan with
