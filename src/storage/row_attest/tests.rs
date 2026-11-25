@@ -577,6 +577,67 @@ fn row_drift_fails_only_its_row_store_defects_fail_all_10094() {
     assert!(!r.memory_verified("m2"), "a store defect fails every row");
 }
 
+/// #10094: a table-head mismatch is row-local only when the signed head
+/// equals the attested state of the live rows. A row drift alongside a
+/// signed head that matches neither the live rows nor their attested state
+/// leaves the head mismatch unexplained, so it stays store-wide and fails
+/// every row, the untouched one included.
+#[test]
+fn unexplained_head_mismatch_beside_a_row_drift_fails_every_row_10094() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m2", "two");
+    let s = spec("memories");
+    let key_m2 = encode_key(s, &[t("m2")]);
+    let m2_digest = f
+        .live
+        .iter()
+        .find(|r| r.key == key_m2)
+        .map_or(ZERO_DIGEST, |r| r.digest);
+    // A signed head for m2 (its row digest is right) whose accumulator also
+    // counts a row that never existed: matches neither acc nor attested_acc.
+    let ghost = acc_term("memories", b"ghost-10094", &[7_u8; 32]);
+    let bogus = acc_add(&f.head_acc("memories"), &ghost);
+    let seq = f.next_seq("memories", &key_m2);
+    let table_seq = f.head_seq("memories") + 1;
+    let head = f.att(
+        "memories",
+        key_m2,
+        seq,
+        Op::Update,
+        Some(m2_digest),
+        table_seq,
+        bogus,
+    );
+    f.atts.push(head);
+    // Row drift on m1.
+    let key_m1 = encode_key(s, &[t("m1")]);
+    let i = f
+        .live
+        .iter()
+        .position(|r| r.key == key_m1)
+        .unwrap_or(usize::MAX);
+    f.live[i].digest = row_digest(
+        s,
+        &[t("m1"), t(r#"["evil"]"#), Cell::Int(5), t("long"), t("one")],
+    );
+    let r = f.report();
+    let head_defect = format!(
+        "memories: live rows do not match the signed table head (table_seq {table_seq})"
+    );
+    assert_eq!(
+        r.store_defects,
+        vec![head_defect],
+        "only the unexplained head mismatch is store-wide: {:?}",
+        r.defects
+    );
+    assert!(!r.memory_verified("m1"), "the drifted row fails");
+    assert!(
+        !r.memory_verified("m2"),
+        "an unexplained head mismatch fails the untouched row too"
+    );
+}
+
 #[test]
 fn verify_detects_row_and_attestations_deleted_together_c5() {
     let mut f = Fixture::new();
