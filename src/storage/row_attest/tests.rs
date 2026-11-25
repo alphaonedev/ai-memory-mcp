@@ -540,6 +540,43 @@ fn verify_detects_mutated_base_row_c5_e1() {
     assert!(r.unverified_memories.contains("m1"));
 }
 
+/// #10094: a row drift fails only the row it names; an unexplained or
+/// store-wide defect, or no anchor, fails every row.
+#[test]
+fn row_drift_fails_only_its_row_store_defects_fail_all_10094() {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m2", "two");
+    let s = spec("memories");
+    let key = encode_key(s, &[t("m1")]);
+    let i = f
+        .live
+        .iter()
+        .position(|r| r.key == key)
+        .unwrap_or(usize::MAX);
+    f.live[i].digest = row_digest(
+        s,
+        &[t("m1"), t(r#"["evil"]"#), Cell::Int(5), t("long"), t("one")],
+    );
+    let r = f.report();
+    assert_defect(&r, "memories: live rows do not match the signed table head");
+    assert!(r.store_defects.is_empty(), "{:?}", r.store_defects);
+    assert!(!r.memory_verified("m1"), "the drifted row fails");
+    assert!(r.memory_verified("m2"), "the untouched row verifies");
+    // No anchor: no row verifies.
+    let why = anchor::Unanchored::Missing {
+        path: "/nonexistent-10094".into(),
+    };
+    let r = f.report_with(&anchor::AnchorLoad::Unanchored(why));
+    assert!(!r.memory_verified("m2"), "no signature was checked");
+    // A store-wide defect (an unsigned attestation) fails every row.
+    let last = f.atts.len() - 1;
+    f.atts[last].signature = None;
+    let r = f.report();
+    assert!(!r.store_defects.is_empty(), "{:?}", r.defects);
+    assert!(!r.memory_verified("m2"), "a store defect fails every row");
+}
+
 #[test]
 fn verify_detects_row_and_attestations_deleted_together_c5() {
     let mut f = Fixture::new();

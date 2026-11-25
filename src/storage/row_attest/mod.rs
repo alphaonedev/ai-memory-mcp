@@ -1049,6 +1049,11 @@ pub struct Report {
     pub defects: Vec<String>,
     /// Memory ids whose attestation does not verify (E-3).
     pub unverified_memories: std::collections::BTreeSet<String>,
+    /// #10094: the defects that cannot be pinned on one live row (a
+    /// signature, the store identity, a chain, the tail, the seal, a table
+    /// head the row drifts do not explain). Empty while every defect is a
+    /// row drift, so one unattested write fails only the rows it wrote.
+    pub store_defects: Vec<String>,
 }
 
 impl Report {
@@ -1071,6 +1076,17 @@ impl Report {
     #[must_use]
     pub fn ok(&self) -> bool {
         self.outcome() == Outcome::Clean
+    }
+
+    /// #10094: the per-row verdict. A memory row verifies when the
+    /// signatures were checked against an anchor, no defect is store-wide
+    /// and no row-local defect names it. A row drift written outside an
+    /// armed connection fails only the rows it wrote; any other defect
+    /// still fails every row (fail closed).
+    pub fn memory_verified(&self, id: &str) -> bool {
+        matches!(self.anchor, AnchorStatus::Anchored { .. })
+            && self.store_defects.is_empty()
+            && !self.unverified_memories.contains(id)
     }
 }
 
@@ -1179,6 +1195,8 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         .collect();
     let mut tables: BTreeMap<String, TableVerdict> = BTreeMap::new();
     let mut unverified = std::collections::BTreeSet::new();
+    // #10094: indexes into `defects` of the defects pinned on one live row.
+    let mut row_local: Vec<usize> = Vec::new();
     let d = &mut defects;
     let stores: Vec<&Attestation> = input
         .attestations
@@ -1192,6 +1210,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
             return Report {
                 anchor: AnchorStatus::of(input.anchor),
                 tables,
+                store_defects: defects.clone(),
                 defects,
                 unverified_memories: unverified,
             };
@@ -1201,6 +1220,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
             return Report {
                 anchor: AnchorStatus::of(input.anchor),
                 tables,
+                store_defects: defects.clone(),
                 defects,
                 unverified_memories: unverified,
             };
@@ -1332,10 +1352,24 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         let live_keys: std::collections::BTreeSet<&[u8]> =
             live.iter().map(|r| r.key.as_slice()).collect();
         let mut acc = ZERO_DIGEST;
+        // #10094: the accumulator of the attested state of the live rows; a
+        // head that matches it is explained by the row drifts found here.
+        let mut attested_acc = ZERO_DIGEST;
+        let mut drifted = false;
         for row in &live {
             acc = acc_add(&acc, &acc_term(spec.table, &row.key, &row.digest));
-            match by_key.get(row.key.as_slice()).and_then(|c| c.last()) {
+            let latest = by_key.get(row.key.as_slice()).and_then(|c| c.last());
+            if let Some(attested) = latest
+                .filter(|l| l.op != Op::Delete.as_str())
+                .and_then(|l| l.row_digest.as_deref())
+                .and_then(|r| <[u8; 32]>::try_from(r).ok())
+            {
+                attested_acc = acc_add(&attested_acc, &acc_term(spec.table, &row.key, &attested));
+            }
+            match latest {
                 Some(latest) if latest.op == Op::Delete.as_str() => {
+                    drifted = true;
+                    row_local.push(d.len());
                     d.push(format!(
                         "{}: live row has a delete as latest attestation",
                         spec.table
@@ -1346,6 +1380,8 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
                     verdict.verified += 1;
                 }
                 Some(latest) => {
+                    drifted = true;
+                    row_local.push(d.len());
                     d.push(format!(
                         "{}: live row differs from its latest attestation {}",
                         spec.table, latest.id
@@ -1355,6 +1391,8 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
                 // #10095: every attested table, side tables included. The
                 // arm baselines each pre-existing row, so none is legacy.
                 None => {
+                    drifted = true;
+                    row_local.push(d.len());
                     d.push(format!("{}: live row has no attestation", spec.table));
                     mark_memory(&mut unverified, spec, row, input);
                 }
@@ -1371,6 +1409,9 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         }
         if let Some(head) = atts.last() {
             if head.table_acc != acc.to_vec() {
+                if drifted && head.table_acc == attested_acc.to_vec() {
+                    row_local.push(d.len());
+                }
                 d.push(format!(
                     "{}: live rows do not match the signed table head (table_seq {})",
                     spec.table, head.table_seq
@@ -1378,11 +1419,18 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
             }
         }
     }
+    let store_defects = defects
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !row_local.contains(i))
+        .map(|(_, x)| x.clone())
+        .collect();
     Report {
         anchor: AnchorStatus::of(input.anchor),
         tables,
         defects,
         unverified_memories: unverified,
+        store_defects,
     }
 }
 

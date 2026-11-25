@@ -109,6 +109,7 @@ fn report_json(report: &Report, outcome: &Outcome) -> Value {
         "defects": report.defects.len(),
         "first_defect": report.defects.first(),
         "unverified_memories": report.unverified_memories.len(),
+        "store_defects": report.store_defects.len(),
         "tables": tables,
     })
 }
