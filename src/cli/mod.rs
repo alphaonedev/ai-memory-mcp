@@ -18,6 +18,7 @@
 pub mod agents;
 pub mod archive;
 pub mod audit;
+pub mod audit_verify_rows;
 pub mod backup;
 pub mod boot;
 /// v0.9.0 G10.1 (#1827) — macaroon capability-token lifecycle

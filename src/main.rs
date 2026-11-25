@@ -630,6 +630,23 @@ fn is_key_provisioning_verb(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
+/// #10040 A-3 — `audit verify-rows` takes the deployment's key directory as
+/// its trust anchor. The boot ensure would mint a key into that directory
+/// before the verifier reads it, so a missing or empty anchor would come
+/// back "anchored" to a key the verify run made itself. The verb loads only
+/// and, writing no ledger row, is no ledger writer: it observes the key
+/// directory as the operator left it.
+fn is_anchor_reading_verb(cmd: &daemon_runtime::Command) -> bool {
+    use ai_memory::cli::audit::{AuditAction, AuditArgs};
+    matches!(
+        cmd,
+        daemon_runtime::Command::Audit(AuditArgs {
+            action: AuditAction::VerifyRows(_),
+            ..
+        })
+    )
+}
+
 /// How the boot sets up the resolved id's signing key
 /// ([`init_forensic_audit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -657,7 +674,7 @@ fn boot_key_setup(cmd: &daemon_runtime::Command) -> BootKeySetup {
     {
         return BootKeySetup::Skip;
     }
-    if is_key_provisioning_verb(cmd) {
+    if is_key_provisioning_verb(cmd) || is_anchor_reading_verb(cmd) {
         BootKeySetup::LoadOnly
     } else {
         BootKeySetup::Ensure
@@ -698,6 +715,7 @@ fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
     }
     !(is_egress_verb(cmd)
         || is_remediation_verb(cmd)
+        || is_anchor_reading_verb(cmd)
         || matches!(
             cmd,
             // Read-only and diagnostic verbs: no write funnel.
@@ -1116,7 +1134,7 @@ mod tests {
     #[test]
     fn boot_key_setup_skips_only_non_writer_wake_hub_modes_9562() {
         let parse = |argv: &[&str]| Cli::try_parse_from(argv).expect("argv parses").command;
-        let table: [(&[&str], BootKeySetup); 11] = [
+        let table: [(&[&str], BootKeySetup); 13] = [
             (&["ai-memory", "wake-hub", "--posture"], BootKeySetup::Skip),
             (
                 &["ai-memory", "wake-hub", "--posture", "--json"],
@@ -1143,10 +1161,19 @@ mod tests {
                 &["ai-memory", "identity", "generate", "--agent-id", "ai:x"],
                 BootKeySetup::LoadOnly,
             ),
+            // #10040 A-3: the row verifier reads the key dir as its anchor.
+            (
+                &["ai-memory", "audit", "verify-rows"],
+                BootKeySetup::LoadOnly,
+            ),
+            (&["ai-memory", "audit", "verify"], BootKeySetup::Ensure),
         ];
         for (argv, want) in table {
             let cmd = parse(argv);
             assert_eq!(boot_key_setup(&cmd), want, "{argv:?}");
+            if argv.ends_with(&["verify-rows"]) {
+                assert!(!ledger_writer(&cmd), "{argv:?} writes no ledger row");
+            }
             if want == BootKeySetup::Skip {
                 assert!(!ledger_writer(&cmd), "{argv:?} skips only as a non-writer");
             }

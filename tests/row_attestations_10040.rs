@@ -2567,6 +2567,15 @@ fn audit_verify_rows_reports_unanchored_distinct_from_clean_10086() {
         assert_eq!(report["signatures_checked"], false, "{reason}: {report}");
     }
     set_mode(&unreadable, 0o700);
+    // The verify run never mints its own anchor (the boot key ensure).
+    assert!(!missing.exists(), "verify-rows created the missing key dir");
+    assert_eq!(
+        std::fs::read_dir(&empty)
+            .expect("read empty key dir")
+            .count(),
+        0,
+        "verify-rows wrote into the empty key dir"
+    );
 
     sb.raw(
         "UPDATE memories SET priority = priority + 1 WHERE id = ?1",
@@ -2580,5 +2589,31 @@ fn audit_verify_rows_reports_unanchored_distinct_from_clean_10086() {
             .as_str()
             .is_some_and(|d| !d.is_empty()),
         "a defect names itself: {report}"
+    );
+
+    // A postgres-resolved node is never certified from the local sqlite file.
+    let out = sb
+        .base_command(AGENT, "0")
+        .env("AI_MEMORY_KEY_DIR", &keys)
+        .env("AI_MEMORY_STORE_URL", "postgres://u@127.0.0.1:1/none")
+        .args([
+            "--db",
+            sb.db().to_str().expect("utf-8 db path"),
+            "audit",
+            "verify-rows",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run audit verify-rows on a pg node");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_ne!(
+        out.status.code(),
+        Some(VERIFY_ROWS_EXIT_CLEAN),
+        "pg: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"outcome\":\"clean\""),
+        "pg node reported clean: {stdout}"
     );
 }

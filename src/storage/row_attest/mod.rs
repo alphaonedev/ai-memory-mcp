@@ -1017,7 +1017,26 @@ impl Outcome {
             Self::Defective { .. } => "defective",
         }
     }
+
+    /// Process exit code of `ai-memory audit verify-rows` (A-3): only
+    /// [`Outcome::Clean`] is 0, and an unanchored run has its own code so
+    /// automation never reads "could not check" as "checked".
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::Clean => VERIFY_EXIT_CLEAN,
+            Self::Defective { .. } => VERIFY_EXIT_DEFECTIVE,
+            Self::Unanchored(_) => VERIFY_EXIT_UNANCHORED,
+        }
+    }
 }
+
+/// Exit code of a clean verify (A-3).
+pub const VERIFY_EXIT_CLEAN: i32 = 0;
+/// Exit code of a verify that found a defect (A-3); 2 as `audit verify`.
+pub const VERIFY_EXIT_DEFECTIVE: i32 = 2;
+/// Exit code of a verify with no trust anchor (A-3); never 0.
+pub const VERIFY_EXIT_UNANCHORED: i32 = 3;
 
 /// The completeness verifier's report (C-5, E-3).
 #[derive(Debug, Clone, PartialEq, Eq)]
