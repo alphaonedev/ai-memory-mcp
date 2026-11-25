@@ -24,3 +24,7 @@ CREATE TABLE IF NOT EXISTS row_attestations (
 );
 CREATE INDEX IF NOT EXISTS idx_row_attestations_table_seq
     ON row_attestations (table_name, table_seq);
+-- PR 10083 L-3: the Supersede tombstone prune and the cutover probes filter
+-- on `op` (and `op` plus `table_name`); `op` leads so both are searches.
+CREATE INDEX IF NOT EXISTS idx_row_attestations_op_table
+    ON row_attestations (op, table_name);
