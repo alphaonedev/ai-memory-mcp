@@ -20,7 +20,8 @@ use std::sync::OnceLock;
 use ai_memory::db;
 use ai_memory::models::{Memory, MemoryKind, Tier};
 use ai_memory::signed_events::agent_cutover::{
-    AGENT_CUTOVER_AGENT_ID, agent_cutover_payload_hash, build_marker, resolve_sqlite_agent_cutover,
+    AGENT_CUTOVER_AGENT_ID, MarkerOrigin, build_marker, resolve_sqlite_agent_cutover,
+    signed_marker_payload_hash,
 };
 use ai_memory::signed_events::{
     AGENT_CUTOVER_EVENT_TYPE, AgentCutover, RowSignatureVerdict, SignatureFailure, SignedEvent,
@@ -42,6 +43,8 @@ const FIXTURE_EVENT_TYPE: &str = "governance.test";
 const V102_RUNG: i64 = 102;
 /// The ladder tip this step moves to.
 const V103_TIP: i64 = 103;
+/// An Ed25519 signature's length in bytes.
+const SIGNATURE_LEN: usize = 64;
 /// Rows the fixture chains hold before v103 runs.
 const PREFIX_ROWS: i64 = 3;
 /// The exact pair-rule refusal of the v103 triggers.
@@ -178,16 +181,25 @@ fn migrated_over_prefix(
     path: &std::path::Path,
     conn: rusqlite::Connection,
 ) -> rusqlite::Connection {
+    drop_genesis_marker(&conn);
     for _ in 0..PREFIX_ROWS {
         append_genuine(&conn);
     }
-    assert!(
-        markers(&conn).is_empty(),
-        "no marker on a chain built after v103"
-    );
     rewind_to_v102(&conn);
     drop(conn);
     db::open(path).expect("re-open runs v103")
+}
+
+/// #10145 — a v102-shaped chain: remove the genesis marker a fresh open
+/// wrote (asserting there was exactly one), so a bump has a chain with no
+/// marker to write above.
+fn drop_genesis_marker(conn: &rusqlite::Connection) {
+    assert_eq!(markers(conn).len(), 1, "a fresh open writes one genesis marker");
+    conn.execute(
+        "DELETE FROM signed_events WHERE event_type = ?1",
+        params![AGENT_CUTOVER_EVENT_TYPE],
+    )
+    .expect("drop genesis marker");
 }
 
 fn walk_failures(conn: &rusqlite::Connection) -> (Vec<i64>, Vec<i64>) {
@@ -225,10 +237,15 @@ fn v103_appends_one_verified_marker_with_the_stamp_10108() {
         "the marker sits at the head"
     );
     assert_eq!(marker.agent_id, AGENT_CUTOVER_AGENT_ID);
-    assert_eq!(marker.attest_level, "unsigned");
-    assert_eq!(marker.signature, None);
+    assert_eq!(marker.attest_level, "daemon_signed");
+    assert_eq!(marker.signature.as_ref().map(Vec::len), Some(SIGNATURE_LEN));
     assert_eq!(
-        resolve_sqlite_agent_cutover(&conn).expect("resolve"),
+        marker.payload_hash.first(),
+        Some(&MarkerOrigin::Migrate.byte()),
+        "a bump is origin Migrate"
+    );
+    assert_eq!(
+        resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
         AgentCutover::Valid {
             sequence: PREFIX_ROWS + 1,
             legacy_agent_rows: 0
@@ -251,6 +268,7 @@ fn v103_appends_one_verified_marker_with_the_stamp_10108() {
 #[test]
 fn v103_marker_binds_the_legacy_agent_row_count_10108() {
     let (_dir, path, conn) = open_db();
+    drop_genesis_marker(&conn);
     append_genuine(&conn);
     insert_agent_labelled(&conn);
     rewind_to_v102(&conn);
@@ -265,15 +283,15 @@ fn v103_marker_binds_the_legacy_agent_row_count_10108() {
     assert_eq!(marker.prev_hash, prev);
     assert_eq!(
         Some(marker.payload_hash.clone()),
-        agent_cutover_payload_hash(marker.sequence, &prev, 1)
+        signed_marker_payload_hash(marker.sequence, &prev, 1, MarkerOrigin::Migrate)
     );
     assert_ne!(
         Some(marker.payload_hash),
-        agent_cutover_payload_hash(3, &prev, 0),
+        signed_marker_payload_hash(3, &prev, 0, MarkerOrigin::Migrate),
         "control: another count gives another hash"
     );
     assert_eq!(
-        resolve_sqlite_agent_cutover(&conn).expect("resolve"),
+        resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
         AgentCutover::Valid {
             sequence: 3,
             legacy_agent_rows: 1
@@ -281,16 +299,46 @@ fn v103_marker_binds_the_legacy_agent_row_count_10108() {
     );
 }
 
-/// An empty chain gets no marker; v103 is stamped.
+/// #10145 W-9 — a fresh create writes the signed genesis marker at sequence
+/// 1 above `ZERO_HASH`, origin Create, in the same transaction as the stamp;
+/// it verifies under the daemon key on both walks, and a re-open writes no
+/// second marker.
 #[test]
-fn v103_on_an_empty_chain_writes_no_marker_10108() {
-    let (_dir, _path, conn) = open_db();
+fn a_fresh_create_writes_one_signed_genesis_marker_10145() {
+    let (_dir, path, conn) = open_db();
     assert_eq!(version(&conn), V103_TIP);
-    assert_eq!(markers(&conn).len(), 0, "no marker on an empty chain");
+    let found = markers(&conn);
+    assert_eq!(found.len(), 1, "exactly one genesis marker");
+    let genesis = &found[0];
+    assert_eq!(genesis.sequence, 1);
+    assert_eq!(genesis.prev_hash, ZERO_HASH.to_vec());
+    assert_eq!(genesis.attest_level, "daemon_signed");
     assert_eq!(
-        resolve_sqlite_agent_cutover(&conn).expect("resolve"),
-        AgentCutover::Absent
+        Some(genesis.payload_hash.clone()),
+        signed_marker_payload_hash(1, &ZERO_HASH, 0, MarkerOrigin::Create)
     );
+    assert_eq!(
+        resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
+        AgentCutover::Valid {
+            sequence: 1,
+            legacy_agent_rows: 0
+        }
+    );
+    assert_eq!(
+        resolve_sqlite_agent_cutover(&conn, None).expect("resolve"),
+        AgentCutover::Invalid,
+        "no verifier never reads Valid"
+    );
+    let other = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+    assert_eq!(
+        resolve_sqlite_agent_cutover(&conn, Some(&other)).expect("resolve"),
+        AgentCutover::Invalid,
+        "another key never reads Valid"
+    );
+    assert_eq!(walk_failures(&conn), (Vec::new(), Vec::new()));
+    drop(conn);
+    let conn = db::open(&path).expect("re-open");
+    assert_eq!(markers(&conn).len(), 1, "a re-open writes no second marker");
 }
 
 /// S-3 — a marker write that fails rolls the whole step back: the database is
@@ -299,6 +347,7 @@ fn v103_on_an_empty_chain_writes_no_marker_10108() {
 #[test]
 fn v103_marker_and_stamp_commit_together_10108() {
     let (_dir, path, conn) = open_db();
+    drop_genesis_marker(&conn);
     for _ in 0..PREFIX_ROWS {
         append_genuine(&conn);
     }
@@ -348,7 +397,7 @@ fn append_refuses_the_marker_event_type_10108() {
              schema step v103"
         )
     );
-    assert!(markers(&conn).is_empty(), "nothing written");
+    assert_eq!(markers(&conn).len(), 1, "nothing written beside the genesis marker");
 }
 
 /// B-5 / S-3 — a tampered marker fails on both walks with the exact reason.
@@ -363,7 +412,7 @@ fn a_tampered_marker_fails_both_walks_10108() {
     )
     .expect("tamper");
     assert_eq!(
-        resolve_sqlite_agent_cutover(&conn).expect("resolve"),
+        resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
         AgentCutover::Invalid
     );
     let tampered = markers(&conn).pop().expect("marker");
@@ -414,7 +463,7 @@ fn a_second_marker_fails_both_markers_10108() {
     )
     .expect("insert second marker");
     assert_eq!(
-        resolve_sqlite_agent_cutover(&conn).expect("resolve"),
+        resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
         AgentCutover::Invalid
     );
     let both = vec![first.sequence, second.sequence];
