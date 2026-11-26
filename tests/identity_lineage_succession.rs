@@ -993,6 +993,238 @@ fn truncation_after_revocation_is_detected() {
 }
 
 #[test]
+fn append_revocation_refusals_match_shared_preconditions_10118() {
+    // #10118 (PR #10130 r1 sec F2) — `append_revocation` MUST route through
+    // `succession_preconditions` and consume the shared `SuccessionChecked`
+    // proof so all three precondition refusals use the exact canonical
+    // suffixes and order, leaving lineage rows and head untouched.
+    let (_dir, conn) = fresh_db();
+    let successor_b64 = kp("rev-succ-10118").public_base64();
+
+    // 1. No lineage enrolled.
+    let agent_noln = "rev-noln-10118";
+    db::register_agent(&conn, agent_noln, "ai:test", &[]).expect("register noln");
+    let k_noln = kp(agent_noln);
+    let err_noln =
+        db::append_revocation(&conn, agent_noln, &k_noln, &successor_b64, 10, None).unwrap_err();
+    let msg_noln = format!("{err_noln:#}");
+    assert!(
+        msg_noln.contains(&format!(
+            "no lineage enrolled for '{agent_noln}' — {}",
+            db::SUCCESSION_ERR_NO_LINEAGE
+        )),
+        "expected shared no-lineage refusal, got: {msg_noln}"
+    );
+    assert_eq!(db::read_lineage(&conn, agent_noln).unwrap().len(), 0);
+
+    // 2. Public-only keypair.
+    let agent_pub = "rev-pub-10118";
+    let mut k_pub = register_and_enroll(&conn, agent_pub);
+    let head_before_pub = db::lineage_head(&conn, agent_pub)
+        .unwrap()
+        .map(|(r, _)| (r.epoch, r.successor_pubkey_b64));
+    k_pub.private = None;
+    let err_pub =
+        db::append_revocation(&conn, agent_pub, &k_pub, &successor_b64, 10, None).unwrap_err();
+    let msg_pub = format!("{err_pub:#}");
+    assert!(
+        msg_pub.contains(&format!(
+            "keypair for '{agent_pub}' {}",
+            db::SUCCESSION_ERR_PUBLIC_ONLY
+        )),
+        "expected shared public-only refusal, got: {msg_pub}"
+    );
+    assert_eq!(db::read_lineage(&conn, agent_pub).unwrap().len(), 1);
+    assert_eq!(
+        db::lineage_head(&conn, agent_pub)
+            .unwrap()
+            .map(|(r, _)| (r.epoch, r.successor_pubkey_b64)),
+        head_before_pub
+    );
+
+    // 3. Keypair is not the current lineage head.
+    let agent_nh = "rev-nothead-10118";
+    let _k_head = register_and_enroll(&conn, agent_nh);
+    let head_before_nh = db::lineage_head(&conn, agent_nh)
+        .unwrap()
+        .map(|(r, _)| (r.epoch, r.successor_pubkey_b64));
+    let k_other = kp(agent_nh);
+    let err_nh =
+        db::append_revocation(&conn, agent_nh, &k_other, &successor_b64, 10, None).unwrap_err();
+    let msg_nh = format!("{err_nh:#}");
+    assert!(
+        msg_nh.contains(&format!(
+            "signing keypair is not the current lineage head for '{agent_nh}' — {}",
+            db::SUCCESSION_ERR_NOT_HEAD
+        )),
+        "expected shared not-head refusal, got: {msg_nh}"
+    );
+    assert_eq!(db::read_lineage(&conn, agent_nh).unwrap().len(), 1);
+    assert_eq!(
+        db::lineage_head(&conn, agent_nh)
+            .unwrap()
+            .map(|(r, _)| (r.epoch, r.successor_pubkey_b64)),
+        head_before_nh
+    );
+}
+
+#[test]
+fn succession_checked_is_single_use_by_value_and_non_copy_10148() {
+    // #10148 (PR #10130 r3 N2) — pin every property that makes reusing a
+    // `SuccessionChecked` proof fail specifically with the move error (E0382).
+    const DOC_PREFIX: &str = concat!("/", "/", "/");
+
+    struct Probe<T>(std::marker::PhantomData<T>);
+    impl<T> Probe<T> {
+        const fn new() -> Self {
+            Self(std::marker::PhantomData)
+        }
+    }
+    trait IsCopy: Sized {
+        fn has_copy(self) -> bool {
+            true
+        }
+    }
+    impl<T: Copy> IsCopy for &Probe<T> {}
+    trait NotCopy: Sized {
+        fn has_copy(self) -> bool {
+            false
+        }
+    }
+    impl<T> NotCopy for &&Probe<T> {}
+
+    trait IsClone: Sized {
+        fn has_clone(self) -> bool {
+            true
+        }
+    }
+    impl<T: Clone> IsClone for &Probe<T> {}
+    trait NotClone: Sized {
+        fn has_clone(self) -> bool {
+            false
+        }
+    }
+    impl<T> NotClone for &&Probe<T> {}
+
+    trait IsDefault: Sized {
+        fn has_default(self) -> bool {
+            true
+        }
+    }
+    impl<T: Default> IsDefault for &Probe<T> {}
+    trait NotDefault: Sized {
+        fn has_default(self) -> bool {
+            false
+        }
+    }
+    impl<T> NotDefault for &&Probe<T> {}
+
+    // 1. Both checked appends take `SuccessionChecked<'_>` BY VALUE.
+    let _: fn(
+        &Connection,
+        db::SuccessionChecked<'_>,
+        &str,
+        Option<&str>,
+    ) -> anyhow::Result<LineageRecord> = db::append_succession_checked;
+    let _: fn(
+        &Connection,
+        db::SuccessionChecked<'_>,
+        &str,
+        u64,
+        Option<&str>,
+    ) -> anyhow::Result<LineageRecord> = db::append_revocation_checked;
+
+    // 2. `SuccessionChecked` implements neither `Copy`, `Clone`, nor `Default`
+    //    (autoref specialization probe with positive controls `u32` and `String`).
+    assert!((&Probe::<u32>::new()).has_copy(), "control u32 is Copy");
+    assert!((&Probe::<u32>::new()).has_clone(), "control u32 is Clone");
+    assert!(
+        (&Probe::<u32>::new()).has_default(),
+        "control u32 is Default"
+    );
+    assert!(
+        !(&Probe::<String>::new()).has_copy(),
+        "control String is !Copy"
+    );
+    assert!(
+        (&Probe::<String>::new()).has_clone(),
+        "control String is Clone"
+    );
+    assert!(
+        (&Probe::<String>::new()).has_default(),
+        "control String is Default"
+    );
+
+    assert!(
+        !(&Probe::<db::SuccessionChecked<'static>>::new()).has_copy(),
+        "#10148: SuccessionChecked must NOT implement Copy"
+    );
+    assert!(
+        !(&Probe::<db::SuccessionChecked<'static>>::new()).has_clone(),
+        "#10148: SuccessionChecked must NOT implement Clone"
+    );
+    assert!(
+        !(&Probe::<db::SuccessionChecked<'static>>::new()).has_default(),
+        "#10148: SuccessionChecked must NOT implement Default"
+    );
+
+    // 3. The `SuccessionChecked` rustdoc MUST carry a compiling single-use
+    //    `no_run` positive control right beside a `compile_fail` reuse block
+    //    whose code differs ONLY by the single duplicated move-reuse line (and
+    //    must not rely on the unenforced `compile_fail,E...` tag on stable).
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/mod.rs"),
+    )
+    .expect("read src/storage/mod.rs");
+    let struct_pos = src
+        .find("pub struct SuccessionChecked")
+        .expect("locate SuccessionChecked");
+    let doc_start = src[..struct_pos].rfind("\n\n").map_or(0, |i| i + 2);
+    let doc_block = &src[doc_start..struct_pos];
+    assert!(
+        !doc_block.contains("compile_fail,E"),
+        "#10148: stable rustdoc does not enforce compile_fail,E<code>; use paired no_run + compile_fail"
+    );
+
+    let extract_fence = |tag: &str| -> Vec<String> {
+        let marker = format!("{DOC_PREFIX} ```{tag}");
+        let closing = format!("{DOC_PREFIX} ```");
+        let start = doc_block
+            .find(&marker)
+            .unwrap_or_else(|| panic!("#10148: missing `{marker}` doctest on SuccessionChecked"));
+        let rest = &doc_block[start + marker.len()..];
+        let mut lines = Vec::new();
+        for line in rest.lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed == closing {
+                return lines;
+            }
+            let body = trimmed.strip_prefix(DOC_PREFIX).unwrap_or(trimmed).trim();
+            lines.push(body.to_string());
+        }
+        panic!("#10148: unterminated `{marker}` fence on SuccessionChecked");
+    };
+
+    let positive = extract_fence("no_run");
+    let negative = extract_fence("compile_fail");
+    let reuse_line = "let _ = ai_memory::db::append_succession_checked(conn, proof, next, None)?;";
+    assert!(
+        positive.iter().any(|l| l == reuse_line),
+        "#10148: positive no_run doctest must call append_succession_checked once"
+    );
+    let mut expected_negative = positive.clone();
+    let first_call = expected_negative
+        .iter()
+        .position(|l| l == reuse_line)
+        .expect("positive call index");
+    expected_negative.insert(first_call + 1, reuse_line.to_string());
+    assert_eq!(
+        negative, expected_negative,
+        "#10148: compile_fail doctest must equal the compiling no_run positive control plus ONLY the duplicated move-reuse line"
+    );
+}
+
+#[test]
 fn custody_refuse_guard_blocks_non_software_file_mint() {
     // #1949 — the OSS refuse-guard is CODE: append_lineage_record refuses
     // any record whose custody_class is not software-file, and persists
