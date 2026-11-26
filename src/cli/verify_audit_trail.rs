@@ -363,11 +363,8 @@ mod tests {
 
     #[test]
     fn empty_db_exits_zero_intact() {
-        // #10117 - `run` reads the witness custody (head-anchor high water);
-        // never the host default.
-        let _lock = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // #10117 / #10119 - `run` reads the witness custody (head-anchor high
+        // water); the armed fixture owns `key_dir_env_lock()` and hides host default.
         let _custody = IsolatedWitnessCustody::arm();
         let (_dir, path) = temp_db();
         let args = VerifyAuditTrailArgs {
@@ -388,11 +385,8 @@ mod tests {
 
     #[test]
     fn clean_chain_exits_zero_text() {
-        // #10117 - `run` reads the witness custody (head-anchor high water);
-        // never the host default.
-        let _lock = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // #10117 / #10119 - `run` reads the witness custody (head-anchor high
+        // water); the armed fixture owns `key_dir_env_lock()` and hides host default.
         let _custody = IsolatedWitnessCustody::arm();
         let (_dir, path) = temp_db();
         {
@@ -428,11 +422,8 @@ mod tests {
     /// note the operator would see only "stripped / downgraded / forged".
     #[test]
     fn unsigned_prefix_under_pin_prints_the_limitation_note_3354() {
-        // #10117 - `run` reads the witness custody (head-anchor high water);
-        // never the host default.
-        let _lock = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // #10117 / #10119 - `run` reads the witness custody (head-anchor high
+        // water); the armed fixture owns `key_dir_env_lock()` and hides host default.
         let _custody = IsolatedWitnessCustody::arm();
         let (_dir, path) = temp_db();
         {
