@@ -1859,4 +1859,499 @@ mod tests {
             std::env::remove_var(RECOVERY_THRESHOLD_ENV);
         }
     }
+
+    const EXPECTED_NO_LINEAGE_SUFFIX_10118: &str = "run enroll-lineage first";
+    const EXPECTED_PUBLIC_ONLY_SUFFIX_10118: &str = "is public-only — cannot sign a succession";
+    const EXPECTED_NOT_HEAD_SUFFIX_10118: &str =
+        "only the head key can hand the identity off (key-LOSS recovery lands in v1.0)";
+    const ATTESTATION_FAILED_MARKER_10118: &str = "ATTESTATION_FAILED";
+
+    fn lineage_row_count(db_path: &Path, agent_id: &str) -> i64 {
+        let conn = crate::db::open(db_path).expect("open db for lineage count");
+        conn.query_row(
+            "SELECT COUNT(*) FROM agent_lineage WHERE agent_id = ?1",
+            [agent_id],
+            |r| r.get(0),
+        )
+        .expect("count agent_lineage rows")
+    }
+
+    fn signed_attestation_count(db_path: &Path) -> i64 {
+        let conn = crate::db::open(db_path).expect("open db for attestation count");
+        conn.query_row(
+            "SELECT COUNT(*) FROM row_attestations WHERE signature IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count signed row_attestations")
+    }
+
+    fn head_summary(db_path: &Path, agent_id: &str) -> Option<(u64, String)> {
+        let conn = crate::db::open(db_path).expect("open db for lineage head");
+        crate::db::lineage_head(&conn, agent_id)
+            .expect("read lineage_head")
+            .map(|(rec, _)| (rec.epoch, rec.successor_pubkey_b64))
+    }
+
+    /// #10118 — every succession precondition refusal (no lineage, public-only,
+    /// not head) on `identity succeed` MUST return its own exact message before
+    /// `arm_with_key`, leaving `agent_lineage` count, `lineage_head`, on-disk
+    /// keypair, and signed `row_attestations` unchanged. A valid enrolled head
+    /// still succeeds and arms row attestation (#10089).
+    #[test]
+    fn succeed_refusals_precede_attestation_arming_10118() {
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        let rec_b64 = keypair::generate("cold-suc-10118").unwrap().public_base64();
+
+        // 1. No lineage enrolled.
+        let agent_noln = "suc-noln-10118";
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_noln, "ai:test", &[]).unwrap();
+        }
+        let k0_noln = keypair::generate(agent_noln).unwrap();
+        keypair::save(&k0_noln, &dir_path).unwrap();
+        let signed_before = signed_attestation_count(&db_path);
+        let err_noln = {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Succeed {
+                        agent_id: Some(agent_noln.to_string()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err()
+        };
+        let msg_noln = format!("{err_noln:#}");
+        assert!(
+            msg_noln.contains(&format!(
+                "no lineage enrolled for '{agent_noln}' — {EXPECTED_NO_LINEAGE_SUFFIX_10118}"
+            )),
+            "expected no-lineage refusal, got: {msg_noln}"
+        );
+        assert!(
+            !msg_noln.contains(ATTESTATION_FAILED_MARKER_10118),
+            "attestation must not mask no-lineage refusal: {msg_noln}"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent_noln), 0);
+        assert_eq!(head_summary(&db_path, agent_noln), None);
+        assert_eq!(signed_attestation_count(&db_path), signed_before);
+        assert_eq!(
+            keypair::load(agent_noln, &dir_path)
+                .unwrap()
+                .public
+                .to_bytes(),
+            k0_noln.public.to_bytes()
+        );
+
+        // 2. Public-only keypair on disk after enrolling lineage.
+        let agent_pub = "suc-pub-10118";
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_pub, "ai:test", &[]).unwrap();
+        }
+        let k0_pub = keypair::generate(agent_pub).unwrap();
+        keypair::save(&k0_pub, &dir_path).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some(agent_pub.to_string()),
+                        recovery_pubkey: Some(rec_b64.clone()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(dir_path.join(format!("{agent_pub}.priv"))).unwrap();
+        assert!(!keypair::load(agent_pub, &dir_path).unwrap().can_sign());
+        let head_before_pub = head_summary(&db_path, agent_pub);
+        let signed_before_pub = signed_attestation_count(&db_path);
+        let err_pub = {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Succeed {
+                        agent_id: Some(agent_pub.to_string()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err()
+        };
+        let msg_pub = format!("{err_pub:#}");
+        assert!(
+            msg_pub.contains(&format!(
+                "keypair for '{agent_pub}' {EXPECTED_PUBLIC_ONLY_SUFFIX_10118}"
+            )),
+            "expected shared public-only refusal, got: {msg_pub}"
+        );
+        assert!(
+            !msg_pub.contains(ATTESTATION_FAILED_MARKER_10118),
+            "attestation must not mask public-only refusal: {msg_pub}"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent_pub), 1);
+        assert_eq!(head_summary(&db_path, agent_pub), head_before_pub);
+        assert_eq!(signed_attestation_count(&db_path), signed_before_pub);
+
+        // 3. Keypair on disk is NOT the current lineage head.
+        let agent_nothead = "suc-nothead-10118";
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_nothead, "ai:test", &[]).unwrap();
+        }
+        let k0_nh = keypair::generate(agent_nothead).unwrap();
+        keypair::save(&k0_nh, &dir_path).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some(agent_nothead.to_string()),
+                        recovery_pubkey: Some(rec_b64.clone()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let k_other = keypair::generate(agent_nothead).unwrap();
+        keypair::save(&k_other, &dir_path).unwrap();
+        let head_before_nh = head_summary(&db_path, agent_nothead);
+        let signed_before_nh = signed_attestation_count(&db_path);
+        let err_nh = {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Succeed {
+                        agent_id: Some(agent_nothead.to_string()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err()
+        };
+        let msg_nh = format!("{err_nh:#}");
+        assert!(
+            msg_nh.contains(&format!(
+                "signing keypair is not the current lineage head for '{agent_nothead}' — {EXPECTED_NOT_HEAD_SUFFIX_10118}"
+            )),
+            "expected not-head refusal, got: {msg_nh}"
+        );
+        assert!(
+            !msg_nh.contains(ATTESTATION_FAILED_MARKER_10118),
+            "attestation must not mask not-head refusal: {msg_nh}"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent_nothead), 1);
+        assert_eq!(head_summary(&db_path, agent_nothead), head_before_nh);
+        assert_eq!(signed_attestation_count(&db_path), signed_before_nh);
+        assert_eq!(
+            keypair::load(agent_nothead, &dir_path)
+                .unwrap()
+                .public
+                .to_bytes(),
+            k_other.public.to_bytes()
+        );
+
+        // 4. Enrolled head still succeeds and arms row attestation (#10089).
+        let agent_ok = "suc-ok-10118";
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_ok, "ai:test", &[]).unwrap();
+        }
+        let k0_ok = keypair::generate(agent_ok).unwrap();
+        keypair::save(&k0_ok, &dir_path).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some(agent_ok.to_string()),
+                        recovery_pubkey: Some(rec_b64.clone()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Succeed {
+                        agent_id: Some(agent_ok.to_string()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        assert_eq!(lineage_row_count(&db_path, agent_ok), 2);
+        assert!(
+            signed_attestation_count(&db_path) > 0,
+            "valid succession must still arm row attestation (#10089)"
+        );
+    }
+
+    /// #10118 — `identity register-recovery-key` MUST return the exact same
+    /// three precondition refusals via the shared function, leaving lineage
+    /// state and attestations untouched.
+    #[test]
+    fn register_recovery_key_refusals_match_shared_preconditions_10118() {
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        let rec_b64 = keypair::generate("cold-rec-10118").unwrap().public_base64();
+
+        // 1. No lineage enrolled.
+        let agent_noln = "rec-noln-10118";
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_noln, "ai:test", &[]).unwrap();
+        }
+        let k0 = keypair::generate(agent_noln).unwrap();
+        keypair::save(&k0, &dir_path).unwrap();
+        let signed_before = signed_attestation_count(&db_path);
+        let err_noln = {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::RegisterRecoveryKey {
+                        agent_id: Some(agent_noln.to_string()),
+                        recovery_pubkey: rec_b64.clone(),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err()
+        };
+        let msg_noln = format!("{err_noln:#}");
+        assert!(
+            msg_noln.contains(&format!(
+                "no lineage enrolled for '{agent_noln}' — {EXPECTED_NO_LINEAGE_SUFFIX_10118}"
+            )),
+            "expected no-lineage refusal, got: {msg_noln}"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent_noln), 0);
+        assert_eq!(head_summary(&db_path, agent_noln), None);
+        assert_eq!(signed_attestation_count(&db_path), signed_before);
+
+        // 2. Public-only keypair.
+        let agent_pub = "rec-pub-10118";
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_pub, "ai:test", &[]).unwrap();
+        }
+        let k0_pub = keypair::generate(agent_pub).unwrap();
+        keypair::save(&k0_pub, &dir_path).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some(agent_pub.to_string()),
+                        recovery_pubkey: Some(rec_b64.clone()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(dir_path.join(format!("{agent_pub}.priv"))).unwrap();
+        let head_before_pub = head_summary(&db_path, agent_pub);
+        let err_pub = {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::RegisterRecoveryKey {
+                        agent_id: Some(agent_pub.to_string()),
+                        recovery_pubkey: rec_b64.clone(),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err()
+        };
+        let msg_pub = format!("{err_pub:#}");
+        assert!(
+            msg_pub.contains(&format!(
+                "keypair for '{agent_pub}' {EXPECTED_PUBLIC_ONLY_SUFFIX_10118}"
+            )),
+            "expected public-only refusal, got: {msg_pub}"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent_pub), 1);
+        assert_eq!(head_summary(&db_path, agent_pub), head_before_pub);
+        assert_eq!(signed_attestation_count(&db_path), signed_before);
+
+        // 3. Not current lineage head.
+        let agent_nh = "rec-nothead-10118";
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_nh, "ai:test", &[]).unwrap();
+        }
+        let k0_nh = keypair::generate(agent_nh).unwrap();
+        keypair::save(&k0_nh, &dir_path).unwrap();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some(agent_nh.to_string()),
+                        recovery_pubkey: Some(rec_b64.clone()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let k_other = keypair::generate(agent_nh).unwrap();
+        keypair::save(&k_other, &dir_path).unwrap();
+        let head_before_nh = head_summary(&db_path, agent_nh);
+        let err_nh = {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::RegisterRecoveryKey {
+                        agent_id: Some(agent_nh.to_string()),
+                        recovery_pubkey: rec_b64,
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err()
+        };
+        let msg_nh = format!("{err_nh:#}");
+        assert!(
+            msg_nh.contains(&format!(
+                "signing keypair is not the current lineage head for '{agent_nh}' — {EXPECTED_NOT_HEAD_SUFFIX_10118}"
+            )),
+            "expected not-head refusal, got: {msg_nh}"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent_nh), 1);
+        assert_eq!(head_summary(&db_path, agent_nh), head_before_nh);
+        assert_eq!(signed_attestation_count(&db_path), signed_before);
+    }
+
+    /// #10118 — `fresh_env()` MUST produce a `0o700` key directory under
+    /// `umask 0002` so `keypair::save` succeeds whatever the host umask.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_env_keypair_save_succeeds_under_umask_0002_10118() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_IDENTITY_UMASK_10118_ROLE";
+        const MARKER_ENV: &str = "AI_MEMORY_TEST_IDENTITY_UMASK_10118_MARKER";
+        const TEST_PATH: &str =
+            "cli::identity::tests::fresh_env_keypair_save_succeeds_under_umask_0002_10118";
+
+        struct UmaskGuard(libc::mode_t);
+        impl UmaskGuard {
+            fn set(mask: libc::mode_t) -> Self {
+                // SAFETY: `umask` has no preconditions and runs inside an
+                // isolated single-test child process.
+                let prev = unsafe { libc::umask(mask) };
+                Self(prev)
+            }
+        }
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                // SAFETY: restores the prior process umask on normal return
+                // and panic unwind.
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+
+        let mode_of = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("stat dir")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            let _umask = UmaskGuard::set(0o002);
+            let control = tempfile::tempdir().expect("control tempdir");
+            assert_eq!(
+                mode_of(control.path()),
+                0o775,
+                "#10118 precondition: umask 0002 must yield 0775 for bare tempdir"
+            );
+            let (_env, dir) = fresh_env();
+            assert_eq!(
+                mode_of(dir.path()),
+                0o700,
+                "#10118: fresh_env() key dir must be mode 0700 under umask 0002"
+            );
+            let kp = keypair::generate("umask-0002-10118").expect("gen");
+            keypair::save(&kp, dir.path())
+                .expect("#10118: keypair::save must accept fresh_env() dir under umask 0002");
+            let marker = std::env::var_os(MARKER_ENV).expect("marker env");
+            std::fs::write(marker, b"ran").expect("write marker");
+            return;
+        }
+
+        let scratch = crate::identity::test_key_dir::private_tempdir();
+        let marker = scratch.path().join("child-ran");
+        let status = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .arg("--exact")
+            .arg(TEST_PATH)
+            .arg("--nocapture")
+            .env(ROLE_ENV, "child")
+            .env(MARKER_ENV, &marker)
+            .status()
+            .expect("spawn umask-0002 child");
+        assert!(
+            status.success(),
+            "#10118: umask-0002 child run failed with {status}"
+        );
+        assert!(
+            marker.exists(),
+            "#10118: umask-0002 child must execute test body"
+        );
+    }
 }
