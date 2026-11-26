@@ -29,6 +29,110 @@ use crate::validate;
 /// JSON output field for the base64 public key (#1558 batch 6).
 const PUBLIC_KEY_B64_FIELD: &str = "public_key_b64";
 
+/// #10110 — canonical refusal message when `identity import` targets an agent
+/// that already has a different key on disk. Names the signed succession path
+/// (`ai-memory identity succeed`) so operators never destroy the trust
+/// anchor's verification key for historical rows.
+pub(crate) const IMPORT_REFUSED_DIFFERENT_KEY: &str = "refusing to overwrite existing keypair with a different key: import carries no succession \
+     proof and would orphan historical attestations under the trust anchor; rotate via \
+     `ai-memory identity succeed` instead";
+
+/// Unforgeable proof (private fields, constructible ONLY by
+/// [`decide_import_slot`]) that no different key exists for `kp.agent_id` in
+/// `dir` and that writing `kp` to disk is permitted (#10110, CBC-03/05).
+#[must_use]
+struct FreshImportProof<'a> {
+    dir: &'a Path,
+    kp: &'a keypair::AgentKeypair,
+}
+
+/// Exhaustive decision for `identity import` before touching disk (#10110,
+/// CBC-04). There is no boolean "exists" flag a caller can ignore: the write
+/// helper [`persist_fresh_import`] accepts ONLY [`FreshImportProof`].
+#[must_use]
+enum ImportDecision<'a> {
+    /// No key (or only a matching orphaned private half) exists — safe to write.
+    Fresh(FreshImportProof<'a>),
+    /// The existing public key on disk matches the imported public key — no-op.
+    Identical,
+    /// A different key already exists on disk — refuse and write nothing.
+    RefusedDifferentKey { existing_path: PathBuf },
+}
+
+/// Classify `dir`'s key slot for `kp.agent_id` BEFORE any write (#10110).
+/// Fails closed if existing key files are unreadable, corrupt, or under an
+/// insecure directory chain.
+fn decide_import_slot<'a>(
+    dir: &'a Path,
+    kp: &'a keypair::AgentKeypair,
+) -> Result<ImportDecision<'a>> {
+    let pub_path = keypair::agent_pub_path(dir, &kp.agent_id);
+    match std::fs::symlink_metadata(&pub_path) {
+        Ok(_) => {
+            let existing = keypair::load_public(&kp.agent_id, dir)?;
+            if existing.to_bytes() == kp.public.to_bytes() {
+                Ok(ImportDecision::Identical)
+            } else {
+                Ok(ImportDecision::RefusedDifferentKey {
+                    existing_path: pub_path,
+                })
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let priv_path = keypair::agent_priv_path(dir, &kp.agent_id);
+            match std::fs::symlink_metadata(&priv_path) {
+                Err(pe) if pe.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(ImportDecision::Fresh(FreshImportProof { dir, kp }))
+                }
+                Ok(_) => {
+                    keypair::enforce_key_path_chain_secure(dir, &priv_path)?;
+                    let priv_bytes = keypair::read_raw_key_file(&priv_path).with_context(|| {
+                        format!("reading existing private key {}", priv_path.display())
+                    })?;
+                    let existing_pub = SigningKey::from_bytes(&priv_bytes).verifying_key();
+                    if existing_pub.to_bytes() == kp.public.to_bytes() {
+                        Ok(ImportDecision::Fresh(FreshImportProof { dir, kp }))
+                    } else {
+                        Ok(ImportDecision::RefusedDifferentKey {
+                            existing_path: priv_path,
+                        })
+                    }
+                }
+                Err(pe) => Err(pe).with_context(|| {
+                    format!("checking existing private key {}", priv_path.display())
+                }),
+            }
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("checking existing public key {}", pub_path.display()))
+        }
+    }
+}
+
+/// The sole write funnel for `identity import`: accepts ONLY a
+/// [`FreshImportProof`] minted by [`decide_import_slot`] (#10110).
+fn persist_fresh_import(proof: FreshImportProof<'_>) -> Result<()> {
+    if proof.kp.private.is_some() {
+        keypair::save(proof.kp, proof.dir)
+    } else {
+        keypair::save_public_only(proof.kp, proof.dir)
+    }
+}
+
+/// Exhaustively execute an [`ImportDecision`]: only `Fresh` writes to disk,
+/// `Identical` is a no-op, and `RefusedDifferentKey` bails with
+/// [`IMPORT_REFUSED_DIFFERENT_KEY`] (#10110).
+fn apply_import_decision(decision: ImportDecision<'_>) -> Result<()> {
+    match decision {
+        ImportDecision::Fresh(proof) => persist_fresh_import(proof),
+        ImportDecision::Identical => Ok(()),
+        ImportDecision::RefusedDifferentKey { existing_path } => bail!(
+            "{IMPORT_REFUSED_DIFFERENT_KEY} (existing key at {})",
+            existing_path.display()
+        ),
+    }
+}
+
 #[derive(Args)]
 pub struct IdentityArgs {
     /// Override the default key storage directory.
@@ -502,11 +606,8 @@ fn import(
         public,
         private,
     };
-    if kp.private.is_some() {
-        keypair::save(&kp, dir)?;
-    } else {
-        keypair::save_public_only(&kp, dir)?;
-    }
+    let decision = decide_import_slot(dir, &kp)?;
+    apply_import_decision(decision)?;
 
     if json_out {
         writeln!(
@@ -2502,7 +2603,7 @@ mod tests {
             } else {
                 "pub-only"
             };
-            let err = {
+            let err = match {
                 let mut out = env.output();
                 run(
                     &db_path,
@@ -2517,15 +2618,16 @@ mod tests {
                     false,
                     &mut out,
                 )
-            }
-            .expect_err(&format!(
-                "#10110 ({mode}): importing a different key over a present key MUST be refused"
-            ));
+            } {
+                Err(e) => e,
+                Ok(()) => panic!(
+                    "#10110 ({mode}): importing a different key over a present key MUST be refused"
+                ),
+            };
             let msg = format!("{err:#}");
             assert!(
-                msg.contains("refusing to overwrite existing keypair with a different key")
-                    && msg.contains("ai-memory identity succeed"),
-                "#10110 ({mode}): refusal must name the overwrite refusal and succession path; got: {msg}"
+                msg.contains(IMPORT_REFUSED_DIFFERENT_KEY),
+                "#10110 ({mode}): refusal must contain IMPORT_REFUSED_DIFFERENT_KEY; got: {msg}"
             );
         }
 
@@ -2637,5 +2739,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #10110 — fail closed when an existing `.pub` is corrupt/truncated or
+    /// when an orphaned `.priv` belongs to a different key.
+    #[test]
+    fn import_refuses_corrupt_pub_and_different_orphan_priv_10110() {
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let k_new = keypair::generate("carol-10110").unwrap();
+        let staging = tempfile::TempDir::new().unwrap();
+        let k_pub = staging.path().join("c.pub");
+        let k_priv = staging.path().join("c.priv");
+        std::fs::write(&k_pub, k_new.public.to_bytes()).unwrap();
+        std::fs::write(&k_priv, k_new.private.as_ref().unwrap().to_bytes()).unwrap();
+
+        // 1. Corrupt existing `.pub` fails closed without overwriting.
+        let bad_pub = dir_path.join("carol-10110.pub");
+        std::fs::write(&bad_pub, b"truncated").unwrap();
+        {
+            let mut out = env.output();
+            run_nodb(
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Import {
+                        agent_id: "carol-10110".to_string(),
+                        public: k_pub.clone(),
+                        private: Some(k_priv.clone()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .expect_err("#10110: corrupt existing .pub must fail closed");
+        }
+        assert_eq!(std::fs::read(&bad_pub).unwrap(), b"truncated");
+        std::fs::remove_file(&bad_pub).unwrap();
+
+        // 2. Orphan `.priv` of a different key fails closed with IMPORT_REFUSED_DIFFERENT_KEY.
+        let k_other = keypair::generate("carol-10110").unwrap();
+        let orphan_priv = dir_path.join("carol-10110.priv");
+        let other_priv_bytes = k_other.private.as_ref().unwrap().to_bytes();
+        std::fs::write(&orphan_priv, other_priv_bytes).unwrap();
+        let err = {
+            let mut out = env.output();
+            run_nodb(
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Import {
+                        agent_id: "carol-10110".to_string(),
+                        public: k_pub,
+                        private: Some(k_priv),
+                    },
+                },
+                false,
+                &mut out,
+            )
+        }
+        .expect_err("#10110: different orphan .priv must be refused");
+        assert!(
+            format!("{err:#}").contains(IMPORT_REFUSED_DIFFERENT_KEY),
+            "got: {err:#}"
+        );
+        assert_eq!(std::fs::read(&orphan_priv).unwrap(), other_priv_bytes);
+        assert!(!bad_pub.exists());
     }
 }
