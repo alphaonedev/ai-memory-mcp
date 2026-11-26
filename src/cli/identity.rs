@@ -786,7 +786,7 @@ fn succeed(
         )
         .context("succession: row attestation could not be armed with K_old (#10089)")?;
         let record =
-            crate::db::append_succession_checked(&conn, &checked, &k_new.public_base64(), None)?;
+            crate::db::append_succession_checked(&conn, checked, &k_new.public_base64(), None)?;
         recorded.replace(Some(record));
         Ok(())
     })?;
@@ -839,7 +839,7 @@ fn register_recovery_key(
     let checked = crate::db::succession_preconditions(&conn, &id, &kp)?;
     let record = crate::db::append_succession_checked(
         &conn,
-        &checked,
+        checked,
         &kp.public_base64(),
         Some(recovery_pubkey),
     )?;
@@ -2005,6 +2005,14 @@ mod tests {
         .expect("count signed row_attestations")
     }
 
+    fn seal_state_for(db_path: &Path) -> crate::storage::row_attest::seal::SealState {
+        let anchor = crate::storage::row_attest::anchor::TrustAnchor::from_key_dir();
+        crate::storage::row_attest::seal::path_for(&anchor, Some(db_path)).map_or(
+            crate::storage::row_attest::seal::SealState::NotSealed,
+            |p| crate::storage::row_attest::seal::read(&p),
+        )
+    }
+
     fn head_summary(db_path: &Path, agent_id: &str) -> Option<(u64, String)> {
         let conn = crate::db::open(db_path).expect("open db for lineage head");
         crate::db::lineage_head(&conn, agent_id)
@@ -2033,6 +2041,7 @@ mod tests {
         let k0_noln = keypair::generate(agent_noln).unwrap();
         keypair::save(&k0_noln, &dir_path).unwrap();
         let signed_before = signed_attestation_count(&db_path);
+        let seal_before = seal_state_for(&db_path);
         let err_noln = {
             let mut out = env.output();
             run(
@@ -2062,12 +2071,74 @@ mod tests {
         assert_eq!(lineage_row_count(&db_path, agent_noln), 0);
         assert_eq!(head_summary(&db_path, agent_noln), None);
         assert_eq!(signed_attestation_count(&db_path), signed_before);
+        assert_eq!(seal_state_for(&db_path), seal_before);
         assert_eq!(
             keypair::load(agent_noln, &dir_path)
                 .unwrap()
                 .public
                 .to_bytes(),
             k0_noln.public.to_bytes()
+        );
+
+        // 1b. PR #10130 r1 sec F1: registered agent whose pubkey IS bound to
+        // the on-disk keypair, with NO lineage enrolled — so `arm_with_key`
+        // would SUCCEED if invoked before `succession_preconditions`. Assert
+        // the NO_LINEAGE refusal leaves signed attestations and the seal
+        // untouched.
+        let agent_noln_bound = "suc-noln-bound-10118";
+        let k0_bound = keypair::generate(agent_noln_bound).unwrap();
+        keypair::save(&k0_bound, &dir_path).unwrap();
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent_noln_bound, "ai:test", &[]).unwrap();
+            crate::db::bind_agent_pubkey_with_keypair(&conn, agent_noln_bound, &k0_bound).unwrap();
+        }
+        let signed_before_bound = signed_attestation_count(&db_path);
+        let seal_before_bound = seal_state_for(&db_path);
+        let err_noln_bound = {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Succeed {
+                        agent_id: Some(agent_noln_bound.to_string()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err()
+        };
+        let msg_noln_bound = format!("{err_noln_bound:#}");
+        assert!(
+            msg_noln_bound.contains(&format!(
+                "no lineage enrolled for '{agent_noln_bound}' — {EXPECTED_NO_LINEAGE_SUFFIX_10118}"
+            )),
+            "expected no-lineage refusal on bound-key fixture, got: {msg_noln_bound}"
+        );
+        assert!(
+            !msg_noln_bound.contains(ATTESTATION_FAILED_MARKER_10118),
+            "attestation must not mask no-lineage refusal on bound-key fixture: {msg_noln_bound}"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent_noln_bound), 0);
+        assert_eq!(head_summary(&db_path, agent_noln_bound), None);
+        assert_eq!(
+            signed_attestation_count(&db_path),
+            signed_before_bound,
+            "refused succeed with bound key must not arm row attestation"
+        );
+        assert_eq!(
+            seal_state_for(&db_path),
+            seal_before_bound,
+            "refused succeed with bound key must not advance the row-attestation seal"
+        );
+        assert_eq!(
+            keypair::load(agent_noln_bound, &dir_path)
+                .unwrap()
+                .public
+                .to_bytes(),
+            k0_bound.public.to_bytes()
         );
 
         // 2. Public-only keypair on disk after enrolling lineage.
