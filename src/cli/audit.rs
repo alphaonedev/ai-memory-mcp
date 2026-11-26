@@ -2438,6 +2438,176 @@ pub(crate) mod witness_isolation_10117 {
         let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
         crate::identity::keypair::save(&kp, custody.path()).expect("save into isolated custody");
     }
+
+    const SANDBOX_KEY_DIR_VALUE: &str = "/sandbox/preexisting-witness-custody-10119";
+    const SANDBOX_PUBKEY_VALUE: &str = "preexisting-witness-pubkey-10119";
+    const MUTATED_PUBKEY_VALUE: &str = "in-test-mutated-witness-pubkey-10119";
+    const PANIC_PROBE_MSG: &str = "10119-unwind-restore-probe";
+    #[cfg(unix)]
+    const NON_UTF8_KEY_DIR_BYTES: &[u8] = b"/sandbox/witness-10119-\xff\xfe";
+    #[cfg(unix)]
+    const NON_UTF8_PUBKEY_BYTES: &[u8] = b"pubkey-10119-\x80\xff";
+
+    /// Outer test cleanup guard so a red-first failure in the test below does
+    /// not leak the probe values into sibling tests in the same binary.
+    struct OuterWitnessEnvCleanup {
+        prior_dir: Option<std::ffi::OsString>,
+        prior_pub: Option<std::ffi::OsString>,
+    }
+
+    impl OuterWitnessEnvCleanup {
+        fn capture() -> Self {
+            Self {
+                prior_dir: std::env::var_os(witness::WITNESS_KEY_DIR_ENV),
+                prior_pub: std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+            }
+        }
+    }
+
+    impl Drop for OuterWitnessEnvCleanup {
+        fn drop(&mut self) {
+            // SAFETY: test-only; caller holds `key_dir_env_lock()`.
+            unsafe {
+                match self.prior_dir.as_deref() {
+                    Some(v) => std::env::set_var(witness::WITNESS_KEY_DIR_ENV, v),
+                    None => std::env::remove_var(witness::WITNESS_KEY_DIR_ENV),
+                }
+                match self.prior_pub.as_deref() {
+                    Some(v) => std::env::set_var(witness::WITNESS_PUBKEY_ENV, v),
+                    None => std::env::remove_var(witness::WITNESS_PUBKEY_ENV),
+                }
+            }
+        }
+    }
+
+    fn apply_probe_env(dir: Option<&std::ffi::OsStr>, pubkey: Option<&std::ffi::OsStr>) {
+        // SAFETY: test-only; caller holds `key_dir_env_lock()`.
+        unsafe {
+            match dir {
+                Some(v) => std::env::set_var(witness::WITNESS_KEY_DIR_ENV, v),
+                None => std::env::remove_var(witness::WITNESS_KEY_DIR_ENV),
+            }
+            match pubkey {
+                Some(v) => std::env::set_var(witness::WITNESS_PUBKEY_ENV, v),
+                None => std::env::remove_var(witness::WITNESS_PUBKEY_ENV),
+            }
+        }
+    }
+
+    fn assert_restore_for_case(
+        label: &str,
+        initial_dir: Option<std::ffi::OsString>,
+        initial_pub: Option<std::ffi::OsString>,
+        mutate_while_armed: bool,
+        unwind_via_panic: bool,
+    ) {
+        apply_probe_env(initial_dir.as_deref(), initial_pub.as_deref());
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_KEY_DIR_ENV),
+            initial_dir,
+            "{label}: pre-condition key dir mismatch"
+        );
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+            initial_pub,
+            "{label}: pre-condition pubkey mismatch"
+        );
+
+        let result = std::panic::catch_unwind(move || {
+            let custody = IsolatedWitnessCustody::arm();
+            assert_eq!(
+                std::env::var_os(witness::WITNESS_KEY_DIR_ENV).as_deref(),
+                Some(custody.path().as_os_str()),
+                "{label}: armed fixture must redirect WITNESS_KEY_DIR_ENV"
+            );
+            assert_eq!(
+                std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+                None,
+                "{label}: armed fixture must clear WITNESS_PUBKEY_ENV during test"
+            );
+            if mutate_while_armed {
+                // SAFETY: test-only; outer caller holds `key_dir_env_lock()`.
+                unsafe {
+                    std::env::set_var(witness::WITNESS_PUBKEY_ENV, MUTATED_PUBKEY_VALUE);
+                }
+            }
+            if unwind_via_panic {
+                panic!("{PANIC_PROBE_MSG}");
+            }
+        });
+
+        if unwind_via_panic {
+            let payload = result.expect_err("panic unwind case must panic");
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(
+                msg,
+                Some(PANIC_PROBE_MSG),
+                "{label}: unexpected panic payload"
+            );
+        } else {
+            assert!(result.is_ok(), "{label}: normal-return case must not panic");
+        }
+
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_KEY_DIR_ENV),
+            initial_dir,
+            "{label}: WITNESS_KEY_DIR_ENV must be restored to its pre-arm var_os value"
+        );
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+            initial_pub,
+            "{label}: WITNESS_PUBKEY_ENV must be restored to its pre-arm var_os value"
+        );
+    }
+
+    /// #10119 / umbrella #8170 — dropping an armed `IsolatedWitnessCustody`
+    /// MUST restore every touched witness variable to its exact pre-`arm()`
+    /// `var_os` value (set stays set, absent stays absent, including non-UTF-8
+    /// values), on both normal return and panic unwind.
+    #[test]
+    fn isolated_custody_restores_prior_env_on_drop_and_unwind_10119() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _outer_cleanup = OuterWitnessEnvCleanup::capture();
+
+        let dir_set = Some(std::ffi::OsString::from(SANDBOX_KEY_DIR_VALUE));
+        let pub_set = Some(std::ffi::OsString::from(SANDBOX_PUBKEY_VALUE));
+
+        let mut cases: Vec<(&str, Option<std::ffi::OsString>, Option<std::ffi::OsString>)> = vec![
+            ("both-set", dir_set.clone(), pub_set.clone()),
+            ("both-absent", None, None),
+            ("dir-set-pub-absent", dir_set, None),
+            ("dir-absent-pub-set", None, pub_set),
+        ];
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            cases.push((
+                "both-non-utf8",
+                Some(std::ffi::OsStr::from_bytes(NON_UTF8_KEY_DIR_BYTES).to_os_string()),
+                Some(std::ffi::OsStr::from_bytes(NON_UTF8_PUBKEY_BYTES).to_os_string()),
+            ));
+        }
+
+        for (label, initial_dir, initial_pub) in cases {
+            for mutate_while_armed in [false, true] {
+                for unwind_via_panic in [false, true] {
+                    assert_restore_for_case(
+                        label,
+                        initial_dir.clone(),
+                        initial_pub.clone(),
+                        mutate_while_armed,
+                        unwind_via_panic,
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
