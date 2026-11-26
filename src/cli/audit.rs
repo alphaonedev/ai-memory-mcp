@@ -2359,44 +2359,295 @@ mod tests {
 /// emission can append to the real log. Arming this fixture points the
 /// custody env at an EMPTY private (0700) temp dir instead, so the test reads
 /// and writes only its own tempdir, whatever the host or the umask.
-/// Dropping it clears both env vars (also on panic).
+/// Dropping it restores both env vars to their exact pre-`arm()` `var_os`
+/// values (absent stays absent, set stays set, including empty and non-UTF-8
+/// values), on both normal return and panic unwind (#10119 / umbrella #8170).
 ///
-/// The caller MUST hold `crate::identity::keypair::key_dir_env_lock()` for
-/// the fixture's whole life (the env vars are process-global); declare the
-/// lock guard BEFORE the fixture so the fixture drops first.
+/// `IsolatedWitnessCustody::arm()` acquires and owns
+/// `crate::identity::keypair::key_dir_env_lock()` as its last field, so no
+/// caller can arm without holding the lock and the lock is released only
+/// AFTER both env vars are restored and the tempdir is removed. Nested scopes
+/// use [`IsolatedWitnessCustody::arm_nested`], whose `&mut self` borrow
+/// enforces strict LIFO drop order at compile time.
 #[cfg(test)]
 pub(crate) mod witness_isolation_10117 {
     use crate::governance::audit as witness;
+    use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
-    pub(crate) struct IsolatedWitnessCustody {
-        dir: tempfile::TempDir,
+    const SET_KEY_DIR_REFUSED_EMPTY: &str = "IsolatedWitnessCustody::set_key_dir refuses an empty \
+         or whitespace-only path (would fail open to the host default custody directory)";
+    const SET_KEY_DIR_REFUSED_NON_UTF8: &str = "IsolatedWitnessCustody::set_key_dir refuses a \
+         non-UTF-8 path (witness_key_dir reads std::env::var and would fail open to host default)";
+    const SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX: &str = "IsolatedWitnessCustody::set_key_dir refuses \
+         a path outside the guard's private sandbox";
+
+    /// Typed refusal returned by [`IsolatedWitnessCustody::try_set_key_dir`]
+    /// (#10119 N2/N3).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum SetKeyDirError {
+        Empty,
+        NonUtf8,
+        OutsideSandbox,
     }
 
-    impl IsolatedWitnessCustody {
+    impl std::fmt::Display for SetKeyDirError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Empty => f.write_str(SET_KEY_DIR_REFUSED_EMPTY),
+                Self::NonUtf8 => f.write_str(SET_KEY_DIR_REFUSED_NON_UTF8),
+                Self::OutsideSandbox => f.write_str(SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX),
+            }
+        }
+    }
+
+    /// Private lock-proof submodule (#10119 N1, mirroring PR #10124
+    /// `hardened_env_fixture::lock`). Keeping [`WitnessEnvLock`] in its own
+    /// submodule makes `_guard` invisible even to `witness_isolation_10117`, so
+    /// no struct literal over a foreign `Mutex<()>` can compile (E0451).
+    mod lock {
+        use std::sync::MutexGuard;
+
+        /// Proof that the holder owns `crate::identity::keypair::key_dir_env_lock()`
+        /// and no other mutex. No `Default`, `Clone`, `Copy`, or `From` exists;
+        /// [`Self::acquire`] is the sole constructor.
+        #[must_use = "the witness env lock is released when this guard drops"]
+        pub(super) struct WitnessEnvLock {
+            _guard: MutexGuard<'static, ()>,
+        }
+
+        impl WitnessEnvLock {
+            /// Acquire `crate::identity::keypair::key_dir_env_lock()`,
+            /// recovering from poison (CONCURRENCY-18).
+            pub(super) fn acquire() -> Self {
+                Self {
+                    _guard: crate::identity::keypair::key_dir_env_lock()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                }
+            }
+        }
+    }
+
+    use lock::WitnessEnvLock;
+
+    /// Ownership of [`WitnessEnvLock`] held as the last field of
+    /// [`IsolatedWitnessCustody`] so the lock always outlives env restoration
+    /// and tempdir cleanup.
+    enum CustodyLock<'a> {
+        Owned(WitnessEnvLock),
+        Borrowed(&'a mut WitnessEnvLock),
+    }
+
+    impl CustodyLock<'_> {
+        fn as_lock(&self) -> &WitnessEnvLock {
+            match self {
+                Self::Owned(g) => g,
+                Self::Borrowed(g) => g,
+            }
+        }
+
+        fn as_lock_mut(&mut self) -> &mut WitnessEnvLock {
+            match self {
+                Self::Owned(g) => g,
+                Self::Borrowed(g) => g,
+            }
+        }
+    }
+
+    /// Single process-environment variable binding whose prior `var_os` value
+    /// is captured before mutation and restored under [`WitnessEnvLock`]
+    /// (CBC-03, ERRORS-09, OWNERSHIP-24, OWNERSHIP-25).
+    struct EnvVarSlot {
+        name: &'static str,
+        previous: Option<OsString>,
+        restored: bool,
+    }
+
+    impl EnvVarSlot {
+        /// The SOLE site in `src/cli/audit.rs` that writes or removes an env
+        /// var. Requiring `&WitnessEnvLock` (constructible only via
+        /// `WitnessEnvLock::acquire()`) proves at compile time that
+        /// `key_dir_env_lock()` is held for every mutation and restore.
+        fn write_raw(name: &'static str, value: Option<&OsStr>, _lock: &WitnessEnvLock) {
+            // SAFETY: test-only; `_lock: &WitnessEnvLock` is constructible only
+            // by `WitnessEnvLock::acquire()` on `key_dir_env_lock()`.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        /// Capture the current `var_os(name)` without mutating it.
+        fn capture(name: &'static str) -> Self {
+            Self {
+                name,
+                previous: std::env::var_os(name),
+                restored: false,
+            }
+        }
+
+        /// Capture the current `var_os(name)` and apply `value` (`Some` sets,
+        /// `None` removes) under `lock`.
+        fn apply(name: &'static str, value: Option<&OsStr>, lock: &WitnessEnvLock) -> Self {
+            let slot = Self::capture(name);
+            Self::write_raw(name, value, lock);
+            slot
+        }
+
+        /// Update `self.name` within the armed scope while preserving the
+        /// original `self.previous` captured at arm time.
+        fn overwrite(&mut self, value: Option<&OsStr>, lock: &WitnessEnvLock) {
+            Self::write_raw(self.name, value, lock);
+        }
+
+        /// Infallibly restore `self.name` to `self.previous` under `lock`
+        /// (OWNERSHIP-25, CBC-04). Idempotent.
+        fn restore(&mut self, lock: &WitnessEnvLock) {
+            if !self.restored {
+                self.restored = true;
+                Self::write_raw(self.name, self.previous.as_deref(), lock);
+            }
+        }
+    }
+
+    #[must_use = "dropping IsolatedWitnessCustody immediately restores the witness env"]
+    pub(crate) struct IsolatedWitnessCustody<'a> {
+        // Drop order: `Drop::drop` runs first (restoring both `EnvVarSlot`s
+        // while `lock` is held), then fields drop in declaration order so
+        // `dir` is removed BEFORE `lock` releases `key_dir_env_lock()`.
+        key_dir_env: EnvVarSlot,
+        pubkey_env: EnvVarSlot,
+        dir: tempfile::TempDir,
+        lock: CustodyLock<'a>,
+    }
+
+    impl Drop for IsolatedWitnessCustody<'_> {
+        fn drop(&mut self) {
+            let lock = self.lock.as_lock();
+            self.key_dir_env.restore(lock);
+            self.pubkey_env.restore(lock);
+        }
+    }
+
+    impl IsolatedWitnessCustody<'static> {
+        /// Acquire `key_dir_env_lock()` via [`WitnessEnvLock::acquire`] and arm
+        /// an isolated witness custody tempdir. The guard owns the lock proof as
+        /// its last field so no caller can arm without holding the lock.
         pub(crate) fn arm() -> Self {
+            Self::arm_inner(CustodyLock::Owned(WitnessEnvLock::acquire()))
+        }
+    }
+
+    impl<'a> IsolatedWitnessCustody<'a> {
+        fn arm_inner(lock: CustodyLock<'a>) -> Self {
             // 0700 under any umask (the #3198 refusal never fires) and the
             // custody env points HERE, so the default resolution is never
-            // reached.
+            // reached. Each slot captures `var_os` in the single constructor
+            // that mutates it (CBC-03), so no caller can arm without saving.
             let dir = crate::identity::test_key_dir::private_tempdir();
-            unsafe {
-                std::env::set_var(witness::WITNESS_KEY_DIR_ENV, dir.path());
-                std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
+            let key_dir_env = EnvVarSlot::apply(
+                witness::WITNESS_KEY_DIR_ENV,
+                Some(dir.path().as_os_str()),
+                lock.as_lock(),
+            );
+            let pubkey_env = EnvVarSlot::apply(witness::WITNESS_PUBKEY_ENV, None, lock.as_lock());
+            Self {
+                key_dir_env,
+                pubkey_env,
+                dir,
+                lock,
             }
-            Self { dir }
+        }
+
+        /// Arm a nested isolated custody scope borrowing this guard's lock
+        /// exclusively, enforcing strict LIFO drop order at compile time.
+        pub(crate) fn arm_nested(&mut self) -> IsolatedWitnessCustody<'_> {
+            IsolatedWitnessCustody::arm_inner(CustodyLock::Borrowed(self.lock.as_lock_mut()))
+        }
+
+        /// Arm under an already-held [`WitnessEnvLock`] (used by the restore
+        /// matrix test so setup, unwind, and assertions run under one
+        /// uninterrupted critical section).
+        fn arm_with_lock(lock: &'a mut WitnessEnvLock) -> Self {
+            Self::arm_inner(CustodyLock::Borrowed(lock))
+        }
+
+        /// Access the held [`WitnessEnvLock`] proof within this module.
+        fn env_lock(&self) -> &WitnessEnvLock {
+            self.lock.as_lock()
         }
 
         pub(crate) fn path(&self) -> &Path {
             self.dir.path()
         }
-    }
 
-    impl Drop for IsolatedWitnessCustody {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var(witness::WITNESS_KEY_DIR_ENV);
-                std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
+        /// Checked setter for `WITNESS_KEY_DIR_ENV` within the armed scope
+        /// (#10119 F3 / N2 / N3). Refuses empty, non-UTF-8, whitespace-only,
+        /// relative, parent-traversal, outside-sandbox, symlink-escape, and
+        /// dangling-symlink paths with a typed [`SetKeyDirError`] and zero env
+        /// writes so an armed guard can never fail open to the host default.
+        pub(crate) fn try_set_key_dir(&mut self, path: &Path) -> Result<(), SetKeyDirError> {
+            if path.as_os_str().is_empty() {
+                return Err(SetKeyDirError::Empty);
             }
+            let Some(utf8_path) = path.to_str() else {
+                return Err(SetKeyDirError::NonUtf8);
+            };
+            if utf8_path.trim().is_empty() {
+                return Err(SetKeyDirError::Empty);
+            }
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(SetKeyDirError::OutsideSandbox);
+            }
+            let Ok(canon_sandbox) = std::fs::canonicalize(self.dir.path()) else {
+                return Err(SetKeyDirError::OutsideSandbox);
+            };
+            let mut cur = Some(path);
+            let resolved_ancestor = loop {
+                let Some(candidate) = cur else {
+                    return Err(SetKeyDirError::OutsideSandbox);
+                };
+                match std::fs::symlink_metadata(candidate) {
+                    Ok(_) => {
+                        let Ok(canon) = std::fs::canonicalize(candidate) else {
+                            return Err(SetKeyDirError::OutsideSandbox);
+                        };
+                        break canon;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        cur = candidate.parent();
+                    }
+                    Err(_) => return Err(SetKeyDirError::OutsideSandbox),
+                }
+            };
+            if !resolved_ancestor.starts_with(&canon_sandbox) {
+                return Err(SetKeyDirError::OutsideSandbox);
+            }
+            self.key_dir_env
+                .overwrite(Some(OsStr::new(utf8_path)), self.lock.as_lock());
+            Ok(())
+        }
+
+        /// Update `WITNESS_KEY_DIR_ENV` within the armed scope; panics with the
+        /// exact [`SetKeyDirError`] display message if [`Self::try_set_key_dir`]
+        /// refuses the path.
+        pub(crate) fn set_key_dir(&mut self, path: &Path) {
+            self.try_set_key_dir(path)
+                .unwrap_or_else(|err| panic!("{err}"));
+        }
+
+        /// Update `WITNESS_PUBKEY_ENV` within the armed scope; dropping this
+        /// guard still restores the pre-`arm()` value captured by `pubkey_env`.
+        pub(crate) fn set_pubkey(&mut self, pubkey: &str) {
+            self.pubkey_env
+                .overwrite(Some(OsStr::new(pubkey)), self.lock.as_lock());
         }
     }
 
@@ -2405,9 +2656,6 @@ pub(crate) mod witness_isolation_10117 {
     /// host default — and the dir accepts a key save under any umask.
     #[test]
     fn isolated_custody_never_resolves_to_host_default_10117() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let custody = IsolatedWitnessCustody::arm();
         assert_eq!(
             witness::witness_key_dir().expect("resolve custody dir"),
@@ -2438,6 +2686,433 @@ pub(crate) mod witness_isolation_10117 {
         let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
         crate::identity::keypair::save(&kp, custody.path()).expect("save into isolated custody");
     }
+
+    const SANDBOX_KEY_DIR_VALUE: &str = "/sandbox/preexisting-witness-custody-10119";
+    const SANDBOX_PUBKEY_VALUE: &str = "preexisting-witness-pubkey-10119";
+    const MUTATED_PUBKEY_VALUE: &str = "in-test-mutated-witness-pubkey-10119";
+    const NESTED_PUBKEY_VALUE: &str = "in-test-nested-witness-pubkey-10119";
+    const PANIC_PROBE_MSG: &str = "10119-unwind-restore-probe";
+    #[cfg(unix)]
+    const NON_UTF8_KEY_DIR_BYTES: &[u8] = b"/sandbox/witness-10119-\xff\xfe";
+    #[cfg(unix)]
+    const NON_UTF8_PUBKEY_BYTES: &[u8] = b"pubkey-10119-\x80\xff";
+
+    /// Outer test cleanup guard owning [`WitnessEnvLock`] so a failure in
+    /// the restore matrix cannot leak probe values into sibling tests.
+    struct OuterWitnessEnvCleanup {
+        dir_slot: EnvVarSlot,
+        pub_slot: EnvVarSlot,
+        lock: WitnessEnvLock,
+    }
+
+    impl OuterWitnessEnvCleanup {
+        fn enter() -> Self {
+            let lock = WitnessEnvLock::acquire();
+            Self {
+                dir_slot: EnvVarSlot::capture(witness::WITNESS_KEY_DIR_ENV),
+                pub_slot: EnvVarSlot::capture(witness::WITNESS_PUBKEY_ENV),
+                lock,
+            }
+        }
+
+        fn lock_mut(&mut self) -> &mut WitnessEnvLock {
+            &mut self.lock
+        }
+    }
+
+    impl Drop for OuterWitnessEnvCleanup {
+        fn drop(&mut self) {
+            self.dir_slot.restore(&self.lock);
+            self.pub_slot.restore(&self.lock);
+        }
+    }
+
+    fn apply_probe_env(dir: Option<&OsStr>, pubkey: Option<&OsStr>, lock: &WitnessEnvLock) {
+        EnvVarSlot::write_raw(witness::WITNESS_KEY_DIR_ENV, dir, lock);
+        EnvVarSlot::write_raw(witness::WITNESS_PUBKEY_ENV, pubkey, lock);
+    }
+
+    fn assert_restore_for_case(
+        lock: &mut WitnessEnvLock,
+        label: &str,
+        initial_dir: Option<OsString>,
+        initial_pub: Option<OsString>,
+        mutate_while_armed: bool,
+        unwind_via_panic: bool,
+    ) {
+        apply_probe_env(initial_dir.as_deref(), initial_pub.as_deref(), lock);
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_KEY_DIR_ENV),
+            initial_dir,
+            "{label}: pre-condition key dir mismatch"
+        );
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+            initial_pub,
+            "{label}: pre-condition pubkey mismatch"
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut custody = IsolatedWitnessCustody::arm_with_lock(lock);
+            assert_eq!(
+                std::env::var_os(witness::WITNESS_KEY_DIR_ENV).as_deref(),
+                Some(custody.path().as_os_str()),
+                "{label}: armed fixture must redirect WITNESS_KEY_DIR_ENV"
+            );
+            assert_eq!(
+                std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+                None,
+                "{label}: armed fixture must clear WITNESS_PUBKEY_ENV during test"
+            );
+            if mutate_while_armed {
+                let sub = custody.path().join("mutated-subpath");
+                custody.set_key_dir(&sub);
+                custody.set_pubkey(MUTATED_PUBKEY_VALUE);
+            }
+            if unwind_via_panic {
+                panic!("{PANIC_PROBE_MSG}");
+            }
+        }));
+
+        if unwind_via_panic {
+            let payload = result.expect_err("panic unwind case must panic");
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(
+                msg,
+                Some(PANIC_PROBE_MSG),
+                "{label}: unexpected panic payload"
+            );
+        } else {
+            assert!(result.is_ok(), "{label}: normal-return case must not panic");
+        }
+
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_KEY_DIR_ENV),
+            initial_dir,
+            "{label}: WITNESS_KEY_DIR_ENV must be restored to its pre-arm var_os value"
+        );
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+            initial_pub,
+            "{label}: WITNESS_PUBKEY_ENV must be restored to its pre-arm var_os value"
+        );
+    }
+
+    fn assert_nested_guard_lifo_restore(
+        lock: &mut WitnessEnvLock,
+        label: &str,
+        initial_dir: Option<OsString>,
+        initial_pub: Option<OsString>,
+        unwind_inner: bool,
+    ) {
+        apply_probe_env(initial_dir.as_deref(), initial_pub.as_deref(), lock);
+        {
+            let mut outer = IsolatedWitnessCustody::arm_with_lock(lock);
+            let outer_sub = outer.path().join("outer-sub");
+            outer.set_key_dir(&outer_sub);
+            outer.set_pubkey(MUTATED_PUBKEY_VALUE);
+
+            let inner_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut inner = outer.arm_nested();
+                assert_ne!(
+                    inner.path(),
+                    outer_sub.as_path(),
+                    "{label}: nested guard must allocate its own private sandbox"
+                );
+                assert_eq!(
+                    std::env::var_os(witness::WITNESS_KEY_DIR_ENV).as_deref(),
+                    Some(inner.path().as_os_str()),
+                    "{label}: nested guard must redirect WITNESS_KEY_DIR_ENV"
+                );
+                assert_eq!(
+                    std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+                    None,
+                    "{label}: nested guard must clear WITNESS_PUBKEY_ENV"
+                );
+                let inner_sub = inner.path().join("inner-sub");
+                inner.set_key_dir(&inner_sub);
+                inner.set_pubkey(NESTED_PUBKEY_VALUE);
+                if unwind_inner {
+                    panic!("{PANIC_PROBE_MSG}");
+                }
+            }));
+            if unwind_inner {
+                let payload = inner_res.expect_err("inner unwind case must panic");
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+                assert_eq!(
+                    msg,
+                    Some(PANIC_PROBE_MSG),
+                    "{label}: unexpected inner panic payload"
+                );
+            } else {
+                assert!(inner_res.is_ok(), "{label}: inner return must succeed");
+            }
+            assert_eq!(
+                std::env::var_os(witness::WITNESS_KEY_DIR_ENV).as_deref(),
+                Some(outer_sub.as_os_str()),
+                "{label}: dropping nested guard must restore outer guard's WITNESS_KEY_DIR_ENV"
+            );
+            assert_eq!(
+                std::env::var_os(witness::WITNESS_PUBKEY_ENV).as_deref(),
+                Some(OsStr::new(MUTATED_PUBKEY_VALUE)),
+                "{label}: dropping nested guard must restore outer guard's WITNESS_PUBKEY_ENV"
+            );
+        }
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_KEY_DIR_ENV),
+            initial_dir,
+            "{label}: dropping outer guard must restore pre-outer WITNESS_KEY_DIR_ENV"
+        );
+        assert_eq!(
+            std::env::var_os(witness::WITNESS_PUBKEY_ENV),
+            initial_pub,
+            "{label}: dropping outer guard must restore pre-outer WITNESS_PUBKEY_ENV"
+        );
+    }
+
+    /// #10119 / umbrella #8170 — dropping an armed `IsolatedWitnessCustody`
+    /// MUST restore every touched witness variable to its exact pre-`arm()`
+    /// `var_os` value (set stays set, absent stays absent, empty stays empty,
+    /// non-UTF-8 stays byte-identical, nested guards restore LIFO), on both
+    /// normal return and panic unwind.
+    #[test]
+    fn isolated_custody_restores_prior_env_on_drop_and_unwind_10119() {
+        let mut outer_cleanup = OuterWitnessEnvCleanup::enter();
+
+        let dir_set = Some(OsString::from(SANDBOX_KEY_DIR_VALUE));
+        let pub_set = Some(OsString::from(SANDBOX_PUBKEY_VALUE));
+        let empty = Some(OsString::from(""));
+
+        let mut cases: Vec<(&str, Option<OsString>, Option<OsString>)> = vec![
+            ("both-set", dir_set.clone(), pub_set.clone()),
+            ("both-absent", None, None),
+            ("dir-set-pub-absent", dir_set.clone(), None),
+            ("dir-absent-pub-set", None, pub_set.clone()),
+            ("both-empty", empty.clone(), empty.clone()),
+            ("dir-empty-pub-set", empty.clone(), pub_set),
+            ("dir-set-pub-empty", dir_set, empty),
+        ];
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            cases.push((
+                "both-non-utf8",
+                Some(OsStr::from_bytes(NON_UTF8_KEY_DIR_BYTES).to_os_string()),
+                Some(OsStr::from_bytes(NON_UTF8_PUBKEY_BYTES).to_os_string()),
+            ));
+        }
+
+        for (label, initial_dir, initial_pub) in cases {
+            for mutate_while_armed in [false, true] {
+                for unwind_via_panic in [false, true] {
+                    assert_restore_for_case(
+                        outer_cleanup.lock_mut(),
+                        label,
+                        initial_dir.clone(),
+                        initial_pub.clone(),
+                        mutate_while_armed,
+                        unwind_via_panic,
+                    );
+                }
+            }
+            for unwind_inner in [false, true] {
+                assert_nested_guard_lifo_restore(
+                    outer_cleanup.lock_mut(),
+                    label,
+                    initial_dir.clone(),
+                    initial_pub.clone(),
+                    unwind_inner,
+                );
+            }
+        }
+    }
+
+    /// #10119 round 1/2 (L1 / F2 / N1 / N4) — `IsolatedWitnessCustody::arm()`
+    /// MUST own [`WitnessEnvLock`] as a field so no caller can arm without
+    /// holding `key_dir_env_lock()`, and dropping the guard MUST release it
+    /// deterministically without racing `try_lock()` probes.
+    #[test]
+    fn isolated_custody_owns_env_lock_without_caller_lock_10119() {
+        let custody = IsolatedWitnessCustody::arm();
+        // Type-level proof (N1): `env_lock()` returns `&WitnessEnvLock`, whose
+        // private `_guard` field is constructible only via `WitnessEnvLock::acquire()`.
+        let held: &WitnessEnvLock = custody.env_lock();
+        let _ = held;
+        assert_eq!(
+            witness::witness_key_dir().expect("resolve witness dir while armed"),
+            custody.path(),
+            "#10119: armed guard must isolate witness_key_dir while holding WitnessEnvLock"
+        );
+        drop(custody);
+        // Deterministic release proof (N4): blocking acquire succeeds cleanly
+        // after drop under any parallel test contention (zero racing `try_lock()`).
+        let released = WitnessEnvLock::acquire();
+        drop(released);
+        let rearmed = IsolatedWitnessCustody::arm();
+        assert_eq!(
+            witness::witness_key_dir().expect("resolve witness dir on rearm"),
+            rearmed.path(),
+            "#10119: re-arming after drop must acquire and isolate cleanly"
+        );
+    }
+
+    /// Lock identity pin (#10119 / #8168): while a [`WitnessEnvLock`], or an
+    /// armed [`IsolatedWitnessCustody`], is held, the process-wide
+    /// `crate::identity::keypair::key_dir_env_lock()` is locked, so a wrapper
+    /// over any other mutex is red. Asserts the held state only: an `Ok`
+    /// probe after drop would race other tests that take the same lock.
+    #[test]
+    fn witness_env_lock_and_custody_hold_key_dir_env_lock_identity_10119() {
+        fn key_dir_lock_is_held() -> bool {
+            matches!(
+                crate::identity::keypair::key_dir_env_lock().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            )
+        }
+        let env_lock = WitnessEnvLock::acquire();
+        assert!(
+            key_dir_lock_is_held(),
+            "#10119: a held WitnessEnvLock must hold key_dir_env_lock()"
+        );
+        drop(env_lock);
+        let custody = IsolatedWitnessCustody::arm();
+        assert!(
+            key_dir_lock_is_held(),
+            "#10119: an armed IsolatedWitnessCustody must hold key_dir_env_lock()"
+        );
+        drop(custody);
+    }
+
+    fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            String::from("<non-string panic payload>")
+        }
+    }
+
+    /// #10119 round 1/2 (F3, N2, N3) — `try_set_key_dir` and `set_key_dir` MUST
+    /// refuse empty, whitespace, non-UTF-8, relative, parent-traversal,
+    /// outside-sandbox, symlink-escape, and dangling-symlink paths with their
+    /// exact [`SetKeyDirError`] variant and reason constant so an armed guard
+    /// can never fail open to the host default custody directory.
+    #[test]
+    fn set_key_dir_refuses_empty_and_outside_sandbox_paths_10119() {
+        let mut custody = IsolatedWitnessCustody::arm();
+        let expected_dir = custody.path().to_path_buf();
+        let outside_dir = crate::identity::test_key_dir::private_tempdir();
+        let outside_path = outside_dir.path().join("outside-sandbox-10119");
+        let traversal_path = custody.path().join("..").join("escape-10119");
+        let mut bad_paths: Vec<(&str, std::path::PathBuf, SetKeyDirError, &str)> = vec![
+            (
+                "empty",
+                std::path::PathBuf::from(""),
+                SetKeyDirError::Empty,
+                SET_KEY_DIR_REFUSED_EMPTY,
+            ),
+            (
+                "whitespace",
+                std::path::PathBuf::from("   "),
+                SetKeyDirError::Empty,
+                SET_KEY_DIR_REFUSED_EMPTY,
+            ),
+            (
+                "relative",
+                std::path::PathBuf::from("relative/custody"),
+                SetKeyDirError::OutsideSandbox,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ),
+            (
+                "outside-sandbox",
+                outside_path,
+                SetKeyDirError::OutsideSandbox,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ),
+            (
+                "parent-traversal",
+                traversal_path,
+                SetKeyDirError::OutsideSandbox,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::os::unix::fs::symlink;
+
+            let non_utf8_in_sandbox = custody.path().join(OsStr::from_bytes(b"non-utf8-\xff\xfe"));
+            bad_paths.push((
+                "non-utf8-in-sandbox",
+                non_utf8_in_sandbox,
+                SetKeyDirError::NonUtf8,
+                SET_KEY_DIR_REFUSED_NON_UTF8,
+            ));
+
+            let escape_link = custody.path().join("escape-link");
+            symlink(outside_dir.path(), &escape_link).expect("create escape symlink");
+            bad_paths.push((
+                "symlink-escape",
+                escape_link.clone(),
+                SetKeyDirError::OutsideSandbox,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ));
+            bad_paths.push((
+                "symlink-escape-child",
+                escape_link.join("nonexistent-child"),
+                SetKeyDirError::OutsideSandbox,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ));
+
+            let dangling_link = custody.path().join("dangling-link");
+            symlink(outside_dir.path().join("does-not-exist"), &dangling_link)
+                .expect("create dangling symlink");
+            bad_paths.push((
+                "dangling-symlink",
+                dangling_link,
+                SetKeyDirError::OutsideSandbox,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ));
+        }
+
+        for (label, bad, expected_err, expected_reason) in bad_paths {
+            assert_eq!(
+                custody.try_set_key_dir(&bad),
+                Err(expected_err),
+                "#10119 ({label}): try_set_key_dir({bad:?}) must return exact refusal variant"
+            );
+            assert_eq!(
+                witness::witness_key_dir().expect("resolve witness dir after try_set_key_dir"),
+                expected_dir,
+                "#10119 ({label}): refused try_set_key_dir must keep witness_key_dir on sandbox"
+            );
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                custody.set_key_dir(&bad);
+            }));
+            let payload = match res {
+                Err(payload) => payload,
+                Ok(()) => panic!("#10119 ({label}): set_key_dir({bad:?}) must refuse invalid path"),
+            };
+            let msg = panic_payload_message(payload);
+            assert!(
+                msg.contains(expected_reason),
+                "#10119 ({label}): expected refusal containing {expected_reason:?}, got: {msg:?}"
+            );
+            assert_eq!(
+                witness::witness_key_dir().expect("resolve witness dir"),
+                expected_dir,
+                "#10119 ({label}): refused set_key_dir must keep witness_key_dir on sandbox"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2445,7 +3120,7 @@ mod restore_attest_1946_tests {
     //! #1946 CLI-verb coverage: every arm of `run_restore_attest`.
     //! Witness env vars are process-global → serialised on the crate's
     //! key-dir env lock (the `governance::audit` test convention) and
-    //! cleared before release.
+    //! restored to their prior values on drop.
     use super::*;
     use crate::cli::test_utils::TestEnv;
     use crate::governance::audit as witness;
@@ -2463,13 +3138,12 @@ mod restore_attest_1946_tests {
     /// Seed the off-table anchor ABOVE the (empty) DB head by enrolling a
     /// witness key, appending rows, forcing an anchor emission, then
     /// re-opening a FRESH empty db path so `db_head < anchor`.
-    fn seed_anchor_above_head(env: &TestEnv, witness_dir: &std::path::Path) {
+    fn seed_anchor_above_head(env: &TestEnv, custody: &mut IsolatedWitnessCustody<'_>) {
+        let witness_dir = custody.path().to_path_buf();
         let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
-        crate::identity::keypair::save(&kp, witness_dir).expect("save");
-        unsafe {
-            std::env::set_var(witness::WITNESS_KEY_DIR_ENV, witness_dir);
-            std::env::set_var(witness::WITNESS_PUBKEY_ENV, kp.public_base64());
-        }
+        crate::identity::keypair::save(&kp, &witness_dir).expect("save");
+        custody.set_key_dir(&witness_dir);
+        custody.set_pubkey(&kp.public_base64());
         // Anchor from a THROWAWAY db that has rows; the TestEnv db stays empty.
         let anchor_db = witness_dir.join("anchor-seed.db");
         let conn = crate::db::open(&anchor_db).expect("open");
@@ -2492,11 +3166,8 @@ mod restore_attest_1946_tests {
 
     #[test]
     fn no_anchor_bails_with_enrolment_hint() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // #10117 — the bail must hold on a host WITH an enrolled witness and
-        // a pinned head anchor: the armed fixture hides the host default.
+        // #10117 / #10119 — the armed fixture owns `key_dir_env_lock()` and
+        // hides the host default.
         let _custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
         let db_path = env.db_path.clone();
@@ -2512,18 +3183,14 @@ mod restore_attest_1946_tests {
 
     #[test]
     fn gap_zero_reports_no_rollback_and_exits_zero() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
         // Anchor from the SAME db the CLI will read → head == anchor → gap 0.
+        let witness_dir = custody.path().to_path_buf();
         let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
-        crate::identity::keypair::save(&kp, custody.path()).expect("save");
-        unsafe {
-            std::env::set_var(witness::WITNESS_KEY_DIR_ENV, custody.path());
-            std::env::set_var(witness::WITNESS_PUBKEY_ENV, kp.public_base64());
-        }
+        crate::identity::keypair::save(&kp, &witness_dir).expect("save");
+        custody.set_key_dir(&witness_dir);
+        custody.set_pubkey(&kp.public_base64());
         {
             let conn = crate::db::open(&env.db_path).expect("open");
             let ev = crate::signed_events::SignedEvent {
@@ -2553,12 +3220,9 @@ mod restore_attest_1946_tests {
 
     #[test]
     fn dry_run_prints_gap_text_and_json_without_signing() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
-        seed_anchor_above_head(&env, custody.path());
+        seed_anchor_above_head(&env, &mut custody);
         let db_path = env.db_path.clone();
         {
             let mut out = env.output();
@@ -2595,12 +3259,9 @@ mod restore_attest_1946_tests {
 
     #[test]
     fn sign_missing_operator_key_errors() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
-        seed_anchor_above_head(&env, custody.path());
+        seed_anchor_above_head(&env, &mut custody);
         let db_path = env.db_path.clone();
         let empty_keys = crate::identity::test_key_dir::private_tempdir();
         let mut out = env.output();
@@ -2615,12 +3276,9 @@ mod restore_attest_1946_tests {
 
     #[test]
     fn sign_happy_path_appends_sanction_text_and_json() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
-        seed_anchor_above_head(&env, custody.path());
+        seed_anchor_above_head(&env, &mut custody);
         let op_dir = crate::identity::test_key_dir::private_tempdir();
         let op = crate::identity::keypair::generate(crate::cli::rules::OPERATOR_KEY_ID)
             .expect("gen operator");
@@ -2692,31 +3350,27 @@ mod reanchor_ceremony_2004_cli_tests {
         }
     }
 
-    /// Enrol a witness signing key in `dir` and set the custody-dir env; the
-    /// K1 pubkey env is set SEPARATELY by the caller (so the drift case can
-    /// pin a DIFFERENT key than the one that signs).
-    fn enrol_signing_key(dir: &std::path::Path) -> crate::identity::keypair::AgentKeypair {
+    /// Enrol a witness signing key in `custody` and set the custody-dir env;
+    /// the K1 pubkey env is set SEPARATELY by the caller (so the drift case
+    /// can pin a DIFFERENT key than the one that signs).
+    fn enrol_signing_key(
+        custody: &mut IsolatedWitnessCustody<'_>,
+    ) -> crate::identity::keypair::AgentKeypair {
+        let witness_dir = custody.path().to_path_buf();
         let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
-        crate::identity::keypair::save(&kp, dir).expect("save");
-        unsafe {
-            std::env::set_var(witness::WITNESS_KEY_DIR_ENV, dir);
-        }
+        crate::identity::keypair::save(&kp, &witness_dir).expect("save");
+        custody.set_key_dir(&witness_dir);
         kp
     }
 
     #[test]
     fn re_anchor_readback_pass_exits_zero() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
         append_rows(&env.db_path, 2);
-        let kp = enrol_signing_key(custody.path());
+        let kp = enrol_signing_key(&mut custody);
         // K1 pins the SAME key that signs → PASS.
-        unsafe {
-            std::env::set_var(witness::WITNESS_PUBKEY_ENV, kp.public_base64());
-        }
+        custody.set_pubkey(&kp.public_base64());
         let db_path = env.db_path.clone();
         let code = {
             let mut out = env.output();
@@ -2732,20 +3386,15 @@ mod reanchor_ceremony_2004_cli_tests {
 
     #[test]
     fn re_anchor_enrolment_drift_fails_closed_nonzero() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
         append_rows(&env.db_path, 2);
-        let _signer = enrol_signing_key(custody.path());
+        let _signer = enrol_signing_key(&mut custody);
         // ENROLMENT DRIFT: pin a DIFFERENT key than the custody signer. The
         // persisted anchor's resolver_pubkey is the signer's, so the K1 pin
         // fails — the ceremony persisted but is NOT verifiable.
         let other = crate::identity::keypair::generate("someone-else").expect("gen");
-        unsafe {
-            std::env::set_var(witness::WITNESS_PUBKEY_ENV, other.public_base64());
-        }
+        custody.set_pubkey(&other.public_base64());
         let db_path = env.db_path.clone();
         let code = {
             let mut out = env.output();
@@ -2787,13 +3436,10 @@ mod reanchor_ceremony_2004_cli_tests {
     /// enrolled).
     #[test]
     fn re_anchor_unloadable_custody_fails_closed_nonzero() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
         append_rows(&env.db_path, 2);
-        let _signer = enrol_signing_key(custody.path());
+        let _signer = enrol_signing_key(&mut custody);
         std::fs::remove_file(
             custody
                 .path()
@@ -2833,20 +3479,13 @@ mod reanchor_ceremony_2004_cli_tests {
     /// stderr naming the enrolment lever, nothing persisted.
     #[test]
     fn re_anchor_absent_custody_is_explicit_skip_not_fail() {
-        let _g = crate::identity::keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let custody = IsolatedWitnessCustody::arm();
+        let mut custody = IsolatedWitnessCustody::arm();
         let mut env = TestEnv::fresh();
         append_rows(&env.db_path, 2);
         // Point custody at a dir that does NOT exist (hermetic — never the
         // host's real default custody dir).
-        unsafe {
-            std::env::set_var(
-                witness::WITNESS_KEY_DIR_ENV,
-                custody.path().join("does-not-exist"),
-            );
-        }
+        let absent_dir = custody.path().join("does-not-exist");
+        custody.set_key_dir(&absent_dir);
         let db_path = env.db_path.clone();
         let code = {
             let mut out = env.output();
