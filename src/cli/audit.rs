@@ -2643,12 +2643,16 @@ pub(crate) mod witness_isolation_10117 {
 
         let dir_set = Some(std::ffi::OsString::from(SANDBOX_KEY_DIR_VALUE));
         let pub_set = Some(std::ffi::OsString::from(SANDBOX_PUBKEY_VALUE));
+        let empty = Some(std::ffi::OsString::from(""));
 
         let mut cases: Vec<(&str, Option<std::ffi::OsString>, Option<std::ffi::OsString>)> = vec![
             ("both-set", dir_set.clone(), pub_set.clone()),
             ("both-absent", None, None),
-            ("dir-set-pub-absent", dir_set, None),
-            ("dir-absent-pub-set", None, pub_set),
+            ("dir-set-pub-absent", dir_set.clone(), None),
+            ("dir-absent-pub-set", None, pub_set.clone()),
+            ("both-empty", empty.clone(), empty.clone()),
+            ("dir-empty-pub-set", empty.clone(), pub_set),
+            ("dir-set-pub-empty", dir_set, empty),
         ];
 
         #[cfg(unix)]
@@ -2673,6 +2677,59 @@ pub(crate) mod witness_isolation_10117 {
                     );
                 }
             }
+        }
+    }
+
+    /// #10119 round 1 (L1 / F2) — `IsolatedWitnessCustody::arm()` MUST own
+    /// `key_dir_env_lock()` as a field so no caller can arm without holding
+    /// the lock, and dropping the guard MUST release the lock.
+    #[test]
+    fn isolated_custody_owns_env_lock_without_caller_lock_10119() {
+        let custody = IsolatedWitnessCustody::arm();
+        assert!(
+            crate::identity::keypair::key_dir_env_lock()
+                .try_lock()
+                .is_err(),
+            "#10119: armed IsolatedWitnessCustody must hold key_dir_env_lock() itself"
+        );
+        drop(custody);
+        let probe = crate::identity::keypair::key_dir_env_lock().try_lock();
+        assert!(
+            probe.is_ok(),
+            "#10119: dropping IsolatedWitnessCustody must release key_dir_env_lock()"
+        );
+    }
+
+    /// #10119 round 1 (F3) — `set_key_dir` MUST refuse empty, whitespace,
+    /// relative, parent-traversal, and outside-sandbox paths so an armed guard
+    /// can never fail open to the host default custody directory.
+    #[test]
+    fn set_key_dir_refuses_empty_and_outside_sandbox_paths_10119() {
+        let custody = IsolatedWitnessCustody::arm();
+        let expected_dir = custody.path().to_path_buf();
+        let outside_path = std::env::temp_dir().join("outside-sandbox-10119");
+        let traversal_path = custody.path().join("..").join("escape-10119");
+        let bad_paths: [(&str, &Path); 5] = [
+            ("empty", Path::new("")),
+            ("whitespace", Path::new("   ")),
+            ("relative", Path::new("relative/custody")),
+            ("outside-sandbox", outside_path.as_path()),
+            ("parent-traversal", traversal_path.as_path()),
+        ];
+        for (label, bad) in bad_paths {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                custody.set_key_dir(bad);
+            }));
+            assert!(
+                res.is_err(),
+                "#10119 ({label}): set_key_dir({:?}) must refuse invalid path",
+                bad
+            );
+            assert_eq!(
+                witness::witness_key_dir().expect("resolve witness dir"),
+                expected_dir,
+                "#10119 ({label}): refused set_key_dir must keep witness_key_dir on sandbox"
+            );
         }
     }
 }
