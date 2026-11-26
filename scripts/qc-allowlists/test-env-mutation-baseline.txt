@@ -16,7 +16,8 @@
 0 6 src/cli/commands/atomise.rs
 0 12 src/cli/commands/config.rs
 0 3 src/cli/curator.rs
-0 24 src/cli/doctor.rs
+0 13 src/cli/doctor.rs
+0 6 src/cli/doctor_posture_fixture_10121.rs
 0 2 src/cli/governance_install_defaults.rs
 0 6 src/cli/helpers.rs
 0 4 src/cli/identity.rs
@@ -36,7 +37,8 @@
 0 69 src/daemon_runtime.rs
 0 5 src/egress.rs
 0 9 src/embeddings.rs
-0 47 src/enterprise_federation_posture.rs
+0 34 src/enterprise_federation_posture.rs
+0 7 src/enterprise_federation_posture/hardened_env_fixture.rs
 0 11 src/erasure/mod.rs
 0 1 src/federation/identity/credential.rs
 0 1 src/federation/identity/inventory.rs
