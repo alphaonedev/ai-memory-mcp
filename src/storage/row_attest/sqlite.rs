@@ -1113,25 +1113,21 @@ fn verify_inner(
     anchor: &super::anchor::AnchorLoad,
     sealed: &SealState,
 ) -> Result<(Report, SealRecord)> {
-    // #10116: one read snapshot for every streamed query (outside a caller's
-    // transaction); read-only, so it is dropped (rolled back) at the end.
-    let snapshot = if conn.is_autocommit() {
-        Some(conn.unchecked_transaction()?)
-    } else {
-        None
-    };
-    let mut src = SqliteSource {
-        conn,
-        non_canonical: Vec::new(),
-    };
-    let ctx = super::stream::Ctx {
-        anchor,
-        memory_id_of_key: &super::memory_id_of_key,
-        seal: sealed,
-    };
-    let out = super::stream::run(&mut src, &ctx);
-    drop(snapshot);
-    out
+    // #10116: one read snapshot for every streamed query and the closing
+    // count (a caller's open transaction is used as is). The read-only
+    // snapshot helper is the one #5084 allowlists; nothing here writes.
+    crate::governance::policy_version::with_read_snapshot(conn, |conn| {
+        let mut src = SqliteSource {
+            conn,
+            non_canonical: Vec::new(),
+        };
+        let ctx = super::stream::Ctx {
+            anchor,
+            memory_id_of_key: &super::memory_id_of_key,
+            seal: sealed,
+        };
+        super::stream::run(&mut src, &ctx)
+    })
 }
 
 /// Refusal prefix of [`check_snapshot`] (C-7, E-6).
