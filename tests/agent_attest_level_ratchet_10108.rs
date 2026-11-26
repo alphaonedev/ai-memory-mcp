@@ -45,7 +45,67 @@ const LITERALS: [&str; 3] = ["\"self_signed\"", "\"signed_by_peer\"", "\"peer_at
 
 /// `(file, count)`: every `.rs` file that names an agent level, with the exact
 /// number of forms it holds. Regenerate only after reviewing each new site.
-const ALLOWLIST: &[(&str, usize)] = &[];
+const ALLOWLIST: &[(&str, usize)] = &[
+    ("src/cli/commands/export_reflections.rs", 13),
+    ("src/cli/link.rs", 1),
+    ("src/cli/verify.rs", 7),
+    ("src/curator/mod.rs", 4),
+    ("src/handlers/capture_turn/attestation.rs", 2),
+    ("src/handlers/coordination.rs", 1),
+    ("src/handlers/federation_receive.rs", 1),
+    ("src/handlers/federation_signing_check.rs", 1),
+    ("src/handlers/tests.rs", 1),
+    ("src/handlers/transport.rs", 1),
+    ("src/identity/verify.rs", 6),
+    ("src/mcp/mod.rs", 12),
+    ("src/mcp/tools/capture_turn.rs", 10),
+    ("src/mcp/tools/checkpoint.rs", 4),
+    ("src/mcp/tools/link.rs", 1),
+    ("src/mcp/tools/recall.rs", 23),
+    ("src/mcp/tools/routine.rs", 1),
+    ("src/mcp/tools/signal.rs", 2),
+    ("src/mcp/tools/verify.rs", 6),
+    ("src/models/link.rs", 26),
+    ("src/models/mod.rs", 24),
+    ("src/offload/mod.rs", 1),
+    ("src/persona/mod.rs", 10),
+    ("src/signed_events.rs", 11),
+    ("src/signed_events/agent_row.rs", 9),
+    ("src/signed_events/agent_row_10108_tests.rs", 10),
+    ("src/storage/migrations.rs", 4),
+    ("src/storage/mod.rs", 18),
+    ("src/store/mod.rs", 5),
+    ("src/store/postgres.rs", 4),
+    ("src/store/sqlite.rs", 1),
+    ("src/trust.rs", 4),
+    ("tests/a2a_campaign_round1.rs", 1),
+    ("tests/agent_row_pg_10108.rs", 5),
+    ("tests/archive_restore_link_cid_3250.rs", 1),
+    ("tests/attest_level_stamp_values_3548.rs", 4),
+    ("tests/attest_level_string_invariant.rs", 3),
+    ("tests/capture_turn_security_integrity.rs", 8),
+    ("tests/cov_ga2_pg_federation.rs", 1),
+    ("tests/curator_conserves_contradiction_g7.rs", 1),
+    ("tests/federation_inbound_verify.rs", 3),
+    ("tests/g3_postgres_verify_link_signature_roundtrip.rs", 2),
+    ("tests/h2_invalidate_link_signed.rs", 2),
+    ("tests/http_capture_attestation_3406.rs", 3),
+    ("tests/identity_e2e.rs", 13),
+    ("tests/issue_2059_2060_covenant_pg.rs", 1),
+    ("tests/issue_2121_2122_2123_covenant_funnels.rs", 1),
+    ("tests/link_invalidate_payload_hash_parity_3281.rs", 2),
+    ("tests/memory_verify.rs", 12),
+    ("tests/persona_signing_pipeline_813.rs", 7),
+    ("tests/recall_no_lock_across_hnsw.rs", 4),
+    ("tests/recursive_sal_coverage.rs", 2),
+    ("tests/reflect_owner_parity_3423.rs", 2),
+    ("tests/sal_contract.rs", 2),
+    ("tests/sal_parity_link_window_3178.rs", 2),
+    ("tests/serve_postgres_smoke.rs", 1),
+    ("tests/signed_events_legacy_cutoff_10074.rs", 15),
+    ("tests/signed_events_legacy_cutoff_10074_pg.rs", 5),
+    ("tests/store_parity_gaps.rs", 1),
+];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -61,7 +121,13 @@ fn tree_files() -> BTreeSet<String> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .arg("-C")
         .arg(root())
-        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .output()
         .unwrap_or_else(|e| panic!("git ls-files could not run: {e}"));
     assert!(
@@ -75,7 +141,11 @@ fn tree_files() -> BTreeSet<String> {
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect();
-    assert!(files.len() > MIN_TREE_FILES, "tree listing too small: {}", files.len());
+    assert!(
+        files.len() > MIN_TREE_FILES,
+        "tree listing too small: {}",
+        files.len()
+    );
     files
 }
 
@@ -98,13 +168,19 @@ fn count_word(text: &str, word: &str) -> usize {
 /// The number of agent-level forms `text` holds.
 fn count_forms(text: &str) -> usize {
     VARIANTS.iter().map(|v| count_word(text, v)).sum::<usize>()
-        + LITERALS.iter().map(|l| text.matches(l).count()).sum::<usize>()
+        + LITERALS
+            .iter()
+            .map(|l| text.matches(l).count())
+            .sum::<usize>()
 }
 
 fn observed() -> BTreeMap<String, usize> {
     let mut map = BTreeMap::new();
     for f in tree_files() {
-        if !f.ends_with(".rs") || f == SELF {
+        let is_rust = std::path::Path::new(&f)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+        if !is_rust || f == SELF {
             continue;
         }
         let path = root().join(&f);
@@ -113,7 +189,8 @@ fn observed() -> BTreeMap<String, usize> {
             // staged) holds no code.
             continue;
         };
-        let text = String::from_utf8(bytes).unwrap_or_else(|_| panic!("{f}: .rs file is not UTF-8"));
+        let text =
+            String::from_utf8(bytes).unwrap_or_else(|_| panic!("{f}: .rs file is not UTF-8"));
         let n = count_forms(&text);
         if n > 0 {
             map.insert(f, n);
@@ -124,20 +201,29 @@ fn observed() -> BTreeMap<String, usize> {
 
 #[test]
 fn agent_attest_level_sites_match_the_allowlist_10108() {
-    let want: BTreeMap<String, usize> = ALLOWLIST.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+    let want: BTreeMap<String, usize> = ALLOWLIST
+        .iter()
+        .map(|(f, n)| ((*f).to_string(), *n))
+        .collect();
     assert_eq!(want.len(), ALLOWLIST.len(), "duplicate allowlist entry");
     let got = observed();
     let mut diffs = Vec::new();
     for (f, n) in &got {
         match want.get(f) {
-            None => diffs.push(format!("{f}: {n} agent-level form(s), file not allowlisted")),
-            Some(w) if w != n => diffs.push(format!("{f}: {n} agent-level form(s), allowlist says {w}")),
+            None => diffs.push(format!(
+                "{f}: {n} agent-level form(s), file not allowlisted"
+            )),
+            Some(w) if w != n => {
+                diffs.push(format!("{f}: {n} agent-level form(s), allowlist says {w}"));
+            }
             Some(_) => {}
         }
     }
     for (f, w) in &want {
         if !got.contains_key(f) {
-            diffs.push(format!("{f}: allowlisted with {w}, holds none (stale entry)"));
+            diffs.push(format!(
+                "{f}: allowlisted with {w}, holds none (stale entry)"
+            ));
         }
     }
     assert!(
@@ -155,7 +241,10 @@ fn counter_sees_every_form_10108() {
         ("AttestLevel::SignedByPeer.as_str()", 1),
         ("use crate::models::AttestLevel::PeerAttested as Pa;", 1),
         ("AttestLevel::from_str(\"peer_attested\")", 1),
-        ("const L: [AttestLevel; 2] = [AttestLevel::SelfSigned, AttestLevel::PeerAttested];", 2),
+        (
+            "const L: [AttestLevel; 2] = [AttestLevel::SelfSigned, AttestLevel::PeerAttested];",
+            2,
+        ),
         ("match x { AgentAttestation::SelfSigned => 1 }", 1),
         // Not a form: a longer identifier or an unquoted word.
         ("SelfSignedLike self_signed_count NotPeerAttested", 0),

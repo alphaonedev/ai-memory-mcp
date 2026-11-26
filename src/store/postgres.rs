@@ -132,7 +132,8 @@ mod lifecycle_tx_3152;
 // #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
 mod forensic_outage_4199;
 // v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
-mod lock_order_4209;
+mod link_created_10108;
+mod lock_order_4209; // #10108 D5 pg `memory_link.created` append (qual_10 budget)
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -13801,14 +13802,37 @@ impl PostgresStore {
         .bind(created_at_dt)
         .bind(valid_from_dt)
         .bind(valid_until_dt)
-        .bind(signature)
+        .bind(signature.as_deref())
         .bind(attest_level)
-        .bind(observed_by_col)
+        .bind(observed_by_col.as_deref())
         .bind(source_cid)
         .bind(target_cid)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_link", e))?;
+        // #10108 (D5) — the `memory_link.created` row, in this transaction,
+        // only when the INSERT wrote a row (a replay appends nothing, as on
+        // sqlite). Same pre-image as the signer above.
+        let created_anchor = if insert_res.rows_affected() > 0 {
+            let signable = crate::identity::sign::SignableLink {
+                src_id: &link.source_id,
+                dst_id: &link.target_id,
+                relation: link.relation.as_str(),
+                observed_by: observed_by_col.as_deref(),
+                created_at: Some(created_at_str.as_str()),
+                valid_from: Some(valid_from_str.as_str()),
+                valid_until: valid_until_str.as_deref(),
+            };
+            link_created_10108::append_link_created_in_tx(
+                &mut tx,
+                &signable,
+                attest_level,
+                signature.as_deref(),
+            )
+            .await?
+        } else {
+            crate::governance::audit::PendingAuditAnchor::none()
+        };
         // #3051 / Fable #3237 item 2 — ON CONFLICT DO NOTHING preserves the
         // existing row. Returning the freshly COMPUTED `attest_level` on
         // that path would report `unsigned` for a replay of an unsigned
@@ -13968,7 +13992,7 @@ impl PostgresStore {
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, created_anchor)
             .await
             .map_err(|e| to_store_err("commit link tx", e))?;
 
@@ -15313,6 +15337,8 @@ impl PostgresStore {
         let edge_created_at_dt = truncate_to_microseconds(created_at_dt);
         let edge_created_at_str =
             crate::identity::attest::canonical_created_at_stamp(edge_created_at_dt);
+        // #10108 (D5) — one `memory_link.created` row per edge this tx wrote.
+        let mut created_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for src_id in &input.source_ids {
             validate::validate_link(
                 &actual_id,
@@ -15354,7 +15380,7 @@ impl PostgresStore {
             // `db::create_link` which uses the same connection; we
             // mirror that here with a `&mut tx` binding so a link
             // failure rolls back the memory insert.
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO memory_links \
                     (source_id, target_id, relation, created_at, valid_from, signature, \
                      attest_level, observed_by) \
@@ -15365,15 +15391,35 @@ impl PostgresStore {
             .bind(src_id)
             .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
             .bind(edge_created_at_dt)
-            .bind(signature)
+            .bind(signature.as_deref())
             .bind(attest_level)
-            .bind(observed_by_col)
+            .bind(observed_by_col.as_deref())
             .execute(&mut *tx)
             .await
             .map_err(|e| ReflectError::Database(format!("insert reflects_on link: {e}")))?;
+            if inserted.rows_affected() > 0 {
+                let signable = crate::identity::sign::SignableLink {
+                    src_id: &actual_id,
+                    dst_id: src_id,
+                    relation: crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
+                    observed_by: observed_by_col.as_deref(),
+                    created_at: Some(edge_created_at_str.as_str()),
+                    valid_from: Some(edge_created_at_str.as_str()),
+                    valid_until: None,
+                };
+                let anchor = link_created_10108::append_link_created_in_tx(
+                    &mut tx,
+                    &signable,
+                    attest_level,
+                    signature.as_deref(),
+                )
+                .await
+                .map_err(|e| ReflectError::Database(e.to_string()))?;
+                created_anchor = created_anchor.merge(anchor);
+            }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, created_anchor)
             .await
             .map_err(|e| ReflectError::Database(format!("commit reflect tx: {e}")))?;
 
@@ -15942,13 +15988,16 @@ async fn pg_invalidate_link_relational_in_tx(
         // NEVER the original attester (`observed_by`): that would name the
         // peer which signed the edge as the actor of an invalidation it never
         // performed. `observed_by`'s identity instead travels inside the CBOR
-        // that `payload_hash` commits to, and its Ed25519 proof stays in the
-        // `signature` column below. `None` records the `system` sentinel — an
+        // that `payload_hash` commits to; its Ed25519 proof stays on the
+        // `memory_link.created` row. `None` records the `system` sentinel — an
         // honest "unattributed substrate path", never a borrowed identity.
         let event_agent = actor
             .unwrap_or(crate::identity::sentinels::SYSTEM_PRINCIPAL)
             .to_string();
         let event_id = uuid::Uuid::new_v4().to_string();
+        // #10108 (D2): `unsigned` with a NULL signature. The prior link
+        // signature signs the creation pre-image, not this row's payload.
+        let row_sig = crate::signed_events::AgentRowSignature::Unsigned;
         pg_append_signed_event_with_chain_in_tx(
             tx,
             PgSignedEventInsert {
@@ -15956,8 +16005,8 @@ async fn pg_invalidate_link_relational_in_tx(
                 agent_id: &event_agent,
                 event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED,
                 payload_hash: &payload_hash,
-                signature: prior_signature.as_deref(),
-                attest_level: crate::models::AttestLevel::Unsigned.as_str(),
+                signature: row_sig.signature_bytes(),
+                attest_level: row_sig.attest_level().as_str(),
                 timestamp: Utc::now(),
                 // Parity with the sqlite twin: no triggering cause is bound on
                 // the supersession path on either backend.
@@ -28714,6 +28763,7 @@ impl MemoryStore for PostgresStore {
         } else {
             None
         };
+        let mut created_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for (id, source_cid) in ids.iter().zip(source_cids.iter()) {
             if id == &new_id {
                 continue;
@@ -28753,7 +28803,7 @@ impl MemoryStore for PostgresStore {
                 // cid mirror, and flip `lifecycle_state` to `tombstoned`.
                 // The source's own inbound provenance edges survive (no
                 // delete, no CASCADE), so multi-hop lineage stays walkable.
-                sqlx::query(
+                let edge = sqlx::query(
                     "INSERT INTO memory_links
                          (source_id, target_id, relation, created_at, valid_from,
                           attest_level, source_cid, target_cid)
@@ -28770,6 +28820,19 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?;
+                // #10108 (D5) — sqlite `create_link` appends this row too.
+                if edge.rows_affected() > 0 {
+                    created_anchor = created_anchor.merge(
+                        link_created_10108::append_unsigned_edge_created_in_tx(
+                            &mut tx,
+                            &new_id,
+                            id,
+                            crate::models::MemoryLinkRelation::DerivedFrom,
+                            now,
+                        )
+                        .await?,
+                    );
+                }
                 // #3691 — GUARDED tombstone (sqlite twin in `storage::consolidate`):
                 // a source quarantined / contaminated since the snapshot read keeps
                 // its security state; zero rows affected aborts the whole cluster
@@ -28894,7 +28957,7 @@ impl MemoryStore for PostgresStore {
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, created_anchor)
             .await
             .map_err(|e| to_store_err("consolidate commit", e))?;
         Ok(new_id)

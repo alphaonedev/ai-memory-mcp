@@ -596,24 +596,20 @@ fn append_audit_row(
     // AttestLevel variant, leaking a fourth-shape that AttestLevel::from_str
     // silently downgraded to None. The offload audit row is signed locally
     // by the daemon, so the canonical variant is SelfSigned.
-    let attest_level = if signature_bytes.is_some() {
-        crate::models::AttestLevel::SelfSigned.as_str()
-    } else {
-        crate::models::AttestLevel::Unsigned.as_str()
-    };
-    let event = SignedEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        agent_id: agent_id.to_string(),
-        event_type: event_type.to_string(),
-        payload_hash: hash,
-        signature: signature_bytes,
-        attest_level: attest_level.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        prev_hash: Vec::new(),
-        sequence: 0,
-        // v73 (#1822, G5a): offload audit rows bind no triggering cause.
-        cause_hash: None,
-    };
+    // #10108: the signer is the caller's own keypair (`self.signer`), so the
+    // row is `self_signed` only with its 64 bytes; any other length is
+    // `unsigned` with a NULL signature.
+    let event = SignedEvent::agent_row(
+        crate::signed_events::AgentRow {
+            agent_id: agent_id.to_string(),
+            event_type: event_type.to_string(),
+            payload_hash: hash,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            // v73 (#1822, G5a): offload audit rows bind no triggering cause.
+            cause_hash: None,
+        },
+        &crate::signed_events::AgentRowSignature::self_signed(signature_bytes.as_deref()),
+    );
     append_signed_event(conn, &event)?;
     Ok(())
 }

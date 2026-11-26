@@ -49,7 +49,9 @@ use rusqlite::{Connection, params};
 
 use crate::identity::keypair::AgentKeypair;
 use crate::models::{Memory, MemoryKind, MemoryLinkRelation, SourceSpan};
-use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
+use crate::signed_events::{
+    AgentRow, AgentRowSignature, SignedEvent, append_signed_event, payload_hash,
+};
 use crate::storage as db;
 use curator::Curator;
 
@@ -961,27 +963,29 @@ pub(crate) fn emit_atomisation_complete_event(
         "curator_model": curator_model,
     });
     let bytes = serde_json::to_vec(&payload)?;
-    let (signature, attest_level) = if let Some(kp) = keypair.filter(|k| k.can_sign()) {
-        let signing = kp.private.as_ref().expect("can_sign() checked");
-        use ed25519_dalek::Signer;
-        let sig = signing.sign(&bytes);
-        (
-            Some(sig.to_bytes().to_vec()),
-            crate::models::AttestLevel::SelfSigned.as_str(),
-        )
-    } else {
-        (None, crate::models::AttestLevel::Unsigned.as_str())
+    // #10108: the label and the signature come from one value, so a row is
+    // `self_signed` only with the 64 bytes the caller's key made (per
+    // ERRORS-06 no `expect`: a keypair without a private half is unsigned).
+    let row_sig = match keypair
+        .filter(|k| k.can_sign())
+        .and_then(|k| k.private.as_ref())
+    {
+        Some(signing) => {
+            use ed25519_dalek::Signer;
+            AgentRowSignature::self_signed(Some(&signing.sign(&bytes).to_bytes()))
+        }
+        None => AgentRowSignature::Unsigned,
     };
-    let event = SignedEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        agent_id: calling_agent_id.to_string(),
-        event_type: crate::signed_events::event_types::ATOMISATION_COMPLETE.to_string(),
-        payload_hash: payload_hash(&bytes),
-        signature,
-        attest_level: attest_level.to_string(),
-        timestamp: Utc::now().to_rfc3339(),
-        ..SignedEvent::default()
-    };
+    let event = SignedEvent::agent_row(
+        AgentRow {
+            agent_id: calling_agent_id.to_string(),
+            event_type: crate::signed_events::event_types::ATOMISATION_COMPLETE.to_string(),
+            payload_hash: payload_hash(&bytes),
+            timestamp: Utc::now().to_rfc3339(),
+            cause_hash: None,
+        },
+        &row_sig,
+    );
     append_signed_event(conn, &event)?;
     Ok(())
 }

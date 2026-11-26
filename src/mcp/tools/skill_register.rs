@@ -417,23 +417,19 @@ pub(super) fn register_core(
     });
     let event_bytes = serde_json::to_vec(&event_payload).unwrap_or_default();
     let ev_hash = payload_hash(&event_bytes);
-    let attest = if signature_bytes.is_some() {
-        crate::models::AttestLevel::SelfSigned.as_str()
-    } else {
-        crate::models::AttestLevel::Unsigned.as_str()
-    };
-    let event = SignedEvent {
-        id: Uuid::new_v4().to_string(),
-        agent_id: signing_agent_str
-            .clone()
-            .unwrap_or_else(|| "anonymous".to_string()),
-        event_type: crate::signed_events::event_types::SKILL_REGISTERED.to_string(),
-        payload_hash: ev_hash,
-        signature: signature_bytes.clone(),
-        attest_level: attest.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        ..SignedEvent::default()
-    };
+    // #10108: `self_signed` only with the 64 bytes the agent's key made.
+    let event = SignedEvent::agent_row(
+        crate::signed_events::AgentRow {
+            agent_id: signing_agent_str
+                .clone()
+                .unwrap_or_else(|| "anonymous".to_string()),
+            event_type: crate::signed_events::event_types::SKILL_REGISTERED.to_string(),
+            payload_hash: ev_hash,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            cause_hash: None,
+        },
+        &crate::signed_events::AgentRowSignature::self_signed(signature_bytes.as_deref()),
+    );
     // #1887 — we are already inside a BEGIN IMMEDIATE tx, so use the
     // `_no_tx` variant: the public `append_signed_event` opens its OWN
     // IMMEDIATE tx, which SQLite rejects as a nested transaction. Still

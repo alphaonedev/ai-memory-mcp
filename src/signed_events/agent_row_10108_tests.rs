@@ -142,11 +142,43 @@ fn scratch_db() -> (Connection, tempfile::TempDir) {
     (conn, dir)
 }
 
+/// The module path the isolated child runs each test under.
+const MODULE: &str = "signed_events::agent_row_10108_tests::";
+
+/// Run the test body in an env-isolated child whose witness custody points
+/// at an ABSENT scratch path, so `db::open` never reads (and no commit ever
+/// appends to) the host's real `~/.config/ai-memory/witness-keys` anchor log
+/// (#10117 class). `Some(guards)` = child role: keep them alive for the body.
+/// `None` = parent role: the child already ran the body; return.
+fn hermetic_child(
+    name: &str,
+) -> Option<(
+    std::sync::MutexGuard<'static, ()>,
+    crate::test_support::EnvGuard,
+)> {
+    if crate::test_support::run_env_isolated_child_or_spawn(&format!("{MODULE}{name}")) {
+        return None;
+    }
+    let lock = crate::test_support::env_lock();
+    let witness =
+        crate::test_support::EnvGuard::capture(crate::governance::audit::WITNESS_KEY_DIR_ENV);
+    let absent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".local-runs/agent-row-10108/no-witness-custody");
+    assert!(!absent.exists(), "witness scratch path must stay absent");
+    witness.set(absent.to_str().expect("utf-8 scratch path"));
+    Some((lock, witness))
+}
+
 fn keypair() -> AgentKeypair {
     crate::identity::keypair::generate(AGENT).expect("generate keypair")
 }
 
-fn seed_memory(conn: &Connection, title: &str, kind: MemoryKind, metadata: serde_json::Value) -> String {
+fn seed_memory(
+    conn: &Connection,
+    title: &str,
+    kind: MemoryKind,
+    metadata: serde_json::Value,
+) -> String {
     let now = chrono::Utc::now().to_rfc3339();
     let mem = Memory {
         id: uuid::Uuid::new_v4().to_string(),
@@ -190,12 +222,15 @@ fn drive_atomisation(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::Re
 }
 
 fn drive_offload(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::Result<()> {
-    let off = crate::offload::ContextOffloader::new(conn, kp, crate::offload::OffloadConfig::default());
-    off.offload("payload for #10108", NS, None, AGENT).map(|_| ())
+    let off =
+        crate::offload::ContextOffloader::new(conn, kp, crate::offload::OffloadConfig::default());
+    off.offload("payload for #10108", NS, None, AGENT)
+        .map(|_| ())
 }
 
 fn drive_skill_register(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::Result<()> {
-    let md = "---\nnamespace: testns\nname: skill-10108\ndescription: A demo skill.\n---\n\nBody.\n";
+    let md =
+        "---\nnamespace: testns\nname: skill-10108\ndescription: A demo skill.\n---\n\nBody.\n";
     crate::mcp::handle_skill_register(conn, &serde_json::json!({"inline_skill": md}), kp)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("skill register: {e}"))
@@ -248,7 +283,12 @@ fn drive_capture_turn(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::R
     super::append_signed_event(conn, &write.signed_event)
 }
 
-fn inbound_link(s: String, t: String, signature: Option<Vec<u8>>, attest_level: &str) -> MemoryLink {
+fn inbound_link(
+    s: String,
+    t: String,
+    signature: Option<Vec<u8>>,
+    attest_level: &str,
+) -> MemoryLink {
     let now = chrono::Utc::now().to_rfc3339();
     MemoryLink {
         source_id: s,
@@ -267,7 +307,10 @@ fn inbound_link(s: String, t: String, signature: Option<Vec<u8>>, attest_level: 
 
 /// A peer-attested inbound link; the signed leg carries 64 signature bytes,
 /// the unsigned leg the bare label (the forged shape #10108 forbids).
-fn drive_link_inbound_peer_attested(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::Result<()> {
+fn drive_link_inbound_peer_attested(
+    conn: &Connection,
+    kp: Option<&AgentKeypair>,
+) -> anyhow::Result<()> {
     let (s, t) = seed_pair(conn);
     let sig = kp.map(|_| vec![7u8; ED25519_SIG_LEN]);
     let level = crate::models::AttestLevel::PeerAttested.as_str();
@@ -276,7 +319,10 @@ fn drive_link_inbound_peer_attested(conn: &Connection, kp: Option<&AgentKeypair>
 
 /// A self-signed inbound link whose signature is NOT 64 bytes (signed leg)
 /// or absent (unsigned leg): both are refused, and no row carries the label.
-fn drive_link_inbound_short_signature(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::Result<()> {
+fn drive_link_inbound_short_signature(
+    conn: &Connection,
+    kp: Option<&AgentKeypair>,
+) -> anyhow::Result<()> {
     let (s, t) = seed_pair(conn);
     let sig = kp.map(|_| vec![7u8; 10]);
     let level = crate::models::AttestLevel::SelfSigned.as_str();
@@ -286,7 +332,15 @@ fn drive_link_inbound_short_signature(conn: &Connection, kp: Option<&AgentKeypai
 fn drive_link_invalidated(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::Result<()> {
     let (s, t) = seed_pair(conn);
     db::create_link_signed(conn, &s, &t, "related_to", kp)?;
-    db::invalidate_link(conn, &s, &t, "related_to", None, Some("ai:invalidator-10108")).map(|_| ())
+    db::invalidate_link(
+        conn,
+        &s,
+        &t,
+        "related_to",
+        None,
+        Some("ai:invalidator-10108"),
+    )
+    .map(|_| ())
 }
 
 fn stored_rows(conn: &Connection, event_type: &str) -> Vec<(String, Option<usize>)> {
@@ -315,20 +369,32 @@ fn run_leg(case: &WriterCase, signed: bool, outcome: Outcome) -> Option<String> 
             return Some(format!("{} [{leg}]: writer failed: {e:#}", case.name));
         }
         (Outcome::Refused(phrase), Ok(())) => {
-            return Some(format!("{} [{leg}]: writer succeeded, expected refusal {phrase:?}", case.name));
+            return Some(format!(
+                "{} [{leg}]: writer succeeded, expected refusal {phrase:?}",
+                case.name
+            ));
         }
         (Outcome::Refused(phrase), Err(e)) => {
             let text = format!("{e:#}");
             if !text.contains(phrase) {
-                return Some(format!("{} [{leg}]: refused with {text:?}, expected {phrase:?}", case.name));
+                return Some(format!(
+                    "{} [{leg}]: refused with {text:?}, expected {phrase:?}",
+                    case.name
+                ));
             }
             &[]
         }
     };
     let got = stored_rows(&conn, case.event_type);
-    let want: Vec<(String, Option<usize>)> = expected.iter().map(|(l, n)| ((*l).to_string(), *n)).collect();
+    let want: Vec<(String, Option<usize>)> = expected
+        .iter()
+        .map(|(l, n)| ((*l).to_string(), *n))
+        .collect();
     if got != want {
-        return Some(format!("{} [{leg}]: stored {got:?}, expected {want:?}", case.name));
+        return Some(format!(
+            "{} [{leg}]: stored {got:?}, expected {want:?}",
+            case.name
+        ));
     }
     let report = verify_chain(&conn, None, None).expect("verify_chain");
     let missing = report
@@ -352,6 +418,11 @@ fn run_leg(case: &WriterCase, signed: bool, outcome: Outcome) -> Option<String> 
 
 #[test]
 fn agent_row_writer_table_stores_truthful_label_and_signature_10108() {
+    let Some(_hermetic) =
+        hermetic_child("agent_row_writer_table_stores_truthful_label_and_signature_10108")
+    else {
+        return;
+    };
     let mut failures = Vec::new();
     for case in WRITERS {
         if let Some(expected) = case.signed {
@@ -359,13 +430,63 @@ fn agent_row_writer_table_stores_truthful_label_and_signature_10108() {
         }
         failures.extend(run_leg(case, false, case.unsigned));
     }
-    assert!(failures.is_empty(), "#10108 untruthful agent rows:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "#10108 untruthful agent rows:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// I1 at the constructor: every agent level keeps its label only with exactly
+/// 64 signature bytes. The writer table cannot reach a wrong length through
+/// the link writers (their own 64-byte check refuses first), so the
+/// constructor is pinned directly over the boundary lengths.
+#[test]
+fn agent_row_signature_keeps_label_only_with_64_bytes_10108() {
+    use super::{AgentAttestation, AgentRowSignature};
+    const LENGTHS: [usize; 7] = [0, 1, 32, 63, 65, 96, 128];
+    let levels = [
+        (AgentAttestation::SelfSigned, "self_signed"),
+        (AgentAttestation::SignedByPeer, "signed_by_peer"),
+        (AgentAttestation::PeerAttested, "peer_attested"),
+    ];
+    let mut failures = Vec::new();
+    for (level, label) in levels {
+        let sig = [9u8; ED25519_SIG_LEN];
+        let row = AgentRowSignature::from_signature(level, Some(&sig));
+        if row.attest_level().as_str() != label || row.signature_bytes() != Some(&sig[..]) {
+            failures.push(format!("{label} with 64 bytes lost its label or bytes"));
+        }
+        let none = AgentRowSignature::from_signature(level, None);
+        if none.attest_level().as_str() != "unsigned" || none.signature().is_some() {
+            failures.push(format!("{label} with no signature kept a label or bytes"));
+        }
+        for len in LENGTHS {
+            let bytes = vec![9u8; len];
+            let row = AgentRowSignature::from_signature(level, Some(&bytes));
+            if row.attest_level().as_str() != "unsigned" || row.signature().is_some() {
+                failures.push(format!("{label} with {len} bytes kept a label or bytes"));
+            }
+            let labelled = AgentRowSignature::from_label(label, Some(&bytes));
+            if labelled.attest_level().as_str() != "unsigned" || labelled.signature().is_some() {
+                failures.push(format!("from_label({label}) with {len} bytes kept a label"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "#10108 agent label without a 64-byte signature:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// D2 / I2 on its own: the invalidated row of a SIGNED link has a NULL
 /// signature (it used to carry the prior link signature under `unsigned`).
 #[test]
 fn link_invalidated_row_signature_is_null_10108() {
+    let Some(_hermetic) = hermetic_child("link_invalidated_row_signature_is_null_10108") else {
+        return;
+    };
     let (conn, _dir) = scratch_db();
     let kp = keypair();
     drive_link_invalidated(&conn, Some(&kp)).expect("drive");

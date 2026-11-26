@@ -129,9 +129,20 @@ async fn fixture(url: &str) -> Fixture {
     let src = uuid::Uuid::new_v4().to_string();
     let dst = uuid::Uuid::new_v4().to_string();
     let ctx = seed_ctx();
-    store.store(&ctx, &memory("src", &src)).await.expect("store src");
-    store.store(&ctx, &memory("dst", &dst)).await.expect("store dst");
-    Fixture { store, pool, src, dst }
+    store
+        .store(&ctx, &memory("src", &src))
+        .await
+        .expect("store src");
+    store
+        .store(&ctx, &memory("dst", &dst))
+        .await
+        .expect("store dst");
+    Fixture {
+        store,
+        pool,
+        src,
+        dst,
+    }
 }
 
 async fn rows_by_hash(pool: &sqlx::PgPool, event_type: &str, hash: &[u8]) -> Vec<Row> {
@@ -208,7 +219,11 @@ async fn pg_signed_link_create_appends_self_signed_created_row_10108() {
     let hash = created_hash(&f.src, &f.dst, Some(&agent));
     let got = rows_by_hash(&f.pool, "memory_link.created", &hash).await;
     cleanup(&f, &[hash], Some(&agent)).await;
-    assert_eq!(got, want(&[SELF_SIGNED_ROW]), "#10108 D5: pg signed link create row");
+    assert_eq!(
+        got,
+        want(&[SELF_SIGNED_ROW]),
+        "#10108 D5: pg signed link create row"
+    );
 }
 
 #[tokio::test]
@@ -224,7 +239,11 @@ async fn pg_unsigned_link_create_appends_unsigned_created_row_10108() {
     let hash = created_hash(&f.src, &f.dst, None);
     let got = rows_by_hash(&f.pool, "memory_link.created", &hash).await;
     cleanup(&f, &[hash], None).await;
-    assert_eq!(got, want(&[UNSIGNED_ROW]), "#10108 D5: pg unsigned link create row");
+    assert_eq!(
+        got,
+        want(&[UNSIGNED_ROW]),
+        "#10108 D5: pg unsigned link create row"
+    );
 }
 
 /// The postgres CHECK that refuses an agent label without a 64-byte
@@ -245,8 +264,18 @@ enum Outcome {
 async fn pg_inbound_link_rows_are_truthful_10108() {
     let Some(url) = pg_url() else { return };
     let cases: [(&str, &str, Option<usize>, Outcome); 3] = [
-        ("peer_64", "peer_attested", Some(64), Outcome::Rows(&[PEER_ATTESTED_ROW])),
-        ("peer_short", "peer_attested", Some(10), Outcome::Refused(LINK_SIG_CHECK_REFUSAL)),
+        (
+            "peer_64",
+            "peer_attested",
+            Some(64),
+            Outcome::Rows(&[PEER_ATTESTED_ROW]),
+        ),
+        (
+            "peer_short",
+            "peer_attested",
+            Some(10),
+            Outcome::Refused(LINK_SIG_CHECK_REFUSAL),
+        ),
         ("unsigned", "unsigned", None, Outcome::Rows(&[UNSIGNED_ROW])),
     ];
     let mut failures = Vec::new();
@@ -275,7 +304,11 @@ async fn pg_inbound_link_rows_are_truthful_10108() {
             )),
         }
     }
-    assert!(failures.is_empty(), "#10108 pg inbound rows:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "#10108 pg inbound rows:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[tokio::test]
@@ -296,7 +329,12 @@ async fn pg_link_invalidated_row_signature_is_null_10108() {
         .expect("invalidate_link")
         .found;
     let got = rows_by_agent(&f.pool, "memory_link.invalidated", &actor).await;
-    cleanup(&f, &[created_hash(&f.src, &f.dst, Some(&agent))], Some(&actor)).await;
+    cleanup(
+        &f,
+        &[created_hash(&f.src, &f.dst, Some(&agent))],
+        Some(&actor),
+    )
+    .await;
     assert!(found, "the signed link must be found");
     assert_eq!(got, want(&[UNSIGNED_ROW]), "#10108 D2: pg invalidated row");
 }

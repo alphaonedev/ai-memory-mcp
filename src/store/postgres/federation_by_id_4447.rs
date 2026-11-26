@@ -106,7 +106,7 @@ impl PostgresStore {
             }
         }
 
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO memory_links (
                 source_id, target_id, relation, created_at,
                 valid_from, valid_until, observed_by, signature, attest_level
@@ -125,6 +125,29 @@ impl PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("apply_remote_link", e))?;
+        // #10108 (D5) — the inbound `memory_link.created` row, in this tx, only
+        // when the INSERT wrote a row. The pre-image is the wire link the peer
+        // signed (sqlite `create_link_inbound` twin).
+        let created_anchor = if inserted.rows_affected() > 0 {
+            let signable = crate::identity::sign::SignableLink {
+                src_id: link.source_id.as_str(),
+                dst_id: link.target_id.as_str(),
+                relation: link.relation.as_str(),
+                observed_by: link.observed_by.as_deref(),
+                created_at: Some(link.created_at.as_str()),
+                valid_from: link.valid_from.as_deref(),
+                valid_until: link.valid_until.as_deref(),
+            };
+            super::link_created_10108::append_link_created_in_tx(
+                &mut tx,
+                &signable,
+                attest_level,
+                link.signature.as_deref(),
+            )
+            .await?
+        } else {
+            crate::governance::audit::PendingAuditAnchor::none()
+        };
 
         if matches!(self.kg_backend, KgBackend::Age) {
             // #1542 — same SAVEPOINT isolation + warn-on-runtime-failure
@@ -185,7 +208,7 @@ impl PostgresStore {
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, created_anchor)
             .await
             .map_err(|e| to_store_err("commit apply_remote_link tx", e))?;
         Ok(())

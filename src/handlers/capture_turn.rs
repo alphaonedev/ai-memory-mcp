@@ -164,7 +164,9 @@ async fn capture_turn_write(
         Ok(level) => level,
         Err(response) => return response,
     };
-    write.signed_event.attest_level = attest_level.as_str().to_string();
+    // #10108: the audit row keeps the label `prepare_capture_turn` derived
+    // from the signature it holds (`signed_by_peer` with the verified 64
+    // bytes, else `unsigned`); only the memory's capture label is set here.
     if let Some(metadata) = write.memory.metadata.as_object_mut() {
         metadata.insert(
             field_names::ATTEST_LEVEL.into(),

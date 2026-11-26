@@ -9871,16 +9871,21 @@ pub fn create_link_signed_with_window(
         };
         match crate::identity::sign::canonical_cbor(&signable) {
             Ok(cbor) => {
-                let event = crate::signed_events::SignedEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    agent_id: agent_for_event,
-                    event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
-                    payload_hash: crate::signed_events::payload_hash(&cbor),
-                    signature: signature.clone(),
-                    attest_level: attest_level.to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    ..crate::signed_events::SignedEvent::default()
-                };
+                // #10108: label and signature from one value.
+                let event = crate::signed_events::SignedEvent::agent_row(
+                    crate::signed_events::AgentRow {
+                        agent_id: agent_for_event,
+                        event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED
+                            .to_string(),
+                        payload_hash: crate::signed_events::payload_hash(&cbor),
+                        timestamp: Utc::now().to_rfc3339(),
+                        cause_hash: None,
+                    },
+                    &crate::signed_events::AgentRowSignature::from_label(
+                        attest_level,
+                        signature.as_deref(),
+                    ),
+                );
                 if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
                     tracing::warn!(
                         target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
@@ -10150,16 +10155,21 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
         };
         match crate::identity::sign::canonical_cbor(&signable) {
             Ok(cbor) => {
-                let event = crate::signed_events::SignedEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    agent_id: agent_for_event,
-                    event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
-                    payload_hash: crate::signed_events::payload_hash(&cbor),
-                    signature: link.signature.clone(),
-                    attest_level: attest_level.to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    ..crate::signed_events::SignedEvent::default()
-                };
+                // #10108: label and signature from one value.
+                let event = crate::signed_events::SignedEvent::agent_row(
+                    crate::signed_events::AgentRow {
+                        agent_id: agent_for_event,
+                        event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED
+                            .to_string(),
+                        payload_hash: crate::signed_events::payload_hash(&cbor),
+                        timestamp: Utc::now().to_rfc3339(),
+                        cause_hash: None,
+                    },
+                    &crate::signed_events::AgentRowSignature::from_label(
+                        attest_level,
+                        link.signature.as_deref(),
+                    ),
+                );
                 if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
                     tracing::warn!(
                         target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
@@ -12660,11 +12670,12 @@ pub fn invalidate_link(
     // cleared a signature. The `payload_hash` commits to the
     // canonical CBOR over the post-supersession SignableLink so the
     // auditor sees exactly what the row looks like now (`valid_until`
-    // populated). The `signature` column on the audit row is the
-    // *previous* signature — the auditor can compare it byte-for-byte
-    // against the original `memory_link.created` row's signature to
-    // confirm the same key issued both events. We deliberately do NOT
-    // re-sign here: this writer has no guarantee that the original
+    // populated). #10108 (D2): the row is `unsigned` with a NULL
+    // signature. It used to carry the *previous* link signature, which
+    // signs the creation pre-image, not this row's payload: a signature
+    // over a different object under the `unsigned` label. The prior
+    // signature stays on the `memory_link.created` row. We deliberately
+    // do NOT re-sign here: this writer has no guarantee that the original
     // signing keypair is loaded (federation may have applied an
     // inbound `peer_attested` row), so an honest "the signing surface
     // was cleared" event is the only response that doesn't risk
@@ -12687,29 +12698,29 @@ pub fn invalidate_link(
         };
         match crate::identity::sign::canonical_cbor(&signable) {
             Ok(cbor) => {
-                let event = crate::signed_events::SignedEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    // #3203 — the ACTING principal. This used to be
-                    // `observed_by` (the original ATTESTER), so an
-                    // audit replay named the peer that signed the edge
-                    // as the actor of an invalidation it never
-                    // performed. `None` records the `system` sentinel
-                    // — an honest "unattributed substrate path" — never
-                    // another principal's identity. The superseded
-                    // signer survives in the `signature` column and,
-                    // as `observed_by`, inside the CBOR that
-                    // `payload_hash` commits to (see the docblock).
-                    agent_id: actor
-                        .unwrap_or(crate::identity::sentinels::SYSTEM_PRINCIPAL)
-                        .to_string(),
-                    event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED
-                        .to_string(),
-                    payload_hash: crate::signed_events::payload_hash(&cbor),
-                    signature: prior_signature,
-                    attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    ..crate::signed_events::SignedEvent::default()
-                };
+                let event = crate::signed_events::SignedEvent::agent_row(
+                    crate::signed_events::AgentRow {
+                        // #3203 — the ACTING principal. This used to be
+                        // `observed_by` (the original ATTESTER), so an
+                        // audit replay named the peer that signed the edge
+                        // as the actor of an invalidation it never
+                        // performed. `None` records the `system` sentinel
+                        // — an honest "unattributed substrate path" — never
+                        // another principal's identity. The superseded
+                        // signer survives, as `observed_by`, inside the
+                        // CBOR that `payload_hash` commits to.
+                        agent_id: actor
+                            .unwrap_or(crate::identity::sentinels::SYSTEM_PRINCIPAL)
+                            .to_string(),
+                        event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED
+                            .to_string(),
+                        payload_hash: crate::signed_events::payload_hash(&cbor),
+                        timestamp: Utc::now().to_rfc3339(),
+                        cause_hash: None,
+                    },
+                    // #10108 (D2): no signature over another object.
+                    &crate::signed_events::AgentRowSignature::Unsigned,
+                );
                 // v0.7.0 ship-readiness: use the `_no_tx` variant — we
                 // are already inside the BEGIN IMMEDIATE wrap (line 3560
                 // above). The public `append_signed_event` opens its own

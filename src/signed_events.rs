@@ -135,8 +135,10 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+pub mod agent_row;
 #[cfg(test)]
 mod agent_row_10108_tests;
+pub use agent_row::{AGENT_SIGNATURE_LEN, AgentRow, AgentRowSignature};
 pub mod legacy_cutoff;
 use legacy_cutoff::{DaemonForm, daemon_signature_form};
 pub use legacy_cutoff::{

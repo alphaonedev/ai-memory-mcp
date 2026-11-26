@@ -829,16 +829,19 @@ fn emit_persona_generated_event(
         hasher.update(b"\x1f");
     }
     let payload_hash = hasher.finalize().to_vec();
-    let event = SignedEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        agent_id: agent_id.to_string(),
-        event_type: crate::signed_events::event_types::PERSONA_GENERATED.to_string(),
-        payload_hash,
-        signature: signature.map(<[u8]>::to_vec),
-        attest_level: attest_level.to_string(),
-        timestamp: now.to_string(),
-        ..SignedEvent::default()
-    };
+    // #10108 (D1): the persona's label can come from its source links
+    // (`link_attest`) while the persona itself is unsigned; the audit row
+    // keeps an agent label only with the curator's 64 signature bytes.
+    let event = SignedEvent::agent_row(
+        crate::signed_events::AgentRow {
+            agent_id: agent_id.to_string(),
+            event_type: crate::signed_events::event_types::PERSONA_GENERATED.to_string(),
+            payload_hash,
+            timestamp: now.to_string(),
+            cause_hash: None,
+        },
+        &crate::signed_events::AgentRowSignature::from_label(attest_level, signature),
+    );
     append_signed_event(conn, &event)
 }
 
