@@ -18,6 +18,7 @@ use crate::signed_events::agent_cutover::{
     AGENT_CUTOVER_EVENT_TYPE, AGENT_CUTOVER_ROW_LIMIT, AgentCutover, build_marker,
     legacy_agent_row_count, resolve,
 };
+use crate::signed_events::agent_era::{AgentDomainEvidence, StoredReceiptRow};
 use crate::store::{BoxBackendError, StoreError, StoreResult};
 
 /// The v103 DDL: the two `transcript_line_dedup` columns with their CHECK and
@@ -182,4 +183,67 @@ pub(super) async fn apply_v103(store: &PostgresStore) -> StoreResult<()> {
         "schema migration v103 applied (#10108: agent signature places + cutover marker)"
     );
     Ok(())
+}
+
+/// One stored `atomisation_receipts` row, in [`load_pg_agent_evidence`]
+/// column order.
+type PgReceiptCols = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+);
+
+/// #10108 (B-4) — the postgres twin of
+/// [`crate::signed_events::agent_era::load_sqlite_agent_evidence`]: the
+/// receipts and forget tombstones the walk recomputes agent-kind rows from.
+/// A missing table is no evidence, never an error (K3 parity).
+///
+/// # Errors
+/// A read of either table failed.
+pub(super) async fn load_pg_agent_evidence(
+    pool: &sqlx::PgPool,
+    daemon_key: Option<&ed25519_dalek::VerifyingKey>,
+) -> StoreResult<AgentDomainEvidence> {
+    const OP: &str = "verify_audit_trail: agent evidence";
+    let (receipts_present, tombstones_present): (bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('atomisation_receipts') IS NOT NULL, \
+                to_regclass('forget_tombstones') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| to_store_err(OP, e))?;
+    let mut receipts = Vec::new();
+    if receipts_present {
+        let rows: Vec<PgReceiptCols> = sqlx::query_as(
+            "SELECT source_id, atomised_at, atom_ids, atom_count, calling_agent_id, \
+                    curator_model, signature FROM atomisation_receipts",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| to_store_err(OP, e))?;
+        receipts.extend(rows.into_iter().map(|r| StoredReceiptRow {
+            source_id: r.0,
+            atomised_at: r.1,
+            atom_ids_json: r.2,
+            atom_count: r.3,
+            calling_agent_id: r.4,
+            curator_model: r.5,
+            signature: r.6,
+        }));
+    }
+    let mut forgotten = Vec::new();
+    if tombstones_present {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT memory_id FROM forget_tombstones")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| to_store_err(OP, e))?;
+        forgotten.extend(rows.into_iter().map(|(id,)| id));
+    }
+    Ok(AgentDomainEvidence::build(
+        &receipts, &forgotten, daemon_key,
+    ))
 }

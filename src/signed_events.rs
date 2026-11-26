@@ -137,6 +137,7 @@ use sha2::{Digest, Sha256};
 
 pub mod agent_cutover;
 pub use agent_cutover::{AGENT_CUTOVER_EVENT_TYPE, AgentCutover};
+pub mod agent_era;
 pub mod agent_payload;
 pub mod agent_row;
 #[cfg(test)]
@@ -1134,6 +1135,9 @@ pub struct ChainVerificationReport {
     /// #10105 — agent-signed rows with a missing or malformed signature, each
     /// with its exact failure. Their sequences are also in `signature_failures`.
     pub agent_signature_defects: Vec<(i64, SignatureFailure)>,
+    /// #10135 — daemon-signed `atomisation_complete` rows whose receipt was
+    /// erased under a forget tombstone. Never counted verified.
+    pub agent_receipts_erased: u64,
 }
 
 impl ChainVerificationReport {
@@ -1199,6 +1203,12 @@ pub enum SkipReason {
     /// does NOT verify the signature. Reported apart from `Verified` as
     /// [`ChainVerificationReport::agent_signed_rows_not_verified`].
     AgentSignedDomainObject,
+    /// #10135 — a daemon-signed `atomisation_complete` row whose receipt is
+    /// gone and whose source memory carries a forget tombstone: the domain
+    /// bytes were erased by an authorised forget, so the row cannot be
+    /// recomputed. Counted apart as
+    /// [`ChainVerificationReport::agent_receipts_erased`]; never `Verified`.
+    ReceiptErasedUnderTombstone,
 }
 
 /// #10105 — the agent-signed attestation forms of [`SignerIdentity::Agent`].
@@ -1276,6 +1286,24 @@ pub enum SignatureFailure {
     /// #10108 (B-5, S-3) — a `signed_events.agent_cutover` row whose recompute
     /// did not match, or one of two or more such rows.
     CutoverMarkerInvalid,
+    /// #10108 (S-5, S-3 residual, B-5) — an agent-labelled (or unsigned
+    /// agent-kind) row ABOVE a valid cutover marker: a binary that predates
+    /// the cutover wrote the old form after it. Never merged with a legacy
+    /// row.
+    PreCutoverWriter,
+    /// #10108 (B-5) — an agent row whose era cannot be resolved because the
+    /// cutover marker is invalid.
+    AgentEraUnresolvable,
+    /// #10108 (B-4, S-4) — a daemon-signed agent-kind row whose stored domain
+    /// row is missing (no receipt, no source binding, or a kind with no
+    /// domain source yet).
+    DomainRowMissing,
+    /// #10108 (B-4) — a receipt exists for the row's source but its recomputed
+    /// `payload_hash` does not match the stored one.
+    DomainPayloadMismatch,
+    /// #10108 (B-4) — the recomputed `payload_hash` matches but the domain
+    /// row's signature does not verify under the daemon key.
+    DomainSignatureInvalid,
 }
 
 impl SignatureFailure {
@@ -1290,6 +1318,11 @@ impl SignatureFailure {
             Self::AgentSignatureMissing => "agent_signature_missing",
             Self::AgentSignatureMalformed => "agent_signature_malformed",
             Self::CutoverMarkerInvalid => "agent_cutover_marker_invalid",
+            Self::PreCutoverWriter => "agent_pre_cutover_writer",
+            Self::AgentEraUnresolvable => "agent_era_unresolvable",
+            Self::DomainRowMissing => "agent_domain_row_missing",
+            Self::DomainPayloadMismatch => "agent_domain_payload_mismatch",
+            Self::DomainSignatureInvalid => "agent_domain_signature_invalid",
         }
     }
 }
@@ -1338,7 +1371,22 @@ impl RowSignatureVerdict {
                     | SignatureFailure::AgentSignatureMissing
                     | SignatureFailure::AgentSignatureMalformed
                     | SignatureFailure::CutoverMarkerInvalid
+                    | SignatureFailure::PreCutoverWriter
+                    | SignatureFailure::AgentEraUnresolvable
+                    | SignatureFailure::DomainRowMissing
+                    | SignatureFailure::DomainPayloadMismatch
+                    | SignatureFailure::DomainSignatureInvalid
             )
+        )
+    }
+
+    /// #10135 — `true` iff the row's receipt was erased under a forget
+    /// tombstone (its own counter, never `Verified`).
+    #[must_use]
+    pub fn is_receipt_erased(self) -> bool {
+        matches!(
+            self,
+            RowSignatureVerdict::Skipped(SkipReason::ReceiptErasedUnderTombstone)
         )
     }
 
@@ -1359,7 +1407,12 @@ impl RowSignatureVerdict {
         match self {
             RowSignatureVerdict::Failed(
                 f @ (SignatureFailure::AgentSignatureMissing
-                | SignatureFailure::AgentSignatureMalformed),
+                | SignatureFailure::AgentSignatureMalformed
+                | SignatureFailure::PreCutoverWriter
+                | SignatureFailure::AgentEraUnresolvable
+                | SignatureFailure::DomainRowMissing
+                | SignatureFailure::DomainPayloadMismatch
+                | SignatureFailure::DomainSignatureInvalid),
             ) => Some(f),
             _ => None,
         }
@@ -1591,6 +1644,16 @@ pub fn verify_chain(
     let cutoff = resolve_sqlite_legacy_cutoff(conn, verifier)?;
     // #10108 — the agent cutover marker, resolved over the whole table too.
     let agent_cutover = agent_cutover::resolve_sqlite_agent_cutover(conn)?;
+    // #10108 (B-4) — the stored domain rows agent-kind rows recompute from.
+    let agent_evidence = agent_era::load_sqlite_agent_evidence(conn, verifier)?;
+    let agent_walk = agent_era::AgentEraWalk {
+        cutover: agent_cutover,
+        evidence: &agent_evidence,
+        daemon_verifier: verifier,
+        recorder_verifier: recorder_verifier.as_ref(),
+        cutoff: &cutoff,
+    };
+    let mut agent_receipts_erased: u64 = 0;
     let mut signature_failures: Vec<i64> = Vec::new();
     let mut role_separation_failures: Vec<i64> = Vec::new();
     let mut rows_positively_verified: u64 = 0;
@@ -1683,9 +1746,12 @@ pub fn verify_chain(
         // the postgres verify twin (C7) surface IDENTICAL signature_failures +
         // role_separation_failures (K3 parity). A signature failure is disjoint
         // from a chain break by design (per-row forgery vs substrate tamper).
-        let rv = agent_cutover.verdict_for(&event).unwrap_or_else(|| {
-            classify_row_signature(&event, verifier, recorder_verifier.as_ref(), &cutoff)
-        });
+        // #10108 — every row that claims agent attribution goes through the
+        // two-era classifier shared with the postgres twin.
+        let rv = agent_era::classify_agent_era_row(&event, &agent_walk);
+        if rv.is_receipt_erased() {
+            agent_receipts_erased += 1;
+        }
         if rv.is_verified() {
             rows_positively_verified += 1;
         }
@@ -1720,6 +1786,7 @@ pub fn verify_chain(
         role_separation_failures,
         agent_signed_rows_not_verified,
         agent_signature_defects,
+        agent_receipts_erased,
     })
 }
 
@@ -3051,6 +3118,11 @@ pub struct AuditTrailReport {
     /// per-domain verifier owns them). Never part of a positive verification.
     /// Populated IDENTICALLY by both backends.
     pub agent_signed_rows_not_verified: u64,
+    /// #10135 — daemon-signed `atomisation_complete` rows whose receipt was
+    /// erased under a forget tombstone. Never verified. Not on the wire (the
+    /// JSON shape is unchanged); populated IDENTICALLY by both backends.
+    #[serde(skip)]
+    pub agent_receipts_erased: u64,
     /// v0.9.0 G9 (#1826) — three-key Recorder/Judge/Stopper signing-layer
     /// SEPARATION verdict (K1 pin of the judge/stopper checkpoints + per-row
     /// recorder verification + C3 distinctness + C2 daemon-demotion).
@@ -3543,6 +3615,7 @@ pub fn verify_audit_trail(
         cause_binding,
         signature_failures: report.signature_failures.clone(),
         agent_signed_rows_not_verified: report.agent_signed_rows_not_verified,
+        agent_receipts_erased: report.agent_receipts_erased,
         role_separation,
         lineage,
         rollback,
@@ -4378,6 +4451,7 @@ mod tests {
             cause_binding: CauseBinding::Unknown,
             signature_failures: Vec::new(),
             agent_signed_rows_not_verified: 0,
+            agent_receipts_erased: 0,
             role_separation: RoleSeparationCheck::Unknown,
             lineage: crate::identity::lineage::LineageCheck::Unknown,
             rollback: RollbackCheck::Unknown,

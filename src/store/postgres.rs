@@ -16591,6 +16591,17 @@ impl PostgresStore {
         let recorder_verifier = crate::governance::audit::load_enrolled_recorder_pubkey()
             .ok()
             .flatten();
+        // #10108 (B-4) — K3 twin of the sqlite walk's domain evidence.
+        let agent_evidence =
+            agent_cutover_v103::load_pg_agent_evidence(&self.pool, daemon_verifier).await?;
+        let agent_walk = crate::signed_events::agent_era::AgentEraWalk {
+            cutover: agent_cutover,
+            evidence: &agent_evidence,
+            daemon_verifier,
+            recorder_verifier: recorder_verifier.as_ref(),
+            cutoff: &cutoff,
+        };
+        let mut agent_receipts_erased: u64 = 0;
         let mut signature_failures: Vec<i64> = Vec::new();
         let mut role_separation_failures: Vec<i64> = Vec::new();
         let mut rows_positively_verified: u64 = 0;
@@ -16621,14 +16632,10 @@ impl PostgresStore {
                 sequence: seq,
                 cause_hash: cause,
             };
-            let rv = agent_cutover.verdict_for(&ev).unwrap_or_else(|| {
-                crate::signed_events::classify_row_signature(
-                    &ev,
-                    daemon_verifier,
-                    recorder_verifier.as_ref(),
-                    &cutoff,
-                )
-            });
+            let rv = crate::signed_events::agent_era::classify_agent_era_row(&ev, &agent_walk);
+            if rv.is_receipt_erased() {
+                agent_receipts_erased += 1;
+            }
             if rv.is_verified() {
                 rows_positively_verified += 1;
             }
@@ -16885,6 +16892,7 @@ impl PostgresStore {
             cause_binding,
             signature_failures,
             agent_signed_rows_not_verified,
+            agent_receipts_erased,
             role_separation,
             lineage,
             rollback,
