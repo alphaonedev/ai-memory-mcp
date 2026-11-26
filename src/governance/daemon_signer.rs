@@ -157,6 +157,65 @@ impl TryFrom<crate::identity::keypair::AgentKeypair> for DaemonChainSigner {
 }
 
 impl DaemonChainSigner {
+    /// #10145 K-5 — the signer for a schema create or v103 bump, from the
+    /// daemon key in `key_dir`. Both halves are checked here first: a key is
+    /// generated only when neither half exists, and a partial key (one half
+    /// alone) is refused, never healed. Nothing in the database is touched.
+    ///
+    /// # Errors
+    /// The typed, counted [`DaemonKeyMissing`] for every cause.
+    pub fn provision(key_dir: &Path) -> Result<Self, DaemonKeyMissing> {
+        use crate::identity::keypair::{
+            DAEMON_KEYPAIR_LABEL, EnsureOutcome, agent_priv_path, agent_pub_path, ensure_keypair,
+            load,
+        };
+        /// One provisioning at a time in this process, so two opens never see
+        /// each other's half-written pair as a partial key. The guarded state
+        /// is `()`, so a poisoned lock carries nothing torn (CONCURRENCY-18).
+        static PROVISION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = PROVISION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refuse = |cause| DaemonKeyMissing::new(cause, Some(key_dir));
+        let has_pub = agent_pub_path(key_dir, DAEMON_KEYPAIR_LABEL).exists();
+        let has_priv = agent_priv_path(key_dir, DAEMON_KEYPAIR_LABEL).exists();
+        match (has_pub, has_priv) {
+            (true, true) => {}
+            (true, false) => return Err(refuse(DaemonKeyCause::PublicOnly)),
+            (false, true) => return Err(refuse(DaemonKeyCause::PrivateOnly)),
+            (false, false) => match ensure_keypair(DAEMON_KEYPAIR_LABEL, key_dir, false) {
+                Ok(EnsureOutcome::Generated { .. } | EnsureOutcome::AlreadyExists { .. }) => {}
+                Ok(EnsureOutcome::SkippedDisabled) => {
+                    return Err(refuse(DaemonKeyCause::GenerationDisabled));
+                }
+                Ok(
+                    EnsureOutcome::RepairedPublicFromPrivate { .. }
+                    | EnsureOutcome::PublicOnlyDegraded { .. },
+                )
+                | Err(_) => return Err(refuse(DaemonKeyCause::KeyDirUnusable)),
+            },
+        }
+        let kp = load(DAEMON_KEYPAIR_LABEL, key_dir)
+            .map_err(|_| refuse(DaemonKeyCause::KeyDirUnusable))?;
+        Self::try_from(kp).map_err(|e| refuse(e.cause()))
+    }
+
+    /// The daemon key already installed in this process (loaded from the key
+    /// directory at boot, the key `verify_chain` checks against), else
+    /// [`Self::provision`] in the resolved default key directory.
+    ///
+    /// # Errors
+    /// [`DaemonKeyMissing`] with [`DaemonKeyCause::NoKeyDir`] when no key
+    /// directory resolves, else as [`Self::provision`].
+    pub fn provision_default() -> Result<Self, DaemonKeyMissing> {
+        if let Some(key) = DAEMON_AUDIT_KEY.get() {
+            return Ok(Self { key: key.clone() });
+        }
+        let dir = crate::identity::keypair::default_key_dir()
+            .map_err(|_| DaemonKeyMissing::new(DaemonKeyCause::NoKeyDir, None))?;
+        Self::provision(&dir)
+    }
+
     /// The public half, for verifying what this signer wrote.
     #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {

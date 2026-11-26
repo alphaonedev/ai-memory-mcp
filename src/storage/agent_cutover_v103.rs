@@ -74,7 +74,11 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     )?)
 }
 
-pub(super) fn migrate_v103(conn: &Connection) -> Result<()> {
+pub(super) fn migrate_v103(
+    conn: &Connection,
+    signer: &crate::governance::daemon_signer::DaemonChainSigner,
+    origin: crate::signed_events::agent_cutover::MarkerOrigin,
+) -> Result<()> {
     conn.execute_batch(MIGRATION_V103_SQLITE)?;
     // Same gate as the v102 arm: every deployed path creates the table before
     // `migrate`; only fixtures that stamp a version without it lack it.
@@ -86,10 +90,11 @@ pub(super) fn migrate_v103(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch(DEDUP_PAIR_TRIGGERS)?;
     }
-    // #10108 (S-3) — the marker is written in the same transaction as the
-    // stamp below: no committed state has the schema at v103 and no marker.
+    // #10108 (S-3), #10145 (W-9) — the one marker write, shared by a fresh
+    // create and a bump, in the same transaction as the stamp below: no
+    // committed state has the schema at v103 and no signed marker.
     if table_exists(conn, super::schema_integrity::TABLE_SIGNED_EVENTS)? {
-        crate::signed_events::agent_cutover::write_sqlite_agent_cutover(conn)?;
+        crate::signed_events::agent_cutover::write_sqlite_signed_marker(conn, signer, origin)?;
     }
     conn.execute(super::migrations::SQL_CLEAR_SCHEMA_VERSION, [])?;
     conn.execute("INSERT INTO schema_version (version) VALUES (103)", [])?;

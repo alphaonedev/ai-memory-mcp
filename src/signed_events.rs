@@ -1643,7 +1643,7 @@ pub fn verify_chain(
     // still refuses every legacy form when the cutoff is missing or invalid.
     let cutoff = resolve_sqlite_legacy_cutoff(conn, verifier)?;
     // #10108 — the agent cutover marker, resolved over the whole table too.
-    let agent_cutover = agent_cutover::resolve_sqlite_agent_cutover(conn)?;
+    let agent_cutover = agent_cutover::resolve_sqlite_agent_cutover(conn, verifier)?;
     // #10108 (B-4) — the stored domain rows agent-kind rows recompute from.
     let agent_evidence = agent_era::load_sqlite_agent_evidence(conn, verifier)?;
     let agent_walk = agent_era::AgentEraWalk {

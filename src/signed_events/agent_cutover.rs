@@ -359,12 +359,43 @@ pub fn resolve(
     }
 }
 
+/// #10145 (I-2) — judge a SIGNED marker: exactly one, its recompute matches
+/// at its position over `legacy_agent_rows`, and its signature verifies under
+/// `verifier` (the daemon key resolved outside the database). No verifier, an
+/// unsigned marker or a corrupt count is [`AgentCutover::Invalid`].
+#[must_use]
+pub fn resolve_signed(
+    verifier: Option<&ed25519_dalek::VerifyingKey>,
+    markers: &[SignedEvent],
+    prev: Option<&SignedEvent>,
+    legacy_agent_rows: Option<u64>,
+) -> AgentCutover {
+    let marker = match markers {
+        [] => return AgentCutover::Absent,
+        [one] => one,
+        _ => return AgentCutover::Invalid,
+    };
+    let (Some(vk), Some(count)) = (verifier, legacy_agent_rows) else {
+        return AgentCutover::Invalid;
+    };
+    match verify_signed_marker(vk, marker, prev, count) {
+        Some(_) => AgentCutover::Valid {
+            sequence: marker.sequence,
+            legacy_agent_rows: count,
+        },
+        None => AgentCutover::Invalid,
+    }
+}
+
 /// #10108 — resolve the sqlite cutover over the WHOLE table, whatever window
 /// the caller walks.
 ///
 /// # Errors
 /// Propagates a `rusqlite` read error.
-pub fn resolve_sqlite_agent_cutover(conn: &Connection) -> Result<AgentCutover> {
+pub fn resolve_sqlite_agent_cutover(
+    conn: &Connection,
+    verifier: Option<&ed25519_dalek::VerifyingKey>,
+) -> Result<AgentCutover> {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {} FROM signed_events WHERE event_type = ?1 \
@@ -386,7 +417,7 @@ pub fn resolve_sqlite_agent_cutover(conn: &Connection) -> Result<AgentCutover> {
     let below = first.sequence;
     let prev = sqlite_row_below(conn, below)?;
     let count = sqlite_legacy_agent_rows(conn, below)?;
-    Ok(resolve(&markers, prev.as_ref(), count))
+    Ok(resolve_signed(verifier, &markers, prev.as_ref(), count))
 }
 
 /// The row with the highest sequence below `below`.
@@ -422,16 +453,22 @@ fn sqlite_legacy_agent_rows(conn: &Connection, below: i64) -> Result<Option<u64>
     ))
 }
 
-/// #10108 (S-3) — append the marker at the sqlite chain head. Runs inside the
-/// caller's migrate transaction, before the v103 stamp, so the marker and the
-/// stamp commit or roll back together. Writes nothing when the chain is empty
-/// or a marker-type row already exists (a restored database carries its own).
-/// Returns the marker's sequence when one was written.
+/// #10108 (S-3), #10145 (W-9) — write the signed marker: at sequence 1 above
+/// [`ZERO_HASH`] on an empty chain, else directly above the head. Runs inside
+/// the caller's migrate transaction, before the v103 stamp, so the marker and
+/// the stamp commit or roll back together. Insert-only: writes nothing when a
+/// marker-type row already exists (a restored database carries its own).
+/// Returns the marker's sequence when one was written. This is the only
+/// sqlite write of a marker, and it cannot run without a [`DaemonChainSigner`].
 ///
 /// # Errors
 /// Propagates a read or insert error, and refuses a chain whose head hash does
 /// not match its head row (a partially migrated chain).
-pub fn write_sqlite_agent_cutover(conn: &Connection) -> Result<Option<i64>> {
+pub(crate) fn write_sqlite_signed_marker(
+    conn: &Connection,
+    signer: &DaemonChainSigner,
+    origin: MarkerOrigin,
+) -> Result<Option<i64>> {
     let existing: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM signed_events WHERE event_type = ?1)",
@@ -444,33 +481,35 @@ pub fn write_sqlite_agent_cutover(conn: &Connection) -> Result<Option<i64>> {
     }
     let (head_seq, head_hash) = super::read_chain_head(conn).context("agent cutover: head")?;
     let above = head_seq.saturating_add(1);
-    let Some(head) = sqlite_row_below(conn, above)? else {
-        return Ok(None);
-    };
+    let head = sqlite_row_below(conn, above)?;
     let Some(count) = sqlite_legacy_agent_rows(conn, above)? else {
         anyhow::bail!("agent cutover: corrupt attest_level counts below sequence {above}");
     };
-    let Some(marker) = build_marker(
-        &head,
+    let Some(marker) = build_signed_marker(
+        signer,
+        head.as_ref(),
         count,
+        origin,
         uuid::Uuid::new_v4().to_string(),
         chrono::Utc::now().to_rfc3339(),
     ) else {
         anyhow::bail!("agent cutover: no sequence above head {head_seq}");
     };
-    if head.sequence != head_seq || marker.prev_hash != head_hash {
+    let head_matches = head.as_ref().map_or(head_seq == 0, |h| h.sequence == head_seq);
+    if !head_matches || marker.prev_hash != head_hash {
         anyhow::bail!("agent cutover: chain head {head_seq} does not match its row");
     }
     conn.execute(
         "INSERT INTO signed_events \
             (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
              prev_hash, sequence, cause_hash) \
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
         params![
             marker.id,
             marker.agent_id,
             marker.event_type,
             marker.payload_hash,
+            marker.signature,
             marker.attest_level,
             marker.timestamp,
             marker.prev_hash,

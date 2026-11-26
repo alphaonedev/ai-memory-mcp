@@ -1871,7 +1871,38 @@ pub(super) fn repair_under_writer_lock(conn: &Connection) -> Result<bool> {
 // `conn.execute_batch(...)?` are similarly unreachable without
 // semantic SQL-fault injection.
 #[allow(clippy::too_many_lines)]
+/// Bring the schema to `CURRENT_SCHEMA_VERSION`. A ladder run (create or
+/// bump) first provisions the daemon chain signer (#10145 K-1, K-5) and is
+/// refused with the typed, counted
+/// [`crate::governance::daemon_signer::DaemonKeyMissing`] before any byte
+/// changes when it cannot; an at-tip or ahead database never needs a key.
+///
+/// # Errors
+/// As [`migrate_signed`], plus the key refusal.
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+    migrate_inner(
+        conn,
+        crate::governance::daemon_signer::DaemonChainSigner::provision_default,
+    )
+}
+
+/// #10145 — [`migrate`] with the caller's signer: the one seam that creates
+/// or bumps the sqlite schema, so v103 cannot exist without a signed marker.
+///
+/// # Errors
+/// Propagates every ladder, probe and snapshot error.
+pub(crate) fn migrate_signed(
+    conn: &Connection,
+    signer: &crate::governance::daemon_signer::DaemonChainSigner,
+) -> Result<()> {
+    migrate_inner(conn, || Ok(signer))
+}
+
+fn migrate_inner<S, F>(conn: &Connection, signer: F) -> Result<()>
+where
+    S: std::borrow::Borrow<crate::governance::daemon_signer::DaemonChainSigner>,
+    F: FnOnce() -> std::result::Result<S, crate::governance::daemon_signer::DaemonKeyMissing>,
+{
     // v1.0.0 #2445 — tri-state, never `.unwrap_or(0)`. The pre-#2445 form
     // collapsed a READ ERROR into "fresh", and the pre-migration safety
     // snapshot below is gated on `version > 0` — so an unreadable stamp
@@ -1961,7 +1992,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // the database with the longest ladder still to replay — precisely the one
     // that most needs a snapshot. Probe for durable rows so the snapshot can
     // never again be suppressed on a populated database.
-    if version > 0 || database_holds_durable_rows(conn)? {
+    // #10145 K-1 — the signer before any byte this ladder changes (snapshot,
+    // DDL, stamp); W-9 — a fresh database's marker says Create, any other
+    // database's says Migrate.
+    let signer = signer()?;
+    let holds_rows = database_holds_durable_rows(conn)?;
+    let origin = if version == 0 && !holds_rows {
+        crate::signed_events::agent_cutover::MarkerOrigin::Create
+    } else {
+        crate::signed_events::agent_cutover::MarkerOrigin::Migrate
+    };
+    if version > 0 || holds_rows {
         if let Some(snapshot) = snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)? {
             tracing::info!(
                 from_version = version,
@@ -4590,7 +4631,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
         if version < CURRENT_SCHEMA_VERSION {
             // v103 (#10108): agent signature places + the cutover marker.
-            super::agent_cutover_v103::migrate_v103(conn)?;
+            super::agent_cutover_v103::migrate_v103(conn, std::borrow::Borrow::borrow(&signer), origin)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
