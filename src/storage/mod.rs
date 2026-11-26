@@ -15929,16 +15929,34 @@ pub fn enroll_lineage(
     Ok(record)
 }
 
-/// Proof value returned by [`succession_preconditions`] (#10118, CBC-03,
-/// CBC-05, CBC-06, ERRORS-09).
+/// Proof value returned by [`succession_preconditions`] (#10118, #10148,
+/// CBC-03, CBC-05, CBC-06, ERRORS-09).
 ///
-/// Private fields (and no `Clone` or `Copy`) ensure this proof can only be
-/// constructed after all three preconditions hold and is consumed by value by
-/// exactly one [`append_succession_checked`] or [`append_revocation_checked`]
-/// call. Reusing one proof for a second append does not compile:
+/// Private fields (and no `Clone`, `Copy`, or `Default`) ensure this proof can
+/// only be constructed after all three preconditions hold and is consumed by
+/// value by exactly one [`append_succession_checked`] or
+/// [`append_revocation_checked`] call.
 ///
-/// ```compile_fail,E0382
-/// # fn reuse(
+/// Positive single-use control (must compile):
+///
+/// ```no_run
+/// # fn single_use(
+/// #     conn: &rusqlite::Connection,
+/// #     k: &ai_memory::identity::keypair::AgentKeypair,
+/// #     next: &str,
+/// # ) -> anyhow::Result<()> {
+/// let proof = ai_memory::db::succession_preconditions(conn, "a", k)?;
+/// let _ = ai_memory::db::append_succession_checked(conn, proof, next, None)?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Identical snippet with one duplicated call — reusing a moved proof fails
+/// to compile (`E0382`, pinned alongside `!Copy`/`!Clone`/`!Default` and
+/// by-value signatures in `tests/identity_lineage_succession.rs`):
+///
+/// ```compile_fail
+/// # fn single_use(
 /// #     conn: &rusqlite::Connection,
 /// #     k: &ai_memory::identity::keypair::AgentKeypair,
 /// #     next: &str,
@@ -16042,7 +16060,16 @@ pub fn append_succession_checked(
 }
 
 /// Mint + persist a ROTATION succession from the current head to
-/// `successor_pubkey_b64`, signed by `k_old` (#1828 G13).
+/// `successor_pubkey_b64`, signed by `k_old` (#1828 G13, #10118, #10149).
+///
+/// Routes through [`succession_preconditions`] and consumes the shared
+/// [`SuccessionChecked`] proof by value in [`append_succession_checked`].
+///
+/// `k_old` must hold the private half of the CURRENT head key.
+/// `recovery_pubkey_b64 = None` carries the head's recovery commitment
+/// forward unchanged; `Some(key)` re-registers it (the
+/// `register-recovery-key` CLI passes the current head as successor —
+/// a self-rotation that only updates the recovery commitment).
 ///
 /// # Errors
 ///
@@ -16094,9 +16121,25 @@ pub fn append_revocation_checked(
     Ok(record)
 }
 
-/// v1.0.0 #1949 — mint + persist a REVOCATION succession from the current head
-/// to `successor_pubkey_b64`, routing through [`succession_preconditions`] and
-/// consuming the shared [`SuccessionChecked`] proof (#10118).
+/// v1.0.0 #1949 — mint + persist a REVOCATION succession from the
+/// current head to `successor_pubkey_b64` (the fresh post-revocation
+/// head), signed by `k_old` (the current head key), dating a suspected
+/// compromise from `suspected_compromise_from_seq` (a `signed_events`
+/// witness SEQUENCE high-water mark — the ordering authority, never
+/// wall-clock) (#10118, #10149).
+///
+/// Routes through [`succession_preconditions`] and consumes the shared
+/// [`SuccessionChecked`] proof by value in [`append_revocation_checked`].
+/// `k_old` must hold the private half of the CURRENT head key;
+/// `recovery_pubkey_b64 = None` carries the head's recovery commitment
+/// forward unchanged.
+///
+/// Rides the same chain as [`append_succession`] (epoch +1,
+/// predecessor == head successor, C1/C3/C5 anchoring, single
+/// [`crate::identity::lineage::verify_lineage`] walk). **Verdict-surface
+/// only** — entries in `[suspected_compromise_from_seq, S_rev)` are
+/// downgraded to a Suspect verdict by the verify-audit-trail readout;
+/// there is NO write-path enforcement this train (R13).
 ///
 /// # Errors
 ///
