@@ -30,6 +30,12 @@ const GOLDEN_RECEIPT_SHA256: &str =
     "ee95c1e422a3bf1b90d0b62eb3b27b5f05a98ed4dfc6c10f561ad9b2ebab58cc";
 const GOLDEN_RECEIPT_LEN: usize = 135;
 
+/// Python: the same receipt with `curator_model: None`, which encodes as
+/// a single 0x00 flag byte (126 bytes).
+const GOLDEN_RECEIPT_NO_MODEL_SHA256: &str =
+    "a632c3e25e219c0cff800a803feedc741a266656cb8e8690bbd6ec67a4cecb1b";
+const GOLDEN_RECEIPT_NO_MODEL_LEN: usize = 126;
+
 /// Hand-written: every agent kind, its stored event type and its tag.
 const KIND_TABLE: [(AgentEventKind, &str, u8); 7] = [
     (AgentEventKind::LinkCreated, "memory_link.created", 1),
@@ -161,6 +167,18 @@ fn receipt_bytes_match_the_documented_encoding_10108() {
     assert!(bytes.starts_with(ATOMISATION_RECEIPT_DOMAIN));
     assert_eq!(bytes.len(), GOLDEN_RECEIPT_LEN);
     assert_eq!(hex::encode(Sha256::digest(&bytes)), GOLDEN_RECEIPT_SHA256);
+}
+
+#[test]
+fn receipt_without_model_matches_the_documented_encoding_10108() {
+    let bytes = AtomisationReceipt {
+        curator_model: None,
+        ..receipt()
+    }
+    .canonical_bytes();
+    assert_eq!(bytes.len(), GOLDEN_RECEIPT_NO_MODEL_LEN);
+    assert_eq!(bytes.last(), Some(&0_u8));
+    assert_eq!(hex::encode(Sha256::digest(&bytes)), GOLDEN_RECEIPT_NO_MODEL_SHA256);
 }
 
 #[test]
