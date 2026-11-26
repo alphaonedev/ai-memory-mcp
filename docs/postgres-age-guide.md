@@ -52,8 +52,8 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sqlite-over-NFS is not.
 
 The two backends are at **schema parity at v102**
-(`CURRENT_SCHEMA_VERSION = 102` on both ladders — the postgres upgrade
-ladder ends at `migrate_v102()`).
+(`CURRENT_SCHEMA_VERSION = 103` on both ladders — the postgres upgrade
+ladder ends at `migrate_v103()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
@@ -1437,7 +1437,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v102 | v102 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v103 | v103 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |

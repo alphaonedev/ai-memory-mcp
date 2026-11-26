@@ -55,6 +55,9 @@ BEGIN
 END;
 ";
 
+/// The table the v103 columns land on (pm-v3.1: one named constant).
+const DEDUP_TABLE: &str = "transcript_line_dedup";
+
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -75,9 +78,9 @@ pub(super) fn migrate_v103(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_V103_SQLITE)?;
     // Same gate as the v102 arm: every deployed path creates the table before
     // `migrate`; only fixtures that stamp a version without it lack it.
-    if table_exists(conn, "transcript_line_dedup")? {
+    if table_exists(conn, DEDUP_TABLE)? {
         for (column, ddl) in DEDUP_COLUMNS {
-            if !column_exists(conn, "transcript_line_dedup", column)? {
+            if !column_exists(conn, DEDUP_TABLE, column)? {
                 conn.execute(ddl, [])?;
             }
         }
@@ -85,7 +88,7 @@ pub(super) fn migrate_v103(conn: &Connection) -> Result<()> {
     }
     // #10108 (S-3) — the marker is written in the same transaction as the
     // stamp below: no committed state has the schema at v103 and no marker.
-    if table_exists(conn, "signed_events")? {
+    if table_exists(conn, super::schema_integrity::TABLE_SIGNED_EVENTS)? {
         crate::signed_events::agent_cutover::write_sqlite_agent_cutover(conn)?;
     }
     conn.execute(super::migrations::SQL_CLEAR_SCHEMA_VERSION, [])?;
