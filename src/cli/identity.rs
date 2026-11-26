@@ -2372,4 +2372,270 @@ mod tests {
             "#10118: umask-0002 child must execute test body"
         );
     }
+
+    /// Snapshot every regular file in `dir` as sorted `(name, bytes)` so tests
+    /// can assert byte-for-byte identity of the entire trust anchor (#10110).
+    fn snapshot_anchor_dir(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).expect("read key dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = std::fs::read(&path).expect("read anchor file");
+                out.insert(name, bytes);
+            }
+        }
+        out
+    }
+
+    /// #10110 — importing a DIFFERENT key over a present key MUST be refused
+    /// (naming `ai-memory identity succeed`), leave the key files, trust
+    /// anchor, and database byte-identical (with unchanged row counts), and
+    /// preserve verification of rows signed by the present key.
+    #[test]
+    fn import_refuses_different_key_and_preserves_anchor_and_signed_row_10110() {
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+
+        // 1. Generate K0 for `alice`, register her, enroll lineage (binds K0),
+        //    and write a row attested under K0.
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, "alice", "ai:test", &[]).unwrap();
+        }
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Generate {
+                        agent_id: Some("alice".to_string()),
+                        force: false,
+                        no_overwrite: false,
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let k0 = keypair::load("alice", &dir_path).unwrap();
+        let recovery_b64 = keypair::generate("alice-recovery-10110")
+            .unwrap()
+            .public_base64();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some("alice".to_string()),
+                        recovery_pubkey: Some(recovery_b64),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::storage::row_attest::sqlite::arm_with_key(
+                &conn,
+                "alice",
+                k0.private.as_ref().unwrap(),
+            )
+            .expect("arm connection with K0");
+            crate::db::register_agent(&conn, "alice-signed-row-10110", "ai:test", &[])
+                .expect("write attested row under K0");
+            let anchor = crate::storage::row_attest::anchor::TrustAnchor::load_dir(&dir_path);
+            let report =
+                crate::storage::row_attest::sqlite::verify_sqlite_with(&conn, &anchor).unwrap();
+            assert_eq!(
+                report.outcome(),
+                crate::storage::row_attest::Outcome::Clean,
+                "pre-import signed row must verify cleanly: {:?}",
+                report.defects
+            );
+            assert!(
+                report.tables["memories"].verified >= 2,
+                "expected attested memories rows before import"
+            );
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        // 2. Snapshot key files, full anchor directory, DB bytes, and row counts.
+        let pub_path = dir_path.join("alice.pub");
+        let priv_path = dir_path.join("alice.priv");
+        let before_pub = std::fs::read(&pub_path).unwrap();
+        let before_priv = std::fs::read(&priv_path).unwrap();
+        let before_anchor = snapshot_anchor_dir(&dir_path);
+        let before_db_bytes = std::fs::read(&db_path).unwrap();
+        let (before_mem_rows, before_attest_rows): (i64, i64) = {
+            let conn = crate::db::open(&db_path).unwrap();
+            let m: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .unwrap();
+            let a: i64 = conn
+                .query_row("SELECT COUNT(*) FROM row_attestations", [], |r| r.get(0))
+                .unwrap();
+            (m, a)
+        };
+
+        // 3. Stage a DIFFERENT keypair K1 and attempt both full and pub-only import.
+        let k1 = keypair::generate("alice").unwrap();
+        assert_ne!(k1.public.to_bytes(), k0.public.to_bytes());
+        let staging = tempfile::TempDir::new().unwrap();
+        let k1_pub = staging.path().join("k1.pub");
+        let k1_priv = staging.path().join("k1.priv");
+        std::fs::write(&k1_pub, k1.public.to_bytes()).unwrap();
+        std::fs::write(&k1_priv, k1.private.as_ref().unwrap().to_bytes()).unwrap();
+
+        for priv_arg in [Some(k1_priv.clone()), None] {
+            let mode = if priv_arg.is_some() {
+                "with-priv"
+            } else {
+                "pub-only"
+            };
+            let err = {
+                let mut out = env.output();
+                run(
+                    &db_path,
+                    IdentityArgs {
+                        key_dir: Some(dir_path.clone()),
+                        action: IdentityAction::Import {
+                            agent_id: "alice".to_string(),
+                            public: k1_pub.clone(),
+                            private: priv_arg,
+                        },
+                    },
+                    false,
+                    &mut out,
+                )
+            }
+            .expect_err(&format!(
+                "#10110 ({mode}): importing a different key over a present key MUST be refused"
+            ));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("refusing to overwrite existing keypair with a different key")
+                    && msg.contains("ai-memory identity succeed"),
+                "#10110 ({mode}): refusal must name the overwrite refusal and succession path; got: {msg}"
+            );
+        }
+
+        // 4. Key files, full trust anchor, DB bytes, and row counts are byte-identical.
+        assert_eq!(std::fs::read(&pub_path).unwrap(), before_pub);
+        assert_eq!(std::fs::read(&priv_path).unwrap(), before_priv);
+        assert_eq!(snapshot_anchor_dir(&dir_path), before_anchor);
+        assert_eq!(std::fs::read(&db_path).unwrap(), before_db_bytes);
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            let after_mem_rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .unwrap();
+            let after_attest_rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM row_attestations", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after_mem_rows, before_mem_rows);
+            assert_eq!(after_attest_rows, before_attest_rows);
+
+            // 5. The row signed by K0 still verifies cleanly against the anchor.
+            let anchor = crate::storage::row_attest::anchor::TrustAnchor::load_dir(&dir_path);
+            let report =
+                crate::storage::row_attest::sqlite::verify_sqlite_with(&conn, &anchor).unwrap();
+            assert_eq!(
+                report.outcome(),
+                crate::storage::row_attest::Outcome::Clean,
+                "#10110: row signed by K0 must still verify after refused import: {:?}",
+                report.defects
+            );
+        }
+    }
+
+    /// #10110 — importing into an empty home succeeds, and re-importing the
+    /// IDENTICAL key (both full and pub-only) is a true no-op that does not
+    /// rewrite existing key files on disk.
+    #[test]
+    fn import_identical_key_is_noop_and_fresh_empty_home_succeeds_10110() {
+        let (mut env, dir) = fresh_env();
+        let empty_home = dir.path().join("fresh-home");
+        let k0 = keypair::generate("bob-10110").unwrap();
+        let staging = tempfile::TempDir::new().unwrap();
+        let k0_pub = staging.path().join("k0.pub");
+        let k0_priv = staging.path().join("k0.priv");
+        std::fs::write(&k0_pub, k0.public.to_bytes()).unwrap();
+        std::fs::write(&k0_priv, k0.private.as_ref().unwrap().to_bytes()).unwrap();
+
+        // 1. Fresh import into an empty home succeeds.
+        {
+            let mut out = env.output();
+            run_nodb(
+                IdentityArgs {
+                    key_dir: Some(empty_home.clone()),
+                    action: IdentityAction::Import {
+                        agent_id: "bob-10110".to_string(),
+                        public: k0_pub.clone(),
+                        private: Some(k0_priv.clone()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .expect("fresh import into empty home must succeed");
+        }
+        let loaded = keypair::load("bob-10110", &empty_home).unwrap();
+        assert_eq!(loaded.public.to_bytes(), k0.public.to_bytes());
+        assert!(loaded.can_sign());
+
+        let pub_path = empty_home.join("bob-10110.pub");
+        let priv_path = empty_home.join("bob-10110.priv");
+        let before_anchor = snapshot_anchor_dir(&empty_home);
+        #[cfg(unix)]
+        let (before_pub_ino, before_priv_ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (
+                std::fs::metadata(&pub_path).unwrap().ino(),
+                std::fs::metadata(&priv_path).unwrap().ino(),
+            )
+        };
+
+        // 2. Identical re-import (both with --priv and pub-only) is a true no-op.
+        for priv_arg in [Some(k0_priv.clone()), None] {
+            let mut out = env.output();
+            run_nodb(
+                IdentityArgs {
+                    key_dir: Some(empty_home.clone()),
+                    action: IdentityAction::Import {
+                        agent_id: "bob-10110".to_string(),
+                        public: k0_pub.clone(),
+                        private: priv_arg,
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .expect("re-importing the identical key must succeed as a no-op");
+            assert_eq!(snapshot_anchor_dir(&empty_home), before_anchor);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                assert_eq!(
+                    std::fs::metadata(&pub_path).unwrap().ino(),
+                    before_pub_ino,
+                    "#10110: identical import must be a no-op and not rewrite .pub"
+                );
+                assert_eq!(
+                    std::fs::metadata(&priv_path).unwrap().ino(),
+                    before_priv_ino,
+                    "#10110: identical import must be a no-op and not rewrite .priv"
+                );
+            }
+        }
+    }
 }
