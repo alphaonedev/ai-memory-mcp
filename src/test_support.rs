@@ -548,18 +548,115 @@ pub(crate) fn tls_test_client(timeout: std::time::Duration) -> reqwest::Client {
         .expect("TLS test client")
 }
 
-/// v1.0.0 #3152 — run THIS test binary again as a child that executes
-/// exactly `test` (its full path inside the lib test binary) with `env` set.
-/// The child starts from a CLEAN environment (the #3550 `publish_3550`
-/// shape), so no parallel test's environment leaks into it, and it never
-/// reads the operator config file. The crate's own `cfg(test)` harness arms
-/// the #3355 key-directory guard by itself, so no key-dir variable is
-/// needed. The spawn goes through the #1937 audited chokepoint (the
-/// `spawn_audit_gate_1937` guard bans a raw process constructor outside
-/// `src/spawn_audit.rs`); its best-effort audit emit is a no-op in a unit
-/// test process, which seeds no spawn-audit database.
+/// #10122 — wall-clock bound for every re-executed child test process so a
+/// spinning or stalled child is killed and surfaces a named failure instead of
+/// hanging the suite.
+#[cfg(any(test, unix))]
+pub(crate) const TEST_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(any(test, unix))]
+const TEST_CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// #10122 — canonical error prefix returned by [`run_command_with_timeout`]
+/// when a child exceeds its wall-clock bound.
+#[cfg(any(test, unix))]
+pub(crate) const TEST_CHILD_TIMEOUT_PREFIX: &str = "test child timed out";
+
+/// #10122 (C-F4, ERRORS-19) — read a child capture file, surfacing any I/O
+/// failure verbatim instead of collapsing it into empty output.
+#[cfg(any(test, unix))]
+fn read_child_capture(
+    path: &std::path::Path,
+    stream: &str,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("read child {stream} capture for {label}: {e}"))
+}
+
+/// #10122 (C-F1) — allocate a private 0700 sandbox and configure `cmd` so the
+/// child resolves `HOME`, `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR`
+/// inside that sandbox (applied before any caller overrides). The caller keeps
+/// the returned `TempDir` alive until the child exits.
+#[cfg(any(test, unix))]
+fn apply_isolated_child_sandbox(cmd: &mut std::process::Command) -> tempfile::TempDir {
+    let sandbox = crate::identity::test_key_dir::private_tempdir();
+    let xdg_config = sandbox.path().join(".config");
+    let witness_dir = sandbox.path().join("witness-keys");
+    std::fs::create_dir_all(&xdg_config).expect("isolated child XDG_CONFIG_HOME");
+    cmd.env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env(crate::governance::audit::WITNESS_KEY_DIR_ENV, &witness_dir);
+    sandbox
+}
+
+/// #10122 — run `command` with file-backed stdout/stderr captures and a hard
+/// wall-clock `timeout`. If the child does not exit before the deadline it is
+/// killed and reaped (CONCURRENCY-11) before returning `Err` prefixed with
+/// [`TEST_CHILD_TIMEOUT_PREFIX`].
+#[cfg(any(test, unix))]
+pub(crate) fn run_command_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    let scratch = crate::identity::test_key_dir::private_tempdir();
+    let stdout_path = scratch.path().join("stdout");
+    let stderr_path = scratch.path().join("stderr");
+    let stdout_file = std::fs::File::create(&stdout_path)
+        .map_err(|e| format!("create child stdout capture for {label}: {e}"))?;
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .map_err(|e| format!("create child stderr capture for {label}: {e}"))?;
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+        .map_err(|e| format!("spawn test child {label}: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("poll test child {label}: {e}"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(TEST_CHILD_POLL_INTERVAL);
+    };
+    let kill_error = if timed_out { child.kill().err() } else { None };
+    let status = child
+        .wait()
+        .map_err(|e| format!("reap test child {label}: {e}"))?;
+    let stdout = read_child_capture(&stdout_path, "stdout", label)?;
+    let stderr = read_child_capture(&stderr_path, "stderr", label)?;
+    if timed_out {
+        return Err(format!(
+            "{TEST_CHILD_TIMEOUT_PREFIX}: {label} exceeded {}ms (kill_error={kill_error:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            timeout.as_millis(),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Internal bounded form of [`spawn_test_child`] so tests can drive a child
+/// past a short bound and pin the timeout path (#10122 C-F3).
 #[cfg(unix)]
-pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
+fn spawn_test_child_with_timeout(
+    test: &str,
+    env: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
     let mut cmd = crate::spawn_audit::audited_command(
         std::env::current_exe().expect("lib test binary"),
         "test_support::spawn_test_child",
@@ -571,10 +668,31 @@ pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
         .env("TMPDIR", std::env::temp_dir())
         .env("AI_MEMORY_NO_CONFIG", "1");
+    let _sandbox = apply_isolated_child_sandbox(&mut cmd);
     for (key, value) in env {
         cmd.env(key, value);
     }
-    cmd.output().expect("spawn the test child")
+    run_command_with_timeout(&mut cmd, timeout, test)
+}
+
+/// v1.0.0 #3152 — run THIS test binary again as a child that executes
+/// exactly `test` (its full path inside the lib test binary) with `env` set.
+/// The child starts from a CLEAN environment (the #3550 `publish_3550`
+/// shape), so no parallel test's environment leaks into it, and it never
+/// reads the operator config file or the host's live witness custody
+/// directory (#10122: `HOME`, `XDG_CONFIG_HOME`, and
+/// `AI_MEMORY_WITNESS_KEY_DIR` default to a fresh private 0700 sandbox unless
+/// overridden in `env`). Waits under [`TEST_CHILD_TIMEOUT`] so a spinning
+/// child is killed and reported instead of hanging the suite.
+///
+/// The spawn goes through the #1937 audited chokepoint (the
+/// `spawn_audit_gate_1937` guard bans a raw process constructor outside
+/// `src/spawn_audit.rs`); its best-effort audit emit is a no-op in a unit
+/// test process, which seeds no spawn-audit database.
+#[cfg(unix)]
+pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
+    spawn_test_child_with_timeout(test, env, TEST_CHILD_TIMEOUT)
+        .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
 /// Role env marker for [`run_env_isolated_child_or_spawn`] (#2905).
@@ -654,17 +772,17 @@ pub(crate) fn run_env_isolated_child_or_spawn_home(exact_path: &str) -> bool {
     )
 }
 
-/// Spawn `exact_path` alone in a child test process with `scrub` removed
-/// from and `set` added to its environment; panics unless exactly one test
-/// ran and passed.
+/// Internal bounded form of [`spawn_env_isolated_child`] (#10122 C-F1 / C-F3):
+/// defaults `HOME`, `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` to a
+/// fresh private 0700 sandbox before `scrub` and `set`, and bounds the child
+/// wait under `timeout`.
 #[cfg(test)]
-fn spawn_env_isolated_child(
+fn try_spawn_env_isolated_child_with_timeout(
     exact_path: &str,
     scrub: &[&str],
     set: &[(&str, &std::path::Path)],
-) -> bool {
-    // The child inherits the parent's environment (incl. AI_MEMORY_NO_CONFIG
-    // and TMPDIR), so we only add the role marker.
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
     // Route the spawn through the #1937 audited chokepoint (never a raw
     // process-constructor, which the `spawn_audit_gate_1937` guard bans
     // outside `src/spawn_audit.rs`). The best-effort audit emit is a no-op
@@ -675,13 +793,14 @@ fn spawn_env_isolated_child(
     );
     cmd.args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
         .env(TEST_ENV_ISOLATION_ROLE_ENV, "child");
+    let _sandbox = apply_isolated_child_sandbox(&mut cmd);
     for name in scrub {
         cmd.env_remove(name);
     }
     for (name, value) in set {
         cmd.env(name, value);
     }
-    let output = cmd.output().expect("spawn env-isolated child test");
+    let output = run_command_with_timeout(&mut cmd, timeout, exact_path)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -695,7 +814,21 @@ fn spawn_env_isolated_child(
         "env-isolated child test {exact_path} did NOT run (expected `1 passed`); \
          a mistyped path silently runs zero tests. child stdout:\n{stdout}"
     );
-    true // caller must `return`
+    Ok(true) // caller must `return`
+}
+
+/// Spawn `exact_path` alone in a child test process with isolated sandbox
+/// defaults (`HOME`, `XDG_CONFIG_HOME`, `AI_MEMORY_WITNESS_KEY_DIR`), `scrub`
+/// removed, and `set` added; panics unless exactly one test ran and passed
+/// within [`TEST_CHILD_TIMEOUT`].
+#[cfg(test)]
+fn spawn_env_isolated_child(
+    exact_path: &str,
+    scrub: &[&str],
+    set: &[(&str, &std::path::Path)],
+) -> bool {
+    try_spawn_env_isolated_child_with_timeout(exact_path, scrub, set, TEST_CHILD_TIMEOUT)
+        .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
 #[cfg(test)]
@@ -940,47 +1073,21 @@ mod tests {
         }
     }
 
-    /// Copy the #8166 file-capture and bounded child-reaping precedent.
+    /// #10122 (C-F1 / C-F6) — route PKI test children through the single shared
+    /// isolated-sandbox + bounded-timeout helper instead of duplicating the
+    /// capture/poll/kill/reap loop.
     #[cfg(unix)]
     fn run_pki_child_8651(
         mut command: std::process::Command,
-        scratch: &std::path::Path,
+        _scratch: &std::path::Path,
     ) -> std::process::Output {
-        // Hang guard, not a latency budget; startup under CI load is included.
-        const CHILD_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
-        const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
-        let stdout = scratch.join("stdout");
-        let stderr = scratch.join("stderr");
-        let mut child = command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::fs::File::create(&stdout).expect("child stdout capture"))
-            .stderr(std::fs::File::create(&stderr).expect("child stderr capture"))
-            .spawn()
-            .expect("spawn isolated PKI child");
-        let deadline = std::time::Instant::now() + CHILD_HANG_GUARD;
-        let timed_out = loop {
-            if child.try_wait().expect("poll PKI child").is_some() {
-                break false;
-            }
-            if std::time::Instant::now() >= deadline {
-                break true;
-            }
-            std::thread::sleep(CHILD_POLL_INTERVAL);
-        };
-        // CONCURRENCY-11: always reap before reading captures or dropping scratch.
-        let kill_error = if timed_out { child.kill().err() } else { None };
-        let output = std::process::Output {
-            status: child.wait().expect("reap PKI child"),
-            stdout: std::fs::read(stdout).expect("read child stdout"),
-            stderr: std::fs::read(stderr).expect("read child stderr"),
-        };
-        assert!(
-            !timed_out,
-            "PKI child hang guard expired; kill error={kill_error:?}: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
+        let _sandbox = super::apply_isolated_child_sandbox(&mut command);
+        super::run_command_with_timeout(
+            &mut command,
+            super::TEST_CHILD_TIMEOUT,
+            "run_pki_child_8651",
+        )
+        .unwrap_or_else(|msg| panic!("{msg}"))
     }
 
     /// #3523 — the OBSERVED singleton pin: `test_support::env_lock()` and
@@ -1040,6 +1147,300 @@ mod tests {
         assert!(
             std::env::var_os(KEY).is_none(),
             "#3523: `EnvGuard` must restore the ABSENT pre-guard state on drop"
+        );
+    }
+
+    /// #10122 (C-F1 / C-F2) — shared child-side assertion that a spawned test
+    /// child sees isolated `HOME`, `XDG_CONFIG_HOME`, and
+    /// `AI_MEMORY_WITNESS_KEY_DIR` VALUES (not merely that variables are set).
+    #[cfg(unix)]
+    fn assert_child_sees_isolated_sandbox_values(
+        spawner: &str,
+        parent_home_env: &str,
+        parent_witness_env: &str,
+    ) {
+        let child_home = std::path::PathBuf::from(
+            std::env::var_os("HOME")
+                .unwrap_or_else(|| panic!("#10122 ({spawner}): child HOME must be set")),
+        );
+        let child_xdg =
+            std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap_or_else(|| {
+                panic!("#10122 ({spawner}): child XDG_CONFIG_HOME must be set")
+            }));
+        let child_witness = std::path::PathBuf::from(
+            std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV).unwrap_or_else(|| {
+                panic!("#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR must be set")
+            }),
+        );
+        if let Some(parent_home) = std::env::var_os(parent_home_env) {
+            let parent_home = std::path::PathBuf::from(parent_home);
+            assert_ne!(
+                child_home, parent_home,
+                "#10122 ({spawner}): child HOME must differ from parent HOME"
+            );
+        }
+        if let Some(parent_witness) = std::env::var_os(parent_witness_env) {
+            let parent_witness = std::path::PathBuf::from(parent_witness);
+            assert_ne!(
+                child_witness, parent_witness,
+                "#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR must differ from parent witness dir"
+            );
+        }
+        assert!(
+            child_xdg.starts_with(&child_home),
+            "#10122 ({spawner}): child XDG_CONFIG_HOME ({child_xdg:?}) must lie inside child HOME ({child_home:?})"
+        );
+        assert!(
+            child_witness.starts_with(&child_home),
+            "#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR ({child_witness:?}) must lie inside child HOME ({child_home:?})"
+        );
+        let resolved_witness =
+            crate::governance::audit::witness_key_dir().expect("resolve child witness_key_dir");
+        assert_eq!(
+            resolved_witness, child_witness,
+            "#10122 ({spawner}): witness_key_dir() must resolve to the isolated child witness dir"
+        );
+        assert!(
+            !child_witness.join("head-anchor.log").exists(),
+            "#10122 ({spawner}): isolated child witness dir must not contain a pre-existing head-anchor.log"
+        );
+    }
+
+    /// #10122 (C-F2) — `spawn_test_child` MUST isolate `HOME`,
+    /// `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` VALUES to a fresh
+    /// private sandbox distinct from the parent's home and witness dir.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_test_child_isolates_home_and_witness_dir_10122() {
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_10122_ISOLATION_ROLE";
+        const PARENT_HOME_ENV: &str = "AI_MEMORY_TEST_10122_PARENT_HOME";
+        const PARENT_WITNESS_ENV: &str = "AI_MEMORY_TEST_10122_PARENT_WITNESS";
+        const TEST: &str =
+            "test_support::tests::spawn_test_child_isolates_home_and_witness_dir_10122";
+        if std::env::var_os(ROLE_ENV).is_some() {
+            assert_child_sees_isolated_sandbox_values(
+                "spawn_test_child",
+                PARENT_HOME_ENV,
+                PARENT_WITNESS_ENV,
+            );
+            return;
+        }
+        let parent_home = std::env::var("HOME").unwrap_or_default();
+        let parent_witness = crate::governance::audit::witness_key_dir()
+            .expect("resolve parent witness_key_dir")
+            .to_string_lossy()
+            .into_owned();
+        let out = super::spawn_test_child(
+            TEST,
+            &[
+                (ROLE_ENV, "1"),
+                (PARENT_HOME_ENV, &parent_home),
+                (PARENT_WITNESS_ENV, &parent_witness),
+            ],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "#10122 isolation child failed:\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "#10122 isolation child ran zero tests:\n{stdout}"
+        );
+    }
+
+    /// #10122 (C-F1 / C-F2) — `spawn_env_isolated_child` MUST isolate `HOME`,
+    /// `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` VALUES to a fresh
+    /// private sandbox distinct from the parent's home and witness dir.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_env_isolated_child_isolates_home_config_and_witness_dir_10122() {
+        const PARENT_HOME_ENV: &str = "AI_MEMORY_TEST_10122_ENV_ISO_PARENT_HOME";
+        const PARENT_WITNESS_ENV: &str = "AI_MEMORY_TEST_10122_ENV_ISO_PARENT_WITNESS";
+        const TEST: &str = "test_support::tests::spawn_env_isolated_child_isolates_home_config_and_witness_dir_10122";
+        if std::env::var(super::TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
+            assert_child_sees_isolated_sandbox_values(
+                "spawn_env_isolated_child",
+                PARENT_HOME_ENV,
+                PARENT_WITNESS_ENV,
+            );
+            return;
+        }
+        let parent_home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let parent_witness =
+            crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir");
+        let ran_in_child = super::spawn_env_isolated_child(
+            TEST,
+            &[],
+            &[
+                (PARENT_HOME_ENV, parent_home.as_path()),
+                (PARENT_WITNESS_ENV, parent_witness.as_path()),
+            ],
+        );
+        assert!(ran_in_child, "parent branch must spawn child");
+    }
+
+    /// #10122 (C-F1 / C-F6) — `run_pki_child_8651` MUST isolate `HOME`,
+    /// `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` VALUES to a fresh
+    /// private sandbox distinct from the parent's home and witness dir.
+    #[cfg(unix)]
+    #[test]
+    fn pki_child_spawner_isolates_home_config_and_witness_dir_10122() {
+        const CHILD: &str = "AI_MEMORY_TEST_10122_PKI_ISO_ROLE";
+        const PARENT_HOME_ENV: &str = "AI_MEMORY_TEST_10122_PKI_PARENT_HOME";
+        const PARENT_WITNESS_ENV: &str = "AI_MEMORY_TEST_10122_PKI_PARENT_WITNESS";
+        const TEST: &str =
+            "test_support::tests::pki_child_spawner_isolates_home_config_and_witness_dir_10122";
+        if std::env::var_os(CHILD).is_some() {
+            assert_child_sees_isolated_sandbox_values(
+                "run_pki_child_8651",
+                PARENT_HOME_ENV,
+                PARENT_WITNESS_ENV,
+            );
+            return;
+        }
+        let parent_home = std::env::var_os("HOME").unwrap_or_default();
+        let parent_witness =
+            crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir");
+        let scratch = crate::identity::test_key_dir::private_tempdir();
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::pki_child_spawner_isolates_home_config_and_witness_dir_10122",
+        );
+        command
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(PARENT_HOME_ENV, &parent_home)
+            .env(PARENT_WITNESS_ENV, &parent_witness)
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        let out = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "#10122 PKI isolation child failed:\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "#10122 PKI isolation child ran zero tests:\n{stdout}"
+        );
+    }
+
+    /// #10122 — `run_command_with_timeout` MUST kill a hanging child when the
+    /// bound expires and return an `Err` naming `TEST_CHILD_TIMEOUT_PREFIX`.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_kills_and_reports_hanging_child_10122() {
+        const SLEEP_ROLE_ENV: &str = "AI_MEMORY_TEST_10122_TIMEOUT_SLEEP_ROLE";
+        const TEST: &str =
+            "test_support::tests::run_command_with_timeout_kills_and_reports_hanging_child_10122";
+        const SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(150);
+        const MAX_WALL_ELAPSED: std::time::Duration = std::time::Duration::from_secs(5);
+        if std::env::var_os(SLEEP_ROLE_ENV).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let mut cmd = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::run_command_with_timeout_kills_and_reports_hanging_child_10122",
+        );
+        cmd.args(["--exact", TEST, "--test-threads=1"])
+            .env(SLEEP_ROLE_ENV, "1");
+        let start = std::time::Instant::now();
+        let err = super::run_command_with_timeout(&mut cmd, SHORT_BOUND, TEST)
+            .expect_err("sleeping child must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            err.starts_with(super::TEST_CHILD_TIMEOUT_PREFIX),
+            "expected timeout prefix, got: {err}"
+        );
+        assert!(
+            err.contains(TEST),
+            "timeout message must name the child label: {err}"
+        );
+        assert!(
+            elapsed < MAX_WALL_ELAPSED,
+            "timeout kill took too long: {elapsed:?}"
+        );
+    }
+
+    /// #10122 (C-F3, kills mutant M6) — `spawn_test_child` MUST execute through
+    /// the bounded wait so a hanging child is killed and reported with
+    /// `TEST_CHILD_TIMEOUT_PREFIX`.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_test_child_enforces_timeout_10122() {
+        const SLEEP_ROLE_ENV: &str = "AI_MEMORY_TEST_10122_SPAWN_TEST_TIMEOUT_ROLE";
+        const TEST: &str = "test_support::tests::spawn_test_child_enforces_timeout_10122";
+        const SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(150);
+        const MAX_WALL_ELAPSED: std::time::Duration = std::time::Duration::from_secs(5);
+        if std::env::var_os(SLEEP_ROLE_ENV).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let start = std::time::Instant::now();
+        let err = super::spawn_test_child_with_timeout(TEST, &[(SLEEP_ROLE_ENV, "1")], SHORT_BOUND)
+            .expect_err("sleeping spawn_test_child must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            err.starts_with(super::TEST_CHILD_TIMEOUT_PREFIX),
+            "expected timeout prefix, got: {err}"
+        );
+        assert!(
+            err.contains(TEST),
+            "timeout message must name the child label: {err}"
+        );
+        assert!(
+            elapsed < MAX_WALL_ELAPSED,
+            "spawn_test_child timeout kill took too long: {elapsed:?}"
+        );
+    }
+
+    /// #10122 (C-F3, kills mutant M5) — `spawn_env_isolated_child` MUST execute
+    /// through the bounded wait so a hanging child is killed and reported with
+    /// `TEST_CHILD_TIMEOUT_PREFIX`.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_env_isolated_child_enforces_timeout_10122() {
+        const TEST: &str = "test_support::tests::spawn_env_isolated_child_enforces_timeout_10122";
+        const SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(150);
+        const MAX_WALL_ELAPSED: std::time::Duration = std::time::Duration::from_secs(5);
+        if std::env::var(super::TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let start = std::time::Instant::now();
+        let err = super::try_spawn_env_isolated_child_with_timeout(TEST, &[], &[], SHORT_BOUND)
+            .expect_err("sleeping spawn_env_isolated_child must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            err.starts_with(super::TEST_CHILD_TIMEOUT_PREFIX),
+            "expected timeout prefix, got: {err}"
+        );
+        assert!(
+            err.contains(TEST),
+            "timeout message must name the child label: {err}"
+        );
+        assert!(
+            elapsed < MAX_WALL_ELAPSED,
+            "spawn_env_isolated_child timeout kill took too long: {elapsed:?}"
+        );
+    }
+
+    /// #10122 (C-F4, ERRORS-19) — a missing or unreadable child capture file
+    /// MUST surface an explicit error naming the stream and label instead of
+    /// silently collapsing to empty bytes via `unwrap_or_default()`.
+    #[cfg(any(test, unix))]
+    #[test]
+    fn read_child_capture_surfaces_io_error_10122() {
+        let scratch = crate::identity::test_key_dir::private_tempdir();
+        let missing = scratch.path().join("missing-stdout-capture");
+        let err = super::read_child_capture(&missing, "stdout", "capture-probe-10122")
+            .expect_err("missing capture file must error");
+        assert!(
+            err.contains("read child stdout capture for capture-probe-10122"),
+            "expected explicit capture-read error, got: {err}"
         );
     }
 
