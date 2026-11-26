@@ -889,21 +889,21 @@ mod tests {
         super::hardened_env_fixture::EnvLockGuard::acquire()
     }
 
-    /// # Safety
-    /// Caller must hold [`env_lock`].
-    pub(super) unsafe fn clear_all() {
-        // SAFETY: forwarded caller contract.
-        unsafe { super::hardened_env_fixture::clear_posture_env() };
+    /// Remove every posture variable under the env-lock proof `lock`.
+    pub(super) fn clear_all(lock: &super::hardened_env_fixture::EnvLockGuard<'_>) {
+        super::hardened_env_fixture::clear_posture_env(lock);
     }
 
     /// RAII guard mirroring `security_profile::tests::KnobsGuard` — a
     /// mid-test panic still restores the baseline for whatever `--lib`
-    /// test runs next in the same process.
-    pub(super) struct EnvGuard;
-    impl Drop for EnvGuard {
+    /// test runs next in the same process. It holds the env-lock proof it
+    /// clears under (#10124 N1), so it cannot exist without the lock.
+    pub(super) struct EnvGuard<'a>(
+        pub(super) &'a super::hardened_env_fixture::EnvLockGuard<'static>,
+    );
+    impl Drop for EnvGuard<'_> {
         fn drop(&mut self) {
-            // SAFETY: constructed only while the caller holds `env_lock()`.
-            unsafe { clear_all() };
+            clear_all(self.0);
         }
     }
 
@@ -935,10 +935,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
 
         let app_config = AppConfig::default();
@@ -982,10 +980,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let app_config = AppConfig::default();
         let checks = evaluate(&app_config);
         let c = find(&checks, "AI_MEMORY_SECURITY_PROFILE");
@@ -1007,10 +1003,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
 
         // Arrange: the bare cert-evidence leg — no profile, no knobs set.
         // Act
@@ -1064,10 +1058,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
 
         let checks = evaluate(&AppConfig::default());
@@ -1100,10 +1092,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         unsafe {
             std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hardd");
         }
@@ -1127,10 +1117,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         // Loosen ONE of the 27 pinned knobs after the fact.
         unsafe {
@@ -1152,10 +1140,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(
@@ -1190,10 +1176,8 @@ mod tests {
         // false-green. This is the regression test proving the fix:
         // the same env now FAILS check #3.
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             // Deliberately confirm the strict knob is untouched (unset ->
@@ -1241,10 +1225,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(crate::federation::signing::REQUIRE_SIG_ENV, "false");
@@ -1262,10 +1244,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(crate::federation::signing::REQUIRE_NONCE_ENV, "off");
@@ -1283,10 +1263,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(
@@ -1310,10 +1288,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var("AI_MEMORY_PERMISSIONS_MODE", "advisory");
@@ -1332,10 +1308,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN, "1");
@@ -1353,10 +1327,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::remove_var(TRUST_DOMAIN_ENV_FOR_TEST);
@@ -1374,10 +1346,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::remove_var(crate::tls::FED_PEER_FINGERPRINTS_ENV);
@@ -1395,10 +1365,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(
@@ -1419,10 +1387,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::remove_var(PEER_ATTESTATION_ENV);
@@ -1441,10 +1407,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(PEER_ATTESTATION_ENV, "not json{{");
@@ -1467,10 +1431,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(
@@ -1496,10 +1458,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(
@@ -1523,10 +1483,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(
@@ -1550,10 +1508,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "0");
@@ -1571,10 +1527,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV, "1");
@@ -1624,10 +1578,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         // Fully hardened (which enrolls an approver key), then strip the
         // enrollment: no approver key resolvable → check #20 FAILs. Also
         // neutralise any on-disk operator key so a dev host's staged
@@ -1660,10 +1612,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         // Fully hardened (which arms BOTH halves), then strip the append-only
         // flag: the spine is off, so no leaf is written at all — check #19 FAILs
         // even though the signing key is armed.
@@ -1694,10 +1644,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         // Arm the append-only spine but deliberately DO NOT install a daemon
         // audit key (never call set_fully_hardened_env, which would), and point
         // the key dir at an EMPTY temp dir so `load_daemon_signing_key` finds no
@@ -1745,10 +1693,8 @@ mod tests {
         // the helper now sets — strip it so doctor --posture sees the
         // pre-#2911 "PASS while daemon would not refuse boot" shape.
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::remove_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE);
@@ -1779,10 +1725,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "0");
@@ -1803,10 +1747,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(
@@ -1845,10 +1787,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         // Deliberately leave the posture unsatisfied AND the require
         // flag unset — must still boot (byte-identical legacy).
         let app_config = AppConfig::default();
@@ -1863,10 +1803,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         unsafe {
             std::env::set_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "1");
         }
@@ -1955,10 +1893,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp =
             set_postgres_backend(&_g, "postgres://u@db.internal:5432/mem?sslmode=verify-full");
         unsafe {
@@ -2007,10 +1943,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         // verify-full pinned, but the operator attestation is UNSET.
         let _fp = set_postgres_backend(&_g, "postgres://u@db.internal/mem?sslmode=verify-full");
 
@@ -2033,10 +1967,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         // Attested, but the DSN pins a WEAKER TLS mode than verify-full.
         let _fp = set_postgres_backend(&_g, "postgres://u@db.internal/mem?sslmode=require");
         unsafe {
@@ -2065,10 +1997,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         // No attestation env is set here on purpose: the pin is the TLS half,
         // and the `actual` text must name the transport so the FAIL cannot be
         // read as "just the attestation is missing" (this also keeps the
@@ -2105,10 +2035,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         unsafe {
             std::env::set_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "1");

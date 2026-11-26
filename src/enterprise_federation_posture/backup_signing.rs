@@ -46,8 +46,8 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe { clear_all() };
-        let _cleanup = EnvGuard;
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
         let _fp_file = set_fully_hardened_env(&_g);
         let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let checks = evaluate(&AppConfig::default());

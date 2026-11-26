@@ -18,13 +18,19 @@
 //! [`EnvLockGuard`], whose only constructor is [`EnvLockGuard::acquire`] (the
 //! crate-wide env lock), so a fixture cannot be built under another mutex and
 //! cannot outlive the lock that serialises it (UNSAFE-04, API-08).
+//!
+//! #10124 (round 2): the guard lives in its own private submodule `lock`, so
+//! its field is private to that submodule alone: no struct literal, no
+//! `Default` and no `Clone` reaches it from this module, a sibling or the
+//! tests module. Every function here that writes the process env is safe only
+//! because it takes `&EnvLockGuard` ([`clear_posture_env`], [`apply`]); there
+//! is no safe env write that does not.
 //! The ratchet `doctor_holds_no_hand_rolled_posture_env` keeps a second copy
 //! out of `src/cli/doctor.rs`.
 
 use std::ffi::OsString;
-use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::{MutexGuard, OnceLock};
+use std::sync::OnceLock;
 
 use super::{
     ENV_PG_AT_REST_ATTESTED, ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, PEER_ATTESTATION_ENV,
@@ -86,14 +92,10 @@ pub(super) fn posture_env_vars() -> Vec<&'static str> {
     vars
 }
 
-/// Remove every posture variable.
-///
-/// # Safety
-/// The caller holds `crate::config::test_env_lock()`.
-pub(super) unsafe fn clear_posture_env() {
+/// Remove every posture variable, under the proof `lock` of the env lock.
+pub(super) fn clear_posture_env(lock: &EnvLockGuard<'_>) {
     for env in posture_env_vars() {
-        // SAFETY: the caller holds the crate-wide env lock.
-        unsafe { std::env::remove_var(env) };
+        apply(lock, env, None);
     }
 }
 
@@ -110,27 +112,38 @@ pub(super) fn approver_pubkey_b64() -> String {
 /// and first-install-wins, so it is the one part a drop cannot restore.
 static POSTURE_AUDIT_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
-/// Proof that the holder owns the crate-wide process-env lock
-/// (`crate::config::test_env_lock`) and no other mutex.
-///
-/// The field is private to this module and the only constructor is
-/// [`EnvLockGuard::acquire`], so no `MutexGuard` of another mutex converts into
-/// it (`tests::no_foreign_guard_converts_into_env_lock_guard` proves it at
-/// compile time). [`PostureEnv`] takes this type and nothing else.
-#[must_use = "the env lock is released when this guard drops"]
-pub(crate) struct EnvLockGuard<'a> {
-    _guard: MutexGuard<'a, ()>,
-}
+/// The lock proof, alone in its own module so that its field is private to
+/// this module and nothing else (#10124 N2): a private field is visible to the
+/// defining module and its descendants, so in the parent module the tests
+/// module could build the guard by struct literal from any mutex.
+mod lock {
+    use std::sync::MutexGuard;
 
-impl EnvLockGuard<'static> {
-    /// Take the crate-wide env lock (a poisoned lock is recovered, as in
-    /// `test_env_lock`: CONCURRENCY-18).
-    pub(crate) fn acquire() -> Self {
-        Self {
-            _guard: crate::config::test_env_lock(),
+    /// Proof that the holder owns the crate-wide process-env lock
+    /// (`crate::config::test_env_lock`) and no other mutex.
+    ///
+    /// The field is private to this module and the only constructor is
+    /// [`EnvLockGuard::acquire`]: no struct literal, `From`, `Default` or
+    /// `Clone` makes one (the tests module proves the last three at compile
+    /// time). [`super::PostureEnv`] and every env writer of the fixture take
+    /// this type and nothing else.
+    #[must_use = "the env lock is released when this guard drops"]
+    pub(crate) struct EnvLockGuard<'a> {
+        _guard: MutexGuard<'a, ()>,
+    }
+
+    impl EnvLockGuard<'static> {
+        /// Take the crate-wide env lock (a poisoned lock is recovered, as in
+        /// `test_env_lock`: CONCURRENCY-18).
+        pub(crate) fn acquire() -> Self {
+            Self {
+                _guard: crate::config::test_env_lock(),
+            }
         }
     }
 }
+
+pub(crate) use lock::EnvLockGuard;
 
 /// What a [`PostureEnv`] created and must keep alive while it lives.
 struct HardenedParts {
@@ -145,15 +158,20 @@ struct HardenedParts {
 pub(crate) struct PostureEnv<'lock> {
     saved: Vec<(&'static str, Option<OsString>)>,
     hardened: Option<HardenedParts>,
-    _lock: PhantomData<&'lock EnvLockGuard<'static>>,
+    /// The proof every env write of this value (drop included) passes on.
+    lock: &'lock EnvLockGuard<'static>,
 }
 
 impl<'lock> PostureEnv<'lock> {
     /// Every posture variable unset.
-    pub(crate) fn bare(_lock: &'lock EnvLockGuard<'static>) -> Self {
-        // SAFETY: `_lock` proves the caller holds the crate-wide env lock for
-        // at least `'lock`, which outlives the returned value.
-        unsafe { Self::bare_unchecked() }
+    pub(crate) fn bare(lock: &'lock EnvLockGuard<'static>) -> Self {
+        let saved = snapshot(posture_env_vars());
+        clear_posture_env(lock);
+        Self {
+            saved,
+            hardened: None,
+            lock,
+        }
     }
 
     /// The certified enterprise-federation posture: `asi-hard` pinned through
@@ -161,43 +179,24 @@ impl<'lock> PostureEnv<'lock> {
     /// private key directory holding the operator public key (check #22) and
     /// one agent public key (check #23). Only the at-rest-encryption row
     /// depends on the build (`--features sqlcipher`).
-    pub(crate) fn fully_hardened(_lock: &'lock EnvLockGuard<'static>) -> Self {
-        // SAFETY: as in `bare`.
-        unsafe { Self::fully_hardened_unchecked() }
-    }
-
-    /// # Safety
-    /// The caller holds `crate::config::test_env_lock()` until the value drops.
-    /// Private: the only caller is [`PostureEnv::bare`], which holds the proof.
-    unsafe fn bare_unchecked() -> Self {
-        let saved = snapshot(posture_env_vars());
-        // SAFETY: forwarded caller contract.
-        unsafe { clear_posture_env() };
-        Self {
-            saved,
-            hardened: None,
-            _lock: PhantomData,
-        }
-    }
-
-    /// # Safety
-    /// The caller holds `crate::config::test_env_lock()` until the value drops.
-    /// Private: the only caller is [`PostureEnv::fully_hardened`].
-    unsafe fn fully_hardened_unchecked() -> Self {
+    pub(crate) fn fully_hardened(lock: &'lock EnvLockGuard<'static>) -> Self {
         let mut vars = posture_env_vars();
         vars.push(KEY_DIR_ENV);
         let saved = snapshot(vars);
-        // SAFETY: forwarded caller contract.
-        unsafe { clear_posture_env() };
+        clear_posture_env(lock);
         // From here on a panic still restores `saved` through `Drop`.
         let mut env = Self {
             saved,
             hardened: None,
-            _lock: PhantomData,
+            lock,
         };
-        // SAFETY: forwarded caller contract.
-        unsafe { set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard") };
-        // Pins the asi-hard knobs via the REAL enforcement fn.
+        apply(
+            lock,
+            crate::security_profile::ENV_SECURITY_PROFILE,
+            Some("asi-hard".as_ref()),
+        );
+        // Pins the asi-hard knobs via the REAL enforcement fn (a product fn
+        // that writes env; called only here, under `lock`).
         crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
 
         let fp_file = tempfile::NamedTempFile::new().expect("fingerprints file");
@@ -232,8 +231,7 @@ impl<'lock> PostureEnv<'lock> {
             (KEY_DIR_ENV, key_dir.path().as_os_str()),
         ];
         for (name, value) in settings {
-            // SAFETY: forwarded caller contract.
-            unsafe { set_var(name, value) };
+            apply(lock, name, Some(value));
         }
         env.hardened = Some(HardenedParts {
             _fp_file: fp_file,
@@ -267,7 +265,7 @@ impl<'lock> PostureEnv<'lock> {
             self.saved.iter().any(|(n, _)| *n == name),
             "{name} is not owned by this fixture"
         );
-        apply(name, None);
+        apply(self.lock, name, None);
     }
 
     /// Set one variable the fixture owns to `value` (drop restores it). The
@@ -280,7 +278,7 @@ impl<'lock> PostureEnv<'lock> {
             self.saved.iter().any(|(n, _)| *n == name),
             "{name} is not owned by this fixture"
         );
-        apply(name, Some(value.as_ref()));
+        apply(self.lock, name, Some(value.as_ref()));
     }
 
     /// The fixture's key directory, or `None` for a bare env.
@@ -312,15 +310,17 @@ impl<'lock> PostureEnv<'lock> {
 impl Drop for PostureEnv<'_> {
     fn drop(&mut self) {
         for (name, prior) in &self.saved {
-            apply(name, prior.as_deref());
+            apply(self.lock, name, prior.as_deref());
         }
     }
 }
 
-/// Set (`Some`) or remove (`None`) one variable.
-fn apply(name: &str, value: Option<&std::ffi::OsStr>) {
-    // SAFETY: a `PostureEnv` exists only inside the borrow of its
-    // `EnvLockGuard` (constructors) and drops before it; `unset` takes `&self`.
+/// Set (`Some`) or remove (`None`) one variable. The one env writer of the
+/// fixture: safe only because it takes the lock proof (#10124 N1).
+fn apply(_lock: &EnvLockGuard<'_>, name: &str, value: Option<&std::ffi::OsStr>) {
+    // SAFETY: `_lock` proves the caller holds the crate-wide env lock (the
+    // one lock every test that touches the process env takes) for at least
+    // this call.
     unsafe {
         match value {
             Some(v) => std::env::set_var(name, v),
@@ -331,13 +331,6 @@ fn apply(name: &str, value: Option<&std::ffi::OsStr>) {
 
 fn snapshot(vars: Vec<&'static str>) -> Vec<(&'static str, Option<OsString>)> {
     vars.into_iter().map(|v| (v, std::env::var_os(v))).collect()
-}
-
-/// # Safety
-/// The caller holds `crate::config::test_env_lock()`.
-unsafe fn set_var(name: &str, value: impl AsRef<std::ffi::OsStr>) {
-    // SAFETY: forwarded caller contract.
-    unsafe { std::env::set_var(name, value) };
 }
 
 #[cfg(test)]
@@ -754,7 +747,7 @@ mod tests {
         fn check() {}
     }
     impl<T: ?Sized> AmbiguousIfFromGuard<()> for T {}
-    impl<T: ?Sized + From<MutexGuard<'static, ()>>> AmbiguousIfFromGuard<u8> for T {}
+    impl<T: ?Sized + From<std::sync::MutexGuard<'static, ()>>> AmbiguousIfFromGuard<u8> for T {}
 
     #[test]
     fn no_foreign_guard_converts_into_env_lock_guard() {

@@ -8844,23 +8844,22 @@ enabled = true
     // #1146 / #1598 reachability probes + #1598 GPU policy — coverage
     // lift (GA push). Driven by wiremock + spawn_blocking (the
     // reachability sections use reqwest::blocking) with the resolver
-    // env vars serialised on a module-local lock. Mirrors the
+    // env vars serialised on the crate-wide env lock: every env writer
+    // below takes its proof `&EnvLockGuard` (#10124 N1). Mirrors the
     // remote-section test idiom above.
     // ---------------------------------------------------------------
-
-    fn reach_env_lock() -> &'static std::sync::Mutex<()> {
-        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        L.get_or_init(|| std::sync::Mutex::new(()))
-    }
 
     /// RAII env setter scoped to a test; restores prior values on drop.
     struct EnvScope(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl EnvScope {
-        fn set(pairs: &[(&'static str, &str)]) -> Self {
+        fn set(
+            _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
+            pairs: &[(&'static str, &str)],
+        ) -> Self {
             let mut prev = Vec::new();
             for (k, v) in pairs {
                 prev.push((*k, std::env::var_os(k)));
-                // SAFETY: serialised by reach_env_lock in every caller.
+                // SAFETY: `_lock` proves the crate-wide env lock is held.
                 unsafe { std::env::set_var(k, v) };
             }
             // AI_MEMORY_NO_CONFIG keeps AppConfig::load off any on-disk
@@ -8884,7 +8883,9 @@ enabled = true
         }
     }
 
-    fn clear_llm_embed_env() {
+    fn clear_llm_embed_env(
+        _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
+    ) {
         for k in [
             "AI_MEMORY_LLM_BACKEND",
             "AI_MEMORY_LLM_BASE_URL",
@@ -8911,9 +8912,9 @@ enabled = true
 
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_reachability_compiled_default_is_info_1146() {
-        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        clear_llm_embed_env();
-        let _scope = EnvScope::set(&[]);
+        let g = posture_env_lock();
+        clear_llm_embed_env(&g);
+        let _scope = EnvScope::set(&g, &[]);
         let section = tokio::task::spawn_blocking(section_llm_reachability_1146)
             .await
             .unwrap();
@@ -8950,14 +8951,16 @@ enabled = true
                 .mount(&server)
                 .await;
             let resolved = {
-                // Hold both existing test locks only while resolving, never
-                // across await. Restore the fixture key before network I/O.
-                let _config = crate::config::test_env_lock();
-                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-                let _scope = EnvScope::set(&[
-                    ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
-                    ("AI_MEMORY_LLM_BASE_URL", ""),
-                ]);
+                // Hold the env lock only while resolving, never across
+                // await. Restore the fixture key before network I/O.
+                let reach = posture_env_lock();
+                let _scope = EnvScope::set(
+                    &reach,
+                    &[
+                        ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
+                        ("AI_MEMORY_LLM_BASE_URL", ""),
+                    ],
+                );
                 crate::config::AppConfig::default().resolve_llm(
                     Some(backend),
                     Some("fixture-model"),
@@ -9013,14 +9016,17 @@ enabled = true
                 .await;
             let uri = server.uri();
             let section = {
-                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-                clear_llm_embed_env();
-                let _scope = EnvScope::set(&[
-                    ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
-                    ("AI_MEMORY_LLM_BASE_URL", &uri),
-                    ("AI_MEMORY_LLM_API_KEY", "probe-key"),
-                    ("AI_MEMORY_LLM_MODEL", "probe-model"),
-                ]);
+                let g = posture_env_lock();
+                clear_llm_embed_env(&g);
+                let _scope = EnvScope::set(
+                    &g,
+                    &[
+                        ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
+                        ("AI_MEMORY_LLM_BASE_URL", &uri),
+                        ("AI_MEMORY_LLM_API_KEY", "probe-key"),
+                        ("AI_MEMORY_LLM_MODEL", "probe-model"),
+                    ],
+                );
                 tokio::task::spawn_blocking(section_llm_reachability_1146)
                     .await
                     .unwrap()
@@ -9032,9 +9038,9 @@ enabled = true
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_reachability_compiled_default_is_info_1598() {
-        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        clear_llm_embed_env();
-        let _scope = EnvScope::set(&[]);
+        let g = posture_env_lock();
+        clear_llm_embed_env(&g);
+        let _scope = EnvScope::set(&g, &[]);
         let section = tokio::task::spawn_blocking(section_embeddings_reachability_1598)
             .await
             .unwrap();
@@ -9069,14 +9075,17 @@ enabled = true
                 .await;
             let uri = server.uri();
             let section = {
-                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-                clear_llm_embed_env();
-                let _scope = EnvScope::set(&[
-                    ("AI_MEMORY_EMBED_BACKEND", "openai-compatible"),
-                    ("AI_MEMORY_EMBED_BASE_URL", &uri),
-                    ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
-                    ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
-                ]);
+                let g = posture_env_lock();
+                clear_llm_embed_env(&g);
+                let _scope = EnvScope::set(
+                    &g,
+                    &[
+                        ("AI_MEMORY_EMBED_BACKEND", "openai-compatible"),
+                        ("AI_MEMORY_EMBED_BASE_URL", &uri),
+                        ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
+                        ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
+                    ],
+                );
                 tokio::task::spawn_blocking(section_embeddings_reachability_1598)
                     .await
                     .unwrap()
@@ -9088,11 +9097,11 @@ enabled = true
 
     // ---------------------------------------------------------------
     // v1.0.0 §5.3 — `doctor --posture enterprise-federation`.
-    // Isolated via the crate-wide `test_env_lock` (NOT `reach_env_lock`
-    // above, which only serialises within THIS module — the posture
-    // env vars are shared with `enterprise_federation_posture::tests`
-    // and `security_profile::tests`, see the #2159 lesson documented
-    // there).
+    // Isolated via the crate-wide `test_env_lock` (a module-local lock
+    // would only serialise within THIS module — the posture env vars
+    // are shared with `enterprise_federation_posture::tests` and
+    // `security_profile::tests`, see the #2159 lesson documented there).
+    // The reachability tests above take the same lock (#10124 N1).
     // ---------------------------------------------------------------
 
     fn posture_env_lock()
