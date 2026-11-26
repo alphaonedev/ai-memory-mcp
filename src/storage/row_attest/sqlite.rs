@@ -231,13 +231,29 @@ pub fn read_rows(conn: &Connection, spec: &TableSpec) -> Result<Vec<Vec<Cell>>> 
         .with_context(|| format!("row attestation read of {}", spec.table))
 }
 
+/// #10116: the table accumulator of the live rows of `spec`, folded over
+/// streamed rows (one row held at a time).
+///
+/// # Errors
+///
+/// The query failure, or the first row with no canonical form (the rows
+/// after it are not folded).
 pub(super) fn live_acc(conn: &Connection, spec: &TableSpec) -> Result<[u8; 32]> {
     let mut acc = ZERO_DIGEST;
-    for cells in read_rows(conn, spec)? {
-        let row = CanonicalRow::parse(spec, &cells)?;
-        acc = acc_add(&acc, &acc_term(spec.table, row.key(), &row_digest(&row)));
+    let mut first_err: Option<anyhow::Error> = None;
+    stream_rows(conn, spec, &mut |cells| {
+        if first_err.is_some() {
+            return;
+        }
+        match CanonicalRow::parse(spec, cells) {
+            Ok(row) => acc = acc_add(&acc, &acc_term(spec.table, row.key(), &row_digest(&row))),
+            Err(e) => first_err = Some(e.into()),
+        }
+    })?;
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(acc),
     }
-    Ok(acc)
 }
 
 fn insert_row(conn: &Connection, a: &Attestation) -> rusqlite::Result<i64> {
@@ -854,13 +870,22 @@ pub(super) fn seal_at_arm(conn: &Connection, seal_file: Option<&std::path::Path>
     Ok(())
 }
 
-/// The seal marks of every attestation in `conn`.
+/// The seal marks of every attestation in `conn`: #10116, the
+/// [`SealRecord::add`] fold over one streamed read (no Vec; equal to
+/// [`SealRecord::of`] over the same rows).
 ///
 /// # Errors
 ///
-/// Surfaces the query failure.
+/// Surfaces the query failure or a row that does not decode.
 pub(super) fn seal_marks(conn: &Connection) -> Result<SealRecord> {
-    Ok(SealRecord::of(&read_attestations(conn)?))
+    let mut rec = SealRecord::default();
+    stream_attestations(
+        conn,
+        &format!("SELECT {ATT_COLS} FROM row_attestations ORDER BY id"),
+        [],
+        &mut |a| rec.add(&a),
+    )?;
+    Ok(rec)
 }
 
 /// Whether [`sign_cutovers`] has nothing to sign or refuse on `conn`: no
@@ -1203,32 +1228,62 @@ pub(super) fn check_snapshot_with(
     if present.is_none() {
         return Err(refuse("it has no row_attestations table"));
     }
-    let attestations = read_attestations(conn)?;
-    let stores = attestations
-        .iter()
-        .filter(|a| a.table == STORE_ROW_TABLE)
-        .count();
-    if stores != 1 {
-        return Err(refuse(&format!(
-            "it holds {stores} store-identity rows, not one"
-        )));
-    }
-    for spec in TABLES {
-        let cut = attestations
-            .iter()
-            .find(|a| a.table == spec.table && a.op == Op::Cutover.as_str());
-        if cut.is_none() {
-            return Err(refuse(&format!("{} has no cutover watermark", spec.table)));
+    // #10116 (J2): the shape checks are aggregate queries that decode no
+    // attestation, and every path then decodes each attestation exactly
+    // once: the verifier on a signed or sealed snapshot, a decode-only pass
+    // on a never-armed one (a row that does not decode is an error there
+    // too, never a pass). One read snapshot covers every query.
+    crate::governance::policy_version::with_read_snapshot(conn, |conn| {
+        let stores: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM row_attestations WHERE table_name = ?1",
+            [STORE_ROW_TABLE],
+            |r| r.get(0),
+        )?;
+        if stores != 1 {
+            return Err(refuse(&format!(
+                "it holds {stores} store-identity rows, not one"
+            )));
         }
-    }
-    let target_seal = seal::state_for(anchor, Some(target));
-    let any_signed = attestations.iter().any(|a| a.signature.is_some());
-    if !any_signed && target_seal == SealState::NotSealed {
-        return Ok(SnapshotVerdict::NeverArmed);
-    }
-    // The snapshot is judged on its own marks: restoring an older verified
-    // store is an explicit order, and the target's seal is replaced by the
-    // snapshot's once it is published.
+        for spec in TABLES {
+            let cut: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM row_attestations \
+                 WHERE table_name = ?1 AND op = ?2)",
+                params![spec.table, Op::Cutover.as_str()],
+                |r| r.get(0),
+            )?;
+            if !cut {
+                return Err(refuse(&format!("{} has no cutover watermark", spec.table)));
+            }
+        }
+        let target_seal = seal::state_for(anchor, Some(target));
+        let any_signed: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM row_attestations WHERE signature IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !any_signed && target_seal == SealState::NotSealed {
+            stream_attestations(
+                conn,
+                &format!("SELECT {ATT_COLS} FROM row_attestations ORDER BY id"),
+                [],
+                &mut |_| {},
+            )?;
+            return Ok(SnapshotVerdict::NeverArmed);
+        }
+        // The snapshot is judged on its own marks: restoring an older
+        // verified store is an explicit order, and the target's seal is
+        // replaced by the snapshot's once it is published.
+        snapshot_verdict(conn, anchor, &refuse)
+    })
+}
+
+/// The verifier's verdict on a signed or sealed snapshot (the one decoding
+/// read of [`check_snapshot_with`] on that path).
+fn snapshot_verdict(
+    conn: &Connection,
+    anchor: &super::anchor::AnchorLoad,
+    refuse: &dyn Fn(&str) -> anyhow::Error,
+) -> Result<SnapshotVerdict> {
     let (report, marks) = verify_inner(conn, anchor, &SealState::NotSealed)?;
     match report.outcome() {
         super::Outcome::Clean => Ok(SnapshotVerdict::Verified(marks)),

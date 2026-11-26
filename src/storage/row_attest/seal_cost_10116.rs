@@ -425,7 +425,15 @@ fn live_acc_folds_streamed_rows_j4_10116() {
     assert_eq!(probe::get(Count::Gather), 0, "no gathered Vec");
     assert_eq!(probe::get(Count::RowRead), 3, "one read per row");
 
-    let bad = [t("bad"), t("{"), Cell::Int(5), t("long"), t("x")];
+    // A duplicate JSON key is the stored value with no single meaning
+    // (#10092): `CanonicalRow::parse` refuses it.
+    let bad = [
+        t("bad"),
+        t(r#"{"a":1,"a":2}"#),
+        Cell::Int(5),
+        t("long"),
+        t("x"),
+    ];
     let why = CanonicalRow::parse(s, &bad)
         .expect_err("no canonical form")
         .to_string();

@@ -273,12 +273,7 @@ impl Visit {
         tick(Count::AttVisit);
         self.seen = self.seen.saturating_add(1);
         self.max_id = Some(self.max_id.map_or(a.id, |m| m.max(a.id)));
-        self.seal.high_water = self.seal.high_water.max(a.id);
-        if let Some(head) = self.seal.heads.get_mut(&a.table) {
-            *head = (*head).max(a.table_seq);
-        } else {
-            self.seal.heads.insert(a.table.clone(), a.table_seq);
-        }
+        self.seal.add(a);
     }
 }
 

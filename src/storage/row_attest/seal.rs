@@ -49,11 +49,23 @@ impl SealRecord {
     pub fn of(attestations: &[Attestation]) -> Self {
         let mut rec = Self::default();
         for a in attestations {
-            rec.high_water = rec.high_water.max(a.id);
-            let head = rec.heads.entry(a.table.clone()).or_insert(a.table_seq);
-            *head = (*head).max(a.table_seq);
+            rec.add(a);
         }
         rec
+    }
+
+    /// Fold one attestation into the marks (#10116: the one fold [`of`] and
+    /// every streamed read share, so a streamed seal equals the slice form).
+    ///
+    /// [`of`]: Self::of
+    pub fn add(&mut self, a: &Attestation) {
+        self.high_water = self.high_water.max(a.id);
+        match self.heads.get_mut(&a.table) {
+            Some(head) => *head = (*head).max(a.table_seq),
+            None => {
+                self.heads.insert(a.table.clone(), a.table_seq);
+            }
+        }
     }
 
     /// The field-wise maximum of `self` and `other` (a seal never moves back).
@@ -211,13 +223,24 @@ fn write_atomic(path: &Path, rec: &SealRecord) -> Result<()> {
 /// Move the seal at `path` up to `rec` (field-wise maximum with what it
 /// holds; it never moves back).
 ///
+/// #10116: when the merged marks equal the readable stored seal, nothing is
+/// written (the file keeps its bytes, inode and mtime). Only a seal that
+/// was read and parsed can be equal; a missing seal is written and an
+/// unreadable one is refused.
+///
 /// # Errors
 ///
 /// An unreadable seal (it is never overwritten) or a write failure.
 pub fn advance(path: &Path, rec: &SealRecord) -> Result<()> {
     let next = match read(path) {
         SealState::NotSealed => rec.clone(),
-        SealState::Sealed(old) => old.merged(rec),
+        SealState::Sealed(old) => {
+            let next = old.clone().merged(rec);
+            if next == old {
+                return Ok(());
+            }
+            next
+        }
         SealState::Unreadable { path, why } => {
             anyhow::bail!("the anchored seal {} cannot be read: {why}", path.display())
         }

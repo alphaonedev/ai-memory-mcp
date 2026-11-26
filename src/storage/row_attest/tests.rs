@@ -2218,8 +2218,10 @@ const VERIFY_COLLECT_SITES_10116: &[(&str, [usize; 4])] = &[
     // Test code: the slice form the J1 fold is compared with, and the
     // `collect`s that build fixture SQL and expected marks (#10116 lane 2).
     ("src/storage/row_attest/seal_cost_10116.rs", [1, 0, 0, 4]),
-    // The two readers and their callers outside the verifier (live_acc, arm, check_snapshot).
-    ("src/storage/row_attest/sqlite.rs", [3, 3, 4, 6]),
+    // The two readers (their definitions) and the one caller left outside
+    // the verifier: the cutover baseline (#10114). #10116 lane 2 streams
+    // live_acc, the arm seal marks and check_snapshot.
+    ("src/storage/row_attest/sqlite.rs", [1, 2, 4, 6]),
     // The slice adapter buckets an in-memory store (never the SQLite path).
     ("src/storage/row_attest/stream.rs", [0, 0, 3, 6]),
     // This file names the two readers in the ratchet itself.
