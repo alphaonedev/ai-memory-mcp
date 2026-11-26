@@ -191,6 +191,11 @@ const SECTION_CORRUPT_GOVERNANCE: &str = "Corrupt governance standards (#4285)";
 #[path = "over_depth_4715.rs"]
 mod over_depth_4715;
 
+/// #10121 — the hardened-fixture ratchet and the check #23 negative.
+#[cfg(test)]
+#[path = "doctor_posture_fixture_10121.rs"]
+mod doctor_posture_fixture_10121;
+
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
 const MSG_PG_PROBE_RUNTIME: &str = "build ephemeral runtime for the postgres extension probe";
