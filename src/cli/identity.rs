@@ -685,7 +685,7 @@ fn succeed(
         )
         .context("succession: row attestation could not be armed with K_old (#10089)")?;
         let record =
-            crate::db::append_succession_checked(&conn, &checked, &k_new.public_base64(), None)?;
+            crate::db::append_succession_checked(&conn, checked, &k_new.public_base64(), None)?;
         recorded.replace(Some(record));
         Ok(())
     })?;
@@ -738,7 +738,7 @@ fn register_recovery_key(
     let checked = crate::db::succession_preconditions(&conn, &id, &kp)?;
     let record = crate::db::append_succession_checked(
         &conn,
-        &checked,
+        checked,
         &kp.public_base64(),
         Some(recovery_pubkey),
     )?;

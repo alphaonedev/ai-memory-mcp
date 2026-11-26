@@ -1005,8 +1005,8 @@ fn append_revocation_refusals_match_shared_preconditions_10118() {
     let agent_noln = "rev-noln-10118";
     db::register_agent(&conn, agent_noln, "ai:test", &[]).expect("register noln");
     let k_noln = kp(agent_noln);
-    let err_noln = db::append_revocation(&conn, agent_noln, &k_noln, &successor_b64, 10, None)
-        .unwrap_err();
+    let err_noln =
+        db::append_revocation(&conn, agent_noln, &k_noln, &successor_b64, 10, None).unwrap_err();
     let msg_noln = format!("{err_noln:#}");
     assert!(
         msg_noln.contains(&format!(
@@ -1015,7 +1015,7 @@ fn append_revocation_refusals_match_shared_preconditions_10118() {
         )),
         "expected shared no-lineage refusal, got: {msg_noln}"
     );
-    assert!(db::read_lineage(&conn, agent_noln).unwrap().is_empty());
+    assert_eq!(db::read_lineage(&conn, agent_noln).unwrap().len(), 0);
 
     // 2. Public-only keypair.
     let agent_pub = "rev-pub-10118";
@@ -1024,8 +1024,8 @@ fn append_revocation_refusals_match_shared_preconditions_10118() {
         .unwrap()
         .map(|(r, _)| (r.epoch, r.successor_pubkey_b64));
     k_pub.private = None;
-    let err_pub = db::append_revocation(&conn, agent_pub, &k_pub, &successor_b64, 10, None)
-        .unwrap_err();
+    let err_pub =
+        db::append_revocation(&conn, agent_pub, &k_pub, &successor_b64, 10, None).unwrap_err();
     let msg_pub = format!("{err_pub:#}");
     assert!(
         msg_pub.contains(&format!(
@@ -1049,8 +1049,8 @@ fn append_revocation_refusals_match_shared_preconditions_10118() {
         .unwrap()
         .map(|(r, _)| (r.epoch, r.successor_pubkey_b64));
     let k_other = kp(agent_nh);
-    let err_nh = db::append_revocation(&conn, agent_nh, &k_other, &successor_b64, 10, None)
-        .unwrap_err();
+    let err_nh =
+        db::append_revocation(&conn, agent_nh, &k_other, &successor_b64, 10, None).unwrap_err();
     let msg_nh = format!("{err_nh:#}");
     assert!(
         msg_nh.contains(&format!(

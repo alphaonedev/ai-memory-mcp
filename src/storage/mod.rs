@@ -15932,13 +15932,24 @@ pub fn enroll_lineage(
 /// Proof value returned by [`succession_preconditions`] (#10118, CBC-03,
 /// CBC-05, CBC-06, ERRORS-09).
 ///
-/// Private fields ensure this proof can only be constructed after all three
-/// succession preconditions (enrolled lineage exists, `k_old` holds a private
-/// signing key, and `k_old` matches the current lineage head) have been
-/// verified in the one canonical order. Callers pass it to
-/// [`append_succession_checked`] and extract [`Self::signing_key`] to arm row
-/// attestation only after preconditions hold.
-#[must_use = "a SuccessionChecked proof must be consumed by append_succession_checked"]
+/// Private fields (and no `Clone` or `Copy`) ensure this proof can only be
+/// constructed after all three preconditions hold and is consumed by value by
+/// exactly one [`append_succession_checked`] or [`append_revocation_checked`]
+/// call. Reusing one proof for a second append does not compile:
+///
+/// ```compile_fail,E0382
+/// # fn reuse(
+/// #     conn: &rusqlite::Connection,
+/// #     k: &ai_memory::identity::keypair::AgentKeypair,
+/// #     next: &str,
+/// # ) -> anyhow::Result<()> {
+/// let proof = ai_memory::db::succession_preconditions(conn, "a", k)?;
+/// let _ = ai_memory::db::append_succession_checked(conn, proof, next, None)?;
+/// let _ = ai_memory::db::append_succession_checked(conn, proof, next, None)?;
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "a SuccessionChecked proof must be consumed by append_succession_checked or append_revocation_checked"]
 pub struct SuccessionChecked<'a> {
     agent_id: &'a str,
     head: crate::identity::lineage::LineageRecord,
@@ -15997,15 +16008,15 @@ pub fn succession_preconditions<'a>(
     })
 }
 
-/// Mint + persist a ROTATION succession using a pre-validated
-/// [`SuccessionChecked`] proof (#10118, CBC-03).
+/// Mint + persist a ROTATION succession consuming a [`SuccessionChecked`]
+/// proof by value (#10118, CBC-03).
 ///
 /// # Errors
 ///
 /// Undecodable successor/recovery key or any [`append_lineage_record`] failure.
 pub fn append_succession_checked(
     conn: &Connection,
-    checked: &SuccessionChecked<'_>,
+    checked: SuccessionChecked<'_>,
     successor_pubkey_b64: &str,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
@@ -16033,12 +16044,6 @@ pub fn append_succession_checked(
 /// Mint + persist a ROTATION succession from the current head to
 /// `successor_pubkey_b64`, signed by `k_old` (#1828 G13).
 ///
-/// `k_old` must hold the private half of the CURRENT head key.
-/// `recovery_pubkey_b64 = None` carries the head's recovery commitment
-/// forward unchanged; `Some(key)` re-registers it (the
-/// `register-recovery-key` CLI passes the current head as successor —
-/// a self-rotation that only updates the recovery commitment).
-///
 /// # Errors
 ///
 /// No enrolled lineage, a `k_old` that is public-only or not the head
@@ -16052,22 +16057,46 @@ pub fn append_succession(
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
     let checked = succession_preconditions(conn, agent_id, k_old)?;
-    append_succession_checked(conn, &checked, successor_pubkey_b64, recovery_pubkey_b64)
+    append_succession_checked(conn, checked, successor_pubkey_b64, recovery_pubkey_b64)
 }
 
-/// v1.0.0 #1949 — mint + persist a REVOCATION succession from the
-/// current head to `successor_pubkey_b64` (the fresh post-revocation
-/// head), signed by `k_old` (the current head key), dating a suspected
-/// compromise from `suspected_compromise_from_seq` (a `signed_events`
-/// witness SEQUENCE high-water mark — the ordering authority, never
-/// wall-clock).
+/// Mint + persist a REVOCATION succession consuming a [`SuccessionChecked`]
+/// proof by value (#1949, #10118).
 ///
-/// Rides the same chain as [`append_succession`] (epoch +1,
-/// predecessor == head successor, C1/C3/C5 anchoring, single
-/// [`crate::identity::lineage::verify_lineage`] walk). **Verdict-surface
-/// only** — entries in `[suspected_compromise_from_seq, S_rev)` are
-/// downgraded to a Suspect verdict by the verify-audit-trail readout;
-/// there is NO write-path enforcement this train (R13).
+/// # Errors
+///
+/// Undecodable successor/recovery key or any [`append_lineage_record`] failure.
+pub fn append_revocation_checked(
+    conn: &Connection,
+    checked: SuccessionChecked<'_>,
+    successor_pubkey_b64: &str,
+    suspected_compromise_from_seq: u64,
+    recovery_pubkey_b64: Option<&str>,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
+        .context("decoding successor pubkey")?;
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
+    }
+    // None carries the existing recovery commitment forward.
+    let recovery = recovery_pubkey_b64
+        .map(str::to_string)
+        .or_else(|| checked.head.recovery_pubkey_b64.clone());
+    let record = crate::identity::lineage::LineageRecord::revocation(
+        &checked.head,
+        successor_pubkey_b64,
+        suspected_compromise_from_seq,
+        recovery,
+        &Utc::now().to_rfc3339(),
+    )?;
+    let sig = crate::identity::sign::sign_succession(checked.k_old, &record.to_signable())?;
+    append_lineage_record(conn, checked.agent_id, &record, &sig)?;
+    Ok(record)
+}
+
+/// v1.0.0 #1949 — mint + persist a REVOCATION succession from the current head
+/// to `successor_pubkey_b64`, routing through [`succession_preconditions`] and
+/// consuming the shared [`SuccessionChecked`] proof (#10118).
 ///
 /// # Errors
 ///
@@ -16082,39 +16111,14 @@ pub fn append_revocation(
     suspected_compromise_from_seq: u64,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    let Some((head, _)) = lineage_head(conn, agent_id)? else {
-        anyhow::bail!("no lineage enrolled for '{agent_id}' — nothing to revoke");
-    };
-    if !k_old.can_sign() {
-        anyhow::bail!("keypair for '{agent_id}' is public-only — cannot sign a revocation");
-    }
-    let head_key = crate::identity::keypair::decode_public_base64(&head.successor_pubkey_b64)
-        .context("decoding lineage head key")?;
-    if head_key.to_bytes() != k_old.public.to_bytes() {
-        anyhow::bail!(
-            "signing keypair is not the current lineage head for '{agent_id}' — only the \
-             head key can sign a revocation this train (recovery-signed revocation lands in v1.0)"
-        );
-    }
-    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
-        .context("decoding successor pubkey")?;
-    if let Some(rec) = recovery_pubkey_b64 {
-        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
-    }
-    // None carries the existing recovery commitment forward.
-    let recovery = recovery_pubkey_b64
-        .map(str::to_string)
-        .or_else(|| head.recovery_pubkey_b64.clone());
-    let record = crate::identity::lineage::LineageRecord::revocation(
-        &head,
+    let checked = succession_preconditions(conn, agent_id, k_old)?;
+    append_revocation_checked(
+        conn,
+        checked,
         successor_pubkey_b64,
         suspected_compromise_from_seq,
-        recovery,
-        &Utc::now().to_rfc3339(),
-    )?;
-    let sig = crate::identity::sign::sign_succession(k_old, &record.to_signable())?;
-    append_lineage_record(conn, agent_id, &record, &sig)?;
-    Ok(record)
+        recovery_pubkey_b64,
+    )
 }
 
 /// v1.0.0 #1831 (G17) — deterministically mint the recovery record that
