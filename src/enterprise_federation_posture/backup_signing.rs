@@ -48,7 +48,7 @@ mod tests {
         let _g = env_lock();
         unsafe { clear_all() };
         let _cleanup = EnvGuard;
-        let _fp_file = set_fully_hardened_env();
+        let _fp_file = set_fully_hardened_env(&_g);
         let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let checks = evaluate(&AppConfig::default());
         let c = find(&checks, "backup manifest signing");

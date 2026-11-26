@@ -9095,8 +9095,9 @@ enabled = true
     // there).
     // ---------------------------------------------------------------
 
-    fn posture_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::config::test_env_lock()
+    fn posture_env_lock()
+    -> crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'static> {
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire()
     }
 
     #[test]

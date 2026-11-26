@@ -262,7 +262,7 @@ fn run_posture_fails_only_the_anchor_row_without_an_agent_key_10121() {
     ) {
         return;
     }
-    let lock = crate::config::test_env_lock();
+    let lock = crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
     let env =
         crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::fully_hardened(
             &lock,

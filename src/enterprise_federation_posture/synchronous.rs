@@ -93,7 +93,7 @@ mod tests {
             clear_all();
         }
         let _cleanup = EnvGuard;
-        let _fp_file = set_fully_hardened_env();
+        let _fp_file = set_fully_hardened_env(&_g);
         assert_eq!(
             crate::storage::resolved_synchronous().level,
             crate::storage::SynchronousLevel::Full,
