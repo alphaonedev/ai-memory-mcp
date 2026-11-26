@@ -270,6 +270,19 @@ impl<'lock> PostureEnv<'lock> {
         apply(name, None);
     }
 
+    /// Set one variable the fixture owns to `value` (drop restores it). The
+    /// weak-value probe of the fixture's own tests (N4 of #10124).
+    ///
+    /// # Panics
+    /// When `name` is not a variable this fixture snapshots.
+    pub(crate) fn set(&self, name: &str, value: &str) {
+        assert!(
+            self.saved.iter().any(|(n, _)| *n == name),
+            "{name} is not owned by this fixture"
+        );
+        apply(name, Some(value.as_ref()));
+    }
+
     /// The fixture's key directory, or `None` for a bare env.
     pub(crate) fn key_dir(&self) -> Option<&Path> {
         self.hardened.as_ref().map(|h| h.key_dir.path())
@@ -343,7 +356,24 @@ mod tests {
         Redundant(u32),
         /// The row only turns on a sqlcipher build; elsewhere it already fails.
         NeedsSqlcipher(&'static str),
+        /// N4 (#10124): unset reads as strict, so removal changes no row (and
+        /// that is asserted); setting the knob to the non-strict `weak` value
+        /// makes exactly `rows` fail, which proves the pin is load-bearing.
+        DefaultStrict {
+            weak: &'static str,
+            rows: &'static [&'static str],
+        },
+        /// N4 (#10124): the row is also satisfied by `file` in the fixture's
+        /// key directory, so removal alone changes no row (asserted); with
+        /// `file` removed, unsetting the variable makes exactly `rows` fail.
+        ShadowedBy {
+            file: &'static str,
+            rows: &'static [&'static str],
+        },
     }
+
+    /// The aggregate pins row: a weak value of any pinned knob fails it.
+    const PINS_ROW: &str = "asi-hard pinned knobs";
 
     const KNOB_TABLE: &[(&str, Expect)] = &[
         (
@@ -401,7 +431,10 @@ mod tests {
         ("AI_MEMORY_FED_REQUIRE_NONCE", Expect::Redundant(10131)),
         (
             "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT",
-            Expect::Redundant(10131),
+            Expect::DefaultStrict {
+                weak: "0",
+                rows: &[PINS_ROW, "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT"],
+            },
         ),
         (
             "AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE",
@@ -427,18 +460,35 @@ mod tests {
             "AI_MEMORY_FED_REQUIRE_SERVER_VERIFY",
             Expect::Redundant(10131),
         ),
+        // #3705: the https-only row (16) is pinned green; the pins row is the
+        // one that holds this knob.
         (
             "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS",
-            Expect::Redundant(10131),
+            Expect::DefaultStrict {
+                weak: "1",
+                rows: &[PINS_ROW],
+            },
         ),
         (
             "AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES",
             Expect::Redundant(10131),
         ),
-        ("AI_MEMORY_PERMISSIONS_MODE", Expect::Redundant(10131)),
+        (
+            "AI_MEMORY_PERMISSIONS_MODE",
+            Expect::DefaultStrict {
+                weak: "advisory",
+                rows: &[
+                    PINS_ROW,
+                    "AI_MEMORY_PERMISSIONS_MODE (ruling: AI_MEMORY_FED_PERMISSIONS_MODE)",
+                ],
+            },
+        ),
         (
             "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR",
-            Expect::Redundant(10131),
+            Expect::DefaultStrict {
+                weak: "1",
+                rows: &[PINS_ROW, "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR"],
+            },
         ),
         (
             "AI_MEMORY_FED_REQUIRE_POLICY_CURRENT",
@@ -446,7 +496,10 @@ mod tests {
         ),
         (
             "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS",
-            Expect::Redundant(10131),
+            Expect::DefaultStrict {
+                weak: "1",
+                rows: &[PINS_ROW, "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT"],
+            },
         ),
         ("AI_MEMORY_FED_CERT_PEER_BINDING", Expect::Redundant(10131)),
         ("AI_MEMORY_UNSTAMPED_MUTATION", Expect::Redundant(10131)),
@@ -459,7 +512,14 @@ mod tests {
             Expect::Redundant(10131),
         ),
         ("AI_MEMORY_REQUIRE_FORENSIC_SINK", Expect::Redundant(10131)),
-        ("AI_MEMORY_APPROVER_PUBKEYS", Expect::Redundant(10131)),
+        // Row 20 also counts the on-disk operator key (`enrolled_approver_keys`).
+        (
+            "AI_MEMORY_APPROVER_PUBKEYS",
+            Expect::ShadowedBy {
+                file: OPERATOR_PUBKEY_FILE,
+                rows: &["R40 escalate producer"],
+            },
+        ),
         (
             "AI_MEMORY_ENCRYPT_AT_REST",
             Expect::NeedsSqlcipher("AI_MEMORY_ENCRYPT_AT_REST"),
@@ -481,6 +541,90 @@ mod tests {
             .map(|(name, _)| *name)
             .filter(|name| std::env::var_os(name).is_some())
             .collect()
+    }
+
+    /// Rows of [`KNOB_TABLE`], written out (8 load-bearing by removal, 5
+    /// default-strict, 1 shadowed, 25 redundant, 1 sqlcipher): never computed
+    /// from the fixture.
+    const KNOB_TABLE_ROWS: usize = 40;
+
+    fn table_names(table: &[(&'static str, Expect)]) -> Vec<&'static str> {
+        table.iter().map(|(n, _)| *n).collect()
+    }
+
+    /// N3 (#10124): every variable the fixture sets has exactly one table row
+    /// and every row names a variable the fixture sets. Each problem is
+    /// reported once, in a fixed order, so a test can assert it exactly.
+    fn exactly_once(table: &[&str], set: &[&str]) -> Result<(), Vec<String>> {
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for name in table {
+            *counts.entry(name).or_default() += 1;
+        }
+        let mut problems = Vec::new();
+        for (name, n) in &counts {
+            if *n > 1 {
+                problems.push(format!("{name}: {n} KNOB_TABLE rows"));
+            }
+            if !set.contains(name) {
+                problems.push(format!("{name}: KNOB_TABLE row not set by the fixture"));
+            }
+        }
+        for name in set {
+            if !counts.contains_key(name) {
+                problems.push(format!(
+                    "{name}: set by the fixture but has no KNOB_TABLE row"
+                ));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems)
+        }
+    }
+
+    /// N3 (#10124): the exactly-once check refuses a duplicated row, a missing
+    /// row and a stale row, each with its exact reason.
+    #[test]
+    fn exactly_once_refuses_duplicate_missing_and_stale_rows_10124() {
+        let set = ["A", "B", "C"];
+        let cases: &[(&[&str], Result<(), Vec<String>>)] = &[
+            (&["A", "B", "C"], Ok(())),
+            (&["C", "A", "B"], Ok(())),
+            (
+                &["A", "B", "C", "A"],
+                Err(vec!["A: 2 KNOB_TABLE rows".to_string()]),
+            ),
+            (
+                &["A", "B"],
+                Err(vec![
+                    "C: set by the fixture but has no KNOB_TABLE row".to_string(),
+                ]),
+            ),
+            (
+                &["A", "B", "C", "D"],
+                Err(vec!["D: KNOB_TABLE row not set by the fixture".to_string()]),
+            ),
+            (
+                &["A", "A", "B"],
+                Err(vec![
+                    "A: 2 KNOB_TABLE rows".to_string(),
+                    "C: set by the fixture but has no KNOB_TABLE row".to_string(),
+                ]),
+            ),
+        ];
+        for (table, want) in cases {
+            assert_eq!(&exactly_once(table, &set), want, "table {table:?}");
+        }
+    }
+
+    /// N3 (#10124): the table has its written-out row count and no name twice,
+    /// independently of what the fixture sets.
+    #[test]
+    fn knob_table_lists_each_name_once_10124() {
+        let names = table_names(KNOB_TABLE);
+        assert_eq!(names.len(), KNOB_TABLE_ROWS);
+        assert_eq!(exactly_once(&names, &names), Ok(()));
     }
 
     #[test]
@@ -506,19 +650,8 @@ mod tests {
             let env = PostureEnv::fully_hardened(&guard);
             set_vars(&env)
         };
-        // No unclassified variable, no stale table row.
-        for name in &names {
-            assert!(
-                KNOB_TABLE.iter().any(|(n, _)| n == name),
-                "{name} is set by the fixture but has no KNOB_TABLE row"
-            );
-        }
-        for (name, _) in KNOB_TABLE {
-            assert!(
-                names.contains(name),
-                "KNOB_TABLE row {name} is not set by the fixture"
-            );
-        }
+        // No unclassified variable, no stale or duplicated table row.
+        assert_eq!(exactly_once(&table_names(KNOB_TABLE), &names), Ok(()));
         let sqlcipher = crate::build_features::has_feature("sqlcipher");
         let cfg = AppConfig::default();
         let mut load_bearing = 0_usize;
@@ -542,6 +675,45 @@ mod tests {
                          Redundant(#{issue}) row and name the rows"
                     );
                 }
+                Expect::DefaultStrict { weak, rows } => {
+                    assert!(
+                        newly.is_empty(),
+                        "unset {name} must read as strict, yet it fails {newly:?}"
+                    );
+                    drop(env);
+                    let env = PostureEnv::fully_hardened(&guard);
+                    env.set(name, weak);
+                    let weakened = failing(evaluate(&cfg));
+                    let got: Vec<&str> = weakened
+                        .iter()
+                        .filter(|c| !base.contains(c))
+                        .map(String::as_str)
+                        .collect();
+                    assert_eq!(
+                        got,
+                        rows.to_vec(),
+                        "{name}={weak} must fail exactly these rows"
+                    );
+                    load_bearing += 1;
+                }
+                Expect::ShadowedBy { file, rows } => {
+                    assert!(
+                        newly.is_empty(),
+                        "unset {name} alone must stay covered by {file}, yet it fails {newly:?}"
+                    );
+                    drop(env);
+                    let env = PostureEnv::fully_hardened(&guard);
+                    let key_dir = env.key_dir().expect("hardened key dir");
+                    std::fs::remove_file(key_dir.join(file)).expect("remove shadowing file");
+                    let shadow_base = failing(evaluate(&cfg));
+                    env.unset(name);
+                    let got: Vec<String> = failing(evaluate(&cfg))
+                        .into_iter()
+                        .filter(|c| !shadow_base.contains(c))
+                        .collect();
+                    assert_eq!(got, rows.to_vec(), "{name} unset without {file}");
+                    load_bearing += 1;
+                }
                 Expect::NeedsSqlcipher(row) => {
                     if sqlcipher {
                         assert_eq!(newly, vec![&row.to_string()], "removing {name}");
@@ -556,9 +728,12 @@ mod tests {
             }
         }
         // Profile, key dir, synchronous, trust domain, peer fingerprints, peer
-        // attestation, boot-refusal env and append-only (+ encrypt-at-rest on a
-        // sqlcipher build): a knob that stops mattering must be noticed.
-        let expected_load_bearing = 8 + usize::from(sqlcipher);
+        // attestation, boot-refusal env and append-only (8 by removal), the 5
+        // default-strict knobs proven by a weak value and the approver keys
+        // proven with the operator key removed (6, N4 of #10124), plus
+        // encrypt-at-rest on a sqlcipher build: a knob that stops mattering
+        // must be noticed.
+        let expected_load_bearing = 8 + 6 + usize::from(sqlcipher);
         assert_eq!(load_bearing, expected_load_bearing);
     }
 
@@ -585,5 +760,30 @@ mod tests {
     fn no_foreign_guard_converts_into_env_lock_guard() {
         // Compiles only while `EnvLockGuard: !From<MutexGuard<'static, ()>>`.
         <EnvLockGuard<'static> as AmbiguousIfFromGuard<_>>::check();
+    }
+
+    // N2 (#10124): the same probe for the other two ways to get a guard
+    // without the lock. A `Default` guard would hold no lock; a `Clone` (or
+    // `Copy`) one would outlive the lock it came from. The same holds for a
+    // cloned `PostureEnv`, whose two drops would restore the env twice.
+    trait AmbiguousIfDefault<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfDefault<()> for T {}
+    impl<T: ?Sized + Default> AmbiguousIfDefault<u8> for T {}
+
+    trait AmbiguousIfClone<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+
+    #[test]
+    fn env_lock_guard_and_posture_env_have_no_default_or_clone_10124() {
+        // Compiles only while neither type is `Default` or `Clone`.
+        <EnvLockGuard<'static> as AmbiguousIfDefault<_>>::check();
+        <EnvLockGuard<'static> as AmbiguousIfClone<_>>::check();
+        <PostureEnv<'static> as AmbiguousIfDefault<_>>::check();
+        <PostureEnv<'static> as AmbiguousIfClone<_>>::check();
     }
 }
