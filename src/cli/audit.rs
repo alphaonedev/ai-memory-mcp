@@ -2762,7 +2762,16 @@ pub(crate) mod witness_isolation_10117 {
                 }
             }));
             if unwind_inner {
-                assert!(inner_res.is_err(), "{label}: inner unwind must panic");
+                let payload = inner_res.expect_err("inner unwind case must panic");
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+                assert_eq!(
+                    msg,
+                    Some(PANIC_PROBE_MSG),
+                    "{label}: unexpected inner panic payload"
+                );
             } else {
                 assert!(inner_res.is_ok(), "{label}: inner return must succeed");
             }
@@ -2867,29 +2876,101 @@ pub(crate) mod witness_isolation_10117 {
         );
     }
 
-    /// #10119 round 1 (F3) — `set_key_dir` MUST refuse empty, whitespace,
-    /// relative, parent-traversal, and outside-sandbox paths so an armed guard
+    fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            String::from("<non-string panic payload>")
+        }
+    }
+
+    /// #10119 round 1/2 (F3, N2, N3) — `set_key_dir` MUST refuse empty,
+    /// whitespace, non-UTF-8, relative, parent-traversal, outside-sandbox, and
+    /// symlink-escape paths with their exact reason constant so an armed guard
     /// can never fail open to the host default custody directory.
     #[test]
     fn set_key_dir_refuses_empty_and_outside_sandbox_paths_10119() {
         let mut custody = IsolatedWitnessCustody::arm();
         let expected_dir = custody.path().to_path_buf();
-        let outside_path = std::env::temp_dir().join("outside-sandbox-10119");
+        let outside_dir = crate::identity::test_key_dir::private_tempdir();
+        let outside_path = outside_dir.path().join("outside-sandbox-10119");
         let traversal_path = custody.path().join("..").join("escape-10119");
-        let bad_paths: [(&str, &Path); 5] = [
-            ("empty", Path::new("")),
-            ("whitespace", Path::new("   ")),
-            ("relative", Path::new("relative/custody")),
-            ("outside-sandbox", outside_path.as_path()),
-            ("parent-traversal", traversal_path.as_path()),
+        let mut bad_paths: Vec<(&str, std::path::PathBuf, &str)> = vec![
+            (
+                "empty",
+                std::path::PathBuf::from(""),
+                SET_KEY_DIR_REFUSED_EMPTY,
+            ),
+            (
+                "whitespace",
+                std::path::PathBuf::from("   "),
+                SET_KEY_DIR_REFUSED_EMPTY,
+            ),
+            (
+                "relative",
+                std::path::PathBuf::from("relative/custody"),
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ),
+            (
+                "outside-sandbox",
+                outside_path,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ),
+            (
+                "parent-traversal",
+                traversal_path,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ),
         ];
-        for (label, bad) in bad_paths {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            use std::os::unix::fs::symlink;
+
+            let non_utf8_in_sandbox = custody.path().join(OsStr::from_bytes(b"non-utf8-\xff\xfe"));
+            bad_paths.push((
+                "non-utf8-in-sandbox",
+                non_utf8_in_sandbox,
+                "IsolatedWitnessCustody::set_key_dir refuses a non-UTF-8 path",
+            ));
+
+            let escape_link = custody.path().join("escape-link");
+            symlink(outside_dir.path(), &escape_link).expect("create escape symlink");
+            bad_paths.push((
+                "symlink-escape",
+                escape_link.clone(),
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ));
+            bad_paths.push((
+                "symlink-escape-child",
+                escape_link.join("nonexistent-child"),
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ));
+
+            let dangling_link = custody.path().join("dangling-link");
+            symlink(outside_dir.path().join("does-not-exist"), &dangling_link)
+                .expect("create dangling symlink");
+            bad_paths.push((
+                "dangling-symlink",
+                dangling_link,
+                SET_KEY_DIR_REFUSED_OUTSIDE_SANDBOX,
+            ));
+        }
+
+        for (label, bad, expected_reason) in bad_paths {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                custody.set_key_dir(bad);
+                custody.set_key_dir(&bad);
             }));
+            let payload = match res {
+                Err(payload) => payload,
+                Ok(()) => panic!("#10119 ({label}): set_key_dir({bad:?}) must refuse invalid path"),
+            };
+            let msg = panic_payload_message(payload);
             assert!(
-                res.is_err(),
-                "#10119 ({label}): set_key_dir({bad:?}) must refuse invalid path"
+                msg.contains(expected_reason),
+                "#10119 ({label}): expected refusal containing {expected_reason:?}, got: {msg:?}"
             );
             assert_eq!(
                 witness::witness_key_dir().expect("resolve witness dir"),
