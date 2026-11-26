@@ -8910,6 +8910,21 @@ enabled = true
         assert!(!gpu_policy_warn_applicable("ollama", true));
     }
 
+    /// #10124 R3-1 class probe, RED at base 2f18736a: an `EnvScope` can be
+    /// built under the lock guard and dropped after the guard is gone, so its
+    /// `Drop` writes the process environment without the lock. This compiles
+    /// and passes today, which is the defect.
+    #[test]
+    fn envscope_outlives_its_lock_guard_10124_r31() {
+        let scope;
+        {
+            let g = posture_env_lock();
+            scope = EnvScope::set(&g, &[("AI_MEMORY_R31_PROBE_10124", "1")]);
+        }
+        // The guard is gone; `scope` still lives and writes env on drop.
+        drop(scope);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_reachability_compiled_default_is_info_1146() {
         let g = posture_env_lock();
