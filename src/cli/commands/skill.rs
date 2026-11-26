@@ -285,16 +285,6 @@ pub struct DeleteArgs {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-/// Dispatch entry-point called from `daemon_runtime::run`.
-///
-/// Loads the active keypair (when configured) so register / export /
-/// promote can sign their output, matching the MCP-side wiring.
-///
-/// # Errors
-///
-/// Surfaces DB-open errors verbatim. Substrate-handler failures bubble
-/// up as exit codes (non-zero) with the substrate's error string
-/// printed to stderr.
 /// Verb label for read verbs that enforce [`cli_read_caller`] (#8832, #10122).
 /// Exhaustive match so any new `SkillAction` variant forces an explicit choice
 /// (CBC-04).
@@ -312,6 +302,18 @@ const fn read_verb_name(action: &SkillAction) -> Option<&'static str> {
     }
 }
 
+/// Dispatch entry-point called from `daemon_runtime::run`.
+///
+/// Loads the active keypair (when configured) so register / export /
+/// promote can sign their output, matching the MCP-side wiring.
+///
+/// # Errors
+///
+/// Read verbs (`list`, `get`, `resource`, `export`, `compose`) refuse an empty,
+/// non-Unicode, or shape-invalid `AI_MEMORY_AGENT_ID` with exit code 2 before
+/// the database is opened (#10122). Surfaces DB-open errors verbatim.
+/// Substrate-handler failures bubble up as exit codes (non-zero) with the
+/// substrate's error string printed to stderr.
 pub fn run(
     db_path: &Path,
     args: &SkillArgs,
