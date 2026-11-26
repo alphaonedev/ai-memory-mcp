@@ -20,8 +20,8 @@ const SIG: [u8; 64] = [7; 64];
 const KEY: [u8; 32] = [9; 32];
 const SIGNED: &[u8] = b"link-cbor";
 
-/// Python: sha256(domain | 0x01 | lp("memory_link.created") | lp("link-cbor")
-/// | 0x07*64 | 0x09*32), lp = u64 big-endian length prefix.
+/// Python: `sha256(domain | 0x01 | lp("memory_link.created") | lp("link-cbor")
+/// | 0x07*64 | 0x09*32)`, where `lp` is a u64 big-endian length prefix.
 const GOLDEN_LINK_PAYLOAD: &str =
     "50d7eaf8c23c24d958901f3fc47bf76f4b2ba8f285b235971dd8d792a3011368";
 
@@ -41,9 +41,17 @@ const KIND_TABLE: [(AgentEventKind, &str, u8); 7] = [
     (AgentEventKind::LinkCreated, "memory_link.created", 1),
     (AgentEventKind::CaptureTurn, "memory_capture_turn", 2),
     (AgentEventKind::PersonaGenerated, "persona_generated", 3),
-    (AgentEventKind::AtomisationComplete, "atomisation_complete", 4),
+    (
+        AgentEventKind::AtomisationComplete,
+        "atomisation_complete",
+        4,
+    ),
     (AgentEventKind::ContextOffloaded, "context_offloaded", 5),
-    (AgentEventKind::ContextDereferenced, "context_dereferenced", 6),
+    (
+        AgentEventKind::ContextDereferenced,
+        "context_dereferenced",
+        6,
+    ),
     (AgentEventKind::SkillRegistered, "skill.registered", 7),
 ];
 
@@ -178,7 +186,10 @@ fn receipt_without_model_matches_the_documented_encoding_10108() {
     .canonical_bytes();
     assert_eq!(bytes.len(), GOLDEN_RECEIPT_NO_MODEL_LEN);
     assert_eq!(bytes.last(), Some(&0_u8));
-    assert_eq!(hex::encode(Sha256::digest(&bytes)), GOLDEN_RECEIPT_NO_MODEL_SHA256);
+    assert_eq!(
+        hex::encode(Sha256::digest(&bytes)),
+        GOLDEN_RECEIPT_NO_MODEL_SHA256
+    );
 }
 
 #[test]
@@ -233,7 +244,11 @@ fn era_table_is_exhaustive_10108() {
     };
     let rows: [(AgentCutover, i64, RowEra); 9] = [
         (AgentCutover::Absent, 1, RowEra::Era(PayloadEra::Legacy)),
-        (AgentCutover::Absent, i64::MAX, RowEra::Era(PayloadEra::Legacy)),
+        (
+            AgentCutover::Absent,
+            i64::MAX,
+            RowEra::Era(PayloadEra::Legacy),
+        ),
         (valid, i64::MIN, RowEra::Era(PayloadEra::Legacy)),
         (valid, 9, RowEra::Era(PayloadEra::Legacy)),
         (valid, 10, RowEra::Marker),
@@ -243,7 +258,11 @@ fn era_table_is_exhaustive_10108() {
         (AgentCutover::Invalid, 11, RowEra::Unresolvable),
     ];
     for (cutover, seq, expected) in rows {
-        assert_eq!(RowEra::resolve(&cutover, seq), expected, "{cutover:?} {seq}");
+        assert_eq!(
+            RowEra::resolve(&cutover, seq),
+            expected,
+            "{cutover:?} {seq}"
+        );
     }
 }
 
@@ -256,5 +275,8 @@ fn encoder_is_linear_in_the_signed_bytes_10108() {
         ..payload(AgentEventKind::ContextOffloaded)
     });
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
-    assert_ne!(h, AgentPayloadHash::encode(&payload(AgentEventKind::ContextOffloaded)));
+    assert_ne!(
+        h,
+        AgentPayloadHash::encode(&payload(AgentEventKind::ContextOffloaded))
+    );
 }
