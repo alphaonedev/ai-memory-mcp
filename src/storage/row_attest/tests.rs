@@ -2466,12 +2466,15 @@ enum CutAt {
 }
 
 /// A [`probe::SliceSource`] whose read fails mid-stream (I4: a cut read is
-/// an error, never a clean verdict).
+/// an error, never a clean verdict). With `once` the failure is transient:
+/// the failing call drops the rest of its items and later calls read
+/// normally, so an error the verifier swallows is not masked by a later one.
 struct CutSource<'a> {
     inner: probe::SliceSource<'a>,
     at: CutAt,
     left: Option<usize>,
     cut: bool,
+    once: bool,
 }
 
 impl<'a> CutSource<'a> {
@@ -2485,12 +2488,19 @@ impl<'a> CutSource<'a> {
             at,
             left,
             cut: false,
+            once: false,
         }
     }
 
-    fn checked(&self) -> Result<(), String> {
+    fn checked(&mut self) -> Result<(), String> {
         match (self.cut, self.at) {
-            (true, CutAt::Items(k)) => Err(format!("{READ_CUT_10116} {k} items")),
+            (true, CutAt::Items(k)) => {
+                if self.once {
+                    self.cut = false;
+                    self.left = None;
+                }
+                Err(format!("{READ_CUT_10116} {k} items"))
+            }
             _ => Ok(()),
         }
     }
@@ -2575,8 +2585,9 @@ fn fixture_input<'a>(f: &'a Fixture, anchor: &'a anchor::AnchorLoad) -> VerifyIn
     }
 }
 
-/// I4: a read that fails after k streamed items, at the high-water read or
-/// at the closing count ends the run with that exact error, for every cut
+/// I4: a read that fails after k streamed items (lasting or transient), at
+/// the high-water read or at the closing count ends the run with that exact
+/// error, for every cut
 /// point of a store (never a clean or partial verdict); a read that is
 /// never cut gives the clean verdict.
 #[test]
@@ -2590,13 +2601,17 @@ fn verify_fails_closed_on_a_cut_read_10116() {
         seal: &super::seal::SealState::NotSealed,
     };
     let items = f.atts.len() + f.live.len();
-    for k in 0..items {
-        let got = probe::run(&mut CutSource::new(&input, CutAt::Items(k)), &ctx);
-        assert_eq!(
-            got.map(|(r, _)| r),
-            Err(format!("read cut after {k} items")),
-            "cut after {k} of {items}"
-        );
+    for once in [false, true] {
+        for k in 0..items {
+            let mut src = CutSource::new(&input, CutAt::Items(k));
+            src.once = once;
+            let got = probe::run(&mut src, &ctx);
+            assert_eq!(
+                got.map(|(r, _)| r),
+                Err(format!("read cut after {k} items")),
+                "cut after {k} of {items} (transient: {once})"
+            );
+        }
     }
     for (at, want) in [
         (CutAt::HighWater, "high-water read failed"),
