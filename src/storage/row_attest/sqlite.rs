@@ -207,6 +207,7 @@ fn now_ts() -> String {
 ///
 /// Surfaces the query failure.
 pub fn read_rows(conn: &Connection, spec: &TableSpec) -> Result<Vec<Vec<Cell>>> {
+    super::stream::tick(super::stream::Count::Gather);
     let cols = spec
         .cols
         .iter()
@@ -230,7 +231,7 @@ pub fn read_rows(conn: &Connection, spec: &TableSpec) -> Result<Vec<Vec<Cell>>> 
         .with_context(|| format!("row attestation read of {}", spec.table))
 }
 
-fn live_acc(conn: &Connection, spec: &TableSpec) -> Result<[u8; 32]> {
+pub(super) fn live_acc(conn: &Connection, spec: &TableSpec) -> Result<[u8; 32]> {
     let mut acc = ZERO_DIGEST;
     for cells in read_rows(conn, spec)? {
         let row = CanonicalRow::parse(spec, &cells)?;
@@ -830,17 +831,36 @@ fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState
         crate::storage::connection::in_write_txn(conn, || sign_cutovers(conn, who, &sealed))
             .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
     }
-    // #10087, #10088: record in the anchor that this file is armed, at the
-    // marks it holds now. Only once the signing committed (inside a caller's
-    // transaction a rollback could undo it); a failure refuses the arm.
-    if let Some(path) = seal_file.as_deref()
-        && conn.is_autocommit()
-    {
-        seal::advance(path, &SealRecord::of(&read_attestations(conn)?))
-            .map_err(|e| e.context("row attestation seal (#10087)"))?;
-    }
+    seal_at_arm(conn, seal_file.as_deref())?;
     register(conn, source)?;
     Ok(ArmState::Armed)
+}
+
+/// #10087, #10088: record in the anchor that the file behind `conn` is
+/// armed, at the marks it holds now. Only once the signing committed
+/// (inside a caller's transaction a rollback could undo it, so nothing is
+/// written there); a failure refuses the arm.
+///
+/// # Errors
+///
+/// The attestation read, an unreadable seal or a seal write failure.
+pub(super) fn seal_at_arm(conn: &Connection, seal_file: Option<&std::path::Path>) -> Result<()> {
+    if let Some(path) = seal_file
+        && conn.is_autocommit()
+    {
+        seal::advance(path, &seal_marks(conn)?)
+            .map_err(|e| e.context("row attestation seal (#10087)"))?;
+    }
+    Ok(())
+}
+
+/// The seal marks of every attestation in `conn`.
+///
+/// # Errors
+///
+/// Surfaces the query failure.
+pub(super) fn seal_marks(conn: &Connection) -> Result<SealRecord> {
+    Ok(SealRecord::of(&read_attestations(conn)?))
 }
 
 /// Whether [`sign_cutovers`] has nothing to sign or refuse on `conn`: no
@@ -929,6 +949,7 @@ fn stream_attestations<P: rusqlite::Params>(
 ///
 /// Surfaces the query failure.
 pub fn read_attestations(conn: &Connection) -> Result<Vec<Attestation>> {
+    super::stream::tick(super::stream::Count::Gather);
     let mut out = Vec::new();
     stream_attestations(
         conn,
@@ -1158,6 +1179,19 @@ pub enum SnapshotVerdict {
 ///
 /// The exact reason, prefixed with [`SNAPSHOT_REFUSAL_PREFIX`].
 pub fn check_snapshot(conn: &Connection, target: &std::path::Path) -> Result<SnapshotVerdict> {
+    check_snapshot_with(conn, target, &super::anchor::TrustAnchor::from_key_dir())
+}
+
+/// [`check_snapshot`] under the loaded `anchor`.
+///
+/// # Errors
+///
+/// As [`check_snapshot`].
+pub(super) fn check_snapshot_with(
+    conn: &Connection,
+    target: &std::path::Path,
+    anchor: &super::anchor::AnchorLoad,
+) -> Result<SnapshotVerdict> {
     let refuse = |why: &str| anyhow::anyhow!("{SNAPSHOT_REFUSAL_PREFIX} {why}");
     let present: Option<String> = conn
         .query_row(
@@ -1187,8 +1221,7 @@ pub fn check_snapshot(conn: &Connection, target: &std::path::Path) -> Result<Sna
             return Err(refuse(&format!("{} has no cutover watermark", spec.table)));
         }
     }
-    let anchor = super::anchor::TrustAnchor::from_key_dir();
-    let target_seal = seal::state_for(&anchor, Some(target));
+    let target_seal = seal::state_for(anchor, Some(target));
     let any_signed = attestations.iter().any(|a| a.signature.is_some());
     if !any_signed && target_seal == SealState::NotSealed {
         return Ok(SnapshotVerdict::NeverArmed);
@@ -1196,7 +1229,7 @@ pub fn check_snapshot(conn: &Connection, target: &std::path::Path) -> Result<Sna
     // The snapshot is judged on its own marks: restoring an older verified
     // store is an explicit order, and the target's seal is replaced by the
     // snapshot's once it is published.
-    let (report, marks) = verify_inner(conn, &anchor, &SealState::NotSealed)?;
+    let (report, marks) = verify_inner(conn, anchor, &SealState::NotSealed)?;
     match report.outcome() {
         super::Outcome::Clean => Ok(SnapshotVerdict::Verified(marks)),
         super::Outcome::Unanchored(why) => {

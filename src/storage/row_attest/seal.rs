@@ -193,6 +193,7 @@ pub fn state_for(anchor: &AnchorLoad, db: Option<&Path>) -> SealState {
 }
 
 fn write_atomic(path: &Path, rec: &SealRecord) -> Result<()> {
+    super::stream::tick(super::stream::Count::SealWrite);
     let dir = path
         .parent()
         .context("a seal path always has a parent directory")?;

@@ -33,12 +33,17 @@ pub(crate) enum Count {
     DefectEq,
     /// One attestation re-read for a row chain stored out of order.
     ChainRead,
+    /// One whole-table read gathered into a `Vec` (`read_attestations`,
+    /// `read_rows`): never on a verify, arm or snapshot path (#10116).
+    Gather,
+    /// One write of an anchored seal file (#10116 J3).
+    SealWrite,
 }
 
 impl Count {
     /// Every counter, in index order.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; COUNTERS] = [
         Self::AttRead,
         Self::RowRead,
         Self::AttVisit,
@@ -46,6 +51,8 @@ impl Count {
         Self::Sig,
         Self::DefectEq,
         Self::ChainRead,
+        Self::Gather,
+        Self::SealWrite,
     ];
 
     #[cfg(test)]
@@ -58,14 +65,21 @@ impl Count {
             Self::Sig => 4,
             Self::DefectEq => 5,
             Self::ChainRead => 6,
+            Self::Gather => 7,
+            Self::SealWrite => 8,
         }
     }
 }
 
+/// How many counters [`Count`] has.
+#[cfg(test)]
+const COUNTERS: usize = 9;
+
 #[cfg(test)]
 thread_local! {
-    static COUNTS: [std::cell::Cell<u64>; 7] = Default::default();
-    static CEILINGS: [std::cell::Cell<u64>; 7] = const { [const { std::cell::Cell::new(u64::MAX) }; 7] };
+    static COUNTS: [std::cell::Cell<u64>; COUNTERS] = Default::default();
+    static CEILINGS: [std::cell::Cell<u64>; COUNTERS] =
+        const { [const { std::cell::Cell::new(u64::MAX) }; COUNTERS] };
 }
 
 /// Count one `c` (a no-op outside test builds).

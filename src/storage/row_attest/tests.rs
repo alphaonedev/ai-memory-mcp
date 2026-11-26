@@ -2215,6 +2215,9 @@ const VERIFY_COLLECT_SITES_10116: &[(&str, [usize; 4])] = &[
     ("src/storage/row_attest/mod.rs", [0, 0, 4, 4]),
     // `SealRecord::of` takes a slice; one `collect` parses a seal line.
     ("src/storage/row_attest/seal.rs", [0, 0, 2, 1]),
+    // Test code: the slice form the J1 fold is compared with, and the
+    // `collect`s that build fixture SQL and expected marks (#10116 lane 2).
+    ("src/storage/row_attest/seal_cost_10116.rs", [1, 0, 0, 4]),
     // The two readers and their callers outside the verifier (live_acc, arm, check_snapshot).
     ("src/storage/row_attest/sqlite.rs", [3, 3, 4, 6]),
     // The slice adapter buckets an in-memory store (never the SQLite path).
@@ -2832,3 +2835,6 @@ fn timed_10k_drifted_verify_10116() {
     assert_eq!(r.defects.len(), TIMED_MEMORIES_10116 + 1);
     assert!(took < TIMED_VERIFY_CEILING_10116, "{took:?}");
 }
+
+#[path = "seal_cost_10116.rs"]
+mod seal_cost_10116;

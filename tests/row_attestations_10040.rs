@@ -2815,3 +2815,88 @@ fn streaming_read_fails_closed_on_an_undecodable_row_10116() {
         Err(UNDECODABLE_SEQ_10116.to_string())
     );
 }
+
+// ---------------------------------------------------------------------------
+// #10116 lane 2, J3: a clean verify rewrites the anchored seal only when a
+// mark moves
+// ---------------------------------------------------------------------------
+
+/// The one seal file of `sb` with its bytes, inode and mtime.
+fn seal_file_id_10116(sb: &Sandbox) -> (Vec<u8>, u64, std::time::SystemTime) {
+    let seals = sb
+        .root
+        .join("keys")
+        .join(ai_memory::storage::row_attest::seal::SEAL_DIR);
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&seals).expect("seal dir") {
+        let path = entry.expect("seal entry").path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    assert_eq!(files.len(), 1, "one seal for the one store: {files:?}");
+    let meta = std::fs::metadata(&files[0]).expect("seal metadata");
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let ino = 0;
+    (
+        std::fs::read(&files[0]).expect("seal bytes"),
+        ino,
+        meta.modified().expect("seal mtime"),
+    )
+}
+
+/// J3 end to end through `audit verify-rows`: a second clean verify that
+/// sees nothing new leaves the seal file as it was (bytes, inode, mtime);
+/// a clean verify after a new signed write moves it (a new file, new
+/// marks); a defective verify never writes it.
+#[test]
+fn clean_verify_rewrites_the_seal_only_when_a_mark_moves_10116() {
+    let (sb, key, mut mcp) = armed();
+    mcp.store("seal cost one 10116");
+    drop(mcp);
+    let keys = sb.root.join("keys");
+    let (code, report) = verify_rows(&sb, &keys);
+    assert_eq!(code, VERIFY_ROWS_EXIT_CLEAN, "first clean verify: {report}");
+    let first = seal_file_id_10116(&sb);
+
+    let (code, report) = verify_rows(&sb, &keys);
+    assert_eq!(
+        code, VERIFY_ROWS_EXIT_CLEAN,
+        "second clean verify: {report}"
+    );
+    assert_eq!(
+        seal_file_id_10116(&sb),
+        first,
+        "an equal clean verify leaves the seal as it was"
+    );
+
+    let mut mcp = sb.start(&key);
+    let id = mcp.store("seal cost two 10116");
+    drop(mcp);
+    let (code, report) = verify_rows(&sb, &keys);
+    assert_eq!(
+        code, VERIFY_ROWS_EXIT_CLEAN,
+        "verify after a write: {report}"
+    );
+    let moved = seal_file_id_10116(&sb);
+    assert_ne!(moved.0, first.0, "the seal records the new marks");
+    #[cfg(unix)]
+    assert_ne!(moved.1, first.1, "an advance is a new file (atomic rename)");
+
+    sb.raw(
+        "UPDATE memories SET content = 'tampered 10116' WHERE id = ?1",
+        &id,
+    );
+    let (code, report) = verify_rows(&sb, &keys);
+    assert_eq!(
+        code, VERIFY_ROWS_EXIT_DEFECTIVE,
+        "tampered verify: {report}"
+    );
+    assert_eq!(
+        seal_file_id_10116(&sb),
+        moved,
+        "a defective verify never writes the seal"
+    );
+}
