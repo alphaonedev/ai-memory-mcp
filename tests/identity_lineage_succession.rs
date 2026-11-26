@@ -993,6 +993,82 @@ fn truncation_after_revocation_is_detected() {
 }
 
 #[test]
+fn append_revocation_refusals_match_shared_preconditions_10118() {
+    // #10118 (PR #10130 r1 sec F2) — `append_revocation` MUST route through
+    // `succession_preconditions` and consume the shared `SuccessionChecked`
+    // proof so all three precondition refusals use the exact canonical
+    // suffixes and order, leaving lineage rows and head untouched.
+    let (_dir, conn) = fresh_db();
+    let successor_b64 = kp("rev-succ-10118").public_base64();
+
+    // 1. No lineage enrolled.
+    let agent_noln = "rev-noln-10118";
+    db::register_agent(&conn, agent_noln, "ai:test", &[]).expect("register noln");
+    let k_noln = kp(agent_noln);
+    let err_noln = db::append_revocation(&conn, agent_noln, &k_noln, &successor_b64, 10, None)
+        .unwrap_err();
+    let msg_noln = format!("{err_noln:#}");
+    assert!(
+        msg_noln.contains(&format!(
+            "no lineage enrolled for '{agent_noln}' — {}",
+            db::SUCCESSION_ERR_NO_LINEAGE
+        )),
+        "expected shared no-lineage refusal, got: {msg_noln}"
+    );
+    assert!(db::read_lineage(&conn, agent_noln).unwrap().is_empty());
+
+    // 2. Public-only keypair.
+    let agent_pub = "rev-pub-10118";
+    let mut k_pub = register_and_enroll(&conn, agent_pub);
+    let head_before_pub = db::lineage_head(&conn, agent_pub)
+        .unwrap()
+        .map(|(r, _)| (r.epoch, r.successor_pubkey_b64));
+    k_pub.private = None;
+    let err_pub = db::append_revocation(&conn, agent_pub, &k_pub, &successor_b64, 10, None)
+        .unwrap_err();
+    let msg_pub = format!("{err_pub:#}");
+    assert!(
+        msg_pub.contains(&format!(
+            "keypair for '{agent_pub}' {}",
+            db::SUCCESSION_ERR_PUBLIC_ONLY
+        )),
+        "expected shared public-only refusal, got: {msg_pub}"
+    );
+    assert_eq!(db::read_lineage(&conn, agent_pub).unwrap().len(), 1);
+    assert_eq!(
+        db::lineage_head(&conn, agent_pub)
+            .unwrap()
+            .map(|(r, _)| (r.epoch, r.successor_pubkey_b64)),
+        head_before_pub
+    );
+
+    // 3. Keypair is not the current lineage head.
+    let agent_nh = "rev-nothead-10118";
+    let _k_head = register_and_enroll(&conn, agent_nh);
+    let head_before_nh = db::lineage_head(&conn, agent_nh)
+        .unwrap()
+        .map(|(r, _)| (r.epoch, r.successor_pubkey_b64));
+    let k_other = kp(agent_nh);
+    let err_nh = db::append_revocation(&conn, agent_nh, &k_other, &successor_b64, 10, None)
+        .unwrap_err();
+    let msg_nh = format!("{err_nh:#}");
+    assert!(
+        msg_nh.contains(&format!(
+            "signing keypair is not the current lineage head for '{agent_nh}' — {}",
+            db::SUCCESSION_ERR_NOT_HEAD
+        )),
+        "expected shared not-head refusal, got: {msg_nh}"
+    );
+    assert_eq!(db::read_lineage(&conn, agent_nh).unwrap().len(), 1);
+    assert_eq!(
+        db::lineage_head(&conn, agent_nh)
+            .unwrap()
+            .map(|(r, _)| (r.epoch, r.successor_pubkey_b64)),
+        head_before_nh
+    );
+}
+
+#[test]
 fn custody_refuse_guard_blocks_non_software_file_mint() {
     // #1949 — the OSS refuse-guard is CODE: append_lineage_record refuses
     // any record whose custody_class is not software-file, and persists
