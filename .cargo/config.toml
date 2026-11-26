@@ -1,0 +1,10 @@
+# #10108 (GA standard 3, K-8): every process cargo starts (cargo test, cargo
+# run, CI) is a test-guarded process. The guard routes the default daemon key
+# directory to identity::test_key_dir::install()'s private 0700 sandbox outside
+# HOME, so no test ever generates a key into the real home key directory.
+# No key directory path is set here on purpose: a checkout under HOME (CI
+# runners, developer clones) would put it under HOME, which the #3355 guard
+# refuses; install() stays authoritative (#3584). Pinned by
+# tests/test_key_sandbox_cargo_env_10108.rs. The installed binary is untouched.
+[env]
+AI_MEMORY_TEST_KEY_GUARD = "1"
