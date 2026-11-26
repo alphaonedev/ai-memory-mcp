@@ -2207,6 +2207,14 @@ mod tests {
             signed_attestation_count(&db_path) > 0,
             "valid succession must still arm row attestation (#10089)"
         );
+        assert!(
+            matches!(
+                seal_state_for(&db_path),
+                crate::storage::row_attest::seal::SealState::Sealed(ref rec) if rec.high_water > 0
+            ),
+            "#10147: seal_state_for must observe a real Sealed record after valid succeed (non-vacuous positive control), got: {:?}",
+            seal_state_for(&db_path)
+        );
     }
 
     /// #10118 — `identity register-recovery-key` MUST return the exact same

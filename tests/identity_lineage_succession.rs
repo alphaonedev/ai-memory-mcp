@@ -1069,6 +1069,166 @@ fn append_revocation_refusals_match_shared_preconditions_10118() {
 }
 
 #[test]
+fn succession_checked_is_single_use_by_value_and_non_copy_10148() {
+    // #10148 (PR #10130 r3 N2) — pin every property that makes reusing a
+    // `SuccessionChecked` proof fail specifically with the move error (E0382):
+    // 1. Both checked appends take `SuccessionChecked<'_>` BY VALUE.
+    let _: fn(
+        &Connection,
+        db::SuccessionChecked<'_>,
+        &str,
+        Option<&str>,
+    ) -> anyhow::Result<LineageRecord> = db::append_succession_checked;
+    let _: fn(
+        &Connection,
+        db::SuccessionChecked<'_>,
+        &str,
+        u64,
+        Option<&str>,
+    ) -> anyhow::Result<LineageRecord> = db::append_revocation_checked;
+
+    // 2. `SuccessionChecked` implements neither `Copy`, `Clone`, nor `Default`
+    //    (autoref specialization probe with positive controls `u32` and `String`).
+    struct Probe<T>(std::marker::PhantomData<T>);
+    impl<T> Probe<T> {
+        const fn new() -> Self {
+            Self(std::marker::PhantomData)
+        }
+    }
+    trait IsCopy: Sized {
+        fn is_copy(self) -> bool {
+            true
+        }
+    }
+    impl<T: Copy> IsCopy for &Probe<T> {}
+    trait NotCopy: Sized {
+        fn is_copy(self) -> bool {
+            false
+        }
+    }
+    impl<T> NotCopy for &&Probe<T> {}
+
+    trait IsClone: Sized {
+        fn is_clone(self) -> bool {
+            true
+        }
+    }
+    impl<T: Clone> IsClone for &Probe<T> {}
+    trait NotClone: Sized {
+        fn is_clone(self) -> bool {
+            false
+        }
+    }
+    impl<T> NotClone for &&Probe<T> {}
+
+    trait IsDefault: Sized {
+        fn is_default(self) -> bool {
+            true
+        }
+    }
+    impl<T: Default> IsDefault for &Probe<T> {}
+    trait NotDefault: Sized {
+        fn is_default(self) -> bool {
+            false
+        }
+    }
+    impl<T> NotDefault for &&Probe<T> {}
+
+    // Positive controls prove the probes detect Copy/Clone/Default.
+    assert!((&Probe::<u32>::new()).is_copy(), "control u32 is Copy");
+    assert!((&Probe::<u32>::new()).is_clone(), "control u32 is Clone");
+    assert!(
+        (&Probe::<u32>::new()).is_default(),
+        "control u32 is Default"
+    );
+    assert!(
+        !(&Probe::<String>::new()).is_copy(),
+        "control String is !Copy"
+    );
+    assert!(
+        (&Probe::<String>::new()).is_clone(),
+        "control String is Clone"
+    );
+    assert!(
+        (&Probe::<String>::new()).is_default(),
+        "control String is Default"
+    );
+
+    // Guard assertions on `SuccessionChecked`.
+    assert!(
+        !(&Probe::<db::SuccessionChecked<'static>>::new()).is_copy(),
+        "#10148: SuccessionChecked must NOT implement Copy"
+    );
+    assert!(
+        !(&Probe::<db::SuccessionChecked<'static>>::new()).is_clone(),
+        "#10148: SuccessionChecked must NOT implement Clone"
+    );
+    assert!(
+        !(&Probe::<db::SuccessionChecked<'static>>::new()).is_default(),
+        "#10148: SuccessionChecked must NOT implement Default"
+    );
+
+    // 3. The `SuccessionChecked` rustdoc MUST carry a compiling single-use
+    //    `no_run` positive control right beside a `compile_fail` reuse block
+    //    whose code differs ONLY by the single duplicated move-reuse line (and
+    //    must not rely on the unenforced `compile_fail,E...` tag on stable).
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/mod.rs"),
+    )
+    .expect("read src/storage/mod.rs");
+    let struct_pos = src
+        .find("pub struct SuccessionChecked")
+        .expect("locate SuccessionChecked");
+    let doc_start = src[..struct_pos]
+        .rfind("\n\n")
+        .map_or(0, |i| i + 2);
+    let doc_block = &src[doc_start..struct_pos];
+    assert!(
+        !doc_block.contains("compile_fail,E"),
+        "#10148: stable rustdoc does not enforce compile_fail,E<code>; use paired no_run + compile_fail"
+    );
+
+    const DOC_PREFIX: &str = concat!("/", "/", "/");
+    let extract_fence = |tag: &str| -> Vec<String> {
+        let marker = format!("{DOC_PREFIX} ```{tag}");
+        let closing = format!("{DOC_PREFIX} ```");
+        let start = doc_block
+            .find(&marker)
+            .unwrap_or_else(|| panic!("#10148: missing `{marker}` doctest on SuccessionChecked"));
+        let rest = &doc_block[start + marker.len()..];
+        let mut lines = Vec::new();
+        for line in rest.lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed == closing {
+                return lines;
+            }
+            let body = trimmed.strip_prefix(DOC_PREFIX).unwrap_or(trimmed).trim();
+            lines.push(body.to_string());
+        }
+        panic!("#10148: unterminated `{marker}` fence on SuccessionChecked");
+    };
+
+    let positive = extract_fence("no_run");
+    let negative = extract_fence("compile_fail");
+    let reuse_line =
+        "let _ = ai_memory::db::append_succession_checked(conn, proof, next, None)?;";
+    assert!(
+        positive.iter().any(|l| l == reuse_line),
+        "#10148: positive no_run doctest must call append_succession_checked once"
+    );
+    let mut expected_negative = positive.clone();
+    let first_call = expected_negative
+        .iter()
+        .position(|l| l == reuse_line)
+        .expect("positive call index");
+    expected_negative.insert(first_call + 1, reuse_line.to_string());
+    assert_eq!(
+        negative, expected_negative,
+        "#10148: compile_fail doctest must equal the compiling no_run positive control plus ONLY the duplicated move-reuse line"
+    );
+}
+
+#[test]
 fn custody_refuse_guard_blocks_non_software_file_mint() {
     // #1949 — the OSS refuse-guard is CODE: append_lineage_record refuses
     // any record whose custody_class is not software-file, and persists
