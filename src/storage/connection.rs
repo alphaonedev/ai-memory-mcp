@@ -1171,10 +1171,45 @@ fn test_trace_on_open(conn: Connection) -> Connection {
     conn
 }
 
+/// The sqlite path that names an in-memory database (always a fresh create).
+const SQLITE_MEMORY_PATH: &str = ":memory:";
+
+/// #10145 K-1, K-3 — does this open of an EXISTING file bump the schema? The
+/// file is read only (no pragma, no DDL): it needs the ladder unless its stamp
+/// is a known version at or above this binary's. An unreadable stamp counts as
+/// a ladder run, so the key is required (fail closed); the posture guard then
+/// refuses it as before.
+fn open_runs_ladder(conn: &Connection) -> bool {
+    !matches!(
+        probe_schema_stamp(conn),
+        Ok(SchemaStamp::Known(v)) if v >= super::migrations::current_schema_version()
+    )
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
+    // #10145 K-1, K-3 — a create (an absent path or `:memory:`) provisions
+    // the signer BEFORE `Connection::open` creates the file, so a keyless
+    // refusal leaves no file behind.
+    let creates = path.as_os_str() == SQLITE_MEMORY_PATH || !path.exists();
+    let create_signer = if creates {
+        Some(crate::governance::daemon_signer::DaemonChainSigner::provision_default()?)
+    } else {
+        None
+    };
     let conn = Connection::open(path).context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
+    // #10145 K-1 — the signer for a bump is obtained here, before the writer
+    // pragmas (`journal_mode` rewrites the header), the bootstrap DDL and the
+    // ladder: a keyless refusal leaves the file byte-identical. An at-tip
+    // database needs no key and opens keyless.
+    let signer = match create_signer {
+        Some(signer) => Some(signer),
+        None if open_runs_ladder(&conn) => {
+            Some(crate::governance::daemon_signer::DaemonChainSigner::provision_default()?)
+        }
+        None => None,
+    };
     apply_writer_pragmas(&conn)?;
     // v1.0.0 #2445 — the DOWNGRADE guard, deliberately placed HERE: after the
     // pragma block (so `busy_timeout` is already in force and ordinary
@@ -1199,7 +1234,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     }
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
-    migrate(&conn)?;
+    match &signer {
+        Some(signer) => super::migrations::migrate_signed(&conn, signer)?,
+        None => migrate(&conn)?,
+    }
     // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap
     // relations (`agent_lineage`), placed HERE in the open funnel rather than
     // inside `migrate`, and deliberately AFTER `execute_batch(SCHEMA)`. The
