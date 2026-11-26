@@ -2706,4 +2706,160 @@ mod postgres_parity {
             .await
             .expect("drop isolated schema by rollback");
     }
+
+    /// #10112 (R-13) — PostgreSQL parity: `PostgresStore::append_lineage_record`
+    /// MUST refuse a `LineageReason::Recovery` rebind preflight with
+    /// `StoreError::UnsupportedCapability` carrying `REFUSE_RECOVERY_VERIFY_ONLY`,
+    /// leaving `agent_lineage`, `agent_pubkey_history`, and `_agents` untouched
+    /// (zero unattested rebinds on either backend).
+    #[tokio::test]
+    async fn postgres_recovery_rebind_refuses_unattested_write_10112() {
+        struct PgEnvGuard {
+            prev_pubs: Option<std::ffi::OsString>,
+            prev_thr: Option<std::ffi::OsString>,
+        }
+        impl Drop for PgEnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: test-only restore for postgres parity cell.
+                unsafe {
+                    match &self.prev_pubs {
+                        Some(v) => std::env::set_var(
+                            ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                            v,
+                        ),
+                        None => std::env::remove_var(
+                            ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                        ),
+                    }
+                    match &self.prev_thr {
+                        Some(v) => std::env::set_var(
+                            ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV,
+                            v,
+                        ),
+                        None => std::env::remove_var(
+                            ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV,
+                        ),
+                    }
+                }
+            }
+        }
+        let Some(store) = connect().await else { return };
+        let Some(pool) = raw_pool().await else { return };
+        let (agent_id, k0) = pg_register_and_enroll(&store).await;
+        let k_new = kp(&agent_id);
+        let g0 = kp("pg-g0");
+        let g1 = kp("pg-g1");
+        let g2 = kp("pg-g2");
+        let gpubs = format!(
+            "{},{},{}",
+            g0.public_base64(),
+            g1.public_base64(),
+            g2.public_base64()
+        );
+        let _pg_env = {
+            let prev_pubs =
+                std::env::var_os(ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV);
+            let prev_thr = std::env::var_os(ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV);
+            // SAFETY: single-test postgres parity cell restored on drop.
+            unsafe {
+                std::env::set_var(
+                    ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                    &gpubs,
+                );
+                std::env::set_var(ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV, "2");
+            }
+            PgEnvGuard {
+                prev_pubs,
+                prev_thr,
+            }
+        };
+        let policy = ai_memory::identity::lineage::RecoveryPolicy::from_env()
+            .expect("recovery policy from env");
+
+        let lineage_before = store
+            .read_lineage(&agent_id)
+            .await
+            .expect("read_lineage before");
+        assert_eq!(lineage_before.len(), 1);
+        let head = &lineage_before[0].0;
+        let pub_before = store
+            .agent_pubkey(&agent_id)
+            .await
+            .expect("agent_pubkey before");
+        assert_eq!(pub_before.as_deref(), Some(k0.public_base64().as_str()));
+        let versions_before = store
+            .agent_pubkey_versions(&agent_id)
+            .await
+            .expect("versions before");
+
+        let rec = LineageRecord::recovery(
+            head,
+            &k_new.public_base64(),
+            None,
+            head.recovery_pubkey_b64.clone(),
+            policy.guardian_set_id(),
+            2,
+            "2026-11-26T12:00:00Z",
+        )
+        .expect("build recovery record");
+        let signing_input = rec.signing_input().expect("signing_input");
+        let atts = vec![
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g0.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g0.private.as_ref().expect("g0 priv"),
+                    &signing_input,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g1.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g1.private.as_ref().expect("g1 priv"),
+                    &signing_input,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+        ];
+        let quorum_blob =
+            ai_memory::identity::lineage::encode_recovery_quorum(&atts).expect("encode quorum");
+
+        let ctx = CallerContext::for_admin("test:pg-10112");
+        let err = store
+            .append_lineage_record(&ctx, &agent_id, &rec, &quorum_blob)
+            .await
+            .expect_err("Postgres must refuse unattested recovery rebind (#10112 R-13)");
+        assert!(
+            matches!(
+                err,
+                ai_memory::store::StoreError::UnsupportedCapability { .. }
+            ),
+            "expected UnsupportedCapability, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(ai_memory::storage::row_attest::sqlite::REFUSE_RECOVERY_VERIFY_ONLY),
+            "expected REFUSE_RECOVERY_VERIFY_ONLY in error, got: {err}"
+        );
+
+        // Zero DB writes occurred on Postgres.
+        let lineage_after = store
+            .read_lineage(&agent_id)
+            .await
+            .expect("read_lineage after");
+        assert_eq!(lineage_after.len(), lineage_before.len());
+        let pub_after = store
+            .agent_pubkey(&agent_id)
+            .await
+            .expect("agent_pubkey after");
+        assert_eq!(pub_after, pub_before);
+        let versions_after = store
+            .agent_pubkey_versions(&agent_id)
+            .await
+            .expect("versions after");
+        assert_eq!(versions_after.len(), versions_before.len());
+        let _ = pool;
+    }
 }

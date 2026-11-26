@@ -73,6 +73,27 @@ pub const REFUSE_SEAL_UNREADABLE: &str = "the anchored seal of this database can
 /// Refusal: the row changed outside the funnel since its last attestation.
 pub const REFUSE_ROW_DRIFT: &str =
     "the row changed outside the funnel since its latest attestation";
+/// Refusal (#10112 Option B, vote V1-RECOVER-REBIND-ATTEST R-8 / R-13):
+/// guardian recovery rebinds `_agents` on an attested store and requires a
+/// signing arm holding `K_new.priv`; a verify-only arm or backend without a
+/// `K_new` signing arm is refused with zero writes.
+pub const REFUSE_RECOVERY_VERIFY_ONLY: &str = "recovery rebind requires a signing arm holding K_new.priv \
+     (verify-only arm refused; Option B, #10112)";
+/// Refusal (#10112 R-8): `K_new.priv` is missing from the key directory.
+pub const REFUSE_RECOVERY_MISSING_PRIV: &str =
+    "recovery rebind requires K_new private key inside the key directory (Option B, #10112)";
+/// Refusal (#10112 R-4): signing arm's `K_new` public key disagrees with `--successor-pubkey`.
+pub const REFUSE_RECOVERY_KEY_MISMATCH: &str =
+    "recovery signing arm K_new public key does not match --successor-pubkey (#10112)";
+/// Refusal (#10112 R-9): replaying an already-applied recovery record or epoch.
+pub const REFUSE_RECOVERY_REPLAY: &str =
+    "recovery record or epoch already applied (replay refused; #10112)";
+/// Refusal (#10112 R-2): guardian set or threshold disagrees with a prior signed lineage record.
+pub const REFUSE_RECOVERY_QUORUM_DRIFT: &str =
+    "recovery guardian set does not match prior signed lineage record (#10112 R-2)";
+/// Refusal (#10112 R-7): anchor current key is not backed by a quorum-verified lineage record.
+pub const REFUSE_ANCHOR_UNATTESTED_KEY_SWAP: &str =
+    "anchor current key is not backed by a quorum-verified lineage record (#10112 R-7)";
 
 /// How [`install`] left the connection.
 #[must_use]
@@ -134,7 +155,7 @@ pub fn refuse_attested_writes(conn: &Connection) -> Result<()> {
 /// #10091 — whether the store behind `conn` was ever armed: the trust anchor
 /// holds a seal for it (or one it cannot read, which fails closed), or a
 /// cutover in it carries a signature.
-fn was_armed(conn: &Connection) -> Result<bool> {
+pub(crate) fn was_armed(conn: &Connection) -> Result<bool> {
     let anchor = super::anchor::TrustAnchor::from_key_dir();
     let sealed = seal::path_for(&anchor, seal::db_of(conn).as_deref())
         .as_deref()
@@ -376,13 +397,24 @@ enum SignerSource {
     /// armed (#10089: the rotation connection, whose own write re-binds the
     /// agent to the successor key inside the succession transaction).
     Fixed(Signer),
+    /// One recovery key (`K_new`) paired with the single handoff timestamp
+    /// `attested_at` (#10112 Option B, R-5/R-9: `K_old` valid_to, `K_new`
+    /// valid_from, and the `_agents` rebind attestation share one timestamp).
+    FixedAt { who: Signer, attested_at: String },
 }
 
 impl SignerSource {
     fn identity(&self, conn: &Connection) -> Result<Signer, String> {
         match self {
             Self::Session => session_identity(conn),
-            Self::Fixed(who) => Ok(who.clone()),
+            Self::Fixed(who) | Self::FixedAt { who, .. } => Ok(who.clone()),
+        }
+    }
+
+    fn attested_at(&self) -> String {
+        match self {
+            Self::Session | Self::Fixed(_) => now_ts(),
+            Self::FixedAt { attested_at, .. } => attested_at.clone(),
         }
     }
 }
@@ -467,6 +499,7 @@ fn append(
     who: &Signer,
     store: &str,
     ch: &Change<'_>,
+    attested_at: String,
 ) -> Result<(), FunnelRefusal> {
     let db = |e: rusqlite::Error| refusal(&e.to_string());
     let (head_seq, head_acc) = head_for(conn, ch.spec.table)
@@ -507,7 +540,7 @@ fn append(
             .map_or_else(|| ZERO_DIGEST.to_vec(), |l| l.digest.clone()),
         agent_id: who.agent_id.clone(),
         key_id: who.key_id.clone(),
-        attested_at: now_ts(),
+        attested_at,
         format_version: FORMAT_VERSION,
         covered_columns: ch.spec.covered(),
         store_id: store.to_string(),
@@ -619,8 +652,9 @@ fn attest_call(
     }
     let who = source.identity(conn)?;
     let store = store_id(conn)?;
+    let attested_at = source.attested_at();
     for ch in &todo {
-        append(conn, &who, &store, ch)?;
+        append(conn, &who, &store, ch, attested_at.clone())?;
     }
     Ok(())
 }
@@ -666,6 +700,15 @@ const STRIPPED_CUTOVER_SQL: &str = "SELECT c.table_name FROM row_attestations c 
      ORDER BY c.id LIMIT 1";
 
 fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<()> {
+    sign_cutovers_at(conn, who, sealed, None)
+}
+
+fn sign_cutovers_at(
+    conn: &Connection,
+    who: &Signer,
+    sealed: &SealState,
+    fixed_at: Option<&str>,
+) -> Result<()> {
     let store = store_id(conn).map_err(anyhow::Error::msg)?;
     // A-8: checked for every table before any row is signed (the memories
     // baselines signed below must not make a later pristine cutover look
@@ -708,6 +751,9 @@ fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<
         cut.id = id;
         cut.agent_id.clone_from(&who.agent_id);
         cut.key_id.clone_from(&who.key_id);
+        if let Some(ts) = fixed_at {
+            cut.attested_at = ts.to_string();
+        }
         let acc = live_acc(conn, spec)?;
         cut.table_acc = acc.to_vec();
         sign(&mut cut, &who.signing);
@@ -740,6 +786,9 @@ fn sign_cutovers(conn: &Connection, who: &Signer, sealed: &SealState) -> Result<
             b.row_digest = Some(row_digest(&row).to_vec());
             b.agent_id.clone_from(&who.agent_id);
             b.key_id.clone_from(&who.key_id);
+            if let Some(ts) = fixed_at {
+                b.attested_at = ts.to_string();
+            }
             b.table_seq = table_seq;
             b.table_acc = acc.to_vec();
             sign(&mut b, &who.signing);
@@ -840,6 +889,107 @@ fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState
     }
     register(conn, source)?;
     Ok(ArmState::Armed)
+}
+
+/// #10112 (Option B, vote V1-RECOVER-REBIND-ATTEST R-5/R-9) — arm `conn` inside
+/// an ALREADY-OPEN recovery `WriteTxn` with the verified successor key `K_new`
+/// and the single handoff timestamp `attested_at`.
+///
+/// Existing [`install`] and [`arm_with_key`] stay byte-for-byte unchanged; this
+/// crate-private helper is reachable only from `storage::recovery_rebind` after
+/// consuming a quorum-verified `RecoveryChecked` proof.
+///
+/// # Errors
+///
+/// Fails closed if `conn` is not inside an active write transaction, if the
+/// store identity or seal is unreadable, or if trigger registration fails.
+pub(crate) fn arm_for_recovery_in_tx(
+    conn: &Connection,
+    agent_id: &str,
+    k_new_signing: &ed25519_dalek::SigningKey,
+    anchor_dir: &std::path::Path,
+    attested_at: &str,
+) -> Result<()> {
+    if conn.is_autocommit() {
+        anyhow::bail!(
+            "{}: recovery arm must run inside the single recovery write transaction (#10112 R-5)",
+            refusal(REFUSE_UNARMED_HANDLE)
+        );
+    }
+    let verifying = k_new_signing.verifying_key();
+    let who = Signer {
+        agent_id: agent_id.to_string(),
+        key_id: key_id_of(&verifying),
+        signing: k_new_signing.clone(),
+    };
+    let anchor = super::anchor::TrustAnchor::load_dir(anchor_dir);
+    let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
+    let sealed = seal_file
+        .as_deref()
+        .map_or(SealState::NotSealed, seal::read);
+    if cutovers_all_signed(conn, &sealed) {
+        store_id(conn)
+            .map_err(anyhow::Error::msg)
+            .map_err(|e| e.context("row attestation recovery arm (#10112)"))?;
+    } else {
+        sign_cutovers_at(conn, &who, &sealed, Some(attested_at))
+            .map_err(|e| e.context("row attestation recovery cutover signing (#10112)"))?;
+    }
+    register(
+        conn,
+        SignerSource::FixedAt {
+            who,
+            attested_at: attested_at.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+/// #10112 — clear the temporary recovery `FixedAt` trigger binding after the
+/// recovery transaction finishes so a reused `Connection` never stamps later
+/// writes with the frozen recovery timestamp.
+pub(crate) fn restore_post_recovery_funnel(conn: &Connection) -> Result<()> {
+    let _ = install(conn)?;
+    Ok(())
+}
+
+/// #10112 (R-10) — advance the anchored seal strictly under `anchor_dir` after
+/// recovery commits and the anchor swap completes (never reads or writes any
+/// ambient `from_key_dir()` path outside `anchor_dir`).
+pub(crate) fn advance_seal_after_recovery(
+    conn: &Connection,
+    anchor_dir: &std::path::Path,
+) -> Result<()> {
+    let db = seal::db_of(conn);
+    let rec = SealRecord::of(&read_attestations(conn)?);
+    let explicit_anchor = super::anchor::TrustAnchor::load_dir(anchor_dir);
+    let Some(path) = seal::path_for(&explicit_anchor, db.as_deref()) else {
+        anyhow::bail!(
+            "row attestation seal (#10112 R-10): anchor directory {} is not anchored after swap",
+            anchor_dir.display()
+        );
+    };
+    seal::advance(&path, &rec).map_err(|e| e.context("row attestation seal (#10112 R-10)"))?;
+    Ok(())
+}
+
+/// #10112 (R-6) — check whether the anchored seal under `anchor_dir` already
+/// covers the database's current `row_attestations` marks.
+pub(crate) fn seal_is_current(conn: &Connection, anchor_dir: &std::path::Path) -> Result<bool> {
+    let db = seal::db_of(conn);
+    let explicit_anchor = super::anchor::TrustAnchor::load_dir(anchor_dir);
+    let Some(path) = seal::path_for(&explicit_anchor, db.as_deref()) else {
+        return Ok(false);
+    };
+    let rec = SealRecord::of(&read_attestations(conn)?);
+    match seal::read(&path) {
+        SealState::Sealed(existing) => Ok(existing.high_water >= rec.high_water
+            && rec
+                .heads
+                .iter()
+                .all(|(t, s)| existing.heads.get(t).copied().unwrap_or(0) >= *s)),
+        SealState::NotSealed | SealState::Unreadable { .. } => Ok(false),
+    }
 }
 
 /// Whether [`sign_cutovers`] has nothing to sign or refuse on `conn`: no

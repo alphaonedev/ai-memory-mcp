@@ -14718,6 +14718,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
 }
 
 mod pubkey_history;
+pub mod recovery_rebind;
 use pubkey_history::bind_agent_pubkey_no_tx;
 pub use pubkey_history::{
     AgentPubkeyVersion, AttestationPubkeyAt, agent_pubkey_at, agent_pubkey_for_attestation_at,
@@ -14732,6 +14733,11 @@ pub(crate) use pubkey_history::{
 pub(crate) use pubkey_history::{
     select_agent_pubkey_version_at, strip_unproven_agent_pubkey_binding,
     validate_agent_pubkey_transition_time,
+};
+pub use recovery_rebind::{
+    RecoveryArm, RecoveryChecked, RecoveryFaultPoint, RecoveryOutcome, RecoveryRequest,
+    execute_recovery_rebind, execute_recovery_rebind_with_fault, recovery_preconditions,
+    verify_anchor_against_lineage,
 };
 
 /// Fetch the Ed25519 public key bound to `agent_id`, if any (#626
@@ -16146,7 +16152,8 @@ fn mint_recovery_record(
     recovery_pubkey_b64: Option<&str>,
     not_before: &str,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    let Some((head, _)) = lineage_head(conn, agent_id)? else {
+    let lineage = read_lineage(conn, agent_id)?;
+    let Some((head, _)) = lineage.last() else {
         anyhow::bail!("no lineage enrolled for '{agent_id}' — nothing to recover");
     };
     crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
@@ -16160,20 +16167,16 @@ fn mint_recovery_record(
              (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
         )
     })?;
-    let threshold = policy.threshold.ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot mint a recovery record — AI_MEMORY_RECOVERY_THRESHOLD is unset; \
-             set an explicit M-of-N threshold (a key-takeover primitive never defaults to 1)"
-        )
-    })?;
-    let guardian_set_id = policy.guardian_set_id();
-    let threshold_u64 = u64::try_from(threshold).unwrap_or(u64::MAX);
+    // #10112 R-2: read quorum set and threshold from prior signed lineage
+    // record when one committed them, never from CLI args or request.
+    let (guardian_set_id, threshold_u64) =
+        recovery_rebind::resolve_committed_quorum(&lineage, &policy)?;
     // None carries the existing recovery commitment forward.
     let recovery = recovery_pubkey_b64
         .map(str::to_string)
         .or_else(|| head.recovery_pubkey_b64.clone());
     crate::identity::lineage::LineageRecord::recovery(
-        &head,
+        head,
         successor_pubkey_b64,
         suspected_compromise_from_seq,
         recovery,
@@ -16242,6 +16245,12 @@ pub fn append_recovery(
     recovery_pubkey_b64: Option<&str>,
     not_before: &str,
 ) -> Result<crate::identity::lineage::LineageRecord> {
+    // #10112 (Option B, R-8): an armed store MUST route recovery through
+    // `recovery_preconditions` + `execute_recovery_rebind` with a `K_new`
+    // signing arm — never an unattested direct lineage/rebind write.
+    if row_attest::sqlite::was_armed(conn)? {
+        anyhow::bail!("{}", row_attest::sqlite::REFUSE_RECOVERY_VERIFY_ONLY);
+    }
     let record = mint_recovery_record(
         conn,
         agent_id,

@@ -27685,6 +27685,7 @@ impl MemoryStore for PostgresStore {
         // is the CBOR quorum, NOT a single Ed25519 sig); every other reason is a
         // single predecessor signature. Mirrors the sqlite SSOT branch.
         if record.reason == LineageReason::Recovery {
+            let prior_lineage = self.read_lineage(agent_id).await?;
             let policy = crate::identity::lineage::RecoveryPolicy::from_env().ok_or_else(|| {
                 invalid(
                     "cannot mint a recovery record — no recovery guardians enrolled \
@@ -27692,6 +27693,17 @@ impl MemoryStore for PostgresStore {
                         .to_string(),
                 )
             })?;
+            // #10112 R-2: prior signed lineage record's committed quorum rules.
+            if let Some((prior_gid, prior_thr)) =
+                crate::storage::recovery_rebind::committed_quorum_from_lineage(&prior_lineage)
+                && (record.guardian_set_id.as_deref() != Some(prior_gid.as_slice())
+                    || record.recovery_threshold != Some(prior_thr)
+                    || policy.guardian_set_id() != prior_gid)
+            {
+                return Err(invalid(
+                    crate::storage::row_attest::sqlite::REFUSE_RECOVERY_QUORUM_DRIFT.to_string(),
+                ));
+            }
             crate::identity::lineage::verify_recovery_record(record, signature, &policy).map_err(
                 |e| {
                     invalid(format!(
@@ -27699,6 +27711,14 @@ impl MemoryStore for PostgresStore {
                     ))
                 },
             )?;
+            // #10112 R-13 (Option B, vote V1-RECOVER-REBIND-ATTEST): PostgreSQL
+            // does not yet implement a K_new row-attestation signing arm, so
+            // refuse unattested recovery rebinds with the same named refusal
+            // before opening any write transaction (zero DB writes).
+            return Err(StoreError::UnsupportedCapability {
+                capability: crate::storage::row_attest::sqlite::REFUSE_RECOVERY_VERIFY_ONLY
+                    .to_string(),
+            });
         } else {
             let predecessor =
                 crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)

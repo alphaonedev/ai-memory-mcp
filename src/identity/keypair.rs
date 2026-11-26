@@ -106,7 +106,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::validate;
 
 /// Suffix for the public-key file (`<agent_id>.pub`).
-const PUB_SUFFIX: &str = ".pub";
+pub(crate) const PUB_SUFFIX: &str = ".pub";
 /// Suffix for the private-key file (`<agent_id>.priv`).
 const PRIV_SUFFIX: &str = ".priv";
 

@@ -147,10 +147,22 @@ pub(super) fn bind_agent_pubkey_no_tx(
     pubkey_b64: &str,
     proof: &crate::identity::pubkey_bind::PossessionProof,
 ) -> Result<()> {
+    bind_agent_pubkey_no_tx_at(conn, agent_id, pubkey_b64, proof, &Utc::now().to_rfc3339())
+}
+
+/// In-transaction pubkey bind at an explicit RFC3339 timestamp `now` (#10112
+/// R-9: ensures `K_old.superseded_at`, `K_new.bound_at`, the `_agents` row
+/// update, and the `row_attestations` rebind row share ONE exact timestamp).
+pub(super) fn bind_agent_pubkey_no_tx_at(
+    conn: &Connection,
+    agent_id: &str,
+    pubkey_b64: &str,
+    proof: &crate::identity::pubkey_bind::PossessionProof,
+    now: &str,
+) -> Result<()> {
     use rusqlite::OptionalExtension as _;
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let title = crate::models::agent_registration_title(agent_id);
-    let now = Utc::now().to_rfc3339();
     // Fail-closed BEFORE any ledger append: an unregistered agent must not
     // leave a history row behind (the flat UPDATE below is what has always
     // enforced this, and it still does — this probe only moves the refusal
@@ -184,7 +196,7 @@ pub(super) fn bind_agent_pubkey_no_tx(
                 .map(|(key, superseded)| (key.as_str(), superseded.is_none())),
         )
         .map_err(anyhow::Error::new)?;
-    append_agent_pubkey_version(conn, agent_id, pubkey_b64, proof, &now)?;
+    append_agent_pubkey_version(conn, agent_id, pubkey_b64, proof, now)?;
     // #9259 - the flat projection carries the OPEN history row's `bound_at`,
     // not `now`: a same-key rebind appends no version and keeps the original
     // validity boundary, so writing `now` would move it (and the v102 guard
@@ -209,7 +221,7 @@ pub(super) fn bind_agent_pubkey_no_tx(
                 '$.attest_level', 'claimed'),
             updated_at = ?5
          WHERE namespace = ?1 AND title = ?2",
-        params![AGENTS_NAMESPACE, &title, pubkey_b64, &bound_at, &now],
+        params![AGENTS_NAMESPACE, &title, pubkey_b64, &bound_at, now],
     )?;
     if affected == 0 {
         return Err(anyhow::anyhow!(
@@ -233,7 +245,7 @@ pub(super) fn bind_agent_pubkey_no_tx(
             None,
             AGENTS_NAMESPACE,
             None,
-            &now,
+            now,
         )?;
     }
     Ok(())
