@@ -33,8 +33,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AgentAttestation, RowSignatureVerdict, SignatureFailure, SignedEvent, SignerIdentity,
-    canonical_chain_bytes,
+    ZERO_HASH, canonical_chain_bytes,
 };
+use crate::governance::daemon_signer::DaemonChainSigner;
 
 /// #10108 — the `event_type` of the single cutover marker row. Append refuses
 /// it on both backends; only the v103 migration step writes it.
@@ -133,6 +134,141 @@ pub fn build_marker(
         sequence,
         cause_hash: None,
     })
+}
+
+/// #10145 — the domain tag of the signed marker's payload preimage (v2: it
+/// carries the origin; I-9).
+const AGENT_CUTOVER_PREIMAGE_DOMAIN_V2: &[u8] = b"ai-memory/signed-events/agent-cutover-v2\0";
+
+/// #10145 (I-9) — where a signed marker came from. The byte is the first byte
+/// of the marker's `payload_hash` and is inside the hashed preimage, so the
+/// daemon signature covers it twice; no other byte decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerOrigin {
+    /// A fresh database: the schema create wrote it at sequence 1.
+    Create,
+    /// An existing database bumped to v103.
+    Migrate,
+    /// A database written by an import.
+    Import,
+}
+
+impl MarkerOrigin {
+    /// Every origin, in byte order.
+    pub const ALL: [Self; 3] = [Self::Create, Self::Migrate, Self::Import];
+
+    /// The stored byte.
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        match self {
+            Self::Create => 1,
+            Self::Migrate => 2,
+            Self::Import => 3,
+        }
+    }
+
+    /// The origin of a stored byte; `None` for every other byte.
+    #[must_use]
+    pub const fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::Create),
+            2 => Some(Self::Migrate),
+            3 => Some(Self::Import),
+            _ => None,
+        }
+    }
+}
+
+/// #10145 — the signed marker's `payload_hash`: the origin byte, then
+/// SHA-256 over the v2 domain tag, the big-endian sequence, the
+/// length-prefixed preceding head hash, the big-endian legacy agent-row count
+/// and the origin byte. A non-positive `sequence` is `None`.
+#[must_use]
+pub fn signed_marker_payload_hash(
+    sequence: i64,
+    prev_head_hash: &[u8],
+    legacy_agent_rows: u64,
+    origin: MarkerOrigin,
+) -> Option<Vec<u8>> {
+    let seq = u64::try_from(sequence).ok().filter(|s| *s > 0)?;
+    let prev_len = u64::try_from(prev_head_hash.len()).ok()?;
+    let mut h = Sha256::new();
+    h.update(AGENT_CUTOVER_PREIMAGE_DOMAIN_V2);
+    h.update(seq.to_be_bytes());
+    h.update(prev_len.to_be_bytes());
+    h.update(prev_head_hash);
+    h.update(legacy_agent_rows.to_be_bytes());
+    h.update([origin.byte()]);
+    let mut out = Vec::with_capacity(1 + 32);
+    out.push(origin.byte());
+    out.extend_from_slice(&h.finalize());
+    Some(out)
+}
+
+/// The sequence and link hash of a marker above `prev` (`None`: the genesis
+/// position, sequence 1 above [`ZERO_HASH`]).
+fn marker_position(prev: Option<&SignedEvent>) -> Option<(i64, Vec<u8>)> {
+    match prev {
+        None => Some((1, ZERO_HASH.to_vec())),
+        Some(head) => Some((
+            head.sequence.checked_add(1)?,
+            Sha256::digest(canonical_chain_bytes(head)).to_vec(),
+        )),
+    }
+}
+
+/// #10145 (I-2, I-9) — the signed marker row, at sequence 1 above
+/// [`ZERO_HASH`] when `prev` is `None` (a fresh chain) or directly above
+/// `prev`. Only a [`DaemonChainSigner`] can build one, so no unsigned marker
+/// can be constructed. `None` on a sequence overflow.
+#[must_use]
+pub fn build_signed_marker(
+    signer: &DaemonChainSigner,
+    prev: Option<&SignedEvent>,
+    legacy_agent_rows: u64,
+    origin: MarkerOrigin,
+    id: String,
+    timestamp: String,
+) -> Option<SignedEvent> {
+    let (sequence, prev_hash) = marker_position(prev)?;
+    let payload_hash = signed_marker_payload_hash(sequence, &prev_hash, legacy_agent_rows, origin)?;
+    let mut row = SignedEvent {
+        id,
+        agent_id: AGENT_CUTOVER_AGENT_ID.to_string(),
+        event_type: AGENT_CUTOVER_EVENT_TYPE.to_string(),
+        payload_hash,
+        signature: None,
+        attest_level: String::new(),
+        timestamp,
+        prev_hash,
+        sequence,
+        cause_hash: None,
+    };
+    signer.sign_row(&mut row);
+    Some(row)
+}
+
+/// #10145 — the origin of `marker` when it is a well-formed signed marker
+/// directly above `prev` (`None`: the genesis position) over
+/// `legacy_agent_rows`, its recompute matches and its signature verifies
+/// under `vk` (the daemon key resolved outside the database); else `None`.
+#[must_use]
+pub fn verify_signed_marker(
+    vk: &ed25519_dalek::VerifyingKey,
+    marker: &SignedEvent,
+    prev: Option<&SignedEvent>,
+    legacy_agent_rows: u64,
+) -> Option<MarkerOrigin> {
+    let (sequence, prev_hash) = marker_position(prev)?;
+    let origin = MarkerOrigin::from_byte(*marker.payload_hash.first()?)?;
+    let expected = signed_marker_payload_hash(sequence, &prev_hash, legacy_agent_rows, origin)?;
+    let well_formed = marker.agent_id == AGENT_CUTOVER_AGENT_ID
+        && marker.event_type == AGENT_CUTOVER_EVENT_TYPE
+        && marker.cause_hash.is_none()
+        && marker.sequence == sequence
+        && marker.prev_hash == prev_hash
+        && marker.payload_hash == expected;
+    (well_formed && DaemonChainSigner::verify_row(vk, marker)).then_some(origin)
 }
 
 /// #10108 — the resolved cutover of one database. Matched exhaustively by

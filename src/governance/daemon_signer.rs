@@ -11,7 +11,9 @@
 //! `tests/daemon_signer_ratchet_10074.rs` holds that no other file reaches the
 //! key or signs with it.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
@@ -110,12 +112,171 @@ pub fn preimage(domain: DaemonDomain, body: &[u8]) -> Vec<u8> {
 #[must_use]
 pub fn sign(domain: DaemonDomain, body: &[u8]) -> Option<(Vec<u8>, &'static str)> {
     let key = DAEMON_AUDIT_KEY.get()?;
-    let sig: Signature = key.sign(&preimage(domain, body));
     Some((
-        sig.to_bytes().to_vec(),
+        sign_with(key, domain, body),
         crate::models::AttestLevel::DaemonSigned.as_str(),
     ))
 }
+
+/// The one daemon `.sign(` call: `key` over `domain.tag() || body`.
+fn sign_with(key: &SigningKey, domain: DaemonDomain, body: &[u8]) -> Vec<u8> {
+    let sig: Signature = key.sign(&preimage(domain, body));
+    sig.to_bytes().to_vec()
+}
+
+/// #10145 (3-agent vote (71472661) V2-10108-KEYLESS-MARKER) — the daemon key
+/// as a value, for the one path that writes the signed genesis marker (schema
+/// create or v103 bump). It holds the private half by construction: no
+/// `Default`, no `Option`, and the only way in is `TryFrom<AgentKeypair>`,
+/// which refuses a public-only or mismatched keypair. It is never cloned and
+/// its `Debug` never prints the key.
+pub struct DaemonChainSigner {
+    key: SigningKey,
+}
+
+impl std::fmt::Debug for DaemonChainSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonChainSigner")
+            .field("verifying_key", &self.key.verifying_key())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TryFrom<crate::identity::keypair::AgentKeypair> for DaemonChainSigner {
+    type Error = DaemonKeyMissing;
+
+    fn try_from(kp: crate::identity::keypair::AgentKeypair) -> Result<Self, Self::Error> {
+        let Some(key) = kp.private else {
+            return Err(DaemonKeyMissing::new(DaemonKeyCause::PublicOnly, None));
+        };
+        if key.verifying_key() != kp.public {
+            return Err(DaemonKeyMissing::new(DaemonKeyCause::KeyMismatch, None));
+        }
+        Ok(Self { key })
+    }
+}
+
+impl DaemonChainSigner {
+    /// The public half, for verifying what this signer wrote.
+    #[must_use]
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.key.verifying_key()
+    }
+
+    /// Sign `row` as a daemon row: sets `attest_level` to `daemon_signed`
+    /// first (it is part of the signed input), then the signature over
+    /// [`DaemonDomain::EventRow`] and
+    /// [`crate::signed_events::daemon_row_signing_input`].
+    pub fn sign_row(&self, row: &mut crate::signed_events::SignedEvent) {
+        crate::models::AttestLevel::DaemonSigned
+            .as_str()
+            .clone_into(&mut row.attest_level);
+        let body = crate::signed_events::daemon_row_signing_input(row);
+        row.signature = Some(sign_with(&self.key, DaemonDomain::EventRow, &body));
+    }
+
+    /// `true` iff `row` is `daemon_signed` and its signature verifies under
+    /// `vk` over the same input [`Self::sign_row`] signs.
+    #[must_use]
+    pub fn verify_row(vk: &VerifyingKey, row: &crate::signed_events::SignedEvent) -> bool {
+        let Some(sig) = row.signature.as_deref() else {
+            return false;
+        };
+        row.attest_level == crate::models::AttestLevel::DaemonSigned.as_str()
+            && verify(
+                vk,
+                DaemonDomain::EventRow,
+                &crate::signed_events::daemon_row_signing_input(row),
+                sig,
+            )
+    }
+}
+
+/// Why no [`DaemonChainSigner`] could be built. Matched exhaustively by the
+/// refusal text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonKeyCause {
+    /// Key generation is disabled (`[identity].disabled`) and no key exists.
+    GenerationDisabled,
+    /// The public half exists without its private half.
+    PublicOnly,
+    /// The private half exists without its public half (never healed here).
+    PrivateOnly,
+    /// The two halves are not one keypair.
+    KeyMismatch,
+    /// No key directory resolves (no home directory).
+    NoKeyDir,
+    /// The key directory is unwritable or insecure, or a key file is unreadable.
+    KeyDirUnusable,
+}
+
+impl DaemonKeyCause {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::GenerationDisabled => "key generation is disabled and no daemon key exists",
+            Self::PublicOnly => "the daemon public key exists without its private key",
+            Self::PrivateOnly => "the daemon private key exists without its public key",
+            Self::KeyMismatch => "the daemon public and private keys are not one keypair",
+            Self::NoKeyDir => "no key directory resolves (no home directory)",
+            Self::KeyDirUnusable => {
+                "the key directory is unwritable or insecure, or a key file is unreadable"
+            }
+        }
+    }
+}
+
+static DAEMON_KEY_MISSING_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// How many [`DaemonKeyMissing`] refusals this process has raised.
+#[must_use]
+pub fn daemon_key_missing_total() -> u64 {
+    DAEMON_KEY_MISSING_TOTAL.load(Ordering::Relaxed)
+}
+
+/// #10145 K-3 — the typed, counted refusal of a schema create or v103 bump
+/// that has no daemon private key. Nothing is written when it is raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonKeyMissing {
+    cause: DaemonKeyCause,
+    key_dir: Option<PathBuf>,
+}
+
+impl DaemonKeyMissing {
+    /// Raise (and count) the refusal.
+    #[must_use]
+    pub fn new(cause: DaemonKeyCause, key_dir: Option<&Path>) -> Self {
+        DAEMON_KEY_MISSING_TOTAL.fetch_add(1, Ordering::Relaxed);
+        Self {
+            cause,
+            key_dir: key_dir.map(Path::to_path_buf),
+        }
+    }
+
+    /// The cause.
+    #[must_use]
+    pub fn cause(&self) -> DaemonKeyCause {
+        self.cause
+    }
+}
+
+impl std::fmt::Display for DaemonKeyMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dir = self
+            .key_dir
+            .as_deref()
+            .map_or_else(|| "<unresolved>".to_string(), |d| d.display().to_string());
+        write!(
+            f,
+            "daemon key missing: {}; creating or upgrading the database needs the daemon \
+             signing key (key directory {dir}, override with AI_MEMORY_KEY_DIR); provision it \
+             with `ai-memory identity generate --agent-id daemon`; the database was not \
+             touched and can still be copied out with `ai-memory backup`",
+            self.cause.describe()
+        )
+    }
+}
+
+impl std::error::Error for DaemonKeyMissing {}
 
 /// `true` iff `signature` is a strict Ed25519 signature by `vk` over
 /// `domain.tag() || body`.
