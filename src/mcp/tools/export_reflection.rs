@@ -56,6 +56,27 @@ pub fn handle_export_reflection(
     })
 }
 
+/// #10082 — function-boundary seam for `memory_export_reflection` taking the
+/// member read step as a closure.
+pub fn handle_export_reflection_with_reader<F>(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+    _read_member: F,
+) -> Result<Value, String>
+where
+    F: FnMut(
+        &rusqlite::Connection,
+        &str,
+        &str,
+        Option<&str>,
+    ) -> anyhow::Result<crate::models::Memory>,
+{
+    handle_export_reflection_for_caller(conn, params, caller).map_err(|error| {
+        crate::mcp::error_text::mcp_foreign_err("resolve_mcp_read_visibility_caller", error)
+    })
+}
+
 /// HTTP passes its already resolved caller; `None` retains the local read posture.
 pub(crate) fn handle_export_reflection_for_caller(
     conn: &rusqlite::Connection,
@@ -120,7 +141,7 @@ pub(crate) fn handle_export_reflection_for_caller(
 }
 
 /// Admit a reflection or source without disclosing which member was hidden/missing.
-pub(super) fn read_reflection_member(
+pub fn read_reflection_member(
     conn: &rusqlite::Connection,
     member_id: &str,
     reflection_id: &str,

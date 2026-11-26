@@ -251,3 +251,135 @@ fn unsealed_visible_members_export_10064() {
         "the rendered payload names the reflection"
     );
 }
+
+/// #10082 — when a source row becomes sealed INSIDE the injected read step
+/// (closing the window between the pre-read classification and the read
+/// return), the post-read re-check MUST refuse with the exact
+/// `SEALED_EXPORT_REFUSED` text naming the source, and export nothing.
+#[test]
+fn source_sealed_inside_injected_read_is_refused_10082() {
+    for seal_before_inner_read in [false, true] {
+        let fx = Fixture::new(member(Seen::ByAll, false), member(Seen::ByAll, false));
+        let conn = db::open(&fx.db_path).expect("open db");
+        let source_id = fx.source_id.clone();
+        let mut sealed_fired = false;
+        let err = ai_memory::mcp::handle_export_reflection_with_reader(
+            &conn,
+            &serde_json::json!({"memory_id": fx.reflection_id, "format": "md"}),
+            Some(BOB),
+            |c, member_id, reflection_id, caller| {
+                if member_id == source_id && seal_before_inner_read {
+                    let changed = c
+                        .execute(
+                            "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+                            rusqlite::params![sealed_envelope(), member_id],
+                        )
+                        .expect("seal source before inner read");
+                    assert_eq!(changed, 1);
+                    sealed_fired = true;
+                }
+                let mem =
+                    ai_memory::mcp::read_reflection_member(c, member_id, reflection_id, caller)?;
+                if member_id == source_id && !seal_before_inner_read {
+                    let changed = c
+                        .execute(
+                            "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+                            rusqlite::params![sealed_envelope(), member_id],
+                        )
+                        .expect("seal source after inner read");
+                    assert_eq!(changed, 1);
+                    sealed_fired = true;
+                }
+                Ok(mem)
+            },
+        )
+        .expect_err("#10082: source sealed inside read must refuse export");
+        assert!(
+            sealed_fired,
+            "#10082: injected read seam must execute and seal the source row"
+        );
+        assert_eq!(
+            err,
+            expected_refusal(&fx.source_id),
+            "#10082: post-read re-check must emit exact SEALED_EXPORT_REFUSED naming source"
+        );
+        assert_no_marker(&err, "post-read sealed source 10082");
+    }
+}
+
+/// #10082 — sibling in the same handler: when the reflection row itself
+/// becomes sealed INSIDE the injected read step, the post-read re-check MUST
+/// refuse with `SEALED_EXPORT_REFUSED` naming the reflection.
+#[test]
+fn reflection_sealed_inside_injected_read_is_refused_10082() {
+    let fx = Fixture::new(member(Seen::ByAll, false), member(Seen::ByAll, false));
+    let conn = db::open(&fx.db_path).expect("open db");
+    let reflection_id_target = fx.reflection_id.clone();
+    let mut sealed_fired = false;
+    let err = ai_memory::mcp::handle_export_reflection_with_reader(
+        &conn,
+        &serde_json::json!({"memory_id": fx.reflection_id, "format": "md"}),
+        Some(BOB),
+        |c, member_id, reflection_id, caller| {
+            let mem = ai_memory::mcp::read_reflection_member(c, member_id, reflection_id, caller)?;
+            if member_id == reflection_id_target {
+                let changed = c
+                    .execute(
+                        "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+                        rusqlite::params![sealed_envelope(), member_id],
+                    )
+                    .expect("seal reflection inside read");
+                assert_eq!(changed, 1);
+                sealed_fired = true;
+            }
+            Ok(mem)
+        },
+    )
+    .expect_err("#10082: reflection sealed inside read must refuse export");
+    assert!(
+        sealed_fired,
+        "#10082: injected read seam must execute and seal the reflection row"
+    );
+    assert_eq!(
+        err,
+        expected_refusal(&fx.reflection_id),
+        "#10082: post-read re-check must emit exact SEALED_EXPORT_REFUSED naming reflection"
+    );
+    assert_no_marker(&err, "post-read sealed reflection 10082");
+}
+
+/// #10082 — pre-read check proof: a source that is ALREADY sealed before the
+/// read MUST be refused BEFORE the injected decrypting reader is ever called
+/// (kills the "pre-read check removed" mutant even on visible sealed rows).
+#[test]
+fn pre_read_sealed_source_never_invokes_decrypting_reader_10082() {
+    let fx = Fixture::new(member(Seen::ByAll, false), member(Seen::ByAll, true));
+    let conn = db::open(&fx.db_path).expect("open db");
+    let source_id = fx.source_id.clone();
+    let mut source_reader_invoked = false;
+    let mut reflection_reader_invoked = false;
+    let err = ai_memory::mcp::handle_export_reflection_with_reader(
+        &conn,
+        &serde_json::json!({"memory_id": fx.reflection_id, "format": "md"}),
+        Some(BOB),
+        |c, member_id, reflection_id, caller| {
+            if member_id == source_id {
+                source_reader_invoked = true;
+            } else {
+                reflection_reader_invoked = true;
+            }
+            ai_memory::mcp::read_reflection_member(c, member_id, reflection_id, caller)
+        },
+    )
+    .expect_err("#10082: already-sealed visible source must be refused");
+    assert!(
+        reflection_reader_invoked,
+        "#10082: unsealed reflection must still pass through injected reader"
+    );
+    assert!(
+        !source_reader_invoked,
+        "#10082: pre-read check must refuse already-sealed source before calling reader"
+    );
+    assert_eq!(err, expected_refusal(&fx.source_id));
+    assert_no_marker(&err, "pre-read sealed source 10082");
+}

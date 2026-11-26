@@ -885,8 +885,10 @@ pub use skill_retire::{handle_skill_delete, handle_skill_retire};
 // entirely (SR-4 three-surface-parity audit gap).
 pub use calibrate_confidence::handle_calibrate_confidence;
 pub use dependents_of_invalidated::handle_dependents_of_invalidated;
-pub use export_reflection::handle_export_reflection;
 pub(crate) use export_reflection::handle_export_reflection_for_caller;
+pub use export_reflection::{
+    handle_export_reflection, handle_export_reflection_with_reader, read_reflection_member,
+};
 pub use pending::{DlqListError, handle_subscription_dlq_list, handle_subscription_dlq_list_for};
 pub use reflect::{handle_reflect, handle_reflect_caller};
 // Consumed only by the postgres SAL HTTP branch in `route_1111`, which is
