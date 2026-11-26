@@ -134,7 +134,8 @@ async fn pg_schema_tip_carries_the_partial_title_slot_index_3690() {
         .await
         .expect("schema_version");
     // #8341: tip pin moved 101 -> 102 with the FTS projection guard.
-    assert_eq!(version, 102);
+    // #10108: 102 -> 103 with the agent signature places.
+    assert_eq!(version, 103);
     let indexdef: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'memories_title_ns_uidx'",
     )
@@ -838,8 +839,12 @@ async fn pg_refused_conflict_keeps_its_typed_shape_and_a_visible_occupant_keeps_
 const TSV_SCRATCH_PREFIX: &str = "ai_memory_tsv8341_";
 /// The v101 shape: v102 is stamp-only on postgres, so dropping its stamp is
 /// the whole of the v101-equivalent rewind.
+/// #10108: the v103 stamp above v102 is dropped too (its DDL is IF NOT
+/// EXISTS and its marker is skipped on an empty chain).
 const V101_EQUIVALENT: i32 = 101;
-const V102_TIP: i32 = 102;
+const V102_RUNG: i32 = 102;
+/// #10108: the ladder tip moved 102 -> 103.
+const LADDER_TIP: i32 = 103;
 const TSV_AMENDED_TITLE: &str = "plain ascii";
 /// `(title, content)`; titles are unique so they key the snapshot.
 const TSV_CORPUS: [(&str, &str); 5] = [
@@ -954,11 +959,11 @@ async fn pg_tsv_rows_are_identical_at_v101_equivalent_and_v102_8341() {
     let url = scratch.url();
     drop(PostgresStore::connect(&url).await.expect("greenfield"));
     let pool = tsv_pool(&url).await;
-    assert_eq!(max_version(&pool).await, V102_TIP);
+    assert_eq!(max_version(&pool).await, LADDER_TIP);
     let catalog_v102 = tsv_catalog(&pool).await;
 
-    sqlx::query("DELETE FROM schema_version WHERE version = $1")
-        .bind(V102_TIP)
+    sqlx::query("DELETE FROM schema_version WHERE version >= $1")
+        .bind(V102_RUNG)
         .execute(&pool)
         .await
         .expect("rewind to v101");
@@ -993,7 +998,7 @@ async fn pg_tsv_rows_are_identical_at_v101_equivalent_and_v102_8341() {
             .await
             .expect("ladder re-runs v102"),
     );
-    assert_eq!(max_version(&pool).await, V102_TIP);
+    assert_eq!(max_version(&pool).await, LADDER_TIP);
     assert_eq!(
         tsv_snapshot(&pool, &ns_v101).await,
         at_v101,

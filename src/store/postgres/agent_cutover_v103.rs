@@ -1,0 +1,185 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #10108 (`3-agent vote (71472661)` V1-AGENT-SIG-SCHEMA, decision A,
+//! conditions S-1 and S-3) — the postgres twin of
+//! `crate::storage::agent_cutover_v103`: the v103 arm and the whole-table
+//! cutover resolver. Both backends judge the marker with the SAME
+//! [`crate::signed_events::agent_cutover::resolve`], so a database gives the
+//! same verdict on either. Own module for the qual_10 budget of `postgres.rs`.
+
+use super::legacy_cutoff_10074::{PG_ROW_COLUMNS, to_event};
+use super::{
+    PgSignedEventWalkRow, PostgresStore, TRACE_TARGET, record_schema_version, to_store_err,
+    truncate_to_microseconds,
+};
+use crate::signed_events::SignedEvent;
+use crate::signed_events::agent_cutover::{
+    AGENT_CUTOVER_EVENT_TYPE, AGENT_CUTOVER_ROW_LIMIT, AgentCutover, build_marker,
+    legacy_agent_row_count, resolve,
+};
+use crate::store::{BoxBackendError, StoreError, StoreResult};
+
+/// The v103 DDL: the two `transcript_line_dedup` columns with their CHECK and
+/// the `atomisation_receipts` table (all `IF NOT EXISTS`).
+const MIGRATION_V103_AGENT_SIGNATURE_PLACES: &str =
+    include_str!("../../../migrations/postgres/0060_v103_agent_signature_places.sql");
+
+/// The row with the highest sequence below `below`.
+async fn pg_row_below(
+    conn: &mut sqlx::PgConnection,
+    below: i64,
+    op: &'static str,
+) -> StoreResult<Option<SignedEvent>> {
+    let row: Option<PgSignedEventWalkRow> = sqlx::query_as(&format!(
+        "SELECT {PG_ROW_COLUMNS} FROM signed_events WHERE COALESCE(sequence, 0) < $1 \
+         ORDER BY COALESCE(sequence, 0) DESC, id DESC LIMIT 1"
+    ))
+    .bind(below)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| to_store_err(op, e))?;
+    Ok(row.map(to_event))
+}
+
+/// The agent-labelled row count below `below` (`None` on a corrupt count).
+async fn pg_legacy_agent_rows(
+    conn: &mut sqlx::PgConnection,
+    below: i64,
+    op: &'static str,
+) -> StoreResult<Option<u64>> {
+    let groups: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT attest_level, COUNT(*) FROM signed_events \
+         WHERE COALESCE(sequence, 0) < $1 GROUP BY attest_level",
+    )
+    .bind(below)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| to_store_err(op, e))?;
+    Ok(legacy_agent_row_count(
+        groups.iter().map(|(a, n)| (a.as_str(), *n)),
+    ))
+}
+
+/// #10108 — resolve the postgres cutover over the WHOLE table, in one
+/// `REPEATABLE READ READ ONLY` snapshot (the same shape as the legacy cutoff
+/// resolver), whatever window the caller walks.
+///
+/// # Errors
+/// Propagates a pg read error.
+pub(super) async fn resolve_pg_agent_cutover(pool: &sqlx::PgPool) -> StoreResult<AgentCutover> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| to_store_err("agent_cutover.begin", e))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("agent_cutover.snapshot", e))?;
+    let markers: Vec<PgSignedEventWalkRow> = sqlx::query_as(&format!(
+        "SELECT {PG_ROW_COLUMNS} FROM signed_events WHERE event_type = $1 \
+         ORDER BY COALESCE(sequence, 0) ASC, id ASC LIMIT $2"
+    ))
+    .bind(AGENT_CUTOVER_EVENT_TYPE)
+    .bind(AGENT_CUTOVER_ROW_LIMIT)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| to_store_err("agent_cutover.rows", e))?;
+    let markers: Vec<SignedEvent> = markers.into_iter().map(to_event).collect();
+    let verdict = match markers.first() {
+        None => AgentCutover::Absent,
+        Some(first) => {
+            let below = first.sequence;
+            let prev = pg_row_below(&mut tx, below, "agent_cutover.prev").await?;
+            let count = pg_legacy_agent_rows(&mut tx, below, "agent_cutover.count").await?;
+            resolve(&markers, prev.as_ref(), count)
+        }
+    };
+    // Read only: ending the transaction writes nothing.
+    tx.rollback()
+        .await
+        .map_err(|e| to_store_err("agent_cutover.end", e))?;
+    Ok(verdict)
+}
+
+fn refusal(detail: String) -> StoreError {
+    StoreError::Backend(BoxBackendError::new(format!("migrate v103: {detail}")))
+}
+
+/// v103 (#10108) — the DDL, then the cutover marker appended at the chain
+/// head under `LOCK TABLE signed_events IN EXCLUSIVE MODE`, then the stamp, in
+/// ONE transaction: no committed state is at v103 without its marker (S-3).
+/// Strictly additive; the marker is skipped on an empty chain or when a
+/// marker-type row already exists.
+///
+/// # Errors
+/// A pg error or a corrupt chain head refuses the step; nothing commits.
+pub(super) async fn apply_v103(store: &PostgresStore) -> StoreResult<()> {
+    let mut tx = store
+        .pool
+        .begin()
+        .await
+        .map_err(|e| to_store_err("begin v103 tx", e))?;
+    sqlx::raw_sql(MIGRATION_V103_AGENT_SIGNATURE_PLACES)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("apply v103 agent-signature-places migration", e))?;
+    sqlx::query("LOCK TABLE signed_events IN EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v103 lock signed_events", e))?;
+    let existing: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM signed_events WHERE event_type = $1)")
+            .bind(AGENT_CUTOVER_EVENT_TYPE)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v103 existing marker", e))?;
+    let mut written: Option<i64> = None;
+    if !existing {
+        if let Some(head) = pg_row_below(&mut tx, i64::MAX, "v103 head").await? {
+            let above = head.sequence.saturating_add(1);
+            let Some(count) = pg_legacy_agent_rows(&mut tx, above, "v103 count").await? else {
+                return Err(refusal(format!(
+                    "corrupt attest_level counts below sequence {above}"
+                )));
+            };
+            let ts = truncate_to_microseconds(chrono::Utc::now());
+            let Some(marker) = build_marker(
+                &head,
+                count,
+                uuid::Uuid::new_v4().to_string(),
+                ts.to_rfc3339(),
+            ) else {
+                return Err(refusal(format!("no sequence above head {}", head.sequence)));
+            };
+            sqlx::query(
+                "INSERT INTO signed_events \
+                        (id, agent_id, event_type, payload_hash, signature, attest_level, \
+                         timestamp, prev_hash, sequence, cause_hash) \
+                     VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, NULL)",
+            )
+            .bind(&marker.id)
+            .bind(&marker.agent_id)
+            .bind(&marker.event_type)
+            .bind(&marker.payload_hash)
+            .bind(&marker.attest_level)
+            .bind(ts)
+            .bind(&marker.prev_hash)
+            .bind(marker.sequence)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v103 insert cutover marker", e))?;
+            written = Some(marker.sequence);
+        }
+    }
+    record_schema_version(&mut tx, 103).await?;
+    tx.commit()
+        .await
+        .map_err(|e| to_store_err("commit v103 migration", e))?;
+    tracing::info!(
+        target: TRACE_TARGET,
+        marker_sequence = ?written,
+        "schema migration v103 applied (#10108: agent signature places + cutover marker)"
+    );
+    Ok(())
+}

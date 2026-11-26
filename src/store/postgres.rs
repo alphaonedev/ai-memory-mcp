@@ -82,6 +82,8 @@ mod pubkey_history;
 // arm. The two funnels answer different questions and stay separate.
 mod chain_append;
 mod legacy_cutoff_10074; // #10074 pg cutoff resolver + mint (qual_10 budget)
+// #10108 pg v103 arm + cutover resolver (qual_10 budget).
+mod agent_cutover_v103;
 // v1.0.0 #3520 — the shared bounded-retry funnel for a transaction PostgreSQL
 // aborted as a concurrency victim (40P01 / 40001). Own module for the same
 // qual_10 budget reason as `parity_3064` above.
@@ -830,6 +832,9 @@ const SQL_DELETE_DLQ_BY_MEMORY_IDS: &str =
 /// victim ids (slice-bound twin of [`SQL_DELETE_DLQ_BY_MEMORY_IDS`]).
 const SQL_DELETE_DEDUP_BY_MEMORY_IDS: &str =
     "DELETE FROM transcript_line_dedup WHERE memory_id = ANY($1)";
+/// #10108 (S-8) — purge the v103 atomisation receipts of the victim sources.
+const SQL_DELETE_RECEIPTS_BY_SOURCE_IDS: &str =
+    "DELETE FROM atomisation_receipts WHERE source_id = ANY($1)";
 /// #3272 C-2 — clear the FORGET tombstone for one id on an EXPLICIT
 /// operator/rollback RESTORE only (`restore_or_conflict` → the
 /// `RestoreSameId` CAS). Postgres twin of the sqlite
@@ -2152,7 +2157,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
 // v102: #8341 SQLite FTS projection guard; postgres version-stamp only
 //       (doc twin migrations/postgres/0059_v102_fts_projection_guard_noop.sql).
-const CURRENT_SCHEMA_VERSION: i32 = 102;
+const CURRENT_SCHEMA_VERSION: i32 = 103;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4328,8 +4333,11 @@ impl PostgresStore {
         if current_version < 101 {
             self.migrate_v101().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 102 {
             self.migrate_v102().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v103().await?;
         }
 
         Ok(())
@@ -7531,6 +7539,12 @@ impl PostgresStore {
              for the Agent2Agent standard binding)"
         );
         Ok(())
+    }
+
+    /// v103 (#10108) - agent signature places and the cutover marker; the
+    /// body lives in `agent_cutover_v103::apply_v103` (qual_10 budget).
+    async fn migrate_v103(&self) -> StoreResult<()> {
+        agent_cutover_v103::apply_v103(self).await
     }
 
     /// v102 (#8341) - SQLite-only FTS projection guard. The postgres v97
@@ -16573,6 +16587,7 @@ impl PostgresStore {
             watermark_db_id.as_deref(),
         )
         .await?;
+        let agent_cutover = agent_cutover_v103::resolve_pg_agent_cutover(&self.pool).await?;
         let recorder_verifier = crate::governance::audit::load_enrolled_recorder_pubkey()
             .ok()
             .flatten();
@@ -16606,12 +16621,14 @@ impl PostgresStore {
                 sequence: seq,
                 cause_hash: cause,
             };
-            let rv = crate::signed_events::classify_row_signature(
-                &ev,
-                daemon_verifier,
-                recorder_verifier.as_ref(),
-                &cutoff,
-            );
+            let rv = agent_cutover.verdict_for(&ev).unwrap_or_else(|| {
+                crate::signed_events::classify_row_signature(
+                    &ev,
+                    daemon_verifier,
+                    recorder_verifier.as_ref(),
+                    &cutoff,
+                )
+            });
             if rv.is_verified() {
                 rows_positively_verified += 1;
             }
@@ -17252,6 +17269,10 @@ pub(crate) async fn pg_purge_dlq_dedup_in_tx(
         .execute(&mut **tx)
         .await?;
     sqlx::query(SQL_DELETE_DEDUP_BY_MEMORY_IDS)
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_DELETE_RECEIPTS_BY_SOURCE_IDS)
         .bind(ids)
         .execute(&mut **tx)
         .await?;

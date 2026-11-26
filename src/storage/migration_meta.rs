@@ -476,6 +476,14 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // and the FTS index is regenerable. Postgres twin is a version stamp
     // (`PostgresStore::migrate_v102`).
     meta(102, "FTS_PROJECTION_GUARD", true, false, NoLoss, Sqlite),
+    // v103 (#10108, signed writes) — `transcript_line_dedup.host_signature`
+    // and `host_pubkey` (NULL-able, both-or-neither), the new
+    // `atomisation_receipts` table and ONE appended
+    // `signed_events.agent_cutover` row, stamped in the same transaction.
+    // Idempotent (column probes, IF NOT EXISTS, the marker is skipped when one
+    // exists). NOT reversible: the appended chain row is history. NoLoss: no
+    // existing row is rewritten. Postgres twin `PostgresStore::migrate_v103`.
+    meta(103, "AGENT_SIGNATURE_PLACES", true, false, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

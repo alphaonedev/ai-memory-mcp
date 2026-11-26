@@ -88,6 +88,9 @@ const SQL_DELETE_DLQ_BY_MEMORY_ID: &str = "DELETE FROM federation_push_dlq WHERE
 /// deleted id.
 const SQL_DELETE_DEDUP_BY_MEMORY_ID: &str =
     "DELETE FROM transcript_line_dedup WHERE memory_id = ?1";
+/// #10108 (S-8) — purge the v103 atomisation receipts of a deleted source id.
+const SQL_DELETE_RECEIPTS_BY_SOURCE_ID: &str =
+    "DELETE FROM atomisation_receipts WHERE source_id = ?1";
 /// #3272 C-2 — clear the FORGET tombstone for one id on an EXPLICIT
 /// operator/rollback RESTORE only (`insert_restore_same_id`). A restored
 /// original must be federation-syncable ([`insert_if_newer`]) and importable
@@ -932,6 +935,8 @@ pub use approval_depth::{
 };
 /// #8444 - durable Agent2Agent Task rows (SQLite SSOT; postgres twin in the store).
 pub mod a2a_tasks;
+/// #10108 - v103: agent signature places and the agent cutover marker.
+mod agent_cutover_v103;
 /// #8341 - the `_agents` public-key projection every write funnel carries (v102).
 pub(crate) mod agent_projection;
 pub mod embed_skip;
@@ -6079,9 +6084,14 @@ fn purge_and_tombstone_forget(
         q
     };
     let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(AsRef::as_ref).collect();
-    for table in ["federation_push_dlq", "transcript_line_dedup"] {
+    for (table, column) in [
+        ("federation_push_dlq", "memory_id"),
+        ("transcript_line_dedup", "memory_id"),
+        // #10108 (S-8) — the v103 receipts of a forgotten source.
+        ("atomisation_receipts", "source_id"),
+    ] {
         conn.execute(
-            &format!("DELETE FROM {table} WHERE memory_id IN ({victims})"),
+            &format!("DELETE FROM {table} WHERE {column} IN ({victims})"),
             refs.as_slice(),
         )?;
     }
@@ -6729,6 +6739,7 @@ fn tombstone_and_erase(
     // content-hash oracle intact AFTER the "crypto-erase".
     conn.execute(SQL_DELETE_DLQ_BY_MEMORY_ID, params![id])?;
     conn.execute(SQL_DELETE_DEDUP_BY_MEMORY_ID, params![id])?;
+    conn.execute(SQL_DELETE_RECEIPTS_BY_SOURCE_ID, params![id])?;
     Ok(())
 }
 

@@ -1361,19 +1361,27 @@ fn apply_all_classes(
         let ev: crate::signed_events::SignedEvent = dto.clone().into();
         // #10074 (S-2) — a restore carries its one cutoff row byte-for-byte
         // (standard 4), but never a SECOND cutoff row next to a different one.
-        if ev.event_type == crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE {
+        // #10108 (S-3) — the same holds for the v103 agent cutover marker.
+        let single = match ev.event_type.as_str() {
+            crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE => Some(("legacy cutoff", "cutoff")),
+            crate::signed_events::AGENT_CUTOVER_EVENT_TYPE => {
+                Some(("agent cutover", "cutover marker"))
+            }
+            _ => None,
+        };
+        if let Some((kind, noun)) = single {
             let other: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM signed_events \
                      WHERE event_type = ?1 AND id <> ?2)",
-                    params![crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE, ev.id],
+                    params![ev.event_type, ev.id],
                     |r| r.get(0),
                 )
-                .with_context(|| format!("import: cutoff probe for signed_event {}", ev.id))?;
+                .with_context(|| format!("import: {kind} probe for signed_event {}", ev.id))?;
             if other {
                 anyhow::bail!(
-                    "import signed_event {} (sequence {}): a different legacy cutoff row \
-                     already exists; refusing a second cutoff",
+                    "import signed_event {} (sequence {}): a different {kind} row \
+                     already exists; refusing a second {noun}",
                     ev.id,
                     ev.sequence
                 );

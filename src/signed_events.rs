@@ -135,6 +135,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+pub mod agent_cutover;
+pub use agent_cutover::{AGENT_CUTOVER_EVENT_TYPE, AgentCutover};
 pub mod agent_row;
 #[cfg(test)]
 mod agent_row_10108_tests;
@@ -1270,6 +1272,9 @@ pub enum SignatureFailure {
     /// #10105 — an agent-signed row whose signature is not exactly
     /// [`ed25519_dalek::SIGNATURE_LENGTH`] bytes (an empty blob included).
     AgentSignatureMalformed,
+    /// #10108 (B-5, S-3) — a `signed_events.agent_cutover` row whose recompute
+    /// did not match, or one of two or more such rows.
+    CutoverMarkerInvalid,
 }
 
 impl SignatureFailure {
@@ -1283,6 +1288,7 @@ impl SignatureFailure {
             Self::LegacyPayloadOnlyAfterCutoff => "legacy_payload_only_after_cutoff",
             Self::AgentSignatureMissing => "agent_signature_missing",
             Self::AgentSignatureMalformed => "agent_signature_malformed",
+            Self::CutoverMarkerInvalid => "agent_cutover_marker_invalid",
         }
     }
 }
@@ -1330,6 +1336,7 @@ impl RowSignatureVerdict {
                     | SignatureFailure::LegacyPayloadOnlyAfterCutoff
                     | SignatureFailure::AgentSignatureMissing
                     | SignatureFailure::AgentSignatureMalformed
+                    | SignatureFailure::CutoverMarkerInvalid
             )
         )
     }
@@ -1581,6 +1588,8 @@ pub fn verify_chain(
     // `since_sequence` is, so a windowed walk that starts above the cutoff
     // still refuses every legacy form when the cutoff is missing or invalid.
     let cutoff = resolve_sqlite_legacy_cutoff(conn, verifier)?;
+    // #10108 — the agent cutover marker, resolved over the whole table too.
+    let agent_cutover = agent_cutover::resolve_sqlite_agent_cutover(conn)?;
     let mut signature_failures: Vec<i64> = Vec::new();
     let mut role_separation_failures: Vec<i64> = Vec::new();
     let mut rows_positively_verified: u64 = 0;
@@ -1673,7 +1682,9 @@ pub fn verify_chain(
         // the postgres verify twin (C7) surface IDENTICAL signature_failures +
         // role_separation_failures (K3 parity). A signature failure is disjoint
         // from a chain break by design (per-row forgery vs substrate tamper).
-        let rv = classify_row_signature(&event, verifier, recorder_verifier.as_ref(), &cutoff);
+        let rv = agent_cutover.verdict_for(&event).unwrap_or_else(|| {
+            classify_row_signature(&event, verifier, recorder_verifier.as_ref(), &cutoff)
+        });
         if rv.is_verified() {
             rows_positively_verified += 1;
         }
@@ -3759,6 +3770,13 @@ pub fn append_signed_event_no_tx(
         anyhow::bail!(
             "append signed_event: event_type {LEGACY_CUTOFF_EVENT_TYPE} is reserved for the \
              operator legacy-cutoff mint"
+        );
+    }
+    // #10108 (S-3) — the cutover marker is written only by schema step v103.
+    if event.event_type == AGENT_CUTOVER_EVENT_TYPE {
+        anyhow::bail!(
+            "append signed_event: event_type {AGENT_CUTOVER_EVENT_TYPE} is reserved for \
+             schema step v103"
         );
     }
     let (max_seq, prev_hash) = read_chain_head(conn).context("append signed_event: read head")?;
