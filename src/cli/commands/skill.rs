@@ -1381,4 +1381,80 @@ mod tests {
             );
         }
     }
+
+    /// #10122 — all five skill read verbs (`list`, `get`, `resource`, `export`,
+    /// `compose`) MUST refuse a shape-invalid `AI_MEMORY_AGENT_ID` BEFORE
+    /// opening the database (`db::open` runs migrations and
+    /// `scan_head_anchor_log`). Using a path whose parent is a regular file
+    /// proves `db::open` is never reached on a refused agent id.
+    #[test]
+    fn skill_read_verbs_refuse_invalid_agent_id_before_db_open_10122() {
+        const BAD: &str = "not a valid id";
+        let _guard = crate::identity::test_agent_id::AgentIdOverride::set(BAD);
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        let unopenable_db = blocker.join("ai-memory.db");
+        let want_reason = format!(
+            "AI_MEMORY_AGENT_ID is invalid: {}",
+            crate::validate::validate_agent_id_shape(BAD).expect_err("BAD must be shape-invalid")
+        );
+        let verbs = [
+            (
+                "list",
+                SkillAction::List(ListArgs {
+                    namespace: None,
+                    filter: None,
+                    include_retired: false,
+                    json: true,
+                }),
+            ),
+            (
+                "get",
+                SkillAction::Get(GetArgs {
+                    id: "sk-any".to_string(),
+                    json: true,
+                }),
+            ),
+            (
+                "resource",
+                SkillAction::Resource(ResourceArgs {
+                    id: "sk-any".to_string(),
+                    path: "scripts/run.py".to_string(),
+                    json: true,
+                }),
+            ),
+            (
+                "export",
+                SkillAction::Export(ExportArgs {
+                    id: "sk-any".to_string(),
+                    output: dir.path().join("export-out"),
+                    json: true,
+                }),
+            ),
+            (
+                "compose",
+                SkillAction::Compose(ComposeArgs {
+                    id: "sk-any".to_string(),
+                    budget_tokens: None,
+                    json: true,
+                }),
+            ),
+        ];
+        for (verb, action) in verbs {
+            let mut stdout: Vec<u8> = Vec::new();
+            let mut stderr: Vec<u8> = Vec::new();
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let code = run(&unopenable_db, &SkillArgs { action }, None, &mut out)
+                .unwrap_or_else(|e| panic!("verb={verb} opened db before refusing bad id: {e:#}"));
+            drop(out);
+            assert_eq!(code, 2, "verb={verb}");
+            assert!(stdout.is_empty(), "verb={verb} must not write stdout");
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                format!("ai-memory skill {verb}: {want_reason}\n"),
+                "verb={verb}"
+            );
+        }
+    }
 }

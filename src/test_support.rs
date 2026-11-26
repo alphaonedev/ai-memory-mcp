@@ -1043,6 +1043,43 @@ mod tests {
         );
     }
 
+    /// #10122 — `spawn_test_child` MUST isolate `HOME`, `XDG_CONFIG_HOME`, and
+    /// `AI_MEMORY_WITNESS_KEY_DIR` to a private empty sandbox so a child never
+    /// falls back via `getpwuid_r` to the host's live witness custody dir.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_test_child_isolates_home_and_witness_dir_10122() {
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_10122_ISOLATION_ROLE";
+        const TEST: &str =
+            "test_support::tests::spawn_test_child_isolates_home_and_witness_dir_10122";
+        if std::env::var_os(ROLE_ENV).is_some() {
+            assert!(
+                std::env::var_os("HOME").is_some(),
+                "#10122: spawn_test_child must set an isolated HOME (unset falls back to live /etc/passwd home)"
+            );
+            assert!(
+                std::env::var_os("XDG_CONFIG_HOME").is_some(),
+                "#10122: spawn_test_child must set an isolated XDG_CONFIG_HOME"
+            );
+            assert!(
+                std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV).is_some(),
+                "#10122: spawn_test_child must set an isolated AI_MEMORY_WITNESS_KEY_DIR"
+            );
+            return;
+        }
+        let out = super::spawn_test_child(TEST, &[(ROLE_ENV, "1")]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "#10122 isolation child failed:\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "#10122 isolation child ran zero tests:\n{stdout}"
+        );
+    }
+
     /// #3577 — `LineageDagIsolation` restores BOTH flags on drop,
     /// including the "was false" case a seeder must not leak.
     ///
