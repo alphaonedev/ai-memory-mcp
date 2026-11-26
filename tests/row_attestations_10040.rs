@@ -2779,3 +2779,39 @@ fn boot_and_list(sb: &Sandbox, key: &Path) -> (Vec<i64>, String) {
         .collect();
     (answered, String::from_utf8_lossy(&out.stderr).into_owned())
 }
+
+// ---------------------------------------------------------------------------
+// #10116: the streaming SQLite read fails closed
+// ---------------------------------------------------------------------------
+
+/// The streamed attestation read stops at the attestation that cannot be
+/// decoded. That stops the whole verify with this exact error. It never
+/// gives a report built from the rows read before it.
+const UNDECODABLE_SEQ_10116: &str = "Invalid column type Text at index: 3, name: seq";
+
+/// I4 (#10116): an attestation whose `seq` cannot be decoded, in the middle
+/// of the streamed `memories` read, makes `verify_sqlite_with` an error
+/// with its exact reason, never a clean or partial report.
+#[test]
+fn streaming_read_fails_closed_on_an_undecodable_row_10116() {
+    let (sb, _key, mut mcp) = armed();
+    for i in 0..3 {
+        mcp.store(&format!("attest stream {i} 10116"));
+    }
+    drop(mcp);
+    assert!(sb.report().ok(), "clean before the cut");
+    let n = sb
+        .seed_conn()
+        .execute(
+            "UPDATE row_attestations SET seq = 'x-10116' WHERE id = \
+             (SELECT min(id) FROM row_attestations WHERE table_name = 'memories' AND seq > 0)",
+            [],
+        )
+        .expect("raw write");
+    assert_eq!(n, 1, "one attestation made undecodable");
+    let got = verify_sqlite_with(&sb.conn(), &TrustAnchor::load_dir(&sb.root.join("keys")));
+    assert_eq!(
+        got.map(|r| r.ok()).map_err(|e| format!("{e:#}")),
+        Err(UNDECODABLE_SEQ_10116.to_string())
+    );
+}

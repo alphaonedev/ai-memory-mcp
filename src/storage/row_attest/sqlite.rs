@@ -12,7 +12,7 @@
 use super::seal::{self, SealRecord, SealState};
 use super::{
     Attestation, CanonicalRow, Cell, FORMAT_VERSION, LiveRow, Op, Report, Retention,
-    STORE_ROW_TABLE, TABLES, TableSpec, VerifyInput, ZERO_DIGEST, acc_add, acc_sub, acc_term,
+    STORE_ROW_TABLE, TABLES, TableSpec, ZERO_DIGEST, acc_add, acc_sub, acc_term,
     attestation_digest, encode_key, key_id_of, row_digest, sign, spec_for,
 };
 use anyhow::{Context as _, Result};
@@ -876,40 +876,198 @@ fn register(conn: &Connection, source: SignerSource) -> Result<()> {
     Ok(())
 }
 
-/// Every `row_attestations` row.
+/// The `row_attestations` columns every attestation read selects, in the
+/// order [`att_of_row`] decodes them.
+const ATT_COLS: &str = "id, table_name, row_key, seq, op, row_digest, prior_digest, agent_id, \
+                        key_id, attested_at, format_version, covered_columns, store_id, \
+                        table_seq, table_acc, signature, attestation_digest";
+
+fn att_of_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attestation> {
+    Ok(Attestation {
+        id: r.get(0)?,
+        table: r.get(1)?,
+        row_key: r.get(2)?,
+        seq: r.get(3)?,
+        op: r.get(4)?,
+        row_digest: r.get(5)?,
+        prior_digest: r.get(6)?,
+        agent_id: r.get(7)?,
+        key_id: r.get(8)?,
+        attested_at: r.get(9)?,
+        format_version: r.get(10)?,
+        covered_columns: r.get(11)?,
+        store_id: r.get(12)?,
+        table_seq: r.get(13)?,
+        table_acc: r.get(14)?,
+        signature: r.get(15)?,
+        attestation_digest: r.get(16)?,
+    })
+}
+
+/// #10116: stream the attestations `sql` selects (its columns are
+/// [`ATT_COLS`]) to `f`, one at a time. A row that does not decode ends the
+/// read with its error.
+fn stream_attestations<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    f: &mut dyn FnMut(Attestation),
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params)?;
+    while let Some(r) = rows.next()? {
+        super::stream::tick(super::stream::Count::AttRead);
+        f(att_of_row(r)?);
+    }
+    Ok(())
+}
+
+/// Every `row_attestations` row, by id. Not a verify path (#10116): the
+/// verifier streams instead.
 ///
 /// # Errors
 ///
 /// Surfaces the query failure.
 pub fn read_attestations(conn: &Connection) -> Result<Vec<Attestation>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, table_name, row_key, seq, op, row_digest, prior_digest, agent_id, key_id, \
-         attested_at, format_version, covered_columns, store_id, table_seq, table_acc, \
-         signature, attestation_digest FROM row_attestations ORDER BY id",
+    let mut out = Vec::new();
+    stream_attestations(
+        conn,
+        &format!("SELECT {ATT_COLS} FROM row_attestations ORDER BY id"),
+        [],
+        &mut |a| out.push(a),
     )?;
-    let rows = stmt.query_map([], |r| {
-        super::stream::tick(super::stream::Count::AttRead);
-        Ok(Attestation {
-            id: r.get(0)?,
-            table: r.get(1)?,
-            row_key: r.get(2)?,
-            seq: r.get(3)?,
-            op: r.get(4)?,
-            row_digest: r.get(5)?,
-            prior_digest: r.get(6)?,
-            agent_id: r.get(7)?,
-            key_id: r.get(8)?,
-            attested_at: r.get(9)?,
-            format_version: r.get(10)?,
-            covered_columns: r.get(11)?,
-            store_id: r.get(12)?,
-            table_seq: r.get(13)?,
-            table_acc: r.get(14)?,
-            signature: r.get(15)?,
-            attestation_digest: r.get(16)?,
+    Ok(out)
+}
+
+/// #10116: stream every live row of `spec` to `f` as cells in spec order.
+///
+/// # Errors
+///
+/// Surfaces the query failure.
+fn stream_rows(conn: &Connection, spec: &TableSpec, f: &mut dyn FnMut(&[Cell])) -> Result<()> {
+    let cols = spec
+        .cols
+        .iter()
+        .map(|(c, _)| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {cols} FROM main.\"{}\"", spec.table);
+    let ctx = || format!("row attestation read of {}", spec.table);
+    let mut stmt = conn.prepare(&sql).with_context(ctx)?;
+    let mut rows = stmt.query([]).with_context(ctx)?;
+    let mut cells = Vec::with_capacity(spec.cols.len());
+    while let Some(r) = rows.next().with_context(ctx)? {
+        super::stream::tick(super::stream::Count::RowRead);
+        cells.clear();
+        for i in 0..spec.cols.len() {
+            cells.push(cell_of(r.get_ref(i).with_context(ctx)?));
+        }
+        f(&cells);
+    }
+    Ok(())
+}
+
+/// #10116: the `SQLite` store as a [`super::stream::Source`]: every read
+/// is a streaming query, so the verifier holds one row at a time.
+struct SqliteSource<'c> {
+    conn: &'c Connection,
+    /// The defect line of each non-canonical live row (#10092), in read
+    /// order (one line per defective row, never one per row).
+    non_canonical: Vec<String>,
+}
+
+impl super::stream::Source for SqliteSource<'_> {
+    type Error = anyhow::Error;
+
+    fn other_atts(&mut self, f: &mut dyn FnMut(&Attestation)) -> Result<()> {
+        let marks = vec!["?"; TABLES.len()].join(", ");
+        stream_attestations(
+            self.conn,
+            &format!("SELECT {ATT_COLS} FROM row_attestations WHERE table_name NOT IN ({marks})"),
+            rusqlite::params_from_iter(TABLES.iter().map(|s| s.table)),
+            &mut |a| f(&a),
+        )
+    }
+
+    fn table_atts(
+        &mut self,
+        spec: &'static TableSpec,
+        f: &mut dyn FnMut(&Attestation),
+    ) -> Result<()> {
+        stream_attestations(
+            self.conn,
+            &format!(
+                "SELECT {ATT_COLS} FROM row_attestations WHERE table_name = ?1 \
+                 ORDER BY table_seq, id"
+            ),
+            [spec.table],
+            &mut |a| f(&a),
+        )
+    }
+
+    fn key_chain(
+        &mut self,
+        spec: &'static TableSpec,
+        key: &[u8],
+        f: &mut dyn FnMut(&Attestation),
+    ) -> Result<()> {
+        stream_attestations(
+            self.conn,
+            &format!(
+                "SELECT {ATT_COLS} FROM row_attestations WHERE table_name = ?1 AND row_key = ?2 \
+                 AND op <> 'cutover' ORDER BY seq, table_seq, id"
+            ),
+            params![spec.table, key],
+            &mut |a| f(&a),
+        )
+    }
+
+    fn live_rows(&mut self, spec: &'static TableSpec, f: &mut dyn FnMut(&LiveRow)) -> Result<()> {
+        let nc = &mut self.non_canonical;
+        stream_rows(self.conn, spec, &mut |cells| {
+            // #10092: a row with no canonical form is a defect and matches
+            // no attestation (its digest is the zero digest, never signed).
+            let digest = match CanonicalRow::parse(spec, cells) {
+                Ok(row) => row_digest(&row),
+                Err(e) => {
+                    nc.push(e.to_string());
+                    ZERO_DIGEST
+                }
+            };
+            f(&LiveRow {
+                table: spec.table.to_string(),
+                key: encode_key(spec, cells),
+                digest,
+            });
         })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn non_canonical(&mut self, f: &mut dyn FnMut(String)) {
+        for line in self.non_canonical.drain(..) {
+            f(line);
+        }
+    }
+
+    fn id_high_water(&mut self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'row_attestations'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn finish(&mut self, atts_seen: u64) -> Result<()> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM row_attestations", [], |r| r.get(0))?;
+        if u64::try_from(total).ok() != Some(atts_seen) {
+            anyhow::bail!("row attestation read covered {atts_seen} of {total} rows");
+        }
+        Ok(())
+    }
 }
 
 /// The completeness verifier over a `SQLite` store (C-5).
@@ -924,7 +1082,7 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
     let sealed = seal_file
         .as_deref()
         .map_or(SealState::NotSealed, seal::read);
-    let (report, attestations) = verify_inner(conn, &anchor, &sealed)?;
+    let (report, marks) = verify_inner(conn, &anchor, &sealed)?;
     // #10087: a clean verify moves the seal up to what it verified, so a
     // later rollback of those writes is seen. Not inside a transaction (its
     // rollback could undo what was verified); a failed write only leaves the
@@ -932,7 +1090,7 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
     if let Some(path) = seal_file.as_deref()
         && matches!(report.outcome(), super::Outcome::Clean)
         && conn.is_autocommit()
-        && let Err(e) = seal::advance(path, &SealRecord::of(&attestations))
+        && let Err(e) = seal::advance(path, &marks)
     {
         tracing::warn!("row attestation seal (#10087) not advanced: {e:#}");
     }
@@ -954,45 +1112,26 @@ fn verify_inner(
     conn: &Connection,
     anchor: &super::anchor::AnchorLoad,
     sealed: &SealState,
-) -> Result<(Report, Vec<Attestation>)> {
-    let mut live = Vec::new();
-    let mut non_canonical = Vec::new();
-    for spec in TABLES {
-        for cells in read_rows(conn, spec)? {
-            // #10092: a row with no canonical form is a defect and matches
-            // no attestation (its digest is the zero digest, never signed).
-            let digest = match CanonicalRow::parse(spec, &cells) {
-                Ok(row) => row_digest(&row),
-                Err(nc) => {
-                    non_canonical.push(nc);
-                    ZERO_DIGEST
-                }
-            };
-            live.push(LiveRow {
-                table: spec.table.to_string(),
-                key: encode_key(spec, &cells),
-                digest,
-            });
-        }
-    }
-    let attestations = read_attestations(conn)?;
-    let id_high_water: Option<i64> = conn
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'row_attestations'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let report = super::verify(&VerifyInput {
-        live: &live,
-        attestations: &attestations,
+) -> Result<(Report, SealRecord)> {
+    // #10116: one read snapshot for every streamed query (outside a caller's
+    // transaction); read-only, so it is dropped (rolled back) at the end.
+    let snapshot = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let mut src = SqliteSource {
+        conn,
+        non_canonical: Vec::new(),
+    };
+    let ctx = super::stream::Ctx {
         anchor,
-        id_high_water,
         memory_id_of_key: &super::memory_id_of_key,
-        non_canonical: &non_canonical,
         seal: sealed,
-    });
-    Ok((report, attestations))
+    };
+    let out = super::stream::run(&mut src, &ctx);
+    drop(snapshot);
+    out
 }
 
 /// Refusal prefix of [`check_snapshot`] (C-7, E-6).
@@ -1061,9 +1200,9 @@ pub fn check_snapshot(conn: &Connection, target: &std::path::Path) -> Result<Sna
     // The snapshot is judged on its own marks: restoring an older verified
     // store is an explicit order, and the target's seal is replaced by the
     // snapshot's once it is published.
-    let (report, attestations) = verify_inner(conn, &anchor, &SealState::NotSealed)?;
+    let (report, marks) = verify_inner(conn, &anchor, &SealState::NotSealed)?;
     match report.outcome() {
-        super::Outcome::Clean => Ok(SnapshotVerdict::Verified(SealRecord::of(&attestations))),
+        super::Outcome::Clean => Ok(SnapshotVerdict::Verified(marks)),
         super::Outcome::Unanchored(why) => {
             // #10086 A-3: a signed snapshot with no out-of-database key
             // cannot be verified; it is refused, never let through.
