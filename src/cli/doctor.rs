@@ -191,6 +191,11 @@ const SECTION_CORRUPT_GOVERNANCE: &str = "Corrupt governance standards (#4285)";
 #[path = "over_depth_4715.rs"]
 mod over_depth_4715;
 
+/// #10121 — the hardened-fixture ratchet and the check #23 negative.
+#[cfg(test)]
+#[path = "doctor_posture_fixture_10121.rs"]
+mod doctor_posture_fixture_10121;
+
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
 const MSG_PG_PROBE_RUNTIME: &str = "build ephemeral runtime for the postgres extension probe";
@@ -8839,23 +8844,22 @@ enabled = true
     // #1146 / #1598 reachability probes + #1598 GPU policy — coverage
     // lift (GA push). Driven by wiremock + spawn_blocking (the
     // reachability sections use reqwest::blocking) with the resolver
-    // env vars serialised on a module-local lock. Mirrors the
+    // env vars serialised on the crate-wide env lock: every env writer
+    // below takes its proof `&EnvLockGuard` (#10124 N1). Mirrors the
     // remote-section test idiom above.
     // ---------------------------------------------------------------
-
-    fn reach_env_lock() -> &'static std::sync::Mutex<()> {
-        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        L.get_or_init(|| std::sync::Mutex::new(()))
-    }
 
     /// RAII env setter scoped to a test; restores prior values on drop.
     struct EnvScope(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl EnvScope {
-        fn set(pairs: &[(&'static str, &str)]) -> Self {
+        fn set(
+            _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
+            pairs: &[(&'static str, &str)],
+        ) -> Self {
             let mut prev = Vec::new();
             for (k, v) in pairs {
                 prev.push((*k, std::env::var_os(k)));
-                // SAFETY: serialised by reach_env_lock in every caller.
+                // SAFETY: `_lock` proves the crate-wide env lock is held.
                 unsafe { std::env::set_var(k, v) };
             }
             // AI_MEMORY_NO_CONFIG keeps AppConfig::load off any on-disk
@@ -8879,7 +8883,9 @@ enabled = true
         }
     }
 
-    fn clear_llm_embed_env() {
+    fn clear_llm_embed_env(
+        _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
+    ) {
         for k in [
             "AI_MEMORY_LLM_BACKEND",
             "AI_MEMORY_LLM_BASE_URL",
@@ -8906,9 +8912,9 @@ enabled = true
 
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_reachability_compiled_default_is_info_1146() {
-        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        clear_llm_embed_env();
-        let _scope = EnvScope::set(&[]);
+        let g = posture_env_lock();
+        clear_llm_embed_env(&g);
+        let _scope = EnvScope::set(&g, &[]);
         let section = tokio::task::spawn_blocking(section_llm_reachability_1146)
             .await
             .unwrap();
@@ -8945,14 +8951,16 @@ enabled = true
                 .mount(&server)
                 .await;
             let resolved = {
-                // Hold both existing test locks only while resolving, never
-                // across await. Restore the fixture key before network I/O.
-                let _config = crate::config::test_env_lock();
-                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-                let _scope = EnvScope::set(&[
-                    ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
-                    ("AI_MEMORY_LLM_BASE_URL", ""),
-                ]);
+                // Hold the env lock only while resolving, never across
+                // await. Restore the fixture key before network I/O.
+                let reach = posture_env_lock();
+                let _scope = EnvScope::set(
+                    &reach,
+                    &[
+                        ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
+                        ("AI_MEMORY_LLM_BASE_URL", ""),
+                    ],
+                );
                 crate::config::AppConfig::default().resolve_llm(
                     Some(backend),
                     Some("fixture-model"),
@@ -9008,14 +9016,17 @@ enabled = true
                 .await;
             let uri = server.uri();
             let section = {
-                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-                clear_llm_embed_env();
-                let _scope = EnvScope::set(&[
-                    ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
-                    ("AI_MEMORY_LLM_BASE_URL", &uri),
-                    ("AI_MEMORY_LLM_API_KEY", "probe-key"),
-                    ("AI_MEMORY_LLM_MODEL", "probe-model"),
-                ]);
+                let g = posture_env_lock();
+                clear_llm_embed_env(&g);
+                let _scope = EnvScope::set(
+                    &g,
+                    &[
+                        ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
+                        ("AI_MEMORY_LLM_BASE_URL", &uri),
+                        ("AI_MEMORY_LLM_API_KEY", "probe-key"),
+                        ("AI_MEMORY_LLM_MODEL", "probe-model"),
+                    ],
+                );
                 tokio::task::spawn_blocking(section_llm_reachability_1146)
                     .await
                     .unwrap()
@@ -9027,9 +9038,9 @@ enabled = true
 
     #[tokio::test(flavor = "multi_thread")]
     async fn embeddings_reachability_compiled_default_is_info_1598() {
-        let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        clear_llm_embed_env();
-        let _scope = EnvScope::set(&[]);
+        let g = posture_env_lock();
+        clear_llm_embed_env(&g);
+        let _scope = EnvScope::set(&g, &[]);
         let section = tokio::task::spawn_blocking(section_embeddings_reachability_1598)
             .await
             .unwrap();
@@ -9064,14 +9075,17 @@ enabled = true
                 .await;
             let uri = server.uri();
             let section = {
-                let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-                clear_llm_embed_env();
-                let _scope = EnvScope::set(&[
-                    ("AI_MEMORY_EMBED_BACKEND", "openai-compatible"),
-                    ("AI_MEMORY_EMBED_BASE_URL", &uri),
-                    ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
-                    ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
-                ]);
+                let g = posture_env_lock();
+                clear_llm_embed_env(&g);
+                let _scope = EnvScope::set(
+                    &g,
+                    &[
+                        ("AI_MEMORY_EMBED_BACKEND", "openai-compatible"),
+                        ("AI_MEMORY_EMBED_BASE_URL", &uri),
+                        ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
+                        ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
+                    ],
+                );
                 tokio::task::spawn_blocking(section_embeddings_reachability_1598)
                     .await
                     .unwrap()
@@ -9083,55 +9097,16 @@ enabled = true
 
     // ---------------------------------------------------------------
     // v1.0.0 §5.3 — `doctor --posture enterprise-federation`.
-    // Isolated via the crate-wide `test_env_lock` (NOT `reach_env_lock`
-    // above, which only serialises within THIS module — the posture
-    // env vars are shared with `enterprise_federation_posture::tests`
-    // and `security_profile::tests`, see the #2159 lesson documented
-    // there).
+    // Isolated via the crate-wide `test_env_lock` (a module-local lock
+    // would only serialise within THIS module — the posture env vars
+    // are shared with `enterprise_federation_posture::tests` and
+    // `security_profile::tests`, see the #2159 lesson documented there).
+    // The reachability tests above take the same lock (#10124 N1).
     // ---------------------------------------------------------------
 
-    fn posture_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::config::test_env_lock()
-    }
-
-    fn clear_posture_env() {
-        unsafe {
-            std::env::remove_var(crate::security_profile::ENV_SECURITY_PROFILE);
-            for (env, _) in crate::security_profile::pinned_knobs() {
-                std::env::remove_var(env);
-            }
-            for env in [
-                crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
-                crate::federation::signing::REQUIRE_SIG_ENV,
-                crate::federation::signing::REQUIRE_NONCE_ENV,
-                crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
-                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
-                "AI_MEMORY_PERMISSIONS_MODE",
-                crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
-                crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
-                crate::tls::FED_PEER_FINGERPRINTS_ENV,
-                crate::federation::peer_attestation::PEER_ATTESTATION_ENV,
-                crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
-                crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
-                crate::encryption::ENV_ENCRYPT_AT_REST,
-                crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
-                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
-                // #2954 check #19 — append-only spine flag.
-                crate::config::ENV_APPEND_ONLY,
-                // #2991 check #20 — R40 approver-key enrollment.
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                "AI_MEMORY_OPERATOR_PUBKEY",
-            ] {
-                std::env::remove_var(env);
-            }
-        }
-    }
-
-    struct PostureEnvGuard;
-    impl Drop for PostureEnvGuard {
-        fn drop(&mut self) {
-            clear_posture_env();
-        }
+    fn posture_env_lock()
+    -> crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'static> {
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire()
     }
 
     #[test]
@@ -9159,8 +9134,8 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::bare(&_g);
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("posture-3553.db");
@@ -9230,8 +9205,8 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::bare(&_g);
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -9302,8 +9277,8 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::bare(&_g);
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -9346,60 +9321,11 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
-
-        unsafe {
-            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
-        }
-        crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly");
-
-        let fp_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(fp_file.path(), "example.org abc123\n").unwrap();
-        // #2991 check #20 — a deterministic, valid base64 Ed25519 approver pubkey.
-        let approver_pubkey_b64 = {
-            use base64::Engine as _;
-            let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
-        };
-        // #3199 check #22 — the operator public key restore verifies backups
-        // against, in the per-process test key sandbox (no env write).
-        let keys = crate::identity::keypair::default_key_dir().expect("sandbox key dir");
-        std::fs::write(keys.join("operator.key.pub"), &approver_pubkey_b64).expect("write pubkey");
-        unsafe {
-            std::env::set_var(
-                crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
-                "test-fleet",
+        // #10121 — the ONE hardened fixture (check #23's anchor key included).
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::fully_hardened(
+                &_g,
             );
-            std::env::set_var(
-                crate::tls::FED_PEER_FINGERPRINTS_ENV,
-                fp_file.path().to_str().unwrap(),
-            );
-            std::env::set_var(
-                crate::federation::peer_attestation::PEER_ATTESTATION_ENV,
-                r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
-            );
-            std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "1");
-            std::env::set_var(
-                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
-                "1",
-            );
-            // #2954 check #19 — arm the append-only audit spine flag.
-            std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
-            // #2991 check #20 — enroll a deterministic approver key so the R40
-            // escalate producer routes to a SATISFIABLE signed-approval gate.
-            std::env::set_var(
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                &approver_pubkey_b64,
-            );
-        }
-        // #2954 check #19 — install a process-wide daemon audit signing key so
-        // the append-only leaves would be SIGNED (the other half of the
-        // pairing). Isolated per env-isolated child; the OnceLock persists for
-        // the child's lifetime independent of the tempdir.
-        let _audit_dir = tempfile::tempdir().expect("audit dir");
-        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-        let _ = crate::governance::audit::init(_audit_dir.path(), Some(signing));
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();

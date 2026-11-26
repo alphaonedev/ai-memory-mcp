@@ -89,11 +89,9 @@ mod tests {
             return;
         }
         let _g = env_lock();
-        unsafe {
-            clear_all();
-        }
-        let _cleanup = EnvGuard;
-        let _fp_file = set_fully_hardened_env();
+        clear_all(&_g);
+        let _cleanup = EnvGuard(&_g);
+        let _fp_file = set_fully_hardened_env(&_g);
         assert_eq!(
             crate::storage::resolved_synchronous().level,
             crate::storage::SynchronousLevel::Full,

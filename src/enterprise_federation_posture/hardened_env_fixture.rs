@@ -1,0 +1,782 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #10121 — the ONE definition of the certified enterprise-federation posture
+//! environment for tests.
+//!
+//! Before #10121 the "fully hardened" environment was written twice: once in
+//! `enterprise_federation_posture::tests::set_fully_hardened_env` and once by
+//! hand in `cli::doctor::tests`. Check #23 (row-attestation trust anchor,
+//! commit 44598c23f) seeded its key in the first copy only, so the doctor
+//! proof test of GA standard 5 went red while the posture suite stayed green.
+//! Every consumer now builds its environment through [`PostureEnv`], so a new
+//! posture check turns every consumer red or green together.
+//!
+//! [`PostureEnv`] owns everything it creates (the peer-fingerprints file and
+//! a private 0700 key directory) and restores every variable it touched to its
+//! prior value on drop (class #8168). Its constructors take an
+//! [`EnvLockGuard`], whose only constructor is [`EnvLockGuard::acquire`] (the
+//! crate-wide env lock), so a fixture cannot be built under another mutex and
+//! cannot outlive the lock that serialises it (UNSAFE-04, API-08).
+//!
+//! #10124 (round 2): the guard lives in its own private submodule `lock`, so
+//! its field is private to that submodule alone: no struct literal, no
+//! `Default` and no `Clone` reaches it from this module, a sibling or the
+//! tests module. Every function here that writes the process env is safe only
+//! because it takes `&EnvLockGuard` ([`clear_posture_env`], [`apply`]); there
+//! is no safe env write that does not.
+//! The ratchet `doctor_holds_no_hand_rolled_posture_env` keeps a second copy
+//! out of `src/cli/doctor.rs`.
+
+use std::ffi::OsString;
+use std::path::Path;
+use std::sync::OnceLock;
+
+use super::{
+    ENV_PG_AT_REST_ATTESTED, ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, PEER_ATTESTATION_ENV,
+};
+use crate::config::AppConfig;
+use crate::identity::keypair::KEY_DIR_ENV;
+
+/// Every env var the posture module (beyond the `asi-hard` knobs) reads, so a
+/// fixture starts from, and restores, a known state. The 22 `asi-hard` knobs
+/// and the profile selector come from `security_profile` (single source).
+pub(super) const FED_ENV_VARS: &[&str] = &[
+    crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+    crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
+    crate::federation::signing::REQUIRE_SIG_ENV,
+    crate::federation::signing::REQUIRE_NONCE_ENV,
+    crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+    crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+    AppConfig::ENV_PERMISSIONS_MODE,
+    crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
+    crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
+    crate::tls::FED_PEER_FINGERPRINTS_ENV,
+    PEER_ATTESTATION_ENV,
+    crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
+    crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+    crate::encryption::ENV_ENCRYPT_AT_REST,
+    crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
+    ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+    // #2954 — check #19 append-only spine flag.
+    crate::config::ENV_APPEND_ONLY,
+    // #3061 — check #15 resolves the store URL through these two channels and,
+    // on a postgres:// DSN, reads the pg at-rest attestation.
+    crate::store_url::STORE_URL_ENV,
+    crate::store_url::STORE_URL_FILE_ENV,
+    ENV_PG_AT_REST_ATTESTED,
+    // #2991 check #20 — the escalate-producer approver-key enrollment.
+    crate::approvals::signed::APPROVER_PUBKEYS_ENV,
+    // #3199 check #22 — the env channel of the operator public key.
+    "AI_MEMORY_OPERATOR_PUBKEY",
+];
+
+/// File name of the operator public key restore verifies backups against.
+pub(super) const OPERATOR_PUBKEY_FILE: &str = "operator.key.pub";
+
+/// Every posture variable: the profile selector, its pinned knobs and
+/// [`FED_ENV_VARS`]. The key-directory override is not one of them (the
+/// per-process test key sandbox owns it); [`PostureEnv::fully_hardened`]
+/// snapshots and restores it separately.
+pub(super) fn posture_env_vars() -> Vec<&'static str> {
+    let mut vars = vec![crate::security_profile::ENV_SECURITY_PROFILE];
+    vars.extend(
+        crate::security_profile::pinned_knobs()
+            .iter()
+            .map(|(env, _)| *env),
+    );
+    vars.extend_from_slice(FED_ENV_VARS);
+    // Several knobs are also named in `FED_ENV_VARS`: keep the first of each.
+    let mut seen = std::collections::BTreeSet::new();
+    vars.retain(|v| seen.insert(*v));
+    vars
+}
+
+/// Remove every posture variable, under the proof `lock` of the env lock.
+pub(super) fn clear_posture_env(lock: &EnvLockGuard<'_>) {
+    for env in posture_env_vars() {
+        apply(lock, env, None);
+    }
+}
+
+/// A deterministic, valid base64 Ed25519 approver public key (#2991 check
+/// #20, #3199 check #22). Fixed seed: stable and never RNG-dependent.
+pub(super) fn approver_pubkey_b64() -> String {
+    use base64::Engine as _;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
+}
+
+/// #2954 check #19 — keeps the installed daemon-audit-key directory alive for
+/// the whole (env-isolated child) process. The key install is process-global
+/// and first-install-wins, so it is the one part a drop cannot restore.
+static POSTURE_AUDIT_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+/// The lock proof, alone in its own module so that its field is private to
+/// this module and nothing else (#10124 N2): a private field is visible to the
+/// defining module and its descendants, so in the parent module the tests
+/// module could build the guard by struct literal from any mutex.
+mod lock {
+    use std::sync::MutexGuard;
+
+    /// Proof that the holder owns the crate-wide process-env lock
+    /// (`crate::config::test_env_lock`) and no other mutex.
+    ///
+    /// The field is private to this module and the only constructor is
+    /// [`EnvLockGuard::acquire`]: no struct literal, `From`, `Default` or
+    /// `Clone` makes one (the tests module proves the last three at compile
+    /// time). [`super::PostureEnv`] and every env writer of the fixture take
+    /// this type and nothing else.
+    #[must_use = "the env lock is released when this guard drops"]
+    pub(crate) struct EnvLockGuard<'a> {
+        _guard: MutexGuard<'a, ()>,
+    }
+
+    impl EnvLockGuard<'static> {
+        /// Take the crate-wide env lock (a poisoned lock is recovered, as in
+        /// `test_env_lock`: CONCURRENCY-18).
+        pub(crate) fn acquire() -> Self {
+            Self {
+                _guard: crate::config::test_env_lock(),
+            }
+        }
+    }
+}
+
+pub(crate) use lock::EnvLockGuard;
+
+/// What a [`PostureEnv`] created and must keep alive while it lives.
+struct HardenedParts {
+    /// Held only so the fingerprints file outlives the fixture's assertions.
+    _fp_file: tempfile::NamedTempFile,
+    key_dir: tempfile::TempDir,
+}
+
+/// The posture environment of one test: the bare env or the certified,
+/// fully hardened one. Restores every variable it touched on drop.
+#[must_use = "the environment is restored when this value drops"]
+pub(crate) struct PostureEnv<'lock> {
+    saved: Vec<(&'static str, Option<OsString>)>,
+    hardened: Option<HardenedParts>,
+    /// The proof every env write of this value (drop included) passes on.
+    lock: &'lock EnvLockGuard<'static>,
+}
+
+impl<'lock> PostureEnv<'lock> {
+    /// Every posture variable unset.
+    pub(crate) fn bare(lock: &'lock EnvLockGuard<'static>) -> Self {
+        let saved = snapshot(posture_env_vars());
+        clear_posture_env(lock);
+        Self {
+            saved,
+            hardened: None,
+            lock,
+        }
+    }
+
+    /// The certified enterprise-federation posture: `asi-hard` pinned through
+    /// the real `enforce_at_boot`, every federation addition set, and a
+    /// private key directory holding the operator public key (check #22) and
+    /// one agent public key (check #23). Only the at-rest-encryption row
+    /// depends on the build (`--features sqlcipher`).
+    pub(crate) fn fully_hardened(lock: &'lock EnvLockGuard<'static>) -> Self {
+        let mut vars = posture_env_vars();
+        vars.push(KEY_DIR_ENV);
+        let saved = snapshot(vars);
+        clear_posture_env(lock);
+        // From here on a panic still restores `saved` through `Drop`.
+        let mut env = Self {
+            saved,
+            hardened: None,
+            lock,
+        };
+        apply(
+            lock,
+            crate::security_profile::ENV_SECURITY_PROFILE,
+            Some("asi-hard".as_ref()),
+        );
+        // Pins the asi-hard knobs via the REAL enforcement fn (a product fn
+        // that writes env; called only here, under `lock`).
+        crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
+
+        let fp_file = tempfile::NamedTempFile::new().expect("fingerprints file");
+        std::fs::write(fp_file.path(), "example.org abc123\n").expect("write fingerprints");
+        // Owner-only from creation (`tempfile::Builder` mode 0700), so the
+        // #3198 key-directory check passes under umask 022 and 0002 alike.
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
+        let pubkey = approver_pubkey_b64();
+        std::fs::write(key_dir.path().join(OPERATOR_PUBKEY_FILE), &pubkey).expect("operator key");
+        super::row_attest_anchor::seed_anchor_key(key_dir.path()); // #10086 check #23
+        let fp_path = fp_file.path().to_str().expect("utf-8 temp path").to_owned();
+        let settings: [(&str, &std::ffi::OsStr); 8] = [
+            (
+                crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
+                "test-fleet".as_ref(),
+            ),
+            (crate::tls::FED_PEER_FINGERPRINTS_ENV, fp_path.as_ref()),
+            (
+                PEER_ATTESTATION_ENV,
+                r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#.as_ref(),
+            ),
+            (crate::encryption::ENV_ENCRYPT_AT_REST, "1".as_ref()),
+            // #2911 check #17 — the boot-refusal env defaults OFF; unset FAILs.
+            (ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "1".as_ref()),
+            // #2954 check #19 — arm the append-only audit spine.
+            (crate::config::ENV_APPEND_ONLY, "1".as_ref()),
+            // #2991 check #20 — a SATISFIABLE signed-approval gate.
+            (
+                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
+                pubkey.as_ref(),
+            ),
+            (KEY_DIR_ENV, key_dir.path().as_os_str()),
+        ];
+        for (name, value) in settings {
+            apply(lock, name, Some(value));
+        }
+        env.hardened = Some(HardenedParts {
+            _fp_file: fp_file,
+            key_dir,
+        });
+        // #2954 check #19 — a process-wide daemon audit signing key, so the
+        // append-only leaves would be SIGNED.
+        POSTURE_AUDIT_DIR.get_or_init(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("ef-posture-audit-")
+                .tempdir()
+                .expect("audit tempdir");
+            let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+            crate::governance::audit::init(dir.path(), Some(signing)).expect("install audit key");
+            dir
+        });
+        // The remaining federation knobs stay UNSET on purpose: each already
+        // defaults to the certified-compliant state, which is part of what a
+        // passing posture proves.
+        env
+    }
+
+    /// Remove one variable the fixture owns (it is in the snapshot, so drop
+    /// restores it). The input-removal probe of the fixture's own tests.
+    ///
+    /// # Panics
+    /// When `name` is not a variable this fixture snapshots: removing it would
+    /// leak past drop.
+    pub(crate) fn unset(&self, name: &str) {
+        assert!(
+            self.saved.iter().any(|(n, _)| *n == name),
+            "{name} is not owned by this fixture"
+        );
+        apply(self.lock, name, None);
+    }
+
+    /// Set one variable the fixture owns to `value` (drop restores it). The
+    /// weak-value probe of the fixture's own tests (N4 of #10124).
+    ///
+    /// # Panics
+    /// When `name` is not a variable this fixture snapshots.
+    pub(crate) fn set(&self, name: &str, value: &str) {
+        assert!(
+            self.saved.iter().any(|(n, _)| *n == name),
+            "{name} is not owned by this fixture"
+        );
+        apply(self.lock, name, Some(value.as_ref()));
+    }
+
+    /// The fixture's key directory, or `None` for a bare env.
+    pub(crate) fn key_dir(&self) -> Option<&Path> {
+        self.hardened.as_ref().map(|h| h.key_dir.path())
+    }
+
+    /// Remove every agent public key (each `.pub` but the operator key) from
+    /// the fixture's key directory, so check #23 loads unanchored while check
+    /// #22 keeps its operator key. Returns how many keys it removed.
+    pub(crate) fn remove_agent_keys(&self) -> usize {
+        let Some(dir) = self.key_dir() else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in std::fs::read_dir(dir).expect("read fixture key dir") {
+            let path = entry.expect("key dir entry").path();
+            let is_agent_key = path.extension().is_some_and(|e| e == "pub")
+                && path.file_name().is_some_and(|n| n != OPERATOR_PUBKEY_FILE);
+            if is_agent_key {
+                std::fs::remove_file(&path).expect("remove agent key");
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+impl Drop for PostureEnv<'_> {
+    fn drop(&mut self) {
+        for (name, prior) in &self.saved {
+            apply(self.lock, name, prior.as_deref());
+        }
+    }
+}
+
+/// Set (`Some`) or remove (`None`) one variable. The one env writer of the
+/// fixture: safe only because it takes the lock proof (#10124 N1).
+fn apply(_lock: &EnvLockGuard<'_>, name: &str, value: Option<&std::ffi::OsStr>) {
+    // SAFETY: `_lock` proves the caller holds the crate-wide env lock (the
+    // one lock every test that touches the process env takes) for at least
+    // this call.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+fn snapshot(vars: Vec<&'static str>) -> Vec<(&'static str, Option<OsString>)> {
+    vars.into_iter().map(|v| (v, std::env::var_os(v))).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enterprise_federation_posture::{PostureCheck, evaluate};
+
+    /// What removing one pinned variable from the fully hardened fixture must do.
+    enum Expect {
+        /// Exactly these rows newly fail (the expected set is written out here,
+        /// never computed from the code under test).
+        Rows(&'static [&'static str]),
+        /// No row changes: the variable is pinned but nothing proves it
+        /// (FINDING #10131); the test pins that observation so the day a row
+        /// starts to depend on it, this table must be updated.
+        Redundant(u32),
+        /// The row only turns on a sqlcipher build; elsewhere it already fails.
+        NeedsSqlcipher(&'static str),
+        /// N4 (#10124): unset reads as strict, so removal changes no row (and
+        /// that is asserted); setting the knob to the non-strict `weak` value
+        /// makes exactly `rows` fail, which proves the pin is load-bearing.
+        DefaultStrict {
+            weak: &'static str,
+            rows: &'static [&'static str],
+        },
+        /// N4 (#10124): the row is also satisfied by `file` in the fixture's
+        /// key directory, so removal alone changes no row (asserted); with
+        /// `file` removed, unsetting the variable makes exactly `rows` fail.
+        ShadowedBy {
+            file: &'static str,
+            rows: &'static [&'static str],
+        },
+    }
+
+    /// The aggregate pins row: a weak value of any pinned knob fails it.
+    const PINS_ROW: &str = "asi-hard pinned knobs";
+
+    const KNOB_TABLE: &[(&str, Expect)] = &[
+        (
+            "AI_MEMORY_SECURITY_PROFILE",
+            Expect::Rows(&["AI_MEMORY_SECURITY_PROFILE", "asi-hard pinned knobs"]),
+        ),
+        (
+            "AI_MEMORY_KEY_DIR",
+            Expect::Rows(&["backup manifest signing", "row attestation trust anchor"]),
+        ),
+        (
+            "AI_MEMORY_DB_SYNCHRONOUS",
+            Expect::Rows(&["PRAGMA synchronous (AI_MEMORY_DB_SYNCHRONOUS)"]),
+        ),
+        (
+            "AI_MEMORY_FED_TRUST_DOMAIN",
+            Expect::Rows(&["AI_MEMORY_FED_TRUST_DOMAIN"]),
+        ),
+        (
+            "AI_MEMORY_FED_PEER_FINGERPRINTS",
+            Expect::Rows(&["AI_MEMORY_FED_PEER_FINGERPRINTS"]),
+        ),
+        (
+            "AI_MEMORY_FED_PEER_ATTESTATION",
+            Expect::Rows(&[
+                "AI_MEMORY_FED_PEER_ATTESTATION",
+                "AI_MEMORY_FED_PEER_ATTESTATION (no `**` allow-all glob)",
+            ]),
+        ),
+        (
+            "AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE",
+            Expect::Rows(&["AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE"]),
+        ),
+        (
+            "AI_MEMORY_APPEND_ONLY",
+            Expect::Rows(&["append-only audit spine"]),
+        ),
+        ("AI_MEMORY_SECRET_SCREEN_MODE", Expect::Redundant(10131)),
+        ("AI_MEMORY_ALLOW_SCHEMA_AHEAD", Expect::Redundant(10131)),
+        (
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+            Expect::Redundant(10131),
+        ),
+        ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", Expect::Redundant(10131)),
+        ("AI_MEMORY_FED_REQUIRE_SIGNAL_SIG", Expect::Redundant(10131)),
+        (
+            "AI_MEMORY_FED_REQUIRE_TRANSITION_SIG",
+            Expect::Redundant(10131),
+        ),
+        (
+            "AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG",
+            Expect::Redundant(10131),
+        ),
+        ("AI_MEMORY_FED_REQUIRE_SIG", Expect::Redundant(10131)),
+        ("AI_MEMORY_FED_REQUIRE_NONCE", Expect::Redundant(10131)),
+        (
+            "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT",
+            Expect::DefaultStrict {
+                weak: "0",
+                rows: &[PINS_ROW, "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT"],
+            },
+        ),
+        (
+            "AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE",
+            Expect::Redundant(10131),
+        ),
+        (
+            "AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED",
+            Expect::Redundant(10131),
+        ),
+        ("AI_MEMORY_CID_ENFORCE", Expect::Redundant(10131)),
+        ("AI_MEMORY_REQUIRE_ROLLBACK_CHECK", Expect::Redundant(10131)),
+        ("AI_MEMORY_REQUIRE_WITNESS", Expect::Redundant(10131)),
+        ("AI_MEMORY_REQUIRE_CAUSE_BINDING", Expect::Redundant(10131)),
+        (
+            "AI_MEMORY_REQUIRE_ROLE_SEPARATION",
+            Expect::Redundant(10131),
+        ),
+        (
+            "AI_MEMORY_REQUIRE_IDENTITY_LINEAGE",
+            Expect::Redundant(10131),
+        ),
+        (
+            "AI_MEMORY_FED_REQUIRE_SERVER_VERIFY",
+            Expect::Redundant(10131),
+        ),
+        // #3705: the https-only row (16) is pinned green; the pins row is the
+        // one that holds this knob.
+        (
+            "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS",
+            Expect::DefaultStrict {
+                weak: "1",
+                rows: &[PINS_ROW],
+            },
+        ),
+        (
+            "AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES",
+            Expect::Redundant(10131),
+        ),
+        (
+            "AI_MEMORY_PERMISSIONS_MODE",
+            Expect::DefaultStrict {
+                weak: "advisory",
+                rows: &[
+                    PINS_ROW,
+                    "AI_MEMORY_PERMISSIONS_MODE (ruling: AI_MEMORY_FED_PERMISSIONS_MODE)",
+                ],
+            },
+        ),
+        (
+            "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR",
+            Expect::DefaultStrict {
+                weak: "1",
+                rows: &[PINS_ROW, "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR"],
+            },
+        ),
+        (
+            "AI_MEMORY_FED_REQUIRE_POLICY_CURRENT",
+            Expect::Redundant(10131),
+        ),
+        (
+            "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS",
+            Expect::DefaultStrict {
+                weak: "1",
+                rows: &[PINS_ROW, "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT"],
+            },
+        ),
+        ("AI_MEMORY_FED_CERT_PEER_BINDING", Expect::Redundant(10131)),
+        ("AI_MEMORY_UNSTAMPED_MUTATION", Expect::Redundant(10131)),
+        (
+            "AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS",
+            Expect::Redundant(10131),
+        ),
+        (
+            "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS",
+            Expect::Redundant(10131),
+        ),
+        ("AI_MEMORY_REQUIRE_FORENSIC_SINK", Expect::Redundant(10131)),
+        // Row 20 also counts the on-disk operator key (`enrolled_approver_keys`).
+        (
+            "AI_MEMORY_APPROVER_PUBKEYS",
+            Expect::ShadowedBy {
+                file: OPERATOR_PUBKEY_FILE,
+                rows: &["R40 escalate producer"],
+            },
+        ),
+        (
+            "AI_MEMORY_ENCRYPT_AT_REST",
+            Expect::NeedsSqlcipher("AI_MEMORY_ENCRYPT_AT_REST"),
+        ),
+    ];
+
+    fn failing(checks: Vec<PostureCheck>) -> Vec<String> {
+        checks
+            .into_iter()
+            .filter(|c| !c.pass)
+            .map(|c| c.control)
+            .collect()
+    }
+
+    /// Every variable the fully hardened fixture sets, in a fresh process env.
+    fn set_vars(env: &PostureEnv<'_>) -> Vec<&'static str> {
+        env.saved
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| std::env::var_os(name).is_some())
+            .collect()
+    }
+
+    /// Rows of [`KNOB_TABLE`], written out (8 load-bearing by removal, 5
+    /// default-strict, 1 shadowed, 25 redundant, 1 sqlcipher): never computed
+    /// from the fixture.
+    const KNOB_TABLE_ROWS: usize = 40;
+
+    fn table_names(table: &[(&'static str, Expect)]) -> Vec<&'static str> {
+        table.iter().map(|(n, _)| *n).collect()
+    }
+
+    /// N3 (#10124): every variable the fixture sets has exactly one table row
+    /// and every row names a variable the fixture sets. Each problem is
+    /// reported once, in a fixed order, so a test can assert it exactly.
+    fn exactly_once(table: &[&str], set: &[&str]) -> Result<(), Vec<String>> {
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for name in table {
+            *counts.entry(name).or_default() += 1;
+        }
+        let mut problems = Vec::new();
+        for (name, n) in &counts {
+            if *n > 1 {
+                problems.push(format!("{name}: {n} KNOB_TABLE rows"));
+            }
+            if !set.contains(name) {
+                problems.push(format!("{name}: KNOB_TABLE row not set by the fixture"));
+            }
+        }
+        for name in set {
+            if !counts.contains_key(name) {
+                problems.push(format!(
+                    "{name}: set by the fixture but has no KNOB_TABLE row"
+                ));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems)
+        }
+    }
+
+    /// N3 (#10124): the exactly-once check refuses a duplicated row, a missing
+    /// row and a stale row, each with its exact reason.
+    #[test]
+    fn exactly_once_refuses_duplicate_missing_and_stale_rows_10124() {
+        let set = ["A", "B", "C"];
+        let cases: &[(&[&str], Result<(), Vec<String>>)] = &[
+            (&["A", "B", "C"], Ok(())),
+            (&["C", "A", "B"], Ok(())),
+            (
+                &["A", "B", "C", "A"],
+                Err(vec!["A: 2 KNOB_TABLE rows".to_string()]),
+            ),
+            (
+                &["A", "B"],
+                Err(vec![
+                    "C: set by the fixture but has no KNOB_TABLE row".to_string(),
+                ]),
+            ),
+            (
+                &["A", "B", "C", "D"],
+                Err(vec!["D: KNOB_TABLE row not set by the fixture".to_string()]),
+            ),
+            (
+                &["A", "A", "B"],
+                Err(vec![
+                    "A: 2 KNOB_TABLE rows".to_string(),
+                    "C: set by the fixture but has no KNOB_TABLE row".to_string(),
+                ]),
+            ),
+        ];
+        for (table, want) in cases {
+            assert_eq!(&exactly_once(table, &set), want, "table {table:?}");
+        }
+    }
+
+    /// N3 (#10124): the table has its written-out row count and no name twice,
+    /// independently of what the fixture sets.
+    #[test]
+    fn knob_table_lists_each_name_once_10124() {
+        let names = table_names(KNOB_TABLE);
+        assert_eq!(names.len(), KNOB_TABLE_ROWS);
+        assert_eq!(exactly_once(&names, &names), Ok(()));
+    }
+
+    #[test]
+    fn posture_env_vars_has_no_duplicates() {
+        let vars = posture_env_vars();
+        let mut seen = std::collections::BTreeSet::new();
+        for v in &vars {
+            assert!(seen.insert(*v), "{v} is listed twice in posture_env_vars()");
+        }
+    }
+
+    /// I-3 (#10124 F3/S4): every variable the fully hardened fixture sets either
+    /// makes a named posture row fail when removed, or is a recorded finding.
+    #[test]
+    fn every_pinned_variable_is_load_bearing_or_a_recorded_finding_10124() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::hardened_env_fixture::tests::every_pinned_variable_is_load_bearing_or_a_recorded_finding_10124",
+        ) {
+            return;
+        }
+        let guard = EnvLockGuard::acquire();
+        let names: Vec<&'static str> = {
+            let env = PostureEnv::fully_hardened(&guard);
+            set_vars(&env)
+        };
+        // No unclassified variable, no stale or duplicated table row.
+        assert_eq!(exactly_once(&table_names(KNOB_TABLE), &names), Ok(()));
+        let sqlcipher = crate::build_features::has_feature("sqlcipher");
+        let cfg = AppConfig::default();
+        let mut load_bearing = 0_usize;
+        for (name, expect) in KNOB_TABLE {
+            let env = PostureEnv::fully_hardened(&guard);
+            let base = failing(evaluate(&cfg));
+            env.unset(name);
+            let after = failing(evaluate(&cfg));
+            let newly: Vec<&String> = after.iter().filter(|c| !base.contains(c)).collect();
+            match expect {
+                Expect::Rows(rows) => {
+                    let want: Vec<&str> = rows.to_vec();
+                    let got: Vec<&str> = newly.iter().map(|s| s.as_str()).collect();
+                    assert_eq!(got, want, "removing {name} must fail exactly these rows");
+                    load_bearing += 1;
+                }
+                Expect::Redundant(issue) => {
+                    assert!(
+                        newly.is_empty(),
+                        "removing {name} now fails {newly:?}: it is load-bearing, so drop its \
+                         Redundant(#{issue}) row and name the rows"
+                    );
+                }
+                Expect::DefaultStrict { weak, rows } => {
+                    assert!(
+                        newly.is_empty(),
+                        "unset {name} must read as strict, yet it fails {newly:?}"
+                    );
+                    drop(env);
+                    let env = PostureEnv::fully_hardened(&guard);
+                    env.set(name, weak);
+                    let weakened = failing(evaluate(&cfg));
+                    let got: Vec<&str> = weakened
+                        .iter()
+                        .filter(|c| !base.contains(c))
+                        .map(String::as_str)
+                        .collect();
+                    assert_eq!(
+                        got,
+                        rows.to_vec(),
+                        "{name}={weak} must fail exactly these rows"
+                    );
+                    load_bearing += 1;
+                }
+                Expect::ShadowedBy { file, rows } => {
+                    assert!(
+                        newly.is_empty(),
+                        "unset {name} alone must stay covered by {file}, yet it fails {newly:?}"
+                    );
+                    drop(env);
+                    let env = PostureEnv::fully_hardened(&guard);
+                    let key_dir = env.key_dir().expect("hardened key dir");
+                    std::fs::remove_file(key_dir.join(file)).expect("remove shadowing file");
+                    let shadow_base = failing(evaluate(&cfg));
+                    env.unset(name);
+                    let got: Vec<String> = failing(evaluate(&cfg))
+                        .into_iter()
+                        .filter(|c| !shadow_base.contains(c))
+                        .collect();
+                    assert_eq!(got, rows.to_vec(), "{name} unset without {file}");
+                    load_bearing += 1;
+                }
+                Expect::NeedsSqlcipher(row) => {
+                    if sqlcipher {
+                        assert_eq!(newly, vec![&row.to_string()], "removing {name}");
+                        load_bearing += 1;
+                    } else {
+                        assert!(
+                            base.iter().any(|c| c == row),
+                            "{row} fails without sqlcipher"
+                        );
+                    }
+                }
+            }
+        }
+        // Profile, key dir, synchronous, trust domain, peer fingerprints, peer
+        // attestation, boot-refusal env and append-only (8 by removal), the 5
+        // default-strict knobs proven by a weak value and the approver keys
+        // proven with the operator key removed (6, N4 of #10124), plus
+        // encrypt-at-rest on a sqlcipher build: a knob that stops mattering
+        // must be noticed.
+        let expected_load_bearing = 8 + 6 + usize::from(sqlcipher);
+        assert_eq!(load_bearing, expected_load_bearing);
+    }
+
+    /// `unset` refuses a variable the fixture does not snapshot.
+    #[test]
+    #[should_panic(expected = "is not owned by this fixture")]
+    fn unset_refuses_a_foreign_variable() {
+        let guard = EnvLockGuard::acquire();
+        let env = PostureEnv::bare(&guard);
+        env.unset("AI_MEMORY_NOT_A_POSTURE_VARIABLE_10124");
+    }
+
+    // I-1 (#10124 F1/S1): no foreign `MutexGuard` converts into an `EnvLockGuard`.
+    // The standard ambiguity probe: `Probe::<_>::check()` has two applicable
+    // impls (and fails to compile) exactly when `EnvLockGuard` implements
+    // `From<MutexGuard<'static, ()>>`.
+    trait AmbiguousIfFromGuard<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfFromGuard<()> for T {}
+    impl<T: ?Sized + From<std::sync::MutexGuard<'static, ()>>> AmbiguousIfFromGuard<u8> for T {}
+
+    #[test]
+    fn no_foreign_guard_converts_into_env_lock_guard() {
+        // Compiles only while `EnvLockGuard: !From<MutexGuard<'static, ()>>`.
+        <EnvLockGuard<'static> as AmbiguousIfFromGuard<_>>::check();
+    }
+
+    // N2 (#10124): the same probe for the other two ways to get a guard
+    // without the lock. A `Default` guard would hold no lock; a `Clone` (or
+    // `Copy`) one would outlive the lock it came from. The same holds for a
+    // cloned `PostureEnv`, whose two drops would restore the env twice.
+    trait AmbiguousIfDefault<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfDefault<()> for T {}
+    impl<T: ?Sized + Default> AmbiguousIfDefault<u8> for T {}
+
+    trait AmbiguousIfClone<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+
+    #[test]
+    fn env_lock_guard_and_posture_env_have_no_default_or_clone_10124() {
+        // Compiles only while neither type is `Default` or `Clone`.
+        <EnvLockGuard<'static> as AmbiguousIfDefault<_>>::check();
+        <EnvLockGuard<'static> as AmbiguousIfClone<_>>::check();
+        <PostureEnv<'static> as AmbiguousIfDefault<_>>::check();
+        <PostureEnv<'static> as AmbiguousIfClone<_>>::check();
+    }
+}
