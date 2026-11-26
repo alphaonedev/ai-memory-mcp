@@ -662,24 +662,30 @@ fn succeed(
 ) -> Result<()> {
     let id = resolve_lineage_id(explicit_agent_id)?;
     let conn = crate::db::open(db_path)?;
+    // #10118: check the three lineage preconditions via the one shared
+    // function BEFORE rotate_with_succession or arm_with_key so every refusal
+    // preserves the exact canonical order and message without arming or
+    // touching disk.
+    let preloaded = keypair::load(&id, dir)?;
+    let _prechecked = crate::db::succession_preconditions(&conn, &id, &preloaded)?;
     let recorded: std::cell::RefCell<Option<crate::identity::lineage::LineageRecord>> =
         std::cell::RefCell::new(None);
     // Sign-then-rotate seam: the succession is signed by K_old and
     // durably persisted (body + pubkey sync + witness, one tx) BEFORE
     // `save` destroys K_old on disk.
     let outcome = keypair::rotate_with_succession(&id, dir, |k_old, k_new| {
-        // #10089: the succession re-binds the agent row of `memories`, an
-        // attested table. This process runs no session signer, so the row
-        // funnel is armed with K_old (the bound key, checked here) before
-        // the write: the rebind is attested inside K_old's window and never
-        // lands as drift. A refusal aborts the rotation with keys untouched.
-        let signing = k_old
-            .private
-            .as_ref()
-            .context("succession: K_old carries no private key")?;
-        crate::storage::row_attest::sqlite::arm_with_key(&conn, &id, signing)
-            .context("succession: row attestation could not be armed with K_old (#10089)")?;
-        let record = crate::db::append_succession(&conn, &id, k_old, &k_new.public_base64(), None)?;
+        // #10118 / #10089: re-verify on the exact `k_old` loaded for rotation
+        // (eliminating TOCTOU) and require the `SuccessionChecked` proof to
+        // supply the signing key to `arm_with_key` and `append_succession_checked`.
+        let checked = crate::db::succession_preconditions(&conn, &id, k_old)?;
+        crate::storage::row_attest::sqlite::arm_with_key(
+            &conn,
+            checked.agent_id(),
+            checked.signing_key(),
+        )
+        .context("succession: row attestation could not be armed with K_old (#10089)")?;
+        let record =
+            crate::db::append_succession_checked(&conn, &checked, &k_new.public_base64(), None)?;
         recorded.replace(Some(record));
         Ok(())
     })?;
@@ -728,8 +734,14 @@ fn register_recovery_key(
     let conn = crate::db::open(db_path)?;
     // Self-succession: the head key re-signs itself carrying the new
     // recovery commitment — the head does not change, the epoch does.
-    let record =
-        crate::db::append_succession(&conn, &id, &kp, &kp.public_base64(), Some(recovery_pubkey))?;
+    // #10118: validate via the one shared `succession_preconditions` proof.
+    let checked = crate::db::succession_preconditions(&conn, &id, &kp)?;
+    let record = crate::db::append_succession_checked(
+        &conn,
+        &checked,
+        &kp.public_base64(),
+        Some(recovery_pubkey),
+    )?;
     if json_out {
         writeln!(
             out.stdout,
@@ -946,7 +958,13 @@ mod tests {
 
     fn fresh_env() -> (TestEnv, tempfile::TempDir) {
         let env = TestEnv::fresh();
-        let dir = tempfile::TempDir::new().unwrap();
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = builder.tempdir().unwrap();
         (env, dir)
     }
 
