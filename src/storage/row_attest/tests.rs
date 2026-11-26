@@ -2840,3 +2840,18 @@ fn timed_10k_drifted_verify_10116() {
 
 #[path = "seal_cost_10116.rs"]
 mod seal_cost_10116;
+
+/// Register `agent` and bind its public key in the store (#10144 fixture).
+/// It lives here because the DB key-reader ratchet (#10086) exempts only
+/// this file in `row_attest/`.
+fn register_and_bind_for_test(
+    conn: &rusqlite::Connection,
+    agent: &str,
+    kp: &crate::identity::keypair::AgentKeypair,
+) {
+    crate::db::register_agent(conn, agent, "nhi", &[]).expect("register");
+    crate::db::bind_agent_pubkey_with_keypair(conn, agent, kp).expect("bind");
+}
+
+#[path = "recall_cost_10144.rs"]
+mod recall_cost_10144;

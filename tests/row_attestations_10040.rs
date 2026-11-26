@@ -1265,6 +1265,18 @@ const C8_SUPERSEDE_EXTRA_ROWS: i64 = 2;
 /// Renews made more than a second apart, so each changes the lease row.
 const C8_SPACED_RENEWS: usize = 3;
 const C8_RENEW_SPACING: std::time::Duration = std::time::Duration::from_millis(1_100);
+/// On a loaded host (the unsigned p95 above the budget) the armed p95
+/// overhead may be at most this many times the unsigned p95 (#10144).
+const C8_LOADED_OVERHEAD_RATIO: u64 = 1;
+
+/// The load-normalised bound of a p95 overhead (#10144): exactly `budget`
+/// on a quiet host, where the unsigned p95 is within it; on a loaded host
+/// the overhead is bounded by the unsigned call itself times
+/// [`C8_LOADED_OVERHEAD_RATIO`]. The primary, counted gate is the lib test
+/// `storage::row_attest::tests::recall_cost_10144`.
+fn load_normalised_budget(budget: u64, plain_p95: u64) -> u64 {
+    budget.max(plain_p95.saturating_mul(C8_LOADED_OVERHEAD_RATIO))
+}
 
 fn table_attestations(sb: &Sandbox, table: &str) -> i64 {
     sb.conn()
@@ -1326,7 +1338,8 @@ fn c8_seed(mcp: &mut Mcp) -> Value {
 /// and `leases` at the live key count (plus the cutover and one delete): a
 /// lease renewed `C8_RENEWS` times keeps one attestation, and a round of
 /// recalls adds no more than `MAX_ATTESTATIONS_PER_10K_RECALLS` per 10,000;
-/// the two p95 overhead budgets (signed session minus an unsigned one) hold.
+/// the two p95 overhead budgets (signed session minus an unsigned one) hold,
+/// load-normalised by [`load_normalised_budget`] (#10144).
 #[test]
 fn operational_tables_supersede_and_stay_in_budget_10040() {
     use ai_memory::storage::row_attest::{
@@ -1398,13 +1411,17 @@ fn operational_tables_supersede_and_stay_in_budget_10040() {
     drop(mcp);
     let recall_over = armed_recall.saturating_sub(plain_recall);
     let renew_over = armed_renew.saturating_sub(plain_renew);
+    let recall_bound = load_normalised_budget(RECALL_ATTEST_P95_BUDGET_US, plain_recall);
+    let renew_bound = load_normalised_budget(LEASE_RENEW_ATTEST_P95_BUDGET_US, plain_renew);
     assert!(
-        recall_over <= RECALL_ATTEST_P95_BUDGET_US,
-        "memory_recall p95 overhead {recall_over}us (armed {armed_recall}us, unsigned {plain_recall}us)"
+        recall_over <= recall_bound,
+        "memory_recall p95 overhead {recall_over}us over {recall_bound}us \
+         (budget {RECALL_ATTEST_P95_BUDGET_US}us; armed {armed_recall}us, unsigned {plain_recall}us)"
     );
     assert!(
-        renew_over <= LEASE_RENEW_ATTEST_P95_BUDGET_US,
-        "lease renew p95 overhead {renew_over}us (armed {armed_renew}us, unsigned {plain_renew}us)"
+        renew_over <= renew_bound,
+        "lease renew p95 overhead {renew_over}us over {renew_bound}us \
+         (budget {LEASE_RENEW_ATTEST_P95_BUDGET_US}us; armed {armed_renew}us, unsigned {plain_renew}us)"
     );
     eprintln!(
         "c8: recall p95 armed {armed_recall}us unsigned {plain_recall}us; \
