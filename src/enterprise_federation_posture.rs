@@ -103,6 +103,10 @@ mod backup_signing;
 /// #10086 A-4 — the row-attestation trust-anchor posture row (check #23).
 mod row_attest_anchor;
 
+/// #10121 — the one hardened-posture test fixture.
+#[cfg(test)]
+pub(crate) mod hardened_env_fixture;
+
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
 /// name here — deliberately not a free-form string so a typo in
@@ -881,46 +885,6 @@ mod tests {
     const PIN_PROVABLE: bool = cfg!(feature = "sal-postgres");
     use super::*;
 
-    /// Every env var this module (or the `asi-hard` KNOBS it reuses)
-    /// reads or pins, for test isolation. Delegates the 22 `asi-hard`
-    /// knobs + the profile selector to `security_profile::pinned_knobs`
-    /// / `ENV_SECURITY_PROFILE` rather than re-listing them (single
-    /// source of truth even inside the test cleanup).
-    const FED_ENV_VARS: &[&str] = &[
-        crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
-        crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
-        crate::federation::signing::REQUIRE_SIG_ENV,
-        crate::federation::signing::REQUIRE_NONCE_ENV,
-        crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
-        crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
-        AppConfig::ENV_PERMISSIONS_MODE,
-        crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
-        crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
-        crate::tls::FED_PEER_FINGERPRINTS_ENV,
-        PEER_ATTESTATION_ENV,
-        crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
-        crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
-        crate::encryption::ENV_ENCRYPT_AT_REST,
-        crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
-        ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
-        // #2954 — check #19 append-only spine flag.
-        crate::config::ENV_APPEND_ONLY,
-        // #3061 — check #15 is now backend-aware: it resolves the store URL
-        // via `store_url::resolve_store_url(None)` (these two channels) and,
-        // on a postgres:// DSN, reads the pg at-rest attestation. Cleared so
-        // the sqlite/sqlcipher leg every existing test asserts is
-        // deterministic regardless of a stray ambient store URL.
-        crate::store_url::STORE_URL_ENV,
-        crate::store_url::STORE_URL_FILE_ENV,
-        ENV_PG_AT_REST_ATTESTED,
-    ];
-
-    /// #2954 — keeps the installed daemon-audit-key temp dir alive for the
-    /// whole (env-isolated child) process so check #19's signing-key half stays
-    /// armed. First-install-wins (`OnceLock`), mirroring the flag-on suite's
-    /// `AUDIT_DIR`.
-    static POSTURE_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-
     pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::config::test_env_lock()
     }
@@ -928,18 +892,8 @@ mod tests {
     /// # Safety
     /// Caller must hold [`env_lock`].
     pub(super) unsafe fn clear_all() {
-        unsafe {
-            std::env::remove_var(crate::security_profile::ENV_SECURITY_PROFILE);
-            for (env, _) in crate::security_profile::pinned_knobs() {
-                std::env::remove_var(env);
-            }
-            for env in FED_ENV_VARS {
-                std::env::remove_var(env);
-            }
-            // #2991 check #20 — the escalate-producer approver-key enrollment.
-            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
-            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
-        }
+        // SAFETY: forwarded caller contract.
+        unsafe { super::hardened_env_fixture::clear_posture_env() };
     }
 
     /// RAII guard mirroring `security_profile::tests::KnobsGuard` — a
@@ -960,97 +914,11 @@ mod tests {
             .unwrap_or_else(|| panic!("no check with control prefix {control_prefix:?}"))
     }
 
-    /// Sets every certified-posture env var to its compliant value
-    /// (asi-hard engaged + pinned via the real `enforce_at_boot`, plus
-    /// every federation-specific addition). Does NOT — cannot — compile
-    /// in the `sqlcipher` feature, so the at-rest-encryption check is
-    /// asserted separately per the build's actual compiled features.
-    ///
-    /// Returns the peer-fingerprints tempfile so it stays alive for the
-    /// duration of the caller's assertions (dropped = file removed).
-    /// #2991 — a deterministic, valid base64 Ed25519 approver pubkey for the
-    /// escalate-producer posture check (#20). Derived from a fixed seed so the
-    /// value is stable and never depends on an RNG.
-    fn approver_pubkey_b64_for_test() -> String {
-        use base64::Engine as _;
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
-    }
-
-    pub(super) fn set_fully_hardened_env() -> tempfile::NamedTempFile {
-        unsafe {
-            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
-        }
-        // Pins the 31 asi-hard knobs via the REAL enforcement fn — the
-        // single source of truth for what "compliant" means for that set.
-        crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly from a clean env");
-
-        let fp_file = tempfile::NamedTempFile::new().expect("tempfile");
-        std::fs::write(fp_file.path(), "example.org abc123\n").expect("write fp file");
-
-        unsafe {
-            std::env::set_var(TRUST_DOMAIN_ENV_FOR_TEST, "test-fleet");
-            std::env::set_var(
-                crate::tls::FED_PEER_FINGERPRINTS_ENV,
-                fp_file.path().to_str().unwrap(),
-            );
-            std::env::set_var(
-                PEER_ATTESTATION_ENV,
-                r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
-            );
-            std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "1");
-            // #2911 check #17 — unlike the default-ON `AI_MEMORY_FED_REQUIRE_*`
-            // knobs below, the boot-refusal env defaults OFF. Unset is now
-            // a FAIL (doctor must not PASS a process whose daemon would
-            // not refuse boot on later drift).
-            std::env::set_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "1");
-            // #2954 check #19 — the append-only audit spine must be armed for
-            // the certified posture (else a federation supersede leaf is
-            // unsigned theater). The signing-key half is armed just below.
-            std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
-            // #2991 check #20 — enroll an approver key so the wired L1-6
-            // escalate producer routes to a SATISFIABLE signed-approval gate
-            // (a keyless fleet would fail the check by design).
-            std::env::set_var(
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                approver_pubkey_b64_for_test(),
-            );
-        }
-        // #3199 check #22 — the operator public key restore verifies backups
-        // against, in the per-process test key sandbox (no env write).
-        let (keys, pk) = (
-            crate::identity::keypair::default_key_dir(),
-            approver_pubkey_b64_for_test(),
-        );
-        let keys = keys.expect("key dir");
-        std::fs::write(keys.join("operator.key.pub"), pk).expect("write pubkey");
-        super::row_attest_anchor::seed_anchor_key(&keys); // #10086 check #23
-        // #2954 check #19 — install a process-wide daemon audit signing key so
-        // the append-only leaves would be SIGNED. Process-global `OnceLock`
-        // install, isolated per env-isolated child
-        // (`run_env_isolated_child_or_spawn`), kept alive for the test in a
-        // module-static tempdir (first-install-wins, like the flag-on suite).
-        POSTURE_AUDIT_DIR.get_or_init(|| {
-            let dir = tempfile::Builder::new()
-                .prefix("ef-posture-audit-")
-                .tempdir()
-                .expect("audit tempdir");
-            let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-            crate::governance::audit::init(dir.path(), Some(signing))
-                .expect("install daemon audit key");
-            dir
-        });
-        // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT / _SIG / _NONCE /
-        // _PUSH_NAMESPACE_SCOPE / _POLICY_CURRENT /
-        // AI_MEMORY_PERMISSIONS_MODE /
-        // AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR / _SYNC_TRUST_PEER /
-        // _TRUST_BODY_AGENT_ID / _ALLOW_PLAINTEXT_PEERS /
-        // _ALLOW_UNENROLLED_PEERS are all deliberately left UNSET — every
-        // one of them already defaults to the certified-compliant state
-        // (each check now calls the real production reader function
-        // directly, per the B1/NB1 fixes), which is itself part of what
-        // this test proves.
-        fp_file
+    /// #10121 — the certified posture env from the ONE fixture
+    /// (`hardened_env_fixture::PostureEnv`); restores the env on drop.
+    pub(super) fn set_fully_hardened_env() -> super::hardened_env_fixture::PostureEnv<'static> {
+        // SAFETY: every caller holds `env_lock()` for the whole test.
+        unsafe { super::hardened_env_fixture::PostureEnv::fully_hardened_unchecked() }
     }
 
     // Alias so the const import above stays readable without a `use`
@@ -2066,7 +1934,7 @@ mod tests {
     /// at a postgres:// DSN, so check #15 evaluates the COMPENSATING pg
     /// at-rest control instead of the sqlcipher predicate. Returns the
     /// fingerprints tempfile (kept alive by the caller).
-    fn set_postgres_backend(dsn: &str) -> tempfile::NamedTempFile {
+    fn set_postgres_backend(dsn: &str) -> super::hardened_env_fixture::PostureEnv<'static> {
         let fp = set_fully_hardened_env();
         unsafe {
             std::env::set_var(crate::store_url::STORE_URL_ENV, dsn);

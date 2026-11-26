@@ -9099,46 +9099,6 @@ enabled = true
         crate::config::test_env_lock()
     }
 
-    fn clear_posture_env() {
-        unsafe {
-            std::env::remove_var(crate::security_profile::ENV_SECURITY_PROFILE);
-            for (env, _) in crate::security_profile::pinned_knobs() {
-                std::env::remove_var(env);
-            }
-            for env in [
-                crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
-                crate::federation::signing::REQUIRE_SIG_ENV,
-                crate::federation::signing::REQUIRE_NONCE_ENV,
-                crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
-                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
-                "AI_MEMORY_PERMISSIONS_MODE",
-                crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
-                crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
-                crate::tls::FED_PEER_FINGERPRINTS_ENV,
-                crate::federation::peer_attestation::PEER_ATTESTATION_ENV,
-                crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
-                crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
-                crate::encryption::ENV_ENCRYPT_AT_REST,
-                crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
-                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
-                // #2954 check #19 — append-only spine flag.
-                crate::config::ENV_APPEND_ONLY,
-                // #2991 check #20 — R40 approver-key enrollment.
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                "AI_MEMORY_OPERATOR_PUBKEY",
-            ] {
-                std::env::remove_var(env);
-            }
-        }
-    }
-
-    struct PostureEnvGuard;
-    impl Drop for PostureEnvGuard {
-        fn drop(&mut self) {
-            clear_posture_env();
-        }
-    }
-
     #[test]
     fn run_posture_unrecognised_name_exits_2() {
         let mut stdout = Vec::<u8>::new();
@@ -9164,8 +9124,8 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::bare(&_g);
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("posture-3553.db");
@@ -9235,8 +9195,8 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::bare(&_g);
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -9307,8 +9267,8 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::bare(&_g);
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -9351,60 +9311,11 @@ enabled = true
             return;
         }
         let _g = posture_env_lock();
-        clear_posture_env();
-        let _cleanup = PostureEnvGuard;
-
-        unsafe {
-            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
-        }
-        crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly");
-
-        let fp_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(fp_file.path(), "example.org abc123\n").unwrap();
-        // #2991 check #20 — a deterministic, valid base64 Ed25519 approver pubkey.
-        let approver_pubkey_b64 = {
-            use base64::Engine as _;
-            let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
-        };
-        // #3199 check #22 — the operator public key restore verifies backups
-        // against, in the per-process test key sandbox (no env write).
-        let keys = crate::identity::keypair::default_key_dir().expect("sandbox key dir");
-        std::fs::write(keys.join("operator.key.pub"), &approver_pubkey_b64).expect("write pubkey");
-        unsafe {
-            std::env::set_var(
-                crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
-                "test-fleet",
+        // #10121 — the ONE hardened fixture (check #23's anchor key included).
+        let _env =
+            crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::fully_hardened(
+                &_g,
             );
-            std::env::set_var(
-                crate::tls::FED_PEER_FINGERPRINTS_ENV,
-                fp_file.path().to_str().unwrap(),
-            );
-            std::env::set_var(
-                crate::federation::peer_attestation::PEER_ATTESTATION_ENV,
-                r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
-            );
-            std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "1");
-            std::env::set_var(
-                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
-                "1",
-            );
-            // #2954 check #19 — arm the append-only audit spine flag.
-            std::env::set_var(crate::config::ENV_APPEND_ONLY, "1");
-            // #2991 check #20 — enroll a deterministic approver key so the R40
-            // escalate producer routes to a SATISFIABLE signed-approval gate.
-            std::env::set_var(
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                &approver_pubkey_b64,
-            );
-        }
-        // #2954 check #19 — install a process-wide daemon audit signing key so
-        // the append-only leaves would be SIGNED (the other half of the
-        // pairing). Isolated per env-isolated child; the OnceLock persists for
-        // the child's lifetime independent of the tempdir.
-        let _audit_dir = tempfile::tempdir().expect("audit dir");
-        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-        let _ = crate::governance::audit::init(_audit_dir.path(), Some(signing));
 
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();

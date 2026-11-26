@@ -250,3 +250,63 @@ fn ratchet_refuses_every_form_of_a_second_posture_block() {
         format!("{allowed_body}/// `enforce_at_boot` pins FULL; set_var is not called here.\n");
     assert_eq!(scan(&documented), Vec::new());
 }
+
+/// #10121 negative: the certified posture with its agent keys removed has
+/// exactly one failing row besides the build-dependent at-rest row — check
+/// #23, `row attestation trust anchor`, naming the empty key directory — and
+/// `doctor --posture` exits 2.
+#[test]
+fn run_posture_fails_only_the_anchor_row_without_an_agent_key_10121() {
+    if crate::config::run_env_isolated_child_or_spawn(
+        "cli::doctor::doctor_posture_fixture_10121::run_posture_fails_only_the_anchor_row_without_an_agent_key_10121",
+    ) {
+        return;
+    }
+    let lock = crate::config::test_env_lock();
+    let env =
+        crate::enterprise_federation_posture::hardened_env_fixture::PostureEnv::fully_hardened(
+            &lock,
+        );
+    assert_eq!(
+        env.remove_agent_keys(),
+        1,
+        "the fixture seeds exactly one agent key"
+    );
+
+    let mut stdout = Vec::<u8>::new();
+    let mut stderr = Vec::<u8>::new();
+    let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+    let exit = super::run_posture(
+        crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
+        true,
+        None,
+        &mut out,
+    )
+    .expect("posture report");
+    assert_eq!(exit, 2, "an unanchored verifier must fail the posture");
+
+    let v: serde_json::Value = serde_json::from_slice(&stdout).expect("posture JSON");
+    assert_eq!(v["pass"], false);
+    let sqlcipher_compiled = crate::build_features::has_feature("sqlcipher");
+    let failing: Vec<&serde_json::Value> = v["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .filter(|c| c["pass"] == false)
+        .filter(|c| sqlcipher_compiled || c["control"] != crate::encryption::ENV_ENCRYPT_AT_REST)
+        .collect();
+    assert_eq!(failing.len(), 1, "exactly one failing row: {failing:?}");
+    let row = failing[0];
+    assert_eq!(row["control"], "row attestation trust anchor", "{row}");
+    let key_dir = env
+        .key_dir()
+        .expect("hardened key dir")
+        .display()
+        .to_string();
+    assert_eq!(
+        row["actual"],
+        format!("unanchored: key directory {key_dir} holds no public key"),
+        "{row}"
+    );
+    drop(stderr);
+}
