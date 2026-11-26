@@ -8849,17 +8849,28 @@ enabled = true
     // remote-section test idiom above.
     // ---------------------------------------------------------------
 
+    type EnvLockProof =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'static>;
+
     /// RAII env setter scoped to a test; restores prior values on drop.
-    struct EnvScope(Vec<(&'static str, Option<std::ffi::OsString>)>);
-    impl EnvScope {
-        fn set(
-            _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
-            pairs: &[(&'static str, &str)],
-        ) -> Self {
+    ///
+    /// The scope borrows the lock guard it was built under (`'lock`), so a
+    /// scope that outlives its guard is a compile error (E0597), not a
+    /// declaration-order convention (#10124 R3-1, per OWNERSHIP-18 and
+    /// UNSAFE-04): `Drop` writes the process environment, and the borrow
+    /// proves the crate-wide env lock is still held when it does.
+    struct EnvScope<'lock> {
+        _lock: &'lock EnvLockProof,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl<'lock> EnvScope<'lock> {
+        fn set(lock: &'lock EnvLockProof, pairs: &[(&'static str, &str)]) -> Self {
             let mut prev = Vec::new();
             for (k, v) in pairs {
                 prev.push((*k, std::env::var_os(k)));
-                // SAFETY: `_lock` proves the crate-wide env lock is held.
+                // SAFETY: `lock` is a live `EnvLockGuard`, so the crate-wide
+                // env lock is held and no other test thread reads or writes
+                // the environment while this runs.
                 unsafe { std::env::set_var(k, v) };
             }
             // AI_MEMORY_NO_CONFIG keeps AppConfig::load off any on-disk
@@ -8868,24 +8879,31 @@ enabled = true
                 "AI_MEMORY_NO_CONFIG",
                 std::env::var_os("AI_MEMORY_NO_CONFIG"),
             ));
+            // SAFETY: same proof as above; `lock` is still borrowed here.
             unsafe { std::env::set_var("AI_MEMORY_NO_CONFIG", "1") };
-            Self(prev)
+            Self {
+                _lock: lock,
+                saved: prev,
+            }
         }
     }
-    impl Drop for EnvScope {
+    impl Drop for EnvScope<'_> {
         fn drop(&mut self) {
-            for (k, v) in &self.0 {
+            for (k, v) in &self.saved {
                 match v {
+                    // SAFETY: `self._lock` borrows the live `EnvLockGuard`
+                    // this scope was built under, so the env lock is held
+                    // for the whole of this drop (the borrow checker
+                    // refuses a scope that outlives its guard).
                     Some(val) => unsafe { std::env::set_var(k, val) },
+                    // SAFETY: as the arm above.
                     None => unsafe { std::env::remove_var(k) },
                 }
             }
         }
     }
 
-    fn clear_llm_embed_env(
-        _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
-    ) {
+    fn clear_llm_embed_env(_lock: &EnvLockProof) {
         for k in [
             "AI_MEMORY_LLM_BACKEND",
             "AI_MEMORY_LLM_BASE_URL",
@@ -8896,6 +8914,8 @@ enabled = true
             "AI_MEMORY_EMBED_API_KEY",
             "AI_MEMORY_EMBED_MODEL",
         ] {
+            // SAFETY: `_lock` is a live `EnvLockGuard`, so the crate-wide env
+            // lock is held for the whole call.
             unsafe { std::env::remove_var(k) };
         }
     }
@@ -8910,19 +8930,26 @@ enabled = true
         assert!(!gpu_policy_warn_applicable("ollama", true));
     }
 
-    /// #10124 R3-1 class probe, RED at base 2f18736a: an `EnvScope` can be
-    /// built under the lock guard and dropped after the guard is gone, so its
-    /// `Drop` writes the process environment without the lock. This compiles
-    /// and passes today, which is the defect.
+    /// #10124 R3-1: the red probe of the previous commit (an `EnvScope`
+    /// dropped after its guard) no longer compiles: rustc refuses it with
+    /// E0597 (`g` does not live long enough). A compile-fail body cannot sit
+    /// in a passing test, so this pin holds the property at the type level:
+    /// `bind` hands out a scope typed `EnvScope<'a>` for the guard borrow
+    /// `'a`. It stops compiling (E0107) if `EnvScope` loses its lifetime
+    /// parameter, the first step of re-opening the defect.
     #[test]
-    fn envscope_outlives_its_lock_guard_10124_r31() {
-        let scope;
-        {
-            let g = posture_env_lock();
-            scope = EnvScope::set(&g, &[("AI_MEMORY_R31_PROBE_10124", "1")]);
+    fn envscope_is_bound_to_its_lock_guard_10124_r31() {
+        fn bind<'a>(g: &'a EnvLockProof) -> EnvScope<'a> {
+            EnvScope::set(g, &[("AI_MEMORY_R31_PROBE_10124", "1")])
         }
-        // The guard is gone; `scope` still lives and writes env on drop.
+        let g = posture_env_lock();
+        let scope = bind(&g);
+        assert_eq!(
+            std::env::var("AI_MEMORY_R31_PROBE_10124").as_deref(),
+            Ok("1")
+        );
         drop(scope);
+        assert!(std::env::var_os("AI_MEMORY_R31_PROBE_10124").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
