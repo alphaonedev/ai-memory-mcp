@@ -151,4 +151,109 @@ mod tests {
         let p = preimage(DaemonDomain::EventRow, b"xyz");
         assert_eq!(p, b"ai-memory/daemon-sig/v2/event-row\0xyz");
     }
+
+    mod chain_signer_10145 {
+        use super::super::{DaemonChainSigner, DaemonKeyCause, DaemonKeyMissing};
+        use crate::identity::keypair::AgentKeypair;
+        use crate::signed_events::SignedEvent;
+        use ed25519_dalek::SigningKey;
+
+        const SEED: [u8; 32] = [7u8; 32];
+        const OTHER_SEED: [u8; 32] = [9u8; 32];
+
+        fn pair(seed: [u8; 32]) -> AgentKeypair {
+            let key = SigningKey::from_bytes(&seed);
+            AgentKeypair {
+                agent_id: crate::identity::keypair::DAEMON_KEYPAIR_LABEL.to_string(),
+                public: key.verifying_key(),
+                private: Some(key),
+            }
+        }
+
+        fn row() -> SignedEvent {
+            SignedEvent {
+                id: "row-10145".to_string(),
+                agent_id: "ai-memory:migration-v103".to_string(),
+                event_type: "signed_events.agent_cutover".to_string(),
+                payload_hash: vec![3u8; 33],
+                signature: None,
+                attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+                timestamp: "2026-11-26T00:00:00+00:00".to_string(),
+                prev_hash: vec![0u8; 32],
+                sequence: 1,
+                cause_hash: None,
+            }
+        }
+
+        #[test]
+        fn a_public_only_keypair_builds_no_chain_signer_10145() {
+            let mut kp = pair(SEED);
+            kp.private = None;
+            let err = DaemonChainSigner::try_from(kp).expect_err("public-only must refuse");
+            assert_eq!(err.cause(), DaemonKeyCause::PublicOnly);
+        }
+
+        #[test]
+        fn a_mismatched_keypair_builds_no_chain_signer_10145() {
+            let mut kp = pair(SEED);
+            kp.public = SigningKey::from_bytes(&OTHER_SEED).verifying_key();
+            let err = DaemonChainSigner::try_from(kp).expect_err("mismatch must refuse");
+            assert_eq!(err.cause(), DaemonKeyCause::KeyMismatch);
+        }
+
+        #[test]
+        fn a_signed_row_verifies_and_every_flipped_byte_fails_10145() {
+            let signer = DaemonChainSigner::try_from(pair(SEED)).expect("full keypair");
+            let vk = signer.verifying_key();
+            let mut signed = row();
+            signer.sign_row(&mut signed);
+            assert_eq!(
+                signed.attest_level,
+                crate::models::AttestLevel::DaemonSigned.as_str()
+            );
+            assert_eq!(signed.signature.as_ref().map(Vec::len), Some(64));
+            assert!(DaemonChainSigner::verify_row(&vk, &signed));
+            let other = SigningKey::from_bytes(&OTHER_SEED).verifying_key();
+            assert!(!DaemonChainSigner::verify_row(&other, &signed));
+            for i in 0..signed.payload_hash.len() {
+                let mut m = signed.clone();
+                m.payload_hash[i] ^= 1;
+                assert!(!DaemonChainSigner::verify_row(&vk, &m), "payload byte {i}");
+            }
+            for i in 0..64 {
+                let mut m = signed.clone();
+                if let Some(s) = m.signature.as_mut() {
+                    s[i] ^= 1;
+                }
+                assert!(
+                    !DaemonChainSigner::verify_row(&vk, &m),
+                    "signature byte {i}"
+                );
+            }
+            let mut m = signed.clone();
+            m.sequence = 2;
+            assert!(!DaemonChainSigner::verify_row(&vk, &m), "sequence");
+            let mut m = signed.clone();
+            m.attest_level = crate::models::AttestLevel::Unsigned.as_str().to_string();
+            assert!(!DaemonChainSigner::verify_row(&vk, &m), "attest level");
+            let mut m = signed;
+            m.signature = None;
+            assert!(!DaemonChainSigner::verify_row(&vk, &m), "no signature");
+        }
+
+        #[test]
+        fn the_refusal_is_counted_and_names_the_provisioning_command_10145() {
+            let before = super::super::daemon_key_missing_total();
+            let err = DaemonKeyMissing::new(DaemonKeyCause::GenerationDisabled, None);
+            assert!(super::super::daemon_key_missing_total() > before);
+            let text = err.to_string();
+            assert!(
+                text.contains("ai-memory identity generate --agent-id daemon"),
+                "{text}"
+            );
+            assert!(text.contains("AI_MEMORY_KEY_DIR"), "{text}");
+            assert!(text.contains("ai-memory backup"), "{text}");
+            assert!(text.contains("key generation is disabled"), "{text}");
+        }
+    }
 }

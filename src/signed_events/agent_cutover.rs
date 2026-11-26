@@ -344,3 +344,7 @@ pub fn write_sqlite_agent_cutover(conn: &Connection) -> Result<Option<i64>> {
     .context("agent cutover: insert marker")?;
     Ok(Some(marker.sequence))
 }
+
+#[cfg(test)]
+#[path = "agent_cutover_signed_tests.rs"]
+mod signed_tests;
