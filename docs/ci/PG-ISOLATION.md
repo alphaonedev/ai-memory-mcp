@@ -1,53 +1,105 @@
-# Per-binary Postgres isolation (#6383 / #6386)
+# Per-binary Postgres isolation (#6383 / #6386 / #9592)
 
-Status: **opt-in, off on every CI leg.** The lane runs only when
-`AI_MEMORY_TEST_PG_ISOLATE` is `1` in the job environment, and
-`.github/workflows/ci.yml` sets it on no leg (the invariant
-`G1-opt-in` in `scripts/ci/check_pg_isolate_invariants.py` fails the build if
-it ever does). This was decided by GOD in review r1 (M4): the first sharded
-carrier run goes with isolation off. Making it the default, and raising
-in-binary `--test-threads` above 1, wait for two green sharded carrier runs and
-the 1x3 vote when the `CLAUDE.md` threshold is met, cited as
-`3-agent vote (6def5ab6)`. The repository variable `CI_PG_ISOLATE_OFF=1` is
-an extra hard kill switch that wins over the flag.
+Status: **on in one step of one leg.** Since #9592 (`3-agent vote (71472661)`,
+decision A, step-scoped opt-in) the flag `AI_MEMORY_TEST_PG_ISOLATE=1` is set
+in exactly one place: the env of the step
+`Serial shard isolated binaries (linux-fed enterprise-fed, issue 9592)` in the
+`check` job of `.github/workflows/ci.yml`, guarded to `matrix.node == 'linux-fed'`
+and `matrix.tier == 'enterprise-fed'` and never run on a fork pull request.
+The invariant `G1-opt-in` in `scripts/ci/check_pg_isolate_invariants.py` is
+red on a second site, on any other value form, on another job, on a changed
+guard, on an expression-valued `env:` mapping and on a script under
+`scripts/` that names the flag within three lines of `GITHUB_ENV`; G7, G8
+and G10-G14 check that "Run tests", the isolated step, the log redaction
+and Cleanup agree (kill-switch env line, deferral pins, Cleanup exit code, no
+`continue-on-error`, fork guard, host semaphore). The wrapper default (off),
+in-binary `--test-threads=1` and the partition
+(`scripts/ci/partition_test_binaries.py`) are unchanged. The repository
+variable `CI_PG_ISOLATE_OFF` is the hard kill switch: `1`, `true` or `on`
+(any case) select the exact serial path, `0`, `false`, `off` or empty keep
+isolation on, and any other value fails "Run tests".
 
-## What changes when it is on
+**One completion ledger (fix notice 9592 r1).** "Run tests" writes the
+deferred list (`$RUNNER_TEMP/ci-shard/iso_targets.txt`) and the mode file
+`$RUNNER_TEMP/ci-iso-mode.txt` (`none`, `deferred` or `killswitch`). The
+isolated step writes the run id to `$RUNNER_TEMP/ci-iso-run.txt` before its
+first clone and, only when green, `$RUNNER_TEMP/ci-iso-ledger.txt`: one row
+per deferred binary, then `complete binaries=N run_id=<id>` as the last row.
+Cleanup is red unless the ledger lists exactly the deferred binaries and no
+clone or template is left. A missing, short, unreadable or misspelled mode,
+run id, ledger, kill switch or `GITHUB_ENV` is red, never "nothing to do".
 
-Before, every test binary on an enterprise-fed leg shared one ephemeral
-database, so the class (a) binaries (Postgres, `#[serial]`, `federat*`) ran one
-after another. With the lane on (flag `1`, kill switch not `1`, tier
-`enterprise-fed`):
+## How the leg runs
 
-1. **Configure** runs `pg_isolated_binary.py setup --emit-env`. It checks the
-   live connection budget: `max_connections` minus the reserved slots minus the
-   sessions open right now (`pg_stat_activity`) must cover
-   `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. It builds
-   `<CI_FED_DB>_tpl` with the `age` and `vector` extensions and marks it
-   `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so `CREATE DATABASE ... TEMPLATE`
-   only hits SQLSTATE 55006 under a stray session, which the mint retries. It
-   exports `AI_MEMORY_TEST_PG_TEMPLATE` and `AI_MEMORY_TEST_PG_RUN_ID` to
-   `$GITHUB_ENV`.
-2. **Run.** The test step fails with `::error::` when the lane is on but the
-   template or run id is missing; it never skips. `run_isolated_lane` prebuilds
-   only the targets in `iso_targets.txt`, then calls
-   `pg_isolated_binary.py run` under the #1492 watchdog. For each
-   `--test`/`--bin` it mints `ai_memory_t_<run id>_<unix seconds>_<8 hex>`,
-   holds a keepalive session on it, points `AI_MEMORY_TEST_POSTGRES_URL` (and
-   `AI_MEMORY_TEST_AGE_URL` when set) at it, runs
-   `cargo test --no-fail-fast --test <bin> -- --test-threads=1`, then releases
-   the hold and drops the clone. The width is 8, reduced to what the live
-   budget allows. Each binary writes its own log under
-   `$RUNNER_TEMP/ci-shard/iso-logs/<bin>.log`. A failing binary's last 200
-   lines are echoed in a `::group::`, and the step
-   `Upload isolated-lane per-binary logs (#6383)` uploads the directory with
-   `if: always()`.
-   Binaries named in `scripts/ci/pg_isolate_serial_residual.txt`, binaries
-   that bind a fixed loopback port or use a shared path, and binaries with no
-   readable source (`scripts/ci/pg_isolate_split.py`) run last, one at a time,
-   on the shared database. The flag is stripped from their environment, so the
-   Rust helper does not mint for them.
-3. **Cleanup** runs `pg_isolated_binary.py teardown --run-id <this run>`, which
-   drops this run's leftover clones and the template.
+1. **Run tests (impact-aware)** exports `AI_MEMORY_TEST_PG_ISOLATE=0` and runs
+   the three shards as before. On linux-fed enterprise-fed with the kill
+   switch off, `scripts/ci/pg_isolate_split.py` splits the serial shard: its
+   `--test` binaries are deferred (`$RUNNER_TEMP/ci-shard/iso_targets.txt`,
+   the residual subset in `iso_residual.txt`) and the mode file
+   `$RUNNER_TEMP/ci-iso-mode.txt` says `deferred`; the `--bin`, `--example`
+   and `--bench` selectors keep their in-line serial run. With the kill
+   switch on, that leg runs every serial-shard binary in-line (the exact
+   serial path) and the mode file says `killswitch`; every other leg says
+   `none`.
+2. **Serial shard isolated binaries** runs
+   `scripts/ci/pg_isolate_serial_step.py run` inside the #7914 host semaphore
+   (`scripts/ci/host_semaphore.py`, the slots and wait of "Run tests", label
+   `<node>/<tier>/iso`). Mode `none` with no deferred list and mode
+   `killswitch` are green no-ops; mode `none` with a deferred list, `deferred`
+   without one, or a mode that disagrees with the kill switch is red.
+   Otherwise it prebuilds the targets, runs `pg_isolated_binary.py setup`
+   (age+vector template `<CI_FED_DB>_tpl`, `IS_TEMPLATE true
+   ALLOW_CONNECTIONS false`, a fresh run id), then `pg_isolated_binary.py run
+   --jobs 8` under the job-time watchdog. For each binary the wrapper mints
+   `ai_memory_t_<run id>_<unix seconds>_<8 hex>`, holds a keepalive session on
+   it, points `AI_MEMORY_TEST_POSTGRES_URL` (and `AI_MEMORY_TEST_AGE_URL` when
+   set) at it and runs `cargo test --no-fail-fast --test <bin> --
+   --test-threads=1 --show-output`. Admission re-reads the live connection
+   budget on every acquire and reserves the sessions of every binary in flight
+   (PR 8230 defect 1 closed by construction), so the width falls to what the
+   budget allows instead of overcommitting it. Each binary writes
+   `$RUNNER_TEMP/ci-shard/iso-logs/<bin>.log` and its first line is the
+   evidence line `# [pg_isolated_binary] current_database=<db> mode=isolated`
+   (or `mode=residual`); no URL or credential is ever logged.
+   The residual binaries (named in `scripts/ci/pg_isolate_serial_residual.txt`,
+   or detected by `pg_isolate_split.py`: a fixed loopback port, a shared path,
+   no readable source) run last, one at a time, on the shared database. The
+   residual file holds every binary that the I-7 audit
+   (`scripts/ci/pg_isolate_cluster_audit.py`) finds with a cluster-global
+   operation or a wall-time assert (the load-sensitive class of PR 8230
+   defect 2, issue 6796), so those never run beside the pool.
+3. **Fail closed.** The step is red on a missing log, a zero-test binary (a
+   log with no test line at all: no `test X ... ok`, `FAILED` or `ignored`
+   line, whatever its result line says), a log whose test lines do not prove
+   its result line (the ok / FAILED / ignored lines differ from the passed /
+   failed / ignored totals, the result line has no filtered-out count or any
+   test is filtered out, or a second `test result:` line appears outside a
+   `---- X stdout ----` / `---- X stderr ----` body; the real one is the
+   last), a log without its evidence line, two binaries on one database, any
+   test that prints a skip message (the word `skip`, `skips`, `skipped` or
+   `skipping` in any case, with or without a colon), ignored test names that
+   differ from the binary's own `--list --ignored`, a
+   clone mint failure, a teardown failure and any clone or template of the
+   run left after teardown. Teardown runs in a
+   `finally` and on SIGTERM, passing `AI_MEMORY_TEST_PG_TEMPLATE`, the run id
+   and a `--db` equal to the URL database explicitly; no decision reads the
+   text of a refusal message.
+4. **Redact isolated-lane per-binary logs (issue 9592)** rewrites every log
+   through the step's redaction (`always()`), then **Upload isolated-lane
+   per-binary logs (#6383)** uploads the log directory with `if: always()`.
+   The host semaphore's KILL grace (20 s) is shorter than the step's TERM
+   wait (90 s), so a semaphore kill can stop the step's own teardown; Cleanup
+   is the backstop.
+5. **Cleanup enterprise-fed ephemeral db** runs
+   `scripts/ci/pg_isolate_serial_step.py cleanup` with `always()`, first and on
+   every leg, and every exit of the step carries its exit code: a cancel or
+   job-cap kill that stopped the step's own teardown is torn down again, and a
+   clone or template still left, a deferred run without its run id or a ledger
+   that does not match the deferred list fails the step.
+
+**Never re-run an isolation red (I-12).** After landing, a red of the isolated
+step is not re-run to pass: the conductor sets `CI_PG_ISOLATE_OFF=1` and files
+an issue with the failing binary and its log line.
 
 On SIGTERM (the watchdog) or SIGINT, the wrapper stops dispatching, sends TERM
 to every running `cargo` process group and KILL 5 s later, drops the clones in

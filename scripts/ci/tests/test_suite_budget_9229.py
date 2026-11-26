@@ -28,6 +28,10 @@ import unittest
 import unittest.mock as mock
 from pathlib import Path
 
+# `python3 -I FILE` leaves the script's own folder off sys.path; append it (never insert at 0) (#9592).
+sys.path.append(str(Path(__file__).resolve().parent))
+import workflow_text  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "ci" / "suite_budget.py"
 CI = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -902,9 +906,9 @@ class StepExec(unittest.TestCase):
                 py.chmod(0o755)
             script = d / "step.sh"
             script.write_text("#!/bin/bash\n" + step_script() + "\n")
-            env = dict(os.environ)
-            env.update({
-                "PATH": "%s:%s" % (bindir, env.get("PATH", "")),
+            # #9769: the step env of ci.yml (every key, unset expressions empty) under the fixture keys.
+            env = workflow_text.step_exec_env({
+                "PATH": "%s:%s" % (bindir, os.environ.get("PATH", "")),
                 "AI_MEMORY_NO_CONFIG": "1", "TIER": "sqlite", "CI_NODE": node,
                 "TEST_IMPACT": impact, "JOB_TIMEOUT_MIN": "95", "JOB_T0": str(FROZEN_EPOCH),
                 "RUNNER_TEMP": str(d), "GITHUB_ENV": str(d / "env"),

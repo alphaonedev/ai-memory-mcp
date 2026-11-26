@@ -1111,6 +1111,11 @@ SIBLING_SCRIPTS = {
     "scripts/ci/suite_budget.py": (),  # #9229 suite margin gate
 }
 SHARED_MODULE_PATH = "scripts/ci/" + SHARED_MODULE_NAME
+# Files a script outside SIBLING_SCRIPTS loads by its real path at import (#9750: the wrapper refuses without the
+# redaction funnel), copied next to it in every layout.
+SCRIPT_COMPANIONS = {
+    "scripts/test/pg_isolated_binary.py": ("scripts/ci/secret_redact.py",),
+}
 
 
 class SiblingLoadInvariant(unittest.TestCase):
@@ -1120,7 +1125,8 @@ class SiblingLoadInvariant(unittest.TestCase):
         base = scratch_dir("sibling-load")
         self.addCleanup(shutil.rmtree, str(base), True)
         repo = base / "repo"
-        for rel in (rel_script, *SIBLING_SCRIPTS.get(rel_script, ()), *((SHARED_MODULE_PATH,) if with_shared else ())):
+        for rel in (rel_script, *SIBLING_SCRIPTS.get(rel_script, ()), *SCRIPT_COMPANIONS.get(rel_script, ()),
+                    *((SHARED_MODULE_PATH,) if with_shared else ())):
             (repo / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(REPO / rel, repo / rel)
         plants = base / "plants"

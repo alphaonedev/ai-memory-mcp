@@ -3,10 +3,26 @@
 Standard library only (no YAML parser): it reads the two-space-indented job
 ids under `jobs:` and, per job, the four-space-indented `if:`, `needs:` and
 `outputs:` keys. That is all the ci.yml invariant tests need.
+
+#9769: `step_env` / `step_exec_env` are the ONE source of the environment of a
+harness that executes the body of a workflow step (by default the check job's
+`Run tests (impact-aware)` step): every key of that step's `env:` block, with
+each `${{ ... }}` expression replaced by the empty string (what Actions gives an
+expression over an unset repository variable or output), so a variable the step
+requires can never be missing from one harness while ci.yml supplies it.
 """
+import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
+
+CI_YML = Path(__file__).resolve().parents[3] / ".github" / "workflows" / "ci.yml"
+RUN_TESTS_JOB = "check"
+RUN_TESTS_STEP = "Run tests (impact-aware)"
+EXPRESSION_RE = re.compile(r"\$\{\{.*?\}\}")
+# What GitHub Actions substitutes for an expression over an unset variable or output.
+UNSET_VALUE = ""
+QUOTES = ("'", '"')
 
 JOB_ID_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 KEY_RE = re.compile(r"^    ([A-Za-z0-9_-]+):\s*(.*)$")
@@ -135,3 +151,38 @@ def read_steps(path: Path, job: str) -> List[dict]:
     if run_lines is not None:
         steps[-1]["run"] = "\n".join(run_lines).rstrip("\n") + "\n"
     return steps
+
+
+def env_value(raw: str) -> str:
+    """The value a step env entry `raw` has at run time when every expression is unset."""
+    value = EXPRESSION_RE.sub(UNSET_VALUE, raw.strip()).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in QUOTES:
+        value = value[1:-1]
+    return value
+
+
+def step_env(path: Path = CI_YML, job: str = RUN_TESTS_JOB, step: str = RUN_TESTS_STEP) -> Dict[str, str]:
+    """{key: run-time value} of the `env:` block of step `step` of `job` (exactly one step by name).
+
+    Raises LookupError when the step is absent, named twice or has no env keys,
+    so a harness never runs with a silently empty step environment.
+    """
+    matches = [s for s in read_steps(path, job) if s["name"] == step]
+    if len(matches) != 1:
+        raise LookupError("%d steps named %r in job %r of %s" % (len(matches), step, job, path))
+    if not matches[0]["env"]:
+        raise LookupError("step %r of job %r has no env keys" % (step, job))
+    return {key: env_value(raw) for key, raw in matches[0]["env"].items()}
+
+
+def step_exec_env(overrides: Mapping[str, str], base: Optional[Mapping[str, str]] = None,
+                  path: Path = CI_YML, job: str = RUN_TESTS_JOB, step: str = RUN_TESTS_STEP) -> Dict[str, str]:
+    """The environment a harness runs the step body with.
+
+    `base` (default os.environ) under the step env (so a runner-level value of a
+    step key never leaks in), under `overrides` (the harness's own fixture values).
+    """
+    env = dict(os.environ if base is None else base)
+    env.update(step_env(path, job, step))
+    env.update(overrides)
+    return env

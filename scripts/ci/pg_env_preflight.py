@@ -35,7 +35,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import re
 import subprocess
 import sys
 import time
@@ -113,7 +112,9 @@ PROBES: tuple[tuple[str, str, str], ...] = (
     ("age", SQL_AGE, REASON_AGE),
 )
 
-_URL_WITH_CREDS = re.compile(r"[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+SECRET_REDACT_NAME = "secret_redact.py"
+DETAIL_WITHHELD = "<detail withheld: redaction funnel unavailable>"
+_SECRET: list = []
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
 
@@ -138,10 +139,29 @@ def class_line(label: str, reason: str) -> str:
     return wa.annotation("error", f"[{label}] PG-ENV {reason}")
 
 
+def _secret_redact():
+    """The redaction funnel next to this file, by real path (#9750); None when it cannot be loaded."""
+    if not _SECRET:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), SECRET_REDACT_NAME)
+        try:
+            spec = importlib.util.spec_from_file_location("pg_secret_redact", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _SECRET.append(module if callable(getattr(module, "redact", None)) else None)
+        except (Exception, SystemExit):
+            _SECRET.append(None)
+    return _SECRET[0]
+
+
 def _detail(proc: subprocess.CompletedProcess) -> str:
+    """The first stderr line, every credential form redacted (#9750); withheld whole without the funnel."""
     text = (proc.stderr or "").strip().splitlines()
     first = text[0] if text else ""
-    return _URL_WITH_CREDS.sub("<redacted>", first)[:DETAIL_MAX_CHARS]
+    funnel = _secret_redact()
+    if funnel is None:
+        return DETAIL_WITHHELD
+    return funnel.redact(first, "<redacted>")[:DETAIL_MAX_CHARS]
 
 
 def run_psql(runner: Runner, psql: str, sql: str) -> tuple[bool, str, str]:

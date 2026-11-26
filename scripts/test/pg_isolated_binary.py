@@ -2,10 +2,20 @@
 """Per-binary Postgres isolation for the enterprise-fed CI legs (#6383 / #6386).
 
 OPT-IN. Nothing here runs unless ``AI_MEMORY_TEST_PG_ISOLATE=1`` is already in
-the environment; ``.github/workflows/ci.yml`` never sets it on any leg, and
-``CI_PG_ISOLATE_OFF=1`` overrides it (hard kill switch). Default-on, and
-raising ``--test-threads`` above 1, wait for two green sharded carrier runs
-and a 5-agent vote (4d3ea1c5).
+the environment. ``.github/workflows/ci.yml`` sets it at exactly one site: the
+env of the "Serial shard isolated binaries" step of the linux-fed
+enterprise-fed leg, which runs this wrapper through
+``scripts/ci/pg_isolate_serial_step.py`` (3-agent vote (71472661), decision A,
+step-scoped opt-in, #9592; ``scripts/ci/check_pg_isolate_invariants.py`` G1 is
+red on any second site). ``CI_PG_ISOLATE_OFF=1`` overrides it (hard kill
+switch). Default-on everywhere, and raising ``--test-threads`` above 1, still
+wait for two green sharded carrier runs and a 5-agent vote (4d3ea1c5).
+
+The pool admits one clone at a time against the LIVE budget: every admission
+re-reads it and reserves the connections of the clones already admitted that
+have not opened their sessions yet (``Admission``, #9592, closing PR 8230
+defect 1). Each per-binary log opens with a
+``# [pg_isolated_binary] current_database=<db> mode=isolated|residual`` line.
 
 With isolation on, every integration-test binary gets its own database cloned
 from a never-connected template, so binaries can run side by side.
@@ -43,8 +53,9 @@ run id is ``[a-z0-9]{1,20}``. The Rust helper (``tests/common/pg_isolate.rs``)
 uses the same shape.
 
 Exit codes: 0 success, 2 usage or wrapper error (fails closed), 3 a clone
-could not be minted or held, 143 terminated, otherwise the worst exit code of
-the cargo runs. Standard library only, Python 3.9+.
+could not be minted or held, 5 a binary held more sessions on its clone than
+the per-binary bound (it is killed), 143 terminated, otherwise the worst exit
+code of the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
 import os
@@ -101,6 +112,35 @@ except (Exception, SystemExit) as exc:  # any failed load: one fixed line built 
           file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
     sys.exit(WA_EXIT_LOAD_REFUSED)
 
+SECRET_REDACT_RELATIVE_PATH = '../ci/secret_redact.py'
+REDACTED_URL = '<redacted-url>'
+
+
+def _load_secret_redact():
+    """The redaction funnel (#9750) by its real path from this file, never through sys.path."""
+    import importlib.util
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), SECRET_REDACT_RELATIVE_PATH))
+    spec = importlib.util.spec_from_file_location('pg_secret_redact', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not callable(getattr(module, 'redact', None)):
+        raise AttributeError('secret_redact.py lacks redact')
+    return module
+
+
+try:
+    _SECRET = _load_secret_redact()
+except (Exception, SystemExit):  # no funnel, no output that could carry a credential: refuse before any child
+    print(wa.log_line('pg_isolated_binary: refused: redaction funnel ci/secret_redact.py cannot be loaded'),
+          file=sys.stderr, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
+
+def redact(text: str) -> str:
+    """``text`` with every URL, keyword and environment credential form replaced (#9750)."""
+    return _SECRET.redact(text, REDACTED_URL)
+
+
 URL_VAR = 'AI_MEMORY_TEST_POSTGRES_URL'
 AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
@@ -123,6 +163,12 @@ DROP_ATTEMPTS = 10
 DROP_RETRY_PAUSE = 1.0
 HOLD_WAIT_SECS = 15.0
 HOLD_POLL_SECS = 0.2
+# decision: a pooled binary waits up to 600 s for a connection slot, then fails closed (EXIT_MINT); the budget is
+# re-read every 2 s, because another runner's load moves it (#9592, PR 8230 defect 1).
+ADMIT_WAIT_SECS = 600.0
+ADMIT_POLL_SECS = 2.0
+EVIDENCE_PREFIX = '# [pg_isolated_binary] current_database='
+UNKNOWN_DB = '<unknown>'
 MIN_SWEEP_AGE_SECS = 600
 TERM_GRACE_SECS = 5.0
 LOG_TAIL_LINES = 200
@@ -148,6 +194,17 @@ IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
 EXIT_MINT = 3
 EXIT_TERM = 143
+EXIT_SESSIONS = 5  # SEC-L4: a binary opened more sessions than the budget assumes (#9592)
+# SEC-L4: how often a running isolated binary's sessions are counted against the per-binary bound.
+SESSION_POLL_SECS = 5.0
+# decision: three unreadable session polls in a row (15 s) fail the binary closed (EXIT_SESSIONS) over skipping
+# them without end, because a count that is never read is a bound that never holds; one bad poll still passes, so
+# a transient admin-session error does not turn a green binary red (#9752).
+SESSION_UNREADABLE_MAX = 3
+# #9752: the server caps each clone's sessions too, at the figure Admission reserves per clone. The cap binds the
+# lane's ordinary roles; a superuser session is exempt from CONNECTION LIMIT, so the poll bound above still holds
+# for that case.
+CLONE_CONNECTION_LIMIT = PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS
 
 # URL query keys and the libpq variable each maps to. Anything else fails
 # closed rather than being silently dropped.
@@ -197,7 +254,7 @@ def _emit(line: str) -> None:
 def log(msg: str) -> None:
     """Diagnostics go to stderr so ``--emit-env`` stdout stays clean."""
     with _PRINT_LOCK:
-        print(wa.log_line('[pg_isolated_binary] ' + msg), file=sys.stderr, flush=True)
+        print(wa.log_line('[pg_isolated_binary] ' + redact(msg)), file=sys.stderr, flush=True)
 
 
 # --- names and URLs -------------------------------------------------------
@@ -838,7 +895,8 @@ def connection_budget(url: str) -> Tuple[int, int, int, int]:
 def mint(base_url: str, tpl: str, run_id: str, now: Optional[int] = None) -> Tuple[str, str]:
     """CREATE DATABASE ... TEMPLATE; retry while the template reports in-use."""
     name = isolated_db_name(run_id, now)
-    sql = 'CREATE DATABASE %s TEMPLATE %s' % (quote_ident(name), quote_ident(_checked_ident(tpl)))
+    sql = 'CREATE DATABASE %s TEMPLATE %s CONNECTION LIMIT %d' % (quote_ident(name), quote_ident(_checked_ident(tpl)),
+                                                                CLONE_CONNECTION_LIMIT)
     last = ''
     for attempt in range(1, MINT_ATTEMPTS + 1):
         try:
@@ -872,7 +930,72 @@ def drop(admin_url: str, name: str, run_id: Optional[str], attempts: int = DROP_
 def session_count(admin_url: str, name: str) -> int:
     raw = psql(admin_url, "SELECT count(*) FROM pg_stat_activity WHERE datname = '%s'"
                % _checked_ident(name), tuples=True).strip()
-    return int(raw) if raw.isdigit() else 0
+    if not raw.isdigit():  # #9752: an answer that is not a count is unreadable, never 0
+        raise WrapperError('could not read the sessions of %s (got %r)' % (name, raw[:40]))
+    return int(raw)
+
+
+def own_sessions(admin_url: str, run_id: str) -> int:
+    """Sessions open right now on this run's clones (the holds and the binaries already connected)."""
+    raw = psql(admin_url, "SELECT count(*) FROM pg_stat_activity WHERE starts_with(datname, '%s')"
+               % run_prefix(checked_run_id(run_id)), tuples=True).strip()
+    if not raw.isdigit():
+        raise WrapperError('could not read the sessions of run %s (got %r)' % (run_id, raw[:40]))
+    return int(raw)
+
+
+def current_database(url: str) -> str:
+    """The database a session on ``url`` lands on, or ``<unknown>``: evidence only, never a decision here."""
+    try:
+        name = psql(url, 'SELECT current_database()', tuples=True).strip()
+    except WrapperError:
+        return UNKNOWN_DB
+    return name if _IDENT_RE.match(name) else UNKNOWN_DB
+
+
+class Admission:
+    """Admits one clone at a time against the LIVE connection budget (#9592, PR 8230 defect 1).
+
+    Every ``acquire`` re-reads the budget and reserves ``in_flight * NEED`` minus the sessions this run's clones
+    already hold, so clones admitted but not yet connected are never counted as free twice. A clone is admitted
+    only while ``free - reserved >= NEED + CONNECTION_HEADROOM``; otherwise it waits (re-reading) and fails closed
+    after ``wait_secs`` or on ``stop``. The read and the decision happen under one lock."""
+
+    NEED = PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS
+
+    def __init__(self, admin_url: str, run_id: str, stop: threading.Event, budget=None, own=None,
+                 wait_secs: float = ADMIT_WAIT_SECS, poll: float = ADMIT_POLL_SECS, clock=time.monotonic) -> None:
+        self.admin = admin_url
+        self.run_id = checked_run_id(run_id)
+        self.stop = stop
+        self.budget = budget or connection_budget
+        self.own = own or (lambda url: own_sessions(url, self.run_id))
+        self.wait_secs = wait_secs
+        self.poll = poll
+        self.clock = clock
+        self.in_flight = 0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        start = self.clock()
+        while True:
+            if self.stop.is_set():
+                raise WrapperError('stopped before a connection slot was admitted')
+            with self._lock:
+                free = self.budget(self.admin)[3]
+                reserved = max(0, self.in_flight * self.NEED - self.own(self.admin))
+                if free - reserved >= self.NEED + CONNECTION_HEADROOM:
+                    self.in_flight += 1
+                    return
+            if self.clock() - start >= self.wait_secs:
+                raise WrapperError('no connection budget for another clone after %gs (free=%d, reserved for '
+                                   'in-flight clones=%d, need=%d)'
+                                   % (self.wait_secs, free, reserved, self.NEED + CONNECTION_HEADROOM))
+            self.stop.wait(self.poll)
+
+    def release(self) -> None:
+        with self._lock:
+            self.in_flight = max(0, self.in_flight - 1)
 
 
 def open_hold(clone_url: str) -> 'subprocess.Popen[str]':
@@ -1056,7 +1179,7 @@ def _stderr_note(text: str) -> None:
     """Best-effort stderr line (``text`` without its newline, through ``log_line``, #9365): a closed stderr
     must not stop the signal loop (#7915)."""
     try:
-        sys.stderr.write(wa.log_line(text) + "\n")
+        sys.stderr.write(wa.log_line(redact(text)) + "\n")
     except (OSError, ValueError):
         return
 
@@ -1078,6 +1201,7 @@ class Runner:
         self._lock = threading.Lock()
         self._children: Dict[int, 'subprocess.Popen[str]'] = {}
         self._killer: Optional[threading.Timer] = None
+        self.admit: Optional[Admission] = None  # set by ``run``; None admits on the width alone (unit use)
 
     def terminate(self) -> None:
         """Stop dispatching, TERM every child group, KILL after a grace."""
@@ -1120,12 +1244,50 @@ class Runner:
             results = [ln for ln in _tail(log_path, 10_000) if 'test result:' in ln]
             _out(wa.log_line('[pg_isolated_binary] PASS %s (log %s)' % (label, log_path)))
             for line in results:
-                _out(wa.log_line('  ' + line))
+                _out(wa.log_line('  ' + redact(line)))
             return
         _out(wa.annotation('group', 'FAIL %s (exit %d), last %d lines of %s' % (label, rc, LOG_TAIL_LINES, log_path)))
         for line in _tail(log_path, LOG_TAIL_LINES):
-            _out(wa.log_line(line))
+            _out(wa.log_line(redact(line)))
         _out(wa.end_group_line())
+
+    def _wait_bounded(self, child: 'subprocess.Popen[str]', minted: Optional[str], label: str) -> int:
+        """Wait for ``child``; on a clone, kill it when it holds more sessions than the budget assumes (SEC-L4).
+
+        The bound is PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS, the figure Admission reserves per clone.
+        A poll that cannot read the count is skipped, up to SESSION_UNREADABLE_MAX in a row; the poll that
+        reaches the limit fails the binary closed (#9752). A readable poll resets the run."""
+        if minted is None:
+            return child.wait()
+        bound = PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS
+        unreadable = 0
+        while True:
+            try:
+                return child.wait(timeout=SESSION_POLL_SECS)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                count = session_count(self.admin, minted)
+            except WrapperError:
+                unreadable += 1
+                if unreadable < SESSION_UNREADABLE_MAX:
+                    continue
+                log('FAIL %s: session count unreadable on %d consecutive polls (limit %d)'
+                    % (label, unreadable, SESSION_UNREADABLE_MAX))
+                return self._kill_bounded(child)
+            unreadable = 0
+            if count > bound:
+                log('FAIL %s: session bound exceeded: %s opened %d sessions (bound %d)' % (label, minted, count, bound))
+                return self._kill_bounded(child)
+
+    @staticmethod
+    def _kill_bounded(child: 'subprocess.Popen[str]') -> int:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # the group already exited
+        child.wait()
+        return EXIT_SESSIONS
 
     def run_one(self, target: List[str], isolate: bool = True) -> int:
         """One binary: mint + hold a clone, cargo test it, release, drop."""
@@ -1138,8 +1300,15 @@ class Runner:
         child_env = dict(self.env)
         minted: Optional[str] = None
         hold = None
+        admitted = False
+        shared = database_name(self.env.get(URL_VAR, ''))
+        # A URL without a database segment would yield its authority (user, password): never write that.
+        evidence = '%s mode=residual' % (shared if _IDENT_RE.match(shared) else UNKNOWN_DB)
         try:
             if isolate:
+                if self.admit is not None:
+                    self.admit.acquire()
+                    admitted = True
                 url, minted = mint(self.admin, self.tpl, self.run_id)
                 hold = open_hold(url)
                 wait_for_hold(self.admin, minted, hold)
@@ -1147,18 +1316,23 @@ class Runner:
                 if self.env.get(AGE_URL_VAR):
                     child_env[AGE_URL_VAR] = with_database(self.env[AGE_URL_VAR], minted)
                 log('%s -> %s' % (label, minted))
+                evidence = '%s mode=isolated' % current_database(url)
             else:
                 # Residual binaries stay on the shared database: strip the flag
                 # so the Rust helper does not mint a clone of its own.
                 child_env.pop(FLAG_VAR, None)
+                # C-L6: the server names the database, as on the isolated path; never the URL text.
+                evidence = '%s mode=residual' % current_database(self.env.get(URL_VAR, ''))
             if self.stop.is_set():
                 return EXIT_TERM
             self.log_dir.mkdir(parents=True, exist_ok=True)
             log_path = self.log_dir / (label + '.log')
             with log_path.open('w', encoding='utf-8') as out:
+                out.write(EVIDENCE_PREFIX + evidence + '\n')  # I-6: names the database, never the URL
+                out.flush()
                 child = self._spawn(argv, child_env, out)
                 try:
-                    rc = child.wait()
+                    rc = self._wait_bounded(child, minted, label)
                 finally:
                     self._forget(child)
             if self.stop.is_set():
@@ -1175,6 +1349,8 @@ class Runner:
                     drop(self.admin, minted, self.run_id)
                 except WrapperError as exc:
                     log('WARN could not drop %s (teardown reclaims it): %s' % (minted, exc))
+            if admitted and self.admit is not None:
+                self.admit.release()
 
     def run_all(self, targets: List[List[str]], residual: Set[str]) -> int:
         """Pool the isolated binaries, then run the residual list serially."""
@@ -1273,6 +1449,9 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     env = dict(os.environ)
     env[URL_VAR] = url
     runner = Runner(cargo, args.test_arg, env, tpl, run_id, url, args.log_dir or _default_log_dir(), width)
+    runner.admit = Admission(url, run_id, runner.stop)
+    log('pool width %d (jobs %d, free connection slots %d at start; every clone is re-admitted against the live '
+        'budget)' % (width, args.jobs, available))
 
     def on_signal(signum: int, _frame: object) -> None:
         log('signal %d: stopping dispatch, terminating children, dropping clones' % signum)
@@ -1306,7 +1485,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         return _cmd_run(args, url)
     except WrapperError as exc:
-        print(wa.log_line('pg_isolated_binary: %s' % exc), file=sys.stderr)
+        print(wa.log_line('pg_isolated_binary: %s' % redact(str(exc))), file=sys.stderr)
         return EXIT_USAGE
 
 

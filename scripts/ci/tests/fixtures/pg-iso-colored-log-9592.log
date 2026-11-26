@@ -1,0 +1,42 @@
+# [pg_isolated_binary] current_database=ai_memory_t_r8858369bbb5_1795267437_5bbbe553 mode=isolated
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on build directory
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.92s
+[1m[92m     Running[0m tests/pg_health_probe_constant_cost_2617.rs (/runner/cargo-target/debug/deps/pg_health_probe_constant_cost_2617-7b0f959a7ea9b5a2)
+
+running 3 tests
+test a_pg_health_check_issues_no_corpus_count_2617 ... ok
+test pg::b_pg_health_probe_touches_at_most_one_row_2617 ... FAILED
+test pg::c_control_legacy_count_scanned_the_whole_corpus_2617 ... FAILED
+
+successes:
+
+successes:
+    a_pg_health_check_issues_no_corpus_count_2617
+
+failures:
+
+---- pg::b_pg_health_probe_touches_at_most_one_row_2617 stdout ----
+
+thread 'pg::b_pg_health_probe_touches_at_most_one_row_2617' (897239) panicked at tests/pg_health_probe_constant_cost_2617.rs:156:14:
+corpus size: Database(PgDatabaseError { severity: Error, code: "42P01", message: "relation \"memories\" does not exist", detail: None, hint: None, position: Some(Original(30)), where: None, schema: None, table: None, column: None, data_type: None, constraint: None, file: Some("parse_relation.c"), line: Some(1498), routine: Some("parserOpenTable") })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- pg::c_control_legacy_count_scanned_the_whole_corpus_2617 stdout ----
+
+thread 'pg::c_control_legacy_count_scanned_the_whole_corpus_2617' (897266) panicked at tests/pg_health_probe_constant_cost_2617.rs:156:14:
+corpus size: Database(PgDatabaseError { severity: Error, code: "42P01", message: "relation \"memories\" does not exist", detail: None, hint: None, position: Some(Original(30)), where: None, schema: None, table: None, column: None, data_type: None, constraint: None, file: Some("parse_relation.c"), line: Some(1498), routine: Some("parserOpenTable") })
+
+
+failures:
+    pg::b_pg_health_probe_touches_at_most_one_row_2617
+    pg::c_control_legacy_count_scanned_the_whole_corpus_2617
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+[1m[91merror[0m: test failed, to rerun pass `--test pg_health_probe_constant_cost_2617`
+[1m[91merror[0m: 1 target failed:
+    `--test pg_health_probe_constant_cost_2617`

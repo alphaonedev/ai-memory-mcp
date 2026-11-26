@@ -11,11 +11,16 @@ Python 3.9+, standard library only; the step script is bash 3.2 compatible.
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path
+
+# `python3 -I FILE` leaves the script's own folder off sys.path; append it (never insert at 0) (#9592).
+sys.path.append(str(Path(__file__).resolve().parent))
+import workflow_text  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 CI = (REPO / '.github' / 'workflows' / 'ci.yml').read_text()
@@ -39,9 +44,9 @@ class StepExec(unittest.TestCase):
             stub.chmod(0o755)
             script = d / 'step.sh'
             script.write_text('#!/bin/bash\n' + step_script() + '\n')
-            env = dict(os.environ)
-            env.update({
-                'PATH': '%s:%s' % (stub.parent, env.get('PATH', '')),
+            # #9769: the step env of ci.yml (every key, unset expressions empty) under the fixture keys.
+            env = workflow_text.step_exec_env({
+                'PATH': '%s:%s' % (stub.parent, os.environ.get('PATH', '')),
                 'AI_MEMORY_NO_CONFIG': '1', 'TIER': tier, 'CI_NODE': 'ubuntu-latest',
                 'TEST_IMPACT': impact, 'JOB_TIMEOUT_MIN': '95', 'JOB_T0': job_t0,
                 'RUNNER_TEMP': str(d), 'GITHUB_ENV': str(d / 'env'),
