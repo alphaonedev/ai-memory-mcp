@@ -1129,31 +1129,94 @@ mod tests {
         );
     }
 
-    /// #10122 — `spawn_test_child` MUST isolate `HOME`, `XDG_CONFIG_HOME`, and
-    /// `AI_MEMORY_WITNESS_KEY_DIR` to a private empty sandbox so a child never
-    /// falls back via `getpwuid_r` to the host's live witness custody dir.
+    /// #10122 (C-F1 / C-F2) — shared child-side assertion that a spawned test
+    /// child sees isolated `HOME`, `XDG_CONFIG_HOME`, and
+    /// `AI_MEMORY_WITNESS_KEY_DIR` VALUES (not merely that variables are set).
+    #[cfg(unix)]
+    fn assert_child_sees_isolated_sandbox_values(
+        spawner: &str,
+        parent_home_env: &str,
+        parent_witness_env: &str,
+    ) {
+        let child_home = std::path::PathBuf::from(
+            std::env::var_os("HOME")
+                .unwrap_or_else(|| panic!("#10122 ({spawner}): child HOME must be set")),
+        );
+        let child_xdg = std::path::PathBuf::from(
+            std::env::var_os("XDG_CONFIG_HOME")
+                .unwrap_or_else(|| panic!("#10122 ({spawner}): child XDG_CONFIG_HOME must be set")),
+        );
+        let child_witness = std::path::PathBuf::from(
+            std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV).unwrap_or_else(|| {
+                panic!("#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR must be set")
+            }),
+        );
+        if let Some(parent_home) = std::env::var_os(parent_home_env) {
+            let parent_home = std::path::PathBuf::from(parent_home);
+            assert_ne!(
+                child_home, parent_home,
+                "#10122 ({spawner}): child HOME must differ from parent HOME"
+            );
+        }
+        if let Some(parent_witness) = std::env::var_os(parent_witness_env) {
+            let parent_witness = std::path::PathBuf::from(parent_witness);
+            assert_ne!(
+                child_witness, parent_witness,
+                "#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR must differ from parent witness dir"
+            );
+        }
+        assert!(
+            child_xdg.starts_with(&child_home),
+            "#10122 ({spawner}): child XDG_CONFIG_HOME ({child_xdg:?}) must lie inside child HOME ({child_home:?})"
+        );
+        assert!(
+            child_witness.starts_with(&child_home),
+            "#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR ({child_witness:?}) must lie inside child HOME ({child_home:?})"
+        );
+        let resolved_witness =
+            crate::governance::audit::witness_key_dir().expect("resolve child witness_key_dir");
+        assert_eq!(
+            resolved_witness, child_witness,
+            "#10122 ({spawner}): witness_key_dir() must resolve to the isolated child witness dir"
+        );
+        assert!(
+            !child_witness.join("head-anchor.log").exists(),
+            "#10122 ({spawner}): isolated child witness dir must not contain a pre-existing head-anchor.log"
+        );
+    }
+
+    /// #10122 (C-F2) — `spawn_test_child` MUST isolate `HOME`,
+    /// `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` VALUES to a fresh
+    /// private sandbox distinct from the parent's home and witness dir.
     #[cfg(unix)]
     #[test]
     fn spawn_test_child_isolates_home_and_witness_dir_10122() {
         const ROLE_ENV: &str = "AI_MEMORY_TEST_10122_ISOLATION_ROLE";
+        const PARENT_HOME_ENV: &str = "AI_MEMORY_TEST_10122_PARENT_HOME";
+        const PARENT_WITNESS_ENV: &str = "AI_MEMORY_TEST_10122_PARENT_WITNESS";
         const TEST: &str =
             "test_support::tests::spawn_test_child_isolates_home_and_witness_dir_10122";
         if std::env::var_os(ROLE_ENV).is_some() {
-            assert!(
-                std::env::var_os("HOME").is_some(),
-                "#10122: spawn_test_child must set an isolated HOME (unset falls back to live /etc/passwd home)"
-            );
-            assert!(
-                std::env::var_os("XDG_CONFIG_HOME").is_some(),
-                "#10122: spawn_test_child must set an isolated XDG_CONFIG_HOME"
-            );
-            assert!(
-                std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV).is_some(),
-                "#10122: spawn_test_child must set an isolated AI_MEMORY_WITNESS_KEY_DIR"
+            assert_child_sees_isolated_sandbox_values(
+                "spawn_test_child",
+                PARENT_HOME_ENV,
+                PARENT_WITNESS_ENV,
             );
             return;
         }
-        let out = super::spawn_test_child(TEST, &[(ROLE_ENV, "1")]);
+        let parent_home = std::env::var("HOME").unwrap_or_default();
+        let parent_witness = crate::governance::audit::witness_key_dir()
+            .expect("resolve parent witness_key_dir")
+            .to_string_lossy()
+            .into_owned();
+        let out = super::spawn_test_child(
+            TEST,
+            &[
+                (ROLE_ENV, "1"),
+                (PARENT_HOME_ENV, &parent_home),
+                (PARENT_WITNESS_ENV, &parent_witness),
+            ],
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -1163,6 +1226,83 @@ mod tests {
         assert!(
             stdout.contains("1 passed") && !stdout.contains("0 passed"),
             "#10122 isolation child ran zero tests:\n{stdout}"
+        );
+    }
+
+    /// #10122 (C-F1 / C-F2) — `spawn_env_isolated_child` MUST isolate `HOME`,
+    /// `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` VALUES to a fresh
+    /// private sandbox distinct from the parent's home and witness dir.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_env_isolated_child_isolates_home_config_and_witness_dir_10122() {
+        const PARENT_HOME_ENV: &str = "AI_MEMORY_TEST_10122_ENV_ISO_PARENT_HOME";
+        const PARENT_WITNESS_ENV: &str = "AI_MEMORY_TEST_10122_ENV_ISO_PARENT_WITNESS";
+        const TEST: &str = "test_support::tests::spawn_env_isolated_child_isolates_home_config_and_witness_dir_10122";
+        if std::env::var(super::TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
+            assert_child_sees_isolated_sandbox_values(
+                "spawn_env_isolated_child",
+                PARENT_HOME_ENV,
+                PARENT_WITNESS_ENV,
+            );
+            return;
+        }
+        let parent_home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let parent_witness =
+            crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir");
+        let ran_in_child = super::spawn_env_isolated_child(
+            TEST,
+            &[],
+            &[
+                (PARENT_HOME_ENV, parent_home.as_path()),
+                (PARENT_WITNESS_ENV, parent_witness.as_path()),
+            ],
+        );
+        assert!(ran_in_child, "parent branch must spawn child");
+    }
+
+    /// #10122 (C-F1 / C-F6) — `run_pki_child_8651` MUST isolate `HOME`,
+    /// `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` VALUES to a fresh
+    /// private sandbox distinct from the parent's home and witness dir.
+    #[cfg(unix)]
+    #[test]
+    fn pki_child_spawner_isolates_home_config_and_witness_dir_10122() {
+        const CHILD: &str = "AI_MEMORY_TEST_10122_PKI_ISO_ROLE";
+        const PARENT_HOME_ENV: &str = "AI_MEMORY_TEST_10122_PKI_PARENT_HOME";
+        const PARENT_WITNESS_ENV: &str = "AI_MEMORY_TEST_10122_PKI_PARENT_WITNESS";
+        const TEST: &str =
+            "test_support::tests::pki_child_spawner_isolates_home_config_and_witness_dir_10122";
+        if std::env::var_os(CHILD).is_some() {
+            assert_child_sees_isolated_sandbox_values(
+                "run_pki_child_8651",
+                PARENT_HOME_ENV,
+                PARENT_WITNESS_ENV,
+            );
+            return;
+        }
+        let parent_home = std::env::var_os("HOME").unwrap_or_default();
+        let parent_witness =
+            crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir");
+        let scratch = crate::identity::test_key_dir::private_tempdir();
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::pki_child_spawner_isolates_home_config_and_witness_dir_10122",
+        );
+        command
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(PARENT_HOME_ENV, &parent_home)
+            .env(PARENT_WITNESS_ENV, &parent_witness)
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        let out = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "#10122 PKI isolation child failed:\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "#10122 PKI isolation child ran zero tests:\n{stdout}"
         );
     }
 
