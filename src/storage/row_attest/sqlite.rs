@@ -219,6 +219,7 @@ pub fn read_rows(conn: &Connection, spec: &TableSpec) -> Result<Vec<Vec<Cell>>> 
         .with_context(|| format!("row attestation read of {}", spec.table))?;
     let n = spec.cols.len();
     let rows = stmt.query_map([], |r| {
+        super::stream::tick(super::stream::Count::RowRead);
         let mut cells = Vec::with_capacity(n);
         for i in 0..n {
             cells.push(cell_of(r.get_ref(i)?));
@@ -887,6 +888,7 @@ pub fn read_attestations(conn: &Connection) -> Result<Vec<Attestation>> {
          signature, attestation_digest FROM row_attestations ORDER BY id",
     )?;
     let rows = stmt.query_map([], |r| {
+        super::stream::tick(super::stream::Count::AttRead);
         Ok(Attestation {
             id: r.get(0)?,
             table: r.get(1)?,

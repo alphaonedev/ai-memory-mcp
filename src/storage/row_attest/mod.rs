@@ -19,6 +19,7 @@
 pub mod anchor;
 pub mod seal;
 pub mod sqlite;
+mod stream;
 
 use crate::models::field_names;
 use crate::storage::schema_integrity;
@@ -1118,6 +1119,7 @@ pub const DEFECT_SEAL_ROLLED_BACK: &str = "row_attestations rolled back below th
 pub const DEFECT_SEAL_HEAD_ROLLED_BACK: &str = "table sequence rolled back below the anchored seal";
 
 fn sig_defect(a: &Attestation, anchor: &anchor::AnchorLoad) -> Option<String> {
+    stream::tick(stream::Count::Sig);
     let Some(sig) = a.signature.as_deref() else {
         return Some(format!("attestation {} ({}) is unsigned", a.id, a.table));
     };
@@ -1196,7 +1198,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
     let mut tables: BTreeMap<String, TableVerdict> = BTreeMap::new();
     let mut unverified = std::collections::BTreeSet::new();
     // #10094: indexes into `defects` of the defects pinned on one live row.
-    let mut row_local: Vec<usize> = Vec::new();
+    let mut row_local: Vec<stream::RowIx> = Vec::new();
     let d = &mut defects;
     let stores: Vec<&Attestation> = input
         .attestations
@@ -1256,7 +1258,10 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         let mut atts: Vec<&Attestation> = input
             .attestations
             .iter()
-            .filter(|a| a.table == spec.table)
+            .filter(|a| {
+                stream::tick(stream::Count::AttVisit);
+                a.table == spec.table
+            })
             .collect();
         atts.sort_by_key(|a| a.table_seq);
         let verdict = tables.entry(spec.table.to_string()).or_default();
@@ -1347,7 +1352,10 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         let live: Vec<&LiveRow> = input
             .live
             .iter()
-            .filter(|r| r.table == spec.table)
+            .filter(|r| {
+                stream::tick(stream::Count::RowVisit);
+                r.table == spec.table
+            })
             .collect();
         let live_keys: std::collections::BTreeSet<&[u8]> =
             live.iter().map(|r| r.key.as_slice()).collect();
@@ -1369,7 +1377,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
             match latest {
                 Some(latest) if latest.op == Op::Delete.as_str() => {
                     drifted = true;
-                    row_local.push(d.len());
+                    row_local.push(stream::RowIx(d.len()));
                     d.push(format!(
                         "{}: live row has a delete as latest attestation",
                         spec.table
@@ -1381,7 +1389,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
                 }
                 Some(latest) => {
                     drifted = true;
-                    row_local.push(d.len());
+                    row_local.push(stream::RowIx(d.len()));
                     d.push(format!(
                         "{}: live row differs from its latest attestation {}",
                         spec.table, latest.id
@@ -1392,7 +1400,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
                 // arm baselines each pre-existing row, so none is legacy.
                 None => {
                     drifted = true;
-                    row_local.push(d.len());
+                    row_local.push(stream::RowIx(d.len()));
                     d.push(format!("{}: live row has no attestation", spec.table));
                     mark_memory(&mut unverified, spec, row, input);
                 }
@@ -1410,7 +1418,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
         if let Some(head) = atts.last() {
             if head.table_acc != acc.to_vec() {
                 if drifted && head.table_acc == attested_acc.to_vec() {
-                    row_local.push(d.len());
+                    row_local.push(stream::RowIx(d.len()));
                 }
                 d.push(format!(
                     "{}: live rows do not match the signed table head (table_seq {})",
@@ -1422,7 +1430,7 @@ pub fn verify(input: &VerifyInput<'_>) -> Report {
     let store_defects = defects
         .iter()
         .enumerate()
-        .filter(|(i, _)| !row_local.contains(i))
+        .filter(|(i, _)| !row_local.contains(&stream::RowIx(*i)))
         .map(|(_, x)| x.clone())
         .collect();
     Report {
