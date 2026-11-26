@@ -137,6 +137,7 @@ use sha2::{Digest, Sha256};
 
 pub mod agent_cutover;
 pub use agent_cutover::{AGENT_CUTOVER_EVENT_TYPE, AgentCutover};
+pub mod agent_payload;
 pub mod agent_row;
 #[cfg(test)]
 mod agent_row_10108_tests;
