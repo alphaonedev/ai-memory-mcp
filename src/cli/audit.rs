@@ -2963,6 +2963,33 @@ pub(crate) mod witness_isolation_10117 {
         );
     }
 
+    /// Lock identity pin (#10119 / #8168): while a [`WitnessEnvLock`], or an
+    /// armed [`IsolatedWitnessCustody`], is held, the process-wide
+    /// `crate::identity::keypair::key_dir_env_lock()` is locked, so a wrapper
+    /// over any other mutex is red. Asserts the held state only: an `Ok`
+    /// probe after drop would race other tests that take the same lock.
+    #[test]
+    fn witness_env_lock_and_custody_hold_key_dir_env_lock_identity_10119() {
+        fn key_dir_lock_is_held() -> bool {
+            matches!(
+                crate::identity::keypair::key_dir_env_lock().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            )
+        }
+        let env_lock = WitnessEnvLock::acquire();
+        assert!(
+            key_dir_lock_is_held(),
+            "#10119: a held WitnessEnvLock must hold key_dir_env_lock()"
+        );
+        drop(env_lock);
+        let custody = IsolatedWitnessCustody::arm();
+        assert!(
+            key_dir_lock_is_held(),
+            "#10119: an armed IsolatedWitnessCustody must hold key_dir_env_lock()"
+        );
+        drop(custody);
+    }
+
     fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
         if let Some(s) = payload.downcast_ref::<&str>() {
             (*s).to_string()
