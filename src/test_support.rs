@@ -548,18 +548,99 @@ pub(crate) fn tls_test_client(timeout: std::time::Duration) -> reqwest::Client {
         .expect("TLS test client")
 }
 
+/// #10122 — wall-clock bound for every re-executed child test process so a
+/// spinning or stalled child is killed and surfaces a named failure instead of
+/// hanging the suite.
+#[cfg(any(test, unix))]
+pub(crate) const TEST_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(any(test, unix))]
+const TEST_CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// #10122 — canonical error prefix returned by [`run_command_with_timeout`]
+/// when a child exceeds its wall-clock bound.
+#[cfg(any(test, unix))]
+pub(crate) const TEST_CHILD_TIMEOUT_PREFIX: &str = "test child timed out";
+
+/// #10122 — run `command` with file-backed stdout/stderr captures and a hard
+/// wall-clock `timeout`. If the child does not exit before the deadline it is
+/// killed and reaped (CONCURRENCY-11) before returning `Err` prefixed with
+/// [`TEST_CHILD_TIMEOUT_PREFIX`].
+#[cfg(any(test, unix))]
+pub(crate) fn run_command_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    let scratch = crate::identity::test_key_dir::private_tempdir();
+    let stdout_path = scratch.path().join("stdout");
+    let stderr_path = scratch.path().join("stderr");
+    let stdout_file = std::fs::File::create(&stdout_path)
+        .map_err(|e| format!("create child stdout capture for {label}: {e}"))?;
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .map_err(|e| format!("create child stderr capture for {label}: {e}"))?;
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+        .map_err(|e| format!("spawn test child {label}: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("poll test child {label}: {e}"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(TEST_CHILD_POLL_INTERVAL);
+    };
+    let kill_error = if timed_out { child.kill().err() } else { None };
+    let status = child
+        .wait()
+        .map_err(|e| format!("reap test child {label}: {e}"))?;
+    let stdout = std::fs::read(&stdout_path).unwrap_or_default();
+    let stderr = std::fs::read(&stderr_path).unwrap_or_default();
+    if timed_out {
+        return Err(format!(
+            "{TEST_CHILD_TIMEOUT_PREFIX}: {label} exceeded {}ms (kill_error={kill_error:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            timeout.as_millis(),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// v1.0.0 #3152 — run THIS test binary again as a child that executes
 /// exactly `test` (its full path inside the lib test binary) with `env` set.
 /// The child starts from a CLEAN environment (the #3550 `publish_3550`
 /// shape), so no parallel test's environment leaks into it, and it never
-/// reads the operator config file. The crate's own `cfg(test)` harness arms
-/// the #3355 key-directory guard by itself, so no key-dir variable is
-/// needed. The spawn goes through the #1937 audited chokepoint (the
+/// reads the operator config file or the host's live witness custody
+/// directory (#10122: `HOME`, `XDG_CONFIG_HOME`, and
+/// `AI_MEMORY_WITNESS_KEY_DIR` default to a fresh private 0700 sandbox unless
+/// overridden in `env`). Waits under [`TEST_CHILD_TIMEOUT`] so a spinning
+/// child is killed and reported instead of hanging the suite.
+///
+/// The spawn goes through the #1937 audited chokepoint (the
 /// `spawn_audit_gate_1937` guard bans a raw process constructor outside
 /// `src/spawn_audit.rs`); its best-effort audit emit is a no-op in a unit
 /// test process, which seeds no spawn-audit database.
 #[cfg(unix)]
 pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let sandbox = crate::identity::test_key_dir::private_tempdir();
+    let xdg_config = sandbox.path().join(".config");
+    let witness_dir = sandbox.path().join("witness-keys");
     let mut cmd = crate::spawn_audit::audited_command(
         std::env::current_exe().expect("lib test binary"),
         "test_support::spawn_test_child",
@@ -570,11 +651,15 @@ pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process
         // with a %p pid template) so the child's execution is measured, not lost.
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
         .env("TMPDIR", std::env::temp_dir())
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env(crate::governance::audit::WITNESS_KEY_DIR_ENV, &witness_dir)
         .env("AI_MEMORY_NO_CONFIG", "1");
     for (key, value) in env {
         cmd.env(key, value);
     }
-    cmd.output().expect("spawn the test child")
+    run_command_with_timeout(&mut cmd, TEST_CHILD_TIMEOUT, test)
+        .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
 /// Role env marker for [`run_env_isolated_child_or_spawn`] (#2905).
@@ -681,7 +766,8 @@ fn spawn_env_isolated_child(
     for (name, value) in set {
         cmd.env(name, value);
     }
-    let output = cmd.output().expect("spawn env-isolated child test");
+    let output = run_command_with_timeout(&mut cmd, TEST_CHILD_TIMEOUT, exact_path)
+        .unwrap_or_else(|msg| panic!("{msg}"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1077,6 +1163,44 @@ mod tests {
         assert!(
             stdout.contains("1 passed") && !stdout.contains("0 passed"),
             "#10122 isolation child ran zero tests:\n{stdout}"
+        );
+    }
+
+    /// #10122 — `run_command_with_timeout` MUST kill a hanging child when the
+    /// bound expires and return an `Err` naming `TEST_CHILD_TIMEOUT_PREFIX`.
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_kills_and_reports_hanging_child_10122() {
+        const SLEEP_ROLE_ENV: &str = "AI_MEMORY_TEST_10122_TIMEOUT_SLEEP_ROLE";
+        const TEST: &str =
+            "test_support::tests::run_command_with_timeout_kills_and_reports_hanging_child_10122";
+        const SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(150);
+        const MAX_WALL_ELAPSED: std::time::Duration = std::time::Duration::from_secs(5);
+        if std::env::var_os(SLEEP_ROLE_ENV).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let mut cmd = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::run_command_with_timeout_kills_and_reports_hanging_child_10122",
+        );
+        cmd.args(["--exact", TEST, "--test-threads=1"])
+            .env(SLEEP_ROLE_ENV, "1");
+        let start = std::time::Instant::now();
+        let err = super::run_command_with_timeout(&mut cmd, SHORT_BOUND, TEST)
+            .expect_err("sleeping child must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            err.starts_with(super::TEST_CHILD_TIMEOUT_PREFIX),
+            "expected timeout prefix, got: {err}"
+        );
+        assert!(
+            err.contains(TEST),
+            "timeout message must name the child label: {err}"
+        );
+        assert!(
+            elapsed < MAX_WALL_ELAPSED,
+            "timeout kill took too long: {elapsed:?}"
         );
     }
 

@@ -295,21 +295,57 @@ pub struct DeleteArgs {
 /// Surfaces DB-open errors verbatim. Substrate-handler failures bubble
 /// up as exit codes (non-zero) with the substrate's error string
 /// printed to stderr.
+/// Verb label for read verbs that enforce [`cli_read_caller`] (#8832, #10122).
+/// Exhaustive match so any new `SkillAction` variant forces an explicit choice
+/// (CBC-04).
+const fn read_verb_name(action: &SkillAction) -> Option<&'static str> {
+    match action {
+        SkillAction::List(_) => Some("list"),
+        SkillAction::Get(_) => Some("get"),
+        SkillAction::Resource(_) => Some("resource"),
+        SkillAction::Export(_) => Some("export"),
+        SkillAction::Compose(_) => Some("compose"),
+        SkillAction::Register(_)
+        | SkillAction::Promote(_)
+        | SkillAction::Retire(_)
+        | SkillAction::Delete(_) => None,
+    }
+}
+
 pub fn run(
     db_path: &Path,
     args: &SkillArgs,
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // #10122 / #8832: validate the read-visibility caller BEFORE opening the
+    // database (`db::open` runs migrations and `scan_head_anchor_log`) so a
+    // shape-invalid `AI_MEMORY_AGENT_ID` fails closed immediately with exit 2
+    // and zero DB or custody-log I/O (CBC-06: parse once at the boundary).
+    let vis_caller = if let Some(verb) = read_verb_name(&args.action) {
+        match cli_read_caller(out, verb)? {
+            Ok(caller) => caller,
+            Err(code) => return Ok(code),
+        }
+    } else {
+        None
+    };
     let conn = db::open(db_path)?;
     match &args.action {
         SkillAction::Register(a) => run_register(&conn, a, active_keypair, out),
-        SkillAction::List(a) => run_list(&conn, a, out),
-        SkillAction::Get(a) => run_get(&conn, a, out),
-        SkillAction::Resource(a) => run_resource(&conn, a, out),
-        SkillAction::Export(a) => run_export(&conn, db_path, a, active_keypair, out),
+        SkillAction::List(a) => run_list(&conn, a, vis_caller.as_deref(), out),
+        SkillAction::Get(a) => run_get(&conn, a, vis_caller.as_deref(), out),
+        SkillAction::Resource(a) => run_resource(&conn, a, vis_caller.as_deref(), out),
+        SkillAction::Export(a) => run_export(
+            &conn,
+            db_path,
+            a,
+            active_keypair,
+            vis_caller.as_deref(),
+            out,
+        ),
         SkillAction::Promote(a) => run_promote(&conn, a, active_keypair, out),
-        SkillAction::Compose(a) => run_compose(&conn, a, out),
+        SkillAction::Compose(a) => run_compose(&conn, a, vis_caller.as_deref(), out),
         SkillAction::Retire(a) => run_retire(&conn, a, active_keypair, out),
         SkillAction::Delete(a) => run_delete(&conn, a, active_keypair, out),
     }
@@ -455,7 +491,12 @@ fn run_register(
 // list
 // ---------------------------------------------------------------------------
 
-fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+fn run_list(
+    conn: &rusqlite::Connection,
+    args: &ListArgs,
+    vis_caller: Option<&str>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let mut params = json!({});
     if let Some(ref ns) = args.namespace {
         params["namespace"] = json!(ns);
@@ -466,12 +507,7 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
     if args.include_retired {
         params[field_names::INCLUDE_RETIRED] = json!(true);
     }
-    // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = match cli_read_caller(out, "list")? {
-        Ok(caller) => caller,
-        Err(code) => return Ok(code),
-    };
-    match crate::mcp::handle_skill_list(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_list(conn, &params, vis_caller) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -497,14 +533,14 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
 // get
 // ---------------------------------------------------------------------------
 
-fn run_get(conn: &rusqlite::Connection, args: &GetArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+fn run_get(
+    conn: &rusqlite::Connection,
+    args: &GetArgs,
+    vis_caller: Option<&str>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let params = json!({ "skill_id": args.id });
-    // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = match cli_read_caller(out, "get")? {
-        Ok(caller) => caller,
-        Err(code) => return Ok(code),
-    };
-    match crate::mcp::handle_skill_get(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_get(conn, &params, vis_caller) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -527,18 +563,14 @@ fn run_get(conn: &rusqlite::Connection, args: &GetArgs, out: &mut CliOutput<'_>)
 fn run_resource(
     conn: &rusqlite::Connection,
     args: &ResourceArgs,
+    vis_caller: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let params = json!({
         "skill_id": args.id,
         (field_names::RESOURCE_PATH): args.path,
     });
-    // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = match cli_read_caller(out, "resource")? {
-        Ok(caller) => caller,
-        Err(code) => return Ok(code),
-    };
-    match crate::mcp::handle_skill_resource(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_resource(conn, &params, vis_caller) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -562,6 +594,7 @@ fn run_export(
     db_path: &Path,
     args: &ExportArgs,
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    vis_caller: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let params = json!({
@@ -571,13 +604,7 @@ fn run_export(
     // #3357 — the store path anchors the default export jail root
     // (`<db parent>/skills-export`); an operator exporting elsewhere sets
     // AI_MEMORY_SKILLS_EXPORT_ROOT.
-    // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = match cli_read_caller(out, "export")? {
-        Ok(caller) => caller,
-        Err(code) => return Ok(code),
-    };
-    let caller = vis_caller.as_deref();
-    match crate::mcp::handle_skill_export(conn, db_path, &params, active_keypair, caller) {
+    match crate::mcp::handle_skill_export(conn, db_path, &params, active_keypair, vis_caller) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -640,20 +667,14 @@ fn run_promote(
 fn run_compose(
     conn: &rusqlite::Connection,
     args: &ComposeArgs,
+    vis_caller: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let mut params = json!({ "skill_id": args.id });
     if let Some(b) = args.budget_tokens {
         params[field_names::BUDGET_TOKENS] = json!(b);
     }
-    // #4059 — the composed reflections are memory rows: scope them to the
-    // CLI read-visibility caller exactly like `ai-memory recall` (`None`,
-    // the single-operator posture, when no identity is configured).
-    let vis_caller = match cli_read_caller(out, "compose")? {
-        Ok(caller) => caller,
-        Err(code) => return Ok(code),
-    };
-    match crate::mcp::handle_skill_compositional_context(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_compositional_context(conn, &params, vis_caller) {
         Ok(v) => {
             emit_json(out, &v)?;
             Ok(0)
