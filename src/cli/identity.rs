@@ -1979,6 +1979,285 @@ mod tests {
         }
     }
 
+    /// Snapshot every regular file (relative path -> raw bytes) under `dir`
+    /// so refusal tests can prove the anchor directory is byte-identical (#10112 R-8).
+    fn snapshot_dir_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).expect("read dir for snapshot") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                out.insert(name, std::fs::read(&path).expect("read snapshot file"));
+            }
+        }
+        out
+    }
+
+    /// #10112 (Option B, vote V1-RECOVER-REBIND-ATTEST) — red-first end-to-end
+    /// pin beside `recovery_ceremony_cli_end_to_end`:
+    /// 1. Refuses recovery when `K_new.priv` is missing (DB + anchor byte-identical).
+    /// 2. With `K_new.priv` in the key dir (K_old.priv LOST), recovery attests
+    ///    the `_agents` rebind row under `K_new`, archives `K_old` as
+    ///    `<agent>.pub.<ts>`, installs `K_new` as `<agent>.pub`, and leaves
+    ///    `verify_sqlite_with` `Outcome::Clean` (pre-recovery row under K_old
+    ///    and rebind under K_new).
+    /// 3. A later `identity succeed` passes without `REFUSE_ROW_DRIFT`.
+    /// 4. Tampering the pre-recovery row is still detected as `Outcome::Defective`.
+    #[test]
+    fn recovery_rebind_arms_k_new_archives_k_old_and_verifies_history_10112() {
+        use crate::identity::lineage::{RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV};
+        use crate::storage::row_attest::Outcome;
+        use crate::storage::row_attest::anchor::TrustAnchor;
+        use crate::storage::row_attest::sqlite::{arm_with_key, verify_sqlite_with};
+
+        let _envg = keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        let agent = "rec-armed-10112";
+
+        let run_action = |env: &mut TestEnv, action: IdentityAction, json: bool| {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action,
+                },
+                json,
+                &mut out,
+            )
+        };
+
+        // Seed agent + K_old + lineage + armed row attestation + pre-recovery row.
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent, "ai:test", &[]).unwrap();
+        }
+        run_action(
+            &mut env,
+            IdentityAction::Generate {
+                agent_id: Some(agent.to_string()),
+                force: false,
+                no_overwrite: false,
+            },
+            false,
+        )
+        .unwrap();
+        let k_old = keypair::load(agent, &dir_path).unwrap();
+        let cold = keypair::generate("cold-10112").unwrap();
+        run_action(
+            &mut env,
+            IdentityAction::EnrollLineage {
+                agent_id: Some(agent.to_string()),
+                recovery_pubkey: Some(cold.public_base64()),
+            },
+            false,
+        )
+        .unwrap();
+
+        // Arm the store with K_old and write an attested pre-recovery memory row.
+        let pre_mem_id = {
+            let conn = crate::db::open(&db_path).unwrap();
+            arm_with_key(&conn, agent, k_old.private.as_ref().unwrap()).unwrap();
+            let mut mem = crate::models::Memory::default();
+            mem.namespace = "recovery-10112".to_string();
+            mem.title = "pre-recovery-row".to_string();
+            mem.content = "signed under K_old before loss".to_string();
+            crate::db::insert(&conn, &mem).unwrap();
+            let anchor = TrustAnchor::load_dir(&dir_path);
+            let pre_report = verify_sqlite_with(&conn, &anchor).unwrap();
+            assert!(
+                matches!(pre_report.outcome(), Outcome::Clean),
+                "pre-recovery store must be Clean: {:?}",
+                pre_report.outcome()
+            );
+            mem.id
+        };
+
+        // Simulate key LOSS of K_old: remove `<agent>.priv`, keeping `<agent>.pub`.
+        std::fs::remove_file(dir_path.join(format!("{agent}.priv"))).unwrap();
+
+        // Enroll 3 guardians (2-of-3).
+        for g in ["g10112-0", "g10112-1", "g10112-2"] {
+            let kp = keypair::generate(g).unwrap();
+            keypair::save(&kp, &dir_path).unwrap();
+        }
+        let gpub = |g: &str| keypair::load(g, &dir_path).unwrap().public_base64();
+        // SAFETY: serialised by key_dir_env_lock above.
+        unsafe {
+            std::env::set_var(
+                RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                format!(
+                    "{},{},{}",
+                    gpub("g10112-0"),
+                    gpub("g10112-1"),
+                    gpub("g10112-2")
+                ),
+            );
+            std::env::set_var(RECOVERY_THRESHOLD_ENV, "2");
+        }
+
+        // Prepare K_new (initially NOT saved in key dir so K_new.priv is missing).
+        let k_new = keypair::generate("rec-armed-10112-new").unwrap();
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            IdentityAction::RecoverPrepare {
+                agent_id: Some(agent.to_string()),
+                successor_pubkey: k_new.public_base64(),
+                from_seq: None,
+                recovery_pubkey: None,
+            },
+            true,
+        )
+        .unwrap();
+        let prep: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        let challenge = prep["challenge_b64"].as_str().unwrap().to_string();
+        let not_before = prep["not_before"].as_str().unwrap().to_string();
+
+        let mut attestations = Vec::new();
+        for g in ["g10112-0", "g10112-1"] {
+            env.stdout.clear();
+            run_action(
+                &mut env,
+                IdentityAction::SignRecovery {
+                    agent_id: Some(g.to_string()),
+                    challenge: challenge.clone(),
+                },
+                true,
+            )
+            .unwrap();
+            let sig: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+            attestations.push(sig["attestation"].as_str().unwrap().to_string());
+        }
+
+        // 1. Missing K_new.priv MUST be refused with zero DB or anchor change (R-8).
+        let db_bytes_before = std::fs::read(&db_path).unwrap();
+        let dir_before = snapshot_dir_bytes(&dir_path);
+        let missing_err = run_action(
+            &mut env,
+            IdentityAction::Recover {
+                agent_id: Some(agent.to_string()),
+                successor_pubkey: k_new.public_base64(),
+                not_before: not_before.clone(),
+                from_seq: None,
+                recovery_pubkey: None,
+                attestations: attestations.clone(),
+            },
+            true,
+        )
+        .expect_err("recovery without K_new.priv in key dir must be refused (#10112 R-8)");
+        let missing_msg = format!("{missing_err:#}");
+        assert!(
+            missing_msg.contains("K_new") || missing_msg.contains("private key"),
+            "expected named missing-K_new.priv refusal, got: {missing_msg}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            db_bytes_before,
+            "refused recovery must leave DB byte-identical"
+        );
+        assert_eq!(
+            snapshot_dir_bytes(&dir_path),
+            dir_before,
+            "refused recovery must leave anchor dir byte-identical"
+        );
+
+        // 2. Stage K_new.{pub,priv} inside key dir and complete recovery.
+        keypair::save(&k_new, &dir_path).unwrap();
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            IdentityAction::Recover {
+                agent_id: Some(agent.to_string()),
+                successor_pubkey: k_new.public_base64(),
+                not_before,
+                from_seq: None,
+                recovery_pubkey: None,
+                attestations,
+            },
+            true,
+        )
+        .unwrap();
+
+        // K_old must be archived under anchor as `<agent>.pub.<ts>` and K_new
+        // installed as `<agent>.pub`.
+        let archived: Vec<_> = std::fs::read_dir(&dir_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{agent}.pub."))
+            })
+            .collect();
+        assert_eq!(
+            archived.len(),
+            1,
+            "retired K_old must be archived as <agent>.pub.<ts> under anchor"
+        );
+        assert_eq!(
+            std::fs::read(archived[0].path()).unwrap(),
+            k_old.public.to_bytes().as_slice(),
+            "archived retired key bytes must equal K_old"
+        );
+        assert_eq!(
+            keypair::load_public(agent, &dir_path).unwrap().to_bytes(),
+            k_new.public.to_bytes(),
+            "current anchor key <agent>.pub must equal K_new"
+        );
+
+        // Pre-recovery row (K_old) AND rebind row (K_new) must verify Clean!
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            let anchor = TrustAnchor::load_dir(&dir_path);
+            let post_report = verify_sqlite_with(&conn, &anchor).unwrap();
+            assert!(
+                matches!(post_report.outcome(), Outcome::Clean),
+                "post-recovery store must verify Clean: {:?}",
+                post_report.outcome()
+            );
+        }
+
+        // 3. A later `identity succeed` must pass without REFUSE_ROW_DRIFT (R-10).
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            IdentityAction::Succeed {
+                agent_id: Some(agent.to_string()),
+            },
+            true,
+        )
+        .expect("later identity succeed after recovery must pass without REFUSE_ROW_DRIFT");
+
+        // 4. Tampering the pre-recovery row is STILL detected as Defective.
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE memories SET content = 'tampered-after-recovery' WHERE id = ?1",
+                [&pre_mem_id],
+            )
+            .unwrap();
+            let anchor = TrustAnchor::load_dir(&dir_path);
+            let tampered = verify_sqlite_with(&conn, &anchor).unwrap();
+            assert!(
+                matches!(tampered.outcome(), Outcome::Defective { .. }),
+                "tampered pre-recovery row must still be detected as Defective: {:?}",
+                tampered.outcome()
+            );
+        }
+
+        // SAFETY: test-only env cleanup serialised by key_dir_env_lock above.
+        unsafe {
+            std::env::remove_var(RECOVERY_GUARDIAN_PUBKEYS_ENV);
+            std::env::remove_var(RECOVERY_THRESHOLD_ENV);
+        }
+    }
+
     const EXPECTED_NO_LINEAGE_SUFFIX_10118: &str = "run enroll-lineage first";
     const EXPECTED_PUBLIC_ONLY_SUFFIX_10118: &str = "is public-only — cannot sign a succession";
     const EXPECTED_NOT_HEAD_SUFFIX_10118: &str =
