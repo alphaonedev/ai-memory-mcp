@@ -4631,7 +4631,11 @@ where
 
         if version < CURRENT_SCHEMA_VERSION {
             // v103 (#10108): agent signature places + the cutover marker.
-            super::agent_cutover_v103::migrate_v103(conn, std::borrow::Borrow::borrow(&signer), origin)?;
+            super::agent_cutover_v103::migrate_v103(
+                conn,
+                std::borrow::Borrow::borrow(&signer),
+                origin,
+            )?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

@@ -495,7 +495,9 @@ pub(crate) fn write_sqlite_signed_marker(
     ) else {
         anyhow::bail!("agent cutover: no sequence above head {head_seq}");
     };
-    let head_matches = head.as_ref().map_or(head_seq == 0, |h| h.sequence == head_seq);
+    let head_matches = head
+        .as_ref()
+        .map_or(head_seq == 0, |h| h.sequence == head_seq);
     if !head_matches || marker.prev_hash != head_hash {
         anyhow::bail!("agent cutover: chain head {head_seq} does not match its row");
     }

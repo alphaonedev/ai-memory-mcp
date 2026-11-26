@@ -194,7 +194,11 @@ fn migrated_over_prefix(
 /// wrote (asserting there was exactly one), so a bump has a chain with no
 /// marker to write above.
 fn drop_genesis_marker(conn: &rusqlite::Connection) {
-    assert_eq!(markers(conn).len(), 1, "a fresh open writes one genesis marker");
+    assert_eq!(
+        markers(conn).len(),
+        1,
+        "a fresh open writes one genesis marker"
+    );
     conn.execute(
         "DELETE FROM signed_events WHERE event_type = ?1",
         params![AGENT_CUTOVER_EVENT_TYPE],
@@ -397,7 +401,11 @@ fn append_refuses_the_marker_event_type_10108() {
              schema step v103"
         )
     );
-    assert_eq!(markers(&conn).len(), 1, "nothing written beside the genesis marker");
+    assert_eq!(
+        markers(&conn).len(),
+        1,
+        "nothing written beside the genesis marker"
+    );
 }
 
 /// B-5 / S-3 — a tampered marker fails on both walks with the exact reason.
