@@ -1737,6 +1737,50 @@ mod tests {
         hex_encode_10176(path.as_os_str().as_bytes())
     }
 
+    /// #10176 (security finding 5) — the lexical `starts_with(root)` check is
+    /// load-bearing: a path outside the sandbox whose existing prefix is a
+    /// symlink pointing INTO the sandbox canonicalizes inside the root, so the
+    /// resolve step alone would accept it. The child would then be handed a
+    /// path that names a directory outside the sandbox and is re-pointable by
+    /// whoever owns that directory. It must be refused by the lexical check.
+    #[cfg(unix)]
+    #[test]
+    fn child_env_refuses_outside_link_into_sandbox_10176() {
+        use super::ChildEnvRefusal as R;
+        let sandbox = super::TestSandbox::new();
+        let outside = crate::identity::test_key_dir::private_tempdir();
+        let link = outside.path().join("link");
+        std::os::unix::fs::symlink(sandbox.work(), &link).expect("plant inward symlink");
+        let resolved = link.canonicalize().expect("inward symlink resolves");
+        assert!(
+            resolved.starts_with(sandbox.root()),
+            "#10176 fixture: the link must resolve inside the root"
+        );
+        let rows = [
+            format!("{}/db.sqlite", link.display()),
+            link.display().to_string(),
+            format!("{}/not/yet/created", link.display()),
+        ];
+        for value in rows {
+            assert_eq!(
+                super::check_child_env(sandbox.root(), "V", std::ffi::OsStr::new(&value)),
+                Err(R::OutsideSandbox {
+                    name: "V".into(),
+                    value: value.clone(),
+                }),
+                "#10176 value {value:?}"
+            );
+            assert_eq!(
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: value.clone(),
+                }
+                .to_string(),
+                format!("child env V value {value:?} is outside the child sandbox")
+            );
+        }
+    }
+
     /// #10176 — the exhaustive refusal table of `check_child_env`: every
     /// sandbox, passthrough and custody name, every name shape and every value
     /// shape, each with its exact `ChildEnvRefusal` (or acceptance).
