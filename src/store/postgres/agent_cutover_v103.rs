@@ -22,7 +22,9 @@ use crate::signed_events::agent_cutover::{
     AGENT_CUTOVER_EVENT_TYPE, AGENT_CUTOVER_ROW_LIMIT, AgentCutover, MarkerOrigin, MarkerVerifier,
     SignedMarker, build_signed_marker, legacy_agent_row_count, resolve_signed,
 };
-use crate::signed_events::agent_era::{AgentDomainEvidence, StoredReceiptRow};
+use crate::signed_events::agent_era::{
+    self, AgentDomainEvidence, ReceiptAnchors, StoredReceiptRow, StoredTombstoneRow,
+};
 use crate::store::{BoxBackendError, StoreError, StoreResult};
 
 /// The v103 DDL: the two `transcript_line_dedup` columns with their CHECK and
@@ -288,15 +290,35 @@ pub(super) async fn load_pg_agent_evidence(
             signature: r.6,
         }));
     }
-    let mut forgotten = Vec::new();
+    let mut tombstones = Vec::new();
     if tombstones_present {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT memory_id FROM forget_tombstones")
-            .fetch_all(pool)
-            .await
-            .map_err(|e| to_store_err(OP, e))?;
-        forgotten.extend(rows.into_iter().map(|(id,)| id));
+        let rows: Vec<(String, String, String, Option<Vec<u8>>)> =
+            sqlx::query_as(agent_era::TOMBSTONE_EVIDENCE_SQL)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| to_store_err(OP, e))?;
+        tombstones.extend(rows.into_iter().map(
+            |(memory_id, namespace, forgotten_at, signature)| StoredTombstoneRow {
+                memory_id,
+                namespace,
+                forgotten_at,
+                signature,
+            },
+        ));
+    }
+    // W-14 — the anchoring chain rows of the whole table (K3 twin).
+    let mut anchors = ReceiptAnchors::default();
+    let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(agent_era::RECEIPT_ANCHOR_SQL)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| to_store_err(OP, e))?;
+    for (payload_hash, cause_hash) in &rows {
+        anchors.insert(payload_hash, cause_hash.as_deref());
     }
     Ok(AgentDomainEvidence::build(
-        &receipts, &forgotten, daemon_key,
+        &receipts,
+        &tombstones,
+        &anchors,
+        daemon_key,
     ))
 }

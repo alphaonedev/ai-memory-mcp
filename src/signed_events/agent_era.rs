@@ -34,7 +34,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
@@ -46,6 +46,7 @@ use super::{
     AGENT_SIGNATURE_LEN, AgentCutover, LegacyCutoff, RowSignatureVerdict, SignatureFailure,
     SignedEvent, SignerIdentity, SkipReason, classify_row_signature,
 };
+use crate::governance::daemon_signer::{self, DaemonDomain};
 
 /// #10108 — the domain tag of [`SourceBinding`]. Never reused.
 pub const ATOMISATION_SOURCE_DOMAIN: &[u8] = b"ai-memory/atomisation-source/v1\0";
@@ -125,6 +126,90 @@ impl StoredReceiptRow {
     }
 }
 
+/// #10135 — one stored `forget_tombstones` row as read. The tombstone is
+/// evidence of an erasure only when its signature verifies under the daemon
+/// key and [`DaemonDomain::Tombstone`] over
+/// [`crate::storage::forget_tombstone_signing_body`] (the body the forget
+/// paths of both backends sign).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTombstoneRow {
+    /// `memory_id`.
+    pub memory_id: String,
+    /// `namespace`.
+    pub namespace: String,
+    /// `forgotten_at`, the stored text the signature covers.
+    pub forgotten_at: String,
+    /// `signature` (NULL when the forget ran keyless).
+    pub signature: Option<Vec<u8>>,
+}
+
+impl StoredTombstoneRow {
+    /// The evidence this tombstone gives under `key`.
+    fn evidence(&self, key: &VerifyingKey) -> TombstoneEvidence {
+        let Some(sig) = self.signature.as_deref() else {
+            return TombstoneEvidence::Unsigned;
+        };
+        let body = crate::storage::forget_tombstone_signing_body(
+            &self.memory_id,
+            &self.namespace,
+            &self.forgotten_at,
+        );
+        if daemon_signer::verify(key, DaemonDomain::Tombstone, &body, sig) {
+            TombstoneEvidence::Signed
+        } else {
+            TombstoneEvidence::Invalid
+        }
+    }
+}
+
+/// #10135 — what one tombstone proves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TombstoneEvidence {
+    /// A daemon signature under the tombstone domain verified: an erasure.
+    Signed,
+    /// No signature: no erasure evidence.
+    Unsigned,
+    /// A signature that does not verify: no erasure evidence.
+    Invalid,
+}
+
+/// #10108 (W-14, S-4) — the `atomisation_complete` chain rows of the WHOLE
+/// table (whatever window a walk covers) a stored receipt can be anchored
+/// to: their stored `payload_hash` and `cause_hash`. Only `daemon_signed`
+/// rows anchor; any other row is itself a failure above the marker.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiptAnchors {
+    payload_hashes: HashSet<[u8; 32]>,
+    causes: HashSet<SourceBinding>,
+}
+
+impl ReceiptAnchors {
+    /// Add one chain row's stored columns.
+    pub fn insert(&mut self, payload_hash: &[u8], cause_hash: Option<&[u8]>) {
+        if let Ok(h) = <[u8; 32]>::try_from(payload_hash) {
+            self.payload_hashes.insert(h);
+        }
+        if let Some(b) = SourceBinding::from_stored(cause_hash) {
+            self.causes.insert(b);
+        }
+    }
+}
+
+/// #10108 (W-14) — whether a stored receipt has a chain row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptAnchoring {
+    /// A chain row names it.
+    Anchored,
+    /// No chain row names it: never verified, a chain-level failure.
+    Orphan,
+}
+
+/// #10108 (W-12) — the query that lists the anchoring rows, shared by both
+/// backends (the event type and the attest level are literals of the
+/// chain's own vocabulary).
+pub const RECEIPT_ANCHOR_SQL: &str = "SELECT payload_hash, cause_hash FROM signed_events \
+     WHERE event_type = 'atomisation_complete' AND attest_level = 'daemon_signed'";
+
 /// #10108 — what a stored receipt whose recomputed hash names a chain row
 /// proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,32 +232,50 @@ pub struct AgentDomainEvidence {
     signed_sources: HashSet<SourceBinding>,
     unsigned_sources: HashSet<SourceBinding>,
     tombstoned_sources: HashSet<SourceBinding>,
+    /// W-14 — stored receipts no chain row of the whole table anchors.
+    orphan_receipts: usize,
 }
 
 impl AgentDomainEvidence {
-    /// Index `receipts` and the forgotten memory ids under the daemon key.
-    /// With no daemon key nothing is indexed: no daemon-signed row can verify
-    /// then, so the index is never consulted.
+    /// Index `receipts` and the daemon-signed tombstones under the daemon
+    /// key, and count the receipts no row of `anchors` names. With no daemon
+    /// key nothing is indexed (no daemon-signed row can verify then, so the
+    /// index is never consulted), but orphans are still counted by source.
     #[must_use]
     pub fn build(
         receipts: &[StoredReceiptRow],
-        forgotten_ids: &[String],
+        tombstones: &[StoredTombstoneRow],
+        anchors: &ReceiptAnchors,
         daemon_key: Option<&VerifyingKey>,
     ) -> Self {
         let mut ev = Self::default();
         let Some(key) = daemon_key else {
+            ev.orphan_receipts = receipts
+                .iter()
+                .filter(|r| {
+                    !anchors
+                        .causes
+                        .contains(&SourceBinding::of_source(&r.source_id))
+                })
+                .count();
             return ev;
         };
         let pubkey = key.to_bytes();
         for row in receipts {
             let binding = SourceBinding::of_source(&row.source_id);
+            let by_source = if anchors.causes.contains(&binding) {
+                ReceiptAnchoring::Anchored
+            } else {
+                ReceiptAnchoring::Orphan
+            };
             let sig = row
                 .signature
                 .as_deref()
                 .and_then(|s| <[u8; AGENT_SIGNATURE_LEN]>::try_from(s).ok());
-            match (row.signature.as_deref(), sig, row.receipt()) {
+            let anchoring = match (row.signature.as_deref(), sig, row.receipt()) {
                 (None, _, _) => {
                     ev.unsigned_sources.insert(binding);
+                    by_source
                 }
                 (Some(_), Some(sig), Some(receipt)) => {
                     ev.signed_sources.insert(binding);
@@ -183,24 +286,53 @@ impl AgentDomainEvidence {
                         signature: &sig,
                         pubkey: &pubkey,
                     });
-                    let check = if key.verify(&bytes, &Signature::from_bytes(&sig)).is_ok() {
+                    // W-13 — the receipt's own domain; a raw-rule or
+                    // other-domain signature never verifies here.
+                    let check = if daemon_signer::verify(
+                        key,
+                        DaemonDomain::AtomisationReceipt,
+                        &bytes,
+                        &sig,
+                    ) {
                         ReceiptCheck::SignatureValid
                     } else {
                         ReceiptCheck::SignatureInvalid
                     };
                     ev.by_hash.insert(*hash.as_bytes(), (check, binding));
+                    if anchors.payload_hashes.contains(hash.as_bytes()) {
+                        ReceiptAnchoring::Anchored
+                    } else {
+                        ReceiptAnchoring::Orphan
+                    }
                 }
                 // A wrong-length signature or unreadable fields: the source
                 // has a receipt that can match no chain row (fail closed).
                 (Some(_), _, _) => {
                     ev.signed_sources.insert(binding);
+                    by_source
                 }
+            };
+            if anchoring == ReceiptAnchoring::Orphan {
+                ev.orphan_receipts += 1;
             }
         }
-        for id in forgotten_ids {
-            ev.tombstoned_sources.insert(SourceBinding::of_source(id));
+        for t in tombstones {
+            match t.evidence(key) {
+                TombstoneEvidence::Signed => {
+                    ev.tombstoned_sources
+                        .insert(SourceBinding::of_source(&t.memory_id));
+                }
+                TombstoneEvidence::Unsigned | TombstoneEvidence::Invalid => {}
+            }
         }
         ev
+    }
+
+    /// W-14 — the chain-level failure of this evidence: a stored receipt
+    /// with no chain row. Reported at sequence 0 on every walk.
+    #[must_use]
+    pub fn chain_failure(&self) -> Option<SignatureFailure> {
+        (self.orphan_receipts > 0).then_some(SignatureFailure::ReceiptChainRowMissing)
     }
 
     /// The verdict of a `daemon_signed` row of `kind` whose daemon signature
@@ -333,6 +465,37 @@ pub fn classify_agent_era_row(event: &SignedEvent, walk: &AgentEraWalk<'_>) -> R
     }
 }
 
+/// #10108 (W-12) — what a row says about the receipt it names, from the
+/// row's position relative to the marker ONLY (never a receipt field or a
+/// signature shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptEra {
+    /// A `daemon_signed` `atomisation_complete` row below the marker (or with
+    /// no marker): its receipt predates the receipt domain, so it is counted
+    /// legacy and never verified; the row keeps the daemon-row check.
+    Legacy,
+    /// Any other row (a signed-era atomisation row is judged by
+    /// [`AgentDomainEvidence::verdict`]).
+    NotLegacyReceipt,
+}
+
+/// #10108 (W-12) — the [`ReceiptEra`] of `event`.
+#[must_use]
+pub fn receipt_era(event: &SignedEvent, walk: &AgentEraWalk<'_>) -> ReceiptEra {
+    let is_atomisation = matches!(
+        AgentEventKind::of_event_type(&event.event_type),
+        Some(AgentEventKind::AtomisationComplete)
+    );
+    match (
+        is_atomisation,
+        SignerIdentity::of(&event.attest_level),
+        RowEra::resolve(&walk.cutover, event.sequence),
+    ) {
+        (true, SignerIdentity::Daemon, RowEra::Era(PayloadEra::Legacy)) => ReceiptEra::Legacy,
+        _ => ReceiptEra::NotLegacyReceipt,
+    }
+}
+
 /// S-4 — a legacy agent-labelled row: NULL and 64-byte signatures are
 /// counted legacy; any other length is malformed.
 fn legacy_agent_verdict(event: &SignedEvent) -> RowSignatureVerdict {
@@ -392,19 +555,49 @@ pub fn load_sqlite_agent_evidence(
             receipts.push(row.context("agent evidence: read receipt")?);
         }
     }
-    let mut forgotten = Vec::new();
+    let mut tombstones = Vec::new();
     if sqlite_table_exists(conn, "forget_tombstones")? {
         let mut stmt = conn
-            .prepare("SELECT memory_id FROM forget_tombstones")
+            .prepare(TOMBSTONE_EVIDENCE_SQL)
             .context("agent evidence: prepare tombstones")?;
         let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |r| {
+                Ok(StoredTombstoneRow {
+                    memory_id: r.get(0)?,
+                    namespace: r.get(1)?,
+                    forgotten_at: r.get(2)?,
+                    signature: r.get(3)?,
+                })
+            })
             .context("agent evidence: query tombstones")?;
         for row in rows {
-            forgotten.push(row.context("agent evidence: read tombstone")?);
+            tombstones.push(row.context("agent evidence: read tombstone")?);
+        }
+    }
+    let mut anchors = ReceiptAnchors::default();
+    if sqlite_table_exists(conn, crate::storage::schema_integrity::TABLE_SIGNED_EVENTS)? {
+        let mut stmt = conn
+            .prepare(RECEIPT_ANCHOR_SQL)
+            .context("agent evidence: prepare anchors")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+            })
+            .context("agent evidence: query anchors")?;
+        for row in rows {
+            let (payload_hash, cause_hash) = row.context("agent evidence: read anchor")?;
+            anchors.insert(&payload_hash, cause_hash.as_deref());
         }
     }
     Ok(AgentDomainEvidence::build(
-        &receipts, &forgotten, daemon_key,
+        &receipts,
+        &tombstones,
+        &anchors,
+        daemon_key,
     ))
 }
+
+/// #10135 — the tombstone columns the signature covers, shared by both
+/// backends' loaders.
+pub const TOMBSTONE_EVIDENCE_SQL: &str =
+    "SELECT memory_id, namespace, forgotten_at, signature FROM forget_tombstones";

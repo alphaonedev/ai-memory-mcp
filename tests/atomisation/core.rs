@@ -31,7 +31,11 @@ use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{AtomiseError, Atomiser, AtomiserConfig};
 use ai_memory::config::FeatureTier;
 use ai_memory::db;
+use ai_memory::governance::daemon_signer;
 use ai_memory::models::{Memory, MemoryKind, MemoryLinkRelation, Tier};
+use ai_memory::signed_events::agent_payload::{
+    AgentEventKind, AgentPayloadHash, AgentSignedPayload, AtomisationReceipt,
+};
 use ai_memory::signed_events::{list_signed_events, payload_hash};
 use ai_memory::storage;
 use ai_memory::storage::GovernanceRefusal;
@@ -253,6 +257,63 @@ fn insert_short_source(conn: &Connection, ns: &str) -> String {
         ..Memory::default()
     };
     db::insert(conn, &mem).expect("seed short source")
+}
+
+/// #10108 slice 2 (S-6): the `atomisation_complete` row is a daemon row
+/// whose `payload_hash` binds the stored receipt (which carries the
+/// curator model). The expected hash of that row if the receipt named
+/// `curator_model`: the stored receipt with only that field replaced,
+/// hashed the way the writer does (receipt-domain binding when the
+/// daemon signed it, the plain payload hash keyless).
+fn expected_completion_hash(conn: &Connection, source_id: &str, curator_model: &str) -> Vec<u8> {
+    let (atomised_at, atom_ids, atom_count, caller, signature): (
+        String,
+        String,
+        i64,
+        String,
+        Option<Vec<u8>>,
+    ) = conn
+        .query_row(
+            "SELECT atomised_at, atom_ids, atom_count, calling_agent_id, signature \
+             FROM atomisation_receipts WHERE source_id = ?1",
+            [source_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .expect("one stored receipt");
+    let receipt = AtomisationReceipt {
+        source_id: source_id.to_string(),
+        atomised_at,
+        atom_ids: serde_json::from_str(&atom_ids).expect("atom ids json"),
+        atom_count: u64::try_from(atom_count).expect("count fits"),
+        calling_agent_id: caller,
+        curator_model: Some(curator_model.to_string()),
+    };
+    let bytes = receipt.canonical_bytes();
+    match signature {
+        Some(sig) => {
+            let sig = <[u8; 64]>::try_from(sig.as_slice()).expect("64-byte receipt signature");
+            let pubkey = daemon_signer::verifying_key()
+                .expect("a signed receipt has a daemon key")
+                .to_bytes();
+            AgentPayloadHash::encode(&AgentSignedPayload {
+                kind: AgentEventKind::AtomisationComplete,
+                signed_bytes: &bytes,
+                signature: &sig,
+                pubkey: &pubkey,
+            })
+            .to_vec()
+        }
+        None => payload_hash(&bytes),
+    }
+}
+
+fn stored_curator_model(conn: &Connection, source_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT curator_model FROM atomisation_receipts WHERE source_id = ?1",
+        [source_id],
+        |r| r.get(0),
+    )
+    .expect("one stored receipt")
 }
 
 fn make_atomiser(curator: Box<dyn Curator>, tier: FeatureTier) -> Atomiser {
@@ -634,7 +695,9 @@ fn test_atomiser_records_signed_events() {
         "exactly one atomisation_complete summary event expected"
     );
     let summary = complete_events[0];
-    assert_eq!(summary.agent_id, "test-agent");
+    // #10108 slice 2: the completion row is the daemon's, bound to the
+    // receipt; the caller is named inside the receipt.
+    assert_eq!(summary.agent_id, "daemon");
     assert!(
         !summary.payload_hash.is_empty(),
         "summary event must carry a payload_hash"
@@ -647,16 +710,14 @@ fn test_atomiser_records_signed_events() {
 // hardcoded "gemma4" literal.
 // ---------------------------------------------------------------------------
 //
-// Approach: the signed_events table stores `payload_hash` (SHA-256
-// over the canonical payload JSON), not the raw payload. We can't
-// read the curator_model literal back from the row directly. Instead
-// we (a) construct an Atomiser with a known, non-gemma curator_model
-// via `Atomiser::with_curator_model`, (b) run atomise, (c)
-// reconstruct the expected payload JSON byte-for-byte (the production
-// `emit_atomisation_complete_event` builds it with serde_json::json!),
-// hash it, and assert the stored `payload_hash` matches.
+// Approach (#10108 slice 2): the daemon's `atomisation_complete` row
+// binds the stored receipt, which carries the curator model. We
+// (a) construct an Atomiser with a known, non-gemma curator_model via
+// `Atomiser::with_curator_model`, (b) run atomise, (c) read the stored
+// receipt's curator_model and rebuild the row's `payload_hash` from the
+// receipt (`expected_completion_hash`), asserting it matches.
 //
-// Cross-check (negative): we ALSO reconstruct the payload with the
+// Cross-check (negative): we ALSO rebuild the binding with the
 // pre-#1244 hardcoded literal `"gemma4"` and assert the hash does
 // NOT match — proves the fix actually threads the new value through,
 // not just that a payload hash exists.
@@ -702,48 +763,22 @@ fn test_atomiser_signed_event_curator_model_threads_through_1244() {
         .find(|e| e.event_type == "atomisation_complete")
         .expect("atomisation_complete signed_event must exist");
 
-    // Re-build the payload byte-for-byte. Field order MUST match the
-    // production `emit_atomisation_complete_event` `serde_json::json!`
-    // invocation (it's stable, the macro preserves declaration order
-    // for the resulting Value's serialisation when keys are unique
-    // strings, AND `serde_json::to_vec` walks `Value::Object`'s
-    // BTreeMap-backed entries — so the canonical bytes are
-    // map-iteration order. We compute the expected bytes by going
-    // through `serde_json::json!` ourselves and `to_vec`-ing them.
-    let expected_payload = serde_json::json!({
-        "event_type": "atomisation_complete",
-        "source_id": source_id,
-        "atom_ids": result.atom_ids,
-        "atom_count": result.atom_count,
-        "calling_agent_id": "test-agent",
-        "atomisation_timestamp": archived_at,
-        "curator_model": custom_curator_model,
-    });
-    let expected_bytes = serde_json::to_vec(&expected_payload).expect("serialize expected payload");
-    let expected_hash = payload_hash(&expected_bytes);
-
+    assert_eq!(
+        stored_curator_model(&conn, &source_id).as_deref(),
+        Some(custom_curator_model),
+        "the stored receipt names the threaded curator_model (#1244)"
+    );
+    let _ = archived_at;
+    let expected_hash = expected_completion_hash(&conn, &source_id, custom_curator_model);
     assert_eq!(
         complete.payload_hash, expected_hash,
-        "atomisation_complete payload_hash must match a payload that carries the \
+        "atomisation_complete payload_hash must bind a receipt that carries the \
          threaded curator_model `{custom_curator_model}` (#1244)"
     );
 
     // Negative cross-check: the pre-#1244 hardcoded literal `"gemma4"`
-    // produces a DIFFERENT hash — proves the fix actually substitutes
-    // the resolved value, not merely that we got SOME hash.
-    let pre_1244_payload = serde_json::json!({
-        "event_type": "atomisation_complete",
-        "source_id": source_id,
-        "atom_ids": result.atom_ids,
-        "atom_count": result.atom_count,
-        "calling_agent_id": "test-agent",
-        "atomisation_timestamp": archived_at,
-        "curator_model": "gemma4",
-    });
-    let pre_1244_bytes =
-        serde_json::to_vec(&pre_1244_payload).expect("serialize pre-#1244 payload");
-    let pre_1244_hash = payload_hash(&pre_1244_bytes);
-
+    // produces a DIFFERENT hash, so the fix threads the resolved value.
+    let pre_1244_hash = expected_completion_hash(&conn, &source_id, "gemma4");
     assert_ne!(
         complete.payload_hash, pre_1244_hash,
         "pre-#1244 hardcoded `gemma4` payload MUST NOT match — the fix has to \
@@ -791,18 +826,13 @@ fn test_atomiser_signed_event_curator_model_defaults_to_unknown_1244() {
         .find(|e| e.event_type == "atomisation_complete")
         .expect("atomisation_complete signed_event must exist");
 
-    let expected_payload = serde_json::json!({
-        "event_type": "atomisation_complete",
-        "source_id": source_id,
-        "atom_ids": result.atom_ids,
-        "atom_count": result.atom_count,
-        "calling_agent_id": "test-agent",
-        "atomisation_timestamp": result.archived_at,
-        "curator_model": "unknown",
-    });
-    let expected_bytes = serde_json::to_vec(&expected_payload).expect("serialize expected payload");
-    let expected_hash = payload_hash(&expected_bytes);
-
+    let _ = &result;
+    assert_eq!(
+        stored_curator_model(&conn, &source_id).as_deref(),
+        Some("unknown"),
+        "the stored receipt names the `unknown` default (#1244)"
+    );
+    let expected_hash = expected_completion_hash(&conn, &source_id, "unknown");
     assert_eq!(
         complete.payload_hash, expected_hash,
         "atomisation_complete payload_hash must reflect the `unknown` default \

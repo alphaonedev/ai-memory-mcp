@@ -1142,6 +1142,10 @@ pub struct ChainVerificationReport {
     /// #10135 — daemon-signed `atomisation_complete` rows whose receipt was
     /// erased under a forget tombstone. Never counted verified.
     pub agent_receipts_erased: u64,
+    /// #10108 (W-12) — daemon-signed `atomisation_complete` rows below the
+    /// cutover marker: their receipts predate the receipt domain and are
+    /// counted legacy, never verified (the row keeps its daemon-row check).
+    pub agent_receipts_legacy: u64,
 }
 
 impl ChainVerificationReport {
@@ -1312,6 +1316,11 @@ pub enum SignatureFailure {
     /// #10108 (B-4) — the recomputed `payload_hash` matches but the domain
     /// row's signature does not verify under the daemon key.
     DomainSignatureInvalid,
+    /// #10108 (W-14, S-4) — a stored atomisation receipt that no
+    /// `atomisation_complete` chain row anchors (by its recomputed
+    /// `payload_hash`, or for a receipt with no usable signature by its source
+    /// binding). A chain-level failure, reported at sequence 0 on every walk.
+    ReceiptChainRowMissing,
 }
 
 impl SignatureFailure {
@@ -1332,6 +1341,7 @@ impl SignatureFailure {
             Self::DomainRowMissing => "agent_domain_row_missing",
             Self::DomainPayloadMismatch => "agent_domain_payload_mismatch",
             Self::DomainSignatureInvalid => "agent_domain_signature_invalid",
+            Self::ReceiptChainRowMissing => "agent_receipt_chain_row_missing",
         }
     }
 }
@@ -1386,6 +1396,7 @@ impl RowSignatureVerdict {
                     | SignatureFailure::DomainRowMissing
                     | SignatureFailure::DomainPayloadMismatch
                     | SignatureFailure::DomainSignatureInvalid
+                    | SignatureFailure::ReceiptChainRowMissing
             )
         )
     }
@@ -1423,7 +1434,8 @@ impl RowSignatureVerdict {
                 | SignatureFailure::AgentEraUnresolvable
                 | SignatureFailure::DomainRowMissing
                 | SignatureFailure::DomainPayloadMismatch
-                | SignatureFailure::DomainSignatureInvalid),
+                | SignatureFailure::DomainSignatureInvalid
+                | SignatureFailure::ReceiptChainRowMissing),
             ) => Some(f),
             _ => None,
         }
@@ -1665,6 +1677,7 @@ pub fn verify_chain(
         cutoff: &cutoff,
     };
     let mut agent_receipts_erased: u64 = 0;
+    let mut agent_receipts_legacy: u64 = 0;
     let mut signature_failures: Vec<i64> = Vec::new();
     let mut role_separation_failures: Vec<i64> = Vec::new();
     let mut rows_positively_verified: u64 = 0;
@@ -1763,6 +1776,10 @@ pub fn verify_chain(
         if rv.is_receipt_erased() {
             agent_receipts_erased += 1;
         }
+        match agent_era::receipt_era(&event, &agent_walk) {
+            agent_era::ReceiptEra::Legacy => agent_receipts_legacy += 1,
+            agent_era::ReceiptEra::NotLegacyReceipt => {}
+        }
         if rv.is_verified() {
             rows_positively_verified += 1;
         }
@@ -1794,6 +1811,14 @@ pub fn verify_chain(
         signature_failures.push(CHAIN_LEVEL_FAILURE_SEQUENCE);
         agent_signature_defects.push((CHAIN_LEVEL_FAILURE_SEQUENCE, f));
     }
+    // #10108 (W-14, S-4) — a stored receipt that no chain row of the whole
+    // table anchors fails every walk, whatever window it covers.
+    if let Some(f) = agent_evidence.chain_failure() {
+        if !signature_failures.contains(&CHAIN_LEVEL_FAILURE_SEQUENCE) {
+            signature_failures.push(CHAIN_LEVEL_FAILURE_SEQUENCE);
+        }
+        agent_signature_defects.push((CHAIN_LEVEL_FAILURE_SEQUENCE, f));
+    }
 
     Ok(ChainVerificationReport {
         rows_checked,
@@ -1804,6 +1829,7 @@ pub fn verify_chain(
         agent_signed_rows_not_verified,
         agent_signature_defects,
         agent_receipts_erased,
+        agent_receipts_legacy,
     })
 }
 
@@ -3140,6 +3166,11 @@ pub struct AuditTrailReport {
     /// JSON shape is unchanged); populated IDENTICALLY by both backends.
     #[serde(skip)]
     pub agent_receipts_erased: u64,
+    /// #10108 (W-12) — daemon-signed `atomisation_complete` rows below the
+    /// cutover marker, whose receipts are counted legacy. Not on the wire;
+    /// populated IDENTICALLY by both backends.
+    #[serde(skip)]
+    pub agent_receipts_legacy: u64,
     /// v0.9.0 G9 (#1826) — three-key Recorder/Judge/Stopper signing-layer
     /// SEPARATION verdict (K1 pin of the judge/stopper checkpoints + per-row
     /// recorder verification + C3 distinctness + C2 daemon-demotion).
@@ -3633,6 +3664,7 @@ pub fn verify_audit_trail(
         signature_failures: report.signature_failures.clone(),
         agent_signed_rows_not_verified: report.agent_signed_rows_not_verified,
         agent_receipts_erased: report.agent_receipts_erased,
+        agent_receipts_legacy: report.agent_receipts_legacy,
         role_separation,
         lineage,
         rollback,
@@ -4469,6 +4501,7 @@ mod tests {
             signature_failures: Vec::new(),
             agent_signed_rows_not_verified: 0,
             agent_receipts_erased: 0,
+            agent_receipts_legacy: 0,
             role_separation: RoleSeparationCheck::Unknown,
             lineage: crate::identity::lineage::LineageCheck::Unknown,
             rollback: RollbackCheck::Unknown,

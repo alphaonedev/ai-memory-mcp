@@ -48,6 +48,9 @@ const RECEIPT_ENCODING_TAG: &[u8] = b"ai-memory/atomisation-receipt-v1\0";
 /// W-13: the receipt domain is the seventh daemon domain.
 const DAEMON_DOMAIN_COUNT: usize = 7;
 const ATOMISATION: &str = "atomisation_complete";
+const LINK_CREATED: &str = "memory_link.created";
+/// The raw receipts the released-database fixture writes before the marker.
+const PRE_MARKER_RECEIPTS: u64 = 3;
 const V102_RUNG: i64 = 102;
 const PREFIX_ROWS: usize = 3;
 const ATOMISED_AT: &str = "2026-11-27T00:00:00Z";
@@ -103,6 +106,24 @@ fn open_db() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
     let dir = home_sandbox::per_test_dir("receipt-10108-");
     let path = dir.path().join("receipt-10108.db");
     let conn = db::open(&path).expect("open db");
+    (dir, path, conn)
+}
+
+/// W-14 — a released pre-v103 database: a fresh open writes the signed
+/// genesis marker (#10145), so the fixture drops it and stamps v102, the
+/// state of a database written before the cutover.
+fn open_released_db() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
+    let (dir, path, conn) = open_db();
+    conn.execute(
+        "DELETE FROM signed_events WHERE event_type = ?1",
+        params![AGENT_CUTOVER_EVENT_TYPE],
+    )
+    .expect("drop the genesis marker");
+    conn.execute_batch(&format!(
+        "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES ({V102_RUNG});"
+    ))
+    .expect("stamp v102");
+    assert_eq!(head_sequence(&conn), 0, "the released chain starts empty");
     (dir, path, conn)
 }
 
@@ -290,9 +311,9 @@ fn receipt_domain_is_separated_from_every_other_domain_and_raw_10108() {
         !daemon_signer::verify(&vk, domain, &body, &raw),
         "a raw signature verifies under the receipt domain"
     );
-    let arr = <[u8; 64]>::try_from(sig.as_slice()).expect("64 bytes");
+    let sig_bytes = <[u8; 64]>::try_from(sig.as_slice()).expect("64 bytes");
     assert!(
-        vk.verify_strict(&body, &ed25519_dalek::Signature::from_bytes(&arr))
+        vk.verify_strict(&body, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
             .is_err(),
         "a receipt-domain signature verifies under the raw rule"
     );
@@ -416,7 +437,7 @@ fn unsigned_receipt_without_chain_row_is_reported_10108() {
 /// stays fully verified; no receipt byte and no chain row byte is rewritten.
 #[test]
 fn pre_marker_raw_receipts_upgrade_verified_and_byte_identical_10108() {
-    let (_dir, path, conn) = open_db();
+    let (_dir, path, conn) = open_released_db();
     append_genuine(&conn);
     for atoms in [&["a1"][..], &["b1", "b2"], &["c1", "c2", "c3"]] {
         let r = receipt(&source(&conn), atoms);
@@ -436,6 +457,10 @@ fn pre_marker_raw_receipts_upgrade_verified_and_byte_identical_10108() {
     let report = walk(&conn);
     assert!(fully_verified(&report), "{report:?}");
     assert!(!orphan_reported(&report));
+    assert_eq!(
+        report.agent_receipts_legacy, PRE_MARKER_RECEIPTS,
+        "W-12: each pre-marker receipt is counted legacy"
+    );
 }
 
 type Dump = (
@@ -482,7 +507,7 @@ fn namespace_of(conn: &rusqlite::Connection, id: &str) -> String {
     .expect("namespace")
 }
 
-fn insert_tombstone(conn: &rusqlite::Connection, id: &str, ns: &str, sig: Option<Vec<u8>>) {
+fn insert_tombstone(conn: &rusqlite::Connection, id: &str, ns: &str, sig: Option<&[u8]>) {
     conn.execute(
         "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at, agent_id, signature) \
          VALUES (?1, ?2, ?3, NULL, ?4)",
@@ -508,12 +533,15 @@ fn unsigned_tombstone_does_not_excuse_a_missing_receipt_10135() {
     assert_eq!(report.agent_receipts_erased, 0);
 }
 
+/// One forged tombstone signature: `(other key, source id, namespace)`.
+type Forgery = fn(&SigningKey, &str, &str) -> Vec<u8>;
+
 /// #10135 — a tombstone signed by another key, or by the daemon under
 /// another domain, or over another source's body, is no erasure record.
 #[test]
 fn forged_tombstone_does_not_excuse_a_missing_receipt_10135() {
     let other = SigningKey::from_bytes(&[0x2a; 32]);
-    let forgeries: [fn(&SigningKey, &str, &str) -> Vec<u8>; 3] = [
+    let forgeries: [Forgery; 3] = [
         |k, id, ns| {
             let body = forget_tombstone_signing_body(id, ns, FORGOTTEN_AT);
             k.sign(&[DaemonDomain::Tombstone.tag(), &body[..]].concat())
@@ -539,7 +567,7 @@ fn forged_tombstone_does_not_excuse_a_missing_receipt_10135() {
         let ns = namespace_of(&conn, &src);
         let r = receipt(&src, &["a1"]);
         let seq = append_row(&conn, &r, &receipt_sign(&r.canonical_bytes()));
-        insert_tombstone(&conn, &src, &ns, Some(forge(&other, &src, &ns)));
+        insert_tombstone(&conn, &src, &ns, Some(&forge(&other, &src, &ns)));
         let report = walk(&conn);
         assert_eq!(
             defect(&report, seq),
@@ -687,7 +715,29 @@ fn atomise_writes_a_domain_signed_receipt_and_its_chain_row_10108() {
     );
     let report = walk(&conn);
     assert_eq!(defect(&report, rows[0].sequence), None, "{report:?}");
-    assert!(fully_verified(&report), "{report:?}");
+    assert!(
+        !report.signature_failures.contains(&rows[0].sequence),
+        "{report:?}"
+    );
+    assert!(!orphan_reported(&report), "{report:?}");
+    assert_eq!(report.agent_receipts_legacy, 0, "a signed-era receipt");
+    // The atoms' `atom_of` edges still go through the agent link writer,
+    // which later slices of #10108 move to the daemon; until then those
+    // rows (and only those) read as pre-cutover writers above the marker.
+    for (seq, f) in &report.agent_signature_defects {
+        let event_type: String = conn
+            .query_row(
+                "SELECT event_type FROM signed_events WHERE sequence = ?1",
+                [seq],
+                |r| r.get(0),
+            )
+            .expect("defect row");
+        assert_eq!(
+            (event_type.as_str(), *f),
+            (LINK_CREATED, SignatureFailure::PreCutoverWriter),
+            "row {seq}: {report:?}"
+        );
+    }
 }
 
 /// The step an injected failure aborts.
@@ -780,5 +830,5 @@ fn receipt_key_collision_is_an_error_10108() {
     }
     assert!(receipts_of(&conn, &src).is_empty(), "the receipt was kept");
     assert_eq!(atomised_into(&conn, &src), None);
-    assert!(completion_rows(&conn).is_empty());
+    assert_eq!(completion_rows(&conn).len(), 0, "a chain row was written");
 }

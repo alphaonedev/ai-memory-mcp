@@ -37,6 +37,9 @@ pub enum DaemonDomain {
     RevisionLeaf,
     /// The one legacy cutoff row of a `signed_events` chain.
     LegacyCutoff,
+    /// #10108 (W-13) — an atomisation receipt
+    /// (`signed_events::agent_payload::AtomisationReceipt::canonical_bytes`).
+    AtomisationReceipt,
 }
 
 /// decision: the tombstone and revision-leaf tags are the domain prefixes those
@@ -49,16 +52,18 @@ const TAG_GOVERNANCE: &[u8] = b"ai-memory/daemon-sig/v2/governance\0";
 const TAG_TOMBSTONE: &[u8] = b"forget-tombstone-v1\x00";
 const TAG_REVISION_LEAF: &[u8] = b"memory-revision-v1\x00";
 const TAG_LEGACY_CUTOFF: &[u8] = b"ai-memory/daemon-sig/v2/legacy-cutoff\0";
+const TAG_ATOMISATION_RECEIPT: &[u8] = b"ai-memory/daemon-sig/v2/atomisation-receipt\0";
 
 impl DaemonDomain {
     /// Every domain, for the cross-domain tests.
-    pub const ALL: [DaemonDomain; 6] = [
+    pub const ALL: [DaemonDomain; 7] = [
         DaemonDomain::EventRow,
         DaemonDomain::EventPayload,
         DaemonDomain::Governance,
         DaemonDomain::Tombstone,
         DaemonDomain::RevisionLeaf,
         DaemonDomain::LegacyCutoff,
+        DaemonDomain::AtomisationReceipt,
     ];
 
     /// The domain tag prefixed to every preimage of this domain. No tag is a
@@ -72,6 +77,7 @@ impl DaemonDomain {
             DaemonDomain::Tombstone => TAG_TOMBSTONE,
             DaemonDomain::RevisionLeaf => TAG_REVISION_LEAF,
             DaemonDomain::LegacyCutoff => TAG_LEGACY_CUTOFF,
+            DaemonDomain::AtomisationReceipt => TAG_ATOMISATION_RECEIPT,
         }
     }
 }
@@ -449,7 +455,7 @@ mod tests {
     /// gets its slot here, and the slot test fails until it is in `ALL`.
     #[test]
     fn all_lists_every_domain_exactly_once_10155() {
-        const DOMAIN_COUNT: usize = 6;
+        const DOMAIN_COUNT: usize = 7;
         fn slot(d: DaemonDomain) -> usize {
             match d {
                 DaemonDomain::EventRow => 0,
@@ -458,6 +464,7 @@ mod tests {
                 DaemonDomain::Tombstone => 3,
                 DaemonDomain::RevisionLeaf => 4,
                 DaemonDomain::LegacyCutoff => 5,
+                DaemonDomain::AtomisationReceipt => 6,
             }
         }
         assert_eq!(DaemonDomain::ALL.len(), DOMAIN_COUNT);

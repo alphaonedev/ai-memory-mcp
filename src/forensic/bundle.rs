@@ -77,6 +77,7 @@ use sha2::{Digest, Sha256};
 use crate::cli::CliOutput;
 use crate::identity::keypair as kp_mod;
 use crate::identity::sign::SignableLink;
+use crate::signed_events::agent_era::SourceBinding;
 
 /// Bundle manifest entry name (#1558 batch 6).
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -944,6 +945,11 @@ fn build_atomisation_envelope(
 ///      The over-fetch is bounded by the agent_id set of the
 ///      chain's `derives_from` writers, so unrelated atomisations
 ///      from other agents are excluded.
+///   3. #10108 slice 2 — since the v103 marker the daemon writes the
+///      `atomisation_complete` row (agent `daemon`, not the calling
+///      agent) and binds it to its source through the signed
+///      `cause_hash` ([`SourceBinding`]). Every such row bound to a
+///      chain id is included exactly, whatever its agent.
 fn fetch_atomisation_signed_events_for(
     conn: &Connection,
     chain_ids: &[String],
@@ -1045,7 +1051,43 @@ fn fetch_atomisation_signed_events_for(
             out.push(ev);
         }
     }
+    push_source_bound_completions(conn, chain_ids, &mut seen, &mut out)?;
     Ok(out)
+}
+
+/// #10108 slice 2 — append every `atomisation_complete` row whose signed
+/// `cause_hash` is the [`SourceBinding`] of a chain id (the daemon-written
+/// completion row), skipping ids already in `seen`.
+fn push_source_bound_completions(
+    conn: &Connection,
+    chain_ids: &[String],
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<SignedEventEnvelope>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, agent_id, event_type, payload_hash, signature, \
+                attest_level, timestamp \
+         FROM signed_events \
+         WHERE event_type = ?1 AND cause_hash = ?2 \
+         ORDER BY timestamp ASC, id ASC",
+    )?;
+    for id in chain_ids {
+        let binding = SourceBinding::of_source(id);
+        let rows = stmt.query_map(
+            params![
+                crate::signed_events::event_types::ATOMISATION_COMPLETE,
+                binding.as_bytes().as_slice()
+            ],
+            row_to_signed_event_envelope,
+        )?;
+        for r in rows {
+            let ev = r?;
+            if seen.insert(ev.id.clone()) {
+                out.push(ev);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v0.7.0 WT-1-E — shared row→envelope decoder. Replicates the

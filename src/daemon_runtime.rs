@@ -5176,8 +5176,7 @@ async fn build_store_handle(
                     .map_or(path, |p| if p.starts_with('/') { p } else { path });
                 tracing::info!("Wave-3: opening SQLite SAL store at {clean} (--store-url)");
                 // #10108 K-7: the typed cause stays a downcastable source.
-                let store = crate::store::sqlite::SqliteStore::open(clean)
-                    .map_err(|e| anyhow::Error::new(e).context("open sqlite adapter"))?;
+                let store = crate::store::sqlite::SqliteStore::open_adapter(clean)?;
                 Ok((StorageBackend::Sqlite, Arc::new(store)))
             } else {
                 // #1579 A3 (SECURITY) — a mistyped scheme can still
@@ -5194,8 +5193,7 @@ async fn build_store_handle(
             let _ = embedder_available;
             let _ = pool;
             tracing::debug!("Wave-3: --store-url absent; opening SQLite SAL store at --db path");
-            let store = crate::store::sqlite::SqliteStore::open(db_path)
-                .map_err(|e| anyhow::Error::new(e).context("open sqlite adapter"))?;
+            let store = crate::store::sqlite::SqliteStore::open_adapter(db_path)?;
             Ok((StorageBackend::Sqlite, Arc::new(store)))
         }
     }

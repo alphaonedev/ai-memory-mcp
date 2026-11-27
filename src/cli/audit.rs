@@ -618,6 +618,7 @@ mod bring_up_remaining_tests {
             signature_failures: vec![],
             agent_signed_rows_not_verified: 0,
             agent_receipts_erased: 0,
+            agent_receipts_legacy: 0,
             role_separation: RoleSeparationCheck::NotDetected,
             lineage: LineageCheck::NotDetected,
             rollback: RollbackCheck::NotDetected,

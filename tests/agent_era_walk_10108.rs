@@ -15,8 +15,11 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use ai_memory::db;
+use ai_memory::governance::daemon_signer::DaemonDomain;
 use ai_memory::models::{Memory, MemoryKind, Tier};
-use ai_memory::signed_events::agent_era::{AgentDomainEvidence, SourceBinding, StoredReceiptRow};
+use ai_memory::signed_events::agent_era::{
+    AgentDomainEvidence, ReceiptAnchors, SourceBinding, StoredReceiptRow, StoredTombstoneRow,
+};
 use ai_memory::signed_events::agent_payload::{
     AgentEventKind, AgentPayloadHash, AgentSignedPayload, AtomisationReceipt,
 };
@@ -61,6 +64,15 @@ const INDEX_ROWS: usize = 100_000;
 const INDEX_SIGNED: usize = 200;
 /// Wall-clock ceiling of the index bound.
 const INDEX_CEILING_SECS: u64 = 60;
+/// The namespace of the index bound's tombstones.
+const INDEX_NAMESPACE: &str = "era-index-10108";
+
+/// W-13 — a signature by `signer` over `body` under the receipt domain.
+fn receipt_sign(signer: &SigningKey, body: &[u8]) -> [u8; 64] {
+    signer
+        .sign(&[DaemonDomain::AtomisationReceipt.tag(), body].concat())
+        .to_bytes()
+}
 
 fn sink() -> VerifyingKey {
     static SINK: OnceLock<tempfile::TempDir> = OnceLock::new();
@@ -93,6 +105,24 @@ fn open_db() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
     let dir = home_sandbox::per_test_dir("agent-era-10108-");
     let path = dir.path().join("era-10108.db");
     let conn = db::open(&path).expect("open db");
+    (dir, path, conn)
+}
+
+/// A released pre-v103 database: a fresh open writes the signed genesis
+/// marker (#10145), so the legacy fixtures drop it and stamp v102, the
+/// state a database written before the cutover is in.
+fn open_legacy_db() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
+    let (dir, path, conn) = open_db();
+    conn.execute(
+        "DELETE FROM signed_events WHERE event_type = ?1",
+        params![AGENT_CUTOVER_EVENT_TYPE],
+    )
+    .expect("drop the genesis marker");
+    conn.execute_batch(&format!(
+        "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES ({V102_RUNG});"
+    ))
+    .expect("stamp v102");
+    assert!(load_rows(&conn).is_empty(), "the legacy chain starts empty");
     (dir, path, conn)
 }
 
@@ -249,7 +279,7 @@ fn append_atomisation(
     signer: &SigningKey,
 ) -> (i64, [u8; 64]) {
     let bytes = r.canonical_bytes();
-    let sig = signer.sign(&bytes).to_bytes();
+    let sig = receipt_sign(signer, &bytes);
     let pubkey = sink().to_bytes();
     let hash = AgentPayloadHash::encode(&AgentSignedPayload {
         kind: AgentEventKind::AtomisationComplete,
@@ -397,7 +427,7 @@ fn receipt_of_another_source_is_a_payload_mismatch_10108() {
     let (_dir, conn) = open_signed_era();
     let r = receipt(&source(&conn), &["a1"]);
     let bytes = r.canonical_bytes();
-    let sig = daemon_key().sign(&bytes).to_bytes();
+    let sig = receipt_sign(&daemon_key(), &bytes);
     let pubkey = sink().to_bytes();
     let hash = AgentPayloadHash::encode(&AgentSignedPayload {
         kind: AgentEventKind::AtomisationComplete,
@@ -484,7 +514,7 @@ fn row_without_cause_or_receipt_is_domain_row_missing_10108() {
 /// malformed.
 #[test]
 fn legacy_agent_rows_are_counted_never_failed_10108() {
-    let (_dir, _path, conn) = open_db();
+    let (_dir, _path, conn) = open_legacy_db();
     let null_row = insert_raw(&conn, ATOMISATION, "self_signed", None);
     let full_row = insert_raw(&conn, ATOMISATION, "self_signed", Some(&[7u8; 64]));
     let short_row = insert_raw(&conn, ATOMISATION, "self_signed", Some(&[7u8; 63]));
@@ -504,7 +534,7 @@ fn legacy_agent_rows_are_counted_never_failed_10108() {
 /// S-4 — legacy rows below the marker keep the legacy outcome.
 #[test]
 fn agent_rows_below_the_marker_are_legacy_10108() {
-    let (_dir, path, conn) = open_db();
+    let (_dir, path, conn) = open_legacy_db();
     let below = insert_raw(&conn, ATOMISATION, "self_signed", None);
     let conn = with_marker(&path, conn);
     let report = walk(&conn);
@@ -592,7 +622,7 @@ fn append_daemon_kind(conn: &rusqlite::Connection, event_type: &str) -> i64 {
 /// domain row and fails.
 #[test]
 fn legacy_daemon_agent_kind_rows_keep_the_daemon_check_10108() {
-    let (_dir, path, conn) = open_db();
+    let (_dir, path, conn) = open_legacy_db();
     let kinds = [ATOMISATION, "memory_link.created"];
     let no_marker: Vec<i64> = kinds.iter().map(|k| append_daemon_kind(&conn, k)).collect();
     let report = walk(&conn);
@@ -663,10 +693,12 @@ fn daemon_agent_kind_row_with_an_invalid_marker_is_unresolvable_10108() {
 }
 
 /// Unbounded input — the evidence index is built and answers in linear
-/// time: `INDEX_ROWS` unsigned receipts, `INDEX_ROWS` tombstones and
-/// `INDEX_ROWS` row verdicts finish within the ceiling (a scan per lookup
-/// would be 10^10 comparisons). Signed receipts are kept to
-/// `INDEX_SIGNED` because each costs one ed25519 verification.
+/// time: `INDEX_ROWS` unsigned receipts, `INDEX_ROWS` unsigned tombstones,
+/// `INDEX_ROWS` anchors and `INDEX_ROWS` row verdicts finish within the
+/// ceiling (a scan per lookup would be 10^10 comparisons). Signed receipts
+/// and signed tombstones are kept to `INDEX_SIGNED` because each costs one
+/// ed25519 verification. An unsigned tombstone never evidences an erasure
+/// (#10135) and every receipt is anchored, so no chain-level failure.
 #[test]
 fn evidence_index_is_linear_at_100k_10108() {
     let key = daemon_key();
@@ -686,7 +718,7 @@ fn evidence_index_is_linear_at_100k_10108() {
     for i in 0..INDEX_SIGNED {
         let r = receipt(&format!("signed-{i}"), &["a"]);
         let bytes = r.canonical_bytes();
-        let sig = key.sign(&bytes).to_bytes();
+        let sig = receipt_sign(&key, &bytes);
         hashes.push(
             AgentPayloadHash::encode(&AgentSignedPayload {
                 kind: AgentEventKind::AtomisationComplete,
@@ -706,9 +738,35 @@ fn evidence_index_is_linear_at_100k_10108() {
             signature: Some(sig.to_vec()),
         });
     }
-    let forgotten: Vec<String> = (0..INDEX_ROWS).map(|i| format!("gone-{i}")).collect();
+    let tombstone = |id: String, signature: Option<Vec<u8>>| StoredTombstoneRow {
+        memory_id: id,
+        namespace: INDEX_NAMESPACE.to_string(),
+        forgotten_at: ATOMISED_AT.to_string(),
+        signature,
+    };
+    let mut tombstones: Vec<StoredTombstoneRow> = (0..INDEX_ROWS)
+        .map(|i| tombstone(format!("unsigned-gone-{i}"), None))
+        .collect();
+    for i in 0..INDEX_SIGNED {
+        let id = format!("gone-{i}");
+        let body =
+            ai_memory::storage::forget_tombstone_signing_body(&id, INDEX_NAMESPACE, ATOMISED_AT);
+        let sig = key
+            .sign(&[DaemonDomain::Tombstone.tag(), &body[..]].concat())
+            .to_bytes();
+        tombstones.push(tombstone(id, Some(sig.to_vec())));
+    }
+    let mut anchors = ReceiptAnchors::default();
+    for i in 0..INDEX_ROWS {
+        let binding = SourceBinding::of_source(&format!("unsigned-{i}"));
+        anchors.insert(&payload_hash(b"x"), Some(binding.as_bytes().as_slice()));
+    }
+    for h in &hashes {
+        anchors.insert(h, None);
+    }
     let started = std::time::Instant::now();
-    let ev = AgentDomainEvidence::build(&stored, &forgotten, Some(&vk));
+    let ev = AgentDomainEvidence::build(&stored, &tombstones, &anchors, Some(&vk));
+    assert_eq!(ev.chain_failure(), None, "every receipt is anchored");
     let row = |payload: Vec<u8>, source: &str| SignedEvent {
         event_type: ATOMISATION.to_string(),
         attest_level: "daemon_signed".to_string(),
@@ -723,10 +781,15 @@ fn evidence_index_is_linear_at_100k_10108() {
             ev.verdict(&unsigned, kind),
             RowSignatureVerdict::Failed(SignatureFailure::AgentSignatureMissing)
         );
-        let gone = row(payload_hash(b"x"), &format!("gone-{i}"));
+        let gone = row(payload_hash(b"x"), &format!("gone-{}", i % INDEX_SIGNED));
         assert_eq!(
             ev.verdict(&gone, kind),
             RowSignatureVerdict::Skipped(SkipReason::ReceiptErasedUnderTombstone)
+        );
+        let forged = row(payload_hash(b"x"), &format!("unsigned-gone-{i}"));
+        assert_eq!(
+            ev.verdict(&forged, kind),
+            RowSignatureVerdict::Failed(SignatureFailure::DomainRowMissing)
         );
         let j = i % INDEX_SIGNED;
         let signed = row(hashes[j].clone(), &format!("signed-{j}"));

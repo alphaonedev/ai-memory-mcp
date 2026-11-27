@@ -136,7 +136,7 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
         let clean = path
             .strip_prefix('/')
             .map_or(path, |p| if p.starts_with('/') { p } else { path });
-        let store = SqliteStore::open(clean).context("open sqlite adapter")?;
+        let store = SqliteStore::open_adapter(clean)?;
         return Ok(Box::new(store));
     }
 

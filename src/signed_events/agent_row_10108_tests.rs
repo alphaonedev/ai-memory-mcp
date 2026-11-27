@@ -62,13 +62,8 @@ const LINK_SIG_CHECK_REFUSAL: Outcome =
 
 /// Every agent-row writer on the SQLite backend (#10108 sibling sweep).
 const WRITERS: &[WriterCase] = &[
-    WriterCase {
-        name: "atomisation_complete",
-        event_type: event_types::ATOMISATION_COMPLETE,
-        drive: drive_atomisation,
-        signed: Some(SELF_SIGNED_ROW),
-        unsigned: UNSIGNED_ROW,
-    },
+    // `atomisation_complete` is a daemon row since #10108 slice 2 (S-6): its
+    // receipt and chain row are pinned by tests/atomisation_receipt_10108.rs.
     WriterCase {
         name: "context_offloaded",
         event_type: "context_offloaded",
@@ -205,19 +200,6 @@ fn seed_pair(conn: &Connection) -> (String, String) {
     (
         seed_memory(conn, "src", MemoryKind::Observation, meta.clone()),
         seed_memory(conn, "dst", MemoryKind::Observation, meta),
-    )
-}
-
-fn drive_atomisation(conn: &Connection, kp: Option<&AgentKeypair>) -> anyhow::Result<()> {
-    crate::atomisation::emit_atomisation_complete_event(
-        conn,
-        "src-10108",
-        &["atom-1".to_string()],
-        1,
-        AGENT,
-        &chrono::Utc::now().to_rfc3339(),
-        kp,
-        "stub-model",
     )
 }
 

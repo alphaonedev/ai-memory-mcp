@@ -75,6 +75,16 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// [`Self::open`] for an `anyhow` caller (the serve boot, `migrate`):
+    /// the typed [`crate::store::StoreError`] stays the downcastable root
+    /// cause (#10108 K-7) under one shared context line.
+    ///
+    /// # Errors
+    /// Whatever [`Self::open`] returns, with that context attached.
+    pub fn open_adapter(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        Self::open(path).map_err(|e| anyhow::Error::new(e).context("open sqlite adapter"))
+    }
+
     /// Open (or create) a `SqliteStore` at the given path. Delegates
     /// schema init + migration to `crate::db::open`.
     pub fn open(path: impl Into<PathBuf>) -> StoreResult<Self> {

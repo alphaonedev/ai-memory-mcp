@@ -782,7 +782,9 @@ fn a_markerless_v103_database_fails_and_is_never_repaired_10145() {
 }
 
 /// #10145 (W-11) — a chain wiped while domain rows survive is a counted
-/// failure on both walks, never read as a fresh database.
+/// failure on both walks, never read as a fresh database. Since #10108 slice
+/// 2 (W-14) the surviving receipt, which no chain row now anchors, is also
+/// reported, so the walk names both the missing marker and the orphan.
 #[test]
 fn a_wiped_chain_with_surviving_domain_rows_fails_10145() {
     let (_dir, _path, conn) = open_db();
@@ -792,5 +794,12 @@ fn a_wiped_chain_with_surviving_domain_rows_fails_10145() {
     conn.execute("DELETE FROM signed_events", [])
         .expect("wipe the chain");
     assert_eq!(receipts(&conn, &source), 1, "the domain row survives");
-    assert_eq!(missing_report(&conn), missing_expected());
+    let (chain, reasons, trail) = missing_expected();
+    let mut reasons = reasons;
+    reasons.push((0, ORPHAN_RECEIPT_REASON));
+    assert_eq!(missing_report(&conn), (chain, reasons, trail));
 }
+
+/// The walk reason for a receipt no chain row anchors (#10108 W-14), stated
+/// here independently of the code under test.
+const ORPHAN_RECEIPT_REASON: &str = "agent_receipt_chain_row_missing";

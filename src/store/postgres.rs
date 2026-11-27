@@ -16614,6 +16614,7 @@ impl PostgresStore {
             cutoff: &cutoff,
         };
         let mut agent_receipts_erased: u64 = 0;
+        let mut agent_receipts_legacy: u64 = 0;
         let mut signature_failures: Vec<i64> = Vec::new();
         let mut role_separation_failures: Vec<i64> = Vec::new();
         let mut rows_positively_verified: u64 = 0;
@@ -16648,6 +16649,10 @@ impl PostgresStore {
             if rv.is_receipt_erased() {
                 agent_receipts_erased += 1;
             }
+            match crate::signed_events::agent_era::receipt_era(&ev, &agent_walk) {
+                crate::signed_events::agent_era::ReceiptEra::Legacy => agent_receipts_legacy += 1,
+                crate::signed_events::agent_era::ReceiptEra::NotLegacyReceipt => {}
+            }
             if rv.is_verified() {
                 rows_positively_verified += 1;
             }
@@ -16670,6 +16675,13 @@ impl PostgresStore {
         // fails every walk, whatever window it covers; no row carries the
         // failure (the sqlite `verify_chain` twin).
         if agent_cutover.chain_failure().is_some() {
+            signature_failures.push(crate::signed_events::CHAIN_LEVEL_FAILURE_SEQUENCE);
+        }
+        // #10108 (W-14, S-4) - a stored receipt no chain row anchors fails
+        // every walk (the sqlite `verify_chain` twin).
+        if agent_evidence.chain_failure().is_some()
+            && !signature_failures.contains(&crate::signed_events::CHAIN_LEVEL_FAILURE_SEQUENCE)
+        {
             signature_failures.push(crate::signed_events::CHAIN_LEVEL_FAILURE_SEQUENCE);
         }
 
@@ -16911,6 +16923,7 @@ impl PostgresStore {
             signature_failures,
             agent_signed_rows_not_verified,
             agent_receipts_erased,
+            agent_receipts_legacy,
             role_separation,
             lineage,
             rollback,
