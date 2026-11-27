@@ -552,6 +552,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # be SPARED, so the exemption is proven deliberate rather than accidental.
     probe_arm_e="${ROOT}/src/check_test_env_arm_e_probe_3523.rs"
     probe_arm_e_exempt="${ROOT}/src/check_test_env_arm_e_exempt_probe_3523.rs"
+    # Arm (e) NEAR MISS (#10204): a file that names only a type whose name
+    # ENDS in the crate guard's name (the store-url guard) and calls a bare
+    # `.set(`. The guard-name match is word-bounded, so it must be SPARED.
+    probe_arm_e_wordbound="${ROOT}/src/check_test_env_arm_e_wordbound_probe_10204.rs"
     # Arm (f) (#3539) probes. Dot-prefixed like the arms (a)-(c) fixtures:
     # arm (f) scans dot-prefixed files (they are the only shape a scratch
     # fixture can take without also tripping arms (d)/(e), which skip them).
@@ -571,7 +575,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     probe_arm_h_compliant="${ROOT}/src/check_test_env_arm_h_compliant_probe_3517.rs"
     probe_arm_h_param="${ROOT}/src/check_test_env_arm_h_param_probe_3517.rs"
 
-    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"; do
+    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_e_wordbound" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run -- remove manually)" >&2
@@ -582,7 +586,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # #4292: every probe is removed on ANY exit, including an interrupted
     # one, and INT/TERM re-raise. See scripts/lib/selftest-probes.sh.
     source "${ROOT}/scripts/lib/selftest-probes.sh"
-    selftest_probes_arm "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"
+    selftest_probes_arm "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_e_wordbound" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"
 
     # Case 1: a plain $HOME mutation with NO test_env_lock reference
     # anywhere in the file -- the "nobody serialized it at all" shape
@@ -870,6 +874,20 @@ fn contrived_exempt_isolation_fixture() {
 }
 EOF
 
+    # Case 10b (arm (e) NEAR MISS, #10204): the store-url guard's name holds
+    # the crate guard's name as a suffix. A substring match counted this
+    # file's `.set(` call as a helper-routed write; it must be SPARED.
+    cat > "$probe_arm_e_wordbound" <<'EOF'
+// CONTRIVED COMPLIANT FIXTURE for scripts/check-test-env-lock.sh
+// --self-test. Names only the store-url guard, whose name ends in the
+// crate guard's name, and calls a bare set method; arm (e) must NOT flag it.
+#[test]
+fn contrived_store_url_guard_user() {
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&outer);
+    let _ = cell.set(1);
+}
+EOF
+
     # Case 11 (arm (f), issue #3539): a `#[test]` fn that SEEDS the passphrase
     # channel and a second one that BOOTS a plain sqlite daemon, both with no
     # passphrase window of any kind -- the exact #3539 shape. Invisible to arms
@@ -1021,6 +1039,11 @@ EOF
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (e) flagged the documented-exempt isolation fixture -- a gate that fires on test_key_dir::install() will be switched off)" >&2
         exit 1
     fi
+    if hay_has 'check_test_env_arm_e_wordbound_probe_10204\.rs' "$gate_output"; then
+        echo "" >&2
+        echo "Test-env-lock gate self-test: FAIL (over-widened: arm (e) counted a file that names only StoreUrlEnvGuard -- the guard-name match must be word-bounded, #10204)" >&2
+        exit 1
+    fi
     if hay_has 'check_test_env_arm_h_compliant_probe_3517\.rs' "$gate_output"; then
         echo "FAIL: self-test -- arm (h) flagged the LOCK-HOLDING reader fixture (over-widening)" >&2
         exit 1
@@ -1036,7 +1059,7 @@ EOF
     fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-env-lock gate self-test: PASS (caught all eleven contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, the #3523 arm (e) helper-routed bypass, BOTH #3539 arm (f) shapes (naked passphrase seed, naked plain-sqlite boot), the #3577 arm (g) LINEAGE_DAG setter, and the #3517 arm (h) unguarded reader -- and spared all six compliant fixtures; exit=${gate_exit})"
+        echo "Test-env-lock gate self-test: PASS (caught all eleven contrived violations -- five \$HOME shapes, the #3475 arm (d) AI_MEMORY_AGENT_ID install, the #3523 arm (e) helper-routed bypass, BOTH #3539 arm (f) shapes (naked passphrase seed, naked plain-sqlite boot), the #3577 arm (g) LINEAGE_DAG setter, and the #3517 arm (h) unguarded reader -- and spared all seven compliant fixtures; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2

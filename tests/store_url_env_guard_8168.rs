@@ -1896,3 +1896,353 @@ fn census_all(files: &[(String, String)]) -> Vec<Finding> {
         .chain(static_census(files).into_iter().map(Finding::Static))
         .collect()
 }
+
+// ---------------------------------------------------------------------
+// #10213 / #10204 r2: mutants the text-match static census lets through.
+// Each mutant edits the live tree in memory only; the census must report it.
+// ---------------------------------------------------------------------
+
+/// One in-memory mutant: tails appended to tree files.
+struct Mutant {
+    /// Test-facing name.
+    id: &'static str,
+    /// `(file, tail)` pairs appended in order.
+    edits: &'static [(&'static str, &'static str)],
+}
+
+/// The file the lock-static mutants land in: it names no store-url
+/// variable, so the text-match census never lexed it (#10213).
+const SUPPORT: &str = "src/test_support.rs";
+
+/// #10213: a lock static in `src/test_support.rs` and a store-url test that
+/// takes it around an env write.
+const M_SUPPORT_LOCK: Mutant = Mutant {
+    id: "support-lock-taken-by-store-url-test",
+    edits: &[
+        (
+            SUPPORT,
+            "#[cfg(test)]\npub(crate) static STORE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());\n",
+        ),
+        (
+            "src/store_url.rs",
+            "#[cfg(test)]\nmod serial_taker {\n    #[test]\n    fn takes_the_support_lock() {\n        let _g = crate::test_support::STORE_SERIAL.lock();\n        unsafe { std::env::remove_var(super::STORE_URL_ENV) };\n    }\n}\n",
+        ),
+    ],
+};
+
+const M_DIRECT: Mutant = Mutant {
+    id: "direct-mutex",
+    edits: &[(
+        SUPPORT,
+        "static FORM_DIRECT: std::sync::Mutex<()> = std::sync::Mutex::new(());\n",
+    )],
+};
+
+const M_ALIAS: Mutant = Mutant {
+    id: "type-alias",
+    edits: &[(
+        SUPPORT,
+        "type FormLock = std::sync::Mutex<()>;\nstatic FORM_ALIAS: FormLock = FormLock::new(());\n",
+    )],
+};
+
+const M_LAZY: Mutant = Mutant {
+    id: "lazy-lock",
+    edits: &[(
+        SUPPORT,
+        "static FORM_LAZY: std::sync::LazyLock<std::sync::Mutex<()>> =\n    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));\n",
+    )],
+};
+
+const M_ONCE_IN_FN: Mutant = Mutant {
+    id: "once-lock-rwlock-in-fn-body",
+    edits: &[(
+        SUPPORT,
+        "fn form_once() -> &'static std::sync::RwLock<()> {\n    static FORM_ONCE: std::sync::OnceLock<std::sync::RwLock<()>> = std::sync::OnceLock::new();\n    FORM_ONCE.get_or_init(|| std::sync::RwLock::new(()))\n}\n",
+    )],
+};
+
+const M_THREAD_LOCAL: Mutant = Mutant {
+    id: "thread-local",
+    edits: &[(
+        SUPPORT,
+        "thread_local! {\n    static FORM_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };\n}\n",
+    )],
+};
+
+const M_STATIC_REF: Mutant = Mutant {
+    id: "lazy-static-ref",
+    edits: &[(
+        SUPPORT,
+        "lazy_static::lazy_static! {\n    static ref FORM_REF: std::sync::Mutex<()> = std::sync::Mutex::new(());\n}\n",
+    )],
+};
+
+const M_STATIC_MUT: Mutant = Mutant {
+    id: "static-mut",
+    edits: &[(SUPPORT, "static mut FORM_MUT: bool = false;\n")],
+};
+
+const M_MACRO: Mutant = Mutant {
+    id: "macro-built-static",
+    edits: &[(
+        SUPPORT,
+        "macro_rules! form_lock {\n    ($n:ident) => {\n        static $n: std::sync::Mutex<()> = std::sync::Mutex::new(());\n    };\n}\nform_lock!(FORM_MACRO);\n",
+    )],
+};
+
+const M_DUPLICATE: Mutant = Mutant {
+    id: "second-static-with-a-listed-name",
+    edits: &[(
+        SUPPORT,
+        "fn second_lock() -> &'static std::sync::Mutex<()> {\n    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());\n    &LOCK\n}\n",
+    )],
+};
+
+const M_TESTS_DIR: Mutant = Mutant {
+    id: "tests-dir",
+    edits: &[(
+        "tests/auto_atomise/core.rs",
+        "static FORM_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());\n",
+    )],
+};
+
+const M_BENCHES_DIR: Mutant = Mutant {
+    id: "benches-dir",
+    edits: &[(
+        "benches/harness_bench.rs",
+        "static FORM_BENCH: std::sync::Mutex<()> = std::sync::Mutex::new(());\n",
+    )],
+};
+
+/// The guard file compiled a second time through `#[path]`.
+const M_PATH: Mutant = Mutant {
+    id: "path-attr",
+    edits: &[(
+        SUPPORT,
+        "#[cfg(test)]\n#[path = \"store_url/env_guard.rs\"]\nmod env_guard_dup;\n",
+    )],
+};
+
+const M_CFG_ATTR_PATH: Mutant = Mutant {
+    id: "cfg-attr-path",
+    edits: &[(
+        SUPPORT,
+        "#[cfg_attr(test, path = \"store_url/env_guard.rs\")]\nmod env_guard_dup;\n",
+    )],
+};
+
+const M_PATH_UPPER: Mutant = Mutant {
+    id: "path-upper-case",
+    edits: &[(
+        SUPPORT,
+        "#[path = \"store_url/ENV_GUARD.RS\"]\nmod env_guard_dup;\n",
+    )],
+};
+
+const M_PATH_ESCAPED: Mutant = Mutant {
+    id: "path-escaped",
+    edits: &[(
+        SUPPORT,
+        "#[path = \"store_url/env\\x5fguard.rs\"]\nmod env_guard_dup;\n",
+    )],
+};
+
+const M_PATH_RAW: Mutant = Mutant {
+    id: "path-raw-string",
+    edits: &[(
+        SUPPORT,
+        "#[path = r#\"store_url/env_guard.rs\"#]\nmod env_guard_dup;\n",
+    )],
+};
+
+const M_PATH_BACKSLASH: Mutant = Mutant {
+    id: "path-backslash",
+    edits: &[(
+        SUPPORT,
+        "#[path = \"store_url\\\\env_guard.rs\"]\nmod env_guard_dup;\n",
+    )],
+};
+
+/// The parent module compiled again: it declares `mod env_guard;`.
+const M_PATH_PARENT: Mutant = Mutant {
+    id: "path-parent-module",
+    edits: &[(SUPPORT, "#[path = \"store_url.rs\"]\nmod store_url_dup;\n")],
+};
+
+const M_INCLUDE: Mutant = Mutant {
+    id: "include",
+    edits: &[(SUPPORT, "include!(\"store_url/env_guard.rs\");\n")],
+};
+
+const M_INCLUDE_CONCAT: Mutant = Mutant {
+    id: "include-concat-env",
+    edits: &[(
+        SUPPORT,
+        "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/store_url/env_guard.rs\"));\n",
+    )],
+};
+
+const M_INCLUDE_SPLIT: Mutant = Mutant {
+    id: "include-split-concat",
+    edits: &[(
+        SUPPORT,
+        "include!(concat!(\"store_url/env_\", \"guard.rs\"));\n",
+    )],
+};
+
+const M_INCLUDE_NOT_LITERAL: Mutant = Mutant {
+    id: "include-not-literal",
+    edits: &[(SUPPORT, "include!(env!(\"GUARD_PATH\"));\n")],
+};
+
+const M_MOD_ELSEWHERE: Mutant = Mutant {
+    id: "mod-store-url-in-a-second-root",
+    edits: &[("src/main.rs", "mod store_url;\n")],
+};
+
+/// The live tree with every edit of `m` applied; also returns the line of
+/// the first appended line of each edit, in edit order.
+fn apply(m: &Mutant) -> (Vec<(String, String)>, Vec<usize>) {
+    let mut files = tree();
+    let mut firsts = Vec::new();
+    for (rel, tail) in m.edits {
+        let entry = files
+            .iter_mut()
+            .find(|(p, _)| p == rel)
+            .unwrap_or_else(|| panic!("{}: mutant target {rel} is not in the tree", m.id));
+        if !entry.1.ends_with('\n') {
+            entry.1.push('\n');
+        }
+        firsts.push(entry.1.lines().count() + 1);
+        entry.1.push_str(tail);
+    }
+    (files, firsts)
+}
+
+/// Red-first form: the census must find something in the mutant.
+fn assert_mutant_red(m: &Mutant) {
+    let (files, _) = apply(m);
+    let found = census_all(&files);
+    assert!(!found.is_empty(), "mutant {} passed the census", m.id);
+}
+
+#[test]
+fn mutant_support_lock_taken_by_store_url_test_is_red_10213() {
+    assert_mutant_red(&M_SUPPORT_LOCK);
+}
+
+#[test]
+fn mutant_static_direct_mutex_is_red_10213() {
+    assert_mutant_red(&M_DIRECT);
+}
+
+#[test]
+fn mutant_static_type_alias_is_red_10213() {
+    assert_mutant_red(&M_ALIAS);
+}
+
+#[test]
+fn mutant_static_lazy_lock_is_red_10213() {
+    assert_mutant_red(&M_LAZY);
+}
+
+#[test]
+fn mutant_static_once_lock_in_fn_body_is_red_10213() {
+    assert_mutant_red(&M_ONCE_IN_FN);
+}
+
+#[test]
+fn mutant_static_thread_local_is_red_10213() {
+    assert_mutant_red(&M_THREAD_LOCAL);
+}
+
+#[test]
+fn mutant_static_ref_is_red_10213() {
+    assert_mutant_red(&M_STATIC_REF);
+}
+
+#[test]
+fn mutant_static_mut_is_red_10213() {
+    assert_mutant_red(&M_STATIC_MUT);
+}
+
+#[test]
+fn mutant_static_built_by_macro_is_red_10213() {
+    assert_mutant_red(&M_MACRO);
+}
+
+#[test]
+fn mutant_static_second_listed_name_is_red_10213() {
+    assert_mutant_red(&M_DUPLICATE);
+}
+
+#[test]
+fn mutant_static_in_tests_dir_is_red_10213() {
+    assert_mutant_red(&M_TESTS_DIR);
+}
+
+#[test]
+fn mutant_static_in_benches_dir_is_red_10213() {
+    assert_mutant_red(&M_BENCHES_DIR);
+}
+
+#[test]
+fn mutant_guard_file_path_reinclusion_is_red_10204() {
+    assert_mutant_red(&M_PATH);
+}
+
+#[test]
+fn mutant_guard_file_cfg_attr_path_is_red_10204() {
+    assert_mutant_red(&M_CFG_ATTR_PATH);
+}
+
+#[test]
+fn mutant_guard_file_path_upper_case_is_red_10204() {
+    assert_mutant_red(&M_PATH_UPPER);
+}
+
+#[test]
+fn mutant_guard_file_path_escaped_is_red_10204() {
+    assert_mutant_red(&M_PATH_ESCAPED);
+}
+
+#[test]
+fn mutant_guard_file_path_raw_string_is_red_10204() {
+    assert_mutant_red(&M_PATH_RAW);
+}
+
+#[test]
+fn mutant_guard_file_path_backslash_is_red_10204() {
+    assert_mutant_red(&M_PATH_BACKSLASH);
+}
+
+#[test]
+fn mutant_guard_parent_module_path_is_red_10204() {
+    assert_mutant_red(&M_PATH_PARENT);
+}
+
+#[test]
+fn mutant_guard_file_include_is_red_10204() {
+    assert_mutant_red(&M_INCLUDE);
+}
+
+#[test]
+fn mutant_guard_file_include_concat_env_is_red_10204() {
+    assert_mutant_red(&M_INCLUDE_CONCAT);
+}
+
+#[test]
+fn mutant_guard_file_include_split_concat_is_red_10204() {
+    assert_mutant_red(&M_INCLUDE_SPLIT);
+}
+
+#[test]
+fn mutant_include_not_literal_is_red_10204() {
+    assert_mutant_red(&M_INCLUDE_NOT_LITERAL);
+}
+
+#[test]
+fn mutant_mod_store_url_in_second_root_is_red_10204() {
+    assert_mutant_red(&M_MOD_ELSEWHERE);
+}
