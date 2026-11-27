@@ -4141,6 +4141,10 @@ mod tests {
     // refused; the table lives in `src/cli/backup/tests/symlink_follow_8950.rs`.
     mod symlink_follow_8950;
 
+    // v1.0.0 #10253 — the backup pair under a failed directory fsync lives in
+    // `src/cli/backup/tests/pair_dir_sync_10253.rs`.
+    mod pair_dir_sync_10253;
+
     /// `stage_and_verify` never touches the target: that is the whole point
     /// of staging. Pinned directly so a future refactor cannot quietly move
     /// the verification after the swap.

@@ -564,4 +564,125 @@ mod tests {
             .expect("insecure mode refused");
         assert!(format!("{err:#}").contains("insecure mode"), "{err:#}");
     }
+
+    /// v1.0.0 #10254 — the words every not-durable report carries.
+    const NOT_DURABLE_10254: &str = "is written but not confirmed durable";
+
+    /// How many directory fsyncs `op` makes on a clean run (#10254).
+    fn dir_syncs_of_10254(op: impl FnOnce()) -> u32 {
+        use crate::storage::snapshot_file::seam;
+        seam::reset();
+        op();
+        u32::try_from(seam::take_dir_syncs().len()).expect("a handful of directory syncs")
+    }
+
+    /// v1.0.0 #10254 — a mint with an enrolled recovery key writes three
+    /// files (`.priv`, escrow, `.pub`). A directory-fsync failure after any
+    /// of them still writes the rest, then reports "written, not confirmed
+    /// durable"; the minted key loads with its escrow beside it.
+    #[test]
+    fn mint_dir_sync_failure_finishes_priv_escrow_and_pub_10254() {
+        use crate::storage::snapshot_file::seam;
+        let clean = dir_syncs_of_10254(|| {
+            let dir = sandbox();
+            mint_recovery_keypair(dir.path(), &dir.path().join("recovery.key")).expect("mint");
+            seam::reset();
+            let agent = format!("ai:escrow-10254-{}", uuid::Uuid::new_v4().simple());
+            drop(get_or_create_keypair_in(&agent, dir.path()).expect("clean mint"));
+        });
+        assert!(
+            clean >= 3,
+            "a mint publishes three files, synced {clean} times"
+        );
+        for nth in 1..=clean {
+            let dir = sandbox();
+            mint_recovery_keypair(dir.path(), &dir.path().join("recovery.key")).expect("mint");
+            let agent = format!("ai:escrow-10254-{}", uuid::Uuid::new_v4().simple());
+            seam::reset();
+            seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+            let got = get_or_create_keypair_in(&agent, dir.path());
+            seam::reset();
+            let err = got.err().expect("a failed sync is reported");
+            assert!(
+                format!("{err:#}").contains(NOT_DURABLE_10254),
+                "row {nth}: the report says written, not durable: {err:#}"
+            );
+            let (pub_path, priv_path) = super::super::x25519_key_paths(&agent, dir.path());
+            assert!(pub_path.exists(), "row {nth}: the .pub is written");
+            assert!(priv_path.exists(), "row {nth}: the .priv is written");
+            assert!(
+                escrow_present(&agent, dir.path()),
+                "row {nth}: the escrow is written"
+            );
+            evict_cached_keypair(&agent);
+            let kp = load_keypair_in(&agent, dir.path())
+                .expect("the pair loads")
+                .expect("the pair is present");
+            assert_eq!(
+                std::fs::read(&pub_path).expect("read .pub"),
+                kp.public.as_bytes().to_vec(),
+                "row {nth}: the .pub matches the .priv"
+            );
+            evict_cached_keypair(&agent);
+        }
+    }
+
+    /// v1.0.0 #10254 — a recovery that re-derives the public half writes
+    /// two files. A directory-fsync failure after the `.priv` restore still
+    /// writes the `.pub`, then reports; the restored key loads byte-identical.
+    #[test]
+    fn recovery_dir_sync_failure_finishes_priv_and_pub_10254() {
+        use crate::storage::snapshot_file::seam;
+        let setup = |dir: &Path| -> (String, [u8; 32]) {
+            let out = dir.join("recovery.key");
+            mint_recovery_keypair(dir, &out).expect("mint recovery key");
+            let agent = format!("ai:escrow-10254-r-{}", uuid::Uuid::new_v4().simple());
+            let kp = get_or_create_keypair_in(&agent, dir).expect("mint");
+            let (pub_path, priv_path) = super::super::x25519_key_paths(&agent, dir);
+            std::fs::remove_file(priv_path).expect("drop .priv");
+            std::fs::remove_file(pub_path).expect("drop .pub");
+            evict_cached_keypair(&agent);
+            (agent, kp.secret.to_bytes())
+        };
+        let clean = {
+            let dir = sandbox();
+            let (agent, _) = setup(dir.path());
+            let recovery = load_recovery_secret(&dir.path().join("recovery.key")).expect("key");
+            dir_syncs_of_10254(|| {
+                let r = recover_private_from_escrow(&agent, dir.path(), &recovery)
+                    .expect("clean recovery");
+                assert!(r.pub_rewritten, "the public half was absent");
+            })
+        };
+        assert!(
+            clean >= 2,
+            "a recovery publishes two files, synced {clean} times"
+        );
+        for nth in 1..=clean {
+            let dir = sandbox();
+            let (agent, secret_before) = setup(dir.path());
+            let recovery = load_recovery_secret(&dir.path().join("recovery.key")).expect("key");
+            seam::reset();
+            seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+            let got = recover_private_from_escrow(&agent, dir.path(), &recovery);
+            seam::reset();
+            let err = got.err().expect("a failed sync is reported");
+            assert!(
+                format!("{err:#}").contains(NOT_DURABLE_10254),
+                "row {nth}: the report says written, not durable: {err:#}"
+            );
+            let (pub_path, _) = super::super::x25519_key_paths(&agent, dir.path());
+            assert!(pub_path.exists(), "row {nth}: the .pub is written");
+            evict_cached_keypair(&agent);
+            let back = load_keypair_in(&agent, dir.path())
+                .expect("the pair loads")
+                .expect("restored");
+            assert_eq!(
+                back.secret.to_bytes(),
+                secret_before,
+                "row {nth}: byte-identical"
+            );
+            evict_cached_keypair(&agent);
+        }
+    }
 }

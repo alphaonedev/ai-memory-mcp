@@ -2926,3 +2926,8 @@ mod tests {
         );
     }
 }
+
+// v1.0.0 #10254 — the two-file key writers under a failed directory fsync.
+#[cfg(test)]
+#[path = "keypair_not_durable_10254_tests.rs"]
+mod not_durable_10254_tests;

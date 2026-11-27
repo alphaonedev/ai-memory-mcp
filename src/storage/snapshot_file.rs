@@ -178,11 +178,33 @@ pub(crate) mod seam {
         static LINK_CALLS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
         static STEP_ERRNO: Cell<Option<(Step, i32)>> = const { Cell::new(None) };
         static DIR_SYNCS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static STEP_AT: Cell<Option<(Step, i32, u32)>> = const { Cell::new(None) };
     }
 
     /// Fail every later `step` of this thread with `errno` (#10214).
     pub(crate) fn inject_step_errno(step: Step, errno: i32) {
         STEP_ERRNO.with(|e| e.set(Some((step, errno))));
+    }
+
+    /// Fail only the `nth` (1-based) later `step` of this thread with
+    /// `errno`; every other one succeeds (#10253: a failure point inside a
+    /// multi-file sequence).
+    pub(crate) fn inject_step_errno_at(step: Step, errno: i32, nth: u32) {
+        STEP_AT.with(|e| e.set(Some((step, errno, nth))));
+    }
+
+    /// The one-shot failure of [`inject_step_errno_at`], counted down.
+    fn step_at(step: Step) -> Option<std::io::Error> {
+        let (failing, errno, nth) = STEP_AT.with(Cell::get)?;
+        if failing != step {
+            return None;
+        }
+        if nth > 1 {
+            STEP_AT.with(|e| e.set(Some((failing, errno, nth - 1))));
+            return None;
+        }
+        STEP_AT.with(|e| e.set(None));
+        Some(std::io::Error::from_raw_os_error(errno))
     }
 
     /// The directories fsynced so far on this thread (and forget them).
@@ -194,6 +216,9 @@ pub(crate) mod seam {
     pub(crate) fn on_step(step: Step, path: &Path) -> Option<std::io::Error> {
         if step == Step::DirSync {
             DIR_SYNCS.with(|c| c.borrow_mut().push(path.to_path_buf()));
+        }
+        if let Some(injected) = step_at(step) {
+            return Some(injected);
         }
         match STEP_ERRNO.with(Cell::get) {
             Some((failing, errno)) if failing == step => {
@@ -224,6 +249,7 @@ pub(crate) mod seam {
         inject_link_errno(None);
         drop(take_link_calls());
         STEP_ERRNO.with(|e| e.set(None));
+        STEP_AT.with(|e| e.set(None));
         drop(take_dir_syncs());
     }
 

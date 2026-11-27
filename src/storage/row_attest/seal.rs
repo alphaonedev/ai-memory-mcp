@@ -1075,4 +1075,33 @@ mod tests {
         writer.join().expect("writer thread");
         assert_eq!(read(&seal), SealState::Sealed(rec_10205(5, 5)));
     }
+
+    /// v1.0.0 #10266 — an advance whose directory fsync fails after the
+    /// rename HAS moved the seal up: the error says the seal holds the new
+    /// record but may not survive a crash (never "not advanced"), and the
+    /// seal on disk is the new record.
+    #[cfg(unix)]
+    #[test]
+    fn advance_dir_sync_failure_reports_the_seal_written_10266() {
+        use crate::storage::snapshot_file::seam;
+        let scratch = scratch_10193();
+        let seal = scratch.path().join(SEAL_DIR).join("db");
+        advance(&seal, &rec_10205(1, 1)).expect("first seal");
+        seam::reset();
+        seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+        let got = advance(&seal, &rec_10205(5, 5));
+        seam::reset();
+        let err = got.expect_err("a failed directory fsync is reported");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{SEAL_WHAT} {} is written but not confirmed durable: the fsync of its \
+                 directory {} failed ({}), so it may not survive a crash (#10214)",
+                seal.display(),
+                seal.parent().expect("parent").display(),
+                std::io::Error::from_raw_os_error(libc::EIO)
+            )
+        );
+        assert_eq!(read(&seal), SealState::Sealed(rec_10205(5, 5)));
+    }
 }
