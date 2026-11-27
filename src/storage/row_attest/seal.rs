@@ -192,44 +192,140 @@ pub fn state_for(anchor: &AnchorLoad, db: Option<&Path>) -> SealState {
     path_for(anchor, db).map_or(SealState::NotSealed, |p| read(&p))
 }
 
-fn write_atomic(path: &Path, rec: &SealRecord) -> Result<()> {
-    let dir = path
-        .parent()
-        .context("a seal path always has a parent directory")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+/// Suffix of the lock file beside each seal (#10193).
+const SEAL_LOCK_SUFFIX: &str = ".lock";
+/// Mode of a seal lock file (owner only, like the seal itself).
+#[cfg(unix)]
+const SEAL_LOCK_MODE: u32 = 0o600;
+
+/// The exclusive lock on one seal (#10193): an advisory `flock` on the
+/// sibling file `<seal>.lock`, held for the whole read-merge-write of an
+/// advance or the write of a replace. Every seal write takes a
+/// `&SealLock`, and [`SealLock::acquire`] is its only constructor, so a seal
+/// write without the lock does not compile. The lock is released when the
+/// guard drops (the file closes). `flock` locks an open file description,
+/// so two opens in one process exclude each other as two processes do.
+#[derive(Debug)]
+pub struct SealLock {
+    /// The open lock file; holding it holds the lock.
+    _file: std::fs::File,
+    /// The seal this lock guards.
+    seal: PathBuf,
+}
+
+impl SealLock {
+    /// Take the exclusive lock on the seal at `seal`, waiting for any other
+    /// holder. Precedent: the scope-key store lock
+    /// (`encryption::scope::store`, `open_lock_file` and `lock`).
+    ///
+    /// # Errors
+    ///
+    /// The seal directory cannot be created, the lock file cannot be opened
+    /// (a symlink, a directory or any other open failure), it is not a
+    /// regular file, or the lock cannot be taken. Each refuses the write: a
+    /// seal is never written unlocked.
+    pub fn acquire(seal: &Path) -> Result<Self> {
+        let dir = seal
+            .parent()
+            .context("a seal path always has a parent directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let lock = lock_path(seal);
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(SEAL_LOCK_MODE);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(&lock)
+            .with_context(|| format!("opening the {SEAL_WHAT} lock {}", lock.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("reading the {SEAL_WHAT} lock {}", lock.display()))?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!(
+                "the {SEAL_WHAT} lock {} is not a regular file",
+                lock.display()
+            );
+        }
+        lock_exclusive(&file).with_context(|| {
+            format!(
+                "locking the {SEAL_WHAT} lock {} exclusively",
+                lock.display()
+            )
+        })?;
+        Ok(Self {
+            _file: file,
+            seal: seal.to_path_buf(),
+        })
+    }
+}
+
+/// The lock file of the seal at `seal`: `<seal>.lock`.
+fn lock_path(seal: &Path) -> PathBuf {
+    let mut name = seal.as_os_str().to_os_string();
+    name.push(SEAL_LOCK_SUFFIX);
+    PathBuf::from(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (#10193): make the lock step fail on this thread.
+    static REFUSE_SEAL_LOCK_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the exclusive `flock` on `file`.
+fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if REFUSE_SEAL_LOCK_FOR_TEST.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("refused by the test seam"));
+    }
+    file.lock()
+}
+
+fn write_atomic(lock: &SealLock, rec: &SealRecord) -> Result<()> {
     // #8950: stage in a private directory and rename, refusing a symlink at
-    // the seal name (never a by-name write that could follow one).
-    crate::storage::snapshot_file::write_replacing(path, SEAL_WHAT, rec.render().as_bytes())
+    // the seal name (never a by-name write that could follow one). The
+    // caller holds the seal lock (#10193).
+    crate::storage::snapshot_file::write_replacing(&lock.seal, SEAL_WHAT, rec.render().as_bytes())
 }
 
 /// What a seal write names in its errors.
 const SEAL_WHAT: &str = "row-attestation seal";
 
 /// Move the seal at `path` up to `rec` (field-wise maximum with what it
-/// holds; it never moves back).
+/// holds; it never moves back). The read and the write run under one
+/// [`SealLock`], so a concurrent advance never writes a seal built from a
+/// stale read (#10193).
 ///
 /// # Errors
 ///
-/// An unreadable seal (it is never overwritten) or a write failure.
+/// The seal lock cannot be taken, an unreadable seal (it is never
+/// overwritten) or a write failure.
 pub fn advance(path: &Path, rec: &SealRecord) -> Result<()> {
-    let next = match read(path) {
+    let lock = SealLock::acquire(path)?;
+    let next = match read(&lock.seal) {
         SealState::NotSealed => rec.clone(),
         SealState::Sealed(old) => old.merged(rec),
         SealState::Unreadable { path, why } => {
             anyhow::bail!("the anchored seal {} cannot be read: {why}", path.display())
         }
     };
-    write_atomic(path, &next)
+    write_atomic(&lock, &next)
 }
 
 /// Replace the seal at `path` with `rec` (a verified restore publishes an
-/// older, verified store at this path: an explicit order).
+/// older, verified store at this path: an explicit order). It holds the
+/// [`SealLock`], so no advance interleaves with it (#10193).
 ///
 /// # Errors
 ///
-/// A write failure.
+/// The seal lock cannot be taken, or a write failure.
 pub fn replace(path: &Path, rec: &SealRecord) -> Result<()> {
-    write_atomic(path, rec)
+    let lock = SealLock::acquire(path)?;
+    write_atomic(&lock, rec)
 }
 
 #[cfg(test)]
@@ -501,6 +597,72 @@ mod tests {
                     "{name} / {plant_name}: the lock open followed a link"
                 );
             }
+        }
+    }
+
+    /// #10193: when the `flock` itself fails, `advance` and `replace` refuse
+    /// with the exact reason and leave the seal as it was.
+    #[test]
+    fn seal_flock_failure_refuses_the_write_10193() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        for (name, write) in rows {
+            let dir = scratch_10193();
+            let seal = dir.path().join(SEAL_DIR).join("db");
+            let rec = |hw: i64| SealRecord {
+                high_water: hw,
+                heads: BTreeMap::new(),
+            };
+            replace(&seal, &rec(1)).expect("first seal");
+            REFUSE_SEAL_LOCK_FOR_TEST.with(|c| c.set(true));
+            let out = write(&seal, &rec(9));
+            REFUSE_SEAL_LOCK_FOR_TEST.with(|c| c.set(false));
+            let err = out.expect_err("no lock, no write");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "locking the row-attestation seal lock {} exclusively",
+                    lock_name_10193(&seal).display()
+                ),
+                "{name}"
+            );
+            assert_eq!(read(&seal), SealState::Sealed(rec(1)), "{name}");
+        }
+    }
+
+    /// #10193: a lock name that opens but is not a regular file (a FIFO)
+    /// refuses the write with the exact reason.
+    #[cfg(unix)]
+    #[test]
+    fn seal_lock_not_a_regular_file_refuses_the_write_10193() {
+        let dir = scratch_10193();
+        let seal = dir.path().join(SEAL_DIR).join("db");
+        let rec = |hw: i64| SealRecord {
+            high_water: hw,
+            heads: BTreeMap::new(),
+        };
+        replace(&seal, &rec(1)).expect("first seal");
+        let lock = lock_name_10193(&seal);
+        std::fs::remove_file(&lock).expect("remove the lock file");
+        let cstr = std::ffi::CString::new(lock.as_os_str().as_encoded_bytes()).expect("no NUL");
+        // SAFETY: a valid NUL-terminated path in a scratch directory this
+        // test owns (UNSAFE-01).
+        let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo");
+        for (name, write) in [
+            ("advance", advance as fn(&Path, &SealRecord) -> Result<()>),
+            ("replace", replace),
+        ] {
+            let err = write(&seal, &rec(9)).expect_err("no lock, no write");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the row-attestation seal lock {} is not a regular file",
+                    lock.display()
+                ),
+                "{name}"
+            );
+            assert_eq!(read(&seal), SealState::Sealed(rec(1)), "{name}");
         }
     }
 }
