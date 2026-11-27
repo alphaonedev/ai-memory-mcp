@@ -907,14 +907,13 @@ mod tests {
         const ROLE: &str = "AI_MEMORY_TEST_4116_THREAD_EXIT_LEAK";
         const PATH: &str = "storage::escalation_deferral::tests::issue_4116_thread_exit_leak_is_reported_on_stderr_and_does_not_abort";
         if std::env::var(ROLE).as_deref() != Ok("child") {
+            let sandbox = crate::test_support::TestSandbox::new();
             let out = crate::test_support::SandboxedTestChild::new(
                 "escalation_deferral::issue_4116_thread_exit_leak",
+                &sandbox,
             )
-            .configure(|cmd| {
-                cmd.args(["--exact", PATH, "--nocapture", "--test-threads=1"])
-                    .env(ROLE, "child");
-            })
-            .arm()
+            .args(["--exact", PATH, "--nocapture", "--test-threads=1"])
+            .env(ROLE, "child")
             .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, PATH)
             .expect("spawn child");
             let stdout = String::from_utf8_lossy(&out.stdout);

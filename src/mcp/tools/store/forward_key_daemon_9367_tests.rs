@@ -92,9 +92,19 @@ fn is_child() -> bool {
 /// plus exactly `env` and the role marker; the child must pass and must have
 /// run that one test (a filter that matches nothing also exits 0).
 fn run_in_child(test: &str, env: &[(&str, &str)]) {
+    run_in_sandboxed_child(&crate::test_support::TestSandbox::new(), test, env);
+}
+
+/// [`run_in_child`] in a caller-held `sandbox`, so a path `env` names can live
+/// inside it (#10176).
+fn run_in_sandboxed_child(
+    sandbox: &crate::test_support::TestSandbox,
+    test: &str,
+    env: &[(&str, &str)],
+) {
     let mut vars = vec![(CHILD_ROLE_ENV, "1")];
     vars.extend_from_slice(env);
-    let out = crate::test_support::spawn_test_child(&format!("{MODULE}::{test}"), &vars);
+    let out = crate::test_support::spawn_test_child(sandbox, &format!("{MODULE}::{test}"), &vars);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -108,16 +118,17 @@ fn run_in_child(test: &str, env: &[(&str, &str)]) {
 }
 
 /// Run `test` in a clean child whose environment names
-/// `<scratch(cell)>/agent.token` in [`KEY_FILE_ENV`] plus `extra`, then drop
-/// the scratch dir.
+/// `<sandbox>/work/<cell>/agent.token` in [`KEY_FILE_ENV`] plus `extra`, then
+/// drop the sandbox (#10176).
 fn run_keyed_child(test: &str, cell: &str, extra: &[(&str, &str)]) {
-    let dir = scratch(cell);
+    let sandbox = crate::test_support::TestSandbox::new();
+    let dir = sandbox.work().join(cell);
+    std::fs::create_dir_all(&dir).expect("sandbox cell dir");
     let path = dir.join(TOKEN_NAME);
     let path = path.to_str().expect("utf-8 scratch path");
     let mut env = vec![(KEY_FILE_ENV, path)];
     env.extend_from_slice(extra);
-    run_in_child(test, &env);
-    let _ = std::fs::remove_dir_all(&dir);
+    run_in_sandboxed_child(&sandbox, test, &env);
 }
 
 /// Parent role of the daemon cell: phase 1 in a clean child with the key
@@ -483,8 +494,9 @@ fn postgres_daemon_keyed_forward_9367() {
         return;
     };
     if !is_child() {
-        // The clean child gets the minted database by name, never on stdout.
-        daemon_children(TEST, &[(PG_URL_ENV, url.as_str())]);
+        // The clean child gets the minted database through the sandbox
+        // passthrough of the test-tier variable (#10176), never on stdout.
+        daemon_children(TEST, &[]);
         return;
     }
     daemon_cell(&|_| Backend::Postgres(url.clone()));

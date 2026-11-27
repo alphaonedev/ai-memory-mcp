@@ -88,10 +88,16 @@ fn assert_unchanged(mem: &Memory, why: &str) {
 }
 
 /// Run THIS test binary again as a child executing exactly `test` (a name
-/// in this module) with `env` set, from a clean environment.
+/// in this module) with `env` set, from a clean environment in `sandbox`
+/// (every path `env` names lives there, #10176).
 #[cfg(unix)]
-fn spawn_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
+fn spawn_child(
+    sandbox: &crate::test_support::TestSandbox,
+    test: &str,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     crate::test_support::spawn_test_child(
+        sandbox,
         &format!("store::update_atomicity_3152_tests::{test}"),
         env,
     )
@@ -249,17 +255,19 @@ async fn sqlite_sal_crash_child_3152() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sqlite_sal_crash_between_patch_and_transition_leaves_row_unchanged_3152() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (store, path) = sqlite_store(dir.path());
+    let sandbox = std::sync::Arc::new(crate::test_support::TestSandbox::new());
+    let (store, path) = sqlite_store(&sandbox.work());
     let mem = fixture("atomicity-3152-sqlite-crash");
     store.store(&owner_ctx(), &mem).await.expect("seed");
     drop(store);
-    let marker = dir.path().join("reached-3152");
+    let marker = sandbox.work().join("reached-3152");
 
     let out = tokio::task::spawn_blocking({
         let (path, id, marker) = (path.clone(), mem.id.clone(), marker.clone());
+        let sandbox = std::sync::Arc::clone(&sandbox);
         move || {
             spawn_child(
+                &sandbox,
                 "sqlite_sal_crash_child_3152",
                 &[
                     (in_tx_fault::CHILD_ROLE_ENV, ROLE_SQLITE_SAL),
@@ -449,13 +457,15 @@ mod pg {
         };
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (store, mem) = rt.block_on(seeded(&url, namespace));
-        let dir = tempfile::tempdir().expect("tempdir");
-        let marker = dir.path().join("reached-3152");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let marker = sandbox.work().join("reached-3152");
         let out = spawn_child(
+            &sandbox,
             "pg::pg_crash_child_3152",
             &[
+                // The child inherits PG_URL_ENV through the sandbox's
+                // test-tier passthrough (#10176); it is not set here.
                 (in_tx_fault::CHILD_ROLE_ENV, role),
-                (PG_URL_ENV, &url),
                 (CHILD_ID_ENV, &mem.id),
                 (CHILD_MARKER_ENV, &marker.to_string_lossy()),
             ],

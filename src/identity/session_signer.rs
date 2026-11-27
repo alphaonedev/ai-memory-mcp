@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn every_later_db_open_seals_session_rows_10012() {
         use base64::Engine as _;
-        if crate::test_support::run_env_isolated_child_or_spawn_home(
+        if crate::test_support::run_env_isolated_child_or_spawn(
             "identity::session_signer::tests::every_later_db_open_seals_session_rows_10012",
         ) {
             return;
@@ -1463,8 +1463,12 @@ mod tests {
         let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
         let config =
             std::path::PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").expect("child XDG"));
+        let sandbox_root = std::env::temp_dir()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .expect("child TMPDIR has a sandbox parent");
         assert!(
-            home.starts_with(std::env::temp_dir()) && config == home.join(".config"),
+            home == sandbox_root.join("home") && config == home.join(".config"),
             "child HOME {home:?} / XDG_CONFIG_HOME {config:?} are not the isolated per-run dir"
         );
         crate::identity::attest::permissive_attestation_for_lib_tests();

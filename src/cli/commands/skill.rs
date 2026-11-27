@@ -1335,9 +1335,10 @@ mod tests {
             std::fs::write(child_var(CHILD_MARKER_ENV), TEST).expect("write the #8832 done marker");
             return;
         }
-        let dir = TempDir::new().unwrap();
-        let marker = dir.path().join("done-8832");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let marker = sandbox.work().join("done-8832");
         let out = crate::test_support::spawn_test_child(
+            &sandbox,
             &format!("cli::commands::skill::tests::{TEST}"),
             &[
                 ("AI_MEMORY_AGENT_ID", BAD),
