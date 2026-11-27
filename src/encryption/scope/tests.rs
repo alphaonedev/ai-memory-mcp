@@ -430,7 +430,7 @@ fn scope_key_zeroizes_and_redacts_8278() {
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+    #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(proptest::prelude::ProptestConfig::with_cases(64)))]
     #[test]
     fn scope_envelope_round_trips_random_lengths_8278(
         content in ".{0,2048}",

@@ -42,6 +42,10 @@ fn read_json(path: &std::path::Path) -> Value {
 }
 
 /// `ai-memory --agent-id <id> install <target> --config <cfg> ...`
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn install_cmd(target: &str, cfg: &std::path::Path, extra: &[&str]) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
@@ -171,6 +175,10 @@ fn install_capture_hook_rejected_on_non_claude_code_3587() {
 
 /// The install must not have written anything when it refuses.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn install_capture_hook_rejection_does_not_touch_config_3587() {
     let tmp = TempDir::new().unwrap();
     let cfg = tmp.path().join("cursor.json");

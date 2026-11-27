@@ -299,6 +299,10 @@ impl Fixture {
     }
 
     /// Run the product binary with `args` on the fixture only (empty HOME, no config).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn run(&self, args: &[&str]) -> std::process::Output {
         let home = TempDir::new().expect("empty home");
         ChildCommand::cargo_bin("ai-memory")
@@ -327,6 +331,10 @@ fn sqlite_command() -> String {
 /// the current version. A later change that makes the verb open read-only
 /// turns this cell red, so the text cannot go stale silently.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn the_sqlite_repair_command_migrates_an_old_stamp_fixture_9557() {
     let fx = Fixture::old_stamp();
     let command = sqlite_command();

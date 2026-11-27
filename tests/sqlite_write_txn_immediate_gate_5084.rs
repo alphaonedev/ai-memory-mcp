@@ -8,6 +8,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool python3, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn run(args: &[&str]) -> (bool, String) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new("python3")

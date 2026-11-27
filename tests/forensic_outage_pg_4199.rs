@@ -121,6 +121,10 @@ impl Drop for Daemon {
 }
 
 /// Boot a postgres-backed daemon over TLS and wait for `/health`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn serve(sb: &Sandbox, url: &str) -> Daemon {
     let port = free_port();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))

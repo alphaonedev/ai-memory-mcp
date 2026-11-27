@@ -19,6 +19,10 @@ use ai_memory::mcp::{
 
 const SCOPED: &str = r#"{"peer":{"allowed_namespaces":["team/**"]}}"#;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command(root: &Path, posture: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.current_dir(root)
@@ -168,6 +172,10 @@ fn direct_entry_points_and_shared_capabilities_keep_the_gate_3582() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn capabilities_preserve_daemon_argv_evaluation_in_v2_and_v3_3582() {
     const CHILD: &str = "PEER_POSTURE_CAPS_CHILD_3582";
     if std::env::var_os(CHILD).is_none() {

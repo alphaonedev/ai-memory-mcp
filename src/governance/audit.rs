@@ -6952,6 +6952,10 @@ mod tests {
     /// refused, which reads as a surviving anchor (fail closed).
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool mkfifo, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     fn head_anchor_reader_refuses_a_fifo_and_links_promptly_4303() {
         let tmp = TempDir::new().unwrap();
         let fifo = tmp.path().join("fifo.log");

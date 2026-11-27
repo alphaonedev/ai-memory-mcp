@@ -21,6 +21,10 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 /// `ai-memory --db <tmp> …` with the uniform test env (no user config).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
@@ -69,6 +73,10 @@ fn notify_dispatch_records_and_reports_id_3885() {
 /// `doctor --json` then reports config health as ok/compiled-defaults with the
 /// resolved `archive_on_gc`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn doctor_config_health_reports_compiled_defaults_when_config_absent_3885() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("doctor.db");
@@ -121,6 +129,10 @@ fn doctor_config_health_reports_compiled_defaults_when_config_absent_3885() {
 // ~/Library and would not find this hooks.toml. The coverage sweep runs on Linux.
 #[cfg(target_os = "linux")]
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn doctor_hooks_json_emits_the_configured_executor_fields_3885() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("doctor.db");

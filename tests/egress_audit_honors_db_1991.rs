@@ -58,6 +58,10 @@ fn count_egress_refusals(db_path: &Path) -> i64 {
 
 /// Run `ai-memory --db <db_path> <args...>` with CWD pinned to `cwd`
 /// (deliberately NOT the db's directory) and the caller-supplied env.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_in(
     cwd: &Path,
     db_path: &Path,

@@ -144,6 +144,10 @@ fn crash_injection_child_payload_3146() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn failing_writer_mid_save_leaves_the_original_keypair_intact_3146() {
     if std::env::var(CHILD_DIR_ENV).is_ok() {
         // We ARE the child; the payload test above does the work.

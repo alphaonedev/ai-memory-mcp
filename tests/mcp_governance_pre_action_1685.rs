@@ -118,6 +118,10 @@ fn seed_filesystem_refuse_rule(db_path: &std::path::Path) {
     .expect("seed filesystem_write rule");
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(db_path: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
     // Hermetic key-dir isolation (mirrors the #1583 test): point
     // `AI_MEMORY_KEY_DIR` at an EMPTY project-local dir so the test runs

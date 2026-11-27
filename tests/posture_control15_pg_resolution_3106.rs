@@ -94,6 +94,10 @@ fn sandbox(label: &str) -> tempfile::TempDir {
 /// `AI_MEMORY_*` var is stripped, then `envs` is applied. A developer (or a
 /// CI leg) with posture knobs exported must not be able to flip which branch
 /// of control #15 resolves, nor pre-satisfy a control under test.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_bin(key_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.args(args);

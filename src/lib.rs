@@ -9,6 +9,12 @@
 // lint backlog the bin target already passes. Allow at the lib level;
 // the bin target is the authoritative gate for production-code linting.
 #![allow(clippy::pedantic, clippy::all)]
+// #10176 process-start gate, layer 1: clippy::all above includes
+// clippy::disallowed_methods (style group), so the clippy.toml list would
+// never fire inside the library. A later attribute for the single lint wins
+// over the group, so re-deny it here. Layer 2
+// (tests/test_child_spawner_isolation_10176.rs) pins this exact line.
+#![deny(clippy::disallowed_methods)]
 
 // Library interface for ai-memory. Exposes public modules for testing and external use.
 

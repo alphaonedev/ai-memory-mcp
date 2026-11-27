@@ -32,6 +32,10 @@
 //! platform-filtered resolution is the load-bearing check.
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn android_transitive_graph_has_no_openssl_sys_1070() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let output = std::process::Command::new("cargo")

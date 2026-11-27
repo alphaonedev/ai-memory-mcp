@@ -2508,6 +2508,7 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
+        #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(proptest::test_runner::Config::default()))]
         // Title rejection happens iff trimmed string is empty (whitespace-only or "").
         #[test]
         fn prop_validate_title_rejects_empty_strings_only_when_actually_empty(
@@ -2527,6 +2528,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(proptest::test_runner::Config::default()))]
         // Namespaces with control chars / spaces / backslashes / null bytes must reject.
         #[test]
         fn prop_validate_namespace_rejects_invalid_chars(
@@ -2543,6 +2545,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(proptest::test_runner::Config::default()))]
         // a/b/c style paths up to 8 levels with safe chars should validate.
         #[test]
         fn prop_validate_namespace_accepts_valid_hierarchy(
@@ -2565,6 +2568,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(proptest::test_runner::Config::default()))]
         // Priority must accept 1..=10, reject anything outside that band.
         #[test]
         fn prop_validate_priority_rejects_outside_range(p in -1000i32..1000i32) {
@@ -2578,6 +2582,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(proptest::test_runner::Config::default()))]
         // Confidence rejects NaN / infinity / out-of-band values, accepts [0.0, 1.0].
         // Documented behavior: rejects (does not clamp).
         #[test]
@@ -2599,6 +2604,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(proptest::test_runner::Config::default()))]
         // Self-link must reject for every relation type, regardless of id payload.
         #[test]
         fn prop_validate_link_rejects_self_link_for_every_relation(

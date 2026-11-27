@@ -54,6 +54,10 @@ use tempfile::TempDir;
 /// a global flag even for verbs (like schema-init) that operate on a
 /// different `--store-url`; we point it at a disposable tempfile to
 /// keep the operator's main DB untouched.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")

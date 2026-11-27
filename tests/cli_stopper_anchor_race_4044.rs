@@ -75,6 +75,10 @@ fn enrol(dir: &Path, label: &str) -> std::path::PathBuf {
 
 /// RED on the pre-fix base: the anchor named the post-evaluation policy P1.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn stopper_anchor_names_the_evaluating_policy_4044() {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))

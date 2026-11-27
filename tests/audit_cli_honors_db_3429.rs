@@ -114,6 +114,10 @@ impl Sandbox {
     /// `ai-memory --db <resolved_db> <args…>` under this sandbox's HOME / CWD,
     /// with the config file DELIBERATELY live (`AI_MEMORY_NO_CONFIG` removed)
     /// and `AI_MEMORY_DB` cleared so `--db` is the only store channel.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn run(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.current_dir(&self.cwd)

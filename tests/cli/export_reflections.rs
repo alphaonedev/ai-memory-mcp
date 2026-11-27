@@ -164,6 +164,10 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_namespace_refusal_escapes_stored_id_8605() {
     const STORED_ID: &str = "stored\nid\t";
     const REFUSED_NAMESPACE: &str = "..";
@@ -211,6 +215,10 @@ fn cli_namespace_refusal_escapes_stored_id_8605() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_namespace_refusal_bounds_stored_values_8605() {
     const OVERSIZED_CHARS: usize = 1024 * 1024;
     const STDERR_MAX_BYTES: usize = 4096;
@@ -262,6 +270,10 @@ fn cli_namespace_refusal_bounds_stored_values_8605() {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn export_output_with_stored_id_8605(stored_id: &str) -> std::process::Output {
     const NAMESPACE: &str = "export-output-diagnostic";
     let tmp = TempDir::new().unwrap();
@@ -350,6 +362,10 @@ enum PlainExportDestination {
     Directory,
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn plain_export_output_8605(
     destination: PlainExportDestination,
 ) -> (TempDir, std::path::PathBuf, std::process::Output) {
@@ -870,6 +886,10 @@ fn test_export_reflections_since_filter() {
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn test_memory_export_reflection_mcp_tool() {
     // Drive the MCP tool over a real stdio JSON-RPC round-trip — same
     // shape every other MCP integration test uses (forensic, reflect,

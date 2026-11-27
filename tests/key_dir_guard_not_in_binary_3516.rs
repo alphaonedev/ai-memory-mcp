@@ -70,6 +70,10 @@ fn key_dir_0700(home: &Path) -> PathBuf {
 
 /// The shipped binary with a CLEAN environment: an operator process, holding
 /// a key directory that resolves UNDER HOME — the DEFAULT operator shape.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn operator_cmd(home: &Path, keys: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env_clear();

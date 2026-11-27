@@ -232,6 +232,10 @@ fn memory_exists(path: &std::path::Path, id: &str) -> bool {
 
 /// Drive the REAL `ai-memory mcp` stdio binary through one `tools/call`
 /// and return the JSON-RPC response for it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn mcp_tool_call(db_path: &std::path::Path, tool: &str, arguments: &serde_json::Value) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .arg("mcp")

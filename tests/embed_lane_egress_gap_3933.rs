@@ -94,6 +94,10 @@ fn embed_lane_egresses_gates_on_transport_not_backend_name_3933() {
 
 // ─── Leg 2 helpers (mirrors tests/inference_egress_dispatch_1963.rs) ──────
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_ai_memory_in(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.current_dir(dir);

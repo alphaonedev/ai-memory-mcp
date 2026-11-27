@@ -724,6 +724,10 @@ fn auto_tag_backend_refuses_every_row() {
 
 /// The child command every doctor spawn starts from: a clean selector
 /// env, no host config, and a sandboxed key dir.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn product_command(db: &Path, keys: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     for key in SELECTOR_ENV_SURFACE {

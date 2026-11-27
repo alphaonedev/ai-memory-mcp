@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 #[path = "common/child_stdin_report.rs"]
 mod child_stdin_report;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn call(
     path: &std::path::Path,
     home: &std::path::Path,

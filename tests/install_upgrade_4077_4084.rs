@@ -5,6 +5,10 @@
 #![cfg(unix)]
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool python3, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn install_upgrade_packaging_contracts_4077_4080_4082_4084() {
     let result = std::process::Command::new("python3")
         .arg(concat!(

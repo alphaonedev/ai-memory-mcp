@@ -20,6 +20,10 @@ use std::time::Duration;
 use ai_memory::inbox_wake::{InboxEvent, subscribe};
 use serde_json::Value;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(root: &Path, agent: &str) -> Command {
     let keys = root.join("keys");
     std::fs::create_dir_all(&keys).unwrap();

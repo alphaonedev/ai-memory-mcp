@@ -26,6 +26,10 @@ fn resolver_probe() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn resolver_panics_under_temporary_home_and_accepts_isolated_override() {
     let home = tempfile::tempdir().unwrap();
     let keys = tempfile::tempdir().unwrap();
@@ -102,6 +106,10 @@ fn ambient_override_probe() {
 /// inherited override. Product behaviour (explicit env beats the derived
 /// default) is unchanged; the helper is what must not be defeatable.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn install_neutralises_ambient_key_dir_3584() {
     let ambient = tempfile::tempdir().unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
@@ -141,6 +149,10 @@ fn shared_helper_isolates_x25519_and_ed25519_writes() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn guarded_child_without_override_uses_the_shared_sandbox_instead_of_home() {
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
@@ -162,6 +174,10 @@ fn guarded_child_without_override_uses_the_shared_sandbox_instead_of_home() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn resolver_rejects_a_symlink_alias_into_temporary_home() {
     let home = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();

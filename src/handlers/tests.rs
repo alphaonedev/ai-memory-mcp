@@ -958,19 +958,19 @@ mod tests_3582_legacy_push {
         }
         // These no-peer-header fixtures intentionally retain their legacy posture.
         // Namespace-enforcement matrices live in separate integration binaries.
-        let output = std::process::Command::new(std::env::current_exe().expect("lib test binary"))
-            .args(["--exact", &full_name, "--test-threads=1", "--nocapture"])
-            .env_clear()
-            // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
-            // with a %p pid template) so the child's execution is measured, not lost.
-            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-            .env("TMPDIR", std::env::temp_dir())
-            .env("AI_MEMORY_NO_CONFIG", "1")
-            // The audit latch mutators accept only an isolated child (#7321).
-            .env(crate::test_support::TEST_ENV_ISOLATION_ROLE_ENV, "child")
-            .env(REQUIRE_SCOPE, "0")
-            .output()
-            .expect("isolated legacy push test child");
+        // #10176: the sandbox builds the env from nothing (no-config, the
+        // coverage sink, private TMPDIR); only the roles are added here.
+        let sandbox = crate::test_support::TestSandbox::new();
+        let output = crate::test_support::SandboxedTestChild::new(
+            "handlers::legacy_push_isolated_child",
+            &sandbox,
+        )
+        .args(["--exact", &full_name, "--test-threads=1", "--nocapture"])
+        // The audit latch mutators accept only an isolated child (#7321).
+        .env(crate::test_support::TEST_ENV_ISOLATION_ROLE_ENV, "child")
+        .env(REQUIRE_SCOPE, "0")
+        .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &full_name)
+        .expect("isolated legacy push test child");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success()

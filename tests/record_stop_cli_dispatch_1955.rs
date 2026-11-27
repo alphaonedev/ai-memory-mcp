@@ -19,6 +19,10 @@ use std::process::Output;
 /// Run `ai-memory --db <db> stop <args...>` against a throwaway DB with the
 /// process env pinned to `AI_MEMORY_NO_CONFIG=1` so no developer config
 /// leaks in. Returns the captured `Output`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_stop(db_path: &Path, args: &[&str]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.arg("--db").arg(db_path).arg("stop");

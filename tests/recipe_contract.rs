@@ -260,6 +260,10 @@ fn openclaw_recipe_registers_ai_memory_mcp_server() {
 
 /// Returns true iff the named binary is on $PATH. Used to skip checks when
 /// e.g. python3 / bash isn't installed (Windows runner without the toolchain).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool which or where, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn binary_on_path(name: &str) -> bool {
     let probe = if cfg!(windows) { "where" } else { "which" };
     Command::new(probe)
@@ -269,6 +273,10 @@ fn binary_on_path(name: &str) -> bool {
 }
 
 /// Run a python3 syntax check on `src`. Returns Ok if `compile()` succeeds.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool python3, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn check_python_syntax(src: &str) -> Result<(), String> {
     // Write to a tempfile so the source is byte-identical to what python
     // sees and any line numbers in error messages are sane.
@@ -297,6 +305,10 @@ fn check_python_syntax(src: &str) -> Result<(), String> {
 
 /// Run `bash -n` (parse-only) over a snippet. Skips when bash is unavailable
 /// (typical on a vanilla Windows runner without WSL).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool bash, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn check_bash_syntax(src: &str) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let file = dir.path().join("snippet.sh");

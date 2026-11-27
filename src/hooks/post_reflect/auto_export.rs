@@ -465,7 +465,6 @@ mod tests {
 
     // Hang guard only: channel ordering proves the property, not host speed.
     const WORKER_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
-    const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
     fn reflection_input(source: String, namespace: &str) -> crate::storage::reflect::ReflectInput {
         crate::storage::reflect::ReflectInput {
@@ -614,46 +613,6 @@ mod tests {
         );
     }
 
-    /// Reap the child before reading its output or dropping its capture directory.
-    /// Files avoid a full stdout/stderr pipe blocking the child before it can exit.
-    fn run_scope_child_with_hang_guard(mut command: std::process::Command) -> std::process::Output {
-        let capture = TempDir::new().unwrap();
-        let stdout_path = capture.path().join("stdout");
-        let stderr_path = capture.path().join("stderr");
-        let mut child = command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::fs::File::create(&stdout_path).unwrap())
-            .stderr(std::fs::File::create(&stderr_path).unwrap())
-            .spawn()
-            .unwrap();
-        // Hang guard, not a latency budget: include startup before the inner poll.
-        let deadline = std::time::Instant::now() + WORKER_HANG_GUARD;
-        let timed_out = loop {
-            if child.try_wait().unwrap().is_some() {
-                break false;
-            }
-            if std::time::Instant::now() >= deadline {
-                break true;
-            }
-            std::thread::sleep(CHILD_POLL_INTERVAL);
-        };
-        // CONCURRENCY-11: kill on expiry and always reap before reporting failure.
-        // A child may exit between try_wait and kill; retain that error in the report.
-        let kill_error = if timed_out { child.kill().err() } else { None };
-        let output = std::process::Output {
-            status: child.wait().unwrap(),
-            stdout: std::fs::read(stdout_path).unwrap(),
-            stderr: std::fs::read(stderr_path).unwrap(),
-        };
-        assert!(
-            !timed_out,
-            "isolated child exceeded the hang guard; killed and reaped (kill error: {kill_error:?}):\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
-    }
-
     /// #8166: prove per-hook panic isolation in a fresh process as well as in parallel.
     /// The child marker selects the process; injection uses only per-hook test controls.
     #[test]
@@ -667,11 +626,18 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             // libtest filters omit the crate prefix retained by module_path!().
             let test = TEST.split_once("::").unwrap().1;
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args(["--exact", test, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1");
-            let output = run_scope_child_with_hang_guard(command);
+            // Hang guard, not a latency budget: the bounded run includes
+            // startup, captures to files (a full pipe cannot block the child)
+            // and kills and reaps on expiry (CONCURRENCY-11, #10176).
+            let sandbox = crate::test_support::TestSandbox::new();
+            let output = crate::test_support::SandboxedTestChild::new(
+                "hooks::post_reflect::auto_export_8166",
+                &sandbox,
+            )
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .run_bounded(WORKER_HANG_GUARD, test)
+            .unwrap_or_else(|e| panic!("isolated child exceeded the hang guard: {e}"));
             assert!(
                 output.status.success(),
                 "isolated injection scope test: {}\n{}",

@@ -45,6 +45,10 @@ const PG_PASSWORD: &str = "hunter2";
 
 /// Spawn `ai-memory serve` with a short timeout. On success the daemon would
 /// listen forever; on the #2679 refuse path it exits non-zero quickly.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn serve_once(db: &Path, store_url: Option<&str>) -> std::process::Output {
     // Fixed high port: clap rejects 0; refuse path exits before bind races matter.
     let mut cmd = Command::new(cargo_bin("ai-memory"));
@@ -158,6 +162,10 @@ fn serve_refuses_postgres_store_url_env_without_creating_sqlite() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn serve_without_store_url_still_starts_sqlite_path_smoke() {
     // Smoke: no store URL → serve still boots on sqlite (then we kill it).
     // This guards against the refuse path over-firing on legitimate boots.

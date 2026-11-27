@@ -135,6 +135,10 @@ fn assert_shape_and_markers(v: &Value, ctx: &str) {
 // ─── CLI surface (subprocess against the real binary) ─────────────────────
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_export_warns_on_stderr_and_marks_payload_without_changing_shape_1944() {
     // Arrange: a fresh db under .local-runs (project no-/tmp HARD RULE) with
     // one seeded row so `count` is non-trivial.

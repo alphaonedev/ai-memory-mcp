@@ -52,6 +52,10 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
 /// Run the built binary with CWD pinned inside `dir`, `--db` pointed at a
 /// scratch file, and `AI_MEMORY_KEY_DIR` / `HOME` redirected to sibling paths so a
 /// key-writing verb can never touch the operator's real key dir.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run(dir: &Path, args: &[&str]) -> Output {
     let db = dir.join("scratch.db");
     let keys = dir.join("keys");

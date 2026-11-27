@@ -67,6 +67,10 @@ fn db_path(home: &Path) -> PathBuf {
     home.join("forensic.db")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_with_env(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     let config_root = home.join(".config").join("ai-memory");
     std::fs::create_dir_all(&config_root).expect("create config root");
@@ -604,6 +608,10 @@ fn a_postgres_backed_process_writes_no_sqlite_outage_row_4199() {
 
 /// Run `archive purge` but give up after `limit`: a hang is a failure, never a
 /// hung test harness (#4273 — a FIFO daily file used to block start-up).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn purge_with_deadline(home: &Path, env: &[(&str, &str)], limit: Duration) -> Option<Output> {
     let config_root = home.join(".config").join("ai-memory");
     std::fs::create_dir_all(&config_root).expect("create config root");
@@ -693,6 +701,10 @@ fn an_uncreatable_forensic_dir_degrades_with_the_outage_signals_4272() {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool mkfifo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn mkfifo(path: &Path) {
     let status = Command::new("mkfifo")
         .arg(path)

@@ -54,6 +54,10 @@ fn leaf(root: &Path) -> common::tls::TestTls {
 
 /// No config file (`AI_MEMORY_NO_CONFIG=1`): the declared shape is
 /// `singleton`; the store is the per-test postgres schema.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command(root: &Path, store_url: &str) -> Command {
     let keys = root.join("keys");
     std::fs::create_dir_all(&keys).expect("mkdir key sandbox");

@@ -79,6 +79,10 @@ fn ignored_endpoint_keys_empty_for_model_only_3808() {
 /// FAILS (no WARN); on the fixed tree both cases pass.
 #[test]
 fn config_load_warns_on_dead_auto_tag_endpoint_key_3808() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn stderr_of(section_body: &str) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         // Portable config redirect (#3808 CI fix). Linux resolves
@@ -170,6 +174,10 @@ fn effective_auto_tag_model_precedence_and_absence_3819() {
 /// (the destination is no longer dead). Also: migrate exits 0 (round-trips
 /// through the validator with zero refusals).
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn config_migrate_preserves_the_auto_tag_model_override_3819() {
     let dir = tempfile::tempdir().expect("tempdir");
     // Portable config redirect — see the note in `stderr_of` above. `config

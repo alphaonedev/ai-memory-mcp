@@ -164,6 +164,10 @@ async fn spawn_daemon(
 /// #3582: keep the original SAL push controls in single-test child processes
 /// with the explicit Standard namespace opt-out. No new process environment
 /// mutation in the parallel parent (UNSAFE-01, CONCURRENCY-20).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn with_legacy_push_env(name: &str, test: impl std::future::Future<Output = ()>) {
     const REQUIRE_SCOPE: &str =
         ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;

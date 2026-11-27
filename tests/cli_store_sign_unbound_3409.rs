@@ -17,6 +17,10 @@ use std::process::{Command, Output};
 
 const AGENT: &str = "ai:signer-3409";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env_clear()

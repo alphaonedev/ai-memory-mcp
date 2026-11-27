@@ -45,6 +45,10 @@ fn with_scratch_safe_audit(section: &str, body: &str) -> String {
 }
 
 /// Write one `[section]` of config into an isolated HOME and run the binary.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_with_section(home: &Path, section: &str, body: &str, args: &[&str]) -> Output {
     let body = with_scratch_safe_audit(section, body);
     let config_root = home.join(".config").join("ai-memory");

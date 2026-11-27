@@ -58,6 +58,10 @@ fn tls_listing(root: &Path) -> Vec<String> {
 
 /// A child with an optional `config.toml` (the way a shape is DECLARED);
 /// `None` sets `AI_MEMORY_NO_CONFIG=1` (declared shape = singleton).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command_with_config(root: &Path, config_body: Option<&str>) -> Command {
     let keys = key_dir(root);
     let xdg = root.join("home/.config");

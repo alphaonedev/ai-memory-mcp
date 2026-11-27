@@ -46,6 +46,10 @@ fn detector_bin() -> &'static PathBuf {
     BIN.get_or_init(build_detector_once)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn build_detector_once() -> PathBuf {
     let manifest_path = std::env::current_dir()
         .expect("cwd")
@@ -92,6 +96,10 @@ fn build_detector_once() -> PathBuf {
 
 /// Pipe `envelope` to the detector in one-shot mode and return
 /// the parsed decision JSON.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the auto-link-detector helper binary built from this repo by this test (child env isolation: #10183)"
+)]
 fn run_once(bin: &Path, envelope: &Value) -> Value {
     let mut child = Command::new(bin)
         .stdin(Stdio::piped())

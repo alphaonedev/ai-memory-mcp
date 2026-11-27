@@ -480,6 +480,10 @@ fn mcp_require_attestation_rejects_unsigned_store() {
 /// scoped to the child, so no in-process reader anywhere can observe
 /// it. No `ENV_LOCK` needed for the same reason.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_require_attestation_rejects_unsigned_store() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("cli-attest.db");
@@ -525,6 +529,10 @@ fn cli_require_attestation_rejects_unsigned_store() {
 /// that reinstated require-by-default on the CLI surface surfaces here,
 /// independent of the parse-ladder pins in `tests/config_precedence.rs`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_default_permissive_lands_unsigned_store_claimed_1985() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("cli-attest-default.db");
@@ -745,6 +753,10 @@ fn mcp_forged_signature_rejected_under_permissive_default_1985() {
 /// in the child env, the write lands `attest_level = "claimed"` (the
 /// documented pre-v0.9 permissive posture).
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_opt_out_zero_lands_unsigned_store_claimed_1751() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("cli-attest-optout.db");

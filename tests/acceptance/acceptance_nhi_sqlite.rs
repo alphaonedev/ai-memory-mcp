@@ -225,6 +225,10 @@ fn acc_key_dir(db: &std::path::Path) -> std::path::PathBuf {
     db.parent().expect("fixture database parent").join("keys")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChild {
     // #3817 — arm the #3516 key-dir guard for children (idempotent, process-wide),
     // then hand this daemon its OWN 0700 key dir instead of the shared sandbox.
@@ -1228,6 +1232,10 @@ impl Drop for McpChild {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp_full(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")
@@ -1420,6 +1428,10 @@ fn first_boot_daemon_refuses_plain_http_3776() {
 /// probe — this control spawns `serve` directly and reads the boot stderr, which
 /// precedes binding, so it is independent of the readiness probe).
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn embedder_offline_empty_cache_reports_fallback_miss_not_coldfetch_3788() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("acc-nocache.db");

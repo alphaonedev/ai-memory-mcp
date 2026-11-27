@@ -45,6 +45,10 @@ fn shapes() -> Vec<(&'static str, String)> {
     ]
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run(args: &[&str], url: &str, home: &std::path::Path) -> String {
     let keys = home.join("keys");
     std::fs::create_dir_all(&keys).expect("keys dir");

@@ -72,6 +72,10 @@ fn power_loss_child_writes_then_aborts() {
 /// Parent: spawn the child, let the injected power-loss abort kill it, then
 /// re-open the DB and assert no acknowledged write was lost + no corruption.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn power_loss_kill_preserves_acked_writes_and_no_corruption() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("power-loss.db");

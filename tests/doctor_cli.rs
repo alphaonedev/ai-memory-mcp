@@ -43,6 +43,10 @@ fn spawn_timeout_is_sixty_seconds_8287() {
 
 /// Build the standard `ai-memory --db <tmp>` command shape with
 /// `AI_MEMORY_NO_CONFIG=1` set.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     // #3198 — the doctor Identity section stats the default key dir. Pin a

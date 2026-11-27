@@ -85,6 +85,10 @@ fn dockerfiles_copy_config_emit_helper_3197() {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool bash, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn render_with_key(key: &str) -> (i32, String, String) {
     let helper = config_emit_path();
     assert!(helper.is_file(), "missing {}", helper.display());

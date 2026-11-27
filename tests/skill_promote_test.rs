@@ -315,6 +315,10 @@ const KEYSTONE_AGENT_ID_8832: &str = REFLECTION_AGENT_ID;
 const REFLECTION_AGENT_ID: &str = "test-agent";
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn round_trip_promote_export_reregister_identical_digest() {
     // KEYSTONE ACCEPTANCE — the round-trip digest match. #8832 — run in a
     // child with a resolved process identity (never a process-env mutation
@@ -557,6 +561,10 @@ fn unknown_reflection_id_returns_not_found() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool skills-ref, which, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn skills_ref_validates_promoted_skill_if_installed() {
     let (conn, _path, dir) = open_test_db();
     let s1 = insert_observation(&conn, "src-val", "ns-val", "body");

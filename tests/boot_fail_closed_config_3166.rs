@@ -90,6 +90,10 @@ impl Sandbox {
     /// directory. `no_config` is applied verbatim when `Some` and REMOVED
     /// when `None` (the suite is commonly run under
     /// `AI_MEMORY_NO_CONFIG=1`, which the child would otherwise inherit).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn run(&self, args: &[&str], no_config: Option<&str>) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.args(args)

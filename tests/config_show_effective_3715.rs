@@ -27,6 +27,10 @@ mod key_dir_sandbox;
 
 const EX_CONFIG: i32 = 78;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command_with_config(root: &Path, config_body: &str) -> (Command, PathBuf) {
     let keys = root.join("keys");
     key_dir_sandbox::mkdir_0700(&keys);

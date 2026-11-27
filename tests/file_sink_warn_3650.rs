@@ -37,6 +37,10 @@ fn scratch_3650(label: &str) -> tempfile::TempDir {
         .expect("tempdir under .local-runs")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn isolated_command_3650(dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env_clear()

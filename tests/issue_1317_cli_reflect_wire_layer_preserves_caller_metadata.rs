@@ -151,6 +151,10 @@ impl Drop for McpChild {
 /// receiver fed by the child's stdout. Caller pops responses with a
 /// bounded `recv_timeout` so a hung response surfaces as a test
 /// failure rather than a CI hang.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")

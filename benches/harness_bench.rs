@@ -82,6 +82,10 @@ const HARNESSES: &[(&str, &str)] = &[
 /// Build the release binary once and return its path. Mirrors the
 /// helper in `benches/recall.rs` so both benches resolve the binary
 /// the same way (cargo metadata + release target dir).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn binary_path() -> PathBuf {
     let output = Command::new("cargo")
         .args(["build", "--release"])
@@ -126,6 +130,10 @@ impl Drop for McpChild {
 /// stdout reader thread feeds line-by-line. Mirrors
 /// `tests/mcp_integration.rs::spawn_mcp` so the bench and the
 /// regression test agree on framing.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bench child: runs the ai-memory release binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(binary: &PathBuf, db_path: &str) -> (McpChild, mpsc::Receiver<String>) {
     let mut child = Command::new(binary)
         .env("AI_MEMORY_NO_CONFIG", "1")

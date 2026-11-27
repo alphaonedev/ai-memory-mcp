@@ -118,6 +118,10 @@ fn seed_corpus(db_path: &Path) -> Vec<String> {
 
 /// Run the real binary's `reembed` subcommand against the scratch DB
 /// with the embed env vars pointed at `base_url` / `model`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_reembed(db_path: &Path, base_url: &str, model: &str, extra_args: &[&str]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.arg("--db")

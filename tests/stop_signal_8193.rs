@@ -173,6 +173,10 @@ struct Verb {
 impl Verb {
     /// Spawn `ai-memory --db <tmp>/verb-8193.db <args>` with an isolated home
     /// and no config, stderr streamed line by line.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn spawn(args: &[&str]) -> Self {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = tmp.path().join("verb-8193.db");

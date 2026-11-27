@@ -25,6 +25,18 @@
 //! production spawn without either routing it through the chokepoint or
 //! tripping the gate.
 //!
+//! Since #10176 a second, compiler-resolved gate covers the same entry
+//! points: `clippy.toml` lists both chokepoints, the std and tokio
+//! `Command::new`, the `assert_cmd` constructors and the libc process-start
+//! functions under `disallowed-methods`, and `src/lib.rs` re-denies that
+//! lint. A call through any alias, re-export or macro is therefore a clippy
+//! error in the code the clippy jobs compile, unless its item carries an
+//! `#[expect(clippy::disallowed_methods, reason = "...")]` that is an exact
+//! row of `tests/test_child_spawner_isolation_10176.rs`. That gate does not
+//! see a second call inside an item that already carries the expectation,
+//! code outside the compiled targets and features, or a process started by
+//! a dependency or by a program not built from this repository.
+//!
 //! # Wired production spawn sites (#1937 acceptance item 1)
 //!
 //! | Site | Program | Caller const |
@@ -240,9 +252,15 @@ pub fn emit_spawn_audit_best_effort(argv0: &str, caller: &str) {
 /// best-effort signed `process.spawn_audited` row for `program` + `caller`,
 /// then returns a fresh `std::process::Command::new(program)` for the caller
 /// to configure (args / env / stdio) and spawn. Every production
-/// `std::process::Command` launch MUST route through here — the CI gate
-/// forbids a raw `Command::new` in production code outside this module.
+/// `std::process::Command` launch MUST route through here: a raw
+/// `Command::new` elsewhere is a clippy `disallowed_methods` error unless its
+/// item carries a reasoned expectation pinned as a #10176 allowlist row (see
+/// the module docs for what that gate does not see).
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#1937 audited spawn chokepoint: the production std Command constructor; the program is a caller argument (#10176 gate row)"
+)]
 pub fn audited_command<S: AsRef<OsStr>>(program: S, caller: &str) -> std::process::Command {
     emit_spawn_audit_best_effort(&argv0_lossy(program.as_ref()), caller);
     std::process::Command::new(program)
@@ -255,6 +273,10 @@ pub fn audited_command<S: AsRef<OsStr>>(program: S, caller: &str) -> std::proces
 /// transient-errno retry ladder, so the audit row is emitted exactly once per
 /// logical spawn (not per retry).
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#1937 audited spawn chokepoint: the production tokio Command constructor; the program is a caller argument (#10176 gate row)"
+)]
 pub fn audited_tokio_command<S: AsRef<OsStr>>(program: S, caller: &str) -> tokio::process::Command {
     // M4 / rust `M-BLOCKING-IN-ASYNC` / `async-spawn-blocking` (#2007): the
     // best-effort emit opens a sqlite connection via `crate::db::open` — the full
@@ -327,6 +349,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "builds an audited Command for the system tool true and never spawns it; pins the #1937 chokepoint (#10176 gate row)"
+    )]
     fn audited_command_returns_a_usable_command() {
         // The chokepoint returns a configurable Command even with no audit
         // target seeded; the spawn must never be blocked by the audit.
@@ -337,6 +363,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "builds an audited tokio Command for the system tool true and never spawns it; pins the #1937 chokepoint (#10176 gate row)"
+    )]
     async fn tokio_chokepoint_returns_usable_command_off_reactor() {
         // #2007 — inside a tokio runtime the audit emit is routed onto the
         // blocking pool (the `Handle::try_current().Ok` arm), so the chokepoint

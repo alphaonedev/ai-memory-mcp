@@ -35,6 +35,10 @@ fn forensic_dir(home: &Path) -> PathBuf {
 
 /// The CLI, isolated: its own config (flat trail off, forensic dir here),
 /// its own key dir, the given extra env.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command(home: &Path, env: &[(&str, &str)]) -> Command {
     let config_root = home.join(".config").join("ai-memory");
     std::fs::create_dir_all(&config_root).expect("create config root");

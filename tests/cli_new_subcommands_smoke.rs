@@ -33,6 +33,10 @@ fn fresh_db() -> (TempDir, std::path::PathBuf) {
 /// `--help` is the most basic smoke check — clap must wire the new
 /// variant + Args struct without panicking. Run for all five.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_kg_query_help_exits_ok() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -43,6 +47,10 @@ fn fx12_kg_query_help_exits_ok() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_find_paths_help_exits_ok() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -53,6 +61,10 @@ fn fx12_find_paths_help_exits_ok() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_recall_observations_help_exits_ok() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -63,6 +75,10 @@ fn fx12_recall_observations_help_exits_ok() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_check_duplicate_help_exits_ok() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -73,6 +89,10 @@ fn fx12_check_duplicate_help_exits_ok() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_replay_help_exits_ok() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -86,6 +106,10 @@ fn fx12_replay_help_exits_ok() {
 /// well-formed JSON envelope with `count: 0`. Pins the wire shape
 /// without requiring any seed data.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_recall_observations_empty_db_json_envelope() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")
@@ -109,6 +133,10 @@ fn fx12_recall_observations_empty_db_json_envelope() {
 /// with a non-zero status because the source id doesn't exist.
 /// Pins the substrate validation path reaches the CLI.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_kg_query_missing_args_fails_clearly() {
     let (_dir, db) = fresh_db();
     // No --source-id and no --by-source-uri → CLI-side guard fires.
@@ -128,6 +156,10 @@ fn fx12_kg_query_missing_args_fails_clearly() {
 /// `find-paths` requires both source-id and target-id (clap-enforced).
 /// Smoke: omit them and confirm clap rejects.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_find_paths_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -140,6 +172,10 @@ fn fx12_find_paths_missing_required_args_fails() {
 /// `check-duplicate` requires `--title` and `--content`. Smoke clap
 /// rejection before any DB work happens.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_check_duplicate_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -151,6 +187,10 @@ fn fx12_check_duplicate_missing_required_args_fails() {
 
 /// `replay` requires `--memory-id`. Smoke clap rejection.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_replay_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -163,6 +203,10 @@ fn fx12_replay_missing_required_args_fails() {
 /// `--help` on the top-level binary must list all 5 new subcommands.
 /// Regression guard against accidentally removing the dispatch arm.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fx12_top_level_help_lists_all_five_new_subcommands() {
     let assert = Command::cargo_bin("ai-memory")
         .unwrap()

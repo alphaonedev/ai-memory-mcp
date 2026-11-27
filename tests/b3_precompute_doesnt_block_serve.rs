@@ -56,6 +56,10 @@ fn scratch_db(infix: &str) -> std::path::PathBuf {
 /// elapses. Returns `Some(elapsed)` on success, `None` on timeout.
 /// #4166 — a child that exits before answering fails at once with its
 /// captured stderr (read from `stderr_log`) instead of burning the budget.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn wait_for_health_within(
     port: u16,
     budget: Duration,
@@ -96,6 +100,10 @@ fn wait_for_health_within(
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn b3_precompute_does_not_block_serve_health() {
     let db = scratch_db("ai-memory-b3-precompute-block");
     let port = free_port();

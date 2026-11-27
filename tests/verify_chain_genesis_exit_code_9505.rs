@@ -170,6 +170,10 @@ fn run_bin(dir: &Path, path: &Path, json_mode: bool) -> Output {
 }
 
 /// The built binary; `cid` adds the fleet-wide `--cid` sweep.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_bin_with(dir: &Path, path: &Path, json_mode: bool, cid: bool) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.current_dir(dir)
@@ -460,6 +464,10 @@ fn binary_failing_states_exit_2_not_the_generic_err_path_9505() {
 
 /// An unknown root still exits 1 NOT FOUND, distinct from 2.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn binary_unknown_root_still_exits_1_9505() {
     let dir = scratch_dir("bin-unknown");
     let path = seeded_db(dir.path(), None);

@@ -189,6 +189,10 @@ fn report_unproven(what: &str) {
 
 /// Resolve a usable interpreter for `reader`, or abort fail-closed.
 /// Returns `None` only when the developer opted out explicitly.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system interpreters python3, python, node or nodejs, binaries not built from this repo, so outside the #10176 isolation gate"
+)]
 fn resolve_interpreter(reader: &Reader) -> Option<&'static str> {
     let mut tried = Vec::new();
     for candidate in reader.candidates {
@@ -242,6 +246,10 @@ fn corpus_root() -> PathBuf {
 /// Run `<interpreter> <reader> --corpus <root>` to completion. A spawn
 /// failure here is a hard error: the interpreter was already proven usable
 /// by `resolve_interpreter`, so failing to launch it is a real defect.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system interpreters python3, python, node or nodejs, binaries not built from this repo, so outside the #10176 isolation gate"
+)]
 fn run_reader(interpreter: &str, reader: &Reader) -> Output {
     let root = corpus_root();
     match Command::new(interpreter)

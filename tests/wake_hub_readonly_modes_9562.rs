@@ -263,6 +263,10 @@ fn hub_env(home: &Home, path: OsString, profile: Option<OsString>) -> ChildEnv {
 
 /// The child environment of a hub user, built from the test process's own
 /// `PATH` and profile variable.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn hub_command(home: &Home, program: &Path) -> Command {
     let mut cmd = Command::new(program);
     apply_env(
@@ -1025,6 +1029,10 @@ fn sink_env(root: &Path, key_dir: &Path, path: OsString, profile: Option<OsStrin
     with_profile(env, profile)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn sink_command(sb: &SinkOutage) -> Command {
     let mut cmd = Command::new(bin());
     apply_env(

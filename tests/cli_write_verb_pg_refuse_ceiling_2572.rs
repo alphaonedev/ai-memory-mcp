@@ -451,6 +451,10 @@ const PG_PASSWORD: &str = "hunter2";
 
 /// Run a fast (non-daemon) CLI verb once and capture its output. `store_url`,
 /// when `Some`, is injected via the owner-only `AI_MEMORY_STORE_URL` channel.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_verb(db: &Path, store_url: Option<&str>, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(cargo_bin("ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")

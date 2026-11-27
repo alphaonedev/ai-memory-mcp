@@ -51,6 +51,10 @@ fn scratch() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 }
 
 /// One `tools/call` against the real MCP stdio server, as `caller`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn mcp(
     db: &std::path::Path,
     home: &std::path::Path,
@@ -107,6 +111,10 @@ fn mcp(
 }
 
 /// `ai-memory <args>` as `caller`, returning (status ok, stdout, stderr).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli(
     db: &std::path::Path,
     home: &std::path::Path,

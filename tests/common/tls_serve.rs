@@ -144,6 +144,10 @@ pub fn try_spawn_serve_with_port_picker(
     Err(last_bind_failure)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn try_spawn_serve_once(
     db: &Path,
     port: u16,

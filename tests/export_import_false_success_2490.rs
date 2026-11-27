@@ -84,6 +84,10 @@ const PG_PASSWORD: &str = "hunter2";
 /// from 1 so an orchestrator can branch on it.
 const EXIT_INCOMPLETE: i32 = 3;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
     cmd.env("AI_MEMORY_NO_CONFIG", "1")

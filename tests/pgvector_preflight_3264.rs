@@ -256,6 +256,10 @@ fn older_schema_init_json_still_parses_3264() {
 /// env-mutating-test doctrine), with `HOME` pointed at a scratch dir so the
 /// run cannot touch a real operator database.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn doctor_reports_the_postgres_extensions_section_3264() {
     let Some(url) = postgres_url() else {
         eprintln!("AI_MEMORY_TEST_POSTGRES_URL unset — skipping (#3264 doctor section)");

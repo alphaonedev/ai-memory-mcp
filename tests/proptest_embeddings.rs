@@ -3,11 +3,18 @@
 
 #![allow(clippy::manual_range_contains)]
 
+// #10176: every proptest! block here opens with proptest_guarded(..), which
+// refuses proptest's fork and timeout (a child process outside the sandbox).
+#[path = "common/proptest_guard.rs"]
+mod proptest_guard;
+use proptest_guard::proptest_guarded;
+
 use ai_memory::embeddings::Embedder;
 use proptest::prelude::*;
 
 // Property 1: cosine_similarity(v, v) == 1.0 (identical vectors)
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_self_similarity_is_one(
         v in prop::collection::vec(-1000f32..1000f32, 10..50)
@@ -22,6 +29,7 @@ proptest! {
 
 // Property 2: cosine_similarity(v, -v) == -1.0 (opposite vectors)
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_opposite_is_minus_one(
         v in prop::collection::vec(-1000f32..1000f32, 10..50)
@@ -37,6 +45,7 @@ proptest! {
 
 // Property 3: cosine_similarity is symmetric
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_symmetric(
         a in prop::collection::vec(-100f32..100f32, 10..30),
@@ -52,6 +61,7 @@ proptest! {
 
 // Property 4: cosine_similarity bounds are [-1, 1]
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_bounded(
         a in prop::collection::vec(-1000f32..1000f32, 5..50),
@@ -67,6 +77,7 @@ proptest! {
 
 // Property 5: cosine_similarity with zero vector
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_zero_vector(
         a in prop::collection::vec(-100f32..100f32, 5..30)
@@ -84,6 +95,7 @@ proptest! {
 
 // Property 6: cosine_similarity with mismatched dimensions returns 0.0
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_mismatched_dims(
         a in prop::collection::vec(-100f32..100f32, 5..30),
@@ -99,6 +111,7 @@ proptest! {
 
 // Property 7: cosine_similarity orthogonal vectors are ~0
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_orthogonal_near_zero(dim in 5usize..20usize) {
         // Build two orthogonal vectors: (1, 0, 0, ...) and (0, 1, 0, ...)
@@ -119,6 +132,7 @@ proptest! {
 
 // Property 8: cosine_similarity with scaled vectors
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_scale_invariant(
         v in prop::collection::vec(1f32..100f32, 5..30),
@@ -138,6 +152,7 @@ proptest! {
 
 // Property 9: cosine_similarity triangle inequality-like behavior
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_satisfies_basic_properties(
         a in prop::collection::vec(-10f32..10f32, 5..20),
@@ -159,6 +174,7 @@ proptest! {
 
 // Property 10: fuse_weight clamping works correctly
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_fuse_clamping(
         primary in prop::collection::vec(-10f32..10f32, 10..20),
@@ -183,6 +199,7 @@ proptest! {
 
 // Property 11: fuse preserves dimension
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_fuse_dimension_preserved(
         primary in prop::collection::vec(-100f32..100f32, 5..50),
@@ -197,6 +214,7 @@ proptest! {
 
 // Property 12: fuse with weight=1.0 returns primary
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_fuse_weight_one_is_primary(
         primary in prop::collection::vec(-100f32..100f32, 5..30),
@@ -213,6 +231,7 @@ proptest! {
 
 // Property 13: fuse with weight=0.0 returns secondary
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_fuse_weight_zero_is_secondary(
         primary in prop::collection::vec(-100f32..100f32, 5..30),
@@ -229,6 +248,7 @@ proptest! {
 
 // Property 14: fuse with mismatched dimensions falls back to primary
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_fuse_mismatch_fallback(
         primary in prop::collection::vec(-100f32..100f32, 5..30),
@@ -243,6 +263,7 @@ proptest! {
 
 // Property 15: Embedding cosine under extreme values (no panic)
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_cosine_extreme_values_no_panic(
         a in prop::collection::vec(any::<f32>(), 5..20),

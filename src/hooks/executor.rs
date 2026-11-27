@@ -664,6 +664,10 @@ impl ExecExecutor {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "audited #1937 spawn of the operator's configured hook command, a program not built from this repo, so outside the #10176 isolation gate"
+    )]
     async fn fire_inner(&self, event: HookEvent, payload: Value) -> Result<HookDecision> {
         // v0.7.0 (issue #691 fold-1) — wire the ProcessSpawn governance
         // gate BEFORE the Command::new(...).spawn() call. The closure
@@ -1063,6 +1067,10 @@ impl DaemonExecutor {
         }))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "audited #1937 spawn of the operator's configured daemon hook command, a program not built from this repo, so outside the #10176 isolation gate"
+    )]
     async fn spawn_one(&self) -> Result<DaemonConnection> {
         // v0.7.0 (issue #691 fold-1) — same ProcessSpawn gate as the
         // exec-mode path above. Daemon-mode hooks spawn at most once
@@ -1707,6 +1715,10 @@ mod tests {
     /// `cfg(unix)` is off).
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool true, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     async fn issue_1207_spawn_retry_first_attempt_succeeds() {
         // #1762 — measure on tokio's VIRTUAL clock (start_paused) so the
         // "no backoff" assertion is deterministic: only `tokio::time::sleep`
@@ -1743,6 +1755,10 @@ mod tests {
     /// immediately without retries.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "names a path that does not exist, so no process starts; pins the non-transient spawn error"
+    )]
     async fn issue_1207_spawn_retry_non_transient_errno_surfaces_immediately() {
         // #1762 — virtual clock so the "no backoff" assertion is immune to
         // real spawn-syscall wall-clock on loaded CI runners (see
@@ -1779,6 +1795,10 @@ mod tests {
     /// against other tests in this module that might race.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool true, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     async fn issue_1207_spawn_retry_recovers_from_transient_eagain() {
         // This test exercises the retry loop by passing a closure
         // that returns a synthesized EAGAIN on its first two calls,

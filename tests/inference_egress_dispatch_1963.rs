@@ -70,6 +70,10 @@ use std::process::Output;
 /// CWD pinned to `dir` (see the module doc's "load-bearing wrinkle") and
 /// `AI_MEMORY_NO_CONFIG=1` plus the caller-supplied env overrides.
 /// Returns the captured [`Output`].
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_ai_memory_in(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.current_dir(dir);

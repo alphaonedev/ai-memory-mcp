@@ -37,6 +37,10 @@ use tempfile::TempDir;
 /// Build the standard `ai-memory --db <db>` invocation. Honors the
 /// project no-config invariant so the test never picks up the
 /// operator's real `config.toml`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")

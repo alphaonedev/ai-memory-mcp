@@ -93,6 +93,10 @@ fn sink_dir(db: &Path) -> std::path::PathBuf {
         .join(SINK_DIR)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
     // #7218 - pin the forensic sink to the test's own directory. Without it the

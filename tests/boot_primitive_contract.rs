@@ -22,6 +22,10 @@ use tempfile::TempDir;
 /// `AI_MEMORY_NO_CONFIG=1` so the user's `~/.config/ai-memory/config.toml`
 /// (which may set `tier=autonomous` and trigger embedder cold-load) is
 /// bypassed in CI.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
