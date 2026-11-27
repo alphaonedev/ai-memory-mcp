@@ -70,9 +70,10 @@ fn in_clean_child(test: &str, body: fn()) {
     }
     #[cfg(unix)]
     {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let marker = dir.path().join("done-3152");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let marker = sandbox.work().join("done-3152");
         let out = crate::test_support::spawn_test_child(
+            &sandbox,
             &format!("{MODULE_PATH}::{test}"),
             &[
                 (in_tx_fault::CHILD_ROLE_ENV, test),
@@ -244,15 +245,16 @@ fn mcp_crash_child_3152() {
 #[cfg(unix)]
 #[test]
 fn mcp_crash_between_patch_and_transition_leaves_row_unchanged_3152() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("mcp-atomicity-3152-crash.db");
+    let sandbox = crate::test_support::TestSandbox::new();
+    let path = sandbox.work().join("mcp-atomicity-3152-crash.db");
     let id = {
         let conn = db::open(&path).expect("open");
         db::insert(&conn, &fixture()).expect("insert")
     };
-    let marker = dir.path().join("reached-3152");
+    let marker = sandbox.work().join("reached-3152");
 
     let out = crate::test_support::spawn_test_child(
+        &sandbox,
         &format!("{MODULE_PATH}::mcp_crash_child_3152"),
         &[
             (in_tx_fault::CHILD_ROLE_ENV, ROLE_MCP_UPDATE),

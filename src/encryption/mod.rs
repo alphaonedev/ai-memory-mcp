@@ -1487,17 +1487,23 @@ mod tests {
             return;
         }
 
-        let scratch = secure_tmp_key_dir();
-        let marker = scratch.path().join("child-ran");
-        let status = std::process::Command::new(std::env::current_exe().expect("test exe"))
-            .arg("--exact")
-            .arg(TEST_PATH)
-            .arg("--nocapture")
-            .env(ROLE_ENV, "child")
-            .env(MARKER_ENV, &marker)
-            .status()
-            .expect("re-launch the test binary");
-        assert!(status.success(), "#8316: the umask-0002 child run failed");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let marker = sandbox.work().join("child-ran");
+        let output = crate::test_support::SandboxedTestChild::new(
+            "encryption::umask_0002_child_8316",
+            &sandbox,
+        )
+        .args(["--exact", TEST_PATH, "--nocapture"])
+        .env(ROLE_ENV, "child")
+        .env(MARKER_ENV, &marker)
+        .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, TEST_PATH)
+        .expect("re-launch the test binary");
+        assert!(
+            output.status.success(),
+            "#8316: the umask-0002 child run failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             marker.exists(),
             "#8316: the child must run the test body, not match zero tests"

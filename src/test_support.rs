@@ -573,33 +573,501 @@ fn read_child_capture(
     std::fs::read(path).map_err(|e| format!("read child {stream} capture for {label}: {e}"))
 }
 
-/// #10122 (C-F1) — allocate a private 0700 sandbox and configure `cmd` so the
-/// child resolves `HOME`, `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR`
-/// inside that sandbox (applied before any caller overrides). The caller keeps
-/// the returned `TempDir` alive until the child exits.
-#[cfg(any(test, unix))]
-fn apply_isolated_child_sandbox(cmd: &mut std::process::Command) -> tempfile::TempDir {
-    let sandbox = crate::identity::test_key_dir::private_tempdir();
-    let xdg_config = sandbox.path().join(".config");
-    let witness_dir = sandbox.path().join("witness-keys");
-    std::fs::create_dir_all(&xdg_config).expect("isolated child XDG_CONFIG_HOME");
-    cmd.env("HOME", sandbox.path())
-        .env("XDG_CONFIG_HOME", &xdg_config)
-        .env(crate::governance::audit::WITNESS_KEY_DIR_ENV, &witness_dir);
-    sandbox
+/// #10176 — the directory every child sandbox and run capture is created in.
+/// It is fixed at first use (the off-HOME temporary root of `test_key_dir`), so
+/// a later change of this process's `TMPDIR` cannot move a sandbox.
+pub(crate) fn child_sandbox_base() -> &'static Path {
+    static BASE: OnceLock<PathBuf> = OnceLock::new();
+    BASE.get_or_init(crate::identity::test_key_dir::isolated_temp_root)
 }
 
-/// #10122 — run `command` with file-backed stdout/stderr captures and a hard
-/// wall-clock `timeout`. If the child does not exit before the deadline it is
-/// killed and reaped (CONCURRENCY-11) before returning `Err` prefixed with
-/// [`TEST_CHILD_TIMEOUT_PREFIX`].
-#[cfg(any(test, unix))]
-pub(crate) fn run_command_with_timeout(
+/// A private (0700) directory in [`child_sandbox_base`].
+fn private_dir_in_base(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(child_sandbox_base())
+}
+
+/// Sandbox layout, relative to [`TestSandbox::root`].
+const SANDBOX_HOME: &str = "home";
+const SANDBOX_CONFIG: &str = "home/.config";
+const SANDBOX_DATA: &str = "home/.local/share";
+const SANDBOX_STATE: &str = "home/.local/state";
+const SANDBOX_CACHE: &str = "home/.cache";
+const SANDBOX_RUNTIME: &str = "run";
+const SANDBOX_TMP: &str = "tmp";
+const SANDBOX_WITNESS: &str = "home/witness-keys";
+const SANDBOX_WORK: &str = "work";
+
+/// Directories [`TestSandbox::new`] creates (the witness directory is left to
+/// the code that creates it with its own mode).
+const SANDBOX_DIRS: &[&str] = &[
+    SANDBOX_CONFIG,
+    SANDBOX_DATA,
+    SANDBOX_STATE,
+    SANDBOX_CACHE,
+    SANDBOX_RUNTIME,
+    SANDBOX_TMP,
+    SANDBOX_WORK,
+];
+
+/// Every variable a lib-test child gets from its sandbox: `(name, path)`.
+const SANDBOX_ENV: &[(&str, &str)] = &[
+    ("HOME", SANDBOX_HOME),
+    ("USERPROFILE", SANDBOX_HOME),
+    ("XDG_CONFIG_HOME", SANDBOX_CONFIG),
+    ("XDG_DATA_HOME", SANDBOX_DATA),
+    ("XDG_STATE_HOME", SANDBOX_STATE),
+    ("XDG_CACHE_HOME", SANDBOX_CACHE),
+    ("XDG_RUNTIME_DIR", SANDBOX_RUNTIME),
+    ("TMPDIR", SANDBOX_TMP),
+    ("TMP", SANDBOX_TMP),
+    ("TEMP", SANDBOX_TMP),
+    (
+        crate::governance::audit::WITNESS_KEY_DIR_ENV,
+        SANDBOX_WITNESS,
+    ),
+];
+
+/// Set to `1` in every child so it never reads an operator config file.
+const CHILD_NO_CONFIG_ENV: &str = "AI_MEMORY_NO_CONFIG";
+
+/// The only parent variables a child inherits: the binary search path, the
+/// coverage sink, backtrace and stack knobs, the CI marker and the test-tier
+/// selectors. None of them names user state.
+const CHILD_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "LLVM_PROFILE_FILE",
+    "RUST_BACKTRACE",
+    "RUST_LIB_BACKTRACE",
+    "RUST_MIN_STACK",
+    "CI",
+    "AI_MEMORY_TEST_POSTGRES_URL",
+    "AI_MEMORY_TEST_AGE_URL",
+    "AI_MEMORY_TEST_PG_ISOLATE",
+    "AI_MEMORY_TEST_PG_LIVE_REQUIRED",
+    "AI_MEMORY_TEST_PG_RUN_ID",
+    "AI_MEMORY_TEST_PG_TEMPLATE",
+    "AI_MEMORY_TEST_TIMING_BUDGET_MULT",
+    "AI_MEMORY_TEST_FORCE_SPAWN_EAGAIN",
+];
+
+/// Names that point at key, audit or database custody. A child never gets one
+/// from a caller; any name holding `KEY_DIR` or ending in `_PUBKEY` is refused
+/// the same way.
+const CHILD_ENV_CUSTODY: &[&str] = &[
+    "AI_MEMORY_DB",
+    "AI_MEMORY_AUDIT_DIR",
+    crate::identity::keypair::KEY_DIR_ENV,
+    "AI_MEMORY_RECORDER_KEY_DIR",
+    "AI_MEMORY_JUDGE_KEY_DIR",
+    "AI_MEMORY_STOPPER_KEY_DIR",
+    "AI_MEMORY_STOPPER_PUBKEY",
+];
+
+/// URL schemes a value may carry without being read as a path.
+const CHILD_ENV_URL_SCHEMES: &[&str] = &["http://", "https://", "postgres://", "postgresql://"];
+
+/// #10176 — why [`SandboxedTestChild::try_env`] refused a variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChildEnvRefusal {
+    /// Empty, or holds `=` or NUL.
+    InvalidName(String),
+    /// Set by the sandbox builder (sandbox paths, passthrough, `XDG_*`).
+    ReservedName(String),
+    /// Key, audit or database custody.
+    CustodyName(String),
+    /// The value is not UTF-8.
+    NonUtf8Value(String),
+    /// A path value that is not absolute.
+    RelativePath { name: String, value: String },
+    /// A path value with a `..` component.
+    ParentComponent { name: String, value: String },
+    /// A path value outside the sandbox root (lexically or once resolved).
+    OutsideSandbox { name: String, value: String },
+}
+
+impl std::fmt::Display for ChildEnvRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName(name) => {
+                write!(f, "child env name {name:?} is empty or holds '=' or NUL")
+            }
+            Self::ReservedName(name) => write!(
+                f,
+                "child env {name} is set by the sandbox builder; a caller may not set it"
+            ),
+            Self::CustodyName(name) => write!(
+                f,
+                "child env {name} names key, audit or database custody; a lib-test child never receives it"
+            ),
+            Self::NonUtf8Value(name) => write!(f, "child env {name} value is not UTF-8"),
+            Self::RelativePath { name, value } => write!(
+                f,
+                "child env {name} value {value:?} is a relative path; a path value must be absolute inside the sandbox"
+            ),
+            Self::ParentComponent { name, value } => {
+                write!(f, "child env {name} value {value:?} holds a `..` component")
+            }
+            Self::OutsideSandbox { name, value } => {
+                write!(
+                    f,
+                    "child env {name} value {value:?} is outside the child sandbox"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChildEnvRefusal {}
+
+fn child_env_name_is_reserved(name: &str) -> bool {
+    name == CHILD_NO_CONFIG_ENV
+        || name.starts_with("XDG_")
+        || SANDBOX_ENV.iter().any(|(n, _)| *n == name)
+        || CHILD_ENV_PASSTHROUGH.contains(&name)
+}
+
+fn child_env_name_is_custody(name: &str) -> bool {
+    CHILD_ENV_CUSTODY.contains(&name) || name.contains("KEY_DIR") || name.ends_with("_PUBKEY")
+}
+
+/// #10176 — the value rule of [`SandboxedTestChild::try_env`]. A value with no
+/// path separator, or an `http(s)`/`postgres` URL with no whitespace, is
+/// accepted. Any other value is a path: it must be absolute, hold no `..`, sit
+/// under `root`, and its nearest existing ancestor must still be under `root`
+/// once resolved (so a symlink inside the sandbox cannot point out of it).
+fn check_child_env(
+    root: &Path,
+    name: &str,
+    value: &std::ffi::OsStr,
+) -> Result<(), ChildEnvRefusal> {
+    if name.is_empty() || name.contains(['=', '\0']) {
+        return Err(ChildEnvRefusal::InvalidName(name.to_string()));
+    }
+    if child_env_name_is_reserved(name) {
+        return Err(ChildEnvRefusal::ReservedName(name.to_string()));
+    }
+    if child_env_name_is_custody(name) {
+        return Err(ChildEnvRefusal::CustodyName(name.to_string()));
+    }
+    let Some(text) = value.to_str() else {
+        return Err(ChildEnvRefusal::NonUtf8Value(name.to_string()));
+    };
+    if !text.contains(['/', '\\']) {
+        return Ok(());
+    }
+    if CHILD_ENV_URL_SCHEMES.iter().any(|s| text.starts_with(s))
+        && !text.chars().any(char::is_whitespace)
+    {
+        return Ok(());
+    }
+    let refuse =
+        |make: fn(String, String) -> ChildEnvRefusal| Err(make(name.to_string(), text.to_string()));
+    let path = Path::new(text);
+    if !path.is_absolute() {
+        return refuse(|name, value| ChildEnvRefusal::RelativePath { name, value });
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return refuse(|name, value| ChildEnvRefusal::ParentComponent { name, value });
+    }
+    let outside = |name, value| ChildEnvRefusal::OutsideSandbox { name, value };
+    if !path.starts_with(root) {
+        return refuse(outside);
+    }
+    let mut probe = Some(path);
+    while let Some(candidate) = probe {
+        if candidate.symlink_metadata().is_ok() {
+            return match candidate.canonicalize() {
+                Ok(resolved) if resolved.starts_with(root) => Ok(()),
+                _ => refuse(outside),
+            };
+        }
+        probe = candidate.parent();
+    }
+    refuse(outside)
+}
+
+/// #10176 — a private sandbox for one or more lib-test children: a 0700
+/// directory in [`child_sandbox_base`] holding the child's home, XDG
+/// directories, runtime and temporary directories, and a `work` directory for
+/// the caller's own files (databases, markers, journals). Removed on drop, so
+/// keep it alive until every child built on it has exited.
+pub(crate) struct TestSandbox {
+    dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl TestSandbox {
+    /// # Panics
+    /// Panics if the sandbox cannot be allocated (test setup).
+    pub(crate) fn new() -> Self {
+        let dir = private_dir_in_base(".ai-memory-child-").expect("#10176 allocate child sandbox");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("#10176 resolve child sandbox root");
+        // Every sandbox directory (and each intermediate one) is created 0700
+        // whatever the umask, so no other user can rename into it and the
+        // deferred-audit spool ancestor check accepts it (#10176).
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        for rel in SANDBOX_DIRS {
+            builder
+                .create(root.join(rel))
+                .expect("#10176 child sandbox directory");
+        }
+        Self { dir, root }
+    }
+
+    /// The sandbox root (resolved); the child's working directory.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The child's `TMPDIR`.
+    pub(crate) fn tmp(&self) -> PathBuf {
+        self.root.join(SANDBOX_TMP)
+    }
+
+    /// A directory for the caller's own files; values under it pass
+    /// [`SandboxedTestChild::try_env`].
+    pub(crate) fn work(&self) -> PathBuf {
+        self.root.join(SANDBOX_WORK)
+    }
+}
+
+impl std::fmt::Debug for TestSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestSandbox")
+            .field("root", &self.root)
+            .field("held", &self.dir.path())
+            .finish()
+    }
+}
+
+/// #10176 — the ONLY way a lib test runs this test binary again as a child.
+///
+/// The child's environment is built from nothing: [`Self::new`] clears it,
+/// copies only [`CHILD_ENV_PASSTHROUGH`], points every [`SANDBOX_ENV`] name
+/// into the [`TestSandbox`], sets `AI_MEMORY_NO_CONFIG=1` and makes the
+/// sandbox root the working directory. The command stays private: a caller
+/// adds arguments, stdio and checked variables ([`Self::try_env`], which
+/// refuses the sandbox, passthrough and custody names and any path outside the
+/// sandbox), then runs it ([`Self::run_bounded`]) or spawns it
+/// ([`Self::spawn`]). Nothing can change the environment or the working
+/// directory around the sandbox.
+///
+/// The key directory: a child gets no `AI_MEMORY_KEY_DIR`, and `cfg(test)`
+/// arms the #3355 guard in it, so `keypair::resolved_default_key_dir_path`
+/// resolves to the child's own `test_key_dir::install` directory, created in
+/// its `TMPDIR` — inside the sandbox.
+///
+/// The spawn goes through the #1937 audited chokepoint; the whole-tree ratchet
+/// `tests/test_child_spawner_isolation_10176.rs` fails when any other file
+/// under `src/` builds a process outside its exact allowlist.
+pub(crate) struct SandboxedTestChild<'s> {
+    command: std::process::Command,
+    sandbox: &'s TestSandbox,
+}
+
+impl<'s> SandboxedTestChild<'s> {
+    /// A child that re-runs this test binary in `sandbox`, labelled `caller`
+    /// in the spawn audit.
+    ///
+    /// # Panics
+    /// Panics if the test binary's path cannot be resolved.
+    pub(crate) fn new(caller: &str, sandbox: &'s TestSandbox) -> Self {
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("current_exe for sandboxed test child"),
+            caller,
+        );
+        command.env_clear();
+        for name in CHILD_ENV_PASSTHROUGH {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        for (name, rel) in SANDBOX_ENV {
+            command.env(name, sandbox.root().join(rel));
+        }
+        command.env(CHILD_NO_CONFIG_ENV, "1");
+        command.current_dir(sandbox.root());
+        Self { command, sandbox }
+    }
+
+    /// Append arguments.
+    #[must_use]
+    pub(crate) fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.command.args(args);
+        self
+    }
+
+    /// Set a variable after [`check_child_env`].
+    ///
+    /// # Errors
+    /// The exact [`ChildEnvRefusal`] when the name is reserved or custody, or
+    /// the value is a path outside the sandbox.
+    pub(crate) fn try_env(
+        mut self,
+        name: &str,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) -> Result<Self, ChildEnvRefusal> {
+        check_child_env(self.sandbox.root(), name, value.as_ref())?;
+        self.command.env(name, value);
+        Ok(self)
+    }
+
+    /// [`Self::try_env`] for a test whose value is fixed.
+    ///
+    /// # Panics
+    /// Panics with the refusal text when [`Self::try_env`] refuses.
+    #[must_use]
+    pub(crate) fn env(self, name: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        self.try_env(name, value)
+            .unwrap_or_else(|refusal| panic!("#10176: {refusal}"))
+    }
+
+    /// The child's stdout ([`Self::run_bounded`] replaces it with a capture).
+    #[must_use]
+    pub(crate) fn stdout(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
+        self.command.stdout(cfg);
+        self
+    }
+
+    /// The child's stderr ([`Self::run_bounded`] replaces it with a capture).
+    #[must_use]
+    pub(crate) fn stderr(mut self, cfg: impl Into<std::process::Stdio>) -> Self {
+        self.command.stderr(cfg);
+        self
+    }
+
+    /// Spawn the child; the handle cannot outlive the sandbox and kills and
+    /// reaps the child when dropped unwaited.
+    ///
+    /// # Errors
+    /// The spawn error.
+    pub(crate) fn spawn(mut self) -> std::io::Result<SpawnedTestChild<'s>> {
+        let child = self.command.spawn()?;
+        Ok(SpawnedTestChild {
+            child,
+            reaped: false,
+            _sandbox: std::marker::PhantomData,
+        })
+    }
+
+    /// Run to completion with file-backed stdout/stderr captures, null stdin
+    /// and a hard wall-clock `timeout`. A child still running at the deadline
+    /// is killed and reaped (CONCURRENCY-11) and the error starts with
+    /// [`TEST_CHILD_TIMEOUT_PREFIX`].
+    ///
+    /// # Errors
+    /// A capture, spawn, poll or reap failure, or the timeout, each naming
+    /// `label`.
+    pub(crate) fn run_bounded(
+        mut self,
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<std::process::Output, String> {
+        run_command_bounded(&mut self.command, timeout, label)
+    }
+}
+
+/// #10176 — a running [`SandboxedTestChild`]. Borrowing the sandbox keeps it
+/// alive while the child runs; drop kills and reaps a child nobody waited on.
+pub(crate) struct SpawnedTestChild<'s> {
+    child: std::process::Child,
+    reaped: bool,
+    _sandbox: std::marker::PhantomData<&'s TestSandbox>,
+}
+
+impl SpawnedTestChild<'_> {
+    /// The child's process id.
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Poll without blocking.
+    ///
+    /// # Errors
+    /// The poll error.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let polled = self.child.try_wait();
+        if matches!(polled, Ok(Some(_))) {
+            self.reaped = true;
+        }
+        polled
+    }
+
+    /// Wait at most `timeout`; a child still running then is killed, reaped
+    /// and reported with [`TEST_CHILD_TIMEOUT_PREFIX`].
+    ///
+    /// # Errors
+    /// A poll or reap failure, or the timeout, each naming `label`.
+    pub(crate) fn wait_bounded(
+        &mut self,
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<std::process::ExitStatus, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(e) => return Err(format!("poll test child {label}: {e}")),
+            }
+            if std::time::Instant::now() >= deadline {
+                let kill_error = self.child.kill().err();
+                let reap = self.child.wait();
+                self.reaped = reap.is_ok();
+                return Err(format!(
+                    "{TEST_CHILD_TIMEOUT_PREFIX}: {label} exceeded {}ms (kill_error={kill_error:?}, reap={reap:?})",
+                    timeout.as_millis()
+                ));
+            }
+            std::thread::sleep(TEST_CHILD_POLL_INTERVAL);
+        }
+    }
+}
+
+impl Drop for SpawnedTestChild<'_> {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // Best effort in drop (OWNERSHIP-25: never panic here): a child
+            // that already exited makes `kill` fail harmlessly; `wait` reaps it.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// #10122 — the bounded run behind [`SandboxedTestChild::run_bounded`]:
+/// file-backed captures in a private directory of [`child_sandbox_base`], a
+/// poll loop to `timeout`, then kill and reap.
+fn run_command_bounded(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
     label: &str,
 ) -> Result<std::process::Output, String> {
-    let scratch = crate::identity::test_key_dir::private_tempdir();
+    let scratch = private_dir_in_base(".ai-memory-child-capture-")
+        .map_err(|e| format!("create child capture dir for {label}: {e}"))?;
     let stdout_path = scratch.path().join("stdout");
     let stderr_path = scratch.path().join("stderr");
     let stdout_file = std::fs::File::create(&stdout_path)
@@ -653,45 +1121,42 @@ pub(crate) fn run_command_with_timeout(
 /// past a short bound and pin the timeout path (#10122 C-F3).
 #[cfg(unix)]
 fn spawn_test_child_with_timeout(
+    sandbox: &TestSandbox,
     test: &str,
     env: &[(&str, &str)],
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, String> {
-    let mut cmd = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("lib test binary"),
-        "test_support::spawn_test_child",
-    );
-    cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
-        .env_clear()
-        // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
-        // with a %p pid template) so the child's execution is measured, not lost.
-        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-        .env("TMPDIR", std::env::temp_dir())
-        .env("AI_MEMORY_NO_CONFIG", "1");
-    let _sandbox = apply_isolated_child_sandbox(&mut cmd);
+    let mut child = SandboxedTestChild::new("test_support::spawn_test_child", sandbox).args([
+        "--exact",
+        test,
+        "--test-threads=1",
+        "--nocapture",
+    ]);
     for (key, value) in env {
-        cmd.env(key, value);
+        child = child
+            .try_env(key, value)
+            .map_err(|e| format!("#10176: {e}"))?;
     }
-    run_command_with_timeout(&mut cmd, timeout, test)
+    child.run_bounded(timeout, test)
 }
 
 /// v1.0.0 #3152 — run THIS test binary again as a child that executes
-/// exactly `test` (its full path inside the lib test binary) with `env` set.
-/// The child starts from a CLEAN environment (the #3550 `publish_3550`
-/// shape), so no parallel test's environment leaks into it, and it never
-/// reads the operator config file or the host's live witness custody
-/// directory (#10122: `HOME`, `XDG_CONFIG_HOME`, and
-/// `AI_MEMORY_WITNESS_KEY_DIR` default to a fresh private 0700 sandbox unless
-/// overridden in `env`). Waits under [`TEST_CHILD_TIMEOUT`] so a spinning
-/// child is killed and reported instead of hanging the suite.
+/// exactly `test` (its full path inside the lib test binary) in `sandbox`
+/// with `env` set. The child's environment is built from nothing
+/// ([`SandboxedTestChild`], #10176), so no parallel test's environment and no
+/// user state reaches it; path values in `env` must live in the sandbox
+/// (typically [`TestSandbox::work`]). Waits under [`TEST_CHILD_TIMEOUT`] so a
+/// spinning child is killed and reported instead of hanging the suite.
 ///
-/// The spawn goes through the #1937 audited chokepoint (the
-/// `spawn_audit_gate_1937` guard bans a raw process constructor outside
-/// `src/spawn_audit.rs`); its best-effort audit emit is a no-op in a unit
-/// test process, which seeds no spawn-audit database.
+/// # Panics
+/// Panics with the refusal, spawn or timeout text.
 #[cfg(unix)]
-pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
-    spawn_test_child_with_timeout(test, env, TEST_CHILD_TIMEOUT)
+pub(crate) fn spawn_test_child(
+    sandbox: &TestSandbox,
+    test: &str,
+    env: &[(&str, &str)],
+) -> std::process::Output {
+    spawn_test_child_with_timeout(sandbox, test, env, TEST_CHILD_TIMEOUT)
         .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
@@ -716,6 +1181,11 @@ pub(crate) const TEST_ENV_ISOLATION_ROLE_ENV: &str = "AI_MEMORY_TEST_ENV_ISOLATI
 /// `governance::deferred_audit` + `recover::durability` `current_exe()`
 /// role-env subprocess isolation.
 ///
+/// The child is a [`SandboxedTestChild`]: its environment is built from
+/// nothing (#10176), so it starts from a hermetic baseline whatever the
+/// parent's tests set, and it never sees the user's home, config, key or
+/// witness directories.
+///
 /// Returns `true` in the PARENT role — the caller MUST `return` immediately,
 /// because the real assertions already ran (and passed) in the spawned
 /// child. Returns `false` in the CHILD role — the caller runs its body,
@@ -727,80 +1197,32 @@ pub(crate) const TEST_ENV_ISOLATION_ROLE_ENV: &str = "AI_MEMORY_TEST_ENV_ISOLATI
 /// asserts the child stdout reports `1 passed` and never `0 passed`.
 #[cfg(test)]
 pub(crate) fn run_env_isolated_child_or_spawn(exact_path: &str) -> bool {
-    run_env_isolated_child_or_spawn_scrubbing(exact_path, &[])
-}
-
-/// [`run_env_isolated_child_or_spawn`] for a test whose outcome depends on
-/// variables the lib-test process may already have set (for example the
-/// process-wide `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` pin from
-/// `identity::attest::permissive_attestation_for_lib_tests`): every name in
-/// `scrub` is removed from the child's environment so the child starts from a
-/// hermetic baseline whatever order the parent's tests ran in (#2967).
-#[cfg(test)]
-pub(crate) fn run_env_isolated_child_or_spawn_scrubbing(exact_path: &str, scrub: &[&str]) -> bool {
     let _ = crate::identity::test_key_dir::install();
     if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
         return false; // caller runs the real body in this isolated child
     }
-    spawn_env_isolated_child(exact_path, scrub, &[])
+    spawn_env_isolated_child(exact_path, &[])
 }
 
-/// The environment variable names [`run_env_isolated_child_or_spawn_home`]
-/// points at a fresh per-run directory in the child (#10012 security LOW-1).
-#[cfg(test)]
-pub(crate) const ISOLATED_HOME_VARS: [&str; 2] = ["HOME", "XDG_CONFIG_HOME"];
-
-/// [`run_env_isolated_child_or_spawn`] for a test that writes through code
-/// which may resolve the user's home or config directory: the child runs with
-/// `HOME` and `XDG_CONFIG_HOME` set to a fresh temporary directory (removed
-/// after the child exits), so it can never read or write the operator's real
-/// home (#10012 security LOW-1).
-#[cfg(test)]
-pub(crate) fn run_env_isolated_child_or_spawn_home(exact_path: &str) -> bool {
-    let _ = crate::identity::test_key_dir::install();
-    if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
-        return false; // caller runs the real body in this isolated child
-    }
-    let home = tempfile::tempdir().expect("isolated child HOME");
-    let config = home.path().join(".config");
-    std::fs::create_dir_all(&config).expect("isolated child XDG_CONFIG_HOME");
-    let [home_var, config_var] = ISOLATED_HOME_VARS;
-    spawn_env_isolated_child(
-        exact_path,
-        &[],
-        &[(home_var, home.path()), (config_var, config.as_path())],
-    )
-}
-
-/// Internal bounded form of [`spawn_env_isolated_child`] (#10122 C-F1 / C-F3):
-/// defaults `HOME`, `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR` to a
-/// fresh private 0700 sandbox before `scrub` and `set`, and bounds the child
-/// wait under `timeout`.
+/// Internal bounded form of [`spawn_env_isolated_child`] (#10122 C-F3): a
+/// fresh [`TestSandbox`], `set` applied through [`SandboxedTestChild::try_env`],
+/// and the child wait bounded under `timeout`.
 #[cfg(test)]
 fn try_spawn_env_isolated_child_with_timeout(
     exact_path: &str,
-    scrub: &[&str],
-    set: &[(&str, &std::path::Path)],
+    set: &[(&str, &str)],
     timeout: std::time::Duration,
 ) -> Result<bool, String> {
-    // Route the spawn through the #1937 audited chokepoint (never a raw
-    // process-constructor, which the `spawn_audit_gate_1937` guard bans
-    // outside `src/spawn_audit.rs`). The best-effort audit emit is a no-op
-    // here because no spawn-audit DB is seeded in a unit-test process.
-    let mut cmd = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("current_exe for env-isolated test spawn"),
-        "config::run_env_isolated_child_or_spawn",
-    );
-    cmd.args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
+    let sandbox = TestSandbox::new();
+    let mut child = SandboxedTestChild::new("config::run_env_isolated_child_or_spawn", &sandbox)
+        .args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
         .env(TEST_ENV_ISOLATION_ROLE_ENV, "child");
-    let _sandbox = apply_isolated_child_sandbox(&mut cmd);
-    for name in scrub {
-        cmd.env_remove(name);
-    }
     for (name, value) in set {
-        cmd.env(name, value);
+        child = child
+            .try_env(name, value)
+            .map_err(|e| format!("#10176: {e}"))?;
     }
-    let output = run_command_with_timeout(&mut cmd, timeout, exact_path)?;
+    let output = child.run_bounded(timeout, exact_path)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -817,17 +1239,12 @@ fn try_spawn_env_isolated_child_with_timeout(
     Ok(true) // caller must `return`
 }
 
-/// Spawn `exact_path` alone in a child test process with isolated sandbox
-/// defaults (`HOME`, `XDG_CONFIG_HOME`, `AI_MEMORY_WITNESS_KEY_DIR`), `scrub`
-/// removed, and `set` added; panics unless exactly one test ran and passed
-/// within [`TEST_CHILD_TIMEOUT`].
+/// Spawn `exact_path` alone in a sandboxed child test process with `set`
+/// added; panics unless exactly one test ran and passed within
+/// [`TEST_CHILD_TIMEOUT`].
 #[cfg(test)]
-fn spawn_env_isolated_child(
-    exact_path: &str,
-    scrub: &[&str],
-    set: &[(&str, &std::path::Path)],
-) -> bool {
-    try_spawn_env_isolated_child_with_timeout(exact_path, scrub, set, TEST_CHILD_TIMEOUT)
+fn spawn_env_isolated_child(exact_path: &str, set: &[(&str, &str)]) -> bool {
+    try_spawn_env_isolated_child_with_timeout(exact_path, set, TEST_CHILD_TIMEOUT)
         .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
@@ -873,22 +1290,16 @@ mod tests {
             }
             return;
         }
-        let scratch = tempfile::tempdir().expect("parent-owned PKI test scratch");
-        let tmp = scratch.path().join("child-tmp");
-        std::fs::create_dir(&tmp).expect("dedicated child TMPDIR");
+        let sandbox = super::TestSandbox::new();
+        let tmp = sandbox.tmp();
         let test = TEST.split_once("::").expect("crate-qualified test name").1;
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::tls_test_pki_is_removed_after_child_exit_8651",
-        );
-        command
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        for name in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(name, &tmp);
-        }
-        let output = run_pki_child_8651(command, scratch.path());
+            &sandbox,
+        )
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1");
+        let output = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "PKI child: {stdout}\n{stderr}");
@@ -944,26 +1355,17 @@ mod tests {
             }
             return;
         }
-        // Keep even the deliberately insecure red fixture behind a private parent.
-        let scratch = tempfile::Builder::new()
-            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .tempdir()
-            .expect("parent-owned permission test scratch");
-        let tmp = scratch.path().join("child-tmp");
-        std::fs::create_dir(&tmp).expect("dedicated permission child TMPDIR");
+        // Keep even the deliberately insecure red fixture behind a private
+        // parent: the sandbox root is 0700.
+        let sandbox = super::TestSandbox::new();
         let test = TEST.split_once("::").expect("crate-qualified test name").1;
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::tls_test_pki_starts_private_under_open_umask_8663",
-        );
-        command
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        for name in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(name, &tmp);
-        }
-        let output = run_pki_child_8651(command, scratch.path());
+            &sandbox,
+        )
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1");
+        let output = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -1018,25 +1420,15 @@ mod tests {
             );
             return;
         }
-        let scratch = tempfile::Builder::new()
-            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .tempdir()
-            .expect("private parent-owned creation scratch");
-        let tmp = scratch.path().join("child-tmp");
-        std::fs::create_dir(&tmp).expect("creation child TMPDIR");
+        let sandbox = super::TestSandbox::new();
         let test = TEST.split_once("::").expect("crate-qualified test name").1;
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::tls_private_key_creation_is_private_8663",
-        );
-        command
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        for name in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(name, &tmp);
-        }
-        let output = run_pki_child_8651(command, scratch.path());
+            &sandbox,
+        )
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1");
+        let output = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -1073,21 +1465,15 @@ mod tests {
         }
     }
 
-    /// #10122 (C-F1 / C-F6) — route PKI test children through the single shared
-    /// isolated-sandbox + bounded-timeout helper instead of duplicating the
-    /// capture/poll/kill/reap loop.
+    /// #10122 (C-F1 / C-F6) / #10176 — route PKI test children through the single
+    /// shared sandboxed builder and bounded-timeout runner instead of duplicating
+    /// the capture/poll/kill/reap loop. The child's environment is built from
+    /// nothing, so no caller variable can replace a sandbox path.
     #[cfg(unix)]
-    fn run_pki_child_8651(
-        mut command: std::process::Command,
-        _scratch: &std::path::Path,
-    ) -> std::process::Output {
-        let _sandbox = super::apply_isolated_child_sandbox(&mut command);
-        super::run_command_with_timeout(
-            &mut command,
-            super::TEST_CHILD_TIMEOUT,
-            "run_pki_child_8651",
-        )
-        .unwrap_or_else(|msg| panic!("{msg}"))
+    fn run_pki_child_8651(child: super::SandboxedTestChild<'_>) -> std::process::Output {
+        child
+            .run_bounded(super::TEST_CHILD_TIMEOUT, "run_pki_child_8651")
+            .unwrap_or_else(|msg| panic!("{msg}"))
     }
 
     /// #3523 — the OBSERVED singleton pin: `test_support::env_lock()` and
@@ -1153,12 +1539,20 @@ mod tests {
     /// #10122 (C-F1 / C-F2) — shared child-side assertion that a spawned test
     /// child sees isolated `HOME`, `XDG_CONFIG_HOME`, and
     /// `AI_MEMORY_WITNESS_KEY_DIR` VALUES (not merely that variables are set).
+    /// The parent passes its own paths hex-encoded ([`parent_path_hex_10122`]),
+    /// because a path outside the sandbox is refused as a child value (#10176).
     #[cfg(unix)]
     fn assert_child_sees_isolated_sandbox_values(
         spawner: &str,
         parent_home_env: &str,
         parent_witness_env: &str,
     ) {
+        use std::os::unix::ffi::OsStringExt as _;
+        let parent_path = |name: &str| {
+            std::env::var(name).ok().map(|hex| {
+                std::path::PathBuf::from(std::ffi::OsString::from_vec(hex_decode_10176(&hex)))
+            })
+        };
         let child_home = std::path::PathBuf::from(
             std::env::var_os("HOME")
                 .unwrap_or_else(|| panic!("#10122 ({spawner}): child HOME must be set")),
@@ -1172,15 +1566,13 @@ mod tests {
                 panic!("#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR must be set")
             }),
         );
-        if let Some(parent_home) = std::env::var_os(parent_home_env) {
-            let parent_home = std::path::PathBuf::from(parent_home);
+        if let Some(parent_home) = parent_path(parent_home_env) {
             assert_ne!(
                 child_home, parent_home,
                 "#10122 ({spawner}): child HOME must differ from parent HOME"
             );
         }
-        if let Some(parent_witness) = std::env::var_os(parent_witness_env) {
-            let parent_witness = std::path::PathBuf::from(parent_witness);
+        if let Some(parent_witness) = parent_path(parent_witness_env) {
             assert_ne!(
                 child_witness, parent_witness,
                 "#10122 ({spawner}): child AI_MEMORY_WITNESS_KEY_DIR must differ from parent witness dir"
@@ -1225,12 +1617,15 @@ mod tests {
             );
             return;
         }
-        let parent_home = std::env::var("HOME").unwrap_or_default();
-        let parent_witness = crate::governance::audit::witness_key_dir()
-            .expect("resolve parent witness_key_dir")
-            .to_string_lossy()
-            .into_owned();
+        let parent_home = parent_path_hex_10122(std::path::Path::new(
+            &std::env::var_os("HOME").unwrap_or_default(),
+        ));
+        let parent_witness = parent_path_hex_10122(
+            &crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir"),
+        );
+        let sandbox = super::TestSandbox::new();
         let out = super::spawn_test_child(
+            &sandbox,
             TEST,
             &[
                 (ROLE_ENV, "1"),
@@ -1267,15 +1662,17 @@ mod tests {
             );
             return;
         }
-        let parent_home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        let parent_witness =
-            crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir");
+        let parent_home = parent_path_hex_10122(std::path::Path::new(
+            &std::env::var_os("HOME").unwrap_or_default(),
+        ));
+        let parent_witness = parent_path_hex_10122(
+            &crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir"),
+        );
         let ran_in_child = super::spawn_env_isolated_child(
             TEST,
-            &[],
             &[
-                (PARENT_HOME_ENV, parent_home.as_path()),
-                (PARENT_WITNESS_ENV, parent_witness.as_path()),
+                (PARENT_HOME_ENV, parent_home.as_str()),
+                (PARENT_WITNESS_ENV, parent_witness.as_str()),
             ],
         );
         assert!(ran_in_child, "parent branch must spawn child");
@@ -1300,21 +1697,22 @@ mod tests {
             );
             return;
         }
-        let parent_home = std::env::var_os("HOME").unwrap_or_default();
-        let parent_witness =
-            crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir");
-        let scratch = crate::identity::test_key_dir::private_tempdir();
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
-            "test_support::pki_child_spawner_isolates_home_config_and_witness_dir_10122",
+        let parent_home = parent_path_hex_10122(std::path::Path::new(
+            &std::env::var_os("HOME").unwrap_or_default(),
+        ));
+        let parent_witness = parent_path_hex_10122(
+            &crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir"),
         );
-        command
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env(PARENT_HOME_ENV, &parent_home)
-            .env(PARENT_WITNESS_ENV, &parent_witness)
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        let out = run_pki_child_8651(command, scratch.path());
+        let sandbox = super::TestSandbox::new();
+        let child = super::SandboxedTestChild::new(
+            "test_support::pki_child_spawner_isolates_home_config_and_witness_dir_10122",
+            &sandbox,
+        )
+        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .env(PARENT_HOME_ENV, &parent_home)
+        .env(PARENT_WITNESS_ENV, &parent_witness);
+        let out = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -1325,6 +1723,352 @@ mod tests {
             stdout.contains("1 passed") && !stdout.contains("0 passed"),
             "#10122 PKI isolation child ran zero tests:\n{stdout}"
         );
+    }
+
+    /// #10176 — hex form of a parent path, passed to a child as a plain value
+    /// (a raw path outside the sandbox is refused as a child value).
+    #[cfg(unix)]
+    fn parent_path_hex_10122(path: &std::path::Path) -> String {
+        use std::os::unix::ffi::OsStrExt as _;
+        hex_encode_10176(path.as_os_str().as_bytes())
+    }
+
+    /// #10176 — the exhaustive refusal table of `check_child_env`: every
+    /// sandbox, passthrough and custody name, every name shape and every value
+    /// shape, each with its exact `ChildEnvRefusal` (or acceptance).
+    #[cfg(unix)]
+    #[test]
+    fn child_env_refusals_are_exact_10176() {
+        use super::ChildEnvRefusal as R;
+        use std::os::unix::ffi::OsStrExt as _;
+        let sandbox = super::TestSandbox::new();
+        let root = sandbox.root();
+        let check = |name: &str, value: &std::ffi::OsStr| super::check_child_env(root, name, value);
+        let os = std::ffi::OsStr::new;
+        for name in ["", "A=B", "A\0B", "="] {
+            assert_eq!(
+                check(name, os("1")),
+                Err(R::InvalidName(name.to_string())),
+                "#10176 name {name:?}"
+            );
+        }
+        let reserved = super::SANDBOX_ENV
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(super::CHILD_ENV_PASSTHROUGH.iter().copied())
+            .chain([super::CHILD_NO_CONFIG_ENV, "XDG_SESSION_ID", "XDG_"]);
+        for name in reserved {
+            assert_eq!(
+                check(name, os("1")),
+                Err(R::ReservedName(name.to_string())),
+                "#10176 reserved {name}"
+            );
+        }
+        for name in super::CHILD_ENV_CUSTODY.iter().copied().chain([
+            "AI_MEMORY_OTHER_KEY_DIR",
+            "KEY_DIR",
+            "AI_MEMORY_OPERATOR_PUBKEY",
+            "X_PUBKEY",
+        ]) {
+            assert_eq!(
+                check(name, os("1")),
+                Err(R::CustodyName(name.to_string())),
+                "#10176 custody {name}"
+            );
+        }
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"\xff/x");
+        assert_eq!(
+            check("AI_MEMORY_10176_V", non_utf8),
+            Err(R::NonUtf8Value("AI_MEMORY_10176_V".to_string()))
+        );
+        let outside = crate::identity::test_key_dir::private_tempdir();
+        let link = sandbox.work().join("escape-link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("plant escape symlink");
+        let root_text = root.to_string_lossy().into_owned();
+        let work = sandbox.work().to_string_lossy().into_owned();
+        let sibling = format!("{root_text}-sibling/work");
+        let parent_escape = format!("{work}/../../..");
+        let through_link = format!("{}/db.sqlite", link.display());
+        let home = crate::identity::test_key_dir::resolved_home()
+            .to_string_lossy()
+            .into_owned();
+        let outside_text = outside.path().to_string_lossy().into_owned();
+        let refused: Vec<(&str, R)> = vec![
+            (
+                "rel/path",
+                R::RelativePath {
+                    name: "V".into(),
+                    value: "rel/path".into(),
+                },
+            ),
+            (
+                "./x",
+                R::RelativePath {
+                    name: "V".into(),
+                    value: "./x".into(),
+                },
+            ),
+            (
+                "https://a b/c",
+                R::RelativePath {
+                    name: "V".into(),
+                    value: "https://a b/c".into(),
+                },
+            ),
+            (
+                "ftp://host/x",
+                R::RelativePath {
+                    name: "V".into(),
+                    value: "ftp://host/x".into(),
+                },
+            ),
+            (
+                "a\\b",
+                R::RelativePath {
+                    name: "V".into(),
+                    value: "a\\b".into(),
+                },
+            ),
+            (
+                parent_escape.as_str(),
+                R::ParentComponent {
+                    name: "V".into(),
+                    value: parent_escape.clone(),
+                },
+            ),
+            (
+                "/etc/passwd",
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: "/etc/passwd".into(),
+                },
+            ),
+            (
+                "/",
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: "/".into(),
+                },
+            ),
+            (
+                home.as_str(),
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: home.clone(),
+                },
+            ),
+            (
+                outside_text.as_str(),
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: outside_text.clone(),
+                },
+            ),
+            (
+                sibling.as_str(),
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: sibling.clone(),
+                },
+            ),
+            (
+                through_link.as_str(),
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: through_link.clone(),
+                },
+            ),
+        ];
+        for (value, expected) in refused {
+            assert_eq!(
+                check("V", os(value)),
+                Err(expected),
+                "#10176 value {value:?}"
+            );
+        }
+        let db = format!("{work}/db.sqlite");
+        let nested = format!("{work}/not/yet/created");
+        for value in [
+            "1",
+            "child",
+            "",
+            "abc def",
+            "https://example.invalid/x",
+            "http://127.0.0.1:1/x",
+            "postgres://u@h/d",
+            "postgresql://u@h/d",
+            root_text.as_str(),
+            work.as_str(),
+            db.as_str(),
+            nested.as_str(),
+        ] {
+            assert_eq!(
+                check("V", os(value)),
+                Ok(()),
+                "#10176 accepted value {value:?}"
+            );
+        }
+    }
+
+    /// #10176 — the exact refusal texts, and the builder methods route through
+    /// the same check: `try_env` returns the refusal and `env` panics with it.
+    #[cfg(unix)]
+    #[test]
+    fn child_env_refusal_texts_and_builder_routing_10176() {
+        use super::ChildEnvRefusal as R;
+        let rows = [
+            (
+                R::InvalidName("A=B".into()),
+                "child env name \"A=B\" is empty or holds '=' or NUL",
+            ),
+            (
+                R::ReservedName("HOME".into()),
+                "child env HOME is set by the sandbox builder; a caller may not set it",
+            ),
+            (
+                R::CustodyName("AI_MEMORY_DB".into()),
+                "child env AI_MEMORY_DB names key, audit or database custody; a lib-test child never receives it",
+            ),
+            (
+                R::NonUtf8Value("V".into()),
+                "child env V value is not UTF-8",
+            ),
+            (
+                R::RelativePath {
+                    name: "V".into(),
+                    value: "a/b".into(),
+                },
+                "child env V value \"a/b\" is a relative path; a path value must be absolute inside the sandbox",
+            ),
+            (
+                R::ParentComponent {
+                    name: "V".into(),
+                    value: "/x/..".into(),
+                },
+                "child env V value \"/x/..\" holds a `..` component",
+            ),
+            (
+                R::OutsideSandbox {
+                    name: "V".into(),
+                    value: "/etc".into(),
+                },
+                "child env V value \"/etc\" is outside the child sandbox",
+            ),
+        ];
+        for (refusal, text) in rows {
+            assert_eq!(refusal.to_string(), text);
+        }
+        let sandbox = super::TestSandbox::new();
+        let refused =
+            super::SandboxedTestChild::new("test_support::refusal_routing_10176", &sandbox)
+                .try_env("AI_MEMORY_KEY_DIR", sandbox.work())
+                .err();
+        assert_eq!(refused, Some(R::CustodyName("AI_MEMORY_KEY_DIR".into())));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::SandboxedTestChild::new("test_support::refusal_routing_10176", &sandbox)
+                .env("HOME", sandbox.work());
+        }))
+        .expect_err("#10176: env must panic on a reserved name");
+        let message = panicked
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            message,
+            "#10176: child env HOME is set by the sandbox builder; a caller may not set it"
+        );
+        let err = super::spawn_test_child_with_timeout(
+            &sandbox,
+            "test_support::tests::never_runs_10176",
+            &[("AI_MEMORY_DB", "x")],
+            super::TEST_CHILD_TIMEOUT,
+        )
+        .expect_err("#10176: spawn_test_child must refuse a custody name");
+        assert_eq!(
+            err,
+            "#10176: child env AI_MEMORY_DB names key, audit or database custody; a lib-test child never receives it"
+        );
+        let err = super::try_spawn_env_isolated_child_with_timeout(
+            "test_support::tests::never_runs_10176",
+            &[("XDG_DATA_HOME", "/x")],
+            super::TEST_CHILD_TIMEOUT,
+        )
+        .expect_err("#10176: the env-isolated spawner must refuse a reserved name");
+        assert_eq!(
+            err,
+            "#10176: child env XDG_DATA_HOME is set by the sandbox builder; a caller may not set it"
+        );
+    }
+
+    /// #10176 — the sandbox layout: a 0700 root inside the off-home base,
+    /// holding every directory the child env points at.
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_layout_is_private_and_off_home_10176() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const PRIVATE: u32 = 0o700;
+        const BITS: u32 = 0o777;
+        let sandbox = super::TestSandbox::new();
+        let root = sandbox.root();
+        assert!(root.starts_with(super::child_sandbox_base()), "{root:?}");
+        if let Ok(home) = crate::identity::test_key_dir::resolved_home().canonicalize() {
+            assert!(
+                !root.starts_with(&home),
+                "#10176 sandbox {root:?} under home {home:?}"
+            );
+        }
+        for rel in [super::SANDBOX_RUNTIME, ""] {
+            let mode = std::fs::metadata(root.join(rel))
+                .expect("sandbox dir metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & BITS, PRIVATE, "#10176 {rel:?} must be 0700");
+        }
+        for rel in super::SANDBOX_DIRS {
+            assert!(root.join(rel).is_dir(), "#10176 sandbox must create {rel}");
+        }
+        let held = root.to_path_buf();
+        drop(sandbox);
+        assert!(!held.exists(), "#10176 the sandbox is removed on drop");
+    }
+
+    /// #10176 — a spawned child is killed and reaped when its handle drops,
+    /// and `wait_bounded` kills a child past its bound.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_test_child_is_bounded_and_reaped_10176() {
+        const SLEEP_ROLE_ENV: &str = "AI_MEMORY_TEST_10176_SPAWNED_SLEEP_ROLE";
+        const TEST: &str = "test_support::tests::spawned_test_child_is_bounded_and_reaped_10176";
+        const SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(150);
+        const MAX_WALL_ELAPSED: std::time::Duration = std::time::Duration::from_secs(5);
+        if std::env::var_os(SLEEP_ROLE_ENV).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let sandbox = super::TestSandbox::new();
+        let spawn = || {
+            super::SandboxedTestChild::new("test_support::spawned_10176", &sandbox)
+                .args(["--exact", TEST, "--test-threads=1"])
+                .env(SLEEP_ROLE_ENV, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn sleeping child")
+        };
+        let start = std::time::Instant::now();
+        let mut child = spawn();
+        let err = child
+            .wait_bounded(SHORT_BOUND, TEST)
+            .expect_err("sleeping child must time out");
+        assert!(err.starts_with(super::TEST_CHILD_TIMEOUT_PREFIX), "{err}");
+        assert!(err.contains(TEST), "{err}");
+        let dropped = spawn();
+        let pid = i32::try_from(dropped.id()).expect("pid fits i32");
+        drop(dropped);
+        // SAFETY: kill with signal 0 only probes whether the pid exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "#10176 a dropped child must be killed and reaped");
+        assert!(start.elapsed() < MAX_WALL_ELAPSED, "{:?}", start.elapsed());
     }
 
     /// #10122 — `run_command_with_timeout` MUST kill a hanging child when the
@@ -1341,14 +2085,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(30));
             return;
         }
-        let mut cmd = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let sandbox = super::TestSandbox::new();
+        let child = super::SandboxedTestChild::new(
             "test_support::run_command_with_timeout_kills_and_reports_hanging_child_10122",
-        );
-        cmd.args(["--exact", TEST, "--test-threads=1"])
-            .env(SLEEP_ROLE_ENV, "1");
+            &sandbox,
+        )
+        .args(["--exact", TEST, "--test-threads=1"])
+        .env(SLEEP_ROLE_ENV, "1");
         let start = std::time::Instant::now();
-        let err = super::run_command_with_timeout(&mut cmd, SHORT_BOUND, TEST)
+        let err = child
+            .run_bounded(SHORT_BOUND, TEST)
             .expect_err("sleeping child must time out");
         let elapsed = start.elapsed();
         assert!(
@@ -1380,8 +2126,14 @@ mod tests {
             return;
         }
         let start = std::time::Instant::now();
-        let err = super::spawn_test_child_with_timeout(TEST, &[(SLEEP_ROLE_ENV, "1")], SHORT_BOUND)
-            .expect_err("sleeping spawn_test_child must time out");
+        let sandbox = super::TestSandbox::new();
+        let err = super::spawn_test_child_with_timeout(
+            &sandbox,
+            TEST,
+            &[(SLEEP_ROLE_ENV, "1")],
+            SHORT_BOUND,
+        )
+        .expect_err("sleeping spawn_test_child must time out");
         let elapsed = start.elapsed();
         assert!(
             err.starts_with(super::TEST_CHILD_TIMEOUT_PREFIX),
@@ -1411,7 +2163,7 @@ mod tests {
             return;
         }
         let start = std::time::Instant::now();
-        let err = super::try_spawn_env_isolated_child_with_timeout(TEST, &[], &[], SHORT_BOUND)
+        let err = super::try_spawn_env_isolated_child_with_timeout(TEST, &[], SHORT_BOUND)
             .expect_err("sleeping spawn_env_isolated_child must time out");
         let elapsed = start.elapsed();
         assert!(
@@ -1517,6 +2269,237 @@ mod tests {
             before,
             "#3577: simulate_production_lineage_seed must restore both flags on drop"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #10176 (MEDIUM 10189 / LOW 10188) — a lib-test child's environment is
+    // built from nothing. The driver re-runs itself in an isolated process,
+    // plants every sandbox, custody and canary name at a path OUTSIDE any
+    // sandbox, moves its own cwd there, then spawns the probe through every
+    // spawner. The probe fails naming each variable that arrived.
+    // ---------------------------------------------------------------------
+
+    /// What the probe child must see for one variable.
+    #[derive(Clone, Copy)]
+    enum ChildEnvExpect10176 {
+        /// Exactly `<sandbox root>/<rel>`.
+        SandboxPath(&'static str),
+        /// Unset, or a path inside the sandbox root (the child's own
+        /// `test_key_dir::install` may arm one there).
+        UnsetOrInsideSandbox,
+        /// Never present in the child.
+        Unset,
+    }
+
+    /// Hand-written expected column (rust-first-pass: never derived from the
+    /// code under test).
+    const CHILD_ENV_EXPECTED_10176: &[(&str, ChildEnvExpect10176)] = &[
+        ("HOME", ChildEnvExpect10176::SandboxPath("home")),
+        ("USERPROFILE", ChildEnvExpect10176::SandboxPath("home")),
+        (
+            "XDG_CONFIG_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.config"),
+        ),
+        (
+            "XDG_DATA_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.local/share"),
+        ),
+        (
+            "XDG_STATE_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.local/state"),
+        ),
+        (
+            "XDG_CACHE_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.cache"),
+        ),
+        ("XDG_RUNTIME_DIR", ChildEnvExpect10176::SandboxPath("run")),
+        ("TMPDIR", ChildEnvExpect10176::SandboxPath("tmp")),
+        ("TMP", ChildEnvExpect10176::SandboxPath("tmp")),
+        ("TEMP", ChildEnvExpect10176::SandboxPath("tmp")),
+        (
+            "AI_MEMORY_WITNESS_KEY_DIR",
+            ChildEnvExpect10176::SandboxPath("home/witness-keys"),
+        ),
+        (
+            "AI_MEMORY_KEY_DIR",
+            ChildEnvExpect10176::UnsetOrInsideSandbox,
+        ),
+        ("AI_MEMORY_DB", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_AUDIT_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_RECORDER_KEY_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_JUDGE_KEY_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_STOPPER_KEY_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_STOPPER_PUBKEY", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_10176_CANARY", ChildEnvExpect10176::Unset),
+    ];
+
+    /// Hex of the planted root; its presence makes the probe run.
+    const PROBE_PLANTED_ENV_10176: &str = "AI_MEMORY_TEST_10176_PLANTED_HEX";
+    /// Printed by the probe once every check ran, so a probe that never saw
+    /// its role cannot count as green.
+    const PROBE_RAN_10176: &str = "child-env-probe-10176: checked";
+    const PROBE_PATH_10176: &str = "test_support::tests::child_env_probe_10176";
+    const DRIVER_PATH_10176: &str = "test_support::tests::child_env_is_built_from_nothing_10176";
+
+    fn hex_encode_10176(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+    }
+
+    fn hex_decode_10176(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("planted hex"))
+            .collect()
+    }
+
+    /// The probe: a no-op unless the driver handed it the planted root.
+    #[cfg(unix)]
+    #[test]
+    fn child_env_probe_10176() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let Ok(planted_hex) = std::env::var(PROBE_PLANTED_ENV_10176) else {
+            return;
+        };
+        let planted =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(hex_decode_10176(&planted_hex)));
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let root = home
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let mut arrived = Vec::new();
+        for (name, expect) in CHILD_ENV_EXPECTED_10176 {
+            let got = std::env::var_os(name).map(std::path::PathBuf::from);
+            let ok = match (*expect, &got) {
+                (ChildEnvExpect10176::SandboxPath(rel), Some(v)) => *v == root.join(rel),
+                (ChildEnvExpect10176::UnsetOrInsideSandbox, Some(v)) => {
+                    v.starts_with(&root) && !v.starts_with(planted.join(name))
+                }
+                (ChildEnvExpect10176::UnsetOrInsideSandbox | ChildEnvExpect10176::Unset, None) => {
+                    true
+                }
+                (ChildEnvExpect10176::SandboxPath(_), None)
+                | (ChildEnvExpect10176::Unset, Some(_)) => false,
+            };
+            if !ok {
+                arrived.push((*name).to_string());
+            }
+        }
+        if home == planted.join("HOME") {
+            arrived.push("HOME (planted value)".to_string());
+        }
+        match std::env::current_dir() {
+            Ok(cwd) if cwd == root => {}
+            _ => arrived.push("cwd".to_string()),
+        }
+        match crate::identity::keypair::resolved_default_key_dir_path() {
+            Ok(dir) if dir.starts_with(&root) && !dir.starts_with(&planted) => {}
+            _ => arrived.push("resolved key dir".to_string()),
+        }
+        assert!(
+            arrived.is_empty(),
+            "#10176: the child environment was not built from nothing; outside-sandbox state arrived for: {arrived:?}"
+        );
+        println!("{PROBE_RAN_10176}");
+    }
+
+    /// Plant every name of [`CHILD_ENV_EXPECTED_10176`] at `<planted>/<NAME>`.
+    #[cfg(unix)]
+    fn plant_child_env_10176(planted: &std::path::Path) -> Vec<EnvGuard> {
+        CHILD_ENV_EXPECTED_10176
+            .iter()
+            .map(|(name, _)| {
+                let dir = planted.join(name);
+                std::fs::create_dir_all(&dir).expect("planted dir");
+                let guard = EnvGuard::capture(name);
+                guard.set(dir.to_str().expect("utf-8 planted dir"));
+                guard
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn probe_outcome_10176(
+        spawner: &str,
+        out: Result<std::process::Output, String>,
+    ) -> Option<String> {
+        match out {
+            Err(e) => Some(format!("{spawner}: {e}")),
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if out.status.success()
+                    && stdout.contains("1 passed")
+                    && stdout.contains(PROBE_RAN_10176)
+                {
+                    None
+                } else {
+                    Some(format!(
+                        "{spawner}: probe failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_env_is_built_from_nothing_10176() {
+        use std::os::unix::ffi::OsStrExt as _;
+        if super::run_env_isolated_child_or_spawn(DRIVER_PATH_10176) {
+            return;
+        }
+        // This body runs alone in its own process, so moving the cwd and the
+        // environment cannot race another test.
+        let _lock = env_lock();
+        // The sandbox base is fixed before anything is planted, so a planted
+        // TMPDIR cannot move it (the base is a process-wide OnceLock).
+        let _ = super::child_sandbox_base();
+        let sandbox = super::TestSandbox::new();
+        let planted_dir = crate::identity::test_key_dir::private_tempdir();
+        let planted = planted_dir.path().to_path_buf();
+        let _guards = plant_child_env_10176(&planted);
+        std::env::set_current_dir(&planted).expect("cwd to planted root");
+        let hex = hex_encode_10176(planted.as_os_str().as_bytes());
+        let mut failures = Vec::new();
+
+        let builder = super::SandboxedTestChild::new("test_support::child_env_10176", &sandbox)
+            .args([
+                "--exact",
+                PROBE_PATH_10176,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE_PLANTED_ENV_10176, &hex)
+            .run_bounded(super::TEST_CHILD_TIMEOUT, "child_env_10176 builder");
+        failures.extend(probe_outcome_10176("SandboxedTestChild", builder));
+
+        let spawned = std::panic::catch_unwind(|| {
+            super::spawn_test_child(
+                &sandbox,
+                PROBE_PATH_10176,
+                &[(PROBE_PLANTED_ENV_10176, hex.as_str())],
+            )
+        })
+        .map_err(|_| "spawn_test_child panicked".to_string());
+        failures.extend(probe_outcome_10176("spawn_test_child", spawned));
+
+        let isolated = std::panic::catch_unwind(|| {
+            super::spawn_env_isolated_child(
+                PROBE_PATH_10176,
+                &[(PROBE_PLANTED_ENV_10176, hex.as_str())],
+            )
+        });
+        if isolated.is_err() {
+            failures.push("spawn_env_isolated_child: probe failed (see panic above)".to_string());
+        }
+        assert!(failures.is_empty(), "#10176: {failures:#?}");
     }
 }
 

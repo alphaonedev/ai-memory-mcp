@@ -905,15 +905,11 @@ mod tests {
     fn quarantine_unattributed_production_explicit_zero_refuses_boot_with_asi_hard_message_2967() {
         // The parent may carry any asi-hard knob (the lib-test process pins
         // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`), and asi-hard refuses on the
-        // first knob below its floor, so the child starts with every pinned
-        // knob removed and only the quarantine knob set below.
-        let pinned: Vec<&str> = crate::security_profile::pinned_knobs()
-            .into_iter()
-            .map(|(env, _)| env)
-            .collect();
-        if crate::config::run_env_isolated_child_or_spawn_scrubbing(
+        // first knob below its floor; the child env is built from nothing
+        // (#10176), so no pinned knob reaches it and only the quarantine knob
+        // set below applies.
+        if crate::config::run_env_isolated_child_or_spawn(
             "config::shape::tests::quarantine_unattributed_production_explicit_zero_refuses_boot_with_asi_hard_message_2967",
-            &pinned,
         ) {
             return;
         }
@@ -960,13 +956,8 @@ mod tests {
     /// reader reports quarantine ON (#2967 security r1 finding 1).
     #[test]
     fn quarantine_unattributed_floor_and_receive_reader_agree_on_every_token_2967() {
-        let pinned: Vec<&str> = crate::security_profile::pinned_knobs()
-            .into_iter()
-            .map(|(env, _)| env)
-            .collect();
-        if crate::config::run_env_isolated_child_or_spawn_scrubbing(
+        if crate::config::run_env_isolated_child_or_spawn(
             "config::shape::tests::quarantine_unattributed_floor_and_receive_reader_agree_on_every_token_2967",
-            &pinned,
         ) {
             return;
         }

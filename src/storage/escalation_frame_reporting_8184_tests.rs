@@ -75,13 +75,14 @@ fn child_stderr(name: &str, action: impl FnOnce() + Send + 'static) -> Option<St
     }
     let (_, module) = module_path!().split_once("::").expect("crate module path");
     let test_path = format!("{module}::{name}");
-    let output = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("test executable"),
+    let sandbox = crate::test_support::TestSandbox::new();
+    let output = crate::test_support::SandboxedTestChild::new(
         "escalation_frame_reporting_8184::child",
+        &sandbox,
     )
     .args(["--exact", &test_path, "--nocapture", "--test-threads=1"])
     .env(CHILD_ROLE, name)
-    .output()
+    .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &test_path)
     .expect("run child");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let stdout = String::from_utf8_lossy(&output.stdout);
