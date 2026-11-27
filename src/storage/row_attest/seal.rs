@@ -220,16 +220,37 @@ impl SealLock {
     ///
     /// # Errors
     ///
-    /// The seal directory cannot be created, the lock file cannot be opened
-    /// (a symlink, a directory or any other open failure), it is not a
+    /// The seal directory cannot be created, it or any directory up to the
+    /// anchor directory is group- or world-writable or owned by another user
+    /// (#10205, the key-directory checks of #3198), the lock file cannot be
+    /// opened (a symlink, a directory or any other open failure), it is not a
     /// regular file, or the lock cannot be taken. Each refuses the write: a
-    /// seal is never written unlocked.
+    /// seal is never written unlocked, and a failed check repairs nothing.
+    ///
+    /// The wait for another holder has no time limit, as in the scope-key
+    /// store lock; only the same user or root can hold the lock, because the
+    /// lock file is 0600 in a directory this check proves owner-only.
     pub fn acquire(seal: &Path) -> Result<Self> {
         let dir = seal
             .parent()
             .context("a seal path always has a parent directory")?;
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        // The seal lives at `<anchor dir>/.row-attest-seals/<name>`, so the
+        // anchor directory is the base of the chain check (#10205).
+        let anchor = dir.parent().unwrap_or(dir);
         let lock = lock_path(seal);
+        // #10205: the scope-store precedent (`open_lock_file`): create every
+        // missing directory 0700 and check it, then check every directory
+        // from the lock's up to the anchor directory, before the open.
+        crate::identity::keypair::ensure_parent(&lock)
+            .with_context(|| format!("securing the {SEAL_WHAT} directory {}", dir.display()))?;
+        crate::identity::keypair::enforce_key_path_chain_secure(anchor, &lock).with_context(
+            || {
+                format!(
+                    "checking the key directories of the {SEAL_WHAT} lock {}",
+                    lock.display()
+                )
+            },
+        )?;
         let mut options = std::fs::OpenOptions::new();
         options.create(true).read(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -295,25 +316,57 @@ fn write_atomic(lock: &SealLock, rec: &SealRecord) -> Result<()> {
 /// What a seal write names in its errors.
 const SEAL_WHAT: &str = "row-attestation seal";
 
+/// What an advance did to the seal on disk (#10206).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealAdvance {
+    /// The merged seal equals the seal on disk: nothing was written and
+    /// nothing was synced.
+    Unchanged,
+    /// A new seal was written (there was none, or it moved up).
+    Written,
+}
+
 /// Move the seal at `path` up to `rec` (field-wise maximum with what it
 /// holds; it never moves back). The read and the write run under one
 /// [`SealLock`], so a concurrent advance never writes a seal built from a
-/// stale read (#10193).
+/// stale read (#10193). The same as [`advance_reporting`], without the
+/// report.
 ///
 /// # Errors
 ///
 /// The seal lock cannot be taken, an unreadable seal (it is never
 /// overwritten) or a write failure.
 pub fn advance(path: &Path, rec: &SealRecord) -> Result<()> {
+    advance_reporting(path, rec).map(|_: SealAdvance| ())
+}
+
+/// [`advance`], reporting whether it wrote. The read, the compare and the
+/// write all run under one [`SealLock`]: when the merged seal equals the
+/// seal on disk nothing is written and nothing is synced (#10206), and a
+/// concurrent real advance is never lost, because the compare reads the
+/// seal the lock protects.
+///
+/// # Errors
+///
+/// As [`advance`].
+pub fn advance_reporting(path: &Path, rec: &SealRecord) -> Result<SealAdvance> {
     let lock = SealLock::acquire(path)?;
     let next = match read(&lock.seal) {
         SealState::NotSealed => rec.clone(),
-        SealState::Sealed(old) => old.merged(rec),
+        SealState::Sealed(old) => {
+            let next = old.clone().merged(rec);
+            if next == old {
+                return Ok(SealAdvance::Unchanged);
+            }
+            next
+        }
         SealState::Unreadable { path, why } => {
             anyhow::bail!("the anchored seal {} cannot be read: {why}", path.display())
         }
     };
-    write_atomic(&lock, &next)
+    write_atomic(&lock, &next)?;
+    Ok(SealAdvance::Written)
 }
 
 /// Replace the seal at `path` with `rec` (a verified restore publishes an
@@ -386,19 +439,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn seal_write_refuses_a_planted_symlink_8950() {
-        let dir = tempfile::tempdir_in(
-            std::env::var_os("TMPDIR")
-                .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from),
-        )
-        .expect("tempdir");
+        let dir = scratch_10193();
         let rec = |hw: i64| SealRecord {
             high_water: hw,
             heads: BTreeMap::new(),
         };
-        let target = dir.path().join("outside");
+        // The real layout, `<anchor dir>/.row-attest-seals/<name>`, under a
+        // private anchor, so the #10205 chain check passes.
+        let seals = dir.path().join(SEAL_DIR);
+        let target = seals.join("outside");
         replace(&target, &rec(1)).expect("seal a regular file");
         let before = std::fs::read_to_string(&target).expect("read target");
-        let link = dir.path().join("seal");
+        let link = seals.join("seal");
         std::os::unix::fs::symlink(&target, &link).expect("plant symlink");
         let rows: [(fn(&Path, &SealRecord) -> Result<()>, String); 2] = [
             (
@@ -438,12 +490,22 @@ mod tests {
     /// Upper bound on a seal write once the lock is free.
     const FREE_BOUND_10193: std::time::Duration = std::time::Duration::from_secs(30);
 
+    /// A private (0700) scratch directory: it stands for the anchor
+    /// directory, which the #10205 chain check requires to be owner-only,
+    /// whatever the runner's umask.
     fn scratch_10193() -> tempfile::TempDir {
-        tempfile::tempdir_in(
-            std::env::var_os("TMPDIR")
-                .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from),
-        )
-        .expect("tempdir")
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        builder
+            .tempdir_in(
+                std::env::var_os("TMPDIR")
+                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from),
+            )
+            .expect("tempdir")
     }
 
     /// The lock file beside a seal: `<seal>.lock` (#10193).
@@ -944,6 +1006,40 @@ mod tests {
         advance(&seal, &higher).expect("a real advance");
         assert_ne!(stamp_10206(&seal).0, before.0, "a real advance writes");
         assert_eq!(read(&seal), SealState::Sealed(full.merged(&higher)));
+    }
+
+    /// #10206: [`advance_reporting`] reports `Written` for a first seal and
+    /// for a real advance, and `Unchanged` (with the seal file untouched)
+    /// for an equal, a lower and an empty record.
+    #[cfg(unix)]
+    #[test]
+    fn advance_reports_unchanged_and_written_10206() {
+        let scratch = scratch_10193();
+        let seal = scratch.path().join(SEAL_DIR).join("db");
+        let full = rec_10205(5, 7);
+        assert_eq!(
+            advance_reporting(&seal, &full).expect("first seal"),
+            SealAdvance::Written
+        );
+        let before = stamp_10206(&seal);
+        let lower = rec_10205(2, 1);
+        let none = SealRecord::default();
+        for (name, rec) in [("equal", &full), ("lower", &lower), ("empty", &none)] {
+            assert_eq!(
+                advance_reporting(&seal, rec).expect("an advance with nothing new"),
+                SealAdvance::Unchanged,
+                "{name}"
+            );
+            assert_eq!(stamp_10206(&seal), before, "{name}: the seal was rewritten");
+        }
+        let mut wider = full.clone();
+        wider.heads.insert("leases".to_string(), 1);
+        assert_eq!(
+            advance_reporting(&seal, &wider).expect("a new head"),
+            SealAdvance::Written
+        );
+        assert_ne!(stamp_10206(&seal).0, before.0, "a new head writes");
+        assert_eq!(read(&seal), SealState::Sealed(wider));
     }
 
     /// #10206: an advance with nothing new still reads and compares under
