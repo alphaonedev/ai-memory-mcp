@@ -1,3 +1,6 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
 //! Lib tests of the MCP session signer (#9926, #10012). They live in their
 //! own file so the #8950 raw-write census counts only production sites.
 
