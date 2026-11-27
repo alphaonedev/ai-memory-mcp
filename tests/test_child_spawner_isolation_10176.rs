@@ -503,7 +503,7 @@ const LIB_REDENY: &str = "#![deny(clippy::disallowed_methods)]";
 /// as the `paste` proc-macro dependency, but as a non-member path package it
 /// is compiled with capped lints and never linted. Its process starts (its
 /// `build.rs` runs `rustc --version`) are counted by
-/// tests/process_start_census_10176.rs (`OUTSIDE_LAYER_ONE`).
+/// `tests/process_start_census_10176.rs` (`OUTSIDE_LAYER_ONE`).
 const OTHER_CRATES: &[(&str, &str)] = &[
     (
         "fuzz",

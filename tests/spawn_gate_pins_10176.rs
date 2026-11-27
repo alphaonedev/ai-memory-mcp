@@ -9,10 +9,13 @@
 //! expectation is unfulfilled and the strict clippy gate turns red here.
 //!
 //! The Linux-only libc names are pinned under `cfg(target_os = "linux")`, and
-//! each target-only start or loader (BSD, Cygwin, Windows CRT, Haiku, VxWorks,
-//! PSP, WALI, glibc's dlmopen) under the cfg of the targets libc 0.2.191
-//! declares it for: the CI clippy jobs run on Linux glibc, and on another
-//! target those names do not exist.
+//! each target-only start or loader (BSD, Cygwin, `VxWorks`, PSP, WALI, the
+//! Windows CRT, Haiku and the glibc `dlmopen`) under the cfg of the targets
+//! libc 0.2.191 declares it for: the CI clippy jobs run on Linux glibc, and on
+//! another target those names do not exist. The 29 entries that do not exist
+//! on Linux glibc carry `allow-invalid = true` in `clippy.toml`, which drops
+//! only the unresolved-path warning there; the pins below still go red on a
+//! target that has the function if its entry stops resolving.
 //! No function here starts a process: none is called with arguments that reach
 //! the operating system, and the one test only takes each function value.
 

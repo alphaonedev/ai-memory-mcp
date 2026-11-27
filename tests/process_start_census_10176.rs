@@ -40,6 +40,7 @@ mod rust_lex;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use proptest_guard::{
@@ -353,10 +354,11 @@ fn libc_start_names() -> BTreeSet<&'static str> {
 fn aliases_in(toks: &[Lexed]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for k in 0..toks.len() {
-        if ident(toks, k) == Some("Command") && ident(toks, k + 1) == Some("as") {
-            if let Some(name) = ident(toks, k + 2).filter(|n| *n != "_") {
-                out.insert(name.to_string());
-            }
+        if ident(toks, k) == Some("Command")
+            && ident(toks, k + 1) == Some("as")
+            && let Some(name) = ident(toks, k + 2).filter(|n| *n != "_")
+        {
+            out.insert(name.to_string());
         }
         if ident(toks, k) == Some("type")
             && let Some(name) = ident(toks, k + 1)
@@ -811,7 +813,10 @@ fn in_package(rel: &str, packages: &[String]) -> bool {
 fn rust_files(tree: &Tree, errors: &mut Vec<String>) -> Vec<(String, Vec<Lexed>)> {
     let mut out = Vec::new();
     for (rel, bytes) in &tree.files {
-        if !rel.ends_with(".rs") {
+        if !Path::new(rel)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+        {
             continue;
         }
         match std::str::from_utf8(bytes) {
@@ -1102,7 +1107,10 @@ fn the_count_tables_are_exact_in_both_directions_10176() {
             "src/b.rs: 0 process-start sites, START_ROWS has 1; a new or removed start needs its row (#10176)".to_string(),
         ]
     );
-    assert!(compare_counts("START_ROWS", &have, [("src/a.rs", 2)].into_iter()).is_empty());
+    assert_eq!(
+        compare_counts("START_ROWS", &have, [("src/a.rs", 2)].into_iter()),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -1127,9 +1135,11 @@ fn a_nested_package_file_and_a_link_are_seen_10176() {
 fn the_census_is_linear_on_large_input_10176() {
     let mut text = String::from("#![allow(dead_code)]\n");
     for i in 0..20_000 {
-        text.push_str(&format!(
-            "#[expect(clippy::disallowed_methods)]\nfn f{i}() {{ std::process::Command::new(\"x\"); }}\nuse a::b{i};\n"
-        ));
+        writeln!(
+            text,
+            "#[expect(clippy::disallowed_methods)]\nfn f{i}() {{ std::process::Command::new(\"x\"); }}\nuse a::b{i};"
+        )
+        .expect("writing to a String cannot fail");
     }
     text.push_str("fn deep() ");
     text.push_str(&"{ ".repeat(20_000));
@@ -1996,12 +2006,171 @@ fn family_findings(clippy: &str) -> Vec<String> {
     out
 }
 
+/// The `disallowed-methods` entries that may carry `allow-invalid = true`,
+/// written out by hand: each is a libc 0.2.191 function that does not exist
+/// for x86_64-unknown-linux-gnu, the CI clippy target, so its entry would
+/// otherwise warn there. The flag drops only the unresolved-path warning, so
+/// it is an exact allowlist: an entry that resolves on Linux never carries it.
+const ALLOW_INVALID: &[&str] = &[
+    "libc::execvP",
+    "libc::exect",
+    "libc::rfork",
+    "libc::pdfork",
+    "libc::kld_load",
+    "libc::dlfork",
+    "libc::execlpe",
+    "libc::wexecl",
+    "libc::wexecle",
+    "libc::wexeclp",
+    "libc::wexeclpe",
+    "libc::wexecv",
+    "libc::wexecve",
+    "libc::wexecvp",
+    "libc::wexecvpe",
+    "libc::load_image",
+    "libc::load_add_on",
+    "libc::rtpSpawn",
+    "libc::sceKernelLoadExec",
+    "libc::sceKernelLoadModule",
+    "libc::sceKernelLoadModuleBufferUsbWlan",
+    "libc::sceKernelLoadModuleByID",
+    "libc::sceKernelLoadModuleMs",
+    "libc::sceUtilityLoadAvModule",
+    "libc::sceUtilityLoadModule",
+    "libc::sceUtilityLoadNetModule",
+    "libc::sceUtilityLoadUsbModule",
+    "libc::__syscall_SYS_execve",
+    "libc::__syscall_SYS_fork",
+];
+
+/// The exact form of the flag on an allowlisted entry.
+const ALLOW_INVALID_FORM: &str = "allow-invalid = true, reason = ";
+
+/// Findings for the `allow-invalid` flag in a `clippy.toml` text: any line
+/// that names the flag in any spelling (case, `_` for `-`) must be a one-line
+/// entry whose path is in [`ALLOW_INVALID`] and that holds
+/// [`ALLOW_INVALID_FORM`]; every [`ALLOW_INVALID`] path must carry it.
+fn allow_invalid_findings(clippy: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (i, line) in clippy.lines().enumerate() {
+        let norm = line.to_ascii_lowercase().replace('_', "-");
+        // A whole-line TOML comment cannot set a key.
+        if line.trim_start().starts_with('#') || !norm.contains("allow-invalid") {
+            continue;
+        }
+        let n = i + 1;
+        let path = line
+            .split("path = \"")
+            .nth(1)
+            .and_then(|r| r.split('"').next());
+        match path {
+            None => out.push(format!(
+                "clippy.toml:{n}: allow-invalid outside a one-line disallowed-methods entry (#10176)"
+            )),
+            Some(p) if !ALLOW_INVALID.contains(&p) => out.push(format!(
+                "clippy.toml:{n}: {p} carries allow-invalid but is not in ALLOW_INVALID; an entry that resolves on Linux glibc must warn when it stops resolving (#10176)"
+            )),
+            Some(p) if !line.contains(ALLOW_INVALID_FORM) => out.push(format!(
+                "clippy.toml:{n}: {p} names allow-invalid but not as `{ALLOW_INVALID_FORM}` (#10176)"
+            )),
+            Some(p) => {
+                seen.insert(p.to_string());
+            }
+        }
+    }
+    for p in ALLOW_INVALID {
+        if !seen.contains(*p) {
+            out.push(format!(
+                "clippy.toml: {p} is in ALLOW_INVALID but its entry does not carry allow-invalid = true (#10176)"
+            ));
+        }
+    }
+    out
+}
+
 #[test]
 fn every_libc_start_and_loader_family_has_a_clippy_entry_10176() {
     let text = std::fs::read_to_string(crate_root().join("clippy.toml"))
         .unwrap_or_else(|e| panic!("#10176: read clippy.toml: {e}"));
     let got = family_findings(&text);
     assert!(got.is_empty(), "#10176 libc families:\n{}", got.join("\n"));
+    let flags = allow_invalid_findings(&text);
+    assert!(
+        flags.is_empty(),
+        "#10176 allow-invalid:\n{}",
+        flags.join("\n")
+    );
+}
+
+#[test]
+fn allow_invalid_is_an_exact_allowlist_10176() {
+    let entry = |p: &str, flag: &str| format!("    {{ path = \"{p}\", {flag}reason = \"r\" }},\n");
+    let mut all = String::new();
+    for p in ALLOW_INVALID {
+        all.push_str(&entry(p, "allow-invalid = true, "));
+    }
+    all.push_str(&entry("libc::fork", ""));
+    assert_eq!(allow_invalid_findings(&all), Vec::<String>::new());
+    assert_eq!(
+        allow_invalid_findings(&format!(
+            "# the target-only entries carry allow-invalid = true\n{all}"
+        )),
+        Vec::<String>::new()
+    );
+    let last = ALLOW_INVALID.len() + 1;
+    let cases: [(String, Vec<String>); 5] = [
+        (
+            all.replace(
+                &entry("libc::fork", ""),
+                &entry("libc::fork", "allow-invalid = true, "),
+            ),
+            vec![format!(
+                "clippy.toml:{last}: libc::fork carries allow-invalid but is not in ALLOW_INVALID; an entry that resolves on Linux glibc must warn when it stops resolving (#10176)"
+            )],
+        ),
+        (
+            all.replace(
+                &entry("libc::fork", ""),
+                &entry("libc::fork", "ALLOW_INVALID=true, "),
+            ),
+            vec![format!(
+                "clippy.toml:{last}: libc::fork carries allow-invalid but is not in ALLOW_INVALID; an entry that resolves on Linux glibc must warn when it stops resolving (#10176)"
+            )],
+        ),
+        (
+            all.replace(
+                &entry("libc::rfork", "allow-invalid = true, "),
+                &entry("libc::rfork", ""),
+            ),
+            vec![
+                "clippy.toml: libc::rfork is in ALLOW_INVALID but its entry does not carry allow-invalid = true (#10176)"
+                    .to_string(),
+            ],
+        ),
+        (
+            all.replace(
+                &entry("libc::rfork", "allow-invalid = true, "),
+                &entry("libc::rfork", "allow-invalid = false, "),
+            ),
+            vec![
+                "clippy.toml:3: libc::rfork names allow-invalid but not as `allow-invalid = true, reason = ` (#10176)"
+                    .to_string(),
+                "clippy.toml: libc::rfork is in ALLOW_INVALID but its entry does not carry allow-invalid = true (#10176)"
+                    .to_string(),
+            ],
+        ),
+        (
+            format!("{all}    allow-invalid = true,\n"),
+            vec![format!(
+                "clippy.toml:{}: allow-invalid outside a one-line disallowed-methods entry (#10176)",
+                last + 1
+            )],
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(allow_invalid_findings(&text), want);
+    }
 }
 
 #[test]
@@ -2015,7 +2184,7 @@ fn a_missing_or_unlisted_libc_entry_is_red_10176() {
             all.push_str(&entry(n));
         }
     }
-    assert!(family_findings(&all).is_empty());
+    assert_eq!(family_findings(&all), Vec::<String>::new());
     let dropped = all.replace(&entry("dlmopen"), "");
     assert_eq!(
         family_findings(&dropped),

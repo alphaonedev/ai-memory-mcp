@@ -61,9 +61,13 @@ too-many-lines-threshold = 250
 # and Hurd only. tests/process_start_census_10176.rs
 # holds the hand-written family table (LIBC_FAMILIES) this list must equal.
 # clippy reports an entry that does not resolve as a warning that -D warnings
-# does not raise, so tests/spawn_gate_pins_10176.rs holds one expectation per
-# entry under the cfg of the targets that have it: an entry that stops
-# resolving turns clippy red there on that target.
+# does not raise. The 29 target-only entries (every libc entry after dlmopen)
+# do not exist on Linux glibc, the CI clippy target, so they carry
+# allow-invalid = true, which drops that warning and nothing else: on a target
+# that has the function the entry lints as usual. tests/spawn_gate_pins_10176.rs
+# holds one expectation per entry under the cfg of the targets that have it,
+# so an entry that stops resolving there turns clippy red on that target, and
+# tests/process_start_census_10176.rs pins every name against LIBC_FAMILIES.
 disallowed-methods = [
     { path = "std::process::Command::new", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
     { path = "tokio::process::Command::new", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
@@ -95,33 +99,33 @@ disallowed-methods = [
     { path = "libc::dlsym", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
     { path = "libc::dlvsym", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
     { path = "libc::dlmopen", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::execvP", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::exect", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::rfork", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::pdfork", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::kld_load", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::dlfork", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::execlpe", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexecl", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexecle", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexeclp", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexeclpe", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexecv", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexecve", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexecvp", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::wexecvpe", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::load_image", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::load_add_on", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::rtpSpawn", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceKernelLoadExec", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceKernelLoadModule", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceKernelLoadModuleBufferUsbWlan", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceKernelLoadModuleByID", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceKernelLoadModuleMs", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceUtilityLoadAvModule", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceUtilityLoadModule", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceUtilityLoadNetModule", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::sceUtilityLoadUsbModule", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::__syscall_SYS_execve", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
-    { path = "libc::__syscall_SYS_fork", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execvP", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::exect", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::rfork", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::pdfork", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::kld_load", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::dlfork", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execlpe", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexecl", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexecle", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexeclp", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexeclpe", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexecv", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexecve", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexecvp", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::wexecvpe", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::load_image", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::load_add_on", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::rtpSpawn", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceKernelLoadExec", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceKernelLoadModule", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceKernelLoadModuleBufferUsbWlan", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceKernelLoadModuleByID", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceKernelLoadModuleMs", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceUtilityLoadAvModule", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceUtilityLoadModule", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceUtilityLoadNetModule", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::sceUtilityLoadUsbModule", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::__syscall_SYS_execve", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::__syscall_SYS_fork", allow-invalid = true, reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
 ]
