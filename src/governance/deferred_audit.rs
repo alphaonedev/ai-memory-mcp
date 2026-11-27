@@ -5323,6 +5323,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool mkfifo, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     fn journal_rejects_fifo_event_without_opening_it() {
         let dir = fresh_tempdir();
         let journal_path = dir.path().join("fifo-event.journal");

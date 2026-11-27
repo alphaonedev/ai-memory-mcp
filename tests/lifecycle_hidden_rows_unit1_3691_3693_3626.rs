@@ -472,6 +472,10 @@ fn mcp_store_dedup_onto_an_unstamped_row_leaves_it_unstamped_3626() {
     );
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn mcp(
     db: &std::path::Path,
     home: &std::path::Path,

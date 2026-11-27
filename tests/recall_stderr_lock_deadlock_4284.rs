@@ -57,6 +57,10 @@ fn closed_loopback_port() -> u16 {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn recall_semantic_cold_cache_hub_down_terminates_4284() {
     let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("recall-4284-{}", uuid::Uuid::new_v4()));

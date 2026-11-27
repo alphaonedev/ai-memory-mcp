@@ -89,6 +89,10 @@ impl Sandbox {
         self.root.join("store.db")
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn base_command(&self, agent: &str, require: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.env_clear()
@@ -1041,6 +1045,10 @@ const VERDICT_LINE: &str = "STORE_VERDICT_10040=";
 /// operator's real HOME (umbrella #8175). No process-global environment of
 /// this test process is changed.
 #[cfg(feature = "sal")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn store_verdict(sb: &Sandbox, db: &Path, id: &str) -> bool {
     let out = Command::new(std::env::current_exe().expect("test binary path"))
         .env_clear()

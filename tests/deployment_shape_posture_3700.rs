@@ -73,6 +73,10 @@ fn leaf(root: &Path) -> common::tls::TestTls {
 /// A child with `config.toml` loading ENABLED (no `AI_MEMORY_NO_CONFIG`);
 /// `config_body` is written to `<XDG_CONFIG_HOME>/ai-memory/config.toml`
 /// when given, else no file exists and the declared shape is `singleton`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command_with_config(root: &Path, config_body: Option<&str>) -> Command {
     let keys = root.join("keys");
     std::fs::create_dir_all(&keys).expect("mkdir key sandbox");

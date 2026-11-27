@@ -398,6 +398,10 @@ impl Daemon {
         d
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn start_on(db_path: &Path) -> Self {
         let port = free_port();
         let tls = common::tls::shared(&std::env::temp_dir());

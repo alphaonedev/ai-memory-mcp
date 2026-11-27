@@ -67,6 +67,10 @@ fn verifier_bin() -> &'static PathBuf {
     BIN.get_or_init(build_verifier_once)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn build_verifier_once() -> PathBuf {
     let manifest_path = repo_root().join("tools/post-ship-converge/Cargo.toml");
     assert!(
@@ -117,6 +121,10 @@ fn build_verifier_once() -> PathBuf {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the ai-memory-post-ship-converge helper binary built from this repo by this test (child env isolation: #10183)"
+)]
 fn e2_dry_run_emits_well_formed_envelope() {
     if skip_under_llvm_cov() {
         return;
@@ -189,6 +197,10 @@ fn e2_dry_run_emits_well_formed_envelope() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the ai-memory-post-ship-converge helper binary built from this repo by this test (child env isolation: #10183)"
+)]
 fn e2_dry_run_supports_brew_install_method() {
     // The runbook documents three install methods (cargo / brew /
     // binary). Cover the brew path under --dry-run too so the
@@ -217,6 +229,10 @@ fn e2_dry_run_supports_brew_install_method() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the ai-memory-post-ship-converge helper binary built from this repo by this test (child env isolation: #10183)"
+)]
 fn e2_missing_version_flag_is_usage_error() {
     // Forgetting --version must be a hard usage error (exit 3), not a
     // silent default to "latest". The release captain MUST type the

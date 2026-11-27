@@ -21,6 +21,10 @@ const BACKUP_TS_FMT: &str = "%Y-%m-%dT%H%M%SZ";
 /// `snapshot_file::SYMLINK_REFUSAL_TAIL`.
 const TAIL: &str = "a symlink sits at that path and would be followed (#8950)";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(home: &Path, db: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")

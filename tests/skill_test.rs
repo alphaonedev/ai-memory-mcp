@@ -364,6 +364,10 @@ fn export_roundtrip_identical_digest() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool which, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn skills_ref_validate_skipped_if_not_installed() {
     // The agentskills.io reference validator (`skills-ref`) is an optional
     // external tool. Skip gracefully when not present.

@@ -555,6 +555,10 @@ mod http {
 // MCP stdio + CLI — the knob rides on the child's environment
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn mcp_call(path: &Path, home: &Path, mode: &str, tool: &str, args: &Value) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")
@@ -648,6 +652,10 @@ fn mcp_update_and_delete_follow_the_posture() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_consolidate_follows_the_posture() {
     for mode in [MODE_WARN, MODE_REFUSE] {
         let (dir, path) = fresh_db_path();
@@ -719,6 +727,10 @@ fn doctor_census_counts_unstamped_malformed_and_archived() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn boot_refuses_an_unrecognised_token_but_doctor_reports_it() {
     let (dir, path) = fresh_db_path();
     drop(db::open(&path).expect("init"));

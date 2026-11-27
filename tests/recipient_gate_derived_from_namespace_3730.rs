@@ -200,6 +200,10 @@ async fn sal_postgres_recipient_cannot_erase_a_non_inbox_row_addressed_to_it_373
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One `tools/call` against the real MCP stdio server, as `caller`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn mcp(
     db: &std::path::Path,
     home: &std::path::Path,

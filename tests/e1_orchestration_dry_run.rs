@@ -99,6 +99,10 @@ fn prebuilt_orchestrator() -> Option<PathBuf> {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn build_orchestrator_once() -> PathBuf {
     let manifest_path = repo_root().join("tools/t0-orchestrate/Cargo.toml");
     assert!(
@@ -167,6 +171,10 @@ fn build_orchestrator_once() -> PathBuf {
     bin
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the orchestrator helper binary built from this repo by this test (child env isolation: #10183)"
+)]
 fn run_dry_run() -> String {
     let bin = orchestrator_bin();
     let output = Command::new(bin)

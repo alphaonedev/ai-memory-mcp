@@ -288,6 +288,10 @@ fn scratch_dir() -> std::path::PathBuf {
 
 /// Spawn `ai-memory mcp` with the given `AI_MEMORY_AGENT_ID` disposition
 /// (`Some(v)` sets it, `None` removes it from the child env).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(agent_id: Option<&str>) -> (McpChild, ChildStdin, mpsc::Receiver<String>) {
     let dir = scratch_dir();
     let db = dir.join(format!("mcp-{}.db", uuid::Uuid::new_v4()));

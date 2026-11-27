@@ -24,6 +24,10 @@ mod child_stdin_report;
 /// Build the standard `ai-memory --db <tmp>` command shape with
 /// `AI_MEMORY_NO_CONFIG=1` set. The returned `Command` still needs the
 /// subcommand and any extra args.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
@@ -34,6 +38,10 @@ fn ai_memory(db: &std::path::Path) -> Command {
 
 /// Build a `std::process::Command` for the binary so callers can pipe
 /// to/from stdin / stdout (`assert_cmd::Command` doesn't surface those).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory_std(db: &std::path::Path) -> StdCommand {
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
@@ -43,6 +51,10 @@ fn ai_memory_std(db: &std::path::Path) -> StdCommand {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn binary_help_succeeds() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -55,6 +67,10 @@ fn binary_help_succeeds() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn binary_version_succeeds() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -67,6 +83,10 @@ fn binary_version_succeeds() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn each_subcommand_help() {
     // Parametrised: every subcommand from `Cli::Command` must accept
     // `--help` and exit 0. If a future subcommand is added without a
@@ -537,6 +557,10 @@ fn shell_quit_immediately() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn invalid_subcommand_errors_with_useful_message() {
     Command::cargo_bin("ai-memory")
         .unwrap()

@@ -75,6 +75,10 @@ fn permissive_attestation_for_tests() {
 /// Spawn `ai-memory mcp --tier keyword` and return the child + a worker
 /// thread reading stdout line-by-line into an mpsc channel. The caller
 /// can pop responses with a bounded `recv_timeout`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
     permissive_attestation_for_tests();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))

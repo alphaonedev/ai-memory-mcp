@@ -74,6 +74,10 @@ fn run_supersede(path: &std::path::Path) -> (String, String, serde_json::Value) 
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn sqlite_nonadmin_supersedes_stamps_only_the_callers_own_descendants_f1() {
     const CHILD: &str = "AI_MEMORY_F1_SQLITE_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -110,6 +114,10 @@ fn sqlite_nonadmin_supersedes_stamps_only_the_callers_own_descendants_f1() {
 /// Trust-all (no `AI_MEMORY_AGENT_ID`) is the single operator — admin-
 /// equivalent — so the whole closure is still stamped (non-regression).
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn sqlite_trust_all_operator_still_stamps_across_owners_f1() {
     const CHILD: &str = "AI_MEMORY_F1_SQLITE_TRUSTALL_CHILD";
     if std::env::var_os(CHILD).is_none() {

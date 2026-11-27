@@ -31,3 +31,57 @@ too-many-lines-threshold = 250
 # 86_400|604_800|7200|21600)` to catch the documented regression
 # patterns). See `scripts/check-vendor-literals.sh` for the full
 # discipline.
+
+# #10176 process-start gate, layer 1. The compiler resolves every path
+# before this lint runs, so a use alias, a grouped use, a re-export, a type
+# alias, a macro body, a path attribute, an include and a function pointer all
+# reach the same entry below. Every entry point that code in this repository
+# can call to start a process is listed, including the two #1937 audited
+# chokepoints, so a caller of a chokepoint is a reasoned site too. A justified site carries an
+# item-level `#[expect(clippy::disallowed_methods, reason = "...")]`: expect,
+# not allow, so a site that stops firing (an entry removed here, a clippy
+# change) turns the clippy gate red as an unfulfilled expectation.
+#
+# Layer 2 is the source ratchet tests/test_child_spawner_isolation_10176.rs:
+# it pins this exact list, counts every attribute that can silence the lint
+# against an exact per-file allowlist, and refuses extern blocks, asm and a
+# path or include target outside src/ and tests/.
+#
+# The libc names are the POSIX process-creation family (fork, vfork, the exec
+# family, posix_spawn, posix_spawnp, system, popen) plus the Linux clone,
+# daemon, forkpty, fexecve, execveat and the raw syscall entry, plus dlopen,
+# dlsym and dlvsym, which look any of those up by name at run time. clippy reports
+# an entry that does not resolve as a warning that -D warnings does not raise,
+# so tests/spawn_gate_pins_10176.rs holds one expectation per entry: an entry
+# that stops resolving turns clippy red there.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "tokio::process::Command::new", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "assert_cmd::Command::new", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "assert_cmd::Command::cargo_bin", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "assert_cmd::cargo::CommandCargoExt::cargo_bin", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "ai_memory::spawn_audit::audited_command", reason = "process start through the #1937 chokepoint: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "ai_memory::spawn_audit::audited_tokio_command", reason = "process start through the #1937 chokepoint: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::fork", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::vfork", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::clone", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::daemon", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::forkpty", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execl", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execle", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execlp", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execv", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execve", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execvp", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execvpe", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::fexecve", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::execveat", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::posix_spawn", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::posix_spawnp", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::system", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::popen", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::syscall", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::dlopen", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::dlsym", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+    { path = "libc::dlvsym", reason = "process start: needs an expect attribute and a row in tests/test_child_spawner_isolation_10176.rs (#10176)" },
+]

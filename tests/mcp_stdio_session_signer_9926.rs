@@ -85,6 +85,10 @@ impl Sandbox {
         self.root.join("keys")
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn base_command(&self, agent: &str, require: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.env_clear()

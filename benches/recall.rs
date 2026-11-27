@@ -4,6 +4,10 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::process::Command;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn binary_path() -> String {
     // Build the binary first, then find it
     let output = Command::new("cargo")
@@ -21,6 +25,10 @@ fn binary_path() -> String {
     format!("{target_dir}/release/ai-memory")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bench child: runs the ai-memory release binary built from this repo (child env isolation: #10183)"
+)]
 fn seed_memories(binary: &str, db_path: &str, count: usize) {
     for i in 0..count {
         let title = format!("bench-memory-{i}");
@@ -52,6 +60,10 @@ fn seed_memories(binary: &str, db_path: &str, count: usize) {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bench child: runs the ai-memory release binary built from this repo (child env isolation: #10183)"
+)]
 fn bench_recall(c: &mut Criterion) {
     let binary = binary_path();
     let dir = std::env::temp_dir();
@@ -124,6 +136,10 @@ fn bench_recall(c: &mut Criterion) {
     let _ = std::fs::remove_file(&db_path);
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bench child: runs the ai-memory release binary built from this repo (child env isolation: #10183)"
+)]
 fn bench_search(c: &mut Criterion) {
     let binary = binary_path();
     let dir = std::env::temp_dir();
@@ -175,6 +191,10 @@ fn bench_search(c: &mut Criterion) {
     let _ = std::fs::remove_file(&db_path);
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bench child: runs the ai-memory release binary built from this repo (child env isolation: #10183)"
+)]
 fn bench_insert(c: &mut Criterion) {
     let binary = binary_path();
     let dir = std::env::temp_dir();

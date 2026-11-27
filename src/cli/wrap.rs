@@ -320,6 +320,10 @@ fn spawn_and_wait(mut cmd: Command) -> Result<i32> {
 /// The caller MUST keep the returned `Option<NamedTempFile>` alive
 /// until after the child has exited; dropping it sooner unlinks the
 /// file mid-spawn on platforms where unlink-while-open is permitted.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "audited #1937 spawn of the agent program the operator names on the command line, a program not built from this repo, so outside the #10176 isolation gate"
+)]
 fn build_command_for_strategy(
     agent: &str,
     strategy: &WrapStrategy,
@@ -794,6 +798,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool false, true, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     fn wrap_passes_through_exit_code_via_status_propagation() {
         // We can't assume any specific binary is on PATH, but we can
         // exercise the propagation logic with a guaranteed-available

@@ -43,6 +43,10 @@ const MANAGED_PRETOOL_MATCHER: &str = "Bash|Edit|Write";
 /// Returns an `assert_cmd::Command` for `ai-memory install claude-code`
 /// with `AI_MEMORY_NO_CONFIG=1` so tests don't accidentally load the
 /// host's `~/.config/ai-memory/config.toml`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn install_cmd() -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
@@ -283,6 +287,10 @@ fn install_uninstall_round_trips() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn install_rejects_hook_flag_on_non_claude_code() {
     let tmp = TempDir::new().unwrap();
     let cfg = tmp.path().join("mcp.json");
@@ -454,6 +462,10 @@ fn installed_hook_smoke_test_invokes_check_action() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn install_help_mentions_hook_flag() {
     // Make sure clap renders `--hook` in `ai-memory install claude-code --help`.
     Command::cargo_bin("ai-memory")
@@ -470,6 +482,10 @@ fn install_help_mentions_hook_flag() {
 /// corrupt the binary's runtime environment). Smoke-level — just
 /// proves the binary remains operable.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn binary_remains_operable_after_install() {
     let tmp = TempDir::new().unwrap();
     let cfg = tmp.path().join("settings.json");

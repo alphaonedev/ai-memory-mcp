@@ -81,6 +81,10 @@ fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Pa
     (home.as_path(), keys.as_path())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
@@ -8408,6 +8412,10 @@ fn stderr_tail(path: &std::path::Path) -> String {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn health_is_200(port: u16) -> bool {
     std::process::Command::new("curl")
         .args([
@@ -8490,6 +8498,10 @@ fn wait_for_health_ceiling_is_sixty_seconds_3615() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     // Phase 3 Task 3b.1 — the grand slam.
     //
@@ -8654,6 +8666,10 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
 /// Generate a self-signed PEM cert + key pair at the given paths. Returns
 /// the (`cert_path`, `key_path`) tuple. Skips the test if openssl isn't on
 /// the PATH (rare on CI runners, but this keeps local-dev friendly).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool openssl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn gen_self_signed_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let cert = dir.join(format!("ai-memory-test-cert-{}.pem", uuid::Uuid::new_v4()));
     let key = dir.join(format!("ai-memory-test-key-{}.pem", uuid::Uuid::new_v4()));
@@ -8695,6 +8711,10 @@ fn gen_self_signed_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, st
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn test_serve_native_tls_health_probe() {
     // Layer 1 — `ai-memory serve --tls-cert ... --tls-key ...` must serve
     // the health endpoint over HTTPS (self-signed cert, --insecure probe).
@@ -8809,6 +8829,10 @@ fn build_mtls_probe_client(
 
 /// Compute SHA-256 fingerprint of a PEM cert's DER body via `openssl`
 /// (same CLI available on all CI runners). Returns hex without `:`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool openssl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn cert_sha256_fingerprint(cert_path: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("openssl")
         .args([
@@ -9061,6 +9085,10 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool kill, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn test_child_guard_kills_daemon_on_assert_panic() {
     // Regression: pre-fix, an `assert!` panic between spawn and the
     // manual cleanup at the bottom of a test would orphan the spawned
@@ -9187,6 +9215,10 @@ const CURL_PROBE_MAX_SECS: &str = "2";
 /// test. The point is a bound that exists, not a tight one.
 const CURL_REQUEST_MAX_SECS: &str = "30";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn curl_get(port: u16, path: &str) -> (String, serde_json::Value) {
     let out = std::process::Command::new("curl")
         .args([
@@ -9212,6 +9244,10 @@ fn curl_get(port: u16, path: &str) -> (String, serde_json::Value) {
 /// for any test that creates rows via `curl_post(.., Some(agent))`
 /// and reads them back — the round-trip needs a matching principal
 /// so the scope=private filter doesn't drop the rows.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn curl_get_as(port: u16, path: &str, agent_id: &str) -> (String, serde_json::Value) {
     let out = std::process::Command::new("curl")
         .args([
@@ -9258,6 +9294,10 @@ fn curl_post_as_admin(
     curl_post(port, path, body, Some(INTEGRATION_TEST_ADMIN))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn curl_post(
     port: u16,
     path: &str,
@@ -9300,6 +9340,10 @@ fn curl_post(
     (code.trim().to_string(), v)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn curl_delete(port: u16, path: &str, agent_id: Option<&str>) -> String {
     let mut args: Vec<String> = vec![
         "-s".into(),
@@ -9803,6 +9847,10 @@ fn http_notify_rejects_missing_payload() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn http_inbox_cross_source_agent_id_body_vs_query_vs_header() {
     // Cross-source agent_id — the inbox endpoint accepts the owner via
     // the query string OR an X-Agent-Id header. All three forms are
@@ -11712,6 +11760,10 @@ fn spawn_leader_with_timeout(
 }
 
 #[allow(dead_code)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn curl_put(
     port: u16,
     path: &str,
@@ -14019,6 +14071,10 @@ fn fixture_probe_child_9719() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn fixture_processes_get_distinct_loadable_key_dirs_9719() {
     let exe = std::env::current_exe().expect("current exe");
     let start_ms = std::time::SystemTime::now()

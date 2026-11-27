@@ -90,6 +90,10 @@ fn permissive_attestation_for_tests() {
     // the process lifetime, set before the caller issues any gated store.
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(db_path: &std::path::Path, mode: &str) -> (McpChild, mpsc::Receiver<String>) {
     permissive_attestation_for_tests();
     let key_dir = db_path
@@ -348,6 +352,10 @@ fn mcp_store_verbatim_under_off_g29() {
 
 /// (a, CLI surface) `ai-memory store` refuses a credential under `refuse`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_store_refuses_credential_under_refuse_g29() {
     let db_path = unique_db();
     let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))

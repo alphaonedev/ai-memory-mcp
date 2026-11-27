@@ -23,6 +23,10 @@ use assert_cmd::Command;
 /// one phrase fails loudly with a clear diff, rather than a single
 /// long-string match that obscures which phrase went missing.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn serve_help_documents_tier_resolution() {
     let assert = Command::cargo_bin("ai-memory")
         .unwrap()
@@ -56,6 +60,10 @@ fn serve_help_documents_tier_resolution() {
 /// with a clap-style "unexpected argument" error, not silently accept
 /// the flag and ignore it. Pins the negative half of #703.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn serve_rejects_tier_flag() {
     let assert = Command::cargo_bin("ai-memory")
         .unwrap()

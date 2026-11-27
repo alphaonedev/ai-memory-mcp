@@ -100,6 +100,10 @@ fn doctor_json(store_url: &str, home: &std::path::Path) -> serde_json::Value {
     doctor_json_env(store_url, home, &[])
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn doctor_json_env(
     store_url: &str,
     home: &std::path::Path,
@@ -373,6 +377,10 @@ fn pgsslmode_env_cannot_change_the_outcome_4434() {
 /// #4434 - the enterprise posture check #15 reads the SAME verdict: a bypass
 /// shape must FAIL it (never `sslmode=verify-full=true`).
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn enterprise_posture_check_15_fails_every_parser_differential_dsn_4434() {
     let home = tempfile::tempdir().expect("scratch HOME");
     let mut shapes = bypass_urls(5432);

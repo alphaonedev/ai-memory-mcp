@@ -122,6 +122,10 @@ fn capture_subscriber(sink: &Capture) -> impl tracing::Subscriber + Send + Sync 
         .finish()
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_bin(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String) {
     let home = dir.join("home");
     std::fs::create_dir_all(home.join(".config")).expect("scratch home");

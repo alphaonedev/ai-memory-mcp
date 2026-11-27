@@ -81,6 +81,10 @@ impl Drop for ChildGuard {
 /// Spawn a stock `ai-memory serve` under the `asi-hard` posture and return
 /// every line it emitted on stdout+stderr until `needle` appeared, the child
 /// exited, or the budget elapsed.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
     let dir = scratch("serve-banner");
     let db = dir.path().join("ai-memory.db");
@@ -183,6 +187,10 @@ fn stock_serve_console_renders_the_boot_posture_banner_2908() {
 /// The install is SCOPED: a CLI one-shot must still render no tracing output,
 /// so every non-daemon subcommand's stdout/stderr stays byte-identical.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_one_shot_still_installs_no_console_subscriber_2908() {
     let dir = scratch("cli-oneshot");
     let db = dir.path().join("ai-memory.db");

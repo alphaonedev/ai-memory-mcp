@@ -207,6 +207,10 @@ const RECORDER_CHILD_MARKER: &str = "AI_MEMORY_TEST_AUDIT_L4_RECORDER_CHILD";
 const RECORDER_CHILD_TEST: &str = "recorder_unenrolled_child_l4";
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn recorder_unenrolled_row_under_pin_dirties_l4() {
     // Parent: re-exec THIS test binary, pointing the recorder custody dir at a
     // guaranteed-EMPTY temp dir and clearing the pubkey env, so the child

@@ -18,6 +18,10 @@ fn scratch_root() -> String {
     std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run(db: &Path, sync: &str, args: &[&str], input: &str) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     command

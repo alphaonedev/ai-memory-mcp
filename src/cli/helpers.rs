@@ -65,6 +65,10 @@ pub fn resolve_namespace(explicit: Option<String>) -> String {
 /// 1. `git remote get-url origin` — repo name (strip trailing `.git`)
 /// 2. `current_dir`'s file_name component
 /// 3. The literal "global" fallback
+#[expect(
+    clippy::disallowed_methods,
+    reason = "audited #1937 spawn of the system tool git, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 pub fn auto_namespace() -> String {
     // #1937 V08-PE-3 — route the production `git` spawn through the audited
     // chokepoint so it emits a signed `process.spawn_audited` row (argv0 +

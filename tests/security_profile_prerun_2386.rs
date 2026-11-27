@@ -77,6 +77,10 @@ fn enforcement_is_pre_runtime_and_absent_from_the_async_body_2386() {
 /// below its hard floor under `asi-hard`) still aborts the boot after the
 /// relocation — now from the pre-runtime phase of `fn main()`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn below_floor_abort_still_fires_after_relocation_2386() {
     // Scratch under the repo's gitignored .local-runs/ (project no-/tmp
     // HARD RULE), mirroring tests/security_profile_dispatch_1961.rs.

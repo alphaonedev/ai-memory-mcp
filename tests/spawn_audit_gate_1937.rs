@@ -249,6 +249,10 @@ fn emit_is_a_first_class_verifiable_event() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "builds an audited Command for the system tool true and never spawns it; pins the #1937 audit row (#10176 gate row)"
+)]
 fn chokepoint_emits_via_seeded_db_path() {
     // Exercise the FULL production chokepoint path: seed the process-wide audit
     // DB, then mint a Command via `audited_command` and confirm the best-effort

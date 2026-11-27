@@ -12,6 +12,10 @@ use std::process::Output;
 
 /// Run `ai-memory bench <args...>` with the process env pinned to
 /// `AI_MEMORY_NO_CONFIG=1`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_bench(args: &[&str]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.arg("bench");

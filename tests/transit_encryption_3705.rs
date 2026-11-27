@@ -80,6 +80,10 @@ fn command(root: &Path) -> Command {
 /// [`command`] with an optional `config.toml` body written under the
 /// sandbox's XDG config dir (and `AI_MEMORY_NO_CONFIG` left unset so the
 /// binary reads it) — the way an operator DECLARES a deployment shape.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command_with_config(root: &Path, config_body: Option<&str>) -> Command {
     let keys = root.join("keys");
     std::fs::create_dir_all(&keys).expect("mkdir key sandbox");
@@ -880,6 +884,10 @@ fn dead_child_is_reported_immediately_7341() {
 /// long pre-listen one.
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool sh, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn listen_signal_switches_to_the_short_budget_7341() {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(format!(

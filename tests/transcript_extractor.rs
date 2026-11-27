@@ -124,6 +124,10 @@ fn bin_copy_pid(name: &str) -> Option<u32> {
 /// `Ok(false)` when it does not, `Err` when the probe itself could not run
 /// (fail closed: the caller must not treat that as dead). The caller logs the
 /// error with the copy path (ERRORS-07). No new dependency.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool kill, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn pid_probe(pid: u32) -> std::io::Result<bool> {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -243,6 +247,10 @@ fn prepare_private_copy(src: &Path, dir: &Path) -> PathBuf {
     install_private_copy(src, dir, std::process::id())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn build_extractor_once() -> PathBuf {
     let manifest_path = std::env::current_dir()
         .expect("cwd")
@@ -334,6 +342,10 @@ fn build_extractor_once() -> PathBuf {
 
 /// Pipe `envelope` to the extractor in one-shot mode and return
 /// the parsed decision JSON.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the transcript-extractor helper binary built from this repo by this test (child env isolation: #10183)"
+)]
 fn run_once(bin: &Path, envelope: &Value) -> Value {
     // v1.0.0 #3140 — stdout/stderr go to FILES, not pipes. `wait_with_output`
     // reads both pipes to EOF with no deadline, so an extractor that never
@@ -529,6 +541,10 @@ fn concurrent_child_7342() {
 /// This test launches `CONCURRENT_PROCESSES_7342` such processes at once and
 /// fails if any of them observed a missing or unspawnable binary.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn concurrent_builds_never_lose_the_uplifted_binary_7342() {
     if std::env::var_os(CHILD_MARKER_ENV_7342).is_some() {
         return;
@@ -649,6 +665,10 @@ fn prune_decision_fails_closed_when_probe_unavailable_7342() {
 }
 
 /// #7342 - the pid of a child that has already exited (dead, not reused yet).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool true, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn dead_pid_7342() -> u32 {
     let mut child = Command::new("true").spawn().expect("spawn true");
     let pid = child.id();

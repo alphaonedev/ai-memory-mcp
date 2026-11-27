@@ -87,6 +87,10 @@ fn uid(prefix: &str) -> String {
 /// is NOT scoped by the verified DB) reads no stray anchor from the
 /// host's real audit dir — otherwise a real watermark higher than the
 /// (empty / freshly-seeded) chain head would falsely dirty the verify.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let audit_dir = db.parent().expect("db has a parent dir");
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();

@@ -217,6 +217,10 @@ fn tls_fixture_directory_is_private_8293() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: re-runs the ai-memory binary command built by tests/common/tls_serve.rs with a changed port (child env isolation: #10183)"
+)]
 fn helper_readiness_rejects_a_foreign_tls_listener_8293() {
     let foreign_tmp = tempfile::tempdir().unwrap();
     let foreign = tls_serve::spawn_serve(&foreign_tmp.path().join("foreign.db"), unsigned_requests);

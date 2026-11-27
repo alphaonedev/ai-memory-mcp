@@ -41,6 +41,10 @@ fn key_dir_0700(root: &Path) -> std::path::PathBuf {
     dir
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cmd(root: &Path, db: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     c.env_clear()

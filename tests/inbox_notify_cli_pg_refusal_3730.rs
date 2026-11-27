@@ -29,6 +29,10 @@ const RECIPIENT: &str = "ai:recipient-3730";
 /// Never connected: port 1 on loopback; the guard refuses on the scheme.
 const PG_STORE_URL: &str = "postgres://ai_memory:hunter2@127.0.0.1:1/ai_memory_3730";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn command(root: &Path, agent: &str, store_url: Option<&str>) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env_clear()

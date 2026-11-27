@@ -72,6 +72,10 @@ fn db_path(home: &Path) -> PathBuf {
 
 /// An MCP child, isolated: own config (flat trail off, forensic dir here),
 /// own key dir, own db, the writer slowed.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int]) -> Child {
     let config_root = home.join(".config").join("ai-memory");
     std::fs::create_dir_all(&config_root).expect("create config root");
@@ -246,6 +250,10 @@ impl Session {
         serde_json::from_str(&line).expect("json response")
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool kill, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     fn signal(&self, name: &str) {
         let status = Command::new("kill")
             .args(["-s", name, &self.child.id().to_string()])
@@ -748,6 +756,10 @@ fn burst_delete(id: u64) -> Value {
 /// plus the ACKNOWLEDGED deletes (no processed request went unacknowledged, no
 /// acknowledged one lost its row), and the chain is unbroken.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool kill, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
     const BURST: u64 = 120;
     for round in 0..6_u64 {

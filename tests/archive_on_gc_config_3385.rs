@@ -125,6 +125,10 @@ fn resolver_precedence_and_source_3385() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_gc_honours_v2_archive_policy_3385() {
     for (body, archive, source) in CASES {
         let archive = *archive;

@@ -291,6 +291,10 @@ fn hook_gates_all_three_insert_paths() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn cli_one_shot_does_not_install_hook() {
     // Project-local scratch DB (no /tmp writes — CLAUDE.md hard rule).
     let db_path = scratch_db("ai-memory-l16e-cli");
@@ -403,6 +407,10 @@ const BIND_IN_USE_MARKER: &str = "Address already in use";
 /// a retryable port collision is told apart from a genuine startup crash,
 /// which is surfaced immediately with its stderr. Returns the live child
 /// and its bound port.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_healthy_serve(
     bin: &str,
     db_path: &std::path::Path,
@@ -502,6 +510,10 @@ const READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(100
 
 /// `true` once `/health` answers 200; `false` when the child exited or the
 /// hang guard tripped (the caller reaps the child and reports its stderr).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn wait_for_health(child: &mut std::process::Child, port: u16, tls: &common::tls::TestTls) -> bool {
     let deadline = std::time::Instant::now() + BOOT_HANG_GUARD;
     while std::time::Instant::now() < deadline {
@@ -532,6 +544,10 @@ fn wait_for_health(child: &mut std::process::Child, port: u16, tls: &common::tls
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn refusal_maps_to_http_403() {
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};

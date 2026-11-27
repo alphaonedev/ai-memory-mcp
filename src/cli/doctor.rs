@@ -4803,6 +4803,10 @@ fn gpu_policy_warn_applicable(backend: &str, gpu_detected: bool) -> bool {
 /// returning success. Any failure (binary missing, driver absent,
 /// non-zero exit) is treated as no-GPU. Deliberately simple — the
 /// GPU-policy WARN is advisory, not load-bearing.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "audited #1937 spawn of the system tool nvidia-smi, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn nvidia_gpu_detected() -> bool {
     // #1937 V08-PE-3 — audited chokepoint: emits a signed `process.spawn_audited`
     // row (argv0 + caller) before the best-effort `nvidia-smi` probe spawns.

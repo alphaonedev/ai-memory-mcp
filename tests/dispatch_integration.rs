@@ -51,6 +51,10 @@ use tempfile::TempDir;
 /// goes through this so `AI_MEMORY_NO_CONFIG=1` is set uniformly and
 /// the global `--db` flag is wired before the subcommand argv. The
 /// returned `Command` still needs the subcommand and any extra args.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
@@ -62,6 +66,10 @@ fn ai_memory(db: &Path) -> Command {
 
 /// Same shape but without a `--db` flag for tests where the DB is not
 /// load-bearing (install, help, unknown-command).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory_bare() -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1");

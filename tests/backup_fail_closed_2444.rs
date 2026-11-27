@@ -63,6 +63,10 @@ const PG_STORE_URL: &str = "postgres://ai_memory:hunter2@127.0.0.1:1/ai_memory";
 /// The literal secret inside [`PG_STORE_URL`]; must never appear in output.
 const PG_PASSWORD: &str = "hunter2";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
     cmd.env("AI_MEMORY_NO_CONFIG", "1")

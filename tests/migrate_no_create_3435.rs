@@ -35,6 +35,10 @@ use ai_memory::models::{
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore};
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run(dir: &Path, args: &[&str]) -> Output {
     let home = dir.join("home");
     std::fs::create_dir_all(home.join(".config")).expect("scratch home");

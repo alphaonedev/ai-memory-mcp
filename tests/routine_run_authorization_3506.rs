@@ -31,6 +31,10 @@ struct Mcp {
 }
 
 impl Mcp {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn start(path: &std::path::Path, home: &std::path::Path) -> Self {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"))
             .arg("--db")
@@ -106,6 +110,10 @@ impl Drop for Mcp {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn run_cases(test: &str) -> Option<String> {
     if let Ok(case) = std::env::var(CASE) {
         return Some(case);

@@ -45,6 +45,10 @@ fn scratch_home() -> PathBuf {
 /// Build a `Command` for the built binary with a CLEAN environment carrying
 /// only the armed enterprise-federation posture gate (nothing that would make
 /// the posture PASS), so `evaluate()` reports a FAIL on the default config.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn armed_failing_cmd(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env_clear();

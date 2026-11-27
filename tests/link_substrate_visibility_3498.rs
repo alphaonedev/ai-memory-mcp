@@ -8,6 +8,10 @@ use ai_memory::models::Memory;
 use serde_json::json;
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn link_target_substrate_gate_3498() {
     const CHILD: &str = "AI_MEMORY_LINK_3498_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -97,6 +101,10 @@ fn link_target_substrate_gate_3498() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn named_kg_namespace_preserves_owner_gate_3498() {
     const CHILD: &str = "AI_MEMORY_KG_3498_CHILD";
     if std::env::var_os(CHILD).is_none() {

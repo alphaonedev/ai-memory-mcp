@@ -2069,6 +2069,10 @@ mod tests {
     /// the child search only `dir` for `git`, so a test runs the "no `git`
     /// binary" row of the skip table without touching this process's
     /// environment.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool git, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     fn docs_census_git_on(
         root: &std::path::Path,
         args: &[&str],

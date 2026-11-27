@@ -37,6 +37,10 @@ use std::process::Output;
 /// Run `ai-memory --db <db> <args...>` with `AI_MEMORY_NO_CONFIG=1` plus the
 /// caller-supplied env overrides (the posture knobs). Returns the captured
 /// [`Output`].
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_ai_memory(db_path: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.arg("--db").arg(db_path);

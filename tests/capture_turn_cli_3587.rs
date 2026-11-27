@@ -45,6 +45,10 @@ fn run_cli(db: &Path, args: &[&str], stdin: &str) -> Output {
 /// As [`run_cli`], with extra child-process environment pairs layered on
 /// top (used to pin `AI_MEMORY_SECRET_SCREEN_MODE=redact` for the
 /// storage-form dedup probe).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_cli_env(db: &Path, args: &[&str], stdin: &str, extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")

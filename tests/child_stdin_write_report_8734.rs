@@ -71,6 +71,10 @@ fn spawn_locked(command: &mut Command) -> Child {
     command.spawn().expect("spawn fixture child")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs the system tool sh, a binary not built from this repo, so outside the #10176 isolation gate"
+)]
 fn sh(script: &str) -> Child {
     spawn_locked(
         Command::new("sh")
@@ -163,6 +167,10 @@ fn early_exit_through_send_and_close_panics_with_the_cause_8734() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn early_exit_of_the_product_binary_names_its_stderr_8734() {
     // The #8734 shape itself: the product binary refuses an invalid `--db`
     // path and exits before it reads the request.

@@ -82,6 +82,10 @@ fn scratch(tag: &str) -> TempDir {
         .expect("tempdir under .local-runs")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn run_bin(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String) {
     let home = dir.join("home");
     std::fs::create_dir_all(home.join(".config")).expect("scratch home");
@@ -287,6 +291,10 @@ fn floor_refuses_every_ambiguous_dsn_6096() {
 /// store scheme (`POSTGRES://`) to `url_origin`, which printed the
 /// credential bytes of an ambiguous DSN. It must reach `store_url_display`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn config_show_effective_redacts_a_case_variant_store_scheme_6102() {
     for scheme in ["POSTGRES", "Postgres", "postgres"] {
         let root = scratch("cfg-show");

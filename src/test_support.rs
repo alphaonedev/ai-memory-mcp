@@ -890,6 +890,10 @@ impl<'s> SandboxedTestChild<'s> {
     ///
     /// # Panics
     /// Panics if the test binary's path cannot be resolved.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one #10176 sandboxed test child: re-runs this test binary with an env built from nothing inside a TestSandbox (#10176 gate row)"
+    )]
     pub(crate) fn new(caller: &str, sandbox: &'s TestSandbox) -> Self {
         let mut command = crate::spawn_audit::audited_command(
             std::env::current_exe().expect("current_exe for sandboxed test child"),

@@ -344,6 +344,10 @@ fn child_mints_process_clone_6570() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn process_clone_is_dropped_at_exit_6570() {
     // Review r2 L2: with the flag on and no wrapper, the clone the helper mints
     // for the process must be gone once the test binary exits.
@@ -453,6 +457,10 @@ fn child_publish_blocked_6889() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "re-runs this test binary as a child process (child env isolation: #10183)"
+)]
 fn mint_fails_closed_and_drops_clone_on_env_lock_timeout_6889() {
     // #6889: pin the CALLER side of #6571. When the publish cannot take the env
     // lock, `mint_for_process` must fail the mint (so `isolated_url()` panics

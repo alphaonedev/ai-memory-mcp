@@ -326,6 +326,10 @@ fn hex_digest(bytes: &[u8]) -> String {
 ///
 /// A spawn failure. A non-zero exit or a timeout is LOGGED, not propagated:
 /// a broken hook must not stop the listener from reading its inbox.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "audited #1937 spawn of the system shell running the operator's configured wake hook, a program not built from this repo, so outside the #10176 isolation gate"
+)]
 pub async fn run_exec_hook(
     cmd: &str,
     resolved: &Resolved,

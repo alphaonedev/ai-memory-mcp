@@ -89,6 +89,10 @@ fn permissive_attestation_for_tests() {
     // the process lifetime, set before the caller issues any gated store.
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn spawn_mcp(db_path: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
     permissive_attestation_for_tests();
     // Hermetic key-dir isolation. `resolve_operator_pubkey()` searches the

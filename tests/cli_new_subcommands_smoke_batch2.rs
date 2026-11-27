@@ -57,6 +57,10 @@ const NEW_SUBCOMMANDS: &[&str] = &[
 // ─── --help smoke for every new subcommand ────────────────────────
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_all_new_subcommands_help_exits_ok() {
     for name in NEW_SUBCOMMANDS {
         Command::cargo_bin("ai-memory")
@@ -71,6 +75,10 @@ fn fxc3_all_new_subcommands_help_exits_ok() {
 // ─── Top-level --help must list every new subcommand ─────────────
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_top_level_help_lists_all_new_subcommands() {
     let assert = Command::cargo_bin("ai-memory")
         .unwrap()
@@ -90,6 +98,10 @@ fn fxc3_top_level_help_lists_all_new_subcommands() {
 // ─── Missing-required-arg → non-zero exit, stable error ──────────
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_reflect_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -100,6 +112,10 @@ fn fxc3_reflect_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_subscribe_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -110,6 +126,10 @@ fn fxc3_subscribe_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_unsubscribe_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -120,6 +140,10 @@ fn fxc3_unsubscribe_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_subscription_replay_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -130,6 +154,10 @@ fn fxc3_subscription_replay_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_notify_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -140,6 +168,10 @@ fn fxc3_notify_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_ingest_multistep_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -150,6 +182,10 @@ fn fxc3_ingest_multistep_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_kg_invalidate_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -160,6 +196,10 @@ fn fxc3_kg_invalidate_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_kg_timeline_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -170,6 +210,10 @@ fn fxc3_kg_timeline_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_entity_register_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -180,6 +224,10 @@ fn fxc3_entity_register_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_entity_get_by_alias_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -190,6 +238,10 @@ fn fxc3_entity_get_by_alias_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_dependents_of_invalidated_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -200,6 +252,10 @@ fn fxc3_dependents_of_invalidated_missing_required_args_fails() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_reflection_origin_missing_required_args_fails() {
     Command::cargo_bin("ai-memory")
         .unwrap()
@@ -213,6 +269,10 @@ fn fxc3_reflection_origin_missing_required_args_fails() {
 
 /// `list-subscriptions --json` against an empty DB returns `count: 0`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_list_subscriptions_empty_db_json_envelope() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")
@@ -228,6 +288,10 @@ fn fxc3_list_subscriptions_empty_db_json_envelope() {
 
 /// `subscription-dlq-list --json` empty-DB shape.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_subscription_dlq_list_empty_db_json_envelope() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")
@@ -248,6 +312,10 @@ fn fxc3_subscription_dlq_list_empty_db_json_envelope() {
 
 /// `inbox --json --agent-id ai:alice` empty-DB shape.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_inbox_empty_db_json_envelope() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")
@@ -270,6 +338,10 @@ fn fxc3_inbox_empty_db_json_envelope() {
 
 /// `quota-status --json` empty-DB shape.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_quota_status_empty_db_json_envelope() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")
@@ -286,6 +358,10 @@ fn fxc3_quota_status_empty_db_json_envelope() {
 /// `subscription-replay --subscription-id unknown --since RFC3339` —
 /// caller-ownership gate returns `count: 0` envelope, not an error.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_subscription_replay_unknown_id_returns_empty_envelope() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")
@@ -310,6 +386,10 @@ fn fxc3_subscription_replay_unknown_id_returns_empty_envelope() {
 
 /// `entity-register` → round-trips to `entity-get-by-alias`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_entity_register_then_get_by_alias_roundtrip() {
     let (_dir, db) = fresh_db();
     Command::cargo_bin("ai-memory")
@@ -353,6 +433,10 @@ fn fxc3_entity_register_then_get_by_alias_roundtrip() {
 
 /// `dependents-of-invalidated --memory-id nope` → empty envelope.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_dependents_of_invalidated_unknown_id_returns_empty() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")
@@ -376,6 +460,10 @@ fn fxc3_dependents_of_invalidated_unknown_id_returns_empty() {
 /// `ingest-multistep --content X --json` — tier-locked advisory
 /// on the keyword tier (default for CLI without config).
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn fxc3_ingest_multistep_tier_locked_returns_envelope() {
     let (_dir, db) = fresh_db();
     let assert = Command::cargo_bin("ai-memory")

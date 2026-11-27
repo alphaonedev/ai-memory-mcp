@@ -106,6 +106,10 @@ impl Fixture {
             .expect("fixture row")
             .id
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+    )]
     fn command(&self, caller: Option<&str>) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         command

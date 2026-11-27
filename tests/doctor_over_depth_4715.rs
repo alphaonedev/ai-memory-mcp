@@ -23,6 +23,10 @@ mod common;
 
 const MAX: usize = 8;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)"
+)]
 fn ai_memory(db: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
     let keys = db.parent().expect("db in a tempdir").join("keys-4715");
