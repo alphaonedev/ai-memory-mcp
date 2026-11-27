@@ -8,8 +8,11 @@
 //! entry stops resolving, the lint no longer fires in its function, the
 //! expectation is unfulfilled and the strict clippy gate turns red here.
 //!
-//! The Linux-only libc names are pinned under `cfg(target_os = "linux")`: the
-//! CI clippy jobs run on Linux, and on another target those names do not exist.
+//! The Linux-only libc names are pinned under `cfg(target_os = "linux")`, and
+//! each target-only start or loader (BSD, Cygwin, Windows CRT, Haiku, VxWorks,
+//! PSP, WALI, glibc's dlmopen) under the cfg of the targets libc 0.2.191
+//! declares it for: the CI clippy jobs run on Linux glibc, and on another
+//! target those names do not exist.
 //! No function here starts a process: none is called with arguments that reach
 //! the operating system, and the one test only takes each function value.
 
@@ -135,11 +138,86 @@ libc_pins! {
     pin_libc_dlsym => dlsym;
     #[cfg(target_os = "linux")]
     pin_libc_dlvsym => dlvsym;
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "hurd"))]
+    pin_libc_dlmopen => dlmopen;
+    #[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "dragonfly"))]
+    #[allow(non_snake_case)]
+    pin_libc_execvP => execvP;
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    pin_libc_exect => exect;
+    #[cfg(target_os = "freebsd")]
+    pin_libc_rfork => rfork;
+    #[cfg(target_os = "freebsd")]
+    pin_libc_pdfork => pdfork;
+    #[cfg(target_os = "freebsd")]
+    pin_libc_kld_load => kld_load;
+    #[cfg(target_os = "cygwin")]
+    pin_libc_dlfork => dlfork;
+    #[cfg(windows)]
+    pin_libc_execlpe => execlpe;
+    #[cfg(windows)]
+    pin_libc_wexecl => wexecl;
+    #[cfg(windows)]
+    pin_libc_wexecle => wexecle;
+    #[cfg(windows)]
+    pin_libc_wexeclp => wexeclp;
+    #[cfg(windows)]
+    pin_libc_wexeclpe => wexeclpe;
+    #[cfg(windows)]
+    pin_libc_wexecv => wexecv;
+    #[cfg(windows)]
+    pin_libc_wexecve => wexecve;
+    #[cfg(windows)]
+    pin_libc_wexecvp => wexecvp;
+    #[cfg(windows)]
+    pin_libc_wexecvpe => wexecvpe;
+    #[cfg(target_os = "haiku")]
+    pin_libc_load_image => load_image;
+    #[cfg(target_os = "haiku")]
+    pin_libc_load_add_on => load_add_on;
+    #[cfg(target_os = "vxworks")]
+    #[allow(non_snake_case)]
+    pin_libc_rtpSpawn => rtpSpawn;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceKernelLoadExec => sceKernelLoadExec;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceKernelLoadModule => sceKernelLoadModule;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceKernelLoadModuleBufferUsbWlan => sceKernelLoadModuleBufferUsbWlan;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceKernelLoadModuleByID => sceKernelLoadModuleByID;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceKernelLoadModuleMs => sceKernelLoadModuleMs;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceUtilityLoadAvModule => sceUtilityLoadAvModule;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceUtilityLoadModule => sceUtilityLoadModule;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceUtilityLoadNetModule => sceUtilityLoadNetModule;
+    #[cfg(target_os = "psp")]
+    #[allow(non_snake_case)]
+    pin_libc_sceUtilityLoadUsbModule => sceUtilityLoadUsbModule;
+    #[cfg(all(target_os = "linux", target_env = "musl", target_arch = "wasm32"))]
+    #[allow(non_snake_case)]
+    pin_libc___syscall_SYS_execve => __syscall_SYS_execve;
+    #[cfg(all(target_os = "linux", target_env = "musl", target_arch = "wasm32"))]
+    #[allow(non_snake_case)]
+    pin_libc___syscall_SYS_fork => __syscall_SYS_fork;
 }
 
-/// The number of `clippy.toml` `disallowed-methods` entries pinned on Linux.
-#[cfg(target_os = "linux")]
-const LINUX_PIN_COUNT: usize = 29;
+/// The number of `clippy.toml` `disallowed-methods` entries pinned on the CI
+/// clippy target, Linux glibc: the 29 POSIX and Linux entries plus dlmopen.
+/// Every other target-only entry is pinned under the cfg of its targets.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const LINUX_PIN_COUNT: usize = 30;
 
 #[test]
 fn every_pin_names_a_function_value_and_none_is_called() {
@@ -157,6 +235,6 @@ fn every_pin_names_a_function_value_and_none_is_called() {
     for pin in named.iter().chain(LIBC_PINS) {
         assert_eq!(pin(), 0);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     assert_eq!(named.len() + LIBC_PINS.len(), LINUX_PIN_COUNT);
 }
