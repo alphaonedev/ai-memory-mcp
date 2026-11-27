@@ -34,8 +34,10 @@ const BOB: &str = "ai:bob";
 /// The plaintext a member is sealed from. It must reach no response or error.
 const SEALED_MARKER: &str = "sealed xagent marker 10064 \u{1f512}";
 
-/// Agent id the encryption keypair is minted for.
-const KEY_AGENT: &str = "ai:xagent-sealed-10064";
+/// Agent id the encryption keypair is minted for: matches the row owner (`ALICE`)
+/// so `db::get` / `read_reflection_member` genuinely decrypts the envelope on the
+/// read path (#10082 r1 item 7, never masking behavior behind a decrypt error).
+const KEY_AGENT: &str = ALICE;
 
 /// The exact sealed-row refusal for one row, written out here.
 fn expected_refusal(id: &str) -> String {
@@ -382,4 +384,189 @@ fn pre_read_sealed_source_never_invokes_decrypting_reader_10082() {
     );
     assert_eq!(err, expected_refusal(&fx.source_id));
     assert_no_marker(&err, "pre-read sealed source 10082");
+}
+
+/// #10082 r1 item 7: prove the test fixture seals with the row owner's key
+/// (`ALICE`) so `db::get` genuinely decrypts the at-rest envelope to
+/// `SEALED_MARKER` — yet `memory_export_reflection` still refuses without
+/// leaking plaintext.
+#[test]
+fn owner_key_sealed_fixture_genuinely_decrypts_on_direct_get_10082() {
+    let fx = Fixture::new(member(Seen::ByAll, false), member(Seen::ByAll, true));
+    let conn = db::open(&fx.db_path).expect("open db");
+    let direct = db::get(&conn, &fx.source_id)
+        .expect("db::get with owner key must decrypt")
+        .expect("source exists");
+    assert_eq!(
+        direct.content, SEALED_MARKER,
+        "fixture envelope must genuinely decrypt under owner key ALICE"
+    );
+    let err = fx
+        .export(ALICE)
+        .expect_err("export must still refuse decryptable owner-sealed source");
+    assert_eq!(err, expected_refusal(&fx.source_id));
+    assert_no_marker(&err, "decryptable owner-sealed source 10082");
+}
+
+/// #10180 (F1): seal-then-unseal inside the read window (Probe P1).
+/// A row starts unsealed ("public v1"), is sealed with the owner's key before
+/// the inner decrypting read (so the reader genuinely decrypts `SEALED_MARKER`),
+/// and is then unsealed back to "public v1" (with the exact same `updated_at`
+/// and `version`) before the post-read check runs. Comparing the same row version
+/// (id, owner, updated_at, version, content/seal digest) across pre-check, read,
+/// and post-check MUST refuse and never export `SEALED_MARKER`.
+#[test]
+fn seal_then_unseal_inside_injected_read_is_refused_10180() {
+    let fx = Fixture::new(member(Seen::ByAll, false), member(Seen::ByAll, false));
+    let conn = db::open(&fx.db_path).expect("open db");
+    let updated_rfl = conn
+        .execute(
+            "UPDATE memories SET content = 'public reflection v1' WHERE id = ?1",
+            rusqlite::params![&fx.reflection_id],
+        )
+        .expect("set plain reflection content");
+    assert_eq!(updated_rfl, 1);
+    let rfl_id = fx.reflection_id.clone();
+    let mut decrypted_sealed = false;
+
+    let res = ai_memory::mcp::handle_export_reflection_with_reader(
+        &conn,
+        &serde_json::json!({"memory_id": fx.reflection_id, "format": "md"}),
+        Some(ALICE),
+        |c, member_id, reflection_id, caller| {
+            if member_id == rfl_id {
+                let changed = c
+                    .execute(
+                        "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+                        rusqlite::params![sealed_envelope(), member_id],
+                    )
+                    .expect("seal reflection before read");
+                assert_eq!(changed, 1);
+            }
+            let mem = ai_memory::mcp::read_reflection_member(c, member_id, reflection_id, caller)?;
+            if member_id == rfl_id {
+                assert_eq!(
+                    mem.content, SEALED_MARKER,
+                    "#10180: inner read must genuinely decrypt the sealed owner envelope"
+                );
+                decrypted_sealed = true;
+                // Unseal back to the exact prior plaintext, preserving updated_at and version.
+                let unsealed = c
+                    .execute(
+                        "UPDATE memories SET content = 'public reflection v1', encrypted_envelope = NULL WHERE id = ?1",
+                        rusqlite::params![member_id],
+                    )
+                    .expect("unseal reflection after read");
+                assert_eq!(unsealed, 1);
+            }
+            Ok(mem)
+        },
+    );
+    assert!(
+        decrypted_sealed,
+        "#10180: injected reader must have executed and decrypted the sealed envelope"
+    );
+    let err = res.expect_err("#10180: seal-then-unseal inside read window must refuse export");
+    assert_no_marker(&err, "seal-then-unseal 10180");
+}
+
+/// #10180: single SQLite read snapshot pins concurrent connections' view across
+/// reflection + source reads so a concurrent writer sealing the row after the
+/// export starts cannot interleave a sealed version into the read.
+#[test]
+fn concurrent_connection_seal_after_snapshot_start_sees_consistent_view_10180() {
+    let fx = Fixture::new(member(Seen::ByAll, false), member(Seen::ByAll, false));
+    let conn_export = db::open(&fx.db_path).expect("open export conn");
+    let conn_writer = db::open(&fx.db_path).expect("open concurrent writer conn");
+    let set_plain = conn_writer
+        .execute(
+            "UPDATE memories SET content = 'consistent plain snapshot v1' WHERE id = ?1",
+            rusqlite::params![&fx.reflection_id],
+        )
+        .expect("seed plain reflection");
+    assert_eq!(set_plain, 1);
+    let rfl_id = fx.reflection_id.clone();
+    let src_id = fx.source_id.clone();
+    let mut writer_committed = false;
+
+    let out = ai_memory::mcp::handle_export_reflection_with_reader(
+        &conn_export,
+        &serde_json::json!({"memory_id": fx.reflection_id, "format": "md"}),
+        Some(ALICE),
+        |c, member_id, reflection_id, caller| {
+            if member_id == rfl_id && !writer_committed {
+                // Concurrent connection seals BOTH reflection and source after
+                // export's pre-check already pinned its WAL read snapshot.
+                let env = sealed_envelope();
+                let c1 = conn_writer
+                    .execute(
+                        "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+                        rusqlite::params![&env, &rfl_id],
+                    )
+                    .expect("writer seal reflection");
+                let c2 = conn_writer
+                    .execute(
+                        "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+                        rusqlite::params![&env, &src_id],
+                    )
+                    .expect("writer seal source");
+                assert_eq!(c1, 1);
+                assert_eq!(c2, 1);
+                writer_committed = true;
+            }
+            ai_memory::mcp::read_reflection_member(c, member_id, reflection_id, caller)
+        },
+    )
+    .expect("#10180: single WAL read snapshot must observe consistent pre-seal state across pre-check, read, and post-check");
+    assert!(writer_committed, "concurrent writer must have committed");
+    let content = out["content"].as_str().expect("content string");
+    assert!(
+        content.contains("consistent plain snapshot v1"),
+        "snapshot export must render the consistent pre-seal plaintext, got: {content}"
+    );
+    assert_no_marker(content, "snapshot export 10180");
+}
+
+/// #10082 r1 item 6(a): a row that becomes hidden AND sealed inside the read
+/// window makes the post-read `classify_visible_sealed_state` return
+/// `Err(ReflectionNotFound)` while `read_member` returned `Ok(mem)`. Ignoring
+/// the post-read error would leak the plaintext — this test kills that mutant.
+#[test]
+fn row_hidden_and_sealed_inside_injected_read_is_not_found_10082() {
+    let fx = Fixture::new(member(Seen::ByAll, false), member(Seen::ByAll, false));
+    let conn = db::open(&fx.db_path).expect("open db");
+    let source_id = fx.source_id.clone();
+    let mut hid_and_sealed = false;
+    let err = ai_memory::mcp::handle_export_reflection_with_reader(
+        &conn,
+        &serde_json::json!({"memory_id": fx.reflection_id, "format": "md"}),
+        Some(BOB),
+        |c, member_id, reflection_id, caller| {
+            let mem = ai_memory::mcp::read_reflection_member(c, member_id, reflection_id, caller)?;
+            if member_id == source_id {
+                let changed = c
+                    .execute(
+                        "UPDATE memories SET content = '', encrypted_envelope = ?1, \
+                         metadata = ?2 WHERE id = ?3",
+                        rusqlite::params![
+                            sealed_envelope(),
+                            serde_json::json!({"agent_id": ALICE, "scope": "private"}).to_string(),
+                            member_id
+                        ],
+                    )
+                    .expect("hide and seal source inside read");
+                assert_eq!(changed, 1);
+                hid_and_sealed = true;
+            }
+            Ok(mem)
+        },
+    )
+    .expect_err("#10082 item 6a: row hidden and sealed inside read must fail closed");
+    assert!(hid_and_sealed, "injected mutation must have executed");
+    assert_eq!(
+        err,
+        expected_not_found(&fx.reflection_id),
+        "#10082 item 6a: hidden sealed source must return ReflectionNotFound"
+    );
+    assert_no_marker(&err, "hidden-and-sealed inside read 10082");
 }

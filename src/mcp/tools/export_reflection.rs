@@ -670,4 +670,28 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn reader_returning_wrong_memory_id_is_refused_10181() {
+        let (conn, _g) = fresh_db();
+        let rfl = make_reflection("ns", 1, "ai:bot");
+        let rfl_id = db::insert(&conn, &rfl).unwrap();
+        let mut other = make_reflection("ns", 1, "ai:bot");
+        other.content = "other reflection body".into();
+        let other_id = db::insert(&conn, &other).unwrap();
+
+        let res = super::handle_export_reflection_with_reader(
+            &conn,
+            &json!({"memory_id": rfl_id}),
+            None,
+            |c, _member_id, reflection_id, caller| {
+                super::read_reflection_member(c, &other_id, reflection_id, caller)
+            },
+        );
+        let err = res.expect_err("#10181: reader returning a different memory.id must be refused");
+        assert!(
+            !err.contains("other reflection body"),
+            "#10181: refusal must not carry substituted row content: {err}"
+        );
+    }
 }
