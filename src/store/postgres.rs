@@ -16887,26 +16887,146 @@ impl PostgresStore {
         ))
     }
 
-    /// #10112 (C-F2 / R-13) — whether the Postgres store carries any signed
-    /// `row_attestations` cutover watermark (the PG twin of `sqlite::was_armed`).
+    /// #10112 (C-F2 / R-13) / #10141 — whether the Postgres store carries any
+    /// signed `row_attestations` cutover watermark on the supplied executor
+    /// (allows checking inside an active `FOR UPDATE` transaction).
+    async fn pg_row_attestations_armed_on<'e, E>(&self, executor: E) -> StoreResult<bool>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let _ = self;
+        // Single query via `to_regclass` so we only consume the executor once.
+        let armed: Option<(bool,)> = sqlx::query_as(
+            "SELECT CASE WHEN to_regclass(format('%I.row_attestations', current_schema())) IS NULL \
+             THEN FALSE \
+             ELSE EXISTS (SELECT 1 FROM row_attestations WHERE op = 'cutover' AND signature IS NOT NULL) \
+             END",
+        )
+        .fetch_optional(executor)
+        .await
+        .map_err(|e| to_store_err("pg_row_attestations_armed", e))?;
+        Ok(armed.is_some_and(|(b,)| b))
+    }
+
     async fn pg_row_attestations_armed(&self) -> StoreResult<bool> {
-        let (present,): (bool,) = sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_schema = current_schema() AND table_name = 'row_attestations')",
+        self.pg_row_attestations_armed_on(&self.pool).await
+    }
+
+    /// #10141 — Read `agent_lineage` rows on the supplied executor (allows
+    /// running the chain-consistency head check inside an active `FOR UPDATE`
+    /// transaction).
+    async fn read_lineage_on<'e, E>(
+        executor: E,
+        agent_id: &str,
+    ) -> StoreResult<Vec<(crate::identity::lineage::LineageRecord, Vec<u8>)>>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        use crate::identity::lineage::{LineageReason, LineageRecord};
+        let rows: Vec<(
+            String,
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            Option<String>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
+                    recovery_pubkey, not_before, prev_record_hash, signature, \
+                    custody_class, suspected_compromise_from_seq, \
+                    guardian_set_id, recovery_threshold \
+             FROM agent_lineage WHERE agent_id = $1 ORDER BY epoch ASC",
         )
-        .fetch_one(&self.pool)
+        .bind(agent_id)
+        .fetch_all(executor)
         .await
-        .map_err(|e| to_store_err("pg_row_attestations_armed table check", e))?;
-        if !present {
-            return Ok(false);
+        .map_err(|e| to_store_err("read_lineage", e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (
+            aid,
+            epoch,
+            reason,
+            pred,
+            succ,
+            recovery,
+            not_before,
+            prev_hash,
+            sig,
+            custody,
+            from_seq,
+            guardian_set_id,
+            recovery_threshold,
+        ) in rows
+        {
+            let reason =
+                LineageReason::from_str(&reason).ok_or_else(|| StoreError::IntegrityFailed {
+                    detail: format!("unknown lineage reason '{reason}' for '{aid}'"),
+                })?;
+            let epoch = u64::try_from(epoch).map_err(|_| StoreError::IntegrityFailed {
+                detail: format!("negative lineage epoch for '{aid}'"),
+            })?;
+            let custody_class =
+                crate::identity::lineage::CustodyClass::from_stored(custody.as_deref())
+                    .ok_or_else(|| StoreError::IntegrityFailed {
+                        detail: format!(
+                            "unknown lineage custody_class '{}' for '{aid}'",
+                            custody.as_deref().unwrap_or("")
+                        ),
+                    })?;
+            out.push((
+                LineageRecord {
+                    agent_id: aid,
+                    epoch,
+                    reason,
+                    predecessor_pubkey_b64: pred,
+                    successor_pubkey_b64: succ,
+                    recovery_pubkey_b64: recovery,
+                    not_before,
+                    prev_record_hash: prev_hash,
+                    custody_class,
+                    suspected_compromise_from_seq: from_seq.map(|s| u64::try_from(s).unwrap_or(0)),
+                    guardian_set_id,
+                    recovery_threshold: recovery_threshold.map(|m| u64::try_from(m).unwrap_or(0)),
+                },
+                sig,
+            ));
         }
-        let armed: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM row_attestations WHERE op = 'cutover' AND signature IS NOT NULL LIMIT 1",
+        Ok(out)
+    }
+
+    /// #10141 — Read `signed_events` lineage witness payload hashes on the
+    /// supplied executor (allows running inside an active `FOR UPDATE` tx).
+    async fn lineage_witness_hashes_on<'e, E>(
+        executor: E,
+        agent_id: &str,
+    ) -> StoreResult<Vec<Vec<u8>>>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let [t_genesis, t_succession, t_recovery, t_revocation] =
+            crate::signed_events::IDENTITY_LINEAGE_EVENT_TYPES;
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT payload_hash FROM signed_events \
+             WHERE agent_id = $1 AND event_type IN ($2, $3, $4, $5) \
+             ORDER BY COALESCE(sequence, 0) ASC",
         )
-        .fetch_optional(&self.pool)
+        .bind(agent_id)
+        .bind(t_genesis)
+        .bind(t_succession)
+        .bind(t_recovery)
+        .bind(t_revocation)
+        .fetch_all(executor)
         .await
-        .map_err(|e| to_store_err("pg_row_attestations_armed cutover check", e))?;
-        Ok(armed.is_some())
+        .map_err(|e| to_store_err("lineage_witness_hashes", e))?;
+        Ok(rows.into_iter().map(|(h,)| h).collect())
     }
 
     /// v0.9.0 G9 (#1826) — read the NEWEST role-separation checkpoint in
@@ -27668,10 +27788,42 @@ impl MemoryStore for PostgresStore {
             .custody_class
             .ensure_oss_mintable()
             .map_err(|e| invalid(e.to_string()))?;
-        // Chain-consistency pre-flight against the current head
-        // (identical refusal set to the sqlite SSOT).
-        let head = self.read_lineage(agent_id).await?.into_iter().next_back();
-        match (&head, record.reason) {
+        let record_bytes = record
+            .canonical_bytes()
+            .map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("encode lineage record: {e:#}"),
+            })?;
+        let witness_hash =
+            record
+                .witness_payload_hash()
+                .map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("hash lineage witness payload: {e:#}"),
+                })?;
+        let title = crate::models::agent_registration_title(agent_id);
+
+        // C4 / #10141: open the transaction and acquire the per-agent
+        // `_agents` FOR UPDATE row lock BEFORE reading the lineage head so
+        // concurrent writers serialize cleanly and losers receive
+        // `StoreError::InvalidInput` rather than a raw 23505 PK error.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("append_lineage_record begin tx", e))?;
+        let existing: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2 FOR UPDATE",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read agent metadata for lineage append", e))?;
+
+        // Chain-consistency pre-flight against the current head INSIDE `tx`
+        // (under the FOR UPDATE row lock when registered).
+        let prior_lineage = Self::read_lineage_on(&mut *tx, agent_id).await?;
+        let head = prior_lineage.last();
+        match (head, record.reason) {
             (None, LineageReason::Genesis) => {}
             (None, _) => {
                 return Err(invalid(format!(
@@ -27702,14 +27854,19 @@ impl MemoryStore for PostgresStore {
                 }
             }
         }
+        let Some((mut meta,)) = existing else {
+            return Err(agent_not_registered_for_bind(agent_id));
+        };
+        let flat_pubkey = meta
+            .get(field_names::AGENT_PUBKEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
         // Never persist a record the walk would reject. Recovery (#1831 G17) is
-        // authorized by the M-of-N guardian quorum (the stored `signature` blob
-        // is the CBOR quorum, NOT a single Ed25519 sig); every other reason is a
-        // single predecessor signature. Mirrors the sqlite SSOT branch.
+        // authorized by the M-of-N guardian quorum; every other reason is a
+        // single predecessor signature. Runs inside `tx` under FOR UPDATE.
         if record.reason == LineageReason::Recovery {
-            let prior_lineage = self.read_lineage(agent_id).await?;
-            let prior_witnesses = self.lineage_witness_hashes(agent_id).await?;
-            let bound = self.agent_pubkey(agent_id).await?;
+            let prior_witnesses = Self::lineage_witness_hashes_on(&mut *tx, agent_id).await?;
             let policy = crate::identity::lineage::RecoveryPolicy::from_env().ok_or_else(|| {
                 invalid(
                     "cannot mint a recovery record — no recovery guardians enrolled \
@@ -27722,7 +27879,7 @@ impl MemoryStore for PostgresStore {
             let verified = crate::identity::lineage::verify_lineage_with_recovery(
                 &prior_lineage,
                 &prior_witnesses,
-                bound.as_deref(),
+                flat_pubkey.as_deref(),
                 Some(&policy),
             )
             .map_err(|e| {
@@ -27748,10 +27905,10 @@ impl MemoryStore for PostgresStore {
                     ))
                 },
             )?;
-            // #10112 (C-F2 / R-13): unarmed PG stores (no signed `row_attestations`
-            // cutover) persist quorum-verified `Recovery` records as at base; armed
-            // PG stores refuse preflight with a PG-accurate named refusal (zero writes).
-            if self.pg_row_attestations_armed().await? {
+            // #10112 (C-F2 / R-13): unarmed PG stores persist quorum-verified
+            // `Recovery` records; armed PG stores refuse preflight with a
+            // PG-accurate named refusal (zero writes).
+            if self.pg_row_attestations_armed_on(&mut *tx).await? {
                 return Err(StoreError::UnsupportedCapability {
                     capability:
                         crate::storage::row_attest::sqlite::REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED
@@ -27769,43 +27926,9 @@ impl MemoryStore for PostgresStore {
             })?;
         }
 
-        let record_bytes = record
-            .canonical_bytes()
-            .map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("encode lineage record: {e:#}"),
-            })?;
-        let witness_hash =
-            record
-                .witness_payload_hash()
-                .map_err(|e| StoreError::IntegrityFailed {
-                    detail: format!("hash lineage witness payload: {e:#}"),
-                })?;
-        let title = crate::models::agent_registration_title(agent_id);
-
-        // C4: one transaction/row lock covers body, history, flat sync, witness.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("append_lineage_record begin tx", e))?;
-        let existing: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2 FOR UPDATE",
-        )
-        .bind(AGENTS_NAMESPACE)
-        .bind(&title)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("read agent metadata for lineage append", e))?;
-        let Some((mut meta,)) = existing else {
-            return Err(agent_not_registered_for_bind(agent_id));
-        };
         // Stamp after serialization; history refuses backward/equal clocks.
         let now = Utc::now();
         let now_rfc = now.to_rfc3339();
-        let flat_pubkey = meta
-            .get(field_names::AGENT_PUBKEY)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
         let proof = if record.reason == LineageReason::Recovery {
             crate::identity::pubkey_bind::PossessionProof::from_verified_guardian_recovery(
                 agent_id,
@@ -27967,105 +28090,11 @@ impl MemoryStore for PostgresStore {
         &self,
         agent_id: &str,
     ) -> StoreResult<Vec<(crate::identity::lineage::LineageRecord, Vec<u8>)>> {
-        use crate::identity::lineage::{LineageReason, LineageRecord};
-        let rows: Vec<(
-            String,
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            Vec<u8>,
-            Vec<u8>,
-            Option<String>,
-            Option<i64>,
-            Option<Vec<u8>>,
-            Option<i64>,
-        )> = sqlx::query_as(
-            "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
-                    recovery_pubkey, not_before, prev_record_hash, signature, \
-                    custody_class, suspected_compromise_from_seq, \
-                    guardian_set_id, recovery_threshold \
-             FROM agent_lineage WHERE agent_id = $1 ORDER BY epoch ASC",
-        )
-        .bind(agent_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("read_lineage", e))?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for (
-            aid,
-            epoch,
-            reason,
-            pred,
-            succ,
-            recovery,
-            not_before,
-            prev_hash,
-            sig,
-            custody,
-            from_seq,
-            guardian_set_id,
-            recovery_threshold,
-        ) in rows
-        {
-            let reason =
-                LineageReason::from_str(&reason).ok_or_else(|| StoreError::IntegrityFailed {
-                    detail: format!("unknown lineage reason '{reason}' for '{aid}'"),
-                })?;
-            let epoch = u64::try_from(epoch).map_err(|_| StoreError::IntegrityFailed {
-                detail: format!("negative lineage epoch for '{aid}'"),
-            })?;
-            // v1.0.0 #1949 — fail-closed on an unknown custody slug (NULL
-            // legacy value → software-file default).
-            let custody_class =
-                crate::identity::lineage::CustodyClass::from_stored(custody.as_deref())
-                    .ok_or_else(|| StoreError::IntegrityFailed {
-                        detail: format!(
-                            "unknown lineage custody_class '{}' for '{aid}'",
-                            custody.as_deref().unwrap_or("")
-                        ),
-                    })?;
-            out.push((
-                LineageRecord {
-                    agent_id: aid,
-                    epoch,
-                    reason,
-                    predecessor_pubkey_b64: pred,
-                    successor_pubkey_b64: succ,
-                    recovery_pubkey_b64: recovery,
-                    not_before,
-                    prev_record_hash: prev_hash,
-                    custody_class,
-                    suspected_compromise_from_seq: from_seq.map(|s| u64::try_from(s).unwrap_or(0)),
-                    guardian_set_id,
-                    recovery_threshold: recovery_threshold.map(|m| u64::try_from(m).unwrap_or(0)),
-                },
-                sig,
-            ));
-        }
-        Ok(out)
+        Self::read_lineage_on(&self.pool, agent_id).await
     }
 
     async fn lineage_witness_hashes(&self, agent_id: &str) -> StoreResult<Vec<Vec<u8>>> {
-        let [t_genesis, t_succession, t_recovery, t_revocation] =
-            crate::signed_events::IDENTITY_LINEAGE_EVENT_TYPES;
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT payload_hash FROM signed_events \
-             WHERE agent_id = $1 AND event_type IN ($2, $3, $4, $5) \
-             ORDER BY COALESCE(sequence, 0) ASC",
-        )
-        .bind(agent_id)
-        .bind(t_genesis)
-        .bind(t_succession)
-        .bind(t_recovery)
-        .bind(t_revocation)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("lineage_witness_hashes", e))?;
-        Ok(rows.into_iter().map(|(h,)| h).collect())
+        Self::lineage_witness_hashes_on(&self.pool, agent_id).await
     }
 
     async fn current_authoritative_key(&self, agent_id: &str) -> StoreResult<Option<String>> {

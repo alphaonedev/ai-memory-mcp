@@ -1014,8 +1014,8 @@ pub use connection::open_read_only;
 pub use connection::{MISSING_DATABASE_REFUSAL, open_existing_read_only};
 // v1.0.0 #2445 — the EGRESS + guard surface (see `schema_guard` module docs).
 pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stamp};
-// v1.0.0 #3152 — one write transaction for a multi-statement logical write.
-pub use connection::in_write_txn;
+// v1.0.0 #3152 / #10141 — one write transaction for a multi-statement logical write.
+pub use connection::{WriteTxn, in_write_txn};
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
 // seeding hook (`daemon_runtime::run`); the DEFAULT const is the
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
@@ -15432,12 +15432,21 @@ fn lineage_witness_event_type(reason: crate::identity::lineage::LineageReason) -
 /// Any pre-flight violation, an unregistered agent (the pubkey sync
 /// requires a `_agents` row), the C5 duplicate-epoch constraint, or an
 /// underlying SQL failure — all of which roll the whole append back.
-pub fn append_lineage_record(
-    conn: &Connection,
+/// #10141 — In-transaction lineage append: runs the chain-consistency head
+/// check, signature/quorum verification, body insert, flat-binding sync, and
+/// audit-witness append under the caller's already-open [`connection::WriteTxn`].
+///
+/// # Errors
+///
+/// Any pre-flight violation, an unregistered agent, the C5 duplicate-epoch
+/// constraint, or an underlying SQL failure.
+pub fn append_lineage_record_in_tx(
+    txn: &connection::WriteTxn<'_>,
     agent_id: &str,
     record: &crate::identity::lineage::LineageRecord,
     signature: &[u8],
 ) -> Result<()> {
+    let conn = txn.conn();
     crate::storage::record_stop::gate_storage_conn(conn)?;
     use crate::identity::lineage::{LineageReason, RecoveryPolicy, verify_succession};
 
@@ -15447,19 +15456,12 @@ pub fn append_lineage_record(
             record.agent_id
         );
     }
-    // v1.0.0 #1831 (G17) — recovery records ARE now mintable: they are
-    // attested by an M-of-N guardian quorum (verified below) instead of a
-    // single predecessor signature. The recovery VERIFY path landed in v1.0
-    // (the key-LOSS half of gap G13).
-    // v1.0.0 #1949 — the CODE refuse-guard: the OSS build STRUCTURALLY
-    // REFUSES to mint any non-`software-file` custody class (the reserved
-    // hardware classes are verify-only this train). Fail-closed BEFORE
-    // any write; nothing persisted on violation.
     record
         .custody_class
         .ensure_oss_mintable()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // Chain-consistency pre-flight against the current head.
+    // #10141: chain-consistency pre-flight runs INSIDE the open WriteTxn so
+    // two racing writers serialize on the SQLite write lock before reading head.
     let head = lineage_head(conn, agent_id)?;
     match (&head, record.reason) {
         (None, LineageReason::Genesis) => {}
@@ -15490,11 +15492,6 @@ pub fn append_lineage_record(
             }
         }
     }
-    // The signature must already verify — never persist a record the walk
-    // would reject. Recovery (#1831 G17) is authorized by the M-of-N
-    // guardian quorum (the stored `signature` blob is the CBOR quorum, NOT
-    // a single Ed25519 sig); every other reason is a single predecessor
-    // signature.
     if record.reason == LineageReason::Recovery {
         let policy = RecoveryPolicy::from_env().ok_or_else(|| {
             anyhow::anyhow!(
@@ -15502,9 +15499,6 @@ pub fn append_lineage_record(
                  (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
             )
         })?;
-        // Verification reads the trust bar (threshold + guardian-set id)
-        // from the record's SIGNED body, not `policy` — `policy` supplies
-        // only the guardian KEY MATERIAL (#1831 ratification delta A).
         crate::identity::lineage::verify_recovery_record(record, signature, &policy).map_err(
             |e| anyhow::anyhow!("refusing to persist unverifiable recovery record: {e}"),
         )?;
@@ -15520,62 +15514,54 @@ pub fn append_lineage_record(
     let witness_hash = record.witness_payload_hash()?;
     let now = Utc::now().to_rfc3339();
 
-    // C4 — one IMMEDIATE transaction for body + pubkey sync + witness
-    // (clone of the capture_turn_idempotent single-tx contract).
+    recovery_rebind::insert_agent_lineage_row(conn, record, signature, &record_bytes, &now)
+        .context("append_lineage_record: insert body")?;
+
+    let proof = if record.reason == LineageReason::Recovery {
+        crate::identity::pubkey_bind::PossessionProof::from_verified_guardian_recovery(
+            agent_id,
+            &record.predecessor_pubkey_b64,
+            &record.successor_pubkey_b64,
+        )?
+    } else {
+        crate::identity::pubkey_bind::PossessionProof::from_verified_lineage_succession(
+            agent_id,
+            &record.predecessor_pubkey_b64,
+            &record.successor_pubkey_b64,
+        )?
+    };
+    let successor_pubkey =
+        crate::identity::keypair::canonical_public_base64(&record.successor_pubkey_b64)?;
+    bind_agent_pubkey_no_tx(conn, agent_id, &successor_pubkey, &proof)?;
+
+    let witness = crate::signed_events::SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.to_string(),
+        event_type: lineage_witness_event_type(record.reason).to_string(),
+        payload_hash: witness_hash,
+        signature: Some(signature.to_vec()),
+        attest_level: crate::models::AttestLevel::LineageSigned
+            .as_str()
+            .to_string(),
+        timestamp: now,
+        ..crate::signed_events::SignedEvent::default()
+    };
+    let anchor = crate::signed_events::append_signed_event_no_tx(conn, &witness)
+        .context("append_lineage_record: witness append")?;
+    escalation_deferral::defer_audit_anchor(conn, anchor);
+    Ok(())
+}
+
+pub fn append_lineage_record(
+    conn: &Connection,
+    agent_id: &str,
+    record: &crate::identity::lineage::LineageRecord,
+    signature: &[u8],
+) -> Result<()> {
+    // C4 / #10141 — open IMMEDIATE WriteTxn BEFORE reading lineage_head so
+    // head check, body insert, pubkey sync, and witness share one atomic tx.
     let write_txn = connection::WriteTxn::begin(conn).context("append_lineage_record: begin tx")?;
-    let tx_result = (|| -> Result<()> {
-        recovery_rebind::insert_agent_lineage_row(conn, record, signature, &record_bytes, &now)
-            .context("append_lineage_record: insert body")?;
-
-        // Flat-binding sync — attest_write keeps trusting this key (C6).
-        //
-        // #3464 — the authority here is the SUCCESSION RECORD, not a
-        // possession proof: the pre-flight above has already `verify_strict`ed
-        // this record under the PREDECESSOR key (or, for a recovery record,
-        // under the M-of-N guardian quorum), so an existing trust authority
-        // authorised this exact successor key. The history row distinguishes
-        // predecessor-signed `lineage_succession` from `guardian_recovery`:
-        // only the latter may advance a closed/revoked history head. Both
-        // constructors are crate-private and reachable only after the
-        // corresponding verification above.
-        let proof = if record.reason == LineageReason::Recovery {
-            crate::identity::pubkey_bind::PossessionProof::from_verified_guardian_recovery(
-                agent_id,
-                &record.predecessor_pubkey_b64,
-                &record.successor_pubkey_b64,
-            )?
-        } else {
-            crate::identity::pubkey_bind::PossessionProof::from_verified_lineage_succession(
-                agent_id,
-                &record.predecessor_pubkey_b64,
-                &record.successor_pubkey_b64,
-            )?
-        };
-        let successor_pubkey =
-            crate::identity::keypair::canonical_public_base64(&record.successor_pubkey_b64)?;
-        bind_agent_pubkey_no_tx(conn, agent_id, &successor_pubkey, &proof)?;
-
-        // Append-only witness (C1/C3 anchor), in THIS transaction.
-        let witness = crate::signed_events::SignedEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            agent_id: agent_id.to_string(),
-            event_type: lineage_witness_event_type(record.reason).to_string(),
-            payload_hash: witness_hash,
-            signature: Some(signature.to_vec()),
-            attest_level: crate::models::AttestLevel::LineageSigned
-                .as_str()
-                .to_string(),
-            timestamp: now.clone(),
-            ..crate::signed_events::SignedEvent::default()
-        };
-        // #7241 - the anchor is emitted when `write_txn` commits.
-        let anchor = crate::signed_events::append_signed_event_no_tx(conn, &witness)
-            .context("append_lineage_record: witness append")?;
-        escalation_deferral::defer_audit_anchor(conn, anchor);
-        Ok(())
-    })();
-
-    match tx_result {
+    match append_lineage_record_in_tx(&write_txn, agent_id, record, signature) {
         Ok(()) => {
             write_txn
                 .commit()
@@ -15878,23 +15864,21 @@ pub fn enroll_lineage(
     if !keypair.can_sign() {
         anyhow::bail!("keypair for '{agent_id}' is public-only — cannot self-sign a genesis");
     }
-    if lineage_head(conn, agent_id)?.is_some() {
-        anyhow::bail!("lineage already enrolled for '{agent_id}'");
-    }
-    // v1.0.0 #1949 — recovery_pubkey is REQUIRED at genesis for NEW
-    // chains so the stolen-AND-lost-key case is coverable (the recovery
-    // signer lands in v1.0; the FORMAT ships now). Existing v76 chains
-    // are grandfathered: `verify_lineage` never requires it, so a legacy
-    // genesis with no recovery key keeps verifying — only fresh
-    // enrollment is gated.
     if recovery_pubkey_b64.is_none() {
         anyhow::bail!(
             "a recovery_pubkey is REQUIRED to enroll a new lineage for '{agent_id}' (#1949) — \
              pass --recovery-pubkey so a stolen-and-lost key is recoverable"
         );
     }
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
+    }
+    let txn = connection::WriteTxn::begin(conn).context("enroll_lineage: begin tx")?;
+    if lineage_head(txn.conn(), agent_id)?.is_some() {
+        anyhow::bail!("lineage already enrolled for '{agent_id}'");
+    }
     let k0_b64 = keypair.public_base64();
-    if let Some(bound) = agent_pubkey(conn, agent_id)? {
+    if let Some(bound) = agent_pubkey(txn.conn(), agent_id)? {
         let bound_key = crate::identity::keypair::decode_public_base64(&bound)
             .context("decoding bound agent_pubkey")?;
         if bound_key.to_bytes() != keypair.public.to_bytes() {
@@ -15904,9 +15888,6 @@ pub fn enroll_lineage(
             );
         }
     }
-    if let Some(rec) = recovery_pubkey_b64 {
-        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
-    }
     let record = crate::identity::lineage::LineageRecord::genesis(
         agent_id,
         &k0_b64,
@@ -15914,7 +15895,8 @@ pub fn enroll_lineage(
         &Utc::now().to_rfc3339(),
     );
     let sig = crate::identity::sign::sign_succession(keypair, &record.to_signable())?;
-    append_lineage_record(conn, agent_id, &record, &sig)?;
+    append_lineage_record_in_tx(&txn, agent_id, &record, &sig)?;
+    txn.commit().context("enroll_lineage: commit")?;
     Ok(record)
 }
 
@@ -15997,6 +15979,53 @@ pub fn succession_preconditions<'a>(
     })
 }
 
+/// #10141 — Validate all three succession preconditions under an open
+/// [`connection::WriteTxn`] so the lineage head cannot advance before arming
+/// or appending.
+///
+/// # Errors
+///
+/// Same exact refusals as [`succession_preconditions`].
+pub fn succession_preconditions_in_tx<'a>(
+    txn: &connection::WriteTxn<'_>,
+    agent_id: &'a str,
+    k_old: &'a crate::identity::keypair::AgentKeypair,
+) -> Result<SuccessionChecked<'a>> {
+    succession_preconditions(txn.conn(), agent_id, k_old)
+}
+
+/// #10141 — Mint and persist a ROTATION succession inside an open
+/// [`connection::WriteTxn`], consuming a [`SuccessionChecked`] proof by value.
+///
+/// # Errors
+///
+/// Undecodable successor/recovery key or any [`append_lineage_record_in_tx`]
+/// failure.
+pub fn append_succession_in_tx(
+    txn: &connection::WriteTxn<'_>,
+    checked: SuccessionChecked<'_>,
+    successor_pubkey_b64: &str,
+    recovery_pubkey_b64: Option<&str>,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
+        .context("decoding successor pubkey")?;
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
+    }
+    let recovery = recovery_pubkey_b64
+        .map(str::to_string)
+        .or_else(|| checked.head.recovery_pubkey_b64.clone());
+    let record = crate::identity::lineage::LineageRecord::rotation(
+        &checked.head,
+        successor_pubkey_b64,
+        recovery,
+        &Utc::now().to_rfc3339(),
+    )?;
+    let sig = crate::identity::sign::sign_succession(checked.k_old, &record.to_signable())?;
+    append_lineage_record_in_tx(txn, checked.agent_id, &record, &sig)?;
+    Ok(record)
+}
+
 /// Mint + persist a ROTATION succession consuming a [`SuccessionChecked`]
 /// proof by value (#10118, CBC-03).
 ///
@@ -16009,35 +16038,20 @@ pub fn append_succession_checked(
     successor_pubkey_b64: &str,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
-        .context("decoding successor pubkey")?;
-    if let Some(rec) = recovery_pubkey_b64 {
-        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
-    }
-    // None carries the existing recovery commitment forward so a plain
-    // rotation never silently drops an enrolled recovery key.
-    let recovery = recovery_pubkey_b64
-        .map(str::to_string)
-        .or_else(|| checked.head.recovery_pubkey_b64.clone());
-    let record = crate::identity::lineage::LineageRecord::rotation(
-        &checked.head,
-        successor_pubkey_b64,
-        recovery,
-        &Utc::now().to_rfc3339(),
-    )?;
-    let sig = crate::identity::sign::sign_succession(checked.k_old, &record.to_signable())?;
-    append_lineage_record(conn, checked.agent_id, &record, &sig)?;
+    let txn = connection::WriteTxn::begin(conn).context("append_succession: begin tx")?;
+    let record = append_succession_in_tx(&txn, checked, successor_pubkey_b64, recovery_pubkey_b64)?;
+    txn.commit().context("append_succession: commit")?;
     Ok(record)
 }
 
 /// Mint + persist a ROTATION succession from the current head to
-/// `successor_pubkey_b64`, signed by `k_old` (#1828 G13).
+/// `successor_pubkey_b64`, signed by `k_old` (#1828 G13, #10141 single tx).
 ///
 /// # Errors
 ///
 /// No enrolled lineage, a `k_old` that is public-only or not the head
 /// key, an undecodable successor/recovery key, or any
-/// [`append_lineage_record`] failure.
+/// [`append_lineage_record_in_tx`] failure.
 pub fn append_succession(
     conn: &Connection,
     agent_id: &str,
@@ -16045,8 +16059,45 @@ pub fn append_succession(
     successor_pubkey_b64: &str,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    let checked = succession_preconditions(conn, agent_id, k_old)?;
-    append_succession_checked(conn, checked, successor_pubkey_b64, recovery_pubkey_b64)
+    let txn = connection::WriteTxn::begin(conn).context("append_succession: begin tx")?;
+    let checked = succession_preconditions_in_tx(&txn, agent_id, k_old)?;
+    let record = append_succession_in_tx(&txn, checked, successor_pubkey_b64, recovery_pubkey_b64)?;
+    txn.commit().context("append_succession: commit")?;
+    Ok(record)
+}
+
+/// #10141 — Mint and persist a REVOCATION succession inside an open
+/// [`connection::WriteTxn`], consuming a [`SuccessionChecked`] proof by value.
+///
+/// # Errors
+///
+/// Undecodable successor/recovery key or any [`append_lineage_record_in_tx`]
+/// failure.
+pub fn append_revocation_in_tx(
+    txn: &connection::WriteTxn<'_>,
+    checked: SuccessionChecked<'_>,
+    successor_pubkey_b64: &str,
+    suspected_compromise_from_seq: u64,
+    recovery_pubkey_b64: Option<&str>,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
+        .context("decoding successor pubkey")?;
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
+    }
+    let recovery = recovery_pubkey_b64
+        .map(str::to_string)
+        .or_else(|| checked.head.recovery_pubkey_b64.clone());
+    let record = crate::identity::lineage::LineageRecord::revocation(
+        &checked.head,
+        successor_pubkey_b64,
+        suspected_compromise_from_seq,
+        recovery,
+        &Utc::now().to_rfc3339(),
+    )?;
+    let sig = crate::identity::sign::sign_succession(checked.k_old, &record.to_signable())?;
+    append_lineage_record_in_tx(txn, checked.agent_id, &record, &sig)?;
+    Ok(record)
 }
 
 /// Mint + persist a REVOCATION succession consuming a [`SuccessionChecked`]
@@ -16062,36 +16113,27 @@ pub fn append_revocation_checked(
     suspected_compromise_from_seq: u64,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
-        .context("decoding successor pubkey")?;
-    if let Some(rec) = recovery_pubkey_b64 {
-        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
-    }
-    // None carries the existing recovery commitment forward.
-    let recovery = recovery_pubkey_b64
-        .map(str::to_string)
-        .or_else(|| checked.head.recovery_pubkey_b64.clone());
-    let record = crate::identity::lineage::LineageRecord::revocation(
-        &checked.head,
+    let txn = connection::WriteTxn::begin(conn).context("append_revocation: begin tx")?;
+    let record = append_revocation_in_tx(
+        &txn,
+        checked,
         successor_pubkey_b64,
         suspected_compromise_from_seq,
-        recovery,
-        &Utc::now().to_rfc3339(),
+        recovery_pubkey_b64,
     )?;
-    let sig = crate::identity::sign::sign_succession(checked.k_old, &record.to_signable())?;
-    append_lineage_record(conn, checked.agent_id, &record, &sig)?;
+    txn.commit().context("append_revocation: commit")?;
     Ok(record)
 }
 
 /// v1.0.0 #1949 — mint + persist a REVOCATION succession from the current head
-/// to `successor_pubkey_b64`, routing through [`succession_preconditions`] and
-/// consuming the shared [`SuccessionChecked`] proof (#10118).
+/// to `successor_pubkey_b64`, routing through [`succession_preconditions_in_tx`]
+/// inside one [`connection::WriteTxn`] (#10118, #10141).
 ///
 /// # Errors
 ///
 /// No enrolled lineage, a `k_old` that is public-only or not the head
 /// key, an undecodable successor/recovery key, or any
-/// [`append_lineage_record`] failure.
+/// [`append_lineage_record_in_tx`] failure.
 pub fn append_revocation(
     conn: &Connection,
     agent_id: &str,
@@ -16100,14 +16142,17 @@ pub fn append_revocation(
     suspected_compromise_from_seq: u64,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    let checked = succession_preconditions(conn, agent_id, k_old)?;
-    append_revocation_checked(
-        conn,
+    let txn = connection::WriteTxn::begin(conn).context("append_revocation: begin tx")?;
+    let checked = succession_preconditions_in_tx(&txn, agent_id, k_old)?;
+    let record = append_revocation_in_tx(
+        &txn,
         checked,
         successor_pubkey_b64,
         suspected_compromise_from_seq,
         recovery_pubkey_b64,
-    )
+    )?;
+    txn.commit().context("append_revocation: commit")?;
+    Ok(record)
 }
 
 /// v1.0.0 #1831 (G17) — deterministically mint the recovery record that

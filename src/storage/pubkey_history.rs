@@ -126,18 +126,10 @@ pub fn bind_agent_pubkey(
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let pubkey_b64 = crate::identity::keypair::canonical_public_base64(pubkey_b64)
         .context("canonicalizing agent pubkey for bind")?;
-    let write_txn = connection::WriteTxn::begin(conn).context("bind_agent_pubkey: begin tx")?;
-    let result = bind_agent_pubkey_no_tx(conn, agent_id, &pubkey_b64, &proof);
-    match result {
-        Ok(()) => {
-            write_txn.commit().context("bind_agent_pubkey: commit tx")?;
-            Ok(())
-        }
-        Err(error) => {
-            write_txn.rollback();
-            Err(error)
-        }
-    }
+    connection::in_write_txn(conn, || {
+        bind_agent_pubkey_no_tx(conn, agent_id, &pubkey_b64, &proof)
+    })
+    .context("bind_agent_pubkey: write tx")
 }
 
 /// In-transaction implementation shared with [`super::append_lineage_record`].

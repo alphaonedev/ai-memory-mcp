@@ -21,13 +21,12 @@ use super::pubkey_history::bind_agent_pubkey_no_tx_at;
 use super::row_attest::anchor::{AnchorLoad, TrustAnchor};
 use super::row_attest::sqlite::{
     REFUSE_ANCHOR_UNATTESTED_KEY_SWAP, REFUSE_RECOVERY_KEY_MISMATCH, REFUSE_RECOVERY_MISSING_PRIV,
-    REFUSE_RECOVERY_QUORUM_DRIFT, REFUSE_RECOVERY_REPLAY, REFUSE_RECOVERY_VERIFY_ONLY,
-    advance_seal_after_recovery, arm_for_recovery_in_tx, restore_post_recovery_funnel,
-    seal_is_current, was_armed_with,
+    REFUSE_RECOVERY_QUORUM_DRIFT, REFUSE_RECOVERY_REPLAY, REFUSE_RECOVERY_VERIFY_ONLY, TxnArmed,
+    advance_seal_after_recovery, restore_post_recovery_funnel, seal_is_current, was_armed_with,
 };
 use super::row_attest::{Attestation, key_id_of};
 use super::{
-    agent_pubkey, escalation_deferral, lineage_witness_event_type, read_lineage,
+    agent_pubkey, escalation_deferral, lineage_head, lineage_witness_event_type, read_lineage,
     verify_agent_lineage, verify_agent_lineage_with_policy,
 };
 use crate::identity::keypair::{
@@ -786,17 +785,36 @@ fn commit_recovery_tx_with_restore(
         record,
         quorum_blob,
     } = *tx_params;
-    // Step 1 (R-5, R-9): single IMMEDIATE SQLite transaction covering:
-    //   (a) arm_for_recovery_in_tx (verifies anchor vs lineage + signs unsigned cutovers + registers FixedAt K_new @ ts_rfc),
-    //   (b) insert_agent_lineage_row (agent_lineage),
-    //   (c) bind_agent_pubkey_no_tx_at (agent_pubkey_history append + _agents UPDATE -> fires row_attestations trigger under K_new @ ts_rfc),
-    //   (d) signed_events witness append.
+    // Step 1 (R-5, R-9, #10141): single IMMEDIATE SQLite transaction covering:
+    //   (a) in-tx lineage_head consistency re-check (closes TOCTOU race),
+    //   (b) TxnArmed::arm_for_recovery (verifies anchor vs lineage + signs unsigned cutovers + registers FixedAt K_new @ ts_rfc; disarms/rolls back on drop),
+    //   (c) insert_agent_lineage_row (agent_lineage),
+    //   (d) bind_agent_pubkey_no_tx_at (agent_pubkey_history append + _agents UPDATE -> fires row_attestations trigger under K_new @ ts_rfc),
+    //   (e) signed_events witness append.
     let record_bytes = record.canonical_bytes()?;
     let witness_hash = record.witness_payload_hash()?;
     let write_txn = WriteTxn::begin(conn).context("execute_recovery_rebind: begin single tx")?;
+    // #10141: verify under the open IMMEDIATE write lock that lineage_head
+    // has not moved between `recovery_preconditions` and this transaction.
+    match lineage_head(write_txn.conn(), agent_id)? {
+        Some((head_rec, _))
+            if record.epoch == head_rec.epoch + 1
+                && record.predecessor_pubkey_b64 == head_rec.successor_pubkey_b64
+                && record.prev_record_hash == head_rec.record_hash()? => {}
+        Some((head_rec, _)) => {
+            bail!(
+                "{REFUSE_RECOVERY_REPLAY}: lineage head advanced to epoch {} before recovery commit",
+                head_rec.epoch
+            );
+        }
+        None => {
+            bail!("no lineage enrolled for '{agent_id}' — nothing to recover");
+        }
+    }
+    let armed = TxnArmed::arm_for_recovery(write_txn, agent_id, k_new_signing, anchor_dir, ts_rfc)?;
     let tx_res = (|| -> Result<()> {
-        arm_for_recovery_in_tx(conn, agent_id, k_new_signing, anchor_dir, ts_rfc)?;
-        insert_agent_lineage_row(conn, record, quorum_blob, &record_bytes, ts_rfc)
+        let tx_conn = armed.conn();
+        insert_agent_lineage_row(tx_conn, record, quorum_blob, &record_bytes, ts_rfc)
             .context("execute_recovery_rebind: insert agent_lineage")?;
 
         let proof = PossessionProof::from_verified_guardian_recovery(
@@ -804,7 +822,13 @@ fn commit_recovery_tx_with_restore(
             &record.predecessor_pubkey_b64,
             &record.successor_pubkey_b64,
         )?;
-        bind_agent_pubkey_no_tx_at(conn, agent_id, successor_pubkey_canonical, &proof, ts_rfc)?;
+        bind_agent_pubkey_no_tx_at(
+            tx_conn,
+            agent_id,
+            successor_pubkey_canonical,
+            &proof,
+            ts_rfc,
+        )?;
 
         let witness = crate::signed_events::SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
@@ -818,24 +842,20 @@ fn commit_recovery_tx_with_restore(
             timestamp: ts_rfc.to_string(),
             ..crate::signed_events::SignedEvent::default()
         };
-        let anchor = crate::signed_events::append_signed_event_no_tx(conn, &witness)
+        let anchor = crate::signed_events::append_signed_event_no_tx(tx_conn, &witness)
             .context("execute_recovery_rebind: witness append")?;
-        escalation_deferral::defer_audit_anchor(conn, anchor);
+        escalation_deferral::defer_audit_anchor(tx_conn, anchor);
         before_commit_hook()?;
         Ok(())
     })();
 
-    let commit_res = match tx_res {
-        Ok(()) => write_txn
-            .commit()
-            .context("execute_recovery_rebind: commit single tx"),
+    match tx_res {
+        Ok(()) => armed.commit_with_restore(restore_fn),
         Err(e) => {
-            write_txn.rollback();
-            Err(e)
+            let restore_res = armed.rollback_with_restore(restore_fn);
+            merge_commit_and_restore(Err(e), restore_res)
         }
-    };
-    let restore_res = restore_fn(conn);
-    merge_commit_and_restore(commit_res, restore_res)
+    }
 }
 
 #[cfg(test)]
@@ -1165,7 +1185,7 @@ mod tests {
     use crate::identity::lineage::{RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV};
     use crate::models::Memory;
     use crate::storage::row_attest::Outcome;
-    use crate::storage::row_attest::sqlite::{arm_with_key, verify_sqlite_with};
+    use crate::storage::row_attest::sqlite::{TxnArmed, verify_sqlite_with};
     use ed25519_dalek::Signer as _;
     use tempfile::TempDir;
 
@@ -1289,14 +1309,17 @@ mod tests {
             let conn = db::open(&db_path).expect("open");
             db::register_agent(&conn, agent, "ai:test", &[]).expect("register");
             db::enroll_lineage(&conn, agent, &k_old, Some(&cold.public_base64())).expect("enroll");
-            arm_with_key(&conn, agent, k_old.private.as_ref().expect("priv")).expect("arm");
+            let txn = WriteTxn::begin(&conn).expect("begin arm tx");
+            let armed = TxnArmed::arm_in_tx(txn, agent, k_old.private.as_ref().expect("priv"))
+                .expect("arm");
             let mem = Memory {
                 namespace: "recovery-fault".to_string(),
                 title: "pre-loss".to_string(),
                 content: "pre-loss attested".to_string(),
                 ..Memory::default()
             };
-            db::insert(&conn, &mem).expect("insert");
+            db::insert(armed.conn(), &mem).expect("insert");
+            armed.commit().expect("commit arm tx");
             drop(conn);
             fs::remove_file(anchor_dir.join(format!("{agent}.priv"))).expect("lose k_old.priv");
             Self {

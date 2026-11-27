@@ -846,30 +846,319 @@ pub fn install(conn: &Connection) -> Result<ArmState> {
     }
 }
 
-/// #10089 — arm `conn` with `signing`, the key the store binds to
-/// `agent_id` right now, for a process that holds that key but runs no
-/// session signer (`identity succeed`). The rotation write re-binds the
-/// agent to its successor inside the succession transaction, so the key is
-/// checked once here, before that write, and every attestation the
-/// connection appends is signed by it (inside its anchored validity: the
-/// key is archived only after the transaction commits). Nothing already
-/// signed is signed again.
+/// #10141 — Transaction-bound row-attestation arming guard (consumed-state
+/// pattern, no boolean flag).
 ///
-/// # Errors
+/// The armed state for key-transition paths (`identity succeed`, guardian
+/// recovery rebind) is unrepresentable outside an open
+/// [`crate::storage::WriteTxn`]: callers obtain [`TxnArmed`] ONLY
+/// by handing an open `WriteTxn` to [`TxnArmed::arm_for_succession`],
+/// [`TxnArmed::arm_for_recovery`], or [`TxnArmed::arm_in_tx`].
 ///
-/// `REFUSE_KEY_MISMATCH` when `signing` is not the bound key, and every
-/// error of [`install`]; the caller refuses the write (fail closed).
-pub fn arm_with_key(
-    conn: &Connection,
-    agent_id: &str,
-    signing: &ed25519_dalek::SigningKey,
-) -> Result<()> {
-    let who = bound_identity(conn, agent_id, signing.clone()).map_err(anyhow::Error::msg)?;
-    match arm(conn, &who, SignerSource::Fixed(who.clone()))? {
-        ArmState::Armed => Ok(()),
-        ArmState::NoSigner | ArmState::Refusing => {
-            anyhow::bail!("{}", refusal(REFUSE_NO_SIGNER))
+/// - [`TxnArmed::commit`] consumes `self`, commits the underlying `WriteTxn`,
+///   advances the anchored seal ONLY AFTER commit succeeds (when configured),
+///   and reconciles the connection funnel so no temporary `Fixed` / `FixedAt`
+///   trigger binding ever outlives the transaction.
+/// - Any early return, refusal, error, or panic unwind drops `TxnArmed`
+///   without committing: [`Drop`] rolls back the `WriteTxn` FIRST (undoing any
+///   cutover signatures and writes atomically) and then disarms/reconciles the
+///   connection (`DROP TRIGGER IF EXISTS temp.ra10040_*`,
+///   `remove_function(ATTEST_FN)`, and `install(conn)` so an unarmed store is
+///   left completely unarmed while an already-armed store returns to its
+///   `Session` / `Refusing` posture).
+#[must_use = "TxnArmed rolls back and disarms on drop unless committed"]
+pub struct TxnArmed<'c> {
+    active: Option<ActiveArmed<'c>>,
+}
+
+struct ActiveArmed<'c> {
+    txn: crate::storage::connection::WriteTxn<'c>,
+    seal_on_commit: Option<std::path::PathBuf>,
+}
+
+impl<'c> TxnArmed<'c> {
+    /// Borrow the SQLite connection guarded by this armed transaction.
+    ///
+    /// # Panics
+    ///
+    /// Never panics while `TxnArmed` is alive (the active slot is only emptied
+    /// by consuming methods `commit` / `rollback_with_restore` or `Drop`).
+    #[must_use]
+    pub fn conn(&self) -> &'c Connection {
+        self.txn().conn()
+    }
+
+    /// Borrow the open [`crate::storage::WriteTxn`] owned by this
+    /// armed guard so in-transaction storage helpers receive compile-time proof
+    /// of an open write transaction.
+    ///
+    /// # Panics
+    ///
+    /// Never panics while `TxnArmed` is alive.
+    #[must_use]
+    pub fn txn(&self) -> &crate::storage::connection::WriteTxn<'c> {
+        &self
+            .active
+            .as_ref()
+            .expect("TxnArmed active state is always present while borrowed")
+            .txn
+    }
+
+    /// #10141 / #10089 — arm `txn` for a lineage succession using the
+    /// validated [`crate::storage::SuccessionChecked`] proof.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed (rolling back `txn` and disarming `conn`) on bound-key
+    /// mismatch, bare-swapped anchor, unreadable seal, stripped cutover, or
+    /// trigger registration error.
+    pub fn arm_for_succession(
+        txn: crate::storage::connection::WriteTxn<'c>,
+        checked: &crate::storage::SuccessionChecked<'_>,
+    ) -> Result<Self> {
+        Self::arm_in_tx(txn, checked.agent_id(), checked.signing_key())
+    }
+
+    /// #10141 / #10089 — arm an open `WriteTxn` with `signing`, the key the
+    /// store binds to `agent_id` right now. Cutover signing runs inside `txn`,
+    /// the anchored seal advances ONLY after [`TxnArmed::commit`] succeeds, and
+    /// dropping without commit rolls back `txn` and disarms `conn`.
+    ///
+    /// # Errors
+    ///
+    /// `REFUSE_KEY_MISMATCH` when `signing` is not the bound key,
+    /// `REFUSE_ANCHOR_UNATTESTED_KEY_SWAP` on bare-swapped anchor, and every
+    /// error of cutover signing or trigger registration. On error `txn` rolls
+    /// back and `conn` is disarmed/reconciled (fail closed).
+    pub fn arm_in_tx(
+        txn: crate::storage::connection::WriteTxn<'c>,
+        agent_id: &str,
+        signing: &ed25519_dalek::SigningKey,
+    ) -> Result<Self> {
+        let conn = txn.conn();
+        let res = (|| -> Result<Option<std::path::PathBuf>> {
+            let who =
+                bound_identity(conn, agent_id, signing.clone()).map_err(anyhow::Error::msg)?;
+            let anchor = super::anchor::TrustAnchor::from_key_dir();
+            if let super::anchor::AnchorLoad::Anchored(ref anchored) = anchor {
+                // #10112 R-7 / #10160: refuse to arm against an anchor whose
+                // current key was bare-swapped outside a verified lineage chain.
+                crate::storage::recovery_rebind::verify_anchor_against_lineage_for_store(
+                    conn, anchored,
+                )?;
+            }
+            let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
+            let sealed = seal_file
+                .as_deref()
+                .map_or(SealState::NotSealed, seal::read);
+            if cutovers_all_signed(conn, &sealed) {
+                store_id(conn)
+                    .map_err(anyhow::Error::msg)
+                    .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
+            } else {
+                sign_cutovers(conn, &who, &sealed)
+                    .map_err(|e| e.context("row attestation cutover signing (#10040)"))?;
+            }
+            register(conn, SignerSource::Fixed(who))?;
+            Ok(seal_file)
+        })();
+
+        match res {
+            Ok(seal_on_commit) => Ok(Self {
+                active: Some(ActiveArmed {
+                    txn,
+                    seal_on_commit,
+                }),
+            }),
+            Err(err) => {
+                txn.rollback();
+                let _ = disarm_and_reconcile_funnel(conn);
+                Err(err)
+            }
         }
+    }
+
+    /// #10112 (Option B, vote V1-RECOVER-REBIND-ATTEST R-5/R-9) / #10141 — arm
+    /// an open recovery `WriteTxn` with the verified successor key `K_new` and
+    /// the single handoff timestamp `attested_at`.
+    ///
+    /// Crate-private: reachable only from `storage::recovery_rebind` after
+    /// consuming a quorum-verified `RecoveryChecked` proof.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed (rolling back `txn` and disarming `conn`) if the anchor is
+    /// unanchored/swapped, the store identity or seal is unreadable, or trigger
+    /// registration fails.
+    pub(crate) fn arm_for_recovery(
+        txn: crate::storage::connection::WriteTxn<'c>,
+        agent_id: &str,
+        k_new_signing: &ed25519_dalek::SigningKey,
+        anchor_dir: &std::path::Path,
+        attested_at: &str,
+    ) -> Result<Self> {
+        let conn = txn.conn();
+        let res = (|| -> Result<()> {
+            let verifying = k_new_signing.verifying_key();
+            let who = Signer {
+                agent_id: agent_id.to_string(),
+                key_id: key_id_of(&verifying),
+                signing: k_new_signing.clone(),
+            };
+            let anchor = super::anchor::TrustAnchor::load_dir(anchor_dir);
+            match &anchor {
+                super::anchor::AnchorLoad::Anchored(anchored) => {
+                    // #10112 R-7 / #10160: verify the pre-recovery anchor against
+                    // the verified pre-recovery lineage chain before arming.
+                    crate::storage::recovery_rebind::verify_anchor_against_lineage_for_store(
+                        conn, anchored,
+                    )?;
+                }
+                super::anchor::AnchorLoad::Unanchored(why) => {
+                    anyhow::bail!("{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: {why}");
+                }
+            }
+            let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
+            let sealed = seal_file
+                .as_deref()
+                .map_or(SealState::NotSealed, seal::read);
+            if cutovers_all_signed(conn, &sealed) {
+                store_id(conn)
+                    .map_err(anyhow::Error::msg)
+                    .map_err(|e| e.context("row attestation recovery arm (#10112)"))?;
+            } else {
+                sign_cutovers_at(conn, &who, &sealed, Some(attested_at))
+                    .map_err(|e| e.context("row attestation recovery cutover signing (#10112)"))?;
+            }
+            register(
+                conn,
+                SignerSource::FixedAt {
+                    who,
+                    attested_at: attested_at.to_string(),
+                },
+            )?;
+            Ok(())
+        })();
+
+        match res {
+            Ok(()) => Ok(Self {
+                active: Some(ActiveArmed {
+                    txn,
+                    // Recovery advances the seal explicitly via
+                    // `advance_seal_after_recovery` after the disk anchor swap.
+                    seal_on_commit: None,
+                }),
+            }),
+            Err(err) => {
+                txn.rollback();
+                let _ = disarm_and_reconcile_funnel(conn);
+                Err(err)
+            }
+        }
+    }
+
+    /// Commit the transaction, advance the anchored seal (if configured), and
+    /// reconcile the connection's funnel so no temporary `Fixed` / `FixedAt`
+    /// trigger binding outlives the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Propagates commit, seal-advance, or funnel-reconciliation errors. On
+    /// commit failure, the transaction is rolled back and `conn` is disarmed
+    /// with the seal left untouched.
+    pub fn commit(self) -> Result<()> {
+        self.commit_with_restore(disarm_and_reconcile_funnel)
+    }
+
+    pub(crate) fn commit_with_restore(
+        mut self,
+        restore_fn: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        let conn = active.txn.conn();
+        if let Err(commit_err) = active.txn.commit() {
+            let restore_res = disarm_and_reconcile_funnel(conn);
+            return merge_txn_and_restore(Err(anyhow::Error::from(commit_err)), restore_res);
+        }
+        let seal_res = if let Some(path) = active.seal_on_commit.as_deref() {
+            read_attestations(conn).and_then(|atts| {
+                seal::advance(path, &SealRecord::of(&atts))
+                    .map_err(|e| e.context("row attestation seal (#10087)"))
+            })
+        } else {
+            Ok(())
+        };
+        let restore_res = disarm_temp_funnel(conn).and_then(|()| restore_fn(conn));
+        merge_txn_and_restore(seal_res, restore_res)
+    }
+
+    pub(crate) fn rollback_with_restore(
+        mut self,
+        restore_fn: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        let conn = active.txn.conn();
+        active.txn.rollback();
+        disarm_temp_funnel(conn)?;
+        restore_fn(conn)
+    }
+}
+
+impl Drop for TxnArmed<'_> {
+    fn drop(&mut self) {
+        if let Some(active) = self.active.take() {
+            let conn = active.txn.conn();
+            active.txn.rollback();
+            if let Err(err) = disarm_and_reconcile_funnel(conn) {
+                // OWNERSHIP-25: never panic during Drop/unwind.
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("ERROR #10141: TxnArmed drop disarm/restore failed: {err:#}\n"),
+                );
+            }
+        }
+    }
+}
+
+fn merge_txn_and_restore(primary: Result<()>, restore: Result<()>) -> Result<()> {
+    match (primary, restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Err(primary_err), Err(restore_err)) => Err(primary_err.context(format!(
+            "additionally failed to reconcile row-attestation funnel: {restore_err:#}"
+        ))),
+    }
+}
+
+/// Remove every temporary `ra10040_*` trigger and unregister `ATTEST_FN` on
+/// `conn` (SQLite `ROLLBACK` does not undo C-API scalar-function registrations).
+fn disarm_temp_funnel(conn: &Connection) -> Result<()> {
+    for spec in TABLES {
+        let t = spec.table;
+        let sql = format!(
+            "DROP TRIGGER IF EXISTS temp.ra10040_{t}_ins;\
+             DROP TRIGGER IF EXISTS temp.ra10040_{t}_upd;\
+             DROP TRIGGER IF EXISTS temp.ra10040_{t}_del;"
+        );
+        conn.execute_batch(&sql)
+            .with_context(|| format!("drop temp row attestation triggers on {t}"))?;
+    }
+    conn.remove_function(ATTEST_FN, -1)
+        .context("remove row attestation scalar function")?;
+    Ok(())
+}
+
+/// Strip temporary `Fixed` / `FixedAt` bindings and restore `conn` to its
+/// canonical [`install`] posture (unarmed when the store is unarmed and no
+/// session signer exists; `Refusing` / `Armed` via `Session` otherwise).
+fn disarm_and_reconcile_funnel(conn: &Connection) -> Result<()> {
+    disarm_temp_funnel(conn)?;
+    match install(conn)? {
+        ArmState::Armed | ArmState::NoSigner | ArmState::Refusing => Ok(()),
     }
 }
 
@@ -883,9 +1172,8 @@ fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState
     let anchor = super::anchor::TrustAnchor::from_key_dir();
     if let super::anchor::AnchorLoad::Anchored(ref anchored) = anchor {
         // #10112 R-7 / #10160: fail-closed production enforcement on session
-        // boot (`install`) and succession (`arm_with_key`) arming — refuse to
-        // arm against an anchor whose current key was bare-swapped outside a
-        // verified lineage chain.
+        // boot (`install`) arming — refuse to arm against an anchor whose
+        // current key was bare-swapped outside a verified lineage chain.
         crate::storage::recovery_rebind::verify_anchor_against_lineage_for_store(conn, anchored)?;
     }
     let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
@@ -917,79 +1205,11 @@ fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState
     Ok(ArmState::Armed)
 }
 
-/// #10112 (Option B, vote V1-RECOVER-REBIND-ATTEST R-5/R-9) — arm `conn` inside
-/// an ALREADY-OPEN recovery `WriteTxn` with the verified successor key `K_new`
-/// and the single handoff timestamp `attested_at`.
-///
-/// Existing [`install`] and [`arm_with_key`] stay byte-for-byte unchanged; this
-/// crate-private helper is reachable only from `storage::recovery_rebind` after
-/// consuming a quorum-verified `RecoveryChecked` proof.
-///
-/// # Errors
-///
-/// Fails closed if `conn` is not inside an active write transaction, if the
-/// store identity or seal is unreadable, or if trigger registration fails.
-pub(crate) fn arm_for_recovery_in_tx(
-    conn: &Connection,
-    agent_id: &str,
-    k_new_signing: &ed25519_dalek::SigningKey,
-    anchor_dir: &std::path::Path,
-    attested_at: &str,
-) -> Result<()> {
-    if conn.is_autocommit() {
-        anyhow::bail!(
-            "{}: recovery arm must run inside the single recovery write transaction (#10112 R-5)",
-            refusal(REFUSE_UNARMED_HANDLE)
-        );
-    }
-    let verifying = k_new_signing.verifying_key();
-    let who = Signer {
-        agent_id: agent_id.to_string(),
-        key_id: key_id_of(&verifying),
-        signing: k_new_signing.clone(),
-    };
-    let anchor = super::anchor::TrustAnchor::load_dir(anchor_dir);
-    match &anchor {
-        super::anchor::AnchorLoad::Anchored(anchored) => {
-            // #10112 R-7 / #10160: verify the pre-recovery anchor against the
-            // verified pre-recovery lineage chain before arming inside the tx.
-            crate::storage::recovery_rebind::verify_anchor_against_lineage_for_store(
-                conn, anchored,
-            )?;
-        }
-        super::anchor::AnchorLoad::Unanchored(why) => {
-            anyhow::bail!("{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: {why}");
-        }
-    }
-    let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
-    let sealed = seal_file
-        .as_deref()
-        .map_or(SealState::NotSealed, seal::read);
-    if cutovers_all_signed(conn, &sealed) {
-        store_id(conn)
-            .map_err(anyhow::Error::msg)
-            .map_err(|e| e.context("row attestation recovery arm (#10112)"))?;
-    } else {
-        sign_cutovers_at(conn, &who, &sealed, Some(attested_at))
-            .map_err(|e| e.context("row attestation recovery cutover signing (#10112)"))?;
-    }
-    register(
-        conn,
-        SignerSource::FixedAt {
-            who,
-            attested_at: attested_at.to_string(),
-        },
-    )?;
-    Ok(())
-}
-
-/// #10112 — clear the temporary recovery `FixedAt` trigger binding after the
-/// recovery transaction finishes so a reused `Connection` never stamps later
-/// writes with the frozen recovery timestamp.
+/// #10112 / #10141 — clear the temporary recovery `FixedAt` trigger binding
+/// after the recovery transaction finishes so a reused `Connection` never
+/// stamps later writes with the frozen recovery timestamp.
 pub(crate) fn restore_post_recovery_funnel(conn: &Connection) -> Result<()> {
-    match install(conn)? {
-        ArmState::Armed | ArmState::NoSigner | ArmState::Refusing => Ok(()),
-    }
+    disarm_and_reconcile_funnel(conn)
 }
 
 /// #10112 (R-10) — advance the anchored seal strictly under `anchor_dir` after
