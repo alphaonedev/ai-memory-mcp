@@ -28,15 +28,35 @@
 //! * C: the libc families of [`LIBC_FAMILIES`] (libc 0.2.191) against the
 //!   `clippy.toml` entries, exact in both directions.
 //!
-//! What this census does not see: a variable set at run time from another
-//! thread, or a name built at compile time (`concat!`), reaches proptest
-//! without passing A1; the run-time refusal (A3) is the guard there. Code of a
-//! dependency is not read; A2 is the reasoned list of those crates.
+//! * R3 (round 3, deny by default): every identifier token of a watched
+//!   process, libc, nix or proptest name, and of every name bound to one, is
+//!   counted per file against `TOKEN_ROWS` under any cfg, in any macro body and
+//!   by any path; every form the census does not model (an impl header naming
+//!   a watched name, a watched path before `$`, a glob import of one, a pasted
+//!   identifier, inline assembly, an extern block) is a row of `SHAPE_ROWS`;
+//!   every macro of the proptest family that runs cases outside a guarded
+//!   `proptest!` block is red, and so is a second `proptest_guarded` or a
+//!   `proptest_guard` module that is not `tests/common/proptest_guard.rs`; a
+//!   silence under `cfg_attr` counts only for a predicate of
+//!   [`ACCEPTED_PREDICATES`] (none); every environment name that is not one
+//!   literal or one named constant is a row of `ENV_NAME_ROWS`, and a proptest
+//!   variable name joined by `concat!` counts against [`ENV_ROWS`]. The tables
+//!   are in `tests/common/census_rows_10176.rs`.
+//!
+//! What this census does not see: a variable name built at run time from
+//! parts (a `format!` or a `String` push) is counted by `ENV_NAME_ROWS` only
+//! where it is passed, not by its value; the run-time refusal (A3) is the guard
+//! there. Code of a dependency is not read; A2 is the reasoned list of those
+//! crates.
 
+#[path = "common/census_rows_10176.rs"]
+mod census_rows;
 #[path = "common/proptest_guard.rs"]
 mod proptest_guard;
 #[path = "common/rust_lex.rs"]
 mod rust_lex;
+
+use census_rows::{ENV_NAME_ROWS, SHAPE_ROWS, TOKEN_ROWS};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -429,8 +449,9 @@ fn starts(toks: &[Lexed], aliases: &BTreeSet<String>, libc_names: &BTreeSet<&str
 
 /// Whether the attribute opened by the `#` at `k` (`#[..]` or `#![..]`)
 /// expects or allows `clippy::disallowed_methods`; returns the index of its
-/// `[` too.
-fn silence_attr(toks: &[Lexed], k: usize) -> Option<(usize, bool)> {
+/// `[` too. Under a `cfg_attr` the silence counts only when every predicate
+/// is in `accepted` (#10176 R9: `cfg_attr(any(), ..)` is never true).
+fn silence_attr(toks: &[Lexed], k: usize, accepted: &[&str]) -> Option<(usize, bool)> {
     if !is_p(toks, k, '#') {
         return None;
     }
@@ -448,17 +469,22 @@ fn silence_attr(toks: &[Lexed], k: usize) -> Option<(usize, bool)> {
             && matches!(w[1].tok, Tok::PathSep)
             && is_ident_tok(&w[2], "disallowed_methods")
     });
-    Some((open, level && lint))
+    Some((open, level && lint && predicates_accepted(body, accepted)))
+}
+
+/// [`coverage_with`] under the census's [`ACCEPTED_PREDICATES`].
+fn coverage(toks: &[Lexed]) -> Vec<bool> {
+    coverage_with(toks, ACCEPTED_PREDICATES)
 }
 
 /// Per token: whether a silence attribute is in reach (its statement or
 /// item prefix, an enclosing item or block, the block's inner attributes,
 /// or the file's inner attributes). One forward pass, linear in the tokens.
-fn coverage(toks: &[Lexed]) -> Vec<bool> {
+fn coverage_with(toks: &[Lexed], accepted: &[&str]) -> Vec<bool> {
     let mut file_inner = false;
     let mut k = 0;
     while is_p(toks, k, '#') && is_p(toks, k + 1, '!') {
-        let Some((open, sil)) = silence_attr(toks, k) else {
+        let Some((open, sil)) = silence_attr(toks, k, accepted) else {
             break;
         };
         file_inner |= sil;
@@ -469,7 +495,7 @@ fn coverage(toks: &[Lexed]) -> Vec<bool> {
     let mut seg = false;
     for (k, slot) in out.iter_mut().enumerate() {
         let block = stack.last().copied().unwrap_or(file_inner);
-        if let Some((_, true)) = silence_attr(toks, k) {
+        if let Some((_, true)) = silence_attr(toks, k, accepted) {
             seg = true;
         }
         *slot = seg || block;
@@ -478,7 +504,7 @@ fn coverage(toks: &[Lexed]) -> Vec<bool> {
                 let mut inner = false;
                 let mut m = k + 1;
                 while is_p(toks, m, '#') && is_p(toks, m + 1, '!') {
-                    let Some((open, sil)) = silence_attr(toks, m) else {
+                    let Some((open, sil)) = silence_attr(toks, m, accepted) else {
                         break;
                     };
                     inner |= sil;
@@ -829,6 +855,524 @@ fn rust_files(tree: &Tree, errors: &mut Vec<String>) -> Vec<(String, Vec<Lexed>)
     out
 }
 
+// ---------------------------------------------------------------- R3: token census
+
+/// The seed of the watched names (#10176 round 3): the process module and
+/// the start types and traits, libc, nix, and every proptest macro and
+/// runner. The census counts every identifier token of these names and of
+/// every name bound to one of them (see [`watched_closure`]), under any cfg,
+/// in any macro body and in any path, and the count of each file is a row of
+/// [`TOKEN_ROWS`]. A token count needs no model of the start form.
+const WATCHED: &[&str] = &[
+    "Command",
+    "CommandCargoExt",
+    "CommandExt",
+    "TestRunner",
+    "audited_command",
+    "audited_tokio_command",
+    "libc",
+    "nix",
+    "process",
+    "prop",
+    "prop_assert",
+    "prop_assert_eq",
+    "prop_assert_ne",
+    "prop_assume",
+    "prop_compose",
+    "prop_oneof",
+    "property_test",
+    "proptest",
+    "proptest_helper",
+    "rusty_fork",
+    "rusty_fork_test",
+    "wait_timeout",
+];
+
+/// The seed of the proptest names: a macro of one of these names, or of a
+/// name bound to one, reaches the proptest runner.
+const RUNNER_FAMILY: &[&str] = &[
+    "TestRunner",
+    "prop",
+    "prop_assert",
+    "prop_assert_eq",
+    "prop_assert_ne",
+    "prop_assume",
+    "prop_compose",
+    "prop_oneof",
+    "property_test",
+    "proptest",
+    "proptest_helper",
+    "rusty_fork",
+    "rusty_fork_test",
+    "wait_timeout",
+];
+
+/// The proptest macros that build a strategy or assert inside a case and
+/// never run cases themselves.
+const NON_RUNNING: &[&str] = &[
+    "prop_assert",
+    "prop_assert_eq",
+    "prop_assert_ne",
+    "prop_assume",
+    "prop_compose",
+    "prop_oneof",
+];
+
+/// The `cfg_attr` predicates under which an expect or allow of
+/// `clippy::disallowed_methods` counts as in reach, written with no blanks.
+/// Empty: every conditional silence is out of reach (#10176 R9).
+const ACCEPTED_PREDICATES: &[&str] = &[];
+
+/// The one file that may define `proptest_guarded`.
+const GUARD_FILE: &str = "tests/common/proptest_guard.rs";
+
+/// The end of the `use` declaration at `k` (its `;`, or the end).
+fn decl_end(toks: &[Lexed], k: usize) -> usize {
+    (k..toks.len())
+        .find(|&m| is_p(toks, m, ';'))
+        .unwrap_or(toks.len())
+}
+
+/// Whether the token at `k` is an identifier of the set.
+fn ident_in(toks: &[Lexed], k: usize, set: &BTreeSet<String>) -> bool {
+    ident(toks, k).is_some_and(|s| set.contains(s))
+}
+
+/// The names one file binds to a name of `watched`: `X as Y` and
+/// `self as Y` in a `use`, `extern crate X as Y`, `type Y = .. X ..`, and
+/// a `macro_rules!` whose body names one.
+fn names_bound_in(toks: &[Lexed], watched: &BTreeSet<String>, add: &mut BTreeSet<String>) {
+    for k in 0..toks.len() {
+        match ident(toks, k) {
+            Some("use") => {
+                let end = decl_end(toks, k);
+                let mut seen = false;
+                for j in k..end {
+                    seen |= ident_in(toks, j, watched);
+                    let Some(y) = ident(toks, j + 2).filter(|y| *y != "_") else {
+                        continue;
+                    };
+                    if j + 2 >= end || ident(toks, j + 1) != Some("as") {
+                        continue;
+                    }
+                    let src =
+                        ident_in(toks, j, watched) || (ident(toks, j) == Some("self") && seen);
+                    if src {
+                        add.insert(y.to_string());
+                    }
+                }
+            }
+            Some("extern")
+                if ident(toks, k + 1) == Some("crate")
+                    && ident(toks, k + 3) == Some("as")
+                    && ident_in(toks, k + 2, watched) =>
+            {
+                if let Some(y) = ident(toks, k + 4).filter(|y| *y != "_") {
+                    add.insert(y.to_string());
+                }
+            }
+            Some("type") if !(k > 0 && is_sep(toks, k - 1)) => {
+                let Some(y) = ident(toks, k + 1) else {
+                    continue;
+                };
+                let end = (k + 1..toks.len())
+                    .find(|&m| matches!(tok(toks, m), Some(Tok::Punct(';' | '{' | '}'))))
+                    .unwrap_or(toks.len());
+                if (k + 2..end).any(|m| ident_in(toks, m, watched)) {
+                    add.insert(y.to_string());
+                }
+            }
+            Some("macro_rules") if is_p(toks, k + 1, '!') => {
+                let Some(y) = ident(toks, k + 2) else {
+                    continue;
+                };
+                let end = group_end(toks, k + 3).min(toks.len());
+                if (k + 3..end).any(|m| ident_in(toks, m, watched)) {
+                    add.insert(y.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The seed and every name bound to a member, to a fixpoint over the tree.
+fn watched_closure(files: &[(String, Vec<Lexed>)], seed: &[&str]) -> BTreeSet<String> {
+    let mut watched: BTreeSet<String> = seed.iter().map(|s| (*s).to_string()).collect();
+    loop {
+        let mut add = BTreeSet::new();
+        for (_, toks) in files {
+            names_bound_in(toks, &watched, &mut add);
+        }
+        let before = watched.len();
+        watched.extend(add);
+        if watched.len() == before {
+            return watched;
+        }
+    }
+}
+
+const SHAPE_IMPL: &str = "an impl whose header names a watched process, libc, nix or proptest name";
+const SHAPE_METAVAR: &str = "a watched path followed by a macro metavariable";
+const SHAPE_GLOB: &str = "a glob import of a watched path";
+const SHAPE_PASTE: &str = "a pasted or concatenated identifier";
+const SHAPE_ASM: &str = "inline assembly";
+const SHAPE_EXTERN: &str = "an extern block";
+
+/// Every shape of one file that the census does not model: (line, shape).
+fn shapes_of(toks: &[Lexed], watched: &BTreeSet<String>) -> Vec<(usize, &'static str)> {
+    let mut out = Vec::new();
+    for k in 0..toks.len() {
+        let line = toks[k].line;
+        let val = ident(toks, k);
+        if val == Some("impl") {
+            let mut depth = 0usize;
+            let mut hit = false;
+            for m in k + 1..toks.len() {
+                match tok(toks, m) {
+                    Some(Tok::Punct('<' | '(' | '[')) => depth += 1,
+                    Some(Tok::Punct('>' | ')' | ']')) => depth = depth.saturating_sub(1),
+                    Some(Tok::Punct('{' | ';')) if depth == 0 => break,
+                    _ => hit |= ident_in(toks, m, watched),
+                }
+            }
+            if hit {
+                out.push((line, SHAPE_IMPL));
+            }
+        }
+        if ident_in(toks, k, watched) && is_sep(toks, k + 1) && is_p(toks, k + 2, '$') {
+            out.push((line, SHAPE_METAVAR));
+        }
+        if val == Some("use") && !(k > 0 && is_sep(toks, k - 1)) {
+            let end = decl_end(toks, k);
+            if (k..end).any(|m| is_p(toks, m, '*')) && (k..end).any(|m| ident_in(toks, m, watched))
+            {
+                out.push((line, SHAPE_GLOB));
+            }
+        }
+        if is_p(toks, k, '[') && is_p(toks, k + 1, '<') {
+            out.push((line, SHAPE_PASTE));
+        }
+        if matches!(val, Some("paste" | "concat_idents")) && is_p(toks, k + 1, '!') {
+            out.push((line, SHAPE_PASTE));
+        }
+        if matches!(val, Some("asm" | "global_asm" | "naked_asm")) && is_p(toks, k + 1, '!') {
+            out.push((line, SHAPE_ASM));
+        }
+        if val == Some("extern")
+            && (is_p(toks, k + 1, '{')
+                || (matches!(tok(toks, k + 1), Some(Tok::Str(_))) && is_p(toks, k + 2, '{')))
+        {
+            out.push((line, SHAPE_EXTERN));
+        }
+    }
+    out
+}
+
+/// The finding for one shape of a file that has no [`SHAPE_ROWS`] row.
+fn shape_finding(rel: &str, line: usize, what: &str) -> String {
+    format!(
+        "{rel}:{line}: {what}; a form the census does not model needs a SHAPE_ROWS row with its reason (#10176)"
+    )
+}
+
+/// The C findings of one file: a macro that reaches the proptest runner
+/// outside a guarded `proptest!` block, a second definition or rename of
+/// the guard, and a guard module that is not the guard file.
+fn guard_findings(rel: &str, toks: &[Lexed], pt: &BTreeSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for k in 0..toks.len() {
+        let Some(val) = ident(toks, k) else { continue };
+        let line = toks[k].line;
+        if is_p(toks, k + 1, '!') && !is_p(toks, k + 2, '=') {
+            let via = k > 1 && is_sep(toks, k - 1) && ident_in(toks, k - 2, pt);
+            if (pt.contains(val) || via)
+                && val != "proptest"
+                && val != "macro_rules"
+                && !NON_RUNNING.contains(&val)
+            {
+                out.push(format!(
+                    "{rel}:{line}: {val}! reaches the proptest runner outside a guarded proptest! block (#10176)"
+                ));
+            }
+        }
+        if val == "proptest_guarded" && rel != GUARD_FILE && k > 0 {
+            let before = ident(toks, k - 1);
+            let defines =
+                matches!(
+                    before,
+                    Some("fn" | "as" | "const" | "static" | "let" | "mut")
+                ) || (k > 1 && is_p(toks, k - 1, '!') && ident(toks, k - 2) == Some("macro_rules"));
+            if defines {
+                out.push(format!(
+                    "{rel}:{line}: a definition or rename of proptest_guarded outside {GUARD_FILE}; a guarded block must call the one guard (#10176)"
+                ));
+            }
+        }
+        if val == "mod" && ident(toks, k + 1) == Some("proptest_guard") && !guard_path(rel, toks, k)
+        {
+            out.push(format!(
+                "{rel}:{line}: a proptest_guard module not loaded from {GUARD_FILE} by #[path] (#10176)"
+            ));
+        }
+    }
+    out
+}
+
+/// Whether the `mod proptest_guard` at `k` is `#[path = ".."]`, right
+/// before it (and its `pub` or `pub(..)`), naming [`GUARD_FILE`] from `rel`,
+/// and ends in `;`.
+fn guard_path(rel: &str, toks: &[Lexed], k: usize) -> bool {
+    if !is_p(toks, k + 2, ';') {
+        return false;
+    }
+    let mut b = k;
+    if b > 0 && ident(toks, b - 1) == Some("pub") {
+        b -= 1;
+    } else if b > 3
+        && is_p(toks, b - 1, ')')
+        && is_p(toks, b - 3, '(')
+        && ident(toks, b - 4) == Some("pub")
+    {
+        b -= 4;
+    }
+    let Some(a) = b.checked_sub(6) else {
+        return false;
+    };
+    let Some(Tok::Str(path)) = tok(toks, a + 4) else {
+        return false;
+    };
+    is_p(toks, a, '#')
+        && is_p(toks, a + 1, '[')
+        && ident(toks, a + 2) == Some("path")
+        && is_p(toks, a + 3, '=')
+        && is_p(toks, a + 5, ']')
+        && lexical_join(rel, path).as_deref() == Some(GUARD_FILE)
+}
+
+/// The tree path that `path` names from the directory of `rel`, with `.`
+/// and `..` folded; `None` when it leaves the tree or is absolute.
+fn lexical_join(rel: &str, path: &str) -> Option<String> {
+    if path.starts_with('/') || path.contains('\\') {
+        return None;
+    }
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop();
+    for p in path.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(p),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// The tokens of a `cfg_attr` predicate written with no blanks.
+fn predicate_text(toks: &[Lexed]) -> String {
+    let mut s = String::new();
+    for t in toks {
+        match &t.tok {
+            Tok::Ident(v) => {
+                if s.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    s.push(' ');
+                }
+                s.push_str(v);
+            }
+            Tok::Punct(c) => s.push(*c),
+            Tok::PathSep => s.push_str("::"),
+            Tok::Str(v) => {
+                s.push('"');
+                s.push_str(v);
+                s.push('"');
+            }
+            Tok::Char => s.push_str("'?'"),
+        }
+    }
+    s
+}
+
+/// Whether every `cfg_attr` predicate in the attribute body is accepted.
+fn predicates_accepted(body: &[Lexed], accepted: &[&str]) -> bool {
+    for k in 0..body.len() {
+        if ident(body, k) != Some("cfg_attr") || !is_p(body, k + 1, '(') {
+            continue;
+        }
+        let end = group_end(body, k + 1).min(body.len());
+        let mut depth = 0usize;
+        let mut comma = end;
+        for m in k + 2..end {
+            match tok(body, m) {
+                Some(Tok::Punct('(' | '[' | '{')) => depth += 1,
+                Some(Tok::Punct(')' | ']' | '}')) => depth = depth.saturating_sub(1),
+                Some(Tok::Punct(',')) if depth == 0 => {
+                    comma = m;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let text = predicate_text(&body[k + 2..comma]);
+        if !accepted.contains(&text.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The finding for a token, shape or env-name table whose count differs.
+fn table_line(rel: &str, table: &str, have: usize, want: usize) -> String {
+    match table {
+        "TOKEN_ROWS" => format!(
+            "{rel}: {have} watched process, libc, nix or proptest tokens, TOKEN_ROWS has {want}; every reference under any cfg, in any macro or by any path needs its exact row (#10176)"
+        ),
+        "SHAPE_ROWS" => format!(
+            "{rel}: {have} forms the census does not model, SHAPE_ROWS has {want}; each needs its exact row with its reason (#10176)"
+        ),
+        _ => format!(
+            "{rel}: {have} environment names that are not one string literal or one named constant, {table} has {want}; a built name can switch proptest fork on (#10176)"
+        ),
+    }
+}
+
+/// Both directions of an R3 table, then each row without a reason of at
+/// least 20 bytes and each row out of order.
+fn table_findings(
+    table: &str,
+    have: &BTreeMap<String, usize>,
+    rows: &[(&str, usize, &str)],
+) -> Vec<String> {
+    let want: BTreeMap<&str, usize> = rows.iter().map(|(p, n, _)| (*p, *n)).collect();
+    let mut out = Vec::new();
+    for (rel, n) in have {
+        let w = want.get(rel.as_str()).copied().unwrap_or(0);
+        if w != *n {
+            out.push(table_line(rel, table, *n, w));
+        }
+    }
+    for (rel, w) in &want {
+        if !have.contains_key(*rel) {
+            out.push(table_line(rel, table, 0, *w));
+        }
+    }
+    for (rel, _, why) in rows {
+        if why.trim().len() < 20 {
+            out.push(format!(
+                "{rel}: the {table} row has no reason of at least 20 bytes (#10176)"
+            ));
+        }
+    }
+    for w in rows.windows(2) {
+        if w[0].0 >= w[1].0 {
+            out.push(format!(
+                "{}: {table} is not sorted or holds the file twice (#10176)",
+                w[1].0
+            ));
+        }
+    }
+    out
+}
+
+const ENV_FNS: &[&str] = &["remove_var", "set_var", "var", "var_os"];
+
+/// The first argument of the group opened at `open`.
+fn first_arg(toks: &[Lexed], open: usize) -> &[Lexed] {
+    let end = group_end(toks, open).min(toks.len());
+    let mut depth = 0usize;
+    for m in open + 1..end {
+        match tok(toks, m) {
+            Some(Tok::Punct('(' | '[' | '{')) => depth += 1,
+            Some(Tok::Punct(')' | ']' | '}')) => depth = depth.saturating_sub(1),
+            Some(Tok::Punct(',')) if depth == 0 => return &toks[open + 1..m],
+            _ => {}
+        }
+    }
+    toks.get(open + 1..end).unwrap_or(&[])
+}
+
+/// Whether an env-name argument is one string literal or one named
+/// constant (`[&] [path ::] NAME`, NAME in upper case).
+fn name_ok(arg: &[Lexed]) -> bool {
+    if let [one] = arg
+        && matches!(one.tok, Tok::Str(_))
+    {
+        return true;
+    }
+    let arg = match arg.first() {
+        Some(t) if matches!(t.tok, Tok::Punct('&')) => &arg[1..],
+        _ => arg,
+    };
+    let Some(Tok::Ident(last)) = arg.last().map(|t| &t.tok) else {
+        return false;
+    };
+    let mut chars = last.chars();
+    let caps = chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    caps && arg.iter().enumerate().all(|(i, t)| {
+        if i % 2 == 0 {
+            matches!(t.tok, Tok::Ident(_))
+        } else {
+            matches!(t.tok, Tok::PathSep)
+        }
+    })
+}
+
+/// The environment-name arguments of one file that are not one literal and
+/// not one named constant (`env::var` and its siblings, `.env(..)`,
+/// `.env_remove(..)`, `env!` and `option_env!`).
+fn env_name_sites(toks: &[Lexed]) -> usize {
+    let mut n = 0;
+    for k in 0..toks.len() {
+        let Some(val) = ident(toks, k) else { continue };
+        let path_call = ENV_FNS.contains(&val)
+            && k > 1
+            && is_sep(toks, k - 1)
+            && ident(toks, k - 2) == Some("env");
+        let method_call = matches!(val, "env" | "env_remove") && k > 0 && is_p(toks, k - 1, '.');
+        let arg = if (path_call || method_call) && is_p(toks, k + 1, '(') {
+            Some(first_arg(toks, k + 1))
+        } else if matches!(val, "env" | "option_env")
+            && is_p(toks, k + 1, '!')
+            && matches!(tok(toks, k + 2), Some(Tok::Punct('(' | '[' | '{')))
+        {
+            Some(first_arg(toks, k + 2))
+        } else {
+            None
+        };
+        if arg.is_some_and(|a| !name_ok(a)) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The proptest variable names that a `concat!` builds and that no one of
+/// its literals holds alone.
+fn concat_needles(toks: &[Lexed], needle: &str) -> usize {
+    let mut n = 0;
+    for k in 0..toks.len() {
+        if ident(toks, k) != Some("concat") || !is_p(toks, k + 1, '!') {
+            continue;
+        }
+        let end = group_end(toks, k + 2).min(toks.len());
+        let parts: Vec<&str> = toks
+            .get(k + 3..end)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|t| match &t.tok {
+                Tok::Str(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let joined = parts.concat();
+        let alone: usize = parts.iter().map(|p| p.matches(needle).count()).sum();
+        n += joined.matches(needle).count().saturating_sub(alone);
+    }
+    n
+}
+
 /// Every census finding of the tree: B, A1 and the env rows.
 fn census(tree: &Tree) -> Vec<String> {
     let mut out: Vec<String> = tree
@@ -839,10 +1383,45 @@ fn census(tree: &Tree) -> Vec<String> {
     let lexed = rust_files(tree, &mut out);
     let names = libc_start_names();
     let aliases: BTreeSet<String> = lexed.iter().flat_map(|(_, t)| aliases_in(t)).collect();
+    let watched = watched_closure(&lexed, WATCHED);
+    let pt = watched_closure(&lexed, RUNNER_FAMILY);
+    let shape_rowed: BTreeSet<&str> = SHAPE_ROWS.iter().map(|r| r.0).collect();
+    let needle = env_needle();
     let mut counts = BTreeMap::new();
     let mut outside = BTreeMap::new();
     let mut a1 = BTreeMap::new();
+    let mut tokens = BTreeMap::new();
+    let mut shapes = BTreeMap::new();
+    let mut env_names = BTreeMap::new();
+    let mut joined = BTreeMap::new();
     for (rel, toks) in &lexed {
+        let n = (0..toks.len())
+            .filter(|&k| ident_in(toks, k, &watched))
+            .count();
+        if n > 0 {
+            tokens.insert(rel.clone(), n);
+        }
+        let found = shapes_of(toks, &watched);
+        if shape_rowed.contains(rel.as_str()) {
+            if !found.is_empty() {
+                shapes.insert(rel.clone(), found.len());
+            }
+        } else {
+            out.extend(
+                found
+                    .iter()
+                    .map(|(line, what)| shape_finding(rel, *line, what)),
+            );
+        }
+        out.extend(guard_findings(rel, toks, &pt));
+        let n = env_name_sites(toks);
+        if n > 0 {
+            env_names.insert(rel.clone(), n);
+        }
+        let n = concat_needles(toks, &needle);
+        if n > 0 {
+            joined.insert(rel.clone(), n);
+        }
         let sites = starts(toks, &aliases, &names);
         let pkg = in_package(rel, &tree.packages);
         if !sites.is_empty() {
@@ -873,8 +1452,11 @@ fn census(tree: &Tree) -> Vec<String> {
             .filter(|r| r.1 > 0)
             .map(|(p, n, _)| (*p, *n)),
     ));
+    out.extend(table_findings("TOKEN_ROWS", &tokens, TOKEN_ROWS));
+    out.extend(table_findings("SHAPE_ROWS", &shapes, SHAPE_ROWS));
     out.extend(compare_forms(&a1));
-    out.extend(env_findings(tree));
+    out.extend(env_findings(tree, &joined));
+    out.extend(table_findings("ENV_NAME_ROWS", &env_names, ENV_NAME_ROWS));
     out
 }
 
@@ -927,12 +1509,17 @@ fn compare_forms(have: &BTreeMap<String, Vec<String>>) -> Vec<String> {
     out
 }
 
-fn env_findings(tree: &Tree) -> Vec<String> {
+/// The [`ENV_ROWS`] findings: the byte count of the needle in every file plus
+/// `joined`, the names a `concat!` of a `.rs` file builds from parts.
+fn env_findings(tree: &Tree, joined: &BTreeMap<String, usize>) -> Vec<String> {
     let needle = env_needle();
     let have: BTreeMap<&str, usize> = tree
         .files
         .iter()
-        .map(|(rel, b)| (rel.as_str(), count_bytes(b, needle.as_bytes())))
+        .map(|(rel, b)| {
+            let built = joined.get(rel).copied().unwrap_or(0);
+            (rel.as_str(), count_bytes(b, needle.as_bytes()) + built)
+        })
         .filter(|(_, n)| *n > 0)
         .collect();
     let want: BTreeMap<&str, usize> = ENV_ROWS.iter().map(|(p, n, _)| (*p, *n)).collect();
@@ -972,6 +1559,18 @@ fn every_row_has_a_reason_and_the_tables_are_sorted_10176() {
     for (p, n, why) in OUTSIDE_LAYER_ONE.iter().chain(A1_ROWS).chain(ENV_ROWS) {
         assert!(why.len() >= 20, "{p}: a reason of at least 20 bytes");
         let _ = n;
+    }
+    for (table, rows) in [
+        ("TOKEN_ROWS", TOKEN_ROWS),
+        ("SHAPE_ROWS", SHAPE_ROWS),
+        ("ENV_NAME_ROWS", ENV_NAME_ROWS),
+    ] {
+        assert_eq!(
+            table_findings(table, &BTreeMap::new(), rows).len(),
+            rows.len(),
+            "{table}: every row is reasoned and sorted (one stale line per row only)"
+        );
+        assert!(rows.iter().all(|r| r.1 > 0), "{table}: no row of count 0");
     }
     for (p, why) in SKIPPED {
         assert!(why.len() >= 10, "{p}: a skip reason");
@@ -1249,7 +1848,7 @@ fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
         links: vec![],
         packages: vec![],
     };
-    let got = env_findings(&tree);
+    let got = env_findings(&tree, &BTreeMap::new());
     let line = |rel: &str, h: usize, w: usize| {
         format!(
             "{rel}: names a proptest environment variable {h} times, ENV_ROWS has {w}; a variable set in CI, .cargo config, a script or code can switch fork on (#10176)"
@@ -1453,6 +2052,95 @@ fn a_wrong_count_and_a_stale_row_of_the_token_tables_are_red_10176() {
             "src/daemon_runtime.rs: 0 forms the census does not model, SHAPE_ROWS has 1; each needs its exact row with its reason (#10176)".to_string(),
             "tests/common/tls_serve.rs: 0 forms the census does not model, SHAPE_ROWS has 3; each needs its exact row with its reason (#10176)".to_string(),
         ]
+    );
+}
+
+/// A row with a short reason, a row out of order and a file held twice are
+/// each red with the exact line; a matching table is green.
+#[test]
+fn a_reasonless_or_unsorted_r3_row_is_red_10176() {
+    let why = "a reason of more than twenty bytes";
+    let have: BTreeMap<String, usize> = [("a.rs".to_string(), 1), ("b.rs".to_string(), 2)]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        table_findings("TOKEN_ROWS", &have, &[("a.rs", 1, why), ("b.rs", 2, why)]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        table_findings(
+            "SHAPE_ROWS",
+            &have,
+            &[("a.rs", 1, "short"), ("b.rs", 2, why)]
+        ),
+        vec!["a.rs: the SHAPE_ROWS row has no reason of at least 20 bytes (#10176)".to_string()]
+    );
+    assert_eq!(
+        table_findings(
+            "ENV_NAME_ROWS",
+            &have,
+            &[("b.rs", 2, why), ("a.rs", 1, why)]
+        ),
+        vec!["a.rs: ENV_NAME_ROWS is not sorted or holds the file twice (#10176)".to_string()]
+    );
+    assert_eq!(
+        table_findings(
+            "TOKEN_ROWS",
+            &have,
+            &[("a.rs", 1, why), ("a.rs", 1, why), ("b.rs", 2, why)]
+        ),
+        vec!["a.rs: TOKEN_ROWS is not sorted or holds the file twice (#10176)".to_string()]
+    );
+}
+
+/// Part D: a silence under `cfg_attr` is in reach only for a predicate of the
+/// accepted set, which is empty in the census; an accepted predicate in a
+/// test set is in reach, and a second predicate that is not accepted is not.
+#[test]
+fn a_cfg_attr_silence_is_in_reach_only_for_an_accepted_predicate_10176() {
+    assert!(
+        ACCEPTED_PREDICATES.is_empty(),
+        "no cfg_attr silence is accepted"
+    );
+    let text =
+        "#[cfg_attr(test, expect(clippy::disallowed_methods, reason = \"x\"))]\nfn f() { g(); }\n";
+    let toks = lex(text);
+    let at = toks
+        .iter()
+        .position(|t| is_ident_tok(t, "g"))
+        .expect("the call is lexed");
+    assert!(
+        !coverage(&toks)[at],
+        "cfg_attr(test, ..) is out of reach in the census"
+    );
+    assert!(
+        coverage_with(&toks, &["test"])[at],
+        "an accepted predicate is in reach"
+    );
+    assert!(
+        !coverage_with(&toks, &["unix"])[at],
+        "another accepted predicate does not cover cfg_attr(test, ..)"
+    );
+    let nested =
+        "#[cfg_attr(test, cfg_attr(unix, expect(clippy::disallowed_methods)))]\nfn f() { g(); }\n";
+    let toks = lex(nested);
+    let at = toks
+        .iter()
+        .position(|t| is_ident_tok(t, "g"))
+        .expect("the call is lexed");
+    assert!(
+        !coverage_with(&toks, &["test"])[at],
+        "every nested predicate must be accepted"
+    );
+    assert!(coverage_with(&toks, &["test", "unix"])[at]);
+    let plain = lex("#[expect(clippy::disallowed_methods)]\nfn f() { g(); }\n");
+    let at = plain
+        .iter()
+        .position(|t| is_ident_tok(t, "g"))
+        .expect("the call is lexed");
+    assert!(
+        coverage(&plain)[at],
+        "an unconditional expect stays in reach"
     );
 }
 

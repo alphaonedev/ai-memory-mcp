@@ -397,8 +397,11 @@ fn scratch_dir(parent: &Path) -> PathBuf {
 // (`LOCK_ROWS`), so a new such package or a version change is red until
 // someone re-reads it; and the one dependency path that forks from inside a
 // test, proptest's `fork` and `timeout` (on by default through its `fork`
-// feature, #10244), is refused at run time by `proptest_guarded` and in the
-// tree by the census of proptest blocks. A program that is not built from
+// feature, #10244), is refused at run time by `proptest_guarded`. In the tree
+// the census counts every proptest token per file (`TOKEN_ROWS`), holds every
+// `proptest!` block to open with the guard, and makes red every other macro of
+// the proptest family that runs cases (`proptest_helper!` among them, and any
+// macro that wraps one). A program that is not built from
 // this repository (a system tool) is outside this gate. The crates in
 // [`OTHER_CRATES`] are separate packages that clippy never lints, and are
 // pinned as a list; tests/process_start_census_10176.rs still counts their
