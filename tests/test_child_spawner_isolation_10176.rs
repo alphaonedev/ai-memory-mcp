@@ -327,3 +327,909 @@ fn scratch_dir(parent: &Path) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
+
+// ---------------------------------------------------------------------------
+// #10176 r1 (LOW 10191 / LOW 10186): every construction of a process command
+// under src/, by any spelling, is an exact per-file allowlist row.
+// ---------------------------------------------------------------------------
+//
+// The scanner below is a small Rust lexer (comments skipped, string, byte
+// string, raw string and char literals DECODED, raw identifiers unwrapped).
+// A "spawn site" in a src/ file is any of:
+//
+// - the identifiers of [`SPAWN_IDENTS`]: `current_exe`, `args_os`, the two
+//   #1937 chokepoints `audited_command` / `audited_tokio_command` and the
+//   `assert_cmd` dev-dependency, so a path call, a `use .. as` alias, a
+//   re-export and a macro body all count;
+// - the paths of [`SPAWN_MEMBERS`]: `process :: Command` (std and tokio),
+//   `env :: args` (argv[0] names the running executable) and the `libc`
+//   fork / exec / spawn calls, each also as `module :: *` and inside a
+//   `module :: { .. }` import group;
+// - a decoded string literal with a `proc` or `exe` path segment; the
+//   pieces of one `concat!( .. )` are joined first, so a split, escaped
+//   (`\x2f`, `\u{2f}`) or `format!`-built `/proc/<pid>/exe` path counts;
+// - a `paste` identifier (the one macro in the dependency tree that can glue
+//   an identifier together from pieces).
+//
+// Refused outright, wherever they appear in the scanned tree: a symbolic link
+// (its target could be any file, scanned or not), an `include!` whose argument
+// is not one literal ending in `.rs`, and a `#[path = ..]` that does not name
+// a `.rs` file.
+
+/// Every src/ file allowed spawn sites, with the exact count and the reason.
+/// `src/test_support.rs` is the builder and is exempt from the count; it is
+/// held to [`builder_exports_no_process_command_10176`] instead.
+const SRC_SPAWN_ALLOWLIST: &[(&str, usize, &str)] = &[
+    (
+        "src/cli/agents.rs",
+        1,
+        "product message text naming /proc cmdline exposure of a token on argv; no spawn",
+    ),
+    (
+        "src/cli/doctor.rs",
+        1,
+        "product doctor probe through the #1937 audited_command chokepoint",
+    ),
+    (
+        "src/cli/helpers.rs",
+        1,
+        "product helper spawn through the #1937 audited_command chokepoint",
+    ),
+    ("src/cli/install.rs", 1, WHY_PRODUCT_PATH),
+    (
+        "src/cli/wake_listen.rs",
+        1,
+        "product wake listener spawn through the #1937 audited_tokio_command chokepoint",
+    ),
+    (
+        "src/cli/wrap.rs",
+        2,
+        "product wrap verb: the process::Command type import and its audited_command spawn",
+    ),
+    (
+        "src/encryption/mod.rs",
+        1,
+        "test helper that runs git on a scratch repository fixture, never the test executable",
+    ),
+    (
+        "src/federation/mod.rs",
+        1,
+        "env::args read of the libtest filter to tell the isolated child apart, no spawn",
+    ),
+    (
+        "src/governance/audit.rs",
+        1,
+        "test runs mkfifo to build a FIFO fixture, never the test executable",
+    ),
+    (
+        "src/governance/capability.rs",
+        1,
+        "product message text naming /proc cmdline exposure of a macaroon on argv; no spawn",
+    ),
+    (
+        "src/governance/deferred_audit.rs",
+        3,
+        "tests run mkfifo and chmod (macOS) to build file fixtures, never the test executable",
+    ),
+    (
+        "src/handlers/tests.rs",
+        1,
+        "env::args read of the libtest filter to tell the isolated child apart, no spawn",
+    ),
+    (
+        "src/hooks/executor.rs",
+        3,
+        "two product hook spawns through audited_tokio_command plus the test module's tokio Command import for hook fixtures",
+    ),
+    (
+        "src/main.rs",
+        1,
+        "product entry point reads env::args to dispatch the CLI, no spawn",
+    ),
+    (
+        "src/spawn_audit.rs",
+        8,
+        "the #1937 product spawn chokepoint itself: the only Command::new sites of the crate",
+    ),
+    (
+        "src/store_url.rs",
+        1,
+        "product message text naming /proc cmdline exposure of a password on argv; no spawn",
+    ),
+];
+
+const SRC_DIR: &str = "src";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    Ident(String),
+    Punct(char),
+    PathSep,
+    Str(String),
+    Char,
+}
+
+#[derive(Debug, Clone)]
+struct Lexed {
+    tok: Tok,
+    line: usize,
+}
+
+/// Decode the body of a (non-raw) string literal starting after the opening
+/// quote at `c[i]`; returns the decoded text and the index after the quote.
+fn decode_quoted(c: &[char], mut i: usize, line: &mut usize) -> (String, usize) {
+    let mut out = String::new();
+    while i < c.len() {
+        let ch = c[i];
+        if ch == '"' {
+            return (out, i + 1);
+        }
+        if ch == '\n' {
+            *line += 1;
+        }
+        if ch != '\\' {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        let Some(&e) = c.get(i + 1) else {
+            return (out, c.len());
+        };
+        i += 2;
+        match e {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '0' => out.push('\0'),
+            '\\' | '\'' | '"' => out.push(e),
+            'x' => {
+                let hex: String = c[i..c.len().min(i + 2)].iter().collect();
+                if let Ok(v) = u8::from_str_radix(&hex, 16) {
+                    out.push(char::from(v));
+                }
+                i += 2;
+            }
+            'u' => {
+                let close = c[i..]
+                    .iter()
+                    .position(|&x| x == '}')
+                    .map_or(c.len(), |p| i + p);
+                let hex: String = c[i..close]
+                    .iter()
+                    .filter(|x| x.is_ascii_hexdigit())
+                    .collect();
+                if let Some(v) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    out.push(v);
+                }
+                i = close + 1;
+            }
+            '\n' => {
+                *line += 1;
+                while i < c.len() && c[i].is_whitespace() {
+                    if c[i] == '\n' {
+                        *line += 1;
+                    }
+                    i += 1;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    (out, i)
+}
+
+fn lex(src: &str) -> Vec<Lexed> {
+    let c: Vec<char> = src.chars().collect();
+    let is_ident_start = |x: char| x.is_alphabetic() || x == '_';
+    let is_ident = |x: char| x.is_alphanumeric() || x == '_';
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut i = 0usize;
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        if ch == '\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if ch == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    if c[i] == '\n' {
+                        line += 1;
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // String prefixes: b"..", c"..", r".." / r#".."#, br, cr.
+        if is_ident_start(ch) {
+            let mut j = i;
+            while j < c.len() && is_ident(c[j]) {
+                j += 1;
+            }
+            let word: String = c[i..j].iter().collect();
+            let at = line;
+            if matches!(word.as_str(), "r" | "br" | "cr") && matches!(c.get(j), Some('"' | '#')) {
+                let mut k = j;
+                let mut hashes = 0usize;
+                while c.get(k) == Some(&'#') {
+                    hashes += 1;
+                    k += 1;
+                }
+                if c.get(k) == Some(&'"') {
+                    k += 1;
+                    let start = k;
+                    while k < c.len()
+                        && !(c[k] == '"' && (0..hashes).all(|h| c.get(k + 1 + h) == Some(&'#')))
+                    {
+                        if c[k] == '\n' {
+                            line += 1;
+                        }
+                        k += 1;
+                    }
+                    let body: String = c[start..k.min(c.len())].iter().collect();
+                    out.push(Lexed {
+                        tok: Tok::Str(body),
+                        line: at,
+                    });
+                    i = k + 1 + hashes;
+                    continue;
+                }
+                if word == "r" && hashes == 1 && c.get(k).is_some_and(|x| is_ident_start(*x)) {
+                    // Raw identifier r#name.
+                    let mut m = k;
+                    while m < c.len() && is_ident(c[m]) {
+                        m += 1;
+                    }
+                    out.push(Lexed {
+                        tok: Tok::Ident(c[k..m].iter().collect()),
+                        line: at,
+                    });
+                    i = m;
+                    continue;
+                }
+            }
+            if matches!(word.as_str(), "b" | "c") && c.get(j) == Some(&'"') {
+                let (body, end) = decode_quoted(&c, j + 1, &mut line);
+                out.push(Lexed {
+                    tok: Tok::Str(body),
+                    line: at,
+                });
+                i = end;
+                continue;
+            }
+            if word == "b" && c.get(j) == Some(&'\'') {
+                let close = c[j + 1..]
+                    .iter()
+                    .position(|&x| x == '\'')
+                    .map_or(c.len(), |p| j + 1 + p);
+                out.push(Lexed {
+                    tok: Tok::Char,
+                    line: at,
+                });
+                i = close + 1;
+                continue;
+            }
+            out.push(Lexed {
+                tok: Tok::Ident(word),
+                line: at,
+            });
+            i = j;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            while i < c.len()
+                && (is_ident(c[i]) || c[i] == '.' && c.get(i + 1).is_some_and(char::is_ascii_digit))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '"' {
+            let at = line;
+            let (body, end) = decode_quoted(&c, i + 1, &mut line);
+            out.push(Lexed {
+                tok: Tok::Str(body),
+                line: at,
+            });
+            i = end;
+            continue;
+        }
+        if ch == '\'' {
+            // Char literal or lifetime.
+            let close = if next == Some('\\') {
+                c[i + 2..]
+                    .iter()
+                    .position(|&x| x == '\'')
+                    .map(|p| i + 2 + p)
+            } else if c.get(i + 2) == Some(&'\'') {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(end) = close {
+                out.push(Lexed {
+                    tok: Tok::Char,
+                    line,
+                });
+                i = end + 1;
+                continue;
+            }
+            out.push(Lexed {
+                tok: Tok::Punct('\''),
+                line,
+            });
+            i += 1;
+            continue;
+        }
+        if ch == ':' && next == Some(':') {
+            out.push(Lexed {
+                tok: Tok::PathSep,
+                line,
+            });
+            i += 2;
+            continue;
+        }
+        out.push(Lexed {
+            tok: Tok::Punct(ch),
+            line,
+        });
+        i += 1;
+    }
+    out
+}
+
+fn is_ident_tok(t: &Lexed, name: &str) -> bool {
+    matches!(&t.tok, Tok::Ident(s) if s == name)
+}
+
+/// Index of the token closing the group opened at `open` (which holds `(`,
+/// `[` or `{`), or the end.
+fn group_end(toks: &[Lexed], open: usize) -> usize {
+    let mut depth = 0usize;
+    for (k, t) in toks.iter().enumerate().skip(open) {
+        match t.tok {
+            Tok::Punct('(' | '[' | '{') => depth += 1,
+            Tok::Punct(')' | ']' | '}') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return k;
+                }
+            }
+            _ => {}
+        }
+    }
+    toks.len()
+}
+
+/// Identifiers that are a spawn site wherever they appear: the executable
+/// path, argv, both #1937 chokepoints, the `assert_cmd` dev-dependency (usable
+/// from a lib test) and the `paste` identifier-gluing macro.
+const SPAWN_IDENTS: &[&str] = &[
+    "current_exe",
+    "args_os",
+    "audited_command",
+    "audited_tokio_command",
+    "assert_cmd",
+    "paste",
+];
+
+/// `module :: member` paths that are a spawn site, with `module :: *` and
+/// every member (or `*`) inside a `module :: { .. }` group.
+const SPAWN_MEMBERS: &[(&str, &[&str])] = &[
+    ("process", &["Command"]),
+    ("env", &["args"]),
+    (
+        "libc",
+        &[
+            "fork",
+            "vfork",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+            "execl",
+            "execle",
+            "execlp",
+            "fexecve",
+            "posix_spawn",
+            "posix_spawnp",
+            "system",
+        ],
+    ),
+];
+
+/// A decoded literal that names a `/proc` or executable path segment.
+fn is_exe_literal(text: &str) -> bool {
+    text.split(['/', '\\'])
+        .any(|seg| seg == "proc" || seg == "exe")
+}
+
+/// The line of every spawn site in one lexed source.
+fn spawn_sites(toks: &[Lexed]) -> Vec<usize> {
+    let mut sites = Vec::new();
+    let mut i = 0usize;
+    while i < toks.len() {
+        let t = &toks[i];
+        let after_sep = |k: usize| -> Option<&Lexed> {
+            (toks.get(k + 1).map(|x| &x.tok) == Some(&Tok::PathSep))
+                .then(|| toks.get(k + 2))
+                .flatten()
+        };
+        match &t.tok {
+            Tok::Ident(s) if SPAWN_IDENTS.contains(&s.as_str()) => {
+                sites.push(t.line);
+            }
+            Tok::Ident(s) if SPAWN_MEMBERS.iter().any(|(m, _)| m == s) => {
+                let members = SPAWN_MEMBERS
+                    .iter()
+                    .find(|(m, _)| m == s)
+                    .map_or(&[][..], |(_, ms)| *ms);
+                let is_member = |x: &Lexed| members.iter().any(|m| is_ident_tok(x, m));
+                if let Some(n) = after_sep(i) {
+                    match &n.tok {
+                        Tok::Ident(_) if is_member(n) => sites.push(n.line),
+                        Tok::Punct('*') => sites.push(n.line),
+                        Tok::Punct('{') => {
+                            let open = i + 2;
+                            let end = group_end(toks, open);
+                            for g in &toks[open..end.min(toks.len())] {
+                                if is_member(g) || g.tok == Tok::Punct('*') {
+                                    sites.push(g.line);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Tok::Ident(s)
+                if s == "concat" && toks.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct('!')) =>
+            {
+                let open = i + 2;
+                let end = group_end(toks, open);
+                let joined: String = toks[open.min(toks.len())..end.min(toks.len())]
+                    .iter()
+                    .filter_map(|x| match &x.tok {
+                        Tok::Str(v) => Some(v.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if is_exe_literal(&joined) {
+                    sites.push(t.line);
+                }
+                i = end;
+            }
+            Tok::Str(v) if is_exe_literal(v) => sites.push(t.line),
+            _ => {}
+        }
+        i += 1;
+    }
+    sites
+}
+
+/// Problems that refuse a file whatever the allowlist says: a computed or
+/// non-`.rs` `include!`, and a `#[path]` to a non-`.rs` file.
+fn include_problems(toks: &[Lexed]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let bang = toks.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct('!'));
+        if is_ident_tok(t, "include") && bang {
+            let lit_rs = matches!(
+                (toks.get(i + 2).map(|x| &x.tok), toks.get(i + 3).map(|x| &x.tok), toks.get(i + 4).map(|x| &x.tok)),
+                (Some(Tok::Punct('(')), Some(Tok::Str(p)), Some(Tok::Punct(')'))) if p.ends_with(".rs")
+            );
+            if !lit_rs {
+                out.push(format!(
+                    "line {}: include! of something other than one literal .rs path",
+                    t.line
+                ));
+            }
+        }
+        if t.tok == Tok::Punct('#')
+            && toks.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct('['))
+            && toks.get(i + 2).is_some_and(|x| is_ident_tok(x, "path"))
+            && toks.get(i + 3).map(|x| &x.tok) == Some(&Tok::Punct('='))
+        {
+            let rs =
+                matches!(toks.get(i + 4).map(|x| &x.tok), Some(Tok::Str(p)) if p.ends_with(".rs"));
+            if !rs {
+                out.push(format!(
+                    "line {}: #[path] to a file that is not .rs",
+                    t.line
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Every file and symbolic link under `dir` (skipping [`SKIPPED`] names).
+/// Symbolic links are returned in the second list, never followed.
+fn walk_all(dir: &Path, root: &Path, files: &mut Vec<PathBuf>, links: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "#10176: read dir {}: {e}; an unreadable dir is not clean",
+            dir.display()
+        )
+    });
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .unwrap_or_else(|e| panic!("#10176: stat {}: {e}", path.display()));
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if SKIPPED.iter().any(|(name, _)| rel == Path::new(name)) {
+            continue;
+        }
+        if kind.is_symlink() {
+            links.push(path);
+        } else if kind.is_dir() {
+            walk_all(&path, root, files, links);
+        } else {
+            files.push(path);
+        }
+    }
+}
+
+fn rel_of(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .expect("walked path is under the root")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// `(spawn sites per src/ file, refusals)` for the tree at `root`.
+fn scan_src(root: &Path) -> (BTreeMap<String, usize>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut links = Vec::new();
+    walk_all(root, root, &mut files, &mut links);
+    let mut problems: Vec<String> = links
+        .iter()
+        .map(|l| {
+            format!(
+                "{}: symbolic link in the scanned tree; a link can hide any file from this ratchet",
+                rel_of(l, root)
+            )
+        })
+        .collect();
+    let mut sites = BTreeMap::new();
+    for file in files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "rs"))
+    {
+        let rel = rel_of(file, root);
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("#10176: read {rel}: {e}; an unreadable file is not clean"));
+        let toks = lex(&text);
+        problems.extend(
+            include_problems(&toks)
+                .into_iter()
+                .map(|p| format!("{rel}: {p}")),
+        );
+        if !rel.starts_with(&format!("{SRC_DIR}/")) || rel == CHOKEPOINT {
+            continue;
+        }
+        let n = spawn_sites(&toks).len();
+        if n > 0 {
+            sites.insert(rel, n);
+        }
+    }
+    (sites, problems)
+}
+
+#[test]
+fn every_src_process_construction_is_an_allowlisted_row_10176() {
+    let root = crate_root();
+    let (observed, mut problems) = scan_src(&root);
+    let pinned: BTreeMap<String, usize> = SRC_SPAWN_ALLOWLIST
+        .iter()
+        .map(|(p, n, _)| ((*p).to_string(), *n))
+        .collect();
+    for (path, n) in &observed {
+        match pinned.get(path) {
+            None => problems.push(format!(
+                "{path}: {n} process-construction site(s) with no allowlist row; a lib-test child \
+                 must come from crate::test_support::SandboxedTestChild (#10176)"
+            )),
+            Some(want) if want != n => problems.push(format!(
+                "{path}: pinned {want} process-construction site(s), found {n}; re-justify the row (#10176)"
+            )),
+            Some(_) => {}
+        }
+    }
+    for path in pinned.keys() {
+        if !observed.contains_key(path) {
+            problems.push(format!(
+                "{path}: pinned but no site found; remove the stale row (#10176)"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "#10176:\n{}", problems.join("\n"));
+}
+
+#[test]
+fn every_src_allowlist_row_has_a_reason_10176() {
+    for (path, n, why) in SRC_SPAWN_ALLOWLIST {
+        assert!(*n > 0, "#10176: row {path} pins zero sites");
+        assert!(
+            why.trim().len() >= 20,
+            "#10176: row {path} needs a real reason, got {why:?}"
+        );
+        assert!(
+            path.starts_with("src/") && *path != CHOKEPOINT,
+            "#10176: row {path} is not a src/ row"
+        );
+    }
+    let unique: std::collections::BTreeSet<_> =
+        SRC_SPAWN_ALLOWLIST.iter().map(|(p, _, _)| *p).collect();
+    assert_eq!(
+        unique.len(),
+        SRC_SPAWN_ALLOWLIST.len(),
+        "#10176: duplicate src rows"
+    );
+}
+
+#[test]
+fn the_src_scanner_sees_every_spelling_10176() {
+    // (source, expected spawn sites). Hand-written expected column.
+    let cases: &[(&str, usize)] = &[
+        // the chokepoint, by path, alias, re-export, glob and bare call
+        ("let c = crate::spawn_audit::audited_command(p, \"x\");", 1),
+        (
+            "use crate::spawn_audit::audited_command as mk;\nlet c = mk(p, \"x\");",
+            1,
+        ),
+        ("pub(crate) use crate::spawn_audit::audited_command;", 1),
+        (
+            "use crate::spawn_audit::*;\nlet c = audited_command(p, \"x\");",
+            1,
+        ),
+        // raw identifier
+        ("let c = r#audited_command(p, \"x\");", 1),
+        // the std and tokio process types, every import shape
+        ("let c = std::process::Command::new(\"git\");", 1),
+        ("use std::process::Command as Cmd;", 1),
+        ("use std::process::{Stdio, Command};", 1),
+        ("use std::process::{self, Command as C, Stdio};", 1),
+        ("use tokio::process::*;", 1),
+        ("use std::{process::{Command}, io};", 1),
+        ("use std::os::unix::process::CommandExt;", 0),
+        (
+            "let c = crate::spawn_audit::audited_tokio_command(p, \"x\");",
+            1,
+        ),
+        ("let c = assert_cmd::Command::cargo_bin(\"ai-memory\");", 1),
+        ("let pid = unsafe { libc::fork() };", 1),
+        ("use libc::{execv as ev, getpid};", 1),
+        ("use libc::*;", 1),
+        ("use std::process::{self, *};", 1),
+        ("let pid = libc::getpid();", 0),
+        // argv[0]
+        ("let me = std::env::args().next();", 1),
+        ("let me = env::args_os().next();", 1),
+        ("use std::env::{args, var};", 1),
+        ("use std::env::*;", 1),
+        // the executable path
+        ("let p = std::env::current_exe()?;", 1),
+        ("macro_rules! m { () => { std::env::current_exe() }; }", 1),
+        ("let p = \"/proc/self/exe\";", 1),
+        ("let p = r#\"/proc/self/exe\"#;", 1),
+        ("let p = b\"/proc/self/exe\";", 1),
+        // hex and unicode escapes
+        ("let p = \"\\x2fproc\\x2fself\\x2fexe\";", 1),
+        ("let p = \"\\u{2f}pro\\u{63}/self/ex\\u{65}\";", 1),
+        // pieces: concat!, format! with the pid, joins
+        ("let p = concat!(\"/pr\", \"oc/se\", \"lf/e\", \"xe\");", 1),
+        ("let p = format!(\"/proc/{}/exe\", std::process::id());", 1),
+        (
+            "let p = format!(\"/{}/{pid}/{}\", \"pr\".to_owned() + \"oc\", \"ex\");",
+            0,
+        ),
+        (
+            "let p = Path::new(\"/\").join(\"proc\").join(\"self\").join(\"exe\");",
+            2,
+        ),
+        // identifier glued from pieces
+        ("paste::paste! { let c = [<Comm and>]::new(\"x\"); }", 2),
+        // never counted: comments, other identifiers, other literals
+        ("// std::process::Command::new(\"x\")", 0),
+        ("/* audited_command /* nested */ current_exe */", 0),
+        ("let s = \"audited_command\"; let t = 'x';", 0),
+        ("let my_current_exe = 1; let audited_command_count = 2;", 0),
+        ("let c = Command::Serve; let a = args.len();", 0),
+        ("let p = \"/process/execute\";", 0),
+    ];
+    for (src, want) in cases {
+        assert_eq!(
+            spawn_sites(&lex(src)).len(),
+            *want,
+            "#10176: src scanner disagrees on source {src:?}"
+        );
+    }
+    // Known limit, pinned so the docs stay honest: a path built at run time
+    // from sub-segment pieces is not a literal; the chokepoint identifier in
+    // the same call is what counts it.
+    assert_eq!(
+        spawn_sites(&lex(
+            "let c = audited_command(PathBuf::from(format!(\"/{}{}\", \"pr\", \"oc\")), \"x\");"
+        ))
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn include_and_path_attributes_must_name_rs_files_10176() {
+    let cases: &[(&str, usize)] = &[
+        ("include!(\"spawn.inc\");", 1),
+        ("include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));", 1),
+        ("include ! ( \"spawn.txt\" );", 1),
+        ("#[path = \"spawn.txt\"] mod s;", 1),
+        ("#[path = \"common/token_scan.rs\"] mod t;", 0),
+        ("include!(\"generated.rs\");", 0),
+        ("let s = include_str!(\"fixture.json\");", 0),
+        ("// include!(\"x.inc\")", 0),
+    ];
+    for (src, want) in cases {
+        assert_eq!(
+            include_problems(&lex(src)).len(),
+            *want,
+            "#10176: include check disagrees on {src:?}"
+        );
+    }
+}
+
+#[test]
+fn a_symlink_or_a_non_rs_include_in_the_tree_is_refused_10176() {
+    let base = scratch_dir(&crate_root().join(".local-runs"));
+    let src = base.join(SRC_DIR);
+    std::fs::create_dir_all(&src).expect("create fixture src");
+    std::fs::write(
+        src.join("real.rs"),
+        "fn f() { let _ = std::env::current_exe(); }\n",
+    )
+    .expect("write fixture");
+    std::fs::write(src.join("spawn.inc"), "std::process::Command::new(\"x\")\n")
+        .expect("write fixture");
+    std::fs::write(src.join("user.rs"), "fn g() { include!(\"spawn.inc\"); }\n")
+        .expect("write fixture");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(src.join("real.rs"), src.join("alias.rs")).expect("symlink fixture");
+    let (sites, problems) = scan_src(&base);
+    std::fs::remove_dir_all(&base).expect("remove scan fixture");
+    assert_eq!(
+        sites.into_iter().collect::<Vec<_>>(),
+        vec![("src/real.rs".to_string(), 1)],
+        "#10176: the real file is counted once, through no link"
+    );
+    let mut want = vec![
+        "src/user.rs: line 1: include! of something other than one literal .rs path".to_string(),
+    ];
+    #[cfg(unix)]
+    want.insert(
+        0,
+        "src/alias.rs: symbolic link in the scanned tree; a link can hide any file from this ratchet".to_string(),
+    );
+    assert_eq!(problems, want, "#10176: link and include refusals");
+}
+
+/// The builder's narrow surface, exactly (hand-written).
+const BUILDER_METHODS: &[&str] = &[];
+
+#[test]
+fn builder_exports_no_process_command_10176() {
+    let text =
+        std::fs::read_to_string(crate_root().join(CHOKEPOINT)).expect("read the builder module");
+    let toks = lex(&text);
+    let mut problems = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if !is_ident_tok(t, "pub") {
+            continue;
+        }
+        // The item or field this `pub` opens, up to its body, `;` or `,`.
+        let mut depth = 0i32;
+        let mut end = i + 1;
+        while end < toks.len() {
+            match toks[end].tok {
+                Tok::Punct('(' | '[') => depth += 1,
+                Tok::Punct(')' | ']') => depth -= 1,
+                Tok::Punct('{' | ';' | ',' | '}' | '=') if depth <= 0 => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        let span = &toks[i..end];
+        let is_use = span.iter().any(|x| is_ident_tok(x, "use"));
+        let names_process = span.iter().any(|x| {
+            ["Command", "audited_command", "spawn_audit", "current_exe"]
+                .iter()
+                .any(|n| is_ident_tok(x, n))
+        });
+        if names_process || (is_use && span.iter().any(|x| x.tok == Tok::Punct('*'))) {
+            problems.push(format!(
+                "{CHOKEPOINT}:{}: a visible item names a process command or re-exports one{}",
+                t.line,
+                if is_use { " (pub use)" } else { "" }
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "#10176: the builder must keep its Command private:\n{}",
+        problems.join("\n")
+    );
+
+    // The builder's methods are exactly the narrow surface.
+    let mut methods = Vec::new();
+    let mut i = 0usize;
+    while i < toks.len() {
+        let opens_impl = is_ident_tok(&toks[i], "impl")
+            && toks[i + 1..]
+                .iter()
+                .take(6)
+                .any(|x| is_ident_tok(x, "SandboxedTestChild"))
+            && !toks[i + 1..].iter().take(6).any(|x| is_ident_tok(x, "for"));
+        if opens_impl {
+            let open = (i..toks.len())
+                .find(|&k| toks[k].tok == Tok::Punct('{'))
+                .unwrap_or(toks.len());
+            let end = group_end(&toks, open);
+            for k in open..end {
+                if is_ident_tok(&toks[k], "fn") {
+                    if let Some(Tok::Ident(name)) = toks.get(k + 1).map(|x| &x.tok) {
+                        let mut b = k;
+                        while b > open
+                            && ["const", "async", "unsafe"]
+                                .iter()
+                                .any(|q| is_ident_tok(&toks[b - 1], q))
+                        {
+                            b -= 1;
+                        }
+                        let vis = (b > open && is_ident_tok(&toks[b - 1], "pub"))
+                            || (b > open + 3
+                                && toks[b - 1].tok == Tok::Punct(')')
+                                && is_ident_tok(&toks[b - 4], "pub"));
+                        if vis {
+                            methods.push(name.clone());
+                        }
+                    }
+                }
+            }
+            i = end;
+        }
+        i += 1;
+    }
+    methods.sort();
+    let mut want: Vec<String> = BUILDER_METHODS.iter().map(|s| (*s).to_string()).collect();
+    want.sort();
+    assert_eq!(
+        methods, want,
+        "#10176: SandboxedTestChild's visible methods are the narrow surface, exactly"
+    );
+}
