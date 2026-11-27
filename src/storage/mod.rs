@@ -15570,7 +15570,7 @@ pub fn append_lineage_record(
         };
         let successor_pubkey =
             crate::identity::keypair::canonical_public_base64(&record.successor_pubkey_b64)?;
-        bind_agent_pubkey_no_tx(conn, agent_id, &successor_pubkey, &proof)?;
+        let _sync = bind_agent_pubkey_no_tx(conn, agent_id, &successor_pubkey, &proof)?;
 
         // Append-only witness (C1/C3 anchor), in THIS transaction.
         let witness = crate::signed_events::SignedEvent {

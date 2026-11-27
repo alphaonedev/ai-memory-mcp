@@ -2402,6 +2402,7 @@ const ENV_HTTP_BIND_10109_KEY: &str = "AI_MEMORY_TEST_HTTP_BIND_10109_KEY";
 ///    `verify_sqlite_with` Clean.
 /// 3. Non-admin HTTP bind attempt returns HTTP 403, writes nothing across all
 ///    four tables, and leaves `verify_sqlite_with` Clean (#10109 r1 item 6).
+///
 /// Runs under BOTH `--features sal` and default (non-SAL) builds (#10109 r1 item 6).
 #[test]
 fn http_bind_pubkey_armed_store_same_key_noop_and_different_key_refused_10109() {

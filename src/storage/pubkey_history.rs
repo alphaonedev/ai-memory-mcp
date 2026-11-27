@@ -129,7 +129,7 @@ pub fn bind_agent_pubkey(
     let write_txn = connection::WriteTxn::begin(conn).context("bind_agent_pubkey: begin tx")?;
     let result = bind_agent_pubkey_no_tx(conn, agent_id, &pubkey_b64, &proof);
     match result {
-        Ok(()) => {
+        Ok(_sync) => {
             write_txn.commit().context("bind_agent_pubkey: commit tx")?;
             Ok(())
         }
@@ -141,12 +141,15 @@ pub fn bind_agent_pubkey(
 }
 
 /// In-transaction implementation shared with [`super::append_lineage_record`].
+/// Returns [`crate::identity::pubkey_bind::LineageKeySync`] naming whether the
+/// agent's key was written or left unchanged (#10109, #10196, #10197).
 pub(super) fn bind_agent_pubkey_no_tx(
     conn: &Connection,
     agent_id: &str,
     pubkey_b64: &str,
     proof: &crate::identity::pubkey_bind::PossessionProof,
-) -> Result<()> {
+) -> Result<crate::identity::pubkey_bind::LineageKeySync> {
+    use crate::identity::pubkey_bind::{BindAuthorization, KeyUnchangedSource, LineageKeySync};
     use rusqlite::OptionalExtension as _;
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let title = crate::models::agent_registration_title(agent_id);
@@ -175,7 +178,7 @@ pub(super) fn bind_agent_pubkey_no_tx(
         )
         .optional()?;
     let write_cap = match proof
-        .authorize_storage_state(
+        .authorize_storage_state_with_cause(
             agent_id,
             pubkey_b64,
             flat_pubkey.as_deref(),
@@ -183,12 +186,27 @@ pub(super) fn bind_agent_pubkey_no_tx(
                 .as_ref()
                 .map(|(key, superseded)| (key.as_str(), superseded.is_none())),
         )
-        .map_err(anyhow::Error::new)?
+        .map_err(|(err, cause)| anyhow::Error::new(err).context(cause))?
     {
-        crate::identity::pubkey_bind::BindAuthorization::AlreadyBound => return Ok(()),
-        crate::identity::pubkey_bind::BindAuthorization::WriteRequired(cap) => cap,
+        BindAuthorization::AlreadyBound => {
+            return Ok(LineageKeySync::KeyUnchanged(
+                KeyUnchangedSource::AuthorizedAlreadyBound,
+            ));
+        }
+        BindAuthorization::WriteRequired(cap) => cap,
     };
-    append_agent_pubkey_version(conn, agent_id, pubkey_b64, proof, write_cap, &now)?;
+    let sync = append_agent_pubkey_version(
+        conn,
+        agent_id,
+        pubkey_b64,
+        flat_pubkey.as_deref(),
+        proof,
+        write_cap,
+        &now,
+    )?;
+    let LineageKeySync::KeyWritten(write_cap) = sync else {
+        return Ok(sync);
+    };
     // #9259 - the flat projection carries the OPEN history row's `bound_at`,
     // not `now`: a same-key rebind appends no version and keeps the original
     // validity boundary, so writing `now` would move it (and the v102 guard
@@ -240,7 +258,7 @@ pub(super) fn bind_agent_pubkey_no_tx(
             &now,
         )?;
     }
-    Ok(())
+    Ok(LineageKeySync::KeyWritten(write_cap))
 }
 
 /// v1.0.0 #3464 — mint and PERSIST a proof-of-possession bind challenge.
@@ -524,10 +542,12 @@ fn append_agent_pubkey_version(
     conn: &Connection,
     agent_id: &str,
     pubkey_b64: &str,
+    flat_pubkey_b64: Option<&str>,
     proof: &crate::identity::pubkey_bind::PossessionProof,
-    _write_cap: crate::identity::pubkey_bind::BindWriteCap,
+    write_cap: crate::identity::pubkey_bind::BindWriteCap,
     now: &str,
-) -> Result<()> {
+) -> Result<crate::identity::pubkey_bind::LineageKeySync> {
+    use crate::identity::pubkey_bind::{KeyUnchangedSource, LineageKeySync};
     use rusqlite::OptionalExtension as _;
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let latest: Option<(i64, String, String, Option<String>)> = conn
@@ -549,7 +569,12 @@ fn append_agent_pubkey_version(
             .as_ref()
             .is_some_and(|(_, live, _, end)| end.is_none() && live == pubkey_b64)
         {
-            return Ok(());
+            if flat_pubkey_b64 == Some(pubkey_b64) {
+                return Ok(LineageKeySync::KeyUnchanged(
+                    KeyUnchangedSource::HistoryReuseDefenseInDepth,
+                ));
+            }
+            return Ok(LineageKeySync::KeyWritten(write_cap));
         }
         anyhow::bail!("refusing to reactivate a superseded or revoked agent pubkey");
     }
@@ -587,7 +612,7 @@ fn append_agent_pubkey_version(
             now,
         ],
     )?;
-    Ok(())
+    Ok(LineageKeySync::KeyWritten(write_cap))
 }
 
 /// v1.0.0 #3464 — every key `agent_id` has ever been bound to, oldest first.

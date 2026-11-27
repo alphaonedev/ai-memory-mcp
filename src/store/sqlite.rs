@@ -301,10 +301,16 @@ fn pubkey_bind_err(error: anyhow::Error, agent_id: &str) -> StoreError {
         .downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
         .is_some()
     {
+        let reason = error
+            .downcast_ref::<crate::identity::pubkey_bind::StorageAuthRefusal>()
+            .map_or(
+                crate::errors::msg::BIND_PROOF_REFUSED,
+                crate::identity::pubkey_bind::StorageAuthRefusal::audit_reason,
+            );
         StoreError::PermissionDenied {
             action: crate::handlers::BIND_AGENT_PUBKEY_ACTION.to_string(),
             target: agent_id.to_string(),
-            reason: crate::errors::msg::BIND_PROOF_REFUSED.to_string(),
+            reason: reason.to_string(),
         }
     } else {
         box_err(error)

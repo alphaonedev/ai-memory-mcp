@@ -14,7 +14,7 @@ impl PostgresStore {
     }
 
     /// Append the next key version in `tx`. Same-open-key returns
-    /// `BindAuthorization::AlreadyBound` without writing; every distinct
+    /// `LineageKeySync::KeyUnchanged` without writing; every distinct
     /// transition closes the open row and appends a dense version.
     pub(super) async fn append_pubkey_version_tx(
         &self,
@@ -24,7 +24,8 @@ impl PostgresStore {
         flat_pubkey_b64: Option<&str>,
         proof: &crate::identity::pubkey_bind::PossessionProof,
         now: &str,
-    ) -> StoreResult<crate::identity::pubkey_bind::BindAuthorization> {
+    ) -> StoreResult<crate::identity::pubkey_bind::LineageKeySync> {
+        use crate::identity::pubkey_bind::{BindAuthorization, KeyUnchangedSource, LineageKeySync};
         self.gate_record_stop_in_transaction()?;
         let latest: Option<(i64, String, String, Option<String>)> = sqlx::query_as(
             "SELECT version, pubkey_b64, bound_at, superseded_at FROM agent_pubkey_history
@@ -35,7 +36,7 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("read latest agent pubkey version", e))?;
         let write_cap = match proof
-            .authorize_storage_state(
+            .authorize_storage_state_with_cause(
                 agent_id,
                 pubkey_b64,
                 flat_pubkey_b64,
@@ -43,15 +44,17 @@ impl PostgresStore {
                     .as_ref()
                     .map(|(_, key, _, superseded)| (key.as_str(), superseded.is_none())),
             )
-            .map_err(|_| StoreError::PermissionDenied {
+            .map_err(|(_err, cause)| StoreError::PermissionDenied {
                 action: crate::handlers::BIND_AGENT_PUBKEY_ACTION.to_string(),
                 target: agent_id.to_string(),
-                reason: crate::errors::msg::BIND_PROOF_REFUSED.to_string(),
+                reason: cause.audit_reason().to_string(),
             })? {
-            crate::identity::pubkey_bind::BindAuthorization::AlreadyBound => {
-                return Ok(crate::identity::pubkey_bind::BindAuthorization::AlreadyBound);
+            BindAuthorization::AlreadyBound => {
+                return Ok(LineageKeySync::KeyUnchanged(
+                    KeyUnchangedSource::AuthorizedAlreadyBound,
+                ));
             }
-            crate::identity::pubkey_bind::BindAuthorization::WriteRequired(cap) => cap,
+            BindAuthorization::WriteRequired(cap) => cap,
         };
         let prior: Vec<(String,)> =
             sqlx::query_as("SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = $1")
@@ -71,7 +74,12 @@ impl PostgresStore {
                 .as_ref()
                 .is_some_and(|(_, live, _, end)| end.is_none() && live == pubkey_b64)
             {
-                return Ok(crate::identity::pubkey_bind::BindAuthorization::AlreadyBound);
+                if flat_pubkey_b64 == Some(pubkey_b64) {
+                    return Ok(LineageKeySync::KeyUnchanged(
+                        KeyUnchangedSource::HistoryReuseDefenseInDepth,
+                    ));
+                }
+                return Ok(LineageKeySync::KeyWritten(write_cap));
             }
             return Err(StoreError::InvalidInput {
                 detail: "refusing to reactivate a superseded or revoked agent pubkey".to_string(),
@@ -122,7 +130,7 @@ impl PostgresStore {
         .execute(&mut **tx)
         .await
         .map_err(|e| to_store_err("append agent pubkey version", e))?;
-        Ok(crate::identity::pubkey_bind::BindAuthorization::WriteRequired(write_cap))
+        Ok(LineageKeySync::KeyWritten(write_cap))
     }
 }
 
@@ -196,7 +204,7 @@ mod tests {
         .expect("history append");
         assert!(matches!(
             auth,
-            crate::identity::pubkey_bind::BindAuthorization::WriteRequired(_)
+            crate::identity::pubkey_bind::LineageKeySync::KeyWritten(_)
         ));
         store
             .record_stop
@@ -211,5 +219,90 @@ mod tests {
         tx.rollback()
             .await
             .expect("rollback isolated history probe");
+    }
+
+    /// #10109 r1 item 3: prove on live PostgreSQL that BOTH same-key HTTP
+    /// rebind (`PossessionProof`) and same-key lineage genesis
+    /// (`LineageSuccession`) are decided upfront by the primary
+    /// `authorize_storage_state` gate (`KeyUnchangedSource::AuthorizedAlreadyBound`)
+    /// rather than masked by the inner history-reuse defence-in-depth check.
+    #[tokio::test]
+    async fn append_pubkey_version_tx_same_key_decided_by_authorize_layer_10109() {
+        use crate::identity::pubkey_bind::{KeyUnchangedSource, LineageKeySync, PossessionProof};
+
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("store");
+        let agent = format!("ai:pg-auth-layer-10109-{}", uuid::Uuid::new_v4());
+        let ctx = CallerContext::for_admin(&agent);
+        let registered_at = chrono::Utc::now().to_rfc3339();
+        store
+            .register_agent(
+                &ctx,
+                &crate::models::AgentRegistration {
+                    agent_id: agent.clone(),
+                    agent_type: "ai:generic".to_string(),
+                    capabilities: Vec::new(),
+                    registered_at: registered_at.clone(),
+                    last_seen_at: registered_at,
+                },
+            )
+            .await
+            .expect("register");
+        let key = crate::identity::keypair::generate(&agent).expect("key");
+        let proof = crate::store::prove_possession_via_store(
+            &store,
+            &ctx,
+            &agent,
+            key.private.as_ref().expect("private"),
+        )
+        .await
+        .expect("possession");
+        let public = key.public_base64();
+        let stamp = chrono::Utc::now().to_rfc3339();
+
+        let mut tx = store.pool.begin().await.expect("begin tx");
+        // First bind writes history (KeyWritten).
+        let first = store
+            .append_pubkey_version_tx(&mut tx, &agent, &public, None, &proof, &stamp)
+            .await
+            .expect("first bind");
+        assert!(matches!(first, LineageKeySync::KeyWritten(_)));
+
+        // Same-key PossessionProof rebind must be decided by the primary authorize layer.
+        let same_rebind = store
+            .append_pubkey_version_tx(&mut tx, &agent, &public, Some(&public), &proof, &stamp)
+            .await
+            .expect("same-key rebind");
+        assert_eq!(
+            same_rebind,
+            LineageKeySync::KeyUnchanged(KeyUnchangedSource::AuthorizedAlreadyBound),
+            "#10109 item 3: same-key rebind must be decided by authorize_storage_state (not inner reuse fallback)"
+        );
+
+        // Same-key LineageSuccession (genesis-after-bind) must ALSO be decided by authorize_storage_state.
+        let genesis_proof =
+            PossessionProof::from_verified_lineage_succession(&agent, &public, &public)
+                .expect("lineage proof");
+        let same_genesis = store
+            .append_pubkey_version_tx(
+                &mut tx,
+                &agent,
+                &public,
+                Some(&public),
+                &genesis_proof,
+                &stamp,
+            )
+            .await
+            .expect("same-key genesis");
+        assert_eq!(
+            same_genesis,
+            LineageKeySync::KeyUnchanged(KeyUnchangedSource::AuthorizedAlreadyBound),
+            "#10196/#10109: same-key genesis must be decided by authorize_storage_state"
+        );
+
+        tx.rollback().await.expect("rollback probe tx");
     }
 }

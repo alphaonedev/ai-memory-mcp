@@ -361,27 +361,59 @@ fn bind_refused_response() -> axum::response::Response {
         .into_response()
 }
 
-/// #10109 — operator log + forensic audit + opaque #3464 wire refusal when an
-/// HTTP bind targets an agent that already has a bound key. Logs only the
-/// agent id and the succession command (never key bytes, nonce, or proof).
+/// #10109 (r1 item 5) — operator log + forensic audit + opaque #3464 wire
+/// refusal when an HTTP bind is refused by storage authorization. Logs the
+/// exact internal cause and `agent_id` only (never key bytes, nonce, or proof),
+/// while keeping the HTTP 403 wire response identically opaque (`BIND_PROOF_REFUSED`).
 fn refuse_existing_identity_rebind(
     caller: &str,
     agent_id: &str,
     pubkey: &str,
+    cause: &str,
 ) -> axum::response::Response {
-    tracing::warn!(
-        target: "identity.bind.requires_succession",
-        agent_id = %agent_id,
-        "pubkey bind refused: agent already has a bound key; rotate via \
-         `ai-memory identity succeed --agent-id <id>` (#10109)"
-    );
-    record_pubkey_bind_decision(
-        caller,
-        "refuse",
-        agent_id,
-        pubkey,
-        "existing_identity_requires_lineage",
-    );
+    let audit_reason: &'static str = match cause {
+        "existing_identity_requires_lineage" => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = "existing_identity_requires_lineage",
+                "pubkey bind refused: agent already has a bound key; rotate via \
+                 `ai-memory identity succeed --agent-id <id>` (#10109)"
+            );
+            "existing_identity_requires_lineage"
+        }
+        "closed_identity_requires_recovery" => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = "closed_identity_requires_recovery",
+                "pubkey bind refused: agent key history is closed or revoked; recover via \
+                 guardian recovery (`ai-memory identity recover`) (#10109)"
+            );
+            "closed_identity_requires_recovery"
+        }
+        "non_canonical_stored_key" => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = "non_canonical_stored_key",
+                "pubkey bind refused: stored agent public key is non-canonical; inspect and \
+                 recover via lineage (#10109)"
+            );
+            "non_canonical_stored_key"
+        }
+        _ => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = "binding_not_authorized",
+                "pubkey bind refused: bind requires lineage succession or recovery \
+                 (`ai-memory identity succeed --agent-id <id>`) (#10109)"
+            );
+            "binding_not_authorized"
+        }
+    };
+    record_pubkey_bind_decision(caller, "refuse", agent_id, pubkey, audit_reason);
     bind_refused_response()
 }
 
@@ -541,10 +573,10 @@ pub async fn bind_agent_pubkey(
                 )
                     .into_response()
             }
-            Err(crate::store::StoreError::PermissionDenied { action, .. })
+            Err(crate::store::StoreError::PermissionDenied { action, reason, .. })
                 if action == BIND_AGENT_PUBKEY_ACTION =>
             {
-                refuse_existing_identity_rebind(&caller, &agent_id, &pubkey)
+                refuse_existing_identity_rebind(&caller, &agent_id, &pubkey, &reason)
             }
             Err(e) => {
                 record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");
@@ -577,7 +609,13 @@ pub async fn bind_agent_pubkey(
                 if e.downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
                     .is_some() =>
             {
-                refuse_existing_identity_rebind(&caller, &agent_id, &pubkey)
+                let cause = e
+                    .downcast_ref::<crate::identity::pubkey_bind::StorageAuthRefusal>()
+                    .map_or(
+                        "binding_not_authorized",
+                        crate::identity::pubkey_bind::StorageAuthRefusal::audit_reason,
+                    );
+                refuse_existing_identity_rebind(&caller, &agent_id, &pubkey, cause)
             }
             Err(e) => {
                 record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");

@@ -258,6 +258,66 @@ pub(crate) enum BindAuthorization {
     WriteRequired(BindWriteCap),
 }
 
+/// Which guard layer proved the agent's key is already bound and unchanged
+/// (#10109 r1 item 3). Lets tests assert that the primary authorization gate
+/// decided upfront while keeping the inner history-reuse check as defence in depth.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyUnchangedSource {
+    /// Decided upfront by [`PossessionProof::authorize_storage_state`].
+    AuthorizedAlreadyBound,
+    /// Caught by the inner history-reuse defence-in-depth check.
+    HistoryReuseDefenseInDepth,
+}
+
+/// Typed outcome of synchronizing an agent's bound key during a bind or lineage
+/// append (#10109, #10196, #10197): names the two lawful cases so no caller can
+/// turn "already bound to the same key" into an error or a redundant write.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LineageKeySync {
+    /// Key state changed (or history/flat state was bootstrapped); carries the
+    /// single-use [`BindWriteCap`] authorizing the flat `_agents` projection write.
+    KeyWritten(BindWriteCap),
+    /// The exact key is already live and bound in both history and `_agents`;
+    /// record the lineage row if requested and skip all key writes.
+    KeyUnchanged(KeyUnchangedSource),
+}
+
+/// Exact internal refusal cause from [`PossessionProof::authorize_storage_state_with_cause`]
+/// (#10109 r1 item 5). Used ONLY for operator logs and forensic audit reasons;
+/// every variant maps onto the exact same opaque HTTP 403 `BIND_PROOF_REFUSED` wire body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageAuthRefusal {
+    /// Target agent already has an open live bound key (requires `identity succeed`).
+    ExistingIdentityRequiresLineage,
+    /// Target agent's key history head is closed/revoked (requires guardian recovery).
+    ClosedIdentityRequiresRecovery,
+    /// A stored key in `_agents` or `agent_pubkey_history` is not canonical base64.
+    NonCanonicalStoredKey,
+    /// Witness claims do not authorize this target/key transition.
+    BindingNotAuthorized,
+}
+
+impl StorageAuthRefusal {
+    /// Stable forensic audit reason slug (internal only; never returned on the wire).
+    #[must_use]
+    pub(crate) const fn audit_reason(&self) -> &'static str {
+        match self {
+            Self::ExistingIdentityRequiresLineage => "existing_identity_requires_lineage",
+            Self::ClosedIdentityRequiresRecovery => "closed_identity_requires_recovery",
+            Self::NonCanonicalStoredKey => "non_canonical_stored_key",
+            Self::BindingNotAuthorized => "binding_not_authorized",
+        }
+    }
+}
+
+impl std::fmt::Display for StorageAuthRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.audit_reason())
+    }
+}
+
 impl PossessionProof {
     /// The authority that admitted this binding.
     #[must_use]
@@ -422,6 +482,7 @@ impl PossessionProof {
     /// latest durable anchor. A closed history is deliberately not reopenable
     /// by candidate possession: recovery goes through the signed lineage /
     /// guardian-quorum path.
+    #[cfg(test)]
     pub(crate) fn authorize_storage_state(
         &self,
         agent_id: &str,
@@ -429,19 +490,54 @@ impl PossessionProof {
         flat_pubkey_b64: Option<&str>,
         latest_history: Option<(&str, bool)>,
     ) -> Result<BindAuthorization, BindProofError> {
+        self.authorize_storage_state_with_cause(
+            agent_id,
+            pubkey_b64,
+            flat_pubkey_b64,
+            latest_history,
+        )
+        .map_err(|(err, _cause)| err)
+    }
+
+    /// Same decision as [`Self::authorize_storage_state`], also returning the
+    /// exact internal [`StorageAuthRefusal`] for operator logging and forensic
+    /// audit reasons (#10109 r1 item 5). Wire responses stay opaque `403`.
+    pub(crate) fn authorize_storage_state_with_cause(
+        &self,
+        agent_id: &str,
+        pubkey_b64: &str,
+        flat_pubkey_b64: Option<&str>,
+        latest_history: Option<(&str, bool)>,
+    ) -> Result<BindAuthorization, (BindProofError, StorageAuthRefusal)> {
         let canonical_pubkey = crate::identity::keypair::canonical_public_base64(pubkey_b64)
-            .map_err(|_| BindProofError::BindingNotAuthorized)?;
+            .map_err(|_| {
+                (
+                    BindProofError::BindingNotAuthorized,
+                    StorageAuthRefusal::BindingNotAuthorized,
+                )
+            })?;
         if self.agent_id != agent_id || self.pubkey_b64 != canonical_pubkey {
-            return Err(BindProofError::BindingNotAuthorized);
+            return Err((
+                BindProofError::BindingNotAuthorized,
+                StorageAuthRefusal::BindingNotAuthorized,
+            ));
         }
         for stored in flat_pubkey_b64
             .into_iter()
             .chain(latest_history.map(|(key, _)| key))
         {
-            let canonical = crate::identity::keypair::canonical_public_base64(stored)
-                .map_err(|_| BindProofError::BindingNotAuthorized)?;
+            let canonical =
+                crate::identity::keypair::canonical_public_base64(stored).map_err(|_| {
+                    (
+                        BindProofError::BindingNotAuthorized,
+                        StorageAuthRefusal::NonCanonicalStoredKey,
+                    )
+                })?;
             if canonical != stored {
-                return Err(BindProofError::BindingNotAuthorized);
+                return Err((
+                    BindProofError::BindingNotAuthorized,
+                    StorageAuthRefusal::NonCanonicalStoredKey,
+                ));
             }
         }
 
@@ -455,14 +551,34 @@ impl PossessionProof {
                 {
                     Ok(BindAuthorization::AlreadyBound)
                 }
-                None | Some(_) => Err(BindProofError::BindingNotAuthorized),
+                Some((_, false)) => Err((
+                    BindProofError::BindingNotAuthorized,
+                    StorageAuthRefusal::ClosedIdentityRequiresRecovery,
+                )),
+                Some((_, true)) => Err((
+                    BindProofError::BindingNotAuthorized,
+                    StorageAuthRefusal::ExistingIdentityRequiresLineage,
+                )),
+                None => Err((
+                    BindProofError::BindingNotAuthorized,
+                    StorageAuthRefusal::ExistingIdentityRequiresLineage,
+                )),
             },
             BindAuthority::LineageSuccession => {
-                let predecessor = self
-                    .predecessor_pubkey_b64
-                    .as_deref()
-                    .ok_or(BindProofError::BindingNotAuthorized)?;
+                let predecessor = self.predecessor_pubkey_b64.as_deref().ok_or((
+                    BindProofError::BindingNotAuthorized,
+                    StorageAuthRefusal::BindingNotAuthorized,
+                ))?;
                 match latest_history {
+                    // #10196/#10197: same-key genesis or self-succession on an
+                    // already-bound agent keeps `_agents` and history untouched.
+                    Some((latest, true))
+                        if latest == predecessor
+                            && latest == pubkey_b64
+                            && flat_pubkey_b64 == Some(pubkey_b64) =>
+                    {
+                        Ok(BindAuthorization::AlreadyBound)
+                    }
                     Some((latest, true)) if latest == predecessor => {
                         Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
                     }
@@ -474,14 +590,21 @@ impl PossessionProof {
                     None if flat_pubkey_b64.is_none() && predecessor == pubkey_b64 => {
                         Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
                     }
-                    None | Some(_) => Err(BindProofError::BindingNotAuthorized),
+                    Some((_, false)) => Err((
+                        BindProofError::BindingNotAuthorized,
+                        StorageAuthRefusal::ClosedIdentityRequiresRecovery,
+                    )),
+                    None | Some(_) => Err((
+                        BindProofError::BindingNotAuthorized,
+                        StorageAuthRefusal::BindingNotAuthorized,
+                    )),
                 }
             }
             BindAuthority::GuardianRecovery => {
-                let predecessor = self
-                    .predecessor_pubkey_b64
-                    .as_deref()
-                    .ok_or(BindProofError::BindingNotAuthorized)?;
+                let predecessor = self.predecessor_pubkey_b64.as_deref().ok_or((
+                    BindProofError::BindingNotAuthorized,
+                    StorageAuthRefusal::BindingNotAuthorized,
+                ))?;
                 match latest_history {
                     Some((latest, _)) if latest == predecessor => {
                         Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
@@ -489,7 +612,10 @@ impl PossessionProof {
                     None if flat_pubkey_b64 == Some(predecessor) => {
                         Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
                     }
-                    None | Some(_) => Err(BindProofError::BindingNotAuthorized),
+                    None | Some(_) => Err((
+                        BindProofError::BindingNotAuthorized,
+                        StorageAuthRefusal::BindingNotAuthorized,
+                    )),
                 }
             }
         }
@@ -689,11 +815,44 @@ mod tests {
             ),
             Err(BindProofError::BindingNotAuthorized)
         );
-        // Closed/revoked same key -> BindingNotAuthorized.
+        // Closed/revoked same key -> BindingNotAuthorized (cause: ClosedIdentityRequiresRecovery).
         assert_eq!(
             proof.authorize_storage_state("ai:alice", &pk, None, Some((&pk, false))),
             Err(BindProofError::BindingNotAuthorized)
         );
+        assert_eq!(
+            proof.authorize_storage_state_with_cause("ai:alice", &pk, None, Some((&pk, false))),
+            Err((
+                BindProofError::BindingNotAuthorized,
+                StorageAuthRefusal::ClosedIdentityRequiresRecovery
+            ))
+        );
+        assert_eq!(
+            proof.authorize_storage_state_with_cause(
+                "ai:alice",
+                &pk,
+                Some(&other_pk),
+                Some((&other_pk, true))
+            ),
+            Err((
+                BindProofError::BindingNotAuthorized,
+                StorageAuthRefusal::ExistingIdentityRequiresLineage
+            ))
+        );
+        // Same-key LineageSuccession on already-bound open agent -> AlreadyBound (#10196/#10197).
+        let genesis = PossessionProof::from_verified_lineage_succession("ai:alice", &pk, &pk)
+            .expect("lineage genesis");
+        assert_eq!(
+            genesis.authorize_storage_state("ai:alice", &pk, Some(&pk), Some((&pk, true))),
+            Ok(BindAuthorization::AlreadyBound)
+        );
+        // Distinct-key LineageSuccession rotation -> WriteRequired.
+        let rotate = PossessionProof::from_verified_lineage_succession("ai:alice", &pk, &other_pk)
+            .expect("lineage rotate");
+        assert!(matches!(
+            rotate.authorize_storage_state("ai:alice", &other_pk, Some(&pk), Some((&pk, true))),
+            Ok(BindAuthorization::WriteRequired(_))
+        ));
     }
 
     #[test]
