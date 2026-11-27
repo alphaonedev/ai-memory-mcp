@@ -5166,7 +5166,7 @@ mod tests {
         // The full SCHEMA already ships the v63 (9-relation) memory_links
         // shape, so drop it and recreate the pre-v63 form to exercise the
         // rebuild rather than the idempotent skip path.
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         conn.execute_batch(
             "DROP TABLE memory_links;
              CREATE TABLE memory_links (
@@ -5279,7 +5279,7 @@ mod tests {
         //   (c) post-v66 an 'escalate' row inserts cleanly,
         //   (d) both indexes were recreated.
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
 
         // The pre-v66 governance_rules shape (3-value severity CHECK).
         conn.execute_batch(
@@ -5517,7 +5517,7 @@ mod tests {
         // lands at CURRENT and the EXCLUSIVE transaction wraps the single
         // arm cleanly.
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -5538,7 +5538,7 @@ mod tests {
         // and re-run migrate so the v54 backfill arm executes (the
         // terminal v55 index arm also runs but does not touch expiry).
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         let created = "2026-01-01T00:00:00+00:00";
         for (id, tier) in [("mid1", "mid"), ("short1", "short"), ("long1", "long")] {
             conn.execute(
@@ -5588,7 +5588,7 @@ mod tests {
         // (which lands the backfill), capture the value, rewind + re-run,
         // and assert the expiry is unchanged.
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         let created = "2026-01-01T00:00:00+00:00";
         conn.execute(
             "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, expires_at) \
@@ -5643,7 +5643,7 @@ mod tests {
         const UPDATED_AT_INDEX: &str = "idx_memories_updated_at";
 
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         // SCHEMA carries the index inline (fresh-bootstrap parity), so
         // drop it to simulate a DB that predates the index migration.
         conn.execute(&format!("DROP INDEX IF EXISTS {UPDATED_AT_INDEX}"), [])
@@ -5698,7 +5698,7 @@ mod tests {
         const LIST_INDEXES: [&str; 2] = ["idx_memories_list_order", "idx_memories_ns_list_order"];
 
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         for idx in LIST_INDEXES {
             conn.execute(&format!("DROP INDEX IF EXISTS {idx}"), [])
                 .expect("drop index to simulate a pre-index DB");
@@ -5840,7 +5840,7 @@ mod tests {
         // a pre-v29 DB by stamping version=28 on the full schema, then
         // re-add the row, then check the column value (which would be
         // 0 because the SCHEMA default already populates it).
-        conn.execute_batch(SCHEMA).unwrap();
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute("INSERT INTO schema_version VALUES (28)", [])
             .unwrap();
@@ -6496,7 +6496,7 @@ mod tests {
         // correlation_id must migrate cleanly to CURRENT_SCHEMA_VERSION
         // with the column + index both present.
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).unwrap();
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute("DROP TABLE IF EXISTS subscription_events", [])
             .unwrap();
@@ -6560,7 +6560,7 @@ mod tests {
     #[test]
     fn historical_replay_v26_shaped_db_installs_v96_embed_skip_triggers_3344() {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", [])
             .expect("v3 embedding column on v26-shaped memories");
         conn.execute("DELETE FROM schema_version", [])
@@ -6891,7 +6891,7 @@ mod tests {
     #[test]
     fn v63_rebuild_leaves_memory_links_with_its_full_trigger_and_index_set_3160() {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
         conn.execute_batch(
             "DROP TABLE memory_links;
              CREATE TABLE memory_links (
@@ -6963,7 +6963,7 @@ mod tests {
     #[test]
     fn v50_rebuild_preserves_agent_quotas_and_recreates_indexes_3160() {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
 
         // The pre-v50 shape: PRIMARY KEY (agent_id), no `namespace` column.
         conn.execute_batch(
@@ -7094,7 +7094,7 @@ mod tests {
     #[test]
     fn v80_rebuild_preserves_agent_lineage_and_widens_reason_check_3160() {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        super::super::migrations_attested_fixture_tests::apply_schema(&conn);
 
         // The pre-v80 shape (v76's table, before the custody widening).
         conn.execute_batch(

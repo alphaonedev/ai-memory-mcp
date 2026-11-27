@@ -673,6 +673,10 @@ fn succeed(
         // funnel is armed with K_old (the bound key, checked here) before
         // the write: the rebind is attested inside K_old's window and never
         // lands as drift. A refusal aborts the rotation with keys untouched.
+        // #10040: the succession preconditions (enrolled lineage, K_old is
+        // the head key) are checked first, so a refusal names the broken
+        // precondition rather than the arming refusal it would cause.
+        crate::db::succession_head(&conn, &id, k_old)?;
         let signing = k_old
             .private
             .as_ref()

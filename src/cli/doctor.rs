@@ -9366,6 +9366,10 @@ enabled = true
         // against, in the per-process test key sandbox (no env write).
         let keys = crate::identity::keypair::default_key_dir().expect("sandbox key dir");
         std::fs::write(keys.join("operator.key.pub"), &approver_pubkey_b64).expect("write pubkey");
+        // #10086 check #23 — one agent public key, so the row-attestation
+        // trust anchor loads anchored (the operator key above is base64 and
+        // is not an anchor key).
+        crate::enterprise_federation_posture::row_attest_anchor::tests::seed_anchor_key(&keys);
         unsafe {
             std::env::set_var(
                 crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,

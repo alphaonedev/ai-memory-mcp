@@ -197,15 +197,13 @@ fn write_atomic(path: &Path, rec: &SealRecord) -> Result<()> {
         .parent()
         .context("a seal path always has a parent directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let name = path
-        .file_name()
-        .context("a seal path always has a file name")?
-        .to_string_lossy();
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, rec.render()).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("publish {}", path.display()))?;
-    Ok(())
+    // #8950: stage in a private directory and rename, refusing a symlink at
+    // the seal name (never a by-name write that could follow one).
+    crate::storage::snapshot_file::write_replacing(path, SEAL_WHAT, rec.render().as_bytes())
 }
+
+/// What a seal write names in its errors.
+const SEAL_WHAT: &str = "row-attestation seal";
 
 /// Move the seal at `path` up to `rec` (field-wise maximum with what it
 /// holds; it never moves back).
@@ -284,5 +282,53 @@ mod tests {
         assert_eq!(m.high_water, 8);
         assert_eq!(m.heads.get("memories"), Some(&9));
         assert_eq!(m.heads.get("leases"), Some(&4));
+    }
+
+    /// #8950: a seal write never follows a symlink planted at the seal name;
+    /// it refuses with the exact symlink reason and leaves the link and its
+    /// target as they were. A regular seal is still replaced.
+    #[cfg(unix)]
+    #[test]
+    fn seal_write_refuses_a_planted_symlink_8950() {
+        let dir = tempfile::tempdir_in(
+            std::env::var_os("TMPDIR")
+                .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from),
+        )
+        .expect("tempdir");
+        let rec = |hw: i64| SealRecord {
+            high_water: hw,
+            heads: BTreeMap::new(),
+        };
+        let target = dir.path().join("outside");
+        replace(&target, &rec(1)).expect("seal a regular file");
+        let before = std::fs::read_to_string(&target).expect("read target");
+        let link = dir.path().join("seal");
+        std::os::unix::fs::symlink(&target, &link).expect("plant symlink");
+        let rows: [(fn(&Path, &SealRecord) -> Result<()>, String); 2] = [
+            (
+                replace,
+                crate::storage::snapshot_file::symlink_refusal(&link),
+            ),
+            (
+                advance,
+                format!(
+                    "the anchored seal {} cannot be read: not a regular file",
+                    link.display()
+                ),
+            ),
+        ];
+        for (write, why) in rows {
+            let err = write(&link, &rec(9)).expect_err("a symlinked seal is refused");
+            assert_eq!(err.to_string(), why);
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("link stays")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_to_string(&target).expect("read"), before);
+        }
+        replace(&target, &rec(5)).expect("a regular seal is replaced");
+        assert_eq!(read(&target), SealState::Sealed(rec(5)));
     }
 }

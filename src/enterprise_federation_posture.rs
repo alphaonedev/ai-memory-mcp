@@ -101,7 +101,7 @@ mod synchronous;
 mod backup_signing;
 
 /// #10086 A-4 — the row-attestation trust-anchor posture row (check #23).
-mod row_attest_anchor;
+pub(crate) mod row_attest_anchor;
 
 /// The one certified posture name this module (and `doctor --posture`)
 /// recognises. Additional certified postures would each get their own
@@ -1024,7 +1024,7 @@ mod tests {
         );
         let keys = keys.expect("key dir");
         std::fs::write(keys.join("operator.key.pub"), pk).expect("write pubkey");
-        super::row_attest_anchor::seed_anchor_key(&keys); // #10086 check #23
+        super::row_attest_anchor::tests::seed_anchor_key(&keys); // #10086 check #23
         // #2954 check #19 — install a process-wide daemon audit signing key so
         // the append-only leaves would be SIGNED. Process-global `OnceLock`
         // install, isolated per env-isolated child
