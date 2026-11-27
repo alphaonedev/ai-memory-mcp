@@ -377,6 +377,10 @@ pub fn verify(vk: &VerifyingKey, domain: DaemonDomain, body: &[u8], signature: &
 }
 
 #[cfg(test)]
+#[path = "daemon_signer_k4_tests.rs"]
+mod k4_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{DaemonDomain, preimage};
 
