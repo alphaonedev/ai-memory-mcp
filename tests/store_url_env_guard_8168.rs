@@ -61,7 +61,7 @@
 //! `static $x`), and `concat!` or escaped spellings of the variable names
 //! are not decoded by part 1.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1752,11 +1752,57 @@ const STATIC_ROOTS: [&str; 4] = ["src/", "tests/", "benches/", "examples/"];
 /// The shortest reason a row may give, in visible characters.
 const MIN_REASON_CHARS: usize = 10;
 
+/// #10251: the number of rows of [`STATICS_TABLE`], pinned exactly, so a
+/// row cannot be swapped or added without a change to this file.
+const STATICS_TABLE_ROWS: usize = 627;
+
+/// #10251: the closed vocabulary a row's reason starts with, as
+/// `<category>: <reason>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Category {
+    /// The static is or holds a `Mutex`, `RwLock`, `Condvar`, a reentrant
+    /// lock or a `Semaphore`.
+    Lock,
+    /// An atomic value.
+    Atomic,
+    /// A value computed once that holds no lock.
+    Once,
+    /// A `thread_local!` value.
+    ThreadLocal,
+    /// Immutable data.
+    Immutable,
+    /// A value of a crate type that holds no lock.
+    CrateType,
+}
+
+impl Category {
+    const ALL: [Self; 6] = [
+        Self::Lock,
+        Self::Atomic,
+        Self::Once,
+        Self::ThreadLocal,
+        Self::Immutable,
+        Self::CrateType,
+    ];
+
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Lock => "lock",
+            Self::Atomic => "atomic",
+            Self::Once => "once",
+            Self::ThreadLocal => "thread-local",
+            Self::Immutable => "immutable",
+            Self::CrateType => "crate-type",
+        }
+    }
+}
+
 /// One parsed row of [`STATICS_TABLE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaticRow {
     path: String,
     name: String,
+    category: Category,
     reason: String,
 }
 
@@ -1771,6 +1817,10 @@ enum TableFinding {
     BadName { line: usize, name: String },
     /// The reason has fewer than [`MIN_REASON_CHARS`] visible characters.
     ShortReason { line: usize },
+    /// #10251: the reason does not start with `<category>: ` for a word of
+    /// [`Category::ALL`]; `word` is the text before the first `:`, or the
+    /// whole reason when it has none.
+    Category { line: usize, word: String },
 }
 
 fn is_rust_ident(s: &str) -> bool {
@@ -1834,6 +1884,7 @@ fn parse_table(text: &str) -> (Vec<StaticRow>, Vec<TableFinding>) {
             rows.push(StaticRow {
                 path: path.to_string(),
                 name: name.to_string(),
+                category: Category::CrateType,
                 reason: reason.to_string(),
             });
         }
@@ -1858,6 +1909,13 @@ enum StaticFinding {
     MacroStatic { file: String, line: usize },
     /// A row with no static.
     Missing { file: String, name: String },
+    /// #10251: a static whose type names a lock, with a row of its key whose
+    /// category is not `lock`.
+    LockNotLabelled {
+        file: String,
+        name: String,
+        line: usize,
+    },
 }
 
 /// Every `static` item of a lexed file: `(name, line)`, plus the lines of
@@ -1931,6 +1989,28 @@ enum IncludeFinding {
         file: String,
         line: usize,
         name: &'static str,
+    },
+    /// #10250: `#[path]` or `include!` names a file that does not end in
+    /// `.rs` (exact case), so the walk never reads it.
+    NotRustFile {
+        file: String,
+        line: usize,
+        value: String,
+    },
+    /// #10250: `#[path]` or `include!` names a `.rs` file the walk did not
+    /// read: absolute, out of the root, under a skipped directory, or absent.
+    Unwalked {
+        file: String,
+        line: usize,
+        value: String,
+    },
+    /// #10250: `#[path]` inside an inline `mod NAME { … }` block, where the
+    /// file it names depends on the module tree, which the census does not
+    /// model; refused rather than guessed.
+    PathInInlineMod {
+        file: String,
+        line: usize,
+        value: String,
     },
     /// The guarded module is declared other than exactly once in its file.
     ModCount {
@@ -2106,7 +2186,13 @@ fn undecodable(file: &str, line: usize, literal: String) -> IncludeFinding {
 
 /// The inclusion census of one lexed file; `mods` counts the guarded
 /// module declarations met in their own files.
-fn inclusions_of(path: &str, t: &[Tok], mods: &mut [usize; 2], found: &mut Vec<IncludeFinding>) {
+fn inclusions_of(
+    path: &str,
+    t: &[Tok],
+    _walked: &BTreeSet<&str>,
+    mods: &mut [usize; 2],
+    found: &mut Vec<IncludeFinding>,
+) {
     let file = || path.to_string();
     let (close, in_attr) = brackets(t);
     for (k, tok) in t.iter().enumerate() {
@@ -2221,6 +2307,7 @@ fn token_census(
             .entry(r.name.as_str())
             .or_default() += 1;
     }
+    let walked: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
     let mut mods = [0usize; 2];
     for (path, text) in files {
         let toks = match lex(text) {
@@ -2253,7 +2340,7 @@ fn token_census(
                 line,
             });
         }
-        inclusions_of(path, &toks, &mut mods, &mut includes);
+        inclusions_of(path, &toks, &walked, &mut mods, &mut includes);
     }
     for r in &rows {
         if let Some(n) = left
@@ -2862,25 +2949,26 @@ fn table_rows_are_refused_exactly_10213() {
     );
     assert_eq!(includes, Vec::<IncludeFinding>::new());
     let text = "# comment\n\
-                src/a.rs\tA\ta reason long enough\n\
+                src/a.rs\tA\tatomic: a reason long enough\n\
                 src/a.rs\tB\n\
                 \n\
                 src/a.rs\tC\tr\textra\n\
-                src/../x.rs\tD\ta reason long enough\n\
-                lib/a.rs\tE\ta reason long enough\n\
-                src/a.txt\tF\ta reason long enough\n\
-                src/a b.rs\tG\ta reason long enough\n\
-                src\\a.rs\tH\ta reason long enough\n\
-                src/a.rs\t9x\ta reason long enough\n\
-                src/a.rs\tI-J\ta reason long enough\n\
-                src/a.rs\tK\t  short  \n\
-                src/a.rs\t\ta reason long enough\n";
+                src/../x.rs\tD\tatomic: a reason long enough\n\
+                lib/a.rs\tE\tatomic: a reason long enough\n\
+                src/a.txt\tF\tatomic: a reason long enough\n\
+                src/a b.rs\tG\tatomic: a reason long enough\n\
+                src\\a.rs\tH\tatomic: a reason long enough\n\
+                src/a.rs\t9x\tatomic: a reason long enough\n\
+                src/a.rs\tI-J\tatomic: a reason long enough\n\
+                src/a.rs\tK\tlock:   short  \n\
+                src/a.rs\t\tatomic: a reason long enough\n";
     let (rows, bad) = parse_table(text);
     assert_eq!(
         rows,
         vec![StaticRow {
             path: "src/a.rs".into(),
             name: "A".into(),
+            category: Category::Atomic,
             reason: "a reason long enough".into(),
         }]
     );
@@ -2928,7 +3016,596 @@ fn table_rows_are_refused_exactly_10213() {
     let (statics, _) = token_census(&[], "src/a.rs\tA\tshort\n");
     assert_eq!(
         statics,
-        vec![StaticFinding::Table(TableFinding::ShortReason { line: 1 })]
+        vec![
+            StaticFinding::Table(TableFinding::Category {
+                line: 1,
+                word: "short".into()
+            }),
+            StaticFinding::Table(TableFinding::ShortReason { line: 1 }),
+        ]
+    );
+}
+
+/// #10251: the table holds exactly [`STATICS_TABLE_ROWS`] good rows.
+#[test]
+fn statics_table_row_count_is_pinned_10251() {
+    let (rows, bad) = parse_table(STATICS_TABLE);
+    assert_eq!(bad, Vec::<TableFinding>::new());
+    assert_eq!(rows.len(), STATICS_TABLE_ROWS);
+}
+
+/// #10251: a reason outside the closed vocabulary is refused with its word;
+/// every word of the vocabulary is accepted.
+#[test]
+fn category_outside_the_vocabulary_is_refused_10251() {
+    let refused: &[(&str, &str)] = &[
+        ("shared-state: a reason long enough", "shared-state"),
+        ("Lock: a reason long enough", "Lock"),
+        (" lock: a reason long enough", " lock"),
+        ("lock:a reason long enough", "lock:a reason long enough"),
+        ("a reason with no category", "a reason with no category"),
+        ("locks: a reason long enough", "locks"),
+        ("thread_local: a reason long enough", "thread_local"),
+    ];
+    for (reason, word) in refused {
+        let (rows, bad) = parse_table(&format!("src/a.rs\tA\t{reason}\n"));
+        assert_eq!(rows, Vec::<StaticRow>::new(), "{reason}");
+        assert_eq!(
+            bad,
+            vec![TableFinding::Category {
+                line: 1,
+                word: (*word).to_string()
+            }],
+            "{reason}"
+        );
+    }
+    let words: [(&str, Category); 6] = [
+        ("lock", Category::Lock),
+        ("atomic", Category::Atomic),
+        ("once", Category::Once),
+        ("thread-local", Category::ThreadLocal),
+        ("immutable", Category::Immutable),
+        ("crate-type", Category::CrateType),
+    ];
+    assert_eq!(words.len(), Category::ALL.len());
+    for (word, category) in words {
+        let (rows, bad) = parse_table(&format!("src/a.rs\tA\t{word}: a reason long enough\n"));
+        assert_eq!(bad, Vec::<TableFinding>::new(), "{word}");
+        assert_eq!(
+            rows,
+            vec![StaticRow {
+                path: "src/a.rs".into(),
+                name: "A".into(),
+                category,
+                reason: "a reason long enough".into(),
+            }],
+            "{word}"
+        );
+    }
+}
+
+/// #10251: the `(path, name)` keys of the `lock` rows, written by hand from
+/// an independent reading of each static's type (every static whose type
+/// is or holds a `Mutex`, `RwLock`, `Condvar`, `ReentrantLock`,
+/// `ReentrantMutex` or `Semaphore`, directly or through a type of its own
+/// file). A row relabelled away from `lock`, or a lock row added, is red.
+const LOCK_ROWS: &[(&str, &str)] = &[
+    ("src/approvals.rs", "EXECUTION_EXEMPTIONS"),
+    ("src/approvals.rs", "LOCK"),
+    ("src/approvals.rs", "SYNTHETIC_RULES"),
+    ("src/audit.rs", "CRASH_SNAPSHOT_DIR"),
+    ("src/audit.rs", "LOCK"),
+    ("src/audit.rs", "VERIFY_AFTER_SNAPSHOT_FOR_TEST"),
+    ("src/background/atomise_worker.rs", "LOCK"),
+    ("src/cli/boot.rs", "LOCK"),
+    ("src/cli/governance_install_defaults.rs", "LOCK"),
+    ("src/cli/helpers.rs", "LOCK"),
+    ("src/cli/install.rs", "LOCK"),
+    ("src/cli/install.rs", "PATH_LOCK"),
+    ("src/cli/shell.rs", "STDIN_LOCK"),
+    ("src/config.rs", "ACTIVE_CAPABILITY_CONFIG"),
+    ("src/config.rs", "ACTIVE_PERMISSIONS_MODE"),
+    ("src/config.rs", "CAP_LOCK"),
+    ("src/config.rs", "CONFIGURED_DEFAULT_NAMESPACE"),
+    ("src/config.rs", "GATE_LOCK"),
+    ("src/config.rs", "LOCK"),
+    ("src/config/shape/detector.rs", "BOOT_ASSESSMENT"),
+    ("src/embeddings.rs", "ACTIVE_EMBEDDING_SPACE"),
+    ("src/embeddings.rs", "QUERY_EMBED_CACHE"),
+    ("src/embeddings/test_hold_hook.rs", "HOLDS"),
+    ("src/erasure/archive_sync.rs", "CURSORS"),
+    ("src/erasure/archive_sync.rs", "FRONTIER"),
+    ("src/erasure/archive_sync.rs", "REG"),
+    ("src/erasure/mod.rs", "LOCK"),
+    ("src/federation/freshness.rs", "LOOPS"),
+    ("src/federation/freshness.rs", "TABLE"),
+    ("src/federation/identity/outbound.rs", "GLOBAL"),
+    ("src/federation/identity/resolver.rs", "M"),
+    ("src/federation/peer_attestation.rs", "ENV_GUARD"),
+    ("src/federation/peer_posture.rs", "BOOT_REPORT"),
+    ("src/federation/push_dlq.rs", "LOCK"),
+    ("src/federation/signing.rs", "M"),
+    ("src/governance/audit.rs", "CHAIN"),
+    ("src/governance/audit.rs", "DEFERRED_FORENSIC_OUTAGES"),
+    ("src/governance/audit.rs", "LOCK"),
+    ("src/governance/audit.rs", "SINK"),
+    ("src/governance/mod.rs", "ACTIVE_PERMISSION_RULES"),
+    ("src/handlers/agent_api_key.rs", "MINT_LIMITER"),
+    ("src/handlers/approvals.rs", "CACHE"),
+    (
+        "src/handlers/federation_receive.rs",
+        "QUARANTINE_METRIC_LOCK",
+    ),
+    ("src/handlers/mod.rs", "LOCK"),
+    ("src/handlers/read_pool.rs", "REGISTRY"),
+    ("src/handlers/tests.rs", "APPROVE_HMAC_TEST_LOCK"),
+    ("src/handlers/tests.rs", "LOCK"),
+    ("src/hnsw.rs", "EVICTION_RATE_RING"),
+    ("src/hooks/timeouts.rs", "LOCK"),
+    ("src/identity/keypair.rs", "LOCK"),
+    ("src/identity/mod.rs", "LOCK"),
+    ("src/inbox_wake.rs", "LOCK"),
+    ("src/inbox_wake.rs", "RECIPIENT_SEQS"),
+    ("src/llm.rs", "ENV_GUARD_1143"),
+    ("src/main.rs", "LOCK"),
+    ("src/mcp/mod.rs", "PRE_EVENT_ENFORCE_GATE"),
+    ("src/mcp/mod.rs", "PRE_SIGNAL_SEND_GATE"),
+    ("src/mcp/mod.rs", "SHARED_PERMISSION_RULES_GUARD"),
+    ("src/mcp/registry.rs", "CACHE"),
+    ("src/mcp/tools/capture_turn.rs", "LOCK"),
+    ("src/mcp/tools/recall.rs", "M"),
+    ("src/mcp/tools/rule_list.rs", "ENV_LOCK"),
+    ("src/portability/import.rs", "IMPORT_TRACE_GUARD"),
+    ("src/portability/import.rs", "IMPORT_TRACE_LOG"),
+    ("src/recover/durability.rs", "LOCK"),
+    ("src/recover/in_tx_fault.rs", "ARMED"),
+    ("src/reranker.rs", "BUDGET_LOCK"),
+    ("src/runtime_context.rs", "GLOBAL"),
+    ("src/storage/connection.rs", "DB_PASSPHRASE"),
+    ("src/storage/mod.rs", "CACHE"),
+    ("src/storage/record_stop.rs", "SQLITE_FLAGS"),
+    ("src/storage/schema_guard.rs", "LOCK"),
+    ("src/store/postgres.rs", "PG_BOOTSTRAP_TEST_LOCK"),
+    ("src/store/sqlite.rs", "OWNER_GATE_TEST_HOOK"),
+    ("src/store_url/env_guard.rs", "LOCK"),
+    ("src/subscriptions.rs", "DISPATCH_SEMAPHORE"),
+    ("src/subscriptions.rs", "SSRF_ENV_GUARD"),
+    ("src/subscriptions/unstarted.rs", "REGISTRY"),
+    ("src/test_support.rs", "LOCK"),
+    ("src/tls.rs", "LOCK"),
+    ("tests/acyclicity_equal_instant_3041.rs", "FLAG_LOCK"),
+    ("tests/admin_action_forensic_audit.rs", "LOCK"),
+    ("tests/admin_audit_chain_913.rs", "LOCK"),
+    ("tests/admin_header_pubkey_bind_8494.rs", "LOCK"),
+    ("tests/admin_header_trust_credential_routes_8574.rs", "LOCK"),
+    ("tests/agent_api_key_admin_route_3474.rs", "ENROLLED_ADMINS"),
+    ("tests/agent_api_key_admin_route_3474.rs", "LOCK"),
+    ("tests/agent_api_key_mint_principal_8535.rs", "LOCK"),
+    ("tests/agent_attestation_integrity.rs", "ENV_LOCK"),
+    ("tests/agent_attestation_postgres.rs", "ENV_LOCK"),
+    ("tests/agent_key_hot_enroll_3418.rs", "ENV_LOCK"),
+    ("tests/agent_key_stale_refresh_4066.rs", "LOCK"),
+    ("tests/append_only_spine_flagon_g6.rs", "FLAG_LOCK"),
+    ("tests/append_only_upsert_supersede_2948.rs", "FLAG_LOCK"),
+    ("tests/approval_approver_hmac_8495.rs", "LOCK_8495"),
+    ("tests/atomisation/core.rs", "M"),
+    ("tests/atomisation/core.rs", "SLOT"),
+    ("tests/audit_exoneration_asymmetry_l7.rs", "LOCK"),
+    ("tests/audit_truncation_anchor_1850.rs", "LOCK"),
+    ("tests/audit_watermark_after_commit_7241.rs", "CELL_LOCK"),
+    ("tests/audit_watermark_db_id_scope_2955.rs", "LOCK"),
+    (
+        "tests/audit_watermark_requires_genesis_7228.rs",
+        "CELL_LOCK",
+    ),
+    ("tests/audit_witness_rollback_7241.rs", "CELL_LOCK"),
+    ("tests/audit_witness_truncation_1822.rs", "LOCK"),
+    ("tests/auto_atomise/core.rs", "M"),
+    ("tests/auto_atomise/core.rs", "SLOT"),
+    ("tests/b4_config_cleanup.rs", "LOCK"),
+    ("tests/batman_atomise_wiring_2983.rs", "LOCK"),
+    ("tests/bias_displacement_invariants_2_6.rs", "M"),
+    ("tests/bind_chain_depth_4492.rs", "SERIAL"),
+    (
+        "tests/bulk_post_commit_stages_2724.rs",
+        "DISPATCH_CELL_LOCK",
+    ),
+    ("tests/capture_turn_security_integrity.rs", "ENV_LOCK"),
+    ("tests/child_stdin_write_report_8734.rs", "SPAWN_LOCK"),
+    ("tests/claim_bitemporal_recall_1834.rs", "M"),
+    ("tests/claim_validtime_canonical_1834.rs", "M"),
+    ("tests/cli_install_pretool_hook.rs", "ENV_LOCK"),
+    ("tests/cli_pending_reject_3448.rs", "LOCK"),
+    ("tests/cli_surface_cluster_r405.rs", "ENV_GUARD"),
+    ("tests/cluster_f_perf_regressions.rs", "TRACE_GUARD"),
+    ("tests/cluster_f_perf_regressions.rs", "TRACE_LOG"),
+    ("tests/common/mod.rs", "ENV_LOCK"),
+    ("tests/common/pg_isolate.rs", "PROCESS_CLONE"),
+    ("tests/corrupt_governance_escape_4285.rs", "SERIAL"),
+    ("tests/corrupt_governance_severed_4285.rs", "STAR"),
+    ("tests/cov3_handlers_postgres.rs", "FED_ENV_LOCK"),
+    ("tests/cov_backup_store_url_3521.rs", "STORE_URL_ENV_LOCK"),
+    (
+        "tests/cov_daemon_passphrase_posture_3521.rs",
+        "ALLOW_LAX_ENV_LOCK",
+    ),
+    ("tests/cov_fupb_approvals.rs", "APPROVALS_GLOBAL_LOCK"),
+    ("tests/cov_fupb_fed_signing.rs", "FED_SIGNING_ENV_LOCK"),
+    ("tests/cov_ga2_federation.rs", "FED_ENV_LOCK"),
+    ("tests/cov_ga2_handlers_b.rs", "GA2_LOCK"),
+    ("tests/cov_ga2_pg_federation.rs", "FED_ENV_LOCK"),
+    ("tests/cov_ga2_pg_handlers_2.rs", "ADMIN_ENV_LOCK"),
+    ("tests/cov_ga2_r4_federation.rs", "FED_ENV_LOCK"),
+    ("tests/cov_ga2_r4_handlers.rs", "LOCK"),
+    ("tests/cov_handlers_gov_admin_1660.rs", "HMAC_LOCK"),
+    ("tests/cov_postgres_lineage.rs", "FLAG_LOCK"),
+    ("tests/cov_postgres_recovery.rs", "ENV_LOCK"),
+    ("tests/cov_sal_refusal_arms_3521.rs", "FED_ENV_LOCK"),
+    ("tests/cross_build_db_compat_8677.rs", "LOCK"),
+    ("tests/curator_conserves_contradiction_g7.rs", "FLAG_LOCK"),
+    ("tests/dispatch_integration.rs", "AUDIT_INIT_LOCK"),
+    ("tests/doctor_over_depth_4715.rs", "SERIAL"),
+    (
+        "tests/embedding_space_provenance_2167.rs",
+        "ACTIVE_SPACE_TEST_LOCK",
+    ),
+    (
+        "tests/embedding_space_provenance_2167.rs",
+        "STRICT_FLAG_GUARD",
+    ),
+    (
+        "tests/embedding_space_provenance_2167_pg.rs",
+        "PG_HEAL_ENV_LOCK",
+    ),
+    ("tests/embeddings_backfill_batch_config_1260.rs", "L"),
+    ("tests/encryption_at_rest.rs", "ENV_GATE_LOCK"),
+    ("tests/encryption_key_absent_3718.rs", "ENV_GATE_LOCK"),
+    ("tests/encryption_upsert_key_2383.rs", "ENV_GATE_LOCK"),
+    ("tests/erasure_cold_tier_2064.rs", "LOCK"),
+    ("tests/f53_claimed_vs_attested_e2e.rs", "ENV_LOCK"),
+    ("tests/fed_archive_restore_lane_3075.rs", "ENV_LOCK"),
+    ("tests/fed_archive_restore_lane_3075_pg.rs", "FED_ENV_LOCK"),
+    ("tests/fed_checkpoint_lane_3075_pg.rs", "FED_ENV_LOCK"),
+    (
+        "tests/fed_consolidate_source_attest_parity_2863.rs",
+        "ENV_LOCK",
+    ),
+    ("tests/fed_inbound_stamp_3624.rs", "ENV_LOCK"),
+    ("tests/fed_owner_floor_4285.rs", "ENV_LOCK"),
+    ("tests/fed_pending_identity_quorum_2710_2720.rs", "ENV_LOCK"),
+    ("tests/fed_require_server_verify_2448.rs", "LOCK"),
+    ("tests/fed_rq_03_policy_refuse_stale.rs", "ENV_LOCK"),
+    ("tests/federation_1566_embed_ship.rs", "LOCK"),
+    ("tests/federation_1936_checkpoint_fed.rs", "ENV_LOCK"),
+    ("tests/federation_2168_embed_fingerprint.rs", "LOCK"),
+    (
+        "tests/federation_by_id_scope_recheck_4447.rs",
+        "SQLITE_CELLS",
+    ),
+    ("tests/federation_catchup_posture_3582.rs", "ENV_LOCK"),
+    ("tests/federation_causal_order_3699.rs", "FED_ENV_LOCK"),
+    ("tests/federation_checkpoint_ns_scope_2708.rs", "ENV_LOCK"),
+    (
+        "tests/federation_confine_ns_scope_2711_pg.rs",
+        "FED_ENV_LOCK",
+    ),
+    ("tests/federation_delete_ns_scope_2488.rs", "ENV_LOCK"),
+    (
+        "tests/federation_delete_ns_scope_2488_pg.rs",
+        "FED_ENV_LOCK",
+    ),
+    (
+        "tests/federation_dequarantine_crossid_3901.rs",
+        "FED_ENV_LOCK",
+    ),
+    ("tests/federation_inbox_wake_3631.rs", "FED_ENV_LOCK"),
+    ("tests/federation_legacy_row_visibility_978.rs", "ENV_LOCK"),
+    (
+        "tests/federation_merge_scope_recheck_4023.rs",
+        "FED_ENV_LOCK",
+    ),
+    (
+        "tests/federation_namespace_meta_descendant_2536.rs",
+        "ENV_LOCK",
+    ),
+    ("tests/federation_nonce_replay_922.rs", "LOCK"),
+    ("tests/federation_ns_meta_ancestor_gate_4478.rs", "ENV_LOCK"),
+    ("tests/federation_ns_meta_scope_2479.rs", "ENV_LOCK"),
+    ("tests/federation_ns_meta_scope_2479_pg.rs", "FED_ENV_LOCK"),
+    ("tests/federation_peer_enrolled_2912.rs", "ENV_LOCK"),
+    ("tests/federation_pending_ns_scope_2478.rs", "ENV_LOCK"),
+    (
+        "tests/federation_pending_ns_scope_2478_pg.rs",
+        "FED_ENV_LOCK",
+    ),
+    ("tests/federation_pending_reject_ns_2532.rs", "ENV_LOCK"),
+    ("tests/federation_pending_resurrection_2529.rs", "ENV_LOCK"),
+    ("tests/federation_plaintext_peer_2477.rs", "ENV_LOCK"),
+    ("tests/federation_receive_coord_screen_3049.rs", "LOCK"),
+    ("tests/federation_signal_authorship_1843.rs", "LOCK"),
+    ("tests/federation_sync_push_catchup_sig_2297.rs", "LOCK"),
+    ("tests/federation_sync_push_tofu_1056.rs", "LOCK"),
+    ("tests/federation_sync_since_sig_1031.rs", "LOCK"),
+    ("tests/federation_sync_since_watermark_2441.rs", "ENV_LOCK"),
+    ("tests/federation_sync_state_merge_1709.rs", "LOCK"),
+    ("tests/federation_write_ns_scope_2447.rs", "ENV_LOCK"),
+    ("tests/federation_write_ns_scope_2447_pg.rs", "FED_ENV_LOCK"),
+    ("tests/forensic/wt1e_chain_test.rs", "M"),
+    ("tests/forensic_audit_log.rs", "LOCK"),
+    ("tests/form_1_synthesis.rs", "LOCK"),
+    ("tests/form_2_synchronous_atomise.rs", "M"),
+    ("tests/form_4_provenance.rs", "M"),
+    ("tests/fts_corrupt_vtab_9273.rs", "TRACE_9273"),
+    (
+        "tests/g3_postgres_verify_link_signature_roundtrip.rs",
+        "LOCK",
+    ),
+    ("tests/g_issue_238_sender_attestation.rs", "ENV_LOCK"),
+    ("tests/g_issue_239_sync_scope.rs", "ENV_LOCK"),
+    ("tests/governance_audit_verdict_2634.rs", "LOCK"),
+    ("tests/governance_chain_depth_4477.rs", "SERIAL"),
+    ("tests/governance_l16_activation.rs", "LOCK"),
+    ("tests/governance_policy_attribution_4044.rs", "LOCK"),
+    ("tests/governance_policy_attribution_4044.rs", "TRIGGER_DB"),
+    ("tests/governance_policy_attribution_4044.rs", "TRIGGER_SQL"),
+    ("tests/governance_policy_read_fault_4043.rs", "ENV_LOCK"),
+    ("tests/governance_policy_read_fault_4043_pg.rs", "ENV_LOCK"),
+    ("tests/governance_pre_write_fxc5_sqlite.rs", "HOOK_MODE"),
+    ("tests/governance_pre_write_fxc5_sqlite.rs", "M"),
+    (
+        "tests/governance_pre_write_postgres_parity.rs",
+        "HOOK_VERDICT",
+    ),
+    ("tests/governance_pre_write_postgres_parity.rs", "M"),
+    ("tests/governance_seed_ceremony_3430.rs", "LOCK"),
+    ("tests/governance_storage_insert_hook.rs", "HOOK_MODE"),
+    ("tests/governance_storage_insert_hook.rs", "M"),
+    ("tests/governance_update_hook_1451.rs", "M"),
+    ("tests/h2_invalidate_link_signed.rs", "ENV_GUARD"),
+    (
+        "tests/health_metrics_constant_cost_2579_2583.rs",
+        "TRACE_LOG",
+    ),
+    ("tests/hot_swap_llm_2166.rs", "LOCK"),
+    ("tests/http_capture_attestation_3406.rs", "TEST_LOCK"),
+    ("tests/i4_memory_replay_authz.rs", "RULES_GUARD"),
+    ("tests/identity_e2e.rs", "ENV_GUARD"),
+    ("tests/inference_egress_proxy_redirect_4193.rs", "ENV_LOCK"),
+    ("tests/issue_1213_atttypmod_age_schema_scope.rs", "LOCK"),
+    ("tests/issue_1234_daemon_sentinel_bootstrap.rs", "LOCK"),
+    ("tests/issue_2059_2060_covenant_pg.rs", "LOCK"),
+    ("tests/issue_2059_2060_covenant_write_gates.rs", "LOCK"),
+    ("tests/issue_2121_2122_2123_covenant_funnels.rs", "LOCK"),
+    ("tests/issue_2122_synthesis_provenance_enforce.rs", "LOCK"),
+    ("tests/issue_3627_retired_llm_alias.rs", "LOCK"),
+    ("tests/issue_4357_reflect_approval_gate_parity.rs", "SERIAL"),
+    ("tests/issue_800_batman_mode.rs", "ENV_LOCK"),
+    ("tests/k10_approval_http.rs", "K10_HTTP_LOCK"),
+    (
+        "tests/k10_approval_postgres_dispatch_1618.rs",
+        "K10_PG_DISPATCH_LOCK",
+    ),
+    ("tests/k10_approval_security.rs", "K10_SECURITY_LOCK"),
+    ("tests/k10_remember_forever.rs", "REMEMBER_LOCK"),
+    ("tests/k7_hmac.rs", "K7_HMAC_GLOBAL_LOCK"),
+    ("tests/k9_kg_invalidate_governance_gate.rs", "LOCK"),
+    ("tests/key_dir_posture_3198.rs", "LOCK"),
+    ("tests/kg_query_visibility_3386.rs", "ENV_GUARD"),
+    ("tests/l07_3_chunk_d_http_surface.rs", "HMAC_LOCK"),
+    ("tests/lax_perms_hatches_doctor_sink_3813.rs", "LOCK"),
+    (
+        "tests/lifecycle_hidden_rows_unit1_3691_3693_3626.rs",
+        "FLAG_LOCK",
+    ),
+    ("tests/lifecycle_owner_lock_pg_4053.rs", "SERIAL"),
+    ("tests/lineage_boot_seed_2233.rs", "BOOT_LOCK"),
+    ("tests/lineage_dag_g13.rs", "FLAG_LOCK"),
+    ("tests/lineage_schema_masks_loss_3172.rs", "ENV_LOCK"),
+    ("tests/mcp_agent_id_env_isolation_3475.rs", "LOCK"),
+    ("tests/memory_verify.rs", "ENV_GUARD"),
+    ("tests/migrate_lineage_roundtrip_3435.rs", "FLAG_LOCK"),
+    ("tests/mtls_agent_binding_8357.rs", "LOCK"),
+    ("tests/mtls_cert_peer_binding_2045.rs", "LOCK"),
+    (
+        "tests/node_local_containment_item3_r2_3266.rs",
+        "FED_ENV_LOCK",
+    ),
+    ("tests/owner_gate_toctou_pg_3953.rs", "SERIAL"),
+    ("tests/pg_lock_order_4209_4210.rs", "SERIAL"),
+    ("tests/pg_lock_order_4329_4330.rs", "SERIAL"),
+    ("tests/pg_sever_audit_event_3290.rs", "LOCK"),
+    ("tests/pillar4_4d_age_unprojection_on_delete_1783.rs", "L"),
+    ("tests/portability_lineage_cid_2215.rs", "FLAG_LOCK"),
+    ("tests/postgres_cross_build_db_compat_8677.rs", "LOCK"),
+    ("tests/postgres_schema_downgrade_guard_2445.rs", "LOCK"),
+    ("tests/principal_binding_3363.rs", "ENV_GUARD"),
+    ("tests/provenance_read_error_surfaces_9435.rs", "FLAG_LOCK"),
+    ("tests/quarantine_operator_surface_2402.rs", "LOCK"),
+    ("tests/query_embed_cache_2577.rs", "CACHE_TEST_LOCK"),
+    ("tests/r40_airgapped_approval.rs", "ENV_LOCK"),
+    ("tests/r40_approval_chokepoint.rs", "GLOBAL_LOCK"),
+    ("tests/reanchor_ceremony_2004.rs", "LOCK"),
+    ("tests/recall/wt1e.rs", "M"),
+    ("tests/recall_purity_p01.rs", "LOCK"),
+    ("tests/recall_purity_p01_postgres.rs", "LOCK"),
+    ("tests/reflect_owner_env_binding_3423.rs", "LOCK"),
+    ("tests/reflect_read_visibility_caller_3282.rs", "ENV_GUARD"),
+    ("tests/retired_provider_aliases.rs", "LOCK"),
+    ("tests/role_separation_1826.rs", "LOCK"),
+    ("tests/rollback_evidence_1946.rs", "LOCK"),
+    ("tests/schema_downgrade_guard_2445.rs", "LOCK"),
+    ("tests/security_admin_wildcard_980.rs", "ENV_LOCK"),
+    ("tests/security_authz_isolation_cluster.rs", "ENV_LOCK"),
+    ("tests/serve_postgres_continuation2.rs", "HMAC_SECRET_LOCK"),
+    ("tests/ship_gate/grand_slam_composition.rs", "LOCK"),
+    ("tests/signal_recipient_validation_4408.rs", "ENV_LOCK"),
+    ("tests/skill_scope_integrity_8832_8834.rs", "ENV_GUARD"),
+    ("tests/skills_jail_caller_text_3762.rs", "SERIAL"),
+    ("tests/sync_since_visibility_gate_948.rs", "ENV_LOCK"),
+    ("tests/synthesis_ownership_gate_3173.rs", "LOCK"),
+    ("tests/tls_import_daemon_3709.rs", "SANDBOX_LOCK"),
+    ("tests/transit_encryption_3709_lib.rs", "ENV_LOCK"),
+    ("tests/trust_propagation_1958_1959.rs", "FLAG_LOCK"),
+    ("tests/unit_escape_4356_4357_4285.rs", "SERIAL"),
+    ("tests/v070_a1_authn.rs", "A1_HMAC_LOCK"),
+    ("tests/wake_hub_write_authority_3578.rs", "TEST_LOCK"),
+    ("tests/webhook_terminal_refusal_3790.rs", "KNOB"),
+    ("tests/wt1c_mcp_atomise.rs", "M"),
+    ("tests/wt1c_mcp_atomise.rs", "SLOT"),
+];
+
+#[test]
+fn lock_rows_are_the_hand_written_set_10251() {
+    let (rows, _) = parse_table(STATICS_TABLE);
+    let got: BTreeSet<(&str, &str)> = rows
+        .iter()
+        .filter(|r| r.category == Category::Lock)
+        .map(|r| (r.path.as_str(), r.name.as_str()))
+        .collect();
+    let want: BTreeSet<(&str, &str)> = LOCK_ROWS.iter().copied().collect();
+    assert_eq!(want.len(), LOCK_ROWS.len(), "LOCK_ROWS holds a duplicate");
+    let extra: Vec<_> = got.difference(&want).collect();
+    let lost: Vec<_> = want.difference(&got).collect();
+    assert_eq!((extra, lost), (Vec::new(), Vec::new()));
+}
+
+/// #10251: a static whose type is or holds a lock, listed with a category
+/// other than `lock`, is red in every form the type can name the lock.
+#[test]
+fn lock_static_not_labelled_lock_is_red_10251() {
+    let forms: &[(&str, &str, usize)] = &[
+        (
+            "direct-mutex",
+            "static FORM_L: std::sync::Mutex<()> = std::sync::Mutex::new(());\n",
+            0,
+        ),
+        (
+            "rwlock-in-once-lock",
+            "static FORM_L: std::sync::OnceLock<std::sync::RwLock<u8>> = std::sync::OnceLock::new();\n",
+            0,
+        ),
+        (
+            "mutex-in-lazy-lock",
+            "static FORM_L: std::sync::LazyLock<Mutex<u8>> =\n    std::sync::LazyLock::new(|| Mutex::new(0));\n",
+            0,
+        ),
+        (
+            "condvar",
+            "static FORM_L: std::sync::Condvar = std::sync::Condvar::new();\n",
+            0,
+        ),
+        (
+            "type-alias",
+            "type FormLockA = std::sync::Mutex<()>;\nstatic FORM_L: FormLockA = FormLockA::new(());\n",
+            1,
+        ),
+        (
+            "alias-of-alias",
+            "type FormLockB = std::sync::RwLock<()>;\ntype FormLockC = FormLockB;\nstatic FORM_L: std::sync::OnceLock<FormLockC> = std::sync::OnceLock::new();\n",
+            2,
+        ),
+        (
+            "struct-wrapper",
+            "struct FormWrap {\n    m: std::sync::Mutex<()>,\n}\nstatic FORM_L: std::sync::OnceLock<FormWrap> = std::sync::OnceLock::new();\n",
+            3,
+        ),
+        (
+            "tuple-struct-wrapper",
+            "struct FormTuple(tokio::sync::Semaphore);\nstatic FORM_L: std::sync::OnceLock<FormTuple> = std::sync::OnceLock::new();\n",
+            1,
+        ),
+        (
+            "enum-wrapper",
+            "enum FormEnum {\n    A(std::sync::Mutex<u8>),\n}\nstatic FORM_L: std::sync::OnceLock<FormEnum> = std::sync::OnceLock::new();\n",
+            3,
+        ),
+        (
+            "use-as-rename",
+            "use std::sync::Mutex as FormM;\nstatic FORM_L: FormM<()> = FormM::new(());\n",
+            1,
+        ),
+        (
+            "reentrant",
+            "static FORM_L: std::sync::ReentrantLock<()> = std::sync::ReentrantLock::new(());\n",
+            0,
+        ),
+        (
+            "static-mut",
+            "static mut FORM_L: Option<std::sync::Mutex<()>> = None;\n",
+            0,
+        ),
+        (
+            "generic-assoc-binding",
+            "static FORM_L: std::sync::OnceLock<Box<dyn Iterator<Item = u8> + Send>> = std::sync::OnceLock::new();\nstatic FORM_M: std::sync::OnceLock<(Box<dyn Fn() -> u8 + Sync>, std::sync::Mutex<u8>)> = std::sync::OnceLock::new();\n",
+            1,
+        ),
+    ];
+    for (id, tail, at) in forms {
+        let (files, first) = tree_appended(SUPPORT, tail);
+        let name = if *id == "generic-assoc-binding" {
+            "FORM_M"
+        } else {
+            "FORM_L"
+        };
+        let mut table =
+            format!("{STATICS_TABLE}{SUPPORT}\t{name}\tatomic: an atomic value of the form\n");
+        if *id == "generic-assoc-binding" {
+            // `Box<dyn Iterator<Item = u8>>` holds no lock: an `atomic` row
+            // is accepted for it, and the `=` of the binding does not end the
+            // type of the next static early.
+            table.push_str(&format!(
+                "{SUPPORT}\tFORM_L\tonce: a value computed once, no lock\n"
+            ));
+        }
+        let (statics, includes) = token_census(&files, &table);
+        assert_eq!(
+            statics,
+            vec![StaticFinding::LockNotLabelled {
+                file: SUPPORT.into(),
+                name: name.into(),
+                line: first + at,
+            }],
+            "{id}"
+        );
+        assert_eq!(includes, Vec::<IncludeFinding>::new(), "{id}");
+    }
+    // The same statics labelled `lock` are clean.
+    for (id, tail, _) in forms {
+        let (files, _) = tree_appended(SUPPORT, tail);
+        let mut table = format!("{STATICS_TABLE}{SUPPORT}\tFORM_L\tlock: a lock of the form\n");
+        if *id == "generic-assoc-binding" {
+            table.push_str(&format!("{SUPPORT}\tFORM_M\tlock: a lock of the form\n"));
+        }
+        let (statics, _) = token_census(&files, &table);
+        assert_eq!(statics, Vec::<StaticFinding>::new(), "{id}");
+    }
+}
+
+/// #10251: a live lock row relabelled `atomic` is red.
+#[test]
+fn live_lock_row_relabelled_is_red_10251() {
+    let (key_path, key_name) = LOCK_ROWS[0];
+    let table: String = STATICS_TABLE
+        .lines()
+        .map(|l| {
+            let mut f = l.splitn(3, '\t');
+            match (f.next(), f.next(), f.next()) {
+                (Some(p), Some(n), Some(r)) if p == key_path && n == key_name => {
+                    format!("{p}\t{n}\tatomic: {}\n", r.trim_start_matches("lock: "))
+                }
+                _ => format!("{l}\n"),
+            }
+        })
+        .collect();
+    let (statics, _) = token_census(&tree(), &table);
+    assert!(
+        !statics.is_empty()
+            && statics.iter().all(|f| matches!(
+                f,
+                StaticFinding::LockNotLabelled { file, name, .. }
+                    if file == key_path && name == key_name
+            )),
+        "{statics:?}"
     );
 }
 
@@ -3040,7 +3717,7 @@ fn undecodable_and_not_literal_are_red_10204() {
         let toks = lex(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
         let mut mods = [0usize; 2];
         let mut got = Vec::new();
-        inclusions_of("src/x.rs", &toks, &mut mods, &mut got);
+        inclusions_of("src/x.rs", &toks, &BTreeSet::new(), &mut mods, &mut got);
         let shape: Vec<IncludeFinding> = got
             .into_iter()
             .map(|f| match f {
@@ -3071,7 +3748,7 @@ fn undecodable_and_not_literal_are_red_10204() {
     }
     let toks = lex("#[path = \"a\\qb.rs\"]\nmod m;\n").expect("lexes");
     let mut got = Vec::new();
-    inclusions_of("src/x.rs", &toks, &mut [0; 2], &mut got);
+    inclusions_of("src/x.rs", &toks, &BTreeSet::new(), &mut [0; 2], &mut got);
     assert_eq!(
         got,
         vec![IncludeFinding::Undecodable {
@@ -3105,6 +3782,265 @@ fn symlink_in_tree_is_refused_10204() {
     fs::remove_dir_all(&root).expect("clean scratch");
 }
 
+/// #10250: a directory named like a skipped one is left out only as a
+/// direct child of the root; at any other depth it is walked. The walked
+/// set is written out by hand.
+#[test]
+fn skip_named_dirs_below_the_root_are_walked_10250() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("store_url_env_guard_8168_skips");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("clear scratch");
+    }
+    let names = [
+        "target",
+        ".git",
+        ".local-runs",
+        ".codegraph",
+        "node_modules",
+    ];
+    assert_eq!(
+        names.len(),
+        SKIPPED_DIRS.len(),
+        "the fixture names every skipped directory"
+    );
+    for (name, _) in SKIPPED_DIRS {
+        assert!(names.contains(name), "{name} is in the fixture");
+    }
+    for name in names {
+        let nested = root.join("src/n").join(name);
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(nested.join("x.rs"), "static X: u8 = 0;\n").expect("write nested");
+        let top = root.join(name);
+        fs::create_dir_all(&top).expect("top dir");
+        fs::write(top.join("y.rs"), "static Y: u8 = 0;\n").expect("write top");
+    }
+    let mut files = Vec::new();
+    let mut links = Vec::new();
+    walk(&root, &root, &mut files, &mut links);
+    let mut got: Vec<String> = files.into_iter().map(|(p, _)| p).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "src/n/.codegraph/x.rs".to_string(),
+            "src/n/.git/x.rs".to_string(),
+            "src/n/.local-runs/x.rs".to_string(),
+            "src/n/node_modules/x.rs".to_string(),
+            "src/n/target/x.rs".to_string(),
+        ]
+    );
+    assert_eq!(links, Vec::<String>::new());
+    fs::remove_dir_all(&root).expect("clean scratch");
+}
+
+fn inc(line: usize, kind: fn(String, usize, String) -> IncludeFinding, value: &str) -> Finding {
+    Finding::Include(kind(SUPPORT.into(), line, value.into()))
+}
+
+fn not_rust(file: String, line: usize, value: String) -> IncludeFinding {
+    IncludeFinding::NotRustFile { file, line, value }
+}
+
+fn unwalked(file: String, line: usize, value: String) -> IncludeFinding {
+    IncludeFinding::Unwalked { file, line, value }
+}
+
+fn in_inline(file: String, line: usize, value: String) -> IncludeFinding {
+    IncludeFinding::PathInInlineMod { file, line, value }
+}
+
+/// #10250: every form a `#[path]` or `include!` can take to name a file the
+/// walk never read, each with its exact finding; and the forms that name a
+/// walked file, each clean. The expected column is written by hand.
+#[test]
+fn inclusion_of_an_unread_file_is_red_10250() {
+    type Kind = fn(String, usize, String) -> IncludeFinding;
+    let red: &[(&str, &str, usize, Kind, &str)] = &[
+        (
+            "path-under-skipped-dir",
+            "#[path = \"../node_modules/x/lock.rs\"]\nmod lock_nm;\n",
+            0,
+            unwalked,
+            "../node_modules/x/lock.rs",
+        ),
+        (
+            "path-under-target",
+            "#[path = \"../target/debug/build/x/out/lock.rs\"]\nmod lock_tgt;\n",
+            0,
+            unwalked,
+            "../target/debug/build/x/out/lock.rs",
+        ),
+        (
+            "path-escapes-root",
+            "#[path = \"../../x.rs\"]\nmod lock_up;\n",
+            0,
+            unwalked,
+            "../../x.rs",
+        ),
+        (
+            "path-absolute",
+            "#[path = \"/srv/x/lock.rs\"]\nmod lock_abs;\n",
+            0,
+            unwalked,
+            "/srv/x/lock.rs",
+        ),
+        (
+            "path-absent-file",
+            "#[path = \"absent_10250.rs\"]\nmod lock_absent;\n",
+            0,
+            unwalked,
+            "absent_10250.rs",
+        ),
+        (
+            "path-wrong-case",
+            "#[path = \"Test_Support.rs\"]\nmod lock_case;\n",
+            0,
+            unwalked,
+            "Test_Support.rs",
+        ),
+        (
+            "path-backslash",
+            "#[path = \"store\\\\sqlite.rs\"]\nmod lock_bs;\n",
+            0,
+            unwalked,
+            "store\\sqlite.rs",
+        ),
+        (
+            "path-cfg-attr",
+            "#[cfg_attr(test, path = \"../.codegraph/lock.rs\")]\nmod lock_cfg;\n",
+            0,
+            unwalked,
+            "../.codegraph/lock.rs",
+        ),
+        (
+            "path-not-rs",
+            "#[path = \"lock.txt\"]\nmod lock_txt;\n",
+            0,
+            not_rust,
+            "lock.txt",
+        ),
+        (
+            "path-upper-ext",
+            "#[path = \"lock.RS\"]\nmod lock_up_ext;\n",
+            0,
+            not_rust,
+            "lock.RS",
+        ),
+        (
+            "path-no-ext",
+            "#[path = \"lock\"]\nmod lock_dir {}\n",
+            0,
+            not_rust,
+            "lock",
+        ),
+        (
+            "path-in-inline-mod",
+            "mod inline_10250 {\n    #[path = \"test_support.rs\"]\n    mod again;\n}\n",
+            1,
+            in_inline,
+            "test_support.rs",
+        ),
+        (
+            "include-not-rs",
+            "include!(\"lock.in\");\n",
+            0,
+            not_rust,
+            "lock.in",
+        ),
+        (
+            "include-under-skipped-dir",
+            "include!(\"../.local-runs/lock.rs\");\n",
+            0,
+            unwalked,
+            "../.local-runs/lock.rs",
+        ),
+        (
+            "include-manifest-target",
+            "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/target/x.rs\"));\n",
+            0,
+            unwalked,
+            "/target/x.rs",
+        ),
+        (
+            "include-manifest-no-slash",
+            "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"src/lib.rs\"));\n",
+            0,
+            unwalked,
+            "src/lib.rs",
+        ),
+        (
+            "include-split-not-rs",
+            "include!(concat!(\"lock\", \".in\"));\n",
+            0,
+            not_rust,
+            "lock.in",
+        ),
+    ];
+    for (id, tail, at, kind, value) in red {
+        let (files, first) = tree_appended(SUPPORT, tail);
+        let got: Vec<Finding> = census_all(&files)
+            .into_iter()
+            .filter(|f| matches!(f, Finding::Include(_)))
+            .collect();
+        assert_eq!(got, vec![inc(first + at, *kind, value)], "{id}");
+    }
+    let clean: &[(&str, &str)] = &[
+        ("path-sibling", "#[path = \"lib.rs\"]\nmod again_lib;\n"),
+        (
+            "path-dot",
+            "#[path = \"./store/sqlite.rs\"]\nmod again_sqlite;\n",
+        ),
+        (
+            "path-parent-back",
+            "#[path = \"../src/lib.rs\"]\nmod again_up;\n",
+        ),
+        (
+            "path-double-slash",
+            "#[path = \"store//sqlite.rs\"]\nmod again_ds;\n",
+        ),
+        ("include-sibling", "include!(\"lib.rs\");\n"),
+        (
+            "include-manifest",
+            "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/lib.rs\"));\n",
+        ),
+        (
+            "include-str-any",
+            "const T: &str = include_str!(\"../README.md\");\n",
+        ),
+        (
+            "include-bytes-any",
+            "const B: &[u8] = include_bytes!(\"/srv/x.bin\");\n",
+        ),
+    ];
+    for (id, tail) in clean {
+        let (files, _) = tree_appended(SUPPORT, tail);
+        let got: Vec<Finding> = census_all(&files)
+            .into_iter()
+            .filter(|f| matches!(f, Finding::Include(_)))
+            .collect();
+        assert_eq!(got, Vec::<Finding>::new(), "{id}");
+    }
+}
+
+/// #10250: `env!("CARGO_MANIFEST_DIR")` anchors a value only as the first
+/// piece of `concat!`; anywhere else the value is not a literal.
+#[test]
+fn manifest_dir_after_the_first_piece_is_not_literal_10250() {
+    let tail = "include!(concat!(\"src/\", env!(\"CARGO_MANIFEST_DIR\"), \"/src/lib.rs\"));\n";
+    let (files, first) = tree_appended(SUPPORT, tail);
+    let got: Vec<Finding> = census_all(&files)
+        .into_iter()
+        .filter(|f| matches!(f, Finding::Include(_)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![Finding::Include(IncludeFinding::IncludeNotLiteral {
+            file: SUPPORT.into(),
+            line: first,
+        })]
+    );
+}
+
 /// The token census is linear: a 200 000-line file of every form it parses
 /// is judged in well under the ceiling, with every hit reported.
 #[test]
@@ -3118,7 +4054,11 @@ fn token_census_cost_is_bounded_10213() {
         big.push_str("#[path = \"other.rs\"]\n");
         big.push_str("const X: &str = include_str!(\"y.md\");\n");
     }
-    let files = vec![("src/big.rs".to_string(), big)];
+    // `#[path = "other.rs"]` resolves to a walked file, so it is no finding.
+    let files = vec![
+        ("src/big.rs".to_string(), big),
+        ("src/other.rs".to_string(), String::new()),
+    ];
     let start = std::time::Instant::now();
     let (statics, includes) = token_census(&files, "");
     assert!(
