@@ -2388,6 +2388,113 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
     assert_ok(&sb.report(), "after the archive is restored");
 }
 
+/// #10111: a write seal (`write_signature`) made under `K_old` still verifies
+/// after a lawful key rotation to `K_new` via `MemoryStore::verify`, a
+/// post-rotation update of that pre-rotation memory under `K_new` succeeds
+/// without tripping `Tampered` and stays clean, and removing or predating
+/// `K_old`'s archive under the trust anchor makes `id_old` fail verification
+/// (never falling back to `K_new` or a database key).
+#[cfg(feature = "sal")]
+#[test]
+fn write_seal_verifies_under_retired_key_after_rotation_10111() {
+    let (sb, _key, mut mcp) = armed();
+    let id_old = mcp.store("write seal 10111 before rotation");
+    drop(mcp);
+    assert_ok(&sb.report(), "before rotation");
+    let before_copy = vacuum_copy(&sb, "seal-10111-before-rot.db");
+    assert!(
+        store_verdict(&sb, &before_copy, &id_old),
+        "pre-rotation memory verifies under K_old before rotation"
+    );
+
+    let recovery = sb.generate(EXTRA_AGENT);
+    sb.cli_ok(
+        AGENT,
+        &[
+            "identity",
+            "enroll-lineage",
+            "--agent-id",
+            AGENT,
+            "--recovery-pubkey",
+            &recovery,
+        ],
+    );
+    sb.cli_ok(AGENT, &["identity", "succeed", "--agent-id", AGENT]);
+    let archives = retired_archives(&sb);
+    assert_eq!(archives.len(), 1, "rotation archived K_old");
+    assert_ok(&sb.report(), "after rotation");
+
+    let rotated_copy = vacuum_copy(&sb, "seal-10111-after-rot.db");
+    assert!(
+        store_verdict(&sb, &rotated_copy, &id_old),
+        "pre-rotation memory sealed under K_old must still verify after rotation to K_new (#10111)"
+    );
+
+    // Start a K_new session: store a new row AND verify both old and new rows.
+    let key_new = current_key_file(&sb, "rotated-10111.key");
+    let mut mcp = sb.start(&key_new);
+    let id_new = mcp.store("write seal 10111 after rotation");
+    drop(mcp);
+    assert_ok(&sb.report(), "after K_new insert");
+
+    let both_copy = vacuum_copy(&sb, "seal-10111-both-keys.db");
+    assert!(
+        store_verdict(&sb, &both_copy, &id_old),
+        "K_old row still verifies after K_new writes"
+    );
+    assert!(
+        store_verdict(&sb, &both_copy, &id_new),
+        "K_new row verifies under current key"
+    );
+
+    // Post-rotation content update of the pre-rotation K_old row must recognize
+    // the prior K_old seal as intact (not Tampered), re-seal under K_new while
+    // preserving created_at, and verify clean.
+    let mut mcp = sb.start(&key_new);
+    mcp.ok(
+        "memory_update",
+        &json!({
+            "id": id_old,
+            "content": "Updated body after rotation to K_new: long enough prose to store cleanly."
+        }),
+    );
+    drop(mcp);
+    assert_ok(&sb.report(), "after post-rotation content update of K_old row");
+    let updated_copy = vacuum_copy(&sb, "seal-10111-updated.db");
+    assert!(
+        store_verdict(&sb, &updated_copy, &id_old),
+        "pre-rotation row updated and re-sealed under K_new must verify (#10111)"
+    );
+
+    // On the pre-update snapshot (`both_copy`, where `id_old` still carries K_old's
+    // seal): removing K_old's archive or moving its retirement timestamp before
+    // `id_old`'s write time must refuse verification (no fallback to K_new).
+    let archive = &archives[0];
+    let retired_bytes = std::fs::read(archive).expect("read retired archive");
+    std::fs::remove_file(archive).expect("remove retired archive");
+    assert!(
+        !store_verdict(&sb, &both_copy, &id_old),
+        "missing retired key archive must not verify or fall back to K_new"
+    );
+
+    let early = sb
+        .root
+        .join("keys")
+        .join(format!("{AGENT}.pub.{EARLY_ARCHIVE_TS}"));
+    std::fs::write(&early, &retired_bytes).expect("write early archive");
+    assert!(
+        !store_verdict(&sb, &both_copy, &id_old),
+        "retired key with validity ending before write time must not verify"
+    );
+
+    std::fs::remove_file(&early).expect("remove early archive");
+    std::fs::write(archive, &retired_bytes).expect("restore archive");
+    assert!(
+        store_verdict(&sb, &both_copy, &id_old),
+        "restoring retired archive restores verification"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #10091: every connection that can write an attested table is armed
 // ---------------------------------------------------------------------------
