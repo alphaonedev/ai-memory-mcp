@@ -8,7 +8,7 @@
 //! store-url lock was a free `pub(crate)` function any test could call, with
 //! or without the outer lock, in either order (a nested take at one site, a
 //! lone take at about eighty). Now the function is private to
-//! `src/store_url.rs` and the only way to take it is
+//! `src/store_url/env_guard.rs` and the only way to take it is
 //! `StoreUrlEnvGuard::acquire(&EnvLockGuard)`, which borrows a held outer
 //! guard: the wrong order and a lone take do not compile.
 //!
@@ -17,10 +17,11 @@
 //! `.local-runs`, `.codegraph` and `node_modules` are left out because they
 //! hold build output, VCS data or scratch, not tracked source). The lock
 //! function's name may appear in code in exactly three lines of
-//! `src/store_url.rs`: its definition, the call inside the guard
+//! `src/store_url/env_guard.rs`: its definition, the call inside the guard
 //! constructor and the held-probe. The constructor's signature is pinned too, so a constructor
-//! that stops taking the outer proof fails here. Comment text is ignored.
+//! that stops taking the outer proof fails here. Comment text is judged as text, not skipped.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,7 +32,7 @@ fn token() -> String {
 }
 
 /// The one file allowed to name the lock function in code.
-const ALLOWED_FILE: &str = "src/store_url.rs";
+const ALLOWED_FILE: &str = "src/store_url/env_guard.rs";
 
 /// The three code lines of [`ALLOWED_FILE`] that may name it, trimmed.
 fn allowed_lines() -> [String; 3] {
@@ -72,52 +73,6 @@ enum Violation {
     ShapeMissing { pin: &'static str },
 }
 
-/// Code lines of `src` with `//` comments and `/* */` blocks removed.
-fn code_lines(src: &str) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    let mut in_block = false;
-    for (i, raw) in src.lines().enumerate() {
-        let mut rest = raw;
-        let mut kept = String::new();
-        loop {
-            if in_block {
-                match rest.find("*/") {
-                    Some(e) => {
-                        rest = &rest[e + 2..];
-                        in_block = false;
-                    }
-                    None => break,
-                }
-            } else {
-                let line_c = rest.find("//");
-                let block_c = rest.find("/*");
-                match (line_c, block_c) {
-                    (Some(l), Some(b)) if b < l => {
-                        kept.push_str(&rest[..b]);
-                        rest = &rest[b + 2..];
-                        in_block = true;
-                    }
-                    (Some(l), _) => {
-                        kept.push_str(&rest[..l]);
-                        break;
-                    }
-                    (None, Some(b)) => {
-                        kept.push_str(&rest[..b]);
-                        rest = &rest[b + 2..];
-                        in_block = true;
-                    }
-                    (None, None) => {
-                        kept.push_str(rest);
-                        break;
-                    }
-                }
-            }
-        }
-        out.push((i + 1, kept));
-    }
-    out
-}
-
 fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -129,19 +84,29 @@ fn census(files: &[(String, String)]) -> Vec<Violation> {
     let mut v = Vec::new();
     let mut seen = [0usize; 3];
     for (path, text) in files {
-        for (line, code) in code_lines(text) {
-            if !code.contains(&tok) {
+        for (i, raw) in text.lines().enumerate() {
+            let line = i + 1;
+            let hits = raw.matches(tok.as_str()).count();
+            if hits == 0 {
                 continue;
             }
             if path != ALLOWED_FILE {
+                // Comments count too: no parser can be blinded by a string
+                // that holds a comment opener.
                 v.push(Violation::OutsideFile {
                     file: path.clone(),
                     line,
                 });
                 continue;
             }
-            let t = collapse(code.trim());
-            match allowed.iter().position(|a| t.contains(a.as_str())) {
+            let t = collapse(raw.trim());
+            if t.starts_with("//") {
+                continue;
+            }
+            match allowed
+                .iter()
+                .position(|a| hits == 1 && t.starts_with(a.as_str()))
+            {
                 Some(k) => seen[k] += 1,
                 None => v.push(Violation::UnlistedLine { line, text: t }),
             }
@@ -222,7 +187,7 @@ fn with(file: &str, text: &str) -> Vec<(String, String)> {
 /// the guard module. Red at the base commit (about eighty outside sites),
 /// green at the head.
 #[test]
-fn store_url_env_lock_is_reachable_only_through_the_guard_8168() {
+fn store_url_lock_is_reachable_only_through_the_guard_8168() {
     let files = tree();
     assert!(
         files.iter().any(|(p, _)| p == ALLOWED_FILE),
@@ -290,10 +255,12 @@ fn mutant_alias_forms_are_red_8168() {
 #[test]
 fn mutant_extra_call_in_allowed_file_is_red_8168() {
     let mut text = good_allowed();
-    text.push_str(&format!(
+    write!(
+        text,
         "#[test]\nfn t() {{\n    let _g = {}().lock();\n}}\n",
         token()
-    ));
+    )
+    .expect("write to String");
     let v = census(&[(ALLOWED_FILE.to_string(), text)]);
     assert_eq!(
         v,
@@ -342,23 +309,45 @@ fn mutant_weak_proof_or_dropped_borrow_is_red_8168() {
     );
 }
 
-/// Comment text and block comments never count; a name inside a block
-/// comment that closes mid-line leaves later code visible.
+/// A comment opener inside a string literal must not blind the census: the
+/// name after it is still seen (the failure mode of a comment stripper).
 #[test]
-fn comments_are_ignored_but_code_after_them_is_not_8168() {
+fn comment_opener_in_a_string_cannot_hide_a_call_8168() {
+    let t = token();
+    let body = format!("const G: &str = \"/*\";\nfn t() {{ {t}(); }}\n");
+    assert_eq!(
+        census(&with("src/z.rs", &body)),
+        vec![Violation::OutsideFile {
+            file: "src/z.rs".into(),
+            line: 2
+        }]
+    );
+}
+
+/// Outside the guard module even a comment naming the function is a
+/// violation; inside it a comment-only line is allowed, a trailing comment
+/// after other code is not, and two names on one line are not.
+#[test]
+fn comments_are_judged_as_text_8168() {
     let t = token();
     assert_eq!(
-        census(&with(
-            "src/z.rs",
-            &format!("// {t}\n/* {t}\n{t} */\nfn ok() {{}}\n")
-        )),
-        Vec::<Violation>::new()
-    );
-    assert_eq!(
-        census(&with("src/z.rs", &format!("/* c */ {t}();"))),
+        census(&with("src/z.rs", &format!("// {t}\n"))),
         vec![Violation::OutsideFile {
             file: "src/z.rs".into(),
             line: 1
         }]
+    );
+    let mut ok = good_allowed();
+    writeln!(ok, "// {t} is private").expect("write to String");
+    assert_eq!(
+        census(&[(ALLOWED_FILE.to_string(), ok)]),
+        Vec::<Violation>::new()
+    );
+    let mut trailing = good_allowed();
+    writeln!(trailing, "fn x() {{ {t}(); }} // _store_url: {t}()").expect("write to String");
+    let found = census(&[(ALLOWED_FILE.to_string(), trailing)]);
+    assert!(
+        matches!(found.as_slice(), [Violation::UnlistedLine { .. }]),
+        "a call hidden behind a trailing comment is one unlisted line: {found:?}"
     );
 }

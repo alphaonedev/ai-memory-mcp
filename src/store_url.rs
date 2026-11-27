@@ -239,16 +239,12 @@ fn url_carries_credentials(url: &str) -> bool {
     })
 }
 
-/// Process-global lock for every test (and test-only caller) that reads or
-/// mutates `AI_MEMORY_STORE_URL` / `_FILE`. A per-test local mutex does NOT
-/// serialise against a sibling test using its own mutex — all store-url env
-/// tests must take THIS one (fixed a real cross-test pollution race that
-/// failed `fx_f2_build_store_handle_no_url` under parallel ordering).
+/// Test-only: the store-url env lock proof (#8168 R3-3). The lock itself
+/// is private to the child module; see `store_url/env_guard.rs`.
 #[cfg(test)]
-pub(crate) fn store_url_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    &LOCK
-}
+mod env_guard;
+#[cfg(test)]
+pub(crate) use env_guard::StoreUrlEnvGuard;
 
 #[cfg(test)]
 mod tests {
@@ -261,9 +257,9 @@ mod tests {
     /// (no channel) vs pass-after (env/file channel).
     #[test]
     fn issue_1927_non_argv_store_url_channel_exists() {
-        let _g = store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = StoreUrlEnvGuard::acquire(&store_url_outer_env);
         // Clean slate.
         // SAFETY: env mutation is serialized by ENV_GUARD; these keys are read
         // only by `resolve_store_url`, which no other test drives concurrently.
@@ -356,9 +352,9 @@ mod tests {
     /// without sal-postgres (the default shipped build). sqlite:// stays ok.
     #[test]
     fn issue_2679_postgres_store_url_fails_closed_without_feature() {
-        let _g = store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = StoreUrlEnvGuard::acquire(&store_url_outer_env);
         unsafe {
             std::env::remove_var(STORE_URL_ENV);
             std::env::remove_var(STORE_URL_FILE_ENV);

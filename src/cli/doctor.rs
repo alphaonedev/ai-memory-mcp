@@ -5711,17 +5711,29 @@ mod tests {
     /// resolves the PROCESS-GLOBAL `AI_MEMORY_STORE_URL` /
     /// `AI_MEMORY_STORE_URL_FILE`. `src/store_url.rs`'s own tests set that
     /// variable to `postgres://u:hunter2@db.internal/mem` in-process under
-    /// `store_url_env_lock()`. Without taking the SAME lock here, a
+    /// `StoreUrlEnvGuard`. Without taking the SAME lock here, a
     /// `cargo test` interleaving would have these tests attempt a real
     /// outbound Postgres connection and grow a 17th section — the #2905
     /// deterministic-env-leak class, not a flake. Taking the lock (and
     /// clearing the vars while we hold it) makes the SQLite report
     /// independent of test ordering.
     fn run_local_collect(db_path: &Path) -> Report {
-        let _guard = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: `store_url_env_lock` is the process-global mutex EVERY
+        let outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        run_local_collect_under(&outer_env, db_path)
+    }
+
+    /// #8168 R3-3: `run_local_collect` for a caller that already holds the
+    /// crate-wide env lock (`outer_env`): the store-url lock is taken second,
+    /// through the proof type, never first.
+    fn run_local_collect_under(
+        outer_env: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<
+            'static,
+        >,
+        db_path: &Path,
+    ) -> Report {
+        let _guard = crate::store_url::StoreUrlEnvGuard::acquire(outer_env);
+        // SAFETY: the `StoreUrlEnvGuard` lock is the process-global mutex EVERY
         // reader/mutator of these two variables takes, and it is held for
         // the whole of `run_local` below, so no concurrent thread observes
         // or races the mutation.
@@ -5790,7 +5802,7 @@ mod tests {
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
         // yields a `postgres://` DSN, or errors. #3264 review fix (B3):
-        // `run_local_collect` holds `store_url_env_lock()` and CLEARS both
+        // `run_local_collect` holds a `StoreUrlEnvGuard` and CLEARS both
         // store-url channels, which is what actually guarantees "no store
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
@@ -6134,12 +6146,13 @@ mod tests {
         ) {
             return;
         }
-        let _lock = crate::test_support::env_lock();
+        let lock =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
         let guard = crate::test_support::EnvGuard::capture(crate::encryption::ENV_ENCRYPT_AT_REST);
         guard.set("1");
         crate::encryption::set_config_at_rest(false);
         let env = TestEnv::fresh();
-        let report = run_local_collect(&env.db_path);
+        let report = run_local_collect_under(&lock, &env.db_path);
         let storage = find(&report, "Storage");
         assert_eq!(
             fact(storage, "at_rest"),
@@ -6354,9 +6367,9 @@ mod tests {
 
         // Resolve the pubkey through the env ladder so `section_governance`
         // sees the L1-6-active posture.
-        let _guard = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _guard = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let prior = std::env::var_os("AI_MEMORY_OPERATOR_PUBKEY");
         // SAFETY: serialised by the process-global env lock held above.
         unsafe {
@@ -6433,9 +6446,9 @@ mod tests {
         )
         .expect("update_signature");
 
-        let _guard = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _guard = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let prior = std::env::var_os("AI_MEMORY_OPERATOR_PUBKEY");
         // SAFETY: serialised by the process-global env lock held above.
         unsafe {

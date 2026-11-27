@@ -39,8 +39,8 @@ const POSTURE_FILES: &[&str] = &["operator.key.pub", "ai:posture-10086.pub"];
 /// Every function of `src/cli/doctor.rs` allowed to mutate the environment,
 /// with its exact count of mutation tokens. None of them builds a posture.
 const ALLOWED_MUTATION_SITES: &[(&str, usize)] = &[
-    // #2905 — clears the two store-URL channels under `store_url_env_lock`.
-    ("run_local_collect", 2),
+    // #2905 — clears the two store-URL channels under `StoreUrlEnvGuard`.
+    ("run_local_collect_under", 2),
     // #3430 — save / set / restore `AI_MEMORY_OPERATOR_PUBKEY` (governance).
     ("governance_section_flags_enabled_but_inert_rules_3430", 3),
     (

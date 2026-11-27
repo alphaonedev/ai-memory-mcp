@@ -31,10 +31,10 @@ const VERIFICATION: &str = "manifest_verification";
 const JANUARY: &str = "ai-memory-2026-01-01T000000Z";
 const JUNE: &str = "ai-memory-2026-06-01T000000Z";
 
-fn lock() -> std::sync::MutexGuard<'static, ()> {
-    crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock<'env>(
+    env: &'env crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'static>,
+) -> crate::store_url::StoreUrlEnvGuard<'env> {
+    crate::store_url::StoreUrlEnvGuard::acquire(env)
 }
 
 /// A key that is NOT the operator's.
@@ -187,7 +187,9 @@ fn signed_payload_encoding_is_pinned_3199() {
 /// The honest path: `backup` signs, reports it, and `restore` verifies it.
 #[test]
 fn a_signed_backup_restores_and_says_so_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "in-the-snapshot", "a");
@@ -237,7 +239,9 @@ fn a_signed_backup_restores_and_says_so_3199() {
 /// match: the signed payload still carries the real digest, so it is refused.
 #[test]
 fn a_swapped_snapshot_under_a_signed_manifest_is_refused_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, manifest_path) = fixture(&mut env, "swap");
     let mut attacker = TestEnv::fresh();
@@ -269,7 +273,9 @@ fn a_swapped_snapshot_under_a_signed_manifest_is_refused_3199() {
 /// default (it is exactly what a writer of the directory can produce).
 #[test]
 fn an_attacker_regenerated_unsigned_manifest_is_refused_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, manifest_path) = fixture(&mut env, "regen");
     strip_signature(&manifest_path);
@@ -290,7 +296,9 @@ fn an_attacker_regenerated_unsigned_manifest_is_refused_3199() {
 /// does not match, so it is refused.
 #[test]
 fn a_renamed_signed_pair_is_refused_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, manifest_path) = fixture(&mut env, "rename");
     let dir = snapshot.parent().unwrap().to_path_buf();
@@ -313,7 +321,9 @@ fn a_renamed_signed_pair_is_refused_3199() {
 /// A signature made with some other key is refused, and no flag accepts it.
 #[test]
 fn a_foreign_key_signature_is_refused_even_with_the_flag_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, manifest_path) = fixture(&mut env, "foreign");
     resign_with(&manifest_path, &foreign_key());
@@ -333,7 +343,9 @@ fn a_foreign_key_signature_is_refused_even_with_the_flag_3199() {
 /// Half a signature is not an unsigned manifest: refused, flag or not.
 #[test]
 fn a_half_signed_manifest_is_refused_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, manifest_path) = fixture(&mut env, "half");
     let mut m = read_manifest(&manifest_path);
@@ -352,7 +364,9 @@ fn a_half_signed_manifest_is_refused_3199() {
 /// then loudly: stderr WARN, `unsigned_allowed`, and where the audit row went.
 #[test]
 fn an_unsigned_manifest_restores_only_with_the_flag_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, manifest_path) = fixture(&mut env, "unsigned");
     strip_signature(&manifest_path);
@@ -378,7 +392,9 @@ fn an_unsigned_manifest_restores_only_with_the_flag_3199() {
 /// `--skip-verify` under the standard posture: restores, WARNs, reports.
 #[test]
 fn skip_verify_warns_and_reports_skipped_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, _) = fixture(&mut env, "skip");
     let mut args = args_for(snapshot);
@@ -396,7 +412,9 @@ fn skip_verify_warns_and_reports_skipped_3199() {
 /// so is an unsigned manifest.
 #[test]
 fn asi_hard_refuses_every_unverified_restore_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, manifest_path) = fixture(&mut env, "hard");
     let live = sha(&db);
@@ -426,7 +444,9 @@ fn asi_hard_refuses_every_unverified_restore_3199() {
 /// checked: it is treated as unverified, never as verified.
 #[test]
 fn a_signed_manifest_with_no_key_to_check_it_is_unverified_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, _) = fixture(&mut env, "noanchor");
     let no_anchor = RestorePolicy {
@@ -450,7 +470,9 @@ fn a_signed_manifest_with_no_key_to_check_it_is_unverified_3199() {
 /// names it.
 #[test]
 fn latest_refuses_a_forged_candidate_naming_it_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "live", "l");
@@ -476,7 +498,9 @@ fn latest_refuses_a_forged_candidate_naming_it_3199() {
 /// verified, and refuses when none verifies.
 #[test]
 fn latest_skips_unverified_candidates_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "live", "l");
@@ -507,7 +531,9 @@ fn latest_skips_unverified_candidates_3199() {
 /// nothing when it refuses.
 #[test]
 fn asi_hard_backup_refuses_what_it_could_not_verify_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");
@@ -551,7 +577,9 @@ fn asi_hard_backup_refuses_what_it_could_not_verify_3199() {
 /// restore that refuses it by default.
 #[test]
 fn standard_backup_without_a_key_is_unsigned_and_says_so_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");
@@ -597,7 +625,9 @@ fn standard_backup_without_a_key_is_unsigned_and_says_so_3199() {
 /// standard-posture way through.
 #[test]
 fn a_planted_sha_only_manifest_beside_a_bak_is_refused_3199() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let (db, snapshot, _) = fixture(&mut env, "bak");
     let bak = db.with_extension("db.bak");
@@ -672,7 +702,9 @@ fn backup_json(
 /// (the older backup survives); asi-hard additionally exits non-zero.
 #[test]
 fn a_non_durable_backup_is_reported_and_rotates_nothing_3605() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");
@@ -710,7 +742,9 @@ fn a_non_durable_backup_is_reported_and_rotates_nothing_3605() {
 /// real backups rotate by their SIGNED time.
 #[test]
 fn rotation_orders_by_signed_time_and_keeps_what_it_cannot_verify_3604() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");
@@ -766,7 +800,9 @@ fn rotation_orders_by_signed_time_and_keeps_what_it_cannot_verify_3604() {
 /// A removal that fails is reported, not swallowed, and the file stays.
 #[test]
 fn rotation_reports_a_removal_it_could_not_make_3604() {
-    let _g = lock();
+    let outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = lock(&outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");

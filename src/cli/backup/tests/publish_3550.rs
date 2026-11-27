@@ -293,9 +293,9 @@ fn child_path(key: &str) -> PathBuf {
 /// one.
 #[test]
 fn restore_refuses_to_publish_when_a_sidecar_unlink_fails_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "unlink");
     // Guarantee a sidecar exists at unlink time whatever the journal mode.
@@ -336,9 +336,9 @@ fn restore_refuses_to_publish_when_a_sidecar_unlink_fails_3550() {
 /// happened while the OLD database was still the target.
 #[test]
 fn no_sidecar_exists_at_the_instant_the_restore_is_published_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "ordering");
     std::fs::write(sidecar_path(&db, "-journal"), b"").expect("plant -journal");
@@ -437,9 +437,9 @@ fn a_writer_starting_mid_restore_is_refused_at_every_locked_step_3550() {
         );
         return;
     }
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "writer");
     let refused = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -503,9 +503,9 @@ fn a_writer_starting_mid_restore_is_refused_at_every_locked_step_3550() {
 #[cfg(unix)]
 #[test]
 fn a_connection_opened_mid_restore_cannot_use_the_replaced_file_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "ghost");
     let ghost = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -573,9 +573,9 @@ fn assert_ghost_is_refused(
 #[cfg(unix)]
 #[test]
 fn a_ghost_cannot_write_when_the_post_publish_fsync_fails_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "ghost-fsync");
     let ghost = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -612,9 +612,9 @@ fn a_ghost_cannot_write_when_the_post_publish_fsync_fails_3550() {
 #[cfg(unix)]
 #[test]
 fn both_fsyncs_failing_leaves_the_orphan_and_says_so_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "both-fsync");
     let mut io = FaultIo {
@@ -650,9 +650,9 @@ fn both_fsyncs_failing_leaves_the_orphan_and_says_so_3550() {
 /// (Restore is SQLite-only; there is no Postgres leg.)
 #[test]
 fn a_crash_at_any_publish_step_leaves_old_or_new_never_a_mix_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     for crash_at in ALL_STEPS {
         let mut env = TestEnv::fresh();
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "crash");
@@ -750,9 +750,9 @@ fn an_abort_at_any_publish_step_leaves_old_or_new_never_a_mix_3550() {
         );
         panic!("the restore must have aborted at {step:?}; it returned {outcome:?}");
     }
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     for step in ALL_STEPS {
         let mut env = TestEnv::fresh();
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "abort");
@@ -836,9 +836,9 @@ fn json_envelope(env: &TestEnv) -> serde_json::Value {
 /// rename) still publishes, and `durable_publish: false` says so.
 #[test]
 fn standard_reports_a_failed_directory_fsync_as_not_durable_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     for (before, after) in [(true, false), (false, true)] {
         let mut env = TestEnv::fresh();
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "fsync-std");
@@ -880,9 +880,9 @@ fn standard_reports_a_failed_directory_fsync_as_not_durable_3550() {
 #[cfg(unix)]
 #[test]
 fn restore_json_reports_a_durable_explicit_publish_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "durable");
     {
@@ -907,9 +907,9 @@ fn restore_json_reports_a_durable_explicit_publish_3550() {
 /// envelope still saying `durable_publish: false`.
 #[test]
 fn asi_hard_enforces_a_durable_publish_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     // Before the rename: refused, the old corpus stays.
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "fsync-hard-pre");
@@ -1028,9 +1028,9 @@ pub(super) fn plant_snapshot(env: &mut TestEnv, dir: &Path, id: &str, rows: usiz
 /// (the newer snapshot) — the misleading mtime is ignored.
 #[test]
 fn snapshot_flag_beats_a_misleading_mtime_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "live", "l");
@@ -1153,9 +1153,9 @@ fn snapshot_flag_beats_a_misleading_mtime_3550() {
 /// this stays as the asi-hard witness.)
 #[test]
 fn asi_hard_refuses_the_mtime_pick_and_lists_candidates_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "live", "l");
@@ -1212,9 +1212,9 @@ fn snapshot_id_accepts_names_and_refuses_paths_3550() {
 /// snapshot that is a symlink.
 #[test]
 fn snapshot_flag_refusals_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "live", "l");
@@ -1271,9 +1271,9 @@ fn snapshot_flag_refusals_3550() {
 #[test]
 fn restore_keeps_the_replaced_databases_permissions_3550() {
     use std::os::unix::fs::PermissionsExt;
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "mode");
     std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(0o666)).expect("chmod");
@@ -1299,9 +1299,9 @@ fn restore_keeps_the_replaced_databases_permissions_3550() {
 #[cfg(unix)]
 #[test]
 fn a_hard_linked_old_database_is_left_intact_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "hardlink");
     let link = db.with_extension("hardlink.db");
@@ -1335,9 +1335,9 @@ fn a_hard_linked_old_database_is_left_intact_3550() {
 /// during the publish is reported as a failure, not handed to a daemon.
 #[test]
 fn a_sidecar_appearing_during_the_publish_is_reported_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "reappear");
     let mut io = FaultIo {
@@ -1416,9 +1416,9 @@ fn move_database_set_aside(db: &Path, dest: &Path) {
 /// target — then works.
 #[test]
 fn restore_refuses_a_wal_it_cannot_checkpoint_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     for policy in [standard(), asi_hard()] {
         let mut env = TestEnv::fresh();
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "ckpt");
@@ -1487,9 +1487,9 @@ fn restore_refuses_a_wal_it_cannot_checkpoint_3550() {
 #[cfg(unix)]
 #[test]
 fn restore_refuses_when_the_staged_file_cannot_be_locked_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     for policy in [standard(), asi_hard()] {
         let mut env = TestEnv::fresh();
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "staged-lock");
@@ -1529,9 +1529,9 @@ fn restore_refuses_when_the_staged_file_cannot_be_locked_3550() {
 /// byte-for-byte as it was; the named way through works.
 #[test]
 fn restore_over_an_unlockable_target_refuses_and_the_escape_works_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "unlockable");
     let dir = db.parent().unwrap().to_path_buf();
@@ -1575,9 +1575,9 @@ fn restore_over_an_unlockable_target_refuses_and_the_escape_works_3550() {
 /// gone, and there is no rollback copy to report.
 #[test]
 fn restore_into_an_empty_target_publishes_without_replacing_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "empty");
     let dir = db.parent().unwrap().to_path_buf();
@@ -1618,9 +1618,9 @@ fn restore_into_an_empty_target_publishes_without_replacing_3550() {
 /// publish is refused and the new database keeps its row.
 #[test]
 fn a_database_appearing_at_an_empty_target_is_never_replaced_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "appears");
     let dir = db.parent().unwrap().to_path_buf();
@@ -1666,9 +1666,9 @@ fn a_database_appearing_at_an_empty_target_is_never_replaced_3550() {
 /// never deleted, and nothing is left beside the restore.
 #[test]
 fn orphan_sidecars_beside_a_missing_database_are_kept_not_deleted_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "orphans");
     let dir = db.parent().unwrap().to_path_buf();
@@ -1717,9 +1717,9 @@ fn orphan_sidecars_beside_a_missing_database_are_kept_not_deleted_3550() {
 /// refuses (never a replacing rename) and says how to finish by hand.
 #[test]
 fn an_empty_target_publish_that_cannot_link_refuses_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "no-link");
     let dir = db.parent().unwrap().to_path_buf();
@@ -1754,9 +1754,9 @@ fn an_empty_target_publish_that_cannot_link_refuses_3550() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_target_restores_the_real_database_3550() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "symlink");
     let link = db.parent().unwrap().join("link-to-the-db.db");

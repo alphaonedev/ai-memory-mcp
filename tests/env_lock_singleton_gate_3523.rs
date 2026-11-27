@@ -79,7 +79,7 @@ use std::path::{Path, PathBuf};
 /// with one of these names that declares its OWN `Mutex<()>` is an env-lock
 /// OWNER; anything else in the family must delegate.
 ///
-/// `store_url_env_lock` / `key_dir_env_lock` / `fed_env_test_lock` are
+/// the store-url lock / `key_dir_env_lock` / `fed_env_test_lock` are
 /// deliberately absent: they are named for the ONE variable each guards, they
 /// are not part of the `$HOME` cohort, and they are reached only through their
 /// own module.
