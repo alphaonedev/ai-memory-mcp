@@ -8869,8 +8869,9 @@ enabled = true
             for (k, v) in pairs {
                 prev.push((*k, std::env::var_os(k)));
                 // SAFETY: `lock` is a live `EnvLockGuard`, so the crate-wide
-                // env lock is held and no other test thread reads or writes
-                // the environment while this runs.
+                // env lock is held: it serialises the writers that take this
+                // lock. Readers and writers that do not take it are not
+                // excluded by it.
                 unsafe { std::env::set_var(k, v) };
             }
             // AI_MEMORY_NO_CONFIG keeps AppConfig::load off any on-disk
@@ -8879,7 +8880,9 @@ enabled = true
                 "AI_MEMORY_NO_CONFIG",
                 std::env::var_os("AI_MEMORY_NO_CONFIG"),
             ));
-            // SAFETY: same proof as above; `lock` is still borrowed here.
+            // SAFETY: same proof as above (the lock is held, which
+            // serialises only the writers that take it); `lock` is still
+            // borrowed here.
             unsafe { std::env::set_var("AI_MEMORY_NO_CONFIG", "1") };
             Self {
                 _lock: lock,
@@ -8889,12 +8892,19 @@ enabled = true
     }
     impl Drop for EnvScope<'_> {
         fn drop(&mut self) {
-            for (k, v) in &self.saved {
+            // Reverse order: the first-saved value of a key is the one that
+            // must win, so a key saved twice ends at its original value
+            // (decision: reverse restore over refusing duplicate keys
+            // because it is exact for every `pairs` input with no change to
+            // the constructor's shape; #10151 S1).
+            for (k, v) in self.saved.iter().rev() {
                 match v {
                     // SAFETY: `self._lock` borrows the live `EnvLockGuard`
                     // this scope was built under, so the env lock is held
                     // for the whole of this drop (the borrow checker
-                    // refuses a scope that outlives its guard).
+                    // refuses a scope that outlives its guard). The lock
+                    // serialises the writers that take it; readers and
+                    // writers that do not take it are not excluded.
                     Some(val) => unsafe { std::env::set_var(k, val) },
                     // SAFETY: as the arm above.
                     None => unsafe { std::env::remove_var(k) },
@@ -8915,7 +8925,9 @@ enabled = true
             "AI_MEMORY_EMBED_MODEL",
         ] {
             // SAFETY: `_lock` is a live `EnvLockGuard`, so the crate-wide env
-            // lock is held for the whole call.
+            // lock is held for the whole call; it serialises the writers
+            // that take it and does not exclude readers or writers that do
+            // not.
             unsafe { std::env::remove_var(k) };
         }
     }
@@ -8948,6 +8960,10 @@ enabled = true
             std::env::var("AI_MEMORY_R31_PROBE_10124").as_deref(),
             Ok("1")
         );
+        // S2: the scope holds THIS guard, not merely some lifetime. A mutant
+        // that swaps the borrow for `PhantomData` (an unbound scope) has no
+        // `_lock` reference to compare, so this stops compiling.
+        assert!(std::ptr::eq(scope._lock, &g));
         drop(scope);
         assert!(std::env::var_os("AI_MEMORY_R31_PROBE_10124").is_none());
     }
