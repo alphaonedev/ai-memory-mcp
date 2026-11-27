@@ -2617,6 +2617,168 @@ fn write_seal_verifies_under_retired_key_after_rotation_10111() {
     );
 }
 
+/// S1 (#10173): a malformed key directory (one badly named archive file) must
+/// refuse BOTH `memory_update` and `memory_store` with the exact named
+/// `Unanchored` reason (never `Tampered` / "stored seal does not verify" and
+/// never bare `SEAL_REFUSAL_PREFIX`).
+#[cfg(feature = "sal")]
+#[test]
+fn malformed_key_dir_refuses_update_and_store_with_exact_unanchored_reason_10173() {
+    let (sb, _key_file, mut mcp) = armed();
+    let id = mcp.store("seed row before anchor corruption 10173");
+
+    let bad_file = sb.root.join("keys").join("stray.pub.not-a-ts");
+    std::fs::write(&bad_file, b"garbage").expect("plant badly named file in keys dir");
+
+    let (upd_err, upd_text) = mcp.call_raw(
+        "memory_update",
+        &json!({
+            "id": id,
+            "content": "Attempted update after key dir became malformed (10173)."
+        }),
+    );
+    assert!(
+        upd_err,
+        "update under malformed anchor must fail: {upd_text}"
+    );
+    assert!(
+        !upd_text.contains("stored seal does not verify"),
+        "S1: malformed anchor must NOT be misreported as Tampered, got: {upd_text}"
+    );
+    assert!(
+        upd_text.contains("trust anchor unusable") && upd_text.contains("stray.pub.not-a-ts"),
+        "S1: update must surface exact Unanchored reason naming bad file, got: {upd_text}"
+    );
+
+    let (store_err, store_text) = mcp.call_raw(
+        "memory_store",
+        &json!({
+            "title": "store under malformed anchor 10173",
+            "content": "Attempted store after key dir became malformed (10173).",
+            "namespace": NAMESPACE,
+            "kind": "observation"
+        }),
+    );
+    assert!(
+        store_err,
+        "store under malformed anchor must fail: {store_text}"
+    );
+    assert!(
+        store_text.contains("trust anchor unusable") && store_text.contains("stray.pub.not-a-ts"),
+        "S1: store must surface exact Unanchored reason naming bad file, got: {store_text}"
+    );
+}
+
+#[cfg(feature = "sal")]
+#[test]
+#[ignore = "subprocess helper for bound_but_unanchored_key_refused_at_install_and_verify_reports_defect_10171"]
+fn store_verify_report_child_10171() {
+    use ai_memory::store::sqlite::SqliteStore;
+    use ai_memory::store::{CallerContext, MemoryStore as _};
+    let db = std::env::var_os(ENV_VERDICT_DB).expect("verify-report child: no store path");
+    let id = std::env::var(ENV_VERDICT_ID).expect("verify-report child: no memory id");
+    let store = SqliteStore::open(PathBuf::from(db)).expect("open store copy");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let report = rt
+        .block_on(store.verify(&CallerContext::for_agent(AGENT), &id))
+        .expect("verify");
+    let json_report = serde_json::json!({
+        "signature_verified": report.signature_verified,
+        "integrity_ok": report.integrity_ok,
+        "findings": report.findings,
+    });
+    println!("VERIFY_REPORT_10171={json_report}");
+}
+
+/// F2 (#10171): a key bound in the database but absent from the trust anchor is
+/// refused at `install_from_env` admission (never admitted only to fail later
+/// as `Tampered`), and `MemoryStore::verify` surfaces the exact `SealDefect`
+/// reason in `VerifyReport.findings` (never bare `false`).
+#[cfg(feature = "sal")]
+#[test]
+fn bound_but_unanchored_key_refused_at_install_and_verify_reports_defect_10171() {
+    let (sb, key_file, mut mcp) = armed();
+    let id = mcp.store("row for verify defect check 10171");
+    drop(mcp);
+
+    let copy = vacuum_copy(&sb, "verify-defect-10171.db");
+    let _other = sb.generate(EXTRA_AGENT);
+    let agent_pub = sb.root.join("keys").join(format!("{AGENT}.pub"));
+    let saved_pub = std::fs::read(&agent_pub).expect("read agent pub");
+    std::fs::remove_file(&agent_pub).expect("remove agent pub from anchor");
+
+    // Part A: MCP boot with a bound-but-unanchored key must refuse at install_from_env.
+    let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", sb.root.join("home"))
+        .env("XDG_CONFIG_HOME", sb.root.join("home/.config"))
+        .env("TMPDIR", &sb.root)
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_AGENT_ID", AGENT)
+        .env("AI_MEMORY_KEY_DIR", sb.root.join("keys"))
+        .env("AI_MEMORY_MCP_SIGNING_KEY_FILE", &key_file)
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1")
+        .args(["--db", sb.db().to_str().expect("db utf8"), "mcp"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mcp boot with unanchored key");
+    assert!(
+        !out.status.success(),
+        "F2: MCP boot with bound-but-unanchored key must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is not in the trust anchor"),
+        "F2: expected exact unanchored-key install refusal, got: {stderr}"
+    );
+
+    // Part B: `MemoryStore::verify` on `copy` with AGENT's key absent from
+    // anchor must surface the exact SealDefect reason in `findings` (not bare false).
+    let child = Command::new(std::env::current_exe().expect("test binary path"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", sb.root.join("home"))
+        .env("XDG_CONFIG_HOME", sb.root.join("home/.config"))
+        .env("TMPDIR", &sb.root)
+        .env("AI_MEMORY_KEY_DIR", sb.root.join("keys"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env(ENV_VERDICT_DB, &copy)
+        .env(ENV_VERDICT_ID, &id)
+        .args([
+            "--exact",
+            "store_verify_report_child_10171",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run verify-report child");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success(),
+        "verify-report child failed: {stdout}{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let payload = stdout
+        .lines()
+        .find_map(|ln| ln.strip_prefix("VERIFY_REPORT_10171="))
+        .expect("VERIFY_REPORT_10171 line");
+    let parsed: Value = serde_json::from_str(payload).expect("parse verify report json");
+    assert_eq!(parsed["signature_verified"], false);
+    let findings = parsed["findings"].as_array().expect("findings array");
+    let want = format!("write seal names agent {AGENT} with no key in the trust anchor");
+    assert!(
+        findings.iter().any(|f| f.as_str() == Some(want.as_str())),
+        "F2: memory verify must surface exact SealDefect in findings ({want:?}), got: {findings:?}"
+    );
+
+    std::fs::write(&agent_pub, &saved_pub).expect("restore agent pub");
+}
+
 // ---------------------------------------------------------------------------
 // #10091: every connection that can write an attested table is armed
 // ---------------------------------------------------------------------------

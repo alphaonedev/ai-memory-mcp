@@ -2034,4 +2034,56 @@ mod tests {
             "write seal key_id kid has invalid write timestamp \"not-a-ts\""
         );
     }
+
+    /// #10170 / #10174 (F1 = S3): changing ONLY the unsigned `updated_at`
+    /// column must NEVER change the seal verdict for the same seal bytes.
+    #[test]
+    fn unsigned_updated_at_never_changes_seal_verdict_10170() {
+        use crate::storage::row_attest::anchor::{AnchorLoad, TrustAnchor};
+        use crate::storage::row_attest::key_id_of;
+
+        const T_ROT: i64 = 1_750_000_000;
+        let ts_before = crate::identity::attest::canonical_created_at_stamp(
+            chrono::DateTime::from_timestamp(T_ROT - 60, 0).expect("ts_before"),
+        );
+        let ts_after = crate::identity::attest::canonical_created_at_stamp(
+            chrono::DateTime::from_timestamp(T_ROT + 60, 0).expect("ts_after"),
+        );
+
+        let k_old = crate::identity::keypair::generate(SEAL_ROT_AGENT_10111).expect("k_old");
+        let k_new = crate::identity::keypair::generate(SEAL_ROT_AGENT_10111).expect("k_new");
+        let id_new = key_id_of(&k_new.public);
+
+        let anchor = AnchorLoad::Anchored(TrustAnchor::for_test(
+            "test-anchor-10170",
+            &[
+                (SEAL_ROT_AGENT_10111, k_old.public, None, Some(T_ROT)),
+                (SEAL_ROT_AGENT_10111, k_new.public, Some(T_ROT), None),
+            ],
+        ));
+
+        let row_with_post_upd =
+            sealed_memory_10111(SEAL_ROT_AGENT_10111, &k_new, &ts_before, &ts_after);
+        let mut row_with_pre_upd = row_with_post_upd.clone();
+        row_with_pre_upd.updated_at = ts_before;
+        let mut row_with_bad_upd = row_with_post_upd.clone();
+        row_with_bad_upd.updated_at = "not-a-timestamp".to_string();
+
+        let v_post = verify_row_seal_with(&row_with_post_upd, &anchor);
+        let v_pre = verify_row_seal_with(&row_with_pre_upd, &anchor);
+        let v_bad = verify_row_seal_with(&row_with_bad_upd, &anchor);
+        assert_eq!(
+            v_post,
+            StoredSealCheck::Verified { key_id: id_new },
+            "post-rotation K_new reseal must verify"
+        );
+        assert_eq!(
+            v_pre, v_post,
+            "F1/S3: changing unsigned updated_at must not change seal verdict"
+        );
+        assert_eq!(
+            v_bad, v_post,
+            "F1/S3: unsigned updated_at must not trigger BadTime"
+        );
+    }
 }
