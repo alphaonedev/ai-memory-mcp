@@ -19,8 +19,8 @@ use super::{
 use crate::governance::daemon_signer::DaemonChainSigner;
 use crate::signed_events::SignedEvent;
 use crate::signed_events::agent_cutover::{
-    AGENT_CUTOVER_EVENT_TYPE, AGENT_CUTOVER_ROW_LIMIT, AgentCutover, MarkerOrigin, SignedMarker,
-    build_signed_marker, legacy_agent_row_count, resolve_signed,
+    AGENT_CUTOVER_EVENT_TYPE, AGENT_CUTOVER_ROW_LIMIT, AgentCutover, MarkerOrigin, MarkerVerifier,
+    SignedMarker, build_signed_marker, legacy_agent_row_count, resolve_signed,
 };
 use crate::signed_events::agent_era::{AgentDomainEvidence, StoredReceiptRow};
 use crate::store::{BoxBackendError, StoreError, StoreResult};
@@ -70,8 +70,9 @@ async fn pg_legacy_agent_rows(
 /// `REPEATABLE READ READ ONLY` snapshot (the same shape as the legacy cutoff
 /// resolver), whatever window the caller walks. The sqlite twin is
 /// [`crate::signed_events::agent_cutover::resolve_sqlite_agent_cutover`]: a
-/// marker is judged by [`resolve_signed`] under `verifier` (no key, an
-/// unsigned marker or a bad signature is invalid), and no marker is decided
+/// marker is judged by [`resolve_signed`] under `verifier` (an unsigned
+/// marker, or a bad signature under a present key, is invalid; a well-formed
+/// marker with no key is valid but unchecked, #10195), and no marker is decided
 /// by the schema version ([`AgentCutover::without_marker`]), so a removed
 /// marker on a v103 database fails the walk (#10145 W-10, W-11).
 ///
@@ -112,7 +113,12 @@ pub(super) async fn resolve_pg_agent_cutover(
             let below = first.sequence;
             let prev = pg_row_below(&mut tx, below, "agent_cutover.prev").await?;
             let count = pg_legacy_agent_rows(&mut tx, below, "agent_cutover.count").await?;
-            resolve_signed(verifier, &markers, prev.as_ref(), count)
+            resolve_signed(
+                MarkerVerifier::from(verifier),
+                &markers,
+                prev.as_ref(),
+                count,
+            )
         }
     };
     // Read only: ending the transaction writes nothing.

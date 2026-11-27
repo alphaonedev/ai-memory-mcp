@@ -10,6 +10,7 @@
 //! docs do not describe turns these tests red.
 
 use ai_memory::signed_events::AgentCutover;
+use ai_memory::signed_events::agent_cutover::MarkerSignature;
 use ai_memory::signed_events::agent_payload::{
     AGENT_PAYLOAD_DOMAIN, ATOMISATION_RECEIPT_DOMAIN, AgentEventKind, AgentPayloadHash,
     AgentSignedPayload, AtomisationReceipt, PayloadEra, RowEra,
@@ -241,6 +242,7 @@ fn era_table_is_exhaustive_10108() {
     let valid = AgentCutover::Valid {
         sequence: 10,
         legacy_agent_rows: 3,
+        signature: MarkerSignature::Verified,
     };
     let rows: [(AgentCutover, i64, RowEra); 9] = [
         (AgentCutover::Absent, 1, RowEra::Era(PayloadEra::Legacy)),

@@ -25,7 +25,10 @@
 //! on an exact match and a daemon signature that verifies. A changed count, a
 //! changed preceding row, a second marker, an unsigned marker or a marker with
 //! any other agent, attestation, signature or cause fails closed
-//! ([`crate::signed_events::SignatureFailure::CutoverMarkerInvalid`]).
+//! ([`crate::signed_events::SignatureFailure::CutoverMarkerInvalid`]). A walk
+//! with no daemon key cannot check the signature: a well-formed marker is then
+//! withheld ([`MarkerSignature::Unchecked`], `Skipped(NoVerifier)`), never
+//! failed and never verified (#10195).
 //!
 //! The resolver is pure: each backend reads the marker rows (at most two), the
 //! row before the first one and the per-`attest_level` counts below it, then
@@ -38,7 +41,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AgentAttestation, RowSignatureVerdict, SignatureFailure, SignedEvent, SignerIdentity,
-    ZERO_HASH, canonical_chain_bytes,
+    SkipReason, ZERO_HASH, canonical_chain_bytes,
 };
 use crate::governance::daemon_signer::DaemonChainSigner;
 
@@ -226,13 +229,14 @@ pub fn build_signed_marker(
     Some(SignedMarker(row))
 }
 
-/// #10145 — the origin of `marker` when it is a well-formed signed marker
+/// #10195 — the origin of `marker` when it is structurally a signed marker
 /// directly above `prev` (`None`: the genesis position) over
-/// `legacy_agent_rows`, its recompute matches and its signature verifies
-/// under `vk` (the daemon key resolved outside the database); else `None`.
+/// `legacy_agent_rows`: the reserved agent and event type, no cause, its
+/// position and link, its recompute, the daemon attestation and a signature of
+/// the Ed25519 length. Says nothing about whether the signature verifies; that
+/// is [`verify_signed_marker`]. Else `None`.
 #[must_use]
-pub fn verify_signed_marker(
-    vk: &ed25519_dalek::VerifyingKey,
+pub fn signed_marker_structure(
     marker: &SignedEvent,
     prev: Option<&SignedEvent>,
     legacy_agent_rows: u64,
@@ -245,8 +249,58 @@ pub fn verify_signed_marker(
         && marker.cause_hash.is_none()
         && marker.sequence == sequence
         && marker.prev_hash == prev_hash
-        && marker.payload_hash == expected;
-    (well_formed && DaemonChainSigner::verify_row(vk, marker)).then_some(origin)
+        && marker.payload_hash == expected
+        && marker.attest_level == crate::models::AttestLevel::DaemonSigned.as_str()
+        && marker
+            .signature
+            .as_deref()
+            .is_some_and(|sig| sig.len() == ed25519_dalek::SIGNATURE_LENGTH);
+    well_formed.then_some(origin)
+}
+
+/// #10145 — the origin of `marker` when it is a well-formed signed marker
+/// ([`signed_marker_structure`]) and its signature verifies under `vk` (the
+/// daemon key resolved outside the database); else `None`.
+#[must_use]
+pub fn verify_signed_marker(
+    vk: &ed25519_dalek::VerifyingKey,
+    marker: &SignedEvent,
+    prev: Option<&SignedEvent>,
+    legacy_agent_rows: u64,
+) -> Option<MarkerOrigin> {
+    let origin = signed_marker_structure(marker, prev, legacy_agent_rows)?;
+    DaemonChainSigner::verify_row(vk, marker).then_some(origin)
+}
+
+/// #10195 — whether the walk judging a marker holds a daemon key. Built from
+/// the walk's `Option` once ([`From`]), so the resolver matches the two
+/// states exhaustively and cannot collapse "no key" into "bad signature".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerVerifier<'a> {
+    /// No daemon key, in process or pinned: the signature cannot be checked.
+    Absent,
+    /// The daemon key the signature must verify under.
+    Present(&'a ed25519_dalek::VerifyingKey),
+}
+
+impl<'a> From<Option<&'a ed25519_dalek::VerifyingKey>> for MarkerVerifier<'a> {
+    fn from(verifier: Option<&'a ed25519_dalek::VerifyingKey>) -> Self {
+        match verifier {
+            Some(vk) => Self::Present(vk),
+            None => Self::Absent,
+        }
+    }
+}
+
+/// #10195 — what is known of a valid marker's signature. Matched
+/// exhaustively by [`AgentCutover::verdict_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerSignature {
+    /// The signature verified under the daemon key.
+    Verified,
+    /// The marker is well formed but the walk held no daemon key, so the
+    /// signature was not checked. Never reported as verified.
+    Unchecked,
 }
 
 /// #10108 — the resolved cutover of one database. Matched exhaustively by
@@ -262,9 +316,12 @@ pub enum AgentCutover {
         sequence: i64,
         /// The legacy agent-labelled rows below it.
         legacy_agent_rows: u64,
+        /// #10195 — whether its signature verified or could not be checked.
+        signature: MarkerSignature,
     },
-    /// A marker-type row exists but the database holds more than one, or the
-    /// recompute did not match. Every marker-type row then fails.
+    /// A marker-type row exists but the database holds more than one, the
+    /// recompute did not match, or a daemon key was present and the signature
+    /// did not verify under it. Every marker-type row then fails.
     Invalid,
     /// #10145 (W-10, W-11) — no marker row, but the database is at
     /// [`AGENT_CUTOVER_SCHEMA_VERSION`] or above: the marker was removed or
@@ -285,9 +342,15 @@ impl AgentCutover {
             return None;
         }
         Some(match self {
-            Self::Valid { sequence, .. } if sequence == event.sequence => {
-                RowSignatureVerdict::Verified
-            }
+            Self::Valid {
+                sequence,
+                signature,
+                ..
+            } if sequence == event.sequence => match signature {
+                MarkerSignature::Verified => RowSignatureVerdict::Verified,
+                // #10195 — no key: withheld, never failed, never verified.
+                MarkerSignature::Unchecked => RowSignatureVerdict::Skipped(SkipReason::NoVerifier),
+            },
             Self::Valid { .. } | Self::Absent | Self::Invalid | Self::Missing => {
                 RowSignatureVerdict::Failed(SignatureFailure::CutoverMarkerInvalid)
             }
@@ -329,13 +392,17 @@ impl AgentCutover {
 /// database at or above it without a marker is [`AgentCutover::Missing`].
 pub const AGENT_CUTOVER_SCHEMA_VERSION: i64 = 103;
 
-/// #10145 (I-2) — judge a SIGNED marker: exactly one, its recompute matches
-/// at its position over `legacy_agent_rows`, and its signature verifies under
-/// `verifier` (the daemon key resolved outside the database). No verifier, an
-/// unsigned marker or a corrupt count is [`AgentCutover::Invalid`].
+/// #10145 (I-2), #10195 — judge a SIGNED marker: exactly one, and its
+/// structure and recompute match at its position over `legacy_agent_rows`
+/// ([`signed_marker_structure`]). With a daemon key
+/// ([`MarkerVerifier::Present`]) its signature must verify under it
+/// ([`MarkerSignature::Verified`]); without one ([`MarkerVerifier::Absent`])
+/// it is [`MarkerSignature::Unchecked`]. A second marker, a corrupt count, a
+/// bad structure or recompute, or a bad signature under a present key is
+/// [`AgentCutover::Invalid`].
 #[must_use]
 pub fn resolve_signed(
-    verifier: Option<&ed25519_dalek::VerifyingKey>,
+    verifier: MarkerVerifier<'_>,
     markers: &[SignedEvent],
     prev: Option<&SignedEvent>,
     legacy_agent_rows: Option<u64>,
@@ -345,13 +412,22 @@ pub fn resolve_signed(
         [one] => one,
         _ => return AgentCutover::Invalid,
     };
-    let (Some(vk), Some(count)) = (verifier, legacy_agent_rows) else {
+    let Some(count) = legacy_agent_rows else {
         return AgentCutover::Invalid;
     };
-    match verify_signed_marker(vk, marker, prev, count) {
-        Some(_) => AgentCutover::Valid {
+    let signature = match verifier {
+        MarkerVerifier::Present(vk) => {
+            verify_signed_marker(vk, marker, prev, count).map(|_| MarkerSignature::Verified)
+        }
+        MarkerVerifier::Absent => {
+            signed_marker_structure(marker, prev, count).map(|_| MarkerSignature::Unchecked)
+        }
+    };
+    match signature {
+        Some(signature) => AgentCutover::Valid {
             sequence: marker.sequence,
             legacy_agent_rows: count,
+            signature,
         },
         None => AgentCutover::Invalid,
     }
@@ -396,7 +472,12 @@ pub fn resolve_sqlite_agent_cutover(
     let below = first.sequence;
     let prev = sqlite_row_below(conn, below)?;
     let count = sqlite_legacy_agent_rows(conn, below)?;
-    Ok(resolve_signed(verifier, &markers, prev.as_ref(), count))
+    Ok(resolve_signed(
+        MarkerVerifier::from(verifier),
+        &markers,
+        prev.as_ref(),
+        count,
+    ))
 }
 
 /// The row with the highest sequence below `below`.

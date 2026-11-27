@@ -20,8 +20,8 @@ use std::sync::OnceLock;
 use ai_memory::db;
 use ai_memory::models::{Memory, MemoryKind, Tier};
 use ai_memory::signed_events::agent_cutover::{
-    AGENT_CUTOVER_AGENT_ID, MarkerOrigin, build_signed_marker, resolve_sqlite_agent_cutover,
-    signed_marker_payload_hash,
+    AGENT_CUTOVER_AGENT_ID, MarkerOrigin, MarkerSignature, build_signed_marker,
+    resolve_sqlite_agent_cutover, signed_marker_payload_hash,
 };
 use ai_memory::signed_events::{
     AGENT_CUTOVER_EVENT_TYPE, AgentCutover, RowSignatureVerdict, SignatureFailure, SignedEvent,
@@ -252,7 +252,8 @@ fn v103_appends_one_verified_marker_with_the_stamp_10108() {
         resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
         AgentCutover::Valid {
             sequence: PREFIX_ROWS + 1,
-            legacy_agent_rows: 0
+            legacy_agent_rows: 0,
+            signature: MarkerSignature::Verified,
         }
     );
     assert_eq!(walk_failures(&conn), (Vec::new(), Vec::new()));
@@ -298,7 +299,8 @@ fn v103_marker_binds_the_legacy_agent_row_count_10108() {
         resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
         AgentCutover::Valid {
             sequence: 3,
-            legacy_agent_rows: 1
+            legacy_agent_rows: 1,
+            signature: MarkerSignature::Verified,
         }
     );
 }
@@ -325,13 +327,18 @@ fn a_fresh_create_writes_one_signed_genesis_marker_10145() {
         resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve"),
         AgentCutover::Valid {
             sequence: 1,
-            legacy_agent_rows: 0
+            legacy_agent_rows: 0,
+            signature: MarkerSignature::Verified,
         }
     );
     assert_eq!(
         resolve_sqlite_agent_cutover(&conn, None).expect("resolve"),
-        AgentCutover::Invalid,
-        "no verifier never reads Valid"
+        AgentCutover::Valid {
+            sequence: 1,
+            legacy_agent_rows: 0,
+            signature: MarkerSignature::Unchecked,
+        },
+        "#10195: no verifier reads the well-formed marker as unchecked, never verified"
     );
     let other = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
     assert_eq!(
