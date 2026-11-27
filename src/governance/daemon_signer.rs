@@ -166,24 +166,31 @@ impl DaemonChainSigner {
     /// The typed, counted [`DaemonKeyMissing`] for every cause.
     pub fn provision(key_dir: &Path) -> Result<Self, DaemonKeyMissing> {
         use crate::identity::keypair::{
-            DAEMON_KEYPAIR_LABEL, EnsureOutcome, agent_priv_path, agent_pub_path, ensure_keypair,
-            load,
+            DAEMON_KEYPAIR_LABEL, EnsureOutcome, KeyDirLock, KeyDirLockError, agent_priv_path,
+            agent_pub_path, ensure_keypair_locked, load,
         };
-        /// One provisioning at a time in this process, so two opens never see
-        /// each other's half-written pair as a partial key. The guarded state
-        /// is `()`, so a poisoned lock carries nothing torn (CONCURRENCY-18).
-        static PROVISION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serial = PROVISION_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let refuse = |cause| DaemonKeyMissing::new(cause, Some(key_dir));
+        // #10108 K-4 — one provisioning at a time across PROCESSES (an OS
+        // file lock in the key directory, which also serialises the threads
+        // of this one), held over the checks, the generate and the load, so
+        // no process reads another's half-written pair as a partial key or
+        // signs with a key that is not the one on disk. A lock that cannot be
+        // taken refuses; it never proceeds unlocked.
+        let lock = KeyDirLock::acquire(key_dir).map_err(|e| {
+            refuse(match e {
+                KeyDirLockError::KeyDir(_) => DaemonKeyCause::KeyDirUnusable,
+                KeyDirLockError::Lock { .. } | KeyDirLockError::TimedOut { .. } => {
+                    DaemonKeyCause::KeyDirLockUnavailable
+                }
+            })
+        })?;
         let has_pub = agent_pub_path(key_dir, DAEMON_KEYPAIR_LABEL).exists();
         let has_priv = agent_priv_path(key_dir, DAEMON_KEYPAIR_LABEL).exists();
         match (has_pub, has_priv) {
             (true, true) => {}
             (true, false) => return Err(refuse(DaemonKeyCause::PublicOnly)),
             (false, true) => return Err(refuse(DaemonKeyCause::PrivateOnly)),
-            (false, false) => match ensure_keypair(DAEMON_KEYPAIR_LABEL, key_dir, false) {
+            (false, false) => match ensure_keypair_locked(&lock, DAEMON_KEYPAIR_LABEL, key_dir) {
                 Ok(EnsureOutcome::Generated { .. } | EnsureOutcome::AlreadyExists { .. }) => {}
                 Ok(EnsureOutcome::SkippedDisabled) => {
                     return Err(refuse(DaemonKeyCause::GenerationDisabled));
@@ -295,6 +302,9 @@ pub enum DaemonKeyCause {
     NoKeyDir,
     /// The key directory is unwritable or insecure, or a key file is unreadable.
     KeyDirUnusable,
+    /// The key-directory lock could not be taken (another process held it
+    /// past the deadline, or the lock file cannot be opened or locked).
+    KeyDirLockUnavailable,
 }
 
 impl DaemonKeyCause {
@@ -307,6 +317,9 @@ impl DaemonKeyCause {
             Self::NoKeyDir => "no key directory resolves (no home directory)",
             Self::KeyDirUnusable => {
                 "the key directory is unwritable or insecure, or a key file is unreadable"
+            }
+            Self::KeyDirLockUnavailable => {
+                "the key directory lock could not be taken (held past its deadline, or the lock file is unusable)"
             }
         }
     }

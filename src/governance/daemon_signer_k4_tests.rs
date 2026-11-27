@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::DaemonChainSigner;
-use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
+use crate::identity::keypair::{DAEMON_KEYPAIR_LABEL, agent_priv_path, agent_pub_path};
 
 const MODULE_PATH: &str = "governance::daemon_signer::k4_tests";
 /// The child role: the key directory it provisions.
@@ -31,7 +31,7 @@ const RACE_ROUNDS: usize = 4;
 const WAIT_DEADLINE: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(1);
 /// The lock file name the fix places at the key-directory root.
-const LOCK_FILE: &str = ".keystore.lock";
+const LOCK_FILE: &str = crate::identity::keypair::KEY_DIR_LOCK_FILE;
 /// How long the held-lock test watches for a write it must not see.
 const HELD_WINDOW: Duration = Duration::from_millis(750);
 
@@ -53,7 +53,11 @@ fn remove_run_dir(dir: &Path) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(".local-runs")
         .join("k4-10108");
-    assert!(dir.starts_with(&root), "refusing to remove {}", dir.display());
+    assert!(
+        dir.starts_with(&root),
+        "refusing to remove {}",
+        dir.display()
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -61,7 +65,10 @@ fn remove_run_dir(dir: &Path) {
 fn wait_for(what: &str, cond: impl Fn() -> bool) {
     let deadline = Instant::now() + WAIT_DEADLINE;
     while !cond() {
-        assert!(Instant::now() < deadline, "deadline passed waiting for {what}");
+        assert!(
+            Instant::now() < deadline,
+            "deadline passed waiting for {what}"
+        );
         std::thread::sleep(POLL);
     }
 }
@@ -132,17 +139,23 @@ fn child_result(out: &std::process::Output) -> (Option<String>, String) {
         stdout.contains("1 passed"),
         "the child must have run exactly one test: {detail}"
     );
-    let line = stdout
-        .lines()
-        .find(|l| l.starts_with(PUB_LINE_PREFIX) || l.starts_with(REFUSED_LINE_PREFIX))
-        .map(str::to_owned);
+    // The harness may print `test <name> ... ` on the same line, before the
+    // child's own output, so the marker is found anywhere in a line.
+    let line = stdout.lines().find_map(|l| {
+        [PUB_LINE_PREFIX, REFUSED_LINE_PREFIX]
+            .iter()
+            .find_map(|prefix| l.find(prefix).map(|at| l[at..].trim_end().to_owned()))
+    });
     (line, detail)
 }
 
 /// The public half on disk, hex.
 fn disk_pub_hex(key_dir: &Path) -> String {
     let kp = crate::identity::keypair::load(DAEMON_KEYPAIR_LABEL, key_dir).expect("load the key");
-    assert!(kp.private.is_some(), "the key on disk must have both halves");
+    assert!(
+        kp.private.is_some(),
+        "the key on disk must have both halves"
+    );
     hex::encode(kp.public.to_bytes())
 }
 
@@ -261,5 +274,33 @@ fn provision_waits_for_the_key_dir_lock_10108() {
         Some(format!("{PUB_LINE_PREFIX}{}", disk_pub_hex(&key_dir)).as_str()),
         "after the lock is released the child provisions the key on disk: {detail}"
     );
+    remove_run_dir(&run);
+}
+
+/// A lock that cannot be taken refuses with its typed cause; no key file is
+/// written and the process never proceeds unlocked.
+#[cfg(unix)]
+#[test]
+fn an_unlockable_key_dir_refuses_typed_10108() {
+    let run = run_dir("unlockable");
+    let key_dir = run.join("keys");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&key_dir)
+            .expect("create the key dir");
+    }
+    // A directory where the lock file goes: it can never be opened as a file.
+    std::fs::create_dir(key_dir.join(LOCK_FILE)).expect("plant the blocker");
+    let err = DaemonChainSigner::provision(&key_dir).expect_err("an unlockable dir must refuse");
+    assert_eq!(err.cause(), super::DaemonKeyCause::KeyDirLockUnavailable);
+    assert!(
+        err.to_string()
+            .contains("the key directory lock could not be taken"),
+        "exact refusal text: {err}"
+    );
+    assert!(!agent_pub_path(&key_dir, DAEMON_KEYPAIR_LABEL).exists());
+    assert!(!agent_priv_path(&key_dir, DAEMON_KEYPAIR_LABEL).exists());
     remove_run_dir(&run);
 }
