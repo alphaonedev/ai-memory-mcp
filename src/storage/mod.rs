@@ -14735,9 +14735,8 @@ pub(crate) use pubkey_history::{
     validate_agent_pubkey_transition_time,
 };
 pub use recovery_rebind::{
-    RecoveryArm, RecoveryChecked, RecoveryFaultPoint, RecoveryOutcome, RecoveryRequest,
-    execute_recovery_rebind, execute_recovery_rebind_with_fault, recovery_preconditions,
-    verify_anchor_against_lineage,
+    RecoveryArm, RecoveryChecked, RecoveryOutcome, RecoveryRequest, execute_recovery_rebind,
+    recovery_preconditions, verify_anchor_against_lineage, verify_anchor_against_verified_lineage,
 };
 
 /// Fetch the Ed25519 public key bound to `agent_id`, if any (#626
@@ -15525,38 +15524,8 @@ pub fn append_lineage_record(
     // (clone of the capture_turn_idempotent single-tx contract).
     let write_txn = connection::WriteTxn::begin(conn).context("append_lineage_record: begin tx")?;
     let tx_result = (|| -> Result<()> {
-        conn.execute(
-            "INSERT INTO agent_lineage \
-                (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
-                 recovery_pubkey, not_before, prev_record_hash, signature, \
-                 record_bytes, created_at, custody_class, suspected_compromise_from_seq, \
-                 guardian_set_id, recovery_threshold) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                record.agent_id,
-                i64::try_from(record.epoch).context("lineage epoch exceeds i64")?,
-                record.reason.as_str(),
-                record.predecessor_pubkey_b64,
-                record.successor_pubkey_b64,
-                record.recovery_pubkey_b64,
-                record.not_before,
-                record.prev_record_hash,
-                signature,
-                record_bytes,
-                now,
-                record.custody_class.as_str(),
-                record
-                    .suspected_compromise_from_seq
-                    .map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
-                // v1.0.0 #1831 (G17) — committed recovery trust anchor
-                // (NULL on every non-recovery record).
-                record.guardian_set_id.as_deref(),
-                record
-                    .recovery_threshold
-                    .map(|m| i64::try_from(m).unwrap_or(i64::MAX)),
-            ],
-        )
-        .context("append_lineage_record: insert body (duplicate epoch is refused by the C5 PK)")?;
+        recovery_rebind::insert_agent_lineage_row(conn, record, signature, &record_bytes, &now)
+            .context("append_lineage_record: insert body")?;
 
         // Flat-binding sync — attest_write keeps trusting this key (C6).
         //
@@ -15799,19 +15768,33 @@ pub fn verify_agent_lineage(
         crate::identity::lineage::LineageError,
     >,
 > {
+    let recovery_policy = crate::identity::lineage::RecoveryPolicy::from_env();
+    verify_agent_lineage_with_policy(conn, agent_id, recovery_policy.as_ref())
+}
+
+/// Explicit-policy twin of [`verify_agent_lineage`] (#10112 / #10159): builds a
+/// [`crate::identity::lineage::VerifiedLineage`] using `recovery_policy`.
+///
+/// # Errors
+/// SQL / decode failures on the three reads.
+pub fn verify_agent_lineage_with_policy(
+    conn: &Connection,
+    agent_id: &str,
+    recovery_policy: Option<&crate::identity::lineage::RecoveryPolicy>,
+) -> Result<
+    std::result::Result<
+        crate::identity::lineage::VerifiedLineage,
+        crate::identity::lineage::LineageError,
+    >,
+> {
     let records = read_lineage(conn, agent_id)?;
     let witnesses = lineage_witness_hashes(conn, agent_id)?;
     let bound = agent_pubkey(conn, agent_id)?;
-    // v1.0.0 #1831 (G17) — resolve the M-of-N recovery guardian policy from
-    // the environment so a chain whose head arrived via a valid guardian
-    // quorum verifies. `None` (no guardians enrolled) fail-closes any
-    // recovery record, preserving the v0.9.0 posture.
-    let recovery_policy = crate::identity::lineage::RecoveryPolicy::from_env();
     Ok(crate::identity::lineage::verify_lineage_with_recovery(
         &records,
         &witnesses,
         bound.as_deref(),
-        recovery_policy.as_ref(),
+        recovery_policy,
     ))
 }
 
@@ -16152,10 +16135,9 @@ fn mint_recovery_record(
     recovery_pubkey_b64: Option<&str>,
     not_before: &str,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    let lineage = read_lineage(conn, agent_id)?;
-    let Some((head, _)) = lineage.last() else {
+    if read_lineage(conn, agent_id)?.is_empty() {
         anyhow::bail!("no lineage enrolled for '{agent_id}' — nothing to recover");
-    };
+    }
     crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
         .context("decoding recovery successor pubkey")?;
     if let Some(rec) = recovery_pubkey_b64 {
@@ -16167,10 +16149,14 @@ fn mint_recovery_record(
              (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
         )
     })?;
-    // #10112 R-2: read quorum set and threshold from prior signed lineage
-    // record when one committed them, never from CLI args or request.
+    // #10159 (S-F1): verify the entire chain into `VerifiedLineage` before
+    // reading committed quorum or head.
+    let verified = verify_agent_lineage_with_policy(conn, agent_id, Some(&policy))?
+        .map_err(|e| anyhow::anyhow!("refusing recovery on unverified lineage chain: {e}"))?;
+    let head = verified.head_record();
+    // #10112 R-2: read quorum set and threshold from `&VerifiedLineage` only.
     let (guardian_set_id, threshold_u64) =
-        recovery_rebind::resolve_committed_quorum(&lineage, &policy)?;
+        recovery_rebind::resolve_committed_quorum(&verified, &policy)?;
     // None carries the existing recovery commitment forward.
     let recovery = recovery_pubkey_b64
         .map(str::to_string)
@@ -16245,11 +16231,14 @@ pub fn append_recovery(
     recovery_pubkey_b64: Option<&str>,
     not_before: &str,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    // #10112 (Option B, R-8): an armed store MUST route recovery through
+    // #10112 (Option B, R-8 / C-F14): an armed store MUST route recovery through
     // `recovery_preconditions` + `execute_recovery_rebind` with a `K_new`
     // signing arm — never an unattested direct lineage/rebind write.
     if row_attest::sqlite::was_armed(conn)? {
-        anyhow::bail!("{}", row_attest::sqlite::REFUSE_RECOVERY_VERIFY_ONLY);
+        anyhow::bail!(
+            "{}",
+            row_attest::sqlite::REFUSE_DIRECT_RECOVERY_ON_ARMED_STORE
+        );
     }
     let record = mint_recovery_record(
         conn,

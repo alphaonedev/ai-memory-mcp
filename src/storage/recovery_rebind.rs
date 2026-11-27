@@ -6,6 +6,7 @@
 //! atomic staged+fsynced anchor swap, idempotent crash recovery, and
 //! `#10040`-byte-identical row attestation signed by `K_new`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -22,19 +23,21 @@ use super::row_attest::sqlite::{
     REFUSE_ANCHOR_UNATTESTED_KEY_SWAP, REFUSE_RECOVERY_KEY_MISMATCH, REFUSE_RECOVERY_MISSING_PRIV,
     REFUSE_RECOVERY_QUORUM_DRIFT, REFUSE_RECOVERY_REPLAY, REFUSE_RECOVERY_VERIFY_ONLY,
     advance_seal_after_recovery, arm_for_recovery_in_tx, restore_post_recovery_funnel,
-    seal_is_current,
+    seal_is_current, was_armed_with,
 };
+use super::row_attest::{Attestation, key_id_of};
 use super::{
-    escalation_deferral, lineage_head, lineage_witness_event_type, read_lineage,
-    verify_agent_lineage,
+    agent_pubkey, escalation_deferral, lineage_witness_event_type, read_lineage,
+    verify_agent_lineage, verify_agent_lineage_with_policy,
 };
 use crate::identity::keypair::{
-    self, PUB_SUFFIX, agent_priv_path, agent_pub_path, canonical_history_contains,
-    canonical_public_base64, decode_public_base64, enforce_key_path_chain_secure,
+    self, agent_priv_path, agent_pub_path, archive_public_key_idempotent_at,
+    canonical_history_contains, canonical_public_base64, decode_public_base64,
+    enforce_key_path_chain_secure, find_existing_archived_public_key_at,
 };
 use crate::identity::lineage::{
-    LineageReason, LineageRecord, RecoveryAttestation, RecoveryPolicy, encode_recovery_quorum,
-    verify_recovery_record,
+    LineageReason, LineageRecord, RecoveryAttestation, RecoveryPolicy, VerifiedLineage,
+    encode_recovery_quorum, verify_recovery_record,
 };
 use crate::identity::pubkey_bind::PossessionProof;
 use crate::validate;
@@ -69,23 +72,19 @@ pub struct RecoveryRequest<'a> {
     pub staged_key_label: Option<&'a str>,
 }
 
-/// Fault-injection hook points proving crash order + idempotent convergence (R-6).
+/// Fault-injection hook points proving crash order + idempotent convergence
+/// (R-6). Private `#[cfg(test)]` only (C-F13 / S-F3, #10161).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryFaultPoint {
-    /// Normal execution with no injected crash.
+enum RecoveryFaultPoint {
     None,
-    /// Abort inside the single SQLite `WriteTxn` right before `commit()` (R-5).
     BeforeDbCommit,
-    /// Abort right after SQLite `commit()`, before archiving `K_old` (R-6).
     AfterDbCommitBeforeArchive,
-    /// Abort right after archiving `<agent>.pub.<ts>`, before installing `<agent>.priv` (R-6).
     AfterArchiveBeforePrivInstall,
-    /// Abort right after installing `<agent>.priv`, before replacing `<agent>.pub` (R-6).
     AfterPrivInstallBeforePubInstall,
-    /// Abort right after replacing `<agent>.pub`, before removing staged sibling (R-6).
     AfterPubInstallBeforeStagedCleanup,
-    /// Abort right after anchor swap, before advancing the anchored seal (R-6).
     AfterPubInstallBeforeSealAdvance,
+    RestoreFunnelFailure,
 }
 
 /// Outcome of a completed recovery rebind (#10112).
@@ -119,10 +118,11 @@ enum RecoveryMode {
 ///
 /// Private fields (and no `Clone`, `Copy`, or `Debug` — protecting `k_new_signing`
 /// per R-14) guarantee that [`execute_recovery_rebind`] is reachable ONLY after:
-/// 1. Guardian M-of-N signatures verified against the committed quorum FIRST (R-1, R-2, R-3);
-/// 2. `--successor-pubkey` equals both the guardian-signed key and the signing arm's `K_new` (R-4);
-/// 3. The arm holds `K_new.priv` (verify-only and missing-priv refused preflight, R-8);
-/// 4. Replay of an already-converged recovery or epoch reuse is refused (R-9).
+/// 1. Full lineage chain verification produced a [`VerifiedLineage`] (#10159);
+/// 2. Guardian M-of-N signatures verified against the committed quorum FIRST (R-1, R-2, R-3);
+/// 3. `--successor-pubkey` equals both the guardian-signed key and the signing arm's `K_new` (R-4);
+/// 4. The arm holds `K_new.priv` (verify-only and missing-priv refused preflight, R-8);
+/// 5. Replay of an already-converged recovery or epoch/key reuse is refused (R-9).
 #[must_use = "a RecoveryChecked proof must be consumed by execute_recovery_rebind"]
 pub struct RecoveryChecked<'a> {
     agent_id: &'a str,
@@ -136,32 +136,19 @@ pub struct RecoveryChecked<'a> {
     mode: RecoveryMode,
 }
 
-/// R-2 helper: return `(guardian_set_id, recovery_threshold)` committed on the
-/// most recent prior signed lineage record that carries them, if any.
-pub(crate) fn committed_quorum_from_lineage(
-    lineage: &[(LineageRecord, Vec<u8>)],
-) -> Option<(Vec<u8>, u64)> {
-    lineage.iter().rev().find_map(|(rec, _)| {
-        match (rec.guardian_set_id.as_ref(), rec.recovery_threshold) {
-            (Some(gid), Some(thr)) => Some((gid.clone(), thr)),
-            _ => None,
-        }
-    })
-}
-
 /// Resolve the committed `(guardian_set_id, recovery_threshold)` for a new
-/// recovery record per R-2: read from the prior signed lineage record whenever
-/// one committed a quorum, else from the enrolled operator `RecoveryPolicy`
-/// (never from CLI arguments or the recovery request).
+/// recovery record per R-2 (#10112) and #10159: takes [`VerifiedLineage`] by
+/// reference so raw unverified `agent_lineage` rows can never compile as a
+/// quorum source.
 pub(crate) fn resolve_committed_quorum(
-    lineage: &[(LineageRecord, Vec<u8>)],
+    verified: &VerifiedLineage,
     policy: &RecoveryPolicy,
 ) -> Result<(Vec<u8>, u64)> {
-    if let Some((prior_gid, prior_thr)) = committed_quorum_from_lineage(lineage) {
-        if policy.guardian_set_id() != prior_gid {
+    if let Some((prior_gid, prior_thr)) = verified.committed_quorum() {
+        if policy.guardian_set_id().as_slice() != prior_gid {
             bail!("{REFUSE_RECOVERY_QUORUM_DRIFT}");
         }
-        return Ok((prior_gid, prior_thr));
+        return Ok((prior_gid.to_vec(), prior_thr));
     }
     let threshold = policy.threshold.ok_or_else(|| {
         anyhow::anyhow!(
@@ -169,12 +156,66 @@ pub(crate) fn resolve_committed_quorum(
              set an explicit M-of-N threshold (a key-takeover primitive never defaults to 1)"
         )
     })?;
-    let threshold_u64 = u64::try_from(threshold).unwrap_or(u64::MAX);
+    let threshold_u64 = u64::try_from(threshold).context("recovery threshold exceeds u64 range")?;
     Ok((policy.guardian_set_id(), threshold_u64))
+}
+
+/// Single shared `INSERT INTO agent_lineage` helper (C-F7 / C-F4 / C-F8) with
+/// checked integer conversions — called by both `storage::append_lineage_record`
+/// and `execute_recovery_rebind`.
+pub(crate) fn insert_agent_lineage_row(
+    conn: &Connection,
+    record: &LineageRecord,
+    signature: &[u8],
+    record_bytes: &[u8],
+    created_at: &str,
+) -> Result<()> {
+    let epoch_i64 = i64::try_from(record.epoch).context("lineage epoch exceeds i64")?;
+    let compromise_i64 = record
+        .suspected_compromise_from_seq
+        .map(|s| i64::try_from(s).context("suspected_compromise_from_seq exceeds i64"))
+        .transpose()?;
+    let threshold_i64 = record
+        .recovery_threshold
+        .map(|m| i64::try_from(m).context("recovery_threshold exceeds i64"))
+        .transpose()?;
+    conn.execute(
+        "INSERT INTO agent_lineage \
+            (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
+             recovery_pubkey, not_before, prev_record_hash, signature, \
+             record_bytes, created_at, custody_class, suspected_compromise_from_seq, \
+             guardian_set_id, recovery_threshold) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            record.agent_id,
+            epoch_i64,
+            record.reason.as_str(),
+            record.predecessor_pubkey_b64,
+            record.successor_pubkey_b64,
+            record.recovery_pubkey_b64,
+            record.not_before,
+            record.prev_record_hash,
+            signature,
+            record_bytes,
+            created_at,
+            record.custody_class.as_str(),
+            compromise_i64,
+            record.guardian_set_id.as_deref(),
+            threshold_i64,
+        ],
+    )
+    .context("insert agent_lineage row (duplicate epoch is refused by the C5 PK)")?;
+    Ok(())
 }
 
 fn format_recovery_ts(dt: DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+fn parse_floor_ts(raw: &str, column: &str) -> Result<DateTime<Utc>> {
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .with_context(|| format!("refusing recovery: malformed {column} timestamp {raw:?}"))?;
+    Ok(parsed.with_timezone(&Utc))
 }
 
 fn pick_recovery_timestamp(conn: &Connection, agent_id: &str) -> Result<(i64, String)> {
@@ -197,49 +238,24 @@ fn pick_recovery_timestamp(conn: &Connection, agent_id: &str) -> Result<(i64, St
 
     let mut ts = Utc::now();
     if let Some((bound_s, sup_s)) = latest_hist {
-        if let Ok(bound) = DateTime::parse_from_rfc3339(&bound_s) {
-            let bound_utc = bound.with_timezone(&Utc);
-            if ts <= bound_utc {
-                ts = bound_utc + Duration::microseconds(1);
-            }
+        let bound_utc = parse_floor_ts(&bound_s, "agent_pubkey_history.bound_at")?;
+        if ts <= bound_utc {
+            ts = bound_utc + Duration::microseconds(1);
         }
-        if let Some(sup_s) = sup_s
-            && let Ok(sup) = DateTime::parse_from_rfc3339(&sup_s)
-        {
-            let sup_utc = sup.with_timezone(&Utc);
+        if let Some(sup_s) = sup_s {
+            let sup_utc = parse_floor_ts(&sup_s, "agent_pubkey_history.superseded_at")?;
             if ts < sup_utc {
                 ts = sup_utc;
             }
         }
     }
-    if let Some(att_s) = latest_att
-        && let Ok(att) = DateTime::parse_from_rfc3339(&att_s)
-    {
-        let att_utc = att.with_timezone(&Utc);
+    if let Some(att_s) = latest_att {
+        let att_utc = parse_floor_ts(&att_s, "row_attestations.attested_at")?;
         if ts < att_utc {
             ts = att_utc;
         }
     }
     Ok((ts.timestamp(), format_recovery_ts(ts)))
-}
-
-fn find_existing_archive_with_bytes(
-    dir: &Path,
-    agent_id: &str,
-    ts_secs: i64,
-    expected_bytes: &[u8; PUBLIC_KEY_LENGTH],
-) -> Option<PathBuf> {
-    let base = dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts_secs}"));
-    if fs::read(&base).ok().as_deref() == Some(expected_bytes.as_slice()) {
-        return Some(base);
-    }
-    for attempt in 1..=64_u32 {
-        let cand = dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts_secs}-{attempt}"));
-        if fs::read(&cand).ok().as_deref() == Some(expected_bytes.as_slice()) {
-            return Some(cand);
-        }
-    }
-    None
 }
 
 fn anchor_and_seal_converged(
@@ -251,21 +267,36 @@ fn anchor_and_seal_converged(
     ts_secs: i64,
     staged_key_label: Option<&str>,
 ) -> Result<bool> {
-    let pub_ok = fs::read(agent_pub_path(anchor_dir, agent_id))
-        .ok()
-        .as_deref()
-        == Some(k_new_verifying.as_bytes().as_slice());
+    let pub_path = agent_pub_path(anchor_dir, agent_id);
+    let pub_ok = match fs::read(&pub_path) {
+        Ok(bytes) => bytes.as_slice() == k_new_verifying.as_bytes().as_slice(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "reading active public key {} during convergence check",
+                    pub_path.display()
+                )
+            });
+        }
+    };
     if !pub_ok {
         return Ok(false);
     }
-    let priv_ok = keypair::load(agent_id, anchor_dir)
-        .ok()
-        .and_then(|kp| kp.private.map(|sk| sk.verifying_key() == *k_new_verifying))
-        .unwrap_or(false);
+    let priv_path = agent_priv_path(anchor_dir, agent_id);
+    if !priv_path.exists() {
+        return Ok(false);
+    }
+    let loaded = keypair::load(agent_id, anchor_dir).with_context(|| {
+        format!("loading keypair for '{agent_id}' during recovery convergence check")
+    })?;
+    let priv_ok = loaded
+        .private
+        .is_some_and(|sk| sk.verifying_key() == *k_new_verifying);
     if !priv_ok {
         return Ok(false);
     }
-    if find_existing_archive_with_bytes(anchor_dir, agent_id, ts_secs, k_old_bytes).is_none() {
+    if find_existing_archived_public_key_at(anchor_dir, agent_id, k_old_bytes, ts_secs)?.is_none() {
         return Ok(false);
     }
     if let Some(staged) = staged_key_label
@@ -275,8 +306,14 @@ fn anchor_and_seal_converged(
     {
         return Ok(false);
     }
-    if !matches!(TrustAnchor::load_dir(anchor_dir), AnchorLoad::Anchored(_)) {
-        return Ok(false);
+    match TrustAnchor::load_dir(anchor_dir) {
+        AnchorLoad::Anchored(_) => {}
+        AnchorLoad::Unanchored(why) => {
+            bail!(
+                "refusing recovery convergence check on unusable anchor {}: {why}",
+                anchor_dir.display()
+            );
+        }
     }
     seal_is_current(conn, anchor_dir)
 }
@@ -301,15 +338,18 @@ fn check_arm<'a>(
 /// mutation (#10112 Option B, vote V1-RECOVER-REBIND-ATTEST R-1..R-9).
 ///
 /// Exact order:
-/// 1. Validate inputs + read enrolled lineage (`lineage_head`);
-/// 2. Resolve guardian quorum policy from prior signed lineage record (R-2) or
-///    enrolled operator policy (never CLI args/request);
+/// 1. Validate inputs + verify the ENTIRE existing lineage chain into a
+///    [`VerifiedLineage`] (#10159: raw storage rows never decide anything);
+/// 2. Resolve guardian quorum policy from `&VerifiedLineage` (R-2) or enrolled
+///    operator policy (never CLI args/request);
 /// 3. Verify M-of-N guardian signatures over `(agent_id, epoch, K_old, K_new)`
 ///    BEFORE evaluating any `K_new` signature or touching state (R-1, R-3);
 /// 4. Evaluate `arm`: refuse verify-only (R-8), missing `K_new.priv` (R-8), or
 ///    `K_new.pub != --successor-pubkey` (R-4);
 /// 5. Refuse replay of an already-converged recovery or epoch/key reuse (R-9),
-///    or prepare an idempotent resume when DB committed before anchor swap (R-6).
+///    or prepare an idempotent resume when DB committed before anchor swap (R-6);
+/// 6. Verify `anchor_dir` existence, security chain, and pre-recovery anchor
+///    agreement with `&VerifiedLineage` on armed stores (R-7 / #10160).
 ///
 /// # Errors
 ///
@@ -331,22 +371,28 @@ pub fn recovery_preconditions<'a>(
     if let Some(rec) = req.recovery_pubkey_b64 {
         decode_public_base64(rec).context("decoding recovery pubkey")?;
     }
-    let lineage = read_lineage(conn, req.agent_id)?;
-    let Some((head, _)) = lineage.last() else {
+    if read_lineage(conn, req.agent_id)?.is_empty() {
         bail!(
             "no lineage enrolled for '{}' — nothing to recover",
             req.agent_id
         );
-    };
+    }
     let policy = RecoveryPolicy::from_env().ok_or_else(|| {
         anyhow::anyhow!(
             "cannot mint a recovery record — no recovery guardians enrolled \
              (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
         )
     })?;
+    // #10159 (S-F1): verify the FULL existing chain into `VerifiedLineage`
+    // BEFORE considering `ResumeAnchor` or resolving any committed quorum.
+    let verified = verify_agent_lineage_with_policy(conn, req.agent_id, Some(&policy))?
+        .map_err(|e| anyhow::anyhow!("refusing recovery on unverified lineage chain: {e}"))?;
+    let head = verified.head_record();
     let quorum_blob = encode_recovery_quorum(req.quorum)?;
 
     // Idempotent post-commit resume vs replay check (R-6 / R-9).
+    // `head` comes exclusively from `VerifiedLineage` (witness + chain + quorum
+    // + flat-binding already cryptographically verified above).
     let head_succ_canon = canonical_public_base64(&head.successor_pubkey_b64)?;
     if head.reason == LineageReason::Recovery
         && head_succ_canon == successor_canonical
@@ -357,6 +403,12 @@ pub fn recovery_preconditions<'a>(
             .map_err(|e| anyhow::anyhow!("refusing unverifiable recovery record: {e}"))?;
         // R-4 & R-8: check signing arm & key equality.
         let k_new_signing = check_arm(arm, &decoded_successor)?;
+        if !anchor_dir.exists() {
+            bail!(
+                "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: anchor directory {} does not exist",
+                anchor_dir.display()
+            );
+        }
         let k_old_key = decode_public_base64(&head.predecessor_pubkey_b64)
             .context("decoding predecessor pubkey on committed recovery head")?;
         let bound_at: String = conn.query_row(
@@ -396,9 +448,8 @@ pub fn recovery_preconditions<'a>(
         });
     }
 
-    // R-2: quorum set and threshold from prior signed lineage record (if any),
-    // never from CLI arguments or the recovery request.
-    let (guardian_set_id, threshold_u64) = resolve_committed_quorum(&lineage, &policy)?;
+    // R-2: quorum set and threshold from `&VerifiedLineage` only.
+    let (guardian_set_id, threshold_u64) = resolve_committed_quorum(&verified, &policy)?;
 
     // Build prospective recovery record at head.epoch + 1.
     let recovery_commit = req
@@ -433,12 +484,30 @@ pub fn recovery_preconditions<'a>(
     // R-4 & R-8: check signing arm (refuses verify-only, missing priv, mismatch).
     let k_new_signing = check_arm(arm, &decoded_successor)?;
 
-    // Verify anchor_dir security chain before touching disk.
+    // R-7 / #10160: verify anchor_dir existence, security chain, and agreement
+    // with `&VerifiedLineage` on armed stores before touching disk or DB.
+    let armed = was_armed_with(conn, Some(anchor_dir))?;
+    if armed {
+        if !anchor_dir.exists() {
+            bail!(
+                "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: anchor directory {} does not exist on armed store",
+                anchor_dir.display()
+            );
+        }
+        match TrustAnchor::load_dir(anchor_dir) {
+            AnchorLoad::Anchored(anchor) => {
+                verify_anchor_against_verified_lineage(&anchor, req.agent_id, &verified)?;
+            }
+            AnchorLoad::Unanchored(why) => {
+                bail!("{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: {why}");
+            }
+        }
+    }
     let target_pub = agent_pub_path(anchor_dir, req.agent_id);
     if target_pub.exists() {
         enforce_key_path_chain_secure(anchor_dir, &target_pub)?;
     } else if anchor_dir.exists() {
-        enforce_key_path_chain_secure(anchor_dir, anchor_dir)?;
+        keypair::enforce_key_dir_secure(anchor_dir)?;
     }
 
     let k_old_key = decode_public_base64(&head.successor_pubkey_b64)
@@ -530,35 +599,6 @@ fn atomic_write_in_anchor(anchor_dir: &Path, dest: &Path, bytes: &[u8], mode: u3
     write_res
 }
 
-fn archive_k_old_idempotent(
-    anchor_dir: &Path,
-    agent_id: &str,
-    k_old_bytes: &[u8; PUBLIC_KEY_LENGTH],
-    ts_secs: i64,
-) -> Result<PathBuf> {
-    if let Some(existing) =
-        find_existing_archive_with_bytes(anchor_dir, agent_id, ts_secs, k_old_bytes)
-    {
-        return Ok(existing);
-    }
-    for attempt in 0..=64_u32 {
-        let cand = if attempt == 0 {
-            anchor_dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts_secs}"))
-        } else {
-            anchor_dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts_secs}-{attempt}"))
-        };
-        if cand.exists() {
-            continue;
-        }
-        atomic_write_in_anchor(anchor_dir, &cand, k_old_bytes, 0o644)?;
-        return Ok(cand);
-    }
-    bail!(
-        "refusing to recover {agent_id}: every archive name for timestamp {ts_secs} under {} is taken",
-        anchor_dir.display()
-    );
-}
-
 fn cleanup_staged_and_temps(
     anchor_dir: &Path,
     agent_id: &str,
@@ -578,22 +618,57 @@ fn cleanup_staged_and_temps(
             }
         }
     }
-    let parent = agent_pub_path(anchor_dir, agent_id)
+    let target_pub = agent_pub_path(anchor_dir, agent_id);
+    let parent = target_pub
         .parent()
         .map_or_else(|| anchor_dir.to_path_buf(), Path::to_path_buf);
-    if let Ok(entries) = fs::read_dir(&parent) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if let Some(s) = name.to_str()
-                && s.starts_with(".recover-")
-                && s.ends_with(".tmp")
-            {
-                let _ = fs::remove_file(entry.path());
+    enforce_key_path_chain_secure(anchor_dir, &target_pub)?;
+    for entry in fs::read_dir(&parent).with_context(|| {
+        format!(
+            "reading anchor directory {} for temp cleanup",
+            parent.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "iterating anchor directory {} for temp cleanup",
+                parent.display()
+            )
+        })?;
+        let name = entry.file_name();
+        if let Some(s) = name.to_str()
+            && s.starts_with(".recover-")
+            && s.ends_with(".tmp")
+        {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("stat temp file {}", path.display()))?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                bail!(
+                    "refusing to delete non-regular temp entry {}",
+                    path.display()
+                );
             }
+            enforce_key_path_chain_secure(anchor_dir, &path)?;
+            fs::remove_file(&path)
+                .with_context(|| format!("removing leftover temp file {}", path.display()))?;
         }
     }
     sync_dir(&parent)?;
     Ok(())
+}
+
+/// Combine the DB transaction result and the post-recovery funnel-restore
+/// result so neither error is ever swallowed (C-F4 / S-F4, #10162).
+fn merge_commit_and_restore(commit_res: Result<()>, restore_res: Result<()>) -> Result<()> {
+    match (commit_res, restore_res) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(restore_err)) => Err(restore_err),
+        (Err(commit_err), Ok(())) => Err(commit_err),
+        (Err(commit_err), Err(restore_err)) => Err(commit_err.context(format!(
+            "also failed to restore post-recovery attestation funnel: {restore_err:#}"
+        ))),
+    }
 }
 
 /// Execute the guardian recovery rebind by consuming `checked` by value
@@ -607,16 +682,164 @@ pub fn execute_recovery_rebind(
     conn: &Connection,
     checked: RecoveryChecked<'_>,
 ) -> Result<RecoveryOutcome> {
-    execute_recovery_rebind_with_fault(conn, checked, RecoveryFaultPoint::None)
+    #[cfg(test)]
+    {
+        execute_recovery_rebind_with_fault(conn, checked, RecoveryFaultPoint::None)
+    }
+    #[cfg(not(test))]
+    {
+        execute_recovery_rebind_impl(conn, checked)
+    }
 }
 
-/// [`execute_recovery_rebind`] with a fault-injection hook at each step of the
-/// DB-commit -> anchor-swap -> seal-advance order (R-6).
-///
-/// # Errors
-///
-/// Propagates storage, filesystem, or injected fault errors.
-pub fn execute_recovery_rebind_with_fault(
+struct RecoveryTxParams<'a> {
+    agent_id: &'a str,
+    anchor_dir: &'a Path,
+    k_new_signing: &'a SigningKey,
+    successor_pubkey_canonical: &'a str,
+    ts_rfc: &'a str,
+    record: &'a LineageRecord,
+    quorum_blob: &'a [u8],
+}
+
+#[cfg(not(test))]
+fn execute_recovery_rebind_impl(
+    conn: &Connection,
+    checked: RecoveryChecked<'_>,
+) -> Result<RecoveryOutcome> {
+    let RecoveryChecked {
+        agent_id,
+        anchor_dir,
+        k_old_pub_bytes,
+        k_new_signing,
+        successor_pubkey_canonical,
+        staged_key_label,
+        ts_secs,
+        ts_rfc,
+        mode,
+    } = checked;
+
+    let (record, resumed_from_committed_db) = match mode {
+        RecoveryMode::ResumeAnchor { record } => (record, true),
+        RecoveryMode::Full {
+            record,
+            quorum_blob,
+        } => {
+            let tx_params = RecoveryTxParams {
+                agent_id,
+                anchor_dir,
+                k_new_signing,
+                successor_pubkey_canonical: &successor_pubkey_canonical,
+                ts_rfc: &ts_rfc,
+                record: &record,
+                quorum_blob: &quorum_blob,
+            };
+            commit_recovery_tx_with_restore(
+                conn,
+                &tx_params,
+                || Ok(()),
+                restore_post_recovery_funnel,
+            )?;
+            (record, false)
+        }
+    };
+
+    let archived_pub =
+        archive_public_key_idempotent_at(anchor_dir, agent_id, &k_old_pub_bytes, ts_secs)?;
+    if let Some(parent) = archived_pub.parent() {
+        sync_dir(parent)?;
+    }
+    let priv_path = agent_priv_path(anchor_dir, agent_id);
+    atomic_write_in_anchor(anchor_dir, &priv_path, &k_new_signing.to_bytes(), 0o600)?;
+    let new_pub = agent_pub_path(anchor_dir, agent_id);
+    atomic_write_in_anchor(
+        anchor_dir,
+        &new_pub,
+        &k_new_signing.verifying_key().to_bytes(),
+        0o644,
+    )?;
+    cleanup_staged_and_temps(anchor_dir, agent_id, staged_key_label)?;
+    advance_seal_after_recovery(conn, anchor_dir)?;
+
+    Ok(RecoveryOutcome {
+        record,
+        archived_pub,
+        new_pub,
+        ts_secs,
+        ts_rfc,
+        resumed_from_committed_db,
+    })
+}
+
+fn commit_recovery_tx_with_restore(
+    conn: &Connection,
+    tx_params: &RecoveryTxParams<'_>,
+    before_commit_hook: impl FnOnce() -> Result<()>,
+    restore_fn: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
+    let RecoveryTxParams {
+        agent_id,
+        anchor_dir,
+        k_new_signing,
+        successor_pubkey_canonical,
+        ts_rfc,
+        record,
+        quorum_blob,
+    } = *tx_params;
+    // Step 1 (R-5, R-9): single IMMEDIATE SQLite transaction covering:
+    //   (a) arm_for_recovery_in_tx (verifies anchor vs lineage + signs unsigned cutovers + registers FixedAt K_new @ ts_rfc),
+    //   (b) insert_agent_lineage_row (agent_lineage),
+    //   (c) bind_agent_pubkey_no_tx_at (agent_pubkey_history append + _agents UPDATE -> fires row_attestations trigger under K_new @ ts_rfc),
+    //   (d) signed_events witness append.
+    let record_bytes = record.canonical_bytes()?;
+    let witness_hash = record.witness_payload_hash()?;
+    let write_txn = WriteTxn::begin(conn).context("execute_recovery_rebind: begin single tx")?;
+    let tx_res = (|| -> Result<()> {
+        arm_for_recovery_in_tx(conn, agent_id, k_new_signing, anchor_dir, ts_rfc)?;
+        insert_agent_lineage_row(conn, record, quorum_blob, &record_bytes, ts_rfc)
+            .context("execute_recovery_rebind: insert agent_lineage")?;
+
+        let proof = PossessionProof::from_verified_guardian_recovery(
+            agent_id,
+            &record.predecessor_pubkey_b64,
+            &record.successor_pubkey_b64,
+        )?;
+        bind_agent_pubkey_no_tx_at(conn, agent_id, successor_pubkey_canonical, &proof, ts_rfc)?;
+
+        let witness = crate::signed_events::SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            event_type: lineage_witness_event_type(record.reason).to_string(),
+            payload_hash: witness_hash,
+            signature: Some(quorum_blob.to_vec()),
+            attest_level: crate::models::AttestLevel::LineageSigned
+                .as_str()
+                .to_string(),
+            timestamp: ts_rfc.to_string(),
+            ..crate::signed_events::SignedEvent::default()
+        };
+        let anchor = crate::signed_events::append_signed_event_no_tx(conn, &witness)
+            .context("execute_recovery_rebind: witness append")?;
+        escalation_deferral::defer_audit_anchor(conn, anchor);
+        before_commit_hook()?;
+        Ok(())
+    })();
+
+    let commit_res = match tx_res {
+        Ok(()) => write_txn
+            .commit()
+            .context("execute_recovery_rebind: commit single tx"),
+        Err(e) => {
+            write_txn.rollback();
+            Err(e)
+        }
+    };
+    let restore_res = restore_fn(conn);
+    merge_commit_and_restore(commit_res, restore_res)
+}
+
+#[cfg(test)]
+fn execute_recovery_rebind_with_fault(
     conn: &Connection,
     checked: RecoveryChecked<'_>,
     fault: RecoveryFaultPoint,
@@ -639,96 +862,28 @@ pub fn execute_recovery_rebind_with_fault(
             record,
             quorum_blob,
         } => {
-            // Step 1 (R-5, R-9): single IMMEDIATE SQLite transaction covering:
-            //   (a) arm_for_recovery_in_tx (signs unsigned cutovers if never armed + registers FixedAt K_new @ ts_rfc),
-            //   (b) INSERT INTO agent_lineage,
-            //   (c) bind_agent_pubkey_no_tx_at (agent_pubkey_history append + _agents UPDATE -> fires row_attestations trigger under K_new @ ts_rfc),
-            //   (d) signed_events witness append.
-            let record_bytes = record.canonical_bytes()?;
-            let witness_hash = record.witness_payload_hash()?;
-            let write_txn =
-                WriteTxn::begin(conn).context("execute_recovery_rebind: begin single tx")?;
-            let tx_res = (|| -> Result<()> {
-                arm_for_recovery_in_tx(conn, agent_id, k_new_signing, anchor_dir, &ts_rfc)?;
-                conn.execute(
-                    "INSERT INTO agent_lineage \
-                        (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
-                         recovery_pubkey, not_before, prev_record_hash, signature, \
-                         record_bytes, created_at, custody_class, suspected_compromise_from_seq, \
-                         guardian_set_id, recovery_threshold) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                    params![
-                        record.agent_id,
-                        i64::try_from(record.epoch).context("lineage epoch exceeds i64")?,
-                        record.reason.as_str(),
-                        record.predecessor_pubkey_b64,
-                        record.successor_pubkey_b64,
-                        record.recovery_pubkey_b64,
-                        record.not_before,
-                        record.prev_record_hash,
-                        quorum_blob,
-                        record_bytes,
-                        ts_rfc,
-                        record.custody_class.as_str(),
-                        record
-                            .suspected_compromise_from_seq
-                            .map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
-                        record.guardian_set_id.as_deref(),
-                        record
-                            .recovery_threshold
-                            .map(|m| i64::try_from(m).unwrap_or(i64::MAX)),
-                    ],
-                )
-                .context("execute_recovery_rebind: insert agent_lineage")?;
-
-                let proof = PossessionProof::from_verified_guardian_recovery(
-                    agent_id,
-                    &record.predecessor_pubkey_b64,
-                    &record.successor_pubkey_b64,
-                )?;
-                bind_agent_pubkey_no_tx_at(
-                    conn,
-                    agent_id,
-                    &successor_pubkey_canonical,
-                    &proof,
-                    &ts_rfc,
-                )?;
-
-                let witness = crate::signed_events::SignedEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    agent_id: agent_id.to_string(),
-                    event_type: lineage_witness_event_type(record.reason).to_string(),
-                    payload_hash: witness_hash,
-                    signature: Some(quorum_blob.clone()),
-                    attest_level: crate::models::AttestLevel::LineageSigned
-                        .as_str()
-                        .to_string(),
-                    timestamp: ts_rfc.clone(),
-                    ..crate::signed_events::SignedEvent::default()
-                };
-                let anchor = crate::signed_events::append_signed_event_no_tx(conn, &witness)
-                    .context("execute_recovery_rebind: witness append")?;
-                escalation_deferral::defer_audit_anchor(conn, anchor);
-
+            let tx_params = RecoveryTxParams {
+                agent_id,
+                anchor_dir,
+                k_new_signing,
+                successor_pubkey_canonical: &successor_pubkey_canonical,
+                ts_rfc: &ts_rfc,
+                record: &record,
+                quorum_blob: &quorum_blob,
+            };
+            let before_commit = || -> Result<()> {
                 if fault == RecoveryFaultPoint::BeforeDbCommit {
                     bail!("injected fault: BeforeDbCommit");
                 }
                 Ok(())
-            })();
-
-            let commit_res = match tx_res {
-                Ok(()) => write_txn
-                    .commit()
-                    .context("execute_recovery_rebind: commit single tx"),
-                Err(e) => {
-                    write_txn.rollback();
-                    Err(e)
-                }
             };
-            // Always restore the normal funnel so `conn` never keeps a frozen
-            // recovery timestamp trigger on subsequent writes.
-            let _ = restore_post_recovery_funnel(conn);
-            commit_res?;
+            let restore = |c: &Connection| -> Result<()> {
+                if fault == RecoveryFaultPoint::RestoreFunnelFailure {
+                    bail!("injected fault: RestoreFunnelFailure");
+                }
+                restore_post_recovery_funnel(c)
+            };
+            commit_recovery_tx_with_restore(conn, &tx_params, before_commit, restore)?;
             (record, false)
         }
     };
@@ -737,21 +892,21 @@ pub fn execute_recovery_rebind_with_fault(
         bail!("injected fault: AfterDbCommitBeforeArchive");
     }
 
-    // Step 2a (R-6, R-9): archive retired K_old to `<agent>.pub.<ts_secs>`.
-    let archived_pub = archive_k_old_idempotent(anchor_dir, agent_id, &k_old_pub_bytes, ts_secs)?;
+    let archived_pub =
+        archive_public_key_idempotent_at(anchor_dir, agent_id, &k_old_pub_bytes, ts_secs)?;
+    if let Some(parent) = archived_pub.parent() {
+        sync_dir(parent)?;
+    }
     if fault == RecoveryFaultPoint::AfterArchiveBeforePrivInstall {
         bail!("injected fault: AfterArchiveBeforePrivInstall");
     }
 
-    // Step 2b (R-6, R-14): install `K_new.priv` at `<agent>.priv` (mode 0600,
-    // staged + fsynced + renamed strictly inside `anchor_dir`).
     let priv_path = agent_priv_path(anchor_dir, agent_id);
     atomic_write_in_anchor(anchor_dir, &priv_path, &k_new_signing.to_bytes(), 0o600)?;
     if fault == RecoveryFaultPoint::AfterPrivInstallBeforePubInstall {
         bail!("injected fault: AfterPrivInstallBeforePubInstall");
     }
 
-    // Step 2c (R-6, R-9): install `K_new.pub` at `<agent>.pub` (mode 0644).
     let new_pub = agent_pub_path(anchor_dir, agent_id);
     atomic_write_in_anchor(
         anchor_dir,
@@ -763,13 +918,11 @@ pub fn execute_recovery_rebind_with_fault(
         bail!("injected fault: AfterPubInstallBeforeStagedCleanup");
     }
 
-    // Step 2d: remove staged sibling keypair so TrustAnchor has zero duplicate key_id.
     cleanup_staged_and_temps(anchor_dir, agent_id, staged_key_label)?;
     if fault == RecoveryFaultPoint::AfterPubInstallBeforeSealAdvance {
         bail!("injected fault: AfterPubInstallBeforeSealAdvance");
     }
 
-    // Step 3 (R-10): advance the anchored seal to the committed DB marks.
     advance_seal_after_recovery(conn, anchor_dir)?;
 
     Ok(RecoveryOutcome {
@@ -780,6 +933,50 @@ pub fn execute_recovery_rebind_with_fault(
         ts_rfc,
         resumed_from_committed_db,
     })
+}
+
+/// R-7 / #10159: verify that `anchor`'s current and retired keys for `agent_id`
+/// are backed exclusively by `verified: &VerifiedLineage` (built only by the
+/// chain verifier).
+///
+/// # Errors
+///
+/// Returns [`REFUSE_ANCHOR_UNATTESTED_KEY_SWAP`] if `anchor`'s current key
+/// disagrees with `verified.head_key` or if any retired key in `anchor` for
+/// `agent_id` does not appear in `verified`.
+pub fn verify_anchor_against_verified_lineage(
+    anchor: &TrustAnchor,
+    agent_id: &str,
+    verified: &VerifiedLineage,
+) -> Result<()> {
+    let expected_key_id = key_id_of(&verified.head_key);
+    let mut current_anchor_keys = Vec::new();
+    let mut retired_anchor_keys = Vec::new();
+    for (aid, kid, retired) in anchor.fingerprints() {
+        if aid != agent_id {
+            continue;
+        }
+        if retired {
+            retired_anchor_keys.push(kid);
+        } else {
+            current_anchor_keys.push(kid);
+        }
+    }
+    if current_anchor_keys.as_slice() != [expected_key_id.clone()] {
+        bail!(
+            "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: anchor current key {current_anchor_keys:?} \
+             does not match verified lineage head {expected_key_id} for '{agent_id}'"
+        );
+    }
+    for retired_kid in retired_anchor_keys {
+        if !verified.contains_key_id(&retired_kid) {
+            bail!(
+                "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: anchor retired key {retired_kid} \
+                 is not in verified lineage for '{agent_id}'"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// R-7: verify that the current (unretired) key for `agent_id` in `anchor` is
@@ -797,24 +994,545 @@ pub fn verify_anchor_against_lineage(
     anchor: &TrustAnchor,
     agent_id: &str,
 ) -> Result<()> {
-    let Some(_) = lineage_head(conn, agent_id)? else {
+    if read_lineage(conn, agent_id)?.is_empty() {
         bail!("{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: no lineage enrolled for '{agent_id}'");
-    };
+    }
     let verified = verify_agent_lineage(conn, agent_id)?.map_err(|e| {
         anyhow::anyhow!("{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: lineage verification failed: {e}")
     })?;
-    let expected_key_id = super::row_attest::key_id_of(&verified.head_key);
-    let current_anchor_keys: Vec<String> = anchor
-        .fingerprints()
-        .into_iter()
-        .filter(|(a, _, retired)| a == agent_id && !retired)
-        .map(|(_, kid, _)| kid)
-        .collect();
-    if current_anchor_keys.as_slice() != [expected_key_id.as_str()] {
-        bail!(
-            "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: anchor current key {current_anchor_keys:?} \
-             does not match quorum-verified lineage head {expected_key_id} for '{agent_id}'"
-        );
+    verify_anchor_against_verified_lineage(anchor, agent_id, &verified)
+}
+
+/// R-7 / #10160: production store-wide anchor-vs-lineage check returning every
+/// defect (used by `row_attest::sqlite::verify_inner` so `verify_sqlite`,
+/// `verify_sqlite_with`, `audit verify-rows`, and doctor fail closed on any
+/// bare anchor swap, whether or not `agent_lineage` was enrolled).
+pub(crate) fn verify_anchor_against_lineage_for_store_defects(
+    conn: &Connection,
+    anchor: &TrustAnchor,
+) -> Result<Vec<String>> {
+    let mut by_agent: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    for (aid, kid, retired) in anchor.fingerprints() {
+        let entry = by_agent.entry(aid).or_default();
+        if retired {
+            entry.1.push(kid);
+        } else {
+            entry.0.push(kid);
+        }
+    }
+    let mut defects = Vec::new();
+    for (agent_id, (current_keys, retired_keys)) in by_agent {
+        if !read_lineage(conn, &agent_id)?.is_empty() {
+            match verify_agent_lineage(conn, &agent_id)? {
+                Ok(verified) => {
+                    if let Err(err) =
+                        verify_anchor_against_verified_lineage(anchor, &agent_id, &verified)
+                    {
+                        defects.push(format!("{err:#}"));
+                    }
+                }
+                Err(err) => {
+                    defects.push(format!(
+                        "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: lineage verification failed for '{agent_id}': {err}"
+                    ));
+                }
+            }
+            continue;
+        }
+        // Agent has zero enrolled `agent_lineage` rows.
+        // Any retired archive `<agent>.pub.<ts>` in the anchor without a
+        // lineage record is a bare key swap (refused fail-closed).
+        if !retired_keys.is_empty() {
+            defects.push(format!(
+                "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: anchor holds retired key(s) {retired_keys:?} \
+                 for '{agent_id}' with no enrolled lineage"
+            ));
+            continue;
+        }
+        // If the agent is bound in `_agents`, the sole current anchor key must
+        // match the bound key (catches in-place `<agent>.pub` overwrite).
+        if let Some(bound_b64) = agent_pubkey(conn, &agent_id)? {
+            match decode_public_base64(&bound_b64) {
+                Ok(bound_vk) => {
+                    let bound_kid = key_id_of(&bound_vk);
+                    if current_keys.as_slice() != [bound_kid.clone()] {
+                        defects.push(format!(
+                            "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: anchor current key {current_keys:?} \
+                             disagrees with bound key {bound_kid} for '{agent_id}'"
+                        ));
+                    }
+                }
+                Err(err) => {
+                    defects.push(format!(
+                        "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: bound key for '{agent_id}' is undecodable: {err:#}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(defects)
+}
+
+/// R-7 / #10160: fail-closed wrapper of [`verify_anchor_against_lineage_for_store_defects`]
+/// for production arming entry points (`arm`, `arm_with_key`, `arm_for_recovery_in_tx`).
+pub(crate) fn verify_anchor_against_lineage_for_store(
+    conn: &Connection,
+    anchor: &TrustAnchor,
+) -> Result<()> {
+    let defects = verify_anchor_against_lineage_for_store_defects(conn, anchor)?;
+    if let Some(first) = defects.first() {
+        bail!("{first}");
     }
     Ok(())
+}
+
+/// R-7 + R-12 snapshot verifier: checks that every key that ACTUALLY signed an
+/// attestation in a backup snapshot is backed by the snapshot's verified
+/// lineage (or bound key when no lineage is enrolled), so a pre-recovery backup
+/// whose rows are all signed by archived `K_old` verifies cleanly under the
+/// post-recovery anchor while any snapshot containing rows signed by an
+/// unattested swapped key is refused.
+pub(crate) fn verify_snapshot_signers_against_lineage(
+    conn: &Connection,
+    anchor: &TrustAnchor,
+    attestations: &[Attestation],
+) -> Result<Vec<String>> {
+    let mut signed_keys_by_agent: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for att in attestations {
+        if att.signature.is_some() && !att.agent_id.is_empty() && !att.key_id.is_empty() {
+            signed_keys_by_agent
+                .entry(att.agent_id.as_str())
+                .or_default()
+                .insert(att.key_id.as_str());
+        }
+    }
+    let anchor_keys: BTreeSet<(String, String)> = anchor
+        .fingerprints()
+        .into_iter()
+        .map(|(aid, kid, _)| (aid, kid))
+        .collect();
+    let mut defects = Vec::new();
+    for (agent_id, key_ids) in signed_keys_by_agent {
+        if !read_lineage(conn, agent_id)?.is_empty() {
+            match verify_agent_lineage(conn, agent_id)? {
+                Ok(verified) => {
+                    for kid in key_ids {
+                        if !verified.contains_key_id(kid)
+                            || !anchor_keys.contains(&(agent_id.to_string(), kid.to_string()))
+                        {
+                            defects.push(format!(
+                                "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: snapshot signer {kid} \
+                                 for '{agent_id}' is not in verified lineage"
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    defects.push(format!(
+                        "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: snapshot lineage verification failed for '{agent_id}': {err}"
+                    ));
+                }
+            }
+        } else if let Some(bound_b64) = agent_pubkey(conn, agent_id)? {
+            match decode_public_base64(&bound_b64) {
+                Ok(bound_vk) => {
+                    let bound_kid = key_id_of(&bound_vk);
+                    for kid in key_ids {
+                        if kid != bound_kid {
+                            defects.push(format!(
+                                "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: snapshot signer {kid} \
+                                 disagrees with bound key {bound_kid} for '{agent_id}'"
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    defects.push(format!(
+                        "{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: snapshot bound key for '{agent_id}' is undecodable: {err:#}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(defects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::identity::keypair::{self, AgentKeypair};
+    use crate::identity::lineage::{RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV};
+    use crate::models::Memory;
+    use crate::storage::row_attest::Outcome;
+    use crate::storage::row_attest::sqlite::{arm_with_key, verify_sqlite_with};
+    use ed25519_dalek::Signer as _;
+    use tempfile::TempDir;
+
+    struct UnitEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl UnitEnvGuard {
+        fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let lock = crate::identity::keypair::key_dir_env_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut saved = Vec::with_capacity(pairs.len());
+            for &(k, v) in pairs {
+                saved.push((k, std::env::var_os(k)));
+                // SAFETY: serialized by crate-wide `key_dir_env_lock` held in `_lock`.
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for UnitEnvGuard {
+        fn drop(&mut self) {
+            for (k, prev) in self.saved.iter().rev() {
+                // SAFETY: serialized by crate-wide `key_dir_env_lock` held until drop.
+                unsafe {
+                    match prev {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    fn private_dir() -> TempDir {
+        let mut b = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            b.permissions(fs::Permissions::from_mode(0o700));
+        }
+        b.tempdir().expect("create 0700 tempdir")
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(base: &Path, cur: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(cur).expect("read_dir") {
+                let entry = entry.expect("dir entry");
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else if p.is_file() {
+                    let rel = p.strip_prefix(base).expect("strip_prefix").to_path_buf();
+                    out.insert(rel, fs::read(&p).expect("read file"));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        if root.exists() {
+            walk(root, root, &mut out);
+        }
+        out
+    }
+
+    struct FaultFixture {
+        _root: TempDir,
+        db_path: PathBuf,
+        anchor_dir: PathBuf,
+        agent: String,
+        guardians: [AgentKeypair; 3],
+        _env: UnitEnvGuard,
+    }
+
+    impl FaultFixture {
+        fn new(agent: &str) -> Self {
+            let root = private_dir();
+            let anchor_dir = root.path().join("keys");
+            let witness_dir = root.path().join("witness");
+            let home_dir = root.path().join("home");
+            for d in [&anchor_dir, &witness_dir, &home_dir] {
+                fs::create_dir_all(d).expect("mkdir");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(d, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+                }
+            }
+            let db_path = root.path().join("store.db");
+            let g0 = keypair::generate("g0").expect("g0");
+            let g1 = keypair::generate("g1").expect("g1");
+            let g2 = keypair::generate("g2").expect("g2");
+            let gpubs = format!(
+                "{},{},{}",
+                g0.public_base64(),
+                g1.public_base64(),
+                g2.public_base64()
+            );
+            let anchor_s = anchor_dir.to_string_lossy().into_owned();
+            let witness_s = witness_dir.to_string_lossy().into_owned();
+            let home_s = home_dir.to_string_lossy().into_owned();
+            let env = UnitEnvGuard::apply(&[
+                ("HOME", Some(&home_s)),
+                ("AI_MEMORY_NO_CONFIG", Some("1")),
+                ("AI_MEMORY_KEY_DIR", Some(&anchor_s)),
+                ("AI_MEMORY_WITNESS_KEY_DIR", Some(&witness_s)),
+                (RECOVERY_GUARDIAN_PUBKEYS_ENV, Some(&gpubs)),
+                (RECOVERY_THRESHOLD_ENV, Some("2")),
+                ("AI_MEMORY_STORE_URL", None),
+            ]);
+            let k_old = keypair::generate(agent).expect("k_old");
+            keypair::save(&k_old, &anchor_dir).expect("save k_old");
+            let cold = keypair::generate("cold").expect("cold");
+            let conn = db::open(&db_path).expect("open");
+            db::register_agent(&conn, agent, "ai:test", &[]).expect("register");
+            db::enroll_lineage(&conn, agent, &k_old, Some(&cold.public_base64())).expect("enroll");
+            arm_with_key(&conn, agent, k_old.private.as_ref().expect("priv")).expect("arm");
+            let mem = Memory {
+                namespace: "recovery-fault".to_string(),
+                title: "pre-loss".to_string(),
+                content: "pre-loss attested".to_string(),
+                ..Memory::default()
+            };
+            db::insert(&conn, &mem).expect("insert");
+            drop(conn);
+            fs::remove_file(anchor_dir.join(format!("{agent}.priv"))).expect("lose k_old.priv");
+            Self {
+                _root: root,
+                db_path,
+                anchor_dir,
+                agent: agent.to_string(),
+                guardians: [g0, g1, g2],
+                _env: env,
+            }
+        }
+
+        fn prepare_and_sign(&self, k_new: &AgentKeypair) -> (String, Vec<RecoveryAttestation>) {
+            let conn = db::open(&self.db_path).expect("open");
+            let nb = Utc::now().to_rfc3339();
+            let (rec, input) = db::prepare_recovery_challenge(
+                &conn,
+                &self.agent,
+                &k_new.public_base64(),
+                None,
+                None,
+                &nb,
+            )
+            .expect("prepare");
+            let atts = [0, 1]
+                .into_iter()
+                .map(|i| RecoveryAttestation {
+                    guardian_pubkey_b64: self.guardians[i].public_base64(),
+                    signature: self.guardians[i]
+                        .private
+                        .as_ref()
+                        .expect("g priv")
+                        .sign(&input)
+                        .to_bytes()
+                        .to_vec(),
+                })
+                .collect();
+            (rec.not_before, atts)
+        }
+
+        fn verify_clean(&self) {
+            let conn = db::open(&self.db_path).expect("open");
+            let anchor = TrustAnchor::load_dir(&self.anchor_dir);
+            let rep = verify_sqlite_with(&conn, &anchor).expect("verify");
+            assert!(
+                matches!(rep.outcome(), Outcome::Clean),
+                "expected Clean, got: {:?}",
+                rep.outcome()
+            );
+        }
+    }
+
+    /// R-5 (moved into `#[cfg(test)]` per C-F13 / S-F3 #10161): failure inside
+    /// the single SQLite transaction rolls back ALL FOUR tables and leaves the
+    /// anchor directory untouched.
+    #[test]
+    fn r5_single_tx_rollback_on_before_db_commit_fault_10112() {
+        let fx = FaultFixture::new("unit-r5-agent");
+        let k_new = keypair::generate("unit-r5-new").expect("k_new");
+        let (nb, atts) = fx.prepare_and_sign(&k_new);
+        let conn = db::open(&fx.db_path).expect("open");
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect("count") };
+        let lin_before = count("SELECT COUNT(*) FROM agent_lineage");
+        let hist_before = count("SELECT COUNT(*) FROM agent_pubkey_history");
+        let att_before = count("SELECT COUNT(*) FROM row_attestations");
+        let pub_before = db::agent_pubkey(&conn, &fx.agent)
+            .expect("pub")
+            .expect("set");
+        let dir_before = snapshot_tree(&fx.anchor_dir);
+
+        let req = RecoveryRequest {
+            agent_id: &fx.agent,
+            successor_pubkey_b64: &k_new.public_base64(),
+            quorum: &atts,
+            suspected_compromise_from_seq: None,
+            recovery_pubkey_b64: None,
+            not_before: &nb,
+            staged_key_label: None,
+        };
+        let checked = recovery_preconditions(
+            &conn,
+            &fx.anchor_dir,
+            &req,
+            RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+        )
+        .expect("preconditions");
+        let err =
+            execute_recovery_rebind_with_fault(&conn, checked, RecoveryFaultPoint::BeforeDbCommit)
+                .expect_err("BeforeDbCommit must abort");
+        assert_eq!(format!("{err:#}"), "injected fault: BeforeDbCommit");
+
+        assert_eq!(count("SELECT COUNT(*) FROM agent_lineage"), lin_before);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM agent_pubkey_history"),
+            hist_before
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM row_attestations"), att_before);
+        assert_eq!(
+            db::agent_pubkey(&conn, &fx.agent)
+                .expect("pub")
+                .expect("set"),
+            pub_before
+        );
+        assert_eq!(snapshot_tree(&fx.anchor_dir), dir_before);
+        drop(conn);
+        fx.verify_clean();
+    }
+
+    /// R-6 (moved into `#[cfg(test)]` per C-F13 / S-F3 #10161): fault injection
+    /// at every post-commit step converges cleanly on idempotent re-run, and a
+    /// third run refuses as exact `REFUSE_RECOVERY_REPLAY`.
+    #[test]
+    fn r6_fault_injection_every_step_converges_cleanly_on_rerun_10112() {
+        let points = [
+            (
+                "after_db_commit",
+                RecoveryFaultPoint::AfterDbCommitBeforeArchive,
+            ),
+            (
+                "after_archive",
+                RecoveryFaultPoint::AfterArchiveBeforePrivInstall,
+            ),
+            (
+                "after_priv",
+                RecoveryFaultPoint::AfterPrivInstallBeforePubInstall,
+            ),
+            (
+                "after_pub_before_cleanup",
+                RecoveryFaultPoint::AfterPubInstallBeforeStagedCleanup,
+            ),
+            (
+                "after_pub_before_seal",
+                RecoveryFaultPoint::AfterPubInstallBeforeSealAdvance,
+            ),
+        ];
+        for (label, fault) in points {
+            let agent = format!("unit-r6-{label}");
+            let fx = FaultFixture::new(&agent);
+            let staged_label = format!("{agent}-staged");
+            let k_new = keypair::generate(&staged_label).expect("k_new");
+            keypair::save(&k_new, &fx.anchor_dir).expect("stage");
+            let (nb, atts) = fx.prepare_and_sign(&k_new);
+            let req = RecoveryRequest {
+                agent_id: &fx.agent,
+                successor_pubkey_b64: &k_new.public_base64(),
+                quorum: &atts,
+                suspected_compromise_from_seq: None,
+                recovery_pubkey_b64: None,
+                not_before: &nb,
+                staged_key_label: Some(&staged_label),
+            };
+            {
+                let conn = db::open(&fx.db_path).expect("open");
+                let checked = recovery_preconditions(
+                    &conn,
+                    &fx.anchor_dir,
+                    &req,
+                    RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+                )
+                .expect("preconditions 1");
+                let err = execute_recovery_rebind_with_fault(&conn, checked, fault)
+                    .expect_err("fault must fail");
+                assert!(
+                    format!("{err:#}").starts_with("injected fault: "),
+                    "{err:#}"
+                );
+            }
+            {
+                let conn = db::open(&fx.db_path).expect("open resume");
+                let checked = recovery_preconditions(
+                    &conn,
+                    &fx.anchor_dir,
+                    &req,
+                    RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+                )
+                .unwrap_or_else(|e| panic!("{label}: resume preconditions failed: {e:#}"));
+                let outcome = execute_recovery_rebind(&conn, checked)
+                    .unwrap_or_else(|e| panic!("{label}: resume execute failed: {e:#}"));
+                assert!(outcome.resumed_from_committed_db);
+            }
+            fx.verify_clean();
+            {
+                let conn = db::open(&fx.db_path).expect("open replay");
+                let err = recovery_preconditions(
+                    &conn,
+                    &fx.anchor_dir,
+                    &req,
+                    RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+                )
+                .err()
+                .expect("replay after convergence must refuse");
+                assert_eq!(format!("{err:#}"), REFUSE_RECOVERY_REPLAY);
+            }
+        }
+    }
+
+    /// C-F4 / S-F4 (#10162): error returned by `restore_post_recovery_funnel`
+    /// is propagated (never silently discarded with `let _ =`).
+    #[test]
+    fn cf4_sf4_restore_post_recovery_funnel_error_propagates_10162() {
+        let fx = FaultFixture::new("unit-cf4-agent");
+        let k_new = keypair::generate("unit-cf4-new").expect("k_new");
+        let (nb, atts) = fx.prepare_and_sign(&k_new);
+        let conn = db::open(&fx.db_path).expect("open");
+        let req = RecoveryRequest {
+            agent_id: &fx.agent,
+            successor_pubkey_b64: &k_new.public_base64(),
+            quorum: &atts,
+            suspected_compromise_from_seq: None,
+            recovery_pubkey_b64: None,
+            not_before: &nb,
+            staged_key_label: None,
+        };
+        let checked = recovery_preconditions(
+            &conn,
+            &fx.anchor_dir,
+            &req,
+            RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+        )
+        .expect("preconditions");
+        let err = execute_recovery_rebind_with_fault(
+            &conn,
+            checked,
+            RecoveryFaultPoint::RestoreFunnelFailure,
+        )
+        .expect_err("restore_post_recovery_funnel error must propagate");
+        assert_eq!(format!("{err:#}"), "injected fault: RestoreFunnelFailure");
+
+        // Also pin `merge_commit_and_restore` when BOTH commit and restore fail.
+        let both = merge_commit_and_restore(
+            Err(anyhow::anyhow!("commit failed")),
+            Err(anyhow::anyhow!("restore failed")),
+        )
+        .expect_err("both errors must surface");
+        let msg = format!("{both:#}");
+        assert!(msg.contains("commit failed"), "{msg}");
+        assert!(msg.contains("restore failed"), "{msg}");
+    }
 }

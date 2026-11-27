@@ -1754,6 +1754,63 @@ fn archive_public_key_at(dir: &Path, agent_id: &str, pub_bytes: &[u8], ts: i64) 
     )
 }
 
+/// #10112 (C-F5 / R-6) — find an existing `#3146` archive for `(agent_id, ts)`
+/// under `dir` whose exact bytes match `pub_bytes` (searching the same
+/// `0..=ARCHIVE_SUFFIX_ATTEMPTS` window as [`archive_public_key_at`]).
+///
+/// # Errors
+///
+/// Propagates any unexpected I/O failure (other than `NotFound`).
+pub(crate) fn find_existing_archived_public_key_at(
+    dir: &Path,
+    agent_id: &str,
+    pub_bytes: &[u8],
+    ts: i64,
+) -> Result<Option<PathBuf>> {
+    for attempt in 0..=ARCHIVE_SUFFIX_ATTEMPTS {
+        let candidate = if attempt == 0 {
+            dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts}"))
+        } else {
+            dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts}-{attempt}"))
+        };
+        match fs::read(&candidate) {
+            Ok(bytes) if bytes == pub_bytes => return Ok(Some(candidate)),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow!(e)).with_context(|| {
+                    format!(
+                        "reading archived public key candidate {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// #10112 (C-F5 / R-6) — idempotent wrapper around [`archive_public_key_at`]:
+/// returns an existing archive for `(agent_id, ts)` when its bytes already
+/// match `pub_bytes`, otherwise delegates to the single `#3146`
+/// `create_new_with_mode` no-overwrite helper (zero exists-then-rename window).
+///
+/// # Errors
+///
+/// Propagates [`find_existing_archived_public_key_at`] or
+/// [`archive_public_key_at`] failures.
+pub(crate) fn archive_public_key_idempotent_at(
+    dir: &Path,
+    agent_id: &str,
+    pub_bytes: &[u8],
+    ts: i64,
+) -> Result<PathBuf> {
+    if let Some(existing) = find_existing_archived_public_key_at(dir, agent_id, pub_bytes, ts)? {
+        return Ok(existing);
+    }
+    archive_public_key_at(dir, agent_id, pub_bytes, ts)
+}
+
 #[cfg(not(unix))]
 pub fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
     // Non-Unix: mode bits don't apply. The file inherits the parent

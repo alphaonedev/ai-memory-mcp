@@ -9,6 +9,8 @@
 //! `AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS`, and `AI_MEMORY_RECOVERY_THRESHOLD`
 //! stay strictly isolated from parallel library unit tests and live host state.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,69 +28,29 @@ use ai_memory::models::Memory;
 use ai_memory::portability::emit::build_full_envelope_audited;
 use ai_memory::portability::import::{ImportOptions, import_full_envelope};
 use ai_memory::storage::recovery_rebind::{
-    RecoveryArm, RecoveryFaultPoint, RecoveryRequest, execute_recovery_rebind,
-    execute_recovery_rebind_with_fault, recovery_preconditions, verify_anchor_against_lineage,
+    RecoveryArm, RecoveryRequest, execute_recovery_rebind, recovery_preconditions,
+    verify_anchor_against_lineage,
 };
-use ai_memory::storage::row_attest::Outcome;
 use ai_memory::storage::row_attest::anchor::{AnchorLoad, KeyRefusal, TrustAnchor};
-use ai_memory::storage::row_attest::key_id_of;
 use ai_memory::storage::row_attest::seal::{self, SealState};
 use ai_memory::storage::row_attest::sqlite::{
-    REFUSE_ANCHOR_UNATTESTED_KEY_SWAP, REFUSE_KEY_MISMATCH, REFUSE_RECOVERY_KEY_MISMATCH,
-    REFUSE_RECOVERY_MISSING_PRIV, REFUSE_RECOVERY_QUORUM_DRIFT, REFUSE_RECOVERY_REPLAY,
-    REFUSE_RECOVERY_VERIFY_ONLY, SnapshotVerdict, arm_with_key, check_snapshot, seal_restored,
-    verify_sqlite_with,
+    REFUSE_ANCHOR_UNATTESTED_KEY_SWAP, REFUSE_DIRECT_RECOVERY_ON_ARMED_STORE, REFUSE_KEY_MISMATCH,
+    REFUSE_RECOVERY_KEY_MISMATCH, REFUSE_RECOVERY_MISSING_PRIV, REFUSE_RECOVERY_QUORUM_DRIFT,
+    REFUSE_RECOVERY_REPLAY, REFUSE_RECOVERY_VERIFY_ONLY, SnapshotVerdict, arm_with_key,
+    check_snapshot, read_attestations, seal_restored, verify_sqlite_with,
 };
+use ai_memory::storage::row_attest::{
+    DOMAIN_TAG, FORMAT_VERSION, Outcome, attestation_digest, key_id_of, preimage, spec_for,
+};
+#[cfg(feature = "sal")]
+use ai_memory::store::sqlite::SqliteStore;
+#[cfg(feature = "sal")]
+use ai_memory::store::{CallerContext, MemoryStore};
 use base64::Engine as _;
-use ed25519_dalek::Signer as _;
+use common::MultiEnvVarGuard;
+use ed25519_dalek::{Signature, Signer as _};
 use rusqlite::Connection;
 use tempfile::TempDir;
-
-/// Serializes every test in this binary that mutates process env vars.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct EnvRestore {
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-impl EnvRestore {
-    fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
-        let guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut saved = Vec::with_capacity(pairs.len());
-        for &(k, v) in pairs {
-            saved.push((k, std::env::var_os(k)));
-            // SAFETY: serialized by ENV_LOCK inside this dedicated integration
-            // test binary (never linked into the library unit-test binary).
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        Self {
-            saved,
-            _guard: guard,
-        }
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        for (k, prev) in self.saved.iter().rev() {
-            // SAFETY: serialized by ENV_LOCK held until self drops.
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
-}
 
 fn private_dir() -> TempDir {
     let mut b = tempfile::Builder::new();
@@ -130,7 +92,7 @@ struct RecoveryFixture {
     k_old: AgentKeypair,
     guardians: [AgentKeypair; 3],
     pre_mem_id: String,
-    _env: EnvRestore,
+    env: Option<MultiEnvVarGuard>,
 }
 
 impl RecoveryFixture {
@@ -162,7 +124,7 @@ impl RecoveryFixture {
         let anchor_str = anchor_dir.to_string_lossy().into_owned();
         let witness_str = witness_dir.to_string_lossy().into_owned();
         let home_str = home_dir.to_string_lossy().into_owned();
-        let env = EnvRestore::apply(&[
+        let env = MultiEnvVarGuard::apply(&[
             ("HOME", Some(&home_str)),
             ("AI_MEMORY_NO_CONFIG", Some("1")),
             ("AI_MEMORY_KEY_DIR", Some(&anchor_str)),
@@ -213,8 +175,33 @@ impl RecoveryFixture {
             k_old,
             guardians: [g0, g1, g2],
             pre_mem_id,
-            _env: env,
+            env: Some(env),
         }
+    }
+
+    fn set_env_overrides(&mut self, key_dir: Option<&Path>, gpubs: &str, threshold: &str) {
+        self.env.take();
+        let key_dir_s = key_dir.map(|p| p.to_string_lossy().into_owned());
+        let witness_s = self.witness_dir.to_string_lossy().into_owned();
+        let home_s = self.home_dir.to_string_lossy().into_owned();
+        self.env = Some(MultiEnvVarGuard::apply(&[
+            ("HOME", Some(&home_s)),
+            ("AI_MEMORY_NO_CONFIG", Some("1")),
+            ("AI_MEMORY_KEY_DIR", key_dir_s.as_deref()),
+            ("AI_MEMORY_WITNESS_KEY_DIR", Some(&witness_s)),
+            (RECOVERY_GUARDIAN_PUBKEYS_ENV, Some(gpubs)),
+            (RECOVERY_THRESHOLD_ENV, Some(threshold)),
+            ("AI_MEMORY_STORE_URL", None),
+        ]));
+    }
+
+    fn default_gpubs(&self) -> String {
+        format!(
+            "{},{},{}",
+            self.guardians[0].public_base64(),
+            self.guardians[1].public_base64(),
+            self.guardians[2].public_base64()
+        )
     }
 
     fn prepare_and_sign(
@@ -432,7 +419,7 @@ fn r1_guardian_quorum_verified_before_k_new_and_never_substituted_10112() {
 /// prior signed lineage record, NEVER from lowered env/CLI arguments.
 #[test]
 fn r2_second_recovery_pins_quorum_from_prior_signed_lineage_record_10112() {
-    let fx = RecoveryFixture::new("r2-agent");
+    let mut fx = RecoveryFixture::new("r2-agent");
 
     // First recovery: 2-of-3 commits (guardian_set_id, threshold=2) on epoch 1.
     let k1 = keypair::generate("r2-k1").expect("k1");
@@ -463,10 +450,9 @@ fn r2_second_recovery_pins_quorum_from_prior_signed_lineage_record_10112() {
     // second recovery with only 1 signature: MUST BE REFUSED because epoch 1
     // committed recovery_threshold = 2!
     let k2 = keypair::generate("r2-k2").expect("k2");
-    // SAFETY: serialized by ENV_LOCK held inside `fx._env`.
-    unsafe {
-        std::env::set_var(RECOVERY_THRESHOLD_ENV, "1");
-    }
+    let orig_gpubs = fx.default_gpubs();
+    let anchor_dir_clone = fx.anchor_dir.clone();
+    fx.set_env_overrides(Some(&anchor_dir_clone), &orig_gpubs, "1");
     let (nb2, one_att2) = fx.prepare_and_sign(&k2, &[0]);
     {
         let conn = db::open(&fx.db_path).expect("open");
@@ -487,19 +473,16 @@ fn r2_second_recovery_pins_quorum_from_prior_signed_lineage_record_10112() {
         )
         .err()
         .expect("1 signature must be refused when prior recovery committed threshold=2");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("quorum") || msg.contains("threshold") || msg.contains("unverifiable"),
-            "expected committed-threshold refusal, got: {msg}"
+        assert_eq!(
+            format!("{err:#}"),
+            "refusing to persist unverifiable recovery record: recovery record at epoch 2 met only 1 of 2 distinct enrolled recovery guardians"
         );
     }
 
-    // Swap guardian set in env -> MUST BE REFUSED with REFUSE_RECOVERY_QUORUM_DRIFT.
+    // Swap guardian set in env -> MUST BE REFUSED with exact REFUSE_RECOVERY_QUORUM_DRIFT.
     let rogue_g = keypair::generate("rogue-g").expect("rogue");
-    // SAFETY: serialized by ENV_LOCK held inside `fx._env`.
-    unsafe {
-        std::env::set_var(RECOVERY_GUARDIAN_PUBKEYS_ENV, rogue_g.public_base64());
-    }
+    let rogue_pub = rogue_g.public_base64();
+    fx.set_env_overrides(Some(&anchor_dir_clone), &rogue_pub, "1");
     {
         let conn = db::open(&fx.db_path).expect("open");
         let req = RecoveryRequest {
@@ -519,25 +502,43 @@ fn r2_second_recovery_pins_quorum_from_prior_signed_lineage_record_10112() {
         )
         .err()
         .expect("drifted guardian set must be refused");
-        let msg = format!("{err:#}");
+        // Under a swapped guardian set with zero matching enrolled signers,
+        // `verify_agent_lineage_with_policy` fails closed on the existing epoch-1
+        // recovery record before quorum resolution! Verify also the superset
+        // roster case (original guardians + extra rogue guardian) triggers exact
+        // REFUSE_RECOVERY_QUORUM_DRIFT.
         assert!(
-            msg.contains(REFUSE_RECOVERY_QUORUM_DRIFT),
-            "expected REFUSE_RECOVERY_QUORUM_DRIFT, got: {msg}"
+            format!("{err:#}").contains("unverified lineage"),
+            "expected unverified lineage refusal under completely replaced roster, got: {err:#}"
         );
+    }
+    let drifted_superset = format!("{orig_gpubs},{rogue_pub}");
+    fx.set_env_overrides(Some(&anchor_dir_clone), &drifted_superset, "1");
+    {
+        let conn = db::open(&fx.db_path).expect("open");
+        let req = RecoveryRequest {
+            agent_id: &fx.agent,
+            successor_pubkey_b64: &k2.public_base64(),
+            quorum: &one_att2,
+            suspected_compromise_from_seq: None,
+            recovery_pubkey_b64: None,
+            not_before: &nb2,
+            staged_key_label: None,
+        };
+        let err = recovery_preconditions(
+            &conn,
+            &fx.anchor_dir,
+            &req,
+            RecoveryArm::Signing(k2.private.as_ref().expect("k2 priv")),
+        )
+        .err()
+        .expect("drifted superset guardian set must refuse with REFUSE_RECOVERY_QUORUM_DRIFT");
+        assert_eq!(format!("{err:#}"), REFUSE_RECOVERY_QUORUM_DRIFT);
     }
 
     // Restore original guardian set (still with env threshold = 1!) and present
     // 2 valid guardian signatures -> SUCCEEDS using committed threshold=2.
-    let orig_gpubs = format!(
-        "{},{},{}",
-        fx.guardians[0].public_base64(),
-        fx.guardians[1].public_base64(),
-        fx.guardians[2].public_base64()
-    );
-    // SAFETY: serialized by ENV_LOCK held inside `fx._env`.
-    unsafe {
-        std::env::set_var(RECOVERY_GUARDIAN_PUBKEYS_ENV, &orig_gpubs);
-    }
+    fx.set_env_overrides(Some(&anchor_dir_clone), &orig_gpubs, "1");
     let (nb2_ok, two_atts2) = fx.prepare_and_sign(&k2, &[1, 2]);
     {
         let conn = db::open(&fx.db_path).expect("open");
@@ -620,11 +621,7 @@ fn r4_successor_pubkey_mismatch_against_guardians_or_arm_refused_zero_change_101
     )
     .err()
     .expect("mismatch against signing arm's K_new must be refused");
-    let msg_arm = format!("{err_arm:#}");
-    assert!(
-        msg_arm.contains(REFUSE_RECOVERY_KEY_MISMATCH),
-        "expected REFUSE_RECOVERY_KEY_MISMATCH, got: {msg_arm}"
-    );
+    assert_eq!(format!("{err_arm:#}"), REFUSE_RECOVERY_KEY_MISMATCH);
 
     drop(conn);
     assert_eq!(fs::read(&fx.db_path).expect("db after"), db_before);
@@ -659,197 +656,15 @@ fn r4_successor_pubkey_mismatch_against_guardians_or_arm_refused_zero_change_101
             true,
         )
         .expect_err("CLI --successor-key-id pointing to K_wrong must refuse");
-    let msg_cli = format!("{err_cli:#}");
-    assert!(
-        msg_cli.contains(REFUSE_RECOVERY_KEY_MISMATCH),
-        "expected REFUSE_RECOVERY_KEY_MISMATCH from CLI, got: {msg_cli}"
-    );
+    assert_eq!(format!("{err_cli:#}"), REFUSE_RECOVERY_KEY_MISMATCH);
     assert_eq!(fs::read(&fx.db_path).expect("db after cli"), db_before_cli);
     assert_eq!(snapshot_tree(&fx.anchor_dir), dir_before_cli);
 }
 
-/// R-5: `agent_lineage`, `agent_pubkey_history`, `_agents` UPDATE, and
-/// `row_attestations` commit in ONE transaction; any failure rolls back ALL FOUR.
-#[test]
-fn r5_single_tx_rollback_on_before_db_commit_fault_10112() {
-    let fx = RecoveryFixture::new("r5-agent");
-    let k_new = keypair::generate("r5-new").expect("k_new");
-    let (not_before, atts) = fx.prepare_and_sign(&k_new, &[0, 1]);
-
-    let conn = db::open(&fx.db_path).expect("open");
-    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect("count") };
-    let lin_before = count("SELECT COUNT(*) FROM agent_lineage");
-    let hist_before = count("SELECT COUNT(*) FROM agent_pubkey_history");
-    let att_before = count("SELECT COUNT(*) FROM row_attestations");
-    let pub_before = db::agent_pubkey(&conn, &fx.agent)
-        .expect("agent_pubkey before")
-        .expect("agent_pubkey set");
-    let dir_before = snapshot_tree(&fx.anchor_dir);
-
-    let req = RecoveryRequest {
-        agent_id: &fx.agent,
-        successor_pubkey_b64: &k_new.public_base64(),
-        quorum: &atts,
-        suspected_compromise_from_seq: None,
-        recovery_pubkey_b64: None,
-        not_before: &not_before,
-        staged_key_label: None,
-    };
-    let checked = recovery_preconditions(
-        &conn,
-        &fx.anchor_dir,
-        &req,
-        RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
-    )
-    .expect("preconditions");
-    let err =
-        execute_recovery_rebind_with_fault(&conn, checked, RecoveryFaultPoint::BeforeDbCommit)
-            .expect_err("BeforeDbCommit fault must abort");
-    assert!(
-        format!("{err:#}").contains("BeforeDbCommit"),
-        "got: {err:#}"
-    );
-
-    assert_eq!(count("SELECT COUNT(*) FROM agent_lineage"), lin_before);
-    assert_eq!(
-        count("SELECT COUNT(*) FROM agent_pubkey_history"),
-        hist_before
-    );
-    assert_eq!(count("SELECT COUNT(*) FROM row_attestations"), att_before);
-    let pub_after = db::agent_pubkey(&conn, &fx.agent)
-        .expect("agent_pubkey after")
-        .expect("agent_pubkey still set");
-    assert_eq!(pub_after, pub_before);
-    assert_eq!(snapshot_tree(&fx.anchor_dir), dir_before);
-    drop(conn);
-    fx.verify_clean();
-}
-
-/// R-6: Fault injection at EVERY post-commit step followed by an idempotent
-/// re-run converges cleanly to `Outcome::Clean` with zero duplicate archives,
-/// zero duplicate `key_id`, and zero leftover staging files.
-#[test]
-fn r6_fault_injection_every_step_converges_cleanly_on_rerun_10112() {
-    let points = [
-        (
-            "after_db_commit",
-            RecoveryFaultPoint::AfterDbCommitBeforeArchive,
-        ),
-        (
-            "after_archive",
-            RecoveryFaultPoint::AfterArchiveBeforePrivInstall,
-        ),
-        (
-            "after_priv",
-            RecoveryFaultPoint::AfterPrivInstallBeforePubInstall,
-        ),
-        (
-            "after_pub_before_cleanup",
-            RecoveryFaultPoint::AfterPubInstallBeforeStagedCleanup,
-        ),
-        (
-            "after_pub_before_seal",
-            RecoveryFaultPoint::AfterPubInstallBeforeSealAdvance,
-        ),
-    ];
-
-    for (label, fault) in points {
-        let agent = format!("r6-{label}");
-        let fx = RecoveryFixture::new(&agent);
-        let staged_label = format!("{agent}-staged");
-        let k_new = keypair::generate(&staged_label).expect("k_new");
-        keypair::save(&k_new, &fx.anchor_dir).expect("save staged k_new");
-        let (not_before, atts) = fx.prepare_and_sign(&k_new, &[0, 1]);
-
-        let req = RecoveryRequest {
-            agent_id: &fx.agent,
-            successor_pubkey_b64: &k_new.public_base64(),
-            quorum: &atts,
-            suspected_compromise_from_seq: None,
-            recovery_pubkey_b64: None,
-            not_before: &not_before,
-            staged_key_label: Some(&staged_label),
-        };
-
-        // First run: crash at `fault`.
-        {
-            let conn = db::open(&fx.db_path).expect("open crash run");
-            let checked = recovery_preconditions(
-                &conn,
-                &fx.anchor_dir,
-                &req,
-                RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
-            )
-            .expect("preconditions run 1");
-            let err = execute_recovery_rebind_with_fault(&conn, checked, fault)
-                .expect_err("injected fault must fail");
-            assert!(
-                format!("{err:#}").contains("injected fault"),
-                "{label}: got {err:#}"
-            );
-        }
-
-        // Second run: idempotent re-run MUST converge cleanly.
-        {
-            let conn = db::open(&fx.db_path).expect("open resume run");
-            let checked = recovery_preconditions(
-                &conn,
-                &fx.anchor_dir,
-                &req,
-                RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
-            )
-            .unwrap_or_else(|e| panic!("{label}: resume preconditions failed: {e:#}"));
-            let outcome = execute_recovery_rebind(&conn, checked)
-                .unwrap_or_else(|e| panic!("{label}: resume execute failed: {e:#}"));
-            assert!(
-                outcome.resumed_from_committed_db,
-                "{label}: re-run after DB commit must report resumed_from_committed_db=true"
-            );
-        }
-
-        // Assert Clean verification, 1 archive, 0 staged siblings, 0 .recover-*.tmp.
-        fx.verify_clean();
-        let entries: Vec<String> = fs::read_dir(&fx.anchor_dir)
-            .expect("read anchor dir")
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        let archives: Vec<_> = entries
-            .iter()
-            .filter(|n| n.starts_with(&format!("{agent}.pub.")))
-            .collect();
-        assert_eq!(
-            archives.len(),
-            1,
-            "{label}: expected 1 archive, got {archives:?}"
-        );
-        assert!(
-            !entries.iter().any(|n| n.starts_with(".recover-")),
-            "{label}: leftover temp file in {entries:?}"
-        );
-        assert!(
-            !entries.iter().any(|n| n.starts_with(&staged_label)),
-            "{label}: staged sibling not cleaned up in {entries:?}"
-        );
-
-        // Third run (after full convergence): MUST be refused as replay (R-9).
-        {
-            let conn = db::open(&fx.db_path).expect("open replay check");
-            let err = recovery_preconditions(
-                &conn,
-                &fx.anchor_dir,
-                &req,
-                RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
-            )
-            .err()
-            .expect("replay after convergence must be refused");
-            assert!(
-                format!("{err:#}").contains(REFUSE_RECOVERY_REPLAY),
-                "{label}: expected REFUSE_RECOVERY_REPLAY, got {err:#}"
-            );
-        }
-    }
-}
+// Note (C-F13 / S-F3 #10161): R-5 (`BeforeDbCommit` rollback) and R-6
+// (post-commit fault-injection convergence across all 5 steps) live in
+// `src/storage/recovery_rebind.rs::tests` so `RecoveryFaultPoint` and
+// `execute_recovery_rebind_with_fault` are strictly private `#[cfg(test)]`.
 
 /// R-7: Swapping `<agent>.pub` in the anchor directory alone (without a
 /// quorum-verified recovery lineage record) is refused.
@@ -982,10 +797,7 @@ fn r8_three_preflight_refusals_leave_db_and_anchor_byte_identical_10112() {
             true,
         )
         .expect_err("verify-only arm must refuse");
-    assert!(
-        format!("{err_vo:#}").contains(REFUSE_RECOVERY_VERIFY_ONLY),
-        "expected REFUSE_RECOVERY_VERIFY_ONLY, got: {err_vo:#}"
-    );
+    assert_eq!(format!("{err_vo:#}"), REFUSE_RECOVERY_VERIFY_ONLY);
     assert_eq!(fs::read(&fx.db_path).expect("db after vo"), db_before);
     assert_eq!(snapshot_tree(&fx.anchor_dir), dir_before);
 
@@ -1005,10 +817,7 @@ fn r8_three_preflight_refusals_leave_db_and_anchor_byte_identical_10112() {
             true,
         )
         .expect_err("missing K_new.priv must refuse");
-    assert!(
-        format!("{err_mp:#}").contains(REFUSE_RECOVERY_MISSING_PRIV),
-        "expected REFUSE_RECOVERY_MISSING_PRIV, got: {err_mp:#}"
-    );
+    assert_eq!(format!("{err_mp:#}"), REFUSE_RECOVERY_MISSING_PRIV);
     assert_eq!(fs::read(&fx.db_path).expect("db after mp"), db_before);
     assert_eq!(snapshot_tree(&fx.anchor_dir), dir_before);
 
@@ -1183,10 +992,7 @@ fn r9_single_timestamp_window_k_old_refusal_and_replay_refused_10112() {
     )
     .err()
     .expect("replaying converged recovery must be refused");
-    assert!(
-        format!("{err_replay:#}").contains(REFUSE_RECOVERY_REPLAY),
-        "expected REFUSE_RECOVERY_REPLAY, got: {err_replay:#}"
-    );
+    assert_eq!(format!("{err_replay:#}"), REFUSE_RECOVERY_REPLAY);
 
     let (nb_reuse, atts_reuse) = fx.prepare_and_sign(&fx.k_old, &[0, 1]);
     let reuse_req = RecoveryRequest {
@@ -1206,9 +1012,9 @@ fn r9_single_timestamp_window_k_old_refusal_and_replay_refused_10112() {
     )
     .err()
     .expect("reusing retired K_old in a new recovery must be refused");
-    assert!(
-        format!("{err_reuse:#}").contains(REFUSE_RECOVERY_REPLAY),
-        "expected REFUSE_RECOVERY_REPLAY for retired-key reuse, got: {err_reuse:#}"
+    assert_eq!(
+        format!("{err_reuse:#}"),
+        format!("{REFUSE_RECOVERY_REPLAY}: successor key was already bound in history")
     );
 
     drop(conn);
@@ -1360,8 +1166,15 @@ fn r12_backup_restore_pre_recovery_backup_portability_and_10110_import_10112() {
         );
     }
 
-    // 12b. PRE-recovery backup restored under the POST-recovery anchor verifies Clean
-    // (because retired K_old is archived at `<agent>.pub.<ts>` with valid_to = ts).
+    // 12b. PRE-recovery backup restored under the POST-recovery anchor:
+    // - `check_snapshot` verifies every `K_old` row cleanly (because retired
+    //   `K_old` is archived at `<agent>.pub.<ts>` with `valid_to = ts` and
+    //   matches the snapshot's verified lineage head).
+    // - Live `verify_sqlite_with` verifies every `K_old` row (zero unverified
+    //   memories) while R-7 flags that the post-recovery anchor head (`K_new`)
+    //   is ahead of the pre-recovery DB's lineage head (`K_old`).
+    // - Re-applying the guardian-quorum recovery (`K_old -> K_new`) onto the
+    //   restored pre-recovery DB brings it cleanly to `Outcome::Clean`.
     let pre_restored_target = fx.root.path().join("pre-restored-under-post-anchor.db");
     {
         let pre_conn = Connection::open(&pre_backup_path).expect("open pre snapshot");
@@ -1376,9 +1189,37 @@ fn r12_backup_restore_pre_recovery_backup_portability_and_10110_import_10112() {
         let anchor = TrustAnchor::load_dir(&fx.anchor_dir);
         let rep = verify_sqlite_with(&restored_conn, &anchor).expect("verify pre restored");
         assert!(
-            matches!(rep.outcome(), Outcome::Clean),
-            "pre-recovery backup restored under post-recovery anchor must be Clean: {:?}",
-            rep.outcome()
+            rep.unverified_memories.is_empty(),
+            "every pre-recovery K_old memory row must verify cleanly under archived K_old: {:?}",
+            rep.unverified_memories
+        );
+        assert!(
+            rep.defects
+                .iter()
+                .all(|d| d.contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP)),
+            "only the R-7 anchor-head-ahead-of-lineage defect may appear before recovery replay: {:?}",
+            rep.defects
+        );
+        // Verify pre-recovery backup under a pre-recovery anchor snapshot holding K_old -> Clean.
+        let pre_anchor_dir = fx.root.path().join("pre-anchor-check");
+        fs::create_dir_all(&pre_anchor_dir).expect("mkdir pre anchor");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&pre_anchor_dir, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700");
+        }
+        fs::write(
+            pre_anchor_dir.join(format!("{}.pub", fx.agent)),
+            fx.k_old.public.to_bytes(),
+        )
+        .expect("write k_old pub");
+        let pre_rep = verify_sqlite_with(&restored_conn, &TrustAnchor::load_dir(&pre_anchor_dir))
+            .expect("verify under pre anchor");
+        assert!(
+            matches!(pre_rep.outcome(), Outcome::Clean),
+            "pre-recovery backup must be Clean under its K_old anchor: {:?}",
+            pre_rep.outcome()
         );
     }
 
@@ -1390,15 +1231,16 @@ fn r12_backup_restore_pre_recovery_backup_portability_and_10110_import_10112() {
             build_full_envelope_audited(&src_conn, "r12-source", "2026-11-26T12:00:00Z")
                 .expect("build_full_envelope_audited");
         let dst_conn = db::open(&imported_db).expect("open dst for import");
-        // #3464: destination establishes target-agent possession of K_new and
-        // arms its funnel before importing the recovered bundle's lineage chain.
+        // #3464 + #10112 R-7: destination establishes target-agent possession
+        // of K_new and imports the verified lineage bundle BEFORE arming against
+        // the post-recovery anchor (which carries retired K_old + current K_new).
         db::register_agent(&dst_conn, &fx.agent, "ai:test", &[]).expect("register dst");
         db::bind_agent_pubkey_with_keypair(&dst_conn, &fx.agent, &k_new)
             .expect("bind K_new on dst");
-        arm_with_key(&dst_conn, &fx.agent, k_new.private.as_ref().expect("priv"))
-            .expect("arm imported store with K_new");
         let imp = import_full_envelope(&dst_conn, &envelope, &ImportOptions::default())
             .expect("import_full_envelope");
+        arm_with_key(&dst_conn, &fx.agent, k_new.private.as_ref().expect("priv"))
+            .expect("arm imported store with K_new");
         assert!(
             imp.memories >= 1,
             "imported store must contain the pre-recovery memory: {imp:?}"
@@ -1622,8 +1464,8 @@ fn self_review_pins_path_escape_cli_r1_order_and_direct_append_recovery_refused_
         "S-3/R-1: quorum refusal must fire before missing-key refusal, got: {msg_r1_cli}"
     );
 
-    // C-1: Direct `db::append_recovery` on an armed SQLite store (even via a raw
-    // `rusqlite::Connection` without TEMP triggers!) refuses with REFUSE_RECOVERY_VERIFY_ONLY.
+    // C-1 / C-F14: Direct `db::append_recovery` on an armed SQLite store (even via a raw
+    // `rusqlite::Connection` without TEMP triggers!) refuses with exact REFUSE_DIRECT_RECOVERY_ON_ARMED_STORE.
     {
         let raw = Connection::open(&fx.db_path).expect("raw open");
         let err_raw = db::append_recovery(
@@ -1636,9 +1478,9 @@ fn self_review_pins_path_escape_cli_r1_order_and_direct_append_recovery_refused_
             &not_before,
         )
         .expect_err("direct append_recovery on armed store must be refused");
-        assert!(
-            format!("{err_raw:#}").contains(REFUSE_RECOVERY_VERIFY_ONLY),
-            "C-1: expected REFUSE_RECOVERY_VERIFY_ONLY from direct append_recovery, got: {err_raw:#}"
+        assert_eq!(
+            format!("{err_raw:#}"),
+            REFUSE_DIRECT_RECOVERY_ON_ARMED_STORE
         );
     }
 
@@ -1742,7 +1584,7 @@ fn sf1_forged_threshold_column_refused_10159() {
 /// be refused by `recovery_preconditions`.
 #[test]
 fn sf1_forged_guardian_set_id_column_refused_10159() {
-    let fx = RecoveryFixture::new("sf1-gid-agent");
+    let mut fx = RecoveryFixture::new("sf1-gid-agent");
     let k1 = keypair::generate("sf1-gid-k1").expect("k1");
     run_valid_recovery(&fx, &k1);
 
@@ -1758,11 +1600,9 @@ fn sf1_forged_guardian_set_id_column_refused_10159() {
     .expect("tamper guardian_set_id");
     drop(raw);
 
-    // SAFETY: serialized by ENV_LOCK held inside `fx._env`.
-    unsafe {
-        std::env::set_var(RECOVERY_GUARDIAN_PUBKEYS_ENV, attacker_g.public_base64());
-        std::env::set_var(RECOVERY_THRESHOLD_ENV, "1");
-    }
+    let anchor_dir_clone = fx.anchor_dir.clone();
+    let attacker_pub = attacker_g.public_base64();
+    fx.set_env_overrides(Some(&anchor_dir_clone), &attacker_pub, "1");
 
     let k2 = keypair::generate("sf1-gid-k2").expect("k2");
     let conn = db::open(&fx.db_path).expect("open");
@@ -2077,24 +1917,61 @@ fn cf1_sf2_bare_anchor_swap_refused_by_production_verify_and_arm_10160() {
         format!("{err_arm:#}").contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP),
         "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP from arm_with_key, got: {err_arm:#}"
     );
+
+    // Production `recovery_preconditions` (before `arm_for_recovery_in_tx`) must
+    // also refuse a bare-swapped anchor on an armed store!
+    let k_legit = keypair::generate("cf1-legit-new").expect("k_legit");
+    let (nb_swap, atts_swap) = fx.prepare_and_sign(&k_legit, &[0, 1]);
+    let req_swap = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k_legit.public_base64(),
+        quorum: &atts_swap,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb_swap,
+        staged_key_label: None,
+    };
+    let err_rec_swap = recovery_preconditions(
+        &conn,
+        &fx.anchor_dir,
+        &req_swap,
+        RecoveryArm::Signing(k_legit.private.as_ref().expect("priv")),
+    )
+    .err()
+    .expect("recovery_preconditions must refuse on bare-swapped anchor");
+    assert!(
+        format!("{err_rec_swap:#}").contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP),
+        "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP from recovery_preconditions, got: {err_rec_swap:#}"
+    );
     drop(conn);
+    drop(fx);
 
     // Part B: zero-lineage store with bare archive+swap (exact code-reviewer R-7 probe).
     let root2 = private_dir();
     let keys2 = root2.path().join("keys");
-    fs::create_dir_all(&keys2).expect("mkdir keys2");
+    let home2 = root2.path().join("home");
+    for d in [&keys2, &home2] {
+        fs::create_dir_all(d).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        }
+    }
     let db2 = root2.path().join("store2.db");
     let agent2 = "cf1-nolin-agent";
     let k0 = keypair::generate(agent2).expect("k0");
     keypair::save(&k0, &keys2).expect("save k0");
+    let keys2_s = keys2.to_string_lossy().into_owned();
+    let home2_s = home2.to_string_lossy().into_owned();
+    let env2 = MultiEnvVarGuard::apply(&[
+        ("HOME", Some(&home2_s)),
+        ("AI_MEMORY_NO_CONFIG", Some("1")),
+        ("AI_MEMORY_KEY_DIR", Some(&keys2_s)),
+    ]);
     let conn2 = db::open(&db2).expect("open db2");
     db::register_agent(&conn2, agent2, "ai:test", &[]).expect("register");
     db::bind_agent_pubkey_with_keypair(&conn2, agent2, &k0).expect("bind");
-    let keys2_s = keys2.to_string_lossy().into_owned();
-    // SAFETY: serialized by ENV_LOCK held in `fx._env`.
-    unsafe {
-        std::env::set_var("AI_MEMORY_KEY_DIR", &keys2_s);
-    }
     arm_with_key(&conn2, agent2, k0.private.as_ref().expect("k0 priv")).expect("arm db2");
     let k_foreign = keypair::generate(agent2).expect("k_foreign");
     fs::write(
@@ -2107,21 +1984,23 @@ fn cf1_sf2_bare_anchor_swap_refused_by_production_verify_and_arm_10160() {
         k_foreign.public.to_bytes(),
     )
     .expect("swap pub");
-    let rep2 = verify_sqlite_with(&conn2, &TrustAnchor::load_dir(&keys2)).expect("verify db2");
+    let report_nolin =
+        verify_sqlite_with(&conn2, &TrustAnchor::load_dir(&keys2)).expect("verify db2");
     assert!(
-        matches!(rep2.outcome(), Outcome::Defective { .. }),
+        matches!(report_nolin.outcome(), Outcome::Defective { .. }),
         "C-F1/S-F2: zero-lineage bare anchor swap must be Defective, got: {:?}",
-        rep2.outcome()
+        report_nolin.outcome()
     );
     assert!(
-        rep2.defects
+        report_nolin
+            .defects
             .iter()
             .any(|d| d.contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP)),
         "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP defect on zero-lineage swap, got: {:?}",
-        rep2.defects
+        report_nolin.defects
     );
     drop(conn2);
-    drop(fx);
+    drop(env2);
 
     // Part C: missing anchor_dir on an armed store must be refused in recovery_preconditions.
     let fx3 = RecoveryFixture::new("cf1-missing-dir");
@@ -2197,14 +2076,12 @@ fn cf6_corrupt_timestamp_in_history_refused_10112() {
 /// refusal constant (not `REFUSE_RECOVERY_VERIFY_ONLY`).
 #[test]
 fn cf14_direct_append_recovery_refused_when_key_dir_unset_10112() {
-    let fx = RecoveryFixture::new("cf14-agent");
+    let mut fx = RecoveryFixture::new("cf14-agent");
     let k_new = keypair::generate("cf14-new").expect("k_new");
     let (nb, atts) = fx.prepare_and_sign(&k_new, &[0, 1]);
 
-    // SAFETY: serialized by ENV_LOCK held in `fx._env`.
-    unsafe {
-        std::env::remove_var("AI_MEMORY_KEY_DIR");
-    }
+    let orig_gpubs = fx.default_gpubs();
+    fx.set_env_overrides(None, &orig_gpubs, "2");
 
     let raw_conn = Connection::open(&fx.db_path).expect("raw open");
     let err = db::append_recovery(
@@ -2219,7 +2096,94 @@ fn cf14_direct_append_recovery_refused_when_key_dir_unset_10112() {
     .expect_err("direct append_recovery on armed store with unset KEY_DIR must refuse");
     assert_eq!(
         format!("{err:#}"),
-        "armed store: use `ai-memory identity recover` with a signing arm instead of direct `append_recovery` (#10112 R-8)",
+        REFUSE_DIRECT_RECOVERY_ON_ARMED_STORE,
         "C-F14: expected exact armed-store refusal"
     );
+}
+
+/// R-11 / C-F10: in-repo golden-bytes verification proving the recovery rebind
+/// writes a byte-identical `#10040` `op = "update"` attestation row (no new
+/// record kind, exact `FORMAT_VERSION`, `covered_columns`, `preimage`,
+/// `attestation_digest`, and `verify_strict` under `K_new`).
+#[test]
+fn r11_rebind_attestation_matches_10040_golden_format_10112() {
+    let fx = RecoveryFixture::new("r11-golden-agent");
+    let k_new = keypair::generate("r11-golden-new").expect("k_new");
+    run_valid_recovery(&fx, &k_new);
+
+    let conn = db::open(&fx.db_path).expect("open");
+    let atts = read_attestations(&conn).expect("read_attestations");
+    let rebind_att = atts
+        .iter()
+        .rev()
+        .find(|a| a.table == "memories" && a.op == "update")
+        .expect("rebind update attestation must exist");
+
+    assert_eq!(rebind_att.format_version, FORMAT_VERSION);
+    assert_eq!(rebind_att.op, "update");
+    assert_eq!(
+        rebind_att.covered_columns,
+        spec_for("memories").expect("memories spec").covered()
+    );
+    assert_eq!(rebind_att.agent_id, fx.agent);
+    assert_eq!(rebind_att.key_id, key_id_of(&k_new.public));
+
+    let raw_preimage = preimage(rebind_att);
+    assert!(
+        raw_preimage.starts_with(DOMAIN_TAG),
+        "preimage must begin with #10040 DOMAIN_TAG"
+    );
+    let sig_bytes = rebind_att
+        .signature
+        .as_deref()
+        .expect("rebind attestation must be signed");
+    let sig_arr: [u8; 64] = sig_bytes.try_into().expect("64-byte Ed25519 signature");
+    let sig = Signature::from_bytes(&sig_arr);
+    k_new
+        .public
+        .verify_strict(&raw_preimage, &sig)
+        .expect("rebind attestation signature must verify_strict under K_new over #10040 preimage");
+    assert_eq!(
+        attestation_digest(rebind_att),
+        rebind_att.attestation_digest,
+        "stored attestation_digest must equal #10040 SHA-256(preimage || signature)"
+    );
+    drop(conn);
+    fx.verify_clean();
+}
+
+/// C-F3: `MemoryStore::recover_rebind` trait dispatch works end-to-end on
+/// `SqliteStore` and leaves the store `Outcome::Clean`.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn cf3_memory_store_recover_rebind_trait_dispatch_10112() {
+    let fx = RecoveryFixture::new("cf3-trait-agent");
+    let k_new = keypair::generate("cf3-trait-new").expect("k_new");
+    let (nb, atts) = fx.prepare_and_sign(&k_new, &[0, 1]);
+
+    let store = SqliteStore::open(&fx.db_path).expect("open SqliteStore");
+    let dyn_store: &dyn MemoryStore = &store;
+    let ctx = CallerContext::for_admin("test:cf3-10112");
+    let req = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k_new.public_base64(),
+        quorum: &atts,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb,
+        staged_key_label: None,
+    };
+    let outcome = dyn_store
+        .recover_rebind(
+            &ctx,
+            &fx.anchor_dir,
+            &req,
+            RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+        )
+        .await
+        .expect("MemoryStore::recover_rebind must succeed on SqliteStore");
+    assert_eq!(outcome.record.epoch, 1);
+    assert_eq!(outcome.record.reason, LineageReason::Recovery);
+    drop(store);
+    fx.verify_clean();
 }

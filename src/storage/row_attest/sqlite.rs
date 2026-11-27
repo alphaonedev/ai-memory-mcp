@@ -94,6 +94,10 @@ pub const REFUSE_RECOVERY_QUORUM_DRIFT: &str =
 /// Refusal (#10112 R-7): anchor current key is not backed by a quorum-verified lineage record.
 pub const REFUSE_ANCHOR_UNATTESTED_KEY_SWAP: &str =
     "anchor current key is not backed by a quorum-verified lineage record (#10112 R-7)";
+/// Refusal (#10112 R-8 / C-F14): direct `db::append_recovery` on an armed SQLite store.
+pub const REFUSE_DIRECT_RECOVERY_ON_ARMED_STORE: &str = "armed store: use `ai-memory identity recover` with a signing arm instead of direct `append_recovery` (#10112 R-8)";
+/// Refusal (#10112 R-13 / C-F2): PostgreSQL armed-store guardian recovery is not yet supported.
+pub const REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED: &str = "PostgreSQL armed-store guardian recovery is not yet supported (no PG row-attestation K_new signing arm; #10112 R-13)";
 
 /// How [`install`] left the connection.
 #[must_use]
@@ -156,7 +160,22 @@ pub fn refuse_attested_writes(conn: &Connection) -> Result<()> {
 /// holds a seal for it (or one it cannot read, which fails closed), or a
 /// cutover in it carries a signature.
 pub(crate) fn was_armed(conn: &Connection) -> Result<bool> {
-    let anchor = super::anchor::TrustAnchor::from_key_dir();
+    was_armed_with(conn, None)
+}
+
+/// #10091 / #10112 (C-F14) — explicit-anchor twin of [`was_armed`]: when
+/// `anchor_dir` is `Some`, checks the seal strictly under `anchor_dir` rather
+/// than consulting ambient `AI_MEMORY_KEY_DIR`; always falls through to the
+/// database's `row_attestations` signed-cutover probe when unsealed so an armed
+/// SQLite store is still detected even if `AI_MEMORY_KEY_DIR` is unset.
+pub(crate) fn was_armed_with(
+    conn: &Connection,
+    anchor_dir: Option<&std::path::Path>,
+) -> Result<bool> {
+    let anchor = anchor_dir.map_or_else(
+        super::anchor::TrustAnchor::from_key_dir,
+        super::anchor::TrustAnchor::load_dir,
+    );
     let sealed = seal::path_for(&anchor, seal::db_of(conn).as_deref())
         .as_deref()
         .map_or(SealState::NotSealed, seal::read);
@@ -862,6 +881,13 @@ fn arm(conn: &Connection, who: &Signer, source: SignerSource) -> Result<ArmState
     // error is returned for that caller to roll back; either way the
     // connection is not armed (fail closed).
     let anchor = super::anchor::TrustAnchor::from_key_dir();
+    if let super::anchor::AnchorLoad::Anchored(ref anchored) = anchor {
+        // #10112 R-7 / #10160: fail-closed production enforcement on session
+        // boot (`install`) and succession (`arm_with_key`) arming — refuse to
+        // arm against an anchor whose current key was bare-swapped outside a
+        // verified lineage chain.
+        crate::storage::recovery_rebind::verify_anchor_against_lineage_for_store(conn, anchored)?;
+    }
     let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
     let sealed = seal_file
         .as_deref()
@@ -923,6 +949,18 @@ pub(crate) fn arm_for_recovery_in_tx(
         signing: k_new_signing.clone(),
     };
     let anchor = super::anchor::TrustAnchor::load_dir(anchor_dir);
+    match &anchor {
+        super::anchor::AnchorLoad::Anchored(anchored) => {
+            // #10112 R-7 / #10160: verify the pre-recovery anchor against the
+            // verified pre-recovery lineage chain before arming inside the tx.
+            crate::storage::recovery_rebind::verify_anchor_against_lineage_for_store(
+                conn, anchored,
+            )?;
+        }
+        super::anchor::AnchorLoad::Unanchored(why) => {
+            anyhow::bail!("{REFUSE_ANCHOR_UNATTESTED_KEY_SWAP}: {why}");
+        }
+    }
     let seal_file = seal::path_for(&anchor, seal::db_of(conn).as_deref());
     let sealed = seal_file
         .as_deref()
@@ -949,8 +987,9 @@ pub(crate) fn arm_for_recovery_in_tx(
 /// recovery transaction finishes so a reused `Connection` never stamps later
 /// writes with the frozen recovery timestamp.
 pub(crate) fn restore_post_recovery_funnel(conn: &Connection) -> Result<()> {
-    let _ = install(conn)?;
-    Ok(())
+    match install(conn)? {
+        ArmState::Armed | ArmState::NoSigner | ArmState::Refusing => Ok(()),
+    }
 }
 
 /// #10112 (R-10) — advance the anchored seal strictly under `anchor_dir` after
@@ -988,7 +1027,14 @@ pub(crate) fn seal_is_current(conn: &Connection, anchor_dir: &std::path::Path) -
                 .heads
                 .iter()
                 .all(|(t, s)| existing.heads.get(t).copied().unwrap_or(0) >= *s)),
-        SealState::NotSealed | SealState::Unreadable { .. } => Ok(false),
+        SealState::NotSealed => Ok(false),
+        SealState::Unreadable { path, why } => {
+            anyhow::bail!(
+                "{} ({}: {why})",
+                refusal(REFUSE_SEAL_UNREADABLE),
+                path.display()
+            );
+        }
     }
 }
 
@@ -1072,7 +1118,7 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
     let sealed = seal_file
         .as_deref()
         .map_or(SealState::NotSealed, seal::read);
-    let (report, attestations) = verify_inner(conn, &anchor, &sealed)?;
+    let (report, attestations) = verify_inner(conn, &anchor, &sealed, true)?;
     // #10087: a clean verify moves the seal up to what it verified, so a
     // later rollback of those writes is seen. Not inside a transaction (its
     // rollback could undo what was verified); a failed write only leaves the
@@ -1095,13 +1141,14 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
 /// As [`verify_sqlite`].
 pub fn verify_sqlite_with(conn: &Connection, anchor: &super::anchor::AnchorLoad) -> Result<Report> {
     let sealed = seal::state_for(anchor, seal::db_of(conn).as_deref());
-    Ok(verify_inner(conn, anchor, &sealed)?.0)
+    Ok(verify_inner(conn, anchor, &sealed, true)?.0)
 }
 
 fn verify_inner(
     conn: &Connection,
     anchor: &super::anchor::AnchorLoad,
     sealed: &SealState,
+    enforce_anchor_head_matches_lineage: bool,
 ) -> Result<(Report, Vec<Attestation>)> {
     let mut live = Vec::new();
     let mut non_canonical = Vec::new();
@@ -1131,7 +1178,7 @@ fn verify_inner(
             |r| r.get(0),
         )
         .optional()?;
-    let report = super::verify(&VerifyInput {
+    let mut report = super::verify(&VerifyInput {
         live: &live,
         attestations: &attestations,
         anchor,
@@ -1140,6 +1187,32 @@ fn verify_inner(
         non_canonical: &non_canonical,
         seal: sealed,
     });
+    if let super::anchor::AnchorLoad::Anchored(anchored) = anchor {
+        // #10112 R-7 / #10160: fail-closed production enforcement linking the
+        // out-of-database anchor to verified lineage. Live verifications
+        // (`verify_sqlite`, `verify_sqlite_with`, `audit verify-rows`, doctor)
+        // require every anchor current key to match the verified lineage head;
+        // point-in-time snapshot checks (`check_snapshot`) verify that every
+        // key that actually signed a snapshot row is backed by the snapshot's
+        // verified lineage (so a pre-recovery backup under a post-recovery
+        // anchor verifies `K_old` rows while a snapshot signed by an unattested
+        // swapped key is refused).
+        let lineage_defects = if enforce_anchor_head_matches_lineage {
+            crate::storage::recovery_rebind::verify_anchor_against_lineage_for_store_defects(
+                conn, anchored,
+            )?
+        } else {
+            crate::storage::recovery_rebind::verify_snapshot_signers_against_lineage(
+                conn,
+                anchored,
+                &attestations,
+            )?
+        };
+        for defect in lineage_defects {
+            report.defects.push(defect.clone());
+            report.store_defects.push(defect);
+        }
+    }
     Ok((report, attestations))
 }
 
@@ -1209,7 +1282,7 @@ pub fn check_snapshot(conn: &Connection, target: &std::path::Path) -> Result<Sna
     // The snapshot is judged on its own marks: restoring an older verified
     // store is an explicit order, and the target's seal is replaced by the
     // snapshot's once it is published.
-    let (report, attestations) = verify_inner(conn, &anchor, &SealState::NotSealed)?;
+    let (report, attestations) = verify_inner(conn, &anchor, &SealState::NotSealed, false)?;
     match report.outcome() {
         super::Outcome::Clean => Ok(SnapshotVerdict::Verified(SealRecord::of(&attestations))),
         super::Outcome::Unanchored(why) => {

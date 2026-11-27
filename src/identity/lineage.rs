@@ -775,6 +775,59 @@ pub struct VerifiedLineage {
     /// (the COMMITTED threshold was met by currently-enrolled valid
     /// signers); surfaced so an operator notices roster drift.
     pub recovery_guardian_set_drift: bool,
+    /// #10112 / #10159 — private verified chain records. Keeping this field
+    /// private guarantees [`VerifiedLineage`] can ONLY be constructed by
+    /// [`verify_lineage_with_recovery`], making it the sole type-enforced
+    /// source of authority for committed quorum, resume head, and anchor
+    /// reachability checks.
+    verified_records: Vec<LineageRecord>,
+}
+
+impl VerifiedLineage {
+    /// Every cryptographically verified record on this chain in ascending-epoch
+    /// order (non-empty: epoch 0 is always genesis).
+    #[must_use]
+    pub fn records(&self) -> &[LineageRecord] {
+        &self.verified_records
+    }
+
+    /// The highest-epoch verified record on this chain.
+    #[must_use]
+    pub fn head_record(&self) -> &LineageRecord {
+        self.verified_records
+            .last()
+            .expect("VerifiedLineage is non-empty past the genesis gate")
+    }
+
+    /// #10112 R-2 / #10159 — `(guardian_set_id, recovery_threshold)` committed
+    /// on the most recent cryptographically verified `Recovery` record, if any.
+    #[must_use]
+    pub fn committed_quorum(&self) -> Option<(&[u8], u64)> {
+        self.verified_records.iter().rev().find_map(|rec| {
+            if rec.reason != LineageReason::Recovery {
+                return None;
+            }
+            match (rec.guardian_set_id.as_deref(), rec.recovery_threshold) {
+                (Some(gid), Some(thr)) => Some((gid, thr)),
+                _ => None,
+            }
+        })
+    }
+
+    /// #10112 R-7 — `true` iff `key_id` (hex SHA-256 of raw Ed25519 verifying
+    /// key bytes) matches the predecessor or successor key of any verified
+    /// record on this chain.
+    #[must_use]
+    pub fn contains_key_id(&self, key_id: &str) -> bool {
+        self.verified_records.iter().any(|rec| {
+            [&rec.predecessor_pubkey_b64, &rec.successor_pubkey_b64]
+                .into_iter()
+                .any(|b64| {
+                    keypair::decode_public_base64(b64)
+                        .is_ok_and(|vk| crate::storage::row_attest::key_id_of(&vk) == key_id)
+                })
+        })
+    }
 }
 
 /// Verify ONE succession record's Ed25519 signature under
@@ -1236,6 +1289,9 @@ pub fn verify_lineage_with_recovery(
     // verified recovery was minted against a since-drifted guardian roster.
     let mut recovered_at_epoch: Option<u64> = None;
     let mut recovery_guardian_set_drift = false;
+    // #10112 R-2 / #10159 — once a verified Recovery commits a guardian set and
+    // threshold, no later Recovery on the same chain may weaken or switch it.
+    let mut committed_recovery_quorum: Option<(&[u8], u64)> = None;
     for (record, signature) in records {
         if let Some(prior) = prev {
             // Contiguity (anti-reorder / anti-drop).
@@ -1328,6 +1384,19 @@ pub fn verify_lineage_with_recovery(
                     epoch: record.epoch,
                 })?;
                 let verified = verify_recovery_record(record, signature, policy)?;
+                if let Some((prior_gid, prior_thr)) = committed_recovery_quorum {
+                    if record.guardian_set_id.as_deref() != Some(prior_gid)
+                        || record.recovery_threshold.is_none_or(|t| t < prior_thr)
+                    {
+                        return Err(LineageError::RecoveryQuorumInvalid {
+                            epoch: record.epoch,
+                        });
+                    }
+                } else if let (Some(gid), Some(thr)) =
+                    (record.guardian_set_id.as_deref(), record.recovery_threshold)
+                {
+                    committed_recovery_quorum = Some((gid, thr));
+                }
                 recovered_at_epoch = Some(record.epoch);
                 recovery_guardian_set_drift |= verified.guardian_set_drift;
             }
@@ -1385,6 +1454,7 @@ pub fn verify_lineage_with_recovery(
         revoked_from_seq,
         recovered_at_epoch,
         recovery_guardian_set_drift,
+        verified_records: records.iter().map(|(r, _)| r.clone()).collect(),
     })
 }
 
