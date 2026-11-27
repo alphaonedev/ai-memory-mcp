@@ -329,123 +329,2020 @@ fn scratch_dir(parent: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// #10176 r1 (LOW 10191 / LOW 10186): every construction of a process command
-// under src/, by any spelling, is an exact per-file allowlist row.
+// #10176 r3 (10191 / 10186): the process-start gate, layer 2.
 // ---------------------------------------------------------------------------
 //
-// The scanner below is a small Rust lexer (comments skipped, string, byte
-// string, raw string and char literals DECODED, raw identifiers unwrapped).
-// A "spawn site" in a src/ file is any of:
+// Layer 1 is clippy: `clippy.toml` lists every entry point that code in this
+// repository can call to start a process (`disallowed-methods`), and
+// `src/lib.rs` re-denies the lint inside the library. The compiler resolves a
+// `use` alias, a grouped import, a re-export, a type alias, a macro body, a
+// `#[path]` module, an `include!` and a function pointer to the same entry, so
+// layer 1 needs no list of spellings. Every justified site carries an
+// item-level `#[expect(clippy::disallowed_methods, reason = "...")]`.
 //
-// - the identifiers of [`SPAWN_IDENTS`]: `current_exe`, `args_os`, the two
-//   #1937 chokepoints `audited_command` / `audited_tokio_command` and the
-//   `assert_cmd` dev-dependency, so a path call, a `use .. as` alias, a
-//   re-export and a macro body all count;
-// - the paths of [`SPAWN_MEMBERS`]: `process :: Command` (std and tokio),
-//   `env :: args` (argv[0] names the running executable) and the `libc`
-//   fork / exec / spawn calls, each also as `module :: *` and inside a
-//   `module :: { .. }` import group;
-// - a decoded string literal with a `proc` or `exe` path segment; the
-//   pieces of one `concat!( .. )` are joined first, so a split, escaped
-//   (`\x2f`, `\u{2f}`) or `format!`-built `/proc/<pid>/exe` path counts;
-// - a `paste` identifier (the one macro in the dependency tree that can glue
-//   an identifier together from pieces).
+// Layer 2 (this section) closes what layer 1 cannot see or can be told to
+// ignore. The names that switch the lint off are a closed set fixed by the
+// toolchain pinned in `rust-toolchain.toml` (clippy 1.99.1):
+// `clippy::disallowed_methods` and `clippy::disallowed_types` (and their
+// renamed spellings `clippy::disallowed_method` / `clippy::disallowed_type`,
+// which clippy still accepts), the group `clippy::style` that holds both, the
+// group `clippy::all` that holds `clippy::style`, and `warnings`.
+// `clippy::pedantic`, `clippy::restriction`, `clippy::nursery` and
+// `clippy::cargo` do not hold them. Per file of the scanned tree it counts:
 //
-// Refused outright, wherever they appear in the scanned tree: a symbolic link
-// (its target could be any file, scanned or not), an `include!` whose argument
-// is not one literal ending in `.rs`, and a `#[path = ..]` that does not name
-// a `.rs` file.
+// - every lint-level group (`allow`, `expect`, `warn`, `deny`, `forbid`
+//   followed by `(..)`) naming one of [`SILENCE_LINTS`], wherever it stands:
+//   an outer attribute, a `cfg_attr`, a statement attribute, or the
+//   arguments of a macro call that may paste it into an attribute; compared
+//   with [`SILENCE_ROWS`], exact in both directions;
+// - the same inside an inner attribute (`#![..]`, a crate- or module-level
+//   silence), compared with [`INNER_ROWS`];
+// - every `extern` that is not `extern crate` or an `extern "abi" fn` type or
+//   definition (an `extern` block can import `fork` or `execve` under any
+//   name, which clippy cannot see), compared with [`EXTERN_ROWS`];
+// - every `asm`, `global_asm` and `naked_asm` identifier (a raw system call by
+//   number), compared with [`ASM_ROWS`];
+// - every `#[path = ..]` and `include!` whose target lies inside the scanned
+//   tree but outside `src/` and `tests/`, compared with [`PATH_OUTSIDE_ROWS`];
+// - every runnable doctest fence in `src/` (clippy does not lint doctests),
+//   compared with [`DOCTEST_ROWS`].
+//
+// Refused outright, with no allowlist: a lint name built by a macro inside an
+// attribute (`$`, `[` or `<` in a lint-level group, or a level taken from a
+// metavariable, `#[$level(..)]`); a `#[path]` or `include!` that is not one
+// literal `.rs` path, or whose target leaves the scanned tree or enters a
+// skipped directory; a fenced code block in a doc form this counter does not
+// read (`/** */`, `/*! */`, a `#[doc = ..]` holding a fence, an
+// `include_str!` or a metavariable); an outer silence on a `mod`, `impl` or
+// `trait` (one row would then cover a whole scope); and a symbolic link.
+//
+// What the two layers do not prove. The unit of an allowlist row is the item
+// that carries the expectation: a second process start added inside an item
+// that already carries a fulfilled `#[expect(clippy::disallowed_methods)]`
+// keeps that expectation fulfilled and is not caught. Code that is not
+// compiled by any clippy job of `.github/workflows/ci.yml` (Linux; default
+// features, `sal`, `sal-postgres`, `vectorlite`) is seen by layer 2 only,
+// never by layer 1. A lint switched off by a build flag outside the tree (a
+// `RUSTFLAGS` value, `--cap-lints`) is not seen; the in-tree places that can
+// do it (`Cargo.toml` `[lints]`, `.cargo/`) are pinned. A process started by a
+// dependency's own code, or by a program that is not built from this
+// repository, is outside this gate; a new direct dependency that can start a
+// process needs a `Cargo.toml` change and its own `clippy.toml` entry. The
+// crates in [`OTHER_CRATES`] are separate packages that the gate commands do
+// not build, and are pinned as a list.
+//
+// The tables were generated by an independent scanner (a Python pass over the
+// same tree with its own lexer), not by this test.
 
-/// Every src/ file allowed spawn sites, with the exact count and the reason.
-/// `src/test_support.rs` (the builder) is counted like every other file; in
-/// addition [`builder_exports_no_process_command_10176`] holds its visible
-/// surface to the narrow methods, so no caller can reach its `Command`.
-const SRC_SPAWN_ALLOWLIST: &[(&str, usize, &str)] = &[
+/// The closed set of lint names that switch the layer-1 lint off under the
+/// pinned toolchain.
+const SILENCE_LINTS: &[&str] = &[
+    "clippy::disallowed_methods",
+    "clippy::disallowed_types",
+    "clippy::disallowed_method",
+    "clippy::disallowed_type",
+    "clippy::style",
+    "clippy::all",
+    "warnings",
+];
+
+/// The lint levels; a level group naming a silence lint is counted at any
+/// level, so the count is exact whatever the level.
+const LEVELS: &[&str] = &["allow", "expect", "warn", "deny", "forbid"];
+
+/// The toolchain the closed set above was read from.
+const PINNED_TOOLCHAIN: &str = "1.99.1";
+
+/// Every `clippy.toml` `disallowed-methods` path, written out by hand.
+const CLIPPY_ENTRIES: &[&str] = &[
+    "std::process::Command::new",
+    "tokio::process::Command::new",
+    "assert_cmd::Command::new",
+    "assert_cmd::Command::cargo_bin",
+    "assert_cmd::cargo::CommandCargoExt::cargo_bin",
+    "ai_memory::spawn_audit::audited_command",
+    "ai_memory::spawn_audit::audited_tokio_command",
+    "libc::fork",
+    "libc::vfork",
+    "libc::clone",
+    "libc::daemon",
+    "libc::forkpty",
+    "libc::execl",
+    "libc::execle",
+    "libc::execlp",
+    "libc::execv",
+    "libc::execve",
+    "libc::execvp",
+    "libc::execvpe",
+    "libc::fexecve",
+    "libc::execveat",
+    "libc::posix_spawn",
+    "libc::posix_spawnp",
+    "libc::system",
+    "libc::popen",
+    "libc::syscall",
+    "libc::dlopen",
+    "libc::dlsym",
+    "libc::dlvsym",
+];
+
+/// The pin file that holds one fulfilled expectation per clippy.toml entry.
+const PINS_FILE: &str = "tests/spawn_gate_pins_10176.rs";
+
+/// The two `src/lib.rs` lines layer 1 rests on, in this order.
+const LIB_GROUP_ALLOW: &str = "#![allow(clippy::pedantic, clippy::all)]";
+const LIB_REDENY: &str = "#![deny(clippy::disallowed_methods)]";
+
+/// Directories holding a separate cargo package: the gate commands do not
+/// build them, so layer 2 does not scan them; the list itself is exact.
+const OTHER_CRATES: &[(&str, &str)] = &[
     (
-        "src/cli/agents.rs",
-        1,
-        "product message text naming /proc cmdline exposure of a token on argv; no spawn",
+        "fuzz",
+        "cargo-fuzz package; built only by the fuzz workflow, never by the lib tests",
     ),
     (
-        "src/cli/doctor.rs",
-        1,
-        "product doctor probe through the #1937 audited_command chokepoint",
+        "loadtest",
+        "load-test package; drives a running server over the network",
     ),
     (
-        "src/cli/helpers.rs",
-        1,
-        "product helper spawn through the #1937 audited_command chokepoint",
-    ),
-    ("src/cli/install.rs", 1, WHY_PRODUCT_PATH),
-    (
-        "src/cli/wake_listen.rs",
-        1,
-        "product wake listener spawn through the #1937 audited_tokio_command chokepoint",
+        "tools/auto-link-detector",
+        "standalone tool package, not linked into ai-memory",
     ),
     (
-        "src/cli/wrap.rs",
-        2,
-        "product wrap verb: the process::Command type import and its audited_command spawn",
+        "tools/post-ship-converge",
+        "standalone tool package, not linked into ai-memory",
     ),
     (
-        "src/encryption/mod.rs",
-        1,
-        "test helper that runs git on a scratch repository fixture, never the test executable",
+        "tools/t0-orchestrate",
+        "standalone tool package, not linked into ai-memory",
     ),
     (
-        "src/federation/mod.rs",
-        1,
-        "env::args read of the libtest filter to tell the isolated child apart, no spawn",
+        "tools/transcript-extractor",
+        "standalone tool package, not linked into ai-memory",
     ),
     (
-        "src/governance/audit.rs",
-        1,
-        "test runs mkfifo to build a FIFO fixture, never the test executable",
+        "vendor/paste",
+        "vendored proc-macro crate (paste); its own tests are its own package",
     ),
     (
-        "src/governance/capability.rs",
-        1,
-        "product message text naming /proc cmdline exposure of a macaroon on argv; no spawn",
-    ),
-    (
-        "src/governance/deferred_audit.rs",
-        3,
-        "tests run mkfifo and chmod (macOS) to build file fixtures, never the test executable",
-    ),
-    (
-        "src/handlers/tests.rs",
-        1,
-        "env::args read of the libtest filter to tell the isolated child apart, no spawn",
-    ),
-    (
-        "src/hooks/executor.rs",
-        3,
-        "two product hook spawns through audited_tokio_command plus the test module's tokio Command import for hook fixtures",
-    ),
-    (
-        "src/main.rs",
-        1,
-        "product entry point reads env::args to dispatch the CLI, no spawn",
-    ),
-    (
-        "src/spawn_audit.rs",
-        8,
-        "the #1937 product spawn chokepoint itself: the only Command::new sites of the crate",
-    ),
-    (
-        "src/store_url.rs",
-        1,
-        "product message text naming /proc cmdline exposure of a password on argv; no spawn",
-    ),
-    (
-        CHOKEPOINT,
-        4,
-        "the #10176 builder itself: the private Command field of SandboxedTestChild, its one \
-         audited_command spawn of current_exe, and the private run_command_bounded parameter",
+        "vendor/paste/tests/macros",
+        "the vendored paste crate's test helper package",
     ),
 ];
 
-const SRC_DIR: &str = "src";
+/// One exact allowlist row: a file, how many sites of one kind it holds, and
+/// why each is justified.
+#[derive(Debug, Clone, Copy)]
+struct Row {
+    path: &'static str,
+    count: usize,
+    reason: &'static str,
+}
+
+/// What the layer-2 scanner found at one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Site {
+    /// A level group naming a silence lint, outside an inner attribute.
+    Silence,
+    /// The same inside an inner attribute.
+    InnerSilence,
+    /// A lint name or level built by a macro inside an attribute.
+    MacroBuiltLint,
+    /// An `extern` block (or a bare `extern` a macro may turn into one).
+    Extern,
+    /// An inline-assembly identifier.
+    Asm,
+    /// A `#[path]` / `include!` target in the tree, outside src/ and tests/.
+    PathOutside,
+    /// A `#[path]` / `include!` target that leaves the scanned tree.
+    PathEscapes,
+    /// A `#[path]` / `include!` that is not one literal `.rs` path.
+    NonLiteralPath,
+    /// A runnable doctest fence in src/.
+    DocTest,
+    /// An outer silence on a `mod`, `impl` or `trait` item.
+    ScopeSilence,
+    /// A fenced block in a doc form the counter does not read.
+    DocRefused,
+    /// A symbolic link in the scanned tree.
+    Link,
+}
+
+/// The allowlist of a site kind, or `None` when the kind is refused outright.
+fn table(site: Site) -> Option<&'static [Row]> {
+    match site {
+        Site::Silence => Some(SILENCE_ROWS),
+        Site::InnerSilence => Some(INNER_ROWS),
+        Site::Extern => Some(EXTERN_ROWS),
+        Site::Asm => Some(ASM_ROWS),
+        Site::PathOutside => Some(PATH_OUTSIDE_ROWS),
+        Site::DocTest => Some(DOCTEST_ROWS),
+        Site::MacroBuiltLint
+        | Site::ScopeSilence
+        | Site::PathEscapes
+        | Site::NonLiteralPath
+        | Site::DocRefused
+        | Site::Link => None,
+    }
+}
+
+/// Inner-attribute silences: only the library root, where the second line
+/// re-denies the one lint the first line's group would switch off.
+const INNER_ROWS: &[Row] = &[Row {
+    path: "src/lib.rs",
+    count: 2,
+    reason: "the library-wide allow of clippy::pedantic and clippy::all (bin target is the lint gate) \
+             and the #10176 re-deny of clippy::disallowed_methods after it",
+}];
+
+const EXTERN_ROWS: &[Row] = &[Row {
+    path: "src/governance/deferred_audit.rs",
+    count: 2,
+    reason: "macOS-only ACL reads (acl_get_fd_np, acl_get_entry, acl_free); no process-start symbol",
+}];
+
+const ASM_ROWS: &[Row] = &[];
+
+const PATH_OUTSIDE_ROWS: &[Row] = &[
+    Row {
+        path: "benches/longmemeval_reflection.rs",
+        count: 2,
+        reason: "benchmarks/longmemeval_reflection dataset and runner modules; linted with the bench target",
+    },
+    Row {
+        path: "tests/longmemeval_reflection_bench.rs",
+        count: 2,
+        reason: "benchmarks/longmemeval_reflection dataset and runner modules; linted with the test target",
+    },
+];
+
+const DOCTEST_ROWS: &[Row] = &[
+    Row {
+        path: "src/harness.rs",
+        count: 1,
+        reason: "Harness::detect value asserts; starts no process",
+    },
+    Row {
+        path: "src/models/namespace.rs",
+        count: 3,
+        reason: "namespace_depth, namespace_parent and namespace_ancestors value asserts; start no process",
+    },
+];
+
+/// Outer and macro-argument silences, per file (generated by the independent
+/// scanner, reasons from each attribute's own `reason`).
+const SILENCE_ROWS: &[Row] = &[
+    Row {
+        path: "benches/harness_bench.rs",
+        count: 2,
+        reason: "bench child: runs the ai-memory release binary built from this repo (child env isolation: #10183); runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "benches/recall.rs",
+        count: 5,
+        reason: "bench child: runs the ai-memory release binary built from this repo (child env isolation: #10183); runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/cli/doctor.rs",
+        count: 1,
+        reason: "audited #1937 spawn of the system tool nvidia-smi, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/cli/helpers.rs",
+        count: 1,
+        reason: "audited #1937 spawn of the system tool git, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/cli/wake_listen.rs",
+        count: 1,
+        reason: "audited #1937 spawn of the system shell running the operator's configured wake hook, a program not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/cli/wrap.rs",
+        count: 2,
+        reason: "audited #1937 spawn of the agent program the operator names on the command line, a program not built from this repo, so outside the #10176 isolation gate; runs the system tool false, true, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/encryption/mod.rs",
+        count: 1,
+        reason: "runs the system tool git, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/governance/audit.rs",
+        count: 1,
+        reason: "runs the system tool mkfifo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/governance/deferred_audit.rs",
+        count: 1,
+        reason: "runs the system tool mkfifo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/hooks/executor.rs",
+        count: 5,
+        reason: "audited #1937 spawn of the operator's configured daemon hook command, a program not built from this repo, so outside the #10176 isolation gate; audited #1937 spawn of the operator's configured hook command, a program not built from this repo, so outside the #10176 isolation gate; names a path that does not exist, so no process starts; pins the non-transient spawn error; runs the system tool true, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "src/spawn_audit.rs",
+        count: 4,
+        reason: "the two #1937 audited chokepoints, the only std and tokio Command::new calls of the \
+                 library, with the program a caller argument; and their two unit tests, which build a \
+                 Command for the system tool true and never spawn it. The row proves these four \
+                 expectations exist; it does not prove what a caller's program does once started",
+    },
+    Row {
+        path: "src/test_support.rs",
+        count: 1,
+        reason: "the one #10176 sandboxed test child: re-runs this test binary with an env built from nothing inside a TestSandbox (#10176 gate row)",
+    },
+    Row {
+        path: "tests/acceptance/acceptance_nhi_sqlite.rs",
+        count: 3,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/agent_attestation_integrity.rs",
+        count: 3,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/archive_mcp_scope_3382.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/archive_mcp_scope_3383.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/archive_on_gc_config_3385.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/as_agent_read_visibility_3499.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/audit_cli_honors_db_3429.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/audit_signature_pin_l4.rs",
+        count: 1,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/authority_boundary_3549.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/b3_precompute_doesnt_block_serve.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/backup_fail_closed_2444.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/backup_never_migrates_4207.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/backup_zeroed_stamp_4323.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/bench_verified_dispatch_1961.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/bind_api_key_token_file_3781.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/boot_fail_closed_config_3166.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/boot_lifecycle.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/boot_posture_banner_2908.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/boot_primitive_contract.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/capture_turn_cli_3587.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/capture_turn_identity_3393.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/child_stdin_write_report_8734.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); runs the system tool sh, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/cli/export_reflections.rs",
+        count: 5,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_governance_check_action.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_install_capture_hook_3587.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_install_pretool_hook.rs",
+        count: 4,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_integration.rs",
+        count: 6,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_new_subcommands_smoke.rs",
+        count: 11,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_new_subcommands_smoke_batch2.rs",
+        count: 22,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_schema_init.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_serve_help_text.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_stdout_hygiene_behaviour_3436.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_stopper_anchor_race_4044.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_store_sign_unbound_3409.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_verify_chain.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/cli_write_verb_pg_refuse_ceiling_2572.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/common/mcp_stdio_child.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/common/tls_serve.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/config_auto_tag_endpoint_3808_3819.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/config_show_effective_3715.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/conformance_readers.rs",
+        count: 2,
+        reason: "runs the system interpreters python3, python, node or nodejs, binaries not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/contaminated_stamp_authz_sqlite_item3_f1.rs",
+        count: 2,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/coverage_uplift_3885.rs",
+        count: 3,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/credential_to_sink_3711.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/deployment_shape_posture_3700.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/deployment_shape_posture_3700_pg.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/dispatch_integration.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/doctor_cli.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/doctor_over_depth_4715.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/doctor_pg_floor_4333.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/doctor_posture_exit_code_3003.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/doctor_synchronous_posture_3553.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/e1_orchestration_dry_run.rs",
+        count: 2,
+        reason: "runs the orchestrator helper binary built from this repo by this test (child env isolation: #10183); runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/e2_post_ship_dry_run.rs",
+        count: 4,
+        reason: "runs the ai-memory-post-ship-converge helper binary built from this repo by this test (child env isolation: #10183); runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/egress_audit_honors_db_1991.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/embed_lane_egress_gap_3933.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/encryption_key_absent_3718_head.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/entrypoint_toml_escape_3197.rs",
+        count: 1,
+        reason: "runs the system tool bash, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/export_import_false_success_2490.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/export_import_roundtrip_3405.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/export_scope_desilence_1944.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/federation_erasure_replication_2446.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/federation_peer_posture_3582.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/file_sink_warn_3650.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/forensic/bundle_test.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/forensic_cross_process_4304.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/forensic_exit_drain_4319.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/forensic_outage_pg_4199.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/forensic_tail_4199.rs",
+        count: 3,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); runs the system tool mkfifo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/g11_auto_link_detector.rs",
+        count: 2,
+        reason: "runs the auto-link-detector helper binary built from this repo by this test (child env isolation: #10183); runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/governance_storage_insert_hook.rs",
+        count: 4,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/health_metrics_constant_cost_2579_2583.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/identity_generate_not_preempted_3743.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/inbox_drain_not_touch_3730.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/inbox_notify_cli_pg_refusal_3730.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/inference_egress_dispatch_1963.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/install_upgrade_4077_4084.rs",
+        count: 1,
+        reason: "runs the system tool python3, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/integration.rs",
+        count: 14,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); re-runs this test binary as a child process (child env isolation: #10183); runs the system tool curl, a binary not built from this repo, so outside the #10176 isolation gate; runs the system tool kill, a binary not built from this repo, so outside the #10176 isolation gate; runs the system tool openssl, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/issue_1317_cli_reflect_wire_layer_preserves_caller_metadata.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/issue_1590_default_namespace_write_paths.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/key_dir_guard_not_in_binary_3516.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/key_dir_isolation_3355.rs",
+        count: 4,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/keypair_write_crash_injection_3146.rs",
+        count: 1,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/keys_escrow_recovery_3717.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/keys_prune_3355.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/lifecycle_hidden_rows_unit1_3691_3693_3626.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/link_substrate_visibility_3498.rs",
+        count: 2,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/logging_pipeline_3651.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/mcp_format_refusal_3803.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/mcp_governance_pre_action_1685.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/mcp_governance_pre_write_hook_1583.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/mcp_integration.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/mcp_signal_drain_4347.rs",
+        count: 3,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); runs the system tool kill, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/mcp_stdio_session_signer_9926.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/mcp_write_seals_10012.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/migrate_no_create_3435.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/no_openssl_sys_android_1070.rs",
+        count: 1,
+        reason: "runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/notify_inbox_no_overwrite_3639.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/pg_isolate_helper_6383.rs",
+        count: 2,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/pgvector_preflight_3264.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/posture_control15_pg_resolution_3106.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/power_loss_durability.rs",
+        count: 1,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/recall_stderr_lock_deadlock_4284.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/recipe_contract.rs",
+        count: 3,
+        reason: "runs the system tool bash, a binary not built from this repo, so outside the #10176 isolation gate; runs the system tool python3, a binary not built from this repo, so outside the #10176 isolation gate; runs the system tool which or where, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/recipient_gate_derived_from_namespace_3730.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/record_stop_cli_dispatch_1955.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/reembed_cli_1598.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/repair_text_cli_parse_9557.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/retired_provider_aliases.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/routine_run_authorization_3506.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/row_attestations_10040.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/secret_screen_g29.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/security_profile_dispatch_1961.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/security_profile_prerun_2386.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/serve_postgres_continuation2.rs",
+        count: 1,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/serve_store_url_explicit_3431.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/signed_events_fresh_store_signs_3354.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/signed_events_fresh_store_signs_3354_pg.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/skill_promote_test.rs",
+        count: 2,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183); runs the system tool skills-ref, which, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/skill_promote_visibility_3551/mod.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/skill_test.rs",
+        count: 1,
+        reason: "runs the system tool which, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/spawn_audit_gate_1937.rs",
+        count: 1,
+        reason: "builds an audited Command for the system tool true and never spawns it; pins the #1937 audit row (#10176 gate row)",
+    },
+    Row {
+        path: "tests/spawn_gate_pins_10176.rs",
+        count: 9,
+        reason: "pins one libc entry of clippy.toml; names the function, never calls it (#10176); pins the clippy.toml entry ai_memory::spawn_audit::audited_command; names the function, never calls it (#10176); pins the clippy.toml entry ai_memory::spawn_audit::audited_tokio_command; names the function, never calls it (#10176); pins the clippy.toml entry assert_cmd::Command::cargo_bin; names the function, never calls it (#10176); pins the clippy.toml entry assert_cmd::Command::new; names the function, never calls it (#10176); pins the clippy.toml entry assert_cmd::cargo::CommandCargoExt::cargo_bin; names the function, never calls it (#10176); pins the clippy.toml entry libc::vfork; names the function, never calls it (#10176); pins the clippy.toml entry std::process::Command::new; names the function, never calls it (#10176); pins the clippy.toml entry tokio::process::Command::new; names the function, never calls it (#10176)",
+    },
+    Row {
+        path: "tests/sqlite_write_txn_immediate_gate_5084.rs",
+        count: 1,
+        reason: "runs the system tool python3, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/stop_signal_8193.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/store_url_ambiguous_userinfo_6096.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/store_url_fail_closed_2679.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/symlink_follow_8950.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/tls_serve_helper_8293.rs",
+        count: 1,
+        reason: "integration child: re-runs the ai-memory binary command built by tests/common/tls_serve.rs with a changed port (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/tls_verbs_3709.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/toon_meta_budget_3802.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/transcript_extractor.rs",
+        count: 5,
+        reason: "re-runs this test binary as a child process (child env isolation: #10183); runs the system tool cargo, a binary not built from this repo, so outside the #10176 isolation gate; runs the system tool kill, a binary not built from this repo, so outside the #10176 isolation gate; runs the system tool true, a binary not built from this repo, so outside the #10176 isolation gate; runs the transcript-extractor helper binary built from this repo by this test (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/transit_encryption_3705.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183); runs the system tool sh, a binary not built from this repo, so outside the #10176 isolation gate",
+    },
+    Row {
+        path: "tests/transit_floor_unverifiable_4434.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/unstamped_policy_3124.rs",
+        count: 3,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/url_allowlist_render_3667.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/verify_audit_trail_store_url_prb.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/verify_chain_genesis_exit_code_9505.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/wake_hub_readonly_modes_9562.rs",
+        count: 2,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+    Row {
+        path: "tests/write_receipts_cli_mcp_3555.rs",
+        count: 1,
+        reason: "integration child: runs the ai-memory binary built from this repo (child env isolation: #10183)",
+    },
+];
+
+/// One place the layer-2 scanner reports.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Finding {
+    site: Site,
+    path: String,
+    line: usize,
+}
+
+fn is_punct(t: Option<&Lexed>, c: char) -> bool {
+    t.is_some_and(|t| t.tok == Tok::Punct(c))
+}
+
+fn is_ident_at(toks: &[Lexed], k: usize, name: &str) -> bool {
+    toks.get(k).is_some_and(|t| is_ident_tok(t, name))
+}
+
+/// The closing index of every opening bracket (one pass; `toks.len()` when a
+/// group is never closed), so no group is scanned twice.
+fn closers(toks: &[Lexed]) -> Vec<usize> {
+    let mut close = vec![toks.len(); toks.len()];
+    let mut open = Vec::new();
+    for (k, t) in toks.iter().enumerate() {
+        match t.tok {
+            Tok::Punct('(' | '[' | '{') => open.push(k),
+            Tok::Punct(')' | ']' | '}') => {
+                if let Some(o) = open.pop() {
+                    close[o] = k;
+                }
+            }
+            _ => {}
+        }
+    }
+    close
+}
+
+/// The comma-separated lint paths between `a` and `b` at depth 0 (`reason =
+/// ".."` dropped), each written `a::b` the way it is matched.
+fn lint_paths(toks: &[Lexed], a: usize, b: usize, close: &[usize]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut cur = String::new();
+    let mut k = a;
+    while k < b {
+        match &toks[k].tok {
+            Tok::Punct(',') => paths.push(std::mem::take(&mut cur)),
+            Tok::Ident(s) if s == "reason" && is_punct(toks.get(k + 1), '=') => {
+                cur.clear();
+                k += 2;
+            }
+            Tok::Ident(s) => cur.push_str(s),
+            Tok::PathSep => cur.push_str("::"),
+            Tok::Punct('(' | '[' | '{') => {
+                cur.push('(');
+                k = close[k];
+            }
+            Tok::Punct(c) => cur.push(*c),
+            Tok::Str(_) | Tok::Char => cur.push('"'),
+        }
+        k += 1;
+    }
+    paths.push(cur);
+    paths.retain(|p| !p.is_empty());
+    paths
+}
+
+/// Where a `#[path]` / `include!` literal points, resolved lexically from the
+/// directory of the file that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// Under `src/` or `tests/`.
+    Inside,
+    /// In the scanned tree, outside `src/` and `tests/`.
+    Outside,
+    /// Above the root, absolute, or into a skipped or other-crate directory.
+    Escapes,
+}
+
+fn resolve(rel_file: &str, lit: &str) -> Target {
+    if lit.starts_with('/') || lit.contains('\\') || lit.contains(':') {
+        return Target::Escapes;
+    }
+    let mut parts: Vec<&str> = rel_file.split('/').collect();
+    parts.pop();
+    for c in lit.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Target::Escapes;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let target = parts.join("/");
+    let skipped = parts
+        .first()
+        .is_some_and(|first| SKIPPED.iter().any(|(name, _)| name == first));
+    let other_crate = OTHER_CRATES
+        .iter()
+        .any(|(dir, _)| target == *dir || target.starts_with(&format!("{dir}/")));
+    if skipped || other_crate {
+        Target::Escapes
+    } else if target.starts_with("src/") || target.starts_with("tests/") {
+        Target::Inside
+    } else {
+        Target::Outside
+    }
+}
+
+/// Runnable doctest fences and refused doc forms, read line by line (the
+/// lexer drops comments). rustdoc closes an open fence where the doc comment
+/// ends, so a non-doc line closes it here too.
+fn scan_doc_lines(rel: &str, text: &str, out: &mut Vec<Finding>) {
+    const NOT_RUN: &[&str] = &["ignore", "text", "compile_fail", "no_run"];
+    const RUST: &[&str] = &[
+        "",
+        "rust",
+        "should_panic",
+        "edition2015",
+        "edition2018",
+        "edition2021",
+        "edition2024",
+        "test_harness",
+        "standalone_crate",
+    ];
+    let runnable = |info: &str| {
+        let words: Vec<&str> = info
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|w| !w.is_empty())
+            .collect();
+        !words.iter().any(|w| NOT_RUN.contains(w))
+            && words.iter().all(|w| {
+                RUST.contains(w)
+                    || w.strip_prefix('E')
+                        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+            })
+    };
+    let mut fence = false;
+    for (n, raw) in text.lines().enumerate() {
+        let s = raw.trim();
+        let at = |site| Finding {
+            site,
+            path: rel.to_string(),
+            line: n + 1,
+        };
+        if (s.starts_with("/**") && !s.starts_with("/***") && !s.starts_with("/**/"))
+            || s.starts_with("/*!")
+        {
+            out.push(at(Site::DocRefused));
+        }
+        let body = if s.starts_with("////") {
+            None
+        } else {
+            s.strip_prefix("///").or_else(|| s.strip_prefix("//!"))
+        };
+        let Some(body) = body else {
+            fence = false;
+            continue;
+        };
+        let c = body.trim();
+        if c.starts_with("```") || c.starts_with("~~~") {
+            if !fence && runnable(&c[3..]) {
+                out.push(at(Site::DocTest));
+            }
+            fence = !fence;
+        }
+    }
+}
+
+/// Every layer-2 finding of one file (`rel` is its path from the root).
+fn scan_file(rel: &str, text: &str, out: &mut Vec<Finding>) {
+    let toks = lex(text);
+    let n = toks.len();
+    let close = closers(&toks);
+    let at = |site, k: usize| Finding {
+        site,
+        path: rel.to_string(),
+        line: toks.get(k).map_or(0, |t| t.line),
+    };
+    // Innermost enclosing attribute (its `[` index) and whether any
+    // enclosing attribute is an inner one, per token, in one pass.
+    let mut attr_open: Vec<Option<usize>> = vec![None; n];
+    let mut in_inner = vec![false; n];
+    let mut stack: Vec<(usize, usize, bool)> = Vec::new();
+    let mut inner_depth = 0usize;
+    for k in 0..n {
+        while stack.last().is_some_and(|s| k > s.1) {
+            if stack.pop().is_some_and(|s| s.2) {
+                inner_depth -= 1;
+            }
+        }
+        attr_open[k] = stack.last().map(|s| s.0);
+        in_inner[k] = inner_depth > 0;
+        if is_punct(toks.get(k), '#') {
+            let inner = is_punct(toks.get(k + 1), '!');
+            let o = if inner { k + 2 } else { k + 1 };
+            if is_punct(toks.get(o), '[') {
+                stack.push((o, close[o], inner));
+                if inner {
+                    inner_depth += 1;
+                }
+            }
+        }
+    }
+    // The first token after a run of outer attributes and `pub(..)` /
+    // `unsafe`, filled from the back so each index is visited once.
+    let mut after = vec![n; n + 1];
+    for k in (0..n).rev() {
+        let outer_attr = is_punct(toks.get(k), '#') && is_punct(toks.get(k + 1), '[');
+        let pub_scope = is_ident_at(&toks, k, "pub") && is_punct(toks.get(k + 1), '(');
+        after[k] = if outer_attr || pub_scope {
+            after[(close[k + 1] + 1).min(n)]
+        } else if is_ident_at(&toks, k, "pub") || is_ident_at(&toks, k, "unsafe") {
+            after[k + 1]
+        } else {
+            k
+        };
+    }
+    let mut dollars = vec![0usize; n + 1];
+    for k in 0..n {
+        dollars[k + 1] = dollars[k] + usize::from(toks[k].tok == Tok::Punct('$'));
+    }
+    for k in 0..n {
+        let Tok::Ident(word) = &toks[k].tok else {
+            if attr_open[k].is_some()
+                && ((toks[k].tok == Tok::Punct('$')
+                    && matches!(toks.get(k + 1).map(|t| &t.tok), Some(Tok::Ident(_)))
+                    && is_punct(toks.get(k + 2), '('))
+                    || (toks[k].tok == Tok::Punct('[') && is_punct(toks.get(k + 1), '<')))
+            {
+                out.push(at(Site::MacroBuiltLint, k));
+            }
+            continue;
+        };
+        let word = word.as_str();
+        if LEVELS.contains(&word) && is_punct(toks.get(k + 1), '(') {
+            let e = close[k + 1];
+            if attr_open[k].is_some() && dollars[e.min(n)] > dollars[k + 2] {
+                out.push(at(Site::MacroBuiltLint, k));
+            }
+            let hits = lint_paths(&toks, k + 2, e.min(n), &close)
+                .iter()
+                .filter(|p| SILENCE_LINTS.contains(&p.as_str()))
+                .count();
+            let site = if in_inner[k] {
+                Site::InnerSilence
+            } else {
+                Site::Silence
+            };
+            for _ in 0..hits {
+                out.push(at(site, k));
+            }
+            if let (true, Site::Silence, Some(o)) = (hits > 0, site, attr_open[k]) {
+                let item = after[(close[o] + 1).min(n)];
+                if ["mod", "impl", "trait"]
+                    .iter()
+                    .any(|w| is_ident_at(&toks, item, w))
+                {
+                    out.push(at(Site::ScopeSilence, k));
+                }
+            }
+        }
+        match word {
+            "extern" => {
+                let mut j = k + 1;
+                if is_ident_at(&toks, j, "crate") {
+                    continue;
+                }
+                if matches!(toks.get(j).map(|t| &t.tok), Some(Tok::Str(_))) {
+                    j += 1;
+                }
+                if !is_ident_at(&toks, j, "fn") {
+                    out.push(at(Site::Extern, k));
+                }
+            }
+            "asm" | "global_asm" | "naked_asm" => out.push(at(Site::Asm, k)),
+            "path" | "include" => {
+                let lit = if word == "path" {
+                    let attr_key = attr_open[k].is_some()
+                        && k > 0
+                        && matches!(toks[k - 1].tok, Tok::Punct('[' | ','))
+                        && is_punct(toks.get(k + 1), '=');
+                    if !attr_key {
+                        continue;
+                    }
+                    match (
+                        toks.get(k + 2).map(|t| &t.tok),
+                        toks.get(k + 3).map(|t| &t.tok),
+                    ) {
+                        (Some(Tok::Str(p)), Some(Tok::Punct(']' | ')'))) => Some(p.clone()),
+                        _ => None,
+                    }
+                } else {
+                    if !is_punct(toks.get(k + 1), '!') {
+                        continue;
+                    }
+                    match (
+                        toks.get(k + 2).map(|t| &t.tok),
+                        toks.get(k + 3).map(|t| &t.tok),
+                        toks.get(k + 4).map(|t| &t.tok),
+                    ) {
+                        (Some(Tok::Punct('(')), Some(Tok::Str(p)), Some(Tok::Punct(')'))) => {
+                            Some(p.clone())
+                        }
+                        _ => None,
+                    }
+                };
+                match lit {
+                    Some(p) if is_exact_rs(&p) => match resolve(rel, &p) {
+                        Target::Inside => {}
+                        Target::Outside => out.push(at(Site::PathOutside, k)),
+                        Target::Escapes => out.push(at(Site::PathEscapes, k)),
+                    },
+                    _ => out.push(at(Site::NonLiteralPath, k)),
+                }
+            }
+            "doc" if rel.starts_with("src/") && is_punct(toks.get(k + 1), '=') => {
+                let Some(o) = attr_open[k] else { continue };
+                let span = k + 2..close[o].min(n);
+                let bad = span.clone().any(|j| match &toks[j].tok {
+                    Tok::Str(s) => s.contains("```") || s.contains("~~~"),
+                    Tok::Ident(s) => s == "include_str",
+                    Tok::Punct('$') => {
+                        !(j >= 3
+                            && is_punct(toks.get(j - 1), '(')
+                            && is_ident_at(&toks, j - 3, "stringify"))
+                    }
+                    _ => false,
+                });
+                if bad {
+                    out.push(at(Site::DocRefused, k));
+                }
+            }
+            _ => {}
+        }
+    }
+    if rel.starts_with("src/") {
+        scan_doc_lines(rel, text, out);
+    }
+}
+
+/// Every `.rs` file and symbolic link under `dir`, skipping [`SKIPPED`] and
+/// [`OTHER_CRATES`] (both by path from the root). Links are never followed.
+fn walk_tree(dir: &Path, root: &Path, files: &mut Vec<PathBuf>, links: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "#10176: read dir {}: {e}; an unreadable dir is not clean",
+            dir.display()
+        )
+    });
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .unwrap_or_else(|e| panic!("#10176: stat {}: {e}", path.display()));
+        let rel = rel_of(&path, root);
+        if SKIPPED.iter().any(|(name, _)| rel == *name)
+            || OTHER_CRATES.iter().any(|(name, _)| rel == *name)
+        {
+            continue;
+        }
+        if kind.is_symlink() {
+            links.push(path);
+        } else if kind.is_dir() {
+            walk_tree(&path, root, files, links);
+        } else if is_exact_rs(&rel) {
+            files.push(path);
+        }
+    }
+}
+
+fn rel_of(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .expect("walked path is under the root")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Every layer-2 finding of the tree at `root`.
+fn scan_tree(root: &Path) -> Vec<Finding> {
+    let (mut files, mut links) = (Vec::new(), Vec::new());
+    walk_tree(root, root, &mut files, &mut links);
+    let mut out = Vec::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f)
+            .unwrap_or_else(|e| panic!("#10176: read {}: {e}", f.display()));
+        scan_file(&rel_of(f, root), &text, &mut out);
+    }
+    for l in &links {
+        out.push(Finding {
+            site: Site::Link,
+            path: rel_of(l, root),
+            line: 0,
+        });
+    }
+    out
+}
+
+/// Every difference between the findings and the allowlists.
+fn compare(findings: &[Finding]) -> Vec<String> {
+    let mut found: BTreeMap<(Site, &str), usize> = BTreeMap::new();
+    let mut problems = Vec::new();
+    for f in findings {
+        if table(f.site).is_some() {
+            *found.entry((f.site, f.path.as_str())).or_default() += 1;
+        } else {
+            problems.push(format!("{:?} refused: {}:{}", f.site, f.path, f.line));
+        }
+    }
+    let mut pinned: BTreeMap<(Site, &str), usize> = BTreeMap::new();
+    for site in [
+        Site::Silence,
+        Site::InnerSilence,
+        Site::Extern,
+        Site::Asm,
+        Site::PathOutside,
+        Site::DocTest,
+    ] {
+        for row in table(site).unwrap_or_default() {
+            pinned.insert((site, row.path), row.count);
+        }
+    }
+    for (key, n) in &found {
+        let want = pinned.get(key).copied().unwrap_or(0);
+        if *n != want {
+            problems.push(format!(
+                "{:?} {}: {n} found, {want} in the allowlist",
+                key.0, key.1
+            ));
+        }
+    }
+    for (key, want) in &pinned {
+        if !found.contains_key(key) {
+            problems.push(format!(
+                "{:?} {}: 0 found, {want} in the allowlist",
+                key.0, key.1
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn every_silence_extern_asm_path_and_doctest_is_an_exact_row_10176() {
+    let problems = compare(&scan_tree(&crate_root()));
+    assert!(
+        problems.is_empty(),
+        "#10176 layer 2: every place that can silence the process-start lint, \
+         start a process past it or escape the scan is an exact allowlist row \
+         (add a row with its reason, or remove the site):\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn every_row_has_a_reason_and_names_one_file_10176() {
+    let root = crate_root();
+    for site in [
+        Site::Silence,
+        Site::InnerSilence,
+        Site::Extern,
+        Site::Asm,
+        Site::PathOutside,
+        Site::DocTest,
+    ] {
+        let rows = table(site).unwrap_or_default();
+        for pair in rows.windows(2) {
+            assert!(
+                pair[0].path < pair[1].path,
+                "#10176: {site:?} rows sorted and unique: {} / {}",
+                pair[0].path,
+                pair[1].path
+            );
+        }
+        for row in rows {
+            assert!(row.count > 0, "#10176: {site:?} {} count 0", row.path);
+            assert!(
+                row.reason.split_whitespace().count() >= 4,
+                "#10176: {site:?} {} needs a reason",
+                row.path
+            );
+            assert!(
+                root.join(row.path).is_file(),
+                "#10176: {site:?} row {} names no file",
+                row.path
+            );
+        }
+    }
+    for (dir, why) in OTHER_CRATES {
+        assert!(
+            why.split_whitespace().count() >= 4,
+            "#10176: {dir} needs a reason"
+        );
+    }
+}
+
+/// The text of `rel` under the crate root.
+fn read_rel(rel: &str) -> String {
+    std::fs::read_to_string(crate_root().join(rel))
+        .unwrap_or_else(|e| panic!("#10176: read {rel}: {e}"))
+}
+
+/// The `path = ".."` values of the `disallowed-methods` array of a clippy.toml.
+fn clippy_entries(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let s = line.trim();
+        if s.starts_with("disallowed-methods") {
+            inside = true;
+            continue;
+        }
+        if inside && s.starts_with(']') {
+            break;
+        }
+        if inside
+            && !s.starts_with('#')
+            && let Some(rest) = s.split("path = \"").nth(1)
+        {
+            out.push(rest.split('"').next().unwrap_or_default().to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn the_layer_one_inputs_are_pinned_10176() {
+    // clippy.toml: the exact list, in order.
+    let entries = clippy_entries(&read_rel("clippy.toml"));
+    assert_eq!(
+        entries, CLIPPY_ENTRIES,
+        "#10176: clippy.toml disallowed-methods"
+    );
+    // Each entry has its fulfilled-expectation pin.
+    let pins = read_rel(PINS_FILE);
+    for entry in CLIPPY_ENTRIES {
+        // An explicit pin names the entry in its reason; a `libc_pins!` row
+        // is `pin_libc_<name> => <name>;`.
+        let explicit = pins.contains(&format!("pins the clippy.toml entry {entry};"));
+        let by_macro = entry
+            .strip_prefix("libc::")
+            .is_some_and(|name| pins.contains(&format!("pin_libc_{name} => {name};")));
+        let pinned = explicit || by_macro;
+        assert!(pinned, "#10176: {entry} has no pin in {PINS_FILE}");
+    }
+    // src/lib.rs: the group allow, then the re-deny after it.
+    let lib = read_rel("src/lib.rs");
+    let lines: Vec<&str> = lib.lines().map(str::trim).collect();
+    let allow = lines.iter().position(|l| *l == LIB_GROUP_ALLOW);
+    let deny = lines.iter().position(|l| *l == LIB_REDENY);
+    assert!(
+        matches!((allow, deny), (Some(a), Some(d)) if a < d),
+        "#10176: src/lib.rs holds {LIB_GROUP_ALLOW} and then {LIB_REDENY}"
+    );
+    // The toolchain the closed set of silence names was read from.
+    let toolchain = read_rel("rust-toolchain.toml");
+    assert!(
+        toolchain
+            .lines()
+            .any(|l| l.trim() == format!("channel = \"{PINNED_TOOLCHAIN}\"")),
+        "#10176: rust-toolchain.toml channel is {PINNED_TOOLCHAIN}; a new toolchain can add \
+         a lint group, so re-read the closed set before moving the pin"
+    );
+    // Cargo.toml: one [lints.clippy] table, none of the silence names in it.
+    let cargo = read_rel("Cargo.toml");
+    let headers: Vec<&str> = cargo
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("[lints") || l.starts_with("[workspace.lints"))
+        .collect();
+    assert_eq!(
+        headers,
+        ["[lints.clippy]"],
+        "#10176: Cargo.toml lint tables"
+    );
+    let body: Vec<&str> = cargo
+        .lines()
+        .map(str::trim)
+        .skip_while(|l| *l != "[lints.clippy]")
+        .skip(1)
+        .take_while(|l| !l.starts_with('['))
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        body,
+        ["too_many_lines = { level = \"warn\", priority = -1 }"],
+        "#10176: Cargo.toml [lints.clippy]"
+    );
+    // .cargo/: no build flags (a rustflags value can cap or allow lints).
+    let cargo_dir = crate_root().join(".cargo");
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&cargo_dir)
+        .expect("read .cargo")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        assert!(
+            !text.contains("rustflags"),
+            "#10176: .cargo/{name} sets rustflags"
+        );
+        names.push(name);
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        ["audit-exceptions.toml", "audit.toml"],
+        "#10176: .cargo/ files"
+    );
+}
+
+/// Every directory below the root (skipping [`SKIPPED`]) holding a Cargo.toml.
+fn nested_packages(dir: &Path, root: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let rel = rel_of(&path, root);
+        if SKIPPED.iter().any(|(name, _)| rel == *name) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|k| k.is_dir()) {
+            if path.join("Cargo.toml").is_file() {
+                out.push(rel);
+            }
+            nested_packages(&path, root, out);
+        }
+    }
+}
+
+#[test]
+fn the_other_packages_are_an_exact_list_10176() {
+    let root = crate_root();
+    let mut found = Vec::new();
+    nested_packages(&root, &root, &mut found);
+    let want: Vec<&str> = OTHER_CRATES.iter().map(|(d, _)| *d).collect();
+    assert_eq!(
+        found, want,
+        "#10176: a new nested package is not built by the clippy gate; list it with its reason"
+    );
+}
+
+/// One fixture: the file path, its text and the findings it must yield.
+type Case = (&'static str, &'static str, &'static [(Site, usize)]);
+
+/// `(site, line)` of each finding of one fixture file at `rel`.
+fn fixture(rel: &str, text: &str) -> Vec<(Site, usize)> {
+    let mut out = Vec::new();
+    scan_file(rel, text, &mut out);
+    let mut got: Vec<(Site, usize)> = out.into_iter().map(|f| (f.site, f.line)).collect();
+    got.sort();
+    got
+}
+
+#[test]
+fn the_scanner_sees_every_form_10176() {
+    use Site::{
+        Asm, DocRefused, DocTest, Extern, InnerSilence, MacroBuiltLint, NonLiteralPath,
+        PathEscapes, PathOutside, ScopeSilence, Silence,
+    };
+    let cases: &[Case] = &[
+        // Item, statement, cfg_attr, every level, raw and spaced names.
+        (
+            "src/a.rs",
+            "#[allow(clippy::disallowed_methods)] fn f() {}",
+            &[(Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[expect(clippy::disallowed_types, reason = \"r\")] fn f() {}",
+            &[(Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "fn f() {\n #[allow(clippy::disallowed_methods)]\n let c = 1; }",
+            &[(Silence, 2)],
+        ),
+        (
+            "src/a.rs",
+            "#[cfg_attr(test, allow(clippy::disallowed_methods))] fn f() {}",
+            &[(Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[cfg_attr(all(), cfg_attr(unix, expect(warnings)))] fn f() {}",
+            &[(Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[warn(clippy::style)] #[deny(clippy::all)] #[forbid(warnings)] fn f() {}",
+            &[(Silence, 1), (Silence, 1), (Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[allow(r#warnings, clippy :: disallowed_method)] fn f() {}",
+            &[(Silence, 1), (Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[allow(clippy::disallowed_type, unused)] fn f() {}",
+            &[(Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[allow(clippy::pedantic, unused, dead_code)] fn f() {}",
+            &[],
+        ),
+        // Inner (crate or module) silences.
+        (
+            "tests/t.rs",
+            "#![allow(clippy::all)]\nfn f() {}",
+            &[(InnerSilence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#![cfg_attr(all(), allow(clippy::disallowed_methods))]",
+            &[(InnerSilence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "fn f() {\n #![allow(warnings)]\n}",
+            &[(InnerSilence, 2)],
+        ),
+        // A silence on a whole scope.
+        (
+            "src/a.rs",
+            "#[allow(clippy::all)]\nmod m;",
+            &[(Silence, 1), (ScopeSilence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[expect(warnings)] #[cfg(test)] pub(crate) mod m {}",
+            &[(Silence, 1), (ScopeSilence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[allow(clippy::style)] impl S {}",
+            &[(Silence, 1), (ScopeSilence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[allow(clippy::style)] pub unsafe trait T {}",
+            &[(Silence, 1), (ScopeSilence, 1)],
+        ),
+        // Through a macro: passed in, built inside, pasted.
+        (
+            "src/a.rs",
+            "m! { #[allow(clippy::disallowed_methods)] fn f() {} }",
+            &[(Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "m!(allow(clippy::disallowed_methods));",
+            &[(Silence, 1)],
+        ),
+        (
+            "src/a.rs",
+            "macro_rules! m { ($l:path) => { #[allow($l)] fn f() {} } }",
+            &[(MacroBuiltLint, 1)],
+        ),
+        (
+            "src/a.rs",
+            "macro_rules! m { ($v:ident) => { #[$v(clippy::all)] fn f() {} } }",
+            &[(MacroBuiltLint, 1)],
+        ),
+        (
+            "src/a.rs",
+            "paste! { #[[<al low>](warnings)] fn f() {} }",
+            &[(MacroBuiltLint, 1)],
+        ),
+        (
+            "src/a.rs",
+            "macro_rules! m { ($(#[$m:meta])*) => { $(#[$m])* fn f() {} } }",
+            &[],
+        ),
+        // Not code.
+        (
+            "src/a.rs",
+            "// #[allow(clippy::all)]\n/* #![allow(warnings)] */\nconst S: &str = \"#[allow(warnings)]\";",
+            &[],
+        ),
+        // Foreign items and assembly.
+        (
+            "src/a.rs",
+            "extern \"C\" { fn fork() -> i32; }",
+            &[(Extern, 1)],
+        ),
+        (
+            "src/a.rs",
+            "unsafe extern \"C\" {\n fn execve(); }",
+            &[(Extern, 1)],
+        ),
+        ("src/a.rs", "extern { fn system(); }", &[(Extern, 1)]),
+        (
+            "src/a.rs",
+            "extern crate libc;\nextern \"C\" fn cb() {}\ntype F = extern \"C\" fn();\nextern fn g() {}",
+            &[],
+        ),
+        (
+            "src/a.rs",
+            "fn f() { unsafe { core::arch::asm!(\"syscall\") } }\nglobal_asm!(\"\");",
+            &[(Asm, 1), (Asm, 2)],
+        ),
+        // Path and include targets.
+        (
+            "src/a.rs",
+            "#[path = \"b/c.rs\"] mod c;\ninclude!(\"d.rs\");",
+            &[],
+        ),
+        (
+            "src/a/b.rs",
+            "#[path = \"../../tests/common/x.rs\"] mod x;",
+            &[],
+        ),
+        (
+            "src/a.rs",
+            "#[path = \"../benchmarks/x.rs\"] mod x;",
+            &[(PathOutside, 1)],
+        ),
+        (
+            "tests/t.rs",
+            "include!(\"../examples/x.rs\");",
+            &[(PathOutside, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[path = \"../../x.rs\"] mod x;",
+            &[(PathEscapes, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[path = \"/etc/x.rs\"] mod x;",
+            &[(PathEscapes, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[path = \"../target/x.rs\"] mod x;",
+            &[(PathEscapes, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[path = \"../vendor/paste/src/x.rs\"] mod x;",
+            &[(PathEscapes, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[path = \"x.txt\"] mod x;",
+            &[(NonLiteralPath, 1)],
+        ),
+        (
+            "src/a.rs",
+            "#[cfg_attr(unix, path = \"x.RS\")] mod x;",
+            &[(NonLiteralPath, 1)],
+        ),
+        (
+            "src/a.rs",
+            "include!(concat!(\"x\", \".rs\"));",
+            &[(NonLiteralPath, 1)],
+        ),
+        ("src/a.rs", "include! {\"x.rs\"}", &[(NonLiteralPath, 1)]),
+        // Doctests (src/ only) and the doc forms the counter does not read.
+        (
+            "src/a.rs",
+            "/// ```\n/// x();\n/// ```\nfn f() {}",
+            &[(DocTest, 1)],
+        ),
+        (
+            "src/a.rs",
+            "//! ```rust,should_panic\n//! x();\n//! ```",
+            &[(DocTest, 1)],
+        ),
+        (
+            "src/a.rs",
+            "/// ```ignore\n/// ```\n/// ```text\n/// ```\n/// ```rust,no_run\n/// ```\n/// ```json\n/// ```",
+            &[],
+        ),
+        (
+            "src/a.rs",
+            "/// ```json\nfn f() {}\n/// ```\n/// ```\nfn g() {}",
+            &[(DocTest, 3)],
+        ),
+        ("tests/t.rs", "/// ```\n/// x();\n/// ```\nfn f() {}", &[]),
+        (
+            "src/a.rs",
+            "/** ```\nx();\n``` */\nfn f() {}",
+            &[(DocRefused, 1)],
+        ),
+        ("src/a.rs", "#[doc = \"```\"] fn f() {}", &[(DocRefused, 1)]),
+        (
+            "src/a.rs",
+            "#![doc = include_str!(\"../README.md\")]",
+            &[(DocRefused, 1)],
+        ),
+        (
+            "src/a.rs",
+            "macro_rules! m { ($d:expr) => { #[doc = $d] fn f() {} } }",
+            &[(DocRefused, 1)],
+        ),
+        (
+            "src/a.rs",
+            "macro_rules! m { ($n:ident) => { #[doc = concat!(\"a \", stringify!($n))] fn f() {} } }",
+            &[],
+        ),
+    ];
+    for (rel, text, want) in cases {
+        let mut want = want.to_vec();
+        want.sort();
+        assert_eq!(fixture(rel, text), want, "#10176 fixture {rel}: {text}");
+    }
+}
+
+#[test]
+fn the_scanner_is_linear_on_large_input_10176() {
+    // 120K silenced items, then 100K unclosed attribute openers: both must
+    // scan in one pass (closers are precomputed, attributes kept on a stack).
+    let n = 120_000usize;
+    let big = "#[allow(clippy::all)] fn f() {}\n".repeat(n);
+    let start = std::time::Instant::now();
+    let got = fixture("src/a.rs", &big);
+    assert_eq!(got.len(), n);
+    let opens = "#[".repeat(100_000);
+    let _ = fixture("src/a.rs", &opens);
+    let deep = format!("{}{}", "allow(".repeat(100_000), ")".repeat(100_000));
+    let _ = fixture("src/a.rs", &deep);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "#10176: layer-2 scan of {} bytes took {:?}",
+        big.len() + opens.len() + deep.len(),
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_link_an_escape_and_an_unlisted_silence_in_a_tree_are_red_10176() {
+    let base = scratch_dir(&crate_root().join(".local-runs"));
+    std::fs::create_dir_all(base.join("src")).expect("mkdir src");
+    std::fs::create_dir_all(base.join("fuzz")).expect("mkdir fuzz");
+    std::fs::write(
+        base.join("src/lib.rs"),
+        "#[path = \"../../up.rs\"] mod up;\n",
+    )
+    .expect("write");
+    std::fs::write(
+        base.join("src/new.rs"),
+        "#[allow(clippy::disallowed_methods)]\nfn f() {}\n",
+    )
+    .expect("write");
+    // Inside an other-crate directory: not scanned.
+    std::fs::write(base.join("fuzz/x.rs"), "#![allow(warnings)]\n").expect("write");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("lib.rs", base.join("src/link.rs")).expect("symlink");
+    let mut got: Vec<(Site, String, usize)> = scan_tree(&base)
+        .into_iter()
+        .map(|f| (f.site, f.path, f.line))
+        .collect();
+    got.sort();
+    let mut want = vec![
+        (Site::Silence, "src/new.rs".to_string(), 1),
+        (Site::PathEscapes, "src/lib.rs".to_string(), 1),
+    ];
+    #[cfg(unix)]
+    want.push((Site::Link, "src/link.rs".to_string(), 0));
+    want.sort();
+    assert_eq!(got, want);
+    let problems = compare(&scan_tree(&base));
+    assert!(
+        problems
+            .iter()
+            .any(|p| p == "PathEscapes refused: src/lib.rs:1")
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p == "Silence src/new.rs: 1 found, 0 in the allowlist")
+    );
+    std::fs::remove_dir_all(&base).expect("remove scratch tree");
+}
+
+// ---------------------------------------------------------------------------
+// The lexer layer 2 and the builder-surface test share.
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
@@ -744,418 +2641,9 @@ fn group_end(toks: &[Lexed], open: usize) -> usize {
     toks.len()
 }
 
-/// Identifiers that are a spawn site wherever they appear: the executable
-/// path, argv, both #1937 chokepoints, the `assert_cmd` dev-dependency (usable
-/// from a lib test) and the `paste` identifier-gluing macro.
-const SPAWN_IDENTS: &[&str] = &[
-    "current_exe",
-    "args_os",
-    "audited_command",
-    "audited_tokio_command",
-    "assert_cmd",
-    "paste",
-];
-
-/// `module :: member` paths that are a spawn site, with `module :: *` and
-/// every member (or `*`) inside a `module :: { .. }` group.
-const SPAWN_MEMBERS: &[(&str, &[&str])] = &[
-    ("process", &["Command"]),
-    ("env", &["args"]),
-    (
-        "libc",
-        &[
-            "fork",
-            "vfork",
-            "execv",
-            "execve",
-            "execvp",
-            "execvpe",
-            "execl",
-            "execle",
-            "execlp",
-            "fexecve",
-            "posix_spawn",
-            "posix_spawnp",
-            "system",
-        ],
-    ),
-];
-
-/// A decoded literal that names a `/proc` or executable path segment.
-fn is_exe_literal(text: &str) -> bool {
-    text.split(['/', '\\'])
-        .any(|seg| seg == "proc" || seg == "exe")
-}
-
-/// The line of every spawn site in one lexed source.
-fn spawn_sites(toks: &[Lexed]) -> Vec<usize> {
-    let mut sites = Vec::new();
-    let mut i = 0usize;
-    while i < toks.len() {
-        let t = &toks[i];
-        let after_sep = |k: usize| -> Option<&Lexed> {
-            (toks.get(k + 1).map(|x| &x.tok) == Some(&Tok::PathSep))
-                .then(|| toks.get(k + 2))
-                .flatten()
-        };
-        match &t.tok {
-            Tok::Ident(s) if SPAWN_IDENTS.contains(&s.as_str()) => {
-                sites.push(t.line);
-            }
-            Tok::Ident(s) if SPAWN_MEMBERS.iter().any(|(m, _)| m == s) => {
-                let members = SPAWN_MEMBERS
-                    .iter()
-                    .find(|(m, _)| m == s)
-                    .map_or(&[][..], |(_, ms)| *ms);
-                let is_member = |x: &Lexed| members.iter().any(|m| is_ident_tok(x, m));
-                if let Some(n) = after_sep(i) {
-                    match &n.tok {
-                        Tok::Ident(_) if is_member(n) => sites.push(n.line),
-                        Tok::Punct('*') => sites.push(n.line),
-                        Tok::Punct('{') => {
-                            let open = i + 2;
-                            let end = group_end(toks, open);
-                            for g in &toks[open..end.min(toks.len())] {
-                                if is_member(g) || g.tok == Tok::Punct('*') {
-                                    sites.push(g.line);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Tok::Ident(s)
-                if s == "concat" && toks.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct('!')) =>
-            {
-                let open = i + 2;
-                let end = group_end(toks, open);
-                let joined: String = toks[open.min(toks.len())..end.min(toks.len())]
-                    .iter()
-                    .filter_map(|x| match &x.tok {
-                        Tok::Str(v) => Some(v.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if is_exe_literal(&joined) {
-                    sites.push(t.line);
-                }
-                i = end;
-            }
-            Tok::Str(v) if is_exe_literal(v) => sites.push(t.line),
-            _ => {}
-        }
-        i += 1;
-    }
-    sites
-}
-
-/// Problems that refuse a file whatever the allowlist says: a computed or
-/// non-`.rs` `include!`, and a `#[path]` to a non-`.rs` file.
-fn include_problems(toks: &[Lexed]) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, t) in toks.iter().enumerate() {
-        let bang = toks.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct('!'));
-        if is_ident_tok(t, "include") && bang {
-            let lit_rs = matches!(
-                (toks.get(i + 2).map(|x| &x.tok), toks.get(i + 3).map(|x| &x.tok), toks.get(i + 4).map(|x| &x.tok)),
-                (Some(Tok::Punct('(')), Some(Tok::Str(p)), Some(Tok::Punct(')'))) if is_exact_rs(p)
-            );
-            if !lit_rs {
-                out.push(format!(
-                    "line {}: include! of something other than one literal .rs path",
-                    t.line
-                ));
-            }
-        }
-        if t.tok == Tok::Punct('#')
-            && toks.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct('['))
-            && toks.get(i + 2).is_some_and(|x| is_ident_tok(x, "path"))
-            && toks.get(i + 3).map(|x| &x.tok) == Some(&Tok::Punct('='))
-        {
-            let rs = matches!(toks.get(i + 4).map(|x| &x.tok), Some(Tok::Str(p)) if is_exact_rs(p));
-            if !rs {
-                out.push(format!(
-                    "line {}: #[path] to a file that is not .rs",
-                    t.line
-                ));
-            }
-        }
-    }
-    out
-}
-
-/// Every file and symbolic link under `dir` (skipping [`SKIPPED`] names).
-/// Symbolic links are returned in the second list, never followed.
-fn walk_all(dir: &Path, root: &Path, files: &mut Vec<PathBuf>, links: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "#10176: read dir {}: {e}; an unreadable dir is not clean",
-            dir.display()
-        )
-    });
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let kind = entry
-            .file_type()
-            .unwrap_or_else(|e| panic!("#10176: stat {}: {e}", path.display()));
-        let rel = path.strip_prefix(root).unwrap_or(&path);
-        if SKIPPED.iter().any(|(name, _)| rel == Path::new(name)) {
-            continue;
-        }
-        if kind.is_symlink() {
-            links.push(path);
-        } else if kind.is_dir() {
-            walk_all(&path, root, files, links);
-        } else {
-            files.push(path);
-        }
-    }
-}
-
-fn rel_of(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .expect("walked path is under the root")
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-/// `(spawn sites per src/ file, refusals)` for the tree at `root`.
-fn scan_src(root: &Path) -> (BTreeMap<String, usize>, Vec<String>) {
-    let mut files = Vec::new();
-    let mut links = Vec::new();
-    walk_all(root, root, &mut files, &mut links);
-    let mut problems: Vec<String> = links
-        .iter()
-        .map(|l| {
-            format!(
-                "{}: symbolic link in the scanned tree; a link can hide any file from this ratchet",
-                rel_of(l, root)
-            )
-        })
-        .collect();
-    let mut sites = BTreeMap::new();
-    for file in files
-        .iter()
-        .filter(|f| f.extension().is_some_and(|e| e == "rs"))
-    {
-        let rel = rel_of(file, root);
-        let text = std::fs::read_to_string(file)
-            .unwrap_or_else(|e| panic!("#10176: read {rel}: {e}; an unreadable file is not clean"));
-        let toks = lex(&text);
-        problems.extend(
-            include_problems(&toks)
-                .into_iter()
-                .map(|p| format!("{rel}: {p}")),
-        );
-        if !rel.starts_with(&format!("{SRC_DIR}/")) {
-            continue;
-        }
-        let n = spawn_sites(&toks).len();
-        if n > 0 {
-            sites.insert(rel, n);
-        }
-    }
-    (sites, problems)
-}
-
-#[test]
-fn every_src_process_construction_is_an_allowlisted_row_10176() {
-    let root = crate_root();
-    let (observed, mut problems) = scan_src(&root);
-    let pinned: BTreeMap<String, usize> = SRC_SPAWN_ALLOWLIST
-        .iter()
-        .map(|(p, n, _)| ((*p).to_string(), *n))
-        .collect();
-    for (path, n) in &observed {
-        match pinned.get(path) {
-            None => problems.push(format!(
-                "{path}: {n} process-construction site(s) with no allowlist row; a lib-test child \
-                 must come from crate::test_support::SandboxedTestChild (#10176)"
-            )),
-            Some(want) if want != n => problems.push(format!(
-                "{path}: pinned {want} process-construction site(s), found {n}; re-justify the row (#10176)"
-            )),
-            Some(_) => {}
-        }
-    }
-    for path in pinned.keys() {
-        if !observed.contains_key(path) {
-            problems.push(format!(
-                "{path}: pinned but no site found; remove the stale row (#10176)"
-            ));
-        }
-    }
-    assert!(problems.is_empty(), "#10176:\n{}", problems.join("\n"));
-}
-
-#[test]
-fn every_src_allowlist_row_has_a_reason_10176() {
-    for (path, n, why) in SRC_SPAWN_ALLOWLIST {
-        assert!(*n > 0, "#10176: row {path} pins zero sites");
-        assert!(
-            why.trim().len() >= 20,
-            "#10176: row {path} needs a real reason, got {why:?}"
-        );
-        assert!(
-            path.starts_with("src/"),
-            "#10176: row {path} is not a src/ row"
-        );
-    }
-    let unique: std::collections::BTreeSet<_> =
-        SRC_SPAWN_ALLOWLIST.iter().map(|(p, _, _)| *p).collect();
-    assert_eq!(
-        unique.len(),
-        SRC_SPAWN_ALLOWLIST.len(),
-        "#10176: duplicate src rows"
-    );
-}
-
-#[test]
-fn the_src_scanner_sees_every_spelling_10176() {
-    // (source, expected spawn sites). Hand-written expected column.
-    let cases: &[(&str, usize)] = &[
-        // the chokepoint, by path, alias, re-export, glob and bare call
-        ("let c = crate::spawn_audit::audited_command(p, \"x\");", 1),
-        (
-            "use crate::spawn_audit::audited_command as mk;\nlet c = mk(p, \"x\");",
-            1,
-        ),
-        ("pub(crate) use crate::spawn_audit::audited_command;", 1),
-        (
-            "use crate::spawn_audit::*;\nlet c = audited_command(p, \"x\");",
-            1,
-        ),
-        // raw identifier
-        ("let c = r#audited_command(p, \"x\");", 1),
-        // the std and tokio process types, every import shape
-        ("let c = std::process::Command::new(\"git\");", 1),
-        ("use std::process::Command as Cmd;", 1),
-        ("use std::process::{Stdio, Command};", 1),
-        ("use std::process::{self, Command as C, Stdio};", 1),
-        ("use tokio::process::*;", 1),
-        ("use std::{process::{Command}, io};", 1),
-        ("use std::os::unix::process::CommandExt;", 0),
-        (
-            "let c = crate::spawn_audit::audited_tokio_command(p, \"x\");",
-            1,
-        ),
-        ("let c = assert_cmd::Command::cargo_bin(\"ai-memory\");", 1),
-        ("let pid = unsafe { libc::fork() };", 1),
-        ("use libc::{execv as ev, getpid};", 1),
-        ("use libc::*;", 1),
-        ("use std::process::{self, *};", 1),
-        ("let pid = libc::getpid();", 0),
-        // argv[0]
-        ("let me = std::env::args().next();", 1),
-        ("let me = env::args_os().next();", 1),
-        ("use std::env::{args, var};", 1),
-        ("use std::env::*;", 1),
-        // the executable path
-        ("let p = std::env::current_exe()?;", 1),
-        ("macro_rules! m { () => { std::env::current_exe() }; }", 1),
-        ("let p = \"/proc/self/exe\";", 1),
-        ("let p = r#\"/proc/self/exe\"#;", 1),
-        ("let p = b\"/proc/self/exe\";", 1),
-        // hex and unicode escapes
-        ("let p = \"\\x2fproc\\x2fself\\x2fexe\";", 1),
-        ("let p = \"\\u{2f}pro\\u{63}/self/ex\\u{65}\";", 1),
-        // pieces: concat!, format! with the pid, joins
-        ("let p = concat!(\"/pr\", \"oc/se\", \"lf/e\", \"xe\");", 1),
-        ("let p = format!(\"/proc/{}/exe\", std::process::id());", 1),
-        (
-            "let p = format!(\"/{}/{pid}/{}\", \"pr\".to_owned() + \"oc\", \"ex\");",
-            0,
-        ),
-        (
-            "let p = Path::new(\"/\").join(\"proc\").join(\"self\").join(\"exe\");",
-            2,
-        ),
-        // identifier glued from pieces
-        ("paste::paste! { let c = [<Comm and>]::new(\"x\"); }", 2),
-        // never counted: comments, other identifiers, other literals
-        ("// std::process::Command::new(\"x\")", 0),
-        ("/* audited_command /* nested */ current_exe */", 0),
-        ("let s = \"audited_command\"; let t = 'x';", 0),
-        ("let my_current_exe = 1; let audited_command_count = 2;", 0),
-        ("let c = Command::Serve; let a = args.len();", 0),
-        ("let p = \"/process/execute\";", 0),
-    ];
-    for (src, want) in cases {
-        assert_eq!(
-            spawn_sites(&lex(src)).len(),
-            *want,
-            "#10176: src scanner disagrees on source {src:?}"
-        );
-    }
-    // Known limit, pinned so the docs stay honest: a path built at run time
-    // from sub-segment pieces is not a literal; the chokepoint identifier in
-    // the same call is what counts it.
-    assert_eq!(
-        spawn_sites(&lex(
-            "let c = audited_command(PathBuf::from(format!(\"/{}{}\", \"pr\", \"oc\")), \"x\");"
-        ))
-        .len(),
-        1
-    );
-}
-
-#[test]
-fn include_and_path_attributes_must_name_rs_files_10176() {
-    let cases: &[(&str, usize)] = &[
-        ("include!(\"spawn.inc\");", 1),
-        ("include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));", 1),
-        ("include ! ( \"spawn.txt\" );", 1),
-        ("#[path = \"spawn.txt\"] mod s;", 1),
-        ("#[path = \"common/token_scan.rs\"] mod t;", 0),
-        ("include!(\"generated.rs\");", 0),
-        ("let s = include_str!(\"fixture.json\");", 0),
-        ("// include!(\"x.inc\")", 0),
-    ];
-    for (src, want) in cases {
-        assert_eq!(
-            include_problems(&lex(src)).len(),
-            *want,
-            "#10176: include check disagrees on {src:?}"
-        );
-    }
-}
-
-#[test]
-fn a_symlink_or_a_non_rs_include_in_the_tree_is_refused_10176() {
-    let base = scratch_dir(&crate_root().join(".local-runs"));
-    let src = base.join(SRC_DIR);
-    std::fs::create_dir_all(&src).expect("create fixture src");
-    std::fs::write(
-        src.join("real.rs"),
-        "fn f() { let _ = std::env::current_exe(); }\n",
-    )
-    .expect("write fixture");
-    std::fs::write(src.join("spawn.inc"), "std::process::Command::new(\"x\")\n")
-        .expect("write fixture");
-    std::fs::write(src.join("user.rs"), "fn g() { include!(\"spawn.inc\"); }\n")
-        .expect("write fixture");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(src.join("real.rs"), src.join("alias.rs")).expect("symlink fixture");
-    let (sites, problems) = scan_src(&base);
-    std::fs::remove_dir_all(&base).expect("remove scan fixture");
-    assert_eq!(
-        sites.into_iter().collect::<Vec<_>>(),
-        vec![("src/real.rs".to_string(), 1)],
-        "#10176: the real file is counted once, through no link"
-    );
-    let mut want = vec![
-        "src/user.rs: line 1: include! of something other than one literal .rs path".to_string(),
-    ];
-    #[cfg(unix)]
-    want.insert(
-        0,
-        "src/alias.rs: symbolic link in the scanned tree; a link can hide any file from this ratchet".to_string(),
-    );
-    assert_eq!(problems, want, "#10176: link and include refusals");
-}
+// ---------------------------------------------------------------------------
+// The builder's surface.
+// ---------------------------------------------------------------------------
 
 /// The builder's narrow surface, exactly (hand-written): no `configure`, no
 /// `into_parts`, nothing that hands out or accepts a raw `Command`.
