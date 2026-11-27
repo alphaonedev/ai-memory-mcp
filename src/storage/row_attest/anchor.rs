@@ -143,6 +143,28 @@ impl AnchorKey {
     pub fn is_retired(&self) -> bool {
         self.valid_to.is_some()
     }
+
+    /// Check whether `at` (unix seconds) satisfies this key's anchored
+    /// validity window (#10086, #10111, #10170).
+    ///
+    /// Shared by [`TrustAnchor::key_for`] (`enforce_valid_from = true`, where
+    /// the attestation instant is signed inside the preimage) and
+    /// [`TrustAnchor::verify_key_for_span`] (`enforce_valid_from = false`,
+    /// where `SignableWrite` signs `created_at` only and does not yet sign the
+    /// reseal instant — tracked in #10174 — so only the signed upper bound
+    /// `created_at <= valid_to` is enforced).
+    fn check_window(&self, at: i64, enforce_valid_from: bool) -> Result<(), KeyRefusal> {
+        let after_start = !enforce_valid_from || self.valid_from.is_none_or(|from| at >= from);
+        let before_end = self.valid_to.is_none_or(|to| at <= to);
+        if after_start && before_end {
+            Ok(())
+        } else {
+            Err(KeyRefusal::OutOfRange {
+                valid_from: self.valid_from,
+                valid_to: self.valid_to,
+            })
+        }
+    }
 }
 
 /// Why an attestation's key is refused by the anchor.
@@ -159,6 +181,39 @@ pub enum KeyRefusal {
     BadTime,
     /// The key is used outside its validity window (A-6).
     OutOfRange {
+        /// Window start, unix seconds.
+        valid_from: Option<i64>,
+        /// Window end, unix seconds.
+        valid_to: Option<i64>,
+    },
+}
+
+/// Refusal of [`TrustAnchor::verify_key_for_span`]: typed per-cause enum so
+/// `key_id` is carried ONLY on variants where an anchored key verified the
+/// signature (`OtherAgent`, `BadTime`, `OutOfRange`) — making an empty `key_id`
+/// unrepresentable (F4, #10111).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpanKeyRefusal {
+    /// The anchor holds no key at all for the claimed agent.
+    UnknownAgent,
+    /// The anchor holds keys for the claimed agent, but none verified the signature.
+    UnknownKey,
+    /// A key in the anchor verified the signature, but it belongs to `anchored_agent`.
+    OtherAgent {
+        /// Matching anchored key id.
+        key_id: String,
+        /// Agent the key is anchored to.
+        anchored_agent: String,
+    },
+    /// The signed `created_at` timestamp is not valid RFC 3339.
+    BadTime {
+        /// Matching anchored key id.
+        key_id: String,
+    },
+    /// The key is used outside its anchored validity window.
+    OutOfRange {
+        /// Matching anchored key id.
+        key_id: String,
         /// Window start, unix seconds.
         valid_from: Option<i64>,
         /// Window end, unix seconds.
@@ -486,16 +541,96 @@ impl TrustAnchor {
         let at = chrono::DateTime::parse_from_rfc3339(attested_at)
             .map_err(|_| KeyRefusal::BadTime)?
             .timestamp();
-        let after_start = k.valid_from.is_none_or(|from| at >= from);
-        let before_end = k.valid_to.is_none_or(|to| at <= to);
-        if after_start && before_end {
-            Ok(&k.key)
-        } else {
-            Err(KeyRefusal::OutOfRange {
-                valid_from: k.valid_from,
-                valid_to: k.valid_to,
-            })
+        k.check_window(at, true).map(|()| &k.key)
+    }
+
+    /// True iff `self` holds `public` as the current (unretired) key for
+    /// `agent_id` (#10171).
+    #[must_use]
+    pub fn holds_current_key(&self, agent_id: &str, public: &VerifyingKey) -> bool {
+        let id = key_id_of(public);
+        self.by_key_id
+            .get(&id)
+            .is_some_and(|k| k.agent_id == agent_id && !k.is_retired())
+    }
+
+    /// Resolve and validity-check the anchored key that signed a record for
+    /// `agent_id` when the record carries no explicit `key_id` (e.g. a
+    /// memory's in-row `write_signature`, #10111).
+    ///
+    /// Reads keys only from this out-of-database anchor and shares the
+    /// validity-window predicate ([`AnchorKey::check_window`]) with
+    /// [`Self::key_for`]:
+    /// - checks every anchored key belonging to `agent_id` (current and
+    ///   retired); when `verifies(key)` succeeds, parses the SIGNED
+    ///   `created_at` as RFC 3339 and enforces ONLY the signed upper bound
+    ///   `created_at <= valid_to` (a retired key never verifies a row dated
+    ///   after its retirement).
+    /// - Unsigned `updated_at` is intentionally NOT consulted (#10170 /
+    ///   #10174): the lower bound (`valid_from`) is not enforced on in-row
+    ///   write seals until the reseal instant is part of `SignableWrite` (a
+    ///   format change tracked in #10174, not this PR), because a lawful
+    ///   post-rotation `K_new` reseal preserves the row's original `created_at`.
+    /// - if no key of `agent_id` verifies, checks other agents' anchored keys
+    ///   so cross-agent misuse surfaces as [`SpanKeyRefusal::OtherAgent`];
+    /// - otherwise returns [`SpanKeyRefusal::UnknownKey`] (when `agent_id` has
+    ///   anchored keys) or [`SpanKeyRefusal::UnknownAgent`] (when it has none),
+    ///   never falling back to the current key or a database key.
+    ///
+    /// # Errors
+    ///
+    /// The exact [`SpanKeyRefusal`].
+    pub fn verify_key_for_span(
+        &self,
+        agent_id: &str,
+        created_at: &str,
+        mut verifies: impl FnMut(&VerifyingKey) -> bool,
+    ) -> Result<String, SpanKeyRefusal> {
+        let mut has_agent = false;
+        for (key_id, k) in &self.by_key_id {
+            if k.agent_id != agent_id {
+                continue;
+            }
+            has_agent = true;
+            if !verifies(&k.key) {
+                continue;
+            }
+            let at = chrono::DateTime::parse_from_rfc3339(created_at)
+                .map_err(|_| SpanKeyRefusal::BadTime {
+                    key_id: key_id.clone(),
+                })?
+                .timestamp();
+            return match k.check_window(at, false) {
+                Ok(()) => Ok(key_id.clone()),
+                Err(KeyRefusal::OutOfRange {
+                    valid_from,
+                    valid_to,
+                }) => Err(SpanKeyRefusal::OutOfRange {
+                    key_id: key_id.clone(),
+                    valid_from,
+                    valid_to,
+                }),
+                Err(_) => Err(SpanKeyRefusal::BadTime {
+                    key_id: key_id.clone(),
+                }),
+            };
         }
+        for (key_id, k) in &self.by_key_id {
+            if k.agent_id == agent_id {
+                continue;
+            }
+            if verifies(&k.key) {
+                return Err(SpanKeyRefusal::OtherAgent {
+                    key_id: key_id.clone(),
+                    anchored_agent: k.agent_id.clone(),
+                });
+            }
+        }
+        Err(if has_agent {
+            SpanKeyRefusal::UnknownKey
+        } else {
+            SpanKeyRefusal::UnknownAgent
+        })
     }
 
     /// An anchor built from explicit keys (unit tests only; still no

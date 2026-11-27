@@ -224,16 +224,31 @@ impl SqliteStore {
 }
 
 /// NOTICE 4c / E-3 — the one verdict for a memory row: its in-row seal
-/// verifies against the owner's bound key AND the one completeness verifier
+/// verifies against the owner's anchored key (current or retired within its
+/// validity window, #10111) AND the one completeness verifier
 /// (`row_attest::sqlite::verify_sqlite`) finds no defect in the store and
 /// does not name this id. #10094: a row drift (a live row with no, a stale or
 /// a delete attestation, and a table head those drifts explain) fails only
 /// the rows it names; any store-wide defect makes every row unverified (fail
 /// closed: a broken signature, chain, seal or unexplained head cannot be
 /// pinned on one row). The rule is `Report::memory_verified`.
-fn memory_signature_verdict(conn: &rusqlite::Connection, mem: &Memory) -> StoreResult<bool> {
-    if !crate::identity::session_signer::row_seal_verifies(conn, mem).map_err(box_err)? {
-        return Ok(false);
+///
+/// #10171: any [`crate::identity::session_signer::SealDefect`] (including
+/// `Unanchored`, `UnknownAgent`, `UnknownKey`, `OutOfRange`, `OtherAgent`,
+/// `BadTime`, `MalformedSignature`) is recorded in `findings` so callers see
+/// the exact defect reason rather than a bare `false`.
+fn memory_signature_verdict(
+    conn: &rusqlite::Connection,
+    mem: &Memory,
+    findings: &mut Vec<String>,
+) -> StoreResult<bool> {
+    match crate::identity::session_signer::verify_row_seal(mem) {
+        crate::identity::session_signer::StoredSealCheck::Verified { .. } => {}
+        crate::identity::session_signer::StoredSealCheck::Unsealed => return Ok(false),
+        crate::identity::session_signer::StoredSealCheck::Defect(defect) => {
+            findings.push(defect.to_string());
+            return Ok(false);
+        }
     }
     let report = crate::storage::row_attest::sqlite::verify_sqlite(conn).map_err(box_err)?;
     Ok(report.memory_verified(&mem.id))
@@ -1383,7 +1398,7 @@ impl MemoryStore for SqliteStore {
         // #1624 — shared finding-checks (see `store::integrity_findings`)
         // so sqlite and postgres report identical findings for
         // identical rows. Real signature verification lands with #302.
-        let findings = super::integrity_findings(&mem);
+        let mut findings = super::integrity_findings(&mem);
         // v0.9.0 G8 (#1825) — when the row carries a `cid`, load its
         // storage-internal `cid_genesis` pre-image and verify the BLAKE3
         // address (partial-corruption detection). `None` when unstamped or
@@ -1391,7 +1406,7 @@ impl MemoryStore for SqliteStore {
         let genesis = db::read_cid_genesis(&conn, id).map_err(box_err)?;
         let (cid_ok, cid_mismatch) =
             super::cid_verify_fields(mem.cid.as_deref(), genesis.as_deref());
-        let signature_verified = memory_signature_verdict(&conn, &mem)?;
+        let signature_verified = memory_signature_verdict(&conn, &mem, &mut findings)?;
         Ok(VerifyReport {
             memory_id: id.to_string(),
             integrity_ok: findings.is_empty(),

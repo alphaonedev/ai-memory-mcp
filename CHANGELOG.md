@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (#10111 — write-seal verification against retired anchored keys)
+
+- In-row write seals (`write_signature`) now verify against the out-of-database trust anchor (`TrustAnchor::verify_key_for_span`), accepting retired keys within their signed upper bound (`created_at <= valid_to`) after key rotation without consulting unsigned `updated_at` (#10170, #10174). The write-seal funnel carries typed `StoredSealCheck` end-to-end with a single anchor load per write so an unusable trust anchor surfaces its exact `Unanchored` reason instead of `Tampered` (#10172, #10173); `install_from_env` and `bound_identity` refuse keys absent from the trust anchor, and `MemoryStore::verify` records exact `SealDefect` reasons in `VerifyReport.findings` (#10171). Fragment: `changelog.d/10111.changed.md`.
+
 ### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
 
 - `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.

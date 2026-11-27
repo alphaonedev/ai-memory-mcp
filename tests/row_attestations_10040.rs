@@ -2388,6 +2388,410 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
     assert_ok(&sb.report(), "after the archive is restored");
 }
 
+/// #10111: a write seal (`write_signature`) made under `K_old` still verifies
+/// after a lawful key rotation to `K_new` via `MemoryStore::verify`, a
+/// post-rotation update of that pre-rotation memory under `K_new` succeeds
+/// without tripping `Tampered` and stays clean, and removing or predating
+/// `K_old`'s archive under the trust anchor makes `id_old` fail verification
+/// (never falling back to `K_new` or a database key).
+#[cfg(feature = "sal")]
+#[test]
+fn write_seal_verifies_under_retired_key_after_rotation_10111() {
+    let (sb, old_key_file, mut mcp) = armed();
+    let id_old = mcp.store("write seal 10111 before rotation");
+    drop(mcp);
+    assert_ok(&sb.report(), "before rotation");
+    let old_key_id = latest(&sb, &id_old).key_id;
+    let old_priv_bytes: [u8; 32] = std::fs::read(&old_key_file)
+        .expect("read K_old priv bytes")
+        .try_into()
+        .expect("32-byte K_old priv");
+    let old_signing = ed25519_dalek::SigningKey::from_bytes(&old_priv_bytes);
+    let old_kp = ai_memory::identity::keypair::AgentKeypair {
+        agent_id: AGENT.to_string(),
+        public: old_signing.verifying_key(),
+        private: Some(old_signing),
+    };
+    let before_copy = vacuum_copy(&sb, "seal-10111-before-rot.db");
+    assert!(
+        store_verdict(&sb, &before_copy, &id_old),
+        "pre-rotation memory verifies under K_old before rotation"
+    );
+
+    let recovery = sb.generate(EXTRA_AGENT);
+    sb.cli_ok(
+        AGENT,
+        &[
+            "identity",
+            "enroll-lineage",
+            "--agent-id",
+            AGENT,
+            "--recovery-pubkey",
+            &recovery,
+        ],
+    );
+    sb.cli_ok(AGENT, &["identity", "succeed", "--agent-id", AGENT]);
+    let archives = retired_archives(&sb);
+    assert_eq!(archives.len(), 1, "rotation archived K_old");
+    assert_ok(&sb.report(), "after rotation");
+
+    let rotated_copy = vacuum_copy(&sb, "seal-10111-after-rot.db");
+    assert!(
+        store_verdict(&sb, &rotated_copy, &id_old),
+        "pre-rotation memory sealed under K_old must still verify after rotation to K_new (#10111)"
+    );
+
+    // Start a K_new session: store a new row AND verify both old and new rows.
+    let key_new = current_key_file(&sb, "rotated-10111.key");
+    let mut mcp = sb.start(&key_new);
+    let id_new = mcp.store("write seal 10111 after rotation");
+    drop(mcp);
+    assert_ok(&sb.report(), "after K_new insert");
+
+    let both_copy = vacuum_copy(&sb, "seal-10111-both-keys.db");
+    assert!(
+        store_verdict(&sb, &both_copy, &id_old),
+        "K_old row still verifies after K_new writes"
+    );
+    assert!(
+        store_verdict(&sb, &both_copy, &id_new),
+        "K_new row verifies under current key"
+    );
+
+    // Post-rotation content update of the pre-rotation K_old row must recognize
+    // the prior K_old seal as intact (not Tampered), re-seal under K_new while
+    // preserving created_at, and verify clean.
+    let mut mcp = sb.start(&key_new);
+    mcp.ok(
+        "memory_update",
+        &json!({
+            "id": id_old,
+            "content": "Updated body after rotation to K_new: long enough prose to store cleanly."
+        }),
+    );
+    drop(mcp);
+    assert_ok(
+        &sb.report(),
+        "after post-rotation content update of K_old row",
+    );
+    let updated_copy = vacuum_copy(&sb, "seal-10111-updated.db");
+    assert!(
+        store_verdict(&sb, &updated_copy, &id_old),
+        "pre-rotation row updated and re-sealed under K_new must verify (#10111)"
+    );
+
+    // On the pre-update snapshot (`both_copy`, where `id_old` still carries K_old's
+    // seal): removing K_old's archive or moving its retirement timestamp before
+    // `id_old`'s write time must refuse verification (no fallback to K_new) and
+    // surface the exact named SealDefect via verify_row_seal_with.
+    let old_row = {
+        let conn = ai_memory::db::open(&both_copy).expect("open both_copy");
+        ai_memory::db::get(&conn, &id_old)
+            .expect("get old_row")
+            .expect("old_row present")
+    };
+    let keys_dir = sb.root.join("keys");
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Verified {
+            key_id: old_key_id.clone(),
+        },
+        "verify_row_seal_with must verify K_old row under K_old's retired anchor key"
+    );
+
+    let archive = &archives[0];
+    let archive_ts: i64 = archive
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.rsplit_once(".pub."))
+        .and_then(|(_, tail)| tail.split('-').next())
+        .and_then(|ts| ts.parse().ok())
+        .expect("parse retired archive unix timestamp");
+    // Sealing a row with K_old dated AFTER the real archive instant against the
+    // unmodified key directory must return the exact OutOfRange defect.
+    let post_ret_ts = chrono::DateTime::from_timestamp(archive_ts + 60, 0)
+        .expect("post-retirement timestamp")
+        .to_rfc3339();
+    let mut post_ret_row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: "seal-10111".to_string(),
+        title: "post-retirement seal 10111".to_string(),
+        content: "row sealed with retired K_old after retirement".to_string(),
+        created_at: post_ret_ts.clone(),
+        updated_at: post_ret_ts,
+        metadata: json!({
+            "agent_id": AGENT,
+            "attest_level": "agent_attested",
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let post_ret_sig =
+        ai_memory::identity::attest::sign_memory_write(&old_kp, &post_ret_row, AGENT)
+            .expect("sign post-retirement row with K_old");
+    ai_memory::identity::attest::persist_write_signature(&mut post_ret_row, &post_ret_sig);
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &post_ret_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(
+            ai_memory::identity::session_signer::SealDefect::OutOfRange {
+                key_id: old_key_id.clone(),
+                valid_from: None,
+                valid_to: Some(archive_ts),
+            }
+        ),
+        "K_old seal dated after its real archive instant must be exact OutOfRange defect"
+    );
+
+    let retired_bytes = std::fs::read(archive).expect("read retired archive");
+    std::fs::remove_file(archive).expect("remove retired archive");
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(
+            ai_memory::identity::session_signer::SealDefect::UnknownKey {
+                agent_id: AGENT.to_string(),
+            }
+        ),
+        "missing retired archive must report UnknownKey defect, never fallback to K_new"
+    );
+    assert!(
+        !store_verdict(&sb, &both_copy, &id_old),
+        "missing retired key archive must not verify or fall back to K_new"
+    );
+
+    let early = sb
+        .root
+        .join("keys")
+        .join(format!("{AGENT}.pub.{EARLY_ARCHIVE_TS}"));
+    std::fs::write(&early, &retired_bytes).expect("write early archive");
+    let expected_oor = ai_memory::identity::session_signer::SealDefect::OutOfRange {
+        key_id: old_key_id.clone(),
+        valid_from: None,
+        valid_to: Some(EARLY_ARCHIVE_TS),
+    };
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(expected_oor.clone()),
+        "retired key ending before write time must report exact OutOfRange defect"
+    );
+    assert_eq!(
+        expected_oor.to_string(),
+        format!(
+            "write seal key_id {old_key_id} used outside its anchored validity (from None to Some({EARLY_ARCHIVE_TS}))"
+        )
+    );
+    assert!(
+        !store_verdict(&sb, &both_copy, &id_old),
+        "retired key with validity ending before write time must not verify"
+    );
+
+    // Unanchored empty key dir -> exact Unanchored::Empty defect (never falls back to DB key).
+    let empty_keys = sb.root.join("empty-keys-10111");
+    std::fs::create_dir_all(&empty_keys).expect("empty key dir");
+    set_mode(&empty_keys, 0o700);
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&empty_keys),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(
+            ai_memory::identity::session_signer::SealDefect::Unanchored(
+                ai_memory::storage::row_attest::anchor::Unanchored::Empty { path: empty_keys }
+            )
+        )
+    );
+
+    std::fs::remove_file(&early).expect("remove early archive");
+    std::fs::write(archive, &retired_bytes).expect("restore archive");
+    assert!(
+        store_verdict(&sb, &both_copy, &id_old),
+        "restoring retired archive restores verification"
+    );
+}
+
+/// S1 (#10173): a malformed key directory (one badly named archive file) must
+/// refuse BOTH `memory_update` and `memory_store` with the exact named
+/// `Unanchored` reason (never `Tampered` / "stored seal does not verify" and
+/// never bare `SEAL_REFUSAL_PREFIX`).
+#[cfg(feature = "sal")]
+#[test]
+fn malformed_key_dir_refuses_update_and_store_with_exact_unanchored_reason_10173() {
+    let (sb, _key_file, mut mcp) = armed();
+    let id = mcp.store("seed row before anchor corruption 10173");
+
+    let bad_file = sb.root.join("keys").join("stray.pub.not-a-ts");
+    std::fs::write(&bad_file, b"garbage").expect("plant badly named file in keys dir");
+
+    let (upd_err, upd_text) = mcp.call_raw(
+        "memory_update",
+        &json!({
+            "id": id,
+            "content": "Attempted update after key dir became malformed (10173)."
+        }),
+    );
+    assert!(
+        upd_err,
+        "update under malformed anchor must fail: {upd_text}"
+    );
+    assert!(
+        !upd_text.contains("stored seal does not verify"),
+        "S1: malformed anchor must NOT be misreported as Tampered, got: {upd_text}"
+    );
+    assert!(
+        upd_text.contains("trust anchor unusable") && upd_text.contains("stray.pub.not-a-ts"),
+        "S1: update must surface exact Unanchored reason naming bad file, got: {upd_text}"
+    );
+
+    let (store_err, store_text) = mcp.call_raw(
+        "memory_store",
+        &json!({
+            "title": "store under malformed anchor 10173",
+            "content": "Attempted store after key dir became malformed (10173).",
+            "namespace": NAMESPACE,
+            "kind": "observation"
+        }),
+    );
+    assert!(
+        store_err,
+        "store under malformed anchor must fail: {store_text}"
+    );
+    assert!(
+        store_text.contains("trust anchor unusable") && store_text.contains("stray.pub.not-a-ts"),
+        "S1: store must surface exact Unanchored reason naming bad file, got: {store_text}"
+    );
+}
+
+#[cfg(feature = "sal")]
+#[test]
+#[ignore = "subprocess helper for bound_but_unanchored_key_refused_at_install_and_verify_reports_defect_10171"]
+fn store_verify_report_child_10171() {
+    use ai_memory::store::sqlite::SqliteStore;
+    use ai_memory::store::{CallerContext, MemoryStore as _};
+    let db = std::env::var_os(ENV_VERDICT_DB).expect("verify-report child: no store path");
+    let id = std::env::var(ENV_VERDICT_ID).expect("verify-report child: no memory id");
+    let store = SqliteStore::open(PathBuf::from(db)).expect("open store copy");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let report = rt
+        .block_on(store.verify(&CallerContext::for_agent(AGENT), &id))
+        .expect("verify");
+    let json_report = serde_json::json!({
+        "signature_verified": report.signature_verified,
+        "integrity_ok": report.integrity_ok,
+        "findings": report.findings,
+    });
+    println!("VERIFY_REPORT_10171={json_report}");
+}
+
+/// F2 (#10171): a key bound in the database but absent from the trust anchor is
+/// refused at `install_from_env` admission (never admitted only to fail later
+/// as `Tampered`), and `MemoryStore::verify` surfaces the exact `SealDefect`
+/// reason in `VerifyReport.findings` (never bare `false`).
+#[cfg(feature = "sal")]
+#[test]
+fn bound_but_unanchored_key_refused_at_install_and_verify_reports_defect_10171() {
+    let (sb, key_file, mut mcp) = armed();
+    let id = mcp.store("row for verify defect check 10171");
+    drop(mcp);
+
+    let copy = vacuum_copy(&sb, "verify-defect-10171.db");
+    let _other = sb.generate(EXTRA_AGENT);
+
+    // Part A: MCP boot with a bound-but-unanchored key must refuse at install_from_env.
+    // Use an anchor dir that has only EXTRA_AGENT's key (no AGENT.pub / AGENT.priv,
+    // so main's #3147 public-from-private self-heal cannot re-derive AGENT.pub).
+    let part_a_keys = sb.root.join("keys-unanchored-10171");
+    std::fs::create_dir_all(&part_a_keys).expect("create part-a anchor dir");
+    set_mode(&part_a_keys, 0o700);
+    std::fs::copy(
+        sb.root.join("keys").join(format!("{EXTRA_AGENT}.pub")),
+        part_a_keys.join(format!("{EXTRA_AGENT}.pub")),
+    )
+    .expect("copy extra agent pub");
+    let mut cmd = sb.base_command(AGENT, "0");
+    cmd.args([
+        "--db",
+        sb.db().to_str().expect("db utf8"),
+        "mcp",
+        "--profile",
+        "full",
+        "--tier",
+        "keyword",
+    ])
+    .env("AI_MEMORY_KEY_DIR", &part_a_keys)
+    .env(ENV_KEY_FILE, &key_file)
+    .stdin(Stdio::null());
+    let out = cmd.output().expect("run mcp boot with unanchored key");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "F2: MCP boot with bound-but-unanchored key must be refused (status={:?}, stdout={stdout:?}, stderr={stderr:?})",
+        out.status
+    );
+    assert!(
+        stderr.contains(ai_memory::identity::session_signer::REFUSE_KEY_NOT_ANCHORED),
+        "F2: expected exact unanchored-key install refusal, got: {stderr}"
+    );
+
+    // Part B: `MemoryStore::verify` on `copy` with AGENT's key absent from
+    // anchor must surface the exact SealDefect reason in `findings` (not bare false).
+    let agent_pub = sb.root.join("keys").join(format!("{AGENT}.pub"));
+    let saved_pub = std::fs::read(&agent_pub).expect("read agent pub");
+    std::fs::remove_file(&agent_pub).expect("remove agent pub from anchor");
+    let child = Command::new(std::env::current_exe().expect("test binary path"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", sb.root.join("home"))
+        .env("XDG_CONFIG_HOME", sb.root.join("home/.config"))
+        .env("TMPDIR", &sb.root)
+        .env("AI_MEMORY_KEY_DIR", sb.root.join("keys"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env(ENV_VERDICT_DB, &copy)
+        .env(ENV_VERDICT_ID, &id)
+        .args([
+            "--exact",
+            "store_verify_report_child_10171",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run verify-report child");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success(),
+        "verify-report child failed: {stdout}{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let payload = stdout
+        .lines()
+        .find_map(|ln| ln.split_once("VERIFY_REPORT_10171=").map(|(_, v)| v))
+        .unwrap_or_else(|| panic!("VERIFY_REPORT_10171 line missing in: {stdout}"));
+    let parsed: Value = serde_json::from_str(payload).expect("parse verify report json");
+    assert_eq!(parsed["signature_verified"], false);
+    let findings = parsed["findings"].as_array().expect("findings array");
+    let want = format!("write seal names agent {AGENT} with no key in the trust anchor");
+    assert!(
+        findings.iter().any(|f| f.as_str() == Some(want.as_str())),
+        "F2: memory verify must surface exact SealDefect in findings ({want:?}), got: {findings:?}"
+    );
+
+    std::fs::write(&agent_pub, &saved_pub).expect("restore agent pub");
+}
+
 // ---------------------------------------------------------------------------
 // #10091: every connection that can write an attested table is armed
 // ---------------------------------------------------------------------------
