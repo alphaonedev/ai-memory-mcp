@@ -343,12 +343,10 @@ fn child_stderr(name: &str, action: impl FnOnce() + Send + 'static) -> Option<St
     }
     let (_, module) = module_path!().split_once("::").expect("crate module path");
     let test_path = format!("{module}::{name}");
-    let output = crate::test_support::SandboxedTestChild::new(CHILD_SPAWN_LABEL)
-        .configure(|cmd| {
-            cmd.args(["--exact", &test_path, "--nocapture", "--test-threads=1"])
-                .env(CHILD_ROLE, name);
-        })
-        .arm()
+    let sandbox = crate::test_support::TestSandbox::new();
+    let output = crate::test_support::SandboxedTestChild::new(CHILD_SPAWN_LABEL, &sandbox)
+        .args(["--exact", &test_path, "--nocapture", "--test-threads=1"])
+        .env(CHILD_ROLE, name)
         .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &test_path)
         .expect("run child");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

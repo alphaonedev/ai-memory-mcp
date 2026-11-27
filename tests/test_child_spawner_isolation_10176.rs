@@ -357,8 +357,9 @@ fn scratch_dir(parent: &Path) -> PathBuf {
 // a `.rs` file.
 
 /// Every src/ file allowed spawn sites, with the exact count and the reason.
-/// `src/test_support.rs` is the builder and is exempt from the count; it is
-/// held to [`builder_exports_no_process_command_10176`] instead.
+/// `src/test_support.rs` (the builder) is counted like every other file; in
+/// addition [`builder_exports_no_process_command_10176`] holds its visible
+/// surface to the narrow methods, so no caller can reach its `Command`.
 const SRC_SPAWN_ALLOWLIST: &[(&str, usize, &str)] = &[
     (
         "src/cli/agents.rs",
@@ -435,6 +436,12 @@ const SRC_SPAWN_ALLOWLIST: &[(&str, usize, &str)] = &[
         "src/store_url.rs",
         1,
         "product message text naming /proc cmdline exposure of a password on argv; no spawn",
+    ),
+    (
+        CHOKEPOINT,
+        4,
+        "the #10176 builder itself: the private Command field of SandboxedTestChild, its one \
+         audited_command spawn of current_exe, and the private run_command_bounded parameter",
     ),
 ];
 
@@ -518,16 +525,25 @@ fn decode_quoted(c: &[char], mut i: usize, line: &mut usize) -> (String, usize) 
     (out, i)
 }
 
+/// True only for a path whose extension is exactly `rs` (lower case): rustc
+/// compiles a `#[path]` or `include!` target of any name, and the scan walks
+/// exactly-`.rs` files, so `x.RS` is a non-`.rs` include and must be red.
+fn is_exact_rs(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext == "rs")
+}
+
 fn lex(src: &str) -> Vec<Lexed> {
-    let c: Vec<char> = src.chars().collect();
+    let chars: Vec<char> = src.chars().collect();
     let is_ident_start = |x: char| x.is_alphabetic() || x == '_';
     let is_ident = |x: char| x.is_alphanumeric() || x == '_';
     let mut out = Vec::new();
     let mut line = 1usize;
     let mut i = 0usize;
-    while i < c.len() {
-        let ch = c[i];
-        let next = c.get(i + 1).copied();
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
         if ch == '\n' {
             line += 1;
             i += 1;
@@ -538,25 +554,25 @@ fn lex(src: &str) -> Vec<Lexed> {
             continue;
         }
         if ch == '/' && next == Some('/') {
-            while i < c.len() && c[i] != '\n' {
+            while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
             continue;
         }
         if ch == '/' && next == Some('*') {
             let mut depth = 0usize;
-            while i < c.len() {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
                     depth += 1;
                     i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
                     depth -= 1;
                     i += 2;
                     if depth == 0 {
                         break;
                     }
                 } else {
-                    if c[i] == '\n' {
+                    if chars[i] == '\n' {
                         line += 1;
                     }
                     i += 1;
@@ -567,30 +583,32 @@ fn lex(src: &str) -> Vec<Lexed> {
         // String prefixes: b"..", c"..", r".." / r#".."#, br, cr.
         if is_ident_start(ch) {
             let mut j = i;
-            while j < c.len() && is_ident(c[j]) {
+            while j < chars.len() && is_ident(chars[j]) {
                 j += 1;
             }
-            let word: String = c[i..j].iter().collect();
+            let word: String = chars[i..j].iter().collect();
             let at = line;
-            if matches!(word.as_str(), "r" | "br" | "cr") && matches!(c.get(j), Some('"' | '#')) {
+            if matches!(word.as_str(), "r" | "br" | "cr") && matches!(chars.get(j), Some('"' | '#'))
+            {
                 let mut k = j;
                 let mut hashes = 0usize;
-                while c.get(k) == Some(&'#') {
+                while chars.get(k) == Some(&'#') {
                     hashes += 1;
                     k += 1;
                 }
-                if c.get(k) == Some(&'"') {
+                if chars.get(k) == Some(&'"') {
                     k += 1;
                     let start = k;
-                    while k < c.len()
-                        && !(c[k] == '"' && (0..hashes).all(|h| c.get(k + 1 + h) == Some(&'#')))
+                    while k < chars.len()
+                        && !(chars[k] == '"'
+                            && (0..hashes).all(|h| chars.get(k + 1 + h) == Some(&'#')))
                     {
-                        if c[k] == '\n' {
+                        if chars[k] == '\n' {
                             line += 1;
                         }
                         k += 1;
                     }
-                    let body: String = c[start..k.min(c.len())].iter().collect();
+                    let body: String = chars[start..k.min(chars.len())].iter().collect();
                     out.push(Lexed {
                         tok: Tok::Str(body),
                         line: at,
@@ -598,22 +616,22 @@ fn lex(src: &str) -> Vec<Lexed> {
                     i = k + 1 + hashes;
                     continue;
                 }
-                if word == "r" && hashes == 1 && c.get(k).is_some_and(|x| is_ident_start(*x)) {
+                if word == "r" && hashes == 1 && chars.get(k).is_some_and(|x| is_ident_start(*x)) {
                     // Raw identifier r#name.
                     let mut m = k;
-                    while m < c.len() && is_ident(c[m]) {
+                    while m < chars.len() && is_ident(chars[m]) {
                         m += 1;
                     }
                     out.push(Lexed {
-                        tok: Tok::Ident(c[k..m].iter().collect()),
+                        tok: Tok::Ident(chars[k..m].iter().collect()),
                         line: at,
                     });
                     i = m;
                     continue;
                 }
             }
-            if matches!(word.as_str(), "b" | "c") && c.get(j) == Some(&'"') {
-                let (body, end) = decode_quoted(&c, j + 1, &mut line);
+            if matches!(word.as_str(), "b" | "c") && chars.get(j) == Some(&'"') {
+                let (body, end) = decode_quoted(&chars, j + 1, &mut line);
                 out.push(Lexed {
                     tok: Tok::Str(body),
                     line: at,
@@ -621,11 +639,11 @@ fn lex(src: &str) -> Vec<Lexed> {
                 i = end;
                 continue;
             }
-            if word == "b" && c.get(j) == Some(&'\'') {
-                let close = c[j + 1..]
+            if word == "b" && chars.get(j) == Some(&'\'') {
+                let close = chars[j + 1..]
                     .iter()
                     .position(|&x| x == '\'')
-                    .map_or(c.len(), |p| j + 1 + p);
+                    .map_or(chars.len(), |p| j + 1 + p);
                 out.push(Lexed {
                     tok: Tok::Char,
                     line: at,
@@ -641,8 +659,9 @@ fn lex(src: &str) -> Vec<Lexed> {
             continue;
         }
         if ch.is_ascii_digit() {
-            while i < c.len()
-                && (is_ident(c[i]) || c[i] == '.' && c.get(i + 1).is_some_and(char::is_ascii_digit))
+            while i < chars.len()
+                && (is_ident(chars[i])
+                    || chars[i] == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit))
             {
                 i += 1;
             }
@@ -650,7 +669,7 @@ fn lex(src: &str) -> Vec<Lexed> {
         }
         if ch == '"' {
             let at = line;
-            let (body, end) = decode_quoted(&c, i + 1, &mut line);
+            let (body, end) = decode_quoted(&chars, i + 1, &mut line);
             out.push(Lexed {
                 tok: Tok::Str(body),
                 line: at,
@@ -661,11 +680,11 @@ fn lex(src: &str) -> Vec<Lexed> {
         if ch == '\'' {
             // Char literal or lifetime.
             let close = if next == Some('\\') {
-                c[i + 2..]
+                chars[i + 2..]
                     .iter()
                     .position(|&x| x == '\'')
                     .map(|p| i + 2 + p)
-            } else if c.get(i + 2) == Some(&'\'') {
+            } else if chars.get(i + 2) == Some(&'\'') {
                 Some(i + 2)
             } else {
                 None
@@ -840,7 +859,7 @@ fn include_problems(toks: &[Lexed]) -> Vec<String> {
         if is_ident_tok(t, "include") && bang {
             let lit_rs = matches!(
                 (toks.get(i + 2).map(|x| &x.tok), toks.get(i + 3).map(|x| &x.tok), toks.get(i + 4).map(|x| &x.tok)),
-                (Some(Tok::Punct('(')), Some(Tok::Str(p)), Some(Tok::Punct(')'))) if p.ends_with(".rs")
+                (Some(Tok::Punct('(')), Some(Tok::Str(p)), Some(Tok::Punct(')'))) if is_exact_rs(p)
             );
             if !lit_rs {
                 out.push(format!(
@@ -854,8 +873,7 @@ fn include_problems(toks: &[Lexed]) -> Vec<String> {
             && toks.get(i + 2).is_some_and(|x| is_ident_tok(x, "path"))
             && toks.get(i + 3).map(|x| &x.tok) == Some(&Tok::Punct('='))
         {
-            let rs =
-                matches!(toks.get(i + 4).map(|x| &x.tok), Some(Tok::Str(p)) if p.ends_with(".rs"));
+            let rs = matches!(toks.get(i + 4).map(|x| &x.tok), Some(Tok::Str(p)) if is_exact_rs(p));
             if !rs {
                 out.push(format!(
                     "line {}: #[path] to a file that is not .rs",
@@ -932,7 +950,7 @@ fn scan_src(root: &Path) -> (BTreeMap<String, usize>, Vec<String>) {
                 .into_iter()
                 .map(|p| format!("{rel}: {p}")),
         );
-        if !rel.starts_with(&format!("{SRC_DIR}/")) || rel == CHOKEPOINT {
+        if !rel.starts_with(&format!("{SRC_DIR}/")) {
             continue;
         }
         let n = spawn_sites(&toks).len();
@@ -982,7 +1000,7 @@ fn every_src_allowlist_row_has_a_reason_10176() {
             "#10176: row {path} needs a real reason, got {why:?}"
         );
         assert!(
-            path.starts_with("src/") && *path != CHOKEPOINT,
+            path.starts_with("src/"),
             "#10176: row {path} is not a src/ row"
         );
     }
@@ -1139,8 +1157,63 @@ fn a_symlink_or_a_non_rs_include_in_the_tree_is_refused_10176() {
     assert_eq!(problems, want, "#10176: link and include refusals");
 }
 
-/// The builder's narrow surface, exactly (hand-written).
-const BUILDER_METHODS: &[&str] = &[];
+/// The builder's narrow surface, exactly (hand-written): no `configure`, no
+/// `into_parts`, nothing that hands out or accepts a raw `Command`.
+const BUILDER_METHODS: &[&str] = &[
+    "args",
+    "env",
+    "new",
+    "run_bounded",
+    "spawn",
+    "stderr",
+    "stdout",
+    "try_env",
+];
+
+/// The spawned handle's narrow surface, exactly (hand-written).
+const SPAWNED_METHODS: &[&str] = &["id", "try_wait", "wait_bounded"];
+
+/// The visible methods of every inherent `impl <ty>` block in `toks`.
+fn visible_methods(toks: &[Lexed], ty: &str) -> Vec<String> {
+    let mut methods = Vec::new();
+    let mut i = 0usize;
+    while i < toks.len() {
+        let opens_impl = is_ident_tok(&toks[i], "impl")
+            && toks[i + 1..].iter().take(6).any(|x| is_ident_tok(x, ty))
+            && !toks[i + 1..].iter().take(6).any(|x| is_ident_tok(x, "for"));
+        if opens_impl {
+            let open = (i..toks.len())
+                .find(|&k| toks[k].tok == Tok::Punct('{'))
+                .unwrap_or(toks.len());
+            let end = group_end(toks, open);
+            for k in open..end {
+                if is_ident_tok(&toks[k], "fn")
+                    && let Some(Tok::Ident(name)) = toks.get(k + 1).map(|x| &x.tok)
+                {
+                    let mut b = k;
+                    while b > open
+                        && ["const", "async", "unsafe"]
+                            .iter()
+                            .any(|q| is_ident_tok(&toks[b - 1], q))
+                    {
+                        b -= 1;
+                    }
+                    let vis = (b > open && is_ident_tok(&toks[b - 1], "pub"))
+                        || (b > open + 3
+                            && toks[b - 1].tok == Tok::Punct(')')
+                            && is_ident_tok(&toks[b - 4], "pub"));
+                    if vis {
+                        methods.push(name.clone());
+                    }
+                }
+            }
+            i = end;
+        }
+        i += 1;
+    }
+    methods.sort();
+    methods
+}
 
 #[test]
 fn builder_exports_no_process_command_10176() {
@@ -1185,51 +1258,17 @@ fn builder_exports_no_process_command_10176() {
         problems.join("\n")
     );
 
-    // The builder's methods are exactly the narrow surface.
-    let mut methods = Vec::new();
-    let mut i = 0usize;
-    while i < toks.len() {
-        let opens_impl = is_ident_tok(&toks[i], "impl")
-            && toks[i + 1..]
-                .iter()
-                .take(6)
-                .any(|x| is_ident_tok(x, "SandboxedTestChild"))
-            && !toks[i + 1..].iter().take(6).any(|x| is_ident_tok(x, "for"));
-        if opens_impl {
-            let open = (i..toks.len())
-                .find(|&k| toks[k].tok == Tok::Punct('{'))
-                .unwrap_or(toks.len());
-            let end = group_end(&toks, open);
-            for k in open..end {
-                if is_ident_tok(&toks[k], "fn") {
-                    if let Some(Tok::Ident(name)) = toks.get(k + 1).map(|x| &x.tok) {
-                        let mut b = k;
-                        while b > open
-                            && ["const", "async", "unsafe"]
-                                .iter()
-                                .any(|q| is_ident_tok(&toks[b - 1], q))
-                        {
-                            b -= 1;
-                        }
-                        let vis = (b > open && is_ident_tok(&toks[b - 1], "pub"))
-                            || (b > open + 3
-                                && toks[b - 1].tok == Tok::Punct(')')
-                                && is_ident_tok(&toks[b - 4], "pub"));
-                        if vis {
-                            methods.push(name.clone());
-                        }
-                    }
-                }
-            }
-            i = end;
-        }
-        i += 1;
+    // The builder's and the handle's methods are exactly the narrow surface.
+    for (ty, want) in [
+        ("SandboxedTestChild", BUILDER_METHODS),
+        ("SpawnedTestChild", SPAWNED_METHODS),
+    ] {
+        let mut want: Vec<String> = want.iter().map(|s| (*s).to_string()).collect();
+        want.sort();
+        assert_eq!(
+            visible_methods(&toks, ty),
+            want,
+            "#10176: {ty}'s visible methods are the narrow surface, exactly"
+        );
     }
-    methods.sort();
-    let mut want: Vec<String> = BUILDER_METHODS.iter().map(|s| (*s).to_string()).collect();
-    want.sort();
-    assert_eq!(
-        methods, want,
-        "#10176: SandboxedTestChild's visible methods are the narrow surface, exactly"
-    );
 }

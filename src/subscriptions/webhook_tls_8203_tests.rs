@@ -155,24 +155,21 @@ fn run_invalid_port_children(test_name: &str) -> bool {
     let module = module_path!().split_once("::").expect("crate module").1;
     let filter = format!("{module}::{test_name}");
     for override_value in [None, Some("1")] {
-        let output = crate::test_support::SandboxedTestChild::new(
+        // #10176: the sandbox builds the env from nothing (no-config,
+        // coverage sink, private TMPDIR); only the role and override are added.
+        let sandbox = crate::test_support::TestSandbox::new();
+        let mut child = crate::test_support::SandboxedTestChild::new(
             "webhook_tls_8203_tests::run_invalid_port_children",
+            &sandbox,
         )
-        .configure(|command| {
-            command
-                .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
-                .env_clear()
-                .env(PORT_CHILD, test_name)
-                .env("TMPDIR", std::env::temp_dir())
-                .env("AI_MEMORY_NO_CONFIG", "1")
-                .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)));
-            if let Some(value) = override_value {
-                command.env(DNS_FAIL_OPEN, value);
-            }
-        })
-        .arm()
-        .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &filter)
-        .expect("isolated invalid-port child");
+        .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
+        .env(PORT_CHILD, test_name);
+        if let Some(value) = override_value {
+            child = child.env(DNS_FAIL_OPEN, value);
+        }
+        let output = child
+            .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &filter)
+            .expect("isolated invalid-port child");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

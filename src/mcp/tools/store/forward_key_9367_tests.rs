@@ -64,17 +64,6 @@ fn synthetic_key() -> String {
     )
 }
 
-/// Scratch dir under the clone (never /tmp): `.local-runs/9367/<cell>-<pid>`.
-fn scratch(cell: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".local-runs")
-        .join("9367")
-        .join(format!("{cell}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
-}
-
 /// Write `contents` to `<dir>/agent.token` with `mode`; return the path.
 fn token_file(dir: &std::path::Path, contents: &[u8], mode: u32) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
@@ -100,9 +89,19 @@ fn is_child() -> bool {
 /// plus exactly `env` and the role marker; the child must pass and must have
 /// run that one test (a filter that matches nothing also exits 0).
 fn run_in_child(test: &str, env: &[(&str, &str)]) {
+    run_in_sandboxed_child(&crate::test_support::TestSandbox::new(), test, env);
+}
+
+/// [`run_in_child`] in a caller-held `sandbox`, so a path `env` names can live
+/// inside it (#10176).
+fn run_in_sandboxed_child(
+    sandbox: &crate::test_support::TestSandbox,
+    test: &str,
+    env: &[(&str, &str)],
+) {
     let mut vars = vec![(CHILD_ROLE_ENV, "1")];
     vars.extend_from_slice(env);
-    let out = crate::test_support::spawn_test_child(&format!("{MODULE}::{test}"), &vars);
+    let out = crate::test_support::spawn_test_child(sandbox, &format!("{MODULE}::{test}"), &vars);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -116,20 +115,21 @@ fn run_in_child(test: &str, env: &[(&str, &str)]) {
 }
 
 /// Parent role: run `test` in a clean child whose environment names
-/// `<scratch(cell)>/agent.token` in [`KEY_FILE_ENV`] (plus `extra`), then drop
-/// the scratch dir, and return `true` (the caller returns). Child role:
+/// `<sandbox>/work/<cell>/agent.token` in [`KEY_FILE_ENV`] (plus `extra`),
+/// drop the sandbox, and return `true` (the caller returns). Child role:
 /// `false`, and the caller runs the cell body.
 fn keyed_child_or_spawn(test: &str, cell: &str, extra: &[(&str, &str)]) -> bool {
     if is_child() {
         return false;
     }
-    let dir = scratch(cell);
+    let sandbox = crate::test_support::TestSandbox::new();
+    let dir = sandbox.work().join(cell);
+    std::fs::create_dir_all(&dir).expect("sandbox cell dir");
     let path = dir.join(TOKEN_NAME);
     let path = path.to_str().expect("utf-8 scratch path");
     let mut env = vec![(KEY_FILE_ENV, path)];
     env.extend_from_slice(extra);
-    run_in_child(test, &env);
-    let _ = std::fs::remove_dir_all(&dir);
+    run_in_sandboxed_child(&sandbox, test, &env);
     true
 }
 

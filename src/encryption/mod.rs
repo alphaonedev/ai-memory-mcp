@@ -1487,20 +1487,17 @@ mod tests {
             return;
         }
 
-        let scratch = secure_tmp_key_dir();
-        let marker = scratch.path().join("child-ran");
-        let output =
-            crate::test_support::SandboxedTestChild::new("encryption::umask_0002_child_8316")
-                .configure(|cmd| {
-                    cmd.arg("--exact")
-                        .arg(TEST_PATH)
-                        .arg("--nocapture")
-                        .env(ROLE_ENV, "child")
-                        .env(MARKER_ENV, &marker);
-                })
-                .arm()
-                .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, TEST_PATH)
-                .expect("re-launch the test binary");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let marker = sandbox.work().join("child-ran");
+        let output = crate::test_support::SandboxedTestChild::new(
+            "encryption::umask_0002_child_8316",
+            &sandbox,
+        )
+        .args(["--exact", TEST_PATH, "--nocapture"])
+        .env(ROLE_ENV, "child")
+        .env(MARKER_ENV, &marker)
+        .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, TEST_PATH)
+        .expect("re-launch the test binary");
         assert!(
             output.status.success(),
             "#8316: the umask-0002 child run failed:\n{}\n{}",

@@ -29,9 +29,8 @@ pub(super) fn resolve(target: &str) -> std::io::Result<Vec<SocketAddr>> {
 fn resolver_error_is_refused_8203() {
     const RESOLVER_TARGET: &str = "resolver-error.invalid:443";
     const WEBHOOK_URL: &str = "https://resolver-error.invalid:443/hook";
-    if crate::test_support::run_env_isolated_child_or_spawn_scrubbing(
+    if crate::test_support::run_env_isolated_child_or_spawn(
         "subscriptions::webhook_ssrf_8203_tests::resolver_error_is_refused_8203",
-        &["AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL"],
     ) {
         return;
     }
@@ -252,6 +251,7 @@ mod dispatch {
     fn send_uses_guarded_dns_answer_6860() {
         if std::env::var_os(CHILD_ROLE).is_none() {
             let output = crate::test_support::spawn_test_child(
+                &crate::test_support::TestSandbox::new(),
                 "subscriptions::webhook_ssrf_8203_tests::dispatch::send_uses_guarded_dns_answer_6860",
                 &[(CHILD_ROLE, "1"), ("NO_PROXY", ""), ("no_proxy", "")],
             );
@@ -274,6 +274,7 @@ mod dispatch {
             let proxy = format!("http://{address}");
             for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
                 let output = crate::test_support::spawn_test_child(
+                    &crate::test_support::TestSandbox::new(),
                     "subscriptions::webhook_ssrf_8203_tests::dispatch::send_ignores_environment_proxies_6372",
                     &[
                         (CHILD_ROLE, "1"),

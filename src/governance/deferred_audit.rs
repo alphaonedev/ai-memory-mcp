@@ -5412,21 +5412,16 @@ mod tests {
             return;
         }
 
-        let dir = fresh_tempdir();
-        let spool = dir.path().join("atomic-private-spool");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let spool = sandbox.work().join("atomic-private-spool");
         const SPOOL_TEST: &str = "governance::deferred_audit::tests::journal_spool_creation_is_private_with_permissive_umask";
         let output = crate::test_support::SandboxedTestChild::new(
             "governance::deferred_audit::spool_umask_child",
+            &sandbox,
         )
-        .configure(|command| {
-            command
-                .arg("--exact")
-                .arg(SPOOL_TEST)
-                .arg("--nocapture")
-                .env(ROLE_ENV, "child")
-                .env(SPOOL_ENV, &spool);
-        })
-        .arm()
+        .args(["--exact", SPOOL_TEST, "--nocapture"])
+        .env(ROLE_ENV, "child")
+        .env(SPOOL_ENV, &spool)
         .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, SPOOL_TEST)
         .unwrap();
         assert!(
@@ -5872,8 +5867,9 @@ mod tests {
             return;
         }
 
-        let dir = fresh_tempdir();
-        let journal_path = dir.path().join("cross-process-quota.journal");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let dir = sandbox.work();
+        let journal_path = dir.join("cross-process-quota.journal");
         let journal = DeferredAuditJournal::open(&journal_path).unwrap();
         let mut sample = DeferredAuditEvent::from_refusal(
             "agent:quota-race-a",
@@ -5904,32 +5900,30 @@ mod tests {
         journal.sync_spool_dir().unwrap();
         drop(journal);
 
-        let start_path = dir.path().join("start");
-        // Declared before the children so the sandboxes outlive them.
-        let mut sandboxes = Vec::new();
+        let start_path = dir.join("start");
+        // Both children share the one sandbox the journal lives in; each
+        // handle borrows it, so it outlives them (#10176).
         let mut children = Vec::new();
         let mut result_paths = Vec::new();
         for role in ["a", "b"] {
-            let ready_path = dir.path().join(format!("ready-{role}"));
-            let result_path = dir.path().join(format!("result-{role}"));
-            let (mut command, sandbox) = crate::test_support::SandboxedTestChild::new(
+            let ready_path = dir.join(format!("ready-{role}"));
+            let result_path = dir.join(format!("result-{role}"));
+            let child = crate::test_support::SandboxedTestChild::new(
                 "governance::deferred_audit::quota_overshoot_child",
+                &sandbox,
             )
-            .configure(|command| {
-                command
-                    .arg("--exact")
-                    .arg("governance::deferred_audit::tests::journal_cross_process_lock_prevents_simultaneous_quota_overshoot")
-                    .arg("--nocapture")
-                    .env(ROLE_ENV, role)
-                    .env(JOURNAL_ENV, &journal_path)
-                    .env(READY_ENV, &ready_path)
-                    .env(START_ENV, &start_path)
-                    .env(RESULT_ENV, &result_path);
-            })
-            .arm()
-            .into_parts();
-            sandboxes.push(sandbox);
-            let child = command.spawn().unwrap();
+            .args([
+                "--exact",
+                "governance::deferred_audit::tests::journal_cross_process_lock_prevents_simultaneous_quota_overshoot",
+                "--nocapture",
+            ])
+            .env(ROLE_ENV, role)
+            .env(JOURNAL_ENV, &journal_path)
+            .env(READY_ENV, &ready_path)
+            .env(START_ENV, &start_path)
+            .env(RESULT_ENV, &result_path)
+            .spawn()
+            .unwrap();
             children.push((child, ready_path));
             result_paths.push(result_path);
         }
@@ -6109,8 +6103,9 @@ mod tests {
             return;
         }
 
-        let dir = fresh_tempdir();
-        let db_path = dir.path().join("cross-process-recovery.db");
+        let sandbox = crate::test_support::TestSandbox::new();
+        let dir = sandbox.work();
+        let db_path = dir.join("cross-process-recovery.db");
         let _ = crate::db::open(&db_path).expect("init db");
         let journal_path = deferred_audit_journal_path(&db_path);
         let occurrence = DeferredAuditEvent::from_refusal(
@@ -6131,33 +6126,31 @@ mod tests {
         journal.append(&legacy).unwrap();
         drop(journal);
 
-        // Declared before the closure so the sandboxes outlive every child.
-        let sandboxes = std::cell::RefCell::new(Vec::new());
+        // Every child shares the one sandbox the journal and database live
+        // in; each handle borrows it, so it outlives them (#10176).
         let spawn_child = |role: &str| {
-            let ready = dir.path().join(format!("ready-{role}"));
-            let release = dir.path().join(format!("release-{role}"));
-            let result = dir.path().join(format!("result-{role}"));
-            let started = dir.path().join(format!("started-{role}"));
-            let (mut command, sandbox) = crate::test_support::SandboxedTestChild::new(
+            let ready = dir.join(format!("ready-{role}"));
+            let release = dir.join(format!("release-{role}"));
+            let result = dir.join(format!("result-{role}"));
+            let started = dir.join(format!("started-{role}"));
+            let child = crate::test_support::SandboxedTestChild::new(
                 "governance::deferred_audit::recovery_claims_child",
+                &sandbox,
             )
-            .configure(|command| {
-                command
-                    .arg("--exact")
-                    .arg("governance::deferred_audit::tests::journal_recovery_serializes_occurrence_and_legacy_claims_across_processes")
-                    .arg("--nocapture")
-                    .env(ROLE_ENV, role)
-                    .env(JOURNAL_ENV, &journal_path)
-                    .env(DB_ENV, &db_path)
-                    .env(RESULT_ENV, &result)
-                    .env(STARTED_ENV, &started)
-                    .env(READY_ENV, &ready)
-                    .env(RELEASE_ENV, &release);
-            })
-            .arm()
-            .into_parts();
-            sandboxes.borrow_mut().push(sandbox);
-            let child = command.spawn().unwrap();
+            .args([
+                "--exact",
+                "governance::deferred_audit::tests::journal_recovery_serializes_occurrence_and_legacy_claims_across_processes",
+                "--nocapture",
+            ])
+            .env(ROLE_ENV, role)
+            .env(JOURNAL_ENV, &journal_path)
+            .env(DB_ENV, &db_path)
+            .env(RESULT_ENV, &result)
+            .env(STARTED_ENV, &started)
+            .env(READY_ENV, &ready)
+            .env(RELEASE_ENV, &release)
+            .spawn()
+            .unwrap();
             (child, started, ready, release, result)
         };
         let (first, first_started, first_ready, first_release, first_result) = spawn_child("first");
@@ -6233,30 +6226,17 @@ mod tests {
     /// The budget is deliberately generous — these children re-exec the whole
     /// test binary and are expected to take seconds, not milliseconds — so it
     /// can only fire on a genuine wedge, never on a slow runner.
-    fn wait_for_test_child(mut child: std::process::Child, what: &str) -> std::process::ExitStatus {
-        let deadline = std::time::Instant::now() + TEST_CHILD_REAP_BUDGET;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return status,
-                Ok(None) if std::time::Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "test child {what} still running after {TEST_CHILD_REAP_BUDGET:?} (#3140)"
-                    );
-                }
-                Ok(None) => std::thread::sleep(TEST_CHILD_POLL_INTERVAL),
-                Err(e) => panic!("try_wait on test child {what}: {e}"),
-            }
-        }
+    fn wait_for_test_child(
+        mut child: crate::test_support::SpawnedTestChild<'_>,
+        what: &str,
+    ) -> std::process::ExitStatus {
+        child
+            .wait_bounded(TEST_CHILD_REAP_BUDGET, what)
+            .unwrap_or_else(|e| panic!("{e} (#3140)"))
     }
 
     /// v1.0.0 #3140 — wall-clock ceiling for [`wait_for_test_child`].
     const TEST_CHILD_REAP_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
-
-    /// v1.0.0 #3140 — poll interval for [`wait_for_test_child`], matching the
-    /// existing [`wait_for_test_path`] barrier cadence.
-    const TEST_CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
     fn wait_for_test_path(path: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

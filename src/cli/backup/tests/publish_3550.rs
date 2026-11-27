@@ -231,26 +231,36 @@ fn two_row_live_one_row_snapshot(env: &mut TestEnv, tag: &str) -> (PathBuf, Path
 /// test (`test`, a `publish_3550::` name) with `env` set, the shape
 /// `federation::tests` and `governance::deferred_audit::tests` use. The
 /// child starts from a clean environment so no parallel test's posture
-/// leaks in.
+/// leaks in; every path it is handed lives in `sandbox` (#10176).
 #[cfg(unix)]
-fn spawn_child_test(test: &str, env: &[(&str, &Path)]) -> std::process::Output {
+fn spawn_child_test(
+    sandbox: &crate::test_support::TestSandbox,
+    test: &str,
+    env: &[(&str, &Path)],
+) -> std::process::Output {
     let name = format!("cli::backup::tests::publish_3550::{test}");
-    crate::test_support::SandboxedTestChild::new("cli::backup::publish_3550::spawn_child_test")
-        .configure(|cmd| {
-            cmd.args(["--exact", &name, "--test-threads=1", "--nocapture"])
-                .env_clear()
-                // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
-                // with a %p pid template) so the child's execution is measured, not lost.
-                .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-                .env("TMPDIR", std::env::temp_dir())
-                .env("AI_MEMORY_NO_CONFIG", "1");
-            for (key, value) in env {
-                cmd.env(key, value);
-            }
-        })
-        .arm()
+    let mut child = crate::test_support::SandboxedTestChild::new(
+        "cli::backup::publish_3550::spawn_child_test",
+        sandbox,
+    )
+    .args(["--exact", &name, "--test-threads=1", "--nocapture"]);
+    for (key, value) in env {
+        child = child.env(key, value);
+    }
+    child
         .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &name)
         .expect("spawn the child test")
+}
+
+/// A fresh [`TestEnv`] whose database lives in `sandbox`, so a child can be
+/// handed its path (#10176).
+#[cfg(unix)]
+fn sandboxed_env(sandbox: &crate::test_support::TestSandbox, tag: &str) -> TestEnv {
+    let mut env = TestEnv::fresh();
+    let dir = sandbox.work().join(tag);
+    std::fs::create_dir_all(&dir).expect("sandbox db dir");
+    env.db_path = dir.join("ai-memory.db");
+    env
 }
 
 /// Env var naming the role a re-executed test plays. Read, never set, in
@@ -440,7 +450,9 @@ fn a_writer_starting_mid_restore_is_refused_at_every_locked_step_3550() {
     let _g = crate::store_url::store_url_env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut env = TestEnv::fresh();
+    let sandbox = std::rc::Rc::new(crate::test_support::TestSandbox::new());
+    let sandbox_in = std::rc::Rc::clone(&sandbox);
+    let mut env = sandboxed_env(&sandbox, "writer");
     let (db, snap) = two_row_live_one_row_snapshot(&mut env, "writer");
     let refused = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let refused_in = std::rc::Rc::clone(&refused);
@@ -451,6 +463,7 @@ fn a_writer_starting_mid_restore_is_refused_at_every_locked_step_3550() {
             }
             let in_process = writer_is_refused(target);
             let child = spawn_child_test(
+                &sandbox_in,
                 "a_writer_starting_mid_restore_is_refused_at_every_locked_step_3550",
                 &[
                     (CHILD_ROLE_ENV, Path::new(ROLE_WRITER)),
@@ -754,13 +767,15 @@ fn an_abort_at_any_publish_step_leaves_old_or_new_never_a_mix_3550() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for step in ALL_STEPS {
-        let mut env = TestEnv::fresh();
+        let sandbox = crate::test_support::TestSandbox::new();
+        let mut env = sandboxed_env(&sandbox, "abort");
         let (db, snap) = two_row_live_one_row_snapshot(&mut env, "abort");
         let snapshot_bytes = std::fs::read(&snap).expect("read snapshot");
         let dir = db.parent().unwrap().to_path_buf();
         let marker = dir.join("abort-marker");
         let step_name = format!("{step:?}");
         let child = spawn_child_test(
+            &sandbox,
             TEST,
             &[
                 (CHILD_ROLE_ENV, Path::new(ROLE_CRASH)),

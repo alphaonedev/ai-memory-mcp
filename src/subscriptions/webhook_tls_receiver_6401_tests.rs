@@ -13,32 +13,18 @@ use axum::{
 use axum_server::accept::Accept;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const CHILD_ROLE: &str = "AI_MEMORY_TEST_TLS_6401_CHILD";
 const CHILD_SCRATCH: &str = "AI_MEMORY_TEST_TLS_8649_SCRATCH";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
-const CHILD_POLL: Duration = Duration::from_millis(20);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_SECRET: &str = "tls-6401-test-secret";
 const WRONG_PORT_URL: &str = "https://localhost:80/hook";
 const PORT_MISMATCH: &str = "tls-test-port-mismatch";
 static RECEIVER_PORT: AtomicU16 = AtomicU16::new(0);
-
-struct ChildProcess(std::process::Child);
-
-impl Drop for ChildProcess {
-    fn drop(&mut self) {
-        // Reap before the parent TempDir drops, including polling/assertion panics.
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            // Best effort on unwind; never cause a second panic in Drop.
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-}
 
 /// Only the isolated child remaps the logical HTTPS pin to its owned socket.
 /// A wrong logical port fails before any connection to a host service.
@@ -65,49 +51,32 @@ pub(crate) fn map_receiver(
 }
 
 fn run_child(name: &str) {
-    let scratch = tempfile::tempdir_in(std::env::temp_dir()).expect("child scratch");
-    let scratch_path = scratch.path().to_path_buf();
-    run_child_in(name, scratch);
-    assert!(!scratch_path.exists(), "child PKI scratch must be removed");
+    let sandbox = crate::test_support::TestSandbox::new();
+    let sandbox_root = sandbox.root().to_path_buf();
+    run_child_in(name, sandbox);
+    assert!(!sandbox_root.exists(), "child PKI scratch must be removed");
 }
 
-fn run_child_in(name: &str, scratch: tempfile::TempDir) {
-    let stdout_path = scratch.path().join("stdout");
-    let stderr_path = scratch.path().join("stderr");
+/// The child's PKI lives in its sandbox `TMPDIR`; the sandbox is owned here,
+/// so it is removed after the child is reaped, on success and on a panic
+/// (the spawned handle, declared later, drops and reaps first) (#10176).
+fn run_child_in(name: &str, sandbox: crate::test_support::TestSandbox) {
+    let stdout_path = sandbox.work().join("stdout");
+    let stderr_path = sandbox.work().join("stderr");
     let module = module_path!().split_once("::").expect("crate module").1;
     let filter = format!("{module}::{name}");
-    // The sandbox (HOME, XDG, witness dir) outlives the child: it is dropped
-    // at the end of this function, after the child is reaped.
-    let (mut command, _sandbox) =
-        crate::test_support::SandboxedTestChild::new("webhook_tls_8203_tests::run_child")
-            .configure(|command| {
-                command
-                    .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
-                    .env_clear()
-                    .env("AI_MEMORY_NO_CONFIG", "1")
-                    // The parent owns this Drop guard: child process statics do not drop.
-                    .env("TMPDIR", scratch.path())
-                    .env(CHILD_SCRATCH, scratch.path())
-                    .env(CHILD_ROLE, "1")
-                    .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-                    .stdout(std::fs::File::create(&stdout_path).expect("child stdout"))
-                    .stderr(std::fs::File::create(&stderr_path).expect("child stderr"));
-            })
-            .arm()
-            .into_parts();
-    let mut child = ChildProcess(command.spawn().expect("spawn isolated TLS test"));
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.0.try_wait().expect("poll TLS child") {
-            break status;
-        }
-        if started.elapsed() >= CHILD_TIMEOUT {
-            child.0.kill().expect("kill timed-out child");
-            child.0.wait().expect("reap timed-out child");
-            panic!("#6401: isolated TLS child exceeded {CHILD_TIMEOUT:?}");
-        }
-        std::thread::sleep(CHILD_POLL);
-    };
+    let mut child =
+        crate::test_support::SandboxedTestChild::new("webhook_tls_8203_tests::run_child", &sandbox)
+            .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
+            .env(CHILD_SCRATCH, sandbox.tmp())
+            .env(CHILD_ROLE, "1")
+            .stdout(std::fs::File::create(&stdout_path).expect("child stdout"))
+            .stderr(std::fs::File::create(&stderr_path).expect("child stderr"))
+            .spawn()
+            .expect("spawn isolated TLS test");
+    let status = child
+        .wait_bounded(CHILD_TIMEOUT, &filter)
+        .unwrap_or_else(|e| panic!("#6401: isolated TLS child: {e}"));
     let stdout = std::fs::read_to_string(stdout_path).expect("read child stdout");
     let stderr = std::fs::read_to_string(stderr_path).expect("read child stderr");
     assert!(
@@ -490,10 +459,10 @@ fn child_pki_is_removed_after_panic_8649() {
         assert!(pki.leaf_key_pem.is_file(), "PKI exists before panic");
         panic!("{EXPECTED_PANIC}");
     }
-    let scratch = tempfile::tempdir_in(std::env::temp_dir()).expect("panic child scratch");
-    let scratch_path = scratch.path().to_path_buf();
+    let sandbox = crate::test_support::TestSandbox::new();
+    let scratch_path = sandbox.root().to_path_buf();
     let failure = std::panic::catch_unwind(|| {
-        run_child_in("child_pki_is_removed_after_panic_8649", scratch);
+        run_child_in("child_pki_is_removed_after_panic_8649", sandbox);
     })
     .expect_err("child failure must propagate");
     let message = failure

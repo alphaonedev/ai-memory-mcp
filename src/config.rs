@@ -10604,9 +10604,7 @@ pub(crate) fn test_env_mutex() -> &'static std::sync::Mutex<()> {
 /// The env-isolation child-spawn helpers live in `test_support` so this file
 /// stays under its QUAL-10 ceiling (#2967 r5); callers keep this path.
 #[cfg(test)]
-pub(crate) use crate::test_support::{
-    run_env_isolated_child_or_spawn, run_env_isolated_child_or_spawn_scrubbing,
-};
+pub(crate) use crate::test_support::run_env_isolated_child_or_spawn;
 
 // ---------------------------------------------------------------------------
 // Tests
