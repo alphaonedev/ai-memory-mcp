@@ -480,3 +480,58 @@ fn dir_sync_einval_fails_closed_10265() {
     assert_eq!(not_durable_errno(&not_durable), Some(libc::EINVAL));
     assert_eq!(bytes_at(&written).as_deref(), Some(AFTER));
 }
+
+/// #9494 / #10214: the pre-migration snapshot (`vacuum_into_private`) syncs
+/// its directory after the publish; a failed directory fsync refuses the
+/// migration with the typed NotDurable report and keeps the snapshot.
+#[test]
+fn pre_migration_snapshot_dir_sync_is_typed_and_keeps_the_snapshot_9494() {
+    let _reset = armed();
+    let dir = scratch();
+    let source = dir.path().join("source-9494.db");
+    let conn = rusqlite::Connection::open(&source).expect("open source db");
+    conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (9494);")
+        .expect("seed source db");
+
+    let clean = dir.path().join("clean-9494.snapshot");
+    super::snapshot_file::vacuum_into_private(&conn, &clean, &source).expect("clean snapshot");
+    assert_eq!(seam::take_dir_syncs(), vec![dir.path().to_path_buf()]);
+
+    let failing = dir.path().join("failing-9494.snapshot");
+    seam::inject_step_errno(seam::Step::DirSync, INJECTED_ERRNO);
+    let err = super::snapshot_file::vacuum_into_private(&conn, &failing, &source)
+        .expect_err("a snapshot not confirmed durable refuses the migration");
+    let not_durable = err
+        .downcast_ref::<NotDurable>()
+        .unwrap_or_else(|| panic!("the refusal carries the typed report: {err:#}"));
+    assert_eq!(not_durable_errno(not_durable), Some(INJECTED_ERRNO));
+    assert!(
+        not_durable
+            .to_string()
+            .contains("is written but not confirmed durable"),
+        "{not_durable}"
+    );
+    let kept = rusqlite::Connection::open(&failing).expect("the snapshot stays");
+    let x: i64 = kept
+        .query_row("SELECT x FROM t", [], |row| row.get(0))
+        .expect("the snapshot is complete");
+    assert_eq!(x, 9494);
+
+    // The migration's own refusal words the state (#10263): never "failed".
+    seam::inject_step_errno(seam::Step::DirSync, INJECTED_ERRNO);
+    let err = super::migrations::snapshot_before_migration(&conn, 1, 2)
+        .expect_err("the migration refuses a snapshot not confirmed durable");
+    assert!(err.downcast_ref::<NotDurable>().is_some(), "{err:#}");
+    let shown = format!("{err:#}");
+    assert!(
+        shown.starts_with(
+            "pre-migration snapshot (v1→v2) is not a confirmed recoverable backup; refusing \
+             to mutate schema: "
+        ),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("is written but not confirmed durable"),
+        "{shown}"
+    );
+}

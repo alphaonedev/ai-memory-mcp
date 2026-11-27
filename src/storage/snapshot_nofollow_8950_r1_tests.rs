@@ -127,8 +127,8 @@ fn migration_snapshot_refuses_swapped_name_rows_8950() {
             ),
         };
         let want = format!(
-            "pre-migration snapshot (v1→v2) failed; refusing to mutate schema without a \
-             recoverable backup: {cause}"
+            "pre-migration snapshot (v1→v2) is not a confirmed recoverable backup; refusing \
+             to mutate schema: {cause}"
         );
         assert_eq!(format!("{err:#}"), want, "{swap:?}");
         match swap {
