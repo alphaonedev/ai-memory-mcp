@@ -95,18 +95,18 @@ pub struct Expected {
 /// The verdict table. Exhaustive, no wildcard arm: a new scenario or verifier
 /// state does not compile until its row is written.
 pub fn expected(scenario: Scenario, verifier: VerifierState) -> Expected {
-    let (failures, checked, verified): (&[i64], u64, u64) = match (scenario, verifier) {
-        // A correctly signed marker with no verifier is unchecked: it fails
-        // nothing and verifies nothing.
-        (Scenario::Valid, VerifierState::None) => (&[], 1, 0),
+    let (failures, checked, positively_verified): (&[i64], u64, u64) = match (scenario, verifier) {
+        // With no verifier, a correctly signed marker and a marker with a bad
+        // signature are both unchecked (a bad signature cannot be seen without
+        // a key): they fail nothing and verify nothing.
+        (Scenario::Valid | Scenario::BadSignature, VerifierState::None) => (&[], 1, 0),
         (Scenario::Valid, VerifierState::Pinned | VerifierState::InProcess) => (&[], 1, 1),
         // A structural defect is invalid whether or not a key is present.
         (
             Scenario::Edited,
             VerifierState::None | VerifierState::Pinned | VerifierState::InProcess,
         ) => (&[GENESIS_SEQ], 1, 0),
-        // A bad signature cannot be seen without a key; with one it is invalid.
-        (Scenario::BadSignature, VerifierState::None) => (&[], 1, 0),
+        // With a key, a bad signature is invalid.
         (Scenario::BadSignature, VerifierState::Pinned | VerifierState::InProcess) => {
             (&[GENESIS_SEQ], 1, 0)
         }
@@ -122,7 +122,7 @@ pub fn expected(scenario: Scenario, verifier: VerifierState) -> Expected {
     Expected {
         failures: failures.to_vec(),
         checked,
-        verified,
+        verified: positively_verified,
     }
 }
 
