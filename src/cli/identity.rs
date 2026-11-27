@@ -3761,4 +3761,144 @@ mod tests {
             "(b) Fixed(K_old) leaked across rollback! got: {post_rollback_err:#}"
         );
     }
+
+    /// #10156 — prove that in a lib-test process with `AI_MEMORY_WITNESS_KEY_DIR`
+    /// unset and a throwaway `HOME`, `witness_key_dir()` resolves to an isolated
+    /// sandbox OUTSIDE `HOME` (never `<HOME>/.config/ai-memory/witness-keys`)
+    /// and distinct from `default_key_dir()`.
+    #[test]
+    fn witness_key_dir_is_isolated_from_home_in_tests_10156() {
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_WITNESS_ISO_10156_ROLE";
+        const FORBIDDEN_HOME_ENV: &str = "AI_MEMORY_TEST_WITNESS_ISO_10156_HOME";
+        const TEST_PATH: &str = "cli::identity::tests::witness_key_dir_is_isolated_from_home_in_tests_10156";
+
+        if std::env::var_os(ROLE_ENV).is_none() {
+            let scratch = crate::identity::test_key_dir::private_tempdir();
+            let fake_home = scratch.path().join("fake-home");
+            std::fs::create_dir_all(&fake_home).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+                .args(["--exact", TEST_PATH, "--nocapture"])
+                .env("HOME", &fake_home)
+                .env("XDG_CONFIG_HOME", fake_home.join(".config"))
+                .env_remove("AI_MEMORY_WITNESS_KEY_DIR")
+                .env_remove("AI_MEMORY_KEY_DIR")
+                .env(FORBIDDEN_HOME_ENV, &fake_home)
+                .env(ROLE_ENV, "child")
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "child failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let forbidden_home =
+            PathBuf::from(std::env::var_os(FORBIDDEN_HOME_ENV).expect("forbidden home env"));
+        let resolved = crate::governance::audit::witness_key_dir().expect("witness_key_dir");
+        assert!(
+            !resolved.starts_with(&forbidden_home),
+            "#10156: witness_key_dir() resolved under HOME: {} (HOME={})",
+            resolved.display(),
+            forbidden_home.display()
+        );
+        let key_dir = keypair::default_key_dir().expect("default_key_dir");
+        assert_ne!(
+            resolved, key_dir,
+            "#10156: witness custody sandbox must be distinct from daemon key dir"
+        );
+    }
+
+    /// #10156 — source ratchet pinning BOTH halves of witness custody isolation:
+    /// (1) `src/governance/audit.rs::witness_key_dir` routes armed test processes
+    ///     through `test_key_dir::armed_witness_sandbox()` and checks
+    ///     `assert_witness_isolated`;
+    /// (2) the three lineage CLI tests (`lineage_verbs_end_to_end`,
+    ///     `lineage_text_surfaces_and_refusals`, `recovery_ceremony_cli_end_to_end`)
+    ///     execute inside `run_in_hermetic_child`;
+    /// (3) no test under `src/` points `AI_MEMORY_WITNESS_KEY_DIR` at a `HOME`
+    ///     or `.config/ai-memory/witness-keys` path.
+    #[test]
+    fn source_ratchet_witness_custody_and_cli_identity_hermetic_10156() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // (1) Crate-wide guard in `witness_key_dir()`.
+        let audit_src =
+            std::fs::read_to_string(manifest_dir.join("src/governance/audit.rs")).unwrap();
+        let fn_start = audit_src
+            .find("pub fn witness_key_dir()")
+            .expect("witness_key_dir must exist");
+        let fn_slice = &audit_src[fn_start..fn_start + 1600.min(audit_src.len() - fn_start)];
+        assert!(
+            fn_slice.contains("armed_witness_sandbox()"),
+            "#10156 ratchet: witness_key_dir() must delegate armed test processes to armed_witness_sandbox()"
+        );
+        assert!(
+            fn_slice.contains("assert_witness_isolated"),
+            "#10156 ratchet: witness_key_dir() must enforce assert_witness_isolated"
+        );
+
+        // (2) The three cli::identity lineage tests run via `run_in_hermetic_child`.
+        let identity_src =
+            std::fs::read_to_string(manifest_dir.join("src/cli/identity.rs")).unwrap();
+        for test_name in [
+            "fn lineage_verbs_end_to_end()",
+            "fn lineage_text_surfaces_and_refusals()",
+            "fn recovery_ceremony_cli_end_to_end()",
+        ] {
+            let start = identity_src
+                .find(test_name)
+                .unwrap_or_else(|| panic!("missing {test_name}"));
+            let window = &identity_src[start..start + 600.min(identity_src.len() - start)];
+            assert!(
+                window.contains("run_in_hermetic_child("),
+                "#10156 ratchet: {test_name} must execute inside run_in_hermetic_child(...)"
+            );
+        }
+
+        // (3) No test under `src/` points WITNESS_KEY_DIR_ENV at HOME/.config.
+        fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    walk_rs(&p, out);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk_rs(&manifest_dir.join("src"), &mut files);
+        files.sort();
+        let mut violations = Vec::new();
+        for path in files {
+            let content = std::fs::read_to_string(&path).unwrap();
+            for (idx, line) in content.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if (trimmed.contains("AI_MEMORY_WITNESS_KEY_DIR")
+                    || trimmed.contains("WITNESS_KEY_DIR_ENV"))
+                    && (trimmed.contains(".config/ai-memory/witness-keys")
+                        || trimmed.contains("dirs::home_dir")
+                        || trimmed.contains("dirs::config_dir"))
+                {
+                    violations.push(format!(
+                        "{}:{}: {trimmed}",
+                        path.strip_prefix(manifest_dir).unwrap_or(&path).display(),
+                        idx + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "#10156 ratchet: tests must not point witness custody at HOME/config:\n{}",
+            violations.join("\n")
+        );
+    }
 }
