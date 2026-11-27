@@ -2397,10 +2397,21 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
 #[cfg(feature = "sal")]
 #[test]
 fn write_seal_verifies_under_retired_key_after_rotation_10111() {
-    let (sb, _key, mut mcp) = armed();
+    let (sb, old_key_file, mut mcp) = armed();
     let id_old = mcp.store("write seal 10111 before rotation");
     drop(mcp);
     assert_ok(&sb.report(), "before rotation");
+    let old_key_id = latest(&sb, &id_old).key_id;
+    let old_priv_bytes: [u8; 32] = std::fs::read(&old_key_file)
+        .expect("read K_old priv bytes")
+        .try_into()
+        .expect("32-byte K_old priv");
+    let old_signing = ed25519_dalek::SigningKey::from_bytes(&old_priv_bytes);
+    let old_kp = ai_memory::identity::keypair::AgentKeypair {
+        agent_id: AGENT.to_string(),
+        public: old_signing.verifying_key(),
+        private: Some(old_signing),
+    };
     let before_copy = vacuum_copy(&sb, "seal-10111-before-rot.db");
     assert!(
         store_verdict(&sb, &before_copy, &id_old),
@@ -2459,7 +2470,10 @@ fn write_seal_verifies_under_retired_key_after_rotation_10111() {
         }),
     );
     drop(mcp);
-    assert_ok(&sb.report(), "after post-rotation content update of K_old row");
+    assert_ok(
+        &sb.report(),
+        "after post-rotation content update of K_old row",
+    );
     let updated_copy = vacuum_copy(&sb, "seal-10111-updated.db");
     assert!(
         store_verdict(&sb, &updated_copy, &id_old),
@@ -2468,10 +2482,85 @@ fn write_seal_verifies_under_retired_key_after_rotation_10111() {
 
     // On the pre-update snapshot (`both_copy`, where `id_old` still carries K_old's
     // seal): removing K_old's archive or moving its retirement timestamp before
-    // `id_old`'s write time must refuse verification (no fallback to K_new).
+    // `id_old`'s write time must refuse verification (no fallback to K_new) and
+    // surface the exact named SealDefect via verify_row_seal_with.
+    let old_row = {
+        let conn = ai_memory::db::open(&both_copy).expect("open both_copy");
+        ai_memory::db::get(&conn, &id_old)
+            .expect("get old_row")
+            .expect("old_row present")
+    };
+    let keys_dir = sb.root.join("keys");
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Verified {
+            key_id: old_key_id.clone(),
+        },
+        "verify_row_seal_with must verify K_old row under K_old's retired anchor key"
+    );
+
     let archive = &archives[0];
+    let archive_ts: i64 = archive
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.rsplit_once(".pub."))
+        .and_then(|(_, tail)| tail.split('-').next())
+        .and_then(|ts| ts.parse().ok())
+        .expect("parse retired archive unix timestamp");
+    // Sealing a row with K_old dated AFTER the real archive instant against the
+    // unmodified key directory must return the exact OutOfRange defect.
+    let post_ret_ts = chrono::DateTime::from_timestamp(archive_ts + 60, 0)
+        .expect("post-retirement timestamp")
+        .to_rfc3339();
+    let mut post_ret_row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: "seal-10111".to_string(),
+        title: "post-retirement seal 10111".to_string(),
+        content: "row sealed with retired K_old after retirement".to_string(),
+        created_at: post_ret_ts.clone(),
+        updated_at: post_ret_ts,
+        metadata: json!({
+            "agent_id": AGENT,
+            "attest_level": "agent_attested",
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let post_ret_sig =
+        ai_memory::identity::attest::sign_memory_write(&old_kp, &post_ret_row, AGENT)
+            .expect("sign post-retirement row with K_old");
+    ai_memory::identity::attest::persist_write_signature(&mut post_ret_row, &post_ret_sig);
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &post_ret_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(
+            ai_memory::identity::session_signer::SealDefect::OutOfRange {
+                key_id: old_key_id.clone(),
+                valid_from: None,
+                valid_to: Some(archive_ts),
+            }
+        ),
+        "K_old seal dated after its real archive instant must be exact OutOfRange defect"
+    );
+
     let retired_bytes = std::fs::read(archive).expect("read retired archive");
     std::fs::remove_file(archive).expect("remove retired archive");
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(
+            ai_memory::identity::session_signer::SealDefect::UnknownKey {
+                agent_id: AGENT.to_string(),
+            }
+        ),
+        "missing retired archive must report UnknownKey defect, never fallback to K_new"
+    );
     assert!(
         !store_verdict(&sb, &both_copy, &id_old),
         "missing retired key archive must not verify or fall back to K_new"
@@ -2482,10 +2571,43 @@ fn write_seal_verifies_under_retired_key_after_rotation_10111() {
         .join("keys")
         .join(format!("{AGENT}.pub.{EARLY_ARCHIVE_TS}"));
     std::fs::write(&early, &retired_bytes).expect("write early archive");
+    let expected_oor = ai_memory::identity::session_signer::SealDefect::OutOfRange {
+        key_id: old_key_id.clone(),
+        valid_from: None,
+        valid_to: Some(EARLY_ARCHIVE_TS),
+    };
+    assert_eq!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&keys_dir),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(expected_oor.clone()),
+        "retired key ending before write time must report exact OutOfRange defect"
+    );
+    assert_eq!(
+        expected_oor.to_string(),
+        format!(
+            "write seal key_id {old_key_id} used outside its anchored validity (from None to Some({EARLY_ARCHIVE_TS}))"
+        )
+    );
     assert!(
         !store_verdict(&sb, &both_copy, &id_old),
         "retired key with validity ending before write time must not verify"
     );
+
+    // Unanchored empty key dir -> Unanchored defect (never falls back to DB key).
+    let empty_keys = sb.root.join("empty-keys-10111");
+    std::fs::create_dir_all(&empty_keys).expect("empty key dir");
+    set_mode(&empty_keys, 0o700);
+    assert!(matches!(
+        ai_memory::identity::session_signer::verify_row_seal_with(
+            &old_row,
+            &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&empty_keys),
+        ),
+        ai_memory::identity::session_signer::StoredSealCheck::Defect(
+            ai_memory::identity::session_signer::SealDefect::Unanchored(_)
+        )
+    ));
 
     std::fs::remove_file(&early).expect("remove early archive");
     std::fs::write(archive, &retired_bytes).expect("restore archive");

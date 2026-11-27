@@ -224,7 +224,8 @@ impl SqliteStore {
 }
 
 /// NOTICE 4c / E-3 — the one verdict for a memory row: its in-row seal
-/// verifies against the owner's bound key AND the one completeness verifier
+/// verifies against the owner's anchored key (current or retired within its
+/// validity window, #10111) AND the one completeness verifier
 /// (`row_attest::sqlite::verify_sqlite`) finds no defect in the store and
 /// does not name this id. #10094: a row drift (a live row with no, a stale or
 /// a delete attestation, and a table head those drifts explain) fails only
@@ -232,7 +233,7 @@ impl SqliteStore {
 /// closed: a broken signature, chain, seal or unexplained head cannot be
 /// pinned on one row). The rule is `Report::memory_verified`.
 fn memory_signature_verdict(conn: &rusqlite::Connection, mem: &Memory) -> StoreResult<bool> {
-    if !crate::identity::session_signer::row_seal_verifies(conn, mem).map_err(box_err)? {
+    if !crate::identity::session_signer::row_seal_verifies(mem) {
         return Ok(false);
     }
     let report = crate::storage::row_attest::sqlite::verify_sqlite(conn).map_err(box_err)?;

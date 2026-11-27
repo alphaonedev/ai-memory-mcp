@@ -166,6 +166,17 @@ pub enum KeyRefusal {
     },
 }
 
+/// Refusal of [`TrustAnchor::verify_key_for_span`]: the exact [`KeyRefusal`]
+/// plus the anchored `key_id` when a key in the anchor matched the signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanKeyRefusal {
+    /// Matching anchored `key_id`, when a key in the anchor verified the
+    /// signature (`OtherAgent`, `BadTime`, `OutOfRange`).
+    pub key_id: Option<String>,
+    /// The exact anchor refusal reason.
+    pub refusal: KeyRefusal,
+}
+
 /// The out-of-database trust anchor (A-2): every public key the verifier
 /// trusts, by `key_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,6 +507,97 @@ impl TrustAnchor {
                 valid_to: k.valid_to,
             })
         }
+    }
+
+    /// Resolve and validity-check the anchored key that signed a record for
+    /// `agent_id` when the record carries no explicit `key_id` (e.g. a
+    /// memory's in-row `write_signature`, #10111).
+    ///
+    /// Uses the same agent-ownership and validity-window rules as
+    /// [`Self::key_for`], reading keys only from this out-of-database anchor:
+    /// - checks every anchored key belonging to `agent_id` (current and
+    ///   retired); when `verifies(key)` succeeds, validates the write span
+    ///   `[created_at, updated_at]` against `[valid_from, valid_to]`:
+    ///   `created_at` must parse as RFC 3339 and satisfy `created_at <= valid_to`
+    ///   (a retired key never verifies a row dated after its retirement,
+    ///   regardless of `updated_at`), and `effective_end` (`max(created_at,
+    ///   updated_at)` when `updated_at` is non-empty, else `created_at`) must
+    ///   satisfy `effective_end >= valid_from`;
+    /// - if no key of `agent_id` verifies, checks other agents' anchored keys
+    ///   so cross-agent misuse surfaces as [`KeyRefusal::OtherAgent`];
+    /// - otherwise returns [`KeyRefusal::UnknownKey`] (when `agent_id` has
+    ///   anchored keys) or [`KeyRefusal::UnknownAgent`] (when it has none),
+    ///   never falling back to the current key or a database key.
+    ///
+    /// # Errors
+    ///
+    /// The exact [`SpanKeyRefusal`].
+    pub fn verify_key_for_span(
+        &self,
+        agent_id: &str,
+        created_at: &str,
+        updated_at: Option<&str>,
+        mut verifies: impl FnMut(&VerifyingKey) -> bool,
+    ) -> Result<String, SpanKeyRefusal> {
+        let mut has_agent = false;
+        for (key_id, k) in &self.by_key_id {
+            if k.agent_id != agent_id {
+                continue;
+            }
+            has_agent = true;
+            if !verifies(&k.key) {
+                continue;
+            }
+            let start = chrono::DateTime::parse_from_rfc3339(created_at)
+                .map_err(|_| SpanKeyRefusal {
+                    key_id: Some(key_id.clone()),
+                    refusal: KeyRefusal::BadTime,
+                })?
+                .timestamp();
+            let end = match updated_at.filter(|s| !s.is_empty()) {
+                Some(raw) => {
+                    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+                        .map_err(|_| SpanKeyRefusal {
+                            key_id: Some(key_id.clone()),
+                            refusal: KeyRefusal::BadTime,
+                        })?
+                        .timestamp();
+                    start.max(parsed)
+                }
+                None => start,
+            };
+            let after_start = k.valid_from.is_none_or(|from| end >= from);
+            let before_end = k.valid_to.is_none_or(|to| start <= to);
+            if after_start && before_end {
+                return Ok(key_id.clone());
+            }
+            return Err(SpanKeyRefusal {
+                key_id: Some(key_id.clone()),
+                refusal: KeyRefusal::OutOfRange {
+                    valid_from: k.valid_from,
+                    valid_to: k.valid_to,
+                },
+            });
+        }
+        for (key_id, k) in &self.by_key_id {
+            if k.agent_id == agent_id {
+                continue;
+            }
+            if verifies(&k.key) {
+                return Err(SpanKeyRefusal {
+                    key_id: Some(key_id.clone()),
+                    refusal: KeyRefusal::OtherAgent(k.agent_id.clone()),
+                });
+            }
+        }
+        Err(SpanKeyRefusal {
+            key_id: None,
+            refusal: if has_agent {
+                KeyRefusal::UnknownKey
+            } else {
+                KeyRefusal::UnknownAgent
+            },
+        })
     }
 
     /// An anchor built from explicit keys (unit tests only; still no
