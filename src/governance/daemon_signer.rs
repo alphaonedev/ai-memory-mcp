@@ -251,6 +251,20 @@ impl DaemonChainSigner {
         Some(DaemonKeyMissing::new(cause, Some(&dir)))
     }
 
+    /// #10179 — the refusal a ledger-writing boot returns when the daemon key
+    /// in the resolved key directory is partial (or no key directory
+    /// resolves), WHATEVER the resolved agent id: the store, link, persona
+    /// and witness rows are signed with the daemon key, so a boot as another
+    /// id must not install its own key and then serve with that signing off.
+    /// The typed [`DaemonKeyMissing`] is the downcastable source (per
+    /// ERRORS-11); the context names the id. Reads two paths; generates and
+    /// heals nothing. `None` when the daemon key is whole or wholly absent.
+    #[must_use]
+    pub fn ledger_writer_boot_refusal(agent_id: &str) -> Option<anyhow::Error> {
+        let cause = Self::partial_key_refusal(crate::identity::keypair::DAEMON_KEYPAIR_LABEL)?;
+        Some(anyhow::Error::new(cause).context(partial_daemon_key_boot_refusal(agent_id)))
+    }
+
     /// The public half, for verifying what this signer wrote.
     #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -325,6 +339,21 @@ impl DaemonKeyCause {
     }
 }
 
+/// #10179 — the issue a ledger-writing boot over a partial daemon key cites.
+pub const PARTIAL_DAEMON_KEY_BOOT_ISSUE: &str = "#10179";
+
+/// #10179 — the context of [`DaemonChainSigner::ledger_writer_boot_refusal`]:
+/// which id refused and why, before the typed cause.
+#[must_use]
+pub fn partial_daemon_key_boot_refusal(agent_id: &str) -> String {
+    format!(
+        "{PARTIAL_DAEMON_KEY_BOOT_ISSUE}: refusing to start a ledger-writing command as \
+         `{agent_id}`: the store, link, persona and witness rows need the whole `{}` key, \
+         which is not usable, so none is written",
+        crate::identity::keypair::DAEMON_KEYPAIR_LABEL
+    )
+}
+
 static DAEMON_KEY_MISSING_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// How many [`DaemonKeyMissing`] refusals this process has raised.
@@ -392,6 +421,10 @@ pub fn verify(vk: &VerifyingKey, domain: DaemonDomain, body: &[u8], signature: &
 #[cfg(test)]
 #[path = "daemon_signer_k4_tests.rs"]
 mod k4_tests;
+
+#[cfg(all(test, unix))]
+#[path = "daemon_signer_k7_tests.rs"]
+mod k7_tests;
 
 #[cfg(test)]
 mod tests {

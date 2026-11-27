@@ -106,7 +106,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::validate;
 
 mod key_dir_lock;
-pub(crate) use key_dir_lock::{KEY_DIR_LOCK_FILE, KeyDirLock, KeyDirLockError};
+#[cfg(test)]
+pub(crate) use key_dir_lock::KEY_DIR_LOCK_FILE;
+pub(crate) use key_dir_lock::{KeyDirLock, KeyDirLockError};
 
 /// Suffix for the public-key file (`<agent_id>.pub`).
 const PUB_SUFFIX: &str = ".pub";
