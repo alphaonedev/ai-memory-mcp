@@ -1224,14 +1224,13 @@ fn skip_qualifiers(t: &[Tok], mut i: usize) -> usize {
     loop {
         let lead = ["unsafe", "async", "default", "safe", "auto"]
             .iter()
-            .any(|w| is_w(t, i, w));
-        if lead && next_is_item(i + 1) {
-            i += 1;
-        } else if is_w(t, i, "const")
+            .any(|w| is_w(t, i, w))
+            && next_is_item(i + 1);
+        let const_fn = is_w(t, i, "const")
             && ["fn", "unsafe", "async", "extern"]
                 .iter()
-                .any(|w| is_w(t, i + 1, w))
-        {
+                .any(|w| is_w(t, i + 1, w));
+        if lead || const_fn {
             i += 1;
         } else if is_w(t, i, "extern")
             && t.get(i + 1).is_some_and(|k| k.kind == TokKind::Str)
