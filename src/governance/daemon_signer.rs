@@ -366,6 +366,35 @@ mod tests {
         }
     }
 
+    /// #10155 (K-9) — `ALL` lists every domain exactly once. The match has no
+    /// wildcard arm (per CBC-04), so a new variant does not compile until it
+    /// gets its slot here, and the slot test fails until it is in `ALL`.
+    #[test]
+    fn all_lists_every_domain_exactly_once_10155() {
+        const DOMAIN_COUNT: usize = 6;
+        fn slot(d: DaemonDomain) -> usize {
+            match d {
+                DaemonDomain::EventRow => 0,
+                DaemonDomain::EventPayload => 1,
+                DaemonDomain::Governance => 2,
+                DaemonDomain::Tombstone => 3,
+                DaemonDomain::RevisionLeaf => 4,
+                DaemonDomain::LegacyCutoff => 5,
+            }
+        }
+        assert_eq!(DaemonDomain::ALL.len(), DOMAIN_COUNT);
+        let mut seen = [false; DOMAIN_COUNT];
+        for d in DaemonDomain::ALL {
+            let s = slot(d);
+            assert!(!seen[s], "{d:?} is listed twice in ALL");
+            seen[s] = true;
+        }
+        assert!(
+            seen.iter().all(|&b| b),
+            "a domain is missing from ALL: {seen:?}"
+        );
+    }
+
     #[test]
     fn preimage_is_tag_then_body_10074() {
         let p = preimage(DaemonDomain::EventRow, b"xyz");

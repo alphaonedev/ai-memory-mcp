@@ -15,8 +15,9 @@
 //! - the count of agent-labelled rows (`self_signed`, `signed_by_peer`,
 //!   `peer_attested`) below it: the legacy rows written before the cutover.
 //!
-//! The marker carries NO signature: migrations run without the daemon key.
-//! Its authority is the recompute. Every committed value is a deterministic
+//! The unsigned marker ([`build_marker`], still written by the postgres
+//! adapter) carries NO signature; its authority is the recompute. On SQLite
+//! the marker is signed by the daemon key ([`build_signed_marker`], #10145). Every committed value is a deterministic
 //! function of the chain prefix, so the walk re-derives the hash from the rows
 //! below the marker and accepts it only on an exact match. A changed count, a
 //! changed preceding row, a second marker or a marker with any other agent,
