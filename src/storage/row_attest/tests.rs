@@ -1534,3 +1534,1324 @@ fn query_plans_of_op_filters_are_index_searches_l3() {
     }
     assert!(wrong.is_empty(), "plans: {wrong:#?}");
 }
+
+// ---------------------------------------------------------------------------
+// #10116: the verifier handles each attestation, live row and signature
+// once (I2), its row-local filter is a set lookup, and its verdicts equal
+// the base verdicts (I3).
+// ---------------------------------------------------------------------------
+
+use super::stream::{self as probe, Count};
+
+/// Memories written for the counted-operation test (#10116).
+const COUNTED_MEMORIES_10116: usize = 64;
+/// Memories in the all-drifted store (#10116): 100K+.
+const DRIFTED_MEMORIES_10116: usize = 100_000;
+/// Defect-index comparisons allowed per defect by a set-lookup filter
+/// (#10116); a `Vec::contains` filter needs about one per earlier defect.
+const DEFECT_EQ_PER_DEFECT_CEILING: u64 = 4;
+
+fn count_of(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// I2: a clean store of N memories costs exactly A attestation visits,
+/// N live-row visits and A - 1 signature checks (the store-identity row
+/// carries no checked signature), never tables x A.
+#[test]
+fn verify_visits_each_attestation_row_and_signature_once_10116() {
+    let mut f = Fixture::new();
+    for n in 0..COUNTED_MEMORIES_10116 {
+        f.put_memory(&format!("m{n}"), "counted");
+    }
+    probe::reset();
+    let r = f.report();
+    assert!(r.ok(), "{:?}", r.defects);
+    let atts = count_of(f.atts.len());
+    assert_eq!(probe::get(Count::AttVisit), atts, "attestation visits");
+    assert_eq!(
+        probe::get(Count::RowVisit),
+        count_of(COUNTED_MEMORIES_10116),
+        "live-row visits"
+    );
+    assert_eq!(probe::get(Count::Sig), atts - 1, "signature checks");
+    assert_eq!(probe::get(Count::DefectEq), 0, "no defect, no comparison");
+    assert_eq!(probe::get(Count::ChainRead), 0, "chains stored in order");
+}
+
+/// The all-drifted store: `n` memories, each attested once and each live
+/// row changed behind the funnel's back. Unanchored (no signature is
+/// checked), so the build is linear.
+fn drifted_store(n: usize) -> Fixture {
+    let mut f = Fixture::new();
+    let s = spec("memories");
+    let covered = s.covered();
+    let key_id = key_id_of(&f.signing.verifying_key());
+    let mut acc = f.head_acc("memories");
+    f.atts.reserve(n);
+    f.live.reserve(n);
+    for i in 0..n {
+        let cells = [
+            t(&format!("d{i}")),
+            t("[]"),
+            Cell::Int(5),
+            t("long"),
+            t("x"),
+        ];
+        let key = encode_key(s, &cells);
+        let digest = row_digest(s, &cells);
+        acc = acc_add(&acc, &acc_term("memories", &key, &digest));
+        let mut a = Attestation {
+            id: f.next_id,
+            table: "memories".to_string(),
+            row_key: key.clone(),
+            seq: 1,
+            op: Op::Insert.as_str().to_string(),
+            row_digest: Some(digest.to_vec()),
+            prior_digest: ZERO_DIGEST.to_vec(),
+            agent_id: AGENT.to_string(),
+            key_id: key_id.clone(),
+            attested_at: "2026-11-23T00:00:00.000000Z".to_string(),
+            format_version: FORMAT_VERSION,
+            covered_columns: covered.clone(),
+            store_id: STORE.to_string(),
+            table_seq: i64::try_from(i).unwrap_or(i64::MAX) + 1,
+            table_acc: acc.to_vec(),
+            signature: Some(vec![0_u8; 64]),
+            attestation_digest: Vec::new(),
+        };
+        a.attestation_digest = attestation_digest(&a);
+        f.next_id += 1;
+        f.atts.push(a);
+        f.live.push(LiveRow {
+            table: "memories".to_string(),
+            key,
+            digest: [9_u8; 32],
+        });
+    }
+    f
+}
+
+fn unanchored_10116() -> anchor::AnchorLoad {
+    anchor::AnchorLoad::Unanchored(anchor::Unanchored::Missing {
+        path: "/nonexistent-10116".into(),
+    })
+}
+
+/// I1/I2: 100K drifted rows are N + 1 row-local defects, found under
+/// linear op-count ceilings (one visit per attestation and row, a bounded
+/// number of defect-index comparisons per defect).
+#[test]
+fn all_drifted_100k_store_verifies_under_linear_ceilings_10116() {
+    let f = drifted_store(DRIFTED_MEMORIES_10116);
+    let n = count_of(DRIFTED_MEMORIES_10116);
+    probe::reset();
+    probe::set_ceiling(Count::AttVisit, count_of(f.atts.len()));
+    probe::set_ceiling(Count::RowVisit, n);
+    probe::set_ceiling(Count::Sig, count_of(f.atts.len()));
+    probe::set_ceiling(Count::DefectEq, DEFECT_EQ_PER_DEFECT_CEILING * (n + 1));
+    let r = f.report_with(&unanchored_10116());
+    probe::reset();
+    assert_eq!(
+        r.defects.len(),
+        DRIFTED_MEMORIES_10116 + 1,
+        "{:?}",
+        r.defects.first()
+    );
+    assert!(r.store_defects.is_empty(), "{:?}", r.store_defects.first());
+    assert_eq!(r.unverified_memories.len(), DRIFTED_MEMORIES_10116);
+    assert_eq!(r.tables["memories"].attestations, n + 1);
+    assert_eq!(r.tables["memories"].verified, 0);
+    let head = format!("memories: live rows do not match the signed table head (table_seq {n})");
+    assert_eq!(r.defects.last(), Some(&head));
+    assert_eq!(
+        r.defects.first().map(String::as_str),
+        Some("memories: live row differs from its latest attestation 16")
+    );
+}
+
+/// One oracle row: the defects, the store-wide defects, the unverified
+/// memories and `verified/attestations` per table in [`TABLES`] order.
+type OracleRow = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static str,
+);
+
+fn oracle_tables(r: &Report) -> String {
+    TABLES
+        .iter()
+        .map(|s| {
+            r.tables.get(s.table).map_or_else(
+                || "-".to_string(),
+                |v| format!("{}/{}", v.verified, v.attestations),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn oracle_report(
+    f: &Fixture,
+    anchor: &anchor::AnchorLoad,
+    high: Option<i64>,
+    non_canonical: &[NonCanonical],
+    seal: &super::seal::SealState,
+) -> Report {
+    let input = VerifyInput {
+        live: &f.live,
+        attestations: &f.atts,
+        anchor,
+        id_high_water: high,
+        memory_id_of_key: &memory_id_of_key,
+        non_canonical,
+        seal,
+    };
+    let report = verify(&input);
+    // I3 (#10116): the slice adapter and the per-query streaming source
+    // give the same report and the same seal marks on every scenario.
+    let ctx = probe::Ctx {
+        anchor,
+        memory_id_of_key: &memory_id_of_key,
+        seal,
+    };
+    let Ok(slice) = probe::run(&mut probe::SliceSource::new(&input), &ctx);
+    assert_eq!(report, slice.0, "verify() is the slice adapter");
+    let streamed = probe::run(&mut FilterSource::new(&input), &ctx);
+    assert_eq!(
+        streamed,
+        Ok(slice),
+        "streaming source differs from the slice adapter"
+    );
+    report
+}
+
+fn fixture_anchor(f: &Fixture) -> anchor::AnchorLoad {
+    anchored(&[(AGENT, f.signing.verifying_key(), None, None)])
+}
+
+fn fixture_report(f: &Fixture) -> Report {
+    let high = f.atts.iter().map(|a| a.id).max();
+    oracle_report(
+        f,
+        &fixture_anchor(f),
+        high,
+        &[],
+        &super::seal::SealState::NotSealed,
+    )
+}
+
+fn two_memories() -> Fixture {
+    let mut f = Fixture::new();
+    f.put_memory("m1", "one");
+    f.put_memory("m2", "two");
+    f.put_memory("m1", "one-b");
+    f
+}
+
+fn drift_m1(f: &mut Fixture) {
+    let s = spec("memories");
+    let key = encode_key(s, &[t("m1")]);
+    if let Some(r) = f.live.iter_mut().find(|r| r.key == key) {
+        r.digest = row_digest(
+            s,
+            &[t("m1"), t(r#"["evil"]"#), Cell::Int(5), t("long"), t("one")],
+        );
+    }
+}
+
+fn resign_last(f: &mut Fixture, mutate: fn(&mut Attestation)) {
+    let i = f.atts.len() - 1;
+    mutate(&mut f.atts[i]);
+    let signing = f.signing.clone();
+    sign(&mut f.atts[i], &signing);
+}
+
+/// The scenario reports of the oracle table, in its order.
+#[allow(clippy::too_many_lines)]
+fn oracle_scenarios() -> Vec<(&'static str, Report)> {
+    use super::seal::{SealRecord, SealState};
+    let mut out = Vec::new();
+    let f = two_memories();
+    out.push(("clean", fixture_report(&f)));
+    out.push((
+        "unanchored",
+        oracle_report(
+            &f,
+            &unanchored_10116(),
+            f.atts.iter().map(|a| a.id).max(),
+            &[],
+            &SealState::NotSealed,
+        ),
+    ));
+    let mut g = two_memories();
+    if let Some(i) = g
+        .atts
+        .iter()
+        .position(|a| a.table == "memories" && a.op == "insert")
+    {
+        g.atts.remove(i);
+    }
+    out.push(("attestation deleted", fixture_report(&g)));
+    let mut g = two_memories();
+    drift_m1(&mut g);
+    out.push(("row drift", fixture_report(&g)));
+    let mut g = two_memories();
+    let s = spec("memories");
+    let key = encode_key(s, &[t("m1")]);
+    if let Some(r) = g.live.iter_mut().find(|r| r.key == key) {
+        r.digest = row_digest(s, &[t("m1"), t("[]"), Cell::Int(5), t("long"), t("one")]);
+    }
+    out.push(("replay of older content", fixture_report(&g)));
+    let mut g = two_memories();
+    let high = g.atts.iter().map(|a| a.id).max();
+    g.atts.pop();
+    out.push((
+        "tail truncated",
+        oracle_report(&g, &fixture_anchor(&g), high, &[], &SealState::NotSealed),
+    ));
+    let mut g = two_memories();
+    let i = g.atts.len() - 1;
+    g.atts[i].signature = None;
+    out.push(("unsigned", fixture_report(&g)));
+    let mut g = two_memories();
+    resign_last(&mut g, |a| a.store_id = "store-b".to_string());
+    out.push(("names another store", fixture_report(&g)));
+    let mut g = two_memories();
+    resign_last(&mut g, |a| a.covered_columns.push('x'));
+    out.push(("covered columns differ", fixture_report(&g)));
+    let mut g = two_memories();
+    resign_last(&mut g, |a| a.op = "bogus".to_string());
+    out.push(("unknown op", fixture_report(&g)));
+    let mut g = two_memories();
+    resign_last(&mut g, |a| a.prior_digest[0] ^= 1);
+    out.push(("row chain breaks", fixture_report(&g)));
+    let mut g = two_memories();
+    g.atts.retain(|a| a.table != STORE_ROW_TABLE);
+    out.push(("no store identity", fixture_report(&g)));
+    let mut g = two_memories();
+    let store = g.atts[0].clone();
+    g.atts.push(store);
+    out.push(("two store identities", fixture_report(&g)));
+    let mut g = two_memories();
+    g.atts
+        .retain(|a| !(a.table == "leases" && a.op == "cutover"));
+    out.push(("no leases cutover", fixture_report(&g)));
+    let mut g = two_memories();
+    g.live
+        .retain(|r| memory_id_of_key(&r.key).as_deref() != Some("m2"));
+    let k = encode_key(spec("memories"), &[t("m2")]);
+    g.atts
+        .retain(|a| !(a.table == "memories" && a.row_key == k));
+    out.push(("row and attestations deleted", fixture_report(&g)));
+    let mut g = two_memories();
+    g.live
+        .retain(|r| memory_id_of_key(&r.key).as_deref() != Some("m2"));
+    out.push(("attested row gone", fixture_report(&g)));
+    let mut g = two_memories();
+    let cells = [t("m9"), t("[]"), Cell::Int(5), t("long"), t("raw")];
+    g.live.push(LiveRow {
+        table: "memories".to_string(),
+        key: encode_key(s, &cells),
+        digest: row_digest(s, &cells),
+    });
+    out.push(("unattested row inserted", fixture_report(&g)));
+    let mut g = two_memories();
+    drift_m1(&mut g);
+    let cells = [t("m9"), t("[]"), Cell::Int(5), t("long"), t("raw")];
+    g.live.push(LiveRow {
+        table: "memories".to_string(),
+        key: encode_key(s, &cells),
+        digest: row_digest(s, &cells),
+    });
+    out.push(("drift beside an unattested row", fixture_report(&g)));
+    let mut g = two_memories();
+    let key_m2 = encode_key(s, &[t("m2")]);
+    let m2 = g
+        .live
+        .iter()
+        .find(|r| r.key == key_m2)
+        .map_or(ZERO_DIGEST, |r| r.digest);
+    let bogus = acc_add(
+        &g.head_acc("memories"),
+        &acc_term("memories", b"ghost-10116", &[7_u8; 32]),
+    );
+    let seq = g.next_seq("memories", &key_m2);
+    let table_seq = g.head_seq("memories") + 1;
+    let head = g.att(
+        "memories",
+        key_m2,
+        seq,
+        Op::Update,
+        Some(m2),
+        table_seq,
+        bogus,
+    );
+    g.atts.push(head);
+    drift_m1(&mut g);
+    out.push(("unexplained head mismatch", fixture_report(&g)));
+    let g = two_memories();
+    let nc = [NonCanonical {
+        table: "memories",
+        column: "content",
+        reason: "not utf-8".to_string(),
+    }];
+    out.push((
+        "non-canonical",
+        oracle_report(
+            &g,
+            &fixture_anchor(&g),
+            g.atts.iter().map(|a| a.id).max(),
+            &nc,
+            &SealState::NotSealed,
+        ),
+    ));
+    let current = SealRecord::of(&g.atts);
+    let high = g.atts.iter().map(|a| a.id).max();
+    let anchor = fixture_anchor(&g);
+    let mut ahead = current.clone();
+    ahead.high_water += 1;
+    out.push((
+        "seal rolled back",
+        oracle_report(&g, &anchor, high, &[], &SealState::Sealed(ahead)),
+    ));
+    let mut head = current.clone();
+    if let Some(h) = head.heads.get_mut("memories") {
+        *h += 1;
+    }
+    out.push((
+        "seal head rolled back",
+        oracle_report(&g, &anchor, high, &[], &SealState::Sealed(head)),
+    ));
+    out.push((
+        "seal unreadable",
+        oracle_report(
+            &g,
+            &anchor,
+            high,
+            &[],
+            &SealState::Unreadable {
+                path: std::path::PathBuf::from("seal-10116"),
+                why: "bad".to_string(),
+            },
+        ),
+    ));
+    out.push((
+        "seal current",
+        oracle_report(&g, &anchor, high, &[], &SealState::Sealed(current)),
+    ));
+    out
+}
+
+/// I3: the verdicts captured at base 9b5953c1 (written out, never derived
+/// from the code under test). Every field of every report must match.
+const ORACLE_10116: &[OracleRow] = &[
+    (
+        "clean",
+        &[],
+        &[],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "unanchored",
+        &[],
+        &[],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "attestation deleted",
+        &[
+            "memories: table sequence breaks between attestations 2 and 17",
+            "memories: row chain breaks at attestation 18",
+        ],
+        &[
+            "memories: table sequence breaks between attestations 2 and 17",
+            "memories: row chain breaks at attestation 18",
+        ],
+        &[],
+        "2/3 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "row drift",
+        &[
+            "memories: live row differs from its latest attestation 18",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[],
+        &["m1"],
+        "1/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "replay of older content",
+        &[
+            "memories: live row differs from its latest attestation 18",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[],
+        &["m1"],
+        "1/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "tail truncated",
+        &[
+            "row_attestations tail truncated: newest id Some(17), high-water Some(18)",
+            "memories: live row differs from its latest attestation 16",
+            "memories: live rows do not match the signed table head (table_seq 2)",
+        ],
+        &["row_attestations tail truncated: newest id Some(17), high-water Some(18)"],
+        &["m1"],
+        "1/3 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "unsigned",
+        &["memories: attestation 18 (memories) is unsigned"],
+        &["memories: attestation 18 (memories) is unsigned"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "names another store",
+        &["memories: attestation 18 names another store"],
+        &["memories: attestation 18 names another store"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "covered columns differ",
+        &["memories: attestation 18 format or covered columns differ"],
+        &["memories: attestation 18 format or covered columns differ"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "unknown op",
+        &["memories: attestation 18 has unknown op bogus"],
+        &["memories: attestation 18 has unknown op bogus"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "row chain breaks",
+        &["memories: row chain breaks at attestation 18"],
+        &["memories: row chain breaks at attestation 18"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "no store identity",
+        &["row_attestations has no store-identity row"],
+        &["row_attestations has no store-identity row"],
+        &[],
+        "- - - - - - - - - - - - - -",
+    ),
+    (
+        "two store identities",
+        &["row_attestations has more than one store-identity row"],
+        &["row_attestations has more than one store-identity row"],
+        &[],
+        "- - - - - - - - - - - - - -",
+    ),
+    (
+        "no leases cutover",
+        &["leases: no cutover watermark"],
+        &["leases: no cutover watermark"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/0 0/1",
+    ),
+    (
+        "row and attestations deleted",
+        &[
+            "memories: table sequence breaks between attestations 16 and 18",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[
+            "memories: table sequence breaks between attestations 16 and 18",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[],
+        "1/3 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "attested row gone",
+        &[
+            "memories: attested row is gone without a delete attestation",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[
+            "memories: attested row is gone without a delete attestation",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[],
+        "1/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "unattested row inserted",
+        &[
+            "memories: live row has no attestation",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[],
+        &["m9"],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "drift beside an unattested row",
+        &[
+            "memories: live row differs from its latest attestation 18",
+            "memories: live row has no attestation",
+            "memories: live rows do not match the signed table head (table_seq 3)",
+        ],
+        &[],
+        &["m1", "m9"],
+        "1/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "unexplained head mismatch",
+        &[
+            "memories: live row differs from its latest attestation 18",
+            "memories: live rows do not match the signed table head (table_seq 4)",
+        ],
+        &["memories: live rows do not match the signed table head (table_seq 4)"],
+        &["m1"],
+        "1/5 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "non-canonical",
+        &["memories.content is not canonical: not utf-8"],
+        &["memories.content is not canonical: not utf-8"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "seal rolled back",
+        &["row_attestations rolled back below the anchored seal: newest id Some(18), sealed 19"],
+        &["row_attestations rolled back below the anchored seal: newest id Some(18), sealed 19"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "seal head rolled back",
+        &["memories: table sequence rolled back below the anchored seal: head 3, sealed 4"],
+        &["memories: table sequence rolled back below the anchored seal: head 3, sealed 4"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "seal unreadable",
+        &["the anchored seal seal-10116 cannot be read: bad"],
+        &["the anchored seal seal-10116 cannot be read: bad"],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+    (
+        "seal current",
+        &[],
+        &[],
+        &[],
+        "2/4 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1 0/1",
+    ),
+];
+
+fn oracle_render(name: &str, r: &Report) -> String {
+    format!(
+        "    ({name:?}, &{:?}, &{:?}, &{:?}, {:?}),",
+        r.defects,
+        r.store_defects,
+        r.unverified_memories.iter().collect::<Vec<_>>(),
+        oracle_tables(r)
+    )
+}
+
+#[test]
+fn verify_matches_the_base_verdicts_10116() {
+    let got = oracle_scenarios();
+    let rendered: Vec<String> = got.iter().map(|(n, r)| oracle_render(n, r)).collect();
+    let mut wrong = Vec::new();
+    for (i, (name, r)) in got.iter().enumerate() {
+        let Some(&(want_name, defects, store, unverified, tables)) = ORACLE_10116.get(i) else {
+            wrong.push(format!("{name}: no oracle row"));
+            continue;
+        };
+        let ok = want_name == *name
+            && r.defects == defects
+            && r.store_defects == store
+            && r.unverified_memories
+                .iter()
+                .map(String::as_str)
+                .eq(unverified.iter().copied())
+            && oracle_tables(r) == tables
+            && r.anchor
+                == AnchorStatus::of(&if *name == "unanchored" {
+                    unanchored_10116()
+                } else {
+                    anchored(&[(AGENT, keypair().verifying_key(), None, None)])
+                });
+        if !ok {
+            wrong.push(format!("{name}: {}", rendered[i]));
+        }
+    }
+    assert_eq!(
+        got.len(),
+        ORACLE_10116.len(),
+        "oracle rows:\n{}",
+        rendered.join("\n")
+    );
+    assert!(wrong.is_empty(), "verdicts differ from base: {wrong:#?}");
+}
+
+/// Files allowed to hold a verify-path collect form, with their counts of
+/// `(read_attestations, read_rows, [Attestation|LiveRow] containers,
+/// collect inside row_attest/)` (#10116). Every other tracked `.rs` file
+/// must hold none of them; left out: `target`, `.git`, `.local-runs`,
+/// `.codegraph`, `node_modules` (build and scratch output, never source).
+const VERIFY_COLLECT_SITES_10116: &[(&str, [usize; 4])] = &[
+    // Two `collect`s that build the anchor key list (no row read).
+    ("src/storage/row_attest/anchor.rs", [0, 0, 0, 2]),
+    // The `VerifyInput` slices, imports and tag or key `collect`s (no row read).
+    ("src/storage/row_attest/mod.rs", [0, 0, 4, 4]),
+    // `SealRecord::of` takes a slice; one `collect` parses a seal line.
+    ("src/storage/row_attest/seal.rs", [0, 0, 2, 1]),
+    // Test code: the slice form the J1 fold is compared with, and the
+    // `collect`s that build fixture SQL and expected marks (#10116 lane 2).
+    ("src/storage/row_attest/seal_cost_10116.rs", [1, 0, 0, 4]),
+    // The two readers (their definitions) and the one caller left outside
+    // the verifier: the cutover baseline (#10114). #10116 lane 2 streams
+    // live_acc, the arm seal marks and check_snapshot.
+    ("src/storage/row_attest/sqlite.rs", [1, 2, 4, 6]),
+    // The slice adapter buckets an in-memory store (never the SQLite path).
+    ("src/storage/row_attest/stream.rs", [0, 0, 3, 6]),
+    // This file names the two readers in the ratchet itself.
+    ("src/storage/row_attest/tests.rs", [1, 1, 2, 0]),
+    ("tests/agent_key_stale_refresh_4066.rs", [0, 6, 0, 0]),
+    ("tests/row_attestations_10040.rs", [7, 2, 5, 0]),
+];
+
+/// Directories never scanned by the #10116 ratchet (not source).
+const RATCHET_SKIP_10116: &[&str] = &[
+    "target",
+    ".git",
+    ".local-runs",
+    ".codegraph",
+    "node_modules",
+];
+const RATCHET_DIR_10116: &str = "src/storage/row_attest/";
+const RATCHET_TESTS_10116: &str = "src/storage/row_attest/tests.rs";
+
+fn ratchet_word(text: &str, w: &str, after: Option<&str>) -> usize {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut n = 0;
+    let mut from = 0;
+    while let Some(j) = text[from..].find(w).map(|j| j + from) {
+        from = j + w.len();
+        let pre = text[..j].chars().next_back().unwrap_or(' ');
+        let next = text[from..].chars().next().unwrap_or(' ');
+        if is_word(pre) || is_word(next) {
+            continue;
+        }
+        if after.is_some_and(|a| !a.contains(next)) {
+            continue;
+        }
+        n += 1;
+    }
+    n
+}
+
+fn ratchet_sites(rel: &str, text: &str) -> [usize; 4] {
+    let code: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let compact: String = code.split_whitespace().collect();
+    let containers = ["Attestation", "LiveRow"]
+        .iter()
+        .map(|w| ratchet_word(&compact, w, Some(">,];")))
+        .sum();
+    let collect = if rel.starts_with(RATCHET_DIR_10116) && rel != RATCHET_TESTS_10116 {
+        ratchet_word(&code, "collect", None)
+    } else {
+        0
+    };
+    [
+        ratchet_word(&code, "read_attestations", None),
+        ratchet_word(&code, "read_rows", None),
+        containers,
+        collect,
+    ]
+}
+
+/// I1 ratchet: an allowlist of every file that reads all attestations or
+/// all rows into memory, over the whole source tree. A new call, an alias,
+/// a `collect::<Vec<_>>()` on the verify path or a file outside
+/// `row_attest/` turns it red.
+#[test]
+fn verify_path_collect_sites_are_allowlisted_10116() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut stack = vec![root.to_path_buf()];
+    let mut found = Vec::new();
+    let mut scanned = 0_usize;
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read source dir")
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let meta = std::fs::symlink_metadata(&p).expect("stat source path");
+            if meta.is_dir() {
+                if !RATCHET_SKIP_10116.contains(&name) {
+                    stack.push(p);
+                }
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                scanned += 1;
+                let rel = p
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = std::fs::read_to_string(&p).expect("read source");
+                let sites = ratchet_sites(&rel, &text);
+                if sites != [0; 4] {
+                    found.push((rel, sites));
+                }
+            }
+        }
+    }
+    found.sort();
+    assert!(scanned > 1000, "the scan reached {scanned} files");
+    let want: Vec<(String, [usize; 4])> = VERIFY_COLLECT_SITES_10116
+        .iter()
+        .map(|(f, s)| ((*f).to_string(), *s))
+        .collect();
+    assert_eq!(found, want, "verify-path collect sites changed");
+}
+
+// ---- #10116 streaming sources ---------------------------------------------
+
+/// The read-cut error of [`CutSource`].
+const READ_CUT_10116: &str = "read cut after";
+/// The high-water read error of [`CutSource`].
+const HIGH_WATER_FAILED_10116: &str = "high-water read failed";
+/// The count read error of [`CutSource`].
+const COUNT_FAILED_10116: &str = "count read failed";
+/// Clean memories streamed by the one-shot source (#10116): 100K+.
+const ONE_SHOT_MEMORIES_10116: usize = 100_000;
+/// Memories of the timed verify (#10116).
+const TIMED_MEMORIES_10116: usize = 10_000;
+/// Wall-clock ceiling of the timed all-drifted verify of
+/// [`TIMED_MEMORIES_10116`] memories in a debug build (#10116).
+const TIMED_VERIFY_CEILING_10116: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A [`probe::Source`] over a held store that answers each call the way
+/// the `SQLite` source queries it: it filters and orders the whole input
+/// per call (by id, by table sequence then id, by row sequence then table
+/// sequence then id) and refuses a run that did not see every attestation.
+/// It shares no bucketing with [`probe::SliceSource`] (#10116, I3).
+struct FilterSource<'a> {
+    input: &'a VerifyInput<'a>,
+    /// A table whose attestations are never streamed (a dropped-table read).
+    skip: Option<&'static str>,
+}
+
+impl<'a> FilterSource<'a> {
+    fn new(input: &'a VerifyInput<'a>) -> Self {
+        Self { input, skip: None }
+    }
+
+    fn ordered<K: Ord>(
+        &self,
+        keep: impl Fn(&Attestation) -> bool,
+        key: impl Fn(&Attestation) -> K,
+        f: &mut dyn FnMut(&Attestation),
+    ) {
+        let mut v: Vec<_> = self.input.attestations.iter().filter(|a| keep(a)).collect();
+        v.sort_by_key(|a| key(a));
+        for a in v {
+            f(a);
+        }
+    }
+}
+
+impl probe::Source for FilterSource<'_> {
+    type Error = String;
+
+    fn other_atts(&mut self, f: &mut dyn FnMut(&Attestation)) -> Result<(), String> {
+        self.ordered(|a| !TABLES.iter().any(|s| s.table == a.table), |a| a.id, f);
+        Ok(())
+    }
+
+    fn table_atts(
+        &mut self,
+        spec: &'static TableSpec,
+        f: &mut dyn FnMut(&Attestation),
+    ) -> Result<(), String> {
+        if self.skip != Some(spec.table) {
+            self.ordered(|a| a.table == spec.table, |a| (a.table_seq, a.id), f);
+        }
+        Ok(())
+    }
+
+    fn key_chain(
+        &mut self,
+        spec: &'static TableSpec,
+        key: &[u8],
+        f: &mut dyn FnMut(&Attestation),
+    ) -> Result<(), String> {
+        self.ordered(
+            |a| a.table == spec.table && a.row_key == key && a.op != Op::Cutover.as_str(),
+            |a| (a.seq, a.table_seq, a.id),
+            f,
+        );
+        Ok(())
+    }
+
+    fn live_rows(
+        &mut self,
+        spec: &'static TableSpec,
+        f: &mut dyn FnMut(&LiveRow),
+    ) -> Result<(), String> {
+        for r in self.input.live.iter().filter(|r| r.table == spec.table) {
+            f(r);
+        }
+        Ok(())
+    }
+
+    fn non_canonical(&mut self, f: &mut dyn FnMut(String)) {
+        for nc in self.input.non_canonical {
+            f(nc.to_string());
+        }
+    }
+
+    fn id_high_water(&mut self) -> Result<Option<i64>, String> {
+        Ok(self.input.id_high_water)
+    }
+
+    fn finish(&mut self, atts_seen: u64) -> Result<(), String> {
+        let total = self.input.attestations.len();
+        if count_of(total) == atts_seen {
+            Ok(())
+        } else {
+            Err(format!(
+                "row attestation read covered {atts_seen} of {total} rows"
+            ))
+        }
+    }
+}
+
+/// Pass one streamed item on unless the read is cut: after `left` items the
+/// next one cuts it and nothing more is passed.
+fn cut_step(left: &mut Option<usize>, cut: &mut bool, pass: impl FnOnce()) {
+    if *cut {
+        return;
+    }
+    match left {
+        Some(0) => *cut = true,
+        Some(n) => {
+            *n -= 1;
+            pass();
+        }
+        None => pass(),
+    }
+}
+
+/// How a [`CutSource`] read fails (#10116, I4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutAt {
+    /// After this many streamed attestations and live rows.
+    Items(usize),
+    /// At the id high-water read.
+    HighWater,
+    /// At the closing count.
+    Finish,
+}
+
+/// A [`probe::SliceSource`] whose read fails mid-stream (I4: a cut read is
+/// an error, never a clean verdict). With `once` the failure is transient:
+/// the failing call drops the rest of its items and later calls read
+/// normally, so an error the verifier swallows is not masked by a later one.
+struct CutSource<'a> {
+    inner: probe::SliceSource<'a>,
+    at: CutAt,
+    left: Option<usize>,
+    cut: bool,
+    once: bool,
+}
+
+impl<'a> CutSource<'a> {
+    fn new(input: &'a VerifyInput<'a>, at: CutAt) -> Self {
+        let left = match at {
+            CutAt::Items(k) => Some(k),
+            CutAt::HighWater | CutAt::Finish => None,
+        };
+        Self {
+            inner: probe::SliceSource::new(input),
+            at,
+            left,
+            cut: false,
+            once: false,
+        }
+    }
+
+    fn checked(&mut self) -> Result<(), String> {
+        match (self.cut, self.at) {
+            (true, CutAt::Items(k)) => {
+                if self.once {
+                    self.cut = false;
+                    self.left = None;
+                }
+                Err(format!("{READ_CUT_10116} {k} items"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl probe::Source for CutSource<'_> {
+    type Error = String;
+
+    fn other_atts(&mut self, f: &mut dyn FnMut(&Attestation)) -> Result<(), String> {
+        let (left, cut) = (&mut self.left, &mut self.cut);
+        let Ok(()) = self.inner.other_atts(&mut |a| cut_step(left, cut, || f(a)));
+        self.checked()
+    }
+
+    fn table_atts(
+        &mut self,
+        spec: &'static TableSpec,
+        f: &mut dyn FnMut(&Attestation),
+    ) -> Result<(), String> {
+        let (left, cut) = (&mut self.left, &mut self.cut);
+        let Ok(()) = self
+            .inner
+            .table_atts(spec, &mut |a| cut_step(left, cut, || f(a)));
+        self.checked()
+    }
+
+    fn key_chain(
+        &mut self,
+        spec: &'static TableSpec,
+        key: &[u8],
+        f: &mut dyn FnMut(&Attestation),
+    ) -> Result<(), String> {
+        let (left, cut) = (&mut self.left, &mut self.cut);
+        let Ok(()) = self
+            .inner
+            .key_chain(spec, key, &mut |a| cut_step(left, cut, || f(a)));
+        self.checked()
+    }
+
+    fn live_rows(
+        &mut self,
+        spec: &'static TableSpec,
+        f: &mut dyn FnMut(&LiveRow),
+    ) -> Result<(), String> {
+        let (left, cut) = (&mut self.left, &mut self.cut);
+        let Ok(()) = self
+            .inner
+            .live_rows(spec, &mut |r| cut_step(left, cut, || f(r)));
+        self.checked()
+    }
+
+    fn non_canonical(&mut self, f: &mut dyn FnMut(String)) {
+        self.inner.non_canonical(f);
+    }
+
+    fn id_high_water(&mut self) -> Result<Option<i64>, String> {
+        if self.at == CutAt::HighWater {
+            return Err(HIGH_WATER_FAILED_10116.to_string());
+        }
+        let Ok(high) = self.inner.id_high_water();
+        Ok(high)
+    }
+
+    fn finish(&mut self, atts_seen: u64) -> Result<(), String> {
+        if self.at == CutAt::Finish {
+            return Err(COUNT_FAILED_10116.to_string());
+        }
+        let Ok(()) = self.inner.finish(atts_seen);
+        Ok(())
+    }
+}
+
+fn fixture_input<'a>(f: &'a Fixture, anchor: &'a anchor::AnchorLoad) -> VerifyInput<'a> {
+    VerifyInput {
+        live: &f.live,
+        attestations: &f.atts,
+        anchor,
+        id_high_water: f.atts.iter().map(|a| a.id).max(),
+        memory_id_of_key: &memory_id_of_key,
+        non_canonical: &[],
+        seal: &super::seal::SealState::NotSealed,
+    }
+}
+
+/// I4: a read that fails after k streamed items (lasting or transient), at
+/// the high-water read or at the closing count ends the run with that exact
+/// error, for every cut
+/// point of a store (never a clean or partial verdict); a read that is
+/// never cut gives the clean verdict.
+#[test]
+fn verify_fails_closed_on_a_cut_read_10116() {
+    let f = two_memories();
+    let anchor = fixture_anchor(&f);
+    let input = fixture_input(&f, &anchor);
+    let ctx = probe::Ctx {
+        anchor: &anchor,
+        memory_id_of_key: &memory_id_of_key,
+        seal: &super::seal::SealState::NotSealed,
+    };
+    let items = f.atts.len() + f.live.len();
+    for once in [false, true] {
+        for k in 0..items {
+            let mut src = CutSource::new(&input, CutAt::Items(k));
+            src.once = once;
+            let got = probe::run(&mut src, &ctx);
+            assert_eq!(
+                got.map(|(r, _)| r),
+                Err(format!("read cut after {k} items")),
+                "cut after {k} of {items} (transient: {once})"
+            );
+        }
+    }
+    for (at, want) in [
+        (CutAt::HighWater, "high-water read failed"),
+        (CutAt::Finish, "count read failed"),
+    ] {
+        let got = probe::run(&mut CutSource::new(&input, at), &ctx);
+        assert_eq!(got.map(|(r, _)| r), Err(want.to_string()), "{at:?}");
+    }
+    let whole = probe::run(&mut CutSource::new(&input, CutAt::Items(items)), &ctx);
+    let whole = whole.map(|(r, _)| r);
+    assert_eq!(whole.as_ref().map(Report::ok), Ok(true), "{whole:?}");
+    assert_eq!(whole, Ok(fixture_report(&f)));
+}
+
+/// I4/I2: a source that never streams one table's attestations is refused
+/// by the closing count with its exact reason (a dropped table is never a
+/// clean verdict).
+#[test]
+fn verify_refuses_a_read_that_skipped_a_table_10116() {
+    let f = two_memories();
+    let anchor = fixture_anchor(&f);
+    let input = fixture_input(&f, &anchor);
+    let ctx = probe::Ctx {
+        anchor: &anchor,
+        memory_id_of_key: &memory_id_of_key,
+        seal: &super::seal::SealState::NotSealed,
+    };
+    let mut src = FilterSource::new(&input);
+    src.skip = Some("memories");
+    assert_eq!(
+        probe::run(&mut src, &ctx).map(|(r, _)| r),
+        Err("row attestation read covered 14 of 18 rows".to_string())
+    );
+}
+
+/// A store of `n` clean memories generated as it is streamed, over the
+/// store row and cutovers of [`Fixture::new`]. It holds no row list and
+/// panics on a second read of the memories attestations or rows, or on a
+/// chain re-read (I1: the verifier is single pass).
+struct OneShotSource {
+    base: Fixture,
+    n: usize,
+    att_reads: usize,
+    row_reads: usize,
+}
+
+impl OneShotSource {
+    fn new(n: usize) -> Self {
+        Self {
+            base: Fixture::new(),
+            n,
+            att_reads: 0,
+            row_reads: 0,
+        }
+    }
+
+    fn cells(i: usize) -> [Cell; 5] {
+        [
+            t(&format!("c{i}")),
+            t("[]"),
+            Cell::Int(5),
+            t("long"),
+            t("clean"),
+        ]
+    }
+
+    fn high_water(&self) -> i64 {
+        self.base.next_id - 1 + i64::try_from(self.n).unwrap_or(i64::MAX)
+    }
+}
+
+impl probe::Source for OneShotSource {
+    type Error = std::convert::Infallible;
+
+    fn other_atts(&mut self, f: &mut dyn FnMut(&Attestation)) -> Result<(), Self::Error> {
+        for a in self
+            .base
+            .atts
+            .iter()
+            .filter(|a| spec_for(&a.table).is_none())
+        {
+            f(a);
+        }
+        Ok(())
+    }
+
+    fn table_atts(
+        &mut self,
+        spec: &'static TableSpec,
+        f: &mut dyn FnMut(&Attestation),
+    ) -> Result<(), Self::Error> {
+        for a in self.base.atts.iter().filter(|a| a.table == spec.table) {
+            f(a);
+        }
+        if spec.table != "memories" {
+            return Ok(());
+        }
+        self.att_reads += 1;
+        assert_eq!(self.att_reads, 1, "memories attestations read twice");
+        let key_id = key_id_of(&self.base.signing.verifying_key());
+        let covered = spec.covered();
+        let mut acc = self.base.head_acc("memories");
+        for i in 0..self.n {
+            let cells = Self::cells(i);
+            let key = encode_key(spec, &cells);
+            let digest = row_digest(spec, &cells);
+            acc = acc_add(&acc, &acc_term("memories", &key, &digest));
+            let ix = i64::try_from(i).unwrap_or(i64::MAX);
+            let mut a = Attestation {
+                id: self.base.next_id + ix,
+                table: "memories".to_string(),
+                row_key: key,
+                seq: 1,
+                op: Op::Insert.as_str().to_string(),
+                row_digest: Some(digest.to_vec()),
+                prior_digest: ZERO_DIGEST.to_vec(),
+                agent_id: AGENT.to_string(),
+                key_id: key_id.clone(),
+                attested_at: "2026-11-23T00:00:00.000000Z".to_string(),
+                format_version: FORMAT_VERSION,
+                covered_columns: covered.clone(),
+                store_id: STORE.to_string(),
+                table_seq: ix + 1,
+                table_acc: acc.to_vec(),
+                signature: Some(vec![0_u8; 64]),
+                attestation_digest: Vec::new(),
+            };
+            a.attestation_digest = attestation_digest(&a);
+            f(&a);
+        }
+        Ok(())
+    }
+
+    fn key_chain(
+        &mut self,
+        spec: &'static TableSpec,
+        _key: &[u8],
+        _f: &mut dyn FnMut(&Attestation),
+    ) -> Result<(), Self::Error> {
+        panic!("{}: chain re-read of an in-order store", spec.table);
+    }
+
+    fn live_rows(
+        &mut self,
+        spec: &'static TableSpec,
+        f: &mut dyn FnMut(&LiveRow),
+    ) -> Result<(), Self::Error> {
+        if spec.table != "memories" {
+            return Ok(());
+        }
+        self.row_reads += 1;
+        assert_eq!(self.row_reads, 1, "memories rows read twice");
+        for i in 0..self.n {
+            let cells = Self::cells(i);
+            f(&LiveRow {
+                table: "memories".to_string(),
+                key: encode_key(spec, &cells),
+                digest: row_digest(spec, &cells),
+            });
+        }
+        Ok(())
+    }
+
+    fn non_canonical(&mut self, _f: &mut dyn FnMut(String)) {}
+
+    fn id_high_water(&mut self) -> Result<Option<i64>, Self::Error> {
+        Ok(Some(self.high_water()))
+    }
+
+    fn finish(&mut self, atts_seen: u64) -> Result<(), Self::Error> {
+        assert_eq!(
+            atts_seen,
+            count_of(self.base.atts.len() + self.n),
+            "every attestation streamed once"
+        );
+        Ok(())
+    }
+}
+
+/// I1/I2: 100K clean memories streamed from a source that holds no row
+/// list and refuses a second pass verify clean, with one visit per
+/// attestation and row.
+#[test]
+fn one_shot_100k_clean_store_verifies_in_one_pass_10116() {
+    let mut src = OneShotSource::new(ONE_SHOT_MEMORIES_10116);
+    let n = count_of(ONE_SHOT_MEMORIES_10116);
+    let atts = count_of(src.base.atts.len()) + n;
+    let anchor = unanchored_10116();
+    let ctx = probe::Ctx {
+        anchor: &anchor,
+        memory_id_of_key: &memory_id_of_key,
+        seal: &super::seal::SealState::NotSealed,
+    };
+    probe::reset();
+    probe::set_ceiling(Count::AttVisit, atts);
+    probe::set_ceiling(Count::RowVisit, n);
+    let Ok((r, _)) = probe::run(&mut src, &ctx);
+    let visits = (probe::get(Count::AttVisit), probe::get(Count::RowVisit));
+    probe::reset();
+    assert!(r.defects.is_empty(), "{:?}", r.defects.first());
+    assert!(r.store_defects.is_empty(), "{:?}", r.store_defects.first());
+    assert!(r.unverified_memories.is_empty());
+    assert_eq!(r.tables["memories"].verified, n);
+    assert_eq!(r.tables["memories"].attestations, n + 1);
+    assert_eq!(visits, (atts, n));
+    assert_eq!((src.att_reads, src.row_reads), (1, 1));
+}
+
+/// The timed all-drifted verify of [`TIMED_MEMORIES_10116`] memories, under
+/// a wall-clock ceiling (the elapsed time is printed for the record).
+#[test]
+fn timed_10k_drifted_verify_10116() {
+    let f = drifted_store(TIMED_MEMORIES_10116);
+    let start = std::time::Instant::now();
+    let r = f.report_with(&unanchored_10116());
+    let took = start.elapsed();
+    eprintln!("timed_10k_drifted_verify_10116: {took:?}");
+    assert_eq!(r.defects.len(), TIMED_MEMORIES_10116 + 1);
+    assert!(took < TIMED_VERIFY_CEILING_10116, "{took:?}");
+}
+
+#[path = "seal_cost_10116.rs"]
+mod seal_cost_10116;
+
+/// Register `agent` and bind its public key in the store (#10144 fixture).
+/// It lives here because the DB key-reader ratchet (#10086) exempts only
+/// this file in `row_attest/`.
+fn register_and_bind_for_test(
+    conn: &rusqlite::Connection,
+    agent: &str,
+    kp: &crate::identity::keypair::AgentKeypair,
+) {
+    crate::db::register_agent(conn, agent, "nhi", &[]).expect("register");
+    crate::db::bind_agent_pubkey_with_keypair(conn, agent, kp).expect("bind");
+}
+
+#[path = "recall_cost_10144.rs"]
+mod recall_cost_10144;
