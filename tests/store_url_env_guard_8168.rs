@@ -43,7 +43,7 @@
 //! or a static built by a macro from pieces is not seen; it does not resolve
 //! names, so a lock static in a file that never names the store-url
 //! variables but is taken by code in one that does is not seen by part 4
-//! (tracked as its own issue); `concat!` or escaped spellings of the
+//! (tracked as issue 10213); `concat!` or escaped spellings of the
 //! variable names are not decoded.
 
 use std::fmt::Write as _;
