@@ -2595,19 +2595,21 @@ fn write_seal_verifies_under_retired_key_after_rotation_10111() {
         "retired key with validity ending before write time must not verify"
     );
 
-    // Unanchored empty key dir -> Unanchored defect (never falls back to DB key).
+    // Unanchored empty key dir -> exact Unanchored::Empty defect (never falls back to DB key).
     let empty_keys = sb.root.join("empty-keys-10111");
     std::fs::create_dir_all(&empty_keys).expect("empty key dir");
     set_mode(&empty_keys, 0o700);
-    assert!(matches!(
+    assert_eq!(
         ai_memory::identity::session_signer::verify_row_seal_with(
             &old_row,
             &ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&empty_keys),
         ),
         ai_memory::identity::session_signer::StoredSealCheck::Defect(
-            ai_memory::identity::session_signer::SealDefect::Unanchored(_)
+            ai_memory::identity::session_signer::SealDefect::Unanchored(
+                ai_memory::storage::row_attest::anchor::Unanchored::Empty { path: empty_keys }
+            )
         )
-    ));
+    );
 
     std::fs::remove_file(&early).expect("remove early archive");
     std::fs::write(archive, &retired_bytes).expect("restore archive");
@@ -2705,38 +2707,49 @@ fn bound_but_unanchored_key_refused_at_install_and_verify_reports_defect_10171()
 
     let copy = vacuum_copy(&sb, "verify-defect-10171.db");
     let _other = sb.generate(EXTRA_AGENT);
-    let agent_pub = sb.root.join("keys").join(format!("{AGENT}.pub"));
-    let saved_pub = std::fs::read(&agent_pub).expect("read agent pub");
-    std::fs::remove_file(&agent_pub).expect("remove agent pub from anchor");
 
     // Part A: MCP boot with a bound-but-unanchored key must refuse at install_from_env.
-    let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", sb.root.join("home"))
-        .env("XDG_CONFIG_HOME", sb.root.join("home/.config"))
-        .env("TMPDIR", &sb.root)
-        .env("AI_MEMORY_NO_CONFIG", "1")
-        .env("AI_MEMORY_AGENT_ID", AGENT)
-        .env("AI_MEMORY_KEY_DIR", sb.root.join("keys"))
-        .env("AI_MEMORY_MCP_SIGNING_KEY_FILE", &key_file)
-        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1")
-        .args(["--db", sb.db().to_str().expect("db utf8"), "mcp"])
-        .stdin(Stdio::null())
-        .output()
-        .expect("run mcp boot with unanchored key");
-    assert!(
-        !out.status.success(),
-        "F2: MCP boot with bound-but-unanchored key must be refused"
-    );
+    // Use an anchor dir that has only EXTRA_AGENT's key (no AGENT.pub / AGENT.priv,
+    // so main's #3147 public-from-private self-heal cannot re-derive AGENT.pub).
+    let part_a_keys = sb.root.join("keys-unanchored-10171");
+    std::fs::create_dir_all(&part_a_keys).expect("create part-a anchor dir");
+    set_mode(&part_a_keys, 0o700);
+    std::fs::copy(
+        sb.root.join("keys").join(format!("{EXTRA_AGENT}.pub")),
+        part_a_keys.join(format!("{EXTRA_AGENT}.pub")),
+    )
+    .expect("copy extra agent pub");
+    let mut cmd = sb.base_command(AGENT, "0");
+    cmd.args([
+        "--db",
+        sb.db().to_str().expect("db utf8"),
+        "mcp",
+        "--profile",
+        "full",
+        "--tier",
+        "keyword",
+    ])
+    .env("AI_MEMORY_KEY_DIR", &part_a_keys)
+    .env(ENV_KEY_FILE, &key_file)
+    .stdin(Stdio::null());
+    let out = cmd.output().expect("run mcp boot with unanchored key");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("is not in the trust anchor"),
+        !out.status.success(),
+        "F2: MCP boot with bound-but-unanchored key must be refused (status={:?}, stdout={stdout:?}, stderr={stderr:?})",
+        out.status
+    );
+    assert!(
+        stderr.contains(ai_memory::identity::session_signer::REFUSE_KEY_NOT_ANCHORED),
         "F2: expected exact unanchored-key install refusal, got: {stderr}"
     );
 
     // Part B: `MemoryStore::verify` on `copy` with AGENT's key absent from
     // anchor must surface the exact SealDefect reason in `findings` (not bare false).
+    let agent_pub = sb.root.join("keys").join(format!("{AGENT}.pub"));
+    let saved_pub = std::fs::read(&agent_pub).expect("read agent pub");
+    std::fs::remove_file(&agent_pub).expect("remove agent pub from anchor");
     let child = Command::new(std::env::current_exe().expect("test binary path"))
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -2765,8 +2778,8 @@ fn bound_but_unanchored_key_refused_at_install_and_verify_reports_defect_10171()
     );
     let payload = stdout
         .lines()
-        .find_map(|ln| ln.strip_prefix("VERIFY_REPORT_10171="))
-        .expect("VERIFY_REPORT_10171 line");
+        .find_map(|ln| ln.split_once("VERIFY_REPORT_10171=").map(|(_, v)| v))
+        .unwrap_or_else(|| panic!("VERIFY_REPORT_10171 line missing in: {stdout}"));
     let parsed: Value = serde_json::from_str(payload).expect("parse verify report json");
     assert_eq!(parsed["signature_verified"], false);
     let findings = parsed["findings"].as_array().expect("findings array");

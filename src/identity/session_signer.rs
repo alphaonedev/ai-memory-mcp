@@ -353,6 +353,21 @@ pub fn install_from_env(
     if encode_public_base64(&public) != bound_canonical {
         return Err(crate::errors::refusal(REFUSE_MISMATCH));
     }
+    // #10171 (F2): admit the session key only when the out-of-database trust
+    // anchor is usable AND holds this key as the agent's current key (never
+    // admit a bound-but-unanchored key that would fail later as `Tampered`).
+    match crate::storage::row_attest::anchor::TrustAnchor::from_key_dir() {
+        crate::storage::row_attest::anchor::AnchorLoad::Anchored(anchor) => {
+            if !anchor.holds_current_key(agent_id, &public) {
+                return Err(crate::errors::refusal(REFUSE_KEY_NOT_ANCHORED));
+            }
+        }
+        crate::storage::row_attest::anchor::AnchorLoad::Unanchored(why) => {
+            return Err(crate::errors::refusal(format!(
+                "{REFUSE_ANCHOR_UNUSABLE}: {why}"
+            )));
+        }
+    }
 
     let signer = SessionSigner {
         agent_id: agent_id.to_string(),
@@ -398,6 +413,25 @@ pub const REFUSE_ROW_ATTEST_NOT_INSTALLED: &str = "row attestation (#10040): the
 /// after the signer was (#10012); boot refuses rather than run unsealed.
 pub const REFUSE_FUNNEL_NOT_INSTALLED: &str =
     "mcp session signer (#10012): the write-seal funnel did not install; refusing to start";
+
+/// #10171 (F2): the session key matches the store's bound key, but the
+/// out-of-database trust anchor does not hold it as the agent's current key.
+pub const REFUSE_KEY_NOT_ANCHORED: &str = "mcp session signer (#9926): signing key is not in the trust anchor for the session agent; refusing to start";
+
+/// #10171 (F2): the out-of-database trust anchor could not be loaded at session
+/// signer admission.
+pub const REFUSE_ANCHOR_UNUSABLE: &str =
+    "mcp session signer (#9926): trust anchor unusable; refusing to start";
+
+/// #10173 (S1): prefix of a write-seal funnel refusal caused by an unusable
+/// out-of-database trust anchor (carried through `funnel_refusal` verbatim with
+/// its exact `Unanchored` reason, never collapsed to `Tampered`).
+pub const REFUSE_SEAL_UNANCHORED_PREFIX: &str =
+    "ATTESTATION_FAILED: mcp session signer (#10012): trust anchor unusable";
+
+fn anchor_fault_refusal(why: &crate::storage::row_attest::anchor::Unanchored) -> String {
+    format!("{REFUSE_SEAL_UNANCHORED_PREFIX}: {why}")
+}
 
 /// A refusal of the #10012 write-seal funnel that names the memory row it
 /// refused (CBC-02: one variant per reason, the text is a `match`).
@@ -513,6 +547,10 @@ pub fn funnel_refusal(text: &str) -> Option<String> {
     {
         return Some(text.to_string());
     }
+    // #10173 (S1) — an anchor fault refusal keeps its exact Unanchored reason.
+    if text.starts_with(REFUSE_SEAL_UNANCHORED_PREFIX) {
+        return Some(text.to_string());
+    }
     // #10040 — a row-attestation refusal keeps its exact reason (C-4).
     if text.starts_with(crate::storage::row_attest::sqlite::ROW_ATTEST_REFUSAL_PREFIX) {
         return Some(text.to_string());
@@ -554,7 +592,7 @@ ON main.memories BEGIN \
 SELECT ai_memory_session_seal_10012(NEW.id, 0); END;";
 
 /// The seal state of a row before a covered UPDATE changed it (#10012).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PriorSeal {
     /// The row is being minted by this session's own insert (the
     /// `created_at` restamp of a fresh row).
@@ -568,15 +606,21 @@ enum PriorSeal {
     SignatureBroken,
     /// The row carries no seal at all.
     Unsigned,
+    /// #10173 (S1): the trust anchor could not be loaded; never misclassify as
+    /// `SignatureBroken` (`Tampered`).
+    AnchorFault(crate::storage::row_attest::anchor::Unanchored),
 }
 
 /// Per-connection state shared by the funnel's SQL functions (#10012).
 #[derive(Debug, Default)]
 struct FunnelLedger {
-    /// Prior seal state per row id, pushed by BEFORE UPDATE and popped by
-    /// the matching AFTER UPDATE (a stack: a nested write of the same row
-    /// pushes and pops inside its parent's AFTER).
-    prior: std::collections::HashMap<String, Vec<PriorSeal>>,
+    /// Prior seal state AND the single anchor snapshot loaded at BEFORE UPDATE
+    /// per row id (#10172 F3: one anchor load per write, reused by PEEK and
+    /// AFTER UPDATE with no TOCTOU re-scan).
+    prior: std::collections::HashMap<
+        String,
+        Vec<(PriorSeal, crate::storage::row_attest::anchor::AnchorLoad)>,
+    >,
     /// Rows this session's own AFTER INSERT is restamping right now.
     fresh: std::collections::HashSet<String>,
 }
@@ -706,6 +750,9 @@ enum SealDecision {
     NotSessionBytes(RowRefusal),
     /// Refuse in both postures.
     Refuse(RowRefusal),
+    /// #10173 (S1): refuse in both postures with the exact named `Unanchored`
+    /// reason (never collapsed to `RowRefusal::Tampered`).
+    AnchorFault(crate::storage::row_attest::anchor::Unanchored),
 }
 
 /// The owner (`metadata.agent_id`) of `row`.
@@ -736,26 +783,36 @@ fn read_row(conn: &rusqlite::Connection, id: &str) -> std::result::Result<Memory
         .ok_or_else(|| format!("{SEAL_REFUSAL_PREFIX}: the written row is gone"))
 }
 
-/// Classify the seal of `row` as it is now.
-fn classify_seal(signer: &SessionSigner, row: &Memory) -> PriorSeal {
+/// Classify the seal of `row` as it is now against the already-loaded `anchor`
+/// (#10172, #10173: never drops `SealDefect::Unanchored` into `SignatureBroken`).
+fn classify_seal(
+    signer: &SessionSigner,
+    row: &Memory,
+    anchor: &crate::storage::row_attest::anchor::AnchorLoad,
+) -> PriorSeal {
     let owner = row_owner(row);
-    if stored_seal_verifies(row, owner) {
-        return if owner.is_some_and(|agent| signer.covers(agent)) {
-            PriorSeal::Intact
-        } else {
-            PriorSeal::VerifiesForeign
-        };
-    }
-    if carries_seal(row) {
-        PriorSeal::SignatureBroken
-    } else {
-        PriorSeal::Unsigned
+    match verify_stored_seal_with(row, owner, anchor) {
+        StoredSealCheck::Verified { .. } => {
+            if owner.is_some_and(|agent| signer.covers(agent)) {
+                PriorSeal::Intact
+            } else {
+                PriorSeal::VerifiesForeign
+            }
+        }
+        StoredSealCheck::Defect(SealDefect::Unanchored(why)) => PriorSeal::AnchorFault(why),
+        StoredSealCheck::Defect(_) => PriorSeal::SignatureBroken,
+        StoredSealCheck::Unsealed => {
+            if carries_seal(row) {
+                PriorSeal::SignatureBroken
+            } else {
+                PriorSeal::Unsigned
+            }
+        }
     }
 }
 
-/// BEFORE UPDATE body: record the seal state of row `id` as it is now.
-/// Returns the state recorded, or `None` when no session signer is
-/// installed (nothing is recorded).
+/// BEFORE UPDATE body: load the trust anchor ONCE for this write (#10172) and
+/// record `(prior_seal, anchor)` so PEEK and AFTER UPDATE share one snapshot.
 fn record_prior_seal(
     conn: &rusqlite::Connection,
     ledger: &SharedLedger,
@@ -765,13 +822,18 @@ fn record_prior_seal(
         return Ok(None);
     };
     let fresh = with_ledger(ledger, |state| state.fresh.contains(id))?;
+    let anchor = crate::storage::row_attest::anchor::TrustAnchor::from_key_dir();
     let prior = if fresh {
         PriorSeal::Fresh
     } else {
-        classify_seal(signer, &read_row(conn, id)?)
+        classify_seal(signer, &read_row(conn, id)?, &anchor)
     };
     with_ledger(ledger, |state| {
-        state.prior.entry(id.to_string()).or_default().push(prior);
+        state
+            .prior
+            .entry(id.to_string())
+            .or_default()
+            .push((prior.clone(), anchor));
     })?;
     Ok(Some(prior))
 }
@@ -785,8 +847,9 @@ fn record_prior_seal(
 pub const PEEK_FN: &str = "ai_memory_session_seal_peek_10012";
 
 /// [`PEEK_FN`] body: the refusal [`seal_stored_row`] would return for the
-/// update of row `id` now in flight (its prior state is peeked, not popped),
-/// or `None` when it would not refuse or no update of `id` is in flight.
+/// update of row `id` now in flight (its prior state and anchor snapshot are
+/// peeked, not popped), or `None` when it would not refuse or no update of
+/// `id` is in flight.
 fn pending_seal_refusal(
     conn: &rusqlite::Connection,
     ledger: &SharedLedger,
@@ -796,16 +859,17 @@ fn pending_seal_refusal(
     let Some(signer) = session_signer() else {
         return Ok(None);
     };
-    let Some(prior) = with_ledger(ledger, |state| {
-        state.prior.get(id).and_then(|stack| stack.last().copied())
+    let Some((prior, anchor)) = with_ledger(ledger, |state| {
+        state.prior.get(id).and_then(|stack| stack.last().cloned())
     })?
     else {
         return Ok(None);
     };
     let row = read_row(conn, id)?;
     let strict = attest::require_agent_attestation_for(attest::WriteSurface::Mcp);
-    Ok(match decide_update(signer, &row, prior) {
+    Ok(match decide_update(signer, &row, &prior, &anchor) {
         SealDecision::Refuse(refusal) => Some(refusal.text(id)),
+        SealDecision::AnchorFault(why) => Some(anchor_fault_refusal(&why)),
         SealDecision::NotSessionBytes(refusal) if strict => Some(refusal.text(id)),
         SealDecision::AlreadySealed | SealDecision::Seal(_) | SealDecision::NotSessionBytes(_) => {
             None
@@ -825,28 +889,35 @@ fn seal_stored_row(
     let Some(signer) = session_signer() else {
         return Ok(StoredSeal::LeftAsWritten);
     };
-    let prior = match phase {
-        RowWrite::Updated => Some(
-            with_ledger(ledger, |state| {
+    let (prior, anchor) = match phase {
+        RowWrite::Updated => {
+            let (prior, anchor) = with_ledger(ledger, |state| {
                 let popped = state.prior.get_mut(id).and_then(Vec::pop);
                 if state.prior.get(id).is_some_and(Vec::is_empty) {
                     state.prior.remove(id);
                 }
                 popped
             })?
-            .ok_or_else(|| seal_refusal("no prior seal state was recorded for the row"))?,
+            .ok_or_else(|| seal_refusal("no prior seal state was recorded for the row"))?;
+            (Some(prior), anchor)
+        }
+        // #10172 (F3): load the anchor ONCE for the whole insert (reused by
+        // `decide_insert` and any `created_at` restamp re-check).
+        RowWrite::Inserted => (
+            None,
+            crate::storage::row_attest::anchor::TrustAnchor::from_key_dir(),
         ),
-        RowWrite::Inserted => None,
     };
     let row = read_row(conn, id)?;
     let strict = attest::require_agent_attestation_for(attest::WriteSurface::Mcp);
-    let decision = match prior {
-        Some(prior) => decide_update(signer, &row, prior),
-        None => decide_insert(conn, signer, &row)?,
+    let decision = match prior.as_ref() {
+        Some(prior) => decide_update(signer, &row, prior, &anchor),
+        None => decide_insert(conn, signer, &row, &anchor)?,
     };
     let proof = match decision {
         SealDecision::AlreadySealed => return Ok(StoredSeal::AlreadySealed),
         SealDecision::Refuse(refusal) => return Err(refusal.text(id)),
+        SealDecision::AnchorFault(why) => return Err(anchor_fault_refusal(&why)),
         SealDecision::NotSessionBytes(refusal) => {
             return if strict {
                 Err(refusal.text(id))
@@ -868,10 +939,15 @@ fn seal_stored_row(
         with_ledger(ledger, |state| state.fresh.remove(id))?;
         restamp.map_err(|e| format!("{SEAL_REFUSAL_PREFIX}: restamping created_at failed: {e}"))?;
         // The restamp is itself a covered write: its own trigger has sealed
-        // the row already (classified fresh), so only re-check it.
+        // the row already (classified fresh), so only re-check it against the
+        // same write's anchor snapshot.
         let restamped = read_row(conn, id)?;
-        if stored_seal_verifies(&restamped, row_owner(&restamped)) {
-            return Ok(StoredSeal::Sealed(Resealed));
+        match verify_stored_seal_with(&restamped, row_owner(&restamped), &anchor) {
+            StoredSealCheck::Verified { .. } => return Ok(StoredSeal::Sealed(Resealed)),
+            StoredSealCheck::Defect(SealDefect::Unanchored(why)) => {
+                return Err(anchor_fault_refusal(&why));
+            }
+            StoredSealCheck::Unsealed | StoredSealCheck::Defect(_) => {}
         }
     }
     reseal_with(conn, id, signer, proof)
@@ -891,12 +967,22 @@ fn not_session_bytes(signer: &SessionSigner, row: &Memory) -> SealDecision {
 
 /// AFTER UPDATE: seal only a change to a row whose prior seal was the
 /// session's own and intact (or a fresh row's restamp).
-fn decide_update(signer: &SessionSigner, row: &Memory, prior: PriorSeal) -> SealDecision {
-    if stored_seal_verifies(row, row_owner(row)) {
-        return SealDecision::AlreadySealed;
+fn decide_update(
+    signer: &SessionSigner,
+    row: &Memory,
+    prior: &PriorSeal,
+    anchor: &crate::storage::row_attest::anchor::AnchorLoad,
+) -> SealDecision {
+    match verify_stored_seal_with(row, row_owner(row), anchor) {
+        StoredSealCheck::Verified { .. } => return SealDecision::AlreadySealed,
+        StoredSealCheck::Defect(SealDefect::Unanchored(why)) => {
+            return SealDecision::AnchorFault(why);
+        }
+        StoredSealCheck::Unsealed | StoredSealCheck::Defect(_) => {}
     }
     let owned = row_owner(row).is_some_and(|agent| signer.covers(agent));
     match prior {
+        PriorSeal::AnchorFault(why) => SealDecision::AnchorFault(why.clone()),
         PriorSeal::Fresh | PriorSeal::Intact if owned => SealDecision::Seal(SessionAuthored(())),
         PriorSeal::Fresh | PriorSeal::Intact => SealDecision::NotSessionBytes(RowRefusal::Foreign),
         PriorSeal::SignatureBroken => SealDecision::Refuse(RowRefusal::Tampered),
@@ -911,10 +997,18 @@ fn decide_insert(
     conn: &rusqlite::Connection,
     signer: &SessionSigner,
     row: &Memory,
+    anchor: &crate::storage::row_attest::anchor::AnchorLoad,
 ) -> std::result::Result<SealDecision, String> {
     use crate::identity::attest::ReownKind;
-    if stored_seal_verifies(row, row_owner(row)) {
-        return Ok(SealDecision::AlreadySealed);
+    match verify_stored_seal_with(row, row_owner(row), anchor) {
+        StoredSealCheck::Verified { .. } => return Ok(SealDecision::AlreadySealed),
+        StoredSealCheck::Defect(SealDefect::Unanchored(why)) => {
+            return Ok(SealDecision::AnchorFault(why));
+        }
+        StoredSealCheck::Unsealed | StoredSealCheck::Defect(_) => {}
+    }
+    if let crate::storage::row_attest::anchor::AnchorLoad::Unanchored(why) = anchor {
+        return Ok(SealDecision::AnchorFault(why.clone()));
     }
     if !row_owner(row).is_some_and(|agent| signer.covers(agent)) {
         return Ok(SealDecision::NotSessionBytes(RowRefusal::Foreign));
@@ -955,14 +1049,14 @@ fn decide_insert(
         .transpose()
         .map_err(|e| seal_refusal(format!("clone source read failed: {e}")))?
         .flatten();
-    let source_intact = source
+    match source
         .as_ref()
-        .is_some_and(|source| classify_seal(signer, source) == PriorSeal::Intact);
-    Ok(if source_intact {
-        SealDecision::Seal(SessionAuthored(()))
-    } else {
-        SealDecision::NotSessionBytes(RowRefusal::Unsealed)
-    })
+        .map(|source| classify_seal(signer, source, anchor))
+    {
+        Some(PriorSeal::Intact) => Ok(SealDecision::Seal(SessionAuthored(()))),
+        Some(PriorSeal::AnchorFault(why)) => Ok(SealDecision::AnchorFault(why)),
+        _ => Ok(SealDecision::NotSessionBytes(RowRefusal::Unsealed)),
+    }
 }
 
 /// Exact reason a persisted row's in-row `write_signature` failed verification
@@ -1089,25 +1183,10 @@ pub fn verify_row_seal_with(
 
 /// Verify the in-row write seal of `row` against the process key directory's
 /// trust anchor ([`crate::storage::row_attest::anchor::TrustAnchor::from_key_dir`], #10111).
-pub fn verify_row_seal(row: &Memory) -> StoredSealCheck {
+/// Narrowed to `pub(crate)` (F6).
+pub(crate) fn verify_row_seal(row: &Memory) -> StoredSealCheck {
     let anchor = crate::storage::row_attest::anchor::TrustAnchor::from_key_dir();
     verify_row_seal_with(row, &anchor)
-}
-
-/// Whether the in-row seal of `row` verifies against its owner's anchored key
-/// (current or retired within its validity window, NOTICE 4c / E-3 / #10111).
-#[cfg(feature = "sal")]
-#[must_use]
-pub(crate) fn row_seal_verifies(row: &Memory) -> bool {
-    verify_row_seal(row).is_verified()
-}
-
-/// Whether `row` carries `agent_attested` and a `write_signature` that
-/// verifies over its stored envelope against the owner's anchored key within
-/// its validity window (#10111).
-fn stored_seal_verifies(row: &Memory, owner: Option<&str>) -> bool {
-    let anchor = crate::storage::row_attest::anchor::TrustAnchor::from_key_dir();
-    verify_stored_seal_with(row, owner, &anchor).is_verified()
 }
 
 fn verify_stored_seal_with(
@@ -1118,7 +1197,7 @@ fn verify_stored_seal_with(
     use crate::identity::attest::content_sha256;
     use crate::identity::sign::SignableWrite;
     use crate::identity::verify::{AttestLevel, SIGNATURE_LEN, verify_write};
-    use crate::storage::row_attest::anchor::{AnchorLoad, KeyRefusal};
+    use crate::storage::row_attest::anchor::{AnchorLoad, SpanKeyRefusal};
     use base64::Engine as _;
 
     let Some(owner) = owner else {
@@ -1155,41 +1234,35 @@ fn verify_stored_seal_with(
         created_at: &row.created_at,
         content_sha256: &content_hash,
     };
-    match anchor.verify_key_for_span(
-        owner,
-        &row.created_at,
-        Some(row.updated_at.as_str()),
-        |public| verify_write(public, &write, &signature).is_ok(),
-    ) {
+    match anchor.verify_key_for_span(owner, &row.created_at, |public| {
+        verify_write(public, &write, &signature).is_ok()
+    }) {
         Ok(key_id) => StoredSealCheck::Verified { key_id },
-        Err(refusal) => StoredSealCheck::Defect(match refusal.refusal {
-            KeyRefusal::UnknownAgent => SealDefect::UnknownAgent {
+        Err(refusal) => StoredSealCheck::Defect(match refusal {
+            SpanKeyRefusal::UnknownAgent => SealDefect::UnknownAgent {
                 agent_id: owner.to_string(),
             },
-            KeyRefusal::UnknownKey => SealDefect::UnknownKey {
+            SpanKeyRefusal::UnknownKey => SealDefect::UnknownKey {
                 agent_id: owner.to_string(),
             },
-            KeyRefusal::OtherAgent(anchored_agent) => SealDefect::OtherAgent {
-                key_id: refusal.key_id.unwrap_or_default(),
+            SpanKeyRefusal::OtherAgent {
+                key_id,
+                anchored_agent,
+            } => SealDefect::OtherAgent {
+                key_id,
                 agent_id: owner.to_string(),
                 anchored_agent,
             },
-            KeyRefusal::BadTime => {
-                let bad_ts = if chrono::DateTime::parse_from_rfc3339(&row.created_at).is_err() {
-                    row.created_at.clone()
-                } else {
-                    row.updated_at.clone()
-                };
-                SealDefect::BadTime {
-                    key_id: refusal.key_id.unwrap_or_default(),
-                    timestamp: bad_ts,
-                }
-            }
-            KeyRefusal::OutOfRange {
+            SpanKeyRefusal::BadTime { key_id } => SealDefect::BadTime {
+                key_id,
+                timestamp: row.created_at.clone(),
+            },
+            SpanKeyRefusal::OutOfRange {
+                key_id,
                 valid_from,
                 valid_to,
             } => SealDefect::OutOfRange {
-                key_id: refusal.key_id.unwrap_or_default(),
+                key_id,
                 valid_from,
                 valid_to,
             },
@@ -1384,12 +1457,15 @@ pub fn reseal_row_sync(
         return Err(MERGE_RESEAL_REFUSAL.to_string());
     };
     let row = read_row(conn, id)?;
-    if row_owner(&row).is_some_and(|agent| signer.covers(agent))
-        && stored_seal_verifies(&row, row_owner(&row))
-    {
-        Ok(Resealed)
-    } else {
-        Err(MERGE_UNSEALED_PRIOR_REFUSAL.to_string())
+    if !row_owner(&row).is_some_and(|agent| signer.covers(agent)) {
+        return Err(MERGE_UNSEALED_PRIOR_REFUSAL.to_string());
+    }
+    match verify_row_seal(&row) {
+        StoredSealCheck::Verified { .. } => Ok(Resealed),
+        StoredSealCheck::Defect(SealDefect::Unanchored(why)) => Err(anchor_fault_refusal(&why)),
+        StoredSealCheck::Unsealed | StoredSealCheck::Defect(_) => {
+            Err(MERGE_UNSEALED_PRIOR_REFUSAL.to_string())
+        }
     }
 }
 
@@ -1634,6 +1710,11 @@ mod tests {
         );
         crate::identity::attest::permissive_attestation_for_lib_tests();
         let kp = crate::identity::keypair::generate(OPEN_ARM_AGENT_10012).expect("keypair");
+        // #10171: provision the agent's public key in the child's isolated
+        // out-of-database trust anchor (empty key dir is now refused fail-closed).
+        let anchor_dir =
+            crate::identity::keypair::resolved_default_key_dir_path().expect("child key dir");
+        crate::identity::keypair::save(&kp, &anchor_dir).expect("anchor keypair");
         // Registered and bound before the signer exists, as the stdio boot
         // requires (REFUSE_UNBOUND); the write goes through a LATER open.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1821,7 +1902,9 @@ mod tests {
             "current K_new inside [T_ROT, None] must verify"
         );
 
-        // 7. Lawful post-rotation re-seal of a pre-rotation row (created_at < T_ROT <= updated_at).
+        // 7. Lawful post-rotation re-seal of a pre-rotation row (`created_at < T_ROT`):
+        // verified regardless of unsigned `updated_at` (#10170 / #10174 — lower bound
+        // `valid_from` is not enforced until reseal instant is inside `SignableWrite`).
         let resealed_new = sealed_memory_10111(SEAL_ROT_AGENT_10111, &k_new, ts_before, ts_after);
         assert_eq!(
             verify_row_seal_with(&resealed_new, &anchor),
@@ -1830,17 +1913,12 @@ mod tests {
             },
             "post-rotation K_new re-seal preserving created_at must verify"
         );
-
-        // 8. Pre-activation un-updated row signed by K_new before valid_from is OutOfRange.
-        let early_new = sealed_memory_10111(SEAL_ROT_AGENT_10111, &k_new, ts_before, ts_before);
+        let mut resealed_same_upd = resealed_new;
+        resealed_same_upd.updated_at = ts_before.to_string();
         assert_eq!(
-            verify_row_seal_with(&early_new, &anchor),
-            StoredSealCheck::Defect(SealDefect::OutOfRange {
-                key_id: id_new,
-                valid_from: Some(T_ROT),
-                valid_to: None,
-            }),
-            "K_new seal with created_at == updated_at < valid_from must be OutOfRange"
+            verify_row_seal_with(&resealed_same_upd, &anchor),
+            StoredSealCheck::Verified { key_id: id_new },
+            "verdict must not depend on unsigned updated_at (#10170)"
         );
 
         // 9. Retired key removed from anchor (only K_new present): named UnknownKey, no fallback.
@@ -1925,19 +2003,10 @@ mod tests {
         assert_eq!(
             verify_row_seal_with(&bad_created, &anchor),
             StoredSealCheck::Defect(SealDefect::BadTime {
-                key_id: id_old.clone(),
+                key_id: id_old,
                 timestamp: "not-a-ts".to_string(),
             }),
-            "malformed created_at must be BadTime"
-        );
-        let bad_updated = sealed_memory_10111(SEAL_ROT_AGENT_10111, &k_old, ts_before, "bad-upd");
-        assert_eq!(
-            verify_row_seal_with(&bad_updated, &anchor),
-            StoredSealCheck::Defect(SealDefect::BadTime {
-                key_id: id_old,
-                timestamp: "bad-upd".to_string(),
-            }),
-            "malformed updated_at must be BadTime"
+            "malformed signed created_at must be BadTime"
         );
 
         // 14. Unanchored trust anchor -> Unanchored defect (never falls back to DB).

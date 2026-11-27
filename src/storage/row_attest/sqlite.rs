@@ -56,6 +56,13 @@ pub const ROW_ATTEST_REFUSAL_PREFIX: &str =
 pub const REFUSE_NO_CUTOVER: &str = "the table has no cutover watermark";
 /// Refusal: the session key no longer matches the agent's bound key.
 pub const REFUSE_KEY_MISMATCH: &str = "the session key is not the agent's bound key";
+/// Refusal (#10171): the session key is bound in the store but not held as a
+/// current key in the out-of-database trust anchor.
+pub const REFUSE_KEY_NOT_ANCHORED: &str =
+    "the session key is not in the trust anchor for this agent";
+/// Refusal prefix (#10171 / #10173): the out-of-database trust anchor is
+/// unreadable, missing, empty, or malformed.
+pub const REFUSE_ANCHOR_UNUSABLE: &str = "trust anchor unusable";
 /// Refusal: no session signer is installed.
 pub const REFUSE_NO_SIGNER: &str = "no session signer is installed";
 /// Refusal (A-8): a cutover watermark lost the signature it was given; it
@@ -345,7 +352,8 @@ fn session_identity(conn: &Connection) -> Result<Signer, String> {
 }
 
 /// `signing` as the identity of `agent_id`, refused unless it is the key
-/// the store binds to that agent right now.
+/// the store binds to that agent right now AND the out-of-database trust
+/// anchor holds it as the agent's current key (#10171).
 fn bound_identity(
     conn: &Connection,
     agent_id: &str,
@@ -358,6 +366,16 @@ fn bound_identity(
         .map_err(|_| refusal(REFUSE_KEY_MISMATCH))?;
     if bound != signing.verifying_key() {
         return Err(refusal(REFUSE_KEY_MISMATCH));
+    }
+    match super::anchor::TrustAnchor::from_key_dir() {
+        super::anchor::AnchorLoad::Anchored(anchor) => {
+            if !anchor.holds_current_key(agent_id, &bound) {
+                return Err(refusal(REFUSE_KEY_NOT_ANCHORED));
+            }
+        }
+        super::anchor::AnchorLoad::Unanchored(why) => {
+            return Err(refusal(&format!("{REFUSE_ANCHOR_UNUSABLE}: {why}")));
+        }
     }
     Ok(Signer {
         agent_id: agent_id.to_string(),
