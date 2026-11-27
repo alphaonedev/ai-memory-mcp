@@ -1645,3 +1645,581 @@ fn self_review_pins_path_escape_cli_r1_order_and_direct_append_recovery_refused_
     assert_eq!(fs::read(&fx.db_path).expect("db after"), db_before);
     assert_eq!(snapshot_tree(&fx.anchor_dir), dir_before);
 }
+
+/// Helper: execute a valid 2-of-3 recovery so a store carries a committed
+/// epoch-1 `Recovery` record before round-1 security probes tamper with raw rows.
+fn run_valid_recovery(fx: &RecoveryFixture, k_new: &AgentKeypair) {
+    let (nb, atts) = fx.prepare_and_sign(k_new, &[0, 1]);
+    let conn = db::open(&fx.db_path).expect("open");
+    let req = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k_new.public_base64(),
+        quorum: &atts,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb,
+        staged_key_label: None,
+    };
+    let checked = recovery_preconditions(
+        &conn,
+        &fx.anchor_dir,
+        &req,
+        RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+    )
+    .expect("valid preconditions");
+    execute_recovery_rebind(&conn, checked).expect("valid execute");
+}
+
+/// S-F1 (#10159) form 1: unsigned edit of `agent_lineage.recovery_threshold`
+/// (2 -> 1) must be refused by `recovery_preconditions` before resolving quorum.
+#[test]
+fn sf1_forged_threshold_column_refused_10159() {
+    let fx = RecoveryFixture::new("sf1-thr-agent");
+    let k1 = keypair::generate("sf1-thr-k1").expect("k1");
+    run_valid_recovery(&fx, &k1);
+
+    // Unsigned raw SQL edit lowers recovery_threshold from 2 -> 1 on epoch 1.
+    let raw = Connection::open(&fx.db_path).expect("raw open");
+    raw.execute(
+        "UPDATE agent_lineage SET recovery_threshold = 1 WHERE agent_id = ?1 AND epoch = 1",
+        [&fx.agent],
+    )
+    .expect("tamper threshold");
+    drop(raw);
+
+    let k2 = keypair::generate("sf1-thr-k2").expect("k2");
+    let conn = db::open(&fx.db_path).expect("open");
+    let (head, _) = db::lineage_head(&conn, &fx.agent)
+        .expect("head")
+        .expect("head exists");
+    let policy = RecoveryPolicy::from_env().expect("policy");
+    let nb = chrono::Utc::now().to_rfc3339();
+    let rec = ai_memory::identity::lineage::LineageRecord::recovery(
+        &head,
+        &k2.public_base64(),
+        None,
+        head.recovery_pubkey_b64.clone(),
+        policy.guardian_set_id(),
+        1,
+        &nb,
+    )
+    .expect("build forged-threshold rec");
+    let sig_input = rec.signing_input().expect("signing_input");
+    let one_att = vec![RecoveryAttestation {
+        guardian_pubkey_b64: fx.guardians[0].public_base64(),
+        signature: fx.guardians[0]
+            .private
+            .as_ref()
+            .expect("g0 priv")
+            .sign(&sig_input)
+            .to_bytes()
+            .to_vec(),
+    }];
+    let req = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k2.public_base64(),
+        quorum: &one_att,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb,
+        staged_key_label: None,
+    };
+    let err = recovery_preconditions(
+        &conn,
+        &fx.anchor_dir,
+        &req,
+        RecoveryArm::Signing(k2.private.as_ref().expect("k2 priv")),
+    )
+    .err()
+    .expect("S-F1: forged recovery_threshold column must be refused");
+    assert!(
+        format!("{err:#}").contains("unverified lineage"),
+        "expected unverified-lineage refusal, got: {err:#}"
+    );
+}
+
+/// S-F1 (#10159) form 2: unsigned edit of `agent_lineage.guardian_set_id` must
+/// be refused by `recovery_preconditions`.
+#[test]
+fn sf1_forged_guardian_set_id_column_refused_10159() {
+    let fx = RecoveryFixture::new("sf1-gid-agent");
+    let k1 = keypair::generate("sf1-gid-k1").expect("k1");
+    run_valid_recovery(&fx, &k1);
+
+    let attacker_g = keypair::generate("sf1-attacker-g").expect("attacker g");
+    let attacker_gid = ai_memory::identity::lineage::guardian_set_id_digest(&[attacker_g.public]);
+
+    let raw = Connection::open(&fx.db_path).expect("raw open");
+    raw.execute(
+        "UPDATE agent_lineage SET guardian_set_id = ?1, recovery_threshold = 1 \
+         WHERE agent_id = ?2 AND epoch = 1",
+        rusqlite::params![attacker_gid, &fx.agent],
+    )
+    .expect("tamper guardian_set_id");
+    drop(raw);
+
+    // SAFETY: serialized by ENV_LOCK held inside `fx._env`.
+    unsafe {
+        std::env::set_var(RECOVERY_GUARDIAN_PUBKEYS_ENV, attacker_g.public_base64());
+        std::env::set_var(RECOVERY_THRESHOLD_ENV, "1");
+    }
+
+    let k2 = keypair::generate("sf1-gid-k2").expect("k2");
+    let conn = db::open(&fx.db_path).expect("open");
+    let (head, _) = db::lineage_head(&conn, &fx.agent)
+        .expect("head")
+        .expect("head exists");
+    let nb = chrono::Utc::now().to_rfc3339();
+    let rec = ai_memory::identity::lineage::LineageRecord::recovery(
+        &head,
+        &k2.public_base64(),
+        None,
+        head.recovery_pubkey_b64.clone(),
+        attacker_gid,
+        1,
+        &nb,
+    )
+    .expect("build rec");
+    let sig_input = rec.signing_input().expect("signing_input");
+    let att = vec![RecoveryAttestation {
+        guardian_pubkey_b64: attacker_g.public_base64(),
+        signature: attacker_g
+            .private
+            .as_ref()
+            .expect("priv")
+            .sign(&sig_input)
+            .to_bytes()
+            .to_vec(),
+    }];
+    let req = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k2.public_base64(),
+        quorum: &att,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb,
+        staged_key_label: None,
+    };
+    let err = recovery_preconditions(
+        &conn,
+        &fx.anchor_dir,
+        &req,
+        RecoveryArm::Signing(k2.private.as_ref().expect("k2 priv")),
+    )
+    .err()
+    .expect("S-F1: forged guardian_set_id column must be refused");
+    assert!(
+        format!("{err:#}").contains("unverified lineage"),
+        "expected unverified-lineage refusal, got: {err:#}"
+    );
+}
+
+/// S-F1 (#10159) form 3: extra unsigned/forged `Recovery` row inserted in
+/// `agent_lineage` with lowered threshold must be refused before quorum resolution.
+#[test]
+fn sf1_forged_extra_recovery_row_refused_10159() {
+    let fx = RecoveryFixture::new("sf1-extra-agent");
+    let k_decoy = keypair::generate("sf1-decoy").expect("decoy");
+    let k_takeover = keypair::generate("sf1-takeover").expect("takeover");
+
+    let policy = RecoveryPolicy::from_env().expect("policy");
+    let raw = Connection::open(&fx.db_path).expect("raw open");
+    let (head, _) = db::lineage_head(&raw, &fx.agent)
+        .expect("head")
+        .expect("head exists");
+    let forged = ai_memory::identity::lineage::LineageRecord::recovery(
+        &head,
+        &k_decoy.public_base64(),
+        None,
+        head.recovery_pubkey_b64.clone(),
+        policy.guardian_set_id(),
+        1,
+        "2026-11-26T00:00:00Z",
+    )
+    .expect("forged");
+    let forged_bytes = forged.canonical_bytes().expect("cbor");
+    let empty_q = encode_recovery_quorum(&[]).expect("empty q");
+    raw.execute(
+        "INSERT INTO agent_lineage \
+            (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, recovery_pubkey, \
+             not_before, prev_record_hash, signature, record_bytes, created_at, custody_class, \
+             suspected_compromise_from_seq, guardian_set_id, recovery_threshold) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        rusqlite::params![
+            forged.agent_id,
+            i64::try_from(forged.epoch).unwrap(),
+            forged.reason.as_str(),
+            forged.predecessor_pubkey_b64,
+            forged.successor_pubkey_b64,
+            forged.recovery_pubkey_b64,
+            forged.not_before,
+            forged.prev_record_hash,
+            empty_q,
+            forged_bytes,
+            "2026-11-26T00:00:00Z",
+            forged.custody_class.as_str(),
+            Option::<i64>::None,
+            forged.guardian_set_id.as_deref(),
+            Some(1_i64),
+        ],
+    )
+    .expect("insert extra forged recovery row");
+    drop(raw);
+
+    let conn = db::open(&fx.db_path).expect("open");
+    let nb = chrono::Utc::now().to_rfc3339();
+    let rec2 = ai_memory::identity::lineage::LineageRecord::recovery(
+        &forged,
+        &k_takeover.public_base64(),
+        None,
+        forged.recovery_pubkey_b64.clone(),
+        policy.guardian_set_id(),
+        1,
+        &nb,
+    )
+    .expect("rec2");
+    let sig_input = rec2.signing_input().expect("signing_input");
+    let one_att = vec![RecoveryAttestation {
+        guardian_pubkey_b64: fx.guardians[0].public_base64(),
+        signature: fx.guardians[0]
+            .private
+            .as_ref()
+            .expect("g0 priv")
+            .sign(&sig_input)
+            .to_bytes()
+            .to_vec(),
+    }];
+    let req = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k_takeover.public_base64(),
+        quorum: &one_att,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb,
+        staged_key_label: None,
+    };
+    let err = recovery_preconditions(
+        &conn,
+        &fx.anchor_dir,
+        &req,
+        RecoveryArm::Signing(k_takeover.private.as_ref().expect("priv")),
+    )
+    .err()
+    .expect("S-F1: extra forged Recovery row must be refused");
+    assert!(
+        format!("{err:#}").contains("unverified lineage"),
+        "expected unverified-lineage refusal, got: {err:#}"
+    );
+}
+
+/// S-F1 (#10159) form 4: forged `Recovery` head matching candidate `K_new` and
+/// `not_before` must NEVER enter `ResumeAnchor`.
+#[test]
+fn sf1_forged_resume_head_refused_10159() {
+    let fx = RecoveryFixture::new("sf1-resume-agent");
+    let k_attacker = keypair::generate("sf1-resume-attacker").expect("k_attacker");
+    let policy = RecoveryPolicy::from_env().expect("policy");
+    let nb = "2026-11-26T15:00:00Z";
+
+    let raw = Connection::open(&fx.db_path).expect("raw open");
+    let (head, _) = db::lineage_head(&raw, &fx.agent)
+        .expect("head")
+        .expect("head exists");
+    let forged = ai_memory::identity::lineage::LineageRecord::recovery(
+        &head,
+        &k_attacker.public_base64(),
+        None,
+        head.recovery_pubkey_b64.clone(),
+        policy.guardian_set_id(),
+        1,
+        nb,
+    )
+    .expect("forged resume head");
+    let sig_input = forged.signing_input().expect("signing_input");
+    let one_att = vec![RecoveryAttestation {
+        guardian_pubkey_b64: fx.guardians[0].public_base64(),
+        signature: fx.guardians[0]
+            .private
+            .as_ref()
+            .expect("g0 priv")
+            .sign(&sig_input)
+            .to_bytes()
+            .to_vec(),
+    }];
+    let forged_q = encode_recovery_quorum(&one_att).expect("encode q");
+    let forged_bytes = forged.canonical_bytes().expect("cbor");
+    raw.execute(
+        "INSERT INTO agent_lineage \
+            (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, recovery_pubkey, \
+             not_before, prev_record_hash, signature, record_bytes, created_at, custody_class, \
+             suspected_compromise_from_seq, guardian_set_id, recovery_threshold) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        rusqlite::params![
+            forged.agent_id,
+            i64::try_from(forged.epoch).unwrap(),
+            forged.reason.as_str(),
+            forged.predecessor_pubkey_b64,
+            forged.successor_pubkey_b64,
+            forged.recovery_pubkey_b64,
+            forged.not_before,
+            forged.prev_record_hash,
+            forged_q,
+            forged_bytes,
+            nb,
+            forged.custody_class.as_str(),
+            Option::<i64>::None,
+            forged.guardian_set_id.as_deref(),
+            Some(1_i64),
+        ],
+    )
+    .expect("insert forged resume head");
+    raw.execute(
+        "UPDATE agent_pubkey_history SET superseded_at = ?2 \
+         WHERE agent_id = ?1 AND superseded_at IS NULL",
+        rusqlite::params![&fx.agent, nb],
+    )
+    .expect("close prior history row");
+    raw.execute(
+        "INSERT INTO agent_pubkey_history \
+            (agent_id, version, pubkey_b64, bind_authority, proof_nonce, bound_at, superseded_at) \
+         VALUES (?1, 2, ?2, 'guardian_recovery', NULL, ?3, NULL)",
+        rusqlite::params![&fx.agent, &k_attacker.public_base64(), nb],
+    )
+    .expect("insert forged history row");
+    drop(raw);
+
+    let conn = db::open(&fx.db_path).expect("open");
+    let req = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k_attacker.public_base64(),
+        quorum: &one_att,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &forged.not_before,
+        staged_key_label: None,
+    };
+    let err = recovery_preconditions(
+        &conn,
+        &fx.anchor_dir,
+        &req,
+        RecoveryArm::Signing(k_attacker.private.as_ref().expect("priv")),
+    )
+    .err()
+    .expect("S-F1: forged ResumeAnchor head must be refused");
+    assert!(
+        format!("{err:#}").contains("unverified lineage"),
+        "expected unverified-lineage refusal, got: {err:#}"
+    );
+}
+
+/// C-F1 / S-F2 (#10160): bare anchor swap MUST be refused by production
+/// `verify_sqlite_with`, `audit verify-rows`, and `arm_with_key` (both with
+/// enrolled lineage AND with zero lineage), and missing `anchor_dir` on an
+/// armed store must be refused by `recovery_preconditions`.
+#[test]
+fn cf1_sf2_bare_anchor_swap_refused_by_production_verify_and_arm_10160() {
+    // Part A: lineage-enrolled store with bare anchor swap.
+    let fx = RecoveryFixture::new("cf1-lin-agent");
+    let k_attacker = keypair::generate(&fx.agent).expect("k_attacker");
+    let future_ts = chrono::Utc::now().timestamp() + 5;
+    fs::write(
+        fx.anchor_dir.join(format!("{}.pub.{future_ts}", fx.agent)),
+        fx.k_old.public.to_bytes(),
+    )
+    .expect("archive k_old");
+    fs::write(
+        fx.anchor_dir.join(format!("{}.pub", fx.agent)),
+        k_attacker.public.to_bytes(),
+    )
+    .expect("swap pub");
+
+    let conn = db::open(&fx.db_path).expect("open");
+    let anchor = TrustAnchor::load_dir(&fx.anchor_dir);
+    let rep = verify_sqlite_with(&conn, &anchor).expect("verify_sqlite_with");
+    assert!(
+        matches!(rep.outcome(), Outcome::Defective { .. }),
+        "C-F1/S-F2: verify_sqlite_with must return Defective after bare anchor swap, got: {:?}",
+        rep.outcome()
+    );
+    assert!(
+        rep.defects
+            .iter()
+            .any(|d| d.contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP)),
+        "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP defect, got: {:?}",
+        rep.defects
+    );
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = {
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        audit_verify_rows::run(&VerifyRowsArgs { json: true }, &fx.db_path, &mut out)
+            .expect("audit verify-rows")
+    };
+    assert_eq!(
+        code,
+        2,
+        "audit verify-rows must exit 2 after bare swap: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+
+    // Production `arm_with_key` even with K_old must refuse when anchor was swapped!
+    let err_arm = arm_with_key(
+        &conn,
+        &fx.agent,
+        fx.k_old.private.as_ref().expect("k_old priv"),
+    )
+    .expect_err("arm_with_key must refuse on bare-swapped anchor");
+    assert!(
+        format!("{err_arm:#}").contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP),
+        "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP from arm_with_key, got: {err_arm:#}"
+    );
+    drop(conn);
+
+    // Part B: zero-lineage store with bare archive+swap (exact code-reviewer R-7 probe).
+    let root2 = private_dir();
+    let keys2 = root2.path().join("keys");
+    fs::create_dir_all(&keys2).expect("mkdir keys2");
+    let db2 = root2.path().join("store2.db");
+    let agent2 = "cf1-nolin-agent";
+    let k0 = keypair::generate(agent2).expect("k0");
+    keypair::save(&k0, &keys2).expect("save k0");
+    let conn2 = db::open(&db2).expect("open db2");
+    db::register_agent(&conn2, agent2, "ai:test", &[]).expect("register");
+    db::bind_agent_pubkey_with_keypair(&conn2, agent2, &k0).expect("bind");
+    let keys2_s = keys2.to_string_lossy().into_owned();
+    // SAFETY: serialized by ENV_LOCK held in `fx._env`.
+    unsafe {
+        std::env::set_var("AI_MEMORY_KEY_DIR", &keys2_s);
+    }
+    arm_with_key(&conn2, agent2, k0.private.as_ref().expect("k0 priv")).expect("arm db2");
+    let k_foreign = keypair::generate(agent2).expect("k_foreign");
+    fs::write(
+        keys2.join(format!("{agent2}.pub.{future_ts}")),
+        k0.public.to_bytes(),
+    )
+    .expect("archive k0");
+    fs::write(
+        keys2.join(format!("{agent2}.pub")),
+        k_foreign.public.to_bytes(),
+    )
+    .expect("swap pub");
+    let rep2 = verify_sqlite_with(&conn2, &TrustAnchor::load_dir(&keys2)).expect("verify db2");
+    assert!(
+        matches!(rep2.outcome(), Outcome::Defective { .. }),
+        "C-F1/S-F2: zero-lineage bare anchor swap must be Defective, got: {:?}",
+        rep2.outcome()
+    );
+    assert!(
+        rep2.defects
+            .iter()
+            .any(|d| d.contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP)),
+        "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP defect on zero-lineage swap, got: {:?}",
+        rep2.defects
+    );
+    drop(conn2);
+    drop(fx);
+
+    // Part C: missing anchor_dir on an armed store must be refused in recovery_preconditions.
+    let fx3 = RecoveryFixture::new("cf1-missing-dir");
+    let k_new3 = keypair::generate("cf1-missing-new").expect("k_new3");
+    let (nb3, atts3) = fx3.prepare_and_sign(&k_new3, &[0, 1]);
+    let missing_dir = fx3.root.path().join("does-not-exist");
+    let conn3 = db::open(&fx3.db_path).expect("open db3");
+    let req3 = RecoveryRequest {
+        agent_id: &fx3.agent,
+        successor_pubkey_b64: &k_new3.public_base64(),
+        quorum: &atts3,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb3,
+        staged_key_label: None,
+    };
+    let err_missing = recovery_preconditions(
+        &conn3,
+        &missing_dir,
+        &req3,
+        RecoveryArm::Signing(k_new3.private.as_ref().expect("priv")),
+    )
+    .err()
+    .expect("missing anchor_dir on armed store must be refused");
+    assert!(
+        format!("{err_missing:#}").contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP),
+        "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP for missing anchor_dir, got: {err_missing:#}"
+    );
+}
+
+/// C-F6: corrupt RFC3339 timestamp in `agent_pubkey_history` or `row_attestations`
+/// must be refused by `recovery_preconditions` instead of silently ignored.
+#[test]
+fn cf6_corrupt_timestamp_in_history_refused_10112() {
+    let fx = RecoveryFixture::new("cf6-ts-agent");
+    let k_new = keypair::generate("cf6-ts-new").expect("k_new");
+    let (nb, atts) = fx.prepare_and_sign(&k_new, &[0, 1]);
+
+    let raw = Connection::open(&fx.db_path).expect("raw open");
+    raw.execute(
+        "UPDATE agent_pubkey_history SET bound_at = 'not-a-valid-rfc3339' WHERE agent_id = ?1",
+        [&fx.agent],
+    )
+    .expect("corrupt bound_at");
+    drop(raw);
+
+    let conn = db::open(&fx.db_path).expect("open");
+    let req = RecoveryRequest {
+        agent_id: &fx.agent,
+        successor_pubkey_b64: &k_new.public_base64(),
+        quorum: &atts,
+        suspected_compromise_from_seq: None,
+        recovery_pubkey_b64: None,
+        not_before: &nb,
+        staged_key_label: None,
+    };
+    let err = recovery_preconditions(
+        &conn,
+        &fx.anchor_dir,
+        &req,
+        RecoveryArm::Signing(k_new.private.as_ref().expect("priv")),
+    )
+    .err()
+    .expect("C-F6: corrupt bound_at timestamp must be refused");
+    assert!(
+        format!("{err:#}").contains("malformed") || format!("{err:#}").contains("timestamp"),
+        "expected malformed timestamp refusal, got: {err:#}"
+    );
+}
+
+/// C-F14: direct `db::append_recovery` on an armed SQLite store with
+/// `AI_MEMORY_KEY_DIR` unset must refuse with its own accurate armed-store
+/// refusal constant (not `REFUSE_RECOVERY_VERIFY_ONLY`).
+#[test]
+fn cf14_direct_append_recovery_refused_when_key_dir_unset_10112() {
+    let fx = RecoveryFixture::new("cf14-agent");
+    let k_new = keypair::generate("cf14-new").expect("k_new");
+    let (nb, atts) = fx.prepare_and_sign(&k_new, &[0, 1]);
+
+    // SAFETY: serialized by ENV_LOCK held in `fx._env`.
+    unsafe {
+        std::env::remove_var("AI_MEMORY_KEY_DIR");
+    }
+
+    let raw_conn = Connection::open(&fx.db_path).expect("raw open");
+    let err = db::append_recovery(
+        &raw_conn,
+        &fx.agent,
+        &k_new.public_base64(),
+        &atts,
+        None,
+        None,
+        &nb,
+    )
+    .expect_err("direct append_recovery on armed store with unset KEY_DIR must refuse");
+    assert_eq!(
+        format!("{err:#}"),
+        "armed store: use `ai-memory identity recover` with a signing arm instead of direct `append_recovery` (#10112 R-8)",
+        "C-F14: expected exact armed-store refusal"
+    );
+}
