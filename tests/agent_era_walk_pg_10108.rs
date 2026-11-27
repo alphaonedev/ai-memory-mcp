@@ -13,6 +13,13 @@
 //! same failing rows, the same erased-receipt count and the same legacy
 //! agent-row count; the expected outcome of every row is written out below.
 //! Soft-skips without `AI_MEMORY_TEST_POSTGRES_URL`.
+//!
+//! Slice 2 (W-12, W-13, W-14, S-4, S-6; #10135): new-era receipts are signed
+//! under the atomisation-receipt domain; a raw-rule or other-domain receipt
+//! above the marker fails; a raw receipt below the marker is legacy; an
+//! unsigned tombstone never evidences an erasure; a receipt no chain row
+//! anchors is a chain-level failure (sequence 0); a receipt key collision
+//! is an error on both backends.
 
 use std::sync::OnceLock;
 
@@ -52,6 +59,13 @@ const ATOMISED_AT: &str = "2026-11-26T00:00:00Z";
 const FIRST_ROW_UNIX: i64 = 1_795_000_000;
 /// The fixture's micro-second offset (postgres keeps micro-seconds).
 const ROW_MICROS: i64 = 123_456;
+/// W-13 — the atomisation-receipt domain tag, written out (independent of
+/// the code under test).
+const RECEIPT_TAG: &[u8] = b"ai-memory/daemon-sig/v2/atomisation-receipt\0";
+/// The fixture tombstones' namespace.
+const TOMBSTONE_NS: &str = "era-10108";
+/// The chain-level failure sequence (W-14).
+const CHAIN_LEVEL_SEQ: i64 = 0;
 
 /// What a fixture row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,10 +76,21 @@ enum Spec {
     Genuine,
     /// A daemon atomisation row whose stored receipt lost an atom.
     Tampered,
-    /// A daemon atomisation row whose receipt was erased under a tombstone.
+    /// A daemon atomisation row whose receipt was erased under a
+    /// daemon-signed tombstone.
     Erased,
     /// A daemon atomisation row with no receipt and no tombstone.
     Missing,
+    /// #10135 — no receipt, and a tombstone with no daemon signature.
+    ForgedTombstone,
+    /// W-12 — a raw-rule receipt above the marker.
+    RawSigned,
+    /// W-13 — a receipt signed under another daemon domain.
+    OtherDomain,
+    /// S-4 — a receipt whose signature column is NULL.
+    NullSig,
+    /// W-12 — a daemon atomisation row below the marker over a raw receipt.
+    LegacyReceipt,
     /// A legacy agent row with a NULL signature.
     LegacyNull,
     /// A legacy agent row with a 63-byte signature.
@@ -77,15 +102,20 @@ enum Spec {
 }
 
 /// The fixture in chain order, and the outcome both walks must report.
-const FIXTURE: [(Spec, Outcome); 9] = [
+const FIXTURE: [(Spec, Outcome); 14] = [
     (Spec::Daemon, Outcome::Clean),
     (Spec::LegacyNull, Outcome::Clean),
     (Spec::LegacyShort, Outcome::Failed),
+    (Spec::LegacyReceipt, Outcome::Clean),
     (Spec::Marker, Outcome::Clean),
     (Spec::Genuine, Outcome::Clean),
     (Spec::Tampered, Outcome::Failed),
     (Spec::Erased, Outcome::Clean),
     (Spec::Missing, Outcome::Failed),
+    (Spec::ForgedTombstone, Outcome::Failed),
+    (Spec::RawSigned, Outcome::Failed),
+    (Spec::OtherDomain, Outcome::Failed),
+    (Spec::NullSig, Outcome::Failed),
     (Spec::PreCutover, Outcome::Failed),
 ];
 /// Agent-labelled rows below the marker (`LegacyNull`, `LegacyShort`).
@@ -146,14 +176,44 @@ fn receipt(run: &str, i: usize, atoms: &[&str]) -> AtomisationReceipt {
 }
 
 /// One stored receipt row: `(receipt, signature)`.
-type StoredReceipt = (AtomisationReceipt, [u8; 64]);
+type StoredReceipt = (AtomisationReceipt, Option<[u8; 64]>);
+/// One stored tombstone: `(memory_id, signature)`.
+type StoredTombstone = (String, Option<Vec<u8>>);
 
 /// The backend-neutral fixture: chain rows (without sequence and
-/// prev_hash), receipts and forgotten source ids.
+/// prev_hash), receipts (one with no chain row) and tombstones.
 struct Fixture {
     rows: Vec<SignedEvent>,
     receipts: Vec<StoredReceipt>,
-    forgotten: Vec<String>,
+    tombstones: Vec<StoredTombstone>,
+}
+
+/// How a fixture receipt is signed.
+#[derive(Debug, Clone, Copy)]
+enum ReceiptSigning {
+    /// Under the atomisation-receipt domain (the new-era rule).
+    Typed,
+    /// Over the bare bytes (the released raw rule).
+    Raw,
+    /// Under another daemon domain.
+    Other(DaemonDomain),
+}
+
+fn receipt_sig(key: &SigningKey, bytes: &[u8], how: ReceiptSigning) -> [u8; 64] {
+    let pre = match how {
+        ReceiptSigning::Typed => [RECEIPT_TAG, bytes].concat(),
+        ReceiptSigning::Raw => bytes.to_vec(),
+        ReceiptSigning::Other(d) => [d.tag(), bytes].concat(),
+    };
+    key.sign(&pre).to_bytes()
+}
+
+/// #10135 — a daemon signature over the tombstone of `id`.
+fn tombstone_sig(id: &str) -> Vec<u8> {
+    let body = ai_memory::storage::forget_tombstone_signing_body(id, TOMBSTONE_NS, ATOMISED_AT);
+    daemon_signer::sign(DaemonDomain::Tombstone, &body)
+        .expect("daemon key installed")
+        .0
 }
 
 fn row_time(i: usize) -> DateTime<Utc> {
@@ -167,7 +227,7 @@ fn fixture(run: &str) -> Fixture {
     let mut out = Fixture {
         rows: Vec::new(),
         receipts: Vec::new(),
-        forgotten: Vec::new(),
+        tombstones: Vec::new(),
     };
     for (i, (spec, _)) in FIXTURE.iter().enumerate() {
         let mut ev = SignedEvent {
@@ -183,10 +243,23 @@ fn fixture(run: &str) -> Fixture {
                 ev.event_type = "governance.test".to_string();
                 ev.payload_hash = payload_hash(ev.id.as_bytes());
             }
-            Spec::Genuine | Spec::Tampered | Spec::Erased | Spec::Missing => {
+            Spec::Genuine
+            | Spec::Tampered
+            | Spec::Erased
+            | Spec::Missing
+            | Spec::ForgedTombstone
+            | Spec::RawSigned
+            | Spec::OtherDomain
+            | Spec::NullSig
+            | Spec::LegacyReceipt => {
                 let r = receipt(run, i, &["a1", "a2"]);
                 let bytes = r.canonical_bytes();
-                let sig = key.sign(&bytes).to_bytes();
+                let how = match spec {
+                    Spec::RawSigned | Spec::LegacyReceipt => ReceiptSigning::Raw,
+                    Spec::OtherDomain => ReceiptSigning::Other(DaemonDomain::EventRow),
+                    _ => ReceiptSigning::Typed,
+                };
+                let sig = receipt_sig(&key, &bytes, how);
                 ev.payload_hash = AgentPayloadHash::encode(&AgentSignedPayload {
                     kind: AgentEventKind::AtomisationComplete,
                     signed_bytes: &bytes,
@@ -196,11 +269,18 @@ fn fixture(run: &str) -> Fixture {
                 .to_vec();
                 ev.cause_hash = Some(SourceBinding::of_source(&r.source_id).as_bytes().to_vec());
                 match spec {
-                    Spec::Genuine => out.receipts.push((r, sig)),
-                    Spec::Tampered => {
-                        out.receipts.push((receipt(run, i, &["a1"]), sig));
+                    Spec::Genuine | Spec::RawSigned | Spec::OtherDomain | Spec::LegacyReceipt => {
+                        out.receipts.push((r, Some(sig)));
                     }
-                    Spec::Erased => out.forgotten.push(r.source_id),
+                    Spec::Tampered => {
+                        out.receipts.push((receipt(run, i, &["a1"]), Some(sig)));
+                    }
+                    Spec::NullSig => out.receipts.push((r, None)),
+                    Spec::Erased => {
+                        let sig = tombstone_sig(&r.source_id);
+                        out.tombstones.push((r.source_id, Some(sig)));
+                    }
+                    Spec::ForgedTombstone => out.tombstones.push((r.source_id, None)),
                     _ => {}
                 }
             }
@@ -219,6 +299,10 @@ fn fixture(run: &str) -> Fixture {
         }
         out.rows.push(ev);
     }
+    // W-14 — a genuine receipt that no chain row anchors.
+    let orphan = receipt(run, FIXTURE.len(), &["o1"]);
+    let sig = receipt_sig(&key, &orphan.canonical_bytes(), ReceiptSigning::Typed);
+    out.receipts.push((orphan, Some(sig)));
     out
 }
 
@@ -307,7 +391,8 @@ fn sqlite_leg(run: &str) -> (Vec<Outcome>, AuditTrailReport) {
         conn.execute(
             "INSERT INTO atomisation_receipts \
                 (source_id, atomised_at, atom_ids, atom_count, calling_agent_id, curator_model, \
-                 signer_agent_id, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'daemon', ?7)",
+                 signer_agent_id, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+                 CASE WHEN ?7 IS NULL THEN NULL ELSE 'daemon' END, ?7)",
             rusqlite::params![
                 r.source_id,
                 r.atomised_at,
@@ -315,19 +400,34 @@ fn sqlite_leg(run: &str) -> (Vec<Outcome>, AuditTrailReport) {
                 i64::try_from(r.atom_count).expect("fits"),
                 r.calling_agent_id,
                 r.curator_model,
-                sig.to_vec()
+                sig.map(|s| s.to_vec())
             ],
         )
         .expect("insert sqlite receipt");
     }
-    for id in &fx.forgotten {
+    for (id, sig) in &fx.tombstones {
         conn.execute(
-            "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at) \
-             VALUES (?1, 'era-10108', ?2)",
-            rusqlite::params![id, ATOMISED_AT],
+            "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at, signature) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, TOMBSTONE_NS, ATOMISED_AT, sig],
         )
         .expect("insert sqlite tombstone");
     }
+    // S-6 — a second receipt under the same (source_id, atomised_at) key is
+    // an error, never a replace or an ignore.
+    let (first, _) = &fx.receipts[0];
+    let dup = conn
+        .execute(
+            "INSERT INTO atomisation_receipts \
+                (source_id, atomised_at, atom_ids, atom_count, calling_agent_id, \
+                 signer_agent_id) VALUES (?1, ?2, '[]', 0, 'ai:dup-10108', NULL)",
+            rusqlite::params![first.source_id, first.atomised_at],
+        )
+        .expect_err("S-6: a receipt key collision is an error on sqlite");
+    assert!(
+        dup.to_string().contains("UNIQUE"),
+        "sqlite collision: {dup}"
+    );
     let report = verify_audit_trail(&conn, None, Some(&vk)).expect("sqlite verify");
     assert!(report.chain_intact, "sqlite fixture chain: {report:?}");
     (outcome(&report, first_seq.expect("rows")), report)
@@ -462,7 +562,8 @@ async fn pg_leg(pg: &PostgresStore, run: &str) -> (Vec<Outcome>, AuditTrailRepor
         sqlx::query(
             "INSERT INTO atomisation_receipts \
                 (source_id, atomised_at, atom_ids, atom_count, calling_agent_id, curator_model, \
-                 signer_agent_id, signature) VALUES ($1,$2,$3,$4,$5,$6,'daemon',$7)",
+                 signer_agent_id, signature) VALUES ($1,$2,$3,$4,$5,$6, \
+                 CASE WHEN $7::bytea IS NULL THEN NULL ELSE 'daemon' END, $7)",
         )
         .bind(&r.source_id)
         .bind(&r.atomised_at)
@@ -470,22 +571,40 @@ async fn pg_leg(pg: &PostgresStore, run: &str) -> (Vec<Outcome>, AuditTrailRepor
         .bind(i64::try_from(r.atom_count).expect("fits"))
         .bind(&r.calling_agent_id)
         .bind(&r.curator_model)
-        .bind(sig.to_vec())
+        .bind(sig.map(|s| s.to_vec()))
         .execute(pool)
         .await
         .expect("insert pg receipt");
     }
-    for id in &fx.forgotten {
+    for (id, sig) in &fx.tombstones {
         sqlx::query(
-            "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at) \
-             VALUES ($1, 'era-10108', $2)",
+            "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at, signature) \
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(id)
+        .bind(TOMBSTONE_NS)
         .bind(ATOMISED_AT)
+        .bind(sig)
         .execute(pool)
         .await
         .expect("insert pg tombstone");
     }
+    // S-6 — the postgres twin of the sqlite collision pin.
+    let (first, _) = &fx.receipts[0];
+    let dup = sqlx::query(
+        "INSERT INTO atomisation_receipts \
+            (source_id, atomised_at, atom_ids, atom_count, calling_agent_id, signer_agent_id) \
+         VALUES ($1, $2, '[]', 0, 'ai:dup-10108', NULL)",
+    )
+    .bind(&first.source_id)
+    .bind(&first.atomised_at)
+    .execute(pool)
+    .await
+    .expect_err("S-6: a receipt key collision is an error on postgres");
+    assert!(
+        dup.to_string().contains("duplicate key"),
+        "pg collision: {dup}"
+    );
     let report = pg
         .verify_audit_trail(None, Some(&vk))
         .await
@@ -517,9 +636,17 @@ async fn agent_era_walk_parity_10108() {
     assert_eq!(sqlite_out, want, "sqlite outcomes");
     assert_eq!(sqlite_report.agent_receipts_erased, WANT_ERASED);
     assert_eq!(sqlite_report.agent_signed_rows_not_verified, WANT_LEGACY);
+    assert!(
+        sqlite_report.signature_failures.contains(&CHAIN_LEVEL_SEQ),
+        "W-14: an unanchored receipt fails the sqlite walk: {sqlite_report:?}"
+    );
 
     let (pg_out, pg_report) = pg_leg(&pg, &run).await;
     assert_eq!(pg_out, want, "pg outcomes");
     assert_eq!(pg_report.agent_receipts_erased, WANT_ERASED);
     assert_eq!(pg_report.agent_signed_rows_not_verified, WANT_LEGACY);
+    assert!(
+        pg_report.signature_failures.contains(&CHAIN_LEVEL_SEQ),
+        "W-14: an unanchored receipt fails the pg walk: {pg_report:?}"
+    );
 }

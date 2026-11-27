@@ -580,6 +580,44 @@ fn typed_signer_signs_once_over_the_domain_preimage_10074() {
     );
 }
 
+/// #10108 W-13 (`3-agent vote (71472661)`) — the domain list holds seven
+/// domains, one of them the atomisation receipt's own tag, and a receipt
+/// signed by the raw rule (no tag) verifies under none of the seven.
+#[test]
+fn receipt_domain_is_listed_and_raw_receipt_signing_verifies_under_no_domain_10108() {
+    use ai_memory::governance::daemon_signer::{self, DaemonDomain};
+    use ai_memory::signed_events::agent_payload::AtomisationReceipt;
+    use ed25519_dalek::{Signer, SigningKey};
+    const DOMAIN_COUNT: usize = 7;
+    const RECEIPT_TAG: &[u8] = b"ai-memory/daemon-sig/v2/atomisation-receipt\0";
+    assert_eq!(DaemonDomain::ALL.len(), DOMAIN_COUNT);
+    let receipt_domain = DaemonDomain::ALL
+        .iter()
+        .copied()
+        .find(|d| d.tag() == RECEIPT_TAG);
+    assert!(
+        receipt_domain.is_some(),
+        "no domain carries the receipt tag"
+    );
+    let key = SigningKey::from_bytes(&[0x42; 32]);
+    let body = AtomisationReceipt {
+        source_id: "src-ratchet-10108".to_string(),
+        atomised_at: "2026-11-27T00:00:00Z".to_string(),
+        atom_ids: vec!["a1".to_string()],
+        atom_count: 1,
+        calling_agent_id: "ai:caller-10108".to_string(),
+        curator_model: None,
+    }
+    .canonical_bytes();
+    let raw = key.sign(&body).to_bytes();
+    for d in DaemonDomain::ALL {
+        assert!(
+            !daemon_signer::verify(&key.verifying_key(), d, &body, &raw),
+            "a raw receipt signature verifies under {d:?}"
+        );
+    }
+}
+
 /// The lexer keeps code that follows a literal holding a quote or a comment
 /// opener, so no literal form can hide code as a "comment" (fail open).
 #[test]
