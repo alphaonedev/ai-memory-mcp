@@ -192,44 +192,193 @@ pub fn state_for(anchor: &AnchorLoad, db: Option<&Path>) -> SealState {
     path_for(anchor, db).map_or(SealState::NotSealed, |p| read(&p))
 }
 
-fn write_atomic(path: &Path, rec: &SealRecord) -> Result<()> {
-    let dir = path
-        .parent()
-        .context("a seal path always has a parent directory")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+/// Suffix of the lock file beside each seal (#10193).
+const SEAL_LOCK_SUFFIX: &str = ".lock";
+/// Mode of a seal lock file (owner only, like the seal itself).
+#[cfg(unix)]
+const SEAL_LOCK_MODE: u32 = 0o600;
+
+/// The exclusive lock on one seal (#10193): an advisory `flock` on the
+/// sibling file `<seal>.lock`, held for the whole read-merge-write of an
+/// advance or the write of a replace. Every seal write takes a
+/// `&SealLock`, and [`SealLock::acquire`] is its only constructor, so a seal
+/// write without the lock does not compile. The lock is released when the
+/// guard drops (the file closes). `flock` locks an open file description,
+/// so two opens in one process exclude each other as two processes do.
+#[derive(Debug)]
+pub struct SealLock {
+    /// The open lock file; holding it holds the lock.
+    _file: std::fs::File,
+    /// The seal this lock guards.
+    seal: PathBuf,
+}
+
+impl SealLock {
+    /// Take the exclusive lock on the seal at `seal`, waiting for any other
+    /// holder. Precedent: the scope-key store lock
+    /// (`encryption::scope::store`, `open_lock_file` and `lock`).
+    ///
+    /// # Errors
+    ///
+    /// The seal directory cannot be created, it or any directory up to the
+    /// anchor directory is group- or world-writable or owned by another user
+    /// (#10205, the key-directory checks of #3198), the lock file cannot be
+    /// opened (a symlink, a directory or any other open failure), it is not a
+    /// regular file, or the lock cannot be taken. Each refuses the write: a
+    /// seal is never written unlocked, and a failed check repairs nothing.
+    ///
+    /// The wait for another holder has no time limit, as in the scope-key
+    /// store lock; only the same user or root can hold the lock, because the
+    /// lock file is 0600 in a directory this check proves owner-only.
+    pub fn acquire(seal: &Path) -> Result<Self> {
+        let dir = seal
+            .parent()
+            .context("a seal path always has a parent directory")?;
+        // The seal lives at `<anchor dir>/.row-attest-seals/<name>`, so the
+        // anchor directory is the base of the chain check (#10205).
+        let anchor = dir.parent().unwrap_or(dir);
+        let lock = lock_path(seal);
+        // #10205: the scope-store precedent (`open_lock_file`): create every
+        // missing directory 0700 and check it, then check every directory
+        // from the lock's up to the anchor directory, before the open.
+        crate::identity::keypair::ensure_parent(&lock)
+            .with_context(|| format!("securing the {SEAL_WHAT} directory {}", dir.display()))?;
+        crate::identity::keypair::enforce_key_path_chain_secure(anchor, &lock).with_context(
+            || {
+                format!(
+                    "checking the key directories of the {SEAL_WHAT} lock {}",
+                    lock.display()
+                )
+            },
+        )?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(SEAL_LOCK_MODE);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(&lock)
+            .with_context(|| format!("opening the {SEAL_WHAT} lock {}", lock.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("reading the {SEAL_WHAT} lock {}", lock.display()))?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!(
+                "the {SEAL_WHAT} lock {} is not a regular file",
+                lock.display()
+            );
+        }
+        lock_exclusive(&file).with_context(|| {
+            format!(
+                "locking the {SEAL_WHAT} lock {} exclusively",
+                lock.display()
+            )
+        })?;
+        Ok(Self {
+            _file: file,
+            seal: seal.to_path_buf(),
+        })
+    }
+}
+
+/// The lock file of the seal at `seal`: `<seal>.lock`.
+fn lock_path(seal: &Path) -> PathBuf {
+    let mut name = seal.as_os_str().to_os_string();
+    name.push(SEAL_LOCK_SUFFIX);
+    PathBuf::from(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (#10193): make the lock step fail on this thread.
+    static REFUSE_SEAL_LOCK_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the exclusive `flock` on `file`.
+fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if REFUSE_SEAL_LOCK_FOR_TEST.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("refused by the test seam"));
+    }
+    file.lock()
+}
+
+fn write_atomic(lock: &SealLock, rec: &SealRecord) -> Result<()> {
     // #8950: stage in a private directory and rename, refusing a symlink at
-    // the seal name (never a by-name write that could follow one).
-    crate::storage::snapshot_file::write_replacing(path, SEAL_WHAT, rec.render().as_bytes())
+    // the seal name (never a by-name write that could follow one). The
+    // caller holds the seal lock (#10193).
+    crate::storage::snapshot_file::write_replacing(&lock.seal, SEAL_WHAT, rec.render().as_bytes())
 }
 
 /// What a seal write names in its errors.
 const SEAL_WHAT: &str = "row-attestation seal";
 
+/// What an advance did to the seal on disk (#10206).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealAdvance {
+    /// The merged seal equals the seal on disk: nothing was written and
+    /// nothing was synced.
+    Unchanged,
+    /// A new seal was written (there was none, or it moved up).
+    Written,
+}
+
 /// Move the seal at `path` up to `rec` (field-wise maximum with what it
-/// holds; it never moves back).
+/// holds; it never moves back). The read and the write run under one
+/// [`SealLock`], so a concurrent advance never writes a seal built from a
+/// stale read (#10193). The same as [`advance_reporting`], without the
+/// report.
 ///
 /// # Errors
 ///
-/// An unreadable seal (it is never overwritten) or a write failure.
+/// The seal lock cannot be taken, an unreadable seal (it is never
+/// overwritten) or a write failure.
 pub fn advance(path: &Path, rec: &SealRecord) -> Result<()> {
-    let next = match read(path) {
+    advance_reporting(path, rec).map(|_: SealAdvance| ())
+}
+
+/// [`advance`], reporting whether it wrote. The read, the compare and the
+/// write all run under one [`SealLock`]: when the merged seal equals the
+/// seal on disk nothing is written and nothing is synced (#10206), and a
+/// concurrent real advance is never lost, because the compare reads the
+/// seal the lock protects.
+///
+/// # Errors
+///
+/// As [`advance`].
+pub fn advance_reporting(path: &Path, rec: &SealRecord) -> Result<SealAdvance> {
+    let lock = SealLock::acquire(path)?;
+    let next = match read(&lock.seal) {
         SealState::NotSealed => rec.clone(),
-        SealState::Sealed(old) => old.merged(rec),
+        SealState::Sealed(old) => {
+            let next = old.clone().merged(rec);
+            if next == old {
+                return Ok(SealAdvance::Unchanged);
+            }
+            next
+        }
         SealState::Unreadable { path, why } => {
             anyhow::bail!("the anchored seal {} cannot be read: {why}", path.display())
         }
     };
-    write_atomic(path, &next)
+    write_atomic(&lock, &next)?;
+    Ok(SealAdvance::Written)
 }
 
 /// Replace the seal at `path` with `rec` (a verified restore publishes an
-/// older, verified store at this path: an explicit order).
+/// older, verified store at this path: an explicit order). It holds the
+/// [`SealLock`], so no advance interleaves with it (#10193).
 ///
 /// # Errors
 ///
-/// A write failure.
+/// The seal lock cannot be taken, or a write failure.
 pub fn replace(path: &Path, rec: &SealRecord) -> Result<()> {
-    write_atomic(path, rec)
+    let lock = SealLock::acquire(path)?;
+    write_atomic(&lock, rec)
 }
 
 #[cfg(test)]
@@ -290,19 +439,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn seal_write_refuses_a_planted_symlink_8950() {
-        let dir = tempfile::tempdir_in(
-            std::env::var_os("TMPDIR")
-                .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from),
-        )
-        .expect("tempdir");
+        let dir = scratch_10193();
         let rec = |hw: i64| SealRecord {
             high_water: hw,
             heads: BTreeMap::new(),
         };
-        let target = dir.path().join("outside");
+        // The real layout, `<anchor dir>/.row-attest-seals/<name>`, under a
+        // private anchor, so the #10205 chain check passes.
+        let seals = dir.path().join(SEAL_DIR);
+        let target = seals.join("outside");
         replace(&target, &rec(1)).expect("seal a regular file");
         let before = std::fs::read_to_string(&target).expect("read target");
-        let link = dir.path().join("seal");
+        let link = seals.join("seal");
         std::os::unix::fs::symlink(&target, &link).expect("plant symlink");
         let rows: [(fn(&Path, &SealRecord) -> Result<()>, String); 2] = [
             (
@@ -330,5 +478,601 @@ mod tests {
         }
         replace(&target, &rec(5)).expect("a regular seal is replaced");
         assert_eq!(read(&target), SealState::Sealed(rec(5)));
+    }
+
+    /// Writers per round of the #10193 concurrency test.
+    const WRITERS_10193: usize = 16;
+    /// Rounds of the #10193 concurrency test.
+    const ROUNDS_10193: i64 = 12;
+    /// How long a seal write is given to (wrongly) finish while another
+    /// holder has the seal lock.
+    const HELD_PROBE_10193: std::time::Duration = std::time::Duration::from_millis(400);
+    /// Upper bound on a seal write once the lock is free.
+    const FREE_BOUND_10193: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A private (0700) scratch directory: it stands for the anchor
+    /// directory, which the #10205 chain check requires to be owner-only,
+    /// whatever the runner's umask.
+    fn scratch_10193() -> tempfile::TempDir {
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        builder
+            .tempdir_in(
+                std::env::var_os("TMPDIR")
+                    .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from),
+            )
+            .expect("tempdir")
+    }
+
+    /// The lock file beside a seal: `<seal>.lock` (#10193).
+    fn lock_name_10193(seal: &Path) -> std::path::PathBuf {
+        let mut name = seal.as_os_str().to_os_string();
+        name.push(".lock");
+        std::path::PathBuf::from(name)
+    }
+
+    /// #10193: many writers advance one seal at once, each with its own table
+    /// and a distinct high-water id, released together by a barrier every
+    /// round. After every round the seal verifies (it parses) and holds every
+    /// writer's mark of that round: no advance lowers or drops another's.
+    #[test]
+    fn concurrent_advances_never_lose_a_mark_10193() {
+        let dir = scratch_10193();
+        let seal = dir.path().join(SEAL_DIR).join("db");
+        let seal = std::sync::Arc::new(seal);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS_10193));
+        let done = std::sync::Arc::new(std::sync::Barrier::new(WRITERS_10193));
+        let lost = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let writers: Vec<_> = (0..WRITERS_10193)
+            .map(|i| {
+                let (seal, start, done, lost) = (
+                    std::sync::Arc::clone(&seal),
+                    std::sync::Arc::clone(&start),
+                    std::sync::Arc::clone(&done),
+                    std::sync::Arc::clone(&lost),
+                );
+                std::thread::spawn(move || {
+                    let width = i64::try_from(WRITERS_10193).expect("writers fit i64");
+                    let me = i64::try_from(i).expect("index fits i64");
+                    for round in 0..ROUNDS_10193 {
+                        let mut rec = SealRecord {
+                            high_water: round * width + me,
+                            heads: BTreeMap::new(),
+                        };
+                        rec.heads.insert(format!("t{i:02}"), round);
+                        start.wait();
+                        let wrote = advance(&seal, &rec);
+                        if done.wait().is_leader() {
+                            let mut want = SealRecord {
+                                high_water: round * width + width - 1,
+                                heads: BTreeMap::new(),
+                            };
+                            for w in 0..WRITERS_10193 {
+                                want.heads.insert(format!("t{w:02}"), round);
+                            }
+                            let got = read(&seal);
+                            if got != SealState::Sealed(want.clone()) {
+                                lost.lock()
+                                    .expect("lost list")
+                                    .push(format!("round {round}: {got:?}, want {want:?}"));
+                            }
+                        }
+                        wrote.expect("an advance succeeds");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer thread");
+        }
+        let lost = lost.lock().expect("lost list");
+        assert!(lost.is_empty(), "lost seal marks: {lost:#?}");
+    }
+
+    /// #10193: while another holder has the seal lock, neither `advance` nor
+    /// `replace` writes; each completes once the lock is released.
+    #[cfg(unix)]
+    #[test]
+    fn seal_writes_wait_for_the_seal_lock_10193() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        for (name, write) in rows {
+            let dir = scratch_10193();
+            let seal = dir.path().join(SEAL_DIR).join("db");
+            let rec = |hw: i64| SealRecord {
+                high_water: hw,
+                heads: BTreeMap::new(),
+            };
+            replace(&seal, &rec(1)).expect("first seal");
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_name_10193(&seal))
+                .expect("open the lock file");
+            held.lock().expect("hold the seal lock");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probe_seal = seal.clone();
+            let writer = std::thread::spawn(move || {
+                let out = write(&probe_seal, &rec(9)).map_err(|e| e.to_string());
+                tx.send(out).expect("report");
+            });
+            assert_eq!(
+                rx.recv_timeout(HELD_PROBE_10193),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                "{name} wrote while the seal lock was held"
+            );
+            assert_eq!(read(&seal), SealState::Sealed(rec(1)), "{name}");
+            drop(held);
+            assert_eq!(rx.recv_timeout(FREE_BOUND_10193), Ok(Ok(())), "{name}");
+            writer.join().expect("writer thread");
+            assert_eq!(read(&seal), SealState::Sealed(rec(9)), "{name}");
+        }
+    }
+
+    /// #10193: a seal lock that cannot be taken (a directory or a symlink at
+    /// the lock name) refuses the write with the exact reason and leaves the
+    /// seal as it was: never an unlocked write.
+    #[cfg(unix)]
+    #[test]
+    fn seal_lock_failure_refuses_the_write_10193() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        let plants: [(&str, fn(&Path, &Path)); 2] = [
+            ("directory", |lock, _| {
+                std::fs::create_dir(lock).expect("plant a directory");
+            }),
+            ("symlink", |lock, target| {
+                std::os::unix::fs::symlink(target, lock).expect("plant a symlink");
+            }),
+        ];
+        for (name, write) in rows {
+            for (plant_name, plant) in plants {
+                let dir = scratch_10193();
+                let seal = dir.path().join(SEAL_DIR).join("db");
+                let rec = |hw: i64| SealRecord {
+                    high_water: hw,
+                    heads: BTreeMap::new(),
+                };
+                replace(&seal, &rec(1)).expect("first seal");
+                let lock = lock_name_10193(&seal);
+                let _ = std::fs::remove_file(&lock);
+                plant(&lock, &dir.path().join("elsewhere"));
+                let err = write(&seal, &rec(9)).expect_err("no lock, no write");
+                assert_eq!(
+                    err.to_string(),
+                    format!("opening the row-attestation seal lock {}", lock.display()),
+                    "{name} / {plant_name}"
+                );
+                assert_eq!(
+                    read(&seal),
+                    SealState::Sealed(rec(1)),
+                    "{name} / {plant_name}"
+                );
+                assert!(
+                    !dir.path().join("elsewhere").exists(),
+                    "{name} / {plant_name}: the lock open followed a link"
+                );
+            }
+        }
+    }
+
+    /// #10193: when the `flock` itself fails, `advance` and `replace` refuse
+    /// with the exact reason and leave the seal as it was.
+    #[test]
+    fn seal_flock_failure_refuses_the_write_10193() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        for (name, write) in rows {
+            let dir = scratch_10193();
+            let seal = dir.path().join(SEAL_DIR).join("db");
+            let rec = |hw: i64| SealRecord {
+                high_water: hw,
+                heads: BTreeMap::new(),
+            };
+            replace(&seal, &rec(1)).expect("first seal");
+            REFUSE_SEAL_LOCK_FOR_TEST.with(|c| c.set(true));
+            let out = write(&seal, &rec(9));
+            REFUSE_SEAL_LOCK_FOR_TEST.with(|c| c.set(false));
+            let err = out.expect_err("no lock, no write");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "locking the row-attestation seal lock {} exclusively",
+                    lock_name_10193(&seal).display()
+                ),
+                "{name}"
+            );
+            assert_eq!(read(&seal), SealState::Sealed(rec(1)), "{name}");
+        }
+    }
+
+    /// #10193: a lock name that opens but is not a regular file (a FIFO)
+    /// refuses the write with the exact reason.
+    #[cfg(unix)]
+    #[test]
+    fn seal_lock_not_a_regular_file_refuses_the_write_10193() {
+        let dir = scratch_10193();
+        let seal = dir.path().join(SEAL_DIR).join("db");
+        let rec = |hw: i64| SealRecord {
+            high_water: hw,
+            heads: BTreeMap::new(),
+        };
+        replace(&seal, &rec(1)).expect("first seal");
+        let lock = lock_name_10193(&seal);
+        std::fs::remove_file(&lock).expect("remove the lock file");
+        let cstr = std::ffi::CString::new(lock.as_os_str().as_encoded_bytes()).expect("no NUL");
+        // SAFETY: a valid NUL-terminated path in a scratch directory this
+        // test owns (UNSAFE-01).
+        let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo");
+        for (name, write) in [
+            ("advance", advance as fn(&Path, &SealRecord) -> Result<()>),
+            ("replace", replace),
+        ] {
+            let err = write(&seal, &rec(9)).expect_err("no lock, no write");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the row-attestation seal lock {} is not a regular file",
+                    lock.display()
+                ),
+                "{name}"
+            );
+            assert_eq!(read(&seal), SealState::Sealed(rec(1)), "{name}");
+        }
+    }
+
+    /// A seal record with one table head (#10205, #10206).
+    fn rec_10205(high_water: i64, head: i64) -> SealRecord {
+        let mut rec = SealRecord {
+            high_water,
+            heads: BTreeMap::new(),
+        };
+        rec.heads.insert("memories".to_string(), head);
+        rec
+    }
+
+    /// The permission bits of `path`, following a symlink.
+    #[cfg(unix)]
+    fn mode_10205(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777
+    }
+
+    /// Set the permission bits of `path`.
+    #[cfg(unix)]
+    fn set_mode_10205(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// Mode of every seal directory a seal write creates (#10205): the
+    /// precedent's key-directory mode.
+    #[cfg(unix)]
+    const SEAL_DIR_MODE_10205: u32 = 0o700;
+
+    /// Run `f` on a thread of its own whose umask is `mask`. `unshare
+    /// (CLONE_FS)` gives that thread its own umask, so no other test thread
+    /// sees the change.
+    #[cfg(target_os = "linux")]
+    fn under_umask_10205<T: Send + 'static>(
+        mask: libc::mode_t,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        std::thread::spawn(move || {
+            // SAFETY: integer-only flag; it unshares this thread's own
+            // filesystem attributes (umask, cwd, root) and nothing else
+            // (UNSAFE-01).
+            let rc = unsafe { libc::unshare(libc::CLONE_FS) };
+            assert_eq!(
+                rc,
+                0,
+                "unshare(CLONE_FS): {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: integer-only call; after the unshare it changes the
+            // umask of this thread alone (UNSAFE-01).
+            unsafe { libc::umask(mask) };
+            f()
+        })
+        .join()
+        .expect("umask thread")
+    }
+
+    /// #10205: under umask 000 and under 022, the seal directory a seal
+    /// write creates is owner-only (0700) and the lock file 0600, as the
+    /// scope-store precedent demands. A plain directory created on the same
+    /// thread shows that the umask took effect.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seal_dir_is_owner_only_under_every_umask_10205() {
+        const UMASKS: [libc::mode_t; 2] = [0o000, 0o022];
+        for mask in UMASKS {
+            let scratch = scratch_10193();
+            let anchor = scratch.path().to_path_buf();
+            let seal = anchor.join(SEAL_DIR).join("db");
+            let probe = anchor.join("probe");
+            let (thread_seal, thread_probe) = (seal.clone(), probe.clone());
+            let out = under_umask_10205(mask, move || {
+                std::fs::create_dir(&thread_probe).expect("probe dir");
+                advance(&thread_seal, &rec_10205(1, 1)).map_err(|e| format!("{e:#}"))
+            });
+            assert_eq!(out, Ok(()), "umask {mask:03o}");
+            assert_eq!(
+                mode_10205(&probe),
+                0o777 & !u32::from(mask),
+                "umask {mask:03o} took effect"
+            );
+            let dir = anchor.join(SEAL_DIR);
+            assert_eq!(
+                mode_10205(&dir),
+                SEAL_DIR_MODE_10205,
+                "seal dir, umask {mask:03o}"
+            );
+            assert_eq!(
+                mode_10205(&lock_name_10193(&seal)),
+                SEAL_LOCK_MODE,
+                "lock, umask {mask:03o}"
+            );
+            assert_eq!(read(&seal), SealState::Sealed(rec_10205(1, 1)));
+        }
+    }
+
+    /// #10205: a seal directory another user can write (group or world
+    /// write bit) refuses `advance` and `replace` with the exact reason, and
+    /// neither the seal nor the lock file is created there.
+    #[cfg(unix)]
+    #[test]
+    fn writable_seal_dir_refuses_the_write_10205() {
+        const MODES: [u32; 4] = [0o777, 0o775, 0o770, 0o702];
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        for (name, write) in rows {
+            for mode in MODES {
+                let scratch = scratch_10193();
+                let dir = scratch.path().join(SEAL_DIR);
+                std::fs::create_dir(&dir).expect("seal dir");
+                set_mode_10205(&dir, mode);
+                let seal = dir.join("db");
+                let err = write(&seal, &rec_10205(1, 1)).expect_err("a writable seal dir");
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "securing the row-attestation seal directory {}",
+                        dir.display()
+                    ),
+                    "{name} / {mode:o}"
+                );
+                let cause = format!("{:#}", err.root_cause());
+                assert!(
+                    cause.starts_with(&format!(
+                        "key directory {} is group- or world-writable (mode {mode:o}); refusing",
+                        dir.display()
+                    )),
+                    "{name} / {mode:o}: {cause}"
+                );
+                assert!(!seal.exists(), "{name} / {mode:o}: a seal was written");
+                assert!(
+                    !lock_name_10193(&seal).exists(),
+                    "{name} / {mode:o}: a lock file was created"
+                );
+                assert_eq!(
+                    mode_10205(&dir),
+                    mode,
+                    "{name} / {mode:o}: no silent repair"
+                );
+            }
+        }
+    }
+
+    /// #10205: an owner-only seal directory under an anchor directory another
+    /// user can write is refused by the path-chain check, with the exact
+    /// reason; nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn writable_anchor_dir_refuses_the_write_10205() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        for (name, write) in rows {
+            let scratch = scratch_10193();
+            let anchor = scratch.path().join("anchor");
+            std::fs::create_dir(&anchor).expect("anchor dir");
+            let dir = anchor.join(SEAL_DIR);
+            std::fs::create_dir(&dir).expect("seal dir");
+            set_mode_10205(&dir, SEAL_DIR_MODE_10205);
+            set_mode_10205(&anchor, 0o775);
+            let seal = dir.join("db");
+            let lock = lock_name_10193(&seal);
+            let err = write(&seal, &rec_10205(1, 1)).expect_err("a writable anchor dir");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "checking the key directories of the row-attestation seal lock {}",
+                    lock.display()
+                ),
+                "{name}"
+            );
+            let cause = format!("{:#}", err.root_cause());
+            assert!(
+                cause.starts_with(&format!(
+                    "key directory {} is group- or world-writable (mode 775); refusing",
+                    anchor.display()
+                )),
+                "{name}: {cause}"
+            );
+            assert!(!seal.exists(), "{name}: a seal was written");
+            assert!(!lock.exists(), "{name}: a lock file was created");
+        }
+    }
+
+    /// #10205: a symlink in the path chain that leads to a directory another
+    /// user can write (at the seal directory, or at the anchor directory) is
+    /// refused with the exact reason; nothing is written behind the link.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_writable_dir_in_the_chain_refuses_the_write_10205() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        for (name, write) in rows {
+            // The seal directory is a link to a world-writable directory.
+            let scratch = scratch_10193();
+            let open = scratch.path().join("open");
+            std::fs::create_dir(&open).expect("open dir");
+            set_mode_10205(&open, 0o777);
+            let dir = scratch.path().join(SEAL_DIR);
+            std::os::unix::fs::symlink(&open, &dir).expect("plant the seal dir link");
+            let seal = dir.join("db");
+            let err = write(&seal, &rec_10205(1, 1)).expect_err("a linked writable seal dir");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "securing the row-attestation seal directory {}",
+                    dir.display()
+                ),
+                "{name} / seal dir link"
+            );
+            assert_eq!(
+                std::fs::read_dir(&open).expect("list").count(),
+                0,
+                "{name} / seal dir link: nothing written behind the link"
+            );
+
+            // The anchor directory is a link to a world-writable directory
+            // that holds an owner-only seal directory.
+            let scratch = scratch_10193();
+            let open = scratch.path().join("open");
+            std::fs::create_dir(&open).expect("open dir");
+            std::fs::create_dir(open.join(SEAL_DIR)).expect("seal dir");
+            set_mode_10205(&open.join(SEAL_DIR), SEAL_DIR_MODE_10205);
+            set_mode_10205(&open, 0o777);
+            let anchor = scratch.path().join("anchor");
+            std::os::unix::fs::symlink(&open, &anchor).expect("plant the anchor link");
+            let seal = anchor.join(SEAL_DIR).join("db");
+            let lock = lock_name_10193(&seal);
+            let err = write(&seal, &rec_10205(1, 1)).expect_err("a linked writable anchor");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "checking the key directories of the row-attestation seal lock {}",
+                    lock.display()
+                ),
+                "{name} / anchor link"
+            );
+            assert_eq!(
+                std::fs::read_dir(open.join(SEAL_DIR))
+                    .expect("list")
+                    .count(),
+                0,
+                "{name} / anchor link: nothing written behind the link"
+            );
+        }
+    }
+
+    /// The inode and modification time of the file at `path`.
+    #[cfg(unix)]
+    fn stamp_10206(path: &Path) -> (u64, std::time::SystemTime) {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(path).expect("stat the seal");
+        (meta.ino(), meta.modified().expect("mtime"))
+    }
+
+    /// #10206: an advance with nothing new (an equal record, a lower one, a
+    /// subset of the heads) leaves the seal file as it was: the same inode
+    /// and the same modification time, no rewrite. A real advance still
+    /// writes.
+    #[cfg(unix)]
+    #[test]
+    fn advance_with_nothing_new_writes_nothing_10206() {
+        let scratch = scratch_10193();
+        let seal = scratch.path().join(SEAL_DIR).join("db");
+        let mut full = rec_10205(5, 7);
+        full.heads.insert("leases".to_string(), 3);
+        advance(&seal, &full).expect("first seal");
+        let before = stamp_10206(&seal);
+        let lower = rec_10205(2, 1);
+        let none = SealRecord::default();
+        for (name, rec) in [("equal", &full), ("lower", &lower), ("empty", &none)] {
+            advance(&seal, rec).expect("an advance with nothing new");
+            assert_eq!(stamp_10206(&seal), before, "{name}: the seal was rewritten");
+            assert_eq!(read(&seal), SealState::Sealed(full.clone()), "{name}");
+        }
+        let higher = rec_10205(9, 7);
+        advance(&seal, &higher).expect("a real advance");
+        assert_ne!(stamp_10206(&seal).0, before.0, "a real advance writes");
+        assert_eq!(read(&seal), SealState::Sealed(full.merged(&higher)));
+    }
+
+    /// #10206: [`advance_reporting`] reports `Written` for a first seal and
+    /// for a real advance, and `Unchanged` (with the seal file untouched)
+    /// for an equal, a lower and an empty record.
+    #[cfg(unix)]
+    #[test]
+    fn advance_reports_unchanged_and_written_10206() {
+        let scratch = scratch_10193();
+        let seal = scratch.path().join(SEAL_DIR).join("db");
+        let full = rec_10205(5, 7);
+        assert_eq!(
+            advance_reporting(&seal, &full).expect("first seal"),
+            SealAdvance::Written
+        );
+        let before = stamp_10206(&seal);
+        let lower = rec_10205(2, 1);
+        let none = SealRecord::default();
+        for (name, rec) in [("equal", &full), ("lower", &lower), ("empty", &none)] {
+            assert_eq!(
+                advance_reporting(&seal, rec).expect("an advance with nothing new"),
+                SealAdvance::Unchanged,
+                "{name}"
+            );
+            assert_eq!(stamp_10206(&seal), before, "{name}: the seal was rewritten");
+        }
+        let mut wider = full.clone();
+        wider.heads.insert("leases".to_string(), 1);
+        assert_eq!(
+            advance_reporting(&seal, &wider).expect("a new head"),
+            SealAdvance::Written
+        );
+        assert_ne!(stamp_10206(&seal).0, before.0, "a new head writes");
+        assert_eq!(read(&seal), SealState::Sealed(wider));
+    }
+
+    /// #10206: an advance with nothing new still reads and compares under
+    /// the seal lock. While another holder has the lock it waits; the holder
+    /// lowers the seal (as a restore does) and releases; the advance then
+    /// sees the lowered seal and writes its mark, so no mark is lost.
+    #[cfg(unix)]
+    #[test]
+    fn advance_compares_under_the_seal_lock_10206() {
+        let scratch = scratch_10193();
+        let seal = scratch.path().join(SEAL_DIR).join("db");
+        advance(&seal, &rec_10205(5, 5)).expect("first seal");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_name_10193(&seal))
+            .expect("open the lock file");
+        held.lock().expect("hold the seal lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_seal = seal.clone();
+        let writer = std::thread::spawn(move || {
+            let out = advance(&probe_seal, &rec_10205(5, 5)).map_err(|e| e.to_string());
+            tx.send(out).expect("report");
+        });
+        assert_eq!(
+            rx.recv_timeout(HELD_PROBE_10193),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "an advance with nothing new finished while the seal lock was held"
+        );
+        std::fs::write(&seal, rec_10205(1, 1).render()).expect("lower the seal under the lock");
+        drop(held);
+        assert_eq!(rx.recv_timeout(FREE_BOUND_10193), Ok(Ok(())));
+        writer.join().expect("writer thread");
+        assert_eq!(read(&seal), SealState::Sealed(rec_10205(5, 5)));
     }
 }

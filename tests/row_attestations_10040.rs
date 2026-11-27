@@ -2724,9 +2724,11 @@ fn armed_open_with_an_unreadable_seal_still_refuses_l4() {
         .root
         .join("keys")
         .join(ai_memory::storage::row_attest::seal::SEAL_DIR);
+    // #10193: each seal has a sibling `<seal>.lock` lock file; count seals.
     let files: Vec<PathBuf> = std::fs::read_dir(&seals)
         .expect("seal dir")
         .map(|e| e.expect("seal entry").path())
+        .filter(|p| p.extension().is_none_or(|x| x != "lock"))
         .collect();
     assert_eq!(files.len(), 1, "one seal for the one store: {files:?}");
     std::fs::remove_file(&files[0]).expect("remove the seal");
