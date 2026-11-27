@@ -112,9 +112,9 @@ fn backup_refuses_planted_symlink_rows_8950() {
         (Plant::Directory, At::Manifest),
     ];
     for (plant, at) in rows {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -184,9 +184,9 @@ fn backup_refuses_planted_symlink_rows_8950() {
 /// and is not touched.
 #[test]
 fn backup_refuses_existing_regular_snapshot_8950() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");
@@ -233,9 +233,9 @@ fn backup_refuses_existing_regular_snapshot_8950() {
 /// directory it resolves to, reported durable.
 #[test]
 fn backup_through_symlinked_parent_dir_writes_regular_files_8950() {
-    let _g = crate::store_url::store_url_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store_url_outer_env =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+    let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
     let mut env = TestEnv::fresh();
     let db = env.db_path.clone();
     seed_memory(&db, "ns", "t", "c");

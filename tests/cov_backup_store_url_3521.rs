@@ -16,7 +16,7 @@
 //! test binary rather than in the shared lib test binary whose cases run on
 //! parallel threads. Within THIS binary they are the only writers and
 //! readers of those variables, and they serialise behind the file-local
-//! lock below (the crate-canonical `store_url_env_lock` is `pub(crate)` and
+//! lock below (the crate-canonical `StoreUrlEnvGuard` is `pub(crate)` and
 //! therefore not reachable from an integration test).
 
 use std::sync::{Mutex, PoisonError};

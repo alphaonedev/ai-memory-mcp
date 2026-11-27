@@ -14247,10 +14247,10 @@ decision = "allow"
         // shared store-url env lock and clear the #1927 env vars so a
         // concurrent sibling test can't leak a postgres:// URL into this
         // fallthrough assertion (the pollution race this pins closed).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: env mutation serialised by store_url_env_lock.
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
+        // SAFETY: env mutation serialised by the StoreUrlEnvGuard.
         unsafe {
             std::env::remove_var(STORE_URL_ENV);
             std::env::remove_var(STORE_URL_FILE_ENV);
@@ -14521,9 +14521,9 @@ decision = "allow"
 
     #[tokio::test]
     async fn prb_run_verify_audit_trail_sqlite_paths() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         // SAFETY: the store-url env lock serialises every store-url env test;
         // clearing the channels here makes the argv store-url authoritative.
         unsafe {
@@ -14546,9 +14546,9 @@ decision = "allow"
 
     #[tokio::test]
     async fn prb_run_verify_audit_trail_unrecognised_scheme_errs() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         // SAFETY: serialised by the store-url env lock (see sibling test).
         unsafe {
             std::env::remove_var(STORE_URL_ENV);
@@ -14598,9 +14598,9 @@ decision = "allow"
     #[cfg(feature = "sal-postgres")]
     #[tokio::test]
     async fn prb_run_verify_audit_trail_postgres_dispatch_errs() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         // SAFETY: serialised by the store-url env lock (see sibling tests).
         unsafe {
             std::env::remove_var(STORE_URL_ENV);

@@ -2981,13 +2981,13 @@ mod tests {
     /// refusal (naming the HTTP-daemon remedy, DSN-redacted) on a `postgres://`
     /// store URL, and is byte-transparent (returns the `--db` path unchanged)
     /// when no store URL is configured. In-process env mutation is serialised
-    /// through the shared `store_url_env_lock` (#2146).
+    /// through the shared `StoreUrlEnvGuard` (#2146).
     #[test]
     fn refuse_pg_store_typed_refusal_on_postgres_url_2572() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: env mutation is serialized by `store_url_env_lock`; these keys
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
+        // SAFETY: env mutation is serialized by the `StoreUrlEnvGuard`; these keys
         // are read only by `resolve_store_url`, held for this whole test.
         unsafe {
             std::env::remove_var(crate::store_url::STORE_URL_ENV);
@@ -3040,9 +3040,9 @@ mod tests {
     #[test]
     fn test_backup_happy_path_creates_snapshot_and_manifest() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3077,9 +3077,9 @@ mod tests {
     #[test]
     fn test_backup_json_emits_manifest_with_sha256() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3104,9 +3104,9 @@ mod tests {
     #[test]
     fn test_restore_from_directory_picks_newest() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "before-backup", "stuff");
@@ -3141,9 +3141,9 @@ mod tests {
     #[test]
     fn test_restore_from_explicit_file_path() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3181,9 +3181,9 @@ mod tests {
     #[test]
     fn test_restore_with_skip_verify_succeeds_without_manifest() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3226,9 +3226,9 @@ mod tests {
     #[test]
     fn test_restore_bad_sha256_errors() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3272,9 +3272,9 @@ mod tests {
     #[test]
     fn test_backup_retention_prunes_old_snapshots() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3321,9 +3321,9 @@ mod tests {
     #[test]
     fn backup_refuses_a_postgres_store_url_argument_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3344,9 +3344,9 @@ mod tests {
     #[test]
     fn restore_refuses_a_postgres_store_url_argument_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = RestoreArgs {
@@ -3372,9 +3372,9 @@ mod tests {
     #[test]
     fn backup_refuses_an_unrecognised_store_url_scheme_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3405,9 +3405,9 @@ mod tests {
     #[test]
     fn backup_refuses_to_create_a_missing_source_database_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let missing = db.parent().unwrap().join("never-created-2444.db");
@@ -3433,9 +3433,9 @@ mod tests {
     #[test]
     fn backup_manifest_records_backend_schema_and_memory_count_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3463,9 +3463,9 @@ mod tests {
     #[test]
     fn backup_warns_but_succeeds_on_an_empty_corpus_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         // Bring the database into existence WITHOUT storing any memory.
@@ -3491,9 +3491,9 @@ mod tests {
     #[test]
     fn restore_refuses_a_cross_backend_manifest_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3528,9 +3528,9 @@ mod tests {
     #[test]
     fn restore_refuses_a_forward_schema_snapshot_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3570,9 +3570,9 @@ mod tests {
     #[test]
     fn restore_accepts_a_legacy_manifest_without_the_new_fields_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3621,9 +3621,9 @@ mod tests {
     #[test]
     fn restore_refuses_a_snapshot_that_is_not_an_ai_memory_database_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "survivor", "must not be clobbered");
@@ -3681,9 +3681,9 @@ mod tests {
     #[test]
     fn restore_refuses_a_snapshot_that_is_not_sqlite_at_all_3553() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "survivor", "must not be clobbered");
@@ -3740,9 +3740,9 @@ mod tests {
     #[test]
     fn restore_moves_the_wal_and_shm_sidecars_aside_2444() {
         // #2970 — serialize the process-global store-url env read (resolve_store_url).
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -3803,9 +3803,9 @@ mod tests {
     /// leave the target byte-for-byte as it was.
     #[test]
     fn restore_refuses_a_locked_target_and_leaves_it_intact_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "live-row", "must survive");
@@ -3860,9 +3860,9 @@ mod tests {
     /// catches — and the live database must still be the original.
     #[test]
     fn restore_refuses_an_integrity_check_failure_and_leaves_the_original_intact_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "live-row", "must survive");
@@ -3912,9 +3912,9 @@ mod tests {
     /// and the rollback path is printed (and surfaced in `--json`).
     #[test]
     fn restore_publishes_identical_bytes_and_leaves_a_rollback_copy_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "in-the-snapshot", "a");
@@ -3969,9 +3969,9 @@ mod tests {
     /// to guess the filename.
     #[test]
     fn restore_json_reports_the_rollback_path_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -4004,9 +4004,9 @@ mod tests {
     /// prompt (it would corrupt the envelope), so it REQUIRES `--yes`.
     #[test]
     fn restore_json_without_yes_is_refused_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -4100,9 +4100,9 @@ mod tests {
     /// not leave a restore-tmp artefact (consent-first, Fable gate).
     #[test]
     fn restore_json_without_yes_leaves_no_restore_tmp_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -4146,9 +4146,9 @@ mod tests {
     /// the verification after the swap.
     #[test]
     fn stage_and_verify_refuses_a_damaged_file_without_publishing_it_3131() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
@@ -4187,9 +4187,9 @@ mod tests {
     /// the primary gate fire instead — and the file is refused either way.
     #[test]
     fn stage_and_verify_refuses_pages_integrity_check_no_longer_reports_3508() {
-        let _g = crate::store_url::store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store_url_outer_env =
+            crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard::acquire();
+        let _g = crate::store_url::StoreUrlEnvGuard::acquire(&store_url_outer_env);
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         seed_memory(&db, "ns", "t", "c");
