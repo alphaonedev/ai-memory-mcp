@@ -100,9 +100,11 @@ const ALLOWED: &[(&str, Needle, usize)] = &[
     ("src/governance/deferred_audit.rs", Needle::ChainWrite, 6),
     ("src/portability/import.rs", Needle::MarkerType, 1),
     ("src/portability/import.rs", Needle::ChainWrite, 1),
-    ("src/signed_events.rs", Needle::MarkerType, 11),
+    // #10145 W-10: +2 for the chain-level CutoverMarkerMissing failure.
+    ("src/signed_events.rs", Needle::MarkerType, 13),
     ("src/signed_events.rs", Needle::ChainWrite, 11),
-    ("src/signed_events/agent_cutover.rs", Needle::MarkerType, 26),
+    // #10145 W-10: +4 for Missing, chain_failure and without_marker.
+    ("src/signed_events/agent_cutover.rs", Needle::MarkerType, 30),
     (
         "src/signed_events/agent_cutover.rs",
         Needle::SignedBuilder,

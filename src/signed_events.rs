@@ -1101,6 +1101,10 @@ fn recompute_signed_row_hash_at(conn: &Connection, sequence: i64) -> Result<Opti
     }))
 }
 
+/// #10145 — the sequence a chain-level failure (one no row carries, such as a
+/// missing cutover marker) is reported at. No chain row has sequence 0.
+pub const CHAIN_LEVEL_FAILURE_SEQUENCE: i64 = 0;
+
 /// Outcome of a [`verify_chain`] pass over the `signed_events` table.
 ///
 /// `rows_checked` counts every row the verifier walked.
@@ -1286,6 +1290,10 @@ pub enum SignatureFailure {
     /// #10108 (B-5, S-3) — a `signed_events.agent_cutover` row whose recompute
     /// did not match, or one of two or more such rows.
     CutoverMarkerInvalid,
+    /// #10145 (W-10, W-11) — the database is at schema v103 or above but
+    /// holds no cutover marker (removed, or the chain wiped). A chain-level
+    /// failure, reported at sequence 0 on every walk; never repaired.
+    CutoverMarkerMissing,
     /// #10108 (S-5, S-3 residual, B-5) — an agent-labelled (or unsigned
     /// agent-kind) row ABOVE a valid cutover marker: a binary that predates
     /// the cutover wrote the old form after it. Never merged with a legacy
@@ -1318,6 +1326,7 @@ impl SignatureFailure {
             Self::AgentSignatureMissing => "agent_signature_missing",
             Self::AgentSignatureMalformed => "agent_signature_malformed",
             Self::CutoverMarkerInvalid => "agent_cutover_marker_invalid",
+            Self::CutoverMarkerMissing => "agent_cutover_marker_missing",
             Self::PreCutoverWriter => "agent_pre_cutover_writer",
             Self::AgentEraUnresolvable => "agent_era_unresolvable",
             Self::DomainRowMissing => "agent_domain_row_missing",
@@ -1371,6 +1380,7 @@ impl RowSignatureVerdict {
                     | SignatureFailure::AgentSignatureMissing
                     | SignatureFailure::AgentSignatureMalformed
                     | SignatureFailure::CutoverMarkerInvalid
+                    | SignatureFailure::CutoverMarkerMissing
                     | SignatureFailure::PreCutoverWriter
                     | SignatureFailure::AgentEraUnresolvable
                     | SignatureFailure::DomainRowMissing
@@ -1408,6 +1418,7 @@ impl RowSignatureVerdict {
             RowSignatureVerdict::Failed(
                 f @ (SignatureFailure::AgentSignatureMissing
                 | SignatureFailure::AgentSignatureMalformed
+                | SignatureFailure::CutoverMarkerMissing
                 | SignatureFailure::PreCutoverWriter
                 | SignatureFailure::AgentEraUnresolvable
                 | SignatureFailure::DomainRowMissing
@@ -1776,6 +1787,12 @@ pub fn verify_chain(
         prev_canonical_hash.copy_from_slice(&hasher.finalize());
 
         expected_seq += 1;
+    }
+    // #10145 (W-10, W-11) — a v103 database without its marker fails every
+    // walk, whatever window it covers; no row carries the failure.
+    if let Some(f) = agent_cutover.chain_failure() {
+        signature_failures.push(CHAIN_LEVEL_FAILURE_SEQUENCE);
+        agent_signature_defects.push((CHAIN_LEVEL_FAILURE_SEQUENCE, f));
     }
 
     Ok(ChainVerificationReport {

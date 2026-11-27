@@ -275,9 +275,10 @@ pub enum RowEra {
 
 impl RowEra {
     /// The era of the chain row at `sequence` under the resolved cutover.
-    /// No marker: every row is [`PayloadEra::Legacy`] (whether a missing
-    /// marker at schema v103 is itself a failure is the walk's B-5 check,
-    /// not the era's). A valid marker: rows below it are legacy, the marker
+    /// No marker below v103 ([`AgentCutover::Absent`]): every row is
+    /// [`PayloadEra::Legacy`]. A missing marker at v103 or above
+    /// ([`AgentCutover::Missing`], #10145) is [`RowEra::Unresolvable`] for
+    /// every position, and the walk also fails it at chain level. A valid marker: rows below it are legacy, the marker
     /// position is [`RowEra::Marker`], rows above it are
     /// [`PayloadEra::Signed`]. An invalid marker: [`RowEra::Unresolvable`]
     /// for every position.
@@ -292,7 +293,7 @@ impl RowEra {
                 Ordering::Equal => Self::Marker,
                 Ordering::Greater => Self::Era(PayloadEra::Signed),
             },
-            AgentCutover::Invalid => Self::Unresolvable,
+            AgentCutover::Invalid | AgentCutover::Missing => Self::Unresolvable,
         }
     }
 }

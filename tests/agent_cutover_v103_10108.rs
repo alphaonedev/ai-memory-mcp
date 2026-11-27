@@ -752,6 +752,11 @@ fn a_markerless_v103_database_fails_and_is_never_repaired_10145() {
     assert!(markers(&conn).is_empty(), "the open wrote no marker");
     let resolved = resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve");
     assert_ne!(resolved, AgentCutover::Absent, "never read as before v103");
+    assert_eq!(resolved, AgentCutover::Missing);
+    assert_eq!(
+        resolved.chain_failure().map(SignatureFailure::reason),
+        Some(MARKER_MISSING_REASON)
+    );
     assert_eq!(missing_report(&conn), missing_expected());
     let vk = sink();
     let windowed = verify_chain(&conn, Some(1), Some(&vk)).expect("windowed walk");

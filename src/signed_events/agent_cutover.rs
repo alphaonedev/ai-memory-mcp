@@ -288,6 +288,12 @@ pub enum AgentCutover {
     /// A marker-type row exists but the database holds more than one, or the
     /// recompute did not match. Every marker-type row then fails.
     Invalid,
+    /// #10145 (W-10, W-11) — no marker row, but the database is at
+    /// [`AGENT_CUTOVER_SCHEMA_VERSION`] or above: the marker was removed or
+    /// the chain wiped. Never read as [`Self::Absent`]; every walk fails with
+    /// [`SignatureFailure::CutoverMarkerMissing`] and every agent row's era is
+    /// unresolvable. Nothing repairs it.
+    Missing,
 }
 
 impl AgentCutover {
@@ -304,7 +310,7 @@ impl AgentCutover {
             Self::Valid { sequence, .. } if sequence == event.sequence => {
                 RowSignatureVerdict::Verified
             }
-            Self::Valid { .. } | Self::Absent | Self::Invalid => {
+            Self::Valid { .. } | Self::Absent | Self::Invalid | Self::Missing => {
                 RowSignatureVerdict::Failed(SignatureFailure::CutoverMarkerInvalid)
             }
         })
@@ -315,10 +321,35 @@ impl AgentCutover {
     pub fn sequence(self) -> Option<i64> {
         match self {
             Self::Valid { sequence, .. } => Some(sequence),
-            Self::Absent | Self::Invalid => None,
+            Self::Absent | Self::Invalid | Self::Missing => None,
+        }
+    }
+
+    /// #10145 — the chain-level failure this cutover puts on every walk,
+    /// whatever window it covers: a missing marker on a v103 database.
+    #[must_use]
+    pub fn chain_failure(self) -> Option<SignatureFailure> {
+        match self {
+            Self::Missing => Some(SignatureFailure::CutoverMarkerMissing),
+            Self::Absent | Self::Valid { .. } | Self::Invalid => None,
+        }
+    }
+
+    /// #10145 — the cutover when no marker row exists: [`Self::Absent`] below
+    /// [`AGENT_CUTOVER_SCHEMA_VERSION`], else [`Self::Missing`].
+    #[must_use]
+    pub fn without_marker(schema_version: i64) -> Self {
+        if schema_version >= AGENT_CUTOVER_SCHEMA_VERSION {
+            Self::Missing
+        } else {
+            Self::Absent
         }
     }
 }
+
+/// #10145 — the schema version whose migration writes the cutover marker. A
+/// database at or above it without a marker is [`AgentCutover::Missing`].
+pub const AGENT_CUTOVER_SCHEMA_VERSION: i64 = 103;
 
 /// #10108 — judge the marker. `markers` are the marker-type rows in ascending
 /// sequence (at most [`AGENT_CUTOVER_ROW_LIMIT`]); `prev` is the row directly
@@ -412,7 +443,16 @@ pub fn resolve_sqlite_agent_cutover(
         .collect::<rusqlite::Result<_>>()
         .context("agent cutover: collect")?;
     let Some(first) = markers.first() else {
-        return Ok(AgentCutover::Absent);
+        // #10145 (W-10, W-11) — no marker: decided by the schema version, so
+        // a removed marker or a wiped chain is never read as before v103.
+        let schema_version: i64 = conn
+            .query_row(
+                crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
+                [],
+                |r| r.get(0),
+            )
+            .context("agent cutover: schema version")?;
+        return Ok(AgentCutover::without_marker(schema_version));
     };
     let below = first.sequence;
     let prev = sqlite_row_below(conn, below)?;
