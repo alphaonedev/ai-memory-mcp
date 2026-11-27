@@ -1478,6 +1478,28 @@ mod tests {
                 assert!(outcome.resumed_from_committed_db);
             }
             fx.verify_clean();
+            let entries: Vec<String> = fs::read_dir(&fx.anchor_dir)
+                .expect("read anchor dir")
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let archives: Vec<_> = entries
+                .iter()
+                .filter(|n| n.starts_with(&format!("{agent}.pub.")))
+                .collect();
+            assert_eq!(
+                archives.len(),
+                1,
+                "{label}: expected 1 archive, got {archives:?}"
+            );
+            assert!(
+                !entries.iter().any(|n| n.starts_with(".recover-")),
+                "{label}: leftover temp file in {entries:?}"
+            );
+            assert!(
+                !entries.iter().any(|n| n.starts_with(&staged_label)),
+                "{label}: staged sibling not cleaned up in {entries:?}"
+            );
             {
                 let conn = db::open(&fx.db_path).expect("open replay");
                 let err = recovery_preconditions(
