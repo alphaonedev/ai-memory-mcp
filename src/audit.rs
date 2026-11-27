@@ -2186,6 +2186,8 @@ fn mark_append_only(_path: &Path) -> Result<()> {
 // Tests.
 // ---------------------------------------------------------------------------
 
+#[cfg(all(test, unix))]
+mod seq_mark_dir_sync_10214_tests;
 #[cfg(test)]
 mod tail_loss_4086_tests;
 

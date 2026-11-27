@@ -163,12 +163,47 @@ pub(crate) mod seam {
         Linked,
     }
 
+    /// #10214 — the steps of a durable replace a test can fail: the staged
+    /// file's fsync, the rename over the destination, and the fsync of the
+    /// destination's directory.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Step {
+        FileSync,
+        Rename,
+        DirSync,
+    }
+
     type Hook = Box<dyn FnMut(Point, &Path)>;
 
     thread_local! {
         static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
         static LINK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static LINK_CALLS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static STEP_ERRNO: Cell<Option<(Step, i32)>> = const { Cell::new(None) };
+        static DIR_SYNCS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Fail every later `step` of this thread with `errno` (#10214).
+    pub(crate) fn inject_step_errno(step: Step, errno: i32) {
+        STEP_ERRNO.with(|e| e.set(Some((step, errno))));
+    }
+
+    /// The directories fsynced so far on this thread (and forget them).
+    pub(crate) fn take_dir_syncs() -> Vec<PathBuf> {
+        DIR_SYNCS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    /// Record `step` at `path` and return the injected failure, if any.
+    pub(crate) fn on_step(step: Step, path: &Path) -> Option<std::io::Error> {
+        if step == Step::DirSync {
+            DIR_SYNCS.with(|c| c.borrow_mut().push(path.to_path_buf()));
+        }
+        match STEP_ERRNO.with(Cell::get) {
+            Some((failing, errno)) if failing == step => {
+                Some(std::io::Error::from_raw_os_error(errno))
+            }
+            _ => None,
+        }
     }
 
     /// Run `hook(point, dest)` at every [`fire`] of this thread.
@@ -191,6 +226,8 @@ pub(crate) mod seam {
         HOOK.with(|h| h.borrow_mut().take());
         inject_link_errno(None);
         drop(take_link_calls());
+        STEP_ERRNO.with(|e| e.set(None));
+        drop(take_dir_syncs());
     }
 
     pub(crate) fn fire(point: Point, dest: &Path) {

@@ -24701,6 +24701,8 @@ mod governance_read_fault_4043_tests;
 #[cfg(test)]
 mod migrations_attested_fixture_tests;
 #[cfg(all(test, unix))]
+mod snapshot_dir_sync_10214_tests;
+#[cfg(all(test, unix))]
 mod snapshot_mode_8679_tests;
 #[cfg(all(test, unix))]
 mod snapshot_nofollow_8950_r1_tests;
