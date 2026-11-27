@@ -784,36 +784,7 @@ fn succeed(
 ) -> Result<()> {
     let id = resolve_lineage_id(explicit_agent_id)?;
     let conn = crate::db::open(db_path)?;
-    // #10118: check the three lineage preconditions via the one shared
-    // function BEFORE rotate_with_succession or arm_with_key so every refusal
-    // preserves the exact canonical order and message without arming or
-    // touching disk.
-    let preloaded = keypair::load(&id, dir)?;
-    let _prechecked = crate::db::succession_preconditions(&conn, &id, &preloaded)?;
-    let recorded: std::cell::RefCell<Option<crate::identity::lineage::LineageRecord>> =
-        std::cell::RefCell::new(None);
-    // Sign-then-rotate seam: the succession is signed by K_old and
-    // durably persisted (body + pubkey sync + witness, one tx) BEFORE
-    // `save` destroys K_old on disk.
-    let outcome = keypair::rotate_with_succession(&id, dir, |k_old, k_new| {
-        // #10118 / #10089: re-verify on the exact `k_old` loaded for rotation
-        // (eliminating TOCTOU) and require the `SuccessionChecked` proof to
-        // supply the signing key to `arm_with_key` and `append_succession_checked`.
-        let checked = crate::db::succession_preconditions(&conn, &id, k_old)?;
-        crate::storage::row_attest::sqlite::arm_with_key(
-            &conn,
-            checked.agent_id(),
-            checked.signing_key(),
-        )
-        .context("succession: row attestation could not be armed with K_old (#10089)")?;
-        let record =
-            crate::db::append_succession_checked(&conn, checked, &k_new.public_base64(), None)?;
-        recorded.replace(Some(record));
-        Ok(())
-    })?;
-    let record = recorded
-        .into_inner()
-        .context("succession closure did not run")?;
+    let (outcome, record) = succeed_on_conn(&conn, dir, &id)?;
     if json_out {
         writeln!(
             out.stdout,
@@ -842,6 +813,63 @@ fn succeed(
     Ok(())
 }
 
+fn succeed_on_conn(
+    conn: &rusqlite::Connection,
+    dir: &Path,
+    id: &str,
+) -> Result<(
+    keypair::RotateOutcome,
+    crate::identity::lineage::LineageRecord,
+)> {
+    succeed_on_conn_with_hook(conn, dir, id, |_| Ok(()))
+}
+
+fn succeed_on_conn_with_hook(
+    conn: &rusqlite::Connection,
+    dir: &Path,
+    id: &str,
+    after_arm_hook: impl FnOnce(&rusqlite::Connection) -> Result<()>,
+) -> Result<(
+    keypair::RotateOutcome,
+    crate::identity::lineage::LineageRecord,
+)> {
+    // #10118: fast-fail check BEFORE rotating on disk so a non-racing refusal
+    // preserves the exact canonical order and message without touching disk.
+    let preloaded = keypair::load(id, dir)?;
+    let _prechecked = crate::db::succession_preconditions(conn, id, &preloaded)?;
+    let recorded: std::cell::RefCell<Option<crate::identity::lineage::LineageRecord>> =
+        std::cell::RefCell::new(None);
+    let mut hook_slot = Some(after_arm_hook);
+    // Sign-then-rotate seam: the succession is checked, armed, signed by K_old,
+    // and durably persisted in ONE IMMEDIATE transaction BEFORE `save`
+    // replaces K_old on disk (#10141).
+    let outcome = keypair::rotate_with_succession(id, dir, |k_old, k_new| {
+        // #10141: open the IMMEDIATE WriteTxn FIRST, then validate
+        // preconditions, arm via `TxnArmed`, and append — ALL inside one
+        // atomic unit. Any refusal, error, or panic drops `TxnArmed`, rolling
+        // back cutovers + writes and disarming `conn`.
+        let txn = crate::storage::connection::WriteTxn::begin(conn)
+            .context("succession: begin write transaction (#10141)")?;
+        let checked = crate::db::succession_preconditions_in_tx(&txn, id, k_old)?;
+        let armed = crate::storage::row_attest::sqlite::TxnArmed::arm_for_succession(txn, &checked)
+            .context("succession: row attestation could not be armed with K_old (#10089)")?;
+        if let Some(hook) = hook_slot.take() {
+            hook(armed.conn())?;
+        }
+        let record =
+            crate::db::append_succession_in_tx(armed.txn(), checked, &k_new.public_base64(), None)?;
+        armed
+            .commit()
+            .context("succession: commit transaction (#10141)")?;
+        recorded.replace(Some(record));
+        Ok(())
+    })?;
+    let record = recorded
+        .into_inner()
+        .context("succession closure did not run")?;
+    Ok((outcome, record))
+}
+
 fn register_recovery_key(
     db_path: &Path,
     dir: &Path,
@@ -856,14 +884,18 @@ fn register_recovery_key(
     let conn = crate::db::open(db_path)?;
     // Self-succession: the head key re-signs itself carrying the new
     // recovery commitment — the head does not change, the epoch does.
-    // #10118: validate via the one shared `succession_preconditions` proof.
-    let checked = crate::db::succession_preconditions(&conn, &id, &kp)?;
-    let record = crate::db::append_succession_checked(
-        &conn,
+    // #10118 / #10141: validate and append inside ONE IMMEDIATE WriteTxn.
+    let txn = crate::storage::connection::WriteTxn::begin(&conn)
+        .context("register_recovery_key: begin write transaction (#10141)")?;
+    let checked = crate::db::succession_preconditions_in_tx(&txn, &id, &kp)?;
+    let record = crate::db::append_succession_in_tx(
+        &txn,
         checked,
         &kp.public_base64(),
         Some(recovery_pubkey),
     )?;
+    txn.commit()
+        .context("register_recovery_key: commit transaction (#10141)")?;
     if json_out {
         writeln!(
             out.stdout,
@@ -2125,7 +2157,7 @@ mod tests {
         use crate::storage::row_attest::Outcome;
         use crate::storage::row_attest::anchor::TrustAnchor;
         use crate::storage::row_attest::sqlite::{
-            REFUSE_RECOVERY_MISSING_PRIV, arm_with_key, verify_sqlite_with,
+            REFUSE_RECOVERY_MISSING_PRIV, TxnArmed, verify_sqlite_with,
         };
 
         const ROLE_ENV: &str = "AI_MEMORY_TEST_RECOVER_10112_ROLE";
@@ -2232,12 +2264,14 @@ mod tests {
         // Arm the store with K_old and write an attested pre-recovery memory row.
         let pre_mem_id = {
             let conn = crate::db::open(&db_path).unwrap();
-            arm_with_key(&conn, agent, k_old.private.as_ref().unwrap()).unwrap();
+            let txn = crate::storage::connection::WriteTxn::begin(&conn).unwrap();
+            let armed = TxnArmed::arm_in_tx(txn, agent, k_old.private.as_ref().unwrap()).unwrap();
             let mut mem = crate::models::Memory::default();
             mem.namespace = "recovery-10112".to_string();
             mem.title = "pre-recovery-row".to_string();
             mem.content = "signed under K_old before loss".to_string();
-            crate::db::insert(&conn, &mem).unwrap();
+            crate::db::insert(armed.conn(), &mem).unwrap();
+            armed.commit().unwrap();
             let anchor = TrustAnchor::load_dir(&dir_path);
             let pre_report = verify_sqlite_with(&conn, &anchor).unwrap();
             assert!(
@@ -3053,14 +3087,16 @@ mod tests {
         }
         {
             let conn = crate::db::open(&db_path).unwrap();
-            crate::storage::row_attest::sqlite::arm_with_key(
-                &conn,
+            let txn = crate::storage::connection::WriteTxn::begin(&conn).unwrap();
+            let armed = crate::storage::row_attest::sqlite::TxnArmed::arm_in_tx(
+                txn,
                 "alice",
                 k0.private.as_ref().unwrap(),
             )
             .expect("arm connection with K0");
-            crate::db::register_agent(&conn, "alice-signed-row-10110", "ai:test", &[])
+            crate::db::register_agent(armed.conn(), "alice-signed-row-10110", "ai:test", &[])
                 .expect("write attested row under K0");
+            armed.commit().expect("commit armed K0 write");
             let anchor = crate::storage::row_attest::anchor::TrustAnchor::load_dir(&dir_path);
             let report =
                 crate::storage::row_attest::sqlite::verify_sqlite_with(&conn, &anchor).unwrap();
@@ -3311,5 +3347,418 @@ mod tests {
         );
         assert_eq!(std::fs::read(&orphan_priv).unwrap(), other_priv_bytes);
         assert!(!bad_pub.exists());
+    }
+
+    fn count_ra10040_temp_triggers(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_temp_master \
+             WHERE type = 'trigger' AND name LIKE 'ra10040_%'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count ra10040 temp triggers")
+    }
+
+    fn attest_fn_is_registered(conn: &rusqlite::Connection) -> bool {
+        let sql = format!("SELECT {}()", crate::storage::row_attest::sqlite::ATTEST_FN);
+        match conn.query_row(&sql, [], |_| Ok(())) {
+            Ok(()) => true,
+            Err(err) => !err.to_string().contains("no such function"),
+        }
+    }
+
+    /// #10141 — source ratchet: production code outside
+    /// `src/storage/row_attest/sqlite.rs` MUST NOT invoke unwrapped arming
+    /// functions (`arm_with_key`, `arm_for_recovery_in_tx`, `row_attest::sqlite::arm`,
+    /// `row_attest::sqlite::register`, or `create_scalar_function(ATTEST_FN`).
+    /// Every production key-transition arming call must go through `TxnArmed`.
+    #[test]
+    fn source_ratchet_no_unwrapped_arming_calls_10141() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src_root = manifest_dir.join("src");
+        let allow_file = src_root.join("storage/row_attest/sqlite.rs");
+
+        let forbidden = [
+            "arm_with_key(",
+            "arm_for_recovery_in_tx(",
+            "row_attest::sqlite::arm(",
+            "row_attest::sqlite::register(",
+            "create_scalar_function(ATTEST_FN",
+        ];
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(&src_root, &mut files);
+        files.sort();
+
+        let mut violations = Vec::new();
+        for path in files {
+            if path == allow_file {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).expect("read src file");
+            let lines: Vec<&str> = content.lines().collect();
+            let mut in_cfg_test_mod = false;
+            for (idx, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if trimmed == "#[cfg(test)]"
+                    && lines
+                        .get(idx + 1)
+                        .is_some_and(|next| next.trim().starts_with("mod "))
+                {
+                    in_cfg_test_mod = true;
+                }
+                if in_cfg_test_mod {
+                    continue;
+                }
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for pat in forbidden {
+                    if trimmed.contains(pat) {
+                        violations.push(format!(
+                            "{}:{}: forbidden unwrapped arming call `{pat}`: {trimmed}",
+                            path.strip_prefix(manifest_dir).unwrap_or(&path).display(),
+                            idx + 1,
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "production code contains unwrapped row-attestation arming calls outside TxnArmed:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// #10141 — deterministic two-connection race on the `identity succeed`
+    /// check-arm-append path (no sleeps; `busy_handler` + `Barrier`): when
+    /// conn A commits K0 -> K1_A while conn B races, conn B MUST receive the
+    /// exact `SUCCESSION_ERR_NOT_HEAD` refusal, its connection MUST NOT be left
+    /// armed afterwards (zero `ra10040_*` temp triggers and `ATTEST_FN` not
+    /// registered), signed attestations and the anchor seal MUST be unchanged,
+    /// and no extra lineage row may be written.
+    #[test]
+    fn succeed_two_conn_race_refuses_not_head_and_leaves_conn_unarmed_10141() {
+        use std::sync::{Arc, Barrier};
+
+        let (env, dir_a) = fresh_env();
+        let dir_a_path = dir_a.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        let agent = "succeed-race-10141";
+
+        let _env_lock = crate::test_support::env_lock();
+        let _key_dir_guard = crate::test_support::EnvGuard::capture("AI_MEMORY_KEY_DIR");
+        _key_dir_guard.set(dir_a_path.to_str().unwrap());
+
+        let k0 = keypair::generate(agent).unwrap();
+        keypair::save(&k0, &dir_a_path).unwrap();
+        let cold = keypair::generate("cold-10141").unwrap();
+        let conn_a = crate::db::open(&db_path).unwrap();
+        crate::db::register_agent(&conn_a, agent, "ai:test", &[]).unwrap();
+        crate::db::enroll_lineage(&conn_a, agent, &k0, Some(&cold.public_base64())).unwrap();
+
+        // Separate key dir for process B holding the same K0.
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let dir_b = builder.tempdir().unwrap();
+        keypair::save(&k0, dir_b.path()).unwrap();
+
+        let signed_before = signed_attestation_count(&db_path);
+        let seal_before = seal_state_for(&db_path);
+        assert_eq!(signed_before, 0);
+        assert_eq!(
+            seal_before,
+            crate::storage::row_attest::seal::SealState::NotSealed
+        );
+
+        let k1_a = keypair::generate(agent).unwrap();
+        let entered_busy = Arc::new(Barrier::new(2));
+        let a_committed = Arc::new(Barrier::new(2));
+        let conn_b = crate::db::open(&db_path).unwrap();
+
+        conn_a.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let dir_b_path = dir_b.path().to_path_buf();
+        let entered_busy_b = Arc::clone(&entered_busy);
+        let a_committed_b = Arc::clone(&a_committed);
+
+        let handle_b = std::thread::spawn(move || {
+            thread_local! {
+                static RACE_BARRIERS: std::cell::RefCell<
+                    Option<(Arc<Barrier>, Arc<Barrier>)>,
+                > = const { std::cell::RefCell::new(None) };
+            }
+            fn race_busy_handler(_retries: i32) -> bool {
+                RACE_BARRIERS.with(|slot| {
+                    if let Some((entered, committed)) = slot.borrow_mut().take() {
+                        entered.wait();
+                        committed.wait();
+                    }
+                });
+                true
+            }
+            RACE_BARRIERS.with(|slot| {
+                *slot.borrow_mut() = Some((entered_busy_b, a_committed_b));
+            });
+            conn_b.busy_handler(Some(race_busy_handler)).unwrap();
+
+            // Run the real production `succeed_on_conn` path on `conn_b`.
+            let res = succeed_on_conn(&conn_b, &dir_b_path, agent).map(|_| ());
+            let triggers_after = count_ra10040_temp_triggers(&conn_b);
+            let fn_after = attest_fn_is_registered(&conn_b);
+            (res, triggers_after, fn_after)
+        });
+
+        entered_busy.wait();
+        conn_a.execute_batch("ROLLBACK").unwrap();
+        let rec_a =
+            crate::db::append_succession(&conn_a, agent, &k0, &k1_a.public_base64(), None).unwrap();
+        assert_eq!(rec_a.epoch, 1);
+        a_committed.wait();
+
+        let (res_b, triggers_after, fn_after) = handle_b.join().unwrap();
+        let err_b = res_b.expect_err("conn_b must lose succession race");
+        let msg = format!("{err_b:#}");
+        assert!(
+            msg.contains(crate::db::SUCCESSION_ERR_NOT_HEAD),
+            "conn_b must receive exact SUCCESSION_ERR_NOT_HEAD, got: {msg}"
+        );
+        assert_eq!(
+            triggers_after, 0,
+            "conn_b must have zero ra10040 temp triggers after refused succession"
+        );
+        assert!(
+            !fn_after,
+            "conn_b must not retain ATTEST_FN registration after refused succession"
+        );
+        assert_eq!(
+            signed_attestation_count(&db_path),
+            signed_before,
+            "signed attestation count must be unchanged after refused race"
+        );
+        assert_eq!(
+            seal_state_for(&db_path),
+            seal_before,
+            "anchor seal must be unchanged after refused race"
+        );
+        assert_eq!(lineage_row_count(&db_path, agent), 2);
+        assert_eq!(
+            head_summary(&db_path, agent),
+            Some((1, k1_a.public_base64()))
+        );
+        assert_eq!(
+            keypair::load(agent, dir_b.path())
+                .unwrap()
+                .public
+                .to_bytes(),
+            k0.public.to_bytes(),
+            "dir_b keypair must remain K0 on refusal"
+        );
+    }
+
+    /// #10141 — every early-return, refusal, error, and panic path AFTER
+    /// `TxnArmed` arms the connection MUST roll back all writes & cutovers,
+    /// leave the anchor seal untouched, and disarm/reconcile `conn`:
+    /// (a) unarmed store + injected error after arm -> 0 temp triggers,
+    ///     `ATTEST_FN` absent, 0 signed cutovers, `NotSealed`;
+    /// (b) already-armed store (no session signer) + injected error after arm
+    ///     -> `Fixed(K_old)` disarmed and restored to `ArmState::Refusing`
+    ///     (subsequent write refused with `REFUSE_NO_SIGNER`);
+    /// (c) invalid successor/recovery key refusal after arm -> rolled back &
+    ///     disarmed;
+    /// (d) panic unwind (`catch_unwind`) after arm -> `TxnArmed::Drop` rolls
+    ///     back & disarms cleanly without aborting;
+    /// (e) `TxnArmed` guard contract (standing order): dropping without commit
+    ///     rolls back & disarms; committing advances seal & strips `Fixed` so
+    ///     a subsequent write without a session signer refuses with
+    ///     `REFUSE_NO_SIGNER`.
+    #[test]
+    fn succeed_early_return_error_panic_and_guard_contract_10141() {
+        let (env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        let agent = "early-return-10141";
+
+        let _env_lock = crate::test_support::env_lock();
+        let _key_dir_guard = crate::test_support::EnvGuard::capture("AI_MEMORY_KEY_DIR");
+        _key_dir_guard.set(dir_path.to_str().unwrap());
+
+        let k0 = keypair::generate(agent).unwrap();
+        keypair::save(&k0, &dir_path).unwrap();
+        let cold = keypair::generate("cold-er-10141").unwrap();
+        let conn = crate::db::open(&db_path).unwrap();
+        crate::db::register_agent(&conn, agent, "ai:test", &[]).unwrap();
+        crate::db::enroll_lineage(&conn, agent, &k0, Some(&cold.public_base64())).unwrap();
+
+        // (a) Unarmed store: injected error after arming inside `succeed_on_conn_with_hook`.
+        let err = succeed_on_conn_with_hook(&conn, &dir_path, agent, |tx_conn| {
+            // Confirm conn IS armed while inside the open WriteTxn!
+            assert!(
+                count_ra10040_temp_triggers(tx_conn) > 0,
+                "triggers must be active inside TxnArmed"
+            );
+            assert!(attest_fn_is_registered(tx_conn));
+            anyhow::bail!("injected early error after arm (#10141)")
+        })
+        .expect_err("injected error must propagate");
+        assert!(
+            format!("{err:#}").contains("injected early error after arm"),
+            "got: {err:#}"
+        );
+        assert_eq!(
+            count_ra10040_temp_triggers(&conn),
+            0,
+            "(a) unarmed conn must have 0 temp triggers after error rollback"
+        );
+        assert!(
+            !attest_fn_is_registered(&conn),
+            "(a) unarmed conn must not retain ATTEST_FN after error rollback"
+        );
+        assert_eq!(signed_attestation_count(&db_path), 0);
+        assert_eq!(
+            seal_state_for(&db_path),
+            crate::storage::row_attest::seal::SealState::NotSealed
+        );
+        assert_eq!(lineage_row_count(&db_path, agent), 1);
+        assert_eq!(
+            keypair::load(agent, &dir_path).unwrap().public.to_bytes(),
+            k0.public.to_bytes()
+        );
+
+        // (c) Refusal inside `append_succession_in_tx` (bad successor / bad recovery key)
+        // after `TxnArmed::arm_for_succession` armed `conn`.
+        for (succ, rec, label) in [
+            ("not-valid-base64!!!", None, "invalid successor"),
+            (
+                &k0.public_base64(),
+                Some("not-valid-rec!!!"),
+                "invalid recovery",
+            ),
+        ] {
+            let txn = crate::storage::connection::WriteTxn::begin(&conn).unwrap();
+            let checked = crate::db::succession_preconditions_in_tx(&txn, agent, &k0).unwrap();
+            let armed =
+                crate::storage::row_attest::sqlite::TxnArmed::arm_for_succession(txn, &checked)
+                    .unwrap();
+            let res = crate::db::append_succession_in_tx(armed.txn(), checked, succ, rec);
+            assert!(res.is_err(), "(c) {label} must refuse");
+            drop(armed);
+            assert_eq!(
+                count_ra10040_temp_triggers(&conn),
+                0,
+                "(c) {label} drop must remove all temp triggers"
+            );
+            assert!(
+                !attest_fn_is_registered(&conn),
+                "(c) {label} drop must unregister ATTEST_FN"
+            );
+            assert_eq!(signed_attestation_count(&db_path), 0);
+            assert_eq!(
+                seal_state_for(&db_path),
+                crate::storage::row_attest::seal::SealState::NotSealed
+            );
+        }
+
+        // (d) Panic unwind after arming inside `succeed_on_conn_with_hook`.
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = succeed_on_conn_with_hook(&conn, &dir_path, agent, |_tx_conn| {
+                panic!("simulated panic after TxnArmed (#10141)");
+            });
+        }));
+        assert!(panic_res.is_err(), "(d) panic must unwind");
+        assert!(
+            conn.is_autocommit(),
+            "(d) panic unwind must roll back WriteTxn back to autocommit"
+        );
+        assert_eq!(
+            count_ra10040_temp_triggers(&conn),
+            0,
+            "(d) panic unwind must remove temp triggers"
+        );
+        assert!(
+            !attest_fn_is_registered(&conn),
+            "(d) panic unwind must unregister ATTEST_FN"
+        );
+        assert_eq!(signed_attestation_count(&db_path), 0);
+        assert_eq!(
+            seal_state_for(&db_path),
+            crate::storage::row_attest::seal::SealState::NotSealed
+        );
+
+        // (e) Guard contract: commit arms & advances seal AND strips Fixed(K_old),
+        // leaving a no-session-signer connection in `Refusing` posture so a
+        // subsequent raw write refuses with `REFUSE_NO_SIGNER` (NOT silently
+        // signed by K_old).
+        {
+            let txn = crate::storage::connection::WriteTxn::begin(&conn).unwrap();
+            let armed = crate::storage::row_attest::sqlite::TxnArmed::arm_in_tx(
+                txn,
+                agent,
+                k0.private.as_ref().unwrap(),
+            )
+            .unwrap();
+            armed.commit().unwrap();
+        }
+        let signed_armed = signed_attestation_count(&db_path);
+        assert!(
+            signed_armed > 0,
+            "(e) committed TxnArmed must sign cutovers"
+        );
+        assert!(
+            matches!(
+                seal_state_for(&db_path),
+                crate::storage::row_attest::seal::SealState::Sealed(_)
+            ),
+            "(e) committed TxnArmed must advance anchor seal"
+        );
+        let probe_mem = crate::models::Memory {
+            namespace: "probe-10141".to_string(),
+            title: "must-refuse-no-signer".to_string(),
+            content: "post-commit Fixed binding must be stripped".to_string(),
+            ..crate::models::Memory::default()
+        };
+        let post_commit_err = crate::db::insert(&conn, &probe_mem)
+            .expect_err("(e) post-commit conn with no session signer must refuse writes");
+        assert!(
+            format!("{post_commit_err:#}")
+                .contains(crate::storage::row_attest::sqlite::REFUSE_NO_SIGNER),
+            "(e) expected REFUSE_NO_SIGNER (proving Fixed(K_old) was stripped), got: {post_commit_err:#}"
+        );
+
+        // (b) Already-armed store + injected error after arming: MUST restore
+        // `Refusing` posture (proving `Fixed(K_old)` was disarmed on rollback!).
+        let seal_armed = seal_state_for(&db_path);
+        let err_armed = succeed_on_conn_with_hook(&conn, &dir_path, agent, |_tx_conn| {
+            anyhow::bail!("injected error on already-armed store (#10141)")
+        })
+        .expect_err("(b) injected error must propagate");
+        assert!(format!("{err_armed:#}").contains("injected error on already-armed store"));
+        assert_eq!(signed_attestation_count(&db_path), signed_armed);
+        assert_eq!(seal_state_for(&db_path), seal_armed);
+        assert_eq!(lineage_row_count(&db_path, agent), 1);
+        let post_rollback_err = crate::db::insert(&conn, &probe_mem)
+            .expect_err("(b) post-rollback armed conn must refuse writes with REFUSE_NO_SIGNER");
+        assert!(
+            format!("{post_rollback_err:#}")
+                .contains(crate::storage::row_attest::sqlite::REFUSE_NO_SIGNER),
+            "(b) Fixed(K_old) leaked across rollback! got: {post_rollback_err:#}"
+        );
     }
 }

@@ -1150,6 +1150,245 @@ fn enroll_requires_recovery_pubkey_for_new_chains() {
 }
 
 // ---------------------------------------------------------------------------
+// #10141 — deterministic two-connection races (no sleeps; SQLite busy_handler
+// + std::sync::Barrier): head check and append MUST run inside one WriteTxn so
+// a losing writer receives the exact not-head / chain-mismatch refusal instead
+// of a raw SQLite composite-PK error.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static SQLITE_RACE_BARRIERS_10141: std::cell::RefCell<
+        Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn sqlite_race_busy_handler_10141(_retries: i32) -> bool {
+    SQLITE_RACE_BARRIERS_10141.with(|slot| {
+        if let Some((entered, committed)) = slot.borrow_mut().take() {
+            entered.wait();
+            committed.wait();
+        }
+    });
+    true
+}
+
+#[test]
+fn sqlite_append_succession_two_conn_race_refuses_not_head_10141() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempfile::Builder::new()
+        .prefix("lineage-race-suc-10141-")
+        .tempdir()
+        .expect("tempdir");
+    let db_path = dir.path().join("race.db");
+    let agent = "race-suc-agent-10141";
+
+    let conn_a = db::open(&db_path).expect("open conn_a");
+    let k0 = register_and_enroll(&conn_a, agent);
+    let k1_a = kp(agent);
+    let k1_b = kp(agent);
+
+    let entered_busy = Arc::new(Barrier::new(2));
+    let a_committed = Arc::new(Barrier::new(2));
+
+    // Open conn_b BEFORE conn_a acquires BEGIN IMMEDIATE so db::open's own
+    // PRAGMA setup does not contend with conn_a's write lock.
+    let conn_b = db::open(&db_path).expect("open conn_b");
+
+    // Conn A holds BEGIN IMMEDIATE so Conn B deterministically enters its
+    // busy_handler at the exact moment Conn B calls BEGIN IMMEDIATE.
+    conn_a
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("conn_a hold write lock");
+
+    let k0_b = AgentKeypair {
+        agent_id: k0.agent_id.clone(),
+        public: k0.public,
+        private: k0.private.clone(),
+    };
+    let k1_b_pub = k1_b.public_base64();
+    let entered_busy_b = Arc::clone(&entered_busy);
+    let a_committed_b = Arc::clone(&a_committed);
+
+    let handle_b = std::thread::spawn(move || {
+        SQLITE_RACE_BARRIERS_10141.with(|slot| {
+            *slot.borrow_mut() = Some((entered_busy_b, a_committed_b));
+        });
+        conn_b
+            .busy_handler(Some(sqlite_race_busy_handler_10141))
+            .expect("install busy_handler on conn_b");
+        db::append_succession(&conn_b, agent, &k0_b, &k1_b_pub, None)
+    });
+
+    // Wait until Conn B has reached BEGIN IMMEDIATE, then release the empty
+    // lock-holder and commit Conn A's genuine K0 -> K1_A succession.
+    entered_busy.wait();
+    conn_a.execute_batch("ROLLBACK").expect("release holder");
+    let rec_a = db::append_succession(&conn_a, agent, &k0, &k1_a.public_base64(), None)
+        .expect("conn_a wins K0 -> K1_A");
+    assert_eq!(rec_a.epoch, 1);
+    a_committed.wait();
+
+    let err_b = handle_b
+        .join()
+        .expect("thread B joined")
+        .expect_err("conn_b must lose race");
+    let msg = format!("{err_b:#}");
+    assert!(
+        msg.contains(db::SUCCESSION_ERR_NOT_HEAD),
+        "loser must receive exact SUCCESSION_ERR_NOT_HEAD (not raw PK error), got: {msg}"
+    );
+    assert!(
+        !msg.contains("UNIQUE constraint failed"),
+        "loser must not surface a raw SQLite PK error: {msg}"
+    );
+    let rows = db::read_lineage(&conn_a, agent).expect("read_lineage");
+    assert_eq!(rows.len(), 2, "only genesis + conn_a succession may exist");
+    assert_eq!(rows[1].0.successor_pubkey_b64, k1_a.public_base64());
+}
+
+#[test]
+fn sqlite_append_revocation_two_conn_race_refuses_not_head_10141() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempfile::Builder::new()
+        .prefix("lineage-race-rev-10141-")
+        .tempdir()
+        .expect("tempdir");
+    let db_path = dir.path().join("race.db");
+    let agent = "race-rev-agent-10141";
+
+    let conn_a = db::open(&db_path).expect("open conn_a");
+    let k0 = register_and_enroll(&conn_a, agent);
+    let k1_a = kp(agent);
+    let k1_b = kp(agent);
+
+    let entered_busy = Arc::new(Barrier::new(2));
+    let a_committed = Arc::new(Barrier::new(2));
+    let conn_b = db::open(&db_path).expect("open conn_b");
+
+    conn_a
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("conn_a hold write lock");
+
+    let k0_b = AgentKeypair {
+        agent_id: k0.agent_id.clone(),
+        public: k0.public,
+        private: k0.private.clone(),
+    };
+    let k1_b_pub = k1_b.public_base64();
+    let entered_busy_b = Arc::clone(&entered_busy);
+    let a_committed_b = Arc::clone(&a_committed);
+
+    let handle_b = std::thread::spawn(move || {
+        SQLITE_RACE_BARRIERS_10141.with(|slot| {
+            *slot.borrow_mut() = Some((entered_busy_b, a_committed_b));
+        });
+        conn_b
+            .busy_handler(Some(sqlite_race_busy_handler_10141))
+            .expect("install busy_handler on conn_b");
+        db::append_revocation(&conn_b, agent, &k0_b, &k1_b_pub, 0, None)
+    });
+
+    entered_busy.wait();
+    conn_a.execute_batch("ROLLBACK").expect("release holder");
+    let rec_a = db::append_succession(&conn_a, agent, &k0, &k1_a.public_base64(), None)
+        .expect("conn_a wins K0 -> K1_A");
+    assert_eq!(rec_a.epoch, 1);
+    a_committed.wait();
+
+    let err_b = handle_b
+        .join()
+        .expect("thread B joined")
+        .expect_err("conn_b revocation must lose race");
+    let msg = format!("{err_b:#}");
+    assert!(
+        msg.contains(db::SUCCESSION_ERR_NOT_HEAD),
+        "revocation loser must receive exact SUCCESSION_ERR_NOT_HEAD (not raw PK error), got: {msg}"
+    );
+    assert!(
+        !msg.contains("UNIQUE constraint failed"),
+        "revocation loser must not surface a raw SQLite PK error: {msg}"
+    );
+    let rows = db::read_lineage(&conn_a, agent).expect("read_lineage");
+    assert_eq!(rows.len(), 2, "only genesis + conn_a succession may exist");
+    assert_eq!(rows[1].0.successor_pubkey_b64, k1_a.public_base64());
+}
+
+#[test]
+fn sqlite_append_lineage_record_two_conn_race_refuses_chain_mismatch_not_pk_10141() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempfile::Builder::new()
+        .prefix("lineage-race-rec-10141-")
+        .tempdir()
+        .expect("tempdir");
+    let db_path = dir.path().join("race.db");
+    let agent = "race-rec-agent-10141";
+
+    let conn_a = db::open(&db_path).expect("open conn_a");
+    let k0 = register_and_enroll(&conn_a, agent);
+    let (genesis, _) = db::lineage_head(&conn_a, agent)
+        .expect("head")
+        .expect("genesis present");
+    let k1_a = kp(agent);
+    let k1_b = kp(agent);
+    let rec_b = LineageRecord::rotation(
+        &genesis,
+        &k1_b.public_base64(),
+        genesis.recovery_pubkey_b64.clone(),
+        "2026-11-27T08:00:00Z",
+    )
+    .expect("build rec_b");
+    let sig_b = sign_succession(&k0, &rec_b.to_signable()).expect("sign rec_b");
+
+    let entered_busy = Arc::new(Barrier::new(2));
+    let a_committed = Arc::new(Barrier::new(2));
+    let conn_b = db::open(&db_path).expect("open conn_b");
+
+    conn_a
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("conn_a hold write lock");
+
+    let entered_busy_b = Arc::clone(&entered_busy);
+    let a_committed_b = Arc::clone(&a_committed);
+
+    let handle_b = std::thread::spawn(move || {
+        SQLITE_RACE_BARRIERS_10141.with(|slot| {
+            *slot.borrow_mut() = Some((entered_busy_b, a_committed_b));
+        });
+        conn_b
+            .busy_handler(Some(sqlite_race_busy_handler_10141))
+            .expect("install busy_handler on conn_b");
+        db::append_lineage_record(&conn_b, agent, &rec_b, &sig_b)
+    });
+
+    entered_busy.wait();
+    conn_a.execute_batch("ROLLBACK").expect("release holder");
+    let rec_a = db::append_succession(&conn_a, agent, &k0, &k1_a.public_base64(), None)
+        .expect("conn_a wins K0 -> K1_A");
+    assert_eq!(rec_a.epoch, 1);
+    a_committed.wait();
+
+    let err_b = handle_b
+        .join()
+        .expect("thread B joined")
+        .expect_err("conn_b append_lineage_record must lose race");
+    let msg = format!("{err_b:#}");
+    assert!(
+        msg.contains("does not succeed the head epoch"),
+        "append_lineage_record loser must receive chain-consistency refusal (not raw PK error), got: {msg}"
+    );
+    assert!(
+        !msg.contains("UNIQUE constraint failed"),
+        "append_lineage_record loser must not surface a raw SQLite PK error: {msg}"
+    );
+    let rows = db::read_lineage(&conn_a, agent).expect("read_lineage");
+    assert_eq!(rows.len(), 2, "only genesis + conn_a succession may exist");
+    assert_eq!(rows[1].0.successor_pubkey_b64, k1_a.public_base64());
+}
+
+// ---------------------------------------------------------------------------
 // (k) postgres parity — identical verdicts on both backends
 // ---------------------------------------------------------------------------
 
@@ -3029,5 +3268,149 @@ mod postgres_parity {
             }
             other => panic!("expected UnsupportedCapability, got: {other:?}"),
         }
+    }
+
+    /// #10141 — Live PostgreSQL two-connection deterministic race on
+    /// `PostgresStore::append_lineage_record` (no sleeps; row-lock + `pg_locks`
+    /// synchronization). The head check MUST run inside the transaction AFTER
+    /// `SELECT ... FOR UPDATE` so the losing writer gets `StoreError::InvalidInput`
+    /// ("does not chain onto the current head") instead of a raw Postgres
+    /// unique-constraint (`23505`) error.
+    #[tokio::test]
+    async fn postgres_append_lineage_record_two_conn_race_refuses_invalid_input_not_pk_10141() {
+        let Some(store) = connect().await else { return };
+        let Some(pool) = raw_pool().await else { return };
+        let (agent_id, k0) = pg_register_and_enroll(&store).await;
+        let genesis = store
+            .read_lineage(&agent_id)
+            .await
+            .expect("read_lineage")
+            .into_iter()
+            .next()
+            .expect("genesis")
+            .0;
+
+        let k1_a = kp(&agent_id);
+        let k1_b = kp(&agent_id);
+        let rec_a = LineageRecord::rotation(
+            &genesis,
+            &k1_a.public_base64(),
+            genesis.recovery_pubkey_b64.clone(),
+            "2026-11-27T08:00:01Z",
+        )
+        .expect("build rec_a");
+        let sig_a = sign_succession(&k0, &rec_a.to_signable()).expect("sign rec_a");
+        let rec_a_bytes = rec_a.canonical_bytes().expect("rec_a bytes");
+
+        let rec_b = LineageRecord::rotation(
+            &genesis,
+            &k1_b.public_base64(),
+            genesis.recovery_pubkey_b64.clone(),
+            "2026-11-27T08:00:02Z",
+        )
+        .expect("build rec_b");
+        let sig_b = sign_succession(&k0, &rec_b.to_signable()).expect("sign rec_b");
+
+        let title = ai_memory::models::agent_registration_title(&agent_id);
+        let mut tx_a = pool.begin().await.expect("tx_a begin");
+        let (tx_a_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx_a)
+            .await
+            .expect("pg_backend_pid");
+        let _locked: (serde_json::Value,) = sqlx::query_as(
+            "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2 FOR UPDATE",
+        )
+        .bind(ai_memory::models::AGENTS_NAMESPACE)
+        .bind(&title)
+        .fetch_one(&mut *tx_a)
+        .await
+        .expect("tx_a acquire FOR UPDATE");
+
+        let store_b = connect().await.expect("second PG store");
+        let agent_b = agent_id.clone();
+        let rec_b_clone = rec_b.clone();
+        let sig_b_clone = sig_b.clone();
+        let task_b = tokio::spawn(async move {
+            let ctx = CallerContext::for_admin("test:pg-race-10141");
+            store_b
+                .append_lineage_record(&ctx, &agent_b, &rec_b_clone, &sig_b_clone)
+                .await
+        });
+
+        // Deterministically wait via Postgres catalog (`pg_blocking_pids`)
+        // until task_b is blocked waiting on tx_a's FOR UPDATE row lock.
+        let mut waited_polls = 0_u32;
+        loop {
+            let (blocked,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_stat_activity
+                    WHERE pid <> $1 AND $1 = ANY(pg_blocking_pids(pid))
+                )",
+            )
+            .bind(tx_a_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("poll pg_blocking_pids");
+            if blocked {
+                break;
+            }
+            waited_polls += 1;
+            assert!(
+                waited_polls < 50_000,
+                "timed out waiting for task_b to block on tx_a's FOR UPDATE lock"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Advance agent_lineage head to epoch 1 inside tx_a and commit.
+        sqlx::query(
+            "INSERT INTO agent_lineage (
+                agent_id, epoch, reason, predecessor_pubkey, successor_pubkey,
+                recovery_pubkey, not_before, prev_record_hash, signature,
+                record_bytes, created_at, custody_class,
+                suspected_compromise_from_seq, guardian_set_id, recovery_threshold
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+             )",
+        )
+        .bind(&rec_a.agent_id)
+        .bind(i64::try_from(rec_a.epoch).expect("epoch i64"))
+        .bind(rec_a.reason.as_str())
+        .bind(&rec_a.predecessor_pubkey_b64)
+        .bind(&rec_a.successor_pubkey_b64)
+        .bind(&rec_a.recovery_pubkey_b64)
+        .bind(&rec_a.not_before)
+        .bind(&rec_a.prev_record_hash)
+        .bind(&sig_a)
+        .bind(&rec_a_bytes)
+        .bind("2026-11-27T08:00:01Z")
+        .bind(rec_a.custody_class.as_str())
+        .bind(Option::<i64>::None)
+        .bind(&rec_a.guardian_set_id)
+        .bind(Option::<i64>::None)
+        .execute(&mut *tx_a)
+        .await
+        .expect("tx_a insert epoch 1");
+        tx_a.commit().await.expect("tx_a commit");
+
+        let err_b = task_b
+            .await
+            .expect("task_b joined")
+            .expect_err("task_b must lose PG race");
+        match err_b {
+            ai_memory::store::StoreError::InvalidInput { detail } => {
+                assert!(
+                    detail.contains("does not chain onto the current head"),
+                    "expected chain-mismatch InvalidInput, got: {detail}"
+                );
+            }
+            other => panic!(
+                "PG race loser must receive StoreError::InvalidInput (not raw 23505 PK error), got: {other:?}"
+            ),
+        }
+
+        let rows = store.read_lineage(&agent_id).await.expect("read_lineage");
+        assert_eq!(rows.len(), 2, "only genesis + tx_a epoch 1 may exist");
+        assert_eq!(rows[1].0.successor_pubkey_b64, k1_a.public_base64());
     }
 }

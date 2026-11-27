@@ -232,6 +232,13 @@ impl<'c> WriteTxn<'c> {
         Ok(Self::opened(conn))
     }
 
+    /// Borrow the underlying SQLite connection bound to this open write
+    /// transaction (#10141).
+    #[must_use]
+    pub const fn conn(&self) -> &'c Connection {
+        self.conn
+    }
+
     /// Commit the transaction, consuming the guard.
     ///
     /// # Errors

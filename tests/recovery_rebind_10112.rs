@@ -27,6 +27,7 @@ use ai_memory::identity::lineage::{
 use ai_memory::models::Memory;
 use ai_memory::portability::emit::build_full_envelope_audited;
 use ai_memory::portability::import::{ImportOptions, import_full_envelope};
+use ai_memory::storage::WriteTxn;
 use ai_memory::storage::recovery_rebind::{
     RecoveryArm, RecoveryRequest, execute_recovery_rebind, recovery_preconditions,
     verify_anchor_against_lineage,
@@ -36,8 +37,8 @@ use ai_memory::storage::row_attest::seal::{self, SealState};
 use ai_memory::storage::row_attest::sqlite::{
     REFUSE_ANCHOR_UNATTESTED_KEY_SWAP, REFUSE_DIRECT_RECOVERY_ON_ARMED_STORE, REFUSE_KEY_MISMATCH,
     REFUSE_RECOVERY_KEY_MISMATCH, REFUSE_RECOVERY_MISSING_PRIV, REFUSE_RECOVERY_QUORUM_DRIFT,
-    REFUSE_RECOVERY_REPLAY, REFUSE_RECOVERY_VERIFY_ONLY, SnapshotVerdict, arm_with_key,
-    check_snapshot, read_attestations, seal_restored, verify_sqlite_with,
+    REFUSE_RECOVERY_REPLAY, REFUSE_RECOVERY_VERIFY_ONLY, SnapshotVerdict, TxnArmed, check_snapshot,
+    read_attestations, seal_restored, verify_sqlite_with,
 };
 use ai_memory::storage::row_attest::{
     DOMAIN_TAG, FORMAT_VERSION, Outcome, attestation_digest, key_id_of, preimage, spec_for,
@@ -141,17 +142,21 @@ impl RecoveryFixture {
         let conn = db::open(&db_path).expect("open db");
         db::register_agent(&conn, agent, "ai:test", &[]).expect("register");
         db::enroll_lineage(&conn, agent, &k_old, Some(&cold.public_base64())).expect("genesis");
-        arm_with_key(&conn, agent, k_old.private.as_ref().expect("k_old priv"))
-            .expect("arm with k_old");
-
-        let mem = Memory {
-            namespace: "recovery-10112".to_string(),
-            title: "pre-loss".to_string(),
-            content: "attested under K_old before loss".to_string(),
-            ..Memory::default()
+        let pre_mem_id = {
+            let txn = WriteTxn::begin(&conn).expect("begin pre-loss arm tx");
+            let armed =
+                TxnArmed::arm_in_tx(txn, agent, k_old.private.as_ref().expect("k_old priv"))
+                    .expect("arm with k_old");
+            let mem = Memory {
+                namespace: "recovery-10112".to_string(),
+                title: "pre-loss".to_string(),
+                content: "attested under K_old before loss".to_string(),
+                ..Memory::default()
+            };
+            db::insert(armed.conn(), &mem).expect("insert pre-recovery memory");
+            armed.commit().expect("commit pre-loss arm tx");
+            mem.id
         };
-        db::insert(&conn, &mem).expect("insert pre-recovery memory");
-        let pre_mem_id = mem.id;
 
         let anchor = TrustAnchor::load_dir(&anchor_dir);
         let pre = verify_sqlite_with(&conn, &anchor).expect("verify pre");
@@ -697,8 +702,13 @@ fn r7_bare_anchor_swap_without_quorum_verified_lineage_refused_10112() {
     );
 
     // Attempting to arm with K_attacker is also refused with REFUSE_KEY_MISMATCH.
-    let err_arm = arm_with_key(&conn, &fx.agent, k_attacker.private.as_ref().expect("priv"))
-        .expect_err("arm_with_key with swapped attacker key must refuse");
+    let err_arm = TxnArmed::arm_in_tx(
+        WriteTxn::begin(&conn).expect("begin tx"),
+        &fx.agent,
+        k_attacker.private.as_ref().expect("priv"),
+    )
+    .err()
+    .expect("TxnArmed::arm_in_tx with swapped attacker key must refuse");
     assert!(
         format!("{err_arm:#}").contains(REFUSE_KEY_MISMATCH),
         "expected REFUSE_KEY_MISMATCH, got: {err_arm:#}"
@@ -943,14 +953,15 @@ fn r9_single_timestamp_window_k_old_refusal_and_replay_refused_10112() {
     );
 
     // 9b. K_old CANNOT attest at or after `ts`:
-    // - `arm_with_key(K_old)` refuses with REFUSE_KEY_MISMATCH
+    // - `TxnArmed::arm_in_tx(K_old)` refuses with REFUSE_KEY_MISMATCH
     // - `TrustAnchor::key_for(K_old, ts + 1)` refuses with OutOfRange
-    let err_old_arm = arm_with_key(
-        &conn,
+    let err_old_arm = TxnArmed::arm_in_tx(
+        WriteTxn::begin(&conn).expect("begin tx"),
         &fx.agent,
         fx.k_old.private.as_ref().expect("k_old priv in mem"),
     )
-    .expect_err("retired K_old must not arm after recovery");
+    .err()
+    .expect("retired K_old must not arm after recovery");
     assert!(
         format!("{err_old_arm:#}").contains(REFUSE_KEY_MISMATCH),
         "expected REFUSE_KEY_MISMATCH, got: {err_old_arm:#}"
@@ -1086,14 +1097,13 @@ fn r10_post_recovery_verify_rows_seal_advance_succeed_and_bind_10112() {
     // passes without REFUSE_ROW_DRIFT.
     {
         let conn = db::open(&fx.db_path).expect("open for bind");
-        arm_with_key(
-            &conn,
-            &fx.agent,
-            k_new.private.as_ref().expect("k_new priv"),
-        )
-        .expect("arm with k_new");
-        db::bind_agent_pubkey_with_keypair(&conn, &fx.agent, &k_new)
+        let txn = WriteTxn::begin(&conn).expect("begin tx");
+        let armed =
+            TxnArmed::arm_in_tx(txn, &fx.agent, k_new.private.as_ref().expect("k_new priv"))
+                .expect("arm with k_new");
+        db::bind_agent_pubkey_with_keypair(armed.conn(), &fx.agent, &k_new)
             .expect("later bind_agent_pubkey must pass without REFUSE_ROW_DRIFT");
+        armed.commit().expect("commit reassertion");
     }
 
     // 10d. Later `identity succeed` passes without REFUSE_ROW_DRIFT and verifies Clean.
@@ -1239,8 +1249,14 @@ fn r12_backup_restore_pre_recovery_backup_portability_and_10110_import_10112() {
             .expect("bind K_new on dst");
         let imp = import_full_envelope(&dst_conn, &envelope, &ImportOptions::default())
             .expect("import_full_envelope");
-        arm_with_key(&dst_conn, &fx.agent, k_new.private.as_ref().expect("priv"))
-            .expect("arm imported store with K_new");
+        TxnArmed::arm_in_tx(
+            WriteTxn::begin(&dst_conn).expect("begin arm tx"),
+            &fx.agent,
+            k_new.private.as_ref().expect("priv"),
+        )
+        .expect("arm imported store with K_new")
+        .commit()
+        .expect("commit arm imported store");
         assert!(
             imp.memories >= 1,
             "imported store must contain the pre-recovery memory: {imp:?}"
@@ -1906,13 +1922,14 @@ fn cf1_sf2_bare_anchor_swap_refused_by_production_verify_and_arm_10160() {
         String::from_utf8_lossy(&stdout)
     );
 
-    // Production `arm_with_key` even with K_old must refuse when anchor was swapped!
-    let err_arm = arm_with_key(
-        &conn,
+    // Production `TxnArmed::arm_in_tx` even with K_old must refuse when anchor was swapped!
+    let err_arm = TxnArmed::arm_in_tx(
+        WriteTxn::begin(&conn).expect("begin tx"),
         &fx.agent,
         fx.k_old.private.as_ref().expect("k_old priv"),
     )
-    .expect_err("arm_with_key must refuse on bare-swapped anchor");
+    .err()
+    .expect("TxnArmed::arm_in_tx must refuse on bare-swapped anchor");
     assert!(
         format!("{err_arm:#}").contains(REFUSE_ANCHOR_UNATTESTED_KEY_SWAP),
         "expected REFUSE_ANCHOR_UNATTESTED_KEY_SWAP from arm_with_key, got: {err_arm:#}"
@@ -1972,7 +1989,14 @@ fn cf1_sf2_bare_anchor_swap_refused_by_production_verify_and_arm_10160() {
     let conn2 = db::open(&db2).expect("open db2");
     db::register_agent(&conn2, agent2, "ai:test", &[]).expect("register");
     db::bind_agent_pubkey_with_keypair(&conn2, agent2, &k0).expect("bind");
-    arm_with_key(&conn2, agent2, k0.private.as_ref().expect("k0 priv")).expect("arm db2");
+    TxnArmed::arm_in_tx(
+        WriteTxn::begin(&conn2).expect("begin db2 arm tx"),
+        agent2,
+        k0.private.as_ref().expect("k0 priv"),
+    )
+    .expect("arm db2")
+    .commit()
+    .expect("commit db2 arm");
     let k_foreign = keypair::generate(agent2).expect("k_foreign");
     fs::write(
         keys2.join(format!("{agent2}.pub.{future_ts}")),
