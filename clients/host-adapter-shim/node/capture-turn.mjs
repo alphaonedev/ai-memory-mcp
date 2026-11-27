@@ -115,7 +115,7 @@ function buildMcpFrames(captureRequest) {
     id: 1,
     method: "initialize",
     params: {
-      protocolVersion: "2025-03-26",
+      protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "capture-turn-shim-node", version: "0.1" },
     },
