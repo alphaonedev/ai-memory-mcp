@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#10082, #10180, #10181 — reflection export sealed re-check runs inside one read snapshot with row-version binding)
+
+- `memory_export_reflection` now runs its pre-read sealed classification, member read, outbound `reflects_on` edge walk, and post-read re-check inside one SQLite read snapshot (`with_read_snapshot`) and binds all three steps to the same `RowVersion` (`id`, `owner`, `updated_at`, `version`, and content/envelope digest) via an unforgeable `RecheckedRow` proof type, closing both seal-inside-read and seal-then-unseal races (#10082, #10180). Returned rows are also verified against the requested `member_id`, and the reader injection test seam is restricted to `#[cfg(any(test, feature = "test-support"))]` (#10181). Fragment: `changelog.d/10082.fixed.md`.
+
 ### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
 
 - `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.

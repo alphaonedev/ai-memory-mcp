@@ -413,7 +413,7 @@ fn owner_key_sealed_fixture_genuinely_decrypts_on_direct_get_10082() {
 /// the inner decrypting read (so the reader genuinely decrypts `SEALED_MARKER`),
 /// and is then unsealed back to "public v1" (with the exact same `updated_at`
 /// and `version`) before the post-read check runs. Comparing the same row version
-/// (id, owner, updated_at, version, content/seal digest) across pre-check, read,
+/// (`id`, `owner`, `updated_at`, `version`, content/seal digest) across pre-check, read,
 /// and post-check MUST refuse and never export `SEALED_MARKER`.
 #[test]
 fn seal_then_unseal_inside_injected_read_is_refused_10180() {

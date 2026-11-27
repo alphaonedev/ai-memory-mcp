@@ -298,38 +298,6 @@ pub(crate) fn reflection_count_mismatch(collected: usize, counted: i64) -> Strin
     )
 }
 
-/// #10061 — refuse one memory with `SEALED_EXPORT_REFUSED` when its row is
-/// sealed at rest (non-NULL envelope). A missing row is not this check's
-/// answer; the caller's own read reports it.
-///
-/// # Errors
-///
-/// The typed [`crate::export_sealed::SealedExportRefused`] for a sealed row,
-/// or the store read error.
-pub(crate) fn refuse_if_sealed(conn: &rusqlite::Connection, id: &str) -> Result<()> {
-    use rusqlite::OptionalExtension as _;
-    let sealed: Option<bool> = conn
-        .query_row(
-            &format!(
-                "SELECT {} IS NOT NULL FROM memories WHERE id = ?1",
-                crate::export_sealed::ENVELOPE_COLUMN
-            ),
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if sealed == Some(true) {
-        return Err(anyhow::Error::new(
-            crate::export_sealed::SealedExportRefused {
-                table: crate::export_sealed::tables::MEMORIES,
-                count: 1,
-                first_id: id.to_owned(),
-            },
-        ));
-    }
-    Ok(())
-}
-
 /// One row of the reflection scan: a row of another kind is passed over
 /// without being projected (so never decrypted); a reflection row is
 /// classified on its at-rest envelope before any projection.

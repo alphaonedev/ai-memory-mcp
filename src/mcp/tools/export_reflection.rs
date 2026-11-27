@@ -45,28 +45,37 @@ use crate::models::MemoryKind;
 /// * `memory is not a reflection: <id>` — caller passed an observation.
 /// * `unsupported export format '<x>'` — `format` was neither
 ///   `md` nor `json`.
+/// Map internal handler errors onto the MCP wire error envelope (single helper
+/// shared by `handle_export_reflection` and the test-support reader seam).
+fn map_export_error(error: anyhow::Error) -> String {
+    crate::mcp::error_text::mcp_foreign_err("resolve_mcp_read_visibility_caller", error)
+}
+
 pub fn handle_export_reflection(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
     let caller =
         crate::identity::resolve_mcp_read_visibility_caller().map_err(|error| error.to_string())?;
-    handle_export_reflection_for_caller(conn, params, caller.as_deref()).map_err(|error| {
-        crate::mcp::error_text::mcp_foreign_err("resolve_mcp_read_visibility_caller", error)
-    })
+    handle_export_reflection_for_caller(conn, params, caller.as_deref()).map_err(map_export_error)
 }
 
-/// #10082 — function-boundary seam for `memory_export_reflection` taking the
-/// member read step as a closure so deterministic race tests can seal a
-/// reflection or source row inside the read step without any test-only flag or
-/// `#[cfg(test)]` branch in the shipped path.
+/// #10082 / #10181 — test-only function-boundary seam for
+/// `memory_export_reflection` taking the member read step as a closure so
+/// deterministic race tests can mutate a reflection or source row inside the
+/// read step without any test-only branch in the shipped path.
+///
+/// Not a stable public API (`#[cfg(any(test, feature = "test-support"))]`,
+/// `#[doc(hidden)]`).
 ///
 /// # Errors
 ///
 /// Returns the same closed-vocabulary error string as
 /// [`handle_export_reflection`] (missing/empty `memory_id`, unsupported
-/// format, hidden/missing member, non-reflection kind, or
-/// `SEALED_EXPORT_REFUSED`).
+/// format, hidden/missing member, non-reflection kind, version/identity
+/// mismatch, or `SEALED_EXPORT_REFUSED`).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub fn handle_export_reflection_with_reader<F>(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -81,11 +90,8 @@ where
         Option<&str>,
     ) -> anyhow::Result<crate::models::Memory>,
 {
-    handle_export_reflection_for_caller_with_reader(conn, params, caller, read_member).map_err(
-        |error| {
-            crate::mcp::error_text::mcp_foreign_err("resolve_mcp_read_visibility_caller", error)
-        },
-    )
+    handle_export_reflection_for_caller_with_reader(conn, params, caller, read_member)
+        .map_err(map_export_error)
 }
 
 /// HTTP passes its already resolved caller; `None` retains the local read posture.
@@ -136,37 +142,44 @@ where
     };
     let format = parse_format_for_mcp(format_str).map_err(crate::errors::invalid_input)?;
 
-    // #10061 / #10082 — classify before read, execute `read_member`, and
-    // re-check live storage after read as ONE indivisible step producing an
+    // #10061 / #10082 / #10180 — run pre-check, read, outbound edge walk, and
+    // post-check for the reflection AND every source inside ONE SQLite read
+    // snapshot (`with_read_snapshot`), and bind every member across pre-check,
+    // read, and post-check to the exact same `RowVersion` producing an
     // unforgeable `RecheckedRow`.
-    let reflection = sealed_recheck::read_and_recheck_unsealed_member(
-        conn,
-        memory_id,
-        memory_id,
-        caller,
-        &mut read_member,
-    )?;
-    if !matches!(reflection.as_memory().memory_kind, MemoryKind::Reflection) {
-        return Err(crate::errors::refusal(format!(
-            "memory is not a reflection: {memory_id}"
-        )));
-    }
+    let (reflection, edges, verified_sources) =
+        crate::governance::policy_version::with_read_snapshot(conn, |snap_conn| {
+            let reflection = sealed_recheck::read_and_recheck_unsealed_member(
+                snap_conn,
+                memory_id,
+                memory_id,
+                caller,
+                &mut read_member,
+            )?;
+            if !matches!(reflection.as_memory().memory_kind, MemoryKind::Reflection) {
+                return Err(crate::errors::refusal(format!(
+                    "memory is not a reflection: {memory_id}"
+                )));
+            }
 
-    let edges =
-        collect_outbound_reflects_on(conn, memory_id).context("reading reflects_on links")?;
-    // #10064 / #10082 — every `reflects_on` source passes through the exact
-    // same `read_and_recheck_unsealed_member` funnel as the reflection itself.
-    let mut verified_sources = Vec::with_capacity(edges.len());
-    for edge in &edges {
-        let source = sealed_recheck::read_and_recheck_unsealed_member(
-            conn,
-            &edge.target_id,
-            memory_id,
-            caller,
-            &mut read_member,
-        )?;
-        verified_sources.push(source);
-    }
+            let edges = collect_outbound_reflects_on(snap_conn, memory_id)
+                .context("reading reflects_on links")?;
+            // #10064 / #10082 / #10180 — every `reflects_on` source passes
+            // through the exact same `read_and_recheck_unsealed_member` funnel
+            // inside the same snapshot as the reflection itself.
+            let mut verified_sources = Vec::with_capacity(edges.len());
+            for edge in &edges {
+                let source = sealed_recheck::read_and_recheck_unsealed_member(
+                    snap_conn,
+                    &edge.target_id,
+                    memory_id,
+                    caller,
+                    &mut read_member,
+                )?;
+                verified_sources.push(source);
+            }
+            Ok((reflection, edges, verified_sources))
+        })?;
     render_verified_reflection(&reflection, &edges, &verified_sources, format)
 }
 
@@ -201,7 +214,7 @@ fn render_verified_reflection(
 ///
 /// Returns `ReflectionNotFound` if the row is absent or unreadable by `caller`,
 /// or a storage error if reading the substrate fails.
-pub fn read_reflection_member(
+pub(crate) fn read_reflection_member(
     conn: &rusqlite::Connection,
     member_id: &str,
     reflection_id: &str,
@@ -213,40 +226,88 @@ pub fn read_reflection_member(
         .ok_or_else(|| anyhow::Error::new(crate::errors::ReflectionNotFound::new(reflection_id)))
 }
 
-/// Pre-read sealed classification of a visible member row (#10082).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SealedState {
-    Unsealed,
+/// Test-only re-export shim for [`read_reflection_member`] (#10181).
+/// Not a stable public API (`#[cfg(any(test, feature = "test-support"))]`).
+///
+/// # Errors
+///
+/// Same errors as [`read_reflection_member`].
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn read_reflection_member_for_test(
+    conn: &rusqlite::Connection,
+    member_id: &str,
+    reflection_id: &str,
+    caller: Option<&str>,
+) -> anyhow::Result<crate::models::Memory> {
+    read_reflection_member(conn, member_id, reflection_id, caller)
+}
+
+/// Row-version fingerprint compared across pre-check, read, and post-check
+/// (#10180) so any mutation — including a seal-then-unseal inside the read
+/// window that restores `updated_at` and `version` — fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowVersion {
+    id: String,
+    owner: Option<String>,
+    updated_at: String,
+    version: i64,
+    content_blake3: [u8; 32],
+    envelope_blake3: Option<[u8; 32]>,
+}
+
+impl RowVersion {
+    fn from_unsealed_memory(memory: &crate::models::Memory) -> Self {
+        Self {
+            id: memory.id.clone(),
+            owner: extract_owner(&memory.metadata),
+            updated_at: memory.updated_at.clone(),
+            version: memory.version,
+            content_blake3: *blake3::hash(memory.content.as_bytes()).as_bytes(),
+            envelope_blake3: None,
+        }
+    }
+}
+
+fn extract_owner(metadata: &Value) -> Option<String> {
+    metadata
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Visibility-checked sealed classification + row-version fingerprint (#10082, #10180).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowClassification {
+    Absent,
+    Unsealed(RowVersion),
     Sealed,
 }
 
-impl SealedState {
-    const fn is_sealed(self) -> bool {
-        matches!(self, Self::Sealed)
-    }
-}
-
-/// Build the canonical `SEALED_EXPORT_REFUSED` error for one memory row.
+/// Build the canonical typed `SEALED_EXPORT_REFUSED` error for one memory row
+/// without any panicking branch (r1 item 4).
 fn sealed_export_refusal(id: &str) -> anyhow::Error {
-    let mut guard =
-        crate::export_sealed::SealedRowGuard::new(crate::export_sealed::tables::MEMORIES);
-    let _: Option<()> = guard.take(crate::export_sealed::ExportRow::Sealed { id: id.to_owned() });
-    match guard.finish() {
-        Ok(()) => unreachable!("SealedRowGuard with a sealed row always refuses"),
-        Err(refused) => anyhow::Error::new(refused),
-    }
+    anyhow::Error::new(crate::export_sealed::SealedExportRefused {
+        table: crate::export_sealed::tables::MEMORIES,
+        count: 1,
+        first_id: id.to_owned(),
+    })
 }
 
 /// Private visibility boundary: [`RecheckedRow`] holds a private `Memory` and
 /// can ONLY be constructed by [`read_and_recheck_unsealed_member`], making it
 /// unrepresentable for a caller to export a row that skipped either the
-/// pre-read classification or the fresh post-read re-check (#10082, CBC-03/05).
+/// pre-read classification, the fresh post-read re-check, or the identity and
+/// row-version binding (#10082, #10180, #10181, CBC-03/05).
 mod sealed_recheck {
-    use super::{SealedState, classify_visible_sealed_state, sealed_export_refusal};
-    use crate::cli::commands::export_reflections;
+    use super::{
+        RowClassification, RowVersion, classify_visible_sealed_state, sealed_export_refusal,
+    };
 
-    /// A memory row proven to have passed BOTH pre-read visibility+sealed
-    /// classification AND a fresh post-read sealed re-check (#10082).
+    /// A memory row proven to have passed pre-read visibility+sealed
+    /// classification, a fresh post-read sealed re-check, `memory.id == member_id`
+    /// identity binding, and identical `RowVersion` across all three steps
+    /// (#10082, #10180, #10181).
     #[must_use]
     pub(super) struct RecheckedRow {
         memory: crate::models::Memory,
@@ -260,8 +321,9 @@ mod sealed_recheck {
     }
 
     /// Execute pre-read sealed classification, invoke the caller-supplied
-    /// `read_member`, and run a fresh post-read sealed re-check against live
-    /// storage as ONE indivisible step (#10082).
+    /// `read_member`, run a fresh post-read sealed re-check, and verify
+    /// `memory.id == member_id` plus identical [`RowVersion`] across all three
+    /// steps inside the caller's read snapshot (#10082, #10180, #10181).
     pub(super) fn read_and_recheck_unsealed_member<F>(
         conn: &rusqlite::Connection,
         member_id: &str,
@@ -277,52 +339,76 @@ mod sealed_recheck {
             Option<&str>,
         ) -> anyhow::Result<crate::models::Memory>,
     {
-        let pre_state: SealedState =
-            classify_visible_sealed_state(conn, member_id, reflection_id, caller)?;
-        if pre_state.is_sealed() {
-            return Err(sealed_export_refusal(member_id));
-        }
+        let pre_version =
+            match classify_visible_sealed_state(conn, member_id, reflection_id, caller)? {
+                RowClassification::Sealed => return Err(sealed_export_refusal(member_id)),
+                RowClassification::Absent => {
+                    return Err(anyhow::Error::new(crate::errors::ReflectionNotFound::new(
+                        reflection_id,
+                    )));
+                }
+                RowClassification::Unsealed(version) => version,
+            };
         let read_result = read_member(conn, member_id, reflection_id, caller);
-        // Fresh post-read re-check against live storage (never reusing
-        // `pre_state`): runs even when `read_member` returned `Err` (e.g. a
-        // decrypt error caused by sealing between pre-read and read) so a row
-        // sealed at any point before `read_member` returns still answers the
-        // exact visibility-gated `SEALED_EXPORT_REFUSED` or `ReflectionNotFound`.
-        let post_state: SealedState =
-            classify_visible_sealed_state(conn, member_id, reflection_id, caller)?;
-        if post_state.is_sealed() {
-            return Err(sealed_export_refusal(member_id));
-        }
+        // Fresh post-read re-check (never reusing `pre_version`): runs even
+        // when `read_member` returned `Err` so a row sealed or hidden at any
+        // point before `read_member` returns still answers the exact
+        // visibility-gated `SEALED_EXPORT_REFUSED` or `ReflectionNotFound`.
+        let post_version =
+            match classify_visible_sealed_state(conn, member_id, reflection_id, caller)? {
+                RowClassification::Sealed => return Err(sealed_export_refusal(member_id)),
+                RowClassification::Absent => {
+                    return Err(anyhow::Error::new(crate::errors::ReflectionNotFound::new(
+                        reflection_id,
+                    )));
+                }
+                RowClassification::Unsealed(version) => version,
+            };
         let memory = read_result?;
-        export_reflections::refuse_if_sealed(conn, &memory.id)?;
+        // #10181 (F2): confirm the returned row is the requested member_id.
+        if memory.id != member_id {
+            return Err(crate::errors::refusal(format!(
+                "reflection export row identity mismatch: requested {member_id}, got {}",
+                memory.id
+            )));
+        }
+        // #10180 (F1): bind pre-check, read row, and post-check to ONE exact
+        // row version (id, owner, updated_at, version, content/seal digest).
+        let read_version = RowVersion::from_unsealed_memory(&memory);
+        if post_version != pre_version || read_version != pre_version {
+            return Err(crate::errors::refusal(format!(
+                "reflection export row version mismatch for {member_id}: row changed across read window"
+            )));
+        }
         Ok(RecheckedRow { memory })
     }
 }
 
-/// #10061 / #10064 / #10082 — classify one member row (`id`: the reflection
-/// itself or a source it reflects on) without decrypting it. An absent or
-/// unsealed row returns `Ok(SealedState::Unsealed)` and is left to
-/// `read_member`. A sealed row is never passed to the decrypting read: hidden
-/// from `caller`, not recall-visible or with metadata that does not parse
-/// (fail closed), it is reported as not found under `reflection_id`, exactly
-/// as [`read_reflection_member`] reports a hidden member, so a sealed hidden
-/// source is indistinguishable from a hidden plain one; visible, it returns
-/// `Ok(SealedState::Sealed)` so the caller refuses with `SEALED_EXPORT_REFUSED`
-/// naming `id`. The visibility gate reads only the row's namespace, metadata
-/// and lifecycle, which are never sealed. A lifecycle value that does not parse
-/// falls back to the default state through `unwrap_or_default`, the same
-/// fallback the row decoder applies, so the gate judges the row exactly as
-/// the decrypting read would.
+/// #10061 / #10064 / #10082 / #10180 — classify one member row (`id`: the
+/// reflection itself or a source it reflects on) without decrypting it. An
+/// absent row returns `Ok(RowClassification::Absent)`; an unsealed row returns
+/// `Ok(RowClassification::Unsealed(RowVersion))`. A sealed row is never passed
+/// to the decrypting read: hidden from `caller`, not recall-visible or with
+/// metadata that does not parse (fail closed), it returns
+/// `Err(ReflectionNotFound(reflection_id))` so a sealed hidden member is
+/// indistinguishable from a hidden plain or absent one; visible, it returns
+/// `Ok(RowClassification::Sealed)` so the caller refuses with
+/// `SEALED_EXPORT_REFUSED` naming `id`. The visibility gate reads only the
+/// row's namespace, metadata and lifecycle, which are never sealed. A
+/// lifecycle value that does not parse falls back to the default state through
+/// `unwrap_or_default`, the same fallback the row decoder applies, so the gate
+/// judges the row exactly as the decrypting read would.
 fn classify_visible_sealed_state(
     conn: &rusqlite::Connection,
     id: &str,
     reflection_id: &str,
     caller: Option<&str>,
-) -> anyhow::Result<SealedState> {
+) -> anyhow::Result<RowClassification> {
     use rusqlite::OptionalExtension as _;
     let header = conn
         .query_row(
-            "SELECT namespace, metadata, lifecycle_state, encrypted_envelope IS NOT NULL \
+            "SELECT id, namespace, metadata, lifecycle_state, updated_at, version, \
+                    content, encrypted_envelope \
              FROM memories WHERE id = ?1",
             rusqlite::params![id],
             |row| {
@@ -330,36 +416,55 @@ fn classify_visible_sealed_state(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?.unwrap_or(1),
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
                 ))
             },
         )
         .optional()
         .context("classifying reflection row")?;
-    let Some((namespace, metadata, lifecycle, sealed)) = header else {
-        return Ok(SealedState::Unsealed);
+    let Some((row_id, namespace, metadata_raw, lifecycle, updated_at, version, content, envelope)) =
+        header
+    else {
+        return Ok(RowClassification::Absent);
     };
-    if !sealed {
-        return Ok(SealedState::Unsealed);
+    if envelope.is_some() {
+        let not_found =
+            || anyhow::Error::new(crate::errors::ReflectionNotFound::new(reflection_id));
+        let Ok(metadata) = serde_json::from_str::<Value>(&metadata_raw) else {
+            return Err(not_found());
+        };
+        let lifecycle_state =
+            crate::models::LifecycleState::from_str(&lifecycle).unwrap_or_default();
+        let probe = crate::models::Memory {
+            id: row_id,
+            namespace,
+            metadata,
+            lifecycle_state,
+            ..Default::default()
+        };
+        if !probe.lifecycle_state.is_recall_visible()
+            || !crate::visibility::is_readable_on_query(&probe, caller, None)
+        {
+            return Err(not_found());
+        }
+        return Ok(RowClassification::Sealed);
     }
-    let not_found = || anyhow::Error::new(crate::errors::ReflectionNotFound::new(reflection_id));
-    let Ok(metadata) = serde_json::from_str::<Value>(&metadata) else {
-        return Err(not_found());
-    };
-    let lifecycle_state = crate::models::LifecycleState::from_str(&lifecycle).unwrap_or_default();
-    let probe = crate::models::Memory {
-        id: id.to_owned(),
-        namespace,
-        metadata,
-        lifecycle_state,
-        ..Default::default()
-    };
-    if !probe.lifecycle_state.is_recall_visible()
-        || !crate::visibility::is_readable_on_query(&probe, caller, None)
-    {
-        return Err(not_found());
-    }
-    Ok(SealedState::Sealed)
+    let owner = serde_json::from_str::<Value>(&metadata_raw)
+        .ok()
+        .as_ref()
+        .and_then(extract_owner);
+    Ok(RowClassification::Unsealed(RowVersion {
+        id: row_id,
+        owner,
+        updated_at,
+        version,
+        content_blake3: *blake3::hash(content.as_bytes()).as_bytes(),
+        envelope_blake3: None,
+    }))
 }
 
 /// Local copy of the format parser — kept here so the MCP error
@@ -677,8 +782,10 @@ mod tests {
         let rfl = make_reflection("ns", 1, "ai:bot");
         let rfl_id = db::insert(&conn, &rfl).unwrap();
         let mut other = make_reflection("ns", 1, "ai:bot");
+        other.title = "other-rfl".into();
         other.content = "other reflection body".into();
         let other_id = db::insert(&conn, &other).unwrap();
+        assert_ne!(other_id, rfl_id, "other must be a distinct row");
 
         let res = super::handle_export_reflection_with_reader(
             &conn,
