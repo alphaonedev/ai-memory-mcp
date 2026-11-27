@@ -4426,3 +4426,453 @@ fn token_census_cost_is_bounded_10213() {
         ]
     );
 }
+const CRATE_NAME: &str = "ai_memory";
+
+/// #10277: a finding of the build-target census of `Cargo.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoFinding {
+    /// The manifest cannot be read.
+    Unreadable(String),
+    /// The manifest is not TOML.
+    Unparseable(String),
+    /// A key the census reads holds a value of a type Cargo does not take there.
+    BadType { key: String },
+    /// A target source that does not end in `.rs` (exact case).
+    NotRs {
+        kind: &'static str,
+        name: String,
+        path: String,
+    },
+    /// A target source the walk did not read.
+    Unwalked {
+        kind: &'static str,
+        name: String,
+        path: String,
+    },
+    /// A `[workspace]` table: members are not modelled.
+    Workspace,
+    /// A `path =` dependency directory that holds no walked file.
+    DependencyPathUnwalked { key: String, path: String },
+    /// `[lib] name` is not [`CRATE_NAME`].
+    LibName { found: String },
+}
+
+impl std::fmt::Display for CargoFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(e) => write!(f, "Cargo.toml cannot be read: {e}"),
+            Self::Unparseable(e) => write!(f, "Cargo.toml does not parse: {e}"),
+            Self::BadType { key } => {
+                write!(f, "Cargo.toml `{key}` is not of the type Cargo reads there")
+            }
+            Self::NotRs { kind, name, path } => write!(
+                f,
+                "Cargo.toml {kind} target `{name}` names `{path}`, which does not end in `.rs` (exact case), so the census never reads it"
+            ),
+            Self::Unwalked { kind, name, path } => write!(
+                f,
+                "Cargo.toml {kind} target `{name}` names `{path}`, which the census did not read"
+            ),
+            Self::Workspace => write!(
+                f,
+                "Cargo.toml has a [workspace] table, whose members the census does not model"
+            ),
+            Self::DependencyPathUnwalked { key, path } => write!(
+                f,
+                "Cargo.toml `{key}` names the directory `{path}`, which holds no file the census read"
+            ),
+            Self::LibName { found } => {
+                write!(f, "Cargo.toml [lib] name is `{found}`, not `{CRATE_NAME}`")
+            }
+        }
+    }
+}
+
+/// #10277 red: at this commit the census does not read `Cargo.toml`, so it
+/// reports no finding for any manifest.
+fn cargo_census(manifest: Result<String, String>, walked: &BTreeSet<&str>) -> Vec<CargoFinding> {
+    let _ = (manifest, walked);
+    Vec::new()
+}
+
+/// #10277: every manifest form that names a source the census did not
+/// read, or a value it cannot read, is red with its exact finding.
+#[test]
+fn cargo_manifest_forms_are_red_10277() {
+    let walked: BTreeSet<&str> = [
+        "src/lib.rs",
+        "src/main.rs",
+        "build.rs",
+        "tests/t.rs",
+        "vendored/x/src/lib.rs",
+    ]
+    .into_iter()
+    .collect();
+    let bad = |k: &str| CargoFinding::BadType { key: k.into() };
+    let unwalked = |kind: &'static str, name: &str, path: &str| CargoFinding::Unwalked {
+        kind,
+        name: name.into(),
+        path: path.into(),
+    };
+    let not_rs = |kind: &'static str, name: &str, path: &str| CargoFinding::NotRs {
+        kind,
+        name: name.into(),
+        path: path.into(),
+    };
+    let dep = |k: &str, p: &str| CargoFinding::DependencyPathUnwalked {
+        key: k.into(),
+        path: p.into(),
+    };
+    let rows: Vec<(&str, &str, Vec<CargoFinding>)> = vec![
+        ("clean", "[package]\nname = \"ai-memory\"\n", vec![]),
+        ("lib-dot-slash", "[lib]\npath = \"./src/lib.rs\"\n", vec![]),
+        (
+            "lib-upper-ext",
+            "[lib]\npath = \"src/lib.RS\"\n",
+            vec![not_rs("lib", CRATE_NAME, "src/lib.RS")],
+        ),
+        (
+            "lib-no-ext",
+            "[lib]\npath = \"src/lib\"\n",
+            vec![not_rs("lib", CRATE_NAME, "src/lib")],
+        ),
+        (
+            "lib-in-target",
+            "[lib]\npath = \"target/gen/lib.rs\"\n",
+            vec![unwalked("lib", CRATE_NAME, "target/gen/lib.rs")],
+        ),
+        (
+            "lib-parent",
+            "[lib]\npath = \"../x/src/lib.rs\"\n",
+            vec![unwalked("lib", CRATE_NAME, "../x/src/lib.rs")],
+        ),
+        (
+            "lib-absolute",
+            "[lib]\npath = \"/abs/lib.rs\"\n",
+            vec![unwalked("lib", CRATE_NAME, "/abs/lib.rs")],
+        ),
+        (
+            "lib-name",
+            "[lib]\nname = \"other\"\n",
+            vec![CargoFinding::LibName {
+                found: "other".into(),
+            }],
+        ),
+        ("lib-name-type", "[lib]\nname = 3\n", vec![bad("lib.name")]),
+        ("lib-path-type", "[lib]\npath = 3\n", vec![bad("lib.path")]),
+        ("lib-not-table", "lib = \"src/lib.rs\"\n", vec![bad("lib")]),
+        (
+            "bin-path",
+            "[[bin]]\nname = \"x\"\npath = \"gen/x.rs\"\n",
+            vec![unwalked("bin", "x", "gen/x.rs")],
+        ),
+        (
+            "bin-walked",
+            "[[bin]]\nname = \"ai-memory\"\npath = \"src/main.rs\"\n",
+            vec![],
+        ),
+        (
+            "test-default-absent",
+            "[[test]]\nname = \"nope\"\n",
+            vec![unwalked("test", "nope", "tests/nope.rs")],
+        ),
+        ("test-default-walked", "[[test]]\nname = \"t\"\n", vec![]),
+        (
+            "bench-not-rs",
+            "[[bench]]\nname = \"b\"\npath = \"benches/b.RS\"\n",
+            vec![not_rs("bench", "b", "benches/b.RS")],
+        ),
+        (
+            "example-default-absent",
+            "[[example]]\nname = \"e\"\n",
+            vec![unwalked("example", "e", "examples/e.rs")],
+        ),
+        ("bin-not-array", "bin = 3\n", vec![bad("bin")]),
+        ("bin-entry-not-table", "bin = [3]\n", vec![bad("bin[0]")]),
+        (
+            "bin-name-type",
+            "[[bin]]\nname = 3\n",
+            vec![bad("bin[0].name")],
+        ),
+        (
+            "bin-path-type",
+            "[[bin]]\nname = \"x\"\npath = 3\n",
+            vec![bad("bin[0].path")],
+        ),
+        ("build-true", "[package]\nbuild = true\n", vec![]),
+        ("build-false", "[package]\nbuild = false\n", vec![]),
+        (
+            "build-string",
+            "[package]\nbuild = \"gen/build.rs\"\n",
+            vec![unwalked("build", "build", "gen/build.rs")],
+        ),
+        (
+            "build-not-rs",
+            "[package]\nbuild = \"build.RS\"\n",
+            vec![not_rs("build", "build", "build.RS")],
+        ),
+        (
+            "build-array",
+            "[package]\nbuild = [\"build.rs\", \"gen/b.rs\", 3]\n",
+            vec![
+                unwalked("build", "build", "gen/b.rs"),
+                bad("package.build[2]"),
+            ],
+        ),
+        (
+            "build-type",
+            "[package]\nbuild = 3\n",
+            vec![bad("package.build")],
+        ),
+        ("package-not-table", "package = 3\n", vec![bad("package")]),
+        (
+            "dep-path-out",
+            "[dependencies]\nx = { path = \"../x\" }\n",
+            vec![dep("dependencies.x.path", "../x")],
+        ),
+        (
+            "dep-path-walked",
+            "[dependencies]\nx = { path = \"vendored/x\" }\n",
+            vec![],
+        ),
+        (
+            "dep-path-type",
+            "[dependencies]\nx = { path = 3 }\n",
+            vec![bad("dependencies.x.path")],
+        ),
+        (
+            "deps-not-table",
+            "dependencies = 3\n",
+            vec![bad("dependencies")],
+        ),
+        (
+            "dev-dep",
+            "[dev-dependencies]\nx = { path = \"gen/x\" }\n",
+            vec![dep("dev-dependencies.x.path", "gen/x")],
+        ),
+        (
+            "build-dep-slash",
+            "[build-dependencies]\nx = { path = \"gen/x/\" }\n",
+            vec![dep("build-dependencies.x.path", "gen/x")],
+        ),
+        (
+            "target-cfg",
+            "[target.'cfg(unix)'.dependencies]\nx = { path = \"../x\" }\n",
+            vec![dep("target.cfg(unix).dependencies.x.path", "../x")],
+        ),
+        ("target-not-table", "target = 3\n", vec![bad("target")]),
+        (
+            "target-cfg-not-table",
+            "[target]\nunix = 3\n",
+            vec![bad("target.unix")],
+        ),
+        (
+            "patch",
+            "[patch.crates-io]\nx = { path = \"../x\" }\n",
+            vec![dep("patch.crates-io.x.path", "../x")],
+        ),
+        ("patch-not-table", "patch = 3\n", vec![bad("patch")]),
+        (
+            "patch-source-not-table",
+            "[patch]\ncrates-io = 3\n",
+            vec![bad("patch.crates-io")],
+        ),
+        (
+            "replace",
+            "[replace]\n\"x:0.1.0\" = { path = \"../x\" }\n",
+            vec![dep("replace.x:0.1.0.path", "../x")],
+        ),
+        ("replace-not-table", "replace = 3\n", vec![bad("replace")]),
+        ("workspace", "[workspace]\n", vec![CargoFinding::Workspace]),
+        (
+            "unparseable",
+            "[package\n",
+            vec![CargoFinding::Unparseable(
+                "invalid table header\nexpected `.`, `]`".into(),
+            )],
+        ),
+    ];
+    let mut miss = Vec::new();
+    for (id, manifest, want) in rows {
+        let got = cargo_census(Ok(manifest.to_string()), &walked);
+        if got != want {
+            miss.push(format!("{id}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+    assert_eq!(
+        cargo_census(Err("permission denied".into()), &walked),
+        vec![CargoFinding::Unreadable("permission denied".into())]
+    );
+}
+
+/// #10277: each census finding prints its exact message.
+#[test]
+fn cargo_findings_print_exactly_10277() {
+    let rows = [
+        (
+            CargoFinding::Unreadable("permission denied".into()),
+            "Cargo.toml cannot be read: permission denied",
+        ),
+        (
+            CargoFinding::Unparseable("bad".into()),
+            "Cargo.toml does not parse: bad",
+        ),
+        (
+            CargoFinding::BadType { key: "lib".into() },
+            "Cargo.toml `lib` is not of the type Cargo reads there",
+        ),
+        (
+            CargoFinding::NotRs {
+                kind: "lib",
+                name: CRATE_NAME.into(),
+                path: "src/lib.RS".into(),
+            },
+            "Cargo.toml lib target `ai_memory` names `src/lib.RS`, which does not end in `.rs` (exact case), so the census never reads it",
+        ),
+        (
+            CargoFinding::Unwalked {
+                kind: "bin",
+                name: "x".into(),
+                path: "gen/x.rs".into(),
+            },
+            "Cargo.toml bin target `x` names `gen/x.rs`, which the census did not read",
+        ),
+        (
+            CargoFinding::Workspace,
+            "Cargo.toml has a [workspace] table, whose members the census does not model",
+        ),
+        (
+            CargoFinding::DependencyPathUnwalked {
+                key: "dependencies.x.path".into(),
+                path: "../x".into(),
+            },
+            "Cargo.toml `dependencies.x.path` names the directory `../x`, which holds no file the census read",
+        ),
+        (
+            CargoFinding::LibName {
+                found: "other".into(),
+            },
+            "Cargo.toml [lib] name is `other`, not `ai_memory`",
+        ),
+    ];
+    for (finding, text) in rows {
+        assert_eq!(finding.to_string(), text);
+    }
+}
+
+/// The types `src/a.rs` defines for the round-2 reviewer forms (#10275).
+const R2_DEFS: &str = "pub struct Gate {\n    m: std::sync::Mutex<u8>,\n}\n\
+pub type One = Two;\npub type Two = std::sync::RwLock<u8>;\npub type Erased = Box<dyn Fn() + Sync>;\n";
+
+/// Round-2 reviewer forms of a static under a `once` row: each is a lock or
+/// a type the census cannot prove lock-free, so the census must report it.
+const R2_STATIC_FORMS: &[(&str, &str)] = &[
+    (
+        "10275-cross-file-path",
+        "static FORM: crate::a::Gate = X;\n",
+    ),
+    ("10275-cross-file-bare", "static FORM: Gate = X;\n"),
+    (
+        "10275-cross-file-alias",
+        "static FORM: crate::a::One = X;\n",
+    ),
+    (
+        "10283-dyn-boxed",
+        "static FORM: Box<dyn std::any::Any + Sync> = X;\n",
+    ),
+    (
+        "10283-dyn-lazy-boxed",
+        "static FORM: std::sync::LazyLock<Box<dyn Send + Sync>> = X;\n",
+    ),
+    ("10283-erased-alias", "static FORM: crate::a::Erased = X;\n"),
+    ("10283-macro-type", "static FORM: my_type!() = X;\n"),
+    (
+        "10283-impl-alias",
+        "type Hidden = impl Sized;\nstatic FORM: Hidden = X;\n",
+    ),
+    (
+        "10278-generic-default",
+        "struct Holder<T = std::sync::Mutex<u8>>(T);\nstatic FORM: Holder = X;\n",
+    ),
+    (
+        "10279-fair",
+        "static FORM: parking_lot::FairMutex<u8> = X;\n",
+    ),
+    (
+        "10279-raw",
+        "static FORM: lock_api::Mutex<parking_lot::RawMutex, u8> = X;\n",
+    ),
+    (
+        "10279-raw-rwlock",
+        "static FORM: parking_lot::RawRwLock = X;\n",
+    ),
+    (
+        "10285-macro-body",
+        "macro_rules! m {\n    () => {\n        static INNER: u8 = 0;\n    };\n}\n",
+    ),
+];
+
+/// Round-2 reviewer forms of an `include!` of a file the walk did not read.
+const R2_INCLUDE_FORMS: &[(&str, &str)] = &[
+    (
+        "10276-use-rename",
+        "use std::include as pull;\npull!(\"missing.rs\");\n",
+    ),
+    ("10276-brackets", "include![\"missing.rs\"];\n"),
+    ("10276-braces", "include! {\"missing.rs\"}\n"),
+    ("10276-core-path", "core::include!(\"missing.rs\");\n"),
+];
+
+/// #10274 round 2: every reviewer form leaves a finding naming `src/b.rs`.
+/// Red where the census was silent (fail-open); the exact findings are
+/// pinned by the form tables that follow the fix.
+#[test]
+fn review_r1_forms_are_red_10274() {
+    let names_b = |dbg: String| dbg.contains("\"src/b.rs\"");
+    let mut silent = Vec::new();
+    for (id, text) in R2_STATIC_FORMS {
+        let files = vec![
+            ("src/a.rs".to_string(), R2_DEFS.to_string()),
+            ("src/b.rs".to_string(), (*text).to_string()),
+        ];
+        let table = "src/b.rs\tFORM\tonce: a value computed once, no lock\n";
+        let (statics, _) = token_census(&files, table);
+        let hit = statics
+            .iter()
+            .any(|f| names_b(format!("{f:?}")) && !matches!(f, StaticFinding::Missing { .. }));
+        if !hit {
+            silent.push(format!("{id}: {statics:?}"));
+        }
+    }
+    for (id, text) in R2_INCLUDE_FORMS {
+        let files = vec![("src/b.rs".to_string(), (*text).to_string())];
+        let (_, includes) = token_census(&files, "");
+        if !includes.iter().any(|f| names_b(format!("{f:?}"))) {
+            silent.push(format!("{id}: {includes:?}"));
+        }
+    }
+    assert_eq!(silent, Vec::<String>::new());
+}
+
+/// #10284: the definition scan is linear for every lexable input, including
+/// one that does not compile: 100 000 repetitions of each item keyword left
+/// without the tokens that would end its scan are judged under the ceiling
+/// (the round-1 scan took 22 s to 76 s at 50 000).
+#[test]
+fn type_definition_cost_is_bounded_10284() {
+    const REPS: usize = 100_000;
+    const CEILING_SECS: u64 = 20;
+    const UNITS: [&str; 4] = ["type x ", "struct x ", "struct x { ", "enum x < "];
+    for unit in UNITS {
+        let files = vec![("src/hostile.rs".to_string(), unit.repeat(REPS))];
+        let start = std::time::Instant::now();
+        let (statics, _) = token_census(&files, "");
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(CEILING_SECS),
+            "{unit:?}: {took:?}"
+        );
+        assert_eq!(statics, Vec::<StaticFinding>::new(), "{unit:?}");
+    }
+}
