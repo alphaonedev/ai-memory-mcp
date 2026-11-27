@@ -351,3 +351,100 @@ fn comments_are_judged_as_text_8168() {
         "a call hidden behind a trailing comment is one unlisted line: {found:?}"
     );
 }
+
+/// The live text of [`ALLOWED_FILE`], the base of the #10208 text mutants.
+fn live_guard_file() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(ALLOWED_FILE);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The opening of the real constructor, the anchor every mutant edits.
+const ACQUIRE_HEAD: &str =
+    "    pub(crate) fn acquire(_env: &'env OuterEnvLock) -> Self {\n        Self {\n";
+
+/// `text` with `from` replaced once; panics when the anchor is gone, so a
+/// mutant can never be a silent no-op.
+fn mutate(text: &str, from: &str, to: &str) -> String {
+    assert_eq!(text.matches(from).count(), 1, "mutant anchor: {from}");
+    text.replacen(from, to, 1)
+}
+
+/// #10208 form 1: a second constructor with no outer proof, which
+/// `acquire` delegates to.
+fn mutant_second_constructor() -> String {
+    mutate(
+        &live_guard_file(),
+        ACQUIRE_HEAD,
+        "    pub(crate) fn acquire(_env: &'env OuterEnvLock) -> Self {\n        Self::lone()\n    }\n\n    pub(crate) fn lone() -> Self {\n        Self {\n",
+    )
+}
+
+/// #10208 form 2: a method that hands out the inner guard by value.
+fn mutant_by_value_accessor() -> String {
+    mutate(
+        &live_guard_file(),
+        "    /// Test probe:",
+        "    pub(crate) fn into_inner(self) -> std::sync::MutexGuard<'static, ()> {\n        self._store_url\n    }\n\n    /// Test probe:",
+    )
+}
+
+/// #10208 form 3: `acquire` delegates to a private helper that takes the
+/// lock with no proof.
+fn mutant_unproven_helper() -> String {
+    let text = mutate(
+        &live_guard_file(),
+        ACQUIRE_HEAD,
+        "    pub(crate) fn acquire(_env: &'env OuterEnvLock) -> Self {\n        take()\n    }\n}\n\nfn take<'a>() -> StoreUrlEnvGuard<'a> {\n    {\n        StoreUrlEnvGuard {\n",
+    );
+    mutate(
+        &text,
+        "    /// Test probe:",
+        "}\n\nimpl StoreUrlEnvGuard<'_> {\n    /// Test probe:",
+    )
+}
+
+/// #10208 form 4: a second mutex static under another name that serialises
+/// the store-url variables in another file.
+fn mutant_second_static() -> (String, String) {
+    (
+        "src/cli/backup.rs".to_string(),
+        "#[cfg(test)]\nmod t {\n    static STORE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());\n    #[test]\n    fn t() {\n        let _g = STORE_ENV.lock();\n        unsafe { std::env::remove_var(crate::store_url::STORE_URL_ENV) };\n    }\n}\n"
+            .to_string(),
+    )
+}
+
+/// #10208: each form the round-1 reviewers kept green must be red.
+#[test]
+fn mutant_second_constructor_is_red_10208() {
+    assert_ne!(
+        census(&[(ALLOWED_FILE.to_string(), mutant_second_constructor())]),
+        Vec::<Violation>::new()
+    );
+}
+
+#[test]
+fn mutant_by_value_accessor_is_red_10208() {
+    assert_ne!(
+        census(&[(ALLOWED_FILE.to_string(), mutant_by_value_accessor())]),
+        Vec::<Violation>::new()
+    );
+}
+
+#[test]
+fn mutant_unproven_helper_is_red_10208() {
+    assert_ne!(
+        census(&[(ALLOWED_FILE.to_string(), mutant_unproven_helper())]),
+        Vec::<Violation>::new()
+    );
+}
+
+#[test]
+fn mutant_second_static_is_red_10208() {
+    assert_ne!(
+        census(&[
+            (ALLOWED_FILE.to_string(), live_guard_file()),
+            mutant_second_static()
+        ]),
+        Vec::<Violation>::new()
+    );
+}
