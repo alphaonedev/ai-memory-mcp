@@ -15921,6 +15921,38 @@ pub fn enroll_lineage(
     Ok(record)
 }
 
+/// #10040 (#10089) — the succession preconditions, in one place: an enrolled
+/// lineage, a `k_old` that can sign, and `k_old` being the current head key.
+/// Returns the head. [`append_succession`] runs it first, and `identity
+/// succeed` runs it before it arms the row funnel with `k_old`, so a refused
+/// succession names the precondition it broke, not the arming refusal.
+///
+/// # Errors
+///
+/// No enrolled lineage, a public-only `k_old`, an undecodable head key, or a
+/// `k_old` that is not the head key.
+pub fn succession_head(
+    conn: &Connection,
+    agent_id: &str,
+    k_old: &crate::identity::keypair::AgentKeypair,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    let Some((head, _)) = lineage_head(conn, agent_id)? else {
+        anyhow::bail!("no lineage enrolled for '{agent_id}' — run enroll-lineage first");
+    };
+    if !k_old.can_sign() {
+        anyhow::bail!("keypair for '{agent_id}' is public-only — cannot sign a succession");
+    }
+    let head_key = crate::identity::keypair::decode_public_base64(&head.successor_pubkey_b64)
+        .context("decoding lineage head key")?;
+    if head_key.to_bytes() != k_old.public.to_bytes() {
+        anyhow::bail!(
+            "signing keypair is not the current lineage head for '{agent_id}' — only the \
+             head key can hand the identity off (key-LOSS recovery lands in v1.0)"
+        );
+    }
+    Ok(head)
+}
+
 /// Mint + persist a ROTATION succession from the current head to
 /// `successor_pubkey_b64`, signed by `k_old` (#1828 G13).
 ///
@@ -15942,20 +15974,7 @@ pub fn append_succession(
     successor_pubkey_b64: &str,
     recovery_pubkey_b64: Option<&str>,
 ) -> Result<crate::identity::lineage::LineageRecord> {
-    let Some((head, _)) = lineage_head(conn, agent_id)? else {
-        anyhow::bail!("no lineage enrolled for '{agent_id}' — run enroll-lineage first");
-    };
-    if !k_old.can_sign() {
-        anyhow::bail!("keypair for '{agent_id}' is public-only — cannot sign a succession");
-    }
-    let head_key = crate::identity::keypair::decode_public_base64(&head.successor_pubkey_b64)
-        .context("decoding lineage head key")?;
-    if head_key.to_bytes() != k_old.public.to_bytes() {
-        anyhow::bail!(
-            "signing keypair is not the current lineage head for '{agent_id}' — only the \
-             head key can hand the identity off (key-LOSS recovery lands in v1.0)"
-        );
-    }
+    let head = succession_head(conn, agent_id, k_old)?;
     crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
         .context("decoding successor pubkey")?;
     if let Some(rec) = recovery_pubkey_b64 {
