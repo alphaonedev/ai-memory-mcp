@@ -1172,13 +1172,9 @@ async fn sqlite_genesis_after_bind_preserves_agent_row_10197() {
 
     let recovery_kp =
         ai_memory::identity::keypair::generate("recovery-10197").expect("recovery keypair");
-    let record = ai_memory::db::enroll_lineage(
-        &conn,
-        TARGET_AGENT,
-        &kp,
-        Some(&recovery_kp.public_base64()),
-    )
-    .expect("#10197: genesis after same-key bind must succeed on SQLite");
+    let record =
+        ai_memory::db::enroll_lineage(&conn, TARGET_AGENT, &kp, Some(&recovery_kp.public_base64()))
+            .expect("#10197: genesis after same-key bind must succeed on SQLite");
     assert_eq!(record.epoch, 0);
 
     let after = snap(&conn);
@@ -1378,10 +1374,10 @@ async fn postgres_armed_bind_matrix_admin_and_non_admin_10109() {
         .await
         .expect("inspect PG pool");
     let non_admin_caller = "ai:non-admin-pg-10109";
-    let non_admin_token = "10109-non-admin-pg-token-0123456789abcdef";
+    let non_admin_key_fixture = "fixture-non-admin-pg-10109";
     state.enrolled_agent_keys.mutate(|m| {
         m.insert(
-            ai_memory::handlers::identity_binding::api_key_sha256_hex(non_admin_token),
+            ai_memory::handlers::identity_binding::api_key_sha256_hex(non_admin_key_fixture),
             non_admin_caller.to_string(),
         );
     });
@@ -1481,7 +1477,7 @@ async fn postgres_armed_bind_matrix_admin_and_non_admin_10109() {
         .uri(format!("/api/v1/agents/{agent}/pubkey"))
         .header("content-type", "application/json")
         .header("x-agent-id", non_admin_caller)
-        .header("x-api-key", non_admin_token)
+        .header("x-api-key", non_admin_key_fixture)
         .body(Body::from(serde_json::to_vec(&diff_body).expect("json")))
         .expect("non-admin req");
     let non_admin_resp = router.oneshot(non_admin_req).await.expect("non-admin resp");
