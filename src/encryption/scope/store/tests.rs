@@ -1321,3 +1321,75 @@ fn note_marker_failure_caps_the_set_8315() {
     );
     assert_eq!(warned.len(), 2, "a saturated slug is not inserted");
 }
+
+/// Clears the thread's seam state on every exit of a test.
+struct SeamReset;
+
+impl Drop for SeamReset {
+    fn drop(&mut self) {
+        crate::storage::snapshot_file::seam::reset();
+    }
+}
+
+/// #10214 (the #10254 class): a scope-key record written but not confirmed
+/// durable never stops the commit. At every directory fsync of a supersede
+/// the failure is reported as "written, not confirmed durable", and both
+/// records, the audit line and the cache are in place: a fresh store loads
+/// the new generation from disk.
+#[test]
+fn supersede_dir_sync_failure_finishes_the_commit_10214() {
+    use crate::storage::snapshot_file::{NotDurableReport, seam};
+    const NOT_DURABLE: &str = "is written but not confirmed durable";
+    let _reset = SeamReset;
+    let stays = test_node("node-stays-10214");
+    let readers = [ReaderKek::from_keypair(&stays)];
+    let clean = {
+        let dir = sandbox();
+        let _recovery = enrol_test_recovery(dir.path());
+        let store = open_store(dir.path());
+        minted(&store, &[&stays]);
+        seam::reset();
+        store.supersede(NS, &readers).expect("clean supersede");
+        seam::take_dir_syncs().len()
+    };
+    assert!(
+        clean >= 2,
+        "a supersede writes two records, synced {clean} times"
+    );
+    for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
+        let dir = sandbox();
+        let _recovery = enrol_test_recovery(dir.path());
+        let store = open_store(dir.path());
+        let first = minted(&store, &[&stays]);
+        seam::reset();
+        seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+        let err = store
+            .supersede(NS, &readers)
+            .expect_err("a record not confirmed durable is reported");
+        seam::reset();
+        assert!(
+            err.downcast_ref::<NotDurableReport>().is_some(),
+            "sync {nth}: the typed report, got {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains(NOT_DURABLE),
+            "sync {nth}: {err:#}"
+        );
+        let current = store
+            .load_current(NS)
+            .expect("current")
+            .expect("a current generation");
+        assert_eq!(
+            current.epoch, 2,
+            "sync {nth}: the cache holds the new generation"
+        );
+        assert_ne!(current.key_id, first.key_id);
+        let reopened = open_store(dir.path());
+        assert_eq!(
+            reopened.load_current(NS).expect("reload from disk"),
+            Some(current),
+            "sync {nth}: both records and the audit line are on disk"
+        );
+        assert_eq!(reopened.history(NS).expect("history").len(), 2);
+    }
+}

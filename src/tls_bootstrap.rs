@@ -1494,4 +1494,65 @@ mod tests {
         let sans = leaf_subject_alt_names("[::1]");
         assert!(sans.iter().any(|s| s == "::1"));
     }
+
+    /// Clears the thread's seam state on every exit of a test.
+    struct SeamReset;
+
+    impl Drop for SeamReset {
+        fn drop(&mut self) {
+            crate::storage::snapshot_file::seam::reset();
+        }
+    }
+
+    /// #10214 (the #10254 class): a failed directory fsync at any point of
+    /// the first boot never stops the sequence. Every file of the CA and the
+    /// leaf is written, the boot reports "written, not confirmed durable",
+    /// and the next boot reuses the complete material.
+    #[test]
+    fn first_boot_dir_sync_failure_finishes_ca_and_leaf_10214() {
+        use crate::storage::snapshot_file::seam;
+        const NOT_DURABLE: &str = "is written but not confirmed durable";
+        let _reset = SeamReset;
+        let clean = {
+            let tmp = sandbox();
+            seam::reset();
+            ensure_local_tls(tmp.path(), "127.0.0.1").expect("clean first boot");
+            seam::take_dir_syncs().len()
+        };
+        assert!(
+            clean >= 4,
+            "a first boot publishes four files, synced {clean} times"
+        );
+        for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
+            let tmp = sandbox();
+            seam::reset();
+            seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+            let err = ensure_local_tls(tmp.path(), "127.0.0.1")
+                .expect_err("a file not confirmed durable is reported");
+            seam::reset();
+            assert!(
+                err.downcast_ref::<NotDurableReport>().is_some(),
+                "sync {nth}: the typed report, got {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains(NOT_DURABLE),
+                "sync {nth}: {err:#}"
+            );
+            let dir = tmp.path().join(TLS_SUBDIR);
+            for file in [
+                SERVER_CERT_FILE,
+                SERVER_KEY_FILE,
+                LOCAL_CA_CERT_FILE,
+                LOCAL_CA_KEY_FILE,
+            ] {
+                assert!(dir.join(file).exists(), "sync {nth}: {file} is written");
+            }
+            let again = ensure_local_tls(tmp.path(), "127.0.0.1").expect("next boot");
+            assert_eq!(
+                again.outcome,
+                Outcome::Reused,
+                "sync {nth}: the material on disk is complete"
+            );
+        }
+    }
 }
