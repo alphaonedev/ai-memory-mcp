@@ -1266,6 +1266,196 @@ fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
     );
 }
 
+// ---------------------------------------------------------------- R3 mutants
+
+/// The census findings of a one-file tree that name that file.
+fn r3_fixture(rel: &str, text: &str) -> Vec<String> {
+    let tree = Tree {
+        files: vec![(rel.to_string(), text.as_bytes().to_vec())],
+        links: vec![],
+        packages: vec![],
+    };
+    let head = format!("{rel}:");
+    census(&tree)
+        .into_iter()
+        .filter(|l| l.starts_with(&head))
+        .collect()
+}
+
+/// Every form the round-2 recogniser did not model (R2, R3, R9, R10, R13) and
+/// the forms invented in round 3 (I1 to I13): each is red with its exact
+/// lines. The expected lines are written out here, never built by the census.
+#[test]
+fn every_round_three_form_is_red_10176() {
+    let rel = "src/r3.rs";
+    let tok = |n: usize| {
+        format!(
+            "{rel}: {n} watched process, libc, nix or proptest tokens, TOKEN_ROWS has 0; every reference under any cfg, in any macro or by any path needs its exact row (#10176)"
+        )
+    };
+    let shape = |line: usize, what: &str| {
+        format!(
+            "{rel}:{line}: {what}; a form the census does not model needs a SHAPE_ROWS row with its reason (#10176)"
+        )
+    };
+    let runner = |line: usize, name: &str| {
+        format!(
+            "{rel}:{line}: {name}! reaches the proptest runner outside a guarded proptest! block (#10176)"
+        )
+    };
+    let env_name = |n: usize| {
+        format!(
+            "{rel}: {n} environment names that are not one string literal or one named constant, ENV_NAME_ROWS has 0; a built name can switch proptest fork on (#10176)"
+        )
+    };
+    let env = |n: usize| {
+        format!(
+            "{rel}: names a proptest environment variable {n} times, ENV_ROWS has 0; a variable set in CI, .cargo config, a script or code can switch fork on (#10176)"
+        )
+    };
+    let uncovered = |line: usize| {
+        format!(
+            "{rel}:{line}: process start with no #[expect(clippy::disallowed_methods)] on its item or statement; layer 1 does not see code under a cfg the clippy jobs do not compile (#10176)"
+        )
+    };
+    let start = format!(
+        "{rel}: 1 process-start sites, START_ROWS has 0; a new or removed start needs its row (#10176)"
+    );
+    let metavar = "a watched path followed by a macro metavariable";
+    let impl_ = "an impl whose header names a watched process, libc, nix or proptest name";
+    let glob = "a glob import of a watched path";
+    let paste = "a pasted or concatenated identifier";
+    let rows: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            "R2 a macro metavariable after std::process",
+            "#[cfg(windows)]\nmacro_rules! spawn_it {\n    ($t:ident) => { std::process::$t::new(\"x\") };\n}\n",
+            vec![shape(3, metavar), tok(2)],
+        ),
+        (
+            "R3 an impl for std::process::Command",
+            "#[cfg(target_os = \"macos\")]\nimpl Spawn for std::process::Command {\n    fn spawn_it() -> Self { Self::new(\"x\") }\n}\n",
+            vec![shape(2, impl_), tok(2)],
+        ),
+        (
+            "R9 an expect under cfg_attr(any())",
+            "#[cfg_attr(any(), expect(clippy::disallowed_methods, reason = \"x\"))]\nfn f() { std::process::Command::new(\"x\"); }\n",
+            vec![uncovered(2), start.clone(), tok(2)],
+        ),
+        (
+            "I10 an allow under cfg_attr(not(all()))",
+            "#[cfg_attr(not(all()), allow(clippy::disallowed_methods))]\nfn f() { std::process::Command::new(\"x\"); }\n",
+            vec![uncovered(2), start.clone(), tok(2)],
+        ),
+        (
+            "R10 proptest_helper! outside a guarded block",
+            "fn t() {\n    proptest_helper!(@_WRAP (x));\n}\n",
+            vec![runner(2, "proptest_helper"), tok(1)],
+        ),
+        (
+            "R13 a proptest variable name built by concat!",
+            "fn f() {\n    std::env::set_var(concat!(\"PROPTEST\", \"_FORK\"), \"true\");\n}\n",
+            vec![env(1), env_name(1)],
+        ),
+        (
+            "I1 an extern block",
+            "extern \"C\" {\n    fn fork() -> i32;\n}\n",
+            vec![shape(1, "an extern block")],
+        ),
+        (
+            "I2 inline assembly",
+            "fn f() {\n    unsafe { core::arch::asm!(\"syscall\") }\n}\n",
+            vec![shape(2, "inline assembly")],
+        ),
+        (
+            "I3 a pasted identifier",
+            "paste::paste! {\n    fn [<sp awn>]() {}\n}\n",
+            vec![shape(1, paste), shape(2, paste)],
+        ),
+        (
+            "I4 std::process renamed by self as",
+            "use std::process::{self as p};\nfn f() -> u32 {\n    p::id()\n}\n",
+            vec![tok(3)],
+        ),
+        (
+            "I5 a type alias of a process type",
+            "type Run = std::process::Child;\nfn f(_: Run) {}\n",
+            vec![tok(3)],
+        ),
+        (
+            "I6 proptest_helper! through #[macro_use] extern crate",
+            "#[macro_use]\nextern crate proptest;\nfn t() {\n    proptest_helper!(@_WRAP (x));\n}\n",
+            vec![runner(4, "proptest_helper"), tok(2)],
+        ),
+        (
+            "I7 a glob import of std::process",
+            "use std::process::*;\n",
+            vec![shape(1, glob), tok(1)],
+        ),
+        (
+            "I8 an environment name passed as a variable",
+            "fn f(k: &str) {\n    let _ = std::env::var(k);\n}\n",
+            vec![env_name(1)],
+        ),
+        (
+            "I9 a proptest variable name built in a const",
+            "const N: &str = concat!(\"PROPTEST\", \"_TIMEOUT\");\n",
+            vec![env(1)],
+        ),
+        (
+            "I11 a macro that wraps a proptest macro",
+            "macro_rules! cases {\n    () => { proptest::prop_compose!{} };\n}\nfn t() { cases!(); }\n",
+            vec![runner(4, "cases"), tok(4)],
+        ),
+        (
+            "I12 another function renamed to proptest_guarded",
+            "use std::convert::identity as proptest_guarded;\n",
+            vec![format!(
+                "{rel}:1: a definition or rename of proptest_guarded outside tests/common/proptest_guard.rs; a guarded block must call the one guard (#10176)"
+            )],
+        ),
+        (
+            "I13 a proptest_guard module from another file",
+            "#[path = \"evil.rs\"]\nmod proptest_guard;\n",
+            vec![format!(
+                "{rel}:2: a proptest_guard module not loaded from tests/common/proptest_guard.rs by #[path] (#10176)"
+            )],
+        ),
+    ];
+    for (form, text, want) in rows {
+        assert_eq!(r3_fixture(rel, text), want, "{form}:\n{text}");
+    }
+}
+
+/// A rowed file with another count and a row whose file has no token are
+/// each red with the exact line of the R3 tables.
+#[test]
+fn a_wrong_count_and_a_stale_row_of_the_token_tables_are_red_10176() {
+    let tree = Tree {
+        files: vec![(
+            "tests/common/tls_serve.rs".to_string(),
+            b"fn f() -> u32 {\n    std::process::id()\n}\n".to_vec(),
+        )],
+        links: vec![],
+        packages: vec![],
+    };
+    let got: Vec<String> = census(&tree)
+        .into_iter()
+        .filter(|l| {
+            (l.starts_with("tests/common/tls_serve.rs:") || l.starts_with("src/daemon_runtime.rs:"))
+                && (l.contains("TOKEN_ROWS") || l.contains("SHAPE_ROWS"))
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "tests/common/tls_serve.rs: 1 watched process, libc, nix or proptest tokens, TOKEN_ROWS has 6; every reference under any cfg, in any macro or by any path needs its exact row (#10176)".to_string(),
+            "src/daemon_runtime.rs: 0 watched process, libc, nix or proptest tokens, TOKEN_ROWS has 178; every reference under any cfg, in any macro or by any path needs its exact row (#10176)".to_string(),
+            "src/daemon_runtime.rs: 0 forms the census does not model, SHAPE_ROWS has 1; each needs its exact row with its reason (#10176)".to_string(),
+            "tests/common/tls_serve.rs: 0 forms the census does not model, SHAPE_ROWS has 3; each needs its exact row with its reason (#10176)".to_string(),
+        ]
+    );
+}
+
 // ---------------------------------------------------------------- A2: Cargo.lock
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
