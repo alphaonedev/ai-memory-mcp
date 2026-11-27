@@ -416,7 +416,17 @@ const RAW_WRITE_CENSUS_8950: &[(&str, usize)] = &[
     // r1 (X-1): the pre-migration VACUUM INTO moved into snapshot_file.rs
     // (migrations.rs 1 -> 0); create_private_target and the by-name settle
     // are gone (snapshot_file.rs 3 -> 2: open_new_private + the VACUUM).
-    ("src/storage/snapshot_file.rs", 2),
+    // #10214 (2 -> 3): the third site is the READ-only `O_DIRECTORY` open of
+    // `sync_dir` (`.read(true)`, no create/truncate/write flag): it fsyncs a
+    // directory and creates or replaces nothing. Guard:
+    // `storage::snapshot_dir_sync_10214_tests::sync_dir_opens_read_only_and_creates_nothing_10214`.
+    ("src/storage/snapshot_file.rs", 3),
+    // #10248: the one production site is the `O_NOFOLLOW | O_CLOEXEC` seal
+    // lock open of `SealLock::acquire` (#10193); the other three are in the file's
+    // inline `mod tests`. Guard:
+    // `storage::row_attest::seal::tests::seal_lock_failure_refuses_the_write_10193`
+    // (a symlink at the lock name refuses the write).
+    ("src/storage/row_attest/seal.rs", 4),
     ("src/storage/sqlite_integrity.rs", 1),
     ("src/store_url.rs", 1),
     ("src/test_support.rs", 6),

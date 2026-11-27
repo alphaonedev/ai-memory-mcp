@@ -57,10 +57,7 @@ pub(super) fn vacuum_into_private(
     seam::fire(seam::Point::Filled, dest);
     stage.verify_identity()?;
     settle_mode_to_source(stage.file(), source)?;
-    stage
-        .file()
-        .sync_all()
-        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    stage.sync_file()?;
     drop(stage.publish()?);
     Ok(())
 }
@@ -414,10 +411,7 @@ pub(crate) fn write_new_private_unique(
 ) -> Result<std::path::PathBuf> {
     let mut stage = stage_in_private_dir(dest, what)?;
     stage.write_all(bytes)?;
-    stage
-        .file()
-        .sync_all()
-        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    stage.sync_file()?;
     for n in 0..=UNIQUE_NAME_ATTEMPTS {
         let candidate = if n == 0 {
             dest.to_path_buf()
@@ -437,23 +431,103 @@ pub(crate) fn write_new_private_unique(
 /// Replace the product-owned file at `dest` with `bytes` (owner-only,
 /// fsynced) by a rename, refusing a symlink at the name instead of following
 /// or replacing it. A regular file there is replaced; an absent one created.
+/// #10214: the rename is made durable by an fsync of `dest`'s directory.
+///
+/// Every failure is an error and `dest` holds exactly the before or the
+/// after bytes: a failure up to and including the rename leaves the old file
+/// (or none) and removes the stage; a failed directory fsync leaves the
+/// complete new file in place and is returned, never swallowed.
 ///
 /// # Errors
-/// A symlink sits at `dest`, or the stage, write, fsync or rename fails.
+/// A symlink sits at `dest`, or the stage, write, fsync, rename or directory
+/// fsync fails.
 pub(crate) fn write_replacing(dest: &Path, what: &'static str, bytes: &[u8]) -> Result<()> {
     refuse_symlink(dest)?;
     let mut stage = stage_in_private_dir(dest, what)?;
     stage.write_all(bytes)?;
-    stage
-        .file()
-        .sync_all()
-        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    stage.sync_file()?;
     stage.verify_identity()?;
     refuse_symlink(dest)?;
-    std::fs::rename(&stage.name.path, dest)
-        .with_context(|| format!("replacing {}", dest.display()))?;
+    rename_replacing(&stage.name.path, dest)
+        .with_context(|| format!("replacing {what} {} (#10214)", dest.display()))?;
     stage.name.armed = false;
-    Ok(())
+    sync_parent_dir(dest, what)
+}
+
+/// The ONE staged-file fsync of the funnel (the test seam sees it).
+fn sync_staged(file: &std::fs::File, staged: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_step(seam::Step::FileSync, staged) {
+        return Err(injected);
+    }
+    #[cfg(not(test))]
+    let _ = staged;
+    file.sync_all()
+}
+
+/// The ONE replacing `rename(2)` of the funnel (the test seam sees it).
+fn rename_replacing(staged: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_step(seam::Step::Rename, dest) {
+        return Err(injected);
+    }
+    std::fs::rename(staged, dest)
+}
+
+/// The directory that holds `dest` (`.` for a bare file name).
+fn parent_dir(dest: &Path) -> &Path {
+    match dest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// #10214 — the ONE directory fsync of the product: a rename or link is
+/// durable only once the directory that holds the new name is synced. Unix
+/// opens the directory read-only (`O_DIRECTORY`, so a non-directory is
+/// refused) and `fsync`s it. Every error is returned, `EINVAL` from a
+/// filesystem that cannot sync a directory included (fail closed: a rename
+/// lost to a crash is lost data). Non-unix has no directory handle to sync
+/// and returns `Ok(())`, as `erasure::store::fsync_dir` does.
+///
+/// # Errors
+/// The directory cannot be opened or its fsync fails.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_step(seam::Step::DirSync, dir) {
+        return Err(injected);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(dir)?
+            .sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Fsync the directory of the just-published `dest` ([`sync_dir`]). The
+/// error says the new file is in place: the caller must not remove it.
+///
+/// # Errors
+/// The directory fsync fails.
+pub(crate) fn sync_parent_dir(dest: &Path, what: &str) -> Result<()> {
+    let dir = parent_dir(dest);
+    sync_dir(dir).with_context(|| {
+        format!(
+            "fsync the directory {} after publishing {what} {}: the new file is in place but \
+             may not survive a crash (#10214)",
+            dir.display(),
+            dest.display()
+        )
+    })
 }
 
 /// The staging step shared by [`stage_beside`] and [`write_replacing`].
@@ -461,10 +535,7 @@ fn stage_in_private_dir(dest: &Path, what: &'static str) -> Result<NoFollowStage
     let name = dest
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} has no file name", dest.display()))?;
-    let dir = match dest.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
+    let dir = parent_dir(dest);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -505,6 +576,21 @@ impl NoFollowStage {
     /// from a name.
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.file
+    }
+
+    /// Fsync the staged file through its handle (#10214: the one file-sync
+    /// step of the funnel, seen by the test seam).
+    ///
+    /// # Errors
+    /// The fsync fails.
+    pub(crate) fn sync_file(&self) -> Result<()> {
+        sync_staged(&self.file, &self.name.path).with_context(|| {
+            format!(
+                "fsync the staged {} for {} (#10214)",
+                self.what,
+                self.dest.display()
+            )
+        })
     }
 
     /// Write `bytes` through the handle.
@@ -561,12 +647,15 @@ impl NoFollowStage {
     /// dropped (best effort). Only a link failure that means "no hard links
     /// here" (`EPERM`, `EOPNOTSUPP`, `ENOSYS`) falls back, and only to an
     /// atomic no-replace rename ([`rename_no_replace`]); a platform without
-    /// one, and every other errno, is refused. The caller fsyncs the
-    /// directory. Returns the handle.
+    /// one, and every other errno, is refused. #10214: the publish then
+    /// fsyncs the destination's directory ([`sync_parent_dir`]). Returns the
+    /// handle.
     ///
     /// # Errors
     /// The identity check fails, something sits at the destination, or the
     /// link (or its no-replace fallback) fails; the staging name is removed.
+    /// A failed directory fsync is returned with the complete new file left
+    /// in place.
     pub(crate) fn publish(mut self) -> Result<std::fs::File> {
         let dest = self.dest.clone();
         if !self.publish_at(&dest)? {
@@ -580,7 +669,8 @@ impl NoFollowStage {
     }
 
     /// ONE no-follow, create-new `link(2)` at `dest`; `Ok(false)`: name taken.
-    /// I-2: nothing that exists at `dest` is replaced, for any errno.
+    /// I-2: nothing that exists at `dest` is replaced, for any errno. A
+    /// successful publish fsyncs `dest`'s directory (#10214).
     fn publish_at(&mut self, dest: &Path) -> Result<bool> {
         self.verify_identity()?;
         match link_no_replace(&self.name.path, dest) {
@@ -592,12 +682,14 @@ impl NoFollowStage {
                 if std::fs::remove_file(&self.name.path).is_ok() {
                     self.name.armed = false;
                 }
+                sync_parent_dir(dest, self.what)?;
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),
             Err(e) if no_hard_links(&e) => match rename_no_replace(&self.name.path, dest) {
                 Ok(()) => {
                     self.name.armed = false;
+                    sync_parent_dir(dest, self.what)?;
                     Ok(true)
                 }
                 Err(r) if r.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),

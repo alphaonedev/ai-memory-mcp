@@ -296,3 +296,27 @@ fn hub_cache_publish_dir_sync_failure_is_returned_10214() {
         "the snapshot is in place (after state)"
     );
 }
+
+/// #8950 census guard: `sync_dir` opens READ-only and creates or replaces
+/// nothing. A missing path stays missing (no create flag), a regular file is
+/// refused with `ENOTDIR` and keeps its bytes (no write or truncate flag),
+/// and a real directory keeps exactly its entries.
+#[cfg(unix)]
+#[test]
+fn sync_dir_opens_read_only_and_creates_nothing_10214() {
+    let _reset = armed();
+    let dir = scratch();
+    let missing = dir.path().join("missing-10214");
+    let err = super::snapshot_file::sync_dir(&missing).expect_err("missing dir");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(bytes_at(&missing), None);
+
+    let file = dir.path().join(DEST_NAME);
+    std::fs::write(&file, BEFORE).expect("plant file");
+    let err = super::snapshot_file::sync_dir(&file).expect_err("not a directory");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+    assert_eq!(bytes_at(&file).as_deref(), Some(BEFORE));
+
+    super::snapshot_file::sync_dir(dir.path()).expect("real directory");
+    assert_eq!(entries(dir.path()), vec![DEST_NAME.to_owned()]);
+}

@@ -1488,14 +1488,17 @@ fn annotate_staging_error(e: &io::Error, dir: &Path, path: &Path) -> io::Error {
     )
 }
 
-/// `fsync` the DIRECTORY so a completed `rename` survives a power cut. On the
-/// platforms we support this is the only way to make a directory entry durable;
-/// best-effort because a filesystem that refuses `fsync` on a directory (some
-/// network mounts) must not fail an otherwise-successful key write.
-fn sync_dir(dir: &Path) {
-    if let Ok(handle) = fs::File::open(dir) {
-        let _ = handle.sync_all();
-    }
+/// `fsync` the DIRECTORY so a completed `rename` or `link` survives a power
+/// cut, through the one funnel ([`crate::storage::snapshot_file::sync_dir`]).
+/// #10214: the error is returned, never swallowed (it used to be best-effort),
+/// because a key rename lost to a crash brings back the old key or none. Every
+/// caller runs it AFTER the new file is complete at its final name and never
+/// removes that file on this error.
+///
+/// # Errors
+/// The directory cannot be opened or its fsync fails.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    crate::storage::snapshot_file::sync_dir(dir)
 }
 
 /// Durably write `bytes` to `path` with an explicit Unix mode, replacing any
@@ -1525,7 +1528,8 @@ fn sync_dir(dir: &Path) {
 /// 4. `fsync` the DIRECTORY so the rename itself survives a power cut.
 ///
 /// Any failure before step 3 removes the staging file and returns the error
-/// with `path` untouched. A failure at step 3 does the same.
+/// with `path` untouched. A failure at step 3 does the same. A failure at
+/// step 4 (#10214) is returned with the complete new file at `path`.
 ///
 /// # Errors
 ///
@@ -1557,17 +1561,15 @@ pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&staged, path)?;
-        sync_dir(&dir);
-        Ok(())
+        fs::rename(&staged, path)
     };
-    match commit() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&staged);
-            Err(e)
-        }
+    if let Err(e) = commit() {
+        let _ = fs::remove_file(&staged);
+        return Err(e);
     }
+    // #10214: after the rename `path` holds the complete new file; a failed
+    // directory fsync is returned and leaves it in place.
+    sync_dir(&dir)
 }
 
 /// #3146 — create `path` with `bytes` and `mode`, REFUSING if it already
@@ -1591,18 +1593,17 @@ fn create_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> 
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        sync_dir(&dir);
         Ok(())
     };
-    match commit() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // The name was ours to claim, so removing the partial file is safe
-            // and keeps a failed archive attempt from blocking a retry.
-            let _ = fs::remove_file(path);
-            Err(e)
-        }
+    if let Err(e) = commit() {
+        // The name was ours to claim, so removing the partial file is safe
+        // and keeps a failed archive attempt from blocking a retry.
+        let _ = fs::remove_file(path);
+        return Err(e);
     }
+    // #10214: the archive is complete; a failed directory fsync is returned
+    // and NEVER removes it (that would destroy the retained anchor).
+    sync_dir(&dir)
 }
 
 #[cfg(not(unix))]
@@ -1616,16 +1617,13 @@ fn create_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()>
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        sync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
         Ok(())
     };
-    match commit() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(path);
-            Err(e)
-        }
+    if let Err(e) = commit() {
+        let _ = fs::remove_file(path);
+        return Err(e);
     }
+    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 /// #3772 — atomically CLAIM `path` for `bytes` at `mode`, FIRST-WRITER-WINS,
@@ -1670,16 +1668,17 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         drop(file);
         // Atomic exclusive-create of the FINAL name pointing at the complete
         // inode: `hard_link` fails with `AlreadyExists` if the name is taken.
-        fs::hard_link(&staged, path)?;
-        sync_dir(&dir);
-        Ok(())
+        fs::hard_link(&staged, path)
     };
     let result = commit();
     // The staging sibling is ours to remove on every path: on success the hard
     // link keeps the key inode alive through `path`; on failure it is a partial
     // temp that must not linger.
     let _ = fs::remove_file(&staged);
-    result
+    result?;
+    // #10214: `path` is the complete claimed key; a failed directory fsync is
+    // returned and leaves it in place.
+    sync_dir(&dir)
 }
 
 /// #3772 — non-Unix twin of [`claim_new_with_mode`]. `hard_link` is
@@ -1701,13 +1700,12 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> 
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::hard_link(&staged, path)?;
-        sync_dir(&dir);
-        Ok(())
+        fs::hard_link(&staged, path)
     };
     let result = commit();
     let _ = fs::remove_file(&staged);
-    result
+    result?;
+    sync_dir(&dir)
 }
 
 /// #3146 — archive `pub_bytes` as a timestamped, PUBLIC-ONLY sibling of
@@ -1790,17 +1788,15 @@ pub fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> 
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&staged, path)?;
-        sync_dir(&dir);
-        Ok(())
+        fs::rename(&staged, path)
     };
-    match commit() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&staged);
-            Err(e)
-        }
+    if let Err(e) = commit() {
+        let _ = fs::remove_file(&staged);
+        return Err(e);
     }
+    // #10214: after the rename `path` holds the complete new file; a failed
+    // directory fsync is returned and leaves it in place.
+    sync_dir(&dir)
 }
 
 #[cfg(test)]
