@@ -133,7 +133,8 @@ fn seal_at_arm_streams_and_writes_only_on_advance_j1_j3_10116() {
     assert_eq!(file_id(&path), before, "same bytes, inode and mtime");
 
     put_mark(&conn, 3, "memories", 2);
-    conn.execute_batch("BEGIN").expect("begin");
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("open a write transaction");
     probe::reset();
     sq::seal_at_arm(&conn, Some(&path)).expect("arm in a transaction");
     assert_eq!(
