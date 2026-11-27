@@ -13,9 +13,11 @@
 //! guard: the wrong order and a lone take do not compile.
 //!
 //! This ratchet keeps that true. It is an allowlist over every `.rs` file
-//! of the source tree (the whole manifest directory; `target`, `.git`,
-//! `.local-runs`, `.codegraph` and `node_modules` are left out because they
-//! hold build output, VCS data or scratch, not tracked source). The lock
+//! of the source tree (the whole manifest directory; the root directories
+//! `target`, `.git`, `.local-runs`, `.codegraph` and `node_modules` are left
+//! out because they hold build output, VCS data or scratch, not tracked
+//! source; #10250: a directory of one of those names below the root is
+//! walked like any other). The lock
 //! function's name may appear in code in exactly three lines of
 //! `src/store_url/env_guard.rs`: its definition, the call inside the guard
 //! constructor and the held-probe. The constructor's signature is pinned too, so a constructor
@@ -43,23 +45,38 @@
 //!    left is `Unlisted` with its path, name and line; a row with no static
 //!    is `Missing`; a bad row is refused with its line; `static $x` in a
 //!    macro body is `MacroStatic`, because its name is unknown until
-//!    expansion. The table may only shrink, each row with its reason;
+//!    expansion. #10251: a reason starts with `<category>: `, the category
+//!    one word of `Category::ALL`, or the row is refused; a static whose
+//!    type names a lock (`BASE_LOCKS`, or a type, struct, enum, union or
+//!    `use … as` of the same file built from one) with a row that does not
+//!    say `lock` is `LockNotLabelled`; the row count is pinned to
+//!    `STATICS_TABLE_ROWS` and the `lock` keys to the hand-written
+//!    `LOCK_ROWS`. The table may only shrink, each row with its reason;
 //! 5. the inclusion census (#10204): the guard file may be compiled once.
 //!    `#[path = …]` (in `cfg_attr` too) and `include!`, `include_str!` or
 //!    `include_bytes!` naming `env_guard.rs` or its parent `store_url.rs`
 //!    (any case, `/` or `\`, escapes and raw strings decoded, `concat!` of
-//!    literals and `env!("CARGO_MANIFEST_DIR")` joined) are red; a path or
-//!    include argument that is not such a literal is red; `mod env_guard;`
-//!    and `mod store_url;` must each occur exactly once, in
-//!    `src/store_url.rs` and `src/lib.rs`.
+//!    literals joined, `env!("CARGO_MANIFEST_DIR")` as its first piece
+//!    only) are red; a path or include argument that is not such a literal
+//!    is red; `mod env_guard;` and `mod store_url;` must each occur exactly
+//!    once, in `src/store_url.rs` and `src/lib.rs`. #10250: every other
+//!    `#[path]` or `include!` must name a walked `.rs` file, resolved from
+//!    the declaring file's directory (from the root after the manifest
+//!    dir): a value that is not `.rs` is `NotRustFile`, a `#[path]` inside
+//!    an inline `mod NAME { … }` is `PathInInlineMod` (its base would be
+//!    the module's directory, which this census does not model), and
+//!    anything else that names no walked file (absolute, a backslash, a
+//!    `..` out of the root, a skipped directory, an absent file) is
+//!    `Unwalked`.
 //!
 //! The walk refuses a symbolic link in the tree. The lexer is std only and
 //! fails closed (an unterminated string or comment is a finding). A file it
 //! cannot lex is reported once by the static census and skipped by the
 //! inclusion census. Its limits: it does not expand macros, so an item
 //! built by a macro from pieces is not seen by parts 2 and 3 (part 4 reports
-//! `static $x`), and `concat!` or escaped spellings of the variable names
-//! are not decoded by part 1.
+//! `static $x`); `concat!` or escaped spellings of the variable names are
+//! not decoded by part 1; a lock type defined in another file and named
+//! through a wrapper of its own file only is not seen as a lock by part 4.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -180,8 +197,10 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>, links: &mut Ve
         let path: PathBuf = entry.path();
         let ft = entry.file_type().expect("file type");
         if ft.is_dir() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if SKIPPED_DIRS.iter().any(|(d, _)| *d == name) {
+            // #10250: only a direct child of the root is skipped; a
+            // directory of the same name deeper in the tree is source.
+            let rel = rel_of(&path, root);
+            if SKIPPED_DIRS.iter().any(|(d, _)| *d == rel) {
                 continue;
             }
             walk(&path, root, out, links);
@@ -1840,6 +1859,21 @@ fn is_row_path(p: &str) -> bool {
         && !p.chars().any(char::is_whitespace)
 }
 
+/// #10251: split a reason into its category and the text after `": "`.
+/// The word must equal one of [`Category::ALL`] exactly (case, blanks and
+/// all); otherwise the error is the text before the first `": "`, or the
+/// whole reason when it has none.
+fn parse_category(reason: &str) -> Result<(Category, &str), String> {
+    let Some((word, rest)) = reason.split_once(": ") else {
+        return Err(reason.to_string());
+    };
+    Category::ALL
+        .into_iter()
+        .find(|c| c.word() == word)
+        .map(|c| (c, rest))
+        .ok_or_else(|| word.to_string())
+}
+
 /// Parse the table; every line that is not a comment must be a good row.
 fn parse_table(text: &str) -> (Vec<StaticRow>, Vec<TableFinding>) {
     let mut rows = Vec::new();
@@ -1872,6 +1906,14 @@ fn parse_table(text: &str) -> (Vec<StaticRow>, Vec<TableFinding>) {
             });
             ok = false;
         }
+        let (category, reason) = match parse_category(reason) {
+            Ok(split) => (Some(split.0), split.1),
+            Err(word) => {
+                bad.push(TableFinding::Category { line, word });
+                ok = false;
+                (None, reason)
+            }
+        };
         let visible = reason
             .chars()
             .filter(|c| !c.is_whitespace() && !c.is_control())
@@ -1880,11 +1922,11 @@ fn parse_table(text: &str) -> (Vec<StaticRow>, Vec<TableFinding>) {
             bad.push(TableFinding::ShortReason { line });
             ok = false;
         }
-        if ok {
+        if let (true, Some(category)) = (ok, category) {
             rows.push(StaticRow {
                 path: path.to_string(),
                 name: name.to_string(),
-                category: Category::CrateType,
+                category,
                 reason: reason.to_string(),
             });
         }
@@ -1918,9 +1960,39 @@ enum StaticFinding {
     },
 }
 
-/// Every `static` item of a lexed file: `(name, line)`, plus the lines of
-/// `static $x` macro forms.
-fn statics_of(t: &[Tok]) -> (Vec<(String, usize)>, Vec<usize>) {
+/// One `static` item of a lexed file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaticItem {
+    name: String,
+    line: usize,
+    /// #10251: every identifier of its declared type.
+    type_idents: Vec<String>,
+}
+
+/// The identifiers from `from` up to the first `=` or `;` outside every
+/// bracket, `<…>` included (`->` is not a closer), or to the end.
+fn type_idents(t: &[Tok], from: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    for (i, k) in t.iter().enumerate().skip(from) {
+        match (k.kind, k.text.as_str()) {
+            (TokKind::Ident, w) => out.push(w.to_string()),
+            (TokKind::Punct, "(" | "[" | "{" | "<") => depth += 1,
+            (TokKind::Punct, ">") if is_p(t, i.wrapping_sub(1), "-") => {}
+            (TokKind::Punct, ")" | "]" | "}" | ">") => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => break,
+            },
+            (TokKind::Punct, "=" | ";") if depth == 0 => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every `static` item of a lexed file, plus the lines of `static $x`
+/// macro forms.
+fn statics_of(t: &[Tok]) -> (Vec<StaticItem>, Vec<usize>) {
     let mut named = Vec::new();
     let mut macros = Vec::new();
     for k in (0..t.len()).filter(|&k| is_w(t, k, "static")) {
@@ -1936,10 +2008,110 @@ fn statics_of(t: &[Tok]) -> (Vec<(String, usize)>, Vec<usize>) {
             continue;
         };
         if is_p(t, n + 1, ":") {
-            named.push((name.text.clone(), name.line));
+            named.push(StaticItem {
+                name: name.text.clone(),
+                line: name.line,
+                type_idents: type_idents(t, n + 2),
+            });
         }
     }
     (named, macros)
+}
+
+/// #10251: the lock types every file starts from.
+const BASE_LOCKS: [&str; 6] = [
+    "Mutex",
+    "RwLock",
+    "Condvar",
+    "ReentrantLock",
+    "ReentrantMutex",
+    "Semaphore",
+];
+
+/// #10251: `(name, identifiers it is built from)` for each type alias,
+/// struct, enum and union of a file, and each `use … as NAME` rename.
+fn type_defs(t: &[Tok]) -> Vec<(String, Vec<String>)> {
+    let ident = |i: usize| t.get(i).filter(|x| x.kind == TokKind::Ident);
+    let mut out = Vec::new();
+    // Whether the walk is inside a `use … ;` statement: one forward pass.
+    let mut in_use = false;
+    for k in 0..t.len() {
+        if is_w(t, k, "use") {
+            in_use = true;
+        } else if is_p(t, k, ";") {
+            in_use = false;
+        }
+        if is_w(t, k, "type")
+            && let Some(name) = ident(k + 1)
+        {
+            // The body after the `=` at depth 0, if any.
+            let mut depth = 0usize;
+            let mut j = k + 2;
+            while let Some(x) = t.get(j) {
+                match (x.kind, x.text.as_str()) {
+                    (TokKind::Punct, "(" | "[" | "{" | "<") => depth += 1,
+                    (TokKind::Punct, ">") if is_p(t, j - 1, "-") => {}
+                    (TokKind::Punct, ")" | "]" | "}" | ">") => depth = depth.saturating_sub(1),
+                    (TokKind::Punct, ";") if depth == 0 => break,
+                    (TokKind::Punct, "=") if depth == 0 => {
+                        out.push((name.text.clone(), type_idents(t, j + 1)));
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        } else if (is_w(t, k, "struct") || is_w(t, k, "enum") || is_w(t, k, "union"))
+            && let Some(name) = ident(k + 1)
+        {
+            let mut j = k + 2;
+            while t
+                .get(j)
+                .is_some_and(|x| !matches!(x.text.as_str(), "{" | "(" | ";"))
+            {
+                j += 1;
+            }
+            if let Some(c) = t
+                .get(j)
+                .filter(|x| x.kind == TokKind::Punct && x.text != ";")
+                .and_then(|_| close_of(t, j))
+            {
+                let body = t[j..c]
+                    .iter()
+                    .filter(|x| x.kind == TokKind::Ident)
+                    .map(|x| x.text.clone())
+                    .collect();
+                out.push((name.text.clone(), body));
+            }
+        } else if is_w(t, k, "as")
+            && in_use
+            && let (Some(from), Some(to)) = (ident(k.wrapping_sub(1)), ident(k + 1))
+        {
+            out.push((to.text.clone(), vec![from.text.clone()]));
+        }
+    }
+    out
+}
+
+/// #10251: the names of a file that are a lock: [`BASE_LOCKS`] closed
+/// through [`type_defs`]. Linear in the size of the definitions.
+fn lock_names(t: &[Tok]) -> BTreeSet<String> {
+    let mut users: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, body) in type_defs(t) {
+        for b in body {
+            users.entry(b).or_default().push(name.clone());
+        }
+    }
+    let mut locks: BTreeSet<String> = BASE_LOCKS.iter().map(|s| (*s).to_string()).collect();
+    let mut todo: Vec<String> = locks.iter().cloned().collect();
+    while let Some(n) = todo.pop() {
+        for u in users.get(&n).into_iter().flatten() {
+            if locks.insert(u.clone()) {
+                todo.push(u.clone());
+            }
+        }
+    }
+    locks
 }
 
 /// The names the guard file can be compiled under: the file itself and its
@@ -2123,10 +2295,19 @@ fn close_of(t: &[Tok], open: usize) -> Option<usize> {
     None
 }
 
+/// One piece of an include argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    /// A string literal, escapes decoded.
+    Lit(String),
+    /// `env!("CARGO_MANIFEST_DIR")`: the crate root.
+    ManifestDir,
+}
+
 /// One piece of an include argument: a literal or the manifest dir.
-fn piece_value(t: &[Tok]) -> Result<String, ValueError> {
+fn piece_value(t: &[Tok]) -> Result<Piece, ValueError> {
     match t {
-        [s] if s.kind == TokKind::Str => decode_str(&s.text),
+        [s] if s.kind == TokKind::Str => decode_str(&s.text).map(Piece::Lit),
         [e, bang, open, var, close]
             if e.kind == TokKind::Ident
                 && e.text == "env"
@@ -2136,7 +2317,7 @@ fn piece_value(t: &[Tok]) -> Result<String, ValueError> {
                 && var.kind == TokKind::Str =>
         {
             if decode_str(&var.text)? == MANIFEST_DIR_VAR {
-                Ok(String::new())
+                Ok(Piece::ManifestDir)
             } else {
                 Err(ValueError::NotLiteral)
             }
@@ -2145,35 +2326,143 @@ fn piece_value(t: &[Tok]) -> Result<String, ValueError> {
     }
 }
 
-/// The value of an include macro's argument tokens (inside its parens).
-fn include_value(t: &[Tok]) -> Result<String, ValueError> {
+/// The value of an include macro's argument tokens (inside its parens),
+/// and whether it is anchored at the crate root: #10250, the manifest dir
+/// counts only as the first piece; anywhere else the value is not a
+/// literal, because what it names cannot be resolved.
+fn include_value(t: &[Tok]) -> Result<(String, bool), ValueError> {
     let is_concat = t.len() >= 4
         && is_w(t, 0, "concat")
         && is_p(t, 1, "!")
         && is_p(t, 2, "(")
         && close_of(t, 2) == Some(t.len() - 1);
-    if !is_concat {
-        return piece_value(t);
+    let pieces: Vec<&[Tok]> = if is_concat {
+        let inner = &t[3..t.len() - 1];
+        let mut out = Vec::new();
+        let mut from = 0;
+        let mut depth = 0usize;
+        for (i, k) in inner.iter().enumerate() {
+            match (k.kind, k.text.as_str()) {
+                (TokKind::Punct, "(" | "[" | "{") => depth += 1,
+                (TokKind::Punct, ")" | "]" | "}") => depth = depth.saturating_sub(1),
+                (TokKind::Punct, ",") if depth == 0 => {
+                    out.push(&inner[from..i]);
+                    from = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if from < inner.len() {
+            out.push(&inner[from..]);
+        }
+        out
+    } else {
+        vec![t]
+    };
+    let mut value = String::new();
+    let mut anchored = false;
+    for (n, p) in pieces.into_iter().enumerate() {
+        match piece_value(p)? {
+            Piece::Lit(s) => value.push_str(&s),
+            Piece::ManifestDir if n == 0 => anchored = true,
+            Piece::ManifestDir => return Err(ValueError::NotLiteral),
+        }
     }
-    let inner = &t[3..t.len() - 1];
-    let mut out = String::new();
-    let mut from = 0;
-    let mut depth = 0usize;
-    for (i, k) in inner.iter().enumerate() {
-        match (k.kind, k.text.as_str()) {
-            (TokKind::Punct, "(" | "[" | "{") => depth += 1,
-            (TokKind::Punct, ")" | "]" | "}") => depth = depth.saturating_sub(1),
-            (TokKind::Punct, ",") if depth == 0 => {
-                out.push_str(&piece_value(&inner[from..i])?);
-                from = i + 1;
+    Ok((value, anchored))
+}
+
+/// #10250: the root-relative path a `#[path]` or `include!` value names,
+/// resolved lexically from `base` (the declaring file's directory, or the
+/// root when anchored). `None` when it cannot name a walked file: a
+/// backslash (not a separator on every host), an absolute value, or a
+/// `..` that leaves the root.
+fn resolve(base: &str, value: &str) -> Option<String> {
+    if value.contains('\\') || value.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = base.split('/').filter(|c| !c.is_empty()).collect();
+    for c in value.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(c),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// The directory part of a root-relative file path (`""` at the root).
+fn dir_of(path: &str) -> &str {
+    path.rfind('/').map_or("", |i| &path[..i])
+}
+
+/// Which construct names a file: `#[path]` or `include!` (the two that
+/// compile what they name as Rust).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Names {
+    PathAttr,
+    Include,
+}
+
+/// #10250: the finding for a decoded `#[path]` or `include!` value that
+/// does not name a guarded file, or `None` when it names a walked `.rs`
+/// file. `anchored` means the value follows `env!("CARGO_MANIFEST_DIR")`.
+fn unread_inclusion(
+    path: &str,
+    line: usize,
+    names: Names,
+    value: String,
+    anchored: bool,
+    in_inline_mod: bool,
+    walked: &BTreeSet<&str>,
+) -> Option<IncludeFinding> {
+    let file = path.to_string();
+    if !value.ends_with(".rs") {
+        return Some(IncludeFinding::NotRustFile { file, line, value });
+    }
+    if names == Names::PathAttr && in_inline_mod {
+        return Some(IncludeFinding::PathInInlineMod { file, line, value });
+    }
+    let target = if anchored {
+        value.strip_prefix('/').and_then(|v| resolve("", v))
+    } else {
+        resolve(dir_of(path), &value)
+    };
+    match target {
+        Some(t) if walked.contains(t.as_str()) => None,
+        _ => Some(IncludeFinding::Unwalked { file, line, value }),
+    }
+}
+
+/// For each token, whether it sits inside the braces of an inline
+/// `mod NAME { … }` block. Linear in the token count.
+fn inside_inline_mod(t: &[Tok]) -> Vec<bool> {
+    let mut out = vec![false; t.len()];
+    let mut stack: Vec<bool> = Vec::new();
+    let mut open_mods = 0usize;
+    for (i, k) in t.iter().enumerate() {
+        out[i] = open_mods > 0;
+        if k.kind != TokKind::Punct {
+            continue;
+        }
+        match k.text.as_str() {
+            "{" => {
+                let is_mod = i >= 2 && t[i - 1].kind == TokKind::Ident && is_w(t, i - 2, "mod");
+                open_mods += usize::from(is_mod);
+                stack.push(is_mod);
+            }
+            "(" | "[" => stack.push(false),
+            ")" | "]" | "}" => {
+                if let Some(is_mod) = stack.pop() {
+                    open_mods -= usize::from(is_mod);
+                }
             }
             _ => {}
         }
     }
-    if from < inner.len() {
-        out.push_str(&piece_value(&inner[from..])?);
-    }
-    Ok(out)
+    out
 }
 
 fn undecodable(file: &str, line: usize, literal: String) -> IncludeFinding {
@@ -2189,12 +2478,13 @@ fn undecodable(file: &str, line: usize, literal: String) -> IncludeFinding {
 fn inclusions_of(
     path: &str,
     t: &[Tok],
-    _walked: &BTreeSet<&str>,
+    walked: &BTreeSet<&str>,
     mods: &mut [usize; 2],
     found: &mut Vec<IncludeFinding>,
 ) {
     let file = || path.to_string();
     let (close, in_attr) = brackets(t);
+    let inline = inside_inline_mod(t);
     for (k, tok) in t.iter().enumerate() {
         if tok.kind != TokKind::Ident {
             continue;
@@ -2214,7 +2504,15 @@ fn inclusions_of(
                             value,
                         });
                     }
-                    Ok(_) => {}
+                    Ok(value) => found.extend(unread_inclusion(
+                        path,
+                        tok.line,
+                        Names::PathAttr,
+                        value,
+                        false,
+                        inline[k],
+                        walked,
+                    )),
                     Err(_) => found.push(undecodable(path, tok.line, v.text.clone())),
                 },
             }
@@ -2224,11 +2522,24 @@ fn inclusions_of(
             let value =
                 close[k + 2].map_or(Err(ValueError::NotLiteral), |c| include_value(&t[k + 3..c]));
             match value {
-                Ok(value) if names_guarded_file(&value) => found.push(IncludeFinding::Include {
-                    file: file(),
-                    line: tok.line,
+                Ok((value, _)) if names_guarded_file(&value) => {
+                    found.push(IncludeFinding::Include {
+                        file: file(),
+                        line: tok.line,
+                        value,
+                    });
+                }
+                // `include_str!` and `include_bytes!` yield a literal, not
+                // code: only `include!` must name a walked `.rs` file.
+                Ok((value, anchored)) if tok.text == "include" => found.extend(unread_inclusion(
+                    path,
+                    tok.line,
+                    Names::Include,
                     value,
-                }),
+                    anchored,
+                    inline[k],
+                    walked,
+                )),
                 Ok(_) => {}
                 Err(ValueError::NotLiteral) => found.push(IncludeFinding::IncludeNotLiteral {
                     file: file(),
@@ -2307,6 +2618,12 @@ fn token_census(
             .entry(r.name.as_str())
             .or_default() += 1;
     }
+    // #10251: the keys with a row whose category is not `lock`.
+    let not_lock: BTreeSet<(&str, &str)> = rows
+        .iter()
+        .filter(|r| r.category != Category::Lock)
+        .map(|r| (r.path.as_str(), r.name.as_str()))
+        .collect();
     let walked: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
     let mut mods = [0usize; 2];
     for (path, text) in files {
@@ -2321,7 +2638,23 @@ fn token_census(
             }
         };
         let (named, macros) = statics_of(&toks);
-        for (name, line) in named {
+        let locks = lock_names(&toks);
+        for StaticItem {
+            name,
+            line,
+            type_idents,
+        } in named
+        {
+            // #10251: a lock static's rows must all say `lock`.
+            if type_idents.iter().any(|i| locks.contains(i))
+                && not_lock.contains(&(path.as_str(), name.as_str()))
+            {
+                statics.push(StaticFinding::LockNotLabelled {
+                    file: path.clone(),
+                    name: name.clone(),
+                    line,
+                });
+            }
             match left
                 .get_mut(path.as_str())
                 .and_then(|m| m.get_mut(name.as_str()))
@@ -2938,7 +3271,8 @@ fn mod_store_url_twice_in_lib_is_red_10204() {
 /// A row with no static is refused, and a bad row is refused with its line.
 #[test]
 fn table_rows_are_refused_exactly_10213() {
-    let ghost = format!("{STATICS_TABLE}src/test_support.rs\tGHOST\tno such static anywhere\n");
+    let ghost =
+        format!("{STATICS_TABLE}src/test_support.rs\tGHOST\tatomic: no such static anywhere\n");
     let (statics, includes) = token_census(&tree(), &ghost);
     assert_eq!(
         statics,
