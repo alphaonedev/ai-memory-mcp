@@ -667,10 +667,16 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             // libtest filters omit the crate prefix retained by module_path!().
             let test = TEST.split_once("::").unwrap().1;
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args(["--exact", test, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1");
+            let (command, _sandbox) = crate::test_support::SandboxedTestChild::new(
+                "hooks::post_reflect::auto_export_8166",
+            )
+            .configure(|command| {
+                command
+                    .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1");
+            })
+            .arm()
+            .into_parts();
             let output = run_scope_child_with_hang_guard(command);
             assert!(
                 output.status.success(),

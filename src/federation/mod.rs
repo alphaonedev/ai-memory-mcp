@@ -1997,18 +1997,24 @@ mod tests {
         // Avoid inheriting another parallel test's temporary security posture.
         // Only the short scratch root and explicit fixture authorization cross
         // into the child; no operator config, keys or database are needed.
-        let output = std::process::Command::new(std::env::current_exe().expect("lib test binary"))
-            .args(["--exact", &full_name, "--test-threads=1", "--nocapture"])
-            .env_clear()
-            // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
-            // with a %p pid template) so the child's execution is measured, not lost.
-            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-            .env("TMPDIR", std::env::temp_dir())
-            .env("AI_MEMORY_NO_CONFIG", "1")
-            .env(super::peer_attestation::PEER_ATTESTATION_ENV, SCOPE)
-            .env(super::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "1")
-            .output()
-            .expect("isolated catchup test child");
+        let output =
+            crate::test_support::SandboxedTestChild::new("federation::catchup_isolated_child")
+                .configure(|cmd| {
+                    cmd.args(["--exact", &full_name, "--test-threads=1", "--nocapture"])
+                        .env_clear()
+                        // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
+                        // with a %p pid template) so the child's execution is measured, not lost.
+                        .envs(
+                            std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)),
+                        )
+                        .env("TMPDIR", std::env::temp_dir())
+                        .env("AI_MEMORY_NO_CONFIG", "1")
+                        .env(super::peer_attestation::PEER_ATTESTATION_ENV, SCOPE)
+                        .env(super::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "1");
+                })
+                .arm()
+                .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &full_name)
+                .expect("isolated catchup test child");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success()

@@ -5414,15 +5414,27 @@ mod tests {
 
         let dir = fresh_tempdir();
         let spool = dir.path().join("atomic-private-spool");
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("governance::deferred_audit::tests::journal_spool_creation_is_private_with_permissive_umask")
-            .arg("--nocapture")
-            .env(ROLE_ENV, "child")
-            .env(SPOOL_ENV, &spool)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        const SPOOL_TEST: &str = "governance::deferred_audit::tests::journal_spool_creation_is_private_with_permissive_umask";
+        let output = crate::test_support::SandboxedTestChild::new(
+            "governance::deferred_audit::spool_umask_child",
+        )
+        .configure(|command| {
+            command
+                .arg("--exact")
+                .arg(SPOOL_TEST)
+                .arg("--nocapture")
+                .env(ROLE_ENV, "child")
+                .env(SPOOL_ENV, &spool);
+        })
+        .arm()
+        .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, SPOOL_TEST)
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "spool umask child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
             std::fs::metadata(spool).unwrap().permissions().mode() & 0o777,
             0o700
@@ -5893,23 +5905,31 @@ mod tests {
         drop(journal);
 
         let start_path = dir.path().join("start");
-        let executable = std::env::current_exe().unwrap();
+        // Declared before the children so the sandboxes outlive them.
+        let mut sandboxes = Vec::new();
         let mut children = Vec::new();
         let mut result_paths = Vec::new();
         for role in ["a", "b"] {
             let ready_path = dir.path().join(format!("ready-{role}"));
             let result_path = dir.path().join(format!("result-{role}"));
-            let child = std::process::Command::new(&executable)
-                .arg("--exact")
-                .arg("governance::deferred_audit::tests::journal_cross_process_lock_prevents_simultaneous_quota_overshoot")
-                .arg("--nocapture")
-                .env(ROLE_ENV, role)
-                .env(JOURNAL_ENV, &journal_path)
-                .env(READY_ENV, &ready_path)
-                .env(START_ENV, &start_path)
-                .env(RESULT_ENV, &result_path)
-                .spawn()
-                .unwrap();
+            let (mut command, sandbox) = crate::test_support::SandboxedTestChild::new(
+                "governance::deferred_audit::quota_overshoot_child",
+            )
+            .configure(|command| {
+                command
+                    .arg("--exact")
+                    .arg("governance::deferred_audit::tests::journal_cross_process_lock_prevents_simultaneous_quota_overshoot")
+                    .arg("--nocapture")
+                    .env(ROLE_ENV, role)
+                    .env(JOURNAL_ENV, &journal_path)
+                    .env(READY_ENV, &ready_path)
+                    .env(START_ENV, &start_path)
+                    .env(RESULT_ENV, &result_path);
+            })
+            .arm()
+            .into_parts();
+            sandboxes.push(sandbox);
+            let child = command.spawn().unwrap();
             children.push((child, ready_path));
             result_paths.push(result_path);
         }
@@ -6111,25 +6131,33 @@ mod tests {
         journal.append(&legacy).unwrap();
         drop(journal);
 
-        let executable = std::env::current_exe().unwrap();
+        // Declared before the closure so the sandboxes outlive every child.
+        let sandboxes = std::cell::RefCell::new(Vec::new());
         let spawn_child = |role: &str| {
             let ready = dir.path().join(format!("ready-{role}"));
             let release = dir.path().join(format!("release-{role}"));
             let result = dir.path().join(format!("result-{role}"));
             let started = dir.path().join(format!("started-{role}"));
-            let child = std::process::Command::new(&executable)
-                .arg("--exact")
-                .arg("governance::deferred_audit::tests::journal_recovery_serializes_occurrence_and_legacy_claims_across_processes")
-                .arg("--nocapture")
-                .env(ROLE_ENV, role)
-                .env(JOURNAL_ENV, &journal_path)
-                .env(DB_ENV, &db_path)
-                .env(RESULT_ENV, &result)
-                .env(STARTED_ENV, &started)
-                .env(READY_ENV, &ready)
-                .env(RELEASE_ENV, &release)
-                .spawn()
-                .unwrap();
+            let (mut command, sandbox) = crate::test_support::SandboxedTestChild::new(
+                "governance::deferred_audit::recovery_claims_child",
+            )
+            .configure(|command| {
+                command
+                    .arg("--exact")
+                    .arg("governance::deferred_audit::tests::journal_recovery_serializes_occurrence_and_legacy_claims_across_processes")
+                    .arg("--nocapture")
+                    .env(ROLE_ENV, role)
+                    .env(JOURNAL_ENV, &journal_path)
+                    .env(DB_ENV, &db_path)
+                    .env(RESULT_ENV, &result)
+                    .env(STARTED_ENV, &started)
+                    .env(READY_ENV, &ready)
+                    .env(RELEASE_ENV, &release);
+            })
+            .arm()
+            .into_parts();
+            sandboxes.borrow_mut().push(sandbox);
+            let child = command.spawn().unwrap();
             (child, started, ready, release, result)
         };
         let (first, first_started, first_ready, first_release, first_result) = spawn_child("first");

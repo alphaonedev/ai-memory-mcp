@@ -573,20 +573,110 @@ fn read_child_capture(
     std::fs::read(path).map_err(|e| format!("read child {stream} capture for {label}: {e}"))
 }
 
-/// #10122 (C-F1) — allocate a private 0700 sandbox and configure `cmd` so the
-/// child resolves `HOME`, `XDG_CONFIG_HOME`, and `AI_MEMORY_WITNESS_KEY_DIR`
-/// inside that sandbox (applied before any caller overrides). The caller keeps
-/// the returned `TempDir` alive until the child exits.
+/// #10122 (C-F1) / #10176 — allocate a private 0700 sandbox directory holding
+/// the child's `XDG_CONFIG_HOME` (`<sandbox>/.config`). The caller keeps the
+/// returned `TempDir` alive until the child exits.
 #[cfg(any(test, unix))]
-fn apply_isolated_child_sandbox(cmd: &mut std::process::Command) -> tempfile::TempDir {
+fn new_child_sandbox() -> tempfile::TempDir {
     let sandbox = crate::identity::test_key_dir::private_tempdir();
-    let xdg_config = sandbox.path().join(".config");
-    let witness_dir = sandbox.path().join("witness-keys");
-    std::fs::create_dir_all(&xdg_config).expect("isolated child XDG_CONFIG_HOME");
-    cmd.env("HOME", sandbox.path())
-        .env("XDG_CONFIG_HOME", &xdg_config)
-        .env(crate::governance::audit::WITNESS_KEY_DIR_ENV, &witness_dir);
+    std::fs::create_dir_all(sandbox.path().join(".config"))
+        .expect("isolated child XDG_CONFIG_HOME");
     sandbox
+}
+
+/// #10176 — point `cmd`'s `HOME`, `XDG_CONFIG_HOME` and
+/// `AI_MEMORY_WITNESS_KEY_DIR` inside `sandbox`. [`SandboxedTestChild::arm`]
+/// calls it AFTER every caller edit of the command, so the sandbox wins over
+/// any caller value, scrub or `env_clear()`.
+#[cfg(any(test, unix))]
+fn set_child_sandbox_env(cmd: &mut std::process::Command, sandbox: &std::path::Path) {
+    cmd.env("HOME", sandbox)
+        .env("XDG_CONFIG_HOME", sandbox.join(".config"))
+        .env(
+            crate::governance::audit::WITNESS_KEY_DIR_ENV,
+            sandbox.join("witness-keys"),
+        );
+}
+
+/// #10176 — the ONLY way a lib test gets a [`std::process::Command`] that
+/// re-runs the test binary. It spawns through the #1937 audited chokepoint and
+/// owns a private sandbox directory; [`Self::arm`] gives the child an isolated
+/// `HOME`, `XDG_CONFIG_HOME` and `AI_MEMORY_WITNESS_KEY_DIR`, applied last so
+/// the sandbox wins over `configure` edits, a scrub and `env_clear()`.
+///
+/// A child that keeps the parent's `HOME`, or that is built after `env_clear()`
+/// (so the platform resolves the passwd home), can open the real user's key
+/// and witness custody directories. The whole-tree ratchet
+/// `tests/test_child_spawner_isolation_10176.rs` fails when any other file
+/// names the executable path.
+#[cfg(any(test, unix))]
+pub(crate) struct SandboxedTestChild {
+    command: std::process::Command,
+    sandbox: tempfile::TempDir,
+}
+
+#[cfg(any(test, unix))]
+impl SandboxedTestChild {
+    /// A command that re-runs this test binary, labelled `caller` in the spawn
+    /// audit. Nothing is armed until [`Self::arm`].
+    pub(crate) fn new(caller: &str) -> Self {
+        let command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("current_exe for sandboxed test child"),
+            caller,
+        );
+        Self {
+            command,
+            sandbox: new_child_sandbox(),
+        }
+    }
+
+    /// Edit the command (arguments, role env, scrub, stdio). Environment edits
+    /// of the three sandbox variables are overridden by [`Self::arm`].
+    #[must_use]
+    pub(crate) fn configure(mut self, edit: impl FnOnce(&mut std::process::Command)) -> Self {
+        edit(&mut self.command);
+        self
+    }
+
+    /// Apply the sandbox LAST and return the runnable child.
+    #[must_use]
+    pub(crate) fn arm(mut self) -> ArmedTestChild {
+        set_child_sandbox_env(&mut self.command, self.sandbox.path());
+        ArmedTestChild {
+            command: self.command,
+            sandbox: self.sandbox,
+        }
+    }
+}
+
+/// #10176 — a [`SandboxedTestChild`] whose sandbox environment is applied.
+#[cfg(any(test, unix))]
+pub(crate) struct ArmedTestChild {
+    command: std::process::Command,
+    sandbox: tempfile::TempDir,
+}
+
+#[cfg(any(test, unix))]
+impl ArmedTestChild {
+    /// Run to completion under `timeout` (see [`run_command_with_timeout`]);
+    /// the sandbox is removed when this returns.
+    pub(crate) fn run_bounded(
+        mut self,
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<std::process::Output, String> {
+        let result = run_command_with_timeout(&mut self.command, timeout, label);
+        drop(self.sandbox);
+        result
+    }
+
+    /// The armed command plus the sandbox guard, for a consumer that owns the
+    /// spawn (a deferred wait, `assert_cmd`, a hang-guard). The caller keeps the
+    /// `TempDir` alive until the child exits and must not set `HOME`,
+    /// `XDG_CONFIG_HOME` or `AI_MEMORY_WITNESS_KEY_DIR` on the command again.
+    pub(crate) fn into_parts(self) -> (std::process::Command, tempfile::TempDir) {
+        (self.command, self.sandbox)
+    }
 }
 
 /// #10122 — run `command` with file-backed stdout/stderr captures and a hard
@@ -657,22 +747,21 @@ fn spawn_test_child_with_timeout(
     env: &[(&str, &str)],
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, String> {
-    let mut cmd = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("lib test binary"),
-        "test_support::spawn_test_child",
-    );
-    cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
-        .env_clear()
-        // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
-        // with a %p pid template) so the child's execution is measured, not lost.
-        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-        .env("TMPDIR", std::env::temp_dir())
-        .env("AI_MEMORY_NO_CONFIG", "1");
-    let _sandbox = apply_isolated_child_sandbox(&mut cmd);
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    run_command_with_timeout(&mut cmd, timeout, test)
+    SandboxedTestChild::new("test_support::spawn_test_child")
+        .configure(|cmd| {
+            cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+                .env_clear()
+                // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
+                // with a %p pid template) so the child's execution is measured, not lost.
+                .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+                .env("TMPDIR", std::env::temp_dir())
+                .env("AI_MEMORY_NO_CONFIG", "1");
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+        })
+        .arm()
+        .run_bounded(timeout, test)
 }
 
 /// v1.0.0 #3152 — run THIS test binary again as a child that executes
@@ -745,31 +834,14 @@ pub(crate) fn run_env_isolated_child_or_spawn_scrubbing(exact_path: &str, scrub:
     spawn_env_isolated_child(exact_path, scrub, &[])
 }
 
-/// The environment variable names [`run_env_isolated_child_or_spawn_home`]
-/// points at a fresh per-run directory in the child (#10012 security LOW-1).
-#[cfg(test)]
-pub(crate) const ISOLATED_HOME_VARS: [&str; 2] = ["HOME", "XDG_CONFIG_HOME"];
-
 /// [`run_env_isolated_child_or_spawn`] for a test that writes through code
-/// which may resolve the user's home or config directory: the child runs with
-/// `HOME` and `XDG_CONFIG_HOME` set to a fresh temporary directory (removed
-/// after the child exits), so it can never read or write the operator's real
-/// home (#10012 security LOW-1).
+/// which may resolve the user's home or config directory: the child's `HOME`,
+/// `XDG_CONFIG_HOME` and `AI_MEMORY_WITNESS_KEY_DIR` are a fresh private sandbox
+/// (removed after the child exits), so it can never read or write the
+/// operator's real home (#10012 security LOW-1, #10176).
 #[cfg(test)]
 pub(crate) fn run_env_isolated_child_or_spawn_home(exact_path: &str) -> bool {
-    let _ = crate::identity::test_key_dir::install();
-    if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
-        return false; // caller runs the real body in this isolated child
-    }
-    let home = tempfile::tempdir().expect("isolated child HOME");
-    let config = home.path().join(".config");
-    std::fs::create_dir_all(&config).expect("isolated child XDG_CONFIG_HOME");
-    let [home_var, config_var] = ISOLATED_HOME_VARS;
-    spawn_env_isolated_child(
-        exact_path,
-        &[],
-        &[(home_var, home.path()), (config_var, config.as_path())],
-    )
+    run_env_isolated_child_or_spawn(exact_path)
 }
 
 /// Internal bounded form of [`spawn_env_isolated_child`] (#10122 C-F1 / C-F3):
@@ -783,24 +855,22 @@ fn try_spawn_env_isolated_child_with_timeout(
     set: &[(&str, &std::path::Path)],
     timeout: std::time::Duration,
 ) -> Result<bool, String> {
-    // Route the spawn through the #1937 audited chokepoint (never a raw
-    // process-constructor, which the `spawn_audit_gate_1937` guard bans
-    // outside `src/spawn_audit.rs`). The best-effort audit emit is a no-op
-    // here because no spawn-audit DB is seeded in a unit-test process.
-    let mut cmd = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("current_exe for env-isolated test spawn"),
-        "config::run_env_isolated_child_or_spawn",
-    );
-    cmd.args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
-        .env(TEST_ENV_ISOLATION_ROLE_ENV, "child");
-    let _sandbox = apply_isolated_child_sandbox(&mut cmd);
-    for name in scrub {
-        cmd.env_remove(name);
-    }
-    for (name, value) in set {
-        cmd.env(name, value);
-    }
-    let output = run_command_with_timeout(&mut cmd, timeout, exact_path)?;
+    // The spawn goes through the #10176 builder: the #1937 audited chokepoint
+    // plus a sandbox applied last (the `spawn_audit_gate_1937` guard bans a raw
+    // process-constructor outside `src/spawn_audit.rs`).
+    let output = SandboxedTestChild::new("config::run_env_isolated_child_or_spawn")
+        .configure(|cmd| {
+            cmd.args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
+                .env(TEST_ENV_ISOLATION_ROLE_ENV, "child");
+            for name in scrub {
+                cmd.env_remove(name);
+            }
+            for (name, value) in set {
+                cmd.env(name, value);
+            }
+        })
+        .arm()
+        .run_bounded(timeout, exact_path)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -877,18 +947,19 @@ mod tests {
         let tmp = scratch.path().join("child-tmp");
         std::fs::create_dir(&tmp).expect("dedicated child TMPDIR");
         let test = TEST.split_once("::").expect("crate-qualified test name").1;
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::tls_test_pki_is_removed_after_child_exit_8651",
-        );
-        command
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        for name in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(name, &tmp);
-        }
-        let output = run_pki_child_8651(command, scratch.path());
+        )
+        .configure(|command| {
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("AI_MEMORY_NO_CONFIG", "1");
+            for name in ["TMPDIR", "TMP", "TEMP"] {
+                command.env(name, &tmp);
+            }
+        });
+        let output = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "PKI child: {stdout}\n{stderr}");
@@ -952,18 +1023,19 @@ mod tests {
         let tmp = scratch.path().join("child-tmp");
         std::fs::create_dir(&tmp).expect("dedicated permission child TMPDIR");
         let test = TEST.split_once("::").expect("crate-qualified test name").1;
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::tls_test_pki_starts_private_under_open_umask_8663",
-        );
-        command
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        for name in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(name, &tmp);
-        }
-        let output = run_pki_child_8651(command, scratch.path());
+        )
+        .configure(|command| {
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("AI_MEMORY_NO_CONFIG", "1");
+            for name in ["TMPDIR", "TMP", "TEMP"] {
+                command.env(name, &tmp);
+            }
+        });
+        let output = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -1025,18 +1097,19 @@ mod tests {
         let tmp = scratch.path().join("child-tmp");
         std::fs::create_dir(&tmp).expect("creation child TMPDIR");
         let test = TEST.split_once("::").expect("crate-qualified test name").1;
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::tls_private_key_creation_is_private_8663",
-        );
-        command
-            .args(["--exact", test, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        for name in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(name, &tmp);
-        }
-        let output = run_pki_child_8651(command, scratch.path());
+        )
+        .configure(|command| {
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("AI_MEMORY_NO_CONFIG", "1");
+            for name in ["TMPDIR", "TMP", "TEMP"] {
+                command.env(name, &tmp);
+            }
+        });
+        let output = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -1073,21 +1146,16 @@ mod tests {
         }
     }
 
-    /// #10122 (C-F1 / C-F6) — route PKI test children through the single shared
-    /// isolated-sandbox + bounded-timeout helper instead of duplicating the
-    /// capture/poll/kill/reap loop.
+    /// #10122 (C-F1 / C-F6) / #10176 — route PKI test children through the single
+    /// shared sandboxed builder and bounded-timeout runner instead of duplicating
+    /// the capture/poll/kill/reap loop. The sandbox is applied last, so it wins
+    /// over any variable the caller set.
     #[cfg(unix)]
-    fn run_pki_child_8651(
-        mut command: std::process::Command,
-        _scratch: &std::path::Path,
-    ) -> std::process::Output {
-        let _sandbox = super::apply_isolated_child_sandbox(&mut command);
-        super::run_command_with_timeout(
-            &mut command,
-            super::TEST_CHILD_TIMEOUT,
-            "run_pki_child_8651",
-        )
-        .unwrap_or_else(|msg| panic!("{msg}"))
+    fn run_pki_child_8651(child: super::SandboxedTestChild) -> std::process::Output {
+        child
+            .arm()
+            .run_bounded(super::TEST_CHILD_TIMEOUT, "run_pki_child_8651")
+            .unwrap_or_else(|msg| panic!("{msg}"))
     }
 
     /// #3523 — the OBSERVED singleton pin: `test_support::env_lock()` and
@@ -1303,18 +1371,18 @@ mod tests {
         let parent_home = std::env::var_os("HOME").unwrap_or_default();
         let parent_witness =
             crate::governance::audit::witness_key_dir().expect("resolve parent witness_key_dir");
-        let scratch = crate::identity::test_key_dir::private_tempdir();
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::pki_child_spawner_isolates_home_config_and_witness_dir_10122",
-        );
-        command
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .env(PARENT_HOME_ENV, &parent_home)
-            .env(PARENT_WITNESS_ENV, &parent_witness)
-            .env("AI_MEMORY_NO_CONFIG", "1");
-        let out = run_pki_child_8651(command, scratch.path());
+        )
+        .configure(|command| {
+            command
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env(PARENT_HOME_ENV, &parent_home)
+                .env(PARENT_WITNESS_ENV, &parent_witness)
+                .env("AI_MEMORY_NO_CONFIG", "1");
+        });
+        let out = run_pki_child_8651(child);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -1324,6 +1392,69 @@ mod tests {
         assert!(
             stdout.contains("1 passed") && !stdout.contains("0 passed"),
             "#10122 PKI isolation child ran zero tests:\n{stdout}"
+        );
+    }
+
+    /// #10176 — the sandbox is applied LAST: a caller that sets `HOME`,
+    /// `XDG_CONFIG_HOME` or `AI_MEMORY_WITNESS_KEY_DIR` through `configure` (or
+    /// clears the environment) never reaches the child with its own value. Each
+    /// variable is asserted separately, so removing any one line of the
+    /// sandbox application turns this test red.
+    #[cfg(unix)]
+    #[test]
+    fn sandboxed_test_child_sandbox_wins_over_caller_env_10176() {
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_10176_SANDBOX_WINS_ROLE";
+        const CALLER_VALUE: &str = "/caller-chosen-10176";
+        const UNSET_PARENT_ENV: &str = "AI_MEMORY_TEST_10176_UNSET_PARENT_VAR";
+        const TEST: &str =
+            "test_support::tests::sandboxed_test_child_sandbox_wins_over_caller_env_10176";
+        if std::env::var_os(ROLE_ENV).is_some() {
+            for name in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                crate::governance::audit::WITNESS_KEY_DIR_ENV,
+            ] {
+                let value = std::env::var_os(name)
+                    .unwrap_or_else(|| panic!("#10176: child {name} must be set"));
+                assert!(
+                    !value.to_string_lossy().starts_with(CALLER_VALUE),
+                    "#10176: child {name} kept the caller value {value:?}; the sandbox must win"
+                );
+            }
+            assert_child_sees_isolated_sandbox_values(
+                "SandboxedTestChild",
+                UNSET_PARENT_ENV,
+                UNSET_PARENT_ENV,
+            );
+            return;
+        }
+        let out = super::SandboxedTestChild::new("test_support::sandbox_wins_10176")
+            .configure(|cmd| {
+                cmd.args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env_clear()
+                    .env(ROLE_ENV, "1")
+                    .env("AI_MEMORY_NO_CONFIG", "1")
+                    .env("TMPDIR", std::env::temp_dir());
+                for name in [
+                    "HOME",
+                    "XDG_CONFIG_HOME",
+                    crate::governance::audit::WITNESS_KEY_DIR_ENV,
+                ] {
+                    cmd.env(name, CALLER_VALUE);
+                }
+            })
+            .arm()
+            .run_bounded(super::TEST_CHILD_TIMEOUT, TEST)
+            .unwrap_or_else(|msg| panic!("{msg}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "#10176 sandbox-wins child failed:\nstdout={stdout}\nstderr={stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "#10176 sandbox-wins child ran zero tests:\n{stdout}"
         );
     }
 
@@ -1341,14 +1472,17 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(30));
             return;
         }
-        let mut cmd = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("lib test binary"),
+        let child = super::SandboxedTestChild::new(
             "test_support::run_command_with_timeout_kills_and_reports_hanging_child_10122",
-        );
-        cmd.args(["--exact", TEST, "--test-threads=1"])
-            .env(SLEEP_ROLE_ENV, "1");
+        )
+        .configure(|cmd| {
+            cmd.args(["--exact", TEST, "--test-threads=1"])
+                .env(SLEEP_ROLE_ENV, "1");
+        });
         let start = std::time::Instant::now();
-        let err = super::run_command_with_timeout(&mut cmd, SHORT_BOUND, TEST)
+        let err = child
+            .arm()
+            .run_bounded(SHORT_BOUND, TEST)
             .expect_err("sleeping child must time out");
         let elapsed = start.elapsed();
         assert!(
