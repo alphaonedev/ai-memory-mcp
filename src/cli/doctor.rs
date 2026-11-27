@@ -8849,17 +8849,29 @@ enabled = true
     // remote-section test idiom above.
     // ---------------------------------------------------------------
 
+    type EnvLockProof =
+        crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'static>;
+
     /// RAII env setter scoped to a test; restores prior values on drop.
-    struct EnvScope(Vec<(&'static str, Option<std::ffi::OsString>)>);
-    impl EnvScope {
-        fn set(
-            _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
-            pairs: &[(&'static str, &str)],
-        ) -> Self {
+    ///
+    /// The scope borrows the lock guard it was built under (`'lock`), so a
+    /// scope that outlives its guard is a compile error (E0597), not a
+    /// declaration-order convention (#10124 R3-1, per OWNERSHIP-18 and
+    /// UNSAFE-04): `Drop` writes the process environment, and the borrow
+    /// proves the crate-wide env lock is still held when it does.
+    struct EnvScope<'lock> {
+        _lock: &'lock EnvLockProof,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl<'lock> EnvScope<'lock> {
+        fn set(lock: &'lock EnvLockProof, pairs: &[(&'static str, &str)]) -> Self {
             let mut prev = Vec::new();
             for (k, v) in pairs {
                 prev.push((*k, std::env::var_os(k)));
-                // SAFETY: `_lock` proves the crate-wide env lock is held.
+                // SAFETY: `lock` is a live `EnvLockGuard`, so the crate-wide
+                // env lock is held: it serialises the writers that take this
+                // lock. Readers and writers that do not take it are not
+                // excluded by it.
                 unsafe { std::env::set_var(k, v) };
             }
             // AI_MEMORY_NO_CONFIG keeps AppConfig::load off any on-disk
@@ -8868,24 +8880,40 @@ enabled = true
                 "AI_MEMORY_NO_CONFIG",
                 std::env::var_os("AI_MEMORY_NO_CONFIG"),
             ));
+            // SAFETY: same proof as above (the lock is held, which
+            // serialises only the writers that take it); `lock` is still
+            // borrowed here.
             unsafe { std::env::set_var("AI_MEMORY_NO_CONFIG", "1") };
-            Self(prev)
+            Self {
+                _lock: lock,
+                saved: prev,
+            }
         }
     }
-    impl Drop for EnvScope {
+    impl Drop for EnvScope<'_> {
         fn drop(&mut self) {
-            for (k, v) in &self.0 {
+            // Reverse order: the first-saved value of a key is the one that
+            // must win, so a key saved twice ends at its original value
+            // (decision: reverse restore over refusing duplicate keys
+            // because it is exact for every `pairs` input with no change to
+            // the constructor's shape; #10151 S1).
+            for (k, v) in self.saved.iter().rev() {
                 match v {
+                    // SAFETY: `self._lock` borrows the live `EnvLockGuard`
+                    // this scope was built under, so the env lock is held
+                    // for the whole of this drop (the borrow checker
+                    // refuses a scope that outlives its guard). The lock
+                    // serialises the writers that take it; readers and
+                    // writers that do not take it are not excluded.
                     Some(val) => unsafe { std::env::set_var(k, val) },
+                    // SAFETY: as the arm above.
                     None => unsafe { std::env::remove_var(k) },
                 }
             }
         }
     }
 
-    fn clear_llm_embed_env(
-        _lock: &crate::enterprise_federation_posture::hardened_env_fixture::EnvLockGuard<'_>,
-    ) {
+    fn clear_llm_embed_env(_lock: &EnvLockProof) {
         for k in [
             "AI_MEMORY_LLM_BACKEND",
             "AI_MEMORY_LLM_BASE_URL",
@@ -8896,6 +8924,10 @@ enabled = true
             "AI_MEMORY_EMBED_API_KEY",
             "AI_MEMORY_EMBED_MODEL",
         ] {
+            // SAFETY: `_lock` is a live `EnvLockGuard`, so the crate-wide env
+            // lock is held for the whole call; it serialises the writers
+            // that take it and does not exclude readers or writers that do
+            // not.
             unsafe { std::env::remove_var(k) };
         }
     }
@@ -8908,6 +8940,92 @@ enabled = true
         // ollama + no GPU → warn applies; ollama + GPU → no warn.
         assert!(gpu_policy_warn_applicable("ollama", false));
         assert!(!gpu_policy_warn_applicable("ollama", true));
+    }
+
+    /// #10124 R3-1: the red probe of the previous commit (an `EnvScope`
+    /// dropped after its guard) no longer compiles: rustc refuses it with
+    /// E0597 (`g` does not live long enough). A compile-fail body cannot sit
+    /// in a passing test, so this pin holds the property at the type level:
+    /// `bind` hands out a scope typed `EnvScope<'a>` for the guard borrow
+    /// `'a`. It stops compiling (E0107) if `EnvScope` loses its lifetime
+    /// parameter, the first step of re-opening the defect.
+    #[test]
+    fn envscope_is_bound_to_its_lock_guard_10124_r31() {
+        fn bind<'a>(g: &'a EnvLockProof) -> EnvScope<'a> {
+            EnvScope::set(g, &[("AI_MEMORY_R31_PROBE_10124", "1")])
+        }
+        let g = posture_env_lock();
+        let scope = bind(&g);
+        assert_eq!(
+            std::env::var("AI_MEMORY_R31_PROBE_10124").as_deref(),
+            Ok("1")
+        );
+        // S2: the scope holds THIS guard, not merely some lifetime. A mutant
+        // that swaps the borrow for `PhantomData` (an unbound scope) has no
+        // `_lock` reference to compare, so this stops compiling.
+        assert!(std::ptr::eq(scope._lock, &g));
+        drop(scope);
+        assert!(std::env::var_os("AI_MEMORY_R31_PROBE_10124").is_none());
+    }
+
+    /// #10151 S1 (UNSAFE-04): `EnvScope` restores the process environment
+    /// exactly for every `pairs` input, including a key given twice and
+    /// `AI_MEMORY_NO_CONFIG` itself. Expected values are written out, never
+    /// computed from the scope under test.
+    #[test]
+    fn envscope_restores_exactly_for_repeated_and_no_config_keys_10151_s1() {
+        const DUP_KEY: &str = "AI_MEMORY_S1_DUP_PROBE_10151";
+        const NO_CONFIG: &str = "AI_MEMORY_NO_CONFIG";
+        let g = posture_env_lock();
+
+        // Case 1: a key given twice, unset before: unset after.
+        assert!(std::env::var_os(DUP_KEY).is_none());
+        {
+            let _s = EnvScope::set(&g, &[(DUP_KEY, "a"), (DUP_KEY, "b")]);
+            assert_eq!(std::env::var(DUP_KEY).as_deref(), Ok("b"));
+        }
+        assert_eq!(std::env::var_os(DUP_KEY), None, "duplicate key, unset case");
+
+        // Case 2: a key given twice, set before: the original value after.
+        // SAFETY: `g` is the live crate-wide env lock guard.
+        unsafe { std::env::set_var(DUP_KEY, "orig") };
+        {
+            let _s = EnvScope::set(&g, &[(DUP_KEY, "a"), (DUP_KEY, "b")]);
+        }
+        assert_eq!(
+            std::env::var(DUP_KEY).as_deref(),
+            Ok("orig"),
+            "duplicate key, set case"
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(DUP_KEY) };
+
+        // Case 3: NO_CONFIG passed in `pairs`, in both the set and unset
+        // starting states.
+        let before = std::env::var_os(NO_CONFIG);
+        for start in [None, Some("orig")] {
+            match start {
+                // SAFETY: as above.
+                Some(v) => unsafe { std::env::set_var(NO_CONFIG, v) },
+                // SAFETY: as above.
+                None => unsafe { std::env::remove_var(NO_CONFIG) },
+            }
+            {
+                let _s = EnvScope::set(&g, &[(NO_CONFIG, "0")]);
+                assert_eq!(std::env::var(NO_CONFIG).as_deref(), Ok("1"));
+            }
+            assert_eq!(
+                std::env::var_os(NO_CONFIG),
+                start.map(std::ffi::OsString::from),
+                "NO_CONFIG in pairs, start {start:?}"
+            );
+        }
+        match before {
+            // SAFETY: as above.
+            Some(v) => unsafe { std::env::set_var(NO_CONFIG, v) },
+            // SAFETY: as above.
+            None => unsafe { std::env::remove_var(NO_CONFIG) },
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
