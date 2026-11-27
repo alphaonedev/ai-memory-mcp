@@ -676,3 +676,101 @@ fn import_refuses_a_second_agent_cutover_marker_10108() {
     import_full_envelope(&dst, &envelope_of(&[own]), &opts).expect("the same marker restores");
     assert_eq!(markers(&dst).len(), 1);
 }
+
+/// #10145 (W-10, W-11) — the exact reason a markerless v103 database reports.
+const MARKER_MISSING_REASON: &str = "agent_cutover_marker_missing";
+
+/// Every row of every table, sorted per table: a byte-level snapshot.
+fn dump(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("prepare");
+    let tables: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect");
+    let mut out = Vec::new();
+    for table in tables {
+        let mut rows = conn
+            .prepare(&format!("SELECT * FROM \"{table}\""))
+            .expect("prepare table");
+        let width = rows.column_count();
+        let mut lines: Vec<String> = rows
+            .query_map([], |r| {
+                let mut cells = Vec::with_capacity(width);
+                for i in 0..width {
+                    cells.push(format!("{:?}", r.get::<_, rusqlite::types::Value>(i)?));
+                }
+                Ok(format!("{table}|{}", cells.join("|")))
+            })
+            .expect("query table")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect table");
+        lines.sort();
+        out.extend(lines);
+    }
+    out
+}
+
+/// Both walks' failures and chain defects, as reason strings.
+type MissingReport = (Vec<i64>, Vec<(i64, &'static str)>, Vec<i64>);
+
+/// Both walks: (chain failures, chain defect reasons, trail failures).
+fn missing_report(conn: &rusqlite::Connection) -> MissingReport {
+    let vk = sink();
+    let chain = verify_chain(conn, None, Some(&vk)).expect("verify_chain");
+    let trail = verify_audit_trail(conn, None, Some(&vk)).expect("verify_audit_trail");
+    let reasons = chain
+        .agent_signature_defects
+        .iter()
+        .map(|(seq, f)| (*seq, f.reason()))
+        .collect();
+    (chain.signature_failures, reasons, trail.signature_failures)
+}
+
+/// The report a markerless v103 database must give on both walks.
+fn missing_expected() -> MissingReport {
+    (vec![0], vec![(0, MARKER_MISSING_REASON)], vec![0])
+}
+
+/// #10145 (W-10) — a v103 database whose marker is gone fails both walks with
+/// the exact reason, whatever window is walked, and no open or append repairs
+/// it: every table is byte-identical across a re-open and an append writes no
+/// marker.
+#[test]
+fn a_markerless_v103_database_fails_and_is_never_repaired_10145() {
+    let (_dir, path, conn) = open_db();
+    seed_memory(&conn, "markerless-10145");
+    append_genuine(&conn);
+    drop_genesis_marker(&conn);
+    assert_eq!(version(&conn), V103_TIP, "control: the database is at v103");
+    let before = dump(&conn);
+    drop(conn);
+    let conn = db::open(&path).expect("re-open");
+    assert_eq!(dump(&conn), before, "the open changed no byte");
+    assert!(markers(&conn).is_empty(), "the open wrote no marker");
+    let resolved = resolve_sqlite_agent_cutover(&conn, Some(&sink())).expect("resolve");
+    assert_ne!(resolved, AgentCutover::Absent, "never read as before v103");
+    assert_eq!(missing_report(&conn), missing_expected());
+    let vk = sink();
+    let windowed = verify_chain(&conn, Some(1), Some(&vk)).expect("windowed walk");
+    assert_eq!(windowed.signature_failures, vec![0], "a window still fails");
+    append_genuine(&conn);
+    assert!(markers(&conn).is_empty(), "an append writes no marker");
+    assert_eq!(missing_report(&conn), missing_expected());
+}
+
+/// #10145 (W-11) — a chain wiped while domain rows survive is a counted
+/// failure on both walks, never read as a fresh database.
+#[test]
+fn a_wiped_chain_with_surviving_domain_rows_fails_10145() {
+    let (_dir, _path, conn) = open_db();
+    let source = seed_memory(&conn, "wiped-10145");
+    seed_receipt(&conn, &source);
+    append_genuine(&conn);
+    conn.execute("DELETE FROM signed_events", [])
+        .expect("wipe the chain");
+    assert_eq!(receipts(&conn, &source), 1, "the domain row survives");
+    assert_eq!(missing_report(&conn), missing_expected());
+}
