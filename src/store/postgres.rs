@@ -16887,6 +16887,28 @@ impl PostgresStore {
         ))
     }
 
+    /// #10112 (C-F2 / R-13) — whether the Postgres store carries any signed
+    /// `row_attestations` cutover watermark (the PG twin of `sqlite::was_armed`).
+    async fn pg_row_attestations_armed(&self) -> StoreResult<bool> {
+        let (present,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_name = 'row_attestations')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("pg_row_attestations_armed table check", e))?;
+        if !present {
+            return Ok(false);
+        }
+        let armed: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM row_attestations WHERE op = 'cutover' AND signature IS NOT NULL LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("pg_row_attestations_armed cutover check", e))?;
+        Ok(armed.is_some())
+    }
+
     /// v0.9.0 G9 (#1826) — read the NEWEST role-separation checkpoint in
     /// `namespace` (a clone of the pg witness fetch). `None` when none exists.
     async fn pg_read_latest_role_checkpoint(
@@ -27685,6 +27707,9 @@ impl MemoryStore for PostgresStore {
         // is the CBOR quorum, NOT a single Ed25519 sig); every other reason is a
         // single predecessor signature. Mirrors the sqlite SSOT branch.
         if record.reason == LineageReason::Recovery {
+            let prior_lineage = self.read_lineage(agent_id).await?;
+            let prior_witnesses = self.lineage_witness_hashes(agent_id).await?;
+            let bound = self.agent_pubkey(agent_id).await?;
             let policy = crate::identity::lineage::RecoveryPolicy::from_env().ok_or_else(|| {
                 invalid(
                     "cannot mint a recovery record — no recovery guardians enrolled \
@@ -27692,6 +27717,30 @@ impl MemoryStore for PostgresStore {
                         .to_string(),
                 )
             })?;
+            // #10159 (S-F1): verify the entire prior chain into `VerifiedLineage`
+            // before trusting any committed quorum from storage.
+            let verified = crate::identity::lineage::verify_lineage_with_recovery(
+                &prior_lineage,
+                &prior_witnesses,
+                bound.as_deref(),
+                Some(&policy),
+            )
+            .map_err(|e| {
+                invalid(format!(
+                    "refusing recovery on unverified lineage chain: {e}"
+                ))
+            })?;
+            // #10112 R-2: prior verified lineage record's committed quorum rules.
+            let (committed_gid, committed_thr) =
+                crate::storage::recovery_rebind::resolve_committed_quorum(&verified, &policy)
+                    .map_err(|e| invalid(format!("{e:#}")))?;
+            if record.guardian_set_id.as_deref() != Some(committed_gid.as_slice())
+                || record.recovery_threshold != Some(committed_thr)
+            {
+                return Err(invalid(
+                    crate::storage::row_attest::sqlite::REFUSE_RECOVERY_QUORUM_DRIFT.to_string(),
+                ));
+            }
             crate::identity::lineage::verify_recovery_record(record, signature, &policy).map_err(
                 |e| {
                     invalid(format!(
@@ -27699,6 +27748,16 @@ impl MemoryStore for PostgresStore {
                     ))
                 },
             )?;
+            // #10112 (C-F2 / R-13): unarmed PG stores (no signed `row_attestations`
+            // cutover) persist quorum-verified `Recovery` records as at base; armed
+            // PG stores refuse preflight with a PG-accurate named refusal (zero writes).
+            if self.pg_row_attestations_armed().await? {
+                return Err(StoreError::UnsupportedCapability {
+                    capability:
+                        crate::storage::row_attest::sqlite::REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED
+                            .to_string(),
+                });
+            }
         } else {
             let predecessor =
                 crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)
@@ -28040,6 +28099,19 @@ impl MemoryStore for PostgresStore {
                 Ok(None)
             }
         }
+    }
+
+    async fn recover_rebind(
+        &self,
+        _ctx: &CallerContext,
+        _anchor_dir: &std::path::Path,
+        _req: &crate::storage::recovery_rebind::RecoveryRequest<'_>,
+        _arm: crate::storage::recovery_rebind::RecoveryArm<'_>,
+    ) -> StoreResult<crate::storage::recovery_rebind::RecoveryOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: crate::storage::row_attest::sqlite::REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED
+                .to_string(),
+        })
     }
 
     // v0.7.0 Wave-3 Continuation 3 — lifecycle write paths on postgres.

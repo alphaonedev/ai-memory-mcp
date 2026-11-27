@@ -314,21 +314,26 @@ pub enum IdentityAction {
         #[arg(long, value_name = "CHALLENGE_B64", allow_hyphen_values = true)]
         challenge: String,
     },
-    /// v1.0.0 G17 (#1831) — phase 2 of the M-of-N recovery ceremony:
-    /// re-mint the SAME recovery record (pass the `--not-before` echoed by
-    /// `recover-prepare`), assemble the collected guardian attestations, and
-    /// persist it — verifying the M-of-N quorum against the enrolled
-    /// guardian set (`AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS` /
-    /// `AI_MEMORY_RECOVERY_THRESHOLD`) + the committed trust bar in the signed
-    /// record body, ordered by `not_before` anti-rollback monotonicity, BEFORE
-    /// any write. There is NO wall-clock / liveness / dead-man silence-window
-    /// gate (that time-windowed resolution is deferred to a future release).
-    /// On success the fresh key is the new authoritative head.
+    /// v1.0.0 G17 (#1831, #10112 Option B) — phase 2 of the M-of-N recovery
+    /// ceremony: verify the M-of-N guardian quorum against the committed trust
+    /// bar BEFORE any write, arm row attestation (#10040) with `K_new`'s
+    /// private key from `--key-dir`, commit the lineage record, pubkey
+    /// history, `_agents` update, and signed `row_attestations` row in one
+    /// SQLite transaction, archive the lost `K_old` public key under the trust
+    /// anchor as `<agent>.pub.<ts>`, install `K_new` as `<agent>.{pub,priv}`,
+    /// and advance the anchored seal.
+    ///
+    /// Option B contract (#10112, vote V1-RECOVER-REBIND-ATTEST): recovery
+    /// requires a signing arm holding `K_new.priv` inside `--key-dir` (either
+    /// auto-matched by `--successor-pubkey` or named via `--successor-key-id`).
+    /// A verify-only arm (`--verify-only`) or missing `K_new.priv` is refused
+    /// preflight with zero database or anchor changes.
     Recover {
         /// Agent identifier whose identity is being recovered.
         #[arg(long)]
         agent_id: Option<String>,
-        /// The SAME fresh-primary public key passed to `recover-prepare`.
+        /// The SAME fresh-primary public key passed to `recover-prepare`
+        /// (must equal both the guardian-signed key and the signing arm's `K_new`).
         #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         successor_pubkey: String,
         /// Echo the `not_before` value `recover-prepare` printed (so the
@@ -341,6 +346,15 @@ pub enum IdentityAction {
         /// The SAME `--recovery-pubkey` (if any) passed to `recover-prepare`.
         #[arg(long, value_name = "PUBKEY_B64", allow_hyphen_values = true)]
         recovery_pubkey: Option<String>,
+        /// Optional keypair label inside `--key-dir` holding `K_new.{pub,priv}`
+        /// (when omitted, `--key-dir` is scanned for the keypair whose public
+        /// key matches `--successor-pubkey`).
+        #[arg(long, value_name = "LABEL")]
+        successor_key_id: Option<String>,
+        /// Explicit verify-only arm posture (always refused on recovery under
+        /// Option B with zero database or anchor changes, #10112 R-8).
+        #[arg(long, default_value_t = false)]
+        verify_only: bool,
         /// A guardian attestation `guardian_pubkey_b64:signature_b64` (from
         /// `sign-recovery`). Repeat once per guardian; M distinct enrolled
         /// signers must be presented.
@@ -473,15 +487,22 @@ pub fn run(
             not_before,
             from_seq,
             recovery_pubkey,
+            successor_key_id,
+            verify_only,
             attestations,
         } => recover(
             db_path,
-            agent_id.as_deref(),
-            &successor_pubkey,
-            &not_before,
-            from_seq,
-            recovery_pubkey.as_deref(),
-            &attestations,
+            &dir,
+            &RecoverCmdArgs {
+                explicit_agent_id: agent_id.as_deref(),
+                successor_pubkey: &successor_pubkey,
+                not_before: &not_before,
+                from_seq,
+                recovery_pubkey: recovery_pubkey.as_deref(),
+                successor_key_id: successor_key_id.as_deref(),
+                verify_only,
+                attestations: &attestations,
+            },
             json_out,
             out,
         ),
@@ -986,25 +1007,94 @@ fn sign_recovery(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Resolve `K_new`'s signing keypair strictly inside `dir` (#10112 Option B,
+/// R-4, R-8, R-14). Never prints, logs, or copies private key material outside
+/// `dir`. Returns `(loaded_keypair, staged_label_if_different_from_agent)`.
+fn resolve_recovery_k_new_in_dir(
+    dir: &Path,
+    agent_id: &str,
+    successor_pubkey: &str,
+    explicit_label: Option<&str>,
+) -> Result<(Option<keypair::AgentKeypair>, Option<String>)> {
+    if let Some(label) = explicit_label {
+        validate::validate_agent_id_shape(label)?;
+        if !keypair::agent_pub_path(dir, label).exists() {
+            // Defer missing-key refusal to `recovery_preconditions` so the
+            // guardian M-of-N quorum is ALWAYS verified first (#10112 R-1).
+            return Ok((None, None));
+        }
+        let kp = keypair::load(label, dir)?;
+        let staged = (label != agent_id).then(|| label.to_string());
+        return Ok((Some(kp), staged));
+    }
+    let target_pub =
+        keypair::decode_public_base64(successor_pubkey).context("decoding --successor-pubkey")?;
+    // First check `<agent_id>` itself (covers idempotent post-commit resume, R-6).
+    if keypair::agent_pub_path(dir, agent_id).exists()
+        && let Ok(kp) = keypair::load(agent_id, dir)
+        && kp.public.to_bytes() == target_pub.to_bytes()
+    {
+        return Ok((Some(kp), None));
+    }
+    // Otherwise scan `dir` for a staged `<label>.pub` matching `target_pub`.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok((None, None));
+    };
+    let mut labels: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.starts_with('.') {
+            continue;
+        }
+        if let Some(stem) = name_str.strip_suffix(keypair::PUB_SUFFIX)
+            && !stem.is_empty()
+            && !stem.contains('.')
+        {
+            labels.push(stem.to_string());
+        }
+    }
+    labels.sort();
+    for label in labels {
+        let Ok(pk) = keypair::load_public(&label, dir) else {
+            continue;
+        };
+        if pk.to_bytes() == target_pub.to_bytes() {
+            let kp = keypair::load(&label, dir)?;
+            let staged = (label != agent_id).then_some(label);
+            return Ok((Some(kp), staged));
+        }
+    }
+    Ok((None, None))
+}
+
+struct RecoverCmdArgs<'a> {
+    explicit_agent_id: Option<&'a str>,
+    successor_pubkey: &'a str,
+    not_before: &'a str,
+    from_seq: Option<u64>,
+    recovery_pubkey: Option<&'a str>,
+    successor_key_id: Option<&'a str>,
+    verify_only: bool,
+    attestations: &'a [String],
+}
+
 fn recover(
     db_path: &Path,
-    explicit_agent_id: Option<&str>,
-    successor_pubkey: &str,
-    not_before: &str,
-    from_seq: Option<u64>,
-    recovery_pubkey: Option<&str>,
-    attestations: &[String],
+    dir: &Path,
+    args: &RecoverCmdArgs<'_>,
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let id = resolve_lineage_id(explicit_agent_id)?;
-    if attestations.is_empty() {
+    let id = resolve_lineage_id(args.explicit_agent_id)?;
+    if args.attestations.is_empty() {
         bail!("no --attestation presented — collect M guardian attestations via sign-recovery");
     }
     let mut quorum: Vec<crate::identity::lineage::RecoveryAttestation> =
-        Vec::with_capacity(attestations.len());
-    for att in attestations {
+        Vec::with_capacity(args.attestations.len());
+    for att in args.attestations {
         let (pk, sig) = att.split_once(':').with_context(|| {
             format!("malformed --attestation '{att}' (expected guardian_pubkey_b64:signature_b64)")
         })?;
@@ -1016,15 +1106,36 @@ fn recover(
         });
     }
     let conn = crate::db::open(db_path)?;
-    let record = crate::db::append_recovery(
-        &conn,
-        &id,
-        successor_pubkey,
-        &quorum,
-        from_seq,
-        recovery_pubkey,
-        not_before,
-    )?;
+
+    // Resolve signing arm posture strictly inside `dir` (R-4, R-8, R-14).
+    // `recovery_preconditions` ALWAYS verifies the guardian M-of-N quorum
+    // FIRST (R-1) before inspecting `arm`, so a quorum shortfall is never
+    // masked by a missing or mismatched `K_new`.
+    let (loaded_k_new, staged_label) = if args.verify_only {
+        (None, None)
+    } else {
+        resolve_recovery_k_new_in_dir(dir, &id, args.successor_pubkey, args.successor_key_id)?
+    };
+    let arm = if args.verify_only {
+        crate::db::RecoveryArm::VerifyOnly
+    } else if let Some(sk) = loaded_k_new.as_ref().and_then(|kp| kp.private.as_ref()) {
+        crate::db::RecoveryArm::Signing(sk)
+    } else {
+        crate::db::RecoveryArm::MissingPrivateKey
+    };
+
+    let req = crate::db::RecoveryRequest {
+        agent_id: &id,
+        successor_pubkey_b64: args.successor_pubkey,
+        quorum: &quorum,
+        suspected_compromise_from_seq: args.from_seq,
+        recovery_pubkey_b64: args.recovery_pubkey,
+        not_before: args.not_before,
+        staged_key_label: staged_label.as_deref(),
+    };
+    let checked = crate::db::recovery_preconditions(&conn, dir, &req, arm)?;
+    let outcome = crate::db::execute_recovery_rebind(&conn, checked)?;
+    let record = outcome.record;
     if json_out {
         writeln!(
             out.stdout,
@@ -1034,6 +1145,7 @@ fn recover(
                 "agent_id": id,
                 "epoch": record.epoch,
                 (PUBLIC_KEY_B64_FIELD): record.successor_pubkey_b64,
+                "archived_pub": outcome.archived_pub.display().to_string(),
                 "guardians_presented": quorum.len(),
             })
         )?;
@@ -1046,7 +1158,8 @@ fn recover(
         write_head_pub_line(out, &record.successor_pubkey_b64)?;
         writeln!(
             out.stdout,
-            "  the lost key is retired; install the fresh keypair on disk under '{id}'"
+            "  archived_prior_pub = {}",
+            outcome.archived_pub.display()
         )?;
     }
     Ok(())
@@ -1955,6 +2068,8 @@ mod tests {
                 not_before,
                 from_seq: None,
                 recovery_pubkey: None,
+                successor_key_id: None,
+                verify_only: false,
                 attestations,
             },
             true,
@@ -1977,6 +2092,328 @@ mod tests {
             std::env::remove_var(RECOVERY_GUARDIAN_PUBKEYS_ENV);
             std::env::remove_var(RECOVERY_THRESHOLD_ENV);
         }
+    }
+
+    /// Snapshot every regular file (relative path -> raw bytes) under `dir`
+    /// so refusal tests can prove the anchor directory is byte-identical (#10112 R-8).
+    fn snapshot_dir_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).expect("read dir for snapshot") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                out.insert(name, std::fs::read(&path).expect("read snapshot file"));
+            }
+        }
+        out
+    }
+
+    /// #10112 (Option B, vote V1-RECOVER-REBIND-ATTEST) — red-first end-to-end
+    /// pin beside `recovery_ceremony_cli_end_to_end`:
+    /// 1. Refuses recovery when `K_new.priv` is missing (DB + anchor byte-identical).
+    /// 2. With `K_new.priv` in the key dir (K_old.priv LOST), recovery attests
+    ///    the `_agents` rebind row under `K_new`, archives `K_old` as
+    ///    `<agent>.pub.<ts>`, installs `K_new` as `<agent>.pub`, and leaves
+    ///    `verify_sqlite_with` `Outcome::Clean` (pre-recovery row under K_old
+    ///    and rebind under K_new).
+    /// 3. A later `identity succeed` passes without `REFUSE_ROW_DRIFT`.
+    /// 4. Tampering the pre-recovery row is still detected as `Outcome::Defective`.
+    #[test]
+    fn recovery_rebind_arms_k_new_archives_k_old_and_verifies_history_10112() {
+        use crate::identity::lineage::{RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV};
+        use crate::storage::row_attest::Outcome;
+        use crate::storage::row_attest::anchor::TrustAnchor;
+        use crate::storage::row_attest::sqlite::{
+            REFUSE_RECOVERY_MISSING_PRIV, arm_with_key, verify_sqlite_with,
+        };
+
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_RECOVER_10112_ROLE";
+        const MARKER_ENV: &str = "AI_MEMORY_TEST_RECOVER_10112_MARKER";
+        const GUARDIAN_DIR_ENV: &str = "AI_MEMORY_TEST_RECOVER_10112_GDIR";
+        const TEST_PATH: &str = "cli::identity::tests::recovery_rebind_arms_k_new_archives_k_old_and_verifies_history_10112";
+
+        if std::env::var_os(ROLE_ENV).is_none() {
+            let scratch = crate::identity::test_key_dir::private_tempdir();
+            let home_dir = scratch.path().join("home");
+            let xdg_dir = scratch.path().join("xdg-config");
+            let witness_dir = scratch.path().join("witness");
+            let guardian_dir = scratch.path().join("guardians");
+            for sub in [&home_dir, &xdg_dir, &witness_dir, &guardian_dir] {
+                std::fs::create_dir_all(sub).expect("create hermetic subdir");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o700))
+                        .expect("chmod 0700 subdir");
+                }
+            }
+            let mut gpubs = Vec::new();
+            for g in ["g10112-0", "g10112-1", "g10112-2"] {
+                let kp = keypair::generate(g).unwrap();
+                keypair::save(&kp, &guardian_dir).unwrap();
+                gpubs.push(kp.public_base64());
+            }
+            let marker = scratch.path().join("child-ran");
+            let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+                .arg("--exact")
+                .arg(TEST_PATH)
+                .arg("--nocapture")
+                .env("HOME", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_dir)
+                .env("AI_MEMORY_WITNESS_KEY_DIR", &witness_dir)
+                .env("AI_MEMORY_NO_CONFIG", "1")
+                .env(RECOVERY_GUARDIAN_PUBKEYS_ENV, gpubs.join(","))
+                .env(RECOVERY_THRESHOLD_ENV, "2")
+                .env(GUARDIAN_DIR_ENV, &guardian_dir)
+                .env(ROLE_ENV, "child")
+                .env(MARKER_ENV, &marker)
+                .output()
+                .expect("spawn hermetic recovery child");
+            assert!(
+                output.status.success(),
+                "hermetic recovery child failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(marker.exists(), "hermetic recovery child must run");
+            return;
+        }
+
+        let mut env = TestEnv::fresh();
+        let dir_path = crate::identity::test_key_dir::install().to_path_buf();
+        let guardian_dir = PathBuf::from(std::env::var_os(GUARDIAN_DIR_ENV).unwrap());
+        let db_path = env.db_path.clone();
+        let agent = "rec-armed-10112";
+
+        let run_action = |env: &mut TestEnv, key_dir: &Path, action: IdentityAction, json: bool| {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(key_dir.to_path_buf()),
+                    action,
+                },
+                json,
+                &mut out,
+            )
+        };
+
+        // Seed agent + K_old + lineage + armed row attestation + pre-recovery row.
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, agent, "ai:test", &[]).unwrap();
+        }
+        run_action(
+            &mut env,
+            &dir_path,
+            IdentityAction::Generate {
+                agent_id: Some(agent.to_string()),
+                force: false,
+                no_overwrite: false,
+            },
+            false,
+        )
+        .unwrap();
+        let k_old = keypair::load(agent, &dir_path).unwrap();
+        let cold = keypair::generate("cold-10112").unwrap();
+        run_action(
+            &mut env,
+            &dir_path,
+            IdentityAction::EnrollLineage {
+                agent_id: Some(agent.to_string()),
+                recovery_pubkey: Some(cold.public_base64()),
+            },
+            false,
+        )
+        .unwrap();
+
+        // Arm the store with K_old and write an attested pre-recovery memory row.
+        let pre_mem_id = {
+            let conn = crate::db::open(&db_path).unwrap();
+            arm_with_key(&conn, agent, k_old.private.as_ref().unwrap()).unwrap();
+            let mut mem = crate::models::Memory::default();
+            mem.namespace = "recovery-10112".to_string();
+            mem.title = "pre-recovery-row".to_string();
+            mem.content = "signed under K_old before loss".to_string();
+            crate::db::insert(&conn, &mem).unwrap();
+            let anchor = TrustAnchor::load_dir(&dir_path);
+            let pre_report = verify_sqlite_with(&conn, &anchor).unwrap();
+            assert!(
+                matches!(pre_report.outcome(), Outcome::Clean),
+                "pre-recovery store must be Clean: {:?}",
+                pre_report.outcome()
+            );
+            mem.id
+        };
+
+        // Simulate key LOSS of K_old: remove `<agent>.priv`, keeping `<agent>.pub`.
+        std::fs::remove_file(dir_path.join(format!("{agent}.priv"))).unwrap();
+
+        // Prepare K_new (initially NOT saved in key dir so K_new.priv is missing).
+        let k_new = keypair::generate("rec-armed-10112-new").unwrap();
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            &dir_path,
+            IdentityAction::RecoverPrepare {
+                agent_id: Some(agent.to_string()),
+                successor_pubkey: k_new.public_base64(),
+                from_seq: None,
+                recovery_pubkey: None,
+            },
+            true,
+        )
+        .unwrap();
+        let prep: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        let challenge = prep["challenge_b64"].as_str().unwrap().to_string();
+        let not_before = prep["not_before"].as_str().unwrap().to_string();
+
+        let mut attestations = Vec::new();
+        for g in ["g10112-0", "g10112-1"] {
+            env.stdout.clear();
+            run_action(
+                &mut env,
+                &guardian_dir,
+                IdentityAction::SignRecovery {
+                    agent_id: Some(g.to_string()),
+                    challenge: challenge.clone(),
+                },
+                true,
+            )
+            .unwrap();
+            let sig: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+            attestations.push(sig["attestation"].as_str().unwrap().to_string());
+        }
+
+        // 1. Missing K_new.priv MUST be refused with exact constant and zero DB or anchor change (R-8).
+        let db_bytes_before = std::fs::read(&db_path).unwrap();
+        let dir_before = snapshot_dir_bytes(&dir_path);
+        let missing_err = run_action(
+            &mut env,
+            &dir_path,
+            IdentityAction::Recover {
+                agent_id: Some(agent.to_string()),
+                successor_pubkey: k_new.public_base64(),
+                not_before: not_before.clone(),
+                from_seq: None,
+                recovery_pubkey: None,
+                successor_key_id: None,
+                verify_only: false,
+                attestations: attestations.clone(),
+            },
+            true,
+        )
+        .expect_err("recovery without K_new.priv in key dir must be refused (#10112 R-8)");
+        let missing_msg = format!("{missing_err:#}");
+        assert!(
+            missing_msg.contains(REFUSE_RECOVERY_MISSING_PRIV),
+            "expected exact REFUSE_RECOVERY_MISSING_PRIV refusal, got: {missing_msg}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            db_bytes_before,
+            "refused recovery must leave DB byte-identical"
+        );
+        assert_eq!(
+            snapshot_dir_bytes(&dir_path),
+            dir_before,
+            "refused recovery must leave anchor dir byte-identical"
+        );
+
+        // 2. Stage K_new.{pub,priv} inside key dir and complete recovery.
+        keypair::save(&k_new, &dir_path).unwrap();
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            &dir_path,
+            IdentityAction::Recover {
+                agent_id: Some(agent.to_string()),
+                successor_pubkey: k_new.public_base64(),
+                not_before,
+                from_seq: None,
+                recovery_pubkey: None,
+                successor_key_id: None,
+                verify_only: false,
+                attestations,
+            },
+            true,
+        )
+        .unwrap();
+
+        // K_old must be archived under anchor as `<agent>.pub.<ts>` and K_new
+        // installed as `<agent>.pub`.
+        let archived: Vec<_> = std::fs::read_dir(&dir_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{agent}.pub."))
+            })
+            .collect();
+        assert_eq!(
+            archived.len(),
+            1,
+            "retired K_old must be archived as <agent>.pub.<ts> under anchor"
+        );
+        assert_eq!(
+            std::fs::read(archived[0].path()).unwrap(),
+            k_old.public.to_bytes().as_slice(),
+            "archived retired key bytes must equal K_old"
+        );
+        assert_eq!(
+            keypair::load_public(agent, &dir_path).unwrap().to_bytes(),
+            k_new.public.to_bytes(),
+            "current anchor key <agent>.pub must equal K_new"
+        );
+
+        // Pre-recovery row (K_old) AND rebind row (K_new) must verify Clean!
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            let anchor = TrustAnchor::load_dir(&dir_path);
+            let post_report = verify_sqlite_with(&conn, &anchor).unwrap();
+            assert!(
+                matches!(post_report.outcome(), Outcome::Clean),
+                "post-recovery store must verify Clean: {:?}",
+                post_report.outcome()
+            );
+        }
+
+        // 3. A later `identity succeed` must pass without REFUSE_ROW_DRIFT (R-10).
+        env.stdout.clear();
+        run_action(
+            &mut env,
+            &dir_path,
+            IdentityAction::Succeed {
+                agent_id: Some(agent.to_string()),
+            },
+            true,
+        )
+        .expect("later identity succeed after recovery must pass without REFUSE_ROW_DRIFT");
+
+        // 4. Direct-file tampering of the pre-recovery row is STILL detected as Defective.
+        {
+            let raw = rusqlite::Connection::open(&db_path).unwrap();
+            raw.execute(
+                "UPDATE memories SET content = 'tampered-after-recovery' WHERE id = ?1",
+                [&pre_mem_id],
+            )
+            .unwrap();
+            drop(raw);
+            let conn = crate::db::open(&db_path).unwrap();
+            let anchor = TrustAnchor::load_dir(&dir_path);
+            let tampered = verify_sqlite_with(&conn, &anchor).unwrap();
+            assert!(
+                matches!(tampered.outcome(), Outcome::Defective { .. }),
+                "tampered pre-recovery row must still be detected as Defective: {:?}",
+                tampered.outcome()
+            );
+        }
+
+        let marker = std::env::var_os(MARKER_ENV).expect("marker env");
+        std::fs::write(marker, b"ran").expect("write marker");
     }
 
     const EXPECTED_NO_LINEAGE_SUFFIX_10118: &str = "run enroll-lineage first";

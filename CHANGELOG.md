@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#10112, vote `V1-RECOVER-REBIND-ATTEST` — guardian recovery signs rebind row under `K_new` and archives retired `K_old`)
+
+- **`ai-memory identity recover` now requires a signing arm holding `K_new.priv` inside `--key-dir` (Option B, #10112).** After verifying the M-of-N guardian quorum against the committed trust bar (read from any prior signed lineage record, never from CLI arguments), recovery commits the `agent_lineage` record, `agent_pubkey_history` transition, `_agents` update, and `#10040`-format `row_attestations` row (signed by `K_new` at one shared timestamp `ts`) in a single SQLite transaction, atomically archives the lost `K_old` public key under the trust anchor as `<agent>.pub.<ts>`, installs `K_new` as `<agent>.{pub,priv}`, and advances the anchored seal. A verify-only arm (`--verify-only`), a missing `K_new.priv`, a key mismatch against `--successor-pubkey`, or a quorum shortfall is refused preflight with zero database or anchor changes; the PostgreSQL backend refuses unattested recovery rebinds with the same named refusal (`REFUSE_RECOVERY_VERIFY_ONLY`). Row-attestation stored bytes and `#10040` verifier rules stay byte-identical; details in `changelog.d/10112.changed.md`.
+
 ### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
 
 - `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.

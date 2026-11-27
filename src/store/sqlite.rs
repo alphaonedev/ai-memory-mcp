@@ -1891,6 +1891,21 @@ impl MemoryStore for SqliteStore {
             .map(|key| crate::identity::lineage::pubkey_b64(&key)))
     }
 
+    async fn recover_rebind(
+        &self,
+        _ctx: &CallerContext,
+        anchor_dir: &std::path::Path,
+        req: &crate::storage::recovery_rebind::RecoveryRequest<'_>,
+        arm: crate::storage::recovery_rebind::RecoveryArm<'_>,
+    ) -> StoreResult<crate::storage::recovery_rebind::RecoveryOutcome> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        let checked =
+            crate::storage::recovery_rebind::recovery_preconditions(&conn, anchor_dir, req, arm)
+                .map_err(box_err)?;
+        crate::storage::recovery_rebind::execute_recovery_rebind(&conn, checked).map_err(box_err)
+    }
+
     // ----- v0.7.0 Wave-3 Continuation 2 — federation surface ---------
 
     async fn list_memories_updated_since(

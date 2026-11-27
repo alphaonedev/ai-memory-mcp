@@ -2595,6 +2595,26 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #10112 (C-F3 / Option B, R-1..R-14) — execute an armed guardian-quorum
+    /// key recovery rebind (`recovery_preconditions` + single-tx DB commit +
+    /// atomic anchor swap + seal advance).
+    ///
+    /// Default returns `UnsupportedCapability`; [`crate::store::sqlite::SqliteStore`]
+    /// delegates to the `storage::recovery_rebind` SSOT and
+    /// [`crate::store::postgres::PostgresStore`] refuses armed PG recovery with
+    /// [`crate::storage::row_attest::sqlite::REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED`].
+    async fn recover_rebind(
+        &self,
+        _ctx: &CallerContext,
+        _anchor_dir: &std::path::Path,
+        _req: &crate::storage::recovery_rebind::RecoveryRequest<'_>,
+        _arm: crate::storage::recovery_rebind::RecoveryArm<'_>,
+    ) -> StoreResult<crate::storage::recovery_rebind::RecoveryOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RECOVER_REBIND".to_string(),
+        })
+    }
+
     /// #1955 [P1][R45] — engage (`engage=true`) or release
     /// (`engage=false`) the substrate record-stop. Emits ONE signed
     /// `substrate.record_stop` / `substrate.record_resume` attestation

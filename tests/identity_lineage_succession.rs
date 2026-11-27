@@ -2706,4 +2706,328 @@ mod postgres_parity {
             .await
             .expect("drop isolated schema by rollback");
     }
+
+    /// #10112 (R-13 / C-F2 / C-F3 / C-F11 / C-F12) — PostgreSQL parity: on an
+    /// armed PG store (carrying a signed `row_attestations` cutover),
+    /// `PostgresStore::append_lineage_record` AND `MemoryStore::recover_rebind`
+    /// MUST refuse preflight with exact `StoreError::UnsupportedCapability`
+    /// carrying `REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED`, leaving `agent_lineage`,
+    /// `agent_pubkey_history`, and `_agents` untouched (zero unattested rebinds).
+    #[tokio::test]
+    async fn postgres_recovery_rebind_refuses_unattested_write_10112() {
+        let Some(store) = connect().await else { return };
+        let Some(pool) = raw_pool().await else { return };
+        let (agent_id, k0) = pg_register_and_enroll(&store).await;
+        let k_new = kp(&agent_id);
+        let g0 = kp("pg-g0");
+        let g1 = kp("pg-g1");
+        let g2 = kp("pg-g2");
+        let gpubs = format!(
+            "{},{},{}",
+            g0.public_base64(),
+            g1.public_base64(),
+            g2.public_base64()
+        );
+        let _pg_env = crate::common::MultiEnvVarGuard::apply(&[
+            (
+                ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                Some(&gpubs),
+            ),
+            (
+                ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV,
+                Some("2"),
+            ),
+        ]);
+        let policy = ai_memory::identity::lineage::RecoveryPolicy::from_env()
+            .expect("recovery policy from env");
+
+        // Mark this PG store armed with a signed cutover watermark.
+        sqlx::query(
+            "INSERT INTO row_attestations \
+                (table_name, row_key, seq, op, row_digest, prior_digest, agent_id, key_id, \
+                 attested_at, format_version, covered_columns, store_id, table_seq, table_acc, \
+                 signature, attestation_digest) \
+             VALUES ('memories', $1, 0, 'cutover', NULL, $2, $3, 'k0', \
+                     '2026-11-26T12:00:00Z', 1, 'id', 'store-pg', 0, $2, $4, $2) \
+             ON CONFLICT (table_name, row_key, seq) DO NOTHING",
+        )
+        .bind(b"pg-cutover-r13".as_slice())
+        .bind([0_u8; 32].as_slice())
+        .bind(&agent_id)
+        .bind([1_u8; 64].as_slice())
+        .execute(&pool)
+        .await
+        .expect("arm PG store with signed cutover");
+
+        let lineage_before = store
+            .read_lineage(&agent_id)
+            .await
+            .expect("read_lineage before");
+        assert_eq!(lineage_before.len(), 1);
+        let head = &lineage_before[0].0;
+        let pub_before = store
+            .agent_pubkey(&agent_id)
+            .await
+            .expect("agent_pubkey before");
+        assert_eq!(pub_before.as_deref(), Some(k0.public_base64().as_str()));
+        let versions_before = store
+            .agent_pubkey_versions(&agent_id)
+            .await
+            .expect("versions before");
+
+        let rec = LineageRecord::recovery(
+            head,
+            &k_new.public_base64(),
+            None,
+            head.recovery_pubkey_b64.clone(),
+            policy.guardian_set_id(),
+            2,
+            "2026-11-26T12:00:00Z",
+        )
+        .expect("build recovery record");
+        let signing_input = rec.signing_input().expect("signing_input");
+        let atts = vec![
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g0.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g0.private.as_ref().expect("g0 priv"),
+                    &signing_input,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g1.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g1.private.as_ref().expect("g1 priv"),
+                    &signing_input,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+        ];
+        let quorum_blob =
+            ai_memory::identity::lineage::encode_recovery_quorum(&atts).expect("encode quorum");
+
+        let ctx = CallerContext::for_admin("test:pg-10112");
+        let err = store
+            .append_lineage_record(&ctx, &agent_id, &rec, &quorum_blob)
+            .await
+            .expect_err("armed Postgres must refuse unattested recovery rebind (#10112 R-13)");
+        match err {
+            ai_memory::store::StoreError::UnsupportedCapability { capability } => {
+                assert_eq!(
+                    capability,
+                    ai_memory::storage::row_attest::sqlite::REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED
+                );
+            }
+            other => panic!("expected UnsupportedCapability, got: {other:?}"),
+        }
+
+        // C-F3: `MemoryStore::recover_rebind` on Postgres also returns exact refusal.
+        let trait_store: &dyn MemoryStore = &store;
+        let req = ai_memory::storage::recovery_rebind::RecoveryRequest {
+            agent_id: &agent_id,
+            successor_pubkey_b64: &k_new.public_base64(),
+            quorum: &atts,
+            suspected_compromise_from_seq: None,
+            recovery_pubkey_b64: None,
+            not_before: &rec.not_before,
+            staged_key_label: None,
+        };
+        let err_trait = trait_store
+            .recover_rebind(
+                &ctx,
+                std::path::Path::new("."),
+                &req,
+                ai_memory::storage::recovery_rebind::RecoveryArm::Signing(
+                    k_new.private.as_ref().expect("k_new priv"),
+                ),
+            )
+            .await
+            .expect_err("Postgres MemoryStore::recover_rebind must return UnsupportedCapability");
+        match err_trait {
+            ai_memory::store::StoreError::UnsupportedCapability { capability } => {
+                assert_eq!(
+                    capability,
+                    ai_memory::storage::row_attest::sqlite::REFUSE_PG_RECOVERY_ARMED_UNSUPPORTED
+                );
+            }
+            other => panic!("expected UnsupportedCapability from recover_rebind, got: {other:?}"),
+        }
+
+        // Zero DB writes occurred on Postgres.
+        let lineage_after = store
+            .read_lineage(&agent_id)
+            .await
+            .expect("read_lineage after");
+        assert_eq!(lineage_after.len(), lineage_before.len());
+        let pub_after = store
+            .agent_pubkey(&agent_id)
+            .await
+            .expect("agent_pubkey after");
+        assert_eq!(pub_after, pub_before);
+        let versions_after = store
+            .agent_pubkey_versions(&agent_id)
+            .await
+            .expect("versions after");
+        assert_eq!(versions_after.len(), versions_before.len());
+    }
+
+    /// #10112 (C-F2 / R-13) — PostgreSQL unarmed store MUST still accept a
+    /// quorum-verified `Recovery` record (base `bd57b51b9` behavior), while an
+    /// armed PG store (carrying a signed `row_attestations` cutover) MUST refuse
+    /// with `StoreError::UnsupportedCapability` carrying the PG-accurate refusal.
+    #[tokio::test]
+    async fn postgres_unarmed_recovery_succeeds_and_armed_refuses_10112() {
+        let Some(store) = connect().await else { return };
+        let Some(pool) = raw_pool().await else { return };
+        let (agent_id, _k0) = pg_register_and_enroll(&store).await;
+        let k_new = kp(&agent_id);
+        let k_new2 = kp(&agent_id);
+        let g0 = kp("pg-cf2-g0");
+        let g1 = kp("pg-cf2-g1");
+        let g2 = kp("pg-cf2-g2");
+        let gpubs = format!(
+            "{},{},{}",
+            g0.public_base64(),
+            g1.public_base64(),
+            g2.public_base64()
+        );
+        let _pg_env = crate::common::MultiEnvVarGuard::apply(&[
+            (
+                ai_memory::identity::lineage::RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                Some(&gpubs),
+            ),
+            (
+                ai_memory::identity::lineage::RECOVERY_THRESHOLD_ENV,
+                Some("2"),
+            ),
+        ]);
+        let policy = ai_memory::identity::lineage::RecoveryPolicy::from_env()
+            .expect("recovery policy from env");
+
+        // Ensure unarmed baseline (no signed cutovers).
+        sqlx::query("DELETE FROM row_attestations WHERE op = 'cutover' AND signature IS NOT NULL")
+            .execute(&pool)
+            .await
+            .expect("clear any signed cutovers");
+
+        let lineage_before = store
+            .read_lineage(&agent_id)
+            .await
+            .expect("read_lineage before");
+        let head = &lineage_before[0].0;
+        let rec = LineageRecord::recovery(
+            head,
+            &k_new.public_base64(),
+            None,
+            head.recovery_pubkey_b64.clone(),
+            policy.guardian_set_id(),
+            2,
+            "2026-11-26T12:00:00Z",
+        )
+        .expect("build recovery record");
+        let signing_input = rec.signing_input().expect("signing_input");
+        let atts = vec![
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g0.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g0.private.as_ref().expect("g0 priv"),
+                    &signing_input,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g1.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g1.private.as_ref().expect("g1 priv"),
+                    &signing_input,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+        ];
+        let quorum_blob =
+            ai_memory::identity::lineage::encode_recovery_quorum(&atts).expect("encode quorum");
+
+        // 1. Unarmed PG store MUST accept quorum-verified recovery.
+        let ctx = CallerContext::for_admin("test:pg-cf2-10112");
+        store
+            .append_lineage_record(&ctx, &agent_id, &rec, &quorum_blob)
+            .await
+            .expect("C-F2: unarmed PG store must persist quorum-verified Recovery");
+        let auth = store
+            .current_authoritative_key(&agent_id)
+            .await
+            .expect("current_authoritative_key");
+        assert_eq!(auth.as_deref(), Some(k_new.public_base64().as_str()));
+
+        // 2. Armed PG store (with a signed cutover watermark) MUST refuse with exact capability.
+        sqlx::query(
+            "INSERT INTO row_attestations \
+                (table_name, row_key, seq, op, row_digest, prior_digest, agent_id, key_id, \
+                 attested_at, format_version, covered_columns, store_id, table_seq, table_acc, \
+                 signature, attestation_digest) \
+             VALUES ('memories', $1, 0, 'cutover', NULL, $2, $3, 'k0', \
+                     '2026-11-26T12:01:00Z', 1, 'id', 'store-pg', 0, $2, $4, $2)",
+        )
+        .bind(b"pg-cutover-cf2".as_slice())
+        .bind([0_u8; 32].as_slice())
+        .bind(&agent_id)
+        .bind([1_u8; 64].as_slice())
+        .execute(&pool)
+        .await
+        .expect("insert signed cutover row");
+
+        let rec2 = LineageRecord::recovery(
+            &rec,
+            &k_new2.public_base64(),
+            None,
+            rec.recovery_pubkey_b64.clone(),
+            policy.guardian_set_id(),
+            2,
+            "2026-11-26T12:05:00Z",
+        )
+        .expect("build second recovery");
+        let signing_input2 = rec2.signing_input().expect("signing_input2");
+        let atts2 = vec![
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g0.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g0.private.as_ref().expect("g0 priv"),
+                    &signing_input2,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+            ai_memory::identity::lineage::RecoveryAttestation {
+                guardian_pubkey_b64: g2.public_base64(),
+                signature: ed25519_dalek::Signer::sign(
+                    g2.private.as_ref().expect("g2 priv"),
+                    &signing_input2,
+                )
+                .to_bytes()
+                .to_vec(),
+            },
+        ];
+        let quorum_blob2 =
+            ai_memory::identity::lineage::encode_recovery_quorum(&atts2).expect("encode quorum 2");
+
+        let err = store
+            .append_lineage_record(&ctx, &agent_id, &rec2, &quorum_blob2)
+            .await
+            .expect_err("armed PG store must refuse unattested recovery");
+        match err {
+            ai_memory::store::StoreError::UnsupportedCapability { capability } => {
+                assert_eq!(
+                    capability,
+                    "PostgreSQL armed-store guardian recovery is not yet supported \
+                     (no PG row-attestation K_new signing arm; #10112 R-13)"
+                );
+            }
+            other => panic!("expected UnsupportedCapability, got: {other:?}"),
+        }
+    }
 }
