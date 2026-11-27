@@ -1751,229 +1751,299 @@ mod tests {
 
     // ----- v0.9.0 G13 (#1828) lineage verbs ----------------------------
 
+    /// #10156 — Execute a `cli::identity` test body inside a fresh hermetic
+    /// child process with per-test `0o700` `HOME`, `XDG_CONFIG_HOME`,
+    /// `AI_MEMORY_KEY_DIR`, and `AI_MEMORY_WITNESS_KEY_DIR` directories outside
+    /// the operator's real `HOME` (plus `AI_MEMORY_NO_CONFIG=1`), asserting
+    /// that the child runs and writes its marker file.
+    fn run_in_hermetic_child(
+        test_path: &str,
+        role_env: &str,
+        marker_env: &str,
+        body: impl FnOnce(),
+    ) {
+        if std::env::var_os(role_env).is_none() {
+            let scratch = crate::identity::test_key_dir::private_tempdir();
+            let home_dir = scratch.path().join("home");
+            let xdg_dir = scratch.path().join("xdg-config");
+            let key_dir = scratch.path().join("keys");
+            let witness_dir = scratch.path().join("witness");
+            for sub in [&home_dir, &xdg_dir, &key_dir, &witness_dir] {
+                std::fs::create_dir_all(sub).expect("create hermetic subdir");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o700))
+                        .expect("chmod 0700 hermetic subdir");
+                }
+            }
+            let marker = scratch.path().join("child-ran");
+            let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+                .args(["--exact", test_path, "--nocapture"])
+                .env("HOME", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_dir)
+                .env("AI_MEMORY_KEY_DIR", &key_dir)
+                .env("AI_MEMORY_WITNESS_KEY_DIR", &witness_dir)
+                .env("AI_MEMORY_NO_CONFIG", "1")
+                .env(role_env, "child")
+                .env(marker_env, &marker)
+                .output()
+                .expect("spawn hermetic child");
+            assert!(
+                output.status.success(),
+                "hermetic child {test_path} failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                marker.exists(),
+                "hermetic child {test_path} did not write marker"
+            );
+            return;
+        }
+        body();
+        let marker = std::env::var_os(marker_env).expect("hermetic child marker env");
+        std::fs::write(marker, b"ran").expect("write hermetic child marker");
+    }
+
     /// Full CLI lifecycle: generate → register → enroll-lineage →
     /// succeed → register-recovery-key, asserting the printed surfaces
     /// and the DB-side chain state after each verb.
     #[test]
     fn lineage_verbs_end_to_end() {
-        let (mut env, dir) = fresh_env();
-        let dir_path = dir.path().to_path_buf();
-        let db_path = env.db_path.clone();
-        {
-            let conn = crate::db::open(&db_path).unwrap();
-            crate::db::register_agent(&conn, "lin-alice", "ai:test", &[]).unwrap();
-        }
-        // generate the K0 keypair.
-        {
-            let mut out = env.output();
-            run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action: IdentityAction::Generate {
-                        agent_id: Some("lin-alice".to_string()),
-                        force: false,
-                        no_overwrite: false,
-                    },
-                },
-                false,
-                &mut out,
-            )
-            .unwrap();
-        }
+        run_in_hermetic_child(
+            "cli::identity::tests::lineage_verbs_end_to_end",
+            "AI_MEMORY_TEST_LINEAGE_E2E_10156_ROLE",
+            "AI_MEMORY_TEST_LINEAGE_E2E_10156_MARKER",
+            || {
+                let (mut env, dir) = fresh_env();
+                let dir_path = dir.path().to_path_buf();
+                let db_path = env.db_path.clone();
+                {
+                    let conn = crate::db::open(&db_path).unwrap();
+                    crate::db::register_agent(&conn, "lin-alice", "ai:test", &[]).unwrap();
+                }
+                // generate the K0 keypair.
+                {
+                    let mut out = env.output();
+                    run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action: IdentityAction::Generate {
+                                agent_id: Some("lin-alice".to_string()),
+                                force: false,
+                                no_overwrite: false,
+                            },
+                        },
+                        false,
+                        &mut out,
+                    )
+                    .unwrap();
+                }
 
-        // enroll-lineage (JSON mode). #1949 — recovery_pubkey is now
-        // REQUIRED at genesis for new chains.
-        let recovery_b64 = keypair::generate("lin-alice-recovery")
-            .unwrap()
-            .public_base64();
-        env.stdout.clear();
-        env.stderr.clear();
-        {
-            let mut out = env.output();
-            run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action: IdentityAction::EnrollLineage {
-                        agent_id: Some("lin-alice".to_string()),
-                        recovery_pubkey: Some(recovery_b64.clone()),
-                    },
-                },
-                true,
-                &mut out,
-            )
-            .unwrap();
-        }
-        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
-        assert_eq!(v["enrolled"], true);
-        assert_eq!(v["epoch"], 0);
-        assert_eq!(v["recovery_pubkey_registered"], true);
+                // enroll-lineage (JSON mode). #1949 — recovery_pubkey is now
+                // REQUIRED at genesis for new chains.
+                let recovery_b64 = keypair::generate("lin-alice-recovery")
+                    .unwrap()
+                    .public_base64();
+                env.stdout.clear();
+                env.stderr.clear();
+                {
+                    let mut out = env.output();
+                    run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action: IdentityAction::EnrollLineage {
+                                agent_id: Some("lin-alice".to_string()),
+                                recovery_pubkey: Some(recovery_b64.clone()),
+                            },
+                        },
+                        true,
+                        &mut out,
+                    )
+                    .unwrap();
+                }
+                let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+                assert_eq!(v["enrolled"], true);
+                assert_eq!(v["epoch"], 0);
+                assert_eq!(v["recovery_pubkey_registered"], true);
 
-        // succeed (text mode) — rotates on disk AND appends the chain.
-        env.stdout.clear();
-        env.stderr.clear();
-        {
-            let mut out = env.output();
-            run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action: IdentityAction::Succeed {
-                        agent_id: Some("lin-alice".to_string()),
-                    },
-                },
-                false,
-                &mut out,
-            )
-            .unwrap();
-        }
-        let stdout = env.stdout_str().to_string();
-        assert!(
-            stdout.contains("signed succession (epoch 1)"),
-            "got: {stdout}"
+                // succeed (text mode) — rotates on disk AND appends the chain.
+                env.stdout.clear();
+                env.stderr.clear();
+                {
+                    let mut out = env.output();
+                    run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action: IdentityAction::Succeed {
+                                agent_id: Some("lin-alice".to_string()),
+                            },
+                        },
+                        false,
+                        &mut out,
+                    )
+                    .unwrap();
+                }
+                let stdout = env.stdout_str().to_string();
+                assert!(
+                    stdout.contains("signed succession (epoch 1)"),
+                    "got: {stdout}"
+                );
+                assert!(stdout.contains("archived_prior_pub"), "got: {stdout}");
+
+                // register-recovery-key (JSON) — self-succession at epoch 2.
+                let recovery = keypair::generate("lin-alice").unwrap();
+                env.stdout.clear();
+                env.stderr.clear();
+                {
+                    let mut out = env.output();
+                    run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action: IdentityAction::RegisterRecoveryKey {
+                                agent_id: Some("lin-alice".to_string()),
+                                recovery_pubkey: recovery.public_base64(),
+                            },
+                        },
+                        true,
+                        &mut out,
+                    )
+                    .unwrap();
+                }
+                let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+                assert_eq!(v["recovery_key_registered"], true);
+                assert_eq!(v["epoch"], 2);
+
+                // DB-side: the chain verifies and the head is the ACTIVE key.
+                let conn = crate::db::open(&db_path).unwrap();
+                let active = keypair::load("lin-alice", &dir_path).unwrap();
+                let verified = crate::db::verify_agent_lineage(&conn, "lin-alice")
+                    .unwrap()
+                    .expect("chain verifies");
+                assert_eq!(verified.epoch, 2);
+                assert_eq!(verified.head_key.to_bytes(), active.public.to_bytes());
+            },
         );
-        assert!(stdout.contains("archived_prior_pub"), "got: {stdout}");
-
-        // register-recovery-key (JSON) — self-succession at epoch 2.
-        let recovery = keypair::generate("lin-alice").unwrap();
-        env.stdout.clear();
-        env.stderr.clear();
-        {
-            let mut out = env.output();
-            run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action: IdentityAction::RegisterRecoveryKey {
-                        agent_id: Some("lin-alice".to_string()),
-                        recovery_pubkey: recovery.public_base64(),
-                    },
-                },
-                true,
-                &mut out,
-            )
-            .unwrap();
-        }
-        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
-        assert_eq!(v["recovery_key_registered"], true);
-        assert_eq!(v["epoch"], 2);
-
-        // DB-side: the chain verifies and the head is the ACTIVE key.
-        let conn = crate::db::open(&db_path).unwrap();
-        let active = keypair::load("lin-alice", &dir_path).unwrap();
-        let verified = crate::db::verify_agent_lineage(&conn, "lin-alice")
-            .unwrap()
-            .expect("chain verifies");
-        assert_eq!(verified.epoch, 2);
-        assert_eq!(verified.head_key.to_bytes(), active.public.to_bytes());
     }
 
     #[test]
     fn lineage_text_surfaces_and_refusals() {
-        let (mut env, dir) = fresh_env();
-        let dir_path = dir.path().to_path_buf();
-        let db_path = env.db_path.clone();
-        {
-            let conn = crate::db::open(&db_path).unwrap();
-            crate::db::register_agent(&conn, "lin-bob", "ai:test", &[]).unwrap();
-        }
-        // enroll without a keypair on disk → clear error.
-        {
-            let mut out = env.output();
-            let err = run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action: IdentityAction::EnrollLineage {
-                        agent_id: Some("lin-bob".to_string()),
-                        recovery_pubkey: None,
-                    },
-                },
-                false,
-                &mut out,
-            )
-            .unwrap_err();
-            assert!(
-                format!("{err:#}").contains("identity generate"),
-                "got: {err:#}"
-            );
-        }
-        // succeed without an enrolled lineage → refused (and the disk
-        // keypair is untouched by the failed rotation).
-        let k0 = keypair::generate("lin-bob").unwrap();
-        keypair::save(&k0, &dir_path).unwrap();
-        {
-            let mut out = env.output();
-            let err = run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action: IdentityAction::Succeed {
-                        agent_id: Some("lin-bob".to_string()),
-                    },
-                },
-                false,
-                &mut out,
-            )
-            .unwrap_err();
-            assert!(
-                format!("{err:#}").contains("enroll-lineage"),
-                "got: {err:#}"
-            );
-            let on_disk = keypair::load("lin-bob", &dir_path).unwrap();
-            assert_eq!(on_disk.public.to_bytes(), k0.public.to_bytes());
-        }
-        // enroll with a recovery key, text mode — surfaces the honest
-        // v1.0 scoping line.
-        env.stdout.clear();
-        env.stderr.clear();
-        {
-            let recovery = keypair::generate("lin-bob").unwrap();
-            let mut out = env.output();
-            run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action: IdentityAction::EnrollLineage {
-                        agent_id: Some("lin-bob".to_string()),
-                        recovery_pubkey: Some(recovery.public_base64()),
-                    },
-                },
-                false,
-                &mut out,
-            )
-            .unwrap();
-        }
-        let stdout = env.stdout_str().to_string();
-        assert!(
-            stdout.contains("enrolled identity lineage"),
-            "got: {stdout}"
+        run_in_hermetic_child(
+            "cli::identity::tests::lineage_text_surfaces_and_refusals",
+            "AI_MEMORY_TEST_LINEAGE_SURF_10156_ROLE",
+            "AI_MEMORY_TEST_LINEAGE_SURF_10156_MARKER",
+            || {
+                let (mut env, dir) = fresh_env();
+                let dir_path = dir.path().to_path_buf();
+                let db_path = env.db_path.clone();
+                {
+                    let conn = crate::db::open(&db_path).unwrap();
+                    crate::db::register_agent(&conn, "lin-bob", "ai:test", &[]).unwrap();
+                }
+                // enroll without a keypair on disk → clear error.
+                {
+                    let mut out = env.output();
+                    let err = run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action: IdentityAction::EnrollLineage {
+                                agent_id: Some("lin-bob".to_string()),
+                                recovery_pubkey: None,
+                            },
+                        },
+                        false,
+                        &mut out,
+                    )
+                    .unwrap_err();
+                    assert!(
+                        format!("{err:#}").contains("identity generate"),
+                        "got: {err:#}"
+                    );
+                }
+                // succeed without an enrolled lineage → refused (and the disk
+                // keypair is untouched by the failed rotation).
+                let k0 = keypair::generate("lin-bob").unwrap();
+                keypair::save(&k0, &dir_path).unwrap();
+                {
+                    let mut out = env.output();
+                    let err = run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action: IdentityAction::Succeed {
+                                agent_id: Some("lin-bob".to_string()),
+                            },
+                        },
+                        false,
+                        &mut out,
+                    )
+                    .unwrap_err();
+                    assert!(
+                        format!("{err:#}").contains("enroll-lineage"),
+                        "got: {err:#}"
+                    );
+                    let on_disk = keypair::load("lin-bob", &dir_path).unwrap();
+                    assert_eq!(on_disk.public.to_bytes(), k0.public.to_bytes());
+                }
+                // enroll with a recovery key, text mode — surfaces the honest
+                // v1.0 scoping line.
+                env.stdout.clear();
+                env.stderr.clear();
+                {
+                    let recovery = keypair::generate("lin-bob").unwrap();
+                    let mut out = env.output();
+                    run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action: IdentityAction::EnrollLineage {
+                                agent_id: Some("lin-bob".to_string()),
+                                recovery_pubkey: Some(recovery.public_base64()),
+                            },
+                        },
+                        false,
+                        &mut out,
+                    )
+                    .unwrap();
+                }
+                let stdout = env.stdout_str().to_string();
+                assert!(
+                    stdout.contains("enrolled identity lineage"),
+                    "got: {stdout}"
+                );
+                assert!(stdout.contains("v1.0"), "got: {stdout}");
+                // register-recovery-key text mode carries the scoping too.
+                env.stdout.clear();
+                env.stderr.clear();
+                {
+                    let recovery = keypair::generate("lin-bob").unwrap();
+                    let mut out = env.output();
+                    run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path),
+                            action: IdentityAction::RegisterRecoveryKey {
+                                agent_id: Some("lin-bob".to_string()),
+                                recovery_pubkey: recovery.public_base64(),
+                            },
+                        },
+                        false,
+                        &mut out,
+                    )
+                    .unwrap();
+                }
+                let stdout = env.stdout_str().to_string();
+                assert!(stdout.contains("registered recovery key"), "got: {stdout}");
+                assert!(stdout.contains("v1.0"), "got: {stdout}");
+            },
         );
-        assert!(stdout.contains("v1.0"), "got: {stdout}");
-        // register-recovery-key text mode carries the scoping too.
-        env.stdout.clear();
-        env.stderr.clear();
-        {
-            let recovery = keypair::generate("lin-bob").unwrap();
-            let mut out = env.output();
-            run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path),
-                    action: IdentityAction::RegisterRecoveryKey {
-                        agent_id: Some("lin-bob".to_string()),
-                        recovery_pubkey: recovery.public_base64(),
-                    },
-                },
-                false,
-                &mut out,
-            )
-            .unwrap();
-        }
-        let stdout = env.stdout_str().to_string();
-        assert!(stdout.contains("registered recovery key"), "got: {stdout}");
-        assert!(stdout.contains("v1.0"), "got: {stdout}");
     }
 
     // ----- v1.0.0 G17 (#1831) M-of-N recovery ceremony (CLI) ----------
@@ -1984,146 +2054,154 @@ mod tests {
     /// 2-of-3 guardian quorum. Exercises the actual `run()` handlers.
     #[test]
     fn recovery_ceremony_cli_end_to_end() {
-        use crate::identity::lineage::{RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV};
-        let _envg = keypair::key_dir_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut env, dir) = fresh_env();
-        let dir_path = dir.path().to_path_buf();
-        let db_path = env.db_path.clone();
-        {
-            let conn = crate::db::open(&db_path).unwrap();
-            crate::db::register_agent(&conn, "rec-cli", "ai:test", &[]).unwrap();
-        }
-        // Generate + enroll K0 (with a cold recovery commitment).
-        let cold = keypair::generate("cold").unwrap();
-        let run_action = |env: &mut TestEnv, action: IdentityAction, json: bool| {
-            let mut out = env.output();
-            run(
-                &db_path,
-                IdentityArgs {
-                    key_dir: Some(dir_path.clone()),
-                    action,
-                },
-                json,
-                &mut out,
-            )
-        };
-        run_action(
-            &mut env,
-            IdentityAction::Generate {
-                agent_id: Some("rec-cli".to_string()),
-                force: false,
-                no_overwrite: false,
+        run_in_hermetic_child(
+            "cli::identity::tests::recovery_ceremony_cli_end_to_end",
+            "AI_MEMORY_TEST_RECOVERY_CLI_10156_ROLE",
+            "AI_MEMORY_TEST_RECOVERY_CLI_10156_MARKER",
+            || {
+                use crate::identity::lineage::{
+                    RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV,
+                };
+                let (mut env, dir) = fresh_env();
+                let dir_path = dir.path().to_path_buf();
+                let db_path = env.db_path.clone();
+                {
+                    let conn = crate::db::open(&db_path).unwrap();
+                    crate::db::register_agent(&conn, "rec-cli", "ai:test", &[]).unwrap();
+                }
+                // Generate + enroll K0 (with a cold recovery commitment).
+                let cold = keypair::generate("cold").unwrap();
+                let run_action = |env: &mut TestEnv, action: IdentityAction, json: bool| {
+                    let mut out = env.output();
+                    run(
+                        &db_path,
+                        IdentityArgs {
+                            key_dir: Some(dir_path.clone()),
+                            action,
+                        },
+                        json,
+                        &mut out,
+                    )
+                };
+                run_action(
+                    &mut env,
+                    IdentityAction::Generate {
+                        agent_id: Some("rec-cli".to_string()),
+                        force: false,
+                        no_overwrite: false,
+                    },
+                    false,
+                )
+                .unwrap();
+                run_action(
+                    &mut env,
+                    IdentityAction::EnrollLineage {
+                        agent_id: Some("rec-cli".to_string()),
+                        recovery_pubkey: Some(cold.public_base64()),
+                    },
+                    false,
+                )
+                .unwrap();
+
+                // Fresh primary + 3 guardians persisted on disk (sign-recovery
+                // loads the guardian private key from the key dir).
+                let k_new = keypair::generate("rec-cli-new").unwrap();
+                keypair::save(&k_new, &dir_path).unwrap();
+                for g in ["g0", "g1", "g2"] {
+                    let kp = keypair::generate(g).unwrap();
+                    keypair::save(&kp, &dir_path).unwrap();
+                }
+                let guardian_pub = |g: &str| keypair::load(g, &dir_path).unwrap().public_base64();
+                // SAFETY: isolated single-threaded hermetic child process.
+                unsafe {
+                    std::env::set_var(
+                        RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                        format!(
+                            "{},{},{}",
+                            guardian_pub("g0"),
+                            guardian_pub("g1"),
+                            guardian_pub("g2")
+                        ),
+                    );
+                    std::env::set_var(RECOVERY_THRESHOLD_ENV, "2");
+                }
+
+                // Phase 1 — recover-prepare (JSON).
+                env.stdout.clear();
+                env.stderr.clear();
+                run_action(
+                    &mut env,
+                    IdentityAction::RecoverPrepare {
+                        agent_id: Some("rec-cli".to_string()),
+                        successor_pubkey: k_new.public_base64(),
+                        from_seq: None,
+                        recovery_pubkey: None,
+                    },
+                    true,
+                )
+                .unwrap();
+                let prep: serde_json::Value =
+                    serde_json::from_str(env.stdout_str().trim()).unwrap();
+                assert_eq!(prep["recovery_prepared"], true);
+                let challenge = prep["challenge_b64"].as_str().unwrap().to_string();
+                let not_before = prep["not_before"].as_str().unwrap().to_string();
+
+                // Phase 1.5 — two guardians sign.
+                let mut attestations = Vec::new();
+                for g in ["g0", "g1"] {
+                    env.stdout.clear();
+                    env.stderr.clear();
+                    run_action(
+                        &mut env,
+                        IdentityAction::SignRecovery {
+                            agent_id: Some(g.to_string()),
+                            challenge: challenge.clone(),
+                        },
+                        true,
+                    )
+                    .unwrap();
+                    let sig: serde_json::Value =
+                        serde_json::from_str(env.stdout_str().trim()).unwrap();
+                    attestations.push(sig["attestation"].as_str().unwrap().to_string());
+                }
+
+                // Phase 2 — recover.
+                env.stdout.clear();
+                env.stderr.clear();
+                run_action(
+                    &mut env,
+                    IdentityAction::Recover {
+                        agent_id: Some("rec-cli".to_string()),
+                        successor_pubkey: k_new.public_base64(),
+                        not_before,
+                        from_seq: None,
+                        recovery_pubkey: None,
+                        successor_key_id: None,
+                        verify_only: false,
+                        attestations,
+                    },
+                    true,
+                )
+                .unwrap();
+                let rec: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+                assert_eq!(rec["recovered"], true);
+                assert_eq!(rec["epoch"], 1);
+
+                // The chain verifies to the fresh head via the guardian quorum.
+                let conn = crate::db::open(&db_path).unwrap();
+                let verified = crate::db::verify_agent_lineage(&conn, "rec-cli")
+                    .unwrap()
+                    .expect("chain verifies after recovery");
+                assert_eq!(verified.head_key.to_bytes(), k_new.public.to_bytes());
+                assert_eq!(verified.recovered_at_epoch, Some(1));
+
+                // SAFETY: isolated single-threaded hermetic child process.
+                unsafe {
+                    std::env::remove_var(RECOVERY_GUARDIAN_PUBKEYS_ENV);
+                    std::env::remove_var(RECOVERY_THRESHOLD_ENV);
+                }
             },
-            false,
-        )
-        .unwrap();
-        run_action(
-            &mut env,
-            IdentityAction::EnrollLineage {
-                agent_id: Some("rec-cli".to_string()),
-                recovery_pubkey: Some(cold.public_base64()),
-            },
-            false,
-        )
-        .unwrap();
-
-        // Fresh primary + 3 guardians persisted on disk (sign-recovery
-        // loads the guardian private key from the key dir).
-        let k_new = keypair::generate("rec-cli-new").unwrap();
-        keypair::save(&k_new, &dir_path).unwrap();
-        for g in ["g0", "g1", "g2"] {
-            let kp = keypair::generate(g).unwrap();
-            keypair::save(&kp, &dir_path).unwrap();
-        }
-        let guardian_pub = |g: &str| keypair::load(g, &dir_path).unwrap().public_base64();
-        // SAFETY: test-only env mutation serialised by the lock above.
-        unsafe {
-            std::env::set_var(
-                RECOVERY_GUARDIAN_PUBKEYS_ENV,
-                format!(
-                    "{},{},{}",
-                    guardian_pub("g0"),
-                    guardian_pub("g1"),
-                    guardian_pub("g2")
-                ),
-            );
-            std::env::set_var(RECOVERY_THRESHOLD_ENV, "2");
-        }
-
-        // Phase 1 — recover-prepare (JSON).
-        env.stdout.clear();
-        env.stderr.clear();
-        run_action(
-            &mut env,
-            IdentityAction::RecoverPrepare {
-                agent_id: Some("rec-cli".to_string()),
-                successor_pubkey: k_new.public_base64(),
-                from_seq: None,
-                recovery_pubkey: None,
-            },
-            true,
-        )
-        .unwrap();
-        let prep: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
-        assert_eq!(prep["recovery_prepared"], true);
-        let challenge = prep["challenge_b64"].as_str().unwrap().to_string();
-        let not_before = prep["not_before"].as_str().unwrap().to_string();
-
-        // Phase 1.5 — two guardians sign.
-        let mut attestations = Vec::new();
-        for g in ["g0", "g1"] {
-            env.stdout.clear();
-            env.stderr.clear();
-            run_action(
-                &mut env,
-                IdentityAction::SignRecovery {
-                    agent_id: Some(g.to_string()),
-                    challenge: challenge.clone(),
-                },
-                true,
-            )
-            .unwrap();
-            let sig: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
-            attestations.push(sig["attestation"].as_str().unwrap().to_string());
-        }
-
-        // Phase 2 — recover.
-        env.stdout.clear();
-        env.stderr.clear();
-        run_action(
-            &mut env,
-            IdentityAction::Recover {
-                agent_id: Some("rec-cli".to_string()),
-                successor_pubkey: k_new.public_base64(),
-                not_before,
-                from_seq: None,
-                recovery_pubkey: None,
-                successor_key_id: None,
-                verify_only: false,
-                attestations,
-            },
-            true,
-        )
-        .unwrap();
-        let rec: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
-        assert_eq!(rec["recovered"], true);
-        assert_eq!(rec["epoch"], 1);
-
-        // The chain verifies to the fresh head via the guardian quorum.
-        let conn = crate::db::open(&db_path).unwrap();
-        let verified = crate::db::verify_agent_lineage(&conn, "rec-cli")
-            .unwrap()
-            .expect("chain verifies after recovery");
-        assert_eq!(verified.head_key.to_bytes(), k_new.public.to_bytes());
-        assert_eq!(verified.recovered_at_epoch, Some(1));
-
-        // SAFETY: test-only env cleanup serialised by the lock above.
-        unsafe {
-            std::env::remove_var(RECOVERY_GUARDIAN_PUBKEYS_ENV);
-            std::env::remove_var(RECOVERY_THRESHOLD_ENV);
-        }
+        );
     }
 
     /// Snapshot every regular file (relative path -> raw bytes) under `dir`
@@ -3759,6 +3837,147 @@ mod tests {
             format!("{post_rollback_err:#}")
                 .contains(crate::storage::row_attest::sqlite::REFUSE_NO_SIGNER),
             "(b) Fixed(K_old) leaked across rollback! got: {post_rollback_err:#}"
+        );
+    }
+
+    /// #10156 — prove that in a lib-test process with `AI_MEMORY_WITNESS_KEY_DIR`
+    /// unset and a throwaway `HOME`, `witness_key_dir()` resolves to an isolated
+    /// sandbox OUTSIDE `HOME` (never `<HOME>/.config/ai-memory/witness-keys`)
+    /// and distinct from `default_key_dir()`.
+    #[test]
+    fn witness_key_dir_is_isolated_from_home_in_tests_10156() {
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_WITNESS_ISO_10156_ROLE";
+        const FORBIDDEN_HOME_ENV: &str = "AI_MEMORY_TEST_WITNESS_ISO_10156_HOME";
+        const TEST_PATH: &str =
+            "cli::identity::tests::witness_key_dir_is_isolated_from_home_in_tests_10156";
+
+        if std::env::var_os(ROLE_ENV).is_none() {
+            let scratch = crate::identity::test_key_dir::private_tempdir();
+            let fake_home = scratch.path().join("fake-home");
+            std::fs::create_dir_all(&fake_home).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+                .args(["--exact", TEST_PATH, "--nocapture"])
+                .env("HOME", &fake_home)
+                .env("XDG_CONFIG_HOME", fake_home.join(".config"))
+                .env_remove("AI_MEMORY_WITNESS_KEY_DIR")
+                .env_remove("AI_MEMORY_KEY_DIR")
+                .env(FORBIDDEN_HOME_ENV, &fake_home)
+                .env(ROLE_ENV, "child")
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "child failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let forbidden_home =
+            PathBuf::from(std::env::var_os(FORBIDDEN_HOME_ENV).expect("forbidden home env"));
+        let resolved = crate::governance::audit::witness_key_dir().expect("witness_key_dir");
+        assert!(
+            !resolved.starts_with(&forbidden_home),
+            "#10156: witness_key_dir() resolved under HOME: {} (HOME={})",
+            resolved.display(),
+            forbidden_home.display()
+        );
+        let key_dir = keypair::default_key_dir().expect("default_key_dir");
+        assert_ne!(
+            resolved, key_dir,
+            "#10156: witness custody sandbox must be distinct from daemon key dir"
+        );
+    }
+
+    /// #10156 — source ratchet pinning BOTH halves of witness custody isolation:
+    /// (1) `src/governance/audit.rs::witness_key_dir` routes armed test processes
+    ///     through `test_key_dir::armed_witness_sandbox()` and checks
+    ///     `assert_witness_isolated`;
+    /// (2) the three lineage CLI tests (`lineage_verbs_end_to_end`,
+    ///     `lineage_text_surfaces_and_refusals`, `recovery_ceremony_cli_end_to_end`)
+    ///     execute inside `run_in_hermetic_child`;
+    /// (3) no test under `src/` points `AI_MEMORY_WITNESS_KEY_DIR` at a `HOME`
+    ///     or `.config/ai-memory/witness-keys` path.
+    #[test]
+    fn source_ratchet_witness_custody_and_cli_identity_hermetic_10156() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // (1) Crate-wide guard in `witness_key_dir()`.
+        let audit_src =
+            std::fs::read_to_string(manifest_dir.join("src/governance/audit.rs")).unwrap();
+        let fn_start = audit_src
+            .find("pub fn witness_key_dir()")
+            .expect("witness_key_dir must exist");
+        let fn_slice = &audit_src[fn_start..fn_start + 1600.min(audit_src.len() - fn_start)];
+        assert!(
+            fn_slice.contains("armed_witness_sandbox()"),
+            "#10156 ratchet: witness_key_dir() must delegate armed test processes to armed_witness_sandbox()"
+        );
+        assert!(
+            fn_slice.contains("assert_witness_isolated"),
+            "#10156 ratchet: witness_key_dir() must enforce assert_witness_isolated"
+        );
+
+        // (2) The three cli::identity lineage tests run via `run_in_hermetic_child`.
+        let identity_src =
+            std::fs::read_to_string(manifest_dir.join("src/cli/identity.rs")).unwrap();
+        for test_name in [
+            "fn lineage_verbs_end_to_end()",
+            "fn lineage_text_surfaces_and_refusals()",
+            "fn recovery_ceremony_cli_end_to_end()",
+        ] {
+            let start = identity_src
+                .find(test_name)
+                .unwrap_or_else(|| panic!("missing {test_name}"));
+            let window = &identity_src[start..start + 600.min(identity_src.len() - start)];
+            assert!(
+                window.contains("run_in_hermetic_child("),
+                "#10156 ratchet: {test_name} must execute inside run_in_hermetic_child(...)"
+            );
+        }
+
+        // (3) No test under `src/` points WITNESS_KEY_DIR_ENV at HOME/.config.
+        fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    walk_rs(&p, out);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk_rs(&manifest_dir.join("src"), &mut files);
+        files.sort();
+        let mut violations = Vec::new();
+        for path in files {
+            let content = std::fs::read_to_string(&path).unwrap();
+            for (idx, line) in content.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if (trimmed.contains("AI_MEMORY_WITNESS_KEY_DIR")
+                    || trimmed.contains("WITNESS_KEY_DIR_ENV"))
+                    && (trimmed.contains(".config/ai-memory/witness-keys")
+                        || trimmed.contains("dirs::home_dir")
+                        || trimmed.contains("dirs::config_dir"))
+                {
+                    violations.push(format!(
+                        "{}:{}: {trimmed}",
+                        path.strip_prefix(manifest_dir).unwrap_or(&path).display(),
+                        idx + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "#10156 ratchet: tests must not point witness custody at HOME/config:\n{}",
+            violations.join("\n")
         );
     }
 }

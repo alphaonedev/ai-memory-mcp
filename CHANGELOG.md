@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#10156 — isolate witness custody directory in tests and hermeticize `cli::identity` lineage tests)
+
+- **`governance::audit::witness_key_dir()` now enforces per-process `#3355`/`#3516` sandbox isolation (`identity::test_key_dir::install_witness()`, `armed_witness_sandbox()`, `assert_witness_isolated()`)**, preventing any test in the crate from opening `<HOME>/.config/ai-memory/witness-keys/head-anchor.log` under the operator's real `HOME` while leaving unmarked production binaries unchanged. Wrapped `cli::identity::tests::{lineage_verbs_end_to_end, lineage_text_surfaces_and_refusals, recovery_ceremony_cli_end_to_end}` in `run_in_hermetic_child` and added witness-isolation and source-ratchet tests; details in `changelog.d/10156.fixed.md`.
+
 ### Fixed (#10141 — atomic transaction-bound row-attestation arming & in-tx lineage head check)
 
 - **`identity succeed`, guardian recovery rebind, and lineage append paths now execute precondition check, attestation arming, and append inside a single atomic write transaction (`TxnArmed`).** Standalone `arm_with_key` and `arm_for_recovery_in_tx` are replaced by the consumed-state RAII guard `TxnArmed<'c>` (obtained only from an open `WriteTxn`, advancing the anchored seal only after commit, and rolling back plus disarming/reconciling the connection on drop). SQLite lineage append/succession/revocation/enroll/recovery-rebind and PostgreSQL `PostgresStore::append_lineage_record` (under `SELECT ... FOR UPDATE`) now run their head-consistency checks inside the write transaction so racing callers receive exact not-head / chain-mismatch refusals instead of primary-key errors and never leave a connection armed; details in `changelog.d/10141.fixed.md`.

@@ -3531,15 +3531,29 @@ pub fn require_cause_binding_enabled() -> bool {
 /// The OS did not advertise a config directory (exotic platforms with no
 /// HOME) and no override was set.
 pub fn witness_key_dir() -> Result<PathBuf> {
-    if let Ok(v) = std::env::var(WITNESS_KEY_DIR_ENV) {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v));
-        }
+    if let Ok(v) = std::env::var(WITNESS_KEY_DIR_ENV)
+        && !v.is_empty()
+    {
+        let p = PathBuf::from(v);
+        #[cfg(any(test, feature = "test-support"))]
+        crate::identity::test_key_dir::assert_witness_isolated(&p);
+        return Ok(p);
+    }
+    // #10156 / #3516 — armed test processes (cfg(test), `test_key_dir::install()`,
+    // or `TEST_KEY_GUARD_ENV` children) resolve to a distinct 0700 sandbox outside
+    // HOME, never `<HOME>/.config/ai-memory/witness-keys/`. Unmarked operator
+    // binaries fall through unchanged.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(sandbox) = crate::identity::test_key_dir::armed_witness_sandbox() {
+        return Ok(sandbox.to_path_buf());
     }
     let base = dirs::config_dir().ok_or_else(|| {
         anyhow!("OS did not advertise a config directory for witness-key storage")
     })?;
-    Ok(base.join("ai-memory").join("witness-keys"))
+    let path = base.join("ai-memory").join("witness-keys");
+    #[cfg(any(test, feature = "test-support"))]
+    crate::identity::test_key_dir::assert_witness_isolated(&path);
+    Ok(path)
 }
 
 /// Load the audit-witness SIGNING keypair from the custody dir. Returns

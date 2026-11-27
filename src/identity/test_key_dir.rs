@@ -56,8 +56,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const TEST_KEY_GUARD_ENV: &str = "AI_MEMORY_TEST_KEY_GUARD";
 
 static DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
+static WITNESS_DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
 static ARMED: AtomicBool = AtomicBool::new(false);
 static KEY_DIR_BIND: OnceLock<KeyDirEnvBind> = OnceLock::new();
+static WITNESS_DIR_BIND: OnceLock<WitnessDirEnvBind> = OnceLock::new();
 
 /// Snapshot+restore of `AI_MEMORY_KEY_DIR` for the process lifetime of
 /// [`install`] (#3584, OWNERSHIP-24 / OWNERSHIP-25).
@@ -77,6 +79,21 @@ impl Drop for KeyDirEnvBind {
         match &self.prev {
             Some(v) => set_env(super::keypair::KEY_DIR_ENV, v),
             None => unset_env(super::keypair::KEY_DIR_ENV),
+        }
+    }
+}
+
+/// Snapshot+restore of `AI_MEMORY_WITNESS_KEY_DIR` for the process lifetime of
+/// [`install_witness`] (#10156, mirror of [`KeyDirEnvBind`]).
+struct WitnessDirEnvBind {
+    prev: Option<OsString>,
+}
+
+impl Drop for WitnessDirEnvBind {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => set_env(crate::governance::audit::WITNESS_KEY_DIR_ENV, v),
+            None => unset_env(crate::governance::audit::WITNESS_KEY_DIR_ENV),
         }
     }
 }
@@ -135,6 +152,42 @@ pub fn install() -> &'static Path {
     // to the tests that hold `key_dir_env_lock` (`default_key_dir_honours_env_override`).
     #[cfg(not(test))]
     bind_key_dir_env(path);
+    // #10156: arming the key sandbox also installs the distinct witness custody
+    // sandbox so no test that calls `install()` can touch `<HOME>/.config/ai-memory/witness-keys`.
+    let _ = install_witness();
+    path
+}
+
+/// #10156 — Arm the process witness custody sandbox (distinct from [`install`]'s
+/// daemon key sandbox) and return its `0o700` path outside `HOME`.
+///
+/// Mirrors [`install`]: exports [`TEST_KEY_GUARD_ENV`] and points
+/// `AI_MEMORY_WITNESS_KEY_DIR` at the sandbox (capturing any previous value for
+/// restore-on-drop). Unmarked operator binaries never call this.
+///
+/// # Panics
+/// Panics if a private temporary directory cannot be allocated outside HOME.
+#[must_use]
+pub fn install_witness() -> &'static Path {
+    let path = WITNESS_DIRECTORY
+        .get_or_init(|| {
+            arm();
+            let root = isolated_temp_root();
+            let dir =
+                tempfile::tempdir_in(root).expect("#10156 allocate isolated witness directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("#10156 chmod 0700 the isolated witness directory");
+            }
+            assert_witness_isolated(dir.path());
+            bind_witness_dir_env(dir.path());
+            dir
+        })
+        .path();
+    #[cfg(not(test))]
+    bind_witness_dir_env(path);
     path
 }
 
@@ -167,6 +220,13 @@ pub(crate) fn armed_sandbox() -> Option<&'static Path> {
     armed().then(install)
 }
 
+/// #10156 — The shared witness custody sandbox, ONLY for a process that armed
+/// the guard (#3516). An unarmed operator process gets `None` and resolves the
+/// real `<config>/ai-memory/witness-keys/` store unchanged.
+pub(crate) fn armed_witness_sandbox() -> Option<&'static Path> {
+    armed().then(install_witness)
+}
+
 // Runs exactly once per process, inside `DIRECTORY`'s `OnceLock` initializer.
 fn arm() {
     ARMED.store(true, Ordering::Release);
@@ -190,6 +250,24 @@ fn bind_key_dir_env(path: &Path) {
 
 fn set_key_dir_env(path: &Path) {
     set_env(super::keypair::KEY_DIR_ENV, path);
+}
+
+fn bind_witness_dir_env(path: &Path) {
+    WITNESS_DIR_BIND.get_or_init(|| {
+        let prev = std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV);
+        set_witness_dir_env(path);
+        WitnessDirEnvBind { prev }
+    });
+    #[cfg(not(test))]
+    if std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV).as_deref()
+        != Some(path.as_os_str())
+    {
+        set_witness_dir_env(path);
+    }
+}
+
+fn set_witness_dir_env(path: &Path) {
+    set_env(crate::governance::audit::WITNESS_KEY_DIR_ENV, path);
 }
 
 fn set_env(key: &str, value: impl AsRef<OsStr>) {
@@ -274,24 +352,37 @@ pub fn isolated_temp_root() -> PathBuf {
 }
 
 pub(crate) fn assert_isolated(path: &Path) {
+    assert_path_outside_home(
+        path,
+        "#3355 test key directory resolves under HOME; use identity::test_key_dir::install() or an isolated AI_MEMORY_KEY_DIR",
+        "#3355 test key directory resolves under HOME through an alias",
+    );
+}
+
+/// #10156 — witness custody twin of [`assert_isolated`]: inert when `!armed()`
+/// (operator binary), panics BEFORE any filesystem access when an armed test
+/// resolves `AI_MEMORY_WITNESS_KEY_DIR` under `HOME` or via a symlink alias.
+pub(crate) fn assert_witness_isolated(path: &Path) {
+    assert_path_outside_home(
+        path,
+        "#10156 test witness custody directory resolves under HOME; use identity::test_key_dir::install_witness() or an isolated AI_MEMORY_WITNESS_KEY_DIR",
+        "#10156 test witness custody directory resolves under HOME through an alias",
+    );
+}
+
+fn assert_path_outside_home(path: &Path, direct_msg: &str, alias_msg: &str) {
     // #3516 — an unarmed process is an operator process: never panic there.
     if !armed() {
         return;
     }
     let home = resolved_home();
     let path = absolute(path);
-    assert!(
-        !path.starts_with(&home),
-        "#3355 test key directory resolves under HOME; use identity::test_key_dir::install() or an isolated AI_MEMORY_KEY_DIR"
-    );
+    assert!(!path.starts_with(&home), "{direct_msg}");
     let canonical_home = home.canonicalize().unwrap_or(home);
     let mut ancestor = path.as_path();
     loop {
         if let Ok(canonical) = ancestor.canonicalize() {
-            assert!(
-                !canonical.starts_with(&canonical_home),
-                "#3355 test key directory resolves under HOME through an alias"
-            );
+            assert!(!canonical.starts_with(&canonical_home), "{alias_msg}");
             break;
         }
         let Some(parent) = ancestor.parent() else {
@@ -346,6 +437,46 @@ mod tests {
             std::env::var_os(crate::identity::keypair::KEY_DIR_ENV),
             prior,
             "#3584: KeyDirEnvBind must restore AI_MEMORY_KEY_DIR on drop"
+        );
+    }
+
+    #[test]
+    fn install_witness_agrees_with_witness_key_dir_and_is_distinct_10156() {
+        let _lock = crate::test_support::env_lock();
+        let key_dir = install();
+        let witness_dir = install_witness();
+        assert_ne!(
+            witness_dir, key_dir,
+            "#10156: witness sandbox must be distinct from daemon key sandbox"
+        );
+        let _g =
+            crate::test_support::EnvGuard::capture(crate::governance::audit::WITNESS_KEY_DIR_ENV);
+        unset_env(crate::governance::audit::WITNESS_KEY_DIR_ENV);
+        assert_eq!(
+            crate::governance::audit::witness_key_dir().expect("resolve witness dir"),
+            witness_dir
+        );
+    }
+
+    #[test]
+    fn witness_dir_env_bind_restores_prior_on_panic_10156() {
+        let _lock = crate::test_support::env_lock();
+        let prior = std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV);
+        let panicked = std::panic::catch_unwind(|| {
+            let _bind = WitnessDirEnvBind {
+                prev: std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV),
+            };
+            set_witness_dir_env(Path::new("/nonexistent-ai-memory-10156-probe"));
+            panic!("10156-restore-probe");
+        });
+        assert!(
+            panicked.is_err(),
+            "#10156 restore pin must take the panic path"
+        );
+        assert_eq!(
+            std::env::var_os(crate::governance::audit::WITNESS_KEY_DIR_ENV),
+            prior,
+            "#10156: WitnessDirEnvBind must restore AI_MEMORY_WITNESS_KEY_DIR on drop"
         );
     }
 }
