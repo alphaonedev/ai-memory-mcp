@@ -820,10 +820,20 @@ fn init_forensic_audit(
     }
     if signing_key.is_none() {
         if ledger_writer {
-            anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+            let refusal = ai_memory::governance::audit::unsigned_ledger_refusal(
                 &agent_id,
-                "no key was loadable after the ensure step"
-            ));
+                "no key was loadable after the ensure step",
+            );
+            // #10108 K-7 — a partial daemon key refuses with the typed
+            // DaemonKeyMissing kept as the downcastable cause (per ERRORS-11).
+            if let Some(cause) =
+                ai_memory::governance::daemon_signer::DaemonChainSigner::partial_key_refusal(
+                    &agent_id,
+                )
+            {
+                return Err(anyhow::Error::new(cause).context(refusal));
+            }
+            anyhow::bail!(refusal);
         }
         if hosts_writers
             && let Some(warning) = ai_memory::governance::audit::ledger_signing_status().warning

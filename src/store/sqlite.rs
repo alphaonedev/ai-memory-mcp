@@ -79,7 +79,18 @@ impl SqliteStore {
     /// schema init + migration to `crate::db::open`.
     pub fn open(path: impl Into<PathBuf>) -> StoreResult<Self> {
         let path = path.into();
-        let conn = db::open(&path).map_err(box_err)?;
+        // #10108 K-7 — keep the open's cause chain (a typed DaemonKeyMissing
+        // refusal stays downcastable), never only its text.
+        // anyhow's boxed form hides the root type from `downcast_ref`, so the
+        // typed refusal is taken out of the chain first and boxed as itself.
+        let conn = db::open(&path).map_err(|e| {
+            StoreError::Backend(
+                match e.downcast::<crate::governance::daemon_signer::DaemonKeyMissing>() {
+                    Ok(refusal) => BoxBackendError::with_source(refusal),
+                    Err(other) => BoxBackendError::with_source(other),
+                },
+            )
+        })?;
         // #1955 R45 — seed the per-DB record-stop flag from the audit
         // chain so a stop persisted before this open survives a restart.
         // A read hiccup is non-fatal (leaves the plane RUNNING).

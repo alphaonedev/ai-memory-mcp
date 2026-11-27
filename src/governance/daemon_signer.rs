@@ -216,6 +216,34 @@ impl DaemonChainSigner {
         Self::provision(&dir)
     }
 
+    /// #10108 K-7 (3-agent vote (71472661) V2-10108-KEYLESS-MARKER) — the
+    /// typed cause a ledger-writing boot refuses with when its agent is the
+    /// daemon label and the daemon key in the resolved key directory is
+    /// partial (one half alone), so the serve path surfaces the same typed
+    /// refusal as the open path. Reads two paths; generates and heals
+    /// nothing. `None` for another agent id, or when the key is whole or
+    /// wholly absent (the boot's ensure step owns those).
+    #[must_use]
+    pub fn partial_key_refusal(agent_id: &str) -> Option<DaemonKeyMissing> {
+        use crate::identity::keypair::{
+            DAEMON_KEYPAIR_LABEL, agent_priv_path, agent_pub_path, default_key_dir,
+        };
+        if agent_id != DAEMON_KEYPAIR_LABEL {
+            return None;
+        }
+        let Ok(dir) = default_key_dir() else {
+            return Some(DaemonKeyMissing::new(DaemonKeyCause::NoKeyDir, None));
+        };
+        let has_pub = agent_pub_path(&dir, DAEMON_KEYPAIR_LABEL).exists();
+        let has_priv = agent_priv_path(&dir, DAEMON_KEYPAIR_LABEL).exists();
+        let cause = match (has_pub, has_priv) {
+            (true, false) => DaemonKeyCause::PublicOnly,
+            (false, true) => DaemonKeyCause::PrivateOnly,
+            (true, true) | (false, false) => return None,
+        };
+        Some(DaemonKeyMissing::new(cause, Some(&dir)))
+    }
+
     /// The public half, for verifying what this signer wrote.
     #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {
