@@ -393,6 +393,11 @@ const RAW_WRITE_CENSUS_8950: &[(&str, usize)] = &[
     ("src/hooks/pre_store/auto_atomise.rs", 1),
     ("src/identity/key_inventory.rs", 4),
     ("src/identity/keypair.rs", 20),
+    // #9926: the one site is the READ-only, O_NOFOLLOW session-key open of
+    // `read_session_key` (src/identity/session_signer.rs, `.read(true)`, no
+    // create/truncate/write flag): it creates and replaces nothing. Guard:
+    // `identity::session_signer::tests::key_file_open_is_read_only_and_no_follow_8950`.
+    ("src/identity/session_signer.rs", 1),
     ("src/inference/mod.rs", 3),
     ("src/keys/roles.rs", 1),
     ("src/log_paths.rs", 5),
