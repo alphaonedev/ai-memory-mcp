@@ -343,7 +343,12 @@ pub fn publish(path: &Path, snapshot: &AllowlistFile) -> Result<()> {
     file.write_all(&serde_json::to_vec(snapshot)?)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|error| error.error)?;
-    crate::storage::snapshot_file::sync_parent_dir(path, HUB_SNAPSHOT_WHAT)
+    // #10214: a failed directory fsync is "written, not confirmed durable";
+    // the new snapshot stays and the error says so.
+    crate::storage::snapshot_file::require_durable(crate::storage::snapshot_file::sync_parent_dir(
+        path,
+        HUB_SNAPSHOT_WHAT,
+    ))
 }
 
 /// The `what` of the hub allowlist snapshot in a publish error (#10214).

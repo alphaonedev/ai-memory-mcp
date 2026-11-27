@@ -166,3 +166,70 @@ fn ensure_keypair_claim_dir_sync_failure_writes_the_pub_10254() {
         assert!(kp.can_sign(), "row {nth}: the pair is complete");
     }
 }
+
+/// The bytes a #10265 row writes.
+const ROW_BYTES_10265: &[u8] = b"key-bytes-10265";
+
+/// The not-durable report of an outcome that must be `NotDurable`.
+fn not_durable_of(outcome: Durability, row: &str) -> NotDurable {
+    match outcome {
+        Durability::NotDurable(not_durable) => not_durable,
+        Durability::Durable => panic!("{row}: a failed directory fsync must be NotDurable"),
+    }
+}
+
+/// The exact report of a failed directory fsync of `path` (#10214 wording).
+fn report_for(what: &str, path: &Path, dir: &Path) -> String {
+    format!(
+        "{what} {} is written but not confirmed durable: the fsync of its directory {} failed \
+         ({}), so it may not survive a crash (#10214)",
+        path.display(),
+        dir.display(),
+        io::Error::from_raw_os_error(libc::EIO)
+    )
+}
+
+/// One row per create-new key writer (#10265): a clean run is `Durable` and
+/// syncs the directory once; a failed directory fsync is `NotDurable` with
+/// the exact report and the complete file left in place. A mutant that
+/// swallows the fsync (`let _ = sync_dir(..)`, then `Durable`) is red.
+#[test]
+fn create_and_claim_dir_sync_failure_is_not_durable_10265() {
+    type Writer = fn(&Path, &[u8], u32) -> io::Result<Durability>;
+    let rows: [(&str, Writer, &str); 2] = [
+        ("create_new_with_mode", create_new_with_mode, ARCHIVE_WHAT),
+        ("claim_new_with_mode", claim_new_with_mode, PRIVATE_KEY_WHAT),
+    ];
+    for (row, write, what) in rows {
+        let _reset = SeamReset;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("clean.key");
+        seam::reset();
+        match write(&path, ROW_BYTES_10265, 0o600).expect("clean write") {
+            Durability::Durable => {}
+            Durability::NotDurable(nd) => panic!("{row}: clean run not durable: {nd}"),
+        }
+        assert_eq!(
+            seam::take_dir_syncs(),
+            vec![dir.path().to_path_buf()],
+            "{row}"
+        );
+
+        let path = dir.path().join("failing.key");
+        seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+        let outcome = write(&path, ROW_BYTES_10265, 0o600).expect("the file is written");
+        seam::reset();
+        let not_durable = not_durable_of(outcome, row);
+        assert_eq!(
+            not_durable.to_string(),
+            report_for(what, &path, dir.path()),
+            "{row}"
+        );
+        assert_eq!(not_durable.raw_os_error(), Some(libc::EIO), "{row}");
+        assert_eq!(
+            fs::read(&path).expect("the complete file stays"),
+            ROW_BYTES_10265,
+            "{row}"
+        );
+    }
+}

@@ -712,10 +712,13 @@ fn create_seq_mark(mark: &Path, value: u64) -> Result<SeqMark> {
             .with_context(ctx)?;
     }
     std::fs::rename(&tmp, mark).with_context(ctx)?;
-    // #10214: the rename is durable only once the directory is synced; a
-    // failure is returned (the complete new mark is already in place), never
-    // swallowed, so a crash cannot silently bring back an older high-water.
-    crate::storage::snapshot_file::sync_parent_dir(mark, "audit sequence high-water")?;
+    // #10214: the rename is durable only once the directory is synced. A
+    // failure is "written, not confirmed durable" (the complete new mark is in
+    // place and stays), never swallowed: the audit sink does not open on a
+    // mark a crash could roll back (fail closed).
+    crate::storage::snapshot_file::require_durable(
+        crate::storage::snapshot_file::sync_parent_dir(mark, "audit sequence high-water"),
+    )?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)

@@ -251,7 +251,10 @@ fn publish_fallback_renames_onto_a_free_name_rows_8950() {
         seam::inject_link_errno(Some(errno));
         let published = stage.publish();
         seam::reset();
-        drop(published.unwrap_or_else(|e| panic!("errno {errno}: {e:#}")));
+        let (file, durability) = published.unwrap_or_else(|e| panic!("errno {errno}: {e:#}"));
+        drop(file);
+        super::snapshot_file::require_durable(durability)
+            .unwrap_or_else(|e| panic!("errno {errno}: {e:#}"));
         assert_eq!(std::fs::read(&dest).expect("published"), b"staged");
         assert_eq!(mode_of(&dest), 0o600);
         assert_eq!(
@@ -327,8 +330,10 @@ fn publish_survives_a_failing_staging_unlink_8950() {
     });
     let published = stage.publish();
     seam::reset();
-    let handle = published.expect("a published file must not fail on the staging unlink");
+    let (handle, durability) =
+        published.expect("a published file must not fail on the staging unlink");
     drop(handle);
+    super::snapshot_file::require_durable(durability).expect("durable publish");
     assert_eq!(std::fs::read(&dest).expect("published"), b"staged");
 }
 
@@ -349,7 +354,9 @@ fn unique_backup_one_link_call_per_name_8950() {
         std::fs::write(name, b"taken").expect("taken");
     }
     seam::reset();
-    let written = write_new_private_unique(&dest, "install backup", b"new").expect("written");
+    let (written, durability) =
+        write_new_private_unique(&dest, "install backup", b"new").expect("written");
+    super::snapshot_file::require_durable(durability).expect("durable");
     let calls = seam::take_link_calls();
     assert_eq!(written, PathBuf::from(format!("{}.3", dest.display())));
     assert_eq!(calls, backup_names(&dest, 3));
@@ -369,7 +376,9 @@ fn unique_backup_bound_is_literal_1000_8950() {
         std::fs::write(name, b"taken").expect("taken");
     }
     seam::reset();
-    let written = write_new_private_unique(&dest, "install backup", b"new").expect("1000 free");
+    let (written, durability) =
+        write_new_private_unique(&dest, "install backup", b"new").expect("1000 free");
+    super::snapshot_file::require_durable(durability).expect("durable");
     assert_eq!(written, PathBuf::from(format!("{}.1000", dest.display())));
     assert_eq!(seam::take_link_calls(), backup_names(&dest, 1000));
     let err = write_new_private_unique(&dest, "install backup", b"new").expect_err("all taken");
@@ -434,4 +443,33 @@ fn doctor_repair_snapshot_refuses_planted_symlink_8950() {
     let err = result.expect_err("a planted symlink must be refused");
     assert_eq!(format!("{err:#}"), symlink_refusal(&link));
     assert_eq!(std::fs::read(&victim).expect("victim"), VICTIM_BYTES);
+}
+
+/// v1.0.0 #10214 — a repair snapshot whose directory fsync fails after the
+/// link IS written: it stays on disk, and the restamp is refused with the
+/// typed "written, not confirmed durable" error (never "could not write").
+#[test]
+fn doctor_repair_snapshot_dir_sync_failure_refuses_restamp_10214() {
+    let dir = scratch();
+    let (conn, db) = source_db(dir.path());
+    seam::reset();
+    seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+    let result = crate::cli::doctor::snapshot_before_repair(&conn, &db, 1, 2);
+    seam::reset();
+    let err = result.expect_err("a snapshot not confirmed durable refuses the restamp");
+    let not_durable = err
+        .downcast_ref::<super::snapshot_file::NotDurable>()
+        .expect("the typed not-durable error");
+    assert_eq!(not_durable.raw_os_error(), Some(libc::EIO));
+    let snapshot = not_durable.dest().to_path_buf();
+    assert!(
+        err.to_string()
+            .contains("is written but not confirmed durable"),
+        "got {err:#}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&snapshot).is_ok_and(|m| m.is_file()),
+        "the written snapshot {} stays",
+        snapshot.display()
+    );
 }

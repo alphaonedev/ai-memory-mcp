@@ -310,7 +310,28 @@ fn write_atomic(lock: &SealLock, rec: &SealRecord) -> Result<()> {
     // #8950: stage in a private directory and rename, refusing a symlink at
     // the seal name (never a by-name write that could follow one). The
     // caller holds the seal lock (#10193).
-    crate::storage::snapshot_file::write_replacing(&lock.seal, SEAL_WHAT, rec.render().as_bytes())
+    // #10214, #10266: after the rename the new seal is in place; a failed
+    // directory fsync is "written, not confirmed durable" and is returned as
+    // the error (never swallowed, never "not advanced").
+    crate::storage::snapshot_file::require_durable(crate::storage::snapshot_file::write_replacing(
+        &lock.seal,
+        SEAL_WHAT,
+        rec.render().as_bytes(),
+    )?)
+}
+
+/// The warning for a best-effort advance that returned `err` (#10263): a
+/// seal written but not confirmed durable WAS advanced, every other error
+/// left it where it was. The words come from the error's state.
+pub(crate) fn advance_failure_warning(err: &anyhow::Error) -> String {
+    if err
+        .downcast_ref::<crate::storage::snapshot_file::NotDurable>()
+        .is_some()
+    {
+        format!("row attestation seal (#10087) advanced but not confirmed durable: {err:#}")
+    } else {
+        format!("row attestation seal (#10087) not advanced: {err:#}")
+    }
 }
 
 /// What a seal write names in its errors.
@@ -1103,5 +1124,53 @@ mod tests {
             )
         );
         assert_eq!(read(&seal), SealState::Sealed(rec_10205(5, 5)));
+        assert_eq!(
+            advance_failure_warning(&err),
+            format!("row attestation seal (#10087) advanced but not confirmed durable: {err:#}")
+        );
+    }
+
+    /// v1.0.0 #10263 — the best-effort advance warning is worded from the
+    /// state: one row per failing funnel step. A step before or at the
+    /// rename leaves the old seal and says "not advanced"; the directory
+    /// fsync leaves the new seal and says "advanced but not confirmed
+    /// durable".
+    #[cfg(unix)]
+    #[test]
+    fn advance_failure_warning_table_10263() {
+        use crate::storage::snapshot_file::seam;
+        let rows: [(seam::Step, &str, SealState); 3] = [
+            (
+                seam::Step::FileSync,
+                "row attestation seal (#10087) not advanced: ",
+                SealState::Sealed(rec_10205(1, 1)),
+            ),
+            (
+                seam::Step::Rename,
+                "row attestation seal (#10087) not advanced: ",
+                SealState::Sealed(rec_10205(1, 1)),
+            ),
+            (
+                seam::Step::DirSync,
+                "row attestation seal (#10087) advanced but not confirmed durable: ",
+                SealState::Sealed(rec_10205(5, 5)),
+            ),
+        ];
+        for (step, prefix, on_disk) in rows {
+            let scratch = scratch_10193();
+            let seal = scratch.path().join(SEAL_DIR).join("db");
+            advance(&seal, &rec_10205(1, 1)).expect("first seal");
+            seam::reset();
+            seam::inject_step_errno_at(step, libc::EIO, 1);
+            let got = advance(&seal, &rec_10205(5, 5));
+            seam::reset();
+            let err = got.expect_err("an injected failure is reported");
+            assert_eq!(
+                advance_failure_warning(&err),
+                format!("{prefix}{err:#}"),
+                "row {step:?}"
+            );
+            assert_eq!(read(&seal), on_disk, "row {step:?}");
+        }
     }
 }

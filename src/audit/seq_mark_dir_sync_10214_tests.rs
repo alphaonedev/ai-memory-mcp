@@ -55,16 +55,16 @@ fn create_seq_mark_dir_sync_failure_is_returned_not_swallowed_10214() {
     assert_eq!(
         err.to_string(),
         format!(
-            "fsync the directory {} after publishing audit sequence high-water {}: the new \
-             file is in place but may not survive a crash (#10214)",
+            "audit sequence high-water {} is written but not confirmed durable: the fsync of \
+             its directory {} failed ({}), so it may not survive a crash (#10214)",
+            mark.display(),
             dir.path().display(),
-            mark.display()
+            std::io::Error::from_raw_os_error(libc::EIO)
         )
     );
     assert_eq!(
-        err.root_cause()
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error),
+        err.downcast_ref::<crate::storage::snapshot_file::NotDurable>()
+            .and_then(crate::storage::snapshot_file::NotDurable::raw_os_error),
         Some(libc::EIO)
     );
     // After state: the complete new record, never a partial file.

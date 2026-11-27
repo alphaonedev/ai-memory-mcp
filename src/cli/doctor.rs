@@ -1088,7 +1088,12 @@ pub(crate) fn snapshot_before_repair(
         .file()
         .sync_all()
         .with_context(|| format!("fsync the repair snapshot {}", snapshot_path.display()))?;
-    drop(stage.publish()?);
+    // #10214: a snapshot whose directory fsync failed IS written (it stays
+    // for the operator) but is no proven recovery point, so the restamp is
+    // refused with the "written, not confirmed durable" error.
+    let (file, durability) = stage.publish()?;
+    drop(file);
+    crate::storage::snapshot_file::require_durable(durability)?;
     Ok(Some(snapshot_path))
 }
 

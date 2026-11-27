@@ -649,7 +649,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
         store_refusal(&store.load_current(NS).expect_err(what))
     };
     let restore = || {
-        store.write_record(&record).expect("restore");
+        crate::storage::snapshot_file::require_durable(
+            store.write_record(&record).expect("restore"),
+        )
+        .expect("durable");
         store.refresh_from_ledger().expect("refresh");
         assert_eq!(
             store.load_current(NS).expect("healed"),
@@ -675,7 +678,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
     // envelope key compare.
     let mut forged = record.clone();
     forged.key_id = ScopeKeyId::random().to_hex();
-    store.write_record(&forged).expect("write forged");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&forged).expect("write forged"),
+    )
+    .expect("durable");
     store.refresh_from_ledger().expect("refresh");
     let err = store
         .load_by_key_id(NS, &record.key_ref().expect("ref"))
@@ -693,7 +699,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
         kek_fingerprint: kek_fp(&test_node("node-intruder")),
         wrapped: record.recipients[0].wrapped.clone(),
     });
-    store.write_record(&widened).expect("write widened");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&widened).expect("write widened"),
+    )
+    .expect("durable");
     assert!(matches!(
         refreshed_refusal("reader set off the log"),
         ScopeKeyStoreError::AuditChainMismatch { .. }
@@ -744,7 +753,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
     // A missing generation is a lost key, never flattened.
     let mut third = record.clone();
     third.epoch = 3;
-    store.write_record(&third).expect("write epoch 3");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&third).expect("write epoch 3"),
+    )
+    .expect("durable");
     store.refresh_from_ledger().expect("refresh");
     assert!(matches!(
         store_refusal(&store.history(NS).expect_err("gap at epoch 2")),
@@ -846,7 +858,10 @@ fn scope_key_audit_refuses_whole_record_substitution_8278() {
         )
         .expect("substitute from public inputs");
         assert_ne!(substitute.key_check, record.key_check);
-        store.write_record(&substitute).expect("write substitute");
+        crate::storage::snapshot_file::require_durable(
+            store.write_record(&substitute).expect("write substitute"),
+        )
+        .expect("durable");
         store.refresh_from_ledger().expect("refresh");
         let err = store
             .load_current(NS)
@@ -855,7 +870,10 @@ fn scope_key_audit_refuses_whole_record_substitution_8278() {
             store_refusal(&err),
             ScopeKeyStoreError::AuditChainMismatch { .. }
         ));
-        store.write_record(&record).expect("restore");
+        crate::storage::snapshot_file::require_durable(
+            store.write_record(&record).expect("restore"),
+        )
+        .expect("durable");
         store.refresh_from_ledger().expect("refresh");
         assert_eq!(
             store.load_current(NS).expect("healed"),
@@ -1161,7 +1179,10 @@ fn scope_key_record_with_another_recovery_fingerprint_is_refused_8278() {
         moved.escrow.recovery_fingerprint,
         record.escrow.recovery_fingerprint
     );
-    store.write_record(&moved).expect("write record");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&moved).expect("write record"),
+    )
+    .expect("durable");
     store.refresh_from_ledger().expect("refresh");
     let err = store
         .load_current(NS)

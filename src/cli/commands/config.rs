@@ -33,6 +33,9 @@
 //! |      | migrated output does not round-trip through `AppConfig`   |
 //! |      | (refused; no file written, original untouched)           |
 //! |   4  | write error — could not write `.bak` or new file         |
+//! |   6  | (#10263) the `.bak` is written but not confirmed durable |
+//! |      | (its directory fsync failed); the migrated file is NOT   |
+//! |      | written, original untouched                              |
 
 use crate::models::field_names;
 use std::path::{Path, PathBuf};
@@ -639,12 +642,24 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
     // A backup already taken in the same second keeps its copy; this one
     // takes the next numbered name.
     let wanted = path.with_extension(format!("toml.bak.{timestamp}"));
+    // #10263: an `Err` is "not written" (exit 4). A backup whose directory
+    // fsync failed IS written but may not survive a crash, so the migrated
+    // file is not written over the only durable copy of the original (exit 6).
     let backup_path = match crate::storage::snapshot_file::write_new_private_unique(
         &wanted,
         "config backup",
         contents.as_bytes(),
     ) {
-        Ok(written) => written,
+        Ok((written, crate::storage::snapshot_file::Durability::Durable)) => written,
+        Ok((_, crate::storage::snapshot_file::Durability::NotDurable(not_durable))) => {
+            let _ = writeln!(
+                out.stderr,
+                "ERROR: {not_durable}; refusing to write the migrated config {} over the \
+                 original until its backup is durable. Your original config is untouched.",
+                path.display(),
+            );
+            return Ok(6);
+        }
         Err(e) => {
             let _ = writeln!(
                 out.stderr,
@@ -896,11 +911,19 @@ fn clean_claude_json(timestamp: &str) -> Result<Option<String>> {
     let wanted = format!("{}.bak.{}", path.display(), timestamp);
     // v1.0.0 #8950 — never follows or replaces a link at the backup name;
     // a backup already taken in the same second keeps its copy.
-    let written = crate::storage::snapshot_file::write_new_private_unique(
+    let (written, durability) = crate::storage::snapshot_file::write_new_private_unique(
         Path::new(&wanted),
         "config backup",
         contents.as_bytes(),
     )?;
+    // #10214: a backup not confirmed durable is no safety net, so the
+    // original is not rewritten; the backup stays on disk.
+    if let crate::storage::snapshot_file::Durability::NotDurable(not_durable) = durability {
+        anyhow::bail!(
+            "{not_durable}; refusing to rewrite {} until its backup is durable (it is untouched)",
+            path.display()
+        );
+    }
     std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
 
     Ok(Some(written.display().to_string()))

@@ -328,7 +328,12 @@ pub(crate) fn x25519_key_paths(agent_id: &str, dir: &Path) -> (PathBuf, PathBuf)
 /// log — the operator-accepted "a lost key loses `content`" posture the
 /// shape contract already admits (`[encryption].at_rest = true` under
 /// `RequiredPendingEscrow`); `keys init` is the ceremony that refuses it.
+///
+/// #10214: a failed directory fsync after a file is in place does not stop the
+/// mint; every file is written, then the error names each one not confirmed
+/// durable.
 fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
+    use crate::storage::snapshot_file::NotDurableReport;
     let (pub_path, priv_path) = x25519_key_paths(&kp.agent_id, dir);
     crate::identity::keypair::ensure_parent(&pub_path)?;
     crate::identity::keypair::ensure_parent(&priv_path)?;
@@ -339,14 +344,23 @@ fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
     // Resolve the recovery key BEFORE the first write so a malformed
     // enrolment refuses the whole mint rather than leaving a keyless escrow.
     let recovery = escrow::load_recovery_pubkey(dir)?;
+    // #10214: a file not confirmed durable is still written; the mint runs to
+    // its end (private, escrow, public) and then reports every such file.
+    let mut report = NotDurableReport::new();
     let mut secret_bytes = kp.secret.to_bytes();
-    let write_res = crate::identity::keypair::write_with_mode(&priv_path, &secret_bytes, 0o600)
-        .with_context(|| format!("writing x25519 private key {}", priv_path.display()));
+    let write_res = crate::identity::keypair::write_with_mode_durable(
+        &priv_path,
+        &secret_bytes,
+        0o600,
+        X25519_PRIVATE_WHAT,
+    )
+    .with_context(|| format!("writing x25519 private key {}", priv_path.display()));
     secret_bytes.zeroize();
-    write_res?;
+    report.note(write_res?);
     match recovery {
         Some(recovery_pub) => {
-            escrow::write_escrow(kp, dir, &recovery_pub)?;
+            let (_escrow, durability) = escrow::write_escrow(kp, dir, &recovery_pub)?;
+            report.note(durability);
         }
         None => tracing::warn!(
             target: TRACING_TARGET,
@@ -359,10 +373,22 @@ fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
             escrow::REMEDY_ENROLL_RECOVERY_KEY
         ),
     }
-    crate::identity::keypair::write_with_mode(&pub_path, kp.public.as_bytes(), 0o644)
-        .with_context(|| format!("writing x25519 public key {}", pub_path.display()))?;
-    Ok(())
+    report.note(
+        crate::identity::keypair::write_with_mode_durable(
+            &pub_path,
+            kp.public.as_bytes(),
+            0o644,
+            X25519_PUBLIC_WHAT,
+        )
+        .with_context(|| format!("writing x25519 public key {}", pub_path.display()))?,
+    );
+    report.finish()
 }
+
+/// The `what` of an x25519 private key in a not-durable report (#10214).
+pub(crate) const X25519_PRIVATE_WHAT: &str = "x25519 private key";
+/// The `what` of an x25519 public key in a not-durable report (#10214).
+pub(crate) const X25519_PUBLIC_WHAT: &str = "x25519 public key";
 
 /// Load `agent_id`'s X25519 keypair from `dir`. Returns `Ok(None)` when
 /// no `.x25519.priv` exists yet (first run for this agent). On Unix a

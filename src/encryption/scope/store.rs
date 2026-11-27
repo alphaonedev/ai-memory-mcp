@@ -1046,13 +1046,26 @@ impl FileScopeKeyStore {
         Ok(Some(record))
     }
 
-    fn write_record(&self, record: &ScopeKeyRecord) -> Result<()> {
+    /// Write one record. An `Err` means NOT written; #10214: a record written
+    /// but not confirmed durable is [`Durability::NotDurable`] and the caller
+    /// reports it after its sequence ends.
+    ///
+    /// [`Durability::NotDurable`]: crate::storage::snapshot_file::Durability::NotDurable
+    fn write_record(
+        &self,
+        record: &ScopeKeyRecord,
+    ) -> Result<crate::storage::snapshot_file::Durability> {
         let path = self.record_path(&record.namespace, record.epoch);
         crate::identity::keypair::ensure_parent(&path)?;
         crate::identity::keypair::enforce_key_path_chain_secure(&self.key_dir, &path)?;
         let bytes = serde_json::to_vec_pretty(record).context("serialising a scope-key record")?;
-        crate::identity::keypair::write_with_mode(&path, &bytes, MODE_PRIVATE)
-            .with_context(|| format!("writing scope-key record {}", path.display()))
+        crate::identity::keypair::write_with_mode_durable(
+            &path,
+            &bytes,
+            MODE_PRIVATE,
+            "scope-key record",
+        )
+        .with_context(|| format!("writing scope-key record {}", path.display()))
     }
 
     /// Append one line to the audit log: owner-only, never through a link,
@@ -1334,14 +1347,19 @@ impl FileScopeKeyStore {
     ) -> Result<()> {
         let entry = ledger.entry_for(change);
         let line = ledger.append(entry).map_err(refuse)?;
+        // #10214: a record written but not confirmed durable is on disk, so
+        // the commit runs to its end (every record, the audit line, the
+        // cache) and then reports each such record.
+        let mut report = crate::storage::snapshot_file::NotDurableReport::new();
         for record in records {
-            self.write_record(record)?;
+            report.note(self.write_record(record)?);
             ledger.put_record((*record).clone());
         }
         self.append_audit_line(namespace, &line)?;
         let mut cache = self.cache.write().map_err(|_| poisoned())?;
         cache.insert(Self::slug(namespace), Ok(ledger));
-        Ok(())
+        drop(cache);
+        report.finish()
     }
 
     fn recovery_pubkey(&self, namespace: &str) -> Result<PublicKey> {

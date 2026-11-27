@@ -103,6 +103,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use crate::storage::snapshot_file::{Durability, NotDurable, NotDurableReport};
 use crate::validate;
 
 /// Suffix for the public-key file (`<agent_id>.pub`).
@@ -353,8 +354,19 @@ pub fn generate(agent_id: &str) -> Result<AgentKeypair> {
 /// # Errors
 ///
 /// Surfaces directory-creation and key-write failures, each with the offending
-/// path named.
+/// path named. #10214: a failed directory fsync after a key file is in place
+/// does not stop the pair: both files are written, then the error names every
+/// file that is written but not confirmed durable.
 pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
+    let mut report = NotDurableReport::new();
+    save_reporting(keypair, dir, &mut report)?;
+    report.finish()
+}
+
+/// [`save`] with its not-durable outcomes collected into `report` (#10214),
+/// so [`rotate`] can finish the whole rotation before it reports. An `Err`
+/// means a file was NOT written.
+fn save_reporting(keypair: &AgentKeypair, dir: &Path, report: &mut NotDurableReport) -> Result<()> {
     let private = keypair.private.as_ref().ok_or_else(|| {
         anyhow!(
             "AgentKeypair for {} has no private key to save",
@@ -381,12 +393,32 @@ pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     // the two renames must leave the RECOVERABLE half-state (`.priv` current,
     // `.pub` derivable from it), never the unrecoverable one (`.pub` current,
     // no matching `.priv`) that also wedges the #3147 existence gate.
-    write_with_mode(&priv_path, &private.to_bytes(), 0o600)
-        .with_context(|| format!("writing private key {}", priv_path.display()))?;
-    write_with_mode(&pub_path, &keypair.public.to_bytes(), 0o644)
-        .with_context(|| writing_public_key_context(&pub_path))?;
+    // #10214: a `.priv` not confirmed durable is still written; the `.pub`
+    // follows it so the pair is complete, and `report` carries the outcome.
+    report.note(
+        write_with_mode_durable(&priv_path, &private.to_bytes(), 0o600, PRIVATE_KEY_WHAT)
+            .with_context(|| format!("writing private key {}", priv_path.display()))?,
+    );
+    report.note(
+        write_with_mode_durable(
+            &pub_path,
+            &keypair.public.to_bytes(),
+            0o644,
+            PUBLIC_KEY_WHAT,
+        )
+        .with_context(|| writing_public_key_context(&pub_path))?,
+    );
     Ok(())
 }
+
+/// The `what` of a private key file in a not-durable report (#10214).
+const PRIVATE_KEY_WHAT: &str = "private key";
+/// The `what` of a public key file in a not-durable report (#10214).
+const PUBLIC_KEY_WHAT: &str = "public key";
+/// The `what` of a rotation archive in a not-durable report (#10214).
+const ARCHIVE_WHAT: &str = "public key archive";
+/// The `what` of a file written through the public [`write_with_mode`].
+const KEY_FILE_WHAT: &str = "key file";
 
 /// Persist only the public-key file. Used by `identity import` when the
 /// caller supplies a public key without a private key (e.g., importing
@@ -402,9 +434,17 @@ pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     // COVERAGE: with_context closure (line 192) same class as save's
     //           pub-write closure (line 178) — reachable on EACCES/
     //           ENOSPC; not portable to unit tests on macOS/Linux.
-    write_with_mode(&pub_path, &keypair.public.to_bytes(), 0o644)
-        .with_context(|| writing_public_key_context(&pub_path))?;
-    Ok(())
+    let mut report = NotDurableReport::new();
+    report.note(
+        write_with_mode_durable(
+            &pub_path,
+            &keypair.public.to_bytes(),
+            0o644,
+            PUBLIC_KEY_WHAT,
+        )
+        .with_context(|| writing_public_key_context(&pub_path))?,
+    );
+    report.finish()
 }
 
 /// Path of `agent_id`'s public-key file under `dir`. Single home for the
@@ -497,15 +537,20 @@ pub fn rotate(agent_id: &str, dir: &Path) -> Result<RotateOutcome> {
     // remove-then-create primitive, so two rotations inside one second silently
     // OVERWROTE the earlier archive — destroying the only retained verification
     // anchor for the identity that rotation had just retired.
-    let archived_pub =
+    let (archived_pub, archive_durability) =
         archive_public_key_at(dir, agent_id, &old_pub, chrono::Utc::now().timestamp())?;
+    // #10214: an archive not confirmed durable is still written; the
+    // rotation runs to its end and reports every not-durable file after.
+    let mut report = NotDurableReport::new();
+    report.note(archive_durability);
 
     // Generate + persist the new keypair. `save` overwrites the old
     // `.pub`/`.priv` in place — destroying the rotated-out PRIVATE key
     // (forward security). The archived `.pub` above is the only retained
     // trace of the prior identity.
     let new_kp = generate(agent_id)?;
-    save(&new_kp, dir)?;
+    save_reporting(&new_kp, dir, &mut report)?;
+    report.finish()?;
     Ok(RotateOutcome {
         archived_pub,
         new_pub: pub_path,
@@ -572,9 +617,13 @@ where
     let old_pub = fs::read(&pub_path)
         .with_context(|| format!("reading current public key {}", pub_path.display()))?;
     // #3146 — collision-safe archive naming, same rationale as `rotate`.
-    let archived_pub =
+    let (archived_pub, archive_durability) =
         archive_public_key_at(dir, agent_id, &old_pub, chrono::Utc::now().timestamp())?;
-    save(&new_kp, dir)?;
+    // #10214: same finish-then-report discipline as `rotate`.
+    let mut report = NotDurableReport::new();
+    report.note(archive_durability);
+    save_reporting(&new_kp, dir, &mut report)?;
+    report.finish()?;
     Ok(RotateOutcome {
         archived_pub,
         new_pub: pub_path,
@@ -1124,8 +1173,13 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
                     priv_path.display()
                 )
             })?;
-            write_with_mode(&pub_path, &signing.verifying_key().to_bytes(), 0o644)
-                .with_context(|| format!("re-deriving public key {}", pub_path.display()))?;
+            let durability = write_with_mode_durable(
+                &pub_path,
+                &signing.verifying_key().to_bytes(),
+                0o644,
+                PUBLIC_KEY_WHAT,
+            )
+            .with_context(|| format!("re-deriving public key {}", pub_path.display()))?;
             tracing::warn!(
                 target: KEYPAIR_TRACE_TARGET,
                 "identity: {} was missing while {} was present — RE-DERIVED the public \
@@ -1136,6 +1190,11 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
                 pub_path.display(),
                 priv_path.display(),
             );
+            // #10214: the re-derived `.pub` is written; one not confirmed
+            // durable is reported, never read as "not repaired".
+            let mut report = NotDurableReport::new();
+            report.note(durability);
+            report.finish()?;
             Ok(EnsureOutcome::RepairedPublicFromPrivate { pub_path })
         }
 
@@ -1203,12 +1262,19 @@ fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<Ensu
         .as_ref()
         .ok_or_else(|| anyhow!("generated keypair for {agent_id} has no private key"))?;
     match claim_new_with_mode(&priv_path, &private.to_bytes(), 0o600) {
-        Ok(()) => {
+        Ok(claim_durability) => {
             // Won the claim. `.pub` is a deterministic function of the `.priv`
             // just committed, so even a concurrent self-heal writing `.pub`
-            // writes byte-identical bytes — the pair cannot tear.
-            write_with_mode(&pub_path, &kp.public.to_bytes(), 0o644)
-                .with_context(|| writing_public_key_context(&pub_path))?;
+            // writes byte-identical bytes — the pair cannot tear. #10214: a
+            // claim not confirmed durable is still the claimed key, so the
+            // `.pub` is written before the outcome is reported.
+            let mut report = NotDurableReport::new();
+            report.note(claim_durability);
+            report.note(
+                write_with_mode_durable(&pub_path, &kp.public.to_bytes(), 0o644, PUBLIC_KEY_WHAT)
+                    .with_context(|| writing_public_key_context(&pub_path))?,
+            );
+            report.finish()?;
             // COVERAGE: tracing::info! lazy-format closure — the format args are
             //           constructed lazily; the closure body runs when the INFO
             //           subscriber is enabled. Documented per L0.7 playbook §3c.
@@ -1490,15 +1556,17 @@ fn annotate_staging_error(e: &io::Error, dir: &Path, path: &Path) -> io::Error {
 
 /// `fsync` the DIRECTORY so a completed `rename` or `link` survives a power
 /// cut, through the one funnel ([`crate::storage::snapshot_file::sync_dir`]).
-/// #10214: the error is returned, never swallowed (it used to be best-effort),
-/// because a key rename lost to a crash brings back the old key or none. Every
-/// caller runs it AFTER the new file is complete at its final name and never
-/// removes that file on this error.
-///
-/// # Errors
-/// The directory cannot be opened or its fsync fails.
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    crate::storage::snapshot_file::sync_dir(dir)
+/// #10214: the outcome is returned, never swallowed (it used to be
+/// best-effort), because a key rename lost to a crash brings back the old key
+/// or none. Every caller runs it AFTER the new file `path` is complete at its
+/// final name, so a failure is [`Durability::NotDurable`] ("written, not
+/// confirmed durable"), never an `Err` that reads as "not written", and the
+/// file is never removed on it.
+fn sync_dir(dir: &Path, path: &Path, what: &str) -> Durability {
+    match crate::storage::snapshot_file::sync_dir(dir) {
+        Ok(()) => Durability::Durable,
+        Err(source) => Durability::NotDurable(NotDurable::new(what, path, dir, source)),
+    }
 }
 
 /// Durably write `bytes` to `path` with an explicit Unix mode, replacing any
@@ -1529,16 +1597,39 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 ///
 /// Any failure before step 3 removes the staging file and returns the error
 /// with `path` untouched. A failure at step 3 does the same. A failure at
-/// step 4 (#10214) is returned with the complete new file at `path`.
+/// step 4 (#10214) leaves the complete new file at `path` and is an `Err`
+/// whose payload is the [`NotDurable`] report ("written, not confirmed
+/// durable"); crate callers use [`write_with_mode_durable`], which returns it
+/// as [`Durability::NotDurable`] instead.
 ///
 /// # Errors
 ///
-/// Surfaces the underlying `io::Error`. A `PermissionDenied` while staging is
+/// Surfaces the underlying `io::Error`; a failed directory fsync is an `Err`
+/// with the new file in place (see above). A `PermissionDenied` while staging is
 /// re-rendered with the key DIRECTORY named plus the `ls -ld` / `lsattr` /
 /// `chattr -i` checks, because a read-only or immutable key directory is the
 /// common cause and the bare errno points at the wrong file.
-#[cfg(unix)]
 pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    match write_with_mode_durable(path, bytes, mode, KEY_FILE_WHAT)? {
+        Durability::Durable => Ok(()),
+        Durability::NotDurable(not_durable) => Err(not_durable.into()),
+    }
+}
+
+/// [`write_with_mode`] with the directory fsync's outcome typed (#10214): an
+/// `Err` means NOT written (`path` holds its old bytes or nothing); after the
+/// rename the outcome is [`Durability`], and `what` names the file in a
+/// [`NotDurable`] report.
+///
+/// # Errors
+/// Not written: the staging, write, file fsync or rename fails.
+#[cfg(unix)]
+pub(crate) fn write_with_mode_durable(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    what: &str,
+) -> io::Result<Durability> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1568,8 +1659,8 @@ pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         return Err(e);
     }
     // #10214: after the rename `path` holds the complete new file; a failed
-    // directory fsync is returned and leaves it in place.
-    sync_dir(&dir)
+    // directory fsync is NotDurable and leaves it in place.
+    Ok(sync_dir(&dir, path, what))
 }
 
 /// #3146 — create `path` with `bytes` and `mode`, REFUSING if it already
@@ -1579,7 +1670,7 @@ pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 /// name IS the atomic claim, and a lost race is reported as `AlreadyExists`
 /// so the caller can pick another name rather than clobber.
 #[cfg(unix)]
-fn create_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+fn create_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<Durability> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1601,14 +1692,15 @@ fn create_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> 
         let _ = fs::remove_file(path);
         return Err(e);
     }
-    // #10214: the archive is complete; a failed directory fsync is returned
-    // and NEVER removes it (that would destroy the retained anchor).
-    sync_dir(&dir)
+    // #10214: the archive is complete; a failed directory fsync is
+    // NotDurable and NEVER removes it (that would destroy the retained anchor).
+    Ok(sync_dir(&dir, path, ARCHIVE_WHAT))
 }
 
 #[cfg(not(unix))]
-fn create_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+fn create_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<Durability> {
     use std::io::Write;
+    let dir = key_file_dir(path)?;
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1623,7 +1715,7 @@ fn create_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()>
         let _ = fs::remove_file(path);
         return Err(e);
     }
-    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+    Ok(sync_dir(&dir, path, ARCHIVE_WHAT))
 }
 
 /// #3772 — atomically CLAIM `path` for `bytes` at `mode`, FIRST-WRITER-WINS,
@@ -1648,7 +1740,7 @@ fn create_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()>
 /// observed incomplete. The staging sibling is always unlinked (the winning
 /// link keeps the inode alive through `path`).
 #[cfg(unix)]
-fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<Durability> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1677,15 +1769,15 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let _ = fs::remove_file(&staged);
     result?;
     // #10214: `path` is the complete claimed key; a failed directory fsync is
-    // returned and leaves it in place.
-    sync_dir(&dir)
+    // NotDurable and leaves it in place.
+    Ok(sync_dir(&dir, path, PRIVATE_KEY_WHAT))
 }
 
 /// #3772 — non-Unix twin of [`claim_new_with_mode`]. `hard_link` is
 /// cross-platform, so the same stage-then-link atomic claim holds; the Unix
 /// mode bits do not apply.
 #[cfg(not(unix))]
-fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<Durability> {
     use std::io::Write;
 
     let dir = key_file_dir(path)?;
@@ -1705,7 +1797,7 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> 
     let result = commit();
     let _ = fs::remove_file(&staged);
     result?;
-    sync_dir(&dir)
+    Ok(sync_dir(&dir, path, PRIVATE_KEY_WHAT))
 }
 
 /// #3146 — archive `pub_bytes` as a timestamped, PUBLIC-ONLY sibling of
@@ -1725,7 +1817,15 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> 
 ///
 /// - the archive directory cannot be created or written;
 /// - every candidate name for `ts` is taken ([`ARCHIVE_SUFFIX_ATTEMPTS`]).
-fn archive_public_key_at(dir: &Path, agent_id: &str, pub_bytes: &[u8], ts: i64) -> Result<PathBuf> {
+///
+/// #10214: the archive written is returned with its [`Durability`]; one not
+/// confirmed durable is still the archive, and the caller reports it.
+fn archive_public_key_at(
+    dir: &Path,
+    agent_id: &str,
+    pub_bytes: &[u8],
+    ts: i64,
+) -> Result<(PathBuf, Durability)> {
     for attempt in 0..=ARCHIVE_SUFFIX_ATTEMPTS {
         let candidate = if attempt == 0 {
             dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts}"))
@@ -1734,7 +1834,7 @@ fn archive_public_key_at(dir: &Path, agent_id: &str, pub_bytes: &[u8], ts: i64) 
         };
         ensure_parent(&candidate)?;
         match create_new_with_mode(&candidate, pub_bytes, 0o644) {
-            Ok(()) => return Ok(candidate),
+            Ok(durability) => return Ok((candidate, durability)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(anyhow!(e)).with_context(|| {
@@ -1753,7 +1853,12 @@ fn archive_public_key_at(dir: &Path, agent_id: &str, pub_bytes: &[u8], ts: i64) 
 }
 
 #[cfg(not(unix))]
-pub fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+pub(crate) fn write_with_mode_durable(
+    path: &Path,
+    bytes: &[u8],
+    _mode: u32,
+    what: &str,
+) -> io::Result<Durability> {
     // Non-Unix: mode bits don't apply. The file inherits the parent
     // directory ACL. (Linux and macOS, the supported platforms, take the
     // unix path above; this branch is a defensive fallback only.)
@@ -1795,8 +1900,8 @@ pub fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> 
         return Err(e);
     }
     // #10214: after the rename `path` holds the complete new file; a failed
-    // directory fsync is returned and leaves it in place.
-    sync_dir(&dir)
+    // directory fsync is NotDurable and leaves it in place.
+    Ok(sync_dir(&dir, path, what))
 }
 
 #[cfg(test)]
@@ -2800,10 +2905,14 @@ mod tests {
         let dir = tmp_dir();
         let ts = 1_700_000_000_i64;
 
-        let first = archive_public_key_at(dir.path(), "daemon", b"FIRSTKEY", ts)
-            .expect("first archive must be written");
-        let second = archive_public_key_at(dir.path(), "daemon", b"SECONDKY", ts)
-            .expect("a second rotation in the SAME second must still archive");
+        let (first, first_durability) =
+            archive_public_key_at(dir.path(), "daemon", b"FIRSTKEY", ts)
+                .expect("first archive must be written");
+        assert!(matches!(first_durability, Durability::Durable));
+        let (second, second_durability) =
+            archive_public_key_at(dir.path(), "daemon", b"SECONDKY", ts)
+                .expect("a second rotation in the SAME second must still archive");
+        assert!(matches!(second_durability, Durability::Durable));
 
         assert_ne!(
             first, second,

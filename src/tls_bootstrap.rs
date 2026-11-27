@@ -40,6 +40,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use crate::storage::snapshot_file::NotDurableReport;
 use anyhow::{Context as _, Result};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -182,29 +183,31 @@ pub fn leaf_subject_alt_names(bind_host: &str) -> Vec<String> {
     sans
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_mode(path, bytes, MODE_PRIVATE)
+/// The `what` of TLS material in a not-durable report (#10214).
+const TLS_MATERIAL_WHAT: &str = "TLS material";
+
+fn write_private(path: &Path, bytes: &[u8], report: &mut NotDurableReport) -> Result<()> {
+    write_mode(path, bytes, MODE_PRIVATE, report)
 }
 
-fn write_public(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_mode(path, bytes, MODE_PUBLIC)
+fn write_public(path: &Path, bytes: &[u8], report: &mut NotDurableReport) -> Result<()> {
+    write_mode(path, bytes, MODE_PUBLIC, report)
 }
 
-fn write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+/// Write one TLS file. An `Err` means NOT written. #10214: a file written but
+/// not confirmed durable is noted in `report` and the caller's sequence goes
+/// on (key, then certificate, then CA), so a set is never left half-written
+/// by this; the caller reports every such file at its end.
+fn write_mode(path: &Path, bytes: &[u8], mode: u32, report: &mut NotDurableReport) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(path)
             .with_context(|| format!("replacing {} (#3709)", path.display()))?;
     }
-    #[cfg(unix)]
-    {
-        crate::identity::keypair::write_with_mode(path, bytes, mode)
-            .with_context(|| format!("writing {} with mode {mode:o} (#3709)", path.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-        std::fs::write(path, bytes).with_context(|| format!("writing {} (#3709)", path.display()))
-    }
+    report.note(
+        crate::identity::keypair::write_with_mode_durable(path, bytes, mode, TLS_MATERIAL_WHAT)
+            .with_context(|| format!("writing {} with mode {mode:o} (#3709)", path.display()))?,
+    );
+    Ok(())
 }
 
 fn ensure_dir(dir: &Path) -> Result<()> {
@@ -554,7 +557,7 @@ pub fn listener_verdict(
     }
 }
 
-fn generate_ca(dir: &Path) -> Result<(String, KeyPair)> {
+fn generate_ca(dir: &Path, report: &mut NotDurableReport) -> Result<(String, KeyPair)> {
     let mut params = CertificateParams::new(Vec::<String>::new())
         .context("building the local CA parameters (#3709)")?;
     params.distinguished_name = dn(CA_COMMON_NAME);
@@ -572,12 +575,22 @@ fn generate_ca(dir: &Path) -> Result<(String, KeyPair)> {
         .self_signed(&key)
         .context("self-signing the local CA (#3709)")?;
     let ca_pem = cert.pem();
-    write_private(&dir.join(LOCAL_CA_KEY_FILE), key.serialize_pem().as_bytes())?;
-    write_public(&dir.join(LOCAL_CA_CERT_FILE), ca_pem.as_bytes())?;
+    write_private(
+        &dir.join(LOCAL_CA_KEY_FILE),
+        key.serialize_pem().as_bytes(),
+        report,
+    )?;
+    write_public(&dir.join(LOCAL_CA_CERT_FILE), ca_pem.as_bytes(), report)?;
     Ok((ca_pem, key))
 }
 
-fn issue_leaf(dir: &Path, ca_pem: &str, ca_key: KeyPair, sans: &[String]) -> Result<()> {
+fn issue_leaf(
+    dir: &Path,
+    ca_pem: &str,
+    ca_key: KeyPair,
+    sans: &[String],
+    report: &mut NotDurableReport,
+) -> Result<()> {
     let issuer = Issuer::from_ca_cert_pem(ca_pem, ca_key)
         .context("re-reading the local CA as an issuer (#3709)")?;
     let mut params = CertificateParams::new(sans.to_vec())
@@ -592,8 +605,12 @@ fn issue_leaf(dir: &Path, ca_pem: &str, ca_key: KeyPair, sans: &[String]) -> Res
     let cert = params
         .signed_by(&key, &issuer)
         .context("signing the server certificate with the local CA (#3709)")?;
-    write_private(&dir.join(SERVER_KEY_FILE), key.serialize_pem().as_bytes())?;
-    write_public(&dir.join(SERVER_CERT_FILE), cert.pem().as_bytes())?;
+    write_private(
+        &dir.join(SERVER_KEY_FILE),
+        key.serialize_pem().as_bytes(),
+        report,
+    )?;
+    write_public(&dir.join(SERVER_CERT_FILE), cert.pem().as_bytes(), report)?;
     Ok(())
 }
 
@@ -659,10 +676,13 @@ pub fn ensure_local_tls(key_dir: &Path, bind_host: &str) -> Result<LocalTls> {
         }
     }
 
+    // #10214: every file of the CA and leaf is written before a file not
+    // confirmed durable is reported.
+    let mut report = NotDurableReport::new();
     let (ca_pem, ca_key, fresh_ca) = match load_ca(&dir)? {
         Some((pem, key)) => (pem, key, false),
         None => {
-            let (pem, key) = generate_ca(&dir)?;
+            let (pem, key) = generate_ca(&dir, &mut report)?;
             (pem, key, true)
         }
     };
@@ -698,7 +718,7 @@ pub fn ensure_local_tls(key_dir: &Path, bind_host: &str) -> Result<LocalTls> {
 
     let outcome = match renew_reason {
         Some(reason) => {
-            issue_leaf(&dir, &ca_pem, ca_key, &wanted)?;
+            issue_leaf(&dir, &ca_pem, ca_key, &wanted, &mut report)?;
             if fresh_ca {
                 Outcome::Generated
             } else {
@@ -707,6 +727,7 @@ pub fn ensure_local_tls(key_dir: &Path, bind_host: &str) -> Result<LocalTls> {
         }
         None => Outcome::Reused,
     };
+    report.finish()?;
     let status = leaf_status(key_dir)?;
     Ok(LocalTls {
         cert_path,
@@ -891,16 +912,18 @@ pub fn import_operator_material(
     ensure_dir(&dir)?;
     let cert_path = dir.join(SERVER_CERT_FILE);
     let key_path = dir.join(SERVER_KEY_FILE);
-    write_private(&key_path, key_pem)?;
-    write_public(&cert_path, cert_pem)?;
+    let mut report = NotDurableReport::new();
+    write_private(&key_path, key_pem, &mut report)?;
+    write_public(&cert_path, cert_pem, &mut report)?;
     let ca_cert_path = match ca_pem {
         Some(ca) => {
-            write_public(&operator_ca_path, ca)?;
+            write_public(&operator_ca_path, ca, &mut report)?;
             Some(operator_ca_path)
         }
         // A retained bundle that verified the new leaf stays the trust root.
         None => operator_ca_path.exists().then_some(operator_ca_path),
     };
+    report.finish()?;
     Ok(ImportReport {
         cert_path,
         key_path,
@@ -918,6 +941,20 @@ pub fn import_operator_material(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test fixture write that must be written AND durable (#10214).
+    fn put_private(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut report = NotDurableReport::new();
+        write_private(path, bytes, &mut report)?;
+        report.finish()
+    }
+
+    /// A test fixture write that must be written AND durable (#10214).
+    fn put_public(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut report = NotDurableReport::new();
+        write_public(path, bytes, &mut report)?;
+        report.finish()
+    }
 
     fn sandbox() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir under TMPDIR")
@@ -1237,8 +1274,8 @@ mod tests {
             pki.leaf(&["memory.example.test"], now() - time::Duration::days(3));
         let dir = tmp.path().join(TLS_SUBDIR);
         ensure_dir(&dir).unwrap();
-        write_public(&dir.join(SERVER_CERT_FILE), old_cert.as_bytes()).unwrap();
-        write_private(&dir.join(SERVER_KEY_FILE), old_key.as_bytes()).unwrap();
+        put_public(&dir.join(SERVER_CERT_FILE), old_cert.as_bytes()).unwrap();
+        put_private(&dir.join(SERVER_KEY_FILE), old_key.as_bytes()).unwrap();
         let err = ensure_local_tls(tmp.path(), "127.0.0.1")
             .expect_err("expired operator material must refuse")
             .to_string();
@@ -1304,12 +1341,12 @@ mod tests {
         let other = sandbox();
         let theirs = ensure_local_tls(other.path(), "127.0.0.1").unwrap();
         let dir = tmp.path().join(TLS_SUBDIR);
-        write_public(
+        put_public(
             &dir.join(SERVER_CERT_FILE),
             &std::fs::read(&theirs.cert_path).unwrap(),
         )
         .unwrap();
-        write_private(
+        put_private(
             &dir.join(SERVER_KEY_FILE),
             &std::fs::read(&theirs.key_path).unwrap(),
         )
@@ -1324,12 +1361,12 @@ mod tests {
         let bare = sandbox();
         let dir = bare.path().join(TLS_SUBDIR);
         ensure_dir(&dir).unwrap();
-        write_public(
+        put_public(
             &dir.join(SERVER_CERT_FILE),
             &std::fs::read(&ours.cert_path).unwrap(),
         )
         .unwrap();
-        write_private(
+        put_private(
             &dir.join(SERVER_KEY_FILE),
             &std::fs::read(&ours.key_path).unwrap(),
         )

@@ -31,6 +31,7 @@
 //! `4d3ea1c5`, decision `2ee4b428`: D1 = B).
 
 use super::{Envelope, Keypair, TRACING_TARGET, X25519_KEY_LEN, decrypt_bytes, encrypt_bytes};
+use crate::storage::snapshot_file::{Durability, NotDurableReport};
 use anyhow::{Context as _, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -132,8 +133,18 @@ pub fn enroll_recovery_pubkey(dir: &Path, public: &PublicKey) -> Result<EnrollOu
     }
     crate::identity::keypair::ensure_parent(&path)?;
     crate::identity::keypair::enforce_key_path_chain_secure(dir, &path)?;
-    crate::identity::keypair::write_with_mode(&path, public.as_bytes(), 0o644)
-        .with_context(|| format!("writing recovery public key {}", path.display()))?;
+    // #10214: an enrolment not confirmed durable is written; the error says so.
+    let mut report = NotDurableReport::new();
+    report.note(
+        crate::identity::keypair::write_with_mode_durable(
+            &path,
+            public.as_bytes(),
+            0o644,
+            RECOVERY_PUBLIC_WHAT,
+        )
+        .with_context(|| format!("writing recovery public key {}", path.display()))?,
+    );
+    report.finish()?;
     Ok(EnrollOutcome::Enrolled)
 }
 
@@ -233,9 +244,16 @@ pub fn load_recovery_secret(path: &Path) -> Result<StaticSecret> {
 /// file). Overwrites an existing escrow for the SAME key only (the caller
 /// has the live secret in hand, so the new escrow is as good as the old).
 ///
+/// #10214: returns the escrow path and its [`Durability`]; an escrow not
+/// confirmed durable is written, and the caller reports it.
+///
 /// # Errors
-/// The AEAD wrap or the write fails.
-pub(crate) fn write_escrow(kp: &Keypair, dir: &Path, recovery_pub: &PublicKey) -> Result<PathBuf> {
+/// Not written: the AEAD wrap or the write fails.
+pub(crate) fn write_escrow(
+    kp: &Keypair,
+    dir: &Path,
+    recovery_pub: &PublicKey,
+) -> Result<(PathBuf, Durability)> {
     let path = escrow_path(&kp.agent_id, dir);
     let mut plaintext = Vec::with_capacity(kp.agent_id.len() + 1 + X25519_KEY_LEN);
     plaintext.extend_from_slice(kp.agent_id.as_bytes());
@@ -248,10 +266,20 @@ pub(crate) fn write_escrow(kp: &Keypair, dir: &Path, recovery_pub: &PublicKey) -
     let envelope = sealed.context("wrapping the at-rest key for escrow")?;
     crate::identity::keypair::ensure_parent(&path)?;
     crate::identity::keypair::enforce_key_path_chain_secure(dir, &path)?;
-    crate::identity::keypair::write_with_mode(&path, &envelope.to_bytes(), MODE_PRIVATE)
-        .with_context(|| format!("writing at-rest key escrow {}", path.display()))?;
-    Ok(path)
+    let durability = crate::identity::keypair::write_with_mode_durable(
+        &path,
+        &envelope.to_bytes(),
+        MODE_PRIVATE,
+        ESCROW_WHAT,
+    )
+    .with_context(|| format!("writing at-rest key escrow {}", path.display()))?;
+    Ok((path, durability))
 }
+
+/// The `what` of an escrow file in a not-durable report (#10214).
+const ESCROW_WHAT: &str = "at-rest key escrow";
+/// The `what` of the enrolled recovery public key (#10214).
+const RECOVERY_PUBLIC_WHAT: &str = "recovery public key";
 
 /// What [`ensure_escrow`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +307,10 @@ pub fn ensure_escrow(agent_id: &str, dir: &Path) -> Result<EscrowOutcome> {
     };
     let kp = super::load_keypair_in(agent_id, dir)?
         .ok_or_else(|| anyhow!("no live at-rest key for {agent_id:?} to escrow"))?;
-    write_escrow(&kp, dir, &recovery)?;
+    let (_path, durability) = write_escrow(&kp, dir, &recovery)?;
+    let mut report = NotDurableReport::new();
+    report.note(durability);
+    report.finish()?;
     Ok(EscrowOutcome::Written)
 }
 
@@ -297,8 +328,17 @@ pub fn repair_public_half(agent_id: &str, dir: &Path) -> Result<bool> {
     let kp = super::load_keypair_in(agent_id, dir)?.ok_or_else(|| {
         anyhow!("no live at-rest key for {agent_id:?} to derive a public half from")
     })?;
-    crate::identity::keypair::write_with_mode(&pub_path, kp.public.as_bytes(), 0o644)
-        .with_context(|| format!("re-deriving x25519 public key {}", pub_path.display()))?;
+    let mut report = NotDurableReport::new();
+    report.note(
+        crate::identity::keypair::write_with_mode_durable(
+            &pub_path,
+            kp.public.as_bytes(),
+            0o644,
+            super::X25519_PUBLIC_WHAT,
+        )
+        .with_context(|| format!("re-deriving x25519 public key {}", pub_path.display()))?,
+    );
+    report.finish()?;
     Ok(true)
 }
 
@@ -384,14 +424,30 @@ pub fn recover_private_from_escrow(
         secret,
     };
     crate::identity::keypair::enforce_key_path_chain_secure(dir, &priv_path)?;
+    // #10214: a restored file not confirmed durable is still written; the
+    // recovery runs to its end (private, public, cache eviction) and then
+    // reports every such file.
+    let mut report = NotDurableReport::new();
     let mut secret_bytes = kp.secret.to_bytes();
-    let write = crate::identity::keypair::write_with_mode(&priv_path, &secret_bytes, MODE_PRIVATE)
-        .with_context(|| format!("restoring x25519 private key {}", priv_path.display()));
+    let write = crate::identity::keypair::write_with_mode_durable(
+        &priv_path,
+        &secret_bytes,
+        MODE_PRIVATE,
+        super::X25519_PRIVATE_WHAT,
+    )
+    .with_context(|| format!("restoring x25519 private key {}", priv_path.display()));
     secret_bytes.zeroize();
-    write?;
+    report.note(write?);
     if pub_rewritten {
-        crate::identity::keypair::write_with_mode(&pub_path, kp.public.as_bytes(), 0o644)
-            .with_context(|| format!("re-deriving x25519 public key {}", pub_path.display()))?;
+        report.note(
+            crate::identity::keypair::write_with_mode_durable(
+                &pub_path,
+                kp.public.as_bytes(),
+                0o644,
+                super::X25519_PUBLIC_WHAT,
+            )
+            .with_context(|| format!("re-deriving x25519 public key {}", pub_path.display()))?,
+        );
     }
     super::evict_cached_keypair(agent_id);
     tracing::warn!(
@@ -400,6 +456,7 @@ pub fn recover_private_from_escrow(
         priv_path = %priv_path.display(),
         "#3717: at-rest key RESTORED from its recovery escrow; sealed rows open again"
     );
+    report.finish()?;
     Ok(Recovered {
         agent_id: agent_id.to_string(),
         priv_path,

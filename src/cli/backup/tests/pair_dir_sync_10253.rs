@@ -124,3 +124,42 @@ fn backup_pair_all_syncs_succeed_is_durable_10253() {
         Some(MANIFEST_TEXT.as_bytes())
     );
 }
+
+/// v1.0.0 #10263 — the restore's trust-anchor warning is worded from the
+/// state of the seal write: a seal written but not confirmed durable says
+/// it was recorded; any other error says it could not be recorded.
+#[test]
+fn restore_seal_warning_table_10263() {
+    let target = Path::new("/restore-10263/ai-memory.db");
+    let seal = Path::new("/restore-10263/seals/db");
+    let not_durable = anyhow::Error::new(snapshot_file::NotDurable::new(
+        "row-attestation seal",
+        seal,
+        Path::new("/restore-10263/seals"),
+        std::io::Error::from_raw_os_error(libc::EIO),
+    ));
+    let not_written = anyhow::anyhow!("the seal lock cannot be taken");
+    let rows: [(&anyhow::Error, String); 2] = [
+        (
+            &not_durable,
+            format!(
+                "warning: restored {} and recorded it in the trust anchor, but the record is \
+                 not confirmed durable ({not_durable:#}); after a crash verify may report it as \
+                 rolled back until the restore is run again (#10087)",
+                target.display()
+            ),
+        ),
+        (
+            &not_written,
+            format!(
+                "warning: restored {} but could not record it in the trust anchor \
+                 ({not_written:#}); verify reports it as rolled back until the restore is run \
+                 again (#10087)",
+                target.display()
+            ),
+        ),
+    ];
+    for (err, want) in rows {
+        assert_eq!(crate::cli::backup::restore_seal_warning(target, err), want);
+    }
+}
