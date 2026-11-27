@@ -8952,6 +8952,66 @@ enabled = true
         assert!(std::env::var_os("AI_MEMORY_R31_PROBE_10124").is_none());
     }
 
+    /// #10151 S1 (UNSAFE-04): `EnvScope` restores the process environment
+    /// exactly for every `pairs` input, including a key given twice and
+    /// `AI_MEMORY_NO_CONFIG` itself. Expected values are written out, never
+    /// computed from the scope under test.
+    #[test]
+    fn envscope_restores_exactly_for_repeated_and_no_config_keys_10151_s1() {
+        const DUP_KEY: &str = "AI_MEMORY_S1_DUP_PROBE_10151";
+        const NO_CONFIG: &str = "AI_MEMORY_NO_CONFIG";
+        let g = posture_env_lock();
+
+        // Case 1: a key given twice, unset before: unset after.
+        assert!(std::env::var_os(DUP_KEY).is_none());
+        {
+            let _s = EnvScope::set(&g, &[(DUP_KEY, "a"), (DUP_KEY, "b")]);
+            assert_eq!(std::env::var(DUP_KEY).as_deref(), Ok("b"));
+        }
+        assert_eq!(std::env::var_os(DUP_KEY), None, "duplicate key, unset case");
+
+        // Case 2: a key given twice, set before: the original value after.
+        // SAFETY: `g` is the live crate-wide env lock guard.
+        unsafe { std::env::set_var(DUP_KEY, "orig") };
+        {
+            let _s = EnvScope::set(&g, &[(DUP_KEY, "a"), (DUP_KEY, "b")]);
+        }
+        assert_eq!(
+            std::env::var(DUP_KEY).as_deref(),
+            Ok("orig"),
+            "duplicate key, set case"
+        );
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(DUP_KEY) };
+
+        // Case 3: NO_CONFIG passed in `pairs`, in both the set and unset
+        // starting states.
+        let before = std::env::var_os(NO_CONFIG);
+        for start in [None, Some("orig")] {
+            match start {
+                // SAFETY: as above.
+                Some(v) => unsafe { std::env::set_var(NO_CONFIG, v) },
+                // SAFETY: as above.
+                None => unsafe { std::env::remove_var(NO_CONFIG) },
+            }
+            {
+                let _s = EnvScope::set(&g, &[(NO_CONFIG, "0")]);
+                assert_eq!(std::env::var(NO_CONFIG).as_deref(), Ok("1"));
+            }
+            assert_eq!(
+                std::env::var_os(NO_CONFIG),
+                start.map(std::ffi::OsString::from),
+                "NO_CONFIG in pairs, start {start:?}"
+            );
+        }
+        match before {
+            // SAFETY: as above.
+            Some(v) => unsafe { std::env::set_var(NO_CONFIG, v) },
+            // SAFETY: as above.
+            None => unsafe { std::env::remove_var(NO_CONFIG) },
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_reachability_compiled_default_is_info_1146() {
         let g = posture_env_lock();
