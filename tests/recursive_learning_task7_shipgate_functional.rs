@@ -44,6 +44,12 @@
 //! test, `expect()` over `unwrap()` where the error message is
 //! load-bearing.
 
+// #10176: every proptest! block here opens with proptest_guarded(..), which
+// refuses proptest's fork and timeout (a child process outside the sandbox).
+#[path = "common/proptest_guard.rs"]
+mod proptest_guard;
+use proptest_guard::proptest_guarded;
+
 use ai_memory::db::{
     self, ReflectError, ReflectHookDecision, ReflectHooks, ReflectInput, ReflectOutcome,
 };
@@ -747,14 +753,14 @@ fn source_not_found_when_id_well_formed_but_missing() {
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::test_runner::Config {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config {
         cases: 32,
         // Larger inputs blow out the SQL plan cache without paying for
         // any extra coverage at the shim layer; 32 keeps wall-clock
         // well under 5s.
         max_shrink_iters: 128,
         .. proptest::test_runner::Config::default()
-    })]
+    }))]
 
     /// For any well-formed title + content + tag list + priority +
     /// confidence, `db::reflect` and `db::reflect_with_hooks(_, _,

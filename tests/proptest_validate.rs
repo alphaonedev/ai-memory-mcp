@@ -3,12 +3,19 @@
 
 #![allow(clippy::bool_assert_comparison, clippy::useless_vec)]
 
+// #10176: every proptest! block here opens with proptest_guarded(..), which
+// refuses proptest's fork and timeout (a child process outside the sandbox).
+#[path = "common/proptest_guard.rs"]
+mod proptest_guard;
+use proptest_guard::proptest_guarded;
+
 use ai_memory::validate::*;
 use proptest::prelude::*;
 use serde_json::json;
 
 // Property 1: Valid titles should always round-trip through validation
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_title_valid_roundtrip(s in r"[A-Za-z0-9 _\-.,!?\n\t]{1,100}") {
         let title = s.trim();
@@ -25,6 +32,7 @@ proptest! {
 
 // Property 2: Empty/whitespace-only titles should always be rejected
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_title_empty_rejected(s in r"[ \t\n]*") {
         assert!(validate_title(&s).is_err());
@@ -33,6 +41,7 @@ proptest! {
 
 // Property 3: Titles exceeding max length should be rejected
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_title_max_length(s in ".{513,}") {
         assert!(validate_title(&s).is_err());
@@ -41,6 +50,7 @@ proptest! {
 
 // Property 4: Valid namespaces with hierarchical structure
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_hierarchical_valid(
         segments in prop::collection::vec("[a-z0-9_-]{1,50}", 1..8)
@@ -57,6 +67,7 @@ proptest! {
 
 // Property 5: Namespace depth = number of '/' + 1
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_depth_is_segment_count(s in r"[a-z][a-z0-9]*(/[a-z][a-z0-9]*){0,7}") {
         if validate_namespace(&s).is_ok() {
@@ -69,6 +80,7 @@ proptest! {
 
 // Property 6: Namespaces with spaces should be rejected
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_space_rejected(
         base in r"[a-z0-9_-]{1,50}"
@@ -80,6 +92,7 @@ proptest! {
 
 // Property 7: Valid agent_ids should round-trip
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_agent_id_valid_roundtrip(
         s in r"[a-zA-Z0-9_\-:@.]{1,128}"
@@ -92,6 +105,7 @@ proptest! {
 
 // Property 8: Empty agent_ids should be rejected
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_agent_id_empty_rejected(_s in Just("")) {
         assert!(validate_agent_id("").is_err());
@@ -100,6 +114,7 @@ proptest! {
 
 // Property 9: Valid scopes from the closed set
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_scope_valid_set(choice in 0usize..5) {
         let scopes = ["private", "team", "unit", "org", "collective"];
@@ -110,6 +125,7 @@ proptest! {
 
 // Property 10: Invalid scopes should be rejected
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_scope_invalid_rejected(
         s in r"[a-z_]{1,50}"
@@ -122,6 +138,7 @@ proptest! {
 
 // Property 11: Metadata validation with reasonable depth
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_metadata_simple_object(
         _u in Just(())
@@ -133,6 +150,7 @@ proptest! {
 
 // Property 12: Tags validation: no empty tags
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_tags_no_empty(tags in prop::collection::vec("[a-z0-9_]{1,50}", 0..20)) {
         assert!(validate_tags(&tags).is_ok());
@@ -141,6 +159,7 @@ proptest! {
 
 // Property 13: Too many tags should be rejected
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_tags_max_count_enforced(
         tags in prop::collection::vec("[a-z]{1,50}", 51..100)
@@ -151,6 +170,7 @@ proptest! {
 
 // Property 14: RFC3339 timestamp validation
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_expires_at_valid_future(
         year in 2026u32..2100u32,
@@ -170,6 +190,7 @@ proptest! {
 
 // Property 15: TTL validation: positive seconds only
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_ttl_positive_only(
         secs in 1i64..=31_536_000i64  // 1 sec to 1 year
@@ -180,6 +201,7 @@ proptest! {
 
 // Property 16: TTL validation: zero and negative rejected
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_ttl_non_positive_rejected(
         secs in -100i64..=0i64

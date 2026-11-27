@@ -37,6 +37,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+/// #10176 — the proptest fork and timeout refusal, shared with the
+/// integration tests: every lib `proptest!` block opens with
+/// `#![proptest_config(crate::test_support::proptest_guard::proptest_guarded(..))]`.
+#[path = "../tests/common/proptest_guard.rs"]
+pub(crate) mod proptest_guard;
+
 /// Process-wide lock serialising every test that mutates an environment
 /// variable in-process, so `set_var`'s single-threaded contract holds and no
 /// test observes another's transient env state.

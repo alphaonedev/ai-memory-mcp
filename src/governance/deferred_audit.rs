@@ -5489,6 +5489,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     impl Drop for AclGuard {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "runs the system tool chmod, a binary not built from this repo, so outside the #10176 isolation gate"
+        )]
         fn drop(&mut self) {
             let _ = std::process::Command::new("chmod")
                 .arg("-N")
@@ -5500,6 +5504,10 @@ mod tests {
     /// Add one extended ACL entry to `path` (asserting `chmod +a` succeeded)
     /// and return the guard that removes it.
     #[cfg(target_os = "macos")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs the system tool chmod, a binary not built from this repo, so outside the #10176 isolation gate"
+    )]
     fn add_acl(path: &Path, entry: &str) -> AclGuard {
         let status = std::process::Command::new("chmod")
             .args(["+a", entry])

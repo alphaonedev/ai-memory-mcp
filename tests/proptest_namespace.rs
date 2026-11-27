@@ -1,11 +1,18 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// #10176: every proptest! block here opens with proptest_guarded(..), which
+// refuses proptest's fork and timeout (a child process outside the sandbox).
+#[path = "common/proptest_guard.rs"]
+mod proptest_guard;
+use proptest_guard::proptest_guarded;
+
 use ai_memory::models::*;
 use proptest::prelude::*;
 
 // Property 1: namespace_depth returns 0 for empty string
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_depth_empty(_u in Just("")) {
         assert_eq!(namespace_depth(""), 0);
@@ -14,6 +21,7 @@ proptest! {
 
 // Property 2: namespace_depth equals segment count for valid paths
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_depth_segment_count(
         segments in prop::collection::vec("[a-z0-9_-]{1,50}", 1..8)
@@ -26,6 +34,7 @@ proptest! {
 
 // Property 3: namespace_depth("flat") == 1
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_depth_flat(s in r"[a-z0-9_-]{1,50}") {
         assert_eq!(namespace_depth(&s), 1);
@@ -34,6 +43,7 @@ proptest! {
 
 // Property 4: namespace_depth scales with nesting
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_depth_scales(depth_target in 1usize..8usize) {
         let mut parts: Vec<&str> = vec![];
@@ -47,6 +57,7 @@ proptest! {
 
 // Property 5: namespace_parent returns None for flat namespaces
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_parent_flat_is_none(s in r"[a-z0-9_-]{1,50}") {
         assert_eq!(namespace_parent(&s), None);
@@ -55,6 +66,7 @@ proptest! {
 
 // Property 6: namespace_parent returns Some for hierarchical paths
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_parent_hierarchical(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 2..8)
@@ -73,6 +85,7 @@ proptest! {
 
 // Property 7: namespace_parent of "a/b/c" is "a/b"
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_parent_removes_last_segment(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 2..6)
@@ -87,6 +100,7 @@ proptest! {
 
 // Property 8: namespace_parent empty string returns None
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_parent_empty(_u in Just("")) {
         assert_eq!(namespace_parent(""), None);
@@ -95,6 +109,7 @@ proptest! {
 
 // Property 9: namespace_ancestors returns non-empty vec for valid namespaces
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_non_empty(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 1..8)
@@ -107,6 +122,7 @@ proptest! {
 
 // Property 10: namespace_ancestors[0] is the input namespace
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_first_is_self(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 1..8)
@@ -119,6 +135,7 @@ proptest! {
 
 // Property 11: namespace_ancestors length equals depth
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_length_equals_depth(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 1..8)
@@ -132,6 +149,7 @@ proptest! {
 
 // Property 12: namespace_ancestors returns singleton vec for flat namespace
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_flat_singleton(s in r"[a-z0-9_-]{1,50}") {
         let ancestors = namespace_ancestors(&s);
@@ -142,6 +160,7 @@ proptest! {
 
 // Property 13: namespace_ancestors is ordered most-specific-first
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_ordered_correctly(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 2..6)
@@ -163,6 +182,7 @@ proptest! {
 
 // Property 14: namespace_ancestors returns empty vec for empty string
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_empty_is_empty(_u in Just("")) {
         assert_eq!(namespace_ancestors(""), [] as [std::string::String; 0]);
@@ -171,6 +191,7 @@ proptest! {
 
 // Property 15: Each ancestor in the list exists as parent of previous
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_parent_chain(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 3..6)
@@ -188,6 +209,7 @@ proptest! {
 
 // Property 16: Ancestors roundtrip correctly
 proptest! {
+    #![proptest_config(proptest_guarded(proptest::test_runner::Config::default()))]
     #[test]
     fn prop_namespace_ancestors_roundtrip(
         segments in prop::collection::vec("[a-z0-9_-]{1,20}", 1..5)
