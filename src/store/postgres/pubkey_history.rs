@@ -13,8 +13,9 @@ impl PostgresStore {
         crate::store::record_stop::gate_flag(&self.record_stop)
     }
 
-    /// Append the next key version in `tx`. Same-open-key is idempotent; every
-    /// distinct transition closes the open row and appends a dense version.
+    /// Append the next key version in `tx`. Same-open-key returns
+    /// `BindAuthorization::AlreadyBound` without writing; every distinct
+    /// transition closes the open row and appends a dense version.
     pub(super) async fn append_pubkey_version_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -23,7 +24,7 @@ impl PostgresStore {
         flat_pubkey_b64: Option<&str>,
         proof: &crate::identity::pubkey_bind::PossessionProof,
         now: &str,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<crate::identity::pubkey_bind::BindAuthorization> {
         self.gate_record_stop_in_transaction()?;
         let latest: Option<(i64, String, String, Option<String>)> = sqlx::query_as(
             "SELECT version, pubkey_b64, bound_at, superseded_at FROM agent_pubkey_history
@@ -33,7 +34,7 @@ impl PostgresStore {
         .fetch_optional(&mut **tx)
         .await
         .map_err(|e| to_store_err("read latest agent pubkey version", e))?;
-        proof
+        let write_cap = match proof
             .authorize_storage_state(
                 agent_id,
                 pubkey_b64,
@@ -46,7 +47,12 @@ impl PostgresStore {
                 action: crate::handlers::BIND_AGENT_PUBKEY_ACTION.to_string(),
                 target: agent_id.to_string(),
                 reason: crate::errors::msg::BIND_PROOF_REFUSED.to_string(),
-            })?;
+            })? {
+            crate::identity::pubkey_bind::BindAuthorization::AlreadyBound => {
+                return Ok(crate::identity::pubkey_bind::BindAuthorization::AlreadyBound);
+            }
+            crate::identity::pubkey_bind::BindAuthorization::WriteRequired(cap) => cap,
+        };
         let prior: Vec<(String,)> =
             sqlx::query_as("SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = $1")
                 .bind(agent_id)
@@ -65,7 +71,7 @@ impl PostgresStore {
                 .as_ref()
                 .is_some_and(|(_, live, _, end)| end.is_none() && live == pubkey_b64)
             {
-                return Ok(());
+                return Ok(crate::identity::pubkey_bind::BindAuthorization::AlreadyBound);
             }
             return Err(StoreError::InvalidInput {
                 detail: "refusing to reactivate a superseded or revoked agent pubkey".to_string(),
@@ -116,7 +122,7 @@ impl PostgresStore {
         .execute(&mut **tx)
         .await
         .map_err(|e| to_store_err("append agent pubkey version", e))?;
-        Ok(())
+        Ok(crate::identity::pubkey_bind::BindAuthorization::WriteRequired(write_cap))
     }
 }
 
@@ -181,13 +187,17 @@ mod tests {
             .store(0, std::sync::atomic::Ordering::Release);
         let stamp = chrono::Utc::now().to_rfc3339();
         let public = key.public_base64();
-        tokio::time::timeout(
+        let auth = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             store.append_pubkey_version_tx(&mut tx, &agent, &public, None, &proof, &stamp),
         )
         .await
         .expect("history write must not check out another pool connection")
         .expect("history append");
+        assert!(matches!(
+            auth,
+            crate::identity::pubkey_bind::BindAuthorization::WriteRequired(_)
+        ));
         store
             .record_stop
             .engage(&agent, crate::store::record_stop::SCOPE_RECORD_PLANE);

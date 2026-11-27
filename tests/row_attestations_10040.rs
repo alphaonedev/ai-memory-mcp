@@ -2396,7 +2396,7 @@ const ENV_HTTP_BIND_10109_KEY: &str = "AI_MEMORY_TEST_HTTP_BIND_10109_KEY";
 /// #10109: on an armed SQLite store served by a verify-only HTTP daemon (no
 /// session signer installed):
 /// 1. Same-key HTTP rebind (`K_old -> K_old`) returns HTTP 200 with the exact
-///    same success payload as a first bind (not 500 ATTESTATION_FAILED), writes
+///    same success payload as a first bind (not 500 `ATTESTATION_FAILED`), writes
 ///    nothing across `memories`, `_agents`, `agent_pubkey_history`, and
 ///    `row_attestations`, and leaves `verify_sqlite_with` Clean.
 /// 2. Different-key HTTP rebind (`K_old -> K_new`) returns HTTP 403 with exact
@@ -2440,55 +2440,79 @@ fn http_bind_pubkey_armed_store_same_key_noop_and_different_key_refused_10109() 
 }
 
 #[cfg(feature = "sal")]
-#[test]
-#[ignore = "child helper of http_bind_pubkey_armed_store_same_key_noop_and_different_key_refused_10109"]
-fn http_bind_pubkey_armed_child_10109() {
+const ADMIN_CALLER_10109: &str = "ai:ops-admin-10109";
+#[cfg(feature = "sal")]
+const ADMIN_TOKEN_10109: &str = "10109-admin-per-agent-token-0123456789abcdef";
+
+#[cfg(feature = "sal")]
+#[derive(Debug, PartialEq, Eq)]
+struct FourTableSnapshot {
+    memories: Vec<(String, String, String, String)>,
+    agents: Vec<(String, String, String)>,
+    history: Vec<(i64, String, String, Option<String>)>,
+    attestations: Vec<Attestation>,
+}
+
+#[cfg(feature = "sal")]
+fn snapshot_four_tables_10109(path: &Path) -> FourTableSnapshot {
+    let c = rusqlite::Connection::open(path).expect("inspect db");
+    let memories = c
+        .prepare("SELECT id, updated_at, metadata, content FROM memories ORDER BY id")
+        .expect("prep memories")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .expect("q memories")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("col memories");
+    let agents = c
+        .prepare(
+            "SELECT updated_at, metadata, content FROM memories WHERE namespace = '_agents' ORDER BY id",
+        )
+        .expect("prep _agents")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("q _agents")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("col _agents");
+    let history = c
+        .prepare(
+            "SELECT version, pubkey_b64, bound_at, superseded_at FROM agent_pubkey_history ORDER BY agent_id, version",
+        )
+        .expect("prep history")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .expect("q history")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("col history");
+    let attestations = read_attestations(&c).expect("read attestations");
+    FourTableSnapshot {
+        memories,
+        agents,
+        history,
+        attestations,
+    }
+}
+
+#[cfg(feature = "sal")]
+fn build_verify_only_http_router_10109(db_path: &Path) -> axum::Router {
     use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
     use ai_memory::handlers::{ApiKeyState, AppState, Db};
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
-    use tower::ServiceExt as _;
-
-    const ADMIN_CALLER: &str = "ai:ops-admin-10109";
-    const ADMIN_TOKEN: &str = "10109-admin-per-agent-token-0123456789abcdef";
-
-    let db_path = PathBuf::from(std::env::var_os(ENV_HTTP_BIND_10109_DB).expect("db env"));
-    let key_path = PathBuf::from(std::env::var_os(ENV_HTTP_BIND_10109_KEY).expect("key env"));
-    let key_dir = PathBuf::from(std::env::var_os("AI_MEMORY_KEY_DIR").expect("key dir env"));
-
-    let priv_bytes: [u8; 32] = std::fs::read(&key_path)
-        .expect("read K_old")
-        .try_into()
-        .expect("32-byte key");
-    let k_old_signing = ed25519_dalek::SigningKey::from_bytes(&priv_bytes);
-    let k_old = ai_memory::identity::keypair::AgentKeypair {
-        agent_id: AGENT.to_string(),
-        public: k_old_signing.verifying_key(),
-        private: Some(k_old_signing),
-    };
-    let k_new = ai_memory::identity::keypair::generate("attacker-10109").expect("k_new");
 
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
     registry.mutate(|m| {
         *m = std::collections::HashMap::from([(
-            ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
-            ADMIN_CALLER.to_string(),
+            ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN_10109),
+            ADMIN_CALLER_10109.to_string(),
         )]);
     });
-
-    // No session signer installed: verify-only HTTP daemon on an armed store.
-    assert!(ai_memory::identity::session_signer::session_signer().is_none());
-    let conn = ai_memory::db::open(&db_path).expect("open db");
+    let conn = ai_memory::db::open(db_path).expect("open db");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,
-        db_path.clone(),
+        db_path.to_path_buf(),
         ResolvedTtl::default(),
         true,
     )));
     let store: Arc<dyn ai_memory::store::MemoryStore> =
-        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("SqliteStore"));
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(db_path).expect("SqliteStore"));
     let app_state = AppState {
         db,
         embedder: Arc::new(None),
@@ -2515,7 +2539,7 @@ fn http_bind_pubkey_armed_child_10109() {
         atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
-        admin_agent_ids: Arc::new(vec![ADMIN_CALLER.to_string()]),
+        admin_agent_ids: Arc::new(vec![ADMIN_CALLER_10109.to_string()]),
         rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: Arc::new(ai_memory::reload::Swappable::new(
             ai_memory::config::ResolvedModels::default(),
@@ -2525,7 +2549,7 @@ fn http_bind_pubkey_armed_child_10109() {
         enrolled_agent_keys: Arc::clone(&registry),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
-    let router = ai_memory::build_router(
+    ai_memory::build_router(
         ApiKeyState {
             key: None,
             mtls_enforced: false,
@@ -2534,111 +2558,105 @@ fn http_bind_pubkey_armed_child_10109() {
             ..Default::default()
         },
         app_state,
-    );
+    )
+}
 
-    type FourTables = (
-        Vec<(String, String, String, String)>,
-        Vec<(String, String, String)>,
-        Vec<(i64, String, String, Option<String>)>,
-        Vec<Attestation>,
-    );
-    let snapshot_four = |path: &Path| -> FourTables {
-        let c = rusqlite::Connection::open(path).expect("inspect db");
-        let memories = c
-            .prepare("SELECT id, updated_at, metadata, content FROM memories ORDER BY id")
-            .expect("prep memories")
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .expect("q memories")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("col memories");
-        let agents = c
-            .prepare(
-                "SELECT updated_at, metadata, content FROM memories WHERE namespace = '_agents' ORDER BY id",
-            )
-            .expect("prep _agents")
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .expect("q _agents")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("col _agents");
-        let history = c
-            .prepare(
-                "SELECT version, pubkey_b64, bound_at, superseded_at FROM agent_pubkey_history ORDER BY agent_id, version",
-            )
-            .expect("prep history")
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .expect("q history")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("col history");
-        let atts = read_attestations(&c).expect("read attestations");
-        (memories, agents, history, atts)
+#[cfg(feature = "sal")]
+async fn send_http_bind_10109(
+    router: axum::Router,
+    kp: &ai_memory::identity::keypair::AgentKeypair,
+) -> (axum::http::StatusCode, Value) {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    let pubkey_b64 = kp.public_base64();
+    let signing = kp.private.as_ref().expect("private key");
+    let ch_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/agents/{AGENT}/pubkey/challenge"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", ADMIN_CALLER_10109)
+        .header("x-api-key", ADMIN_TOKEN_10109)
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "pubkey_b64": pubkey_b64 })).expect("json"),
+        ))
+        .expect("ch req");
+    let ch_resp = router.clone().oneshot(ch_req).await.expect("ch resp");
+    assert_eq!(ch_resp.status(), StatusCode::OK, "challenge issued");
+    let ch_bytes = axum::body::to_bytes(ch_resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("ch bytes");
+    let ch_json: Value = serde_json::from_slice(&ch_bytes).expect("ch json");
+    let challenge = ai_memory::identity::pubkey_bind::BindChallenge {
+        nonce_b64: ch_json["nonce"].as_str().expect("nonce").to_string(),
+        agent_id: AGENT.to_string(),
+        pubkey_b64: pubkey_b64.clone(),
+        expires_at: ch_json["expires_at"]
+            .as_str()
+            .expect("expires_at")
+            .to_string(),
     };
+    let proof_b64 = ai_memory::identity::pubkey_bind::sign_bind_challenge(signing, &challenge);
+    let put_req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/agents/{AGENT}/pubkey"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", ADMIN_CALLER_10109)
+        .header("x-api-key", ADMIN_TOKEN_10109)
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "pubkey_b64": pubkey_b64,
+                "nonce": challenge.nonce_b64,
+                "proof_b64": proof_b64,
+            }))
+            .expect("json"),
+        ))
+        .expect("put req");
+    let put_resp = router.oneshot(put_req).await.expect("put resp");
+    let status = put_resp.status();
+    let bytes = axum::body::to_bytes(put_resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("put bytes");
+    let body: Value = serde_json::from_slice(&bytes).expect("put json");
+    (status, body)
+}
 
+#[cfg(feature = "sal")]
+#[test]
+#[ignore = "child helper of http_bind_pubkey_armed_store_same_key_noop_and_different_key_refused_10109"]
+fn http_bind_pubkey_armed_child_10109() {
+    use axum::http::StatusCode;
+
+    let db_path = PathBuf::from(std::env::var_os(ENV_HTTP_BIND_10109_DB).expect("db env"));
+    let key_path = PathBuf::from(std::env::var_os(ENV_HTTP_BIND_10109_KEY).expect("key env"));
+    let key_dir = PathBuf::from(std::env::var_os("AI_MEMORY_KEY_DIR").expect("key dir env"));
+
+    let priv_bytes: [u8; 32] = std::fs::read(&key_path)
+        .expect("read K_old")
+        .try_into()
+        .expect("32-byte key");
+    let k_old_signing = ed25519_dalek::SigningKey::from_bytes(&priv_bytes);
+    let k_old = ai_memory::identity::keypair::AgentKeypair {
+        agent_id: AGENT.to_string(),
+        public: k_old_signing.verifying_key(),
+        private: Some(k_old_signing),
+    };
+    let k_new = ai_memory::identity::keypair::generate("attacker-10109").expect("k_new");
+
+    // No session signer installed: verify-only HTTP daemon on an armed store.
+    assert!(ai_memory::identity::session_signer::session_signer().is_none());
+    let router = build_verify_only_http_router_10109(&db_path);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("rt");
 
-    let send_bind = |kp: &ai_memory::identity::keypair::AgentKeypair| {
-        let router = router.clone();
-        let pubkey_b64 = kp.public_base64();
-        let signing = kp.private.clone().expect("private key");
-        rt.block_on(async move {
-            let ch_req = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/agents/{AGENT}/pubkey/challenge"))
-                .header("content-type", "application/json")
-                .header("x-agent-id", ADMIN_CALLER)
-                .header("x-api-key", ADMIN_TOKEN)
-                .body(Body::from(
-                    serde_json::to_vec(&json!({ "pubkey_b64": pubkey_b64 })).expect("json"),
-                ))
-                .expect("ch req");
-            let ch_resp = router.clone().oneshot(ch_req).await.expect("ch resp");
-            assert_eq!(ch_resp.status(), StatusCode::OK, "challenge issued");
-            let ch_bytes = axum::body::to_bytes(ch_resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
-                .await
-                .expect("ch bytes");
-            let ch_json: Value = serde_json::from_slice(&ch_bytes).expect("ch json");
-            let challenge = ai_memory::identity::pubkey_bind::BindChallenge {
-                nonce_b64: ch_json["nonce"].as_str().expect("nonce").to_string(),
-                agent_id: AGENT.to_string(),
-                pubkey_b64: pubkey_b64.clone(),
-                expires_at: ch_json["expires_at"]
-                    .as_str()
-                    .expect("expires_at")
-                    .to_string(),
-            };
-            let proof_b64 = ai_memory::identity::pubkey_bind::sign_bind_challenge(&signing, &challenge);
-            let put_req = Request::builder()
-                .method("PUT")
-                .uri(format!("/api/v1/agents/{AGENT}/pubkey"))
-                .header("content-type", "application/json")
-                .header("x-agent-id", ADMIN_CALLER)
-                .header("x-api-key", ADMIN_TOKEN)
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "pubkey_b64": pubkey_b64,
-                        "nonce": challenge.nonce_b64,
-                        "proof_b64": proof_b64,
-                    }))
-                    .expect("json"),
-                ))
-                .expect("put req");
-            let put_resp = router.oneshot(put_req).await.expect("put resp");
-            let status = put_resp.status();
-            let bytes = axum::body::to_bytes(put_resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
-                .await
-                .expect("put bytes");
-            let body: Value = serde_json::from_slice(&bytes).expect("put json");
-            (status, body)
-        })
-    };
-
-    let before = snapshot_four(&db_path);
-    let anchor = ai_memory::storage::row_attest::anchor::TrustAnchor::load_dir(&key_dir);
+    let before = snapshot_four_tables_10109(&db_path);
+    let anchor = TrustAnchor::load_dir(&key_dir);
 
     // 1. Same-key rebind on armed store with verify-only daemon: 200 OK, zero writes, Clean.
-    let (same_status, same_body) = send_bind(&k_old);
+    let (same_status, same_body) = rt.block_on(send_http_bind_10109(router.clone(), &k_old));
     assert_eq!(
         same_status,
         StatusCode::OK,
@@ -2646,20 +2664,19 @@ fn http_bind_pubkey_armed_child_10109() {
     );
     assert_eq!(same_body, json!({ "bound": true, "agent_id": AGENT }));
     assert_eq!(
-        snapshot_four(&db_path),
+        snapshot_four_tables_10109(&db_path),
         before,
         "same-key rebind on armed store must write zero rows in all four tables"
     );
     let inspect = rusqlite::Connection::open(&db_path).expect("verify db");
     assert_ok(
-        &ai_memory::storage::row_attest::sqlite::verify_sqlite_with(&inspect, &anchor)
-            .expect("verify"),
+        &verify_sqlite_with(&inspect, &anchor).expect("verify"),
         "after armed same-key rebind",
     );
     drop(inspect);
 
     // 2. Different-key rebind on armed store: 403 BIND_PROOF_REFUSED, zero writes, Clean.
-    let (diff_status, diff_body) = send_bind(&k_new);
+    let (diff_status, diff_body) = rt.block_on(send_http_bind_10109(router, &k_new));
     assert_eq!(
         diff_status,
         StatusCode::FORBIDDEN,
@@ -2671,14 +2688,13 @@ fn http_bind_pubkey_armed_child_10109() {
         "different-key refusal body must remain exact BIND_PROOF_REFUSED"
     );
     assert_eq!(
-        snapshot_four(&db_path),
+        snapshot_four_tables_10109(&db_path),
         before,
         "different-key refusal on armed store must write zero rows in all four tables"
     );
     let inspect = rusqlite::Connection::open(&db_path).expect("verify db");
     assert_ok(
-        &ai_memory::storage::row_attest::sqlite::verify_sqlite_with(&inspect, &anchor)
-            .expect("verify"),
+        &verify_sqlite_with(&inspect, &anchor).expect("verify"),
         "after armed different-key refusal",
     );
 }

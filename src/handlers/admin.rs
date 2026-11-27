@@ -361,6 +361,30 @@ fn bind_refused_response() -> axum::response::Response {
         .into_response()
 }
 
+/// #10109 — operator log + forensic audit + opaque #3464 wire refusal when an
+/// HTTP bind targets an agent that already has a bound key. Logs only the
+/// agent id and the succession command (never key bytes, nonce, or proof).
+fn refuse_existing_identity_rebind(
+    caller: &str,
+    agent_id: &str,
+    pubkey: &str,
+) -> axum::response::Response {
+    tracing::warn!(
+        target: "identity.bind.requires_succession",
+        agent_id = %agent_id,
+        "pubkey bind refused: agent already has a bound key; rotate via \
+         `ai-memory identity succeed --agent-id <id>` (#10109)"
+    );
+    record_pubkey_bind_decision(
+        caller,
+        "refuse",
+        agent_id,
+        pubkey,
+        "existing_identity_requires_lineage",
+    );
+    bind_refused_response()
+}
+
 /// #8494 — the bind routes' refusal vocabulary for the shared
 /// [`crate::handlers::admin_role::require_key_bound_admin`] gate.
 const BIND_PRINCIPAL_GATE: crate::handlers::admin_role::PrincipalGate =
@@ -520,14 +544,7 @@ pub async fn bind_agent_pubkey(
             Err(crate::store::StoreError::PermissionDenied { action, .. })
                 if action == BIND_AGENT_PUBKEY_ACTION =>
             {
-                record_pubkey_bind_decision(
-                    &caller,
-                    "refuse",
-                    &agent_id,
-                    &pubkey,
-                    "existing_identity_requires_lineage",
-                );
-                bind_refused_response()
+                refuse_existing_identity_rebind(&caller, &agent_id, &pubkey)
             }
             Err(e) => {
                 record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");
@@ -560,14 +577,7 @@ pub async fn bind_agent_pubkey(
                 if e.downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
                     .is_some() =>
             {
-                record_pubkey_bind_decision(
-                    &caller,
-                    "refuse",
-                    &agent_id,
-                    &pubkey,
-                    "existing_identity_requires_lineage",
-                );
-                bind_refused_response()
+                refuse_existing_identity_rebind(&caller, &agent_id, &pubkey)
             }
             Err(e) => {
                 record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");

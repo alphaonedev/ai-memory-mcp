@@ -756,6 +756,8 @@ async fn postgres_admin_route_security_matrix_3464() {
 /// `agent_pubkey_history` keeps one row.
 #[tokio::test]
 async fn sqlite_same_key_rebind_writes_nothing_10109() {
+    type MemoryRowSnap = (String, String, String, String);
+    type HistoryRowSnap = (i64, String, String, Option<String>);
     let _dir = fresh_dir();
     let (router, file) = build_router_fixture();
     register_target_agent(&router).await;
@@ -803,10 +805,7 @@ async fn sqlite_same_key_rebind_writes_nothing_10109() {
     )
     .expect("stamp sentinel signature on _agents row");
 
-    let snapshot = |c: &rusqlite::Connection| -> (
-        Vec<(String, String, String, String)>,
-        Vec<(i64, String, String, Option<String>)>,
-    ) {
+    let snapshot = |c: &rusqlite::Connection| -> (Vec<MemoryRowSnap>, Vec<HistoryRowSnap>) {
         let mut stmt = c
             .prepare("SELECT id, updated_at, metadata, content FROM memories ORDER BY id")
             .expect("prepare memories");
@@ -1097,7 +1096,12 @@ async fn bind_pubkey_route_existing_identity_refusal_log_child_10109() {
             && line.contains(TARGET_AGENT),
         "operator warn must name ai-memory identity succeed and agent_id: {line}"
     );
-    for forbidden in [&attacker_pub, &victim.public_base64(), &hijack_nonce, &hijack_proof] {
+    for forbidden in [
+        &attacker_pub,
+        &victim.public_base64(),
+        &hijack_nonce,
+        &hijack_proof,
+    ] {
         assert!(
             !line.contains(forbidden.as_str()),
             "operator warn must never log key/nonce/proof material ({forbidden:?}): {line}"

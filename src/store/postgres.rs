@@ -27066,16 +27066,24 @@ impl MemoryStore for PostgresStore {
             .map(str::to_string);
 
         // Append/check history BEFORE changing the flat row. The helper
-        // rechecks the exact witness tuple against locked storage state.
-        self.append_pubkey_version_tx(
-            &mut tx,
-            agent_id,
-            &pubkey_b64,
-            flat_pubkey.as_deref(),
-            &proof,
-            &now,
-        )
-        .await?;
+        // rechecks the exact witness tuple against locked storage state;
+        // `AlreadyBound` short-circuits before any UPDATE memories (#10109).
+        let crate::identity::pubkey_bind::BindAuthorization::WriteRequired(_write_cap) = self
+            .append_pubkey_version_tx(
+                &mut tx,
+                agent_id,
+                &pubkey_b64,
+                flat_pubkey.as_deref(),
+                &proof,
+                &now,
+            )
+            .await?
+        else {
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("bind_agent_pubkey commit tx", e))?;
+            return Ok(());
+        };
 
         if let Some(obj) = meta.as_object_mut() {
             obj.insert(
@@ -27764,15 +27772,23 @@ impl MemoryStore for PostgresStore {
         let successor_pubkey =
             crate::identity::keypair::canonical_public_base64(&record.successor_pubkey_b64)
                 .map_err(|e| invalid(format!("canonicalize lineage successor: {e:#}")))?;
-        self.append_pubkey_version_tx(
-            &mut tx,
-            agent_id,
-            &successor_pubkey,
-            flat_pubkey.as_deref(),
-            &proof,
-            &now_rfc,
-        )
-        .await?;
+        let crate::identity::pubkey_bind::BindAuthorization::WriteRequired(_write_cap) = self
+            .append_pubkey_version_tx(
+                &mut tx,
+                agent_id,
+                &successor_pubkey,
+                flat_pubkey.as_deref(),
+                &proof,
+                &now_rfc,
+            )
+            .await?
+        else {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "lineage append for '{agent_id}' returned AlreadyBound without a write capability"
+                ),
+            });
+        };
         if let Some(obj) = meta.as_object_mut() {
             obj.insert(
                 field_names::AGENT_PUBKEY.to_string(),

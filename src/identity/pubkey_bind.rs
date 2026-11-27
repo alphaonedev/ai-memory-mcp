@@ -235,6 +235,29 @@ pub struct PossessionProof {
     nonce_b64: Option<String>,
 }
 
+/// Single-use private write-capability token issued by
+/// [`PossessionProof::authorize_storage_state`] only when storage state must
+/// change (first bind, legacy backfill, lineage succession, or guardian
+/// recovery, #10109). Deliberately neither `Copy` nor `Clone`.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BindWriteCap(());
+
+/// Outcome of checking a [`PossessionProof`] against locked storage state (#10109).
+///
+/// `AlreadyBound` carries no write capability so both SQLite and PostgreSQL
+/// short-circuit before touching `memories`, `agent_pubkey_history`,
+/// `memory_revisions`, or `row_attestations`.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BindAuthorization {
+    /// The exact candidate key is already the live open history binding and
+    /// flat `_agents` binding; perform zero writes.
+    AlreadyBound,
+    /// Storage state must change; carries the single-use private write capability.
+    WriteRequired(BindWriteCap),
+}
+
 impl PossessionProof {
     /// The authority that admitted this binding.
     #[must_use]
@@ -405,7 +428,7 @@ impl PossessionProof {
         pubkey_b64: &str,
         flat_pubkey_b64: Option<&str>,
         latest_history: Option<(&str, bool)>,
-    ) -> Result<(), BindProofError> {
+    ) -> Result<BindAuthorization, BindProofError> {
         let canonical_pubkey = crate::identity::keypair::canonical_public_base64(pubkey_b64)
             .map_err(|_| BindProofError::BindingNotAuthorized)?;
         if self.agent_id != agent_id || self.pubkey_b64 != canonical_pubkey {
@@ -424,11 +447,13 @@ impl PossessionProof {
 
         match self.authority {
             BindAuthority::PossessionProof => match latest_history {
-                None if flat_pubkey_b64.is_none() || flat_pubkey_b64 == Some(pubkey_b64) => Ok(()),
+                None if flat_pubkey_b64.is_none() || flat_pubkey_b64 == Some(pubkey_b64) => {
+                    Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
+                }
                 Some((latest, true))
                     if latest == pubkey_b64 && flat_pubkey_b64 == Some(pubkey_b64) =>
                 {
-                    Ok(())
+                    Ok(BindAuthorization::AlreadyBound)
                 }
                 None | Some(_) => Err(BindProofError::BindingNotAuthorized),
             },
@@ -438,11 +463,17 @@ impl PossessionProof {
                     .as_deref()
                     .ok_or(BindProofError::BindingNotAuthorized)?;
                 match latest_history {
-                    Some((latest, true)) if latest == predecessor => Ok(()),
-                    None if flat_pubkey_b64 == Some(predecessor) => Ok(()),
+                    Some((latest, true)) if latest == predecessor => {
+                        Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
+                    }
+                    None if flat_pubkey_b64 == Some(predecessor) => {
+                        Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
+                    }
                     // A verified self-signed genesis is the only lineage bind
                     // that may create the first anchor from empty state.
-                    None if flat_pubkey_b64.is_none() && predecessor == pubkey_b64 => Ok(()),
+                    None if flat_pubkey_b64.is_none() && predecessor == pubkey_b64 => {
+                        Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
+                    }
                     None | Some(_) => Err(BindProofError::BindingNotAuthorized),
                 }
             }
@@ -452,8 +483,12 @@ impl PossessionProof {
                     .as_deref()
                     .ok_or(BindProofError::BindingNotAuthorized)?;
                 match latest_history {
-                    Some((latest, _)) if latest == predecessor => Ok(()),
-                    None if flat_pubkey_b64 == Some(predecessor) => Ok(()),
+                    Some((latest, _)) if latest == predecessor => {
+                        Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
+                    }
+                    None if flat_pubkey_b64 == Some(predecessor) => {
+                        Ok(BindAuthorization::WriteRequired(BindWriteCap(())))
+                    }
                     None | Some(_) => Err(BindProofError::BindingNotAuthorized),
                 }
             }
@@ -611,10 +646,54 @@ mod tests {
         let recovery =
             PossessionProof::from_verified_guardian_recovery("ai:alice", &predecessor, &successor)
                 .expect("valid canonical recovery keys");
-        recovery
+        let auth = recovery
             .authorize_storage_state("ai:alice", &successor, None, Some((&predecessor, false)))
             .expect("independently verified guardian recovery may advance the closed head");
+        assert!(matches!(auth, BindAuthorization::WriteRequired(_)));
         assert_eq!(recovery.authority(), BindAuthority::GuardianRecovery);
+    }
+
+    #[test]
+    fn authorize_storage_state_distinguishes_already_bound_from_write_required_10109() {
+        let sk = SigningKey::from_bytes(&[12u8; 32]);
+        let pk = URL_SAFE_NO_PAD.encode(sk.verifying_key().to_bytes());
+        let other_sk = SigningKey::from_bytes(&[13u8; 32]);
+        let other_pk = URL_SAFE_NO_PAD.encode(other_sk.verifying_key().to_bytes());
+        let ch = challenge_for("ai:alice", &pk, &future());
+        let sig = sign_bind_challenge(&sk, &ch);
+        let proof = PossessionProof::verify_challenge_response(consumed(ch), "ai:alice", &pk, &sig)
+            .expect("valid proof");
+
+        // First bind (no history, no flat key) -> WriteRequired.
+        assert!(matches!(
+            proof.authorize_storage_state("ai:alice", &pk, None, None),
+            Ok(BindAuthorization::WriteRequired(_))
+        ));
+        // Legacy flat key with no history -> WriteRequired (must backfill history).
+        assert!(matches!(
+            proof.authorize_storage_state("ai:alice", &pk, Some(&pk), None),
+            Ok(BindAuthorization::WriteRequired(_))
+        ));
+        // Same still-open key in both history and flat projection -> AlreadyBound (zero writes).
+        assert_eq!(
+            proof.authorize_storage_state("ai:alice", &pk, Some(&pk), Some((&pk, true))),
+            Ok(BindAuthorization::AlreadyBound)
+        );
+        // Different open key -> BindingNotAuthorized.
+        assert_eq!(
+            proof.authorize_storage_state(
+                "ai:alice",
+                &pk,
+                Some(&other_pk),
+                Some((&other_pk, true))
+            ),
+            Err(BindProofError::BindingNotAuthorized)
+        );
+        // Closed/revoked same key -> BindingNotAuthorized.
+        assert_eq!(
+            proof.authorize_storage_state("ai:alice", &pk, None, Some((&pk, false))),
+            Err(BindProofError::BindingNotAuthorized)
+        );
     }
 
     #[test]

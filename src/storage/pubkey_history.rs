@@ -174,7 +174,7 @@ pub(super) fn bind_agent_pubkey_no_tx(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    proof
+    let write_cap = match proof
         .authorize_storage_state(
             agent_id,
             pubkey_b64,
@@ -183,8 +183,12 @@ pub(super) fn bind_agent_pubkey_no_tx(
                 .as_ref()
                 .map(|(key, superseded)| (key.as_str(), superseded.is_none())),
         )
-        .map_err(anyhow::Error::new)?;
-    append_agent_pubkey_version(conn, agent_id, pubkey_b64, proof, &now)?;
+        .map_err(anyhow::Error::new)?
+    {
+        crate::identity::pubkey_bind::BindAuthorization::AlreadyBound => return Ok(()),
+        crate::identity::pubkey_bind::BindAuthorization::WriteRequired(cap) => cap,
+    };
+    append_agent_pubkey_version(conn, agent_id, pubkey_b64, proof, write_cap, &now)?;
     // #9259 - the flat projection carries the OPEN history row's `bound_at`,
     // not `now`: a same-key rebind appends no version and keeps the original
     // validity boundary, so writing `now` would move it (and the v102 guard
@@ -521,6 +525,7 @@ fn append_agent_pubkey_version(
     agent_id: &str,
     pubkey_b64: &str,
     proof: &crate::identity::pubkey_bind::PossessionProof,
+    _write_cap: crate::identity::pubkey_bind::BindWriteCap,
     now: &str,
 ) -> Result<()> {
     use rusqlite::OptionalExtension as _;
