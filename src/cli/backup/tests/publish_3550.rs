@@ -234,23 +234,23 @@ fn two_row_live_one_row_snapshot(env: &mut TestEnv, tag: &str) -> (PathBuf, Path
 /// leaks in.
 #[cfg(unix)]
 fn spawn_child_test(test: &str, env: &[(&str, &Path)]) -> std::process::Output {
-    let mut cmd = std::process::Command::new(std::env::current_exe().expect("lib test binary"));
-    cmd.args([
-        "--exact",
-        &format!("cli::backup::tests::publish_3550::{test}"),
-        "--test-threads=1",
-        "--nocapture",
-    ])
-    .env_clear()
-    // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
-    // with a %p pid template) so the child's execution is measured, not lost.
-    .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-    .env("TMPDIR", std::env::temp_dir())
-    .env("AI_MEMORY_NO_CONFIG", "1");
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    cmd.output().expect("spawn the child test")
+    let name = format!("cli::backup::tests::publish_3550::{test}");
+    crate::test_support::SandboxedTestChild::new("cli::backup::publish_3550::spawn_child_test")
+        .configure(|cmd| {
+            cmd.args(["--exact", &name, "--test-threads=1", "--nocapture"])
+                .env_clear()
+                // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
+                // with a %p pid template) so the child's execution is measured, not lost.
+                .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+                .env("TMPDIR", std::env::temp_dir())
+                .env("AI_MEMORY_NO_CONFIG", "1");
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+        })
+        .arm()
+        .run_bounded(crate::test_support::TEST_CHILD_TIMEOUT, &name)
+        .expect("spawn the child test")
 }
 
 /// Env var naming the role a re-executed test plays. Read, never set, in

@@ -76,21 +76,25 @@ fn run_child_in(name: &str, scratch: tempfile::TempDir) {
     let stderr_path = scratch.path().join("stderr");
     let module = module_path!().split_once("::").expect("crate module").1;
     let filter = format!("{module}::{name}");
-    let mut command = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("current lib test binary"),
-        "webhook_tls_8203_tests::run_child",
-    );
-    command
-        .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
-        .env_clear()
-        .env("AI_MEMORY_NO_CONFIG", "1")
-        // The parent owns this Drop guard: child process statics do not drop.
-        .env("TMPDIR", scratch.path())
-        .env(CHILD_SCRATCH, scratch.path())
-        .env(CHILD_ROLE, "1")
-        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-        .stdout(std::fs::File::create(&stdout_path).expect("child stdout"))
-        .stderr(std::fs::File::create(&stderr_path).expect("child stderr"));
+    // The sandbox (HOME, XDG, witness dir) outlives the child: it is dropped
+    // at the end of this function, after the child is reaped.
+    let (mut command, _sandbox) =
+        crate::test_support::SandboxedTestChild::new("webhook_tls_8203_tests::run_child")
+            .configure(|command| {
+                command
+                    .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
+                    .env_clear()
+                    .env("AI_MEMORY_NO_CONFIG", "1")
+                    // The parent owns this Drop guard: child process statics do not drop.
+                    .env("TMPDIR", scratch.path())
+                    .env(CHILD_SCRATCH, scratch.path())
+                    .env(CHILD_ROLE, "1")
+                    .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+                    .stdout(std::fs::File::create(&stdout_path).expect("child stdout"))
+                    .stderr(std::fs::File::create(&stderr_path).expect("child stderr"));
+            })
+            .arm()
+            .into_parts();
     let mut child = ChildProcess(command.spawn().expect("spawn isolated TLS test"));
     let started = Instant::now();
     let status = loop {

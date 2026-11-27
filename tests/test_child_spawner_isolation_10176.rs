@@ -72,24 +72,48 @@ const WHY_PRODUCT_PATH: &str = "product code: resolves the running binary's own 
      an install config entry; it never spawns the executable";
 const WHY_INTEGRATION_CHILD: &str = "integration test binary (its own process, not the lib \
      test binary) that re-runs itself as a child; tracked for the same isolation under the \
-     umbrella issue named in the #10176 PR body, not part of the 14 lib spawners";
+     issue #10183, not part of the 14 lib spawners";
 
 /// `(path, sites, reason)`. A row's count is exact.
 const ALLOWLIST: &[(&str, usize, &str)] = &[
     ("src/cli/install.rs", 1, WHY_PRODUCT_PATH),
     ("tests/audit_signature_pin_l4.rs", 1, WHY_INTEGRATION_CHILD),
     ("tests/common/pg_isolate.rs", 1, WHY_INTEGRATION_CHILD),
-    ("tests/contaminated_stamp_authz_sqlite_item3_f1.rs", 2, WHY_INTEGRATION_CHILD),
-    ("tests/federation_peer_posture_3582.rs", 1, WHY_INTEGRATION_CHILD),
+    (
+        "tests/contaminated_stamp_authz_sqlite_item3_f1.rs",
+        2,
+        WHY_INTEGRATION_CHILD,
+    ),
+    (
+        "tests/federation_peer_posture_3582.rs",
+        1,
+        WHY_INTEGRATION_CHILD,
+    ),
     ("tests/integration.rs", 1, WHY_INTEGRATION_CHILD),
     ("tests/key_dir_isolation_3355.rs", 4, WHY_INTEGRATION_CHILD),
-    ("tests/keypair_write_crash_injection_3146.rs", 1, WHY_INTEGRATION_CHILD),
-    ("tests/link_substrate_visibility_3498.rs", 2, WHY_INTEGRATION_CHILD),
+    (
+        "tests/keypair_write_crash_injection_3146.rs",
+        1,
+        WHY_INTEGRATION_CHILD,
+    ),
+    (
+        "tests/link_substrate_visibility_3498.rs",
+        2,
+        WHY_INTEGRATION_CHILD,
+    ),
     ("tests/pg_isolate_helper_6383.rs", 2, WHY_INTEGRATION_CHILD),
     ("tests/power_loss_durability.rs", 1, WHY_INTEGRATION_CHILD),
-    ("tests/routine_run_authorization_3506.rs", 1, WHY_INTEGRATION_CHILD),
+    (
+        "tests/routine_run_authorization_3506.rs",
+        1,
+        WHY_INTEGRATION_CHILD,
+    ),
     ("tests/row_attestations_10040.rs", 1, WHY_INTEGRATION_CHILD),
-    ("tests/serve_postgres_continuation2.rs", 1, WHY_INTEGRATION_CHILD),
+    (
+        "tests/serve_postgres_continuation2.rs",
+        1,
+        WHY_INTEGRATION_CHILD,
+    ),
     ("tests/skill_promote_test.rs", 1, WHY_INTEGRATION_CHILD),
     ("tests/transcript_extractor.rs", 1, WHY_INTEGRATION_CHILD),
 ];
@@ -236,7 +260,10 @@ fn the_counter_sees_every_form_and_no_literal_10176() {
         // short path
         ("let p = env::current_exe()?;", 1),
         // alias import: the import line itself is a site
-        ("use std::env::current_exe as exe_path;\nlet p = exe_path();", 1),
+        (
+            "use std::env::current_exe as exe_path;\nlet p = exe_path();",
+            1,
+        ),
         // plain import plus a bare call: two sites
         ("use std::env::current_exe;\nlet p = current_exe();", 2),
         // let binding of a fn pointer

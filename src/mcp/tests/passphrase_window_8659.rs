@@ -105,20 +105,20 @@ fn audit_dispatch_holds_passphrase_window_8659() {
     }
     // Only this test runs in the fresh child, so a sibling cannot hold the
     // mutex and manufacture an Excluded result for an unguarded audit reader.
-    let mut command = crate::spawn_audit::audited_command(
-        std::env::current_exe().expect("#8659: locate the lib-test executable"),
-        "mcp::tests::passphrase_window_8659",
-    );
-    command
-        .args(["--exact", EXACT_TEST, "--nocapture", "--test-threads=1"])
-        .env_clear()
-        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
-        .env("TMPDIR", std::env::temp_dir())
-        .env(NO_CONFIG_ENV, "1")
-        .env(CHILD_ROLE, EXACT_TEST);
-    let output = assert_cmd::Command::from_std(command)
-        .timeout(CHILD_TIMEOUT)
-        .output()
+    let output = crate::test_support::SandboxedTestChild::new("mcp::tests::passphrase_window_8659")
+        .configure(|command| {
+            command
+                .args(["--exact", EXACT_TEST, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .envs(
+                    std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)),
+                )
+                .env("TMPDIR", std::env::temp_dir())
+                .env(NO_CONFIG_ENV, "1")
+                .env(CHILD_ROLE, EXACT_TEST);
+        })
+        .arm()
+        .run_bounded(CHILD_TIMEOUT, EXACT_TEST)
         .expect("#8659: execute and reap the bounded audit-reader child");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
