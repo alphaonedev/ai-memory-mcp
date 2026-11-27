@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use ai_memory::db;
 use ai_memory::models::{Memory, MemoryKind, Tier};
 use ai_memory::signed_events::agent_cutover::{
-    AGENT_CUTOVER_AGENT_ID, MarkerOrigin, build_marker, resolve_sqlite_agent_cutover,
+    AGENT_CUTOVER_AGENT_ID, MarkerOrigin, build_signed_marker, resolve_sqlite_agent_cutover,
     signed_marker_payload_hash,
 };
 use ai_memory::signed_events::{
@@ -440,29 +440,37 @@ fn a_tampered_marker_fails_both_walks_10108() {
     );
 }
 
-/// B-5 / S-3 — a second marker-type row makes every marker fail.
+/// B-5 / S-3 — a second marker-type row, built and signed by the shared
+/// constructor, makes every marker fail.
 #[test]
 fn a_second_marker_fails_both_markers_10108() {
     let (_dir, path, conn) = open_db();
     let conn = migrated_over_prefix(&path, conn);
     let first = markers(&conn).pop().expect("marker");
-    let second = build_marker(
-        &first,
+    let _ = sink();
+    let signer = ai_memory::governance::daemon_signer::DaemonChainSigner::provision_default()
+        .expect("daemon key installed");
+    let second: SignedEvent = build_signed_marker(
+        &signer,
+        Some(&first),
         0,
+        MarkerOrigin::Migrate,
         uuid::Uuid::new_v4().to_string(),
         chrono::Utc::now().to_rfc3339(),
     )
+    .map(Into::into)
     .expect("a row above the head");
     conn.execute(
         "INSERT INTO signed_events \
             (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
              prev_hash, sequence, cause_hash) \
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
         params![
             second.id,
             second.agent_id,
             second.event_type,
             second.payload_hash,
+            second.signature,
             second.attest_level,
             second.timestamp,
             second.prev_hash,

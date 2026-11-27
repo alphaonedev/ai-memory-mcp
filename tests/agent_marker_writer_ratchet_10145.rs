@@ -45,10 +45,11 @@
 //! tests in `tests/agent_cutover_v103_10108.rs` (`append` refuses the marker
 //! type, an import refuses a second marker) hold that path.
 //!
-//! Postgres (step 3 of #10108 slice 1): `src/store/postgres/agent_cutover_v103.rs`
-//! still builds the marker with the unsigned `build_marker` (2 sites) and
-//! judges it with the unsigned `resolve` (3 sites). Those rows are in
-//! [`POSTGRES_STEP_3`] by exact count, and step 3 must take both to zero.
+//! Postgres (#10108 lane o): `src/store/postgres/agent_cutover_v103.rs` builds
+//! the marker with the same signed constructor and judges it with the same
+//! verifier as sqlite. The unsigned `build_marker` / `resolve` pair is gone
+//! from the tree: no row of either needle is allowed in any file, and the
+//! needles stay so a return of either is a site.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,10 +60,6 @@ const SRC_DIR: &str = "src";
 const MODULE_DIR: &str = "src/signed_events";
 /// The file-name prefix of the module's own files.
 const MODULE_PREFIX: &str = "agent_cutover";
-/// The defining file of the unsigned pair.
-const DEFINING_FILE: &str = "src/signed_events/agent_cutover.rs";
-/// The postgres file still on the unsigned pair until step 3.
-const POSTGRES_MARKER_FILE: &str = "src/store/postgres/agent_cutover_v103.rs";
 /// The floor of scanned files, so a broken walk cannot pass empty.
 const MIN_SOURCE_FILES: usize = 500;
 
@@ -90,7 +87,7 @@ impl Needle {
     ];
 }
 
-/// Every allowed site outside [`POSTGRES_STEP_3`], by exact count.
+/// Every allowed site, by exact count.
 const ALLOWED: &[(&str, Needle, usize)] = &[
     ("src/cli/boot.rs", Needle::Stamp, 2),
     ("src/cli/doctor.rs", Needle::Stamp, 2),
@@ -156,15 +153,6 @@ const ALLOWED: &[(&str, Needle, usize)] = &[
         1,
     ),
     ("src/store/postgres_inbox_tests.rs", Needle::Stamp, 1),
-];
-
-/// The postgres marker file, allowlisted by exact count until step 3 signs
-/// it; step 3 takes the two unsigned rows to zero.
-const POSTGRES_STEP_3: &[(&str, Needle, usize)] = &[
-    (POSTGRES_MARKER_FILE, Needle::MarkerType, 15),
-    (POSTGRES_MARKER_FILE, Needle::UnsignedBuilder, 2),
-    (POSTGRES_MARKER_FILE, Needle::UnsignedResolve, 3),
-    (POSTGRES_MARKER_FILE, Needle::ChainWrite, 1),
 ];
 
 /// The characters a split or quoted spelling leaves between its halves.
@@ -326,7 +314,6 @@ fn census() -> (BTreeMap<(String, Needle), usize>, usize) {
 fn expected() -> BTreeMap<(String, Needle), usize> {
     ALLOWED
         .iter()
-        .chain(POSTGRES_STEP_3)
         .map(|(f, n, c)| (((*f).to_string(), *n), *c))
         .collect()
 }
@@ -369,28 +356,30 @@ fn marker_and_stamp_sites_are_exactly_the_allowlist_10145() {
     );
 }
 
-/// No sqlite path names the unsigned `build_marker` / `resolve` pair: the
-/// only files are the defining module and the postgres step-3 file.
+/// #10108 lane o — no file names the unsigned `build_marker` / `resolve`
+/// pair: both backends build and judge the marker with the signed pair, and
+/// the allowlist holds no row of either needle.
 #[test]
-fn no_sqlite_path_names_the_unsigned_marker_pair_10145() {
+fn no_file_names_the_unsigned_marker_pair_10108() {
     let (actual, _) = census();
+    let unsigned =
+        |needle: &Needle| matches!(needle, Needle::UnsignedBuilder | Needle::UnsignedResolve);
     let offenders: Vec<String> = actual
         .iter()
-        .filter(|((file, needle), _)| {
-            matches!(needle, Needle::UnsignedBuilder | Needle::UnsignedResolve)
-                && file != DEFINING_FILE
-                && file != POSTGRES_MARKER_FILE
-        })
+        .filter(|((_, needle), _)| unsigned(needle))
         .map(|((file, needle), n)| format!("{file} {needle:?} {n}"))
         .collect();
     assert_eq!(offenders, Vec::<String>::new());
-    for (file, needle, n) in POSTGRES_STEP_3 {
-        assert_eq!(
-            actual.get(&((*file).to_string(), *needle)),
-            Some(n),
-            "{file} {needle:?}: step 3 shrinks this row, never grows it"
-        );
-    }
+    let rows: Vec<&str> = ALLOWED
+        .iter()
+        .filter(|(_, needle, _)| unsigned(needle))
+        .map(|(file, _, _)| *file)
+        .collect();
+    assert_eq!(
+        rows,
+        Vec::<&str>::new(),
+        "no allowlist row of the unsigned pair"
+    );
 }
 
 /// One form of the construct and the needle it must raise.

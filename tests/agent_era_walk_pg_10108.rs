@@ -17,8 +17,8 @@
 use std::sync::OnceLock;
 
 use ai_memory::db;
-use ai_memory::governance::daemon_signer::{self, DaemonDomain};
-use ai_memory::signed_events::agent_cutover::build_marker;
+use ai_memory::governance::daemon_signer::{self, DaemonChainSigner, DaemonDomain};
+use ai_memory::signed_events::agent_cutover::{MarkerOrigin, build_signed_marker};
 use ai_memory::signed_events::agent_era::SourceBinding;
 use ai_memory::signed_events::agent_payload::{
     AgentEventKind, AgentPayloadHash, AgentSignedPayload, AtomisationReceipt,
@@ -35,6 +35,12 @@ use sha2::{Digest, Sha256};
 
 #[path = "common/home_sandbox.rs"]
 mod home_sandbox;
+
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
+/// Scratch database name prefix for this file.
+const SCRATCH_PREFIX: &str = "ai_memory_10108era";
 
 /// The test daemon key.
 const TEST_DAEMON_SEED: [u8; 32] = [0x5d; 32];
@@ -217,12 +223,22 @@ fn fixture(run: &str) -> Fixture {
 }
 
 /// Link `ev` after `head` (as both walks recompute it) and daemon-sign it;
-/// a marker placeholder becomes the v103 marker above `head`.
+/// a marker placeholder becomes the signed v103 marker above `head`, built by
+/// the one shared constructor both backends' writers use.
 fn link(mut ev: SignedEvent, head: Option<&SignedEvent>) -> SignedEvent {
     if ev.event_type == AGENT_CUTOVER_EVENT_TYPE {
         let head = head.expect("a marker sits above a row");
-        return build_marker(head, LEGACY_BELOW_MARKER, ev.id, ev.timestamp)
-            .expect("marker above head");
+        let signer = DaemonChainSigner::provision_default().expect("daemon key installed");
+        return build_signed_marker(
+            &signer,
+            Some(head),
+            LEGACY_BELOW_MARKER,
+            MarkerOrigin::Migrate,
+            ev.id,
+            ev.timestamp,
+        )
+        .map(Into::<SignedEvent>::into)
+        .expect("marker above head");
     }
     let (seq, prev) = head.map_or((1, ZERO_HASH.to_vec()), |h| {
         (
@@ -259,8 +275,9 @@ fn sqlite_leg(run: &str) -> (Vec<Outcome>, AuditTrailReport) {
     let dir = home_sandbox::per_test_dir("agent-era-pg-10108-");
     let conn = db::open(&dir.path().join("era.db")).expect("open db");
     let fx = fixture(run);
-    let mut head = sqlite_head(&conn);
+    clear_chain_sqlite(&conn);
     assert_no_marker(&conn);
+    let mut head = sqlite_head(&conn);
     let mut first_seq = None;
     for ev in fx.rows {
         let ev = link(ev, head.as_ref());
@@ -341,6 +358,13 @@ fn sqlite_head(conn: &rusqlite::Connection) -> Option<SignedEvent> {
     .expect("read sqlite head")
 }
 
+/// #10145 — a fresh database holds its genesis marker; the fixture is its
+/// own whole chain (with the only marker), so the leg starts from no rows.
+fn clear_chain_sqlite(conn: &rusqlite::Connection) {
+    conn.execute("DELETE FROM signed_events", [])
+        .expect("clear sqlite chain");
+}
+
 /// The fixture adds the only marker; a database that already holds one
 /// would make both walks unresolvable.
 fn assert_no_marker(conn: &rusqlite::Connection) {
@@ -394,6 +418,10 @@ async fn pg_leg(pg: &PostgresStore, run: &str) -> (Vec<Outcome>, AuditTrailRepor
     let vk = sink();
     let pool = pg.pool();
     let fx = fixture(run);
+    sqlx::query("DELETE FROM signed_events")
+        .execute(pool)
+        .await
+        .expect("clear pg chain (the genesis marker of a fresh create)");
     let markers: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM signed_events WHERE event_type = $1")
             .bind(AGENT_CUTOVER_EVENT_TYPE)
@@ -474,7 +502,14 @@ async fn agent_era_walk_parity_10108() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset");
         return;
     };
-    let pg = PostgresStore::connect(&url).await.expect("pg connect");
+    // The daemon key first, so the schema create signs with the test key.
+    let _ = sink();
+    let scratch = pg_barrier::ScratchDb::create(&url, SCRATCH_PREFIX)
+        .await
+        .expect("create scratch database");
+    let pg = PostgresStore::connect(&scratch.url())
+        .await
+        .expect("pg connect");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let want: Vec<Outcome> = FIXTURE.iter().map(|(_, o)| *o).collect();
 
