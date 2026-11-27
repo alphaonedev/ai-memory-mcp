@@ -85,7 +85,7 @@ fn v66_rebuild_preserves_governance_rules_and_accepts_escalate_severity() {
     conn.execute("INSERT INTO schema_version (version) VALUES (65)", [])
         .expect("stamp v65");
 
-    super::migrate(&conn).expect("migrate to v66 succeeds");
+    migrate(&conn).expect("migrate to v66 succeeds");
     assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
 
     // (a) the signed row survived verbatim — every column intact.
