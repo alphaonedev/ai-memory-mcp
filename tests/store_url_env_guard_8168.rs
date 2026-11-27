@@ -2419,7 +2419,8 @@ fn unread_inclusion(
     walked: &BTreeSet<&str>,
 ) -> Option<IncludeFinding> {
     let file = path.to_string();
-    if !value.ends_with(".rs") {
+    // Exact, case-sensitive, as the walk reads only `.rs` files.
+    if Path::new(&value).extension().is_none_or(|e| e != "rs") {
         return Some(IncludeFinding::NotRustFile { file, line, value });
     }
     if names == Names::PathAttr && in_inline_mod {
@@ -3884,12 +3885,11 @@ fn lock_static_not_labelled_lock_is_red_10251() {
         let mut table =
             format!("{STATICS_TABLE}{SUPPORT}\t{name}\tatomic: an atomic value of the form\n");
         if *id == "generic-assoc-binding" {
-            // `Box<dyn Iterator<Item = u8>>` holds no lock: an `atomic` row
+            // `Box<dyn Iterator<Item = u8>>` holds no lock: a `once` row
             // is accepted for it, and the `=` of the binding does not end the
             // type of the next static early.
-            table.push_str(&format!(
-                "{SUPPORT}\tFORM_L\tonce: a value computed once, no lock\n"
-            ));
+            table.push_str(SUPPORT);
+            table.push_str("\tFORM_L\tonce: a value computed once, no lock\n");
         }
         let (statics, includes) = token_census(&files, &table);
         assert_eq!(
@@ -3908,7 +3908,8 @@ fn lock_static_not_labelled_lock_is_red_10251() {
         let (files, _) = tree_appended(SUPPORT, tail);
         let mut table = format!("{STATICS_TABLE}{SUPPORT}\tFORM_L\tlock: a lock of the form\n");
         if *id == "generic-assoc-binding" {
-            table.push_str(&format!("{SUPPORT}\tFORM_M\tlock: a lock of the form\n"));
+            table.push_str(SUPPORT);
+            table.push_str("\tFORM_M\tlock: a lock of the form\n");
         }
         let (statics, _) = token_census(&files, &table);
         assert_eq!(statics, Vec::<StaticFinding>::new(), "{id}");
