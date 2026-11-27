@@ -331,4 +331,176 @@ mod tests {
         replace(&target, &rec(5)).expect("a regular seal is replaced");
         assert_eq!(read(&target), SealState::Sealed(rec(5)));
     }
+
+    /// Writers per round of the #10193 concurrency test.
+    const WRITERS_10193: usize = 16;
+    /// Rounds of the #10193 concurrency test.
+    const ROUNDS_10193: i64 = 12;
+    /// How long a seal write is given to (wrongly) finish while another
+    /// holder has the seal lock.
+    const HELD_PROBE_10193: std::time::Duration = std::time::Duration::from_millis(400);
+    /// Upper bound on a seal write once the lock is free.
+    const FREE_BOUND_10193: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn scratch_10193() -> tempfile::TempDir {
+        tempfile::tempdir_in(
+            std::env::var_os("TMPDIR")
+                .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from),
+        )
+        .expect("tempdir")
+    }
+
+    /// The lock file beside a seal: `<seal>.lock` (#10193).
+    fn lock_name_10193(seal: &Path) -> std::path::PathBuf {
+        let mut name = seal.as_os_str().to_os_string();
+        name.push(".lock");
+        std::path::PathBuf::from(name)
+    }
+
+    /// #10193: many writers advance one seal at once, each with its own table
+    /// and a distinct high-water id, released together by a barrier every
+    /// round. After every round the seal verifies (it parses) and holds every
+    /// writer's mark of that round: no advance lowers or drops another's.
+    #[test]
+    fn concurrent_advances_never_lose_a_mark_10193() {
+        let dir = scratch_10193();
+        let seal = dir.path().join(SEAL_DIR).join("db");
+        let seal = std::sync::Arc::new(seal);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS_10193));
+        let done = std::sync::Arc::new(std::sync::Barrier::new(WRITERS_10193));
+        let lost = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let writers: Vec<_> = (0..WRITERS_10193)
+            .map(|i| {
+                let (seal, start, done, lost) = (
+                    std::sync::Arc::clone(&seal),
+                    std::sync::Arc::clone(&start),
+                    std::sync::Arc::clone(&done),
+                    std::sync::Arc::clone(&lost),
+                );
+                std::thread::spawn(move || {
+                    let width = i64::try_from(WRITERS_10193).expect("writers fit i64");
+                    let me = i64::try_from(i).expect("index fits i64");
+                    for round in 0..ROUNDS_10193 {
+                        let mut rec = SealRecord {
+                            high_water: round * width + me,
+                            heads: BTreeMap::new(),
+                        };
+                        rec.heads.insert(format!("t{i:02}"), round);
+                        start.wait();
+                        let wrote = advance(&seal, &rec);
+                        if done.wait().is_leader() {
+                            let mut want = SealRecord {
+                                high_water: round * width + width - 1,
+                                heads: BTreeMap::new(),
+                            };
+                            for w in 0..WRITERS_10193 {
+                                want.heads.insert(format!("t{w:02}"), round);
+                            }
+                            let got = read(&seal);
+                            if got != SealState::Sealed(want.clone()) {
+                                lost.lock()
+                                    .expect("lost list")
+                                    .push(format!("round {round}: {got:?}, want {want:?}"));
+                            }
+                        }
+                        wrote.expect("an advance succeeds");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer thread");
+        }
+        let lost = lost.lock().expect("lost list");
+        assert!(lost.is_empty(), "lost seal marks: {lost:#?}");
+    }
+
+    /// #10193: while another holder has the seal lock, neither `advance` nor
+    /// `replace` writes; each completes once the lock is released.
+    #[cfg(unix)]
+    #[test]
+    fn seal_writes_wait_for_the_seal_lock_10193() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        for (name, write) in rows {
+            let dir = scratch_10193();
+            let seal = dir.path().join(SEAL_DIR).join("db");
+            let rec = |hw: i64| SealRecord {
+                high_water: hw,
+                heads: BTreeMap::new(),
+            };
+            replace(&seal, &rec(1)).expect("first seal");
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_name_10193(&seal))
+                .expect("open the lock file");
+            held.lock().expect("hold the seal lock");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probe_seal = seal.clone();
+            let writer = std::thread::spawn(move || {
+                let out = write(&probe_seal, &rec(9)).map_err(|e| e.to_string());
+                tx.send(out).expect("report");
+            });
+            assert_eq!(
+                rx.recv_timeout(HELD_PROBE_10193),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                "{name} wrote while the seal lock was held"
+            );
+            assert_eq!(read(&seal), SealState::Sealed(rec(1)), "{name}");
+            drop(held);
+            assert_eq!(rx.recv_timeout(FREE_BOUND_10193), Ok(Ok(())), "{name}");
+            writer.join().expect("writer thread");
+            assert_eq!(read(&seal), SealState::Sealed(rec(9)), "{name}");
+        }
+    }
+
+    /// #10193: a seal lock that cannot be taken (a directory or a symlink at
+    /// the lock name) refuses the write with the exact reason and leaves the
+    /// seal as it was: never an unlocked write.
+    #[cfg(unix)]
+    #[test]
+    fn seal_lock_failure_refuses_the_write_10193() {
+        let rows: [(&str, fn(&Path, &SealRecord) -> Result<()>); 2] =
+            [("advance", advance), ("replace", replace)];
+        let plants: [(&str, fn(&Path, &Path)); 2] = [
+            ("directory", |lock, _| {
+                std::fs::create_dir(lock).expect("plant a directory");
+            }),
+            ("symlink", |lock, target| {
+                std::os::unix::fs::symlink(target, lock).expect("plant a symlink");
+            }),
+        ];
+        for (name, write) in rows {
+            for (plant_name, plant) in plants {
+                let dir = scratch_10193();
+                let seal = dir.path().join(SEAL_DIR).join("db");
+                let rec = |hw: i64| SealRecord {
+                    high_water: hw,
+                    heads: BTreeMap::new(),
+                };
+                replace(&seal, &rec(1)).expect("first seal");
+                let lock = lock_name_10193(&seal);
+                let _ = std::fs::remove_file(&lock);
+                plant(&lock, &dir.path().join("elsewhere"));
+                let err = write(&seal, &rec(9)).expect_err("no lock, no write");
+                assert_eq!(
+                    err.to_string(),
+                    format!("opening the row-attestation seal lock {}", lock.display()),
+                    "{name} / {plant_name}"
+                );
+                assert_eq!(
+                    read(&seal),
+                    SealState::Sealed(rec(1)),
+                    "{name} / {plant_name}"
+                );
+                assert!(
+                    !dir.path().join("elsewhere").exists(),
+                    "{name} / {plant_name}: the lock open followed a link"
+                );
+            }
+        }
+    }
 }
