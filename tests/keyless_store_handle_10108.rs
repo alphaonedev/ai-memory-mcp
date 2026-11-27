@@ -10,7 +10,10 @@
 //!   the database directory nor the key directory changes by a byte;
 //! - a keyless `ai-memory --db <stale> serve` on the default profile exits
 //!   non-zero with the exact refusal text, never reports unsigned-link mode
-//!   over the database it could not bump, and leaves the database unchanged.
+//!   over the database it could not bump, and leaves the database unchanged;
+//! - #10179: the same serve under ANOTHER agent id refuses at boot with the
+//!   same typed cause: it neither installs that id's key, nor bumps the
+//!   database with it, nor serves with link signing off.
 //!
 //! One test function: every step shares this process's sandbox key directory
 //! (the cargo `[env]` guard), so the steps must not run in parallel.
@@ -54,6 +57,10 @@ const FLATTENED_PREFIX: &str = "underlying backend error: daemon key missing";
 const SERVE_REFUSAL_DEADLINE: Duration = Duration::from_secs(120);
 /// Poll interval while waiting for the serve child to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// #10179 — an agent id that is not the daemon label.
+const OTHER_AGENT_ID: &str = "agent-10179";
+/// #10179 — the boot refusal context for a partial daemon key.
+const PARTIAL_BOOT_TEXT: &str = "#10179: refusing to start a ledger-writing command as";
 
 fn half(dir: &Path, suffix: &str) -> PathBuf {
     dir.join(format!("{DAEMON_KEYPAIR_LABEL}{suffix}"))
@@ -150,6 +157,7 @@ fn keyless_serve(
     store_url: Option<&str>,
     key_dir: &Path,
     work: &Path,
+    agent_id: &str,
 ) -> (std::process::ExitStatus, String) {
     let sandbox = home_sandbox::install();
     let tls = tls_helper::TestTls::generate(&work.join("tls-10108"));
@@ -174,9 +182,9 @@ fn keyless_serve(
         .env("XDG_CONFIG_HOME", sandbox.home().join(".config"))
         .env("AI_MEMORY_KEY_DIR", key_dir)
         // The boot ensures the resolved agent's key and installs it as the
-        // chain signer (main.rs boot, #3354); naming the daemon label makes
-        // that the public-only daemon key, so the serve is genuinely keyless.
-        .env("AI_MEMORY_AGENT_ID", DAEMON_KEYPAIR_LABEL)
+        // chain signer (main.rs boot, #3354). The daemon label makes that the
+        // public-only daemon key; another id (#10179) would get its own key.
+        .env("AI_MEMORY_AGENT_ID", agent_id)
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_EMBED_OFFLINE", "1")
         .env("HF_HUB_OFFLINE", "1")
@@ -277,7 +285,8 @@ fn a_keyless_adapter_open_and_serve_keep_the_typed_refusal_10108() {
         legs.push((&tip, Some(stale_url.as_str())));
     }
     for (db_arg, url) in legs {
-        let (status, stderr) = keyless_serve(db_arg, url, &key_dir, work.path());
+        let (status, stderr) =
+            keyless_serve(db_arg, url, &key_dir, work.path(), DAEMON_KEYPAIR_LABEL);
         assert!(
             !status.success(),
             "a keyless serve exits non-zero: {stderr}"
@@ -295,6 +304,34 @@ fn a_keyless_adapter_open_and_serve_keep_the_typed_refusal_10108() {
         );
         assert_eq!(snapshot(&key_dir), before_keys, "serve healed no key half");
     }
+
+    // #10179 — a serve as another agent id over the same public-only daemon
+    // key refuses at boot with the typed cause, before it generates that
+    // id's key or bumps the database with it.
+    let (status, stderr) = keyless_serve(&stale, None, &key_dir, work.path(), OTHER_AGENT_ID);
+    assert!(
+        !status.success(),
+        "a serve as {OTHER_AGENT_ID} over a partial daemon key exits non-zero: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{PARTIAL_BOOT_TEXT} `{OTHER_AGENT_ID}`")),
+        "the refusal names the agent id: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("daemon key missing: {PUBLIC_ONLY_TEXT};")),
+        "the typed cause: {stderr}"
+    );
+    assert!(!stderr.contains(UNSIGNED_LINK_WARN), "{stderr}");
+    assert_eq!(
+        snapshot(&stale_dir),
+        before_db,
+        "a serve as {OTHER_AGENT_ID} left the db unchanged"
+    );
+    assert_eq!(
+        snapshot(&key_dir),
+        before_keys,
+        "a serve as {OTHER_AGENT_ID} wrote no key file"
+    );
 
     // Both halves back: the funnel opens and bumps.
     std::fs::rename(aside(&private), &private).expect("restore private");
