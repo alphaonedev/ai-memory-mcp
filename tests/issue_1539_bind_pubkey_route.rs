@@ -1108,3 +1108,525 @@ async fn bind_pubkey_route_existing_identity_refusal_log_child_10109() {
         );
     }
 }
+
+/// #10197 / #10199 (SQLite): enrolling a self-signed genesis lineage record for
+/// an agent whose key is already bound must succeed AND leave `_agents`
+/// (`write_signature`, `attest_level`, `updated_at`, `pubkey_bound_at`,
+/// `content`), `agent_pubkey_history`, `memory_revisions`, and
+/// `row_attestations` completely unchanged (only `agent_lineage` and its
+/// witness event advance).
+#[tokio::test]
+async fn sqlite_genesis_after_bind_preserves_agent_row_10197() {
+    let _dir = fresh_dir();
+    let (router, file) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let kp = valid_keypair();
+    let first_body = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &kp).await;
+    let first_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &first_body))
+        .await
+        .expect("first bind");
+    assert_eq!(first_resp.status(), StatusCode::OK);
+
+    let agent_title = ai_memory::models::agent_registration_title(TARGET_AGENT);
+    let conn = ai_memory::db::open(file.path()).expect("open db");
+    conn.execute(
+        "UPDATE memories
+         SET metadata = json_set(metadata, '$.write_signature', 'sentinel-sig-10197', '$.attest_level', 'agent_attested'),
+             content  = json_set(content,  '$.write_signature', 'sentinel-sig-10197', '$.attest_level', 'agent_attested')
+         WHERE namespace = '_agents' AND title = ?1",
+        [&agent_title],
+    )
+    .expect("stamp sentinel write_signature");
+
+    let snap = |c: &rusqlite::Connection| {
+        let agent_row: (String, String, String) = c
+            .query_row(
+                "SELECT updated_at, metadata, content FROM memories WHERE namespace = '_agents' AND title = ?1",
+                [&agent_title],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("agent row");
+        let counts: (i64, i64, i64, i64) = (
+            c.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .expect("memories count"),
+            c.query_row(
+                "SELECT COUNT(*) FROM agent_pubkey_history WHERE agent_id = ?1",
+                [TARGET_AGENT],
+                |r| r.get(0),
+            )
+            .expect("history count"),
+            c.query_row("SELECT COUNT(*) FROM memory_revisions", [], |r| r.get(0))
+                .expect("revisions count"),
+            c.query_row("SELECT COUNT(*) FROM row_attestations", [], |r| r.get(0))
+                .expect("attestations count"),
+        );
+        (agent_row, counts)
+    };
+    let before = snap(&conn);
+    assert_eq!(before.1.1, 1, "one history row after initial bind");
+
+    std::thread::sleep(std::time::Duration::from_millis(15));
+
+    let recovery_kp =
+        ai_memory::identity::keypair::generate("recovery-10197").expect("recovery keypair");
+    let record = ai_memory::db::enroll_lineage(
+        &conn,
+        TARGET_AGENT,
+        &kp,
+        Some(&recovery_kp.public_base64()),
+    )
+    .expect("#10197: genesis after same-key bind must succeed on SQLite");
+    assert_eq!(record.epoch, 0);
+
+    let after = snap(&conn);
+    assert_eq!(
+        after.0, before.0,
+        "#10197: SQLite same-key genesis must leave _agents row byte-equal (write_signature, attest_level, updated_at, pubkey_bound_at unchanged)"
+    );
+    assert_eq!(
+        after.1, before.1,
+        "#10197: SQLite same-key genesis must not change row counts in memories, agent_pubkey_history, memory_revisions, or row_attestations"
+    );
+    let lineage_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_lineage WHERE agent_id = ?1",
+            [TARGET_AGENT],
+            |r| r.get(0),
+        )
+        .expect("lineage count");
+    assert_eq!(lineage_count, 1, "genesis lineage row recorded");
+}
+
+/// #10196 / #10198 & #10197 / #10199 (PostgreSQL): recording a self-signed
+/// genesis lineage record on an already-bound agent MUST succeed on PostgreSQL
+/// (matching SQLite) AND leave `_agents` (`write_signature`, `attest_level`,
+/// `updated_at`, `pubkey_bound_at`, `content`), `agent_pubkey_history`,
+/// `memory_revisions`, and `row_attestations` byte-identical.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_genesis_after_bind_succeeds_and_preserves_agent_row_10196() {
+    use ai_memory::store::{CallerContext, MemoryStore as _};
+
+    let (mut state, _file) = build_app_fixture();
+    let url =
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");
+    let pg_store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("own PG database");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("inspect PG pool");
+    let store_arc = Arc::new(pg_store);
+    state.store = Arc::clone(&store_arc) as Arc<dyn ai_memory::store::MemoryStore>;
+    state.storage_backend = ai_memory::handlers::StorageBackend::Postgres;
+    let router = router_for_state(state);
+
+    let agent = format!("ai:pg-genesis-10196-{}", uuid::Uuid::new_v4());
+    let reg_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/agents")
+        .header("content-type", "application/json")
+        .header("x-agent-id", ADMIN_CALLER)
+        .header("x-api-key", ADMIN_TOKEN)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "agent_id": agent,
+                "agent_type": "ai:test",
+            }))
+            .expect("json"),
+        ))
+        .expect("reg req");
+    let reg_resp = router.clone().oneshot(reg_req).await.expect("reg resp");
+    assert_eq!(reg_resp.status(), StatusCode::CREATED);
+
+    let kp = valid_keypair();
+    let first_body = proved_bind_body(&router, &agent, ADMIN_CALLER, &kp).await;
+    let first_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(&agent, ADMIN_CALLER, &first_body))
+        .await
+        .expect("first bind");
+    assert_eq!(first_resp.status(), StatusCode::OK);
+
+    let agent_title = ai_memory::models::agent_registration_title(&agent);
+    sqlx::query(
+        "UPDATE memories
+         SET metadata = jsonb_set(jsonb_set(metadata, '{write_signature}', '\"sentinel-pg-10196\"'::jsonb, true), '{attest_level}', '\"agent_attested\"'::jsonb, true),
+             content  = (jsonb_set(jsonb_set(content::jsonb, '{write_signature}', '\"sentinel-pg-10196\"'::jsonb, true), '{attest_level}', '\"agent_attested\"'::jsonb, true))::text
+         WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .execute(&pool)
+    .await
+    .expect("stamp sentinel sig");
+
+    let before_row: (String, serde_json::Value, String) = sqlx::query_as(
+        "SELECT updated_at::text, metadata, content FROM memories WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .fetch_one(&pool)
+    .await
+    .expect("before _agents row");
+    let before_hist: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT version, pubkey_b64, bound_at::text, superseded_at::text
+         FROM agent_pubkey_history WHERE agent_id = $1 ORDER BY version",
+    )
+    .bind(&agent)
+    .fetch_all(&pool)
+    .await
+    .expect("before history");
+    let before_rev_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_revisions")
+        .fetch_one(&pool)
+        .await
+        .expect("before revisions");
+    let before_attest_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM row_attestations")
+        .fetch_one(&pool)
+        .await
+        .expect("before attestations");
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let genesis = ai_memory::identity::lineage::LineageRecord::genesis(
+        &agent,
+        &kp.public_base64(),
+        None,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    let sig_input = genesis.signing_input().expect("signing input");
+    let sig = ed25519_dalek::Signer::sign(kp.private.as_ref().expect("private key"), &sig_input)
+        .to_bytes()
+        .to_vec();
+    let ctx = CallerContext::for_admin(ADMIN_CALLER);
+    store_arc
+        .append_lineage_record(&ctx, &agent, &genesis, &sig)
+        .await
+        .expect("#10196: PostgreSQL genesis after same-key bind must succeed");
+
+    let after_row: (String, serde_json::Value, String) = sqlx::query_as(
+        "SELECT updated_at::text, metadata, content FROM memories WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .fetch_one(&pool)
+    .await
+    .expect("after _agents row");
+    let after_hist: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT version, pubkey_b64, bound_at::text, superseded_at::text
+         FROM agent_pubkey_history WHERE agent_id = $1 ORDER BY version",
+    )
+    .bind(&agent)
+    .fetch_all(&pool)
+    .await
+    .expect("after history");
+    let after_rev_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_revisions")
+        .fetch_one(&pool)
+        .await
+        .expect("after revisions");
+    let after_attest_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM row_attestations")
+        .fetch_one(&pool)
+        .await
+        .expect("after attestations");
+    let (lineage_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM agent_lineage WHERE agent_id = $1")
+            .bind(&agent)
+            .fetch_one(&pool)
+            .await
+            .expect("lineage count");
+    assert_eq!(lineage_count, 1, "genesis lineage row recorded on PG");
+    assert_eq!(
+        after_row, before_row,
+        "#10196/#10197: PostgreSQL same-key genesis must leave _agents byte-equal"
+    );
+    assert_eq!(
+        after_hist, before_hist,
+        "#10196: PostgreSQL same-key genesis must leave agent_pubkey_history unchanged"
+    );
+    assert_eq!(
+        after_rev_count, before_rev_count,
+        "#10196: PostgreSQL same-key genesis must emit zero memory_revisions rows"
+    );
+    assert_eq!(
+        after_attest_count, before_attest_count,
+        "#10196: PostgreSQL same-key genesis must write zero row_attestations rows"
+    );
+}
+
+/// #10109 r1 item 6 (PostgreSQL matrix cells with attestation rows present):
+/// admin same-key rebind (200, zero writes), admin different-key rebind
+/// (opaque 403, zero writes), and non-admin bind attempt (403, zero writes)
+/// all leave `_agents`, `agent_pubkey_history`, `memory_revisions`, and
+/// `row_attestations` unchanged.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_armed_bind_matrix_admin_and_non_admin_10109() {
+    let (mut state, _file) = build_app_fixture();
+    let url =
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");
+    let pg_store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("own PG database");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("inspect PG pool");
+    let non_admin_caller = "ai:non-admin-pg-10109";
+    let non_admin_token = "10109-non-admin-pg-token-0123456789abcdef";
+    state.enrolled_agent_keys.mutate(|m| {
+        m.insert(
+            ai_memory::handlers::identity_binding::api_key_sha256_hex(non_admin_token),
+            non_admin_caller.to_string(),
+        );
+    });
+    state.store = Arc::new(pg_store);
+    state.storage_backend = ai_memory::handlers::StorageBackend::Postgres;
+    let router = router_for_state(state);
+
+    let agent = format!("ai:pg-armed-10109-{}", uuid::Uuid::new_v4());
+    let reg_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/agents")
+        .header("content-type", "application/json")
+        .header("x-agent-id", ADMIN_CALLER)
+        .header("x-api-key", ADMIN_TOKEN)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "agent_id": agent,
+                "agent_type": "ai:test",
+            }))
+            .expect("json"),
+        ))
+        .expect("reg req");
+    assert_eq!(
+        router.clone().oneshot(reg_req).await.expect("reg").status(),
+        StatusCode::CREATED
+    );
+
+    let kp = valid_keypair();
+    let first_body = proved_bind_body(&router, &agent, ADMIN_CALLER, &kp).await;
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(put_pubkey_body(&agent, ADMIN_CALLER, &first_body))
+            .await
+            .expect("bind")
+            .status(),
+        StatusCode::OK
+    );
+
+    // Seed an armed-store sentinel row in `row_attestations` so PG armed table
+    // presence is exercised alongside `_agents`, `agent_pubkey_history`, and
+    // `memory_revisions`.
+    let agent_title = ai_memory::models::agent_registration_title(&agent);
+    let before_row: (String, serde_json::Value, String) = sqlx::query_as(
+        "SELECT updated_at::text, metadata, content FROM memories WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .fetch_one(&pool)
+    .await
+    .expect("before _agents");
+    let before_hist: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM agent_pubkey_history WHERE agent_id = $1")
+            .bind(&agent)
+            .fetch_one(&pool)
+            .await
+            .expect("before hist");
+    let before_rev: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_revisions")
+        .fetch_one(&pool)
+        .await
+        .expect("before rev");
+    let before_att: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM row_attestations")
+        .fetch_one(&pool)
+        .await
+        .expect("before att");
+
+    // 1. Admin same-key rebind -> 200 OK, zero writes.
+    let same_body = proved_bind_body(&router, &agent, ADMIN_CALLER, &kp).await;
+    let same_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(&agent, ADMIN_CALLER, &same_body))
+        .await
+        .expect("same");
+    assert_eq!(same_resp.status(), StatusCode::OK);
+
+    // 2. Admin different-key rebind -> opaque 403 BIND_PROOF_REFUSED, zero writes.
+    let other_kp = ai_memory::identity::keypair::generate("pg-other-10109").expect("other kp");
+    let diff_body = proved_bind_body(&router, &agent, ADMIN_CALLER, &other_kp).await;
+    let diff_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(&agent, ADMIN_CALLER, &diff_body))
+        .await
+        .expect("diff");
+    assert_eq!(diff_resp.status(), StatusCode::FORBIDDEN);
+    let diff_bytes = axum::body::to_bytes(diff_resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("bytes");
+    let diff_json: serde_json::Value = serde_json::from_slice(&diff_bytes).expect("json");
+    assert_eq!(
+        diff_json,
+        serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED })
+    );
+
+    // 3. Non-admin bind attempt -> 403 refusal, zero writes.
+    let non_admin_req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/agents/{agent}/pubkey"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", non_admin_caller)
+        .header("x-api-key", non_admin_token)
+        .body(Body::from(serde_json::to_vec(&diff_body).expect("json")))
+        .expect("non-admin req");
+    let non_admin_resp = router.oneshot(non_admin_req).await.expect("non-admin resp");
+    assert_eq!(non_admin_resp.status(), StatusCode::FORBIDDEN);
+
+    let after_row: (String, serde_json::Value, String) = sqlx::query_as(
+        "SELECT updated_at::text, metadata, content FROM memories WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .fetch_one(&pool)
+    .await
+    .expect("after _agents");
+    let after_hist: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM agent_pubkey_history WHERE agent_id = $1")
+            .bind(&agent)
+            .fetch_one(&pool)
+            .await
+            .expect("after hist");
+    let after_rev: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_revisions")
+        .fetch_one(&pool)
+        .await
+        .expect("after rev");
+    let after_att: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM row_attestations")
+        .fetch_one(&pool)
+        .await
+        .expect("after att");
+    assert_eq!(after_row, before_row, "PG matrix: _agents unchanged");
+    assert_eq!(after_hist, before_hist, "PG matrix: history unchanged");
+    assert_eq!(after_rev, before_rev, "PG matrix: revisions unchanged");
+    assert_eq!(after_att, before_att, "PG matrix: attestations unchanged");
+}
+
+/// #10109 r1 item 5: when an agent's key history head is closed/revoked, the
+/// HTTP wire response stays the exact opaque 403 `BIND_PROOF_REFUSED`, while
+/// the internal operator warn log names the exact closed-history recovery cause
+/// (never claiming "agent already has a bound key").
+#[test]
+fn bind_pubkey_route_closed_history_logs_exact_recovery_reason_10109() {
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "bind_pubkey_route_closed_history_log_child_10109",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .expect("spawn closed-history log child");
+    assert!(
+        out.status.success(),
+        "closed-history log child failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[ignore = "child helper of bind_pubkey_route_closed_history_logs_exact_recovery_reason_10109"]
+async fn bind_pubkey_route_closed_history_log_child_10109() {
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct GuardWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for GuardWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = GuardWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            GuardWriter(Arc::clone(&self.0))
+        }
+    }
+
+    let buf = SharedBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(buf.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let _dir = fresh_dir();
+    let (router, file) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let kp = valid_keypair();
+    let bootstrap = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &kp).await;
+    let ok_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &bootstrap))
+        .await
+        .expect("bootstrap");
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    // Close the history head (revoked/superseded state).
+    let conn = ai_memory::db::open(file.path()).expect("open db");
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_pubkey_history SET superseded_at = ?1 WHERE agent_id = ?2 AND superseded_at IS NULL",
+        rusqlite::params![&now, TARGET_AGENT],
+    )
+    .expect("close history head");
+    drop(conn);
+
+    let attempt = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &kp).await;
+    let resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &attempt))
+        .await
+        .expect("closed history bind");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("body bytes");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED }),
+        "closed-history refusal wire body must stay opaque BIND_PROOF_REFUSED"
+    );
+
+    let captured = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+    let matching_lines: Vec<&str> = captured
+        .lines()
+        .filter(|l| l.contains("identity.bind.requires_succession"))
+        .collect();
+    assert_eq!(
+        matching_lines.len(),
+        1,
+        "expected one warn event on identity.bind.requires_succession; captured:\n{captured}"
+    );
+    let line = matching_lines[0];
+    assert!(
+        !line.contains("agent already has a bound key"),
+        "#10109 item 5: closed/revoked history must NOT log 'agent already has a bound key': {line}"
+    );
+    assert!(
+        line.contains("closed") || line.contains("recovery"),
+        "#10109 item 5: closed/revoked history warn must name closed/recovery cause: {line}"
+    );
+}

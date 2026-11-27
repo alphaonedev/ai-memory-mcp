@@ -2388,9 +2388,7 @@ fn rotation_keeps_history_verifiable_and_never_re_signs_10089() {
     assert_ok(&sb.report(), "after the archive is restored");
 }
 
-#[cfg(feature = "sal")]
 const ENV_HTTP_BIND_10109_DB: &str = "AI_MEMORY_TEST_HTTP_BIND_10109_DB";
-#[cfg(feature = "sal")]
 const ENV_HTTP_BIND_10109_KEY: &str = "AI_MEMORY_TEST_HTTP_BIND_10109_KEY";
 
 /// #10109: on an armed SQLite store served by a verify-only HTTP daemon (no
@@ -2402,7 +2400,9 @@ const ENV_HTTP_BIND_10109_KEY: &str = "AI_MEMORY_TEST_HTTP_BIND_10109_KEY";
 /// 2. Different-key HTTP rebind (`K_old -> K_new`) returns HTTP 403 with exact
 ///    `BIND_PROOF_REFUSED`, writes nothing across all four tables, and leaves
 ///    `verify_sqlite_with` Clean.
-#[cfg(feature = "sal")]
+/// 3. Non-admin HTTP bind attempt returns HTTP 403, writes nothing across all
+///    four tables, and leaves `verify_sqlite_with` Clean (#10109 r1 item 6).
+/// Runs under BOTH `--features sal` and default (non-SAL) builds (#10109 r1 item 6).
 #[test]
 fn http_bind_pubkey_armed_store_same_key_noop_and_different_key_refused_10109() {
     let (sb, old_key_file, mut mcp) = armed();
@@ -2439,12 +2439,11 @@ fn http_bind_pubkey_armed_store_same_key_noop_and_different_key_refused_10109() 
     );
 }
 
-#[cfg(feature = "sal")]
 const ADMIN_CALLER_10109: &str = "ai:ops-admin-10109";
-#[cfg(feature = "sal")]
 const ADMIN_TOKEN_10109: &str = "10109-admin-per-agent-token-0123456789abcdef";
+const NON_ADMIN_CALLER_10109: &str = "ai:non-admin-10109";
+const NON_ADMIN_TOKEN_10109: &str = "10109-non-admin-token-0123456789abcdef";
 
-#[cfg(feature = "sal")]
 #[derive(Debug, PartialEq, Eq)]
 struct FourTableSnapshot {
     memories: Vec<(String, String, String, String)>,
@@ -2453,7 +2452,6 @@ struct FourTableSnapshot {
     attestations: Vec<Attestation>,
 }
 
-#[cfg(feature = "sal")]
 fn snapshot_four_tables_10109(path: &Path) -> FourTableSnapshot {
     let c = rusqlite::Connection::open(path).expect("inspect db");
     let memories = c
@@ -2490,7 +2488,6 @@ fn snapshot_four_tables_10109(path: &Path) -> FourTableSnapshot {
     }
 }
 
-#[cfg(feature = "sal")]
 fn build_verify_only_http_router_10109(db_path: &Path) -> axum::Router {
     use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
     use ai_memory::handlers::{ApiKeyState, AppState, Db};
@@ -2499,10 +2496,16 @@ fn build_verify_only_http_router_10109(db_path: &Path) -> axum::Router {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
     registry.mutate(|m| {
-        *m = std::collections::HashMap::from([(
-            ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN_10109),
-            ADMIN_CALLER_10109.to_string(),
-        )]);
+        *m = std::collections::HashMap::from([
+            (
+                ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN_10109),
+                ADMIN_CALLER_10109.to_string(),
+            ),
+            (
+                ai_memory::handlers::identity_binding::api_key_sha256_hex(NON_ADMIN_TOKEN_10109),
+                NON_ADMIN_CALLER_10109.to_string(),
+            ),
+        ]);
     });
     let conn = ai_memory::db::open(db_path).expect("open db");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
@@ -2511,6 +2514,7 @@ fn build_verify_only_http_router_10109(db_path: &Path) -> axum::Router {
         ResolvedTtl::default(),
         true,
     )));
+    #[cfg(feature = "sal")]
     let store: Arc<dyn ai_memory::store::MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(db_path).expect("SqliteStore"));
     let app_state = AppState {
@@ -2525,6 +2529,7 @@ fn build_verify_only_http_router_10109(db_path: &Path) -> axum::Router {
         active_keypair: Arc::new(None),
         family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
         storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
+        #[cfg(feature = "sal")]
         store,
         llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
@@ -2561,7 +2566,6 @@ fn build_verify_only_http_router_10109(db_path: &Path) -> axum::Router {
     )
 }
 
-#[cfg(feature = "sal")]
 async fn send_http_bind_10109(
     router: axum::Router,
     kp: &ai_memory::identity::keypair::AgentKeypair,
@@ -2622,7 +2626,6 @@ async fn send_http_bind_10109(
     (status, body)
 }
 
-#[cfg(feature = "sal")]
 #[test]
 #[ignore = "child helper of http_bind_pubkey_armed_store_same_key_noop_and_different_key_refused_10109"]
 fn http_bind_pubkey_armed_child_10109() {
@@ -2676,7 +2679,7 @@ fn http_bind_pubkey_armed_child_10109() {
     drop(inspect);
 
     // 2. Different-key rebind on armed store: 403 BIND_PROOF_REFUSED, zero writes, Clean.
-    let (diff_status, diff_body) = rt.block_on(send_http_bind_10109(router, &k_new));
+    let (diff_status, diff_body) = rt.block_on(send_http_bind_10109(router.clone(), &k_new));
     assert_eq!(
         diff_status,
         StatusCode::FORBIDDEN,
@@ -2696,6 +2699,45 @@ fn http_bind_pubkey_armed_child_10109() {
     assert_ok(
         &verify_sqlite_with(&inspect, &anchor).expect("verify"),
         "after armed different-key refusal",
+    );
+    drop(inspect);
+
+    // 3. Non-admin caller on armed store (#10109 r1 item 6): 403, zero writes, Clean.
+    let non_admin_status = rt.block_on(async {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/agents/{AGENT}/pubkey"))
+            .header("content-type", "application/json")
+            .header("x-agent-id", NON_ADMIN_CALLER_10109)
+            .header("x-api-key", NON_ADMIN_TOKEN_10109)
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "pubkey_b64": k_old.public_base64(),
+                    "nonce": "non-admin-nonce",
+                    "proof_b64": "non-admin-proof",
+                }))
+                .expect("json"),
+            ))
+            .expect("non-admin req");
+        router.oneshot(req).await.expect("non-admin resp").status()
+    });
+    assert_eq!(
+        non_admin_status,
+        StatusCode::FORBIDDEN,
+        "non-admin bind attempt on armed store must return 403"
+    );
+    assert_eq!(
+        snapshot_four_tables_10109(&db_path),
+        before,
+        "non-admin refusal on armed store must write zero rows in all four tables"
+    );
+    let inspect = rusqlite::Connection::open(&db_path).expect("verify db");
+    assert_ok(
+        &verify_sqlite_with(&inspect, &anchor).expect("verify"),
+        "after armed non-admin refusal",
     );
 }
 
