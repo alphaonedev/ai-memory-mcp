@@ -748,3 +748,359 @@ async fn postgres_admin_route_security_matrix_3464() {
     state.storage_backend = ai_memory::handlers::StorageBackend::Postgres;
     public_bind_matrix(state).await;
 }
+
+/// #10109 (A2, SQLite): an idempotent same-key HTTP rebind changes nothing and
+/// must execute zero writes — every row's `write_signature`, `updated_at`,
+/// `metadata`, and `content` (both the `_agents` registration row and signed
+/// user memories) stays byte-identical before and after, and
+/// `agent_pubkey_history` keeps one row.
+#[tokio::test]
+async fn sqlite_same_key_rebind_writes_nothing_10109() {
+    let _dir = fresh_dir();
+    let (router, file) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let kp = valid_keypair();
+    let first_body = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &kp).await;
+    let first_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &first_body))
+        .await
+        .expect("first bind response");
+    assert_eq!(first_resp.status(), StatusCode::OK);
+
+    // Write a signed regular memory row AND stamp a write_signature on the
+    // `_agents` registration row so any `UPDATE memories` is immediately visible
+    // via both `updated_at` and `write_signature`.
+    let agent_title = ai_memory::models::agent_registration_title(TARGET_AGENT);
+    let conn = ai_memory::db::open(file.path()).expect("open db");
+    let now = ai_memory::identity::attest::now_attestable_rfc3339();
+    let mut signed_mem = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: "rebind-noop-10109".to_string(),
+        title: "signed row 10109".to_string(),
+        content: "signed body that must remain byte-identical across same-key rebind".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({
+            "agent_id": TARGET_AGENT,
+            "attest_level": "agent_attested",
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let sig = ai_memory::identity::attest::sign_memory_write(&kp, &signed_mem, TARGET_AGENT)
+        .expect("sign memory");
+    ai_memory::identity::attest::persist_write_signature(&mut signed_mem, &sig);
+    ai_memory::db::insert(&conn, &signed_mem).expect("insert signed memory");
+    // Stamp a write_signature marker on the `_agents` row (preserving the
+    // authoritative agent_pubkey / pubkey_bound_at projection).
+    conn.execute(
+        "UPDATE memories
+         SET metadata = json_set(metadata, '$.write_signature', 'sentinel-sig-10109', '$.attest_level', 'agent_attested'),
+             content  = json_set(content,  '$.write_signature', 'sentinel-sig-10109', '$.attest_level', 'agent_attested')
+         WHERE namespace = ?1 AND title = ?2",
+        rusqlite::params![ai_memory::models::AGENTS_NAMESPACE, &agent_title],
+    )
+    .expect("stamp sentinel signature on _agents row");
+
+    let snapshot = |c: &rusqlite::Connection| -> (
+        Vec<(String, String, String, String)>,
+        Vec<(i64, String, String, Option<String>)>,
+    ) {
+        let mut stmt = c
+            .prepare("SELECT id, updated_at, metadata, content FROM memories ORDER BY id")
+            .expect("prepare memories");
+        let memories = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query memories")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect memories");
+        let mut hstmt = c
+            .prepare(
+                "SELECT version, pubkey_b64, bound_at, superseded_at
+                 FROM agent_pubkey_history WHERE agent_id = ?1 ORDER BY version",
+            )
+            .expect("prepare history");
+        let history = hstmt
+            .query_map([TARGET_AGENT], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .expect("query history")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect history");
+        (memories, history)
+    };
+    let before = snapshot(&conn);
+    assert_eq!(before.1.len(), 1, "one history row after first bind");
+    drop(conn);
+
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    let rebind_body = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &kp).await;
+    let rebind_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &rebind_body))
+        .await
+        .expect("rebind response");
+    assert_eq!(rebind_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(rebind_resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("rebind body bytes");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("rebind json");
+    assert_eq!(
+        body,
+        serde_json::json!({ "bound": true, "agent_id": TARGET_AGENT }),
+        "same-key rebind returns the exact same success payload as first bind"
+    );
+
+    let conn = ai_memory::db::open(file.path()).expect("reopen db");
+    let after = snapshot(&conn);
+    assert_eq!(
+        after.0, before.0,
+        "same-key HTTP rebind must write nothing to memories (updated_at, write_signature, metadata, content byte-identical)"
+    );
+    assert_eq!(
+        after.1, before.1,
+        "same-key HTTP rebind must write nothing to agent_pubkey_history"
+    );
+}
+
+/// #10109 (A2, PostgreSQL): live PostgreSQL parity for same-key HTTP rebind
+/// writing nothing to `memories` or `agent_pubkey_history`.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_same_key_rebind_writes_nothing_10109() {
+    let (mut state, _file) = build_app_fixture();
+    let url =
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");
+    let pg_store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("own PG database");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("inspect PG pool");
+    state.store = Arc::new(pg_store);
+    state.storage_backend = ai_memory::handlers::StorageBackend::Postgres;
+    let router = router_for_state(state);
+
+    let agent = format!("ai:pg-rebind-noop-10109-{}", uuid::Uuid::new_v4());
+    let reg_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/agents")
+        .header("content-type", "application/json")
+        .header("x-agent-id", ADMIN_CALLER)
+        .header("x-api-key", ADMIN_TOKEN)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "agent_id": agent,
+                "agent_type": "ai:test",
+            }))
+            .expect("json"),
+        ))
+        .expect("reg req");
+    let reg_resp = router.clone().oneshot(reg_req).await.expect("reg resp");
+    assert_eq!(reg_resp.status(), StatusCode::CREATED);
+
+    let kp = valid_keypair();
+    let first_body = proved_bind_body(&router, &agent, ADMIN_CALLER, &kp).await;
+    let first_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(&agent, ADMIN_CALLER, &first_body))
+        .await
+        .expect("first bind");
+    assert_eq!(first_resp.status(), StatusCode::OK);
+
+    let agent_title = ai_memory::models::agent_registration_title(&agent);
+    // Stamp a write_signature sentinel on the `_agents` row so any UPDATE
+    // rewriting metadata/content or moving updated_at is caught immediately.
+    sqlx::query(
+        "UPDATE memories
+         SET metadata = jsonb_set(jsonb_set(metadata, '{write_signature}', '\"sentinel-pg-10109\"'::jsonb, true), '{attest_level}', '\"agent_attested\"'::jsonb, true),
+             content  = (jsonb_set(jsonb_set(content::jsonb, '{write_signature}', '\"sentinel-pg-10109\"'::jsonb, true), '{attest_level}', '\"agent_attested\"'::jsonb, true))::text
+         WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .execute(&pool)
+    .await
+    .expect("stamp sentinel sig on PG _agents row");
+
+    let before_row: (String, serde_json::Value, String) = sqlx::query_as(
+        "SELECT updated_at::text, metadata, content FROM memories WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .fetch_one(&pool)
+    .await
+    .expect("before _agents row");
+    let before_hist: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT version, pubkey_b64, bound_at::text, superseded_at::text
+         FROM agent_pubkey_history WHERE agent_id = $1 ORDER BY version",
+    )
+    .bind(&agent)
+    .fetch_all(&pool)
+    .await
+    .expect("before history");
+    assert_eq!(before_hist.len(), 1, "one history row after first bind");
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let rebind_body = proved_bind_body(&router, &agent, ADMIN_CALLER, &kp).await;
+    let rebind_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(&agent, ADMIN_CALLER, &rebind_body))
+        .await
+        .expect("rebind resp");
+    assert_eq!(rebind_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(rebind_resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("bytes");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        body,
+        serde_json::json!({ "bound": true, "agent_id": agent })
+    );
+
+    let after_row: (String, serde_json::Value, String) = sqlx::query_as(
+        "SELECT updated_at::text, metadata, content FROM memories WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ai_memory::models::AGENTS_NAMESPACE)
+    .bind(&agent_title)
+    .fetch_one(&pool)
+    .await
+    .expect("after _agents row");
+    let after_hist: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT version, pubkey_b64, bound_at::text, superseded_at::text
+         FROM agent_pubkey_history WHERE agent_id = $1 ORDER BY version",
+    )
+    .bind(&agent)
+    .fetch_all(&pool)
+    .await
+    .expect("after history");
+    assert_eq!(
+        after_row, before_row,
+        "PostgreSQL same-key HTTP rebind must write nothing (updated_at, write_signature, pubkey_bound_at, content unchanged)"
+    );
+    assert_eq!(
+        after_hist, before_hist,
+        "PostgreSQL same-key HTTP rebind must not modify agent_pubkey_history"
+    );
+}
+
+/// #10109 (operator log): the `existing_identity_requires_lineage` refusal
+/// emits one `tracing::warn!` naming `ai-memory identity succeed` and the
+/// `agent_id` only (no pubkey, no nonce, no proof), while keeping the HTTP 403
+/// wire body equal to `BIND_PROOF_REFUSED`. Runs in an isolated child process
+/// so the global tracing callsite cache cannot race sibling tests.
+#[test]
+fn bind_pubkey_route_existing_identity_refusal_logs_succession_without_secrets_10109() {
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "bind_pubkey_route_existing_identity_refusal_log_child_10109",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .expect("spawn log child");
+    assert!(
+        out.status.success(),
+        "log child failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[ignore = "child helper of bind_pubkey_route_existing_identity_refusal_logs_succession_without_secrets_10109"]
+async fn bind_pubkey_route_existing_identity_refusal_log_child_10109() {
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct GuardWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for GuardWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = GuardWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            GuardWriter(Arc::clone(&self.0))
+        }
+    }
+
+    let buf = SharedBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(buf.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let _dir = fresh_dir();
+    let (router, _file) = build_router_fixture();
+    register_target_agent(&router).await;
+
+    let victim = valid_keypair();
+    let bootstrap = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &victim).await;
+    let ok_resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &bootstrap))
+        .await
+        .expect("bootstrap");
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    let attacker = ai_memory::identity::keypair::generate("attacker-log-10109").expect("attacker");
+    let hijack = proved_bind_body(&router, TARGET_AGENT, ADMIN_CALLER, &attacker).await;
+    let attacker_pub = attacker.public_base64();
+    let hijack_nonce = hijack["nonce"].as_str().expect("nonce").to_string();
+    let hijack_proof = hijack["proof_b64"].as_str().expect("proof").to_string();
+
+    let resp = router
+        .clone()
+        .oneshot(put_pubkey_body(TARGET_AGENT, ADMIN_CALLER, &hijack))
+        .await
+        .expect("hijack");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .expect("body bytes");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED }),
+        "HTTP response body must remain exact opaque BIND_PROOF_REFUSED"
+    );
+
+    let captured = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+    let matching_lines: Vec<&str> = captured
+        .lines()
+        .filter(|l| l.contains("identity.bind.requires_succession"))
+        .collect();
+    assert_eq!(
+        matching_lines.len(),
+        1,
+        "expected exactly one warn event on identity.bind.requires_succession; captured:\n{captured}"
+    );
+    let line = matching_lines[0];
+    assert!(
+        line.contains("WARN")
+            && line.contains("ai-memory identity succeed")
+            && line.contains(TARGET_AGENT),
+        "operator warn must name ai-memory identity succeed and agent_id: {line}"
+    );
+    for forbidden in [&attacker_pub, &victim.public_base64(), &hijack_nonce, &hijack_proof] {
+        assert!(
+            !line.contains(forbidden.as_str()),
+            "operator warn must never log key/nonce/proof material ({forbidden:?}): {line}"
+        );
+    }
+}
