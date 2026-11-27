@@ -1652,6 +1652,233 @@ mod tests {
             "#3577: simulate_production_lineage_seed must restore both flags on drop"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // #10176 (MEDIUM 10189 / LOW 10188) — a lib-test child's environment is
+    // built from nothing. The driver re-runs itself in an isolated process,
+    // plants every sandbox, custody and canary name at a path OUTSIDE any
+    // sandbox, moves its own cwd there, then spawns the probe through every
+    // spawner. The probe fails naming each variable that arrived.
+    // ---------------------------------------------------------------------
+
+    /// What the probe child must see for one variable.
+    #[derive(Clone, Copy)]
+    enum ChildEnvExpect10176 {
+        /// Exactly `<sandbox root>/<rel>`.
+        SandboxPath(&'static str),
+        /// Unset, or a path inside the sandbox root (the child's own
+        /// `test_key_dir::install` may arm one there).
+        UnsetOrInsideSandbox,
+        /// Never present in the child.
+        Unset,
+    }
+
+    /// Hand-written expected column (rust-first-pass: never derived from the
+    /// code under test).
+    const CHILD_ENV_EXPECTED_10176: &[(&str, ChildEnvExpect10176)] = &[
+        ("HOME", ChildEnvExpect10176::SandboxPath("home")),
+        ("USERPROFILE", ChildEnvExpect10176::SandboxPath("home")),
+        (
+            "XDG_CONFIG_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.config"),
+        ),
+        (
+            "XDG_DATA_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.local/share"),
+        ),
+        (
+            "XDG_STATE_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.local/state"),
+        ),
+        (
+            "XDG_CACHE_HOME",
+            ChildEnvExpect10176::SandboxPath("home/.cache"),
+        ),
+        ("XDG_RUNTIME_DIR", ChildEnvExpect10176::SandboxPath("run")),
+        ("TMPDIR", ChildEnvExpect10176::SandboxPath("tmp")),
+        ("TMP", ChildEnvExpect10176::SandboxPath("tmp")),
+        ("TEMP", ChildEnvExpect10176::SandboxPath("tmp")),
+        (
+            "AI_MEMORY_WITNESS_KEY_DIR",
+            ChildEnvExpect10176::SandboxPath("home/witness-keys"),
+        ),
+        (
+            "AI_MEMORY_KEY_DIR",
+            ChildEnvExpect10176::UnsetOrInsideSandbox,
+        ),
+        ("AI_MEMORY_DB", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_AUDIT_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_RECORDER_KEY_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_JUDGE_KEY_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_STOPPER_KEY_DIR", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_STOPPER_PUBKEY", ChildEnvExpect10176::Unset),
+        ("AI_MEMORY_10176_CANARY", ChildEnvExpect10176::Unset),
+    ];
+
+    /// Hex of the planted root; its presence makes the probe run.
+    const PROBE_PLANTED_ENV_10176: &str = "AI_MEMORY_TEST_10176_PLANTED_HEX";
+    /// Printed by the probe once every check ran, so a probe that never saw
+    /// its role cannot count as green.
+    const PROBE_RAN_10176: &str = "child-env-probe-10176: checked";
+    const PROBE_PATH_10176: &str = "test_support::tests::child_env_probe_10176";
+    const DRIVER_PATH_10176: &str = "test_support::tests::child_env_is_built_from_nothing_10176";
+
+    fn hex_encode_10176(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+    }
+
+    fn hex_decode_10176(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("planted hex"))
+            .collect()
+    }
+
+    /// The probe: a no-op unless the driver handed it the planted root.
+    #[cfg(unix)]
+    #[test]
+    fn child_env_probe_10176() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let Ok(planted_hex) = std::env::var(PROBE_PLANTED_ENV_10176) else {
+            return;
+        };
+        let planted =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(hex_decode_10176(&planted_hex)));
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let root = home
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let mut arrived = Vec::new();
+        for (name, expect) in CHILD_ENV_EXPECTED_10176 {
+            let got = std::env::var_os(name).map(std::path::PathBuf::from);
+            let ok = match (*expect, &got) {
+                (ChildEnvExpect10176::SandboxPath(rel), Some(v)) => *v == root.join(rel),
+                (ChildEnvExpect10176::UnsetOrInsideSandbox, Some(v)) => {
+                    v.starts_with(&root) && !v.starts_with(planted.join(name))
+                }
+                (ChildEnvExpect10176::UnsetOrInsideSandbox | ChildEnvExpect10176::Unset, None) => {
+                    true
+                }
+                (ChildEnvExpect10176::SandboxPath(_), None)
+                | (ChildEnvExpect10176::Unset, Some(_)) => false,
+            };
+            if !ok {
+                arrived.push((*name).to_string());
+            }
+        }
+        if home == planted.join("HOME") {
+            arrived.push("HOME (planted value)".to_string());
+        }
+        match std::env::current_dir() {
+            Ok(cwd) if cwd == root => {}
+            _ => arrived.push("cwd".to_string()),
+        }
+        match crate::identity::keypair::resolved_default_key_dir_path() {
+            Ok(dir) if dir.starts_with(&root) && !dir.starts_with(&planted) => {}
+            _ => arrived.push("resolved key dir".to_string()),
+        }
+        assert!(
+            arrived.is_empty(),
+            "#10176: the child environment was not built from nothing; outside-sandbox state arrived for: {arrived:?}"
+        );
+        println!("{PROBE_RAN_10176}");
+    }
+
+    /// Plant every name of [`CHILD_ENV_EXPECTED_10176`] at `<planted>/<NAME>`.
+    #[cfg(unix)]
+    fn plant_child_env_10176(planted: &std::path::Path) -> Vec<EnvGuard> {
+        CHILD_ENV_EXPECTED_10176
+            .iter()
+            .map(|(name, _)| {
+                let dir = planted.join(name);
+                std::fs::create_dir_all(&dir).expect("planted dir");
+                let guard = EnvGuard::capture(name);
+                guard.set(dir.to_str().expect("utf-8 planted dir"));
+                guard
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn probe_outcome_10176(
+        spawner: &str,
+        out: Result<std::process::Output, String>,
+    ) -> Option<String> {
+        match out {
+            Err(e) => Some(format!("{spawner}: {e}")),
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if out.status.success()
+                    && stdout.contains("1 passed")
+                    && stdout.contains(PROBE_RAN_10176)
+                {
+                    None
+                } else {
+                    Some(format!(
+                        "{spawner}: probe failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_env_is_built_from_nothing_10176() {
+        use std::os::unix::ffi::OsStrExt as _;
+        if super::run_env_isolated_child_or_spawn(DRIVER_PATH_10176) {
+            return;
+        }
+        // This body runs alone in its own process, so moving the cwd and the
+        // environment cannot race another test.
+        let _lock = env_lock();
+        let planted_dir = crate::identity::test_key_dir::private_tempdir();
+        let planted = planted_dir.path().to_path_buf();
+        let _guards = plant_child_env_10176(&planted);
+        std::env::set_current_dir(&planted).expect("cwd to planted root");
+        let hex = hex_encode_10176(planted.as_os_str().as_bytes());
+        let mut failures = Vec::new();
+
+        let builder = super::SandboxedTestChild::new("test_support::child_env_10176")
+            .configure(|cmd| {
+                cmd.args([
+                    "--exact",
+                    PROBE_PATH_10176,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(PROBE_PLANTED_ENV_10176, &hex);
+            })
+            .arm()
+            .run_bounded(super::TEST_CHILD_TIMEOUT, "child_env_10176 builder");
+        failures.extend(probe_outcome_10176("SandboxedTestChild", builder));
+
+        let spawned = std::panic::catch_unwind(|| {
+            super::spawn_test_child(PROBE_PATH_10176, &[(PROBE_PLANTED_ENV_10176, hex.as_str())])
+        })
+        .map_err(|_| "spawn_test_child panicked".to_string());
+        failures.extend(probe_outcome_10176("spawn_test_child", spawned));
+
+        let isolated = std::panic::catch_unwind(|| {
+            super::spawn_env_isolated_child(
+                PROBE_PATH_10176,
+                &[],
+                &[(PROBE_PLANTED_ENV_10176, std::path::Path::new(&hex))],
+            )
+        });
+        if isolated.is_err() {
+            failures.push("spawn_env_isolated_child: probe failed (see panic above)".to_string());
+        }
+        assert!(failures.is_empty(), "#10176: {failures:#?}");
+    }
 }
 
 /// Captures formatted tracing output (no ANSI, no timestamps).
