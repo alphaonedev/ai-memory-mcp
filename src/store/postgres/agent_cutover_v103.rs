@@ -4,19 +4,23 @@
 //! #10108 (`3-agent vote (71472661)` V1-AGENT-SIG-SCHEMA, decision A,
 //! conditions S-1 and S-3) — the postgres twin of
 //! `crate::storage::agent_cutover_v103`: the v103 arm and the whole-table
-//! cutover resolver. Both backends judge the marker with the SAME
-//! [`crate::signed_events::agent_cutover::resolve`], so a database gives the
-//! same verdict on either. Own module for the qual_10 budget of `postgres.rs`.
+//! cutover resolver. Both backends build the marker with the SAME
+//! [`crate::signed_events::agent_cutover::build_signed_marker`], insert only a
+//! [`SignedMarker`], and judge it with the SAME
+//! [`crate::signed_events::agent_cutover::resolve_signed`], so a database
+//! gives the same verdict on either (#10145 on postgres). Own module for the
+//! qual_10 budget of `postgres.rs`.
 
 use super::legacy_cutoff_10074::{PG_ROW_COLUMNS, to_event};
 use super::{
     PgSignedEventWalkRow, PostgresStore, TRACE_TARGET, record_schema_version, to_store_err,
     truncate_to_microseconds,
 };
+use crate::governance::daemon_signer::DaemonChainSigner;
 use crate::signed_events::SignedEvent;
 use crate::signed_events::agent_cutover::{
-    AGENT_CUTOVER_EVENT_TYPE, AGENT_CUTOVER_ROW_LIMIT, AgentCutover, build_marker,
-    legacy_agent_row_count, resolve,
+    AGENT_CUTOVER_EVENT_TYPE, AGENT_CUTOVER_ROW_LIMIT, AgentCutover, MarkerOrigin, SignedMarker,
+    build_signed_marker, legacy_agent_row_count, resolve_signed,
 };
 use crate::signed_events::agent_era::{AgentDomainEvidence, StoredReceiptRow};
 use crate::store::{BoxBackendError, StoreError, StoreResult};
@@ -62,13 +66,21 @@ async fn pg_legacy_agent_rows(
     ))
 }
 
-/// #10108 — resolve the postgres cutover over the WHOLE table, in one
+/// #10108 — judge the postgres cutover over the WHOLE table, in one
 /// `REPEATABLE READ READ ONLY` snapshot (the same shape as the legacy cutoff
-/// resolver), whatever window the caller walks.
+/// resolver), whatever window the caller walks. The sqlite twin is
+/// [`crate::signed_events::agent_cutover::resolve_sqlite_agent_cutover`]: a
+/// marker is judged by [`resolve_signed`] under `verifier` (no key, an
+/// unsigned marker or a bad signature is invalid), and no marker is decided
+/// by the schema version ([`AgentCutover::without_marker`]), so a removed
+/// marker on a v103 database fails the walk (#10145 W-10, W-11).
 ///
 /// # Errors
 /// Propagates a pg read error.
-pub(super) async fn resolve_pg_agent_cutover(pool: &sqlx::PgPool) -> StoreResult<AgentCutover> {
+pub(super) async fn resolve_pg_agent_cutover(
+    pool: &sqlx::PgPool,
+    verifier: Option<&ed25519_dalek::VerifyingKey>,
+) -> StoreResult<AgentCutover> {
     let mut tx = pool
         .begin()
         .await
@@ -88,12 +100,19 @@ pub(super) async fn resolve_pg_agent_cutover(pool: &sqlx::PgPool) -> StoreResult
     .map_err(|e| to_store_err("agent_cutover.rows", e))?;
     let markers: Vec<SignedEvent> = markers.into_iter().map(to_event).collect();
     let verdict = match markers.first() {
-        None => AgentCutover::Absent,
+        None => {
+            let schema_version: Option<i32> =
+                sqlx::query_scalar(crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("agent_cutover.schema_version", e))?;
+            AgentCutover::without_marker(i64::from(schema_version.unwrap_or(0)))
+        }
         Some(first) => {
             let below = first.sequence;
             let prev = pg_row_below(&mut tx, below, "agent_cutover.prev").await?;
             let count = pg_legacy_agent_rows(&mut tx, below, "agent_cutover.count").await?;
-            resolve(&markers, prev.as_ref(), count)
+            resolve_signed(verifier, &markers, prev.as_ref(), count)
         }
     };
     // Read only: ending the transaction writes nothing.
@@ -107,15 +126,60 @@ fn refusal(detail: String) -> StoreError {
     StoreError::Backend(BoxBackendError::new(format!("migrate v103: {detail}")))
 }
 
-/// v103 (#10108) — the DDL, then the cutover marker appended at the chain
-/// head under `LOCK TABLE signed_events IN EXCLUSIVE MODE`, then the stamp, in
-/// ONE transaction: no committed state is at v103 without its marker (S-3).
-/// Strictly additive; the marker is skipped on an empty chain or when a
-/// marker-type row already exists.
+/// #10108 (lane o) — insert the signed marker. It takes a [`SignedMarker`],
+/// which only [`build_signed_marker`] makes, so this writer cannot insert an
+/// unsigned or hand-built marker; the signature is bound with the row.
+async fn insert_signed_marker(
+    conn: &mut sqlx::PgConnection,
+    signed: &SignedMarker,
+    ts: chrono::DateTime<chrono::Utc>,
+) -> StoreResult<i64> {
+    let marker = signed.event();
+    sqlx::query(
+        "INSERT INTO signed_events \
+                (id, agent_id, event_type, payload_hash, signature, attest_level, \
+                 timestamp, prev_hash, sequence, cause_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)",
+    )
+    .bind(&marker.id)
+    .bind(&marker.agent_id)
+    .bind(&marker.event_type)
+    .bind(&marker.payload_hash)
+    .bind(&marker.signature)
+    .bind(&marker.attest_level)
+    .bind(ts)
+    .bind(&marker.prev_hash)
+    .bind(marker.sequence)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| to_store_err("v103 insert cutover marker", e))?;
+    Ok(marker.sequence)
+}
+
+/// v103 (#10108, #10145 on postgres) — the DDL, then the signed cutover marker
+/// under `LOCK TABLE signed_events IN EXCLUSIVE MODE`, then the stamp, in ONE
+/// transaction: no committed state is at v103 without its marker (S-3). The
+/// marker is at sequence 1 above the zero hash on an empty chain (the genesis
+/// marker, [`MarkerOrigin::Create`] on a fresh database), else
+/// directly above the head; it is skipped only when a marker-type row already
+/// exists. The caller provisions `signer` before the ladder starts (K-1), so
+/// a missing daemon key refuses before any byte changes.
 ///
 /// # Errors
 /// A pg error or a corrupt chain head refuses the step; nothing commits.
-pub(super) async fn apply_v103(store: &PostgresStore) -> StoreResult<()> {
+pub(super) async fn apply_v103(
+    store: &PostgresStore,
+    signer: &DaemonChainSigner,
+    from_version: i32,
+) -> StoreResult<()> {
+    // W-9 — a stamp of 0 that reaches the ladder is a fresh database (the
+    // #2564 guard in `migrate_locked` refused every other), so its marker says
+    // Create and any other says Migrate.
+    let origin = if from_version == 0 {
+        MarkerOrigin::Create
+    } else {
+        MarkerOrigin::Migrate
+    };
     let mut tx = store
         .pool
         .begin()
@@ -137,41 +201,24 @@ pub(super) async fn apply_v103(store: &PostgresStore) -> StoreResult<()> {
             .map_err(|e| to_store_err("v103 existing marker", e))?;
     let mut written: Option<i64> = None;
     if !existing {
-        if let Some(head) = pg_row_below(&mut tx, i64::MAX, "v103 head").await? {
-            let above = head.sequence.saturating_add(1);
-            let Some(count) = pg_legacy_agent_rows(&mut tx, above, "v103 count").await? else {
-                return Err(refusal(format!(
-                    "corrupt attest_level counts below sequence {above}"
-                )));
-            };
-            let ts = truncate_to_microseconds(chrono::Utc::now());
-            let Some(marker) = build_marker(
-                &head,
-                count,
-                uuid::Uuid::new_v4().to_string(),
-                ts.to_rfc3339(),
-            ) else {
-                return Err(refusal(format!("no sequence above head {}", head.sequence)));
-            };
-            sqlx::query(
-                "INSERT INTO signed_events \
-                        (id, agent_id, event_type, payload_hash, signature, attest_level, \
-                         timestamp, prev_hash, sequence, cause_hash) \
-                     VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, NULL)",
-            )
-            .bind(&marker.id)
-            .bind(&marker.agent_id)
-            .bind(&marker.event_type)
-            .bind(&marker.payload_hash)
-            .bind(&marker.attest_level)
-            .bind(ts)
-            .bind(&marker.prev_hash)
-            .bind(marker.sequence)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("v103 insert cutover marker", e))?;
-            written = Some(marker.sequence);
-        }
+        let head = pg_row_below(&mut tx, i64::MAX, "v103 head").await?;
+        // Every row is below the marker: an empty chain counts zero.
+        let Some(count) = pg_legacy_agent_rows(&mut tx, i64::MAX, "v103 count").await? else {
+            return Err(refusal("corrupt attest_level counts".to_owned()));
+        };
+        // The signed timestamp is the one postgres reads back (microseconds).
+        let ts = truncate_to_microseconds(chrono::Utc::now());
+        let Some(signed) = build_signed_marker(
+            signer,
+            head.as_ref(),
+            count,
+            origin,
+            uuid::Uuid::new_v4().to_string(),
+            ts.to_rfc3339(),
+        ) else {
+            return Err(refusal("no sequence above the chain head".to_owned()));
+        };
+        written = Some(insert_signed_marker(&mut tx, &signed, ts).await?);
     }
     record_schema_version(&mut tx, 103).await?;
     tx.commit()

@@ -100,27 +100,19 @@ const ALLOWED: &[(&str, Needle, usize)] = &[
     // #10145 W-10: +2 for the chain-level CutoverMarkerMissing failure.
     ("src/signed_events.rs", Needle::MarkerType, 13),
     ("src/signed_events.rs", Needle::ChainWrite, 11),
-    // #10145 W-10: +4 for Missing, chain_failure and without_marker.
-    ("src/signed_events/agent_cutover.rs", Needle::MarkerType, 30),
+    // #10108 lane o: 30 -> 21, the unsigned pair and its
+    // docs are gone.
+    ("src/signed_events/agent_cutover.rs", Needle::MarkerType, 21),
+    // #10108 lane o: 2 -> 4, the `SignedMarker` docs name the one constructor.
     (
         "src/signed_events/agent_cutover.rs",
         Needle::SignedBuilder,
-        2,
+        4,
     ),
     (
         "src/signed_events/agent_cutover.rs",
         Needle::SignedWriter,
         1,
-    ),
-    (
-        "src/signed_events/agent_cutover.rs",
-        Needle::UnsignedBuilder,
-        1,
-    ),
-    (
-        "src/signed_events/agent_cutover.rs",
-        Needle::UnsignedResolve,
-        3,
     ),
     ("src/signed_events/agent_cutover.rs", Needle::ChainWrite, 1),
     (
@@ -137,14 +129,54 @@ const ALLOWED: &[(&str, Needle, usize)] = &[
     ("src/storage/connection.rs", Needle::Stamp, 3),
     ("src/storage/migration_meta.rs", Needle::MarkerType, 1),
     ("src/storage/migrations.rs", Needle::MarkerType, 3),
-    ("src/storage/migrations.rs", Needle::Stamp, 29),
+    // #10194: 29 -> 28, #10157 moved the v66 rebuild test out (row below).
+    ("src/storage/migrations.rs", Needle::Stamp, 28),
     ("src/storage/migrations.rs", Needle::ChainWrite, 1),
+    // #10194: the #10157 keyless-refusal tests (they read the marker type
+    // and reset the stamp of a scratch database).
+    (
+        "src/storage/migrations_keyless_10157_tests.rs",
+        Needle::MarkerType,
+        4,
+    ),
+    (
+        "src/storage/migrations_keyless_10157_tests.rs",
+        Needle::Stamp,
+        2,
+    ),
+    // #10194: the v66 rebuild test #10157 moved out of `migrations.rs`.
+    (
+        "src/storage/migrations_v66_rebuild_tests.rs",
+        Needle::Stamp,
+        1,
+    ),
     ("src/storage/mod.rs", Needle::MarkerType, 1),
     ("src/storage/mod.rs", Needle::Stamp, 1),
     ("src/storage/title_slot_archive.rs", Needle::Stamp, 1),
-    ("src/store/postgres.rs", Needle::MarkerType, 8),
+    // #10108 lane o: 8 -> 9, the walk fails a markerless v103
+    // chain (`agent_cutover.chain_failure()`).
+    ("src/store/postgres.rs", Needle::MarkerType, 9),
     ("src/store/postgres.rs", Needle::Stamp, 3),
     ("src/store/postgres.rs", Needle::ChainWrite, 2),
+    // #10108 lane o: the postgres v103 arm. `apply_v103` builds the marker
+    // with `build_signed_marker` and `insert_signed_marker` inserts only a
+    // `SignedMarker`; `resolve_pg_agent_cutover` judges it with
+    // `resolve_signed`. The unsigned rows (2 builder, 3 resolve) are gone.
+    (
+        "src/store/postgres/agent_cutover_v103.rs",
+        Needle::MarkerType,
+        19,
+    ),
+    (
+        "src/store/postgres/agent_cutover_v103.rs",
+        Needle::SignedBuilder,
+        4,
+    ),
+    (
+        "src/store/postgres/agent_cutover_v103.rs",
+        Needle::ChainWrite,
+        1,
+    ),
     ("src/store/postgres/chain_append.rs", Needle::MarkerType, 2),
     ("src/store/postgres/chain_append.rs", Needle::ChainWrite, 1),
     (

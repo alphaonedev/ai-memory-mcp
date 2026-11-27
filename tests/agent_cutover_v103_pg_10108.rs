@@ -152,6 +152,9 @@ type Row = (
     Option<Vec<u8>>,
 );
 
+/// One tamper: what it changes, the stored payload hash and signature.
+type Tamper = (&'static str, Vec<u8>, Option<Vec<u8>>);
+
 async fn rows(pg: &PostgresStore) -> Vec<SignedEvent> {
     let rows: Vec<Row> = sqlx::query_as(SELECT_ROWS)
         .fetch_all(pg.pool())
@@ -354,7 +357,7 @@ async fn a_tampered_marker_fails_the_walk_pg_10108() {
     payload[1] ^= 1;
     let mut flipped = sig.clone();
     flipped[0] ^= 1;
-    let tampers: [(&str, Vec<u8>, Option<Vec<u8>>); 3] = [
+    let tampers: [Tamper; 3] = [
         ("payload byte", payload, Some(sig.clone())),
         ("signature byte", marker.payload_hash.clone(), Some(flipped)),
         ("stripped signature", marker.payload_hash.clone(), None),

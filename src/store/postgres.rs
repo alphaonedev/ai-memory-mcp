@@ -4054,6 +4054,12 @@ impl PostgresStore {
             return Ok(());
         }
 
+        // #10108 lane o (#10145 K-1 on postgres) — the daemon signer before any
+        // byte this ladder changes, so a missing key refuses with the database
+        // untouched (the sqlite `migrate` precedent).
+        let signer = crate::governance::daemon_signer::DaemonChainSigner::provision_default()
+            .map_err(|refusal| StoreError::Backend(super::BoxBackendError::with_source(refusal)))?;
+
         // Apply each migration step in its own transaction for idempotence.
         // Versions 15→28 are stamped in order; each migrate_vN function is
         // independently idempotent (column-existence checks + IF NOT EXISTS
@@ -4337,7 +4343,7 @@ impl PostgresStore {
             self.migrate_v102().await?;
         }
         if current_version < CURRENT_SCHEMA_VERSION {
-            self.migrate_v103().await?;
+            self.migrate_v103(&signer, current_version).await?;
         }
 
         Ok(())
@@ -7543,8 +7549,12 @@ impl PostgresStore {
 
     /// v103 (#10108) - agent signature places and the cutover marker; the
     /// body lives in `agent_cutover_v103::apply_v103` (qual_10 budget).
-    async fn migrate_v103(&self) -> StoreResult<()> {
-        agent_cutover_v103::apply_v103(self).await
+    async fn migrate_v103(
+        &self,
+        signer: &crate::governance::daemon_signer::DaemonChainSigner,
+        from_version: i32,
+    ) -> StoreResult<()> {
+        agent_cutover_v103::apply_v103(self, signer, from_version).await
     }
 
     /// v102 (#8341) - SQLite-only FTS projection guard. The postgres v97
@@ -16587,7 +16597,9 @@ impl PostgresStore {
             watermark_db_id.as_deref(),
         )
         .await?;
-        let agent_cutover = agent_cutover_v103::resolve_pg_agent_cutover(&self.pool).await?;
+        // #10108 lane o - judged under the same verifier as the rows (K3).
+        let agent_cutover =
+            agent_cutover_v103::resolve_pg_agent_cutover(&self.pool, daemon_verifier).await?;
         let recorder_verifier = crate::governance::audit::load_enrolled_recorder_pubkey()
             .ok()
             .flatten();
@@ -16653,6 +16665,12 @@ impl PostgresStore {
             h.update(canonical_chain_bytes(&ev));
             expected_prev = h.finalize().to_vec();
             expected_seq = seq + 1;
+        }
+        // #10145 (W-10, W-11) on postgres - a v103 database without its marker
+        // fails every walk, whatever window it covers; no row carries the
+        // failure (the sqlite `verify_chain` twin).
+        if agent_cutover.chain_failure().is_some() {
+            signature_failures.push(crate::signed_events::CHAIN_LEVEL_FAILURE_SEQUENCE);
         }
 
         // Surviving memory_revisions head (the second witnessed chain).

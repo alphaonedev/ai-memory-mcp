@@ -31,6 +31,7 @@ fn signer(seed: [u8; 32]) -> DaemonChainSigner {
 fn genesis(origin: MarkerOrigin) -> SignedEvent {
     build_signed_marker(&signer(SEED), None, 0, origin, "m-1".into(), TS.into())
         .expect("genesis marker")
+        .into_event()
 }
 
 #[test]
@@ -129,7 +130,8 @@ fn a_marker_above_a_head_links_to_it_10145() {
         "m".into(),
         TS.into(),
     )
-    .expect("marker above head");
+    .expect("marker above head")
+    .into_event();
     assert_eq!(m.sequence, 5);
     assert_eq!(
         m.prev_hash,

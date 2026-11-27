@@ -6,27 +6,31 @@
 //! conditions S-1 and S-3; V1V2-AGENT-ROW-VERIFY condition B-5).
 //!
 //! The marker is ONE `signed_events` row of type [`AGENT_CUTOVER_EVENT_TYPE`],
-//! appended at the chain head by the v103 migration step, in the same
-//! transaction as the version stamp, and only when the chain is non-empty. Its
-//! `payload_hash` commits to:
+//! written by the v103 migration step in the same transaction as the version
+//! stamp: at sequence 1 above [`ZERO_HASH`] on an empty chain (the genesis
+//! marker), else directly above the chain head. Its `payload_hash`
+//! ([`signed_marker_payload_hash`]) commits to:
 //!
+//! - its origin ([`MarkerOrigin`]: create, migrate or import);
 //! - its own chain position (`sequence`);
 //! - the canonical chain hash of the row before it (the preceding head);
 //! - the count of agent-labelled rows (`self_signed`, `signed_by_peer`,
 //!   `peer_attested`) below it: the legacy rows written before the cutover.
 //!
-//! The unsigned marker ([`build_marker`], still written by the postgres
-//! adapter) carries NO signature; its authority is the recompute. On SQLite
-//! the marker is signed by the daemon key ([`build_signed_marker`], #10145). Every committed value is a deterministic
-//! function of the chain prefix, so the walk re-derives the hash from the rows
-//! below the marker and accepts it only on an exact match. A changed count, a
-//! changed preceding row, a second marker or a marker with any other agent,
-//! attestation, signature or cause fails closed
+//! Both backends build it with the one constructor [`build_signed_marker`],
+//! which only a [`DaemonChainSigner`] can call and which returns a
+//! [`SignedMarker`], the only type the writers insert (#10145, #10108). Every
+//! committed value is a deterministic function of the chain prefix, so the
+//! walk re-derives the hash from the rows below the marker and accepts it only
+//! on an exact match and a daemon signature that verifies. A changed count, a
+//! changed preceding row, a second marker, an unsigned marker or a marker with
+//! any other agent, attestation, signature or cause fails closed
 //! ([`crate::signed_events::SignatureFailure::CutoverMarkerInvalid`]).
 //!
 //! The resolver is pure: each backend reads the marker rows (at most two), the
 //! row before the first one and the per-`attest_level` counts below it, then
-//! hands them to [`resolve`], so both backends judge identical inputs (K3).
+//! hands them to [`resolve_signed`], so both backends judge identical inputs
+//! (K3).
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -44,10 +48,6 @@ pub const AGENT_CUTOVER_EVENT_TYPE: &str = "signed_events.agent_cutover";
 
 /// #10108 — the reserved `agent_id` of the marker row.
 pub const AGENT_CUTOVER_AGENT_ID: &str = "ai-memory:migration-v103";
-
-/// #10108 — the domain and version tag of the marker's `payload_hash`
-/// pre-image. A new definition gets a new tag, never a reuse of this one.
-const AGENT_CUTOVER_PREIMAGE_DOMAIN: &[u8] = b"ai-memory/signed-events/agent-cutover-v1\0";
 
 /// #10108 — the most marker-type rows a resolver reads. Two is enough to tell
 /// "exactly one" from "more than one".
@@ -84,57 +84,6 @@ pub fn legacy_agent_row_count<'a>(groups: impl IntoIterator<Item = (&'a str, i64
         }
     }
     Some(total)
-}
-
-/// #10108 — the marker's `payload_hash`: SHA-256 over the versioned domain
-/// tag, the big-endian sequence, the length-prefixed preceding head hash and
-/// the big-endian legacy agent-row count.
-///
-/// A non-positive `sequence` is `None` (a marker always sits above a row).
-#[must_use]
-pub fn agent_cutover_payload_hash(
-    sequence: i64,
-    prev_head_hash: &[u8],
-    legacy_agent_rows: u64,
-) -> Option<Vec<u8>> {
-    let seq = u64::try_from(sequence).ok().filter(|s| *s > 0)?;
-    let prev_len = u64::try_from(prev_head_hash.len()).ok()?;
-    let mut h = Sha256::new();
-    h.update(AGENT_CUTOVER_PREIMAGE_DOMAIN);
-    h.update(seq.to_be_bytes());
-    h.update(prev_len.to_be_bytes());
-    h.update(prev_head_hash);
-    h.update(legacy_agent_rows.to_be_bytes());
-    Some(h.finalize().to_vec())
-}
-
-/// #10108 — the marker row the v103 step appends above `head`, the current
-/// last row of the chain. `id` and `timestamp` are the caller's (each backend
-/// formats its own timestamp); every committed field is derived here.
-///
-/// `None` when `head` cannot carry a row above it (sequence overflow).
-#[must_use]
-pub fn build_marker(
-    head: &SignedEvent,
-    legacy_agent_rows: u64,
-    id: String,
-    timestamp: String,
-) -> Option<SignedEvent> {
-    let sequence = head.sequence.checked_add(1)?;
-    let prev_hash = Sha256::digest(canonical_chain_bytes(head)).to_vec();
-    let payload_hash = agent_cutover_payload_hash(sequence, &prev_hash, legacy_agent_rows)?;
-    Some(SignedEvent {
-        id,
-        agent_id: AGENT_CUTOVER_AGENT_ID.to_string(),
-        event_type: AGENT_CUTOVER_EVENT_TYPE.to_string(),
-        payload_hash,
-        signature: None,
-        attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
-        timestamp,
-        prev_hash,
-        sequence,
-        cause_hash: None,
-    })
 }
 
 /// #10145 — the domain tag of the signed marker's payload preimage (v2: it
@@ -218,10 +167,38 @@ fn marker_position(prev: Option<&SignedEvent>) -> Option<(i64, Vec<u8>)> {
     }
 }
 
+/// #10108 (lane o) — a cutover marker row that [`build_signed_marker`] built
+/// and the daemon key signed. The field is private and this module is the only
+/// constructor, so a writer that takes a `SignedMarker` cannot insert an
+/// unsigned or hand-built marker (CBC-03). Both backends' writers take it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedMarker(SignedEvent);
+
+impl SignedMarker {
+    /// The signed row, to bind into an insert.
+    #[must_use]
+    pub fn event(&self) -> &SignedEvent {
+        &self.0
+    }
+
+    /// The signed row, by value.
+    #[must_use]
+    pub fn into_event(self) -> SignedEvent {
+        self.0
+    }
+}
+
+impl From<SignedMarker> for SignedEvent {
+    fn from(marker: SignedMarker) -> Self {
+        marker.0
+    }
+}
+
 /// #10145 (I-2, I-9) — the signed marker row, at sequence 1 above
 /// [`ZERO_HASH`] when `prev` is `None` (a fresh chain) or directly above
 /// `prev`. Only a [`DaemonChainSigner`] can build one, so no unsigned marker
-/// can be constructed. `None` on a sequence overflow.
+/// can be constructed. `None` on a sequence overflow. The one constructor of
+/// the marker on both backends.
 #[must_use]
 pub fn build_signed_marker(
     signer: &DaemonChainSigner,
@@ -230,7 +207,7 @@ pub fn build_signed_marker(
     origin: MarkerOrigin,
     id: String,
     timestamp: String,
-) -> Option<SignedEvent> {
+) -> Option<SignedMarker> {
     let (sequence, prev_hash) = marker_position(prev)?;
     let payload_hash = signed_marker_payload_hash(sequence, &prev_hash, legacy_agent_rows, origin)?;
     let mut row = SignedEvent {
@@ -246,7 +223,7 @@ pub fn build_signed_marker(
         cause_hash: None,
     };
     signer.sign_row(&mut row);
-    Some(row)
+    Some(SignedMarker(row))
 }
 
 /// #10145 — the origin of `marker` when it is a well-formed signed marker
@@ -300,8 +277,8 @@ pub enum AgentCutover {
 impl AgentCutover {
     /// #10108 — the verdict for `event` when it is a marker-type row, else
     /// `None` (the caller classifies it as before). Runs before
-    /// [`crate::signed_events::classify_row_signature`] on both walks, so an
-    /// unsigned marker is never read as a by-design unsigned row.
+    /// [`crate::signed_events::classify_row_signature`] on both walks, so a
+    /// marker-type row is never read as an ordinary daemon or unsigned row.
     #[must_use]
     pub fn verdict_for(self, event: &SignedEvent) -> Option<RowSignatureVerdict> {
         if event.event_type != AGENT_CUTOVER_EVENT_TYPE {
@@ -352,45 +329,6 @@ impl AgentCutover {
 /// database at or above it without a marker is [`AgentCutover::Missing`].
 pub const AGENT_CUTOVER_SCHEMA_VERSION: i64 = 103;
 
-/// #10108 — judge the marker. `markers` are the marker-type rows in ascending
-/// sequence (at most [`AGENT_CUTOVER_ROW_LIMIT`]); `prev` is the row directly
-/// below the first marker (highest sequence under it); `legacy_agent_rows` is
-/// the agent-labelled row count below it (`None` on a corrupt count).
-#[must_use]
-pub fn resolve(
-    markers: &[SignedEvent],
-    prev: Option<&SignedEvent>,
-    legacy_agent_rows: Option<u64>,
-) -> AgentCutover {
-    let marker = match markers {
-        [] => return AgentCutover::Absent,
-        [one] => one,
-        _ => return AgentCutover::Invalid,
-    };
-    let (Some(prev), Some(count)) = (prev, legacy_agent_rows) else {
-        return AgentCutover::Invalid;
-    };
-    let well_formed = marker.agent_id == AGENT_CUTOVER_AGENT_ID
-        && marker.attest_level == crate::models::AttestLevel::Unsigned.as_str()
-        && marker.signature.is_none()
-        && marker.cause_hash.is_none()
-        && prev.sequence.checked_add(1) == Some(marker.sequence);
-    if !well_formed {
-        return AgentCutover::Invalid;
-    }
-    let prev_hash = Sha256::digest(canonical_chain_bytes(prev)).to_vec();
-    if marker.prev_hash != prev_hash {
-        return AgentCutover::Invalid;
-    }
-    match agent_cutover_payload_hash(marker.sequence, &prev_hash, count) {
-        Some(expected) if expected == marker.payload_hash => AgentCutover::Valid {
-            sequence: marker.sequence,
-            legacy_agent_rows: count,
-        },
-        Some(_) | None => AgentCutover::Invalid,
-    }
-}
-
 /// #10145 (I-2) — judge a SIGNED marker: exactly one, its recompute matches
 /// at its position over `legacy_agent_rows`, and its signature verifies under
 /// `verifier` (the daemon key resolved outside the database). No verifier, an
@@ -419,7 +357,7 @@ pub fn resolve_signed(
     }
 }
 
-/// #10108 — resolve the sqlite cutover over the WHOLE table, whatever window
+/// #10108 — judge the sqlite cutover over the WHOLE table, whatever window
 /// the caller walks.
 ///
 /// # Errors
@@ -526,7 +464,7 @@ pub(crate) fn write_sqlite_signed_marker(
     let Some(count) = sqlite_legacy_agent_rows(conn, above)? else {
         anyhow::bail!("agent cutover: corrupt attest_level counts below sequence {above}");
     };
-    let Some(marker) = build_signed_marker(
+    let Some(signed) = build_signed_marker(
         signer,
         head.as_ref(),
         count,
@@ -536,6 +474,7 @@ pub(crate) fn write_sqlite_signed_marker(
     ) else {
         anyhow::bail!("agent cutover: no sequence above head {head_seq}");
     };
+    let marker = signed.event();
     let head_matches = head
         .as_ref()
         .map_or(head_seq == 0, |h| h.sequence == head_seq);
