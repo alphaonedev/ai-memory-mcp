@@ -22,7 +22,7 @@
 //! that stops taking the outer proof fails here. Comment text is judged as text, not skipped.
 //!
 //! #10208 adds a census of whole item sets, because text pins of chosen
-//! lines let a new item through. `census_all` runs four parts:
+//! lines let a new item through. `census_all` runs five parts:
 //!
 //! 1. the line census above;
 //! 2. the item census: every item of the guard file, nested items of `impl`
@@ -34,18 +34,34 @@
 //!    only as `StoreUrlEnvGuard::acquire(` (which needs the outer proof) or
 //!    in the exact statements of `GUARD_USES`. A new impl block, a `Deref`
 //!    impl or an alias in another file is red;
-//! 4. the static census: in the guard file and in every file that names the
-//!    store-url variables, each `static` item (inside a fn body or a macro
-//!    such as `thread_local!` too) must be a row of `STORE_URL_STATICS`.
+//! 4. the static census (#10213): every `static` item of every walked Rust
+//!    file (src/, tests/, benches/, examples/; inside a fn body, an `impl`
+//!    or a macro such as `thread_local!` or `lazy_static!` too, `static mut`
+//!    and `static ref` included, whatever the type is spelled as) must have
+//!    its own row `path<TAB>name<TAB>reason` in
+//!    `tests/store_url_env_guard_8168_statics.tsv`. A static with no row
+//!    left is `Unlisted` with its path, name and line; a row with no static
+//!    is `Missing`; a bad row is refused with its line; `static $x` in a
+//!    macro body is `MacroStatic`, because its name is unknown until
+//!    expansion. The table may only shrink, each row with its reason;
+//! 5. the inclusion census (#10204): the guard file may be compiled once.
+//!    `#[path = …]` (in `cfg_attr` too) and `include!`, `include_str!` or
+//!    `include_bytes!` naming `env_guard.rs` or its parent `store_url.rs`
+//!    (any case, `/` or `\`, escapes and raw strings decoded, `concat!` of
+//!    literals and `env!("CARGO_MANIFEST_DIR")` joined) are red; a path or
+//!    include argument that is not such a literal is red; `mod env_guard;`
+//!    and `mod store_url;` must each occur exactly once, in
+//!    `src/store_url.rs` and `src/lib.rs`.
 //!
-//! The lexer is std only and fails closed (an unterminated string or
-//! comment is a finding). Its limits: it does not expand macros, so an item
-//! or a static built by a macro from pieces is not seen; it does not resolve
-//! names, so a lock static in a file that never names the store-url
-//! variables but is taken by code in one that does is not seen by part 4
-//! (tracked as issue 10213); `concat!` or escaped spellings of the
-//! variable names are not decoded.
+//! The walk refuses a symbolic link in the tree. The lexer is std only and
+//! fails closed (an unterminated string or comment is a finding). A file it
+//! cannot lex is reported once by the static census and skipped by the
+//! inclusion census. Its limits: it does not expand macros, so an item
+//! built by a macro from pieces is not seen by parts 2 and 3 (part 4 reports
+//! `static $x`), and `concat!` or escaped spellings of the variable names
+//! are not decoded by part 1.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -157,7 +173,7 @@ fn census(files: &[(String, String)]) -> Vec<Violation> {
     v
 }
 
-fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>, links: &mut Vec<String>) {
     let rd = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
     for entry in rd {
         let entry = entry.expect("dir entry");
@@ -168,13 +184,13 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
             if SKIPPED_DIRS.iter().any(|(d, _)| *d == name) {
                 continue;
             }
-            walk(&path, root, out);
+            walk(&path, root, out, links);
+        } else if ft.is_symlink() {
+            // A link is refused, never followed or skipped: what it names
+            // could be compiled without the census reading it.
+            links.push(rel_of(&path, root));
         } else if ft.is_file() && path.extension().is_some_and(|e| e == "rs") {
-            let rel = path
-                .strip_prefix(root)
-                .expect("under root")
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_of(&path, root);
             let text = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             out.push((rel, text));
@@ -185,8 +201,21 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
 fn tree() -> Vec<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    walk(root, root, &mut files);
+    let mut links = Vec::new();
+    walk(root, root, &mut files, &mut links);
+    assert_eq!(links, Vec::<String>::new(), "{SYMLINK_REFUSAL}");
     files
+}
+
+/// The refusal for a symbolic link in the source tree.
+const SYMLINK_REFUSAL: &str =
+    "symbolic links in the source tree are refused: the census cannot judge what they name";
+
+fn rel_of(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .expect("under root")
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// A good copy of the allowed file, for the mutant tests below.
@@ -698,6 +727,11 @@ fn unlexable_file_is_red_10208() {
                 file: "src/store_url.rs".into(),
                 error,
             }),
+            Finding::Include(IncludeFinding::ModCount {
+                file: "src/store_url.rs",
+                name: "env_guard",
+                found: 0,
+            }),
         ]
     );
     let mut guard = live_guard_file();
@@ -716,16 +750,21 @@ fn unlexable_file_is_red_10208() {
 /// own lock serialises only that binary's threads.
 #[test]
 fn only_the_guard_file_holds_the_store_url_lock_10208() {
-    let mut locks = Vec::new();
-    for row in &STORE_URL_STATICS {
-        match row.role {
-            StaticRole::StoreUrlEnvLock => locks.push((row.file, row.name)),
-            StaticRole::OwnBinaryLock => assert!(row.file.starts_with("tests/"), "{}", row.file),
-            StaticRole::Unrelated => {}
-        }
-    }
-    assert_eq!(locks, vec![(ALLOWED_FILE, "LOCK")]);
+    let (rows, bad) = parse_table(STATICS_TABLE);
+    assert_eq!(bad, Vec::<TableFinding>::new());
+    let pick = |keep: &dyn Fn(&StaticRow) -> bool| -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|r| keep(r))
+            .map(|r| (r.path.clone(), r.name.clone()))
+            .collect()
+    };
+    let want = vec![(ALLOWED_FILE.to_string(), "LOCK".to_string())];
+    assert_eq!(pick(&|r| r.path == ALLOWED_FILE), want);
+    assert_eq!(pick(&|r| r.reason.starts_with(STORE_URL_LOCK_REASON)), want);
 }
+
+/// The reason text of the one store-url env lock row.
+const STORE_URL_LOCK_REASON: &str = "the store-url env lock;";
 
 /// The lexer: each token form it must tell apart, by kind and text.
 #[test]
@@ -1702,179 +1741,543 @@ fn use_census(files: &[(String, String)]) -> Vec<UseFinding> {
     found
 }
 
-/// What a listed static is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StaticRole {
-    /// The one lock over the store-url variables in the library tests.
-    StoreUrlEnvLock,
-    /// A test binary's own lock: a `tests/` binary is its own process, so
-    /// it serialises only that binary's threads.
-    OwnBinaryLock,
-    /// Not a lock over the process environment.
-    Unrelated,
-}
+/// #10213: the allowlist of every `static` item of the walked tree, one row
+/// per static: `path<TAB>name<TAB>reason`. Lines that start with `#` are
+/// comments. A key that occurs twice in one file has two rows.
+const STATICS_TABLE: &str = include_str!("store_url_env_guard_8168_statics.tsv");
 
-/// One permitted static in a file that names the store-url variables.
+/// The roots a table row's path may name.
+const STATIC_ROOTS: [&str; 4] = ["src/", "tests/", "benches/", "examples/"];
+
+/// The shortest reason a row may give, in visible characters.
+const MIN_REASON_CHARS: usize = 10;
+
+/// One parsed row of [`STATICS_TABLE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StaticRow {
-    file: &'static str,
-    name: &'static str,
-    role: StaticRole,
+    path: String,
+    name: String,
+    reason: String,
 }
 
-/// How many such statics the tree holds.
-const STORE_URL_STATIC_COUNT: usize = 12;
+/// A row of the table that cannot be a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TableFinding {
+    /// The row does not have exactly three tab-separated fields.
+    Fields { line: usize, found: usize },
+    /// The path is not a relative `.rs` path under one of [`STATIC_ROOTS`].
+    BadPath { line: usize, path: String },
+    /// The name is not a Rust identifier.
+    BadName { line: usize, name: String },
+    /// The reason has fewer than [`MIN_REASON_CHARS`] visible characters.
+    ShortReason { line: usize },
+}
 
-const STORE_URL_STATICS: [StaticRow; STORE_URL_STATIC_COUNT] = [
-    StaticRow {
-        file: "src/enterprise_federation_posture/hardened_env_fixture.rs",
-        name: "POSTURE_AUDIT_DIR",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "src/security_profile.rs",
-        name: "BOOT_ENFORCEMENT",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "src/store/postgres.rs",
-        name: "PG_BOOTSTRAP_TEST_LOCK",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "src/store/postgres.rs",
-        name: "SQL_SELECT_MEMORY_ROW_BY_ID",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "src/store/postgres.rs",
-        name: "SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "src/store/postgres.rs",
-        name: "SQL_MERGE_INBOUND_FULL_ROW_UPDATE",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "src/store/postgres.rs",
-        name: "RECORD_STOP_REFRESH_EPOCH",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "src/store/postgres/tx_retry.rs",
-        name: "TX_RETRIES_TOTAL",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: ALLOWED_FILE,
-        name: "LOCK",
-        role: StaticRole::StoreUrlEnvLock,
-    },
-    StaticRow {
-        file: "tests/cov_backup_store_url_3521.rs",
-        name: "STORE_URL_ENV_LOCK",
-        role: StaticRole::OwnBinaryLock,
-    },
-    StaticRow {
-        file: "tests/doctor_over_depth_4715.rs",
-        name: "SERIAL",
-        role: StaticRole::Unrelated,
-    },
-    StaticRow {
-        file: "tests/lax_perms_hatches_doctor_sink_3813.rs",
-        name: "LOCK",
-        role: StaticRole::OwnBinaryLock,
-    },
-];
+fn is_rust_ident(s: &str) -> bool {
+    let mut cs = s.chars();
+    cs.next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && cs.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
 
-/// A file is in the static census when an identifier or a string literal in
-/// its code holds this text: every store-url variable constant
-/// (`STORE_URL_ENV`, `STORE_URL_FILE_ENV`, the lax-perms hatch) and every
-/// spelled-out variable name does. Comments do not count.
-const STORE_URL_TEXT: &str = "STORE_URL";
+fn is_row_path(p: &str) -> bool {
+    STATIC_ROOTS.iter().any(|r| p.starts_with(r))
+        // Exact case on purpose: the walk takes `.rs` files only.
+        && Path::new(p).extension().is_some_and(|e| e == "rs")
+        && !p.contains("..")
+        && !p.contains("//")
+        && !p.contains('\\')
+        && !p.chars().any(char::is_whitespace)
+}
 
-fn names_store_url(t: &[Tok]) -> bool {
-    t.iter().any(|k| match k.kind {
-        TokKind::Ident | TokKind::Str => k.text.contains(STORE_URL_TEXT),
-        TokKind::Lifetime | TokKind::Char | TokKind::Num | TokKind::Punct => false,
-    })
+/// Parse the table; every line that is not a comment must be a good row.
+fn parse_table(text: &str) -> (Vec<StaticRow>, Vec<TableFinding>) {
+    let mut rows = Vec::new();
+    let mut bad = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        if raw.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = raw.split('\t').collect();
+        let [path, name, reason] = fields[..] else {
+            bad.push(TableFinding::Fields {
+                line,
+                found: fields.len(),
+            });
+            continue;
+        };
+        let mut ok = true;
+        if !is_row_path(path) {
+            bad.push(TableFinding::BadPath {
+                line,
+                path: path.to_string(),
+            });
+            ok = false;
+        }
+        if !is_rust_ident(name) {
+            bad.push(TableFinding::BadName {
+                line,
+                name: name.to_string(),
+            });
+            ok = false;
+        }
+        let visible = reason
+            .chars()
+            .filter(|c| !c.is_whitespace() && !c.is_control())
+            .count();
+        if visible < MIN_REASON_CHARS {
+            bad.push(TableFinding::ShortReason { line });
+            ok = false;
+        }
+        if ok {
+            rows.push(StaticRow {
+                path: path.to_string(),
+                name: name.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+    (rows, bad)
 }
 
 /// A finding of the static census.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StaticFinding {
-    Lex {
-        file: String,
-        error: LexError,
-    },
+    /// A bad row of the table.
+    Table(TableFinding),
+    /// A file the lexer cannot read; the inclusion census skips it too.
+    Lex { file: String, error: LexError },
+    /// A static with no row left for its `(file, name)`.
     Unlisted {
         file: String,
         name: String,
         line: usize,
     },
-    Missing {
+    /// `static $name` inside a macro: the name is not known until expansion.
+    MacroStatic { file: String, line: usize },
+    /// A row with no static.
+    Missing { file: String, name: String },
+}
+
+/// Every `static` item of a lexed file: `(name, line)`, plus the lines of
+/// `static $x` macro forms.
+fn statics_of(t: &[Tok]) -> (Vec<(String, usize)>, Vec<usize>) {
+    let mut named = Vec::new();
+    let mut macros = Vec::new();
+    for k in (0..t.len()).filter(|&k| is_w(t, k, "static")) {
+        let mut n = k + 1;
+        while is_w(t, n, "mut") || is_w(t, n, "ref") {
+            n += 1;
+        }
+        if is_p(t, n, "$") {
+            macros.push(t[k].line);
+            continue;
+        }
+        let Some(name) = t.get(n).filter(|x| x.kind == TokKind::Ident) else {
+            continue;
+        };
+        if is_p(t, n + 1, ":") {
+            named.push((name.text.clone(), name.line));
+        }
+    }
+    (named, macros)
+}
+
+/// The names the guard file can be compiled under: the file itself and its
+/// parent module, which declares `mod env_guard;`.
+const GUARDED_FILE_NAMES: [&str; 2] = ["env_guard.rs", "store_url.rs"];
+
+/// `(module name, the one file allowed to declare it, as `mod NAME;`)`.
+const GUARDED_MODS: [(&str, &str); 2] = [
+    ("env_guard", "src/store_url.rs"),
+    ("store_url", "src/lib.rs"),
+];
+
+/// The macros that paste a file into the current one.
+const INCLUDE_MACROS: [&str; 3] = ["include", "include_str", "include_bytes"];
+
+/// The one `env!` variable an include path may use: it names this crate.
+const MANIFEST_DIR_VAR: &str = "CARGO_MANIFEST_DIR";
+
+/// A finding of the inclusion census: the guard file may be compiled once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncludeFinding {
+    /// `path = "…"` in an attribute names a guarded file.
+    PathAttr {
         file: String,
-        name: String,
+        line: usize,
+        value: String,
     },
-    Duplicate {
+    /// `path =` in an attribute is followed by something other than a literal.
+    PathNotLiteral { file: String, line: usize },
+    /// A string literal the census cannot decode (an unknown escape).
+    Undecodable {
         file: String,
-        name: String,
+        line: usize,
+        literal: String,
+    },
+    /// `include!`, `include_str!` or `include_bytes!` names a guarded file.
+    Include {
+        file: String,
+        line: usize,
+        value: String,
+    },
+    /// An include macro whose argument is not a literal, `concat!` of
+    /// literals, or `env!("CARGO_MANIFEST_DIR")`.
+    IncludeNotLiteral { file: String, line: usize },
+    /// `mod NAME;` for a guarded module outside its one file.
+    ModElsewhere {
+        file: String,
+        line: usize,
+        name: &'static str,
+    },
+    /// The guarded module is declared other than exactly once in its file.
+    ModCount {
+        file: &'static str,
+        name: &'static str,
+        found: usize,
     },
 }
 
-fn static_census(files: &[(String, String)]) -> Vec<StaticFinding> {
-    let mut seen = [0usize; STORE_URL_STATIC_COUNT];
-    let mut found = Vec::new();
-    for (path, text) in files {
-        if path != ALLOWED_FILE && !text.contains(STORE_URL_TEXT) {
+/// Why an include or path value is not judged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValueError {
+    NotLiteral,
+    Undecodable(String),
+}
+
+/// The value of a string literal token, escapes decoded.
+fn decode_str(lit: &str) -> Result<String, ValueError> {
+    let undecodable = || ValueError::Undecodable(lit.to_string());
+    let body = lit.strip_prefix(['b', 'c']).unwrap_or(lit);
+    if let Some(raw) = body.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let fence = "#".repeat(hashes);
+        return raw
+            .strip_prefix(fence.as_str())
+            .and_then(|s| s.strip_prefix('"'))
+            .and_then(|s| s.strip_suffix(fence.as_str()))
+            .and_then(|s| s.strip_suffix('"'))
+            .map(str::to_string)
+            .ok_or_else(undecodable);
+    }
+    let inner = body
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(undecodable)?;
+    let mut out = String::new();
+    let mut cs = inner.chars().peekable();
+    while let Some(c) = cs.next() {
+        if c != '\\' {
+            out.push(c);
             continue;
         }
+        match cs.next().ok_or_else(undecodable)? {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '0' => out.push('\0'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '\n' => {
+                while cs.peek().is_some_and(|c| c.is_whitespace()) {
+                    cs.next();
+                }
+            }
+            'x' => {
+                let hex: String = [cs.next(), cs.next()].into_iter().flatten().collect();
+                let v = u8::from_str_radix(&hex, 16).map_err(|_| undecodable())?;
+                if hex.len() != 2 {
+                    return Err(undecodable());
+                }
+                out.push(char::from(v));
+            }
+            'u' => {
+                if cs.next() != Some('{') {
+                    return Err(undecodable());
+                }
+                let hex: String = cs.by_ref().take_while(|&c| c != '}').collect();
+                let v =
+                    u32::from_str_radix(&hex.replace('_', ""), 16).map_err(|_| undecodable())?;
+                out.push(char::from_u32(v).ok_or_else(undecodable)?);
+            }
+            _ => return Err(undecodable()),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a path value names a guarded file: its last component, case
+/// folded, with `/` and `\` both taken as separators.
+fn names_guarded_file(value: &str) -> bool {
+    value
+        .split(['/', '\\'])
+        .rfind(|c| !c.is_empty())
+        .is_some_and(|last| {
+            GUARDED_FILE_NAMES
+                .iter()
+                .any(|g| last.eq_ignore_ascii_case(g))
+        })
+}
+
+/// The index of the token that closes the bracket opened at `open`.
+fn close_of(t: &[Tok], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, k) in t.iter().enumerate().skip(open) {
+        if k.kind != TokKind::Punct {
+            continue;
+        }
+        match k.text.as_str() {
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One piece of an include argument: a literal or the manifest dir.
+fn piece_value(t: &[Tok]) -> Result<String, ValueError> {
+    match t {
+        [s] if s.kind == TokKind::Str => decode_str(&s.text),
+        [e, bang, open, var, close]
+            if e.kind == TokKind::Ident
+                && e.text == "env"
+                && bang.text == "!"
+                && open.text == "("
+                && close.text == ")"
+                && var.kind == TokKind::Str =>
+        {
+            if decode_str(&var.text)? == MANIFEST_DIR_VAR {
+                Ok(String::new())
+            } else {
+                Err(ValueError::NotLiteral)
+            }
+        }
+        _ => Err(ValueError::NotLiteral),
+    }
+}
+
+/// The value of an include macro's argument tokens (inside its parens).
+fn include_value(t: &[Tok]) -> Result<String, ValueError> {
+    let is_concat = t.len() >= 4
+        && is_w(t, 0, "concat")
+        && is_p(t, 1, "!")
+        && is_p(t, 2, "(")
+        && close_of(t, 2) == Some(t.len() - 1);
+    if !is_concat {
+        return piece_value(t);
+    }
+    let inner = &t[3..t.len() - 1];
+    let mut out = String::new();
+    let mut from = 0;
+    let mut depth = 0usize;
+    for (i, k) in inner.iter().enumerate() {
+        match (k.kind, k.text.as_str()) {
+            (TokKind::Punct, "(" | "[" | "{") => depth += 1,
+            (TokKind::Punct, ")" | "]" | "}") => depth = depth.saturating_sub(1),
+            (TokKind::Punct, ",") if depth == 0 => {
+                out.push_str(&piece_value(&inner[from..i])?);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if from < inner.len() {
+        out.push_str(&piece_value(&inner[from..])?);
+    }
+    Ok(out)
+}
+
+fn undecodable(file: &str, line: usize, literal: String) -> IncludeFinding {
+    IncludeFinding::Undecodable {
+        file: file.to_string(),
+        line,
+        literal,
+    }
+}
+
+/// The inclusion census of one lexed file; `mods` counts the guarded
+/// module declarations met in their own files.
+fn inclusions_of(path: &str, t: &[Tok], mods: &mut [usize; 2], found: &mut Vec<IncludeFinding>) {
+    let file = || path.to_string();
+    let (close, in_attr) = brackets(t);
+    for (k, tok) in t.iter().enumerate() {
+        if tok.kind != TokKind::Ident {
+            continue;
+        }
+        // `path = <value>` inside an attribute, `cfg_attr` included.
+        if tok.text == "path" && is_p(t, k + 1, "=") && in_attr[k] {
+            match t.get(k + 2).filter(|v| v.kind == TokKind::Str) {
+                None => found.push(IncludeFinding::PathNotLiteral {
+                    file: file(),
+                    line: tok.line,
+                }),
+                Some(v) => match decode_str(&v.text) {
+                    Ok(value) if names_guarded_file(&value) => {
+                        found.push(IncludeFinding::PathAttr {
+                            file: file(),
+                            line: tok.line,
+                            value,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(_) => found.push(undecodable(path, tok.line, v.text.clone())),
+                },
+            }
+        }
+        if INCLUDE_MACROS.contains(&tok.text.as_str()) && is_p(t, k + 1, "!") && is_p(t, k + 2, "(")
+        {
+            let value =
+                close[k + 2].map_or(Err(ValueError::NotLiteral), |c| include_value(&t[k + 3..c]));
+            match value {
+                Ok(value) if names_guarded_file(&value) => found.push(IncludeFinding::Include {
+                    file: file(),
+                    line: tok.line,
+                    value,
+                }),
+                Ok(_) => {}
+                Err(ValueError::NotLiteral) => found.push(IncludeFinding::IncludeNotLiteral {
+                    file: file(),
+                    line: tok.line,
+                }),
+                Err(ValueError::Undecodable(lit)) => found.push(undecodable(path, tok.line, lit)),
+            }
+        }
+        if tok.text == "mod" && is_p(t, k + 2, ";") {
+            for (m, (name, home)) in GUARDED_MODS.iter().enumerate() {
+                if !is_w(t, k + 1, name) {
+                    continue;
+                }
+                if path == *home {
+                    mods[m] += 1;
+                } else {
+                    found.push(IncludeFinding::ModElsewhere {
+                        file: file(),
+                        line: tok.line,
+                        name,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// One pass over a file's brackets: the index of the closer of each
+/// opener, and whether each token sits inside a `#[…]` or `#![…]`
+/// attribute. Linear in the token count.
+fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
+    let mut close = vec![None; t.len()];
+    let mut in_attr = vec![false; t.len()];
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    let mut inside = 0usize;
+    for (i, k) in t.iter().enumerate() {
+        in_attr[i] = inside > 0;
+        if k.kind != TokKind::Punct {
+            continue;
+        }
+        match k.text.as_str() {
+            "(" | "{" => stack.push((i, false)),
+            "[" => {
+                let attr = is_p(t, i.wrapping_sub(1), "#")
+                    || (is_p(t, i.wrapping_sub(1), "!") && is_p(t, i.wrapping_sub(2), "#"));
+                inside += usize::from(attr);
+                stack.push((i, attr));
+            }
+            ")" | "]" | "}" => {
+                if let Some((open, attr)) = stack.pop() {
+                    close[open] = Some(i);
+                    inside -= usize::from(attr);
+                }
+            }
+            _ => {}
+        }
+    }
+    (close, in_attr)
+}
+
+/// #10213 and #10204: the static census against [`STATICS_TABLE`] and the
+/// inclusion census, over one lex of every walked file.
+fn token_census(
+    files: &[(String, String)],
+    table: &str,
+) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
+    let (rows, bad) = parse_table(table);
+    let mut statics: Vec<StaticFinding> = bad.into_iter().map(StaticFinding::Table).collect();
+    let mut includes = Vec::new();
+    // Rows left per file, then per name: a static takes one row.
+    let mut left: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
+    for r in &rows {
+        *left
+            .entry(r.path.as_str())
+            .or_default()
+            .entry(r.name.as_str())
+            .or_default() += 1;
+    }
+    let mut mods = [0usize; 2];
+    for (path, text) in files {
         let toks = match lex(text) {
             Ok(t) => t,
             Err(error) => {
-                found.push(StaticFinding::Lex {
+                statics.push(StaticFinding::Lex {
                     file: path.clone(),
                     error,
                 });
                 continue;
             }
         };
-        if path != ALLOWED_FILE && !names_store_url(&toks) {
-            continue;
-        }
-        for k in (0..toks.len()).filter(|&k| is_w(&toks, k, "static")) {
-            let mut n = k + 1;
-            while is_w(&toks, n, "mut") || is_w(&toks, n, "ref") {
-                n += 1;
-            }
-            let Some(name) = toks.get(n).filter(|x| x.kind == TokKind::Ident) else {
-                continue;
-            };
-            if !is_p(&toks, n + 1, ":") {
-                continue;
-            }
-            match STORE_URL_STATICS
-                .iter()
-                .position(|r| r.file == path && r.name == name.text)
+        let (named, macros) = statics_of(&toks);
+        for (name, line) in named {
+            match left
+                .get_mut(path.as_str())
+                .and_then(|m| m.get_mut(name.as_str()))
             {
-                Some(r) => seen[r] += 1,
-                None => found.push(StaticFinding::Unlisted {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => statics.push(StaticFinding::Unlisted {
                     file: path.clone(),
-                    name: name.text.clone(),
-                    line: name.line,
+                    name,
+                    line,
                 }),
             }
         }
+        for line in macros {
+            statics.push(StaticFinding::MacroStatic {
+                file: path.clone(),
+                line,
+            });
+        }
+        inclusions_of(path, &toks, &mut mods, &mut includes);
     }
-    for (r, n) in STORE_URL_STATICS.iter().zip(seen) {
-        let (file, name) = (r.file.to_string(), r.name.to_string());
-        match n {
-            0 => found.push(StaticFinding::Missing { file, name }),
-            1 => {}
-            _ => found.push(StaticFinding::Duplicate { file, name }),
+    for r in &rows {
+        if let Some(n) = left
+            .get_mut(r.path.as_str())
+            .and_then(|m| m.get_mut(r.name.as_str()))
+            && *n > 0
+        {
+            *n -= 1;
+            statics.push(StaticFinding::Missing {
+                file: r.path.clone(),
+                name: r.name.clone(),
+            });
         }
     }
-    found
+    for ((name, home), n) in GUARDED_MODS.iter().zip(mods) {
+        if n != 1 {
+            includes.push(IncludeFinding::ModCount {
+                file: home,
+                name,
+                found: n,
+            });
+        }
+    }
+    (statics, includes)
 }
 
 /// One finding of [`census_all`], tagged by the part that found it.
@@ -1884,16 +2287,19 @@ enum Finding {
     Item(ItemFinding),
     Use(UseFinding),
     Static(StaticFinding),
+    Include(IncludeFinding),
 }
 
-/// All four parts of the census over the whole tree.
+/// All five parts of the census over the whole tree.
 fn census_all(files: &[(String, String)]) -> Vec<Finding> {
+    let (statics, includes) = token_census(files, STATICS_TABLE);
     census(files)
         .into_iter()
         .map(Finding::Line)
         .chain(item_census(files).into_iter().map(Finding::Item))
         .chain(use_census(files).into_iter().map(Finding::Use))
-        .chain(static_census(files).into_iter().map(Finding::Static))
+        .chain(statics.into_iter().map(Finding::Static))
+        .chain(includes.into_iter().map(Finding::Include))
         .collect()
 }
 
@@ -2120,129 +2526,628 @@ fn apply(m: &Mutant) -> (Vec<(String, String)>, Vec<usize>) {
     (files, firsts)
 }
 
-/// Red-first form: the census must find something in the mutant.
-fn assert_mutant_red(m: &Mutant) {
-    let (files, _) = apply(m);
-    let found = census_all(&files);
-    assert!(!found.is_empty(), "mutant {} passed the census", m.id);
+fn st_unlisted(file: &str, name: &str, line: usize) -> Finding {
+    Finding::Static(StaticFinding::Unlisted {
+        file: file.into(),
+        name: name.into(),
+        line,
+    })
+}
+
+fn path_attr(line: usize, value: &str) -> Finding {
+    Finding::Include(IncludeFinding::PathAttr {
+        file: SUPPORT.into(),
+        line,
+        value: value.into(),
+    })
+}
+
+fn include_hit(line: usize, value: &str) -> Finding {
+    Finding::Include(IncludeFinding::Include {
+        file: SUPPORT.into(),
+        line,
+        value: value.into(),
+    })
+}
+
+/// The census of mutant `m`, with the first appended line of each edit.
+fn run(m: &Mutant) -> (Vec<Finding>, Vec<usize>) {
+    let (files, firsts) = apply(m);
+    (census_all(&files), firsts)
 }
 
 #[test]
 fn mutant_support_lock_taken_by_store_url_test_is_red_10213() {
-    assert_mutant_red(&M_SUPPORT_LOCK);
+    let (got, f) = run(&M_SUPPORT_LOCK);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "STORE_SERIAL", f[0] + 1)],
+        "{}",
+        M_SUPPORT_LOCK.id
+    );
 }
 
 #[test]
 fn mutant_static_direct_mutex_is_red_10213() {
-    assert_mutant_red(&M_DIRECT);
+    let (got, f) = run(&M_DIRECT);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "FORM_DIRECT", f[0])],
+        "{}",
+        M_DIRECT.id
+    );
 }
 
 #[test]
 fn mutant_static_type_alias_is_red_10213() {
-    assert_mutant_red(&M_ALIAS);
+    let (got, f) = run(&M_ALIAS);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "FORM_ALIAS", f[0] + 1)],
+        "{}",
+        M_ALIAS.id
+    );
 }
 
 #[test]
 fn mutant_static_lazy_lock_is_red_10213() {
-    assert_mutant_red(&M_LAZY);
+    let (got, f) = run(&M_LAZY);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "FORM_LAZY", f[0])],
+        "{}",
+        M_LAZY.id
+    );
 }
 
 #[test]
 fn mutant_static_once_lock_in_fn_body_is_red_10213() {
-    assert_mutant_red(&M_ONCE_IN_FN);
+    let (got, f) = run(&M_ONCE_IN_FN);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "FORM_ONCE", f[0] + 1)],
+        "{}",
+        M_ONCE_IN_FN.id
+    );
 }
 
 #[test]
 fn mutant_static_thread_local_is_red_10213() {
-    assert_mutant_red(&M_THREAD_LOCAL);
+    let (got, f) = run(&M_THREAD_LOCAL);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "FORM_LOCAL", f[0] + 1)],
+        "{}",
+        M_THREAD_LOCAL.id
+    );
 }
 
 #[test]
 fn mutant_static_ref_is_red_10213() {
-    assert_mutant_red(&M_STATIC_REF);
+    let (got, f) = run(&M_STATIC_REF);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "FORM_REF", f[0] + 1)],
+        "{}",
+        M_STATIC_REF.id
+    );
 }
 
 #[test]
 fn mutant_static_mut_is_red_10213() {
-    assert_mutant_red(&M_STATIC_MUT);
+    let (got, f) = run(&M_STATIC_MUT);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "FORM_MUT", f[0])],
+        "{}",
+        M_STATIC_MUT.id
+    );
 }
 
 #[test]
 fn mutant_static_built_by_macro_is_red_10213() {
-    assert_mutant_red(&M_MACRO);
+    let (got, f) = run(&M_MACRO);
+    assert_eq!(
+        got,
+        vec![Finding::Static(StaticFinding::MacroStatic {
+            file: SUPPORT.into(),
+            line: f[0] + 2,
+        })],
+        "{}",
+        M_MACRO.id
+    );
 }
 
 #[test]
 fn mutant_static_second_listed_name_is_red_10213() {
-    assert_mutant_red(&M_DUPLICATE);
+    let (got, f) = run(&M_DUPLICATE);
+    assert_eq!(
+        got,
+        vec![st_unlisted(SUPPORT, "LOCK", f[0] + 1)],
+        "{}",
+        M_DUPLICATE.id
+    );
 }
 
 #[test]
 fn mutant_static_in_tests_dir_is_red_10213() {
-    assert_mutant_red(&M_TESTS_DIR);
+    let (got, f) = run(&M_TESTS_DIR);
+    assert_eq!(
+        got,
+        vec![st_unlisted(
+            "tests/auto_atomise/core.rs",
+            "FORM_TESTS",
+            f[0]
+        )],
+        "{}",
+        M_TESTS_DIR.id
+    );
 }
 
 #[test]
 fn mutant_static_in_benches_dir_is_red_10213() {
-    assert_mutant_red(&M_BENCHES_DIR);
+    let (got, f) = run(&M_BENCHES_DIR);
+    assert_eq!(
+        got,
+        vec![st_unlisted("benches/harness_bench.rs", "FORM_BENCH", f[0])],
+        "{}",
+        M_BENCHES_DIR.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_path_reinclusion_is_red_10204() {
-    assert_mutant_red(&M_PATH);
+    let (got, f) = run(&M_PATH);
+    assert_eq!(
+        got,
+        vec![path_attr(f[0] + 1, "store_url/env_guard.rs")],
+        "{}",
+        M_PATH.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_cfg_attr_path_is_red_10204() {
-    assert_mutant_red(&M_CFG_ATTR_PATH);
+    let (got, f) = run(&M_CFG_ATTR_PATH);
+    assert_eq!(
+        got,
+        vec![path_attr(f[0], "store_url/env_guard.rs")],
+        "{}",
+        M_CFG_ATTR_PATH.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_path_upper_case_is_red_10204() {
-    assert_mutant_red(&M_PATH_UPPER);
+    let (got, f) = run(&M_PATH_UPPER);
+    assert_eq!(
+        got,
+        vec![path_attr(f[0], "store_url/ENV_GUARD.RS")],
+        "{}",
+        M_PATH_UPPER.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_path_escaped_is_red_10204() {
-    assert_mutant_red(&M_PATH_ESCAPED);
+    let (got, f) = run(&M_PATH_ESCAPED);
+    assert_eq!(
+        got,
+        vec![path_attr(f[0], "store_url/env_guard.rs")],
+        "{}",
+        M_PATH_ESCAPED.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_path_raw_string_is_red_10204() {
-    assert_mutant_red(&M_PATH_RAW);
+    let (got, f) = run(&M_PATH_RAW);
+    assert_eq!(
+        got,
+        vec![path_attr(f[0], "store_url/env_guard.rs")],
+        "{}",
+        M_PATH_RAW.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_path_backslash_is_red_10204() {
-    assert_mutant_red(&M_PATH_BACKSLASH);
+    let (got, f) = run(&M_PATH_BACKSLASH);
+    assert_eq!(
+        got,
+        vec![path_attr(f[0], "store_url\\env_guard.rs")],
+        "{}",
+        M_PATH_BACKSLASH.id
+    );
 }
 
 #[test]
 fn mutant_guard_parent_module_path_is_red_10204() {
-    assert_mutant_red(&M_PATH_PARENT);
+    let (got, f) = run(&M_PATH_PARENT);
+    assert_eq!(
+        got,
+        vec![path_attr(f[0], "store_url.rs")],
+        "{}",
+        M_PATH_PARENT.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_include_is_red_10204() {
-    assert_mutant_red(&M_INCLUDE);
+    let (got, f) = run(&M_INCLUDE);
+    assert_eq!(
+        got,
+        vec![include_hit(f[0], "store_url/env_guard.rs")],
+        "{}",
+        M_INCLUDE.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_include_concat_env_is_red_10204() {
-    assert_mutant_red(&M_INCLUDE_CONCAT);
+    let (got, f) = run(&M_INCLUDE_CONCAT);
+    assert_eq!(
+        got,
+        vec![include_hit(f[0], "/src/store_url/env_guard.rs")],
+        "{}",
+        M_INCLUDE_CONCAT.id
+    );
 }
 
 #[test]
 fn mutant_guard_file_include_split_concat_is_red_10204() {
-    assert_mutant_red(&M_INCLUDE_SPLIT);
+    let (got, f) = run(&M_INCLUDE_SPLIT);
+    assert_eq!(
+        got,
+        vec![include_hit(f[0], "store_url/env_guard.rs")],
+        "{}",
+        M_INCLUDE_SPLIT.id
+    );
 }
 
 #[test]
 fn mutant_include_not_literal_is_red_10204() {
-    assert_mutant_red(&M_INCLUDE_NOT_LITERAL);
+    let (got, f) = run(&M_INCLUDE_NOT_LITERAL);
+    assert_eq!(
+        got,
+        vec![Finding::Include(IncludeFinding::IncludeNotLiteral {
+            file: SUPPORT.into(),
+            line: f[0],
+        })],
+        "{}",
+        M_INCLUDE_NOT_LITERAL.id
+    );
 }
 
 #[test]
 fn mutant_mod_store_url_in_second_root_is_red_10204() {
-    assert_mutant_red(&M_MOD_ELSEWHERE);
+    let (got, f) = run(&M_MOD_ELSEWHERE);
+    assert_eq!(
+        got,
+        vec![Finding::Include(IncludeFinding::ModElsewhere {
+            file: "src/main.rs".into(),
+            line: f[0],
+            name: "store_url",
+        })],
+        "{}",
+        M_MOD_ELSEWHERE.id
+    );
+}
+
+/// A second `mod store_url;` in its own file is red too.
+#[test]
+fn mod_store_url_twice_in_lib_is_red_10204() {
+    let (files, _) = tree_appended("src/lib.rs", "pub mod store_url;\n");
+    assert_eq!(
+        census_all(&files),
+        vec![Finding::Include(IncludeFinding::ModCount {
+            file: "src/lib.rs",
+            name: "store_url",
+            found: 2,
+        })]
+    );
+}
+
+/// A row with no static is refused, and a bad row is refused with its line.
+#[test]
+fn table_rows_are_refused_exactly_10213() {
+    let ghost = format!("{STATICS_TABLE}src/test_support.rs\tGHOST\tno such static anywhere\n");
+    let (statics, includes) = token_census(&tree(), &ghost);
+    assert_eq!(
+        statics,
+        vec![StaticFinding::Missing {
+            file: SUPPORT.into(),
+            name: "GHOST".into(),
+        }]
+    );
+    assert_eq!(includes, Vec::<IncludeFinding>::new());
+    let text = "# comment\n\
+                src/a.rs\tA\ta reason long enough\n\
+                src/a.rs\tB\n\
+                \n\
+                src/a.rs\tC\tr\textra\n\
+                src/../x.rs\tD\ta reason long enough\n\
+                lib/a.rs\tE\ta reason long enough\n\
+                src/a.txt\tF\ta reason long enough\n\
+                src/a b.rs\tG\ta reason long enough\n\
+                src\\a.rs\tH\ta reason long enough\n\
+                src/a.rs\t9x\ta reason long enough\n\
+                src/a.rs\tI-J\ta reason long enough\n\
+                src/a.rs\tK\t  short  \n\
+                src/a.rs\t\ta reason long enough\n";
+    let (rows, bad) = parse_table(text);
+    assert_eq!(
+        rows,
+        vec![StaticRow {
+            path: "src/a.rs".into(),
+            name: "A".into(),
+            reason: "a reason long enough".into(),
+        }]
+    );
+    assert_eq!(
+        bad,
+        vec![
+            TableFinding::Fields { line: 3, found: 2 },
+            TableFinding::Fields { line: 4, found: 1 },
+            TableFinding::Fields { line: 5, found: 4 },
+            TableFinding::BadPath {
+                line: 6,
+                path: "src/../x.rs".into()
+            },
+            TableFinding::BadPath {
+                line: 7,
+                path: "lib/a.rs".into()
+            },
+            TableFinding::BadPath {
+                line: 8,
+                path: "src/a.txt".into()
+            },
+            TableFinding::BadPath {
+                line: 9,
+                path: "src/a b.rs".into()
+            },
+            TableFinding::BadPath {
+                line: 10,
+                path: "src\\a.rs".into()
+            },
+            TableFinding::BadName {
+                line: 11,
+                name: "9x".into()
+            },
+            TableFinding::BadName {
+                line: 12,
+                name: "I-J".into()
+            },
+            TableFinding::ShortReason { line: 13 },
+            TableFinding::BadName {
+                line: 14,
+                name: String::new()
+            },
+        ]
+    );
+    let (statics, _) = token_census(&[], "src/a.rs\tA\tshort\n");
+    assert_eq!(
+        statics,
+        vec![StaticFinding::Table(TableFinding::ShortReason { line: 1 })]
+    );
+}
+
+/// The literal decoder, each escape form by hand.
+#[test]
+fn decode_str_forms_10204() {
+    let ok: &[(&str, &str)] = &[
+        ("\"a/b.rs\"", "a/b.rs"),
+        ("\"env\\x5fguard\"", "env_guard"),
+        ("\"\\u{65}nv\"", "env"),
+        ("\"a\\\\b\"", "a\\b"),
+        ("\"a\\\"b\"", "a\"b"),
+        ("\"a\\\n    b\"", "ab"),
+        ("\"\\n\\t\\r\\0\\'\"", "\n\t\r\0'"),
+        ("r\"a\\b\"", "a\\b"),
+        ("r#\"a\"b\"#", "a\"b"),
+        ("br##\"x\"##", "x"),
+        ("b\"x\"", "x"),
+        ("c\"x\"", "x"),
+    ];
+    for (lit, want) in ok {
+        assert_eq!(decode_str(lit), Ok((*want).to_string()), "{lit}");
+    }
+    for lit in [
+        "\"\\q\"",
+        "\"\\x5\"",
+        "\"\\xzz\"",
+        "\"\\u{zz}\"",
+        "\"\\u{d800}\"",
+        "\"\\u65\"",
+        "\"x",
+    ] {
+        assert_eq!(
+            decode_str(lit),
+            Err(ValueError::Undecodable(lit.to_string())),
+            "{lit}"
+        );
+    }
+    let names: &[(&str, bool)] = &[
+        ("store_url/env_guard.rs", true),
+        ("ENV_GUARD.RS", true),
+        ("a\\store_url.rs", true),
+        ("store_url.rs/", true),
+        ("env_guard.rs.bak", false),
+        ("my_env_guard.rs", false),
+        ("store_url/mod.rs", false),
+        ("", false),
+    ];
+    for (v, want) in names {
+        assert_eq!(names_guarded_file(v), *want, "{v}");
+    }
+}
+
+/// An undecodable literal in `#[path]` or an include is a finding, never a
+/// pass, and so is an include macro with a non-literal piece.
+#[test]
+fn undecodable_and_not_literal_are_red_10204() {
+    let rows: &[(&str, &[IncludeFinding])] = &[
+        (
+            "#[path = \"a\\qb.rs\"]\nmod m;\n",
+            &[IncludeFinding::Undecodable {
+                file: String::new(),
+                line: 1,
+                literal: String::new(),
+            }],
+        ),
+        (
+            "#[path = MOD_PATH]\nmod m;\n",
+            &[IncludeFinding::PathNotLiteral {
+                file: String::new(),
+                line: 1,
+            }],
+        ),
+        (
+            "include_str!(concat!(env!(\"OUT_DIR\"), \"/x\"));\n",
+            &[IncludeFinding::IncludeNotLiteral {
+                file: String::new(),
+                line: 1,
+            }],
+        ),
+        (
+            "include_bytes!(concat!(\"a\", X));\n",
+            &[IncludeFinding::IncludeNotLiteral {
+                file: String::new(),
+                line: 1,
+            }],
+        ),
+        (
+            "include!($p);\n",
+            &[IncludeFinding::IncludeNotLiteral {
+                file: String::new(),
+                line: 1,
+            }],
+        ),
+        (
+            "include_str!(\"readme.md\");\nlet path = 1;\nf(path = 2);\n",
+            &[],
+        ),
+        (
+            "#[doc = include_str!(\"../env_guard.rs\")]\nfn f() {}\n",
+            &[IncludeFinding::Include {
+                file: String::new(),
+                line: 1,
+                value: String::new(),
+            }],
+        ),
+    ];
+    for (src, want) in rows {
+        let toks = lex(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        let mut mods = [0usize; 2];
+        let mut got = Vec::new();
+        inclusions_of("src/x.rs", &toks, &mut mods, &mut got);
+        let shape: Vec<IncludeFinding> = got
+            .into_iter()
+            .map(|f| match f {
+                IncludeFinding::Undecodable { line, .. } => IncludeFinding::Undecodable {
+                    file: String::new(),
+                    line,
+                    literal: String::new(),
+                },
+                IncludeFinding::PathNotLiteral { line, .. } => IncludeFinding::PathNotLiteral {
+                    file: String::new(),
+                    line,
+                },
+                IncludeFinding::IncludeNotLiteral { line, .. } => {
+                    IncludeFinding::IncludeNotLiteral {
+                        file: String::new(),
+                        line,
+                    }
+                }
+                IncludeFinding::Include { line, .. } => IncludeFinding::Include {
+                    file: String::new(),
+                    line,
+                    value: String::new(),
+                },
+                other => other,
+            })
+            .collect();
+        assert_eq!(shape, *want, "{src}");
+    }
+    let toks = lex("#[path = \"a\\qb.rs\"]\nmod m;\n").expect("lexes");
+    let mut got = Vec::new();
+    inclusions_of("src/x.rs", &toks, &mut [0; 2], &mut got);
+    assert_eq!(
+        got,
+        vec![IncludeFinding::Undecodable {
+            file: "src/x.rs".into(),
+            line: 1,
+            literal: "\"a\\qb.rs\"".into(),
+        }]
+    );
+}
+
+/// A symbolic link in the tree is refused by the walk, never followed.
+#[test]
+fn symlink_in_tree_is_refused_10204() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("store_url_env_guard_8168_links");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("clear scratch");
+    }
+    fs::create_dir_all(root.join("src")).expect("scratch dir");
+    fs::write(root.join("src/a.rs"), "static A: u8 = 0;\n").expect("write");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("src/a.rs"), root.join("src/b.rs")).expect("symlink");
+    let mut files = Vec::new();
+    let mut links = Vec::new();
+    walk(&root, &root, &mut files, &mut links);
+    assert_eq!(
+        files,
+        vec![("src/a.rs".to_string(), "static A: u8 = 0;\n".to_string())]
+    );
+    #[cfg(unix)]
+    assert_eq!(links, vec!["src/b.rs".to_string()]);
+    fs::remove_dir_all(&root).expect("clean scratch");
+}
+
+/// The token census is linear: a 200 000-line file of every form it parses
+/// is judged in well under the ceiling, with every hit reported.
+#[test]
+fn token_census_cost_is_bounded_10213() {
+    const LINES: usize = 200_000;
+    const CEILING_SECS: u64 = 20;
+    let mut big = String::new();
+    for i in 0..LINES / 4 {
+        let _ = writeln!(big, "static S{i}: u8 = 0;");
+        big.push_str("let path = x;\n");
+        big.push_str("#[path = \"other.rs\"]\n");
+        big.push_str("const X: &str = include_str!(\"y.md\");\n");
+    }
+    let files = vec![("src/big.rs".to_string(), big)];
+    let start = std::time::Instant::now();
+    let (statics, includes) = token_census(&files, "");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(CEILING_SECS),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(statics.len(), LINES / 4);
+    assert_eq!(
+        statics[7],
+        StaticFinding::Unlisted {
+            file: "src/big.rs".into(),
+            name: "S7".into(),
+            line: 29
+        }
+    );
+    assert_eq!(
+        includes,
+        vec![
+            IncludeFinding::ModCount {
+                file: "src/store_url.rs",
+                name: "env_guard",
+                found: 0
+            },
+            IncludeFinding::ModCount {
+                file: "src/lib.rs",
+                name: "store_url",
+                found: 0
+            },
+        ]
+    );
 }

@@ -1348,7 +1348,7 @@ helper_mutation_census () {
         local named guard total rel
         named="$(grep -cE "$HELPER_MUTATION_PATTERN" "$f" 2>/dev/null || true)"
         guard=0
-        if grep -q 'EnvGuard' "$f" 2>/dev/null; then
+        if grep -qw 'EnvGuard' "$f" 2>/dev/null; then
             guard="$(grep -cE "$HELPER_GUARD_METHOD_PATTERN" "$f" 2>/dev/null || true)"
         fi
         total=$(( ${named:-0} + ${guard:-0} ))
