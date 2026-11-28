@@ -8955,3 +8955,203 @@ fn scoped_resolution_cost_is_bounded_10293() {
         assert_eq!(miss, Vec::<String>::new());
     }
 }
+
+// ---------------------------------------------------------------------------
+// #10322 and #10323: a glob of a module the census did not read refuses
+// every name that module does not bind itself, and `mod NAME;` links to the
+// walked file by the Rust rules for the declaring file, after every file is
+// read, so no verdict depends on the walk order.
+// ---------------------------------------------------------------------------
+
+/// A walked module that binds a lock type, for the #10323 link cases.
+const LINKED_GATE: &str = "pub struct Gate(std::sync::Mutex<u8>);\n";
+
+/// #10322: a glob import of an unread module (a `#[path]` module, a declared
+/// module with no walked file) never supplies nothing: a name it may bind,
+/// a prelude name included, is `PathNotLanded`, the refusal the same module
+/// gives when named by path. A glob of a read module stays exact.
+#[test]
+fn unread_module_glob_refuses_10322() {
+    let b = "src/b.rs";
+    let x = ("src/x.rs", "pub struct Thing(u8);\n");
+    let cases: Vec<R3Case> = vec![
+        (
+            "U1-path-module-glob-vec",
+            vec![
+                x,
+                (
+                    b,
+                    "#[path = \"x.rs\"]\nmod px;\nuse px::*;\nstatic FORM: Vec<u8> = X;\n",
+                ),
+            ],
+            vec![r3_unres(b, 4, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+        (
+            "U2-path-module-glob-result",
+            vec![
+                x,
+                (
+                    b,
+                    "#[path = \"x.rs\"]\nmod px;\nuse px::*;\nstatic FORM: Result<u8, u8> = X;\n",
+                ),
+            ],
+            vec![r3_unres(b, 4, Why::PathNotLanded("Result".into()))],
+            None,
+        ),
+        (
+            "U3-declared-no-file-glob-vec",
+            vec![(
+                b,
+                "mod nofile;\nuse nofile::*;\nstatic FORM: Vec<u8> = X;\n",
+            )],
+            vec![r3_unres(b, 3, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+        (
+            "U4-declared-no-file-glob-result",
+            vec![(
+                b,
+                "mod nofile;\nuse nofile::*;\nstatic FORM: Result<u8, u8> = X;\n",
+            )],
+            vec![r3_unres(b, 3, Why::PathNotLanded("Result".into()))],
+            None,
+        ),
+        (
+            "U5-glob-of-read-module-that-globs-unread",
+            vec![
+                x,
+                ("src/a.rs", "#[path = \"x.rs\"]\nmod px;\npub use px::*;\n"),
+                (b, "use crate::a::*;\nstatic FORM: Vec<u8> = X;\n"),
+            ],
+            vec![r3_unres(b, 2, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+        (
+            "U6-control-glob-of-read-module",
+            vec![
+                ("src/a.rs", "pub struct Plain(u8);\n"),
+                (b, "use crate::a::*;\nstatic FORM: Vec<u8> = X;\n"),
+            ],
+            vec![],
+            None,
+        ),
+        (
+            "U7-control-declared-no-file-by-path",
+            vec![(b, "mod nofile;\nstatic FORM: nofile::Thing = X;\n")],
+            vec![r3_unres(b, 2, Why::PathNotLanded("Thing".into()))],
+            None,
+        ),
+    ];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10323: one case run with its files in the order written and reversed.
+fn both_orders(case: R3Case) -> Vec<String> {
+    let (id, files, want, inc) = case;
+    let mut back = files.clone();
+    back.reverse();
+    let fwd_id: &'static str = format!("{id}/written").leak();
+    let back_id: &'static str = format!("{id}/reversed").leak();
+    r3_misses(vec![
+        (fwd_id, files, want.clone(), inc.clone()),
+        (back_id, back, want, inc),
+    ])
+}
+
+/// #10323: `mod NAME;` links to the walked file the Rust rules name for the
+/// declaring file, in either walk order; a declared module whose file was
+/// not walked is unread (#10322).
+#[test]
+fn module_link_ignores_walk_order_10323() {
+    let a = "tests/a.rs";
+    let cases: Vec<R3Case> = vec![
+        (
+            "L1-dir-mod-rs-by-name",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/common/mod.rs", LINKED_GATE),
+            ],
+            vec![r3_lock(a, 3)],
+            None,
+        ),
+        (
+            "L2-sibling-file",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/common.rs", LINKED_GATE),
+            ],
+            vec![r3_lock(a, 3)],
+            None,
+        ),
+        (
+            "L3-foo-rs-with-foo-dir-helper",
+            vec![
+                (
+                    "tests/foo.rs",
+                    "mod helper;\nuse helper::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/foo/helper.rs", LINKED_GATE),
+            ],
+            vec![r3_lock("tests/foo.rs", 3)],
+            None,
+        ),
+        (
+            "L4-glob-of-linked-module",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::*;\nstatic FORM: Vec<Gate> = X;\n",
+                ),
+                ("tests/common/mod.rs", LINKED_GATE),
+            ],
+            vec![r3_unres(a, 3, Why::Glob("Gate".into()))],
+            None,
+        ),
+        (
+            "L5-live-shape-glob-prelude-name",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::*;\nstatic FORM: Vec<u8> = X;\n",
+                ),
+                ("tests/common/mod.rs", "pub fn helper() {}\n"),
+            ],
+            vec![],
+            None,
+        ),
+        (
+            "L6-nested-dir-module",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::inner::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/common/mod.rs", "pub mod inner;\n"),
+                ("tests/common/inner.rs", LINKED_GATE),
+            ],
+            vec![r3_lock(a, 3)],
+            None,
+        ),
+        (
+            "L7-declared-module-not-walked",
+            vec![
+                (a, "mod gone;\nuse gone::*;\nstatic FORM: Vec<u8> = X;\n"),
+                ("tests/common/mod.rs", LINKED_GATE),
+            ],
+            vec![r3_unres(a, 3, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+    ];
+    let mut miss = Vec::new();
+    for case in cases {
+        miss.extend(both_orders(case));
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
