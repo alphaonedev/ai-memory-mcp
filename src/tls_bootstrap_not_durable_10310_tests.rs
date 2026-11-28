@@ -224,9 +224,8 @@ fn reissued_tick_reload_error_logs_whole_chain_10330() {
     let reload = Err(std::io::Error::other(ReloadOuter10330(
         std::io::Error::from_raw_os_error(libc::EACCES),
     )));
-    let tick = tracing::subscriber::with_default(sink.subscriber(), || {
-        reissued_tick(reload, &report, 90)
-    });
+    let tick =
+        tracing::subscriber::with_default(sink.subscriber(), || reissued_tick(reload, &report, 90));
     assert_eq!(tick, RenewalTick::ReloadFailed);
     let message = renewal_tick_message(tick, &report).expect("a failed reload logs");
     assert_eq!(
