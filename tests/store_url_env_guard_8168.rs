@@ -2249,10 +2249,18 @@ fn statics_of(
             name.text.clone()
         };
         if in_macro[k] {
+            // #10350: the written type, when there is one, is read like a
+            // type outside a macro; an empty span is no written type.
+            let ty = if is_p(t, name_at + 1, ":") {
+                let from = name_at + 2;
+                (from, type_end(t, close, from))
+            } else {
+                (k, k)
+            };
             named.push(StaticItem {
                 name,
                 line: t[k].line,
-                ty: (k, k),
+                ty,
                 in_macro: true,
             });
         } else if meta {
@@ -2439,6 +2447,20 @@ fn type_atoms(
                 ">" if is_p(t, i + 1, ":") && is_p(t, i + 2, ":") => {
                     out.push(Atom::Unres(Why::Projection));
                     i += 3;
+                }
+                // #10350: a metavariable (`$t`, `$crate::x::Y`) names no
+                // type until expansion; the path it starts is skipped.
+                "$" => {
+                    let mut j = i + 1;
+                    let name = ident(j).map_or(String::new(), |x| x.text.clone());
+                    if !name.is_empty() {
+                        while is_p(t, j + 1, ":") && is_p(t, j + 2, ":") && ident(j + 3).is_some() {
+                            j += 3;
+                        }
+                        j += 1;
+                    }
+                    out.push(Atom::Unres(Why::MacroFragment(format!("${name}"))));
+                    i = j;
                 }
                 _ => i += 1,
             },
@@ -3935,17 +3957,23 @@ impl Resolved<'_> {
 
     /// #10295: the digest of a static's type: `type=<hash>` of its own
     /// written tokens, then `<module path>::<name>=<hash>` of every
-    /// definition reached from it, each once, sorted; and whether every
-    /// name the type and those definitions write is one the pin reads
-    /// ([`pin_reads`]). Linear in the nodes, atoms and edges reached.
-    fn digest(&self, scope: usize, atoms: &[Atom], own: u64) -> (String, bool) {
+    /// definition reached from it, each once, sorted; and the least reason
+    /// of a name the type or those definitions write that the pin does not
+    /// read ([`pin_reads`]), `None` when the pin reads them all. Linear in
+    /// the nodes, atoms and edges reached.
+    fn digest(&self, scope: usize, atoms: &[Atom], own: u64) -> (String, Option<Why>) {
         let g = self.graph;
-        let mut reads = true;
+        let mut unread: Option<Why> = None;
         let mut seen: BTreeSet<usize> = BTreeSet::new();
         let mut todo: Vec<usize> = Vec::new();
         let mut look = |scope: usize, a: &Atom, todo: &mut Vec<usize>| match g.atom(scope, a) {
             Err(n) => todo.push(n),
-            Ok(Res::Unres(why)) if !pin_reads(&why) => reads = false,
+            Ok(Res::Unres(why)) if !pin_reads(&why) => {
+                unread = Some(match unread.take() {
+                    Some(u) => u.min(why),
+                    None => why,
+                });
+            }
             Ok(_) => {}
         };
         for a in atoms {
@@ -3973,7 +4001,7 @@ impl Resolved<'_> {
             .collect();
         entries.sort();
         entries.insert(0, format!("{OWN_TYPE_KEY}={}", hex8(own)));
-        (entries.join(" "), reads)
+        (entries.join(" "), unread)
     }
 }
 
@@ -5017,35 +5045,49 @@ fn token_census_counted(
         {
             let key = (path.to_string(), name.clone());
             let scope = scope_at(sp, ty.0);
+            // #10350: a macro-body static's written type is read by the same
+            // resolver, in the scope that writes it; a metavariable in it is
+            // a `MacroFragment` atom, and no written type is one too.
             let mut atoms = Vec::new();
-            if !in_macro {
-                type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
+            type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
+            if in_macro && ty.0 >= ty.1 {
+                atoms.push(Atom::Unres(Why::MacroFragment(String::new())));
             }
             // #10295: a row is taken only by the static whose live reason is
             // the row's `why` and whose type the pin reads in full; taking it
-            // checks its pin against the live digest. A macro-body static's
-            // digest is its own written type only. `None` when no row is
-            // taken (the row then stays stale), else the digest finding.
+            // checks its pin against the live digest of the type and every
+            // definition it reaches (#10350: in a macro body too). `Ok` holds
+            // the digest finding; `Err(Some(why))` is a row of this `why`
+            // whose type reaches a name the pin does not read (the least
+            // such reason), `Err(None)` no row of this `why`. A row not taken
+            // stays stale.
             let take = |excepted: &mut BTreeMap<(String, String), (bool, &str, &str)>,
-                        why: &str| {
-                let (used, pinned, admits) = excepted.get_mut(&key)?;
-                let own = token_hash(&f.toks, ty);
-                let (live, reads) = if in_macro {
-                    (format!("{OWN_TYPE_KEY}={}", hex8(own)), true)
-                } else {
-                    resolved.digest(scope, &atoms, own)
+                        why: &str|
+             -> Result<Option<StaticFinding>, Option<Why>> {
+                let Some((used, pinned, admits)) = excepted.get_mut(&key) else {
+                    return Err(None);
                 };
-                if *admits != why || !reads {
-                    return None;
+                if *admits != why {
+                    return Err(None);
+                }
+                let (live, unread) = resolved.digest(scope, &atoms, token_hash(&f.toks, ty));
+                if let Some(u) = unread {
+                    return Err(Some(u));
                 }
                 *used = true;
-                Some(digest_finding(path, &name, pinned, &live))
+                Ok(digest_finding(path, &name, pinned, &live))
             };
             if in_macro {
                 // #10285: never a row; judged only by hand.
                 match take(&mut excepted, MACRO_BODY_WHY) {
-                    Some(stale) => statics.extend(stale),
-                    None => statics.push(StaticFinding::MacroBodyStatic {
+                    Ok(stale) => statics.extend(stale),
+                    Err(Some(why)) => statics.push(StaticFinding::MacroBodyUnread {
+                        file: path.to_string(),
+                        name,
+                        line,
+                        why,
+                    }),
+                    Err(None) => statics.push(StaticFinding::MacroBodyStatic {
                         file: path.to_string(),
                         name,
                         line,
@@ -5065,8 +5107,8 @@ fn token_census_counted(
                 // #10275, #10283: a static not proven lock-free.
                 Res::Unres(why) if not_lock.contains(&key) => {
                     match take(&mut excepted, &why_text(&why)) {
-                        Some(stale) => statics.extend(stale),
-                        None => statics.push(StaticFinding::Unresolvable {
+                        Ok(stale) => statics.extend(stale),
+                        Err(_) => statics.push(StaticFinding::Unresolvable {
                             file: path.to_string(),
                             name: name.clone(),
                             line,
@@ -7281,8 +7323,10 @@ const FORM_WHY: &str = "judged by hand for the form table";
 /// `Unknown` is a `NoDef`, which never takes a row).
 const D_UNRES: &str = "type=83d1c796";
 
-/// #10295: the pinned digest of the macro-body `INNER` static's type.
-const D_INNER: &str = "type=4fd0bfc1";
+/// #10295: the pinned digest of the macro-body `INNER` static's type,
+/// `std::sync::Mutex<u8>` (#10350: the type is read; `4fd0bfc1` was the
+/// hash of the empty span the census used to take).
+const D_INNER: &str = "type=34579755";
 
 /// What the deny-by-default census must decide for one form.
 #[derive(Debug)]
@@ -9512,12 +9556,21 @@ const D_M_NONE_10350: &str = "type=4fd0bfc1";
 /// #10350: a `macro_rules!` whose one arm has the matcher `matcher` and
 /// the body `static FORM<decl> = X;` on line 3.
 fn macro_static_10350(matcher: &str, decl: &str) -> String {
-    format!("macro_rules! m {{\n    ({matcher}) => {{\n        static FORM{decl} = X;\n    }};\n}}\n")
+    format!(
+        "macro_rules! m {{\n    ({matcher}) => {{\n        static FORM{decl} = X;\n    }};\n}}\n"
+    )
 }
 
 /// One #10350 case: `(id, src/a.rs text, src/b.rs text, pinned digest,
 /// why, findings)`.
-type MacroReachCase<'a> = (String, &'a str, String, &'a str, &'a str, Vec<StaticFinding>);
+type MacroReachCase<'a> = (
+    String,
+    &'a str,
+    String,
+    &'a str,
+    &'a str,
+    Vec<StaticFinding>,
+);
 
 /// #10350: a macro-body row is pinned to every definition its written type
 /// reaches, as a row outside a macro is: a lock field added to a reached
