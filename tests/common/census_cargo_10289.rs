@@ -52,7 +52,7 @@ fn norm(name: &str) -> String {
     name.to_ascii_lowercase().replace('-', "_")
 }
 
-fn watched(name: &str) -> bool {
+pub(crate) fn watched(name: &str) -> bool {
     WATCHED_CRATES.contains(&norm(name).as_str())
 }
 

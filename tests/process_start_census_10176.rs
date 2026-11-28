@@ -863,6 +863,11 @@ const ENV_ROWS: &[(&str, usize, &str)] = &[
         "#10299 Python bound fixture: the literal each generated constant binds",
     ),
     (
+        "tests/common/census_config_10301.json",
+        4,
+        "#10301 shared table: the env rows and lines a cargo config refusal names",
+    ),
+    (
         "tests/common/census_env_name_10299.json",
         23,
         "#10299 shared table: the literal the fixture constants and calls name",
@@ -1422,6 +1427,8 @@ fn census(tree: &Tree) -> Vec<String> {
     for (rel, bytes) in &tree.files {
         if rel.rsplit('/').next() == Some("Cargo.toml") {
             out.extend(census_cargo::manifest_findings(rel, bytes));
+        } else if census_config::is_config(rel) {
+            out.extend(census_config::config_findings(rel, bytes));
         }
     }
     out.extend(compare_counts(
@@ -1859,9 +1866,10 @@ fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
                 0,
                 ENV_ROWS[1].1
             ),
-            line("tests/common/census_env_name_10299.json", 0, ENV_ROWS[2].1),
-            line("tests/common/census_env_name_10299.rs", 0, ENV_ROWS[3].1),
-            line("tests/common/proptest_guard.rs", 0, ENV_ROWS[4].1),
+            line("tests/common/census_config_10301.json", 0, ENV_ROWS[2].1),
+            line("tests/common/census_env_name_10299.json", 0, ENV_ROWS[3].1),
+            line("tests/common/census_env_name_10299.rs", 0, ENV_ROWS[4].1),
+            line("tests/common/proptest_guard.rs", 0, ENV_ROWS[5].1),
         ]
     );
 }

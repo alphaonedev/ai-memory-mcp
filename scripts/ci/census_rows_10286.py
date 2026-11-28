@@ -52,6 +52,7 @@ import pathlib
 import re
 import stat
 import sys
+import tomllib
 
 SKIPPED = frozenset({"target", ".git", ".local-runs", ".codegraph", "node_modules"})
 IMPL_CAP = 512
@@ -894,6 +895,130 @@ def tree_rs(root: pathlib.Path) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+# ---------------------------------------------------------------- cargo config (#10301)
+
+# The crates whose replacement would hide a process start or a proptest run,
+# written as Cargo normalises them; the Rust list is census_cargo WATCHED_CRATES.
+WATCHED_CRATES = frozenset({"libc", "nix", "proptest", "rusty_fork", "wait_timeout"})
+# The file names cargo reads its configuration from, inside a `.cargo` dir.
+CONFIG_DIR = ".cargo"
+CONFIG_NAMES = ("config.toml", "config")
+# Top-level tables that cannot replace a crate or start a process.
+CONFIG_PLAIN = frozenset({"alias", "cache", "cargo-new", "doc", "future-incompat-report", "http", "net", "term"})
+# `build` keys that cannot replace a crate or start a process; rustflags are read.
+BUILD_PLAIN = frozenset({"dep-info-basedir", "incremental", "jobs", "target", "target-dir"})
+FLAG_KEYS = frozenset({"rustflags", "rustdocflags"})
+FLAG_SPLIT_RE = re.compile(r"[^A-Za-z0-9_-]+")
+CFG_PATCH = "{rel}: {shown} patches the watched crate {name}; a patched watched crate runs code the census never reads (#10301)"
+CFG_PATHS = ("{rel}: paths overrides crates with local copies; a path override can replace a watched crate with code "
+             "the census never reads (#10301)")
+CFG_SOURCE = "{rel}: {shown} replaces a crate source; a replaced source can serve a watched crate the census never reads (#10301)"
+CFG_FLAG = ("{rel}: {shown} names a watched crate or an extern in a compiler flag; a flag can replace a watched crate "
+            "with code the census never reads (#10301)")
+CFG_ENV = "{rel}: {shown} sets a proptest variable for every cargo command; a config can switch proptest fork on (#10301)"
+CFG_UNKNOWN = ("{rel}: {shown} is a cargo config form the census does not understand; a form it does not read is a "
+               "process start nobody counted (#10301)")
+CFG_NOT_UTF8 = "{rel}: not UTF-8; an unreadable cargo config is not clean (#10301)"
+CFG_NOT_TOML = "{rel}: not TOML the census reads; an unparseable cargo config is not clean (#10301)"
+
+
+def crate_watched(name: str) -> bool:
+    return name.lower().replace("-", "_") in WATCHED_CRATES
+
+
+def is_config(rel: str) -> bool:
+    """Whether `rel` is a file cargo reads its configuration from, at any depth."""
+    parts = rel.split("/")
+    return len(parts) >= 2 and parts[-2] == CONFIG_DIR and parts[-1] in CONFIG_NAMES
+
+
+def _flatten(value: object, path: list[str], out: list[tuple[list[str], str | None]]) -> bool:
+    """Flatten to (key path, string or None) as census_cargo::parse does; False on a
+    value outside the Rust parser's subset (a float or a date)."""
+    if isinstance(value, dict):
+        return all(_flatten(v, [*path, k], out) for k, v in value.items())
+    if isinstance(value, list):
+        return all(_flatten(v, [*path, f"#{i}"], out) for i, v in enumerate(value))
+    if isinstance(value, str):
+        out.append((path, value))
+        return True
+    if isinstance(value, (bool, int)):
+        out.append((path, None))
+        return True
+    return False
+
+
+def _flag_hit(value: str | None) -> bool:
+    if value is None:
+        return False
+    return "extern" in value.lower() or any(crate_watched(w) for w in FLAG_SPLIT_RE.split(value) if w)
+
+
+def config_findings(rel: str, data: bytes) -> list[str]:
+    """The #10301 findings of one cargo config file, sorted and without repeats."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return [CFG_NOT_UTF8.format(rel=rel)]
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return [CFG_NOT_TOML.format(rel=rel)]
+    entries: list[tuple[list[str], str | None]] = []
+    if not _flatten(doc, [], entries):
+        return [CFG_NOT_TOML.format(rel=rel)]
+    out: set[str] = set()
+    for path, value in entries:
+        top = path[0]
+        if top == "patch" and len(path) >= 3:
+            name = path[2]
+            if crate_watched(name):
+                out.add(CFG_PATCH.format(rel=rel, shown=".".join(path[:3]), name=name))
+            elif path[-1] == "package" and value is not None and crate_watched(value):
+                out.add(CFG_PATCH.format(rel=rel, shown=".".join(path[:3]), name=value))
+        elif top == "patch":
+            out.add(CFG_UNKNOWN.format(rel=rel, shown=".".join(path)))
+        elif top == "paths":
+            out.add(CFG_PATHS.format(rel=rel))
+        elif top == "source":
+            out.add(CFG_SOURCE.format(rel=rel, shown=".".join(path[:2])))
+        elif top == "env" and len(path) >= 2:
+            if path[1].upper().startswith("PROPTEST"):
+                out.add(CFG_ENV.format(rel=rel, shown=".".join(path[:2])))
+        elif top == "build" and len(path) >= 2 and path[1] in FLAG_KEYS:
+            if _flag_hit(value):
+                out.add(CFG_FLAG.format(rel=rel, shown=".".join(path)))
+        elif top == "build" and len(path) >= 2 and path[1] in BUILD_PLAIN:
+            pass
+        elif top == "build":
+            out.add(CFG_UNKNOWN.format(rel=rel, shown=".".join(path[:2])))
+        elif top == "target" and len(path) >= 3 and path[2] in FLAG_KEYS:
+            if _flag_hit(value):
+                out.add(CFG_FLAG.format(rel=rel, shown=".".join(path)))
+        elif top == "target":
+            out.add(CFG_UNKNOWN.format(rel=rel, shown=".".join(path[:3])))
+        elif top not in CONFIG_PLAIN:
+            out.add(CFG_UNKNOWN.format(rel=rel, shown=top))
+    return sorted(out)
+
+
+def tree_configs(root: pathlib.Path) -> list[tuple[str, bytes]]:
+    """(relative path, bytes) of every regular cargo config file outside SKIPPED; links not followed."""
+    out = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        for p in sorted(d.iterdir()):
+            rel = p.relative_to(root).as_posix()
+            if rel in SKIPPED or p.is_symlink():
+                continue
+            if p.is_dir():
+                stack.append(p)
+            elif p.is_file() and is_config(rel):
+                out.append((rel, p.read_bytes()))
+    return sorted(out)
+
+
 # ---------------------------------------------------------------- include sites (#10300)
 
 # The include macro whose target is Rust code, and the form each site is
@@ -1165,6 +1290,9 @@ def table(name: str, doc: str, items: dict[str, int], reason: dict[str, str]) ->
 def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
     """The two generated files' text and a few totals."""
     starts = start_files((root / CENSUS).read_text(encoding="utf-8"))
+    config_errors = [f for rel, data in tree_configs(root) for f in config_findings(rel, data)]
+    if config_errors:
+        raise ValueError("\n".join(config_errors))
     lexed = [(rel, lex(text)) for rel, text in tree_rs(root)]
     include_sites_all, include_errors = join_includes(root, lexed)
     if include_errors:
