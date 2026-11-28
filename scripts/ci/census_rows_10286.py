@@ -909,6 +909,11 @@ CONFIG_PLAIN = frozenset({"alias", "cache", "cargo-new", "doc", "future-incompat
 BUILD_PLAIN = frozenset({"dep-info-basedir", "incremental", "jobs", "target", "target-dir"})
 FLAG_KEYS = frozenset({"rustflags", "rustdocflags"})
 FLAG_SPLIT_RE = re.compile(r"[^A-Za-z0-9_-]+")
+# ASCII-only case folding, as Rust to_ascii_lowercase and to_ascii_uppercase do. str.lower()
+# and str.upper() also map non-ASCII letters (U+212A, U+017F) to ASCII, which cargo and
+# proptest never do, so the two census sides would disagree (#10301).
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 CFG_PATCH = "{rel}: {shown} patches the watched crate {name}; a patched watched crate runs code the census never reads (#10301)"
 CFG_PATHS = ("{rel}: paths overrides crates with local copies; a path override can replace a watched crate with code "
              "the census never reads (#10301)")
@@ -923,7 +928,7 @@ CFG_NOT_TOML = "{rel}: not TOML the census reads; an unparseable cargo config is
 
 
 def crate_watched(name: str) -> bool:
-    return name.lower().replace("-", "_") in WATCHED_CRATES
+    return name.translate(ASCII_LOWER).replace("-", "_") in WATCHED_CRATES
 
 
 def is_config(rel: str) -> bool:
@@ -951,7 +956,7 @@ def _flatten(value: object, path: list[str], out: list[tuple[list[str], str | No
 def _flag_hit(value: str | None) -> bool:
     if value is None:
         return False
-    return "extern" in value.lower() or any(crate_watched(w) for w in FLAG_SPLIT_RE.split(value) if w)
+    return "extern" in value.translate(ASCII_LOWER) or any(crate_watched(w) for w in FLAG_SPLIT_RE.split(value) if w)
 
 
 def config_findings(rel: str, data: bytes) -> list[str]:
@@ -983,7 +988,7 @@ def config_findings(rel: str, data: bytes) -> list[str]:
         elif top == "source":
             out.add(CFG_SOURCE.format(rel=rel, shown=".".join(path[:2])))
         elif top == "env" and len(path) >= 2:
-            if path[1].upper().startswith("PROPTEST"):
+            if path[1].translate(ASCII_UPPER).startswith("PROPTEST"):
                 out.add(CFG_ENV.format(rel=rel, shown=".".join(path[:2])))
         elif top == "build" and len(path) >= 2 and path[1] in FLAG_KEYS:
             if _flag_hit(value):
