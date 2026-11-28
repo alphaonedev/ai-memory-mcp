@@ -4,6 +4,7 @@ from pathlib import Path
 import importlib.util
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -131,7 +132,92 @@ class CensusRows10286(unittest.TestCase):
         (self.root / "src/bad.rs").write_bytes(b"fn f() {}\xff\n")
         r = self.check()
         self.assertEqual(r.returncode, EXIT_SCAN)
-        self.assertTrue(r.stderr.startswith("census_rows_10286: scan failed: "), r.stderr)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/bad.rs: not UTF-8 "
+                         "(invalid start byte); the census cannot read it (#10176)")
+
+    def test_a_non_utf8_source_names_its_file_10316(self) -> None:
+        (self.root / "src/deep").mkdir()
+        (self.root / "src/deep/bad.rs").write_bytes(b"fn f() {}\xff\n")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/deep/bad.rs: not UTF-8 "
+                         "(invalid start byte); the census cannot read it (#10176)")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 file")
+    def test_an_unreadable_file_names_its_file_10316(self) -> None:
+        for rel, exp in (("src/locked.rs", "src/locked.rs"), (".cargo/config.toml", ".cargo/config.toml")):
+            p = self.root / rel
+            p.parent.mkdir(exist_ok=True)
+            p.write_text("x = 1\n" if rel.endswith("toml") else "fn h() {}\n", encoding="utf-8")
+            p.chmod(0)
+            self.addCleanup(p.chmod, 0o644)
+            r = self.check()
+            self.assertEqual(r.returncode, EXIT_SCAN, rel)
+            self.assertEqual(r.stderr.strip(), f"census_rows_10286: scan failed: {exp}: unreadable "
+                             "(Permission denied)")
+            p.chmod(0o644)
+            p.unlink()
+
+    def test_a_symlink_in_the_tree_fails_the_scan_10315(self) -> None:
+        (self.root / "src/l.rs").symlink_to("clean.rs")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/l.rs: a symbolic link; "
+                         "the census never follows links (#10176)")
+
+    def test_a_symlink_to_a_directory_and_to_a_non_rs_file_fail_the_scan_10315(self) -> None:
+        (self.root / "src/d").symlink_to(".", target_is_directory=True)
+        (self.root / "notes.txt").symlink_to("src/clean.rs")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: notes.txt: a symbolic link; "
+                         "the census never follows links (#10176)\nsrc/d: a symbolic link; "
+                         "the census never follows links (#10176)")
+
+    def test_the_config_walk_refuses_a_link_10315(self) -> None:
+        m = scanner_module()
+        (self.root / ".cargo").mkdir()
+        (self.root / ".cargo/config.toml").symlink_to("../src/clean.rs")
+        with self.assertRaises(ValueError) as cm:
+            m.tree_configs(self.root)
+        self.assertEqual(str(cm.exception), ".cargo/config.toml: a symbolic link; "
+                         "the census never follows links (#10176)")
+
+    def test_write_never_follows_a_link_to_the_rows_file_10315(self) -> None:
+        outside = self.root.parent / (self.root.name + "-outside.rs")
+        outside.write_text("// outside\n", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        (self.root / ROWS).unlink()
+        (self.root / ROWS).symlink_to(outside)
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "// outside\n")
+
+    def test_the_writer_refuses_a_link_and_a_path_outside_the_root_10315(self) -> None:
+        m = scanner_module()
+        outside = self.root.parent / (self.root.name + "-outside.rs")
+        outside.write_text("// outside\n", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        (self.root / "tests/common/l.rs").symlink_to(outside)
+        with self.assertRaises(ValueError) as cm:
+            m.write_table(self.root, "tests/common/l.rs", "// changed\n")
+        self.assertEqual(str(cm.exception), "tests/common/l.rs: a symbolic link; "
+                         "the census never follows links (#10176)")
+        (self.root / "up").symlink_to(self.root.parent, target_is_directory=True)
+        with self.assertRaises(ValueError) as cm:
+            m.write_table(self.root, "up/x.rs", "// changed\n")
+        self.assertEqual(str(cm.exception), "up/x.rs: resolves outside the root; "
+                         "the census never writes there (#10176)")
+        self.assertEqual(outside.read_text(encoding="utf-8"), "// outside\n")
+        self.assertFalse((self.root.parent / "x.rs").exists())
+
+    def test_a_check_read_of_a_linked_table_names_the_table_10315(self) -> None:
+        # The table is a link only after the scan: read it directly.
+        m = scanner_module()
+        (self.root / "t.rs").symlink_to("src/clean.rs")
+        with self.assertRaises(ValueError) as cm:
+            m.read_scanned(self.root, "t.rs")
+        self.assertEqual(str(cm.exception), "t.rs: a symbolic link; the census never follows links (#10176)")
 
     def test_a_census_without_start_rows_fails_the_scan_10290(self) -> None:
         (self.root / CENSUS).write_text("const START_ROWS: &[(&str, usize)] = &[];\n", encoding="utf-8")
