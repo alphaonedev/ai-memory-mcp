@@ -357,9 +357,6 @@ fn parse_use_tree(toks: &[(Tok, usize)], pos: &mut usize, prefix: &[String], out
     let mut segs: Vec<String> = prefix.to_vec();
     while *pos < toks.len() {
         match &toks[*pos].0 {
-            Tok::ColonColon => {
-                *pos += 1;
-            }
             Tok::Ident(name) => {
                 let name = name.clone();
                 *pos += 1;
@@ -495,7 +492,7 @@ fn collect_aliases(toks: &[(Tok, usize)]) -> Aliases {
 /// - `<fs_or_alias>::write` (call, fn pointer, table entry, match arm)
 /// - directly imported `std::fs::write` (or alias)
 /// - `<File_or_alias>::create` or `<...::File>::create`
-/// - `.truncate(true)` (OpenOptions truncating open, single-line or multi-line)
+/// - `.truncate(true)` (`OpenOptions` truncating open, single-line or multi-line)
 fn find_truncating_write_lines(src: &str) -> Vec<usize> {
     let stripped = strip_comments_and_literals(src);
     let toks = tokenize(&stripped);
