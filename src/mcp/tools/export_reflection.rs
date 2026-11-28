@@ -643,7 +643,7 @@ mod tests {
         let err = handle_export_reflection(&conn, &json!({}))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("memory_id"));
+        assert_eq!(err, crate::errors::msg::MEMORY_ID_REQUIRED);
     }
 
     #[test]
@@ -652,19 +652,17 @@ mod tests {
         let err = handle_export_reflection(&conn, &json!({"memory_id": ""}))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("empty"));
+        assert_eq!(err, crate::errors::msg::MEMORY_ID_EMPTY);
     }
 
     #[test]
     fn unknown_id_errors() {
         let (conn, _g) = fresh_db();
-        let err = handle_export_reflection(
-            &conn,
-            &json!({"memory_id": "11111111-2222-3333-4444-555555555555"}),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not found"));
+        let id = "11111111-2222-3333-4444-555555555555";
+        let err = handle_export_reflection(&conn, &json!({"memory_id": id}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, format!("reflection not found: {id}"));
     }
 
     #[test]
@@ -677,7 +675,7 @@ mod tests {
         let err = handle_export_reflection(&conn, &json!({"memory_id": id}))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not a reflection"));
+        assert_eq!(err, format!("memory is not a reflection: {id}"));
     }
 
     #[test]
@@ -688,7 +686,7 @@ mod tests {
         let err = handle_export_reflection(&conn, &json!({"memory_id": id, "format": "yaml"}))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unsupported export format"));
+        assert_eq!(err, crate::errors::msg::unsupported_export_format("yaml"));
     }
 
     #[test]
@@ -796,6 +794,11 @@ mod tests {
             },
         );
         let err = res.expect_err("#10181: reader returning a different memory.id must be refused");
+        assert_eq!(
+            err,
+            format!("reflection export row identity mismatch: requested {rfl_id}, got {other_id}"),
+            "#10234: identity check must emit exact row identity mismatch refusal"
+        );
         assert!(
             !err.contains("other reflection body"),
             "#10181: refusal must not carry substituted row content: {err}"
