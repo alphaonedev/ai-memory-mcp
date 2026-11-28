@@ -1654,8 +1654,140 @@ fn table_findings(
 
 /// #10311: the findings of a file rowed `R_SHAPE_EXTERN` whose extern blocks
 /// declare anything but `acl_*` functions.
-fn extern_row_findings(_rel: &str, _toks: &[Lexed]) -> Vec<String> {
-    Vec::new()
+/// The blocks are found with the predicate of the extern arm of
+/// [`census_pins::shapes_of`] (`extern {` or `extern "abi" {`). Each item of
+/// a block is read at depth 0: `pub`, `pub(..)`, `unsafe` and `safe` are
+/// skipped; `fn acl_*` is the one permitted item; an attribute is named
+/// `#[name]`, a `static`, `type` or other `fn` by its name, and any other
+/// item (a macro call among them) by its first token. Each block is read
+/// once and the scan resumes after it, so the cost is linear.
+fn extern_row_findings(rel: &str, toks: &[Lexed]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k < toks.len() {
+        let open = if ident(toks, k) != Some("extern") {
+            None
+        } else if is_p(toks, k + 1, '{') {
+            Some(k + 1)
+        } else if matches!(tok(toks, k + 1), Some(Tok::Str(_))) && is_p(toks, k + 2, '{') {
+            Some(k + 2)
+        } else {
+            None
+        };
+        let Some(open) = open else {
+            k += 1;
+            continue;
+        };
+        let end = group_end(toks, open);
+        extern_items(toks, open + 1, end, &mut names);
+        k = end + 1;
+    }
+    names
+        .into_iter()
+        .map(|n| format!("{rel} is rowed R_SHAPE_EXTERN but declares {n} (#10311)"))
+        .collect()
+}
+
+/// The index after the `;` that ends the item at `k` (groups skipped whole),
+/// or `end`.
+fn item_end(toks: &[Lexed], mut k: usize, end: usize) -> usize {
+    while k < end {
+        if is_p(toks, k, '(') || is_p(toks, k, '[') || is_p(toks, k, '{') {
+            k = group_end(toks, k) + 1;
+        } else if is_p(toks, k, ';') {
+            return k + 1;
+        } else {
+            k += 1;
+        }
+    }
+    end
+}
+
+/// The text of one token, for the name of an unexpected item.
+fn tok_text(t: &Tok) -> String {
+    match t {
+        Tok::Ident(s) | Tok::Char(s) | Tok::Num(s) => s.clone(),
+        Tok::Punct(c) => c.to_string(),
+        Tok::PathSep => "::".to_string(),
+        Tok::Str(s) => format!("{s:?}"),
+    }
+}
+
+/// The names of the items of one extern block body, `toks[k..end]`, that are
+/// not `acl_*` functions.
+fn extern_items(toks: &[Lexed], mut k: usize, end: usize, names: &mut Vec<String>) {
+    while k < end {
+        match ident(toks, k) {
+            Some("pub") if is_p(toks, k + 1, '(') => k = group_end(toks, k + 1) + 1,
+            Some("pub" | "unsafe" | "safe") => k += 1,
+            Some("fn") => {
+                match ident(toks, k + 1) {
+                    Some(n) if n.len() > "acl_".len() && n.starts_with("acl_") => {}
+                    Some(n) => names.push(n.to_string()),
+                    None => names.push("fn".to_string()),
+                }
+                k = item_end(toks, k + 1, end);
+            }
+            Some(kw @ ("static" | "type")) => {
+                let at = if kw == "static" && ident(toks, k + 1) == Some("mut") {
+                    k + 2
+                } else {
+                    k + 1
+                };
+                names.push(ident(toks, at).unwrap_or(kw).to_string());
+                k = item_end(toks, at, end);
+            }
+            _ if is_p(toks, k, ';') => k += 1,
+            _ if is_p(toks, k, '#') => {
+                let br = if is_p(toks, k + 1, '!') { k + 2 } else { k + 1 };
+                if is_p(toks, br, '[') {
+                    names.push(format!("#[{}]", ident(toks, br + 1).unwrap_or("?")));
+                    k = group_end(toks, br) + 1;
+                } else {
+                    names.push("#".to_string());
+                    k += 1;
+                }
+            }
+            _ => {
+                names.push(toks.get(k).map_or_else(String::new, |t| tok_text(&t.tok)));
+                k = item_end(toks, k, end);
+            }
+        }
+    }
+}
+
+/// #10311: the extern reason of a `SHAPE_ROWS` row read as a claim about the
+/// file. Under `R_SHAPE_EXTERN` every form is an extern block that declares
+/// only `acl_*` functions; under any other reason no form is an extern block.
+fn extern_reason_findings(
+    rel: &str,
+    toks: &[Lexed],
+    found: &[(&'static str, usize)],
+    reason: &str,
+) -> Vec<String> {
+    if reason == census_rows::R_SHAPE_EXTERN {
+        let mut out: Vec<String> = found
+            .iter()
+            .filter(|(kind, _)| *kind != "extern")
+            .map(|(kind, line)| {
+                format!(
+                    "{rel}:{line}: a {kind} form under an R_SHAPE_EXTERN row, whose reason covers only extern blocks (#10311)"
+                )
+            })
+            .collect();
+        out.extend(extern_row_findings(rel, toks));
+        out
+    } else {
+        found
+            .iter()
+            .filter(|(kind, _)| *kind == "extern")
+            .map(|(_, line)| {
+                format!(
+                    "{rel}:{line}: an extern block under a SHAPE_ROWS row whose reason is not R_SHAPE_EXTERN (#10311)"
+                )
+            })
+            .collect()
+    }
 }
 
 /// The proptest variable names that a `concat!` builds and that no one of
@@ -1713,7 +1845,7 @@ fn census(tree: &Tree) -> Vec<String> {
     let site_rows: BTreeMap<&str, &[&str]> = SITE_ROWS.iter().map(|(r, d)| (*r, *d)).collect();
     let mut site_have: BTreeSet<&str> = BTreeSet::new();
     let mut macros: BTreeMap<(String, &'static str), Vec<usize>> = BTreeMap::new();
-    let shape_rowed: BTreeSet<&str> = SHAPE_ROWS.iter().map(|r| r.0).collect();
+    let shape_rowed: BTreeMap<&str, &str> = SHAPE_ROWS.iter().map(|r| (r.0, r.2)).collect();
     let needle = env_needle();
     let mut counts = BTreeMap::new();
     let mut outside = BTreeMap::new();
@@ -1730,7 +1862,8 @@ fn census(tree: &Tree) -> Vec<String> {
             tokens.insert(rel.clone(), n);
         }
         let found = census_pins::shapes_of(prep, &watched);
-        if shape_rowed.contains(rel.as_str()) {
+        if let Some(reason) = shape_rowed.get(rel.as_str()) {
+            out.extend(extern_reason_findings(rel, toks, &found, reason));
             if !found.is_empty() {
                 shapes.insert(rel.clone(), found.len());
             }
@@ -2606,13 +2739,22 @@ fn a_shape_extern_row_for_a_non_acl_extern_is_red_10311() {
             "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn acl_get_fd_np(fd: i32, t: i32) -> *mut u8;\n}\n",
             vec![],
         ),
-        ("extern {\n    pub fn acl_x(f: fn(i32) -> i32);\n}\n", vec![]),
+        (
+            "extern {\n    pub fn acl_x(f: fn(i32) -> i32);\n}\n",
+            vec![],
+        ),
         (
             "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn fork() -> i32;\n}\n",
             vec![red("fork")],
         ),
-        ("extern \"C\" {\n    fn posix_spawn() -> i32;\n}\n", vec![red("posix_spawn")]),
-        ("extern {\n    static mut environ: *const u8;\n}\n", vec![red("environ")]),
+        (
+            "extern \"C\" {\n    fn posix_spawn() -> i32;\n}\n",
+            vec![red("posix_spawn")],
+        ),
+        (
+            "extern {\n    static mut environ: *const u8;\n}\n",
+            vec![red("environ")],
+        ),
         ("extern \"C\" {\n    type acl_t;\n}\n", vec![red("acl_t")]),
         (
             "extern \"C\" {\n    #[link_name = \"fork\"]\n    fn acl_free() -> i32;\n}\n",
@@ -2648,7 +2790,9 @@ fn the_census_truth_checks_the_extern_reason_of_a_shape_row_10311() {
         (
             ext,
             "unsafe extern \"C\" {\n    fn acl_free() -> i32;\n}\nunsafe extern \"C\" {\n    fn fork() -> i32;\n}\n",
-            vec![format!("{ext} is rowed R_SHAPE_EXTERN but declares fork (#10311)")],
+            vec![format!(
+                "{ext} is rowed R_SHAPE_EXTERN but declares fork (#10311)"
+            )],
         ),
         (
             ext,

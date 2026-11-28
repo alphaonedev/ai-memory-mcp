@@ -719,8 +719,73 @@ def shapes_of(t: list[Tok], watched: set[str]) -> list[tuple[str, int]]:
         if x.kind == IDENT and v == "extern" and (
             is_p(t, k + 1, "{") or (nxt is not None and nxt.kind == STR and is_p(t, k + 2, "{"))
         ):
+            refused = extern_refused(t, k + 1 if is_p(t, k + 1, "{") else k + 2)
+            if refused is not None:
+                raise ValueError(f"line {ln}: an extern block declares {refused}; "
+                                 "only acl_* functions may be declared in one (#10311)")
             out.append(("extern", ln))
     return out
+
+
+def extern_refused(t: list[Tok], open_k: int) -> str | None:
+    """#10311: the first item of the extern block opened at `open_k` that is not an
+    `acl_*` function, named as the Rust census names it (`#[name]` for an
+    attribute, the name of a `static`, `type` or other `fn`, else the first token
+    of the item), or None. Stops at the first refusal, so an acl-only block is read
+    once and the scan stays linear."""
+    k = open_k + 1
+
+    def item_end(j: int) -> int:
+        d = 0
+        while j < len(t):
+            if t[j].kind == PUNCT and t[j].text in "([{":
+                d += 1
+            elif t[j].kind == PUNCT and t[j].text in ")]}":
+                if d == 0:
+                    return j
+                d -= 1
+            elif d == 0 and is_p(t, j, ";"):
+                return j + 1
+            j += 1
+        return j
+
+    while k < len(t):
+        v = ident_at(t, k)
+        if is_p(t, k, "}"):
+            return None
+        if v == "pub" and is_p(t, k + 1, "("):
+            k = _group_after(t, k + 1)
+        elif v in ("pub", "unsafe", "safe"):
+            k += 1
+        elif v == "fn":
+            n = ident_at(t, k + 1)
+            if n is None or len(n) <= len("acl_") or not n.startswith("acl_"):
+                return n if n is not None else "fn"
+            k = item_end(k + 1)
+        elif v in ("static", "type"):
+            at = k + 2 if v == "static" and ident_at(t, k + 1) == "mut" else k + 1
+            return ident_at(t, at) or v
+        elif is_p(t, k, ";"):
+            k += 1
+        elif is_p(t, k, "#"):
+            br = k + 2 if is_p(t, k + 1, "!") else k + 1
+            return f"#[{ident_at(t, br + 1) or '?'}]" if is_p(t, br, "[") else "#"
+        else:
+            return t[k].text if t[k].kind != STR else repr(t[k].text)
+    return None
+
+
+def _group_after(t: list[Tok], open_k: int) -> int:
+    """The index after the group opened at `open_k`."""
+    d = 0
+    for j in range(open_k, len(t)):
+        if t[j].kind == PUNCT and t[j].text in "([{":
+            d += 1
+        elif t[j].kind == PUNCT and t[j].text in ")]}":
+            d -= 1
+            if d == 0:
+                return j + 1
+    return len(t)
 
 
 def env_calls(t: list[Tok], env_fns: set[str], close: list[int], consts: frozenset[str]) -> list[int]:
@@ -1456,7 +1521,10 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
         n_tok = sum(1 for x in t if x.kind == IDENT and x.text in watched)
         if n_tok:
             tok[rel] = n_tok
-        s = shapes_of(t, watched)
+        try:
+            s = shapes_of(t, watched)
+        except ValueError as e:
+            raise ValueError(f"{rel}: {e}") from e
         if s:
             shape[rel] = len(s)
         try:
