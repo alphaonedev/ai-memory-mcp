@@ -847,3 +847,9 @@ mod tests {
         assert_eq!(v["code"].as_str(), Some("unknown_issuer"));
     }
 }
+
+// v1.0.0 #10309 — a written-but-not-durable file is a stderr warning built
+// from the durability report; the command still succeeds.
+#[cfg(test)]
+#[path = "capability_not_durable_10309_tests.rs"]
+mod not_durable_10309_tests;

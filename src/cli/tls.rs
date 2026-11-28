@@ -656,3 +656,9 @@ mod tests {
         );
     }
 }
+
+// v1.0.0 #10309 — a written-but-not-durable file is a stderr warning built
+// from the durability report; the command still succeeds.
+#[cfg(test)]
+#[path = "tls_not_durable_10309_tests.rs"]
+mod not_durable_10309_tests;
