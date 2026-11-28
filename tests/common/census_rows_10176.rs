@@ -3,9 +3,10 @@
 
 //! #10176 round 3: the token, shape and environment-name tables of the
 //! process-start census (`tests/process_start_census_10176.rs`), one row per
-//! file with its exact count and its reason. The counts were taken by an
-//! independent lexer and each reason names the kind of every token in its file; a change of any count is
-//! red until its row changes with it.
+//! file with its exact count and its reason. Written by
+//! `scripts/ci/census_rows_10286.py --write` (#10290); `--check` is red when
+//! this file differs from a fresh scan. A change of any count is red until
+//! its row changes with it.
 
 /// Starts a process at the sites its `START_ROWS` row counts; part B checks each
 /// one is covered by an expect.
@@ -18,7 +19,9 @@ pub(crate) const R_TOK_NAME: &str =
 pub(crate) const R_TOK_LIBC: &str =
     "names libc or nix for calls that start nothing; a libc start name is refused by part B";
 /// Uses proptest's config or strategies; part A1 holds its blocks guarded.
-pub(crate) const R_TOK_PROPTEST: &str = "uses proptest's config or strategies; every proptest! block it holds opens with proptest_guarded";
+#[rustfmt::skip]
+pub(crate) const R_TOK_PROPTEST: &str =
+    "uses proptest's config or strategies; every proptest! block it holds opens with proptest_guarded";
 /// Names a local, a field or a parameter `prop`, not the proptest module.
 pub(crate) const R_TOK_PROP_NAME: &str =
     "names a local, a field or a parameter prop, which is not the proptest prop module";
@@ -38,10 +41,12 @@ pub(crate) const R_SHAPE_METAVAR: &str =
 pub(crate) const R_SHAPE_PASTE: &str =
     "the vendored paste crate's own tests of [< >] pasting; the workspace never builds them";
 /// An environment name that is a parameter or a built string.
+#[rustfmt::skip]
 pub(crate) const R_ENV_NAME: &str =
-    "an environment name passed as a parameter or built at run time; none is a proptest variable";
+    "an environment name passed as a parameter or built at run time, or a local named like an environment function; none is a proptest variable";
 
 /// Every file that holds a watched process, libc, nix or proptest token, with the count.
+#[rustfmt::skip]
 pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("benches/age_vs_cte.rs", 1, R_TOK_NAME),
     ("benches/harness_bench.rs", 6, R_TOK_START),
@@ -55,25 +60,13 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("loadtest/src/main.rs", 2, R_TOK_NAME),
     ("src/agent_key_file.rs", 5, R_TOK_LIBC),
     ("src/audit.rs", 12, R_TOK_LIBC),
-    (
-        "src/audit/append_only_scratch_5752_tests.rs",
-        11,
-        R_TOK_LIBC,
-    ),
+    ("src/audit/append_only_scratch_5752_tests.rs", 11, R_TOK_LIBC),
     ("src/background/fts_integrity.rs", 1, R_TOK_NAME),
     ("src/cli/agents.rs", 2, R_TOK_NAME),
     ("src/cli/archive.rs", 1, R_TOK_NAME),
     ("src/cli/backup/tests/publish_3550.rs", 4, R_TOK_LIBC),
-    (
-        "src/cli/commands/export_reflections/private_file.rs",
-        26,
-        R_TOK_LIBC,
-    ),
-    (
-        "src/cli/commands/export_reflections/private_file/stale.rs",
-        30,
-        R_TOK_LIBC,
-    ),
+    ("src/cli/commands/export_reflections/private_file.rs", 26, R_TOK_LIBC),
+    ("src/cli/commands/export_reflections/private_file/stale.rs", 30, R_TOK_LIBC),
     ("src/cli/crud.rs", 4, R_TOK_NAME),
     ("src/cli/curator.rs", 12, R_TOK_LIBC),
     ("src/cli/doctor.rs", 2, R_TOK_START),
@@ -114,36 +107,20 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("src/mcp/shutdown.rs", 7, R_TOK_LIBC),
     ("src/mcp/stdio_guard.rs", 34, R_TOK_LIBC),
     ("src/mcp/tools/capabilities.rs", 3, R_TOK_PROP_NAME),
-    (
-        "src/mcp/tools/store/forward_key_daemon_9367_tests.rs",
-        1,
-        R_TOK_NAME,
-    ),
+    ("src/mcp/tools/store/forward_key_daemon_9367_tests.rs", 1, R_TOK_NAME),
     ("src/recover/durability.rs", 1, R_TOK_NAME),
     ("src/recover/in_tx_fault.rs", 3, R_TOK_NAME),
     ("src/recover/line_file.rs", 5, R_TOK_LIBC),
     ("src/reranker.rs", 4, R_TOK_NAME),
     ("src/spawn_audit.rs", 12, R_TOK_START),
     ("src/stop_signal.rs", 4, R_TOK_LIBC),
-    (
-        "src/storage/escalation_frame_reporting_8184_tests.rs",
-        9,
-        R_TOK_LIBC,
-    ),
+    ("src/storage/escalation_frame_reporting_8184_tests.rs", 9, R_TOK_LIBC),
     ("src/storage/row_attest/seal.rs", 1, R_TOK_NAME),
     ("src/storage/snapshot_file.rs", 12, R_TOK_LIBC),
-    (
-        "src/storage/snapshot_nofollow_8950_r1_tests.rs",
-        10,
-        R_TOK_LIBC,
-    ),
+    ("src/storage/snapshot_nofollow_8950_r1_tests.rs", 10, R_TOK_LIBC),
     ("src/store/postgres.rs", 2, R_TOK_PROP_NAME),
     ("src/store/update_atomicity_3152_tests.rs", 1, R_TOK_NAME),
-    (
-        "src/subscriptions/webhook_ssrf_8203_tests.rs",
-        1,
-        R_TOK_NAME,
-    ),
+    ("src/subscriptions/webhook_ssrf_8203_tests.rs", 1, R_TOK_NAME),
     ("src/test_support.rs", 26, R_TOK_START),
     ("src/validate.rs", 27, R_TOK_PROPTEST),
     ("src/wake_client/bundle.rs", 4, R_TOK_LIBC),
@@ -187,11 +164,7 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/cli_store_sign_unbound_3409.rs", 4, R_TOK_START),
     ("tests/cli_surface_cluster_r405.rs", 8, R_TOK_NAME),
     ("tests/cli_verify_chain.rs", 3, R_TOK_START),
-    (
-        "tests/cli_write_verb_pg_refuse_ceiling_2572.rs",
-        4,
-        R_TOK_START,
-    ),
+    ("tests/cli_write_verb_pg_refuse_ceiling_2572.rs", 4, R_TOK_START),
     ("tests/common/atomise_gate.rs", 1, R_TOK_PROPTEST),
     ("tests/common/child_stdin_report.rs", 1, R_TOK_NAME),
     ("tests/common/mcp_stdio_child.rs", 7, R_TOK_START),
@@ -201,18 +174,10 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/common/short_sock.rs", 3, R_TOK_NAME),
     ("tests/common/tls.rs", 1, R_TOK_NAME),
     ("tests/common/tls_serve.rs", 6, R_TOK_START),
-    (
-        "tests/config_auto_tag_endpoint_3808_3819.rs",
-        2,
-        R_TOK_START,
-    ),
+    ("tests/config_auto_tag_endpoint_3808_3819.rs", 2, R_TOK_START),
     ("tests/config_show_effective_3715.rs", 5, R_TOK_START),
     ("tests/conformance_readers.rs", 4, R_TOK_START),
-    (
-        "tests/contaminated_stamp_authz_sqlite_item3_f1.rs",
-        4,
-        R_TOK_START,
-    ),
+    ("tests/contaminated_stamp_authz_sqlite_item3_f1.rs", 4, R_TOK_START),
     ("tests/coverage_uplift_3885.rs", 5, R_TOK_START),
     ("tests/credential_to_sink_3711.rs", 2, R_TOK_START),
     ("tests/deployment_shape_posture_3700.rs", 9, R_TOK_START),
@@ -232,11 +197,7 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/export_import_false_success_2490.rs", 3, R_TOK_START),
     ("tests/export_import_roundtrip_3405.rs", 3, R_TOK_START),
     ("tests/export_scope_desilence_1944.rs", 2, R_TOK_START),
-    (
-        "tests/federation_erasure_replication_2446.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/federation_erasure_replication_2446.rs", 3, R_TOK_START),
     ("tests/federation_peer_posture_3582.rs", 5, R_TOK_START),
     ("tests/file_sink_warn_3650.rs", 4, R_TOK_START),
     ("tests/forensic/bundle_test.rs", 3, R_TOK_START),
@@ -246,58 +207,30 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/forensic_tail_4199.rs", 7, R_TOK_START),
     ("tests/g11_auto_link_detector.rs", 5, R_TOK_START),
     ("tests/governance_storage_insert_hook.rs", 12, R_TOK_START),
-    (
-        "tests/health_metrics_constant_cost_2579_2583.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/health_metrics_constant_cost_2579_2583.rs", 3, R_TOK_START),
     ("tests/hooks_hot_reload.rs", 3, R_TOK_LIBC),
-    (
-        "tests/identity_generate_not_preempted_3743.rs",
-        4,
-        R_TOK_START,
-    ),
+    ("tests/identity_generate_not_preempted_3743.rs", 4, R_TOK_START),
     ("tests/inbox_drain_not_touch_3730.rs", 4, R_TOK_START),
     ("tests/inbox_notify_cli_pg_refusal_3730.rs", 5, R_TOK_START),
     ("tests/inference_egress_dispatch_1963.rs", 3, R_TOK_START),
     ("tests/install_upgrade_4077_4084.rs", 2, R_TOK_START),
     ("tests/integration.rs", 90, R_TOK_START),
-    (
-        "tests/issue_1317_cli_reflect_wire_layer_preserves_caller_metadata.rs",
-        3,
-        R_TOK_NAME,
-    ),
-    (
-        "tests/issue_1590_default_namespace_write_paths.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/issue_1317_cli_reflect_wire_layer_preserves_caller_metadata.rs", 3, R_TOK_START),
+    ("tests/issue_1590_default_namespace_write_paths.rs", 3, R_TOK_START),
     ("tests/key_dir_guard_not_in_binary_3516.rs", 6, R_TOK_START),
     ("tests/key_dir_isolation_3355.rs", 6, R_TOK_START),
     ("tests/key_dir_posture_3198.rs", 4, R_TOK_LIBC),
     ("tests/keygen_race_3772.rs", 1, R_TOK_NAME),
-    (
-        "tests/keypair_write_crash_injection_3146.rs",
-        15,
-        R_TOK_START,
-    ),
+    ("tests/keypair_write_crash_injection_3146.rs", 15, R_TOK_START),
     ("tests/keys_escrow_recovery_3717.rs", 4, R_TOK_START),
     ("tests/keys_prune_3355.rs", 7, R_TOK_START),
-    (
-        "tests/lifecycle_hidden_rows_unit1_3691_3693_3626.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/lifecycle_hidden_rows_unit1_3691_3693_3626.rs", 3, R_TOK_START),
     ("tests/link_substrate_visibility_3498.rs", 4, R_TOK_START),
     ("tests/logging_pipeline_3651.rs", 7, R_TOK_START),
     ("tests/mcp_enum_lists_3378.rs", 27, R_TOK_PROP_NAME),
     ("tests/mcp_format_refusal_3803.rs", 6, R_TOK_START),
     ("tests/mcp_governance_pre_action_1685.rs", 3, R_TOK_START),
-    (
-        "tests/mcp_governance_pre_write_hook_1583.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/mcp_governance_pre_write_hook_1583.rs", 3, R_TOK_START),
     ("tests/mcp_integration.rs", 3, R_TOK_START),
     ("tests/mcp_signal_drain_4347.rs", 20, R_TOK_START),
     ("tests/mcp_stdio_oversize_drain_4064.rs", 1, R_TOK_NAME),
@@ -309,11 +242,7 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/notify_inbox_no_overwrite_3639.rs", 5, R_TOK_START),
     ("tests/pg_isolate_helper_6383.rs", 4, R_TOK_START),
     ("tests/pgvector_preflight_3264.rs", 1, R_TOK_START),
-    (
-        "tests/posture_control15_pg_resolution_3106.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/posture_control15_pg_resolution_3106.rs", 3, R_TOK_START),
     ("tests/power_loss_durability.rs", 4, R_TOK_START),
     ("tests/process_start_census_10176.rs", 4, R_TOK_PROPTEST),
     ("tests/proptest_embeddings.rs", 56, R_TOK_PROPTEST),
@@ -321,17 +250,9 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/proptest_validate.rs", 36, R_TOK_PROPTEST),
     ("tests/recall_stderr_lock_deadlock_4284.rs", 3, R_TOK_START),
     ("tests/recipe_contract.rs", 5, R_TOK_START),
-    (
-        "tests/recipient_gate_derived_from_namespace_3730.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/recipient_gate_derived_from_namespace_3730.rs", 3, R_TOK_START),
     ("tests/record_stop_cli_dispatch_1955.rs", 3, R_TOK_START),
-    (
-        "tests/recursive_learning_task7_shipgate_functional.rs",
-        19,
-        R_TOK_PROPTEST,
-    ),
+    ("tests/recursive_learning_task7_shipgate_functional.rs", 19, R_TOK_PROPTEST),
     ("tests/recursive_sal_coverage.rs", 1, R_TOK_NAME),
     ("tests/reembed_cli_1598.rs", 6, R_TOK_START),
     ("tests/repair_text_cli_parse_9557.rs", 5, R_TOK_START),
@@ -345,26 +266,14 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/serve_postgres_continuation2.rs", 2, R_TOK_START),
     ("tests/serve_postgres_handler_parity.rs", 1, R_TOK_NAME),
     ("tests/serve_store_url_explicit_3431.rs", 5, R_TOK_START),
-    (
-        "tests/signed_events_fresh_store_signs_3354.rs",
-        4,
-        R_TOK_START,
-    ),
-    (
-        "tests/signed_events_fresh_store_signs_3354_pg.rs",
-        4,
-        R_TOK_START,
-    ),
+    ("tests/signed_events_fresh_store_signs_3354.rs", 4, R_TOK_START),
+    ("tests/signed_events_fresh_store_signs_3354_pg.rs", 4, R_TOK_START),
     ("tests/skill_promote_test.rs", 6, R_TOK_START),
     ("tests/skill_promote_visibility_3551/mod.rs", 6, R_TOK_START),
     ("tests/skill_test.rs", 2, R_TOK_START),
     ("tests/spawn_audit_gate_1937.rs", 1, R_TOK_START),
     ("tests/spawn_gate_pins_10176.rs", 15, R_TOK_START),
-    (
-        "tests/sqlite_write_txn_immediate_gate_5084.rs",
-        3,
-        R_TOK_START,
-    ),
+    ("tests/sqlite_write_txn_immediate_gate_5084.rs", 3, R_TOK_START),
     ("tests/stop_signal_8193.rs", 10, R_TOK_START),
     ("tests/store_url_ambiguous_userinfo_6096.rs", 4, R_TOK_START),
     ("tests/store_url_fail_closed_2679.rs", 10, R_TOK_START),
@@ -379,11 +288,7 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
     ("tests/unstamped_policy_3124.rs", 5, R_TOK_START),
     ("tests/url_allowlist_render_3667.rs", 2, R_TOK_START),
     ("tests/verify_audit_trail_store_url_prb.rs", 3, R_TOK_START),
-    (
-        "tests/verify_chain_genesis_exit_code_9505.rs",
-        5,
-        R_TOK_START,
-    ),
+    ("tests/verify_chain_genesis_exit_code_9505.rs", 5, R_TOK_START),
     ("tests/wake_hub_denied_3467.rs", 1, R_TOK_LIBC),
     ("tests/wake_hub_readonly_modes_9562.rs", 17, R_TOK_START),
     ("tests/wake_hub_scale_smoke_3467.rs", 7, R_TOK_LIBC),
@@ -395,6 +300,7 @@ pub(crate) const TOKEN_ROWS: &[(&str, usize, &str)] = &[
 ];
 
 /// Every file that holds a form the census does not model, with the count.
+#[rustfmt::skip]
 pub(crate) const SHAPE_ROWS: &[(&str, usize, &str)] = &[
     ("src/daemon_runtime.rs", 1, R_SHAPE_IMPL),
     ("src/governance/deferred_audit.rs", 2, R_SHAPE_EXTERN),
@@ -415,45 +321,18 @@ pub(crate) const SHAPE_ROWS: &[(&str, usize, &str)] = &[
     ("vendor/paste/tests/ui/env-suffix.rs", 2, R_SHAPE_PASTE),
     ("vendor/paste/tests/ui/env-unexpected.rs", 2, R_SHAPE_PASTE),
     ("vendor/paste/tests/ui/invalid-ident.rs", 6, R_SHAPE_PASTE),
-    (
-        "vendor/paste/tests/ui/missing-paren-on-env.rs",
-        2,
-        R_SHAPE_PASTE,
-    ),
+    ("vendor/paste/tests/ui/missing-paren-on-env.rs", 2, R_SHAPE_PASTE),
     ("vendor/paste/tests/ui/no-env-var.rs", 2, R_SHAPE_PASTE),
-    (
-        "vendor/paste/tests/ui/no-ident-after-colon.rs",
-        2,
-        R_SHAPE_PASTE,
-    ),
-    (
-        "vendor/paste/tests/ui/unexpected-group.rs",
-        2,
-        R_SHAPE_PASTE,
-    ),
-    (
-        "vendor/paste/tests/ui/unexpected-modifier.rs",
-        2,
-        R_SHAPE_PASTE,
-    ),
-    (
-        "vendor/paste/tests/ui/unexpected-punct.rs",
-        2,
-        R_SHAPE_PASTE,
-    ),
-    (
-        "vendor/paste/tests/ui/unsupported-literal.rs",
-        8,
-        R_SHAPE_PASTE,
-    ),
-    (
-        "vendor/paste/tests/ui/unsupported-modifier.rs",
-        2,
-        R_SHAPE_PASTE,
-    ),
+    ("vendor/paste/tests/ui/no-ident-after-colon.rs", 2, R_SHAPE_PASTE),
+    ("vendor/paste/tests/ui/unexpected-group.rs", 2, R_SHAPE_PASTE),
+    ("vendor/paste/tests/ui/unexpected-modifier.rs", 2, R_SHAPE_PASTE),
+    ("vendor/paste/tests/ui/unexpected-punct.rs", 2, R_SHAPE_PASTE),
+    ("vendor/paste/tests/ui/unsupported-literal.rs", 8, R_SHAPE_PASTE),
+    ("vendor/paste/tests/ui/unsupported-modifier.rs", 2, R_SHAPE_PASTE),
 ];
 
 /// Every file that names an environment variable by anything but one literal or constant.
+#[rustfmt::skip]
 pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("src/cli/backup/tests/publish_3550.rs", 2, R_ENV_NAME),
     ("src/cli/doctor.rs", 8, R_ENV_NAME),
@@ -475,6 +354,7 @@ pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("src/logging.rs", 1, R_ENV_NAME),
     ("src/recover/in_tx_fault.rs", 1, R_ENV_NAME),
     ("src/recover/nag.rs", 1, R_ENV_NAME),
+    ("src/reranker.rs", 2, R_ENV_NAME),
     ("src/security_profile.rs", 10, R_ENV_NAME),
     ("src/test_support.rs", 11, R_ENV_NAME),
     ("src/transit_encryption.rs", 1, R_ENV_NAME),
@@ -490,52 +370,32 @@ pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("tests/cov_ga2_pg_federation.rs", 2, R_ENV_NAME),
     ("tests/cov_ga2_r4_federation.rs", 2, R_ENV_NAME),
     ("tests/credential_to_sink_3711.rs", 1, R_ENV_NAME),
-    ("tests/doctor_pg_floor_4333.rs", 2, R_ENV_NAME),
+    ("tests/doctor_pg_floor_4333.rs", 7, R_ENV_NAME),
     ("tests/egress_audit_honors_db_1991.rs", 1, R_ENV_NAME),
     ("tests/embed_lane_egress_gap_3933.rs", 1, R_ENV_NAME),
     ("tests/federation_1936_checkpoint_fed.rs", 2, R_ENV_NAME),
     ("tests/federation_catchup_posture_3582.rs", 6, R_ENV_NAME),
     ("tests/federation_causal_order_3699.rs", 3, R_ENV_NAME),
-    (
-        "tests/federation_confine_ns_scope_2711_pg.rs",
-        1,
-        R_ENV_NAME,
-    ),
-    (
-        "tests/federation_dequarantine_crossid_3901.rs",
-        5,
-        R_ENV_NAME,
-    ),
+    ("tests/federation_confine_ns_scope_2711_pg.rs", 1, R_ENV_NAME),
+    ("tests/federation_dequarantine_crossid_3901.rs", 5, R_ENV_NAME),
+    ("tests/federation_peer_posture_3582.rs", 1, R_ENV_NAME),
     ("tests/forensic_cross_process_4304.rs", 1, R_ENV_NAME),
     ("tests/forensic_exit_drain_4319.rs", 1, R_ENV_NAME),
     ("tests/forensic_tail_4199.rs", 2, R_ENV_NAME),
     ("tests/hf_cache_staged_3788.rs", 2, R_ENV_NAME),
     ("tests/inference_egress_dispatch_1963.rs", 1, R_ENV_NAME),
-    (
-        "tests/inference_egress_proxy_redirect_4193.rs",
-        5,
-        R_ENV_NAME,
-    ),
+    ("tests/inference_egress_proxy_redirect_4193.rs", 11, R_ENV_NAME),
     ("tests/issue_2059_2060_covenant_pg.rs", 4, R_ENV_NAME),
     ("tests/issue_3627_retired_llm_alias.rs", 6, R_ENV_NAME),
-    (
-        "tests/issue_4357_reflect_approval_gate_parity.rs",
-        2,
-        R_ENV_NAME,
-    ),
+    ("tests/issue_4357_reflect_approval_gate_parity.rs", 2, R_ENV_NAME),
     ("tests/lax_perms_hatches_doctor_sink_3813.rs", 8, R_ENV_NAME),
     ("tests/mcp_signal_drain_4347.rs", 1, R_ENV_NAME),
-    (
-        "tests/node_local_containment_item3_r2_3266.rs",
-        3,
-        R_ENV_NAME,
-    ),
+    ("tests/mcp_write_seals_10012.rs", 1, R_ENV_NAME),
+    ("tests/migration_ladder_integrity.rs", 1, R_ENV_NAME),
+    ("tests/node_local_containment_item3_r2_3266.rs", 3, R_ENV_NAME),
     ("tests/permissions_mode_gate.rs", 4, R_ENV_NAME),
-    (
-        "tests/posture_control15_pg_resolution_3106.rs",
-        2,
-        R_ENV_NAME,
-    ),
+    ("tests/posture_control15_pg_resolution_3106.rs", 2, R_ENV_NAME),
+    ("tests/provisioning_pgvector_pin_parity.rs", 1, R_ENV_NAME),
     ("tests/r40_airgapped_approval.rs", 1, R_ENV_NAME),
     ("tests/recall_stderr_lock_deadlock_4284.rs", 2, R_ENV_NAME),
     ("tests/retired_provider_aliases.rs", 8, R_ENV_NAME),
@@ -554,7 +414,7 @@ pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("tests/url_allowlist_render_3667.rs", 1, R_ENV_NAME),
     ("tests/wake_hub_readonly_modes_9562.rs", 1, R_ENV_NAME),
     ("tools/t0-orchestrate/src/main.rs", 2, R_ENV_NAME),
-    ("vendor/paste/src/segment.rs", 1, R_ENV_NAME),
+    ("vendor/paste/src/segment.rs", 5, R_ENV_NAME),
     ("vendor/paste/tests/ui/env-empty.rs", 1, R_ENV_NAME),
     ("vendor/paste/tests/ui/env-non-string.rs", 1, R_ENV_NAME),
     ("vendor/paste/tests/ui/env-suffix.rs", 1, R_ENV_NAME),
