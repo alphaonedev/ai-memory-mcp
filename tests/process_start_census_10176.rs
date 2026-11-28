@@ -1830,6 +1830,73 @@ fn every_fork_or_timeout_form_is_red_10176() {
     }
 }
 
+/// Every write to a `fork` or `timeout` field that #10312 found green: a
+/// literal field under `Self`, a metavariable or any other type, field
+/// shorthand, a pattern field, any compound assignment and a `&mut` borrow.
+/// Each row is one exact finding, and the `timeout` twin of each row too.
+/// The expected line is written out here, never built by the census.
+#[test]
+fn every_fork_or_timeout_field_form_is_red_10312() {
+    let rel = "tests/p.rs";
+    let want = "tests/p.rs:1: a field form of fork or timeout (a literal or pattern field outside a proptest Config literal, field shorthand, a compound assignment or a &mut borrow); a proptest config with fork or timeout on re-runs this test binary outside the sandbox (#10176)";
+    let red: &[&str] = &[
+        "macro_rules! m { ($t:expr) => { Cfg { fork: $t } } }",
+        "macro_rules! m { ($t:ident) => { $t { fork: true } } }",
+        "macro_rules! m { ($t:ty) => { type C = $t; let c = C { fork: true }; } }",
+        "impl Default for ProptestConfig { fn default() -> Self { Self { fork: true, ..base() } } }",
+        "impl ProptestConfig { fn f(fork: bool) -> Self { Self { fork } } }",
+        "let c = ProptestConfig { fork, ..ProptestConfig::default() };",
+        "let c = Cfg { cases: 1, fork };",
+        "let Cfg { ref mut fork, .. } = c;",
+        "if let Cfg { fork, .. } = c {}",
+        "let d = Outer { inner: Inner { fork: true } };",
+        "c.fork += 1;",
+        "c.fork |= true;",
+        "c.fork <<= 1;",
+        "c.fork >>= 1;",
+        "c.fork -= 1;",
+        "let r = &mut c.fork;",
+        "core::mem::replace(&mut c.fork, true);",
+        "let r = &mut self.cfg.fork;",
+        "let r = &mut (*p).fork;",
+        "let r = &mut v[0].fork;",
+        "let r = &raw mut c.fork;",
+        "let r = core::ptr::addr_of_mut!(c.fork);",
+    ];
+    for row in red {
+        for text in [row.to_string(), row.replace("fork", "timeout")] {
+            let (_, forms) = pt_findings(rel, &text);
+            assert_eq!(forms, vec![want.to_string()], "fixture: {text}");
+        }
+    }
+    let green: &[&str] = &[
+        "let c = Config { cases: 8, ..Config::default() };",
+        "let ok = c.fork == 0 && !c.fork();",
+        "let t = c.fork;",
+        "let ok = c.fork <= 5 || c.fork >= 1 || c.fork != 2 || c.fork < 3;",
+        "struct S { fork: u32 }",
+        "pub struct S<T> where T: Copy { fork: T }",
+        "enum E { A, V { fork: u32 } }",
+        "fn f(fork: u32) -> u32 { fork }",
+        "fn f() { let fork: u32 = 5; let g = |a, fork: u32| a; }",
+        "let t = if x { fork } else { fork };",
+        "while running { fork }",
+        "for i in 0..fork { fork }",
+        "loop { fork }",
+        "let v = unsafe { fork };",
+        "match x { fork => 1, _ => fork }",
+        "use x::{fork, y};",
+        "let f = Cfg::fork;",
+        "let d = c.fork.clone();",
+    ];
+    for row in green {
+        for text in [row.to_string(), row.replace("fork", "timeout")] {
+            let (_, forms) = pt_findings(rel, &text);
+            assert!(forms.is_empty(), "fixture: {text}: {forms:?}");
+        }
+    }
+}
+
 #[test]
 fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
     let needle = env_needle();
