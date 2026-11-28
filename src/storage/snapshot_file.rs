@@ -188,7 +188,26 @@ impl NotDurableReport {
             Err(anyhow::Error::new(self))
         }
     }
+
+    /// #10310 — keep this report on a LATER error of the same sequence:
+    /// `err` unchanged when every file noted so far is durable, otherwise
+    /// `err` with the report as text context (precedent: the records of
+    /// `scope::store` written before a failed audit line). The context is a
+    /// `String`, never this type, so the combined error never downcasts to a
+    /// [`NotDurableReport`] and is never read as "complete but not durable".
+    pub(crate) fn context_on(self, err: anyhow::Error) -> anyhow::Error {
+        if self.0.is_empty() {
+            err
+        } else {
+            err.context(format!("{WRITTEN_BEFORE_THE_ERROR}: {self}"))
+        }
+    }
 }
+
+/// #10310 — the head of the context [`NotDurableReport::context_on`] puts on
+/// a later error: the files it names are on disk, not confirmed durable.
+pub(crate) const WRITTEN_BEFORE_THE_ERROR: &str =
+    "files written before this error are kept on disk";
 
 impl std::fmt::Display for NotDurableReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

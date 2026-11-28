@@ -698,12 +698,38 @@ pub(crate) fn ensure_local_tls_reported(
     }
 
     // #10214: every file of the CA and leaf is written before a file not
-    // confirmed durable is reported.
+    // confirmed durable is reported. #10310: an error after a file was
+    // noted keeps the report as its context.
     let mut report = NotDurableReport::new();
-    let (ca_pem, ca_key, fresh_ca) = match load_ca(&dir)? {
+    match mint_or_reuse(key_dir, &dir, &wanted, &mut report) {
+        Ok((outcome, leaf_days_remaining)) => Ok((
+            LocalTls {
+                cert_path,
+                key_path,
+                ca_cert_path,
+                outcome,
+                leaf_days_remaining,
+            },
+            report,
+        )),
+        Err(e) => Err(report.context_on(e)),
+    }
+}
+
+/// The CA and leaf steps of [`ensure_local_tls_reported`]: every file
+/// written is noted in `report`, which the caller keeps on an `Err` (#10310).
+fn mint_or_reuse(
+    key_dir: &Path,
+    dir: &Path,
+    wanted: &[String],
+    report: &mut NotDurableReport,
+) -> Result<(Outcome, i64)> {
+    let cert_path = dir.join(SERVER_CERT_FILE);
+    let key_path = dir.join(SERVER_KEY_FILE);
+    let (ca_pem, ca_key, fresh_ca) = match load_ca(dir)? {
         Some((pem, key)) => (pem, key, false),
         None => {
-            let (pem, key) = generate_ca(&dir, &mut report)?;
+            let (pem, key) = generate_ca(dir, report)?;
             (pem, key, true)
         }
     };
@@ -739,7 +765,7 @@ pub(crate) fn ensure_local_tls_reported(
 
     let outcome = match renew_reason {
         Some(reason) => {
-            issue_leaf(&dir, &ca_pem, ca_key, &wanted, &mut report)?;
+            issue_leaf(dir, &ca_pem, ca_key, wanted, report)?;
             if fresh_ca {
                 Outcome::Generated
             } else {
@@ -749,16 +775,7 @@ pub(crate) fn ensure_local_tls_reported(
         None => Outcome::Reused,
     };
     let status = leaf_status(key_dir)?;
-    Ok((
-        LocalTls {
-            cert_path,
-            key_path,
-            ca_cert_path,
-            outcome,
-            leaf_days_remaining: status.days_remaining.unwrap_or_default(),
-        },
-        report,
-    ))
+    Ok((outcome, status.days_remaining.unwrap_or_default()))
 }
 
 /// #10292 — what one certificate-renewal tick of the daemon did. Every arm

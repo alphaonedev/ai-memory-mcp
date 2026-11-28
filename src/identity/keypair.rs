@@ -1410,10 +1410,13 @@ fn ensure_generate(
             // `.pub` is written before the outcome is reported.
             let mut report = NotDurableReport::new();
             report.note(claim_durability);
-            report.note(
-                write_with_mode_durable(&pub_path, &kp.public.to_bytes(), 0o644, PUBLIC_KEY_WHAT)
-                    .with_context(|| writing_public_key_context(&pub_path))?,
-            );
+            // #10310: a failed `.pub` write keeps the claim's report.
+            match write_with_mode_durable(&pub_path, &kp.public.to_bytes(), 0o644, PUBLIC_KEY_WHAT)
+                .with_context(|| writing_public_key_context(&pub_path))
+            {
+                Ok(pub_durability) => report.note(pub_durability),
+                Err(e) => return Err(report.context_on(e)),
+            }
             // COVERAGE: tracing::info! lazy-format closure — the format args are
             //           constructed lazily; the closure body runs when the INFO
             //           subscriber is enabled. Documented per L0.7 playbook §3c.
