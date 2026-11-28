@@ -246,3 +246,32 @@ fn a_large_cargo_config_is_read_in_linear_time_10301() {
         "#10301 bound fixture"
     );
 }
+
+/// A config in a nested `.cargo` directory of a tree read from disk. The
+/// table rows build the tree in memory, so only this test reaches the walk.
+const NESTED_REL: &str = "crates/x/.cargo/config.toml";
+const NESTED_TEXT: &str = "[patch.crates-io.libc]\npath = \"l\"\n";
+
+#[test]
+fn a_nested_cargo_config_on_disk_is_read_10301() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("census_config_10301");
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("#10301: clear the old fixture tree");
+    }
+    let p = root.join(NESTED_REL);
+    std::fs::create_dir_all(p.parent().expect("a fixture file has a parent"))
+        .expect("#10301: create a fixture dir");
+    std::fs::write(&p, NESTED_TEXT).expect("#10301: write a fixture file");
+    let head = format!("{NESTED_REL}:");
+    let got: Vec<String> = census(&super::read_tree(&root))
+        .into_iter()
+        .filter(|l| l.starts_with(&head) && l.ends_with(TAG))
+        .collect();
+    assert_eq!(
+        got,
+        vec![format!(
+            "{NESTED_REL}: patch.crates-io.libc patches the watched crate libc; a patched watched crate runs code the census never reads {TAG}"
+        )],
+        "#10301 a nested config on disk"
+    );
+}

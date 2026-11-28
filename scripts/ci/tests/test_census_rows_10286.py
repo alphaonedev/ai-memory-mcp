@@ -542,6 +542,8 @@ RUST_CARGO = ROOT / "tests/common/census_cargo_10289.rs"
 RUST_CRATES_RE = re.compile(r"^pub\(crate\) const WATCHED_CRATES: &\[&str\] =\n\s*&\[([^\]]*)\];$", re.M)
 CONFIG_PATCH_LINE = (".cargo/config.toml: patch.crates-io.libc patches the watched crate libc; "
                      "a patched watched crate runs code the census never reads (#10301)")
+# A nested cargo config directory for the tree-walk test (the Rust test uses the same path).
+CONFIG_NESTED_DIR = "crates/x/.cargo"
 
 
 class CargoConfig10301(unittest.TestCase):
@@ -601,6 +603,23 @@ class CargoConfig10301(unittest.TestCase):
             r = run("--write", "--root", str(root))
             self.assertEqual(r.returncode, EXIT_SCAN)
             self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: " + CONFIG_PATCH_LINE)
+
+    def test_a_nested_config_fails_the_scan(self) -> None:
+        """A config in a nested `.cargo` directory is found by the tree walk; the
+        table rows call config_findings directly, so only this test reaches it."""
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="census-config-10301-", dir=SCRATCH) as tmp:
+            root = Path(tmp)
+            for rel, text in FIXTURE.items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text, encoding="utf-8")
+            (root / "tests/common").mkdir(parents=True, exist_ok=True)
+            (root / CONFIG_NESTED_DIR).mkdir(parents=True)
+            (root / CONFIG_NESTED_DIR / "config.toml").write_text('[patch.crates-io.libc]\npath = "l"\n', encoding="utf-8")
+            r = run("--write", "--root", str(root))
+            self.assertEqual(r.returncode, EXIT_SCAN)
+            self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: crates/x/" + CONFIG_PATCH_LINE)
 
 
 if __name__ == "__main__":
