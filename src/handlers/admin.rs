@@ -2200,4 +2200,166 @@ mod pubkey_bind_audit_tests {
             "bootstrap_or_idempotent_reassertion"
         );
     }
+
+    #[tokio::test]
+    async fn refuse_existing_identity_rebind_exact_log_and_audit_per_variant_10229() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        struct GuardWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for GuardWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = GuardWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                GuardWriter(std::sync::Arc::clone(&self.0))
+            }
+        }
+
+        let _guard = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join("admin-bind-audit-10229");
+        std::fs::create_dir_all(&root).expect("audit scratch dir");
+        let dir = tempfile::tempdir_in(&root).expect("audit tempdir");
+        crate::governance::audit::shutdown();
+        crate::governance::audit::init(dir.path(), None).expect("init audit");
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(buf.clone())
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
+
+        let all_slugs = [
+            "existing_identity_requires_lineage",
+            "closed_identity_requires_recovery",
+            "non_canonical_stored_key",
+            "binding_not_authorized",
+            "unclassified_refusal",
+        ];
+        let cases: [(&str, &str, &str, &str); 5] = [
+            (
+                "existing_identity_requires_lineage",
+                "WARN",
+                "existing_identity_requires_lineage",
+                "agent already has a bound key",
+            ),
+            (
+                "closed_identity_requires_recovery",
+                "WARN",
+                "closed_identity_requires_recovery",
+                "agent key history is closed or revoked",
+            ),
+            (
+                "non_canonical_stored_key",
+                "WARN",
+                "non_canonical_stored_key",
+                "stored agent public key is non-canonical",
+            ),
+            (
+                "binding_not_authorized",
+                "WARN",
+                "binding_not_authorized",
+                "bind requires lineage succession or recovery",
+            ),
+            (
+                "unknown_future_cause_10227",
+                "ERROR",
+                "unclassified_refusal",
+                "unclassified storage authorization refusal",
+            ),
+        ];
+
+        let actor = "ai:bind-audit-10229";
+        for (input, expected_level, expected_slug, expected_msg) in cases {
+            buf.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let resp = refuse_existing_identity_rebind(actor, "ai:target-10229", "pk-10229", input);
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+                .await
+                .expect("wire body");
+            let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+            assert_eq!(
+                wire,
+                serde_json::json!({ "error": crate::errors::msg::BIND_PROOF_REFUSED }),
+                "wire refusal must remain opaque for {input}"
+            );
+
+            let captured = String::from_utf8(
+                buf.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )
+            .expect("utf8");
+            let lines: Vec<&str> = captured
+                .lines()
+                .filter(|l| l.contains("identity.bind.requires_succession"))
+                .collect();
+            let [line] = lines.as_slice() else {
+                panic!("expected exactly one tracing line for {input}, got: {captured}");
+            };
+            assert!(
+                line.contains(expected_level),
+                "expected log level {expected_level} for {input}, got: {line}"
+            );
+            let expected_cause = format!("cause=\"{expected_slug}\"");
+            assert!(
+                line.contains(&expected_cause),
+                "expected exact {expected_cause} for {input}, got: {line}"
+            );
+            assert!(
+                line.contains(expected_msg),
+                "expected exact message '{expected_msg}' for {input}, got: {line}"
+            );
+            for other in all_slugs.iter().filter(|s| **s != expected_slug) {
+                assert!(
+                    !line.contains(&format!("cause=\"{other}\"")),
+                    "log line for {input} must not emit foreign cause {other}: {line}"
+                );
+            }
+        }
+        crate::governance::audit::shutdown();
+
+        let body = std::fs::read_dir(dir.path())
+            .expect("read audit dir")
+            .filter_map(Result::ok)
+            .map(|entry| std::fs::read_to_string(entry.path()).expect("read audit file"))
+            .collect::<String>();
+        let reasons: Vec<String> = body
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<crate::governance::audit::ForensicDecision>(line).ok()
+            })
+            .filter(|row| {
+                row.actor == actor
+                    && row.decision == "refuse"
+                    && row.kind == BIND_AGENT_PUBKEY_ACTION
+            })
+            .filter_map(|row| row.payload["reason"].as_str().map(str::to_string))
+            .collect();
+        let expected_reasons: Vec<String> = cases.iter().map(|c| c.2.to_string()).collect();
+        assert_eq!(
+            reasons, expected_reasons,
+            "#10227/#10229: forensic audit reasons must match exact per-variant slugs including unclassified_refusal"
+        );
+    }
 }
