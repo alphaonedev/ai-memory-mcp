@@ -1286,11 +1286,12 @@ fn census(tree: &Tree) -> Vec<String> {
     let names = libc_start_names();
     let aliases: BTreeSet<String> = lexed.iter().flat_map(|(_, t)| aliases_in(t)).collect();
     let preps: Vec<Prep<'_>> = lexed.iter().map(|(_, t)| Prep::new(t)).collect();
-    let watched = census_pins::closure(&preps, WATCHED);
-    let pt = census_pins::closure(&preps, RUNNER_FAMILY);
-    let env_mod = census_pins::closure(&preps, census_pins::ENV_MOD_SEED);
-    let env_fns = census_pins::closure(&preps, census_pins::ENV_FN_SEED);
-    let config = census_pins::closure(&preps, CONFIG_SEED);
+    let graph = census_pins::RenameGraph::of(&preps);
+    let watched = graph.reach(WATCHED).names;
+    let pt = graph.reach(RUNNER_FAMILY).names;
+    let env_mod = graph.reach(census_pins::ENV_MOD_SEED).names;
+    let env_fns = graph.reach(census_pins::ENV_FN_SEED).names;
+    let config = graph.reach(CONFIG_SEED).names;
     let env_reach: BTreeSet<String> = env_mod.union(&env_fns).cloned().collect();
     let hot: BTreeSet<String> = watched
         .iter()

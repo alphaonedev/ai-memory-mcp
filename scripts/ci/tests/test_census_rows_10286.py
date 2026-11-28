@@ -282,6 +282,7 @@ CLOSURE_TABLE = ROOT / "tests/common/census_closure_parity_10304.json"
 CLOSURE_ROWS = 25
 CHAIN_BYTES = 100_000
 CHAIN_SECONDS = 5
+RING_HOPS = 64
 CHAIN_HOPS = {
     "use": ("a", "use a{i} as a{j};\n"),
     "type": ("T", "type T{j} = T{i};\n"),
@@ -326,6 +327,20 @@ class RenameClosure10304(unittest.TestCase):
             self.assertEqual(len(got), hops + 1, kind)
             self.assertIn(f"{first}{hops}", got, kind)
             self.assertLess(dt, CHAIN_SECONDS, f"reversed {kind} chain of {hops} hops took {dt:.1f} s (#10304)")
+
+    def test_the_worklist_pushes_each_node_once(self) -> None:
+        rows = json.loads(CLOSURE_TABLE.read_text(encoding="utf-8"))
+        ring = "".join(f"use r{i} as r{(i + 1) % RING_HOPS};\n" for i in range(RING_HOPS))
+        rows.append([ring, ["r0"], [f"r{i}" for i in range(RING_HOPS)]])
+        bad = []
+        for i, (text, seed, want) in enumerate(rows):
+            g = self.m.RenameGraph(self.m.prepare([("t.rs", self.m.lex(text))]))
+            names, pushes = g.walk(frozenset(seed))
+            if pushes > g.nodes():
+                bad.append(f"row {i}: {pushes} pushes over {g.nodes()} nodes")
+            if names != set(want):
+                bad.append(f"row {i}: closure {sorted(names)!r}")
+        self.assertEqual(bad, [], "#10304 worklist pushes")
 
 
 if __name__ == "__main__":

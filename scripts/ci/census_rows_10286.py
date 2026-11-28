@@ -375,55 +375,159 @@ def prepare(lexed: list[tuple[str, list[Tok]]]) -> Prepared:
     return [(rel, t, brackets(t), semis(t), next_of(t, ";{}")) for rel, t in lexed]
 
 
-def closure(prepared: Prepared, seed: frozenset[str]) -> set[str]:
-    """The seed and every name bound to a member, to a fixpoint."""
-    names = set(seed)
-    binders = {"use", "extern", "type", "macro_rules"}
-    while True:
-        add: set[str] = set()
+class RenameGraph:
+    """#10304: the rename graph of a tree, built once. A node is a name or a binder
+    (one `self as Y`, `type Y` or `macro_rules! Y`); an edge a -> b means b is
+    reached when a is. A token has one range edge (the innermost range that holds
+    it), so the graph is linear in the tokens. Overlapping ranges need no edge of
+    their own: the name of an inner binder is a token of the outer range."""
+
+    def __init__(self, prepared: Prepared) -> None:
+        self.ids: dict[str, int] = {}
+        self.name_of: list[str | None] = []
+        self.out: list[list[int]] = []
         for _rel, t, close, semi, stop in prepared:
-            named = prefix(t, lambda x: x.kind == IDENT and x.text in names)
-            use_until = -1
-            for k, x in enumerate(t):
-                if x.kind != IDENT or x.text not in binders:
+            self._uses(t, semi)
+            self._types(t, stop)
+            self._macros(t, close)
+
+    def name(self, s: str) -> int:
+        if s not in self.ids:
+            self.ids[s] = self.binder()
+            self.name_of[self.ids[s]] = s
+        return self.ids[s]
+
+    def binder(self) -> int:
+        self.name_of.append(None)
+        self.out.append([])
+        return len(self.out) - 1
+
+    def _uses(self, t: list[Tok], semi: list[int]) -> None:
+        use_until = -1
+        for k, x in enumerate(t):
+            if x.kind != IDENT:
+                continue
+            if x.text == "use":
+                if k < use_until:
                     continue
-                v = x.text
-                if v == "use":
-                    if k < use_until:
+                end = semi[k]
+                use_until = end
+                pending: list[int] = []
+                for j in range(k, end):
+                    a = ident_at(t, j)
+                    if a is not None:
+                        pending.append(self.name(a))
+                    y = ident_at(t, j + 2)
+                    if y is None or y == "_" or j + 2 >= end or ident_at(t, j + 1) != "as":
                         continue
-                    end = semi[k]
-                    use_until = end
-                    seen = False
-                    for j in range(k, end):
-                        seen |= ident_at(t, j) in names
-                        y = ident_at(t, j + 2)
-                        if y is None or y == "_" or j + 2 >= end or ident_at(t, j + 1) != "as":
-                            continue
-                        if ident_at(t, j) in names or (ident_at(t, j) == "self" and seen):
-                            add.add(y)
-                elif v == "extern" and ident_at(t, k + 1) == "crate" and ident_at(t, k + 3) == "as":
-                    y = ident_at(t, k + 4)
-                    if ident_at(t, k + 2) in names and y is not None and y != "_":
-                        add.add(y)
-                elif v == "type" and not (k > 0 and t[k - 1].kind == SEP):
-                    y = ident_at(t, k + 1)
-                    if y is None:
-                        continue
-                    e = stop[k + 1]
-                    if e > k + 2 and named[e] > named[k + 2]:
-                        add.add(y)
-                elif v == "macro_rules" and is_p(t, k + 1, "!"):
-                    y = ident_at(t, k + 2)
-                    if y is None:
-                        continue
-                    open_ = k + 3
-                    end = close[open_] if 0 <= open_ < len(t) and close[open_] >= 0 else open_
-                    if named[min(end, len(t))] > named[min(open_, len(t))]:
-                        add.add(y)
-        add -= names
-        if not add:
-            return names
-        names |= add
+                    yi = self.name(y)
+                    if a is not None:
+                        self.out[self.name(a)].append(yi)
+                    if a == "self":
+                        s = self.binder()
+                        self.out[s].append(yi)
+                        for p in pending:
+                            self.out[p].append(s)
+                        pending = []
+            elif x.text == "extern" and ident_at(t, k + 1) == "crate" and ident_at(t, k + 3) == "as":
+                a, y = ident_at(t, k + 2), ident_at(t, k + 4)
+                if a is not None and y is not None and y != "_":
+                    self.out[self.name(a)].append(self.name(y))
+
+    def _types(self, t: list[Tok], stop: list[int]) -> None:
+        starts: list[tuple[int, int, int]] = []
+        for k, x in enumerate(t):
+            if x.kind != IDENT or x.text != "type" or (k > 0 and t[k - 1].kind == SEP):
+                continue
+            y = ident_at(t, k + 1)
+            if y is None:
+                continue
+            e = stop[k + 1]
+            if e > k + 2:
+                b = self.binder()
+                self.out[b].append(self.name(y))
+                starts.append((k + 2, e, b))
+        q = 0
+        cur: tuple[int, int] | None = None
+        for i in range(len(t)):
+            if cur is not None and cur[0] <= i:
+                cur = None
+            while q < len(starts) and starts[q][0] <= i:
+                _s, e, b = starts[q]
+                q += 1
+                cur = (e, b)
+            a = ident_at(t, i)
+            if cur is not None and a is not None:
+                self.out[self.name(a)].append(cur[1])
+
+    def _macros(self, t: list[Tok], close: list[int]) -> None:
+        n = len(t)
+        opens: list[tuple[int, int, int]] = []
+        for k, x in enumerate(t):
+            if x.kind != IDENT or x.text != "macro_rules" or not is_p(t, k + 1, "!"):
+                continue
+            y = ident_at(t, k + 2)
+            if y is None:
+                continue
+            open_ = min(k + 3, n)
+            end = min(close[k + 3] if k + 3 < n and close[k + 3] >= 0 else open_, n)
+            if end > open_:
+                b = self.binder()
+                self.out[b].append(self.name(y))
+                opens.append((open_, end, b))
+        q = 0
+        stack: list[tuple[int, int]] = []
+        for i in range(n):
+            while stack and stack[-1][0] <= i:
+                stack.pop()
+            while q < len(opens) and opens[q][0] <= i:
+                _o, e, b = opens[q]
+                q += 1
+                stack.append((e, b))
+            a = ident_at(t, i)
+            if stack and a is not None:
+                self.out[self.name(a)].append(stack[-1][1])
+
+    def nodes(self) -> int:
+        """The number of nodes."""
+        return len(self.out)
+
+    def walk(self, seed: frozenset[str]) -> tuple[set[str], int]:
+        """The seed and every name reached from it, and the pushes: one worklist,
+        each node pushed at most once. The loop is bounded by the node count as
+        well, so a broken visited check ends with pushes over the node count
+        instead of running on."""
+        names = set(seed)
+        visited = [False] * len(self.out)
+        work = []
+        pushes = 0
+        for s in sorted(seed):
+            if s in self.ids and not visited[self.ids[s]]:
+                visited[self.ids[s]] = True
+                work.append(self.ids[s])
+                pushes += 1
+        budget = len(self.out)
+        while budget > 0 and work:
+            budget -= 1
+            x = work.pop()
+            if self.name_of[x] is not None:
+                names.add(self.name_of[x])
+            for y in self.out[x]:
+                if not visited[y]:
+                    visited[y] = True
+                    work.append(y)
+                    pushes += 1
+        return names, pushes
+
+    def reach(self, seed: frozenset[str]) -> set[str]:
+        """The names of [`walk`]."""
+        return self.walk(seed)[0]
+
+
+def closure(prepared: Prepared, seed: frozenset[str]) -> set[str]:
+    """The seed and every name bound to a member: one worklist over the rename graph
+    (#10304), linear in the tokens for a chain in any order."""
+    return RenameGraph(prepared).reach(seed)
 
 
 # ---------------------------------------------------------------- tables
@@ -709,10 +813,11 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
     starts = start_files((root / CENSUS).read_text(encoding="utf-8"))
     lexed = [(rel, lex(text)) for rel, text in tree_rs(root)]
     prepared = prepare(lexed)
-    watched = closure(prepared, WATCHED_SEED)
-    runner = closure(prepared, RUNNER_SEED)
-    env_mod = closure(prepared, ENV_MOD_SEED)
-    env_fns = closure(prepared, ENV_FN_SEED)
+    graph = RenameGraph(prepared)
+    watched = graph.reach(WATCHED_SEED)
+    runner = graph.reach(RUNNER_SEED)
+    env_mod = graph.reach(ENV_MOD_SEED)
+    env_fns = graph.reach(ENV_FN_SEED)
     env_names = env_mod | env_fns
     tok: dict[str, int] = {}
     tok_reason: dict[str, str] = {}

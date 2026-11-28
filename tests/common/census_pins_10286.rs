@@ -336,22 +336,265 @@ impl<'a> Prep<'a> {
     }
 }
 
-/// The seed and every name bound to a member, to a fixpoint over the tree:
-/// `X as Y` and `self as Y` in a `use`, `extern crate X as Y`,
-/// `type Y = .. X ..` and a `macro_rules! Y` whose body names one. Each pass
-/// is linear in the tokens of the tree.
+/// The seed and every name bound to a member, over the tree: `X as Y` and
+/// `self as Y` in a `use`, `extern crate X as Y`, `type Y = .. X ..` and a
+/// `macro_rules! Y` whose body names one. The rename graph is built once
+/// ([`RenameGraph::of`], linear in the tokens) and one worklist walks it
+/// from the seed ([`RenameGraph::reach`]), so a chain in any order is linear
+/// (#10304).
 pub(crate) fn closure(files: &[Prep<'_>], seed: &[&str]) -> BTreeSet<String> {
-    let mut names: BTreeSet<String> = seed.iter().map(|s| (*s).to_string()).collect();
-    loop {
-        let mut add = BTreeSet::new();
+    RenameGraph::of(files).reach(seed).names
+}
+
+/// #10304: the rename graph of a tree. A node is a name or a binder (one
+/// `self as Y`, `type Y` or `macro_rules! Y`); an edge `a -> b` means `b` is
+/// reached when `a` is. A name `X` has an edge to the name `Y` of `X as Y`
+/// and of `extern crate X as Y`, and to the binder of each range it is in:
+/// a binder has an edge to its name `Y`. A token has one range edge (the
+/// innermost range that holds it), so the graph is linear in the tokens.
+/// Overlapping ranges need no edge of their own: the name of an inner
+/// binder (the `Y` of a `self as Y`, of a nested `type Y` or of a nested
+/// `macro_rules! Y`) is a token of the outer range, so it reaches the outer
+/// binder.
+pub(crate) struct RenameGraph {
+    ids: BTreeMap<String, usize>,
+    /// The name of each node; `None` for a binder.
+    name_of: Vec<Option<String>>,
+    out: Vec<Vec<usize>>,
+}
+
+/// The result of one walk of a [`RenameGraph`].
+pub(crate) struct Reach {
+    pub(crate) names: BTreeSet<String>,
+    /// The nodes pushed on the worklist; at most the node count.
+    pub(crate) pushes: usize,
+}
+
+impl RenameGraph {
+    /// The graph of every file, one pass over each file's tokens per kind.
+    pub(crate) fn of(files: &[Prep<'_>]) -> Self {
+        let mut g = RenameGraph {
+            ids: BTreeMap::new(),
+            name_of: Vec::new(),
+            out: Vec::new(),
+        };
         for p in files {
-            bound_in(p, &names, &mut add);
+            g.add_uses(p);
+            g.add_types(p);
+            g.add_macros(p);
         }
-        let before = names.len();
-        names.extend(add);
-        if names.len() == before {
-            return names;
+        g
+    }
+
+    /// The number of nodes.
+    pub(crate) fn nodes(&self) -> usize {
+        self.out.len()
+    }
+
+    fn name(&mut self, s: &str) -> usize {
+        if let Some(&id) = self.ids.get(s) {
+            return id;
         }
+        let id = self.binder();
+        self.name_of[id] = Some(s.to_string());
+        self.ids.insert(s.to_string(), id);
+        id
+    }
+
+    fn binder(&mut self) -> usize {
+        self.name_of.push(None);
+        self.out.push(Vec::new());
+        self.out.len() - 1
+    }
+
+    fn edge(&mut self, from: usize, to: usize) {
+        if let Some(v) = self.out.get_mut(from) {
+            v.push(to);
+        }
+    }
+
+    /// `use` (`X as Y`, `self as Y`) and `extern crate X as Y`.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "token-walk indices (p, t, n, k, e) follow the lexer convention of every census scan"
+    )]
+    fn add_uses(&mut self, p: &Prep<'_>) {
+        let t = p.toks;
+        let mut use_until = 0usize;
+        for k in 0..t.len() {
+            match ident_at(t, k) {
+                Some("use") if k >= use_until => {
+                    let end = p.semi[k];
+                    use_until = end;
+                    let mut pending = Vec::new();
+                    for j in k..end {
+                        let x = ident_at(t, j);
+                        if let Some(x) = x {
+                            let id = self.name(x);
+                            pending.push(id);
+                        }
+                        let Some(y) = ident_at(t, j + 2) else {
+                            continue;
+                        };
+                        if y == "_" || j + 2 >= end || ident_at(t, j + 1) != Some("as") {
+                            continue;
+                        }
+                        let y = self.name(y);
+                        if let Some(x) = x {
+                            let xi = self.name(x);
+                            self.edge(xi, y);
+                        }
+                        if x == Some("self") {
+                            let s = self.binder();
+                            self.edge(s, y);
+                            for a in pending.drain(..) {
+                                self.edge(a, s);
+                            }
+                        }
+                    }
+                }
+                Some("extern")
+                    if ident_at(t, k + 1) == Some("crate") && ident_at(t, k + 3) == Some("as") =>
+                {
+                    if let (Some(x), Some(y)) = (ident_at(t, k + 2), ident_at(t, k + 4))
+                        && y != "_"
+                    {
+                        let (x, y) = (self.name(x), self.name(y));
+                        self.edge(x, y);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `type Y = ..`: the range from `k + 2` to the next `;`, `{` or `}`.
+    /// Two ranges that hold one token end at the same stop, so the later
+    /// one holds the rest of the earlier one.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "token-walk indices (p, t, n, k, e) follow the lexer convention of every census scan"
+    )]
+    fn add_types(&mut self, p: &Prep<'_>) {
+        let t = p.toks;
+        let mut starts: Vec<(usize, usize, usize)> = Vec::new();
+        for k in 0..t.len() {
+            if ident_at(t, k) != Some("type") || k.checked_sub(1).is_some_and(|j| is_sep(t, j)) {
+                continue;
+            }
+            let Some(y) = ident_at(t, k + 1) else {
+                continue;
+            };
+            let e = p.stop[k + 1];
+            if e > k + 2 {
+                let y = self.name(y);
+                let b = self.binder();
+                self.edge(b, y);
+                starts.push((k + 2, e, b));
+            }
+        }
+        let mut next = starts.into_iter().peekable();
+        let mut cur: Option<(usize, usize)> = None;
+        for i in 0..t.len() {
+            if cur.is_some_and(|(e, _)| e <= i) {
+                cur = None;
+            }
+            while let Some(&(s, e, b)) = next.peek()
+                && s <= i
+            {
+                next.next();
+                cur = Some((e, b));
+            }
+            if let (Some((_, c)), Some(x)) = (cur, ident_at(t, i)) {
+                let x = self.name(x);
+                self.edge(x, c);
+            }
+        }
+    }
+
+    /// `macro_rules! Y` and its bracketed body. Bodies nest or are apart
+    /// (one bracket stack); a token's edge goes to the innermost body.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "token-walk indices (p, t, n, k, e) follow the lexer convention of every census scan"
+    )]
+    fn add_macros(&mut self, p: &Prep<'_>) {
+        let t = p.toks;
+        let n = t.len();
+        let mut opens: Vec<(usize, usize, usize)> = Vec::new();
+        for k in 0..n {
+            if ident_at(t, k) != Some("macro_rules") || !is_p(t, k + 1, '!') {
+                continue;
+            }
+            let Some(y) = ident_at(t, k + 2) else {
+                continue;
+            };
+            let open = (k + 3).min(n);
+            let end = p.close.get(k + 3).copied().flatten().unwrap_or(open).min(n);
+            if end > open {
+                let y = self.name(y);
+                let b = self.binder();
+                self.edge(b, y);
+                opens.push((open, end, b));
+            }
+        }
+        let mut next = opens.into_iter().peekable();
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        for i in 0..n {
+            while stack.last().is_some_and(|&(e, _)| e <= i) {
+                stack.pop();
+            }
+            while let Some(&(o, e, b)) = next.peek()
+                && o <= i
+            {
+                next.next();
+                stack.push((e, b));
+            }
+            if let (Some(&(_, c)), Some(x)) = (stack.last(), ident_at(t, i)) {
+                let x = self.name(x);
+                self.edge(x, c);
+            }
+        }
+    }
+
+    /// The seed and every name reached from it: one worklist, each node
+    /// pushed at most once. The loop is bounded by the node count as well,
+    /// so a broken visited check ends with `pushes` over the node count
+    /// instead of running on.
+    pub(crate) fn reach(&self, seed: &[&str]) -> Reach {
+        let mut names: BTreeSet<String> = seed.iter().map(|s| (*s).to_string()).collect();
+        let mut visited = vec![false; self.out.len()];
+        let mut work = Vec::new();
+        let mut pushes = 0usize;
+        for s in seed {
+            if let Some(&id) = self.ids.get(*s)
+                && let Some(v) = visited.get_mut(id)
+                && !*v
+            {
+                *v = true;
+                work.push(id);
+                pushes += 1;
+            }
+        }
+        let mut budget = self.out.len();
+        while budget > 0
+            && let Some(x) = work.pop()
+        {
+            budget -= 1;
+            if let Some(Some(n)) = self.name_of.get(x) {
+                names.insert(n.clone());
+            }
+            for &y in self.out.get(x).map_or(&[][..], Vec::as_slice) {
+                if let Some(v) = visited.get_mut(y)
+                    && !*v
+                {
+                    *v = true;
+                    work.push(y);
+                    pushes += 1;
+                }
+            }
+        }
+        Reach { names, pushes }
     }
 }
 

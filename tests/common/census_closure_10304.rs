@@ -22,6 +22,9 @@ const CHAIN_BYTES_10304: usize = 100_000;
 /// fixpoint took 6.2 s on a 1000-hop use chain (#10304).
 const CHAIN_CEILING_10304: Duration = Duration::from_secs(5);
 
+/// The hops of the ring of renames of the push-bound test.
+const RING_HOPS_10304: usize = 64;
+
 type ClosureRow = (String, Vec<String>, Vec<String>);
 
 fn closure_rows() -> Vec<ClosureRow> {
@@ -124,4 +127,43 @@ fn reversed_rename_chains_are_linear_10304() {
             "reversed {kind} chain of {hops} hops took {dt:?} (#10304)"
         );
     }
+}
+
+/// The worklist pushes each node at most once: on every table row (the
+/// cycles among them) and on a ring of renames, `pushes` is at most the
+/// node count, and the walk ends (its loop is bounded by the node count).
+#[test]
+fn the_worklist_pushes_each_node_once_10304() {
+    let mut bad = Vec::new();
+    let mut ring = String::new();
+    for i in 0..RING_HOPS_10304 {
+        writeln!(ring, "use r{i} as r{};", (i + 1) % RING_HOPS_10304)
+            .expect("writing to a String cannot fail");
+    }
+    let mut rows = closure_rows();
+    rows.push((ring, vec!["r0".to_string()], Vec::new()));
+    for (i, (text, seed, want)) in rows.iter().enumerate() {
+        let toks = lex(text);
+        let prep = Prep::new(&toks);
+        let g = census_pins::RenameGraph::of(std::slice::from_ref(&prep));
+        let s: Vec<&str> = seed.iter().map(String::as_str).collect();
+        let r = g.reach(&s);
+        if r.pushes > g.nodes() {
+            bad.push(format!(
+                "row {i}: {} pushes over {} nodes",
+                r.pushes,
+                g.nodes()
+            ));
+        }
+        if !want.is_empty() && r.names != want.iter().cloned().collect::<BTreeSet<_>>() {
+            bad.push(format!("row {i}: closure {:?}", r.names));
+        }
+        if want.is_empty() && r.names.len() != RING_HOPS_10304 {
+            bad.push(format!(
+                "ring: {} of {RING_HOPS_10304} names",
+                r.names.len()
+            ));
+        }
+    }
+    assert_eq!(bad, Vec::<String>::new(), "#10304 worklist pushes");
 }
