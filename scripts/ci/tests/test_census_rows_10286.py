@@ -123,6 +123,28 @@ class CensusRows10286(unittest.TestCase):
         self.assertIn('    ("src/run.rs", 3, R_TOK_NAME),\n', rows)
         self.assertNotIn("R_TOK_START),", rows)
 
+    def test_each_row_kind_keeps_its_committed_reason_10311(self) -> None:
+        # (table, a committed reason the scan would never pick for this source).
+        # SHAPE: an extern block, which the old scan named R_SHAPE_EXTERN.
+        # ENV: R_ENV_NAME is the only reason of its table; it is kept, not added.
+        keep = (("SHAPE_ROWS", "R_SHAPE_IMPL"), ("ENV_NAME_ROWS", "R_ENV_NAME"))
+        p = self.root / ROWS
+        seeded = p.read_text(encoding="utf-8")
+        before = self.tables()
+        new = self.root / "src/new.rs"
+        for (kind, text, _want), (name, reason) in zip(NEW_FILE_ROWS[1:], keep):
+            new.write_text(text, encoding="utf-8")
+            opener = f"pub(crate) const {name}{TABLE_TYPE}\n"
+            self.assertEqual(seeded.count(opener), 1, kind)
+            p.write_text(seeded.replace(opener, opener + f'    ("src/new.rs", 0, {reason}),\n'), encoding="utf-8")
+            r = run("--write", "--root", str(self.root))
+            self.assertEqual((r.returncode, r.stderr), (EXIT_OK, ""), kind)
+            self.assertIn(f'    ("src/new.rs", 1, {reason}),\n', p.read_text(encoding="utf-8"), kind)
+            for rel, data in before.items():  # --write rewrote both tables
+                (self.root / rel).write_bytes(data)
+        new.unlink()
+        self.assertEqual(self.check().returncode, EXIT_OK)
+
     def test_an_absent_rows_file_is_an_empty_table_10311(self) -> None:
         (self.root / ROWS).unlink()
         r = run("--write", "--root", str(self.root))
