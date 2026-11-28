@@ -868,6 +868,9 @@ struct Tree {
     links: Vec<String>,
     /// Directories (relative) holding a `Cargo.toml`, the root excluded.
     packages: Vec<String>,
+    /// The directory the tree was read from; `None` for a tree built in
+    /// memory. Include targets are looked up under it (#10300).
+    root: Option<PathBuf>,
 }
 
 fn crate_root() -> PathBuf {
@@ -918,6 +921,7 @@ fn read_tree(root: &Path) -> Tree {
         files: Vec::new(),
         links: Vec::new(),
         packages: Vec::new(),
+        root: Some(root.to_path_buf()),
     };
     walk(root, root, &mut tree);
     tree
@@ -1284,7 +1288,8 @@ fn census(tree: &Tree) -> Vec<String> {
         .iter()
         .map(|l| format!("{l}: a symbolic link; the census never follows links (#10176)"))
         .collect();
-    let lexed = rust_files(tree, &mut out);
+    let mut lexed = rust_files(tree, &mut out);
+    census_include::join_includes(tree, &mut lexed, &mut out);
     let names = libc_start_names();
     let aliases: BTreeSet<String> = lexed.iter().flat_map(|(_, t)| aliases_in(t)).collect();
     let preps: Vec<Prep<'_>> = lexed.iter().map(|(_, t)| Prep::new(t)).collect();
@@ -1665,6 +1670,7 @@ fn a_nested_package_file_and_a_link_are_seen_10176() {
         files: vec![],
         links: vec!["src/l.rs".to_string()],
         packages: vec![],
+        root: None,
     };
     let got = census(&tree);
     assert_eq!(
@@ -1797,6 +1803,7 @@ fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
         ],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let got = env_findings(&tree, &BTreeMap::new());
     let line = |rel: &str, h: usize, w: usize| {
@@ -1823,6 +1830,7 @@ fn r3_fixture(rel: &str, text: &str) -> Vec<String> {
         files: vec![(rel.to_string(), text.as_bytes().to_vec())],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let head = format!("{rel}:");
     census(&tree)
@@ -1841,6 +1849,7 @@ fn r4_fixture(rel: &str, text: &str) -> Vec<String> {
         files: vec![(rel.to_string(), text.as_bytes().to_vec())],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let head = format!("{rel}:");
     census(&tree)
@@ -1983,9 +1992,15 @@ fn every_round_three_form_is_red_10176() {
         (
             "I13 a proptest_guard module from another file",
             "#[path = \"evil.rs\"]\nmod proptest_guard;\n",
-            vec![format!(
-                "{rel}:2: a proptest_guard module not loaded from tests/common/proptest_guard.rs by #[path] (#10176)"
-            )],
+            vec![
+                // #10300: the #[path] site is followed, and this tree has no evil.rs.
+                format!(
+                    "{rel}:1: #[path] \"evil.rs\" names src/evil.rs, which is not a regular file (#10300)"
+                ),
+                format!(
+                    "{rel}:2: a proptest_guard module not loaded from tests/common/proptest_guard.rs by #[path] (#10176)"
+                ),
+            ],
         ),
     ];
     for (form, text, want) in rows {
@@ -2004,6 +2019,7 @@ fn a_wrong_count_and_a_stale_row_of_the_token_tables_are_red_10176() {
         )],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let got: Vec<String> = census(&tree)
         .into_iter()

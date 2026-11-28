@@ -47,8 +47,10 @@ from __future__ import annotations
 import argparse
 import collections
 import hashlib
+import os
 import pathlib
 import re
+import stat
 import sys
 
 SKIPPED = frozenset({"target", ".git", ".local-runs", ".codegraph", "node_modules"})
@@ -731,6 +733,197 @@ def tree_rs(root: pathlib.Path) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+# ---------------------------------------------------------------- include sites (#10300)
+
+# The include macro whose target is Rust code, and the form each site is
+# written as in a finding. `include_str!` and `include_bytes!` name data that is
+# never compiled as Rust, so they are not sites (#10300 design call).
+INCLUDE_MACRO = "include"
+INCLUDE_FORM = "include!"
+PATH_FORM = "#[path]"
+# The largest include target the census reads or accepts, in bytes.
+INCLUDE_CAP = 4 * 1024 * 1024
+# The longest include argument the census resolves, in bytes (PATH_MAX); it
+# bounds the lookups of one site.
+INCLUDE_PATH_CAP = 4096
+OPENERS = "([{"
+
+
+def shown(s: str) -> str:
+    """`s` with `\\` and `"` escaped and every character outside printable ASCII
+    written `\\u{hex}`; the Rust census writes the same text."""
+    out = []
+    for c in s:
+        if c in '\\"':
+            out.append("\\" + c)
+        elif " " <= c <= "~":
+            out.append(c)
+        else:
+            out.append(f"\\u{{{ord(c):x}}}")
+    return "".join(out)
+
+
+def _top_items(t: list[Tok], close: list[int], lo: int, hi: int) -> list[tuple[int, int]]:
+    """The comma-separated items of t[lo:hi], each (first, end), nested groups jumped."""
+    items = []
+    start = k = lo
+    while k < hi:
+        if t[k].kind == PUNCT and t[k].text in OPENERS:
+            k = close[k] + 1
+            continue
+        if is_p(t, k, ","):
+            items.append((start, k))
+            start = k + 1
+        k += 1
+    if start < hi:
+        items.append((start, hi))
+    return items
+
+
+def _one_literal(t: list[Tok], lo: int, hi: int) -> str | None:
+    return t[lo].text if hi == lo + 1 and t[lo].kind == STR else None
+
+
+def include_sites(t: list[Tok], close: list[int]) -> list[tuple[int, str, int, str | None]]:
+    """(token index, form, line, the one string-literal argument or None) of every
+    `include!` call and every `path = ..` of a
+    `#[path]` or `#[cfg_attr(.., path = ..)]` attribute, in token order. Each
+    attribute is walked once with a worklist, so the cost is linear."""
+    out = []
+    done = 0
+    n = len(t)
+    for k, x in enumerate(t):
+        if (x.kind == IDENT and x.text == INCLUDE_MACRO and is_p(t, k + 1, "!")
+                and k + 2 < n and t[k + 2].kind == PUNCT and t[k + 2].text in OPENERS):
+            o = k + 2
+            out.append((k, INCLUDE_FORM, x.line, _one_literal(t, o + 1, close[o])))
+            continue
+        if k < done or not is_p(t, k, "#"):
+            continue
+        b = k + 2 if is_p(t, k + 1, "!") else k + 1
+        if not is_p(t, b, "[") or ident_at(t, b + 1) not in ("path", "cfg_attr"):
+            continue
+        end = close[b]
+        done = end + 1
+        work = [(b + 1, end)]
+        while work:
+            lo, hi = work.pop()
+            name = ident_at(t, lo)
+            if name == "path" and is_p(t, lo + 1, "="):
+                out.append((lo, PATH_FORM, t[lo].line, _one_literal(t, lo + 2, hi)))
+            elif name == "cfg_attr" and is_p(t, lo + 1, "("):
+                inner = close[lo + 1]
+                work.extend(_top_items(t, close, lo + 2, min(inner, hi))[1:])
+    return sorted(out, key=lambda s: s[0])
+
+
+def include_steps(rel: str, path: str) -> list[str] | None:
+    """Every tree path a lookup of `path` from the directory of `rel` passes,
+    in order, the target last (`.` and `..` folded, so a component later undone
+    by `..` is still listed); None when it leaves the tree, is absolute or
+    holds a backslash."""
+    if path.startswith("/") or "\\" in path:
+        return None
+    parts = rel.split("/")[:-1]
+    steps = []
+    for p in path.split("/"):
+        if p in ("", "."):
+            continue
+        if p == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(p)
+            steps.append("/".join(parts))
+    steps.append("/".join(parts))
+    return steps
+
+
+def include_target(root: pathlib.Path, rel: str, form: str, line: int, arg: str | None) -> tuple[str | None, str | None]:
+    """(target, None) for a site whose target is a regular file of at most
+    INCLUDE_CAP bytes reached with no symbolic link on any step, else (None,
+    finding)."""
+    at = f"{rel}:{line}: {form}"
+    if arg is None:
+        return None, f"{at} with an argument that is not one string literal; the census cannot resolve it (#10300)"
+    if len(arg.encode()) > INCLUDE_PATH_CAP:
+        return None, f"{at} with an argument over {INCLUDE_PATH_CAP} bytes; the census cannot resolve it (#10300)"
+    steps = include_steps(rel, arg)
+    if steps is None:
+        return None, f'{at} "{shown(arg)}" leaves the repository root (#10300)'
+    target = steps[-1]
+    named = f'{at} "{shown(arg)}" names {shown(target)}'
+    st = None
+    for step in steps:
+        try:
+            st = (root / step).lstat() if step else None
+        except FileNotFoundError:
+            return None, f"{named}, which is not a regular file (#10300)"
+        except OSError as e:
+            return None, f"{named}, which cannot be read (errno {e.errno}) (#10300)"
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            return None, f"{named}, a symbolic link or a path through one; the census never follows links (#10300)"
+    if st is None or not stat.S_ISREG(st.st_mode):
+        return None, f"{named}, which is not a regular file (#10300)"
+    if st.st_size > INCLUDE_CAP:
+        return None, f"{named}, a file over {INCLUDE_CAP} bytes; the census does not read it (#10300)"
+    return target, None
+
+
+def read_target(root: pathlib.Path, target: str) -> bytes:
+    """The bytes of a target found by `include_target`: opened with no link
+    followed, at most INCLUDE_CAP bytes read, and refused when the file opened
+    is not the file looked up (the Rust census does the same); ValueError with
+    the finding otherwise."""
+    try:
+        st = (root / target).lstat()
+        fd = os.open(root / target, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise ValueError(f"{target}: cannot be read (errno {e.errno}) (#10300)") from e
+    with os.fdopen(fd, "rb") as f:
+        m = os.fstat(f.fileno())
+        if (m.st_dev, m.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(m.st_mode):
+            raise ValueError(f"{target}: changed while the census read it; the census never follows links (#10300)")
+        data = f.read(INCLUDE_CAP + 1)
+    if len(data) > INCLUDE_CAP:
+        raise ValueError(f"{target}: grew over {INCLUDE_CAP} bytes while the census read it (#10300)")
+    return data
+
+
+def join_includes(root: pathlib.Path, lexed: list[tuple[str, list[Tok]]]) -> tuple[
+        list[tuple[str, int, str, str]], list[str]]:
+    """Follow every include site of `lexed`, appending each target not yet lexed
+    (a visited set bounds cycles and the cost; each appended target's own sites
+    follow the same rule). Returns every site as (file, line, form, target) and
+    the findings."""
+    seen = {rel for rel, _t in lexed}
+    sites: list[tuple[str, int, str, str]] = []
+    errors: list[str] = []
+    i = 0
+    while i < len(lexed):
+        rel, t = lexed[i]
+        i += 1
+        for _k, form, line, arg in include_sites(t, brackets(t)):
+            target, bad = include_target(root, rel, form, line, arg)
+            if target is None:
+                errors.append(bad)
+                continue
+            sites.append((rel, line, form, target))
+            if target not in seen:
+                seen.add(target)
+                try:
+                    text = read_target(root, target).decode("utf-8")
+                except UnicodeDecodeError as e:
+                    errors.append(f"{target}: not UTF-8 ({e.reason}); the census cannot read it (#10176)")
+                    continue
+                except ValueError as e:
+                    errors.append(str(e))
+                    continue
+                lexed.append((target, lex(text)))
+    return sites, errors
+
+
 def start_files(census: str) -> set[str]:
     b = census.index("START_ROWS_BEGIN")
     e = census.index("START_ROWS_END")
@@ -812,6 +1005,9 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
     """The two generated files' text and a few totals."""
     starts = start_files((root / CENSUS).read_text(encoding="utf-8"))
     lexed = [(rel, lex(text)) for rel, text in tree_rs(root)]
+    include_sites_all, include_errors = join_includes(root, lexed)
+    if include_errors:
+        raise ValueError("\n".join(include_errors))
     prepared = prepare(lexed)
     graph = RenameGraph(prepared)
     watched = graph.reach(WATCHED_SEED)
@@ -874,6 +1070,8 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
         "token_files": len(tok), "tokens": sum(tok.values()), "shape_files": len(shape),
         "env_files": len(env), "env_sites": sum(env.values()), "site_files": len(sites),
         "sites": sum(len(v) for v in sites.values()),
+        "include_sites": len(include_sites_all),
+        "include_files": len({s[0] for s in include_sites_all}),
     }
     return HEADER + "\n" + rows + "\n", "\n".join(site_lines) + "\n", totals
 

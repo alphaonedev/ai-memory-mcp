@@ -15,6 +15,7 @@ fn lines_of(rel: &str, text: &str) -> Vec<String> {
         files: vec![(rel.to_string(), text.as_bytes().to_vec())],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let head = format!("{rel}:");
     let mut out: Vec<String> = census(&tree)

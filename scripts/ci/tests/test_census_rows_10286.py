@@ -401,6 +401,39 @@ class IncludeSites10300(unittest.TestCase):
         self.refused("src/a.rs:1: include! \"l.rs\" names src/l.rs, a symbolic link or a path through one; "
                      "the census never follows links (#10300)")
 
+    def test_an_include_str_target_is_not_lexed(self) -> None:
+        self.tree({"src/a.rs": "const X: &str = include_str!(\"d.txt\");\n", "src/d.txt": INCLUDE_START})
+        rows, _sites, _totals = self.m.scan(self.root)
+        self.assertNotIn("src/d.txt", rows)
+
+    def test_sites_match_the_parity_table(self) -> None:
+        table = json.loads(INCLUDE_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(table), INCLUDE_ROWS)
+        bad = []
+        for i, (text, want) in enumerate(table):
+            t = self.m.lex(text)
+            got = [[line, form, arg] for _k, form, line, arg in self.m.include_sites(t, self.m.brackets(t))]
+            if got != want:
+                bad.append(f"row {i}: {text!r} gave {got!r}")
+        self.assertEqual(bad, [], "#10300 site table")
+
+    def test_sites_are_linear_on_large_inputs(self) -> None:
+        flat = "include!(\"a.rs\");\n" * (INCLUDE_BOUND_BYTES // 18 + 1)
+        depth = INCLUDE_BOUND_BYTES // 12
+        nested = "#[" + "cfg_attr(a, " * depth + "path = \"p.rs\"" + ")" * depth + "]\nmod m;\n"
+        for text, want in ((flat, INCLUDE_BOUND_BYTES // 18 + 1), (nested, 1)):
+            self.assertGreaterEqual(len(text), INCLUDE_BOUND_BYTES)
+            t0 = time.monotonic()
+            t = self.m.lex(text)
+            got = self.m.include_sites(t, self.m.brackets(t))
+            self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
+            self.assertEqual(len(got), want)
+
+
+INCLUDE_TABLE = ROOT / "tests/common/census_include_parity_10300.json"
+INCLUDE_ROWS = 22
+INCLUDE_BOUND_BYTES = 100_000
+
 
 if __name__ == "__main__":
     unittest.main()
