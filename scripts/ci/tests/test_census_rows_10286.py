@@ -365,8 +365,10 @@ class CensusRows10286(unittest.TestCase):
         (self.root / "up").symlink_to(self.root.parent, target_is_directory=True)
         with self.assertRaises(ValueError) as cm:
             m.write_table(self.root, "up/x.rs", "// changed\n")
-        self.assertEqual(str(cm.exception), "up/x.rs: resolves outside the root; "
-                         "the census never writes there (#10176)")
+        # #10345: the walk from the root fd refuses the link itself, so the
+        # refusal names the linked component, not a resolved path.
+        self.assertEqual(str(cm.exception), "up/x.rs: up is a symbolic link; "
+                         "the census never follows links (#10176)")
         self.assertEqual(outside.read_text(encoding="utf-8"), "// outside\n")
         self.assertFalse((self.root.parent / "x.rs").exists())
 
@@ -940,6 +942,131 @@ class ExternArm10311(unittest.TestCase):
             self.assertEqual(r.returncode, EXIT_SCAN)
             self.assertEqual(r.stderr.strip(),
                              "census_rows_10286: scan failed: src/x.rs: line 2: " + EXTERN_REFUSAL_10311.format(name="fork"))
+
+
+# #10345: every open of the census walks from a root directory fd one name at a
+# time with no link followed, so a link in any component below the root (made
+# before the call or swapped in between two walk steps) is refused by the open
+# itself. Exact refusals, written out by hand.
+LINK_10345 = "{rel}: {part} is a symbolic link; the census never follows links (#10176)"
+DOTS_10345 = ("{rel}: holds an empty, '.' or '..' component; the census opens a path below the root one name at "
+              "a time (#10345)")
+OUTSIDE_TEXT_10345 = "// outside\n"
+
+
+class ParentWalk10345(unittest.TestCase):
+    def setUp(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(prefix="census-walk-10345-", dir=SCRATCH)
+        self.root = Path(self._tmp.name)
+        self._out = tempfile.TemporaryDirectory(prefix="census-walk-10345-outside-", dir=SCRATCH)
+        self.outside = Path(self._out.name)
+        (self.outside / "census_rows_10176.rs").write_text(OUTSIDE_TEXT_10345, encoding="utf-8")
+        (self.outside / "x.rs").write_text(OUTSIDE_TEXT_10345, encoding="utf-8")
+        (self.root / "tests/common").mkdir(parents=True)
+        (self.root / "src/inner").mkdir(parents=True)
+        (self.root / "src/inner/x.rs").write_text("// inside\n", encoding="utf-8")
+        self.m = scanner_module()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        self._out.cleanup()
+
+    def outside_untouched(self) -> None:
+        self.assertEqual(sorted(p.name for p in self.outside.iterdir()), ["census_rows_10176.rs", "x.rs"])
+        for p in self.outside.iterdir():
+            self.assertEqual(p.read_text(encoding="utf-8"), OUTSIDE_TEXT_10345)
+
+    def link_common(self) -> None:
+        (self.root / "tests/common").rmdir()
+        (self.root / "tests/common").symlink_to(self.outside, target_is_directory=True)
+
+    def swap_common_on(self, part: str) -> None:
+        """A seam: the parent directory becomes a link to the outside directory
+        just before the walk opens `part`, after any check made by path."""
+        def hook(prefix: str) -> None:
+            if prefix == part and not (self.root / "tests/common").is_symlink():
+                self.link_common()
+        self.m.WALK_HOOK = hook
+
+    def test_write_refuses_a_middle_link_to_an_outside_directory_10345(self) -> None:
+        self.link_common()
+        rel = "tests/common/new_10345.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+        self.outside_untouched()
+
+    def test_write_refuses_a_middle_link_to_a_directory_inside_the_root_10345(self) -> None:
+        (self.root / "tests/common").rmdir()
+        (self.root / "tests/common").symlink_to("../src/inner", target_is_directory=True)
+        rel = "tests/common/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+        self.assertEqual((self.root / "src/inner/x.rs").read_text(encoding="utf-8"), "// inside\n")
+
+    def test_write_refuses_a_parent_swapped_after_the_in_root_check_10345(self) -> None:
+        self.swap_common_on("tests/common")
+        rel = "tests/common/census_rows_10176.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+        self.outside_untouched()
+
+    def test_write_refuses_a_top_component_swapped_between_walk_steps_10345(self) -> None:
+        # The swap lands on the first component, before the walk reaches it.
+        def hook(prefix: str) -> None:
+            if prefix == "tests" and not (self.root / "tests").is_symlink():
+                (self.root / "tests").rename(self.root / "tests-moved")
+                (self.root / "tests").symlink_to(self.outside, target_is_directory=True)
+        self.m.WALK_HOOK = hook
+        rel = "tests/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests"))
+        self.outside_untouched()
+
+    def test_read_scanned_refuses_a_middle_link_10345(self) -> None:
+        self.link_common()
+        rel = "tests/common/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.read_scanned(self.root, rel)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+
+    def test_load_rows_refuses_a_parent_swapped_between_walk_steps_10345(self) -> None:
+        self.swap_common_on("tests/common")
+        with self.assertRaises(ValueError) as cm:
+            self.m.load_rows(self.root)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=str(ROWS), part="tests/common"))
+        self.outside_untouched()
+
+    def test_read_target_refuses_a_middle_link_10345(self) -> None:
+        self.link_common()
+        rel = "tests/common/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.read_target(self.root, rel)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+
+    def test_dot_components_are_refused_before_any_open_10345(self) -> None:
+        for rel in ("tests/../x.rs", "tests/./x.rs", "tests//x.rs", "../x.rs", "/x.rs"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(ValueError) as cm:
+                    self.m.write_table(self.root, rel, "// changed\n")
+                self.assertEqual(str(cm.exception), DOTS_10345.format(rel=rel))
+        self.assertFalse((self.root / "x.rs").exists())
+        self.assertFalse((self.root.parent / "x.rs").exists())
+
+    def test_a_plain_nested_path_is_written_and_read_10345(self) -> None:
+        (self.root / "a/b/c").mkdir(parents=True)
+        rel = "a/b/c/t.rs"
+        self.m.write_table(self.root, rel, "// nested\n")
+        self.assertEqual((self.root / rel).read_text(encoding="utf-8"), "// nested\n")
+        self.assertEqual(self.m.read_scanned(self.root, rel), b"// nested\n")
+        self.assertEqual(self.m.read_target(self.root, rel), b"// nested\n")
+        self.m.write_table(self.root, "top.rs", "// top\n")
+        self.assertEqual(self.m.read_scanned(self.root, "top.rs"), b"// top\n")
+        self.outside_untouched()
 
 
 if __name__ == "__main__":
