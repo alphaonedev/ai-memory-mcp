@@ -75,7 +75,11 @@
 //!    alias cycle). Where definitions disagree, lock wins. A lock static
 //!    whose row is not `lock` is `LockNotLabelled`; an unresolvable static
 //!    whose row is not `lock` is `Unresolvable` with the reason, unless
-//!    `EXCEPTIONS` names it with a reason and a pinned digest. An exception
+//!    `EXCEPTIONS` names it with the exact reason it was granted for (its
+//!    `Why`), a pinned digest and a written reason. #10295: a row is
+//!    taken only when its `Why` is the static's live one and every name
+//!    the type reaches is one the pin reads ([`pin_reads`]); otherwise the
+//!    static is `Unresolvable` and the row is stale. An exception
 //!    that matches nothing (`ExceptionStale`), a second one
 //!    (`ExceptionDuplicate`), one with a short reason (`ExceptionReasonless`)
 //!    or one whose pinned digest is not the live one (`ExceptionDigest`,
@@ -273,6 +277,9 @@ fn tree() -> Vec<(String, String)> {
     let mut links = Vec::new();
     walk(root, root, &mut files, &mut links);
     assert_eq!(links, Vec::<String>::new(), "{SYMLINK_REFUSAL}");
+    // #10323: `read_dir` order is not specified; every census sees the
+    // files sorted by path.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }
 
@@ -2025,7 +2032,18 @@ enum StaticFinding {
         name: String,
         line: usize,
     },
-    /// An [`EXCEPTIONS`] row no static used.
+    /// #10350: a static in a `macro_rules!` body with a
+    /// [`MACRO_BODY_WHY`] row, whose type holds a name the pin cannot read
+    /// ([`pin_reads`]); `why` is the least such reason. The row is not used.
+    MacroBodyUnread {
+        file: String,
+        name: String,
+        line: usize,
+        why: Why,
+    },
+    /// An [`EXCEPTIONS`] row no static used. #10295: a row whose `why` is
+    /// not its static's live reason, or whose static's type reaches a name
+    /// the pin cannot read, is not used.
     ExceptionStale { file: String, name: String },
     /// An [`EXCEPTIONS`] key written twice.
     ExceptionDuplicate { file: String, name: String },
@@ -2058,6 +2076,11 @@ enum Why {
     Projection,
     /// A crate type name with no definition in the walked tree.
     NoDef(String),
+    /// #10356: a name that is, as a whole, one of [`STD_MARKER_TRAITS`],
+    /// has no walked definition and is written in bound position (right
+    /// after `dyn`, `impl`, `+` or `?`), so it names the std trait. The only
+    /// no-definition name the pin reads.
+    MarkerBound(String),
     /// #10294: a name reached only through a glob import (`use x::*`),
     /// of this crate or another: what it names is not read.
     Glob(String),
@@ -2067,7 +2090,8 @@ enum Why {
     /// where the name is a lock, a proven type or a prelude type.
     Shadowed(String),
     /// #10293: a `self`, `super` or `crate` path that lands on no walked
-    /// definition.
+    /// definition. #10322: also a name only a glob of an unread module (a
+    /// `#[path]` module, a declared module with no walked file) can supply.
     PathNotLanded(String),
     /// A `std`, `core` or `alloc` type that is not in [`LEAF_TYPES`].
     StdNotProven(String),
@@ -2077,6 +2101,10 @@ enum Why {
     Cycle(String),
     /// An associated `type NAME;` with no value.
     NoValue(String),
+    /// #10350: a metavariable in the type of a static in a `macro_rules!`
+    /// body (`$t`, or `$crate` of a path), or `""` when the static there
+    /// writes no type: what it names is not known until expansion.
+    MacroFragment(String),
 }
 
 /// One `static` item of a lexed file.
@@ -2226,10 +2254,18 @@ fn statics_of(
             name.text.clone()
         };
         if in_macro[k] {
+            // #10350: the written type, when there is one, is read like a
+            // type outside a macro; an empty span is no written type.
+            let ty = if is_p(t, name_at + 1, ":") {
+                let from = name_at + 2;
+                (from, type_end(t, close, from))
+            } else {
+                (k, k)
+            };
             named.push(StaticItem {
                 name,
                 line: t[k].line,
-                ty: (k, k),
+                ty,
                 in_macro: true,
             });
         } else if meta {
@@ -2360,8 +2396,14 @@ enum Atom {
     /// A form that names no knowable type.
     Unres(Why),
     /// #10293: a path as written, resolved later through the scope that
-    /// wrote it; `global` when it starts with a leading `::`.
-    Path { segs: Vec<String>, global: bool },
+    /// wrote it; `global` when it starts with a leading `::`. #10356:
+    /// `bound` when it is written in bound position (right after `dyn`,
+    /// `impl`, `+` or `?`), where a name can only be a trait.
+    Path {
+        segs: Vec<String>,
+        global: bool,
+        bound: bool,
+    },
     /// #10293: a single-segment name of a generic parameter in scope.
     Param(String),
 }
@@ -2417,6 +2459,20 @@ fn type_atoms(
                     out.push(Atom::Unres(Why::Projection));
                     i += 3;
                 }
+                // #10350: a metavariable (`$t`, `$crate::x::Y`) names no
+                // type until expansion; the path it starts is skipped.
+                "$" => {
+                    let mut j = i + 1;
+                    let name = ident(j).map_or(String::new(), |x| x.text.clone());
+                    if !name.is_empty() {
+                        while is_p(t, j + 1, ":") && is_p(t, j + 2, ":") && ident(j + 3).is_some() {
+                            j += 3;
+                        }
+                        j += 1;
+                    }
+                    out.push(Atom::Unres(Why::MacroFragment(format!("${name}"))));
+                    i = j;
+                }
                 _ => i += 1,
             },
             TokKind::Ident => {
@@ -2470,9 +2526,18 @@ fn type_atoms(
                             && colon2(i - 2)
                             && (i < 3 || !matches!(t[i - 3].kind, TokKind::Ident))
                             && (i < 3 || !is_p(t, i - 3, ">"));
+                        // #10356: a bound position is right after `dyn`,
+                        // `impl`, `+` or `?`; anywhere else the path is in
+                        // type position.
+                        let bound = i >= 1
+                            && (is_w(t, i - 1, "dyn")
+                                || is_w(t, i - 1, "impl")
+                                || is_p(t, i - 1, "+")
+                                || is_p(t, i - 1, "?"));
                         out.push(Atom::Path {
                             segs: (i..=j).step_by(3).map(|x| t[x].text.clone()).collect(),
                             global,
+                            bound,
                         });
                     }
                     i = j + 1;
@@ -2614,6 +2679,16 @@ const PRIMITIVES: [&str; 17] = [
     "i128", "isize", "f32", "f64",
 ];
 
+/// #10346: the std marker traits whose bare names a pin may read as a
+/// `NoDef` (a trait object or a bound names them, and they hold no
+/// data). Matched on the whole name only.
+const STD_MARKER_TRAITS: [&str; 5] = ["Fn", "FnMut", "FnOnce", "Send", "Sync"];
+
+/// #10346: whether `name` is, as a whole, one of [`STD_MARKER_TRAITS`].
+fn is_std_marker(name: &str) -> bool {
+    STD_MARKER_TRAITS.contains(&name)
+}
+
 /// Whether a bare name means a std type when nothing in scope binds it.
 fn is_prelude(name: &str) -> bool {
     PRELUDE_TYPES.contains(&name) || PRIMITIVES.contains(&name)
@@ -2676,6 +2751,44 @@ fn module_of(path: &str) -> (String, Vec<String>) {
     (root, segs)
 }
 
+/// #10323: the walked paths `mod NAME;` can name, written in `file` inside
+/// the inline modules `inline` (`""` or `::a::b`), by the Rust rules for
+/// that file kind: a `mod.rs`, `lib.rs` or `main.rs` file reads `DIR/NAME`,
+/// any other module file `DIR/STEM/NAME`, and a crate root of another name
+/// (`tests/foo.rs`) both. Each base gives `NAME.rs` and `NAME/mod.rs`.
+fn decl_candidates(file: &str, inline: &str, name: &str) -> Vec<String> {
+    if !inline.is_empty() && !inline.starts_with("::") {
+        return Vec::new();
+    }
+    let (dir, fname) = file.rsplit_once('/').unwrap_or(("", file));
+    let stem = fname.strip_suffix(".rs").unwrap_or(fname);
+    let stem_dir = if dir.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{dir}/{stem}")
+    };
+    let bases: Vec<String> = if matches!(stem, "mod" | "lib" | "main") {
+        vec![dir.to_string()]
+    } else if module_of(file).1.is_empty() {
+        vec![dir.to_string(), stem_dir]
+    } else {
+        vec![stem_dir]
+    };
+    let mut out = Vec::with_capacity(2 * bases.len());
+    for base in bases {
+        let mut parts: Vec<&str> = Vec::new();
+        if !base.is_empty() {
+            parts.push(&base);
+        }
+        parts.extend(inline.split("::").filter(|s| !s.is_empty()));
+        parts.push(name);
+        let stub = parts.join("/");
+        out.push(format!("{stub}.rs"));
+        out.push(format!("{stub}/mod.rs"));
+    }
+    out
+}
+
 /// #10293: the bindings of one name kept in a scope: one resolves, a second
 /// makes the name `Ambiguous`, and a third changes nothing.
 const MAX_BINDINGS: usize = 2;
@@ -2721,6 +2834,34 @@ struct Scope {
     /// `None` for std, another crate or a prefix that lands nowhere, whose
     /// names are not known.
     glob_to: Vec<Option<usize>>,
+    /// #10322: whether the census read this module's body (a walked file
+    /// or an inline `mod NAME { … }`). A `#[path]` module, a declared module
+    /// that links to no walked file and a directory made only as a parent
+    /// are unread: a glob of one supplies names the census cannot see.
+    read: bool,
+}
+
+/// #10322: what the glob imports of a scope can supply for one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Supply {
+    /// No glob in reach can bind the name.
+    No,
+    /// A glob of a read module, or of std or another crate, may bind it.
+    Glob,
+    /// A glob of a module the census did not read is in reach.
+    Unread,
+}
+
+/// #10323: one `mod NAME;` declaration, linked once every file is read.
+#[derive(Debug)]
+struct Decl {
+    /// The scope the declaration is written in.
+    scope: usize,
+    /// The scope of the declaring file.
+    top: usize,
+    /// The walked path of the declaring file.
+    file: String,
+    name: String,
 }
 
 /// #10293: one leaf of a `use` tree.
@@ -2746,7 +2887,8 @@ struct Node {
     /// Whether some definition is a struct, enum or union, so a cycle
     /// through it is recursion, not an alias loop.
     adt: bool,
-    /// #10295: FNV-1a of the tokens of every definition, in walk order.
+    /// #10295: FNV-1a of the tokens of every definition, in file path order
+    /// (#10323: the graph is built over the files sorted by path).
     hash: u64,
 }
 
@@ -2782,6 +2924,8 @@ enum Look {
     Bound(Bind),
     Many,
     Glob,
+    /// #10322: only a glob of an unread module can supply the name.
+    Unread,
     Empty,
 }
 
@@ -2815,6 +2959,27 @@ struct TypeGraph {
     memo: std::cell::RefCell<BTreeMap<usize, Target>>,
     /// #10276: a local name `use`d for one of [`INCLUDE_MACROS`].
     include_aliases: BTreeMap<String, &'static str>,
+    /// #10323: every `mod NAME;` of the tree, linked by
+    /// [`TypeGraph::link_modules`] after the last file.
+    decls: Vec<Decl>,
+    /// #10323: each walked path to the scope of its file.
+    files: BTreeMap<String, usize>,
+    /// #10324: every scope visit of [`TypeGraph::glob_supplies`], read by
+    /// the cost test through [`token_census_counted`].
+    glob_visits: std::cell::Cell<u64>,
+    /// #10324: the answer of [`TypeGraph::glob_supplies`] through a scope,
+    /// per name, then per scope; cleared once the globs are settled.
+    glob_memo: std::cell::RefCell<BTreeMap<String, BTreeMap<usize, Supply>>>,
+}
+
+/// #10324: one scope of the glob walk of [`TypeGraph::glob_supplies`]: the
+/// globs of `scope` left to follow (`next` down to 0) and the lowest depth of
+/// a scope in progress that its walk met (its own depth when none).
+#[derive(Debug, Clone, Copy)]
+struct GlobFrame {
+    scope: usize,
+    next: usize,
+    low: usize,
 }
 
 /// One keyword position of a lexed file, for [`TypeGraph::item`].
@@ -2825,6 +2990,9 @@ struct At<'t> {
     k: usize,
     scope: usize,
     binds: bool,
+    /// #10323: the walked path of the file and the scope of its file.
+    file: &'t str,
+    top: usize,
 }
 
 impl TypeGraph {
@@ -2917,6 +3085,8 @@ impl TypeGraph {
         in_macro: &[bool],
     ) -> Vec<(usize, usize)> {
         let top = self.file_module(path);
+        self.scopes[top].read = true;
+        self.files.insert(path.to_string(), top);
         let mut spans = vec![(0, top)];
         // (index of the closing brace, scope inside, whether types bind).
         let mut stack: Vec<(usize, usize, bool)> = Vec::new();
@@ -2949,6 +3119,8 @@ impl TypeGraph {
                 k,
                 scope,
                 binds,
+                file: path,
+                top,
             };
             self.item(&at, &mut opens, &mut path_attr);
         }
@@ -2972,6 +3144,7 @@ impl TypeGraph {
                 if let Some(name) = ident(k + 1) {
                     if is_p(t, k + 2, "{") {
                         let m = self.child(scope, &name);
+                        self.scopes[m].read = true;
                         opens.entry(k + 2).or_insert((m, true));
                     } else if *path_attr {
                         // #10293: a `#[path]` module is not followed; a
@@ -2980,7 +3153,13 @@ impl TypeGraph {
                         let m = self.new_scope(None, Some(scope), key);
                         self.bind(scope, &name, Bind::Module(m));
                     } else {
-                        self.declared(scope, &name);
+                        // #10323: linked after the last file is read.
+                        self.decls.push(Decl {
+                            scope,
+                            top: at.top,
+                            file: at.file.to_string(),
+                            name,
+                        });
                     }
                 }
                 *path_attr = false;
@@ -3021,21 +3200,32 @@ impl TypeGraph {
         }
     }
 
-    /// `mod name;` in `scope`: the walked file of that module when the
-    /// declaring file is a crate root outside `src/` and a directory module
-    /// of that name was walked (`tests/common/mod.rs`), else the module
-    /// under `scope`.
-    fn declared(&mut self, scope: usize, name: &str) {
-        let here = &self.scopes[scope];
-        if here.parent.is_none()
-            && here.outer.is_none()
-            && let Some((dir, _)) = here.path.rsplit_once('/')
-            && let Some(&m) = self.modules.get(&format!("{dir}/{name}"))
-        {
-            self.bind(scope, name, Bind::Module(m));
-            return;
+    /// #10323: links every `mod NAME;` once every file is read, so no link
+    /// depends on the order the files were walked in. A declaration binds
+    /// the scope of each walked file [`decl_candidates`] names (two make the
+    /// name `Ambiguous`); with none walked it binds the module under its
+    /// scope, which stays unread (#10322) unless a walked file is that
+    /// module. Linear in the declarations.
+    fn link_modules(&mut self) {
+        let decls = std::mem::take(&mut self.decls);
+        for d in &decls {
+            let inline = self.scopes[d.scope]
+                .path
+                .strip_prefix(self.scopes[d.top].path.as_str())
+                .filter(|_| self.scopes[d.scope].outer.is_none());
+            let found: Vec<usize> = inline
+                .map(|rest| decl_candidates(&d.file, rest, &d.name))
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|c| self.files.get(c).copied())
+                .collect();
+            if found.is_empty() {
+                self.child(d.scope, &d.name);
+            }
+            for m in found {
+                self.bind(d.scope, &d.name, Bind::Module(m));
+            }
         }
-        self.child(scope, name);
     }
 
     /// A `type`, `struct`, `enum` or `union` definition at `at.k`.
@@ -3240,8 +3430,10 @@ impl TypeGraph {
                     _ => Look::Many,
                 };
             }
-            if self.glob_supplies(id, name) {
-                return Look::Glob;
+            match self.glob_supplies(id, name) {
+                Supply::Glob => return Look::Glob,
+                Supply::Unread => return Look::Unread,
+                Supply::No => {}
             }
             at = if outward { s.outer } else { None };
         }
@@ -3251,29 +3443,141 @@ impl TypeGraph {
     /// #10294: whether a glob import of `scope` can supply `name`: a glob
     /// whose module is not known (std, another crate, not settled) can
     /// supply any name; one of a walked module supplies the names that
-    /// module binds, and the names its own globs can supply.
-    fn glob_supplies(&self, scope: usize, name: &str) -> bool {
-        let mut seen: BTreeSet<usize> = BTreeSet::new();
-        let mut todo = vec![scope];
-        while let Some(s) = todo.pop() {
-            if !seen.insert(s) {
+    /// module binds, and the names its own globs can supply. #10322: a glob
+    /// of a module the census did not read is [`Supply::Unread`] for every
+    /// name, never [`Supply::No`].
+    ///
+    /// #10324: the closure is walked depth first, in the order of the
+    /// former stack walk (the last glob first), and the answer through each
+    /// scope other than `scope` is memoised per `(scope, name)` once it does
+    /// not depend on a scope still in progress (a cycle back to one), so a
+    /// glob chain is walked once, not once per lookup. A walk that ends in
+    /// [`Supply::No`] memoises every scope it met, `scope` too, when `scope`
+    /// supplies nothing as a glob target, so a glob cycle with no
+    /// definition is walked once as well.
+    fn glob_supplies(&self, scope: usize, name: &str) -> Supply {
+        // Each scope met: `Some(depth)` while its frame is on the stack.
+        let mut seen: BTreeMap<usize, Option<usize>> = BTreeMap::new();
+        let mut frames: Vec<GlobFrame> = Vec::new();
+        seen.insert(scope, Some(0));
+        self.glob_visit();
+        if let Some(r) = self.glob_own(scope, name, true) {
+            return r;
+        }
+        frames.push(GlobFrame {
+            scope,
+            next: self.scopes[scope].glob_to.len(),
+            low: 0,
+        });
+        while let Some(top) = frames.last_mut() {
+            if top.next == 0 {
+                let done = *top;
+                frames.pop();
+                let depth = frames.len();
+                if let Some(parent) = frames.last_mut() {
+                    if done.low >= depth {
+                        self.glob_memo_put(done.scope, name, Supply::No);
+                    }
+                    parent.low = parent.low.min(done.low);
+                }
+                seen.insert(done.scope, None);
                 continue;
             }
-            let sc = &self.scopes[s];
-            if s != scope && sc.items.contains_key(name) {
-                return true;
-            }
-            if sc.glob_to.len() != sc.globs.len() {
-                return true;
-            }
-            for g in &sc.glob_to {
-                match g {
-                    Some(m) => todo.push(*m),
-                    None => return true,
+            top.next -= 1;
+            let Some(child) = self.scopes[top.scope].glob_to[top.next] else {
+                return Supply::Glob;
+            };
+            if let Some(r) = self.glob_memo_get(child, name) {
+                self.glob_visit();
+                if r == Supply::No {
+                    continue;
                 }
+                return self.glob_found(&frames, name, r);
+            }
+            if let Some(&at) = seen.get(&child) {
+                // A cycle back to a scope in progress, or a scope finished
+                // under one: whatever reaches it is not memoised.
+                top.low = top.low.min(at.unwrap_or(0));
+                continue;
+            }
+            let depth = frames.len();
+            seen.insert(child, Some(depth));
+            self.glob_visit();
+            if let Some(r) = self.glob_own(child, name, false) {
+                self.glob_memo_put(child, name, r);
+                return self.glob_found(&frames, name, r);
+            }
+            frames.push(GlobFrame {
+                scope: child,
+                next: self.scopes[child].glob_to.len(),
+                low: depth,
+            });
+        }
+        // Every scope met supplies nothing itself and globs only scopes met
+        // or memoised `No`; when `scope` itself supplies nothing as a glob
+        // target either, each of them (and `scope`) is `No` from anywhere.
+        // Memoising them so walks a glob cycle with no definition once.
+        if self.glob_own(scope, name, false).is_none() {
+            for &s in seen.keys() {
+                self.glob_memo_put(s, name, Supply::No);
             }
         }
-        false
+        Supply::No
+    }
+
+    /// #10324: what `s` itself supplies for `name` before its globs are
+    /// followed; `root` is the scope looked up in, whose own items and
+    /// reading are judged by [`TypeGraph::look`].
+    fn glob_own(&self, s: usize, name: &str, root: bool) -> Option<Supply> {
+        let sc = &self.scopes[s];
+        if !root && sc.items.contains_key(name) {
+            return Some(Supply::Glob);
+        }
+        if !root && !sc.read {
+            return Some(Supply::Unread);
+        }
+        if sc.glob_to.len() != sc.globs.len() || sc.glob_to.iter().any(Option::is_none) {
+            return Some(Supply::Glob);
+        }
+        None
+    }
+
+    /// #10324: `r`, found below every frame of `frames`, is the answer of
+    /// each frame other than the root; it is memoised for each frame whose
+    /// walk met no scope in progress above it.
+    fn glob_found(&self, frames: &[GlobFrame], name: &str, r: Supply) -> Supply {
+        let mut low = usize::MAX;
+        for (depth, f) in frames.iter().enumerate().skip(1).rev() {
+            low = low.min(f.low);
+            if low >= depth {
+                self.glob_memo_put(f.scope, name, r);
+            }
+        }
+        r
+    }
+
+    /// #10324: the memoised answer through `s` for `name`, if any.
+    fn glob_memo_get(&self, s: usize, name: &str) -> Option<Supply> {
+        self.glob_memo
+            .borrow()
+            .get(name)
+            .and_then(|m| m.get(&s))
+            .copied()
+    }
+
+    /// #10324: memoises the answer through `s` for `name`.
+    fn glob_memo_put(&self, s: usize, name: &str, r: Supply) {
+        self.glob_memo
+            .borrow_mut()
+            .entry(name.to_string())
+            .or_default()
+            .insert(s, r);
+    }
+
+    /// #10324: counts one scope visit of [`TypeGraph::glob_supplies`].
+    fn glob_visit(&self) {
+        self.glob_visits
+            .set(self.glob_visits.get().saturating_add(1));
     }
 
     /// #10294: settles the module of every glob import once every file is
@@ -3299,6 +3603,8 @@ impl TypeGraph {
             self.scopes[s].glob_to = to;
         }
         self.memo.get_mut().clear();
+        // #10324: an answer memoised while settling read unsettled globs.
+        self.glob_memo.get_mut().clear();
     }
 
     /// A path root that nothing in scope binds: std, this crate's library,
@@ -3319,12 +3625,14 @@ impl TypeGraph {
         }
     }
 
-    /// The step a binding takes. A bare prelude or primitive name bound
-    /// to a local definition is shadowed.
+    /// The step a binding takes. A bare prelude, primitive or std marker
+    /// trait name bound to a local definition is shadowed (#10346: a
+    /// pin reads a marker name, so a crate item of that name must not
+    /// pass for it).
     fn hop(b: Bind, name: &str, bare: bool) -> Hop {
         match b {
             Bind::Module(m) => Hop::To(Target::Scope(m)),
-            Bind::Def(_) if bare && is_prelude(name) => {
+            Bind::Def(_) if bare && (is_prelude(name) || is_std_marker(name)) => {
                 Hop::To(unres(Why::Shadowed(name.to_string())))
             }
             Bind::Def(n) => Hop::To(Target::Node(n)),
@@ -3347,6 +3655,7 @@ impl TypeGraph {
             Look::Bound(b) => Self::hop(b, seg, last),
             Look::Many => Hop::To(unres(Why::Ambiguous(seg.to_string()))),
             Look::Glob => Hop::To(unres(Why::Glob(seg.to_string()))),
+            Look::Unread => Hop::To(unres(Why::PathNotLanded(seg.to_string()))),
             // P6: `use Mutex as Gatekeeper` names a lock by its bare name.
             Look::Empty if last && LOCK_TYPES.contains(&seg) => Hop::To(Target::Done(Res::Lock)),
             Look::Empty if last && is_prelude(seg) => Hop::To(Target::Done(Res::Clean)),
@@ -3366,7 +3675,7 @@ impl TypeGraph {
             Look::Bound(b) => Self::hop(b, seg, false),
             Look::Many => Hop::To(unres(Why::Ambiguous(seg.to_string()))),
             Look::Glob => Hop::To(unres(Why::Glob(seg.to_string()))),
-            Look::Empty => Hop::To(unres(Why::PathNotLanded(seg.to_string()))),
+            Look::Unread | Look::Empty => Hop::To(unres(Why::PathNotLanded(seg.to_string()))),
         }
     }
 
@@ -3461,15 +3770,29 @@ impl TypeGraph {
                 let known = [&LOCK_TYPES[..], &LEAF_TYPES[..]]
                     .iter()
                     .any(|set| set.contains(&n.as_str()));
-                if bound || known || is_prelude(n) {
+                if bound || known || is_prelude(n) || is_std_marker(n) {
                     Ok(Res::Unres(Why::Shadowed(n.clone())))
                 } else {
                     Ok(Res::Clean)
                 }
             }
-            Atom::Path { segs, global } => {
+            Atom::Path {
+                segs,
+                global,
+                bound,
+            } => {
                 let last = segs.last().cloned().unwrap_or_default();
                 match self.resolve(scope, segs, *global) {
+                    // #10356: a marker-trait name with no walked definition,
+                    // written in bound position, is that trait; the pin
+                    // judges it as `MarkerBound`. In type position it stays
+                    // `NoDef`: a crate type the walk cannot see (an item
+                    // macro's `struct Send`), which the pin never reads.
+                    Target::Done(Res::Unres(Why::NoDef(name)))
+                        if *bound && is_std_marker(&name) =>
+                    {
+                        Ok(Res::Unres(Why::MarkerBound(name)))
+                    }
                     Target::Node(n) => Err(n),
                     Target::Scope(_) => Ok(Res::Unres(Why::PathNotLanded(last))),
                     Target::Std(name) | Target::Foreign { name, .. }
@@ -3609,6 +3932,50 @@ struct Resolved<'g> {
 /// #10295: the digest entry key of a static's own written type.
 const OWN_TYPE_KEY: &str = "type";
 
+/// #10295: the `why` column of an [`EXCEPTIONS`] row for a static in a
+/// `macro_rules!` body, which has no resolved reason.
+const MACRO_BODY_WHY: &str = "MacroBody";
+
+/// #10295: the `why` column text of a reason: its `Debug` form, exact.
+fn why_text(why: &Why) -> String {
+    format!("{why:?}")
+}
+
+/// #10295: whether the pin reads everything a type with this reason
+/// depends on. A name behind a glob, a type in an unread module, a macro's
+/// expansion, an associated type's value and an ambiguous or shadowed
+/// name are not in the digest, so a change there would leave the pin
+/// green: a static whose type reaches one never takes a row. Every
+/// variant is named in an arm and there is no wildcard, so a new reason must
+/// be judged here. #10346: default deny. A name with no walked definition
+/// (`NoDef`: an item a macro writes, a missing file) and an associated
+/// type with no value (`NoValue`) are not read. #10356: the one exception
+/// is `MarkerBound`, a whole std marker trait name in bound position (a
+/// crate item of that name in reach is `Shadowed`, see `TypeGraph::hop`;
+/// the same name in type position is a crate type and stays `NoDef`).
+fn pin_reads(why: &Why) -> bool {
+    match why {
+        // #10356: by position, then by whole name. A `NoDef` is a crate
+        // type the walk cannot see, whatever its name.
+        Why::MarkerBound(name) => is_std_marker(name),
+        Why::TraitObject
+        | Why::OpaqueType
+        | Why::RawPointer
+        | Why::StdNotProven(_)
+        | Why::Foreign { .. }
+        | Why::Cycle(_) => true,
+        Why::MacroType(_)
+        | Why::Projection
+        | Why::Glob(_)
+        | Why::Ambiguous(_)
+        | Why::Shadowed(_)
+        | Why::PathNotLanded(_)
+        | Why::NoValue(_)
+        | Why::MacroFragment(_)
+        | Why::NoDef(_) => false,
+    }
+}
+
 /// A 64-bit hash shown as 8 hex digits: the two halves folded together.
 fn hex8(h: u64) -> String {
     let folded = (h >> 32) ^ (h & 0xffff_ffff);
@@ -3628,20 +3995,36 @@ impl Resolved<'_> {
 
     /// #10295: the digest of a static's type: `type=<hash>` of its own
     /// written tokens, then `<module path>::<name>=<hash>` of every
-    /// definition reached from it, each once, sorted. Linear in the nodes
-    /// and edges reached.
-    fn digest(&self, scope: usize, atoms: &[Atom], own: u64) -> String {
+    /// definition reached from it, each once, sorted; and the least reason
+    /// of a name the type or those definitions write that the pin does not
+    /// read ([`pin_reads`]), `None` when the pin reads them all. Linear in
+    /// the nodes, atoms and edges reached.
+    fn digest(&self, scope: usize, atoms: &[Atom], own: u64) -> (String, Option<Why>) {
+        let g = self.graph;
+        let mut unread: Option<Why> = None;
         let mut seen: BTreeSet<usize> = BTreeSet::new();
-        let mut todo: Vec<usize> = atoms
-            .iter()
-            .filter_map(|a| self.graph.atom(scope, a).err())
-            .collect();
+        let mut todo: Vec<usize> = Vec::new();
+        let mut look = |scope: usize, a: &Atom, todo: &mut Vec<usize>| match g.atom(scope, a) {
+            Err(n) => todo.push(n),
+            Ok(Res::Unres(why)) if !pin_reads(&why) => {
+                unread = Some(match unread.take() {
+                    Some(u) => u.min(why),
+                    None => why,
+                });
+            }
+            Ok(_) => {}
+        };
+        for a in atoms {
+            look(scope, a, &mut todo);
+        }
         while let Some(n) = todo.pop() {
             if seen.insert(n) {
+                for a in &g.nodes[n].atoms {
+                    look(g.nodes[n].scope, a, &mut todo);
+                }
                 todo.extend(self.edges[n].iter().copied().filter(|w| !seen.contains(w)));
             }
         }
-        let g = self.graph;
         let mut entries: Vec<String> = seen
             .iter()
             .map(|&n| {
@@ -3656,7 +4039,7 @@ impl Resolved<'_> {
             .collect();
         entries.sort();
         entries.insert(0, format!("{OWN_TYPE_KEY}={}", hex8(own)));
-        entries.join(" ")
+        (entries.join(" "), unread)
     }
 }
 
@@ -4247,7 +4630,7 @@ fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
     (close, in_attr)
 }
 
-/// #10275, #10285, #10295: `(path, static name, digest, reason)` for each
+/// #10275, #10285, #10295: `(path, static name, digest, why, reason)` for each
 /// static whose type does not resolve to [`LEAF_TYPES`], or that sits in a
 /// `macro_rules!` body, and is judged by hand. Every row must be used. The
 /// digest is `type=<hex8>` (the FNV-1a hash of the written type tokens)
@@ -4256,258 +4639,289 @@ fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
 /// proves the judged text is unchanged since the pin, not that the text is
 /// safe, and it is not collision-resistant against a deliberate edit; a
 /// foreign or std type's source and a macro's expansion are not in it. A change shows as `ExceptionDigest` naming the first changed entry;
-/// re-judge the static, then pin the new digest.
-const EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
+/// re-judge the static, then pin the new digest. `why` is the exact reason
+/// the row admits ([`why_text`] of the static's `Why`, or
+/// [`MACRO_BODY_WHY`]); a static whose live reason is another, or whose
+/// type reaches a name the pin cannot read, does not take the row.
+const EXCEPTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "src/approvals.rs",
         "APPROVAL_BUS",
         "type=54574677 src::approvals::ApprovalEvent=551a13b1",
+        r#"Foreign { root: "tokio", name: "Sender" }"#,
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/config.rs",
         "DISABLED",
         "type=381fd1dd src::governance::capability::CapabilityConfig=1c73fcb7 src::governance::capability::IssuerConfig=4a856305 src::governance::capability::OpLevel=985b095c",
+        r#"Foreign { root: "ed25519_dalek", name: "VerifyingKey" }"#,
         "an Arc of CapabilityConfig whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/config/unknown_keys.rs",
         "SCHEMA",
         "type=d42394ee",
+        r#"Foreign { root: "schemars", name: "RootSchema" }"#,
         "a schemars RootSchema: plain schema data built once",
     ),
     (
         "src/enterprise_federation_posture/hardened_env_fixture.rs",
         "POSTURE_AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/governance/audit.rs",
         "DAEMON_AUDIT_KEY",
         "type=feacdeed",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "RECORDER_KEY",
         "type=feacdeed",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "WRITER",
         "type=3e57fb9c src::governance::audit::PendingRow=120d9247 src::governance::audit::WriteOp=3c1463d5",
+        r#"StdNotProven("Sender")"#,
         "a std mpsc Sender of WriteOp: a channel handle, never acquired as a lock",
     ),
     (
         "src/governance/wire_check.rs",
         "GOVERNANCE_PRE_ACTION",
         "type=71217376 src::governance::agent_action::AgentAction=39cefa84 src::governance::wire_check::WireCheckHook=a65c2e63",
+        "TraitObject",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/handlers/federation_signing_check.rs",
         "BUNDLE",
         "type=948eda2d src::federation::identity::trust_bundle::TrustBundle=64fb7356",
+        r#"Foreign { root: "ed25519_dalek", name: "VerifyingKey" }"#,
         "a TrustBundle whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/identity/session_signer.rs",
         "SESSION_SIGNER",
         "type=ee355834 src::identity::keypair::AgentKeypair=e5642726 src::identity::session_signer::SessionSigner=7c8667f6",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/identity/test_key_dir.rs",
         "DIRECTORY",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/inbox_wake.rs",
         "INBOX_WAKE_BUS",
         "type=deb19289 src::inbox_wake::InboxEvent=109e5130",
+        r#"Foreign { root: "tokio", name: "Sender" }"#,
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/logging.rs",
         "CENSUS_DUMMY_METADATA_3650",
         "type=4b4bb898",
+        r#"Foreign { root: "tracing", name: "Metadata" }"#,
         "a tracing Metadata: static callsite data",
     ),
     (
         "src/logging.rs",
         "INSTALLED_PIPELINE",
         "type=5ea7aa50 src::config::LogSink=bf13c837 src::logging::DeliveryStats=b3b0a375 src::logging::InstalledPipeline=f096f93a",
+        r#"Foreign { root: "tracing_appender", name: "ErrorCounter" }"#,
         "the log pipeline; its foreign leaf is a tracing_appender ErrorCounter, an atomic count",
     ),
     (
         "src/mcp/mod.rs",
         "POST_SIGNAL_ACK_SINK",
         "type=1c9aa41e",
+        r#"Foreign { root: "serde_json", name: "Value" }"#,
         "a tokio UnboundedSender of serde_json Value: a channel handle",
-    ),
-    (
-        "src/mcp/shutdown.rs",
-        "GATE_STUCK",
-        "type=d5eb792a",
-        "a ShutdownGate named through `use super::*`: one AtomicU8 state, no lock",
-    ),
-    (
-        "src/mcp/shutdown.rs",
-        "GATE_UNDER_TEST",
-        "type=d5eb792a",
-        "a ShutdownGate named through `use super::*`: one AtomicU8 state, no lock",
     ),
     (
         "src/metrics.rs",
         "HANDLE",
         "type=0b452c42 src::metrics::Metrics=bc17d7d2",
+        r#"Foreign { root: "prometheus", name: "HistogramVec" }"#,
         "the prometheus Metrics handle; its vectors are updated through their own API, never held",
     ),
     (
         "src/storage/escalation_deferral.rs",
         "TXN_FRAMES",
-        "type=4af0ce2f src::governance::audit::PendingAuditAnchor=10c2b32e src::governance::audit::PendingWatermark=7061bdc8 src::storage::escalation_deferral::DeferredEscalation=75a03a25 src::storage::escalation_deferral::Frames=a5a77e15 src::storage::escalation_deferral::TxnFrame=13954030",
+        "type=4af0ce2f src::governance::audit::PendingAuditAnchor=f6124fa3 src::governance::audit::PendingWatermark=7061bdc8 src::models::checkpoint::Checkpoint=d8fee8d3 src::models::checkpoint::CheckpointState=2990ace0 src::models::checkpoint::ConditionType=7cebdbd3 src::models::namespace::GovernedAction=0991cec5 src::storage::escalation_deferral::DeferredEscalation=75a03a25 src::storage::escalation_deferral::Frames=a5a77e15 src::storage::escalation_deferral::TxnFrame=13954030",
+        r#"Foreign { root: "serde_json", name: "Value" }"#,
         "a thread-local RefCell of frames; the foreign leaf is a serde_json Value",
     ),
     (
         "src/storage/escalation_frame_reporting_8184_tests.rs",
         "WRITE_PAUSE",
         "type=dc90c7c0 src::storage::escalation_frame_reporting_8184_tests::WritePause=0a6b82f0",
+        r#"StdNotProven("Receiver")"#,
         "a thread-local pair of std mpsc channel ends: a test pause, not a lock",
     ),
     (
         "src/storage/mod.rs",
         "BPE",
         "type=16315d13",
+        r#"Foreign { root: "tiktoken_rs", name: "CoreBPE" }"#,
         "a tiktoken CoreBPE: tokenizer tables built once",
     ),
     (
         "src/storage/mod.rs",
         "GOVERNANCE_PRE_WRITE",
-        "type=d6b472da",
+        "type=cb90d06c src::models::memory::Citation=08fa7958 src::models::memory::ConfidenceSignals=0158db0c src::models::memory::ConfidenceSource=df4862e7 src::models::memory::LifecycleState=d4d75c03 src::models::memory::Memory=9c680e1a src::models::memory::MemoryKind=5c963448 src::models::memory::SourceSpan=299aecab src::models::memory::Tier=7773f0eb",
+        "TraitObject",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/storage/snapshot_file.rs",
         "HOOK",
         "type=71d95840 src::storage::snapshot_file::seam::Hook=8a434667 src::storage::snapshot_file::seam::Point=3f4c9617",
+        "TraitObject",
         "a thread-local boxed dyn FnMut test seam, set by one test on its own thread",
     ),
     (
         "src/storage/txn_immediate_5084_tests.rs",
         "HOOK_5084",
         "type=e9493773",
+        "TraitObject",
         "a thread-local boxed dyn FnOnce test seam, set by one test on its own thread",
     ),
     (
         "src/subscriptions.rs",
         "DISPATCH_ROOT_CA",
         "type=9f706e3e",
+        r#"Foreign { root: "reqwest", name: "Certificate" }"#,
         "a reqwest Certificate: certificate bytes, no lock",
     ),
     (
         "src/subscriptions/webhook_ssrf_8203_tests.rs",
         "DNS_ANSWER",
         "type=d3c053c6 src::subscriptions::webhook_ssrf_8203_tests::DnsAnswer=4a0413d0",
+        r#"StdNotProven("SocketAddr")"#,
         "a thread-local one-shot DNS answer: a String and an io Result of SocketAddr",
     ),
     (
         "src/test_support.rs",
         "TLS_TEST_PKI",
         "type=486b0f1c src::test_support::TlsTestPki=bf02fb43",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "the test PKI paths; its foreign leaf is a tempfile TempDir",
     ),
     (
         "tests/agent_projection_txn_9405_9406.rs",
         "RACE",
         "type=188bdf73 tests/agent_projection_txn_9405_9406.rs::Outcome=600430fe tests/agent_projection_txn_9405_9406.rs::Race=490373cf",
+        r#"StdNotProven("Receiver")"#,
         "a thread-local RefCell of Race: std mpsc channel ends and an Outcome",
     ),
     (
         "tests/append_only_spine_flagon_g6.rs",
         "AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/append_only_upsert_supersede_2948.rs",
         "AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/auto_atomise/core.rs",
         "Q",
         "type=6877f3c7 src::background::atomise_worker::AtomiseJob=3c9ace28 src::background::atomise_worker::AtomiseQueue=e38c5ba8",
+        r#"StdNotProven("SyncSender")"#,
         "an AtomiseQueue: a std mpsc SyncSender, a channel handle",
     ),
     (
         "tests/common/mod.rs",
         "CLIENT",
         "type=d258f2f9",
+        r#"Foreign { root: "reqwest", name: "Client" }"#,
         "a reqwest Client: a connection pool handle, never acquired as a lock",
     ),
     (
         "tests/curator_conserves_contradiction_g7.rs",
         "AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/entity_register_owner_8497.rs",
         "TRAIL",
         "type=ce0988eb",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/fed_checkpoint_lane_3075_pg.rs",
         "DIR",
         "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_1936_checkpoint_fed.rs",
         "DIR",
         "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_checkpoint_ns_scope_2708.rs",
         "DIR",
         "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/form_1_synthesis.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/form_1_synthesis_verdict_matrix.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/issue_2122_synthesis_provenance_enforce.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_legacy_classifier_paths.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_synthesis_error_paths.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
 ];
@@ -4527,7 +4941,7 @@ const INCLUDE_ROWS: &[(&str, &str, usize, &str)] = &[(
 /// The hand-written tables the token census judges against.
 struct Tables<'a> {
     statics: &'a str,
-    exceptions: &'a [(&'a str, &'a str, &'a str, &'a str)],
+    exceptions: &'a [(&'a str, &'a str, &'a str, &'a str, &'a str)],
     includes: &'a [(&'a str, &'a str, usize, &'a str)],
 }
 
@@ -4573,6 +4987,16 @@ fn token_census_with(
     files: &[(String, String)],
     tables: &Tables,
 ) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
+    let (statics, includes, _) = token_census_counted(files, tables);
+    (statics, includes)
+}
+
+/// #10324: [`token_census_with`], with the number of scope visits that
+/// [`TypeGraph::glob_supplies`] made.
+fn token_census_counted(
+    files: &[(String, String)],
+    tables: &Tables,
+) -> (Vec<StaticFinding>, Vec<IncludeFinding>, u64) {
     let (rows, bad) = parse_table(tables.statics);
     let mut statics: Vec<StaticFinding> = bad.into_iter().map(StaticFinding::Table).collect();
     let mut includes = Vec::new();
@@ -4598,10 +5022,17 @@ fn token_census_with(
         }
     }
     let mut graph = TypeGraph::default();
-    let spans: Vec<Vec<(usize, usize)>> = lexed
-        .iter()
-        .map(|f| graph.file(f.path, &f.toks, &f.close, &f.lens, &f.in_macro))
-        .collect();
+    // #10323: the graph is built over the files sorted by path, so no
+    // scope, binding or digest depends on the walk order; the spans keep
+    // the walk order of `lexed`.
+    let mut order: Vec<usize> = (0..lexed.len()).collect();
+    order.sort_by(|&a, &b| lexed[a].path.cmp(lexed[b].path));
+    let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); lexed.len()];
+    for i in order {
+        let f = &lexed[i];
+        spans[i] = graph.file(f.path, &f.toks, &f.close, &f.lens, &f.in_macro);
+    }
+    graph.link_modules();
     graph.settle_globs();
     let resolved = graph.values();
     // Rows left per file, then per name: a static takes one row.
@@ -4619,11 +5050,12 @@ fn token_census_with(
         .filter(|r| r.category != Category::Lock)
         .map(|r| (r.path.clone(), r.name.clone()))
         .collect();
-    // #10295: each row, whether a static took it, and its pinned digest.
-    let mut excepted: BTreeMap<(String, String), (bool, &str)> = BTreeMap::new();
-    for &(file, name, digest, reason) in tables.exceptions {
+    // #10295: each row, whether a static took it, its pinned digest and
+    // the reason it admits.
+    let mut excepted: BTreeMap<(String, String), (bool, &str, &str)> = BTreeMap::new();
+    for &(file, name, digest, why, reason) in tables.exceptions {
         let key = (file.to_string(), name.to_string());
-        if excepted.insert(key, (false, digest)).is_some() {
+        if excepted.insert(key, (false, digest, why)).is_some() {
             statics.push(StaticFinding::ExceptionDuplicate {
                 file: file.to_string(),
                 name: name.to_string(),
@@ -4651,29 +5083,49 @@ fn token_census_with(
         {
             let key = (path.to_string(), name.clone());
             let scope = scope_at(sp, ty.0);
+            // #10350: a macro-body static's written type is read by the same
+            // resolver, in the scope that writes it; a metavariable in it is
+            // a `MacroFragment` atom, and no written type is one too.
             let mut atoms = Vec::new();
-            if !in_macro {
-                type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
+            type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
+            if in_macro && ty.0 >= ty.1 {
+                atoms.push(Atom::Unres(Why::MacroFragment(String::new())));
             }
-            // #10295: taking a row checks its pin against the live digest; a
-            // macro-body static's digest is its own written type only.
-            // `None` when no row names the static, else the digest finding.
-            let take = |excepted: &mut BTreeMap<(String, String), (bool, &str)>| {
-                let (used, pinned) = excepted.get_mut(&key)?;
-                *used = true;
-                let own = token_hash(&f.toks, ty);
-                let live = if in_macro {
-                    format!("{OWN_TYPE_KEY}={}", hex8(own))
-                } else {
-                    resolved.digest(scope, &atoms, own)
+            // #10295: a row is taken only by the static whose live reason is
+            // the row's `why` and whose type the pin reads in full; taking it
+            // checks its pin against the live digest of the type and every
+            // definition it reaches (#10350: in a macro body too). `Ok` holds
+            // the digest finding; `Err(Some(why))` is a row of this `why`
+            // whose type reaches a name the pin does not read (the least
+            // such reason), `Err(None)` no row of this `why`. A row not taken
+            // stays stale.
+            let take = |excepted: &mut BTreeMap<(String, String), (bool, &str, &str)>,
+                        why: &str|
+             -> Result<Option<StaticFinding>, Option<Why>> {
+                let Some((used, pinned, admits)) = excepted.get_mut(&key) else {
+                    return Err(None);
                 };
-                Some(digest_finding(path, &name, pinned, &live))
+                if *admits != why {
+                    return Err(None);
+                }
+                let (live, unread) = resolved.digest(scope, &atoms, token_hash(&f.toks, ty));
+                if let Some(u) = unread {
+                    return Err(Some(u));
+                }
+                *used = true;
+                Ok(digest_finding(path, &name, pinned, &live))
             };
             if in_macro {
                 // #10285: never a row; judged only by hand.
-                match take(&mut excepted) {
-                    Some(stale) => statics.extend(stale),
-                    None => statics.push(StaticFinding::MacroBodyStatic {
+                match take(&mut excepted, MACRO_BODY_WHY) {
+                    Ok(stale) => statics.extend(stale),
+                    Err(Some(why)) => statics.push(StaticFinding::MacroBodyUnread {
+                        file: path.to_string(),
+                        name,
+                        line,
+                        why,
+                    }),
+                    Err(None) => statics.push(StaticFinding::MacroBodyStatic {
                         file: path.to_string(),
                         name,
                         line,
@@ -4691,15 +5143,17 @@ fn token_census_with(
                     });
                 }
                 // #10275, #10283: a static not proven lock-free.
-                Res::Unres(why) if not_lock.contains(&key) => match take(&mut excepted) {
-                    Some(stale) => statics.extend(stale),
-                    None => statics.push(StaticFinding::Unresolvable {
-                        file: path.to_string(),
-                        name: name.clone(),
-                        line,
-                        why,
-                    }),
-                },
+                Res::Unres(why) if not_lock.contains(&key) => {
+                    match take(&mut excepted, &why_text(&why)) {
+                        Ok(stale) => statics.extend(stale),
+                        Err(_) => statics.push(StaticFinding::Unresolvable {
+                            file: path.to_string(),
+                            name: name.clone(),
+                            line,
+                            why,
+                        }),
+                    }
+                }
                 _ => {}
             }
             match left.get_mut(path).and_then(|m| m.get_mut(name.as_str())) {
@@ -4739,7 +5193,7 @@ fn token_census_with(
             });
         }
     }
-    for ((file, name), (used, _)) in excepted {
+    for ((file, name), (used, _, _)) in excepted {
         if !used {
             statics.push(StaticFinding::ExceptionStale { file, name });
         }
@@ -4754,7 +5208,7 @@ fn token_census_with(
         }
     }
     includes.extend(include_counts(&lexed, tables.includes));
-    (statics, includes)
+    (statics, includes, graph.glob_visits.get())
 }
 
 /// #10276: every identifier token of [`COUNTED_IDENTS`] (a raw `r#` form
@@ -6902,11 +7356,15 @@ const FORM_ROW: &str = "\tFORM\tonce: a value computed once, no lock\n";
 /// A reason long enough for an exception or an include row.
 const FORM_WHY: &str = "judged by hand for the form table";
 
-/// #10295: the pinned digest of `static FORM: Unknown = X;` in `src/b.rs`.
-const D_UNRES: &str = "type=57dcbc6c";
+/// #10295: the pinned digest of `static FORM: anyhow::Unknown = X;` in
+/// `src/b.rs` (#10346: a foreign type, a reason the pin reads; a bare
+/// `Unknown` is a `NoDef`, which never takes a row).
+const D_UNRES: &str = "type=83d1c796";
 
-/// #10295: the pinned digest of the macro-body `INNER` static's type.
-const D_INNER: &str = "type=4fd0bfc1";
+/// #10295: the pinned digest of the macro-body `INNER` static's type,
+/// `std::sync::Mutex<u8>` (#10350: the type is read; `4fd0bfc1` was the
+/// hash of the empty span the census used to take).
+const D_INNER: &str = "type=34579755";
 
 /// What the deny-by-default census must decide for one form.
 #[derive(Debug)]
@@ -6926,8 +7384,13 @@ pub type One = Two;\npub type Two = std::sync::RwLock<u8>;\npub struct S;\n\
 pub trait Tr {\n    type Out;\n}\npub type Erased = Box<dyn Fn() + Sync>;\n\
 pub struct Plain {\n    v: u8,\n}\n";
 
-/// An exception row as the tests write it: `(file, name, digest, reason)`.
-type ExceptionRow<'a> = (&'a str, &'a str, &'a str, &'a str);
+/// An exception row as the tests write it: `(file, name, digest, why,
+/// reason)`.
+type ExceptionRow<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+
+/// #10295: the `why` of a static whose type reaches the foreign name
+/// `anyhow::Unknown` (#10346: read, unlike the `NoDef` of a bare name).
+const W_UNRES: &str = r#"Foreign { root: "anyhow", name: "Unknown" }"#;
 
 /// One exception case: `(id, text, exceptions, findings written by hand)`.
 type ExceptionCase<'a> = (&'a str, &'a str, Vec<ExceptionRow<'a>>, Vec<StaticFinding>);
@@ -7339,7 +7802,7 @@ fn type_forms_are_judged_deny_by_default_10283() {
 /// never excepted.
 #[test]
 fn exceptions_are_judged_exactly_10275() {
-    const UNRES: &str = "static FORM: Unknown = X;\n";
+    const UNRES: &str = "static FORM: anyhow::Unknown = X;\n";
     const LOCK: &str = "static FORM: std::sync::Mutex<u8> = X;\n";
     const CLEAN: &str = "static FORM: u8 = 0;\n";
     let b = "src/b.rs";
@@ -7353,54 +7816,62 @@ fn exceptions_are_judged_exactly_10275() {
         file: b.into(),
         name: "FORM".into(),
         line: 1,
-        why: Why::NoDef("Unknown".into()),
+        why: Why::Foreign {
+            root: "anyhow".into(),
+            name: "Unknown".into(),
+        },
     };
     let rows: Vec<ExceptionCase<'_>> = vec![
-        ("taken", UNRES, vec![(b, "FORM", D_UNRES, FORM_WHY)], vec![]),
+        (
+            "taken",
+            UNRES,
+            vec![(b, "FORM", D_UNRES, W_UNRES, FORM_WHY)],
+            vec![],
+        ),
         ("absent", UNRES, vec![], vec![unres.clone()]),
         (
             "other-file",
             UNRES,
-            vec![("src/c.rs", "FORM", D_UNRES, FORM_WHY)],
+            vec![("src/c.rs", "FORM", D_UNRES, W_UNRES, FORM_WHY)],
             vec![unres.clone(), named(stale, "src/c.rs", "FORM")],
         ),
         (
             "other-name",
             CLEAN,
-            vec![(b, "OTHER", D_UNRES, FORM_WHY)],
+            vec![(b, "OTHER", D_UNRES, W_UNRES, FORM_WHY)],
             vec![named(stale, b, "OTHER")],
         ),
         (
             "on-a-clean-static",
             CLEAN,
-            vec![(b, "FORM", D_UNRES, FORM_WHY)],
+            vec![(b, "FORM", D_UNRES, W_UNRES, FORM_WHY)],
             vec![named(stale, b, "FORM")],
         ),
         (
             "duplicate",
             UNRES,
             vec![
-                (b, "FORM", D_UNRES, FORM_WHY),
-                (b, "FORM", D_UNRES, FORM_WHY),
+                (b, "FORM", D_UNRES, W_UNRES, FORM_WHY),
+                (b, "FORM", D_UNRES, W_UNRES, FORM_WHY),
             ],
             vec![named(dup, b, "FORM")],
         ),
         (
             "short-reason",
             UNRES,
-            vec![(b, "FORM", D_UNRES, "too short")],
+            vec![(b, "FORM", D_UNRES, W_UNRES, "too short")],
             vec![named(reasonless, b, "FORM")],
         ),
         (
             "blank-reason",
             UNRES,
-            vec![(b, "FORM", D_UNRES, "            ")],
+            vec![(b, "FORM", D_UNRES, W_UNRES, "            ")],
             vec![named(reasonless, b, "FORM")],
         ),
         (
             "on-a-lock",
             LOCK,
-            vec![(b, "FORM", D_UNRES, FORM_WHY)],
+            vec![(b, "FORM", D_UNRES, W_UNRES, FORM_WHY)],
             vec![
                 StaticFinding::LockNotLabelled {
                     file: b.into(),
@@ -7460,7 +7931,7 @@ fn static_in_a_macro_body_is_red_10285() {
             "excepted",
             LOCK_BODY,
             "",
-            vec![(b, "INNER", D_INNER, FORM_WHY)],
+            vec![(b, "INNER", D_INNER, MACRO_BODY_WHY, FORM_WHY)],
             vec![],
         ),
     ];
@@ -8163,6 +8634,12 @@ fn r3_foreign(root: &str, name: &str) -> Why {
 /// The census of `files`, every file that writes `static FORM` carrying a
 /// `once` row for it.
 fn r3_census(files: &[(&str, &str)]) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
+    let (statics, includes, _) = r3_census_counted(files);
+    (statics, includes)
+}
+
+/// #10324: [`r3_census`], with the scope visits of the glob resolver.
+fn r3_census_counted(files: &[(&str, &str)]) -> (Vec<StaticFinding>, Vec<IncludeFinding>, u64) {
     let mut table = String::new();
     for (file, text) in files {
         if text.contains("static FORM") {
@@ -8174,7 +8651,7 @@ fn r3_census(files: &[(&str, &str)]) -> (Vec<StaticFinding>, Vec<IncludeFinding>
         .iter()
         .map(|(f, t)| ((*f).to_string(), (*t).to_string()))
         .collect();
-    token_census_with(&owned, &bare(&table))
+    token_census_counted(&owned, &bare(&table))
 }
 
 /// Runs every case and returns one line per case whose findings differ.
@@ -8801,16 +9278,16 @@ fn invented_scope_forms_are_judged_10293() {
 }
 
 /// #10295: a struct reached from `Bus`, then `Bus` itself.
-const R3_BUS: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
+const R3_BUS: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
 
 /// #10295 P14b: `Bus` gains a foreign field after its exception was pinned.
-const R3_BUS_FIELD: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n    m: dashmap::DashMap<u8, u8>,\n}\nstatic FORM: Bus = X;\n";
+const R3_BUS_FIELD: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n    m: dashmap::DashMap<u8, u8>,\n}\nstatic FORM: Bus = X;\n";
 
 /// #10295: `Inner`, reached from `Bus`, gains a field.
-const R3_INNER_FIELD: &str = "pub struct Inner {\n    v: Unknown,\n    w: u16,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
+const R3_INNER_FIELD: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n    w: u16,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
 
 /// #10295: the static's own written type changes.
-const R3_OWN_TYPE: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: (Bus, u8) = X;\n";
+const R3_OWN_TYPE: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: (Bus, u8) = X;\n";
 
 /// #10295: the pinned digest of `FORM` in [`R3_BUS`].
 const D_BUS: &str = "type=ce1d7f3c src::b::Bus=364aa5fe src::b::Inner=a250aabb";
@@ -8827,35 +9304,40 @@ fn exceptions_are_pinned_by_content_10295() {
     };
     let lock_body = "macro_rules! m {\n    () => {\n        static INNER: std::sync::Mutex<u8> = X;\n    };\n}\n";
     let rows: Vec<ExceptionCase<'_>> = vec![
-        ("same", R3_BUS, vec![(b, "FORM", D_BUS, FORM_WHY)], vec![]),
+        (
+            "same",
+            R3_BUS,
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
+            vec![],
+        ),
         (
             "P14b-field-added",
             R3_BUS_FIELD,
-            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
             vec![digest("FORM", "src::b::Bus")],
         ),
         (
             "reached-definition-changed",
             R3_INNER_FIELD,
-            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
             vec![digest("FORM", "src::b::Inner")],
         ),
         (
             "own-type-changed",
             R3_OWN_TYPE,
-            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
             vec![digest("FORM", "type")],
         ),
         (
             "empty-digest",
             R3_BUS,
-            vec![(b, "FORM", "", FORM_WHY)],
+            vec![(b, "FORM", "", W_UNRES, FORM_WHY)],
             vec![digest("FORM", "type")],
         ),
         (
             "macro-body-wrong-digest",
             lock_body,
-            vec![(b, "INNER", "type=00000000", FORM_WHY)],
+            vec![(b, "INNER", "type=00000000", MACRO_BODY_WHY, FORM_WHY)],
             vec![digest("INNER", "type")],
         ),
     ];
@@ -8869,6 +9351,381 @@ fn exceptions_are_pinned_by_content_10295() {
         };
         let tables = Tables {
             statics: &table,
+            exceptions: &exceptions,
+            includes: &[],
+        };
+        let (statics, _) = token_census_with(&files, &tables);
+        if statics != want {
+            miss.push(format!("{id}: got {statics:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10295: the `Bus` of `src/a.rs` an excepted static reaches, before its
+/// type changes: one foreign channel handle.
+const W_BUS: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n}\n";
+
+/// #10295: [`W_BUS`] after a foreign lock-holding field is added beside it.
+const W_BUS_FIELD: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n    m: dashmap::DashMap<u8, u8>,\n}\n";
+
+/// #10295: [`W_BUS`] with a second type of the same reason beside it.
+const W_BUS_TWO: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n}\npub struct Bus2 {\n    tx: tokio::sync::broadcast::Sender<u16>,\n}\n";
+
+/// #10295: a nested local type of `src/b.rs` after `Cell` gains a foreign
+/// lock-holding field.
+const W_NESTED_FIELD: &str = "mod inner {\n    pub struct Cell {\n        tx: tokio::sync::broadcast::Sender<u8>,\n        m: dashmap::DashMap<u8, u8>,\n    }\n    pub struct Bus {\n        c: Cell,\n    }\n}\nstatic FORM: inner::Bus = X;\n";
+
+/// #10295: the pinned digest of `FORM` over [`W_BUS`] in `src/b.rs`.
+const D_W_DIRECT: &str = "type=ce1d7f3c src::b::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM` in [`W_NESTED_FIELD`] before `Cell`
+/// gained its `m` field.
+const D_W_NESTED: &str = "type=68593f65 src::b::inner::Bus=9dd740f4 src::b::inner::Cell=c02f1c7b";
+/// #10295: the pinned digest of `FORM: Bus` behind `use crate::a::Bus`.
+const D_W_USE: &str = "type=ce1d7f3c src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: Bus` behind `use crate::a::*`.
+const D_W_GLOB: &str = "type=ce1d7f3c";
+/// #10295: the pinned digest of `FORM: Chan` behind `use crate::a::Bus as Chan`.
+const D_W_ALIAS: &str = "type=d8d3b6b7 src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: Option<crate::a::Bus>`.
+const D_W_GENERIC: &str = "type=a8972500 src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: Bus` over [`W_BUS_FIELD`].
+const D_W_REMOVED: &str = "type=ce1d7f3c src::a::Bus=c341dd03";
+/// #10295: the pinned digest of `FORM: crate::a::Bus` over [`W_BUS_TWO`].
+const D_W_SWAPPED: &str = "type=8399cc9c src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: px::Bus` of an unread `#[path]` module.
+const D_W_UNREAD: &str = "type=ffb0c4f4";
+/// #10295: the pinned digest of `FORM: (Box<dyn Fn() + Sync>, Bus)` behind a glob.
+const D_W_GLOB_HIDDEN: &str = "type=06bb9d35";
+/// #10295: the pinned digest of `FORM: (Box<dyn Fn() + Sync>, px::Bus)`.
+const D_W_UNREAD_HIDDEN: &str = "type=60e7ad09";
+
+/// One #10295 type-change form: `(id, files after the change, the digest
+/// and the `why` pinned before it, findings written by hand)`.
+type WhyCase<'a> = (
+    &'a str,
+    Vec<(&'a str, &'a str)>,
+    (&'a str, &'a str),
+    Vec<StaticFinding>,
+);
+
+/// #10295: the `why` of a type whose least reason is a tokio `Sender`.
+const W_TOKIO: &str = r#"Foreign { root: "tokio", name: "Sender" }"#;
+/// #10295: the `why` of a type whose least reason is a `DashMap`.
+const W_DASH: &str = r#"Foreign { root: "dashmap", name: "DashMap" }"#;
+
+/// #10295: an exception is pinned to what it was granted for. When the type
+/// of an excepted static changes under the same `(file, name)` key, in any
+/// form, the row is not taken: the static is `Unresolvable` for its live
+/// reason and the row is `ExceptionStale`. A type the pin cannot fully read
+/// (a glob, an unread module) never takes a row. A change the reason does
+/// not show stays an `ExceptionDigest`.
+#[test]
+fn exception_is_pinned_to_its_why_10295() {
+    let (a, b) = ("src/a.rs", "src/b.rs");
+    let dash = || Why::Foreign {
+        root: "dashmap".into(),
+        name: "DashMap".into(),
+    };
+    let tokio = || Why::Foreign {
+        root: "tokio".into(),
+        name: "Sender".into(),
+    };
+    let stale = || StaticFinding::ExceptionStale {
+        file: b.into(),
+        name: "FORM".into(),
+    };
+    let both = |line: usize, why: Why| vec![r3_unres(b, line, why), stale()];
+    let direct_field = format!("{W_BUS_FIELD}static FORM: Bus = X;\n");
+    let cases: Vec<WhyCase<'_>> = vec![
+        (
+            "same",
+            vec![
+                (a, W_BUS),
+                (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
+            ],
+            (D_W_USE, W_TOKIO),
+            vec![],
+        ),
+        (
+            "field-added-directly",
+            vec![(b, &direct_field)],
+            (D_W_DIRECT, W_TOKIO),
+            both(5, dash()),
+        ),
+        (
+            "field-added-in-a-nested-local-type",
+            vec![(b, W_NESTED_FIELD)],
+            (D_W_NESTED, W_TOKIO),
+            both(10, dash()),
+        ),
+        (
+            "field-added-behind-use",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
+            ],
+            (D_W_USE, W_TOKIO),
+            both(2, dash()),
+        ),
+        (
+            "field-added-behind-a-glob",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "use crate::a::*;\nstatic FORM: Bus = X;\n"),
+            ],
+            (D_W_GLOB, r#"Glob("Bus")"#),
+            both(2, Why::Glob("Bus".into())),
+        ),
+        (
+            "field-added-behind-an-alias",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "use crate::a::Bus as Chan;\nstatic FORM: Chan = X;\n"),
+            ],
+            (D_W_ALIAS, W_TOKIO),
+            both(2, dash()),
+        ),
+        (
+            "field-added-behind-a-generic-argument",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "static FORM: Option<crate::a::Bus> = X;\n"),
+            ],
+            (D_W_GENERIC, W_TOKIO),
+            both(1, dash()),
+        ),
+        (
+            "field-removed",
+            vec![
+                (a, W_BUS),
+                (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
+            ],
+            (D_W_REMOVED, W_DASH),
+            both(2, tokio()),
+        ),
+        (
+            "swapped-for-a-type-of-the-same-why",
+            vec![(a, W_BUS_TWO), (b, "static FORM: crate::a::Bus2 = X;\n")],
+            (D_W_SWAPPED, W_TOKIO),
+            vec![StaticFinding::ExceptionDigest {
+                file: b.into(),
+                name: "FORM".into(),
+                ty: "type".into(),
+            }],
+        ),
+        (
+            "type-in-an-unread-module",
+            vec![(
+                b,
+                "#[path = \"x.rs\"]\nmod px;\nstatic FORM: px::Bus = X;\n",
+            )],
+            (D_W_UNREAD, r#"PathNotLanded("Bus")"#),
+            both(3, Why::PathNotLanded("Bus".into())),
+        ),
+        (
+            "glob-behind-a-smaller-why",
+            vec![
+                (a, W_BUS_FIELD),
+                (
+                    b,
+                    "use crate::a::*;\nstatic FORM: (Box<dyn Fn() + Sync>, Bus) = X;\n",
+                ),
+            ],
+            (D_W_GLOB_HIDDEN, "TraitObject"),
+            both(2, Why::TraitObject),
+        ),
+        (
+            "unread-module-behind-a-smaller-why",
+            vec![(
+                b,
+                "#[path = \"x.rs\"]\nmod px;\nstatic FORM: (Box<dyn Fn() + Sync>, px::Bus) = X;\n",
+            )],
+            (D_W_UNREAD_HIDDEN, "TraitObject"),
+            both(3, Why::TraitObject),
+        ),
+    ];
+    let table = format!("{b}{FORM_ROW}");
+    let mut miss = Vec::new();
+    for (id, files, (pinned, why), want) in cases {
+        let files: Vec<(String, String)> = files
+            .into_iter()
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+        let exceptions = vec![(b, "FORM", pinned, why, FORM_WHY)];
+        let tables = Tables {
+            statics: &table,
+            exceptions: &exceptions,
+            includes: &[],
+        };
+        let (statics, _) = token_census_with(&files, &tables);
+        if statics != want {
+            miss.push(format!("{id}: got {statics:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10350: [`W_BUS`] with a `std::sync::Mutex` field added: the change a
+/// macro-body row whose type reaches `Bus` must see.
+const W_BUS_LOCK_10350: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n    m: std::sync::Mutex<u8>,\n}\n";
+
+// #10350: the pinned digests of a macro-body `static FORM`. Each `type`
+// hash is the FNV-1a fold of the written type tokens, computed outside the
+// census (scratch digests.py over the token texts); `src::a::Bus=969d3b6a`
+// is the walked `Bus` of [`W_BUS`], as in [`D_W_USE`].
+/// #10350: `crate::a::Bus`.
+const D_M_PATH_10350: &str = "type=8399cc9c src::a::Bus=969d3b6a";
+/// #10350: `&'static crate::a::Bus`.
+const D_M_REF_10350: &str = "type=baeabbb4 src::a::Bus=969d3b6a";
+/// #10350: `(u8, crate::a::Bus)`.
+const D_M_TUPLE_10350: &str = "type=bf0254d4 src::a::Bus=969d3b6a";
+/// #10350: `[crate::a::Bus; 2]`.
+const D_M_ARRAY_10350: &str = "type=f1502328 src::a::Bus=969d3b6a";
+/// #10350: `$t`.
+const D_M_META_10350: &str = "type=b0404eb6";
+/// #10350: `$crate::a::Bus`.
+const D_M_CRATE_META_10350: &str = "type=c52d27d2";
+/// #10350: `Unknown`.
+const D_M_UNKNOWN_10350: &str = "type=57dcbc6c";
+/// #10350: no written type (the empty token list).
+const D_M_NONE_10350: &str = "type=4fd0bfc1";
+
+/// #10350: a `macro_rules!` whose one arm has the matcher `matcher` and
+/// the body `static FORM<decl> = X;` on line 3.
+fn macro_static_10350(matcher: &str, decl: &str) -> String {
+    format!(
+        "macro_rules! m {{\n    ({matcher}) => {{\n        static FORM{decl} = X;\n    }};\n}}\n"
+    )
+}
+
+/// One #10350 case: `(id, src/a.rs text, src/b.rs text, pinned digest,
+/// why, findings)`.
+type MacroReachCase<'a> = (
+    String,
+    &'a str,
+    String,
+    &'a str,
+    &'a str,
+    Vec<StaticFinding>,
+);
+
+/// #10350: a macro-body row is pinned to every definition its written type
+/// reaches, as a row outside a macro is: a lock field added to a reached
+/// struct moves the digest. A type that holds a metavariable, writes no
+/// type, or names what does not resolve is unread: the row is not taken
+/// and the finding names the reason. Every expected value is written out.
+#[test]
+fn macro_body_row_reads_what_its_type_reaches_10350() {
+    let (a, b) = ("src/a.rs", "src/b.rs");
+    let changed = vec![StaticFinding::ExceptionDigest {
+        file: b.into(),
+        name: "FORM".into(),
+        ty: "src::a::Bus".into(),
+    }];
+    let stale = || StaticFinding::ExceptionStale {
+        file: b.into(),
+        name: "FORM".into(),
+    };
+    let unread = |why: Why| {
+        vec![
+            StaticFinding::MacroBodyUnread {
+                file: b.into(),
+                name: "FORM".into(),
+                line: 3,
+                why,
+            },
+            stale(),
+        ]
+    };
+    let reached: [(&str, &str, &str); 5] = [
+        ("path", ": crate::a::Bus", D_M_PATH_10350),
+        ("generic-argument", ": Option<crate::a::Bus>", D_W_GENERIC),
+        ("reference", ": &'static crate::a::Bus", D_M_REF_10350),
+        ("tuple", ": (u8, crate::a::Bus)", D_M_TUPLE_10350),
+        ("array", ": [crate::a::Bus; 2]", D_M_ARRAY_10350),
+    ];
+    let mut cases: Vec<MacroReachCase<'_>> = Vec::new();
+    for (form, decl, pinned) in reached {
+        let text = macro_static_10350("", decl);
+        cases.push((
+            format!("{form}-same"),
+            W_BUS,
+            text.clone(),
+            pinned,
+            MACRO_BODY_WHY,
+            vec![],
+        ));
+        cases.push((
+            format!("{form}-lock-field-added"),
+            W_BUS_LOCK_10350,
+            text,
+            pinned,
+            MACRO_BODY_WHY,
+            changed.clone(),
+        ));
+    }
+    let not_read: [(&str, &str, &str, &str, Why); 4] = [
+        (
+            "metavariable",
+            "$t:ty",
+            ": $t",
+            D_M_META_10350,
+            Why::MacroFragment("$t".into()),
+        ),
+        (
+            "dollar-crate-path",
+            "",
+            ": $crate::a::Bus",
+            D_M_CRATE_META_10350,
+            Why::MacroFragment("$crate".into()),
+        ),
+        (
+            "unresolvable",
+            "",
+            ": Unknown",
+            D_M_UNKNOWN_10350,
+            Why::NoDef("Unknown".into()),
+        ),
+        (
+            "no-written-type",
+            "",
+            "",
+            D_M_NONE_10350,
+            Why::MacroFragment(String::new()),
+        ),
+    ];
+    for (form, matcher, decl, pinned, why) in not_read {
+        cases.push((
+            form.to_string(),
+            W_BUS,
+            macro_static_10350(matcher, decl),
+            pinned,
+            MACRO_BODY_WHY,
+            unread(why),
+        ));
+    }
+    cases.push((
+        "row-of-another-why".to_string(),
+        W_BUS,
+        macro_static_10350("", ": crate::a::Bus"),
+        D_M_PATH_10350,
+        W_TOKIO,
+        vec![
+            StaticFinding::MacroBodyStatic {
+                file: b.into(),
+                name: "FORM".into(),
+                line: 3,
+            },
+            stale(),
+        ],
+    ));
+    let mut miss = Vec::new();
+    for (id, a_text, b_text, pinned, why, want) in cases {
+        let files = vec![(a.to_string(), a_text.to_string()), (b.to_string(), b_text)];
+        let exceptions = vec![(b, "FORM", pinned, why, FORM_WHY)];
+        let tables = Tables {
+            statics: "",
             exceptions: &exceptions,
             includes: &[],
         };
@@ -8954,4 +9811,971 @@ fn scoped_resolution_cost_is_bounded_10293() {
         );
         assert_eq!(miss, Vec::<String>::new());
     }
+}
+
+// ---------------------------------------------------------------------------
+// #10322 and #10323: a glob of a module the census did not read refuses
+// every name that module does not bind itself, and `mod NAME;` links to the
+// walked file by the Rust rules for the declaring file, after every file is
+// read, so no verdict depends on the walk order.
+// ---------------------------------------------------------------------------
+
+/// A walked module that binds a lock type, for the #10323 link cases.
+const LINKED_GATE: &str = "pub struct Gate(std::sync::Mutex<u8>);\n";
+
+/// #10322: a glob import of an unread module (a `#[path]` module, a declared
+/// module with no walked file) never supplies nothing: a name it may bind,
+/// a prelude name included, is `PathNotLanded`, the refusal the same module
+/// gives when named by path. A glob of a read module stays exact.
+#[test]
+fn unread_module_glob_refuses_10322() {
+    let b = "src/b.rs";
+    let x = ("src/x.rs", "pub struct Thing(u8);\n");
+    let cases: Vec<R3Case> = vec![
+        (
+            "U1-path-module-glob-vec",
+            vec![
+                x,
+                (
+                    b,
+                    "#[path = \"x.rs\"]\nmod px;\nuse px::*;\nstatic FORM: Vec<u8> = X;\n",
+                ),
+            ],
+            vec![r3_unres(b, 4, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+        (
+            "U2-path-module-glob-result",
+            vec![
+                x,
+                (
+                    b,
+                    "#[path = \"x.rs\"]\nmod px;\nuse px::*;\nstatic FORM: Result<u8, u8> = X;\n",
+                ),
+            ],
+            vec![r3_unres(b, 4, Why::PathNotLanded("Result".into()))],
+            None,
+        ),
+        (
+            "U3-declared-no-file-glob-vec",
+            vec![(
+                b,
+                "mod nofile;\nuse nofile::*;\nstatic FORM: Vec<u8> = X;\n",
+            )],
+            vec![r3_unres(b, 3, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+        (
+            "U4-declared-no-file-glob-result",
+            vec![(
+                b,
+                "mod nofile;\nuse nofile::*;\nstatic FORM: Result<u8, u8> = X;\n",
+            )],
+            vec![r3_unres(b, 3, Why::PathNotLanded("Result".into()))],
+            None,
+        ),
+        (
+            "U5-glob-of-read-module-that-globs-unread",
+            vec![
+                x,
+                ("src/a.rs", "#[path = \"x.rs\"]\nmod px;\npub use px::*;\n"),
+                (b, "use crate::a::*;\nstatic FORM: Vec<u8> = X;\n"),
+            ],
+            vec![r3_unres(b, 2, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+        (
+            "U6-control-glob-of-read-module",
+            vec![
+                ("src/a.rs", "pub struct Plain(u8);\n"),
+                (b, "use crate::a::*;\nstatic FORM: Vec<u8> = X;\n"),
+            ],
+            vec![],
+            None,
+        ),
+        (
+            "U7-control-declared-no-file-by-path",
+            vec![(b, "mod nofile;\nstatic FORM: nofile::Thing = X;\n")],
+            vec![r3_unres(b, 2, Why::PathNotLanded("Thing".into()))],
+            None,
+        ),
+    ];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10323: one case run with its files in the order written and reversed.
+fn both_orders(case: R3Case) -> Vec<String> {
+    let (id, files, want, inc) = case;
+    let mut back = files.clone();
+    back.reverse();
+    let fwd_id: &'static str = format!("{id}/written").leak();
+    let back_id: &'static str = format!("{id}/reversed").leak();
+    r3_misses(vec![
+        (fwd_id, files, want.clone(), inc.clone()),
+        (back_id, back, want, inc),
+    ])
+}
+
+/// #10323: `mod NAME;` links to the walked file the Rust rules name for the
+/// declaring file, in either walk order; a declared module whose file was
+/// not walked is unread (#10322).
+#[test]
+fn module_link_ignores_walk_order_10323() {
+    let a = "tests/a.rs";
+    let cases: Vec<R3Case> = vec![
+        (
+            "L1-dir-mod-rs-by-name",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/common/mod.rs", LINKED_GATE),
+            ],
+            vec![r3_lock(a, 3)],
+            None,
+        ),
+        (
+            "L2-sibling-file",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/common.rs", LINKED_GATE),
+            ],
+            vec![r3_lock(a, 3)],
+            None,
+        ),
+        (
+            "L3-foo-rs-with-foo-dir-helper",
+            vec![
+                (
+                    "tests/foo.rs",
+                    "mod helper;\nuse helper::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/foo/helper.rs", LINKED_GATE),
+            ],
+            vec![r3_lock("tests/foo.rs", 3)],
+            None,
+        ),
+        (
+            "L4-glob-of-linked-module",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::*;\nstatic FORM: Vec<Gate> = X;\n",
+                ),
+                ("tests/common/mod.rs", LINKED_GATE),
+            ],
+            vec![r3_unres(a, 3, Why::Glob("Gate".into()))],
+            None,
+        ),
+        (
+            "L5-live-shape-glob-prelude-name",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::*;\nstatic FORM: Vec<u8> = X;\n",
+                ),
+                ("tests/common/mod.rs", "pub fn helper() {}\n"),
+            ],
+            vec![],
+            None,
+        ),
+        (
+            "L6-nested-dir-module",
+            vec![
+                (
+                    a,
+                    "mod common;\nuse common::inner::Gate;\nstatic FORM: Gate = X;\n",
+                ),
+                ("tests/common/mod.rs", "pub mod inner;\n"),
+                ("tests/common/inner.rs", LINKED_GATE),
+            ],
+            vec![r3_lock(a, 3)],
+            None,
+        ),
+        (
+            "L7-declared-module-not-walked",
+            vec![
+                (a, "mod gone;\nuse gone::*;\nstatic FORM: Vec<u8> = X;\n"),
+                ("tests/common/mod.rs", LINKED_GATE),
+            ],
+            vec![r3_unres(a, 3, Why::PathNotLanded("Vec".into()))],
+            None,
+        ),
+    ];
+    let mut miss = Vec::new();
+    for case in cases {
+        miss.extend(both_orders(case));
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10323 (mutant A2): `tree()` hands every census the files sorted by
+/// path, strictly ascending, so no census depends on the `read_dir` order.
+#[test]
+fn tree_is_sorted_by_path_10323() {
+    let files = tree();
+    let unsorted: Vec<String> = files
+        .windows(2)
+        .filter(|w| w[0].0 >= w[1].0)
+        .map(|w| format!("{} then {}", w[0].0, w[1].0))
+        .collect();
+    assert_eq!(unsorted, Vec::<String>::new());
+}
+
+/// #10323: `T` is defined in both `src/a.rs` and `src/a/mod.rs`, so its
+/// node folds two bodies; `FORM` in `src/b.rs` reaches it.
+const TWO_FILE_T: [(&str, &str); 3] = [
+    ("src/a.rs", "use anyhow::Unknown;\npub struct T(Unknown);\n"),
+    ("src/a/mod.rs", "pub struct T(Unknown, u16);\n"),
+    ("src/b.rs", "use crate::a::T;\nstatic FORM: T = X;\n"),
+];
+
+/// #10323: the pinned digest of `FORM` in [`TWO_FILE_T`], taken from one
+/// green run with the files in path order.
+const D_TWO_FILE_T: &str = "type=bcf2301e src::a::T=5fc443f0";
+
+/// #10295: the static findings of `files` with one exception row for
+/// `FORM` in `src/b.rs` pinned at `pin`.
+fn pinned_census(files: &[(&str, &str)], pin: &str) -> Vec<StaticFinding> {
+    let b = "src/b.rs";
+    let owned: Vec<(String, String)> = files
+        .iter()
+        .map(|(p, t)| ((*p).to_string(), (*t).to_string()))
+        .collect();
+    let table = format!("{b}{FORM_ROW}");
+    let exceptions: Vec<ExceptionRow<'_>> = vec![(b, "FORM", pin, W_UNRES, FORM_WHY)];
+    let tables = Tables {
+        statics: &table,
+        exceptions: &exceptions,
+        includes: &[],
+    };
+    token_census_with(&owned, &tables).0
+}
+
+/// #10323 (mutant A2): a node folded from two files keeps one digest in
+/// either walk order, so its pinned exception holds in both.
+#[test]
+fn merged_node_digest_ignores_walk_order_10323() {
+    let mut back = TWO_FILE_T.to_vec();
+    back.reverse();
+    let mut miss = Vec::new();
+    for (id, files) in [("written", TWO_FILE_T.to_vec()), ("reversed", back)] {
+        let got = pinned_census(&files, D_TWO_FILE_T);
+        if !got.is_empty() {
+            miss.push(format!("{id}: got {got:?}, want []"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10325 (mutant X1): a pinned entry the live digest no longer holds is
+/// reported by its key, even when every live entry is pinned.
+#[test]
+fn pinned_entry_gone_from_live_digest_is_reported_10325() {
+    let pin = format!("{D_BUS} src::b::Gone=0badc0de");
+    let got = pinned_census(&[("src/b.rs", R3_BUS)], &pin);
+    let want = vec![StaticFinding::ExceptionDigest {
+        file: "src/b.rs".into(),
+        name: "FORM".into(),
+        ty: "src::b::Gone".into(),
+    }];
+    assert_eq!(got, want);
+}
+
+/// #10346: the std marker traits a `NoDef` may name and still be read,
+/// written out by hand (never taken from the census under test).
+const MARKER_NAMES_10346: [&str; 5] = ["Fn", "FnMut", "FnOnce", "Send", "Sync"];
+
+/// #10346: names that hold a marker trait name as a suffix, a prefix, a
+/// substring or in another case; each is a crate name and must be unread.
+const NEAR_MARKER_NAMES_10346: [&str; 9] = [
+    "NotSend", "UnSync", "MyFnOnce", "SyncX", "Sendable", "send", "FNMUT", "Fn_", "",
+];
+
+/// #10346: a struct an item macro writes, before it gains a lock field.
+const GEN_BEFORE_10346: &str = "macro_rules! mk {\n    () => {\n        pub struct Gen {\n            v: u8,\n        }\n    };\n}\nmk!();\nstatic FORM: Gen = X;\n";
+/// #10346: the same struct after the macro gives it a lock field.
+const GEN_AFTER_10346: &str = "macro_rules! mk {\n    () => {\n        pub struct Gen {\n            v: std::sync::Mutex<u8>,\n        }\n    };\n}\nmk!();\nstatic FORM: Gen = X;\n";
+/// #10346: the digest a green run reads for `FORM: Gen` (the macro's
+/// struct is not a walked definition, so only the written type counts).
+const D_GEN_10346: &str = "type=60e23212";
+
+/// #10346: the static findings of `files` with one `FORM` row in
+/// `src/b.rs` pinned at `(digest, why)`.
+fn pinned_census_why(files: &[(&str, &str)], pin: &str, why: &str) -> Vec<StaticFinding> {
+    let b = "src/b.rs";
+    let owned: Vec<(String, String)> = files
+        .iter()
+        .map(|(p, t)| ((*p).to_string(), (*t).to_string()))
+        .collect();
+    let table = format!("{b}{FORM_ROW}");
+    let exceptions: Vec<ExceptionRow<'_>> = vec![(b, "FORM", pin, why, FORM_WHY)];
+    let tables = Tables {
+        statics: &table,
+        exceptions: &exceptions,
+        includes: &[],
+    };
+    token_census_with(&owned, &tables).0
+}
+
+/// #10346: every reason is judged by name; the expected value of each
+/// variant is written out. `NoDef` reads only for a whole marker name.
+#[test]
+fn pin_reads_is_default_deny_10346() {
+    let s = String::new;
+    let mut cases: Vec<(Why, bool)> = vec![
+        (Why::TraitObject, true),
+        (Why::OpaqueType, true),
+        (Why::MacroType(s()), false),
+        (Why::RawPointer, true),
+        (Why::Projection, false),
+        (Why::NoDef("Unknown".into()), false),
+        (Why::Glob(s()), false),
+        (Why::Ambiguous(s()), false),
+        (Why::Shadowed("Send".into()), false),
+        (Why::PathNotLanded(s()), false),
+        (Why::StdNotProven(s()), true),
+        (
+            Why::Foreign {
+                root: "tokio".into(),
+                name: "Sender".into(),
+            },
+            true,
+        ),
+        (Why::Cycle(s()), true),
+        (Why::NoValue("Out".into()), false),
+        (Why::NoValue("Send".into()), false),
+        (Why::MacroFragment("$t".into()), false),
+        (Why::MacroFragment(s()), false),
+    ];
+    // #10356: a marker name reads only in bound position (`MarkerBound`);
+    // as a `NoDef` (type position) it is a crate type and never reads.
+    cases.extend(
+        MARKER_NAMES_10346
+            .iter()
+            .map(|n| (Why::MarkerBound((*n).into()), true)),
+    );
+    cases.extend(
+        MARKER_NAMES_10346
+            .iter()
+            .map(|n| (Why::NoDef((*n).into()), false)),
+    );
+    cases.extend(NEAR_MARKER_NAMES_10346.iter().flat_map(|n| {
+        [
+            (Why::NoDef((*n).into()), false),
+            (Why::MarkerBound((*n).into()), false),
+        ]
+    }));
+    let miss: Vec<String> = cases
+        .iter()
+        .filter(|(w, want)| pin_reads(w) != *want)
+        .map(|(w, want)| format!("{w:?}: got {}, want {want}", !want))
+        .collect();
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10351: one row of [`refusing_arms_keep_no_row_10351`]: a case id, the
+/// files, the row's pinned digest and `why`, the static's line, and the
+/// reason the finding names.
+type ArmRow10351 = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+    &'static str,
+    usize,
+    Why,
+);
+
+/// #10351: the file that supplies `crate::a::Plain` for the ambiguous rows.
+const PLAIN_A_10351: (&str, &str) = ("src/a.rs", "pub struct Plain(u8);\n");
+
+/// #10351: every refusing arm of [`pin_reads`] the reviewer's mutants left
+/// green (`Projection`, `MacroType`, `Ambiguous`, `Shadowed`), each as the static's
+/// own reason (`top`) and as a reason reached through a struct whose
+/// least reason is the read `TraitObject` (`behind`). Each row is pinned
+/// at the digest a taken row would match, so the only thing that refuses
+/// it is the arm: flipping the arm to `true` takes the row and the census
+/// reports nothing. The expected findings are written out.
+#[test]
+fn refusing_arms_keep_no_row_10351() {
+    let b = "src/b.rs";
+    let rows: [ArmRow10351; 8] = [
+        (
+            "projection-top",
+            &[(
+                "src/b.rs",
+                "pub struct W<T> {\n    v: T::Out,\n}\nstatic FORM: W<u8> = X;\n",
+            )],
+            "type=e2dc0d97 src::b::W=b985cfbf",
+            "Projection",
+            4,
+            Why::Projection,
+        ),
+        (
+            "projection-behind",
+            &[(
+                "src/b.rs",
+                "pub struct W<T> {\n    v: T::Out,\n}\npub struct H {\n    a: Box<dyn Fn()>,\n    b: W<u8>,\n}\nstatic FORM: H = X;\n",
+            )],
+            "type=bc9c6b72 src::b::H=9d7beb1a src::b::W=b985cfbf",
+            "TraitObject",
+            8,
+            Why::TraitObject,
+        ),
+        (
+            "macro-type-top",
+            &[("src/b.rs", "static FORM: my_type!() = X;\n")],
+            "type=6e9341c8",
+            r#"MacroType("my_type")"#,
+            1,
+            Why::MacroType("my_type".into()),
+        ),
+        (
+            "macro-type-behind",
+            &[(
+                "src/b.rs",
+                "pub struct H {\n    a: Box<dyn Fn()>,\n    b: my_type!(),\n}\nstatic FORM: H = X;\n",
+            )],
+            "type=bc9c6b72 src::b::H=ead6dc79",
+            "TraitObject",
+            5,
+            Why::TraitObject,
+        ),
+        (
+            "ambiguous-top",
+            &[
+                PLAIN_A_10351,
+                (
+                    "src/b.rs",
+                    "use crate::a::Plain;\nstruct Plain(u8);\nstatic FORM: Plain = X;\n",
+                ),
+            ],
+            "type=39727b68",
+            r#"Ambiguous("Plain")"#,
+            3,
+            Why::Ambiguous("Plain".into()),
+        ),
+        (
+            "ambiguous-behind",
+            &[
+                PLAIN_A_10351,
+                (
+                    "src/b.rs",
+                    "use crate::a::Plain;\nstruct Plain(u8);\npub struct H {\n    a: Box<dyn Fn()>,\n    b: Plain,\n}\nstatic FORM: H = X;\n",
+                ),
+            ],
+            "type=bc9c6b72 src::b::H=fc577af4",
+            "TraitObject",
+            7,
+            Why::TraitObject,
+        ),
+        (
+            "shadowed-top",
+            &[(
+                "src/b.rs",
+                "pub struct Send {\n    v: u8,\n}\nstatic FORM: Send = X;\n",
+            )],
+            "type=bb817eeb",
+            r#"Shadowed("Send")"#,
+            4,
+            Why::Shadowed("Send".into()),
+        ),
+        (
+            "shadowed-behind",
+            &[(
+                "src/b.rs",
+                "pub struct Send {\n    v: u8,\n}\npub struct H {\n    a: Box<dyn Fn()>,\n    b: Send,\n}\nstatic FORM: H = X;\n",
+            )],
+            "type=bc9c6b72 src::b::H=6445b588",
+            "TraitObject",
+            8,
+            Why::TraitObject,
+        ),
+    ];
+    let mut miss = Vec::new();
+    for (id, files, pin, why, line, reason) in rows {
+        let want = vec![
+            r3_unres(b, line, reason),
+            StaticFinding::ExceptionStale {
+                file: b.into(),
+                name: "FORM".into(),
+            },
+        ];
+        let got = pinned_census_why(files, pin, why);
+        if got != want {
+            miss.push(format!("{id}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10356: an item macro in `src/a.rs` that writes a lock-holding crate
+/// struct named like the marker trait `Send` (review probe P1 shape). The
+/// census cannot see the struct, so the bare name `Send` has no walked
+/// definition.
+const SEND_MACRO_10356: &str = "macro_rules! mk {\n    () => {\n        pub struct Send {\n            m: std::sync::Mutex<u8>,\n        }\n    };\n}\nmk!();\n";
+
+/// #10356: a lock-holding `struct Send` declared in a file the walk does
+/// not read (a `tests/` file), so in `src/` the bare name has no walked
+/// definition either.
+const SEND_DECL_10356: &str = "pub struct Send {\n    m: std::sync::Mutex<u8>,\n}\n";
+
+/// #10356: one row of the position table: a case id, the files, the row's
+/// pinned digest and `why`, and the findings written out.
+type PosRow10356 = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    &'static str,
+    &'static str,
+    Vec<StaticFinding>,
+);
+
+/// #10356: the position table. A marker-trait name with no walked
+/// definition counts as read only in bound position (after `dyn`, `impl`,
+/// `+` or `?`). In type position (the static's own type, a field type, a
+/// generic argument, a reference) it is a crate type, here one an item
+/// macro or an unwalked file declares holding a lock, and the row pinned
+/// to it is never taken. Each type-position row is pinned at the digest a
+/// taken row matches, so only the position rule refuses it.
+fn marker_position_rows_10356() -> Vec<PosRow10356> {
+    let b = "src/b.rs";
+    let a = ("src/a.rs", SEND_MACRO_10356);
+    let refused = |line: usize| {
+        vec![
+            r3_unres(b, line, Why::NoDef("Send".into())),
+            StaticFinding::ExceptionStale {
+                file: b.into(),
+                name: "FORM".into(),
+            },
+        ]
+    };
+    let send = r#"NoDef("Send")"#;
+    vec![
+        (
+            "type-bare-item-macro",
+            vec![a, (b, "static FORM: Send = X;\n")],
+            "type=bb817eeb",
+            send,
+            refused(1),
+        ),
+        (
+            "type-bare-declared-out-of-walk",
+            vec![
+                ("tests/c.rs", SEND_DECL_10356),
+                (b, "static FORM: Send = X;\n"),
+            ],
+            "type=bb817eeb",
+            send,
+            refused(1),
+        ),
+        (
+            "type-field",
+            vec![
+                a,
+                (b, "pub struct H {\n    s: Send,\n}\nstatic FORM: H = X;\n"),
+            ],
+            "type=bc9c6b72 src::b::H=cd2f8d00",
+            send,
+            refused(4),
+        ),
+        (
+            "type-generic-argument",
+            vec![a, (b, "static FORM: Option<Send> = X;\n")],
+            "type=f3fee676",
+            send,
+            refused(1),
+        ),
+        (
+            "type-reference",
+            vec![a, (b, "static FORM: &'static Send = X;\n")],
+            "type=986e6bab",
+            send,
+            refused(1),
+        ),
+        (
+            "bound-dyn",
+            vec![a, (b, "static FORM: Box<dyn Send> = X;\n")],
+            "type=52e027f4",
+            "TraitObject",
+            vec![],
+        ),
+        (
+            "bound-impl",
+            vec![a, (b, "type Op = impl Send;\nstatic FORM: Op = X;\n")],
+            "type=8f76c987 src::b::Op=b7a99d01",
+            "OpaqueType",
+            vec![],
+        ),
+        (
+            "bound-plus",
+            vec![a, (b, "static FORM: Box<dyn Fn() + Send> = X;\n")],
+            "type=47312b8a",
+            "TraitObject",
+            vec![],
+        ),
+        (
+            "bound-question",
+            vec![a, (b, "static FORM: Box<dyn Fn() + ?Sync> = X;\n")],
+            "type=2f0ed6e9",
+            "TraitObject",
+            vec![],
+        ),
+    ]
+}
+
+/// #10356: a marker-trait name in type position is a crate type: an item
+/// macro's `struct Send` (or one in an unwalked file) is unread, so its
+/// pinned row is refused; the same name in bound position stays read.
+#[test]
+fn marker_name_reads_only_in_bound_position_10356() {
+    let mut miss = Vec::new();
+    for (id, files, pin, why, want) in marker_position_rows_10356() {
+        let got = pinned_census_why(&files, pin, why);
+        if got != want {
+            miss.push(format!("{id}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a struct an item macro writes is no walked definition, so its
+/// name is a `NoDef` the pin cannot read: the row is never taken, before
+/// or after the macro gives the struct a lock.
+#[test]
+fn item_macro_struct_gaining_a_lock_is_refused_10346() {
+    let b = "src/b.rs";
+    let want = vec![
+        r3_unres(b, 9, Why::NoDef("Gen".into())),
+        StaticFinding::ExceptionStale {
+            file: b.into(),
+            name: "FORM".into(),
+        },
+    ];
+    let mut miss = Vec::new();
+    for (id, text) in [
+        ("before", GEN_BEFORE_10346),
+        ("after-lock", GEN_AFTER_10346),
+    ] {
+        let got = pinned_census_why(&[(b, text)], D_GEN_10346, r#"NoDef("Gen")"#);
+        if got != want {
+            miss.push(format!("{id}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a trait object over a std marker trait keeps its row: the
+/// marker name is the one `NoDef` the pin reads.
+#[test]
+fn marker_trait_object_is_read_10346() {
+    let b = "src/b.rs";
+    let digests = [
+        ("Fn", "type=1c5886dd"),
+        ("FnMut", "type=252c0bbc"),
+        ("FnOnce", "type=302fc615"),
+        ("Send", "type=52e027f4"),
+        ("Sync", "type=9e9a3104"),
+    ];
+    assert_eq!(digests.map(|(n, _)| n), MARKER_NAMES_10346);
+    let mut miss = Vec::new();
+    for (n, d) in digests {
+        let text = format!("static FORM: Box<dyn {n}> = X;\n");
+        let got = pinned_census_why(&[(b, &text)], d, "TraitObject");
+        if !got.is_empty() {
+            miss.push(format!("{n}: got {got:?}, want []"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a crate item named like a marker trait is the crate's item, so
+/// the bare name is shadowed and unread.
+#[test]
+fn crate_item_named_like_a_marker_trait_is_unread_10346() {
+    let b = "src/b.rs";
+    let mut miss = Vec::new();
+    for n in MARKER_NAMES_10346 {
+        let text = format!("pub struct {n} {{\n    v: u8,\n}}\nstatic FORM: {n} = X;\n");
+        let files = vec![(b.to_string(), text)];
+        let table = format!("{b}{FORM_ROW}");
+        let tables = Tables {
+            statics: &table,
+            exceptions: &[],
+            includes: &[],
+        };
+        let (got, _) = token_census_with(&files, &tables);
+        let want = vec![r3_unres(b, 4, Why::Shadowed(n.into()))];
+        if got != want {
+            miss.push(format!("{n}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a name that holds a marker name only as a suffix, a prefix or
+/// a substring is a crate name with no definition: unread, so its row is
+/// never taken.
+#[test]
+fn near_marker_name_is_unread_10346() {
+    let b = "src/b.rs";
+    let digests = [
+        ("NotSend", "type=8d3c35c5"),
+        ("UnSync", "type=e7013421"),
+        ("MyFnOnce", "type=cf03c668"),
+        ("SyncX", "type=3d81f351"),
+        ("Sendable", "type=855ff2e6"),
+    ];
+    let mut miss = Vec::new();
+    for (n, d) in digests {
+        let text = format!("static FORM: {n} = X;\n");
+        let why = format!("NoDef({n:?})");
+        let got = pinned_census_why(&[(b, &text)], d, &why);
+        let want = vec![
+            r3_unres(b, 1, Why::NoDef(n.into())),
+            StaticFinding::ExceptionStale {
+                file: b.into(),
+                name: "FORM".into(),
+            },
+        ];
+        if got != want {
+            miss.push(format!("{n}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10325 (mutant X7): a type parameter that hides a type the scope
+/// itself defines is refused as shadowed.
+#[test]
+fn parameter_hiding_a_bound_name_is_shadowed_10325() {
+    let b = "src/b.rs";
+    let cases: Vec<R3Case> = vec![(
+        "X7-param-hides-local-struct",
+        vec![(
+            b,
+            "pub struct Plain(u8);\nstruct Wrap<Plain>(Plain);\nstatic FORM: Wrap<u8> = X;\n",
+        )],
+        vec![r3_unres(b, 3, Why::Shadowed("Plain".into()))],
+        None,
+    )];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10346: a type parameter named like a std marker trait hides the name
+/// the pin reads, so it is refused as shadowed, never taken for the
+/// marker trait.
+#[test]
+fn parameter_named_like_a_marker_trait_is_shadowed_10346() {
+    const TEXTS: [(&str, &str); 5] = [
+        ("Fn", "struct Wrap<Fn>(Fn);\nstatic FORM: Wrap<u8> = X;\n"),
+        (
+            "FnMut",
+            "struct Wrap<FnMut>(FnMut);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+        (
+            "FnOnce",
+            "struct Wrap<FnOnce>(FnOnce);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+        (
+            "Send",
+            "struct Wrap<Send>(Send);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+        (
+            "Sync",
+            "struct Wrap<Sync>(Sync);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+    ];
+    let b = "src/b.rs";
+    assert_eq!(TEXTS.map(|(n, _)| n), MARKER_NAMES_10346);
+    let cases: Vec<R3Case> = TEXTS
+        .iter()
+        .map(|(n, text)| {
+            (
+                *n,
+                vec![(b, *text)],
+                vec![r3_unres(b, 2, Why::Shadowed((*n).into()))],
+                None,
+            )
+        })
+        .collect();
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10325 (mutant X8): an import first resolved while the globs are being
+/// settled (here by the glob of `src/e.rs`, while the glob of `src/b.rs` is
+/// not settled and so may supply any name) is resolved again once every
+/// glob is settled: `crate::d` binds no `Mutex`, so the bare `Mutex` that
+/// `Gate` renames is the lock.
+#[test]
+fn import_through_glob_resolves_after_settle_10325() {
+    let b = "src/b.rs";
+    let cases: Vec<R3Case> = vec![(
+        "X8-import-resolved-again-after-settle",
+        vec![
+            ("src/d.rs", "pub struct Other(u8);\n"),
+            ("src/e.rs", "use crate::b::Gate::*;\n"),
+            (
+                b,
+                "use crate::d::*;\nuse Mutex as Gate;\nstatic FORM: Gate = X;\n",
+            ),
+        ],
+        vec![r3_lock(b, 3)],
+        None,
+    )];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10324: the scope visits of the glob resolver over a chain of `n` walked
+/// modules, each globbing the next and writing `static FORM: Plain`, the
+/// last binding `Plain`, and one hub module globbing every link. Every
+/// static is judged exactly: `Plain` is glob-supplied in each of them.
+/// With `cycle` the last module globs the first instead and nothing binds
+/// `Plain`: a glob cycle with no definition, where every bare `Plain` has
+/// no definition.
+fn glob_chain_visits(n: usize, cycle: bool) -> u64 {
+    let mut files: Vec<(String, String)> = Vec::with_capacity(n + 2);
+    let mut paths: Vec<String> = Vec::with_capacity(n);
+    let mut hub = String::new();
+    for i in 0..n {
+        let path = format!("src/m{i}.rs");
+        let next = i + 1;
+        files.push((
+            path.clone(),
+            format!("use crate::m{next}::*;\nstatic FORM: Plain = X;\n"),
+        ));
+        paths.push(path);
+        let _ = writeln!(hub, "use crate::m{i}::*;");
+    }
+    let (last, why) = if cycle {
+        ("use crate::m0::*;\n", Why::NoDef("Plain".into()))
+    } else {
+        ("pub struct Plain(u8);\n", Why::Glob("Plain".into()))
+    };
+    files.push((format!("src/m{n}.rs"), last.to_string()));
+    hub.push_str("static FORM: Plain = X;\n");
+    files.push(("src/hub.rs".to_string(), hub));
+    let mut want: Vec<String> = paths
+        .iter()
+        .map(|p| format!("{:?}", r3_unres(p, 2, why.clone())))
+        .collect();
+    want.push(format!("{:?}", r3_unres("src/hub.rs", n + 1, why)));
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (statics, includes, visits) = r3_census_counted(&refs);
+    let mut got: Vec<String> = statics.iter().map(|f| format!("{f:?}")).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "glob chain of {n} modules, cycle {cycle}");
+    assert_eq!(
+        includes,
+        no_store_url(),
+        "glob chain of {n} modules, cycle {cycle}"
+    );
+    visits
+}
+
+/// #10324: each scope's glob closure is walked once, not once per lookup:
+/// at four times the modules of a glob chain with fan-out, the resolver
+/// makes at most four times the scope visits, plus a constant, for a chain
+/// that ends in a definition and for a glob cycle with none. The bound is
+/// on operation counts, never on wall-clock time.
+#[test]
+fn glob_chain_resolution_cost_is_linear_10324() {
+    const CHAIN_SMALL: usize = 250;
+    const GROWTH: usize = 4;
+    const SLACK: u64 = 64;
+    let growth = u64::try_from(GROWTH).expect("GROWTH fits u64");
+    let floor = u64::try_from(CHAIN_SMALL).expect("CHAIN_SMALL fits u64");
+    for cycle in [false, true] {
+        let small = glob_chain_visits(CHAIN_SMALL, cycle);
+        let large = glob_chain_visits(CHAIN_SMALL * GROWTH, cycle);
+        // Each static is looked up through at least one glob: a counter
+        // that counts nothing proves nothing.
+        assert!(
+            small >= floor,
+            "cycle {cycle}: glob visits: {small} at {CHAIN_SMALL} modules"
+        );
+        assert!(
+            large <= growth * small + SLACK,
+            "cycle {cycle}: glob visits: {small} at {CHAIN_SMALL} modules, {large} at {} modules",
+            CHAIN_SMALL * GROWTH
+        );
+    }
+}
+
+/// #10324: a cycle of globs terminates and resolves as before. Through the
+/// cycle `ca` <-> `cb`, with `cb` globbing `cd` that binds `Plain`, both
+/// statics are glob-supplied; the cycle `ce` <-> `cf` binds no `Plain`, so
+/// its bare `Plain` has no definition and its bare `Mutex` is the lock; `cg`
+/// globs `ch`, which binds no `Plain`. One name looked up from scopes whose
+/// glob closures differ resolves per scope.
+#[test]
+fn glob_cycle_terminates_and_resolves_10324() {
+    let cases: Vec<R3Case> = vec![(
+        "glob-cycles",
+        vec![
+            ("src/ca.rs", "use crate::cb::*;\nstatic FORM: Plain = X;\n"),
+            (
+                "src/cb.rs",
+                "use crate::ca::*;\nuse crate::cd::*;\nstatic FORM: Plain = X;\n",
+            ),
+            ("src/cd.rs", "pub struct Plain(u8);\n"),
+            ("src/ce.rs", "use crate::cf::*;\nstatic FORM: Plain = X;\n"),
+            ("src/cf.rs", "use crate::ce::*;\nstatic FORM: Mutex = X;\n"),
+            ("src/cg.rs", "use crate::ch::*;\nstatic FORM: Plain = X;\n"),
+            ("src/ch.rs", "pub struct Other(u8);\n"),
+        ],
+        vec![
+            r3_unres("src/ca.rs", 2, Why::Glob("Plain".into())),
+            r3_unres("src/cb.rs", 3, Why::Glob("Plain".into())),
+            r3_unres("src/ce.rs", 2, Why::NoDef("Plain".into())),
+            r3_lock("src/cf.rs", 2),
+            r3_unres("src/cg.rs", 2, Why::NoDef("Plain".into())),
+        ],
+        None,
+    )];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10324: settling the globs drops every glob answer memoised before it,
+/// since such an answer read unsettled globs. A lookup made before the
+/// globs settle (as one made while settling) memoises `No` for the
+/// glob-less `src/c.rs`; after `settle_globs` the memo is empty, and each
+/// scope answers from its settled globs.
+#[test]
+fn settle_drops_glob_answers_memoised_before_10324() {
+    let files = [
+        ("src/a.rs", "use crate::b::*;\nstatic FORM: Plain = X;\n"),
+        ("src/b.rs", "pub struct Plain(u8);\n"),
+        ("src/c.rs", "static FORM: Plain = X;\n"),
+    ];
+    let mut graph = TypeGraph::default();
+    for (path, text) in files {
+        let toks = lex(text).expect("fixture lexes");
+        let close = brackets(&toks).0;
+        let in_macro = macro_bodies(&toks, &close);
+        let lens = array_lengths(&toks, &close);
+        graph.file(path, &toks, &close, &lens, &in_macro);
+    }
+    graph.link_modules();
+    let a = graph.files["src/a.rs"];
+    let c = graph.files["src/c.rs"];
+    // Unsettled: a glob of `a` may supply anything (fail closed).
+    assert_eq!(graph.glob_supplies(a, "Plain"), Supply::Glob);
+    assert_eq!(graph.glob_supplies(c, "Plain"), Supply::No);
+    assert_eq!(graph.glob_memo_get(c, "Plain"), Some(Supply::No));
+    graph.settle_globs();
+    assert!(
+        graph.glob_memo.borrow().is_empty(),
+        "glob answers memoised before settling: {:?}",
+        graph.glob_memo.borrow()
+    );
+    assert_eq!(graph.glob_supplies(a, "Plain"), Supply::Glob);
+    assert_eq!(graph.glob_supplies(c, "Plain"), Supply::No);
 }

@@ -269,7 +269,7 @@ pub use error::{LINK_CYCLE_ERR_PREFIX, LINK_PERMISSION_DENIED_ERR_PREFIX, LinkEn
 ///
 /// See module-level comment for the full layering rationale.
 pub static GOVERNANCE_PRE_WRITE: std::sync::OnceLock<
-    Box<dyn Fn(&Memory) -> std::result::Result<(), String> + Send + Sync>,
+    Box<dyn Fn(&crate::models::memory::Memory) -> std::result::Result<(), String> + Send + Sync>,
 > = std::sync::OnceLock::new();
 
 /// Typed substrate-layer marker error for the pre-write hook refusal
