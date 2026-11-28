@@ -31,7 +31,7 @@ use std::path::Path;
 /// other site writes columns outside the projection or merges metadata with
 /// the reserved keys kept, so the guard predicate is unchanged by it.
 const PINNED_WRITE_SITES_8341: &[(&str, &str, usize)] = &[
-    ("atomisation/mod.rs", "archive_source", 1),
+    ("atomisation/mod.rs", "write_atomisation", 1),
     ("atomisation/mod.rs", "write_atom", 1),
     ("confidence/decay.rs", "apply_decay_touch", 1),
     ("curator/reports.rs", "stamp_backlog_chunk", 1),

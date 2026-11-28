@@ -105,6 +105,11 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::validate;
 
+mod key_dir_lock;
+#[cfg(test)]
+pub(crate) use key_dir_lock::KEY_DIR_LOCK_FILE;
+pub(crate) use key_dir_lock::{KeyDirLock, KeyDirLockError};
+
 /// Suffix for the public-key file (`<agent_id>.pub`).
 const PUB_SUFFIX: &str = ".pub";
 /// Suffix for the private-key file (`<agent_id>.priv`).
@@ -355,6 +360,17 @@ pub fn generate(agent_id: &str) -> Result<AgentKeypair> {
 /// Surfaces directory-creation and key-write failures, each with the offending
 /// path named.
 pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
+    // #10108 K-4 — the key-file writes run under the cross-process lock.
+    let lock = KeyDirLock::acquire(dir)?;
+    save_locked(&lock, keypair, dir)
+}
+
+/// [`save`] under a [`KeyDirLock`] the caller already holds for `dir`.
+///
+/// # Errors
+/// As [`save`], and when `lock` is not the lock of `dir`.
+pub(crate) fn save_locked(lock: &KeyDirLock, keypair: &AgentKeypair, dir: &Path) -> Result<()> {
+    lock.check_guards(dir)?;
     let private = keypair.private.as_ref().ok_or_else(|| {
         anyhow!(
             "AgentKeypair for {} has no private key to save",
@@ -393,6 +409,8 @@ pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
 /// a peer's allowlist entry). The corresponding `.priv` is left absent;
 /// [`load`] will then return a public-only [`AgentKeypair`].
 pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
+    // #10108 K-4 — the key-file write runs under the cross-process lock.
+    let _lock = KeyDirLock::acquire(dir)?;
     let pub_path = dir.join(format!("{}{PUB_SUFFIX}", keypair.agent_id));
     // #1514 — create the parent of the FILE (nested for slashed agent_ids),
     // not just `dir`; for a slash-free id the parent IS `dir`.
@@ -479,6 +497,9 @@ pub struct RotateOutcome {
 /// - archive write, new-key generation, or save failure.
 pub fn rotate(agent_id: &str, dir: &Path) -> Result<RotateOutcome> {
     validate::validate_agent_id_shape(agent_id)?;
+    // #10108 K-4 — the existence check, the archive and the overwrite run
+    // under one cross-process lock.
+    let lock = KeyDirLock::acquire(dir)?;
     let pub_path = agent_pub_path(dir, agent_id);
     if !pub_path.exists() {
         bail!(
@@ -505,7 +526,7 @@ pub fn rotate(agent_id: &str, dir: &Path) -> Result<RotateOutcome> {
     // (forward security). The archived `.pub` above is the only retained
     // trace of the prior identity.
     let new_kp = generate(agent_id)?;
-    save(&new_kp, dir)?;
+    save_locked(&lock, &new_kp, dir)?;
     Ok(RotateOutcome {
         archived_pub,
         new_pub: pub_path,
@@ -567,14 +588,17 @@ where
     sign_and_persist(&old_kp, &new_kp)?;
 
     // Succession persisted — now (and only now) touch the disk. Same
-    // archive-then-overwrite discipline as `rotate` (#1679).
+    // archive-then-overwrite discipline as `rotate` (#1679). #10108 K-4 —
+    // the lock is taken only now, after `sign_and_persist`, so no database
+    // call (which may provision a daemon key) ever runs under it.
+    let lock = KeyDirLock::acquire(dir)?;
     let pub_path = agent_pub_path(dir, agent_id);
     let old_pub = fs::read(&pub_path)
         .with_context(|| format!("reading current public key {}", pub_path.display()))?;
     // #3146 — collision-safe archive naming, same rationale as `rotate`.
     let archived_pub =
         archive_public_key_at(dir, agent_id, &old_pub, chrono::Utc::now().timestamp())?;
-    save(&new_kp, dir)?;
+    save_locked(&lock, &new_kp, dir)?;
     Ok(RotateOutcome {
         archived_pub,
         new_pub: pub_path,
@@ -1092,7 +1116,25 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
     // entry point via the reserved-name-rejecting
     // [`crate::validate::validate_agent_id`].
     validate::validate_agent_id_shape(agent_id)?;
+    // #10108 K-4 — the state table below decides from file existence and
+    // then writes; another process must not write between the two.
+    let lock = KeyDirLock::acquire(dir)?;
+    ensure_keypair_locked(&lock, agent_id, dir)
+}
 
+/// [`ensure_keypair`] (enabled) under a [`KeyDirLock`] the caller already
+/// holds for `dir`, so a caller can keep its own checks and the load that
+/// follows under the same lock.
+///
+/// # Errors
+/// As [`ensure_keypair`], and when `lock` is not the lock of `dir`.
+pub(crate) fn ensure_keypair_locked(
+    lock: &KeyDirLock,
+    agent_id: &str,
+    dir: &Path,
+) -> Result<EnsureOutcome> {
+    lock.check_guards(dir)?;
+    validate::validate_agent_id_shape(agent_id)?;
     let pub_path = agent_pub_path(dir, agent_id);
     let priv_path = agent_priv_path(dir, agent_id);
     // #3198 — before BELIEVING anything about what is on disk, refuse a key
@@ -1162,13 +1204,18 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
         }
 
         // Neither half present — first run.
-        (false, false) => ensure_generate(agent_id, dir, pub_path),
+        (false, false) => ensure_generate(lock, agent_id, dir, pub_path),
     }
 }
 
 /// First-run branch of [`ensure_keypair`], split out so the gate above reads as
 /// a four-way state table.
-fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<EnsureOutcome> {
+fn ensure_generate(
+    lock: &KeyDirLock,
+    agent_id: &str,
+    dir: &Path,
+    pub_path: PathBuf,
+) -> Result<EnsureOutcome> {
     let kp = generate(agent_id)?;
     let priv_path = agent_priv_path(dir, agent_id);
     // #3772 — CONCURRENT-GENERATE RACE. `serve`, `curator`, and one-shot CLI
@@ -1233,7 +1280,7 @@ fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<Ensu
                 agent_id,
                 priv_path.display(),
             );
-            ensure_keypair(agent_id, dir, false)
+            ensure_keypair_locked(lock, agent_id, dir)
         }
         Err(e) => {
             Err(anyhow!(e)).with_context(|| format!("claiming private key {}", priv_path.display()))

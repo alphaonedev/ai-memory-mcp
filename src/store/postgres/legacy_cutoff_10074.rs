@@ -22,11 +22,11 @@ use crate::signed_events::{
 use crate::store::StoreResult;
 
 /// The full-row projection, in [`PgSignedEventWalkRow`] order.
-const PG_ROW_COLUMNS: &str = "id, agent_id, event_type, payload_hash, signature, attest_level, \
+pub(super) const PG_ROW_COLUMNS: &str = "id, agent_id, event_type, payload_hash, signature, attest_level, \
      timestamp, prev_hash, sequence, cause_hash";
 
 /// Map one walk row to a [`SignedEvent`], keeping `prev_hash`.
-fn to_event(row: PgSignedEventWalkRow) -> SignedEvent {
+pub(super) fn to_event(row: PgSignedEventWalkRow) -> SignedEvent {
     let (id, agent_id, event_type, payload_hash, signature, attest_level, ts, prev, seq, cause) =
         row;
     SignedEvent {

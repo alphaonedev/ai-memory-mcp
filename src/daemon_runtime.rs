@@ -2651,13 +2651,8 @@ pub async fn run(
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // #10074 (S-8) — the pin verifies; `--mint-legacy-cutoff` mints.
-            let r = cli::verify_signed_events::dispatch(
-                &db_path,
-                &a,
-                app_config,
-                audit_pubkey,
-                &mut out,
-            );
+            let (cfg, pubkey) = (app_config, audit_pubkey);
+            let r = cli::verify_signed_events::dispatch(&db_path, &a, cfg, pubkey, &mut out);
             match r.await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
@@ -5180,8 +5175,8 @@ async fn build_store_handle(
                     .strip_prefix('/')
                     .map_or(path, |p| if p.starts_with('/') { p } else { path });
                 tracing::info!("Wave-3: opening SQLite SAL store at {clean} (--store-url)");
-                let store = crate::store::sqlite::SqliteStore::open(clean)
-                    .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
+                // #10108 K-7: the typed cause stays a downcastable source.
+                let store = crate::store::sqlite::SqliteStore::open_adapter(clean)?;
                 Ok((StorageBackend::Sqlite, Arc::new(store)))
             } else {
                 // #1579 A3 (SECURITY) — a mistyped scheme can still
@@ -5198,8 +5193,7 @@ async fn build_store_handle(
             let _ = embedder_available;
             let _ = pool;
             tracing::debug!("Wave-3: --store-url absent; opening SQLite SAL store at --db path");
-            let store = crate::store::sqlite::SqliteStore::open(db_path)
-                .map_err(|e| anyhow::anyhow!("open sqlite adapter: {e}"))?;
+            let store = crate::store::sqlite::SqliteStore::open_adapter(db_path)?;
             Ok((StorageBackend::Sqlite, Arc::new(store)))
         }
     }

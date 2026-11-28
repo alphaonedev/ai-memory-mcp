@@ -160,6 +160,9 @@ const SQLITE_RELATIONAL_TABLES: &[&str] = &[
     // migrate_v62), so the parity assertion covers them.
     "routines",
     "routine_runs",
+    // #10108 (S-8) — v103 `atomisation_receipts`, created on BOTH adapters
+    // (sqlite migration 0087 + postgres migrate_v103).
+    "atomisation_receipts",
 ];
 
 /// #1689/n19 — sqlite/daemon-local tables the Postgres adapter intentionally

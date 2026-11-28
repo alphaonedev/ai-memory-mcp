@@ -216,16 +216,23 @@ fn signed_link_invalidation_clears_signature_and_audits_event() {
         32,
         "audit payload_hash must be SHA-256 (32 bytes)"
     );
-    // The audit row preserves the PRIOR signature so an auditor can
-    // bind it back to the original `memory_link.created` row. #3203 keeps
-    // this: the superseded signer's PROOF stays in the `signature` column
-    // (and its identity inside the CBOR `payload_hash` commits to) while
-    // `agent_id` now names the ACTOR — two distinct fields, as they should
-    // always have been.
+    // #10108 (D2): the audit row carries NO signature. The prior link
+    // signature signs the creation pre-image, not this row's payload, so
+    // copying it here put a signature over different bytes on the chain.
+    // The superseded signer's proof stays on the `memory_link.created` row,
+    // and its identity inside the CBOR `payload_hash` commits to; `agent_id`
+    // names the ACTOR (#3203).
+    assert!(
+        sig_before.is_some(),
+        "the link was signed before supersession"
+    );
     assert_eq!(
-        invalidated.signature, sig_before,
-        "audit signature blob must mirror the pre-invalidate signature \
-         so the auditor can join back to the original signing event"
+        (
+            invalidated.signature.as_deref(),
+            invalidated.attest_level.as_str()
+        ),
+        (None, "unsigned"),
+        "#10108 D2: the memory_link.invalidated row is unsigned with a NULL signature"
     );
 }
 

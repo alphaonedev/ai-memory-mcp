@@ -563,14 +563,38 @@ impl StoreError {
 /// a `StoreError` variant. Adapters wrap their native error types in
 /// this to retain the underlying cause without leaking the concrete
 /// type across the trait boundary.
+///
+/// #10108 K-7 — an adapter error built by [`Self::with_source`] keeps its
+/// cause as the [`std::error::Error::source`], so a typed refusal (the
+/// daemon's `DaemonKeyMissing`) stays downcastable through the trait
+/// boundary instead of being flattened to its text (per ERRORS-11, ERRORS-15).
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct BoxBackendError(String);
+#[error("{msg}")]
+pub struct BoxBackendError {
+    msg: String,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+}
 
 impl BoxBackendError {
     #[must_use]
     pub fn new(msg: impl Into<String>) -> Self {
-        Self(msg.into())
+        Self {
+            msg: msg.into(),
+            source: None,
+        }
+    }
+
+    /// The error's own text as the message, with the error kept as the
+    /// source: the message is unchanged from [`Self::new`] and the cause
+    /// chain stays walkable.
+    #[must_use]
+    pub fn with_source(e: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Self {
+        let source = e.into();
+        Self {
+            msg: source.to_string(),
+            source: Some(source),
+        }
     }
 }
 

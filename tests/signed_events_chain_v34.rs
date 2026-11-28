@@ -23,6 +23,14 @@
 //! Per-row Ed25519 signatures remain as defense-in-depth (the chain
 //! is the LOAD-BEARING property); this test suite focuses on the
 //! chain itself.
+//!
+//! #10195: since #10108 a fresh database opens with the daemon-signed
+//! agent cut-over marker at sequence 1, so the chain under test is the
+//! marker followed by the fixture rows. The fixture rows use an event type
+//! that is not agent-attributed: an unsigned agent-kind row above the
+//! marker is a `PreCutoverWriter` defect by design (pinned in
+//! `tests/agent_cutover_v103_10108.rs`), and this suite pins the chain, not
+//! that rule.
 
 use ai_memory::governance::agent_action::{AgentAction, Decision};
 use ai_memory::governance::deferred_audit::{
@@ -30,8 +38,8 @@ use ai_memory::governance::deferred_audit::{
     install_deferred_audit_drainer,
 };
 use ai_memory::signed_events::{
-    SignedEvent, ZERO_HASH, append_signed_event, canonical_chain_bytes, list_signed_events,
-    payload_hash, verify_chain,
+    AGENT_CUTOVER_EVENT_TYPE, ChainVerificationReport, SignedEvent, ZERO_HASH, append_signed_event,
+    canonical_chain_bytes, list_signed_events, payload_hash, verify_chain,
 };
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -51,6 +59,64 @@ fn fresh_db_path(label: &str) -> (tempfile::TempDir, PathBuf) {
     let path = dir.path().join(format!("{label}.db"));
     drop(ai_memory::db::open(&path).expect("init db"));
     (dir, path)
+}
+
+/// #10195 — the rows a fresh database holds before any fixture row: the
+/// signed agent cut-over marker (#10108) at sequence 1.
+const FRESH_DB_MARKER_ROWS: u64 = 1;
+
+/// The number of listed rows, in the unit of `rows_checked`.
+fn row_count(rows: &[SignedEvent]) -> u64 {
+    u64::try_from(rows.len()).expect("row count fits u64")
+}
+
+/// #10195 — the sequence of the first fixture row on a fresh database.
+const FIRST_FIXTURE_SEQUENCE: i64 = 2;
+
+/// #10195 — the fixture event type: a type that is not agent-attributed
+/// (`AgentEventKind::of_event_type` is `None`), so an unsigned fixture row
+/// keeps the plain daemon-row check after the cut-over marker.
+const FIXTURE_EVENT_TYPE: &str = "test.chain_v34_fixture";
+
+/// #10195 — asserts `rows` (ordered by sequence) start with the fresh-DB
+/// marker at sequence 1 with the zero `prev_hash`, and that every later row
+/// links to its predecessor with contiguous sequences.
+fn assert_marker_then_linked(rows: &[SignedEvent]) {
+    let marker = rows.first().expect("fresh database holds the marker");
+    assert_eq!(
+        marker.event_type, AGENT_CUTOVER_EVENT_TYPE,
+        "row 1 of a fresh database MUST be the #10108 cut-over marker"
+    );
+    assert_eq!(marker.sequence, 1, "the marker MUST hold sequence 1");
+    assert_eq!(
+        marker.prev_hash,
+        ZERO_HASH.to_vec(),
+        "the first row's prev_hash MUST be 32 zero bytes"
+    );
+    for pair in rows.windows(2) {
+        let (prev, row) = (&pair[0], &pair[1]);
+        assert_eq!(row.sequence, prev.sequence + 1, "sequences contiguous");
+        let digest = Sha256::digest(canonical_chain_bytes(prev)).to_vec();
+        assert_eq!(
+            row.prev_hash, digest,
+            "row {}'s prev_hash MUST equal SHA-256(canonical_chain_bytes(row {}))",
+            row.sequence, prev.sequence
+        );
+    }
+}
+
+/// #10195 — no row of the walk fails its signature check: the marker
+/// with no verifier in the process is unchecked (never a failure), and the
+/// unsigned non-agent fixture rows keep the plain daemon-row check.
+fn assert_no_agent_defects(report: &ChainVerificationReport) {
+    assert!(
+        report.agent_signature_defects.is_empty(),
+        "no agent-era defect expected; report = {report:?}"
+    );
+    assert!(
+        report.signature_failures.is_empty(),
+        "no signature failure expected; report = {report:?}"
+    );
 }
 
 fn fixture(agent: &str, event_type: &str, payload: &[u8]) -> SignedEvent {
@@ -78,11 +144,16 @@ fn open_conn(path: &std::path::Path) -> Connection {
 fn fresh_db_first_row_has_zero_prev_hash() {
     let (_dir, path) = fresh_db_path("first-row");
     let conn = open_conn(&path);
-    let event = fixture("alice", "memory_link.created", b"first-payload");
+    let event = fixture("alice", FIXTURE_EVENT_TYPE, b"first-payload");
     append_signed_event(&conn, &event).expect("append first event");
 
-    let listed = list_signed_events(&conn, None, 10, 0).expect("list");
-    assert_eq!(listed.len(), 1, "exactly one row expected");
+    let mut listed = list_signed_events(&conn, None, 10, 0).expect("list");
+    listed.sort_by_key(|e| e.sequence);
+    assert_eq!(
+        row_count(&listed),
+        FRESH_DB_MARKER_ROWS + 1,
+        "exactly the marker and one fixture row expected"
+    );
     let row = &listed[0];
     assert_eq!(
         row.prev_hash,
@@ -95,14 +166,18 @@ fn fresh_db_first_row_has_zero_prev_hash() {
         row.sequence, 1,
         "v34 first row's sequence MUST be 1 (monotonic from 1)"
     );
+    assert_marker_then_linked(&listed);
+    assert_eq!(listed[1].id, event.id, "the fixture row follows the marker");
+    assert_eq!(listed[1].sequence, FIRST_FIXTURE_SEQUENCE);
 
     // verify_chain reports the chain holds.
     let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
-        "single-row chain MUST hold; report = {report:?}"
+        "marker plus one row chain MUST hold; report = {report:?}"
     );
-    assert_eq!(report.rows_checked, 1);
+    assert_eq!(report.rows_checked, FRESH_DB_MARKER_ROWS + 1);
+    assert_no_agent_defects(&report);
 }
 
 // -----------------------------------------------------------------
@@ -117,14 +192,14 @@ fn subsequent_rows_chain_correctly() {
     for i in 0..3 {
         let ev = fixture(
             "alice",
-            "memory_link.created",
+            FIXTURE_EVENT_TYPE,
             format!("payload-{i}").as_bytes(),
         );
         append_signed_event(&conn, &ev).expect("append");
     }
 
     let listed = list_signed_events(&conn, None, 100, 0).expect("list");
-    assert_eq!(listed.len(), 3);
+    assert_eq!(row_count(&listed), FRESH_DB_MARKER_ROWS + 3);
 
     // Pull rows back ordered by sequence, since `list` orders by
     // timestamp ASC, id ASC — for a chain test we need
@@ -133,12 +208,12 @@ fn subsequent_rows_chain_correctly() {
     // RFC3339-second-precision rows might share a timestamp).
     let mut by_seq: Vec<SignedEvent> = listed;
     by_seq.sort_by_key(|e| e.sequence);
-    assert_eq!(by_seq[0].sequence, 1);
-    assert_eq!(by_seq[1].sequence, 2);
-    assert_eq!(by_seq[2].sequence, 3);
-
-    // Row 0's prev_hash is ZERO_HASH.
-    assert_eq!(by_seq[0].prev_hash, ZERO_HASH.to_vec());
+    assert_marker_then_linked(&by_seq);
+    // The three fixture rows follow the marker.
+    let by_seq = &by_seq[1..];
+    assert_eq!(by_seq[0].sequence, FIRST_FIXTURE_SEQUENCE);
+    assert_eq!(by_seq[1].sequence, FIRST_FIXTURE_SEQUENCE + 1);
+    assert_eq!(by_seq[2].sequence, FIRST_FIXTURE_SEQUENCE + 2);
     // Row 1's prev_hash is SHA-256(canonical_chain_bytes(row 0)).
     let h0 = {
         let mut hasher = Sha256::new();
@@ -162,8 +237,9 @@ fn subsequent_rows_chain_correctly() {
 
     let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(report.chain_holds(), "report = {report:?}");
-    assert_eq!(report.rows_checked, 3);
+    assert_eq!(report.rows_checked, FRESH_DB_MARKER_ROWS + 3);
     assert_eq!(report.chain_break, None);
+    assert_no_agent_defects(&report);
 }
 
 // -----------------------------------------------------------------
@@ -177,7 +253,7 @@ fn tamper_in_middle_row_breaks_chain() {
     for i in 0..5 {
         let ev = fixture(
             "alice",
-            "memory_link.created",
+            FIXTURE_EVENT_TYPE,
             format!("payload-{i}").as_bytes(),
         );
         append_signed_event(&conn, &ev).expect("append");
@@ -226,7 +302,7 @@ fn tamper_in_sequence_column_caught() {
     for i in 0..5 {
         let ev = fixture(
             "alice",
-            "memory_link.created",
+            FIXTURE_EVENT_TYPE,
             format!("payload-{i}").as_bytes(),
         );
         append_signed_event(&conn, &ev).expect("append");
@@ -324,8 +400,13 @@ async fn chain_holds_across_drainer_writes() {
         report.chain_holds(),
         "chain MUST hold after {expected} concurrent drainer inserts; report = {report:?}"
     );
-    assert_eq!(report.rows_checked, expected);
+    assert_eq!(report.rows_checked, FRESH_DB_MARKER_ROWS + expected);
     assert_eq!(report.chain_break, None);
+    assert_no_agent_defects(&report);
+    let mut by_seq = list_signed_events(&conn, None, 1000, 0).expect("list");
+    by_seq.sort_by_key(|e| e.sequence);
+    assert_eq!(row_count(&by_seq), FRESH_DB_MARKER_ROWS + expected);
+    assert_marker_then_linked(&by_seq);
 }
 
 // -----------------------------------------------------------------
@@ -342,7 +423,7 @@ fn backfill_migration_idempotent_on_replay() {
     for i in 0..5 {
         let ev = fixture(
             "alice",
-            "memory_link.created",
+            FIXTURE_EVENT_TYPE,
             format!("payload-{i}").as_bytes(),
         );
         append_signed_event(&conn, &ev).expect("append");
@@ -354,7 +435,8 @@ fn backfill_migration_idempotent_on_replay() {
         v.sort_by_key(|e| e.sequence);
         v
     };
-    assert_eq!(pre.len(), 5);
+    assert_eq!(row_count(&pre), FRESH_DB_MARKER_ROWS + 5);
+    assert_marker_then_linked(&pre);
 
     // Replay the backfill function. Because every row already has
     // `sequence` non-NULL, the backfill's `WHERE sequence IS NULL`
@@ -374,6 +456,7 @@ fn backfill_migration_idempotent_on_replay() {
         report.chain_holds(),
         "chain MUST still hold after a no-op replay; report = {report:?}"
     );
+    assert_no_agent_defects(&report);
 }
 
 // -----------------------------------------------------------------
@@ -387,23 +470,26 @@ fn verify_chain_with_since_resumes_correctly() {
     for i in 0..6 {
         let ev = fixture(
             "alice",
-            "memory_link.created",
+            FIXTURE_EVENT_TYPE,
             format!("payload-{i}").as_bytes(),
         );
         append_signed_event(&conn, &ev).expect("append");
     }
 
-    // since=3: walk only rows with sequence > 3 → rows 4, 5, 6.
-    let report = verify_chain(&conn, Some(3), None).expect("verify");
+    // The six fixture rows hold sequences 2..=7 after the marker. Resume
+    // after the third fixture row: walk only the fourth, fifth and sixth.
+    let third_fixture_sequence = FIRST_FIXTURE_SEQUENCE + 2;
+    let report = verify_chain(&conn, Some(third_fixture_sequence), None).expect("verify");
     assert!(
         report.chain_holds(),
         "since-resume chain MUST hold; report = {report:?}"
     );
     assert_eq!(
         report.rows_checked, 3,
-        "rows 4,5,6 walked; report = {report:?}"
+        "fixture rows 4,5,6 walked; report = {report:?}"
     );
     assert_eq!(report.chain_break, None);
+    assert_no_agent_defects(&report);
 }
 
 #[test]
@@ -413,7 +499,7 @@ fn verify_chain_with_since_detects_break_in_resumed_range() {
     for i in 0..6 {
         let ev = fixture(
             "alice",
-            "memory_link.created",
+            FIXTURE_EVENT_TYPE,
             format!("payload-{i}").as_bytes(),
         );
         append_signed_event(&conn, &ev).expect("append");
@@ -455,42 +541,48 @@ fn backfill_stamps_pre_existing_rows() {
         conn.execute(
             "INSERT INTO signed_events \
              (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp) \
-             VALUES (?1, 'alice', 'memory_link.created', ?2, NULL, 'unsigned', ?3)",
+             VALUES (?1, 'alice', ?4, ?2, NULL, 'unsigned', ?3)",
             rusqlite::params![
                 uuid::Uuid::new_v4().to_string(),
                 payload_hash(format!("payload-{i}").as_bytes()),
                 format!("2026-05-14T00:00:0{i}+00:00"),
+                FIXTURE_EVENT_TYPE,
             ],
         )
         .expect("raw insert");
     }
 
-    // Pre-backfill: every row has NULL sequence, so verify_chain
-    // (which filters on `COALESCE(sequence, 0) > 0`) sees zero rows
-    // — the chain vacuously "holds" because there's nothing to
-    // verify, but the row count gap surfaces the gap. We check the
-    // gap-detection by comparing rows_checked against the raw count.
+    // Pre-backfill: every raw row has NULL sequence, so verify_chain
+    // (which filters on `COALESCE(sequence, 0) > 0`) sees only the
+    // fresh-DB marker — the raw rows are invisible to the walk, but the
+    // row count gap surfaces the gap. We check the gap-detection by
+    // comparing rows_checked against the raw count.
     let pre = verify_chain(&conn, None, None).expect("verify pre");
     let raw_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM signed_events", [], |r| r.get(0))
         .expect("count");
     assert_eq!(
-        pre.rows_checked, 0,
+        pre.rows_checked, FRESH_DB_MARKER_ROWS,
         "pre-backfill rows with NULL sequence are excluded from the chain walk; got {pre:?}"
     );
-    assert_eq!(raw_count, 4, "raw inserted four rows");
+    assert_eq!(
+        raw_count,
+        i64::try_from(FRESH_DB_MARKER_ROWS).expect("fits") + 4,
+        "the marker plus four raw inserted rows"
+    );
 
     // Run backfill.
     ai_memory::storage::migrations::migrate_v34_backfill_chain(&conn).expect("backfill");
 
-    // Post-backfill: every row carries sequence 1..=4 and a valid
-    // chain.
+    // Post-backfill: the marker keeps sequence 1, the raw rows carry
+    // sequence 2..=5, and the chain is valid.
     let listed: Vec<SignedEvent> = {
         let mut v = list_signed_events(&conn, None, 100, 0).expect("list");
         v.sort_by_key(|e| e.sequence);
         v
     };
-    assert_eq!(listed.len(), 4);
+    assert_eq!(row_count(&listed), FRESH_DB_MARKER_ROWS + 4);
+    assert_marker_then_linked(&listed);
     for (i, row) in listed.iter().enumerate() {
         assert_eq!(
             row.sequence,
@@ -508,7 +600,8 @@ fn backfill_stamps_pre_existing_rows() {
         post.chain_holds(),
         "chain MUST hold post-backfill; report = {post:?}"
     );
-    assert_eq!(post.rows_checked, 4);
+    assert_eq!(post.rows_checked, FRESH_DB_MARKER_ROWS + 4);
+    assert_no_agent_defects(&post);
 }
 
 // -----------------------------------------------------------------
@@ -528,7 +621,7 @@ fn backfill_resumes_from_mixed_state() {
     for i in 0..2 {
         let ev = fixture(
             "alice",
-            "memory_link.created",
+            FIXTURE_EVENT_TYPE,
             format!("stamped-{i}").as_bytes(),
         );
         append_signed_event(&conn, &ev).expect("append stamped");
@@ -538,27 +631,30 @@ fn backfill_resumes_from_mixed_state() {
         conn.execute(
             "INSERT INTO signed_events \
              (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp) \
-             VALUES (?1, 'alice', 'memory_link.created', ?2, NULL, 'unsigned', ?3)",
+             VALUES (?1, 'alice', ?4, ?2, NULL, 'unsigned', ?3)",
             rusqlite::params![
                 uuid::Uuid::new_v4().to_string(),
                 payload_hash(format!("unstamped-{i}").as_bytes()),
                 format!("2026-05-14T01:00:0{i}+00:00"),
+                FIXTURE_EVENT_TYPE,
             ],
         )
         .expect("raw insert");
     }
 
     // Run the backfill — it should pick up exactly the 3 un-stamped
-    // rows and assign sequences 3, 4, 5 chained to row 2.
+    // rows and assign sequences 4, 5, 6 chained to the stamped tail
+    // (the marker holds 1, the stamped rows 2 and 3).
     ai_memory::storage::migrations::migrate_v34_backfill_chain(&conn).expect("backfill");
 
-    // Verify post-state: 5 rows, sequence 1..=5, chain holds.
+    // Verify post-state: marker plus 5 rows, sequence 1..=6, chain holds.
     let listed: Vec<SignedEvent> = {
         let mut v = list_signed_events(&conn, None, 100, 0).expect("list");
         v.sort_by_key(|e| e.sequence);
         v
     };
-    assert_eq!(listed.len(), 5);
+    assert_eq!(row_count(&listed), FRESH_DB_MARKER_ROWS + 5);
+    assert_marker_then_linked(&listed);
     for (i, row) in listed.iter().enumerate() {
         assert_eq!(
             row.sequence,
@@ -571,5 +667,6 @@ fn backfill_resumes_from_mixed_state() {
         report.chain_holds(),
         "mixed-state backfill MUST produce a valid chain; report = {report:?}"
     );
-    assert_eq!(report.rows_checked, 5);
+    assert_eq!(report.rows_checked, FRESH_DB_MARKER_ROWS + 5);
+    assert_no_agent_defects(&report);
 }

@@ -154,6 +154,95 @@ fn atomise(conn: &Connection, source_id: &str, atom_texts: &[&str]) -> Vec<Strin
 }
 
 // ---------------------------------------------------------------------------
+// #10108 slice 2 — the scoped bundle includes the daemon completion row.
+// ---------------------------------------------------------------------------
+
+/// The completion rows of `files`, as `(id, agent_id)`.
+fn bundled_completions(
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<(String, String)> {
+    files
+        .iter()
+        .filter(|(p, _)| p.starts_with("signed_events/"))
+        .filter_map(|(_, body)| {
+            let v: serde_json::Value = serde_json::from_slice(body).expect("parse event");
+            (v["event_type"].as_str() == Some("atomisation_complete")).then(|| {
+                (
+                    v["id"].as_str().unwrap_or_default().to_string(),
+                    v["agent_id"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Since #10108 slice 2 the daemon writes `atomisation_complete`. When the
+/// chain's `derives_from` edges name their writer (the scoped branch of the
+/// bundle fetch), the bundle still holds exactly the daemon row bound to
+/// this source through its signed `cause_hash`, and not the row of another
+/// source atomised by the same agent.
+#[test]
+fn scoped_bundle_includes_the_daemon_completion_row_10108() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ensure_hook_installed();
+
+    let tmp = TempDir::new().unwrap();
+    let (_db_path, conn) = fresh_db_in(tmp.path());
+    let source_a = seed_long_source(&conn, "fb/wt1e/scoped", "etcd");
+    let source_b = seed_long_source(&conn, "fb/wt1e/scoped", "zookeeper");
+    atomise(
+        &conn,
+        &source_a,
+        &[
+            "Etcd stores keys in a raft log.",
+            "Etcd leases expire keys.",
+        ],
+    );
+    atomise(
+        &conn,
+        &source_b,
+        &[
+            "Zookeeper keeps znodes.",
+            "Zookeeper sessions own ephemerals.",
+        ],
+    );
+    // A named edge writer selects the scoped branch of the fetch.
+    conn.execute(
+        "UPDATE memory_links SET observed_by = 'wt1e-fb-agent' \
+         WHERE relation = 'derives_from'",
+        [],
+    )
+    .expect("name the edge writer");
+
+    let binding = ai_memory::signed_events::agent_era::SourceBinding::of_source(&source_a);
+    let expected: String = conn
+        .query_row(
+            "SELECT id FROM signed_events \
+             WHERE event_type = 'atomisation_complete' AND cause_hash = ?1",
+            [binding.as_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .expect("the daemon completion row of source A");
+
+    let args = ExportForensicBundleArgs {
+        memory_id: source_a.clone(),
+        include_reflections: false,
+        include_transcripts: false,
+        include_atomisation_chain: true,
+        output: None,
+    };
+    let files =
+        bundle::build_files(&conn, &args, Some("2026-05-15T00:00:00Z")).expect("build_files");
+    assert_eq!(
+        bundled_completions(&files),
+        vec![(expected, "daemon".to_string())],
+        "the scoped bundle holds exactly source A's daemon completion row"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 5 — forensic export includes the atomisation chain.
 // ---------------------------------------------------------------------------
 

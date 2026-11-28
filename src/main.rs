@@ -788,6 +788,19 @@ fn init_forensic_audit(
     // generate nothing: these verbs write no ledger row (see
     // `is_key_provisioning_verb`), so there is nothing here to sign.
     // #9562 — a non-writer `wake-hub` mode touches no key material at all.
+    // #10179 / #10108 K-7 — a ledger writer over a PARTIAL `daemon` key
+    // refuses here, whatever id it resolved, before any key is ensured: the
+    // store, link, persona and witness rows need the daemon key whole, so a
+    // boot as another id must not mint its own key and then serve with that
+    // signing off. The typed DaemonKeyMissing is the downcastable cause.
+    if ledger_writer
+        && let Some(refusal) =
+            ai_memory::governance::daemon_signer::DaemonChainSigner::ledger_writer_boot_refusal(
+                &agent_id,
+            )
+    {
+        return Err(refusal);
+    }
     let (signing_key, generated) = match key_setup {
         BootKeySetup::Skip => (None, None),
         BootKeySetup::LoadOnly => (
@@ -820,10 +833,11 @@ fn init_forensic_audit(
     }
     if signing_key.is_none() {
         if ledger_writer {
-            anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+            let refusal = ai_memory::governance::audit::unsigned_ledger_refusal(
                 &agent_id,
-                "no key was loadable after the ensure step"
-            ));
+                "no key was loadable after the ensure step",
+            );
+            anyhow::bail!(refusal);
         }
         if hosts_writers
             && let Some(warning) = ai_memory::governance::audit::ledger_signing_status().warning

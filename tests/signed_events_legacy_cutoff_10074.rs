@@ -1482,8 +1482,10 @@ fn agent_signed_row_verdict_table_10105() {
 }
 
 /// #10105 — the chain walk counts agent-signed rows apart from verified
-/// rows, fails exactly the missing and malformed signatures, and the audit
-/// trail carries the same count.
+/// rows, fails exactly the malformed signatures, and the audit trail carries
+/// the same count. #10108 S-4 (`3-agent vote (71472661)`): with no cutover
+/// marker every agent row is legacy, so a NULL signature (seq 5) is counted
+/// with the legacy rows, never failed and never verified.
 #[test]
 fn agent_signed_rows_counted_not_verified_10105() {
     let (_d, _p, conn) = open_db();
@@ -1501,12 +1503,11 @@ fn agent_signed_rows_counted_not_verified_10105() {
     assert_eq!(chain.chain_break, None);
     assert_eq!(chain.rows_checked, 8);
     assert_eq!(chain.rows_positively_verified, 2);
-    assert_eq!(chain.agent_signed_rows_not_verified, 3);
-    assert_eq!(chain.signature_failures, vec![5, 6, 7]);
+    assert_eq!(chain.agent_signed_rows_not_verified, 4);
+    assert_eq!(chain.signature_failures, vec![6, 7]);
     assert_eq!(
         chain.agent_signature_defects,
         vec![
-            (5, SignatureFailure::AgentSignatureMissing),
             (6, SignatureFailure::AgentSignatureMalformed),
             (7, SignatureFailure::AgentSignatureMalformed),
         ]
@@ -1514,8 +1515,8 @@ fn agent_signed_rows_counted_not_verified_10105() {
 
     let trail = verify_audit_trail(&conn, None, Some(&vk)).expect("verify_audit_trail");
     assert!(trail.chain_intact);
-    assert_eq!(trail.signature_failures, vec![5, 6, 7]);
-    assert_eq!(trail.agent_signed_rows_not_verified, 3);
+    assert_eq!(trail.signature_failures, vec![6, 7]);
+    assert_eq!(trail.agent_signed_rows_not_verified, 4);
 }
 
 /// #10105 — valid agent-signed rows alone never make the walk report a

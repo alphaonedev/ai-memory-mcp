@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 102).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 103).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -1002,7 +1002,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// for schema reporting and compatibility checks. Settled ladder arms still
 /// gate on their own literal rung so adding v98 cannot make a v96 database
 /// skip v97.
-const CURRENT_SCHEMA_VERSION: i64 = 102;
+const CURRENT_SCHEMA_VERSION: i64 = 103;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1871,7 +1871,38 @@ pub(super) fn repair_under_writer_lock(conn: &Connection) -> Result<bool> {
 // `conn.execute_batch(...)?` are similarly unreachable without
 // semantic SQL-fault injection.
 #[allow(clippy::too_many_lines)]
+/// Bring the schema to `CURRENT_SCHEMA_VERSION`. A ladder run (create or
+/// bump) first provisions the daemon chain signer (#10145 K-1, K-5) and is
+/// refused with the typed, counted
+/// [`crate::governance::daemon_signer::DaemonKeyMissing`] before any byte
+/// changes when it cannot; an at-tip or ahead database never needs a key.
+///
+/// # Errors
+/// As [`migrate_signed`], plus the key refusal.
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+    migrate_inner(
+        conn,
+        crate::governance::daemon_signer::DaemonChainSigner::provision_default,
+    )
+}
+
+/// #10145 — [`migrate`] with the caller's signer: the one seam that creates
+/// or bumps the sqlite schema, so v103 cannot exist without a signed marker.
+///
+/// # Errors
+/// Propagates every ladder, probe and snapshot error.
+pub(crate) fn migrate_signed(
+    conn: &Connection,
+    signer: &crate::governance::daemon_signer::DaemonChainSigner,
+) -> Result<()> {
+    migrate_inner(conn, || Ok(signer))
+}
+
+fn migrate_inner<S, F>(conn: &Connection, signer: F) -> Result<()>
+where
+    S: std::borrow::Borrow<crate::governance::daemon_signer::DaemonChainSigner>,
+    F: FnOnce() -> std::result::Result<S, crate::governance::daemon_signer::DaemonKeyMissing>,
+{
     // v1.0.0 #2445 — tri-state, never `.unwrap_or(0)`. The pre-#2445 form
     // collapsed a READ ERROR into "fresh", and the pre-migration safety
     // snapshot below is gated on `version > 0` — so an unreadable stamp
@@ -1961,7 +1992,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     // the database with the longest ladder still to replay — precisely the one
     // that most needs a snapshot. Probe for durable rows so the snapshot can
     // never again be suppressed on a populated database.
-    if version > 0 || database_holds_durable_rows(conn)? {
+    // #10145 K-1 — the signer before any byte this ladder changes (snapshot,
+    // DDL, stamp); W-9 — a fresh database's marker says Create, any other
+    // database's says Migrate.
+    let signer = signer()?;
+    let holds_rows = database_holds_durable_rows(conn)?;
+    let origin = if version == 0 && !holds_rows {
+        crate::signed_events::agent_cutover::MarkerOrigin::Create
+    } else {
+        crate::signed_events::agent_cutover::MarkerOrigin::Migrate
+    };
+    if version > 0 || holds_rows {
         if let Some(snapshot) = snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)? {
             tracing::info!(
                 from_version = version,
@@ -4583,9 +4624,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             super::a2a_tasks::migrate_v101(conn)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 102 {
             // v102 (#8341): the v97 projection triggers become abort guards.
             super::agent_projection::migrate_v102(conn)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v103 (#10108): agent signature places + the cutover marker.
+            super::agent_cutover_v103::migrate_v103(
+                conn,
+                std::borrow::Borrow::borrow(&signer),
+                origin,
+            )?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
@@ -4959,6 +5009,12 @@ pub fn migrate_v34_backfill_chain(conn: &Connection) -> Result<()> {
 //     the module docstring (29 as of v0.7.0).
 // -----------------------------------------------------------------
 #[cfg(test)]
+#[path = "migrations_keyless_10157_tests.rs"]
+mod keyless_10157_tests;
+#[cfg(test)]
+#[path = "migrations_v66_rebuild_tests.rs"]
+mod v66_rebuild_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
@@ -5254,163 +5310,6 @@ mod tests {
         // memory_links signature triggers, which v65 had to restore).
         // Assert the COMPLETE tip shape from sqlite_master.
         assert_memory_links_tip_shape(&conn, "v63 rebuild arm");
-    }
-
-    #[test]
-    fn v66_rebuild_preserves_governance_rules_and_accepts_escalate_severity() {
-        // §22 PE-5 (#697) — the load-bearing risk: the v66 full-table
-        // rebuild of `governance_rules` must preserve every
-        // pre-existing row + every column (including the OPERATOR-SIGNED
-        // signature + attest_level data — a dropped signed-rule row or
-        // column is a security regression), recreate BOTH indexes, AND
-        // begin accepting the new `escalate` severity. We build a
-        // pre-v66 (3-value severity CHECK) governance_rules table with
-        // its two indexes, seed a signed rule, stamp the DB at v65, run
-        // the migrate ladder, and assert:
-        //   (a) the seeded row survives the rebuild verbatim (all
-        //       columns, incl. signature + attest_level),
-        //   (b) the pre-v66 CHECK would have REJECTED 'escalate',
-        //   (c) post-v66 an 'escalate' row inserts cleanly,
-        //   (d) both indexes were recreated.
-        let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
-
-        // The pre-v66 governance_rules shape (3-value severity CHECK).
-        conn.execute_batch(
-            "CREATE TABLE governance_rules (
-                 id            TEXT PRIMARY KEY,
-                 kind          TEXT NOT NULL,
-                 matcher       TEXT NOT NULL,
-                 severity      TEXT NOT NULL CHECK (severity IN ('refuse', 'warn', 'log')),
-                 reason        TEXT NOT NULL,
-                 namespace     TEXT NOT NULL DEFAULT '_global',
-                 created_by    TEXT NOT NULL,
-                 created_at    INTEGER NOT NULL,
-                 enabled       INTEGER NOT NULL DEFAULT 1,
-                 signature     BLOB,
-                 attest_level  TEXT NOT NULL DEFAULT 'unsigned'
-             );
-             CREATE INDEX idx_governance_rules_kind_enabled
-                 ON governance_rules (kind, enabled);
-             CREATE INDEX idx_governance_rules_namespace
-                 ON governance_rules (namespace);",
-        )
-        .expect("recreate pre-v66 governance_rules");
-
-        // (b) pre-v66 the CHECK must REJECT 'escalate'.
-        let pre_escalate = conn.execute(
-            "INSERT INTO governance_rules \
-             (id, kind, matcher, severity, reason, created_by, created_at) \
-             VALUES ('E0', 'bash', '{}', 'escalate', 'x', 'test', 0)",
-            [],
-        );
-        assert!(
-            pre_escalate.is_err(),
-            "pre-v66 CHECK must reject the 'escalate' severity"
-        );
-
-        // Seed a signed operator rule (refuse severity + a 64-byte
-        // signature + operator_signed attest_level) to prove the
-        // rebuild preserves signed-rule security columns.
-        let sig = vec![0xABu8; 64];
-        conn.execute(
-            "INSERT INTO governance_rules \
-             (id, kind, matcher, severity, reason, namespace, created_by, created_at, \
-              enabled, signature, attest_level) \
-             VALUES ('R001', 'filesystem_write', '{\"glob\":\"/tmp/**\"}', 'refuse', \
-                     'no /tmp', 'secure', 'operator', 42, 1, ?1, 'operator_signed')",
-            params![sig],
-        )
-        .expect("seed signed pre-v66 rule");
-
-        // Stamp at v65 so the migrate ladder runs the v66 arm.
-        conn.execute("DELETE FROM schema_version", [])
-            .expect("clear schema_version");
-        conn.execute("INSERT INTO schema_version (version) VALUES (65)", [])
-            .expect("stamp v65");
-
-        super::migrate(&conn).expect("migrate to v66 succeeds");
-        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
-
-        // (a) the signed row survived verbatim — every column intact.
-        let (kind, matcher, severity, reason, namespace, created_by, created_at, enabled, attest): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-            i64,
-            String,
-        ) = conn
-            .query_row(
-                "SELECT kind, matcher, severity, reason, namespace, created_by, created_at, \
-                        enabled, attest_level FROM governance_rules WHERE id = 'R001'",
-                [],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                    ))
-                },
-            )
-            .expect("signed rule must survive the v66 rebuild");
-        assert_eq!(kind, "filesystem_write");
-        assert_eq!(matcher, "{\"glob\":\"/tmp/**\"}");
-        assert_eq!(severity, "refuse");
-        assert_eq!(reason, "no /tmp");
-        assert_eq!(namespace, "secure");
-        assert_eq!(created_by, "operator");
-        assert_eq!(created_at, 42);
-        assert_eq!(enabled, 1);
-        assert_eq!(attest, "operator_signed");
-
-        // The signature BLOB survived byte-for-byte.
-        let surviving_sig: Vec<u8> = conn
-            .query_row(
-                "SELECT signature FROM governance_rules WHERE id = 'R001'",
-                [],
-                |r| r.get(0),
-            )
-            .expect("signature column must survive");
-        assert_eq!(
-            surviving_sig, sig,
-            "signed-rule signature must be preserved"
-        );
-
-        // (c) post-v66 an 'escalate' row inserts cleanly.
-        conn.execute(
-            "INSERT INTO governance_rules \
-             (id, kind, matcher, severity, reason, created_by, created_at) \
-             VALUES ('E001', 'bash', '{\"command_substring\":\"sudo\"}', 'escalate', \
-                     'human review', 'operator', 7)",
-            [],
-        )
-        .expect("'escalate' severity must insert cleanly post-v66");
-
-        // (d) both indexes were recreated by the rebuild.
-        for idx in [
-            "idx_governance_rules_kind_enabled",
-            "idx_governance_rules_namespace",
-        ] {
-            let present: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-                     WHERE type = 'index' AND name = ?1)",
-                    params![idx],
-                    |r| r.get(0),
-                )
-                .expect("probe index");
-            assert!(present, "v66 rebuild must recreate {idx}");
-        }
     }
 
     #[test]

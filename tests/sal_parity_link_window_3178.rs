@@ -635,6 +635,48 @@ mod pg {
     use ai_memory::store::sqlite::SqliteStore;
     use ai_memory::store::{CallerContext, MemoryStore, VerifyFilter};
 
+    /// #10108 — the `memory_link.invalidated` pre-image hash of the stored,
+    /// superseded `related_to` row `(src, dst)`: the same `SignableLink`
+    /// fields the writer hashes, read back from the row (`created_at` and
+    /// `valid_from` in chrono's RFC 3339, `valid_until` in the canonical
+    /// microsecond `+00:00` stamp form).
+    async fn pg_invalidated_leaf_hash(pool: &sqlx::PgPool, src: &str, dst: &str) -> Vec<u8> {
+        type Stamp = chrono::DateTime<chrono::Utc>;
+        let (created_at, valid_from, valid_until, observed_by): (
+            Stamp,
+            Option<Stamp>,
+            Option<Stamp>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT created_at, valid_from, valid_until, observed_by FROM memory_links \
+             WHERE source_id = $1 AND target_id = $2 AND relation = 'related_to'",
+        )
+        .bind(src)
+        .bind(dst)
+        .fetch_one(pool)
+        .await
+        .expect("read superseded row");
+        let created_at = created_at.to_rfc3339();
+        let valid_from = valid_from.map(|t| t.to_rfc3339());
+        let valid_until = valid_until
+            .expect("superseded row is stamped")
+            // The canonical stamp form (`canonicalize_valid_until_stamp`):
+            // `AutoSi` digits with the `Z` suffix (#3281, #3322).
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        let signable = ai_memory::identity::sign::SignableLink {
+            src_id: src,
+            dst_id: dst,
+            relation: "related_to",
+            observed_by: observed_by.as_deref(),
+            created_at: Some(created_at.as_str()),
+            valid_from: valid_from.as_deref(),
+            valid_until: Some(valid_until.as_str()),
+        };
+        ai_memory::signed_events::payload_hash(
+            &ai_memory::identity::sign::canonical_cbor(&signable).expect("canonical cbor"),
+        )
+    }
+
     async fn store_or_skip() -> Option<(PostgresStore, String)> {
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
@@ -807,27 +849,37 @@ mod pg {
         assert!(!report.signature_present);
 
         // PRE-FIX: zero rows — the postgres audit chain had no record at all.
-        // Count by event_type AND this edge's prior signature (the sqlite twin
-        // counts by event_type alone because it owns a per-test database):
-        // after #3203 `agent_id` is the ACTING principal (`system` here —
-        // `invalidate_link` was passed `None`), not the attester `kp.agent_id`.
+        // Count by event_type AND this edge's own invalidation pre-image hash
+        // (the sqlite twin counts by event_type alone because it owns a
+        // per-test database). #10108 (D2): the leaf no longer carries the
+        // prior link signature (it is `unsigned`, NULL), so the key is the
+        // `SignableLink` of the stored, superseded row, which commits to this
+        // run's fresh src/dst ids. After #3203 `agent_id` is the ACTING
+        // principal (`system` here — `invalidate_link` was passed `None`),
+        // not the attester `kp.agent_id`.
+        let leaf_hash = pg_invalidated_leaf_hash(&pool, &src, &dst).await;
         let events: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1 AND signature = $2",
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1 AND payload_hash = $2",
         )
         .bind("memory_link.invalidated")
-        .bind(&prior_signature)
+        .bind(&leaf_hash)
         .fetch_one(&pool)
         .await
         .expect("count events");
         assert_eq!(events, 1, "supersession must leave exactly one audit leaf");
-        let actor: String = sqlx::query_scalar(
-            "SELECT agent_id FROM signed_events WHERE event_type = $1 AND signature = $2",
+        let (actor, leaf_sig): (String, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT agent_id, signature FROM signed_events \
+             WHERE event_type = $1 AND payload_hash = $2",
         )
         .bind("memory_link.invalidated")
-        .bind(&prior_signature)
+        .bind(&leaf_hash)
         .fetch_one(&pool)
         .await
         .expect("actor");
+        assert_eq!(
+            leaf_sig, None,
+            "#10108 D2: the invalidated leaf has a NULL signature"
+        );
         assert_eq!(
             actor,
             ai_memory::identity::sentinels::SYSTEM_PRINCIPAL,

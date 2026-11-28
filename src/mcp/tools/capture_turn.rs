@@ -396,8 +396,11 @@ fn capture_turn_write(
     // `SqliteStore::capture_turn_idempotent` through the SAL trait).
     // #3713 — `prepare_capture_turn`'s errors are OUR slugs (`INVALID_INPUT:`,
     // `HOST_PUBKEY_NOT_ENROLLED:`); a typed root keeps them on the wire.
-    let write = prepare_capture_turn(&req, caller).map_err(crate::errors::invalid_input)?;
-    let attest_level = write.signed_event.attest_level.clone();
+    // #10108: the response reports the L4 capture label `verify_host_signature`
+    // computed (unchanged contract), not the audit row's label, which is
+    // `unsigned` for an unsigned capture.
+    let (write, attest_level) =
+        prepare_capture_turn_labelled(&req, caller).map_err(crate::errors::invalid_input)?;
 
     // v0.7.0 H1 (HIGH) — write-gate parity for the mutating
     // `capture_turn` verb. Pre-fix, L4 turn capture persisted a Memory
@@ -584,6 +587,17 @@ pub(crate) fn prepare_capture_turn(
     req: &MemoryCaptureTurnRequest,
     caller: &str,
 ) -> Result<crate::models::CaptureTurnWrite, String> {
+    prepare_capture_turn_labelled(req, caller).map(|(write, _)| write)
+}
+
+/// [`prepare_capture_turn`] plus the L4 capture label (`self_signed` /
+/// `signed_by_peer`) it stamped on the memory. #10108: that label is the
+/// capture contract; the audit row's own label states the signature it
+/// holds, so the two differ for an unsigned capture.
+fn prepare_capture_turn_labelled(
+    req: &MemoryCaptureTurnRequest,
+    caller: &str,
+) -> Result<(crate::models::CaptureTurnWrite, String), String> {
     // #1413 — agent_id agreement. A caller-stamped `metadata.agent_id`
     // MUST equal the resolved caller, else an attacker with access to
     // the surface could forge memories attributed to other identities.
@@ -700,27 +714,34 @@ pub(crate) fn prepare_capture_turn(
     // v0.7.0 #1415 — audit-chain row appended inside the same tx as the
     // data rows (by the store method) so audit can prove L4 caught the
     // turn; attest_level reflects whether the host provided a verified
-    // Ed25519 signature (#1414).
-    let signed_event = SignedEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        agent_id: caller.to_string(),
-        event_type: signed_events::event_types::MEMORY_CAPTURE_TURN.to_string(),
-        payload_hash: sha_vec.clone(),
-        signature: sig_bytes_opt,
-        attest_level,
-        timestamp: now_iso,
-        ..SignedEvent::default()
-    };
+    // Ed25519 signature (#1414). #10108: the row's label and signature come
+    // from one value, so the row is `signed_by_peer` only with the verified
+    // 64 host bytes and `unsigned` (NULL) otherwise. The capture label above
+    // (memory stamp, tag, response) is the L4 attestation contract and is
+    // unchanged.
+    let signed_event = SignedEvent::agent_row(
+        signed_events::AgentRow {
+            agent_id: caller.to_string(),
+            event_type: signed_events::event_types::MEMORY_CAPTURE_TURN.to_string(),
+            payload_hash: sha_vec.clone(),
+            timestamp: now_iso,
+            cause_hash: None,
+        },
+        &signed_events::AgentRowSignature::signed_by_peer(sig_bytes_opt.as_deref()),
+    );
 
-    Ok(crate::models::CaptureTurnWrite {
-        memory: mem,
-        sha256: sha_vec,
-        host_kind,
-        host_session_id: req.host_session_id.clone(),
-        host_turn_index: req.host_turn_index,
-        recovered_at_ms: chrono::Utc::now().timestamp_millis(),
-        signed_event,
-    })
+    Ok((
+        crate::models::CaptureTurnWrite {
+            memory: mem,
+            sha256: sha_vec,
+            host_kind,
+            host_session_id: req.host_session_id.clone(),
+            host_turn_index: req.host_turn_index,
+            recovered_at_ms: chrono::Utc::now().timestamp_millis(),
+            signed_event,
+        },
+        attest_level,
+    ))
 }
 
 /// v0.7.0 #1414 — parse + verify the host signature pair, returning

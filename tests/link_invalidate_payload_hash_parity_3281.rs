@@ -296,22 +296,35 @@ mod pg {
         .expect("read original signature");
         let orig_sig = orig_sig_opt.expect("signature present");
 
+        // #10108 (D2): the invalidated leaf no longer carries the prior link
+        // signature (it is `unsigned` with a NULL signature), so it is found
+        // as the one `ACTOR` invalidation appended after this watermark.
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0)::BIGINT FROM signed_events")
+                .fetch_one(&pool)
+                .await
+                .expect("read signed_events watermark");
+
         store
             .invalidate_link(src, dst, REL_STR, Some(VALID_UNTIL_WIRE), Some(ACTOR))
             .await
             .expect("pg invalidate_link Ok");
 
-        // The audit leaf carries the PRIOR (original) signature verbatim; it is
-        // deterministic and unique to this run's (src,dst), so it selects
-        // exactly this invalidation's leaf out of the shared table.
-        let leaf: Vec<u8> = sqlx::query_scalar(
-            "SELECT payload_hash FROM signed_events \
-             WHERE event_type = 'memory_link.invalidated' AND signature = $1",
+        let (leaf_id, leaf): (String, Vec<u8>) = sqlx::query_as(
+            "SELECT id, payload_hash FROM signed_events \
+             WHERE event_type = 'memory_link.invalidated' AND agent_id = $1 \
+             AND sequence > $2",
         )
-        .bind(&orig_sig)
+        .bind(ACTOR)
+        .bind(watermark)
         .fetch_one(&pool)
         .await
         .expect("read pg invalidated leaf payload_hash");
+        let _ = sqlx::query("DELETE FROM signed_events WHERE id = $1")
+            .bind(&leaf_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup invalidated leaf");
 
         // The CI `sal-postgres` suite shares ONE `ai_memory_test` DB with NO
         // per-test isolation (coverage.yml), and `sal_parity_link_window_3178`

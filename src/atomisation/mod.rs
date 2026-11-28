@@ -47,9 +47,15 @@ use std::sync::Arc;
 use chrono::Utc;
 use rusqlite::{Connection, params};
 
+use crate::governance::daemon_signer::{self, DaemonDomain};
 use crate::identity::keypair::AgentKeypair;
+use crate::identity::sentinels::DAEMON_PRINCIPAL;
 use crate::models::{Memory, MemoryKind, MemoryLinkRelation, SourceSpan};
-use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
+use crate::signed_events::agent_era::SourceBinding;
+use crate::signed_events::agent_payload::{
+    AgentEventKind, AgentPayloadHash, AgentSignedPayload, AtomisationReceipt,
+};
+use crate::signed_events::{SignedEvent, append_signed_event_no_tx, payload_hash};
 use crate::storage as db;
 use curator::Curator;
 
@@ -635,31 +641,25 @@ impl Atomiser {
             atom_ids.push(atom_id);
         }
 
-        // Step 9 — archive the source in a SEPARATE transaction. The
-        // per-atom hooks have already fired by this point, so the
-        // source is still live during those hook callbacks (the WT-1-C
-        // resolver can switch over only after this commit lands).
+        // Step 9 — #10108 (S-6): the dedup column, the daemon-signed receipt
+        // and its chain row land in ONE transaction. The per-atom hooks have
+        // already fired by this point, so the source is still live during
+        // those hook callbacks (the WT-1-C resolver switches over only after
+        // this commit lands).
         let archived_at = Utc::now().to_rfc3339();
-        let atom_count_i64 = i64::try_from(atom_count).unwrap_or(i64::MAX);
-        archive_source(conn, source_id, atom_count_i64, &archived_at)
-            .map_err(|e| AtomiseError::DbError(e.to_string()))?;
-
-        // Step 10 — emit the atomisation_complete signed_event.
-        emit_atomisation_complete_event(
-            conn,
-            source_id,
-            &atom_ids,
-            atom_count,
-            calling_agent_id,
-            &archived_at,
-            self.keypair.as_deref(),
-            &self.curator_model,
-        )
-        .map_err(|e| AtomiseError::DbError(e.to_string()))?;
+        let receipt = AtomisationReceipt {
+            source_id: source_id.to_string(),
+            atomised_at: archived_at.clone(),
+            atom_ids,
+            atom_count: u64::try_from(atom_count).unwrap_or(u64::MAX),
+            calling_agent_id: calling_agent_id.to_string(),
+            curator_model: Some(self.curator_model.clone()),
+        };
+        commit_atomisation(conn, &receipt).map_err(|e| AtomiseError::DbError(format!("{e:#}")))?;
 
         Ok(AtomiseResult {
             source_id: source_id.to_string(),
-            atom_ids,
+            atom_ids: receipt.atom_ids,
             atom_count,
             archived_at,
         })
@@ -874,57 +874,34 @@ fn write_atom(
     Ok(actual_id)
 }
 
-/// Archive the source memory.
+/// #10108 (S-4, S-6, W-13) — commit one atomisation: the dedup column
+/// write on the source, the receipt row and its chain row, in ONE
+/// transaction (any failing step rolls all three back).
 ///
-/// Sets `atomised_into = N` (the substrate-visible signal that the row
-/// has been atomised) and writes an `atomisation_archived_at` RFC3339
-/// stamp into `metadata` (logical "this row is read-only because its
-/// atoms are now the canonical surface"). We do NOT call
-/// `db::archive_memory` here — that physically moves the row to
-/// `archived_memories`, which would invalidate every atom's `atom_of`
-/// FK pointing at it. The atom-of relationship survives as long as
-/// the parent row remains in `memories`; flipping `atomised_into`
-/// from NULL to N is the downstream signal WT-1-C consumes.
+/// * The source keeps its row in `memories` (`atomised_into = N` plus an
+///   `atomisation_archived_at` stamp merged into `metadata`); we do NOT call
+///   `db::archive_memory`, which would break every atom's `atom_of` edge.
+/// * The receipt is a plain INSERT: a key collision on
+///   `(source_id, atomised_at)` is an error, never a replace or an ignore.
+///   It is signed by the daemon under [`DaemonDomain::AtomisationReceipt`]
+///   over [`AtomisationReceipt::canonical_bytes`] (the one encoding the
+///   verifier rebuilds); without a daemon key both signer and signature are
+///   NULL, which the walk never verifies above the marker.
+/// * The chain row is a daemon row whose `payload_hash` covers the stored
+///   signature, the daemon key and the canonical receipt bytes, and whose
+///   `cause_hash` is the signed [`SourceBinding`] of the source.
 ///
-/// Runs in its own transaction so the per-atom hooks (step 8) have
-/// already fired before the source flips into the "atomised" state.
-fn archive_source(
+/// # Errors
+///
+/// Any failing write; the transaction is rolled back and nothing is kept.
+pub(crate) fn commit_atomisation(
     conn: &Connection,
-    source_id: &str,
-    atom_count: i64,
-    archived_at: &str,
+    receipt: &AtomisationReceipt,
 ) -> anyhow::Result<()> {
     let write_txn = crate::storage::connection::WriteTxn::begin(conn)?;
-    let result = (|| -> anyhow::Result<()> {
-        // Merge the existing metadata with the new
-        // `atomisation_archived_at` key — never clobber other keys.
-        let existing_metadata_str: String = conn
-            .query_row(
-                "SELECT metadata FROM memories WHERE id = ?1",
-                params![source_id],
-                |r| {
-                    r.get::<_, Option<String>>(0)
-                        .map(|o| o.unwrap_or_else(|| "{}".to_string()))
-                },
-            )
-            .unwrap_or_else(|_| "{}".to_string());
-        let mut meta: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&existing_metadata_str).unwrap_or_default();
-        meta.insert(
-            crate::models::field_names::ATOMISATION_ARCHIVED_AT.to_string(),
-            serde_json::Value::String(archived_at.to_string()),
-        );
-        let merged = serde_json::Value::Object(meta).to_string();
-        conn.execute(
-            "UPDATE memories SET atomised_into = ?1, metadata = ?2, updated_at = ?3 \
-             WHERE id = ?4",
-            params![atom_count, merged, archived_at, source_id],
-        )?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => {
-            write_txn.commit()?;
+    match write_atomisation(conn, receipt) {
+        Ok(anchor) => {
+            write_txn.commit_and_emit(anchor)?;
             Ok(())
         }
         Err(e) => {
@@ -934,56 +911,96 @@ fn archive_source(
     }
 }
 
-/// Append the final `atomisation_complete` event to `signed_events`.
-/// The payload binds the source id, the atom-id list, and the curator
-/// model id so a downstream auditor can reproduce the decomposition.
-///
-/// v0.7.0 (issue #1244) — `curator_model` is threaded in from the
-/// caller's resolved LLM model name (via [`Atomiser::with_curator_model`])
-/// rather than hardcoded to `"gemma4"`. Default fallback is `"unknown"`.
-fn emit_atomisation_complete_event(
+/// The daemon's receipt signature and verifying key, or `None` keyless.
+type ReceiptSigner = Option<([u8; 64], [u8; 32])>;
+
+/// Sign `bytes` under the receipt domain (per ERRORS-02 a malformed
+/// signature or a key with no verifying half is an error, never unsigned).
+fn sign_receipt(bytes: &[u8]) -> anyhow::Result<ReceiptSigner> {
+    let Some((sig, _)) = daemon_signer::sign(DaemonDomain::AtomisationReceipt, bytes) else {
+        return Ok(None);
+    };
+    let sig = <[u8; 64]>::try_from(sig.as_slice())
+        .map_err(|_| anyhow::anyhow!("daemon receipt signature is not 64 bytes"))?;
+    let vk = daemon_signer::verifying_key()
+        .ok_or_else(|| anyhow::anyhow!("daemon key signed a receipt but has no verifying key"))?;
+    Ok(Some((sig, vk.to_bytes())))
+}
+
+/// The three writes of [`commit_atomisation`], inside its transaction.
+fn write_atomisation(
     conn: &Connection,
-    source_id: &str,
-    atom_ids: &[String],
-    atom_count: usize,
-    calling_agent_id: &str,
-    archived_at: &str,
-    keypair: Option<&AgentKeypair>,
-    curator_model: &str,
-) -> anyhow::Result<()> {
-    let payload = serde_json::json!({
-        "event_type": "atomisation_complete",
-        "source_id": source_id,
-        "atom_ids": atom_ids,
-        (crate::models::field_names::ATOM_COUNT): atom_count,
-        "calling_agent_id": calling_agent_id,
-        "atomisation_timestamp": archived_at,
-        "curator_model": curator_model,
-    });
-    let bytes = serde_json::to_vec(&payload)?;
-    let (signature, attest_level) = if let Some(kp) = keypair.filter(|k| k.can_sign()) {
-        let signing = kp.private.as_ref().expect("can_sign() checked");
-        use ed25519_dalek::Signer;
-        let sig = signing.sign(&bytes);
-        (
-            Some(sig.to_bytes().to_vec()),
-            crate::models::AttestLevel::SelfSigned.as_str(),
-        )
-    } else {
-        (None, crate::models::AttestLevel::Unsigned.as_str())
+    receipt: &AtomisationReceipt,
+) -> anyhow::Result<crate::governance::audit::PendingAuditAnchor> {
+    let source_id = receipt.source_id.as_str();
+    let atomised_at = receipt.atomised_at.as_str();
+    // Merge the existing metadata with the new `atomisation_archived_at`
+    // key — never clobber other keys. Per ERRORS-02 a failed read or a
+    // metadata value that is not a JSON object is an error (the transaction
+    // rolls back), never a silent reset to `{}` that would drop stored keys.
+    let existing_metadata_str: Option<String> = conn.query_row(
+        "SELECT metadata FROM memories WHERE id = ?1",
+        params![source_id],
+        |r| r.get::<_, Option<String>>(0),
+    )?;
+    let mut meta: serde_json::Map<String, serde_json::Value> = match existing_metadata_str {
+        Some(s) => serde_json::from_str(&s).map_err(|e| {
+            anyhow::anyhow!("source {source_id} metadata is not a JSON object: {e}")
+        })?,
+        None => serde_json::Map::new(),
     };
-    let event = SignedEvent {
-        id: uuid::Uuid::new_v4().to_string(),
-        agent_id: calling_agent_id.to_string(),
-        event_type: crate::signed_events::event_types::ATOMISATION_COMPLETE.to_string(),
-        payload_hash: payload_hash(&bytes),
-        signature,
-        attest_level: attest_level.to_string(),
-        timestamp: Utc::now().to_rfc3339(),
-        ..SignedEvent::default()
+    meta.insert(
+        crate::models::field_names::ATOMISATION_ARCHIVED_AT.to_string(),
+        serde_json::Value::String(atomised_at.to_string()),
+    );
+    let merged = serde_json::Value::Object(meta).to_string();
+    let atom_count = i64::try_from(receipt.atom_count)?;
+    conn.execute(
+        "UPDATE memories SET atomised_into = ?1, metadata = ?2, updated_at = ?3 \
+         WHERE id = ?4",
+        params![atom_count, merged, atomised_at, source_id],
+    )?;
+
+    let bytes = receipt.canonical_bytes();
+    let signed = sign_receipt(&bytes)?;
+    let atom_ids = serde_json::to_string(&receipt.atom_ids)?;
+    conn.execute(
+        "INSERT INTO atomisation_receipts \
+             (source_id, atomised_at, atom_ids, atom_count, calling_agent_id, curator_model, \
+              signer_agent_id, signature) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            source_id,
+            atomised_at,
+            atom_ids,
+            atom_count,
+            receipt.calling_agent_id,
+            receipt.curator_model,
+            signed.as_ref().map(|_| DAEMON_PRINCIPAL),
+            signed.as_ref().map(|(sig, _)| sig.to_vec()),
+        ],
+    )?;
+
+    let row_payload = match &signed {
+        Some((sig, pubkey)) => AgentPayloadHash::encode(&AgentSignedPayload {
+            kind: AgentEventKind::AtomisationComplete,
+            signed_bytes: &bytes,
+            signature: sig,
+            pubkey,
+        })
+        .to_vec(),
+        // Keyless: no signature to bind; the row is unsigned and the walk
+        // never verifies it above the marker.
+        None => payload_hash(&bytes),
     };
-    append_signed_event(conn, &event)?;
-    Ok(())
+    let event = SignedEvent::with_daemon_signature(
+        row_payload,
+        DAEMON_PRINCIPAL.to_string(),
+        crate::signed_events::event_types::ATOMISATION_COMPLETE.to_string(),
+        Utc::now().to_rfc3339(),
+        Some(SourceBinding::of_source(source_id).as_bytes()),
+    );
+    append_signed_event_no_tx(conn, &event)
 }
 
 /// v0.7.0 Form 4 (issue #757) — locate an atom's text inside its

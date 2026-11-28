@@ -65,7 +65,8 @@ fn v74_columns_and_version_both_backends() {
     // The v74 cid columns asserted below still exist; only the tip moved
     // (was v97 = #3464 append-only agent key ledger).
     // #8341: tip pin moved 101 -> 102 with the FTS projection guard.
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 102);
+    // #10108: 102 -> 103 with the agent signature places.
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 103);
     // The additive columns exist and are queryable.
     assert!(
         conn.prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")

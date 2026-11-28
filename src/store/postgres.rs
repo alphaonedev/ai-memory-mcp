@@ -82,6 +82,8 @@ mod pubkey_history;
 // arm. The two funnels answer different questions and stay separate.
 mod chain_append;
 mod legacy_cutoff_10074; // #10074 pg cutoff resolver + mint (qual_10 budget)
+// #10108 pg v103 arm + cutover resolver (qual_10 budget).
+mod agent_cutover_v103;
 // v1.0.0 #3520 — the shared bounded-retry funnel for a transaction PostgreSQL
 // aborted as a concurrency victim (40P01 / 40001). Own module for the same
 // qual_10 budget reason as `parity_3064` above.
@@ -132,7 +134,8 @@ mod lifecycle_tx_3152;
 // #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
 mod forensic_outage_4199;
 // v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
-mod lock_order_4209;
+mod link_created_10108;
+mod lock_order_4209; // #10108 D5 pg `memory_link.created` append (qual_10 budget)
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -829,6 +832,9 @@ const SQL_DELETE_DLQ_BY_MEMORY_IDS: &str =
 /// victim ids (slice-bound twin of [`SQL_DELETE_DLQ_BY_MEMORY_IDS`]).
 const SQL_DELETE_DEDUP_BY_MEMORY_IDS: &str =
     "DELETE FROM transcript_line_dedup WHERE memory_id = ANY($1)";
+/// #10108 (S-8) — purge the v103 atomisation receipts of the victim sources.
+const SQL_DELETE_RECEIPTS_BY_SOURCE_IDS: &str =
+    "DELETE FROM atomisation_receipts WHERE source_id = ANY($1)";
 /// #3272 C-2 — clear the FORGET tombstone for one id on an EXPLICIT
 /// operator/rollback RESTORE only (`restore_or_conflict` → the
 /// `RestoreSameId` CAS). Postgres twin of the sqlite
@@ -2151,7 +2157,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
 // v102: #8341 SQLite FTS projection guard; postgres version-stamp only
 //       (doc twin migrations/postgres/0059_v102_fts_projection_guard_noop.sql).
-const CURRENT_SCHEMA_VERSION: i32 = 102;
+const CURRENT_SCHEMA_VERSION: i32 = 103;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4048,6 +4054,12 @@ impl PostgresStore {
             return Ok(());
         }
 
+        // #10108 lane o (#10145 K-1 on postgres) — the daemon signer before any
+        // byte this ladder changes, so a missing key refuses with the database
+        // untouched (the sqlite `migrate` precedent).
+        let signer = crate::governance::daemon_signer::DaemonChainSigner::provision_default()
+            .map_err(|refusal| StoreError::Backend(super::BoxBackendError::with_source(refusal)))?;
+
         // Apply each migration step in its own transaction for idempotence.
         // Versions 15→28 are stamped in order; each migrate_vN function is
         // independently idempotent (column-existence checks + IF NOT EXISTS
@@ -4327,8 +4339,11 @@ impl PostgresStore {
         if current_version < 101 {
             self.migrate_v101().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 102 {
             self.migrate_v102().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v103(&signer, current_version).await?;
         }
 
         Ok(())
@@ -7530,6 +7545,16 @@ impl PostgresStore {
              for the Agent2Agent standard binding)"
         );
         Ok(())
+    }
+
+    /// v103 (#10108) - agent signature places and the cutover marker; the
+    /// body lives in `agent_cutover_v103::apply_v103` (qual_10 budget).
+    async fn migrate_v103(
+        &self,
+        signer: &crate::governance::daemon_signer::DaemonChainSigner,
+        from_version: i32,
+    ) -> StoreResult<()> {
+        agent_cutover_v103::apply_v103(self, signer, from_version).await
     }
 
     /// v102 (#8341) - SQLite-only FTS projection guard. The postgres v97
@@ -13801,14 +13826,37 @@ impl PostgresStore {
         .bind(created_at_dt)
         .bind(valid_from_dt)
         .bind(valid_until_dt)
-        .bind(signature)
+        .bind(signature.as_deref())
         .bind(attest_level)
-        .bind(observed_by_col)
+        .bind(observed_by_col.as_deref())
         .bind(source_cid)
         .bind(target_cid)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_link", e))?;
+        // #10108 (D5) — the `memory_link.created` row, in this transaction,
+        // only when the INSERT wrote a row (a replay appends nothing, as on
+        // sqlite). Same pre-image as the signer above.
+        let created_anchor = if insert_res.rows_affected() > 0 {
+            let signable = crate::identity::sign::SignableLink {
+                src_id: &link.source_id,
+                dst_id: &link.target_id,
+                relation: link.relation.as_str(),
+                observed_by: observed_by_col.as_deref(),
+                created_at: Some(created_at_str.as_str()),
+                valid_from: Some(valid_from_str.as_str()),
+                valid_until: valid_until_str.as_deref(),
+            };
+            link_created_10108::append_link_created_in_tx(
+                &mut tx,
+                &signable,
+                attest_level,
+                signature.as_deref(),
+            )
+            .await?
+        } else {
+            crate::governance::audit::PendingAuditAnchor::none()
+        };
         // #3051 / Fable #3237 item 2 — ON CONFLICT DO NOTHING preserves the
         // existing row. Returning the freshly COMPUTED `attest_level` on
         // that path would report `unsigned` for a replay of an unsigned
@@ -13968,7 +14016,7 @@ impl PostgresStore {
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, created_anchor)
             .await
             .map_err(|e| to_store_err("commit link tx", e))?;
 
@@ -15313,6 +15361,8 @@ impl PostgresStore {
         let edge_created_at_dt = truncate_to_microseconds(created_at_dt);
         let edge_created_at_str =
             crate::identity::attest::canonical_created_at_stamp(edge_created_at_dt);
+        // #10108 (D5) — one `memory_link.created` row per edge this tx wrote.
+        let mut created_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for src_id in &input.source_ids {
             validate::validate_link(
                 &actual_id,
@@ -15354,7 +15404,7 @@ impl PostgresStore {
             // `db::create_link` which uses the same connection; we
             // mirror that here with a `&mut tx` binding so a link
             // failure rolls back the memory insert.
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO memory_links \
                     (source_id, target_id, relation, created_at, valid_from, signature, \
                      attest_level, observed_by) \
@@ -15365,15 +15415,35 @@ impl PostgresStore {
             .bind(src_id)
             .bind(crate::models::MemoryLinkRelation::ReflectsOn.as_str())
             .bind(edge_created_at_dt)
-            .bind(signature)
+            .bind(signature.as_deref())
             .bind(attest_level)
-            .bind(observed_by_col)
+            .bind(observed_by_col.as_deref())
             .execute(&mut *tx)
             .await
             .map_err(|e| ReflectError::Database(format!("insert reflects_on link: {e}")))?;
+            if inserted.rows_affected() > 0 {
+                let signable = crate::identity::sign::SignableLink {
+                    src_id: &actual_id,
+                    dst_id: src_id,
+                    relation: crate::models::MemoryLinkRelation::ReflectsOn.as_str(),
+                    observed_by: observed_by_col.as_deref(),
+                    created_at: Some(edge_created_at_str.as_str()),
+                    valid_from: Some(edge_created_at_str.as_str()),
+                    valid_until: None,
+                };
+                let anchor = link_created_10108::append_link_created_in_tx(
+                    &mut tx,
+                    &signable,
+                    attest_level,
+                    signature.as_deref(),
+                )
+                .await
+                .map_err(|e| ReflectError::Database(e.to_string()))?;
+                created_anchor = created_anchor.merge(anchor);
+            }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, created_anchor)
             .await
             .map_err(|e| ReflectError::Database(format!("commit reflect tx: {e}")))?;
 
@@ -15942,13 +16012,16 @@ async fn pg_invalidate_link_relational_in_tx(
         // NEVER the original attester (`observed_by`): that would name the
         // peer which signed the edge as the actor of an invalidation it never
         // performed. `observed_by`'s identity instead travels inside the CBOR
-        // that `payload_hash` commits to, and its Ed25519 proof stays in the
-        // `signature` column below. `None` records the `system` sentinel — an
+        // that `payload_hash` commits to; its Ed25519 proof stays on the
+        // `memory_link.created` row. `None` records the `system` sentinel — an
         // honest "unattributed substrate path", never a borrowed identity.
         let event_agent = actor
             .unwrap_or(crate::identity::sentinels::SYSTEM_PRINCIPAL)
             .to_string();
         let event_id = uuid::Uuid::new_v4().to_string();
+        // #10108 (D2): `unsigned` with a NULL signature. The prior link
+        // signature signs the creation pre-image, not this row's payload.
+        let row_sig = crate::signed_events::AgentRowSignature::Unsigned;
         pg_append_signed_event_with_chain_in_tx(
             tx,
             PgSignedEventInsert {
@@ -15956,8 +16029,8 @@ async fn pg_invalidate_link_relational_in_tx(
                 agent_id: &event_agent,
                 event_type: crate::signed_events::event_types::MEMORY_LINK_INVALIDATED,
                 payload_hash: &payload_hash,
-                signature: prior_signature.as_deref(),
-                attest_level: crate::models::AttestLevel::Unsigned.as_str(),
+                signature: row_sig.signature_bytes(),
+                attest_level: row_sig.attest_level().as_str(),
                 timestamp: Utc::now(),
                 // Parity with the sqlite twin: no triggering cause is bound on
                 // the supersession path on either backend.
@@ -16524,9 +16597,24 @@ impl PostgresStore {
             watermark_db_id.as_deref(),
         )
         .await?;
+        // #10108 lane o - judged under the same verifier as the rows (K3).
+        let agent_cutover =
+            agent_cutover_v103::resolve_pg_agent_cutover(&self.pool, daemon_verifier).await?;
         let recorder_verifier = crate::governance::audit::load_enrolled_recorder_pubkey()
             .ok()
             .flatten();
+        // #10108 (B-4) — K3 twin of the sqlite walk's domain evidence.
+        let agent_evidence =
+            agent_cutover_v103::load_pg_agent_evidence(&self.pool, daemon_verifier).await?;
+        let agent_walk = crate::signed_events::agent_era::AgentEraWalk {
+            cutover: agent_cutover,
+            evidence: &agent_evidence,
+            daemon_verifier,
+            recorder_verifier: recorder_verifier.as_ref(),
+            cutoff: &cutoff,
+        };
+        let mut agent_receipts_erased: u64 = 0;
+        let mut agent_receipts_legacy: u64 = 0;
         let mut signature_failures: Vec<i64> = Vec::new();
         let mut role_separation_failures: Vec<i64> = Vec::new();
         let mut rows_positively_verified: u64 = 0;
@@ -16557,12 +16645,14 @@ impl PostgresStore {
                 sequence: seq,
                 cause_hash: cause,
             };
-            let rv = crate::signed_events::classify_row_signature(
-                &ev,
-                daemon_verifier,
-                recorder_verifier.as_ref(),
-                &cutoff,
-            );
+            let rv = crate::signed_events::agent_era::classify_agent_era_row(&ev, &agent_walk);
+            if rv.is_receipt_erased() {
+                agent_receipts_erased += 1;
+            }
+            match crate::signed_events::agent_era::receipt_era(&ev, &agent_walk) {
+                crate::signed_events::agent_era::ReceiptEra::Legacy => agent_receipts_legacy += 1,
+                crate::signed_events::agent_era::ReceiptEra::NotLegacyReceipt => {}
+            }
             if rv.is_verified() {
                 rows_positively_verified += 1;
             }
@@ -16580,6 +16670,19 @@ impl PostgresStore {
             h.update(canonical_chain_bytes(&ev));
             expected_prev = h.finalize().to_vec();
             expected_seq = seq + 1;
+        }
+        // #10145 (W-10, W-11) on postgres - a v103 database without its marker
+        // fails every walk, whatever window it covers; no row carries the
+        // failure (the sqlite `verify_chain` twin).
+        if agent_cutover.chain_failure().is_some() {
+            signature_failures.push(crate::signed_events::CHAIN_LEVEL_FAILURE_SEQUENCE);
+        }
+        // #10108 (W-14, S-4) - a stored receipt no chain row anchors fails
+        // every walk (the sqlite `verify_chain` twin).
+        if agent_evidence.chain_failure().is_some()
+            && !signature_failures.contains(&crate::signed_events::CHAIN_LEVEL_FAILURE_SEQUENCE)
+        {
+            signature_failures.push(crate::signed_events::CHAIN_LEVEL_FAILURE_SEQUENCE);
         }
 
         // Surviving memory_revisions head (the second witnessed chain).
@@ -16819,6 +16922,8 @@ impl PostgresStore {
             cause_binding,
             signature_failures,
             agent_signed_rows_not_verified,
+            agent_receipts_erased,
+            agent_receipts_legacy,
             role_separation,
             lineage,
             rollback,
@@ -17203,6 +17308,10 @@ pub(crate) async fn pg_purge_dlq_dedup_in_tx(
         .execute(&mut **tx)
         .await?;
     sqlx::query(SQL_DELETE_DEDUP_BY_MEMORY_IDS)
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(SQL_DELETE_RECEIPTS_BY_SOURCE_IDS)
         .bind(ids)
         .execute(&mut **tx)
         .await?;
@@ -28714,6 +28823,7 @@ impl MemoryStore for PostgresStore {
         } else {
             None
         };
+        let mut created_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for (id, source_cid) in ids.iter().zip(source_cids.iter()) {
             if id == &new_id {
                 continue;
@@ -28753,7 +28863,7 @@ impl MemoryStore for PostgresStore {
                 // cid mirror, and flip `lifecycle_state` to `tombstoned`.
                 // The source's own inbound provenance edges survive (no
                 // delete, no CASCADE), so multi-hop lineage stays walkable.
-                sqlx::query(
+                let edge = sqlx::query(
                     "INSERT INTO memory_links
                          (source_id, target_id, relation, created_at, valid_from,
                           attest_level, source_cid, target_cid)
@@ -28770,6 +28880,19 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?;
+                // #10108 (D5) — sqlite `create_link` appends this row too.
+                if edge.rows_affected() > 0 {
+                    created_anchor = created_anchor.merge(
+                        link_created_10108::append_unsigned_edge_created_in_tx(
+                            &mut tx,
+                            &new_id,
+                            id,
+                            crate::models::MemoryLinkRelation::DerivedFrom,
+                            now,
+                        )
+                        .await?,
+                    );
+                }
                 // #3691 — GUARDED tombstone (sqlite twin in `storage::consolidate`):
                 // a source quarantined / contaminated since the snapshot read keeps
                 // its security state; zero rows affected aborts the whole cluster
@@ -28894,7 +29017,7 @@ impl MemoryStore for PostgresStore {
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, created_anchor)
             .await
             .map_err(|e| to_store_err("consolidate commit", e))?;
         Ok(new_id)

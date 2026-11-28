@@ -366,6 +366,13 @@ pub(super) async fn append_signed_event_row(
             crate::signed_events::LEGACY_CUTOFF_EVENT_TYPE
         )));
     }
+    // #10108 (S-3) — the cutover marker is written only by schema step v103.
+    if event_type == crate::signed_events::AGENT_CUTOVER_EVENT_TYPE {
+        return Err(sqlx::Error::Protocol(format!(
+            "append signed_event: event_type {} is reserved for schema step v103",
+            crate::signed_events::AGENT_CUTOVER_EVENT_TYPE
+        )));
+    }
 
     let mut retry = SequenceRetry::new(SequenceChain::SignedEvents);
     loop {

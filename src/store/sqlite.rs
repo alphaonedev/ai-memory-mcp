@@ -75,11 +75,32 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// [`Self::open`] for an `anyhow` caller (the serve boot, `migrate`):
+    /// the typed [`crate::store::StoreError`] stays the downcastable root
+    /// cause (#10108 K-7) under one shared context line.
+    ///
+    /// # Errors
+    /// Whatever [`Self::open`] returns, with that context attached.
+    pub fn open_adapter(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        Self::open(path).map_err(|e| anyhow::Error::new(e).context("open sqlite adapter"))
+    }
+
     /// Open (or create) a `SqliteStore` at the given path. Delegates
     /// schema init + migration to `crate::db::open`.
     pub fn open(path: impl Into<PathBuf>) -> StoreResult<Self> {
         let path = path.into();
-        let conn = db::open(&path).map_err(box_err)?;
+        // #10108 K-7 — keep the open's cause chain (a typed DaemonKeyMissing
+        // refusal stays downcastable), never only its text.
+        // anyhow's boxed form hides the root type from `downcast_ref`, so the
+        // typed refusal is taken out of the chain first and boxed as itself.
+        let conn = db::open(&path).map_err(|e| {
+            StoreError::Backend(
+                match e.downcast::<crate::governance::daemon_signer::DaemonKeyMissing>() {
+                    Ok(refusal) => BoxBackendError::with_source(refusal),
+                    Err(other) => BoxBackendError::with_source(other),
+                },
+            )
+        })?;
         // #1955 R45 — seed the per-DB record-stop flag from the audit
         // chain so a stop persisted before this open survives a restart.
         // A read hiccup is non-fatal (leaves the plane RUNNING).
