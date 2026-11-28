@@ -2816,7 +2816,8 @@ struct Node {
     /// Whether some definition is a struct, enum or union, so a cycle
     /// through it is recursion, not an alias loop.
     adt: bool,
-    /// #10295: FNV-1a of the tokens of every definition, in walk order.
+    /// #10295: FNV-1a of the tokens of every definition, in file path order
+    /// (#10323: the graph is built over the files sorted by path).
     hash: u64,
 }
 
