@@ -52,10 +52,20 @@
 //!    count is pinned to `STATICS_TABLE_ROWS` (627) and the `lock` keys to
 //!    the hand-written `LOCK_ROWS` (307), both exact: a change that adds or
 //!    removes a row moves the pin under a `Count-Declared` trailer, and a
-//!    new static needs a new row with its reason. #10275, #10283: the type of every static is
-//!    resolved over the whole tree (every walked file's `type`, `struct`,
-//!    `enum`, `union` and `use`, generic defaults included, by one linear
-//!    strongly-connected-component walk). A type is one of three values:
+//!    new static needs a new row with its reason. #10275, #10283, #10293:
+//!    every name in the type of a static resolves through its own scope
+//!    only: a definition in the same module (a fn body also sees its
+//!    enclosing scope), an explicit `use` (renames and chains followed), a
+//!    full `crate::`/`self::`/`super::`/crate-name path to one walked
+//!    definition, or a std/core/alloc path; never a same-named type
+//!    elsewhere in the tree. A name a glob supplies (`Glob`), bound twice
+//!    (`Ambiguous`), a prelude name shadowed by a generic or a definition
+//!    (`Shadowed`), a path into another crate (`Foreign`), a path that
+//!    lands on no walked item (`PathNotLanded`), a type made by a macro
+//!    and an import cycle are each unresolvable with that reason; a
+//!    prelude name is clean only when nothing in scope shadows it. The
+//!    definitions are judged by one linear strongly-connected-component
+//!    walk, generic defaults included. A type is one of three values:
 //!    a lock (it is or holds one of `LOCK_TYPES`: std, tokio and
 //!    `parking_lot`, fair and raw locks and their guards included), proven
 //!    clean (every leaf is a std type of `LEAF_TYPES` or a crate type
@@ -65,9 +75,17 @@
 //!    alias cycle). Where definitions disagree, lock wins. A lock static
 //!    whose row is not `lock` is `LockNotLabelled`; an unresolvable static
 //!    whose row is not `lock` is `Unresolvable` with the reason, unless
-//!    `EXCEPTIONS` names it with a reason. An exception that matches
-//!    nothing (`ExceptionStale`), a second one (`ExceptionDuplicate`) or
-//!    one with a short reason (`ExceptionReasonless`) is red;
+//!    `EXCEPTIONS` names it with a reason and a pinned digest. An exception
+//!    that matches nothing (`ExceptionStale`), a second one
+//!    (`ExceptionDuplicate`), one with a short reason (`ExceptionReasonless`)
+//!    or one whose pinned digest is not the live one (`ExceptionDigest`,
+//!    naming the first changed entry: `type` or a definition path) is red.
+//!    #10295: the digest is a 32-bit FNV-1a hash of the static's written
+//!    type tokens plus one hash of the tokens of each walked definition the
+//!    type reaches. It proves that the text judged by hand has not changed
+//!    since the pin; it is not a cryptographic commitment (a deliberate
+//!    collision is possible) and it does not cover a foreign or std type's
+//!    own source or a macro's expansion;
 //! 5. the inclusion census (#10204): the guard file may be compiled once.
 //!    `#[path = …]` (in `cfg_attr` too) and `include!`, `include_str!` or
 //!    `include_bytes!` naming `env_guard.rs` or its parent `store_url.rs`
@@ -2331,9 +2349,6 @@ const NEUTRAL_WORDS: [&str; 15] = [
     "where", "in", "as", "ref",
 ];
 
-/// The path roots that name this crate.
-const LOCAL_ROOTS: [&str; 4] = ["crate", "self", "super", CRATE_NAME];
-
 /// The path roots of the standard library.
 const STD_ROOTS: [&str; 3] = ["std", "core", "alloc"];
 
@@ -2344,13 +2359,11 @@ enum Atom {
     Lock,
     /// A form that names no knowable type.
     Unres(Why),
-    /// A path: its root segment (`None` for a single segment), its last,
-    /// and the crate scope of the file that wrote it (see [`scope_of`]).
-    Ref {
-        name: String,
-        root: Option<String>,
-        scope: String,
-    },
+    /// #10293: a path as written, resolved later through the scope that
+    /// wrote it; `global` when it starts with a leading `::`.
+    Path { segs: Vec<String>, global: bool },
+    /// #10293: a single-segment name of a generic parameter in scope.
+    Param(String),
 }
 
 /// What a type holds, ordered: a lock wins, then an unresolvable reason.
@@ -2447,13 +2460,19 @@ fn type_atoms(
                     if j > i && (word == "Self" || params.contains(word)) {
                         out.push(Atom::Unres(Why::Projection));
                     } else if j == i && params.contains(word) {
+                        out.push(Atom::Param(word.to_string()));
                     } else if LOCK_TYPES.contains(&last) {
                         out.push(Atom::Lock);
                     } else {
-                        out.push(Atom::Ref {
-                            name: last.to_string(),
-                            root: (j > i).then(|| word.to_string()),
-                            scope: String::new(),
+                        // A leading `::` (not one that follows a path or a
+                        // closing `>`) roots the path at the extern prelude.
+                        let global = i >= 2
+                            && colon2(i - 2)
+                            && (i < 3 || !matches!(t[i - 3].kind, TokKind::Ident))
+                            && (i < 3 || !is_p(t, i - 3, ">"));
+                        out.push(Atom::Path {
+                            segs: (i..=j).step_by(3).map(|x| t[x].text.clone()).collect(),
+                            global,
                         });
                     }
                     i = j + 1;
@@ -2582,232 +2601,509 @@ fn adt_body(t: &[Tok], close: &[Option<usize>], mut j: usize) -> Option<(usize, 
     None
 }
 
-/// The imports of one file: local name to `(root, source name)`.
-type FileImports = BTreeMap<String, (String, String)>;
-
-/// The crate scope of a walked file: every file under `src/` is the
-/// package's own crate, and every other file is a crate (or a module
-/// shared by several) of its own.
-fn scope_of(path: &str) -> String {
-    if path.starts_with("src/") {
-        LIB_SCOPE.to_string()
-    } else {
-        path.to_string()
-    }
-}
-
-/// The scope of the files under `src/`, which [`CRATE_NAME`] names.
+/// The scope of the files under `src/` outside `src/bin/`, which
+/// [`CRATE_NAME`] names.
 const LIB_SCOPE: &str = "src";
 
-/// The node key of a name defined in a scope.
-fn scoped(scope: &str, name: &str) -> String {
-    format!("{scope}\u{0}{name}")
+/// #10293: the types a bare name means when nothing in scope binds it.
+const PRELUDE_TYPES: [&str; 5] = ["Box", "Option", "Result", "String", "Vec"];
+
+/// #10293: the primitive type names.
+const PRIMITIVES: [&str; 17] = [
+    "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+    "i128", "isize", "f32", "f64",
+];
+
+/// Whether a bare name means a std type when nothing in scope binds it.
+fn is_prelude(name: &str) -> bool {
+    PRELUDE_TYPES.contains(&name) || PRIMITIVES.contains(&name)
 }
 
-/// The node key that joins every definition of a name in any scope: what a
-/// name not defined in its own scope reads.
-fn any_scope(name: &str) -> String {
-    scoped("*", name)
-}
+/// The FNV-1a 64-bit offset basis and prime (#10295 digests).
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
-/// Reads the bare names and path roots of `atoms` through the file's own
-/// imports: an imported lock name is a lock, an imported name is the path
-/// it was imported from, and an imported module root is that module's root.
-/// Every name keeps the file's scope.
-fn localise(atoms: &mut [Atom], own: &FileImports, file_scope: &str) {
-    for a in atoms {
-        let Atom::Ref { name, root, scope } = a else {
-            continue;
-        };
-        file_scope.clone_into(scope);
-        match root {
-            None => {
-                if let Some((r, src)) = own.get(name.as_str()) {
-                    if LOCK_TYPES.contains(&src.as_str()) {
-                        *a = Atom::Lock;
-                    } else {
-                        *a = Atom::Ref {
-                            name: src.clone(),
-                            root: Some(r.clone()),
-                            scope: file_scope.to_string(),
-                        };
-                    }
-                }
-            }
-            Some(m) => {
-                if let Some((r, _)) = own.get(m.as_str()) {
-                    *m = r.clone();
-                }
-            }
-        }
+/// FNV-1a over `bytes`, continuing from `h`. Modular by design (per
+/// PERF-04): a digest, not a count.
+fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
     }
+    h
 }
 
-/// One named type of the walked tree: every definition of the name, merged.
+/// The digest of the token texts `t[from..to]`, each followed by a 0 byte
+/// so that token boundaries count.
+fn token_hash(t: &[Tok], (from, to): (usize, usize)) -> u64 {
+    t.get(from..to.min(t.len()))
+        .unwrap_or_default()
+        .iter()
+        .fold(FNV_OFFSET, |h, k| fnv(fnv(h, k.text.as_bytes()), &[0]))
+}
+
+/// The root key and module path of a walked file: every file under `src/`
+/// (outside `src/bin/` and the binary root `src/main.rs`) is a module of
+/// the one crate [`LIB_SCOPE`]; a file in a subdirectory of another top
+/// directory (`tests/common/mod.rs`) is a module of that directory; every
+/// other file is a crate root of its own.
+fn module_of(path: &str) -> (String, Vec<String>) {
+    let file = path.strip_suffix(".rs").unwrap_or(path);
+    let parts: Vec<&str> = file.split('/').collect();
+    let cut = match parts.as_slice() {
+        // #10293: the binary's root is a crate of its own; its imports
+        // (`use ai_memory::config`) never bind in the library's root.
+        ["src", "main"] => return (path.to_string(), Vec::new()),
+        ["src", "bin", _, ..] => 3,
+        ["src", ..] => 1,
+        [_, _, _, ..] => 2,
+        _ => parts.len(),
+    };
+    let root = if cut == parts.len() && !matches!(parts.as_slice(), ["src", ..]) {
+        path.to_string()
+    } else if cut == 1 {
+        LIB_SCOPE.to_string()
+    } else {
+        parts[..cut].join("/")
+    };
+    let mut segs: Vec<String> = parts[cut..].iter().map(|s| (*s).to_string()).collect();
+    if matches!(
+        segs.last().map(String::as_str),
+        Some("mod" | "lib" | "main")
+    ) {
+        segs.pop();
+    }
+    (root, segs)
+}
+
+/// #10293: the bindings of one name kept in a scope: one resolves, a second
+/// makes the name `Ambiguous`, and a third changes nothing.
+const MAX_BINDINGS: usize = 2;
+
+/// #10293: how a `use` leaf names what it imports.
+enum Rename {
+    /// No `as`: the leaf's own last segment.
+    Keep,
+    /// `as name`.
+    As(String),
+    /// `as` followed by no name: binds nothing.
+    Unnamed,
+}
+
+/// #10293: one binding of a name in a scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bind {
+    /// A module: a walked file, an inline `mod`, or a `mod` declaration.
+    Module(usize),
+    /// A type definition: its node.
+    Def(usize),
+    /// An explicit import: its leaf in [`TypeGraph::uses`].
+    Use(usize),
+}
+
+/// #10293: a module or a function body of the walked tree.
 #[derive(Debug, Default)]
+struct Scope {
+    /// For a function body, the scope a name it does not bind is looked up
+    /// in; `None` for a module, which sees no name of an outer module.
+    outer: Option<usize>,
+    /// For a module, its parent (`super`); `None` for a crate root.
+    parent: Option<usize>,
+    /// The display path: the root key, then `::` and each module name.
+    path: String,
+    /// Every binding of each name written here.
+    items: BTreeMap<String, Vec<Bind>>,
+    /// #10294: every glob import (`use x::*`) written here: the last
+    /// segment of its prefix (`None`: no prefix) and whether it starts
+    /// with `::`.
+    globs: Vec<(Option<usize>, bool)>,
+    /// The module each glob of [`Scope::globs`] reads, once settled;
+    /// `None` for std, another crate or a prefix that lands nowhere, whose
+    /// names are not known.
+    glob_to: Vec<Option<usize>>,
+}
+
+/// #10293: one leaf of a `use` tree.
+#[derive(Debug)]
+struct UseLeaf {
+    /// The scope the `use` is written in, where its path is resolved.
+    scope: usize,
+    /// The last segment of its path in [`TypeGraph::segs`].
+    tail: usize,
+    /// Whether the path starts with `::`.
+    global: bool,
+    /// The name it binds.
+    alias: String,
+}
+
+/// One named type of the walked tree: every definition of the name in one
+/// scope, merged (a `cfg` split defines one name twice).
+#[derive(Debug)]
 struct Node {
+    scope: usize,
+    name: String,
     atoms: Vec<Atom>,
     /// Whether some definition is a struct, enum or union, so a cycle
     /// through it is recursion, not an alias loop.
     adt: bool,
+    /// #10295: FNV-1a of the tokens of every definition, in walk order.
+    hash: u64,
 }
 
-/// #10275: the type definitions, modules and imports of the whole tree.
+/// #10293: where a path lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    Scope(usize),
+    Node(usize),
+    /// A std, core or alloc path, by its last segment.
+    Std(String),
+    Foreign {
+        root: String,
+        name: String,
+    },
+    /// A value known without a definition.
+    Done(Res),
+}
+
+/// The value of an unresolvable reason as a target.
+fn unres(why: Why) -> Target {
+    Target::Done(Res::Unres(why))
+}
+
+/// One step of a path walk.
+enum Hop {
+    To(Target),
+    /// An import whose target is needed first.
+    Use(usize),
+}
+
+/// What a name looks up to in a scope.
+enum Look {
+    Bound(Bind),
+    Many,
+    Glob,
+    Empty,
+}
+
+/// A path walk in progress: `segs[pos..]` are left, from `at` (`None`: the
+/// first segment is looked up in `scope`).
+struct Walk {
+    scope: usize,
+    segs: Vec<String>,
+    global: bool,
+    pos: usize,
+    at: Option<Target>,
+    /// The import this walk resolves, if any.
+    leaf: Option<usize>,
+}
+
+/// #10293: the scopes, imports and type definitions of the whole tree.
+/// Every type name is resolved through the scope that wrote it; no name is
+/// looked up across the tree.
 #[derive(Debug, Default)]
 struct TypeGraph {
-    nodes: BTreeMap<String, Node>,
-    mods: BTreeSet<String>,
-    /// `(root, source name, local name)` of each `use` leaf.
-    imports: Vec<(String, String, String)>,
-    local_roots: BTreeSet<String>,
-    std_roots: BTreeSet<String>,
-    /// A name imported unrenamed from outside the crate: why it is not
-    /// proven, when no definition of the name exists.
-    imported: BTreeMap<String, Why>,
+    scopes: Vec<Scope>,
+    /// Module display path to its scope.
+    modules: BTreeMap<String, usize>,
+    nodes: Vec<Node>,
+    uses: Vec<UseLeaf>,
+    /// The segments of every `use` path: `(parent segment, text)`; a leaf's
+    /// path is read back from its tail, so a nested tree costs one entry
+    /// per segment written.
+    segs: Vec<(Option<usize>, String)>,
+    /// The resolved target of each import, once known.
+    memo: std::cell::RefCell<BTreeMap<usize, Target>>,
     /// #10276: a local name `use`d for one of [`INCLUDE_MACROS`].
     include_aliases: BTreeMap<String, &'static str>,
 }
 
-/// How a path root is read.
-enum RootKind {
-    Local,
-    Std,
-    Foreign,
+/// One keyword position of a lexed file, for [`TypeGraph::item`].
+struct At<'t> {
+    t: &'t [Tok],
+    close: &'t [Option<usize>],
+    lens: &'t [Option<usize>],
+    k: usize,
+    scope: usize,
+    binds: bool,
 }
 
 impl TypeGraph {
-    fn root_kind(&self, root: &str) -> RootKind {
-        if LOCAL_ROOTS.contains(&root)
-            || self.mods.contains(root)
-            || self.local_roots.contains(root)
-        {
-            RootKind::Local
-        } else if STD_ROOTS.contains(&root) || self.std_roots.contains(root) {
-            RootKind::Std
-        } else {
-            RootKind::Foreign
+    fn new_scope(&mut self, outer: Option<usize>, parent: Option<usize>, path: String) -> usize {
+        self.scopes.push(Scope {
+            outer,
+            parent,
+            path,
+            ..Scope::default()
+        });
+        self.scopes.len() - 1
+    }
+
+    /// The module `name` under the module `parent`, made and bound once.
+    fn child(&mut self, parent: usize, name: &str) -> usize {
+        let key = format!("{}::{name}", self.scopes[parent].path);
+        let id = self.module_scope(key, Some(parent));
+        self.bind(parent, name, Bind::Module(id));
+        id
+    }
+
+    /// The scope of the module keyed `key`, made once under `parent`.
+    fn module_scope(&mut self, key: String, parent: Option<usize>) -> usize {
+        if let Some(&m) = self.modules.get(&key) {
+            return m;
+        }
+        let m = self.new_scope(None, parent, key.clone());
+        self.modules.insert(key, m);
+        m
+    }
+
+    /// Binds `name` in `scope`, once per distinct binding. Two distinct
+    /// bindings already make the name `Ambiguous`, so at most
+    /// [`MAX_BINDINGS`] are kept and each bind costs O(1), whatever the
+    /// count of `use` lines naming one name.
+    fn bind(&mut self, scope: usize, name: &str, b: Bind) {
+        let v = self.scopes[scope]
+            .items
+            .entry(name.to_string())
+            .or_default();
+        if v.len() < MAX_BINDINGS && !v.contains(&b) {
+            v.push(b);
         }
     }
 
-    fn node(&mut self, key: &str) -> &mut Node {
-        self.nodes.entry(key.to_string()).or_default()
-    }
-
-    /// The node of a definition of `name` in `scope`, joined into the
-    /// node of the name in any scope.
-    fn define(&mut self, scope: &str, name: &str) -> &mut Node {
-        let key = scoped(scope, name);
-        if !self.nodes.contains_key(&key) {
-            self.node(&any_scope(name)).atoms.push(Atom::Ref {
-                name: name.to_string(),
-                root: None,
-                scope: scope.to_string(),
-            });
+    /// The module of a walked file, with every parent module made.
+    fn file_module(&mut self, path: &str) -> usize {
+        let (root, segs) = module_of(path);
+        let mut m = self.module_scope(root, None);
+        for s in &segs {
+            m = self.child(m, s);
         }
-        self.node(&key)
+        m
     }
 
-    /// Collects the definitions of one lexed file, outside `macro_rules!`
-    /// bodies, and returns the file's own imports. A name the file imports
-    /// is read through that import, never through another file's
-    /// definition of the same name. Linear in the token count.
+    /// The node of `name` defined in `scope`: one node per name and scope.
+    fn define(&mut self, scope: usize, name: &str) -> usize {
+        let found = self.scopes[scope].items.get(name).and_then(|bs| {
+            bs.iter().find_map(|b| match b {
+                Bind::Def(n) => Some(*n),
+                _ => None,
+            })
+        });
+        if let Some(n) = found {
+            return n;
+        }
+        self.nodes.push(Node {
+            scope,
+            name: name.to_string(),
+            atoms: Vec::new(),
+            adt: false,
+            hash: FNV_OFFSET,
+        });
+        let n = self.nodes.len() - 1;
+        self.bind(scope, name, Bind::Def(n));
+        n
+    }
+
+    /// Collects the scopes, imports and definitions of one lexed file,
+    /// outside `macro_rules!` bodies, and returns the scope of each token
+    /// as `(first token, scope)` spans in token order. A function body is
+    /// a scope that falls back to its enclosing one; an `impl` or `trait`
+    /// body binds no type name. Linear in the token count.
     fn file(
         &mut self,
-        crate_scope: &str,
+        path: &str,
         t: &[Tok],
         close: &[Option<usize>],
         lens: &[Option<usize>],
         in_macro: &[bool],
-    ) -> FileImports {
-        let ident = |i: usize| t.get(i).filter(|x| x.kind == TokKind::Ident);
-        let first = self.imports.len();
-        for (k, &inside) in in_macro.iter().enumerate() {
-            if !inside && is_w(t, k, "use") {
-                self.use_tree(t, close, k + 1);
-            }
-        }
-        let mut own = FileImports::new();
-        for (root, src, alias) in &self.imports[first..] {
-            if alias != "_" && src != "self" {
-                own.insert(alias.clone(), (root.clone(), src.clone()));
-            }
-        }
+    ) -> Vec<(usize, usize)> {
+        let top = self.file_module(path);
+        let mut spans = vec![(0, top)];
+        // (index of the closing brace, scope inside, whether types bind).
+        let mut stack: Vec<(usize, usize, bool)> = Vec::new();
+        let mut opens: BTreeMap<usize, (usize, bool)> = BTreeMap::new();
+        let mut path_attr = false;
         for k in 0..t.len() {
-            if in_macro[k] || t[k].kind != TokKind::Ident {
+            while stack.last().is_some_and(|&(end, _, _)| k > end) {
+                stack.pop();
+                spans.push((k, stack.last().map_or(top, |e| e.1)));
+            }
+            if let Some((s, binds)) = opens.remove(&k) {
+                stack.push((close[k].unwrap_or(t.len()), s, binds));
+                spans.push((k, s));
+            }
+            if in_macro[k] {
                 continue;
             }
-            let Some(name) = ident(k + 1).map(|x| x.text.clone()) else {
+            if is_p(t, k, "#") && is_p(t, k + 1, "[") && is_w(t, k + 2, "path") {
+                path_attr = true;
                 continue;
+            }
+            if t[k].kind != TokKind::Ident {
+                continue;
+            }
+            let (scope, binds) = stack.last().map_or((top, true), |e| (e.1, e.2));
+            let at = At {
+                t,
+                close,
+                lens,
+                k,
+                scope,
+                binds,
             };
-            match t[k].text.as_str() {
-                "mod" => {
-                    self.mods.insert(name);
-                }
-                "type" => {
-                    let (j, params, defaults) = if is_p(t, k + 2, "<") {
-                        generics(t, close, k + 2)
-                    } else {
-                        (k + 2, Vec::new(), Vec::new())
-                    };
-                    let scope: BTreeSet<&str> = params.iter().map(String::as_str).collect();
-                    let mut atoms = Vec::new();
-                    for d in defaults {
-                        type_atoms(t, close, lens, d, &scope, &mut atoms);
-                    }
-                    if is_p(t, j, "=") {
-                        type_atoms(
-                            t,
-                            close,
-                            lens,
-                            (j + 1, type_end(t, close, j + 1)),
-                            &scope,
-                            &mut atoms,
-                        );
-                    } else {
-                        atoms.push(Atom::Unres(Why::NoValue(name.clone())));
-                    }
-                    localise(&mut atoms, &own, crate_scope);
-                    self.define(crate_scope, &name).atoms.extend(atoms);
-                }
-                w @ ("struct" | "enum" | "union") => {
-                    if w == "union" && !(is_p(t, k + 2, "{") || is_p(t, k + 2, "<")) {
-                        continue;
-                    }
-                    let (j, params, defaults) = if is_p(t, k + 2, "<") {
-                        generics(t, close, k + 2)
-                    } else {
-                        (k + 2, Vec::new(), Vec::new())
-                    };
-                    let scope: BTreeSet<&str> = params.iter().map(String::as_str).collect();
-                    let mut atoms = Vec::new();
-                    for d in defaults {
-                        type_atoms(t, close, lens, d, &scope, &mut atoms);
-                    }
-                    if let Some((open, c)) = adt_body(t, close, j) {
-                        if w == "enum" {
-                            enum_atoms(t, close, lens, (open, c), &scope, &mut atoms);
-                        } else {
-                            type_atoms(t, close, lens, (open + 1, c), &scope, &mut atoms);
-                        }
-                    }
-                    localise(&mut atoms, &own, crate_scope);
-                    let node = self.define(crate_scope, &name);
-                    node.adt = true;
-                    node.atoms.extend(atoms);
-                }
-                _ => {}
-            }
+            self.item(&at, &mut opens, &mut path_attr);
         }
-        own
+        spans
     }
 
-    /// Records every leaf of the `use` tree that starts at `from`. An
-    /// explicit stack keeps any nesting depth off the call stack, and each
-    /// leaf costs O(1).
-    fn use_tree(&mut self, t: &[Tok], close: &[Option<usize>], from: usize) {
+    /// One keyword of [`TypeGraph::file`].
+    fn item(&mut self, at: &At, opens: &mut BTreeMap<usize, (usize, bool)>, path_attr: &mut bool) {
+        let At {
+            t, close, k, scope, ..
+        } = *at;
+        let ident = |i: usize| {
+            t.get(i)
+                .filter(|x| x.kind == TokKind::Ident)
+                .map(|x| x.text.clone())
+        };
+        let word = t[k].text.as_str();
+        match word {
+            "use" => self.use_tree(scope, t, close, k + 1),
+            "mod" => {
+                if let Some(name) = ident(k + 1) {
+                    if is_p(t, k + 2, "{") {
+                        let m = self.child(scope, &name);
+                        opens.entry(k + 2).or_insert((m, true));
+                    } else if *path_attr {
+                        // #10293: a `#[path]` module is not followed; a
+                        // path through it lands nowhere.
+                        let key = format!("{}::{name}#path", self.scopes[scope].path);
+                        let m = self.new_scope(None, Some(scope), key);
+                        self.bind(scope, &name, Bind::Module(m));
+                    } else {
+                        self.declared(scope, &name);
+                    }
+                }
+                *path_attr = false;
+            }
+            "fn" => {
+                // The body follows the generics and the parameter list.
+                let mut from = k + 2;
+                if is_p(t, from, "<") {
+                    from = generics(t, close, from).0;
+                }
+                if is_p(t, from, "(") {
+                    from = close[from].map_or(from + 1, |c| c + 1);
+                }
+                if let Some(name) = ident(k + 1)
+                    && let Some((open, _)) = adt_body(t, close, from)
+                    && !opens.contains_key(&open)
+                {
+                    let key = format!("{}::{{fn {name}}}", self.scopes[scope].path);
+                    let b = self.new_scope(Some(scope), None, key);
+                    opens.insert(open, (b, true));
+                }
+                *path_attr = false;
+            }
+            "impl" | "trait" => {
+                let from = if word == "trait" { k + 2 } else { k + 1 };
+                if let Some((open, _)) = adt_body(t, close, from) {
+                    opens.entry(open).or_insert((scope, false));
+                }
+                *path_attr = false;
+            }
+            "type" | "struct" | "enum" | "union" => {
+                if at.binds {
+                    self.definition(at);
+                }
+                *path_attr = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// `mod name;` in `scope`: the walked file of that module when the
+    /// declaring file is a crate root outside `src/` and a directory module
+    /// of that name was walked (`tests/common/mod.rs`), else the module
+    /// under `scope`.
+    fn declared(&mut self, scope: usize, name: &str) {
+        let here = &self.scopes[scope];
+        if here.parent.is_none()
+            && here.outer.is_none()
+            && let Some((dir, _)) = here.path.rsplit_once('/')
+            && let Some(&m) = self.modules.get(&format!("{dir}/{name}"))
+        {
+            self.bind(scope, name, Bind::Module(m));
+            return;
+        }
+        self.child(scope, name);
+    }
+
+    /// A `type`, `struct`, `enum` or `union` definition at `at.k`.
+    fn definition(&mut self, at: &At) {
+        let At {
+            t,
+            close,
+            lens,
+            k,
+            scope,
+            ..
+        } = *at;
+        let w = t[k].text.as_str();
+        let Some(name) = t
+            .get(k + 1)
+            .filter(|x| x.kind == TokKind::Ident)
+            .map(|x| x.text.clone())
+        else {
+            return;
+        };
+        if w == "union" && !(is_p(t, k + 2, "{") || is_p(t, k + 2, "<")) {
+            return;
+        }
+        let (j, params, defaults) = if is_p(t, k + 2, "<") {
+            generics(t, close, k + 2)
+        } else {
+            (k + 2, Vec::new(), Vec::new())
+        };
+        let ps: BTreeSet<&str> = params.iter().map(String::as_str).collect();
+        let mut atoms = Vec::new();
+        for d in defaults {
+            type_atoms(t, close, lens, d, &ps, &mut atoms);
+        }
+        let end = if w == "type" {
+            if is_p(t, j, "=") {
+                let e = type_end(t, close, j + 1);
+                type_atoms(t, close, lens, (j + 1, e), &ps, &mut atoms);
+                e
+            } else {
+                atoms.push(Atom::Unres(Why::NoValue(name.clone())));
+                j
+            }
+        } else if let Some((open, c)) = adt_body(t, close, j) {
+            if w == "enum" {
+                enum_atoms(t, close, lens, (open, c), &ps, &mut atoms);
+            } else {
+                type_atoms(t, close, lens, (open + 1, c), &ps, &mut atoms);
+            }
+            c + 1
+        } else {
+            j
+        };
+        let h = token_hash(t, (k, end));
+        let n = self.define(scope, &name);
+        let node = &mut self.nodes[n];
+        node.adt |= w != "type";
+        node.atoms.extend(atoms);
+        node.hash = fnv(node.hash, &h.to_le_bytes());
+    }
+
+    /// Records every leaf of the `use` tree that starts at `from` in
+    /// `scope`. An explicit stack keeps any nesting depth off the call
+    /// stack; each segment written is stored once, so the walk is linear.
+    fn use_tree(&mut self, scope: usize, t: &[Tok], close: &[Option<usize>], from: usize) {
         let end = type_end(t, close, from);
-        // (position, end of this level, the prefix root at this level).
-        let mut stack: Vec<(usize, usize, Option<String>)> = vec![(from, end, None)];
+        let global = is_p(t, from, ":") && is_p(t, from + 1, ":");
+        // (position, end of this level, the prefix's last segment).
+        let mut stack: Vec<(usize, usize, Option<usize>)> = vec![(from, end, None)];
         while let Some((mut i, end, base)) = stack.pop() {
             while is_p(t, i, ",") && i < end {
                 i += 1;
@@ -2819,14 +3115,13 @@ impl TypeGraph {
             if is_p(t, i, ":") && is_p(t, i + 1, ":") {
                 i += 2;
             }
-            let mut root = base.clone();
-            let mut last: Option<String> = None;
+            let mut tail = base;
             while let Some(x) = t.get(i).filter(|x| x.kind == TokKind::Ident && i < end) {
                 if x.text == "as" {
                     break;
                 }
-                root.get_or_insert_with(|| x.text.clone());
-                last = Some(x.text.clone());
+                self.segs.push((tail, x.text.clone()));
+                tail = Some(self.segs.len() - 1);
                 i += 1;
                 if is_p(t, i, ":") && is_p(t, i + 1, ":") {
                     i += 2;
@@ -2837,119 +3132,357 @@ impl TypeGraph {
             if is_p(t, i, "{") {
                 let c = close[i].unwrap_or(end);
                 stack.push((c + 1, end, base));
-                stack.push((i + 1, c, root));
+                stack.push((i + 1, c, tail));
                 continue;
             }
             if is_p(t, i, "*") {
+                self.scopes[scope].globs.push((tail, global));
                 stack.push((i + 1, end, base));
                 continue;
             }
-            let alias = if is_w(t, i, "as") {
+            let renamed = if is_w(t, i, "as") {
                 i += 2;
                 t.get(i - 1)
                     .filter(|x| x.kind == TokKind::Ident)
-                    .map(|x| x.text.clone())
+                    .map_or(Rename::Unnamed, |x| Rename::As(x.text.clone()))
             } else {
-                last.clone()
+                Rename::Keep
             };
-            if let (Some(r), Some(src), Some(a)) = (root, last, alias) {
-                self.imports.push((r, src, a));
+            if let Some(leaf) = tail {
+                self.use_leaf(scope, leaf, global, renamed);
             }
             stack.push((i.max(start + 1), end, base));
         }
     }
 
-    /// Turns the imports into names, once every module is known.
-    fn settle_imports(&mut self) {
-        let imports = std::mem::take(&mut self.imports);
-        for (root, _, alias) in &imports {
-            match self.root_kind(root) {
-                RootKind::Local => self.local_roots.insert(alias.clone()),
-                RootKind::Std => self.std_roots.insert(alias.clone()),
-                RootKind::Foreign => false,
-            };
+    /// Binds one `use` leaf whose last segment is `segs[leaf]`. A trailing
+    /// `self` names its prefix; `_` binds nothing.
+    fn use_leaf(&mut self, scope: usize, leaf: usize, global: bool, renamed: Rename) {
+        let (parent, text) = &self.segs[leaf];
+        let (tail, last) = if text == "self" {
+            match parent {
+                Some(p) => (*p, self.segs[*p].1.clone()),
+                None => return,
+            }
+        } else {
+            (leaf, text.clone())
+        };
+        let alias = match renamed {
+            Rename::As(a) => a,
+            Rename::Unnamed => return,
+            Rename::Keep => last.clone(),
+        };
+        if alias == "_" {
+            return;
         }
-        for (root, src, alias) in imports {
-            if alias == "_" || src == "self" {
+        if let Some(m) = INCLUDE_MACROS.iter().find(|m| **m == last)
+            && alias != last
+        {
+            self.include_aliases.insert(alias.clone(), m);
+        }
+        self.uses.push(UseLeaf {
+            scope,
+            tail,
+            global,
+            alias: alias.clone(),
+        });
+        let u = self.uses.len() - 1;
+        self.bind(scope, &alias, Bind::Use(u));
+    }
+
+    /// The path of an import, read back from its tail.
+    fn use_path(&self, tail: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut at = Some(tail);
+        while let Some(i) = at {
+            out.push(self.segs[i].1.clone());
+            at = self.segs[i].0;
+        }
+        out.reverse();
+        out
+    }
+
+    /// The module a scope belongs to: a function body's enclosing module.
+    fn module_of_scope(&self, mut s: usize) -> usize {
+        while let Some(o) = self.scopes[s].outer {
+            s = o;
+        }
+        s
+    }
+
+    /// The crate root of a scope.
+    fn crate_of(&self, s: usize) -> usize {
+        let mut m = self.module_of_scope(s);
+        while let Some(p) = self.scopes[m].parent {
+            m = self.module_of_scope(p);
+        }
+        m
+    }
+
+    /// The parent module of a module, or why `super` lands nowhere.
+    fn super_of(&self, m: usize) -> Target {
+        self.scopes[m].parent.map_or_else(
+            || unres(Why::PathNotLanded("super".to_string())),
+            |p| Target::Scope(self.module_of_scope(p)),
+        )
+    }
+
+    /// `name` in `scope` and, for a function body, the scopes around it.
+    /// A glob import in a scope that binds the name explicitly is shadowed
+    /// there; one that does not may supply it.
+    fn look(&self, scope: usize, name: &str, outward: bool) -> Look {
+        let mut at = Some(scope);
+        while let Some(id) = at {
+            let s = &self.scopes[id];
+            if let Some(bs) = s.items.get(name) {
+                return match bs.as_slice() {
+                    [b] => Look::Bound(*b),
+                    _ => Look::Many,
+                };
+            }
+            if self.glob_supplies(id, name) {
+                return Look::Glob;
+            }
+            at = if outward { s.outer } else { None };
+        }
+        Look::Empty
+    }
+
+    /// #10294: whether a glob import of `scope` can supply `name`: a glob
+    /// whose module is not known (std, another crate, not settled) can
+    /// supply any name; one of a walked module supplies the names that
+    /// module binds, and the names its own globs can supply.
+    fn glob_supplies(&self, scope: usize, name: &str) -> bool {
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut todo = vec![scope];
+        while let Some(s) = todo.pop() {
+            if !seen.insert(s) {
                 continue;
             }
-            if let Some(m) = INCLUDE_MACROS.iter().find(|m| **m == src)
-                && alias != src
-            {
-                self.include_aliases.insert(alias.clone(), m);
+            let sc = &self.scopes[s];
+            if s != scope && sc.items.contains_key(name) {
+                return true;
             }
-            if LOCK_TYPES.contains(&src.as_str()) {
-                self.node(&any_scope(&alias)).atoms.push(Atom::Lock);
-                continue;
+            if sc.glob_to.len() != sc.globs.len() {
+                return true;
             }
-            let kind = self.root_kind(&root);
-            let why = match kind {
-                RootKind::Std if LEAF_TYPES.contains(&src.as_str()) => None,
-                RootKind::Std => Some(Why::StdNotProven(src.clone())),
-                RootKind::Foreign => Some(Why::Foreign {
-                    root: root.clone(),
-                    name: src.clone(),
-                }),
-                RootKind::Local => {
-                    if alias != src {
-                        self.node(&any_scope(&alias)).atoms.push(Atom::Ref {
-                            name: src,
-                            root: None,
-                            scope: String::new(),
-                        });
+            for g in &sc.glob_to {
+                match g {
+                    Some(m) => todo.push(*m),
+                    None => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// #10294: settles the module of every glob import once every file is
+    /// walked. A glob met while settling counts as unknown (it can supply
+    /// any name), and the import targets found meanwhile are dropped after.
+    fn settle_globs(&mut self) {
+        let mut settled = Vec::with_capacity(self.scopes.len());
+        for s in 0..self.scopes.len() {
+            let to: Vec<Option<usize>> = self.scopes[s]
+                .globs
+                .iter()
+                .map(|&(tail, global)| {
+                    let segs = tail.map(|t| self.use_path(t)).unwrap_or_default();
+                    match self.resolve(s, &segs, global) {
+                        Target::Scope(m) if !segs.is_empty() => Some(m),
+                        _ => None,
                     }
-                    continue;
-                }
-            };
-            match why {
-                Some(w) if alias == src => {
-                    self.imported.entry(alias).or_insert(w);
-                }
-                Some(w) => self.node(&any_scope(&alias)).atoms.push(Atom::Unres(w)),
-                None if alias != src => {
-                    self.node(&any_scope(&alias));
-                }
-                None => {}
+                })
+                .collect();
+            settled.push(to);
+        }
+        for (s, to) in settled.into_iter().enumerate() {
+            self.scopes[s].glob_to = to;
+        }
+        self.memo.get_mut().clear();
+    }
+
+    /// A path root that nothing in scope binds: std, this crate's library,
+    /// or another crate.
+    fn root_target(&self, root: &str) -> Target {
+        if STD_ROOTS.contains(&root) {
+            Target::Std(root.to_string())
+        } else if root == CRATE_NAME {
+            self.modules.get(LIB_SCOPE).map_or_else(
+                || unres(Why::PathNotLanded(root.to_string())),
+                |&m| Target::Scope(m),
+            )
+        } else {
+            Target::Foreign {
+                root: root.to_string(),
+                name: root.to_string(),
             }
         }
     }
 
-    /// One atom: its value now, or the node it waits on.
-    fn atom(&self, a: &Atom, index: &BTreeMap<&str, usize>) -> Result<Res, usize> {
-        let (name, root, scope) = match a {
-            Atom::Lock => return Ok(Res::Lock),
-            Atom::Unres(w) => return Ok(Res::Unres(w.clone())),
-            Atom::Ref { name, root, scope } => (name, root, scope),
-        };
-        let kind = root
-            .as_deref()
-            .map_or(RootKind::Local, |r| self.root_kind(r));
-        match kind {
-            RootKind::Local => {
-                let scope = if root.as_deref() == Some(CRATE_NAME) {
-                    LIB_SCOPE
-                } else {
-                    scope.as_str()
-                };
-                if let Some(&n) = index
-                    .get(scoped(scope, name).as_str())
-                    .or_else(|| index.get(any_scope(name).as_str()))
-                {
-                    Err(n)
-                } else if let Some(w) = self.imported.get(name) {
-                    Ok(Res::Unres(w.clone()))
-                } else if LEAF_TYPES.contains(&name.as_str()) {
-                    Ok(Res::Clean)
-                } else {
-                    Ok(Res::Unres(Why::NoDef(name.clone())))
+    /// The step a binding takes. A bare prelude or primitive name bound
+    /// to a local definition is shadowed.
+    fn hop(b: Bind, name: &str, bare: bool) -> Hop {
+        match b {
+            Bind::Module(m) => Hop::To(Target::Scope(m)),
+            Bind::Def(_) if bare && is_prelude(name) => {
+                Hop::To(unres(Why::Shadowed(name.to_string())))
+            }
+            Bind::Def(n) => Hop::To(Target::Node(n)),
+            Bind::Use(u) => Hop::Use(u),
+        }
+    }
+
+    /// The first segment of a path written in `scope`.
+    fn first(&self, scope: usize, seg: &str, global: bool, last: bool) -> Hop {
+        if global {
+            return Hop::To(self.root_target(seg));
+        }
+        match seg {
+            "crate" => return Hop::To(Target::Scope(self.crate_of(scope))),
+            "self" => return Hop::To(Target::Scope(self.module_of_scope(scope))),
+            "super" => return Hop::To(self.super_of(self.module_of_scope(scope))),
+            _ => {}
+        }
+        match self.look(scope, seg, true) {
+            Look::Bound(b) => Self::hop(b, seg, last),
+            Look::Many => Hop::To(unres(Why::Ambiguous(seg.to_string()))),
+            Look::Glob => Hop::To(unres(Why::Glob(seg.to_string()))),
+            // P6: `use Mutex as Gatekeeper` names a lock by its bare name.
+            Look::Empty if last && LOCK_TYPES.contains(&seg) => Hop::To(Target::Done(Res::Lock)),
+            Look::Empty if last && is_prelude(seg) => Hop::To(Target::Done(Res::Clean)),
+            Look::Empty if last => Hop::To(unres(Why::NoDef(seg.to_string()))),
+            Look::Empty => Hop::To(self.root_target(seg)),
+        }
+    }
+
+    /// A later segment of a path, from the module `m`.
+    fn inner(&self, m: usize, seg: &str) -> Hop {
+        match seg {
+            "super" => return Hop::To(self.super_of(m)),
+            "self" => return Hop::To(Target::Scope(m)),
+            _ => {}
+        }
+        match self.look(m, seg, false) {
+            Look::Bound(b) => Self::hop(b, seg, false),
+            Look::Many => Hop::To(unres(Why::Ambiguous(seg.to_string()))),
+            Look::Glob => Hop::To(unres(Why::Glob(seg.to_string()))),
+            Look::Empty => Hop::To(unres(Why::PathNotLanded(seg.to_string()))),
+        }
+    }
+
+    /// Walks `w` until it lands or needs an import not yet resolved.
+    fn step(&self, w: &mut Walk, memo: &BTreeMap<usize, Target>) -> Result<Target, usize> {
+        while let Some(seg) = w.segs.get(w.pos) {
+            let last = w.pos + 1 == w.segs.len();
+            let hop = match &w.at {
+                None => self.first(w.scope, seg, w.global, last),
+                Some(Target::Scope(m)) => self.inner(*m, seg),
+                Some(Target::Std(_)) => Hop::To(Target::Std(seg.clone())),
+                Some(Target::Foreign { root, .. }) => Hop::To(Target::Foreign {
+                    root: root.clone(),
+                    name: seg.clone(),
+                }),
+                Some(Target::Node(_) | Target::Done(Res::Clean)) => Hop::To(unres(Why::Projection)),
+                Some(Target::Done(r)) => return Ok(Target::Done(r.clone())),
+            };
+            match hop {
+                Hop::To(t) => w.at = Some(t),
+                Hop::Use(u) => match memo.get(&u) {
+                    Some(t) => w.at = Some(t.clone()),
+                    None => return Err(u),
+                },
+            }
+            w.pos += 1;
+        }
+        Ok(w.at.take().unwrap_or(Target::Done(Res::Clean)))
+    }
+
+    /// Where the path `segs` written in `scope` lands. Imports are followed
+    /// on an explicit stack and each is resolved once (memoised), so a long
+    /// rename chain costs its length once; an import met again while it is
+    /// being resolved is a cycle.
+    fn resolve(&self, scope: usize, segs: &[String], global: bool) -> Target {
+        let mut memo = self.memo.borrow_mut();
+        let mut on: BTreeSet<usize> = BTreeSet::new();
+        let mut stack = vec![Walk {
+            scope,
+            segs: segs.to_vec(),
+            global,
+            pos: 0,
+            at: None,
+            leaf: None,
+        }];
+        while let Some(w) = stack.last_mut() {
+            match self.step(w, &memo) {
+                Err(u) if on.contains(&u) => {
+                    w.at = Some(unres(Why::Cycle(self.uses[u].alias.clone())));
+                    w.pos = w.segs.len();
+                }
+                Err(u) => {
+                    on.insert(u);
+                    let leaf = &self.uses[u];
+                    stack.push(Walk {
+                        scope: leaf.scope,
+                        segs: self.use_path(leaf.tail),
+                        global: leaf.global,
+                        pos: 0,
+                        at: None,
+                        leaf: Some(u),
+                    });
+                }
+                Ok(t) => {
+                    let done = stack.pop().and_then(|w| w.leaf);
+                    if let Some(u) = done {
+                        on.remove(&u);
+                        memo.insert(u, t.clone());
+                    }
+                    match stack.last_mut() {
+                        Some(p) => {
+                            p.at = Some(t);
+                            p.pos += 1;
+                        }
+                        None => return t,
+                    }
                 }
             }
-            RootKind::Std if LEAF_TYPES.contains(&name.as_str()) => Ok(Res::Clean),
-            RootKind::Std => Ok(Res::Unres(Why::StdNotProven(name.clone()))),
-            RootKind::Foreign => Ok(Res::Unres(Why::Foreign {
-                root: root.clone().unwrap_or_default(),
-                name: name.clone(),
-            })),
+        }
+        Target::Done(Res::Clean)
+    }
+
+    /// One atom written in `scope`: its value now, or the node it waits on.
+    fn atom(&self, scope: usize, a: &Atom) -> Result<Res, usize> {
+        match a {
+            Atom::Lock => Ok(Res::Lock),
+            Atom::Unres(w) => Ok(Res::Unres(w.clone())),
+            Atom::Param(n) => {
+                // #10293: a parameter that hides a name the scope binds,
+                // a lock name or a std name is refused.
+                let bound = matches!(self.look(scope, n, true), Look::Bound(_) | Look::Many);
+                let known = [&LOCK_TYPES[..], &LEAF_TYPES[..]]
+                    .iter()
+                    .any(|set| set.contains(&n.as_str()));
+                if bound || known || is_prelude(n) {
+                    Ok(Res::Unres(Why::Shadowed(n.clone())))
+                } else {
+                    Ok(Res::Clean)
+                }
+            }
+            Atom::Path { segs, global } => {
+                let last = segs.last().cloned().unwrap_or_default();
+                match self.resolve(scope, segs, *global) {
+                    Target::Node(n) => Err(n),
+                    Target::Scope(_) => Ok(Res::Unres(Why::PathNotLanded(last))),
+                    Target::Std(name) | Target::Foreign { name, .. }
+                        if LOCK_TYPES.contains(&name.as_str()) =>
+                    {
+                        Ok(Res::Lock)
+                    }
+                    Target::Std(name) if LEAF_TYPES.contains(&name.as_str()) => Ok(Res::Clean),
+                    Target::Std(name) => Ok(Res::Unres(Why::StdNotProven(name))),
+                    Target::Foreign { root, name } => Ok(Res::Unres(Why::Foreign { root, name })),
+                    Target::Done(r) => Ok(r),
+                }
+            }
         }
     }
 
@@ -2958,20 +3491,17 @@ impl TypeGraph {
     /// reaches. Linear in nodes plus atoms. A cycle with no struct, enum or
     /// union in it is an alias loop: [`Why::Cycle`].
     fn values(&self) -> Resolved<'_> {
-        let names: Vec<&str> = self.nodes.keys().map(String::as_str).collect();
-        let index: BTreeMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
-        let n = names.len();
+        let n = self.nodes.len();
         let mut base = vec![Res::Clean; n];
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (v, node) in self.nodes.values().enumerate() {
+        for (v, node) in self.nodes.iter().enumerate() {
             for a in &node.atoms {
-                match self.atom(a, &index) {
+                match self.atom(node.scope, a) {
                     Ok(r) => base[v] = std::mem::replace(&mut base[v], Res::Clean).join(r),
                     Err(w) => edges[v].push(w),
                 }
             }
         }
-        let adt: Vec<bool> = self.nodes.values().map(|x| x.adt).collect();
         let unset = usize::MAX;
         let mut order = vec![unset; n];
         let mut low = vec![0usize; n];
@@ -3024,54 +3554,144 @@ impl TypeGraph {
                         break;
                     }
                 }
-                let mut val = Res::Clean;
-                let mut cyclic = members.len() > 1;
-                for &m in &members {
-                    val = val.join(base[m].clone());
-                    for &w in &edges[m] {
-                        if comp[w] == id {
-                            cyclic = true;
-                        } else {
-                            val = val.join(comp_val[comp[w]].clone());
-                        }
-                    }
-                }
-                if cyclic && !members.iter().any(|&m| adt[m]) {
-                    let first = members
-                        .iter()
-                        .filter_map(|&m| names[m].rsplit('\u{0}').next())
-                        .min()
-                        .unwrap_or_default();
-                    val = val.join(Res::Unres(Why::Cycle(first.to_string())));
-                }
+                let val = self.component(&members, &base, &edges, (&comp, &comp_val), id);
                 comp_val.push(val);
             }
         }
         Resolved {
             graph: self,
-            index,
             value: comp.iter().map(|&c| comp_val[c].clone()).collect(),
+            edges,
         }
+    }
+
+    /// The value of the strongly connected component `id`: its members'
+    /// own atoms joined with every component it reaches, all settled.
+    fn component(
+        &self,
+        members: &[usize],
+        base: &[Res],
+        edges: &[Vec<usize>],
+        (comp, comp_val): (&[usize], &[Res]),
+        id: usize,
+    ) -> Res {
+        let mut val = Res::Clean;
+        let mut cyclic = members.len() > 1;
+        for &m in members {
+            val = val.join(base[m].clone());
+            for &w in &edges[m] {
+                if comp[w] == id {
+                    cyclic = true;
+                } else {
+                    val = val.join(comp_val[comp[w]].clone());
+                }
+            }
+        }
+        if cyclic && !members.iter().any(|&m| self.nodes[m].adt) {
+            let first = members
+                .iter()
+                .map(|&m| self.nodes[m].name.as_str())
+                .min()
+                .unwrap_or_default();
+            val = val.join(Res::Unres(Why::Cycle(first.to_string())));
+        }
+        val
     }
 }
 
-/// The settled value of every named type.
+/// The settled value of every named type, and the edges between them.
 struct Resolved<'g> {
     graph: &'g TypeGraph,
-    index: BTreeMap<&'g str, usize>,
     value: Vec<Res>,
+    edges: Vec<Vec<usize>>,
+}
+
+/// #10295: the digest entry key of a static's own written type.
+const OWN_TYPE_KEY: &str = "type";
+
+/// A 64-bit hash shown as 8 hex digits: the two halves folded together.
+fn hex8(h: u64) -> String {
+    let folded = (h >> 32) ^ (h & 0xffff_ffff);
+    format!("{folded:08x}")
 }
 
 impl Resolved<'_> {
-    /// What the type with these atoms holds.
-    fn of(&self, atoms: &[Atom]) -> Res {
+    /// What the type with these atoms, written in `scope`, holds.
+    fn of(&self, scope: usize, atoms: &[Atom]) -> Res {
         atoms.iter().fold(Res::Clean, |acc, a| {
-            acc.join(match self.graph.atom(a, &self.index) {
+            acc.join(match self.graph.atom(scope, a) {
                 Ok(r) => r,
                 Err(n) => self.value[n].clone(),
             })
         })
     }
+
+    /// #10295: the digest of a static's type: `type=<hash>` of its own
+    /// written tokens, then `<module path>::<name>=<hash>` of every
+    /// definition reached from it, each once, sorted. Linear in the nodes
+    /// and edges reached.
+    fn digest(&self, scope: usize, atoms: &[Atom], own: u64) -> String {
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut todo: Vec<usize> = atoms
+            .iter()
+            .filter_map(|a| self.graph.atom(scope, a).err())
+            .collect();
+        while let Some(n) = todo.pop() {
+            if seen.insert(n) {
+                todo.extend(self.edges[n].iter().copied().filter(|w| !seen.contains(w)));
+            }
+        }
+        let g = self.graph;
+        let mut entries: Vec<String> = seen
+            .iter()
+            .map(|&n| {
+                let node = &g.nodes[n];
+                format!(
+                    "{}::{}={}",
+                    g.scopes[node.scope].path,
+                    node.name,
+                    hex8(node.hash)
+                )
+            })
+            .collect();
+        entries.sort();
+        entries.insert(0, format!("{OWN_TYPE_KEY}={}", hex8(own)));
+        entries.join(" ")
+    }
+}
+
+/// #10295: the key of the first entry of `live`, in written order (the
+/// `type` entry first), that `pinned` does not hold with the same hash,
+/// else of the first entry of `pinned` that `live` lacks: the type whose
+/// definition changed. `None` when they are equal.
+fn digest_change(pinned: &str, live: &str) -> Option<String> {
+    let set = |s: &str| -> BTreeSet<String> { s.split_whitespace().map(str::to_string).collect() };
+    let (p, l) = (set(pinned), set(live));
+    live.split_whitespace()
+        .chain(pinned.split_whitespace())
+        .find(|e| !p.contains(*e) || !l.contains(*e))
+        .map(str::to_string)
+        .map(|e| {
+            e.rsplit_once('=')
+                .map_or_else(|| e.clone(), |(k, _)| k.to_string())
+        })
+}
+
+/// #10293: the scope of token `k` from the `(first token, scope)` spans
+/// [`TypeGraph::file`] returns, which are in token order.
+fn scope_at(spans: &[(usize, usize)], k: usize) -> usize {
+    let i = spans.partition_point(|s| s.0 <= k);
+    spans[i.saturating_sub(1)].1
+}
+
+/// #10295: the [`StaticFinding::ExceptionDigest`] of a taken exception row
+/// whose pinned digest is not the live one. An empty pin never matches.
+fn digest_finding(file: &str, name: &str, pinned: &str, live: &str) -> Option<StaticFinding> {
+    digest_change(pinned, live).map(|ty| StaticFinding::ExceptionDigest {
+        file: file.to_string(),
+        name: name.to_string(),
+        ty,
+    })
 }
 
 /// The atoms of an enum body `t[open..=c]`: variant names and
@@ -3627,248 +4247,267 @@ fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
     (close, in_attr)
 }
 
-/// #10275, #10285: `(path, static name, reason)` for each static whose
-/// type does not resolve to [`LEAF_TYPES`], or that sits in a
-/// `macro_rules!` body, and is judged by hand. Every row must be used.
+/// #10275, #10285, #10295: `(path, static name, digest, reason)` for each
+/// static whose type does not resolve to [`LEAF_TYPES`], or that sits in a
+/// `macro_rules!` body, and is judged by hand. Every row must be used. The
+/// digest is `type=<hex8>` (the FNV-1a hash of the written type tokens)
+/// then `<module path>::<Name>=<hex8>` for each walked definition the type
+/// reaches, sorted; a macro-body static has the `type` entry only. It
+/// proves the judged text is unchanged since the pin, not that the text is
+/// safe, and it is not collision-resistant against a deliberate edit; a
+/// foreign or std type's source and a macro's expansion are not in it. A change shows as `ExceptionDigest` naming the first changed entry;
+/// re-judge the static, then pin the new digest.
 const EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
     (
         "src/approvals.rs",
         "APPROVAL_BUS",
-        "",
+        "type=54574677 src::approvals::ApprovalEvent=551a13b1",
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/config.rs",
         "DISABLED",
-        "",
+        "type=381fd1dd src::governance::capability::CapabilityConfig=1c73fcb7 src::governance::capability::IssuerConfig=4a856305 src::governance::capability::OpLevel=985b095c",
         "an Arc of CapabilityConfig whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/config/unknown_keys.rs",
         "SCHEMA",
-        "",
+        "type=d42394ee",
         "a schemars RootSchema: plain schema data built once",
     ),
     (
         "src/enterprise_federation_posture/hardened_env_fixture.rs",
         "POSTURE_AUDIT_DIR",
-        "",
+        "type=69062c13",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/governance/audit.rs",
         "DAEMON_AUDIT_KEY",
-        "",
+        "type=feacdeed",
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "RECORDER_KEY",
-        "",
+        "type=feacdeed",
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "WRITER",
-        "",
+        "type=3e57fb9c src::governance::audit::PendingRow=120d9247 src::governance::audit::WriteOp=3c1463d5",
         "a std mpsc Sender of WriteOp: a channel handle, never acquired as a lock",
     ),
     (
         "src/governance/wire_check.rs",
         "GOVERNANCE_PRE_ACTION",
-        "",
+        "type=71217376 src::governance::agent_action::AgentAction=39cefa84 src::governance::wire_check::WireCheckHook=a65c2e63",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/handlers/federation_signing_check.rs",
         "BUNDLE",
-        "",
+        "type=948eda2d src::federation::identity::trust_bundle::TrustBundle=64fb7356",
         "a TrustBundle whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/identity/session_signer.rs",
         "SESSION_SIGNER",
-        "",
+        "type=ee355834 src::identity::keypair::AgentKeypair=e5642726 src::identity::session_signer::SessionSigner=7c8667f6",
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/identity/test_key_dir.rs",
         "DIRECTORY",
-        "",
+        "type=69062c13",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/inbox_wake.rs",
         "INBOX_WAKE_BUS",
-        "",
+        "type=deb19289 src::inbox_wake::InboxEvent=109e5130",
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/logging.rs",
         "CENSUS_DUMMY_METADATA_3650",
-        "",
+        "type=4b4bb898",
         "a tracing Metadata: static callsite data",
     ),
     (
         "src/logging.rs",
         "INSTALLED_PIPELINE",
-        "",
+        "type=5ea7aa50 src::config::LogSink=bf13c837 src::logging::DeliveryStats=b3b0a375 src::logging::InstalledPipeline=f096f93a",
         "the log pipeline; its foreign leaf is a tracing_appender ErrorCounter, an atomic count",
     ),
     (
         "src/mcp/mod.rs",
         "POST_SIGNAL_ACK_SINK",
-        "",
+        "type=1c9aa41e",
         "a tokio UnboundedSender of serde_json Value: a channel handle",
+    ),
+    (
+        "src/mcp/shutdown.rs",
+        "GATE_STUCK",
+        "type=d5eb792a",
+        "a ShutdownGate named through `use super::*`: one AtomicU8 state, no lock",
+    ),
+    (
+        "src/mcp/shutdown.rs",
+        "GATE_UNDER_TEST",
+        "type=d5eb792a",
+        "a ShutdownGate named through `use super::*`: one AtomicU8 state, no lock",
     ),
     (
         "src/metrics.rs",
         "HANDLE",
-        "",
+        "type=0b452c42 src::metrics::Metrics=bc17d7d2",
         "the prometheus Metrics handle; its vectors are updated through their own API, never held",
     ),
     (
         "src/storage/escalation_deferral.rs",
         "TXN_FRAMES",
-        "",
+        "type=4af0ce2f src::governance::audit::PendingAuditAnchor=10c2b32e src::governance::audit::PendingWatermark=7061bdc8 src::storage::escalation_deferral::DeferredEscalation=75a03a25 src::storage::escalation_deferral::Frames=a5a77e15 src::storage::escalation_deferral::TxnFrame=13954030",
         "a thread-local RefCell of frames; the foreign leaf is a serde_json Value",
     ),
     (
         "src/storage/escalation_frame_reporting_8184_tests.rs",
         "WRITE_PAUSE",
-        "",
+        "type=dc90c7c0 src::storage::escalation_frame_reporting_8184_tests::WritePause=0a6b82f0",
         "a thread-local pair of std mpsc channel ends: a test pause, not a lock",
     ),
     (
         "src/storage/mod.rs",
         "BPE",
-        "",
+        "type=16315d13",
         "a tiktoken CoreBPE: tokenizer tables built once",
     ),
     (
         "src/storage/mod.rs",
         "GOVERNANCE_PRE_WRITE",
-        "",
+        "type=d6b472da",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/storage/snapshot_file.rs",
         "HOOK",
-        "",
+        "type=71d95840 src::storage::snapshot_file::seam::Hook=8a434667 src::storage::snapshot_file::seam::Point=3f4c9617",
         "a thread-local boxed dyn FnMut test seam, set by one test on its own thread",
     ),
     (
         "src/storage/txn_immediate_5084_tests.rs",
         "HOOK_5084",
-        "",
+        "type=e9493773",
         "a thread-local boxed dyn FnOnce test seam, set by one test on its own thread",
     ),
     (
         "src/subscriptions.rs",
         "DISPATCH_ROOT_CA",
-        "",
+        "type=9f706e3e",
         "a reqwest Certificate: certificate bytes, no lock",
     ),
     (
         "src/subscriptions/webhook_ssrf_8203_tests.rs",
         "DNS_ANSWER",
-        "",
+        "type=d3c053c6 src::subscriptions::webhook_ssrf_8203_tests::DnsAnswer=4a0413d0",
         "a thread-local one-shot DNS answer: a String and an io Result of SocketAddr",
     ),
     (
         "src/test_support.rs",
         "TLS_TEST_PKI",
-        "",
+        "type=486b0f1c src::test_support::TlsTestPki=bf02fb43",
         "the test PKI paths; its foreign leaf is a tempfile TempDir",
     ),
     (
         "tests/agent_projection_txn_9405_9406.rs",
         "RACE",
-        "",
+        "type=188bdf73 tests/agent_projection_txn_9405_9406.rs::Outcome=600430fe tests/agent_projection_txn_9405_9406.rs::Race=490373cf",
         "a thread-local RefCell of Race: std mpsc channel ends and an Outcome",
     ),
     (
         "tests/append_only_spine_flagon_g6.rs",
         "AUDIT_DIR",
-        "",
+        "type=69062c13",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/append_only_upsert_supersede_2948.rs",
         "AUDIT_DIR",
-        "",
+        "type=69062c13",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/auto_atomise/core.rs",
         "Q",
-        "",
+        "type=6877f3c7 src::background::atomise_worker::AtomiseJob=3c9ace28 src::background::atomise_worker::AtomiseQueue=e38c5ba8",
         "an AtomiseQueue: a std mpsc SyncSender, a channel handle",
     ),
     (
         "tests/common/mod.rs",
         "CLIENT",
-        "",
+        "type=d258f2f9",
         "a reqwest Client: a connection pool handle, never acquired as a lock",
     ),
     (
         "tests/curator_conserves_contradiction_g7.rs",
         "AUDIT_DIR",
-        "",
+        "type=69062c13",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/entity_register_owner_8497.rs",
         "TRAIL",
-        "",
+        "type=ce0988eb",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/fed_checkpoint_lane_3075_pg.rs",
         "DIR",
-        "",
+        "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_1936_checkpoint_fed.rs",
         "DIR",
-        "",
+        "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_checkpoint_ns_scope_2708.rs",
         "DIR",
-        "",
+        "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/form_1_synthesis.rs",
         "RT",
-        "",
+        "type=74e759ab",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/form_1_synthesis_verdict_matrix.rs",
         "RT",
-        "",
+        "type=74e759ab",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/issue_2122_synthesis_provenance_enforce.rs",
         "RT",
-        "",
+        "type=74e759ab",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_legacy_classifier_paths.rs",
         "RT",
-        "",
+        "type=74e759ab",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_synthesis_error_paths.rs",
         "RT",
-        "",
+        "type=74e759ab",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
 ];
@@ -3959,11 +4598,11 @@ fn token_census_with(
         }
     }
     let mut graph = TypeGraph::default();
-    let own: Vec<FileImports> = lexed
+    let spans: Vec<Vec<(usize, usize)>> = lexed
         .iter()
-        .map(|f| graph.file(&scope_of(f.path), &f.toks, &f.close, &f.lens, &f.in_macro))
+        .map(|f| graph.file(f.path, &f.toks, &f.close, &f.lens, &f.in_macro))
         .collect();
-    graph.settle_imports();
+    graph.settle_globs();
     let resolved = graph.values();
     // Rows left per file, then per name: a static takes one row.
     let mut left: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
@@ -3980,10 +4619,11 @@ fn token_census_with(
         .filter(|r| r.category != Category::Lock)
         .map(|r| (r.path.clone(), r.name.clone()))
         .collect();
-    let mut excepted: BTreeMap<(String, String), bool> = BTreeMap::new();
-    for &(file, name, _digest, reason) in tables.exceptions {
+    // #10295: each row, whether a static took it, and its pinned digest.
+    let mut excepted: BTreeMap<(String, String), (bool, &str)> = BTreeMap::new();
+    for &(file, name, digest, reason) in tables.exceptions {
         let key = (file.to_string(), name.to_string());
-        if excepted.insert(key, false).is_some() {
+        if excepted.insert(key, (false, digest)).is_some() {
             statics.push(StaticFinding::ExceptionDuplicate {
                 file: file.to_string(),
                 name: name.to_string(),
@@ -3999,7 +4639,7 @@ fn token_census_with(
     let walked: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
     let mut mods = [0usize; 2];
     let none = BTreeSet::new();
-    for (f, own) in lexed.iter().zip(&own) {
+    for (f, sp) in lexed.iter().zip(&spans) {
         let path = f.path;
         let (named, macros) = statics_of(&f.toks, &f.close, &f.in_macro);
         for StaticItem {
@@ -4010,24 +4650,38 @@ fn token_census_with(
         } in named
         {
             let key = (path.to_string(), name.clone());
-            let take = |excepted: &mut BTreeMap<(String, String), bool>| {
-                excepted.get_mut(&key).map(|used| *used = true).is_some()
+            let scope = scope_at(sp, ty.0);
+            let mut atoms = Vec::new();
+            if !in_macro {
+                type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
+            }
+            // #10295: taking a row checks its pin against the live digest; a
+            // macro-body static's digest is its own written type only.
+            // `None` when no row names the static, else the digest finding.
+            let take = |excepted: &mut BTreeMap<(String, String), (bool, &str)>| {
+                let (used, pinned) = excepted.get_mut(&key)?;
+                *used = true;
+                let own = token_hash(&f.toks, ty);
+                let live = if in_macro {
+                    format!("{OWN_TYPE_KEY}={}", hex8(own))
+                } else {
+                    resolved.digest(scope, &atoms, own)
+                };
+                Some(digest_finding(path, &name, pinned, &live))
             };
             if in_macro {
                 // #10285: never a row; judged only by hand.
-                if !take(&mut excepted) {
-                    statics.push(StaticFinding::MacroBodyStatic {
+                match take(&mut excepted) {
+                    Some(stale) => statics.extend(stale),
+                    None => statics.push(StaticFinding::MacroBodyStatic {
                         file: path.to_string(),
                         name,
                         line,
-                    });
+                    }),
                 }
                 continue;
             }
-            let mut atoms = Vec::new();
-            type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
-            localise(&mut atoms, own, &scope_of(path));
-            match resolved.of(&atoms) {
+            match resolved.of(scope, &atoms) {
                 // #10251: a lock static's rows must all say `lock`.
                 Res::Lock if not_lock.contains(&key) => {
                     statics.push(StaticFinding::LockNotLabelled {
@@ -4037,14 +4691,15 @@ fn token_census_with(
                     });
                 }
                 // #10275, #10283: a static not proven lock-free.
-                Res::Unres(why) if not_lock.contains(&key) && !take(&mut excepted) => {
-                    statics.push(StaticFinding::Unresolvable {
+                Res::Unres(why) if not_lock.contains(&key) => match take(&mut excepted) {
+                    Some(stale) => statics.extend(stale),
+                    None => statics.push(StaticFinding::Unresolvable {
                         file: path.to_string(),
                         name: name.clone(),
                         line,
                         why,
-                    });
-                }
+                    }),
+                },
                 _ => {}
             }
             match left.get_mut(path).and_then(|m| m.get_mut(name.as_str())) {
@@ -4084,7 +4739,7 @@ fn token_census_with(
             });
         }
     }
-    for ((file, name), used) in excepted {
+    for ((file, name), (used, _)) in excepted {
         if !used {
             statics.push(StaticFinding::ExceptionStale { file, name });
         }
@@ -6248,10 +6903,10 @@ const FORM_ROW: &str = "\tFORM\tonce: a value computed once, no lock\n";
 const FORM_WHY: &str = "judged by hand for the form table";
 
 /// #10295: the pinned digest of `static FORM: Unknown = X;` in `src/b.rs`.
-const D_UNRES: &str = "";
+const D_UNRES: &str = "type=57dcbc6c";
 
 /// #10295: the pinned digest of the macro-body `INNER` static's type.
-const D_INNER: &str = "";
+const D_INNER: &str = "type=4fd0bfc1";
 
 /// What the deny-by-default census must decide for one form.
 #[derive(Debug)]
@@ -6724,7 +7379,10 @@ fn exceptions_are_judged_exactly_10275() {
         (
             "duplicate",
             UNRES,
-            vec![(b, "FORM", D_UNRES, FORM_WHY), (b, "FORM", D_UNRES, FORM_WHY)],
+            vec![
+                (b, "FORM", D_UNRES, FORM_WHY),
+                (b, "FORM", D_UNRES, FORM_WHY),
+            ],
             vec![named(dup, b, "FORM")],
         ),
         (
@@ -7465,8 +8123,9 @@ fn token_census_cost_is_bounded_10213() {
 // the definitions behind it.
 // ---------------------------------------------------------------------------
 
-/// One round-3 case: `(id, files (path, text), static findings, include
-/// findings or `None` for exactly [`no_store_url`])`.
+/// One round-3 case: the id, the files as (path, text), the static
+/// findings, and the include findings (`None` for exactly
+/// [`no_store_url`]).
 type R3Case = (
     &'static str,
     Vec<(&'static str, &'static str)>,
@@ -7623,7 +8282,10 @@ fn earlier_review_forms_stay_red_10293() {
     let cases: Vec<R3Case> = vec![
         (
             "P1b-macro-named-struct",
-            vec![(b, "macro_rules! mk {\n    ($n:ident) => {\n        struct $n(std::sync::Mutex<u8>);\n    };\n}\nmk!(W);\nstatic FORM: W = X;\n")],
+            vec![(
+                b,
+                "macro_rules! mk {\n    ($n:ident) => {\n        struct $n(std::sync::Mutex<u8>);\n    };\n}\nmk!(W);\nstatic FORM: W = X;\n",
+            )],
             vec![r3_unres(b, 7, Why::NoDef("W".into()))],
             None,
         ),
@@ -7637,7 +8299,10 @@ fn earlier_review_forms_stay_red_10293() {
             "P3-three-file-alias-chain",
             vec![
                 ("src/a.rs", "pub type A = crate::c::C;\n"),
-                ("src/c.rs", "pub type C = Option<(u8, [parking_lot::Mutex<u8>; 2])>;\n"),
+                (
+                    "src/c.rs",
+                    "pub type C = Option<(u8, [parking_lot::Mutex<u8>; 2])>;\n",
+                ),
                 (b, "static FORM: crate::a::A = X;\n"),
             ],
             vec![r3_lock(b, 1)],
@@ -7645,20 +8310,29 @@ fn earlier_review_forms_stay_red_10293() {
         ),
         (
             "P4-qualified-projection",
-            vec![(b, "trait T {\n    type X;\n}\nstatic FORM: <u8 as T>::X = X;\n")],
+            vec![(
+                b,
+                "trait T {\n    type X;\n}\nstatic FORM: <u8 as T>::X = X;\n",
+            )],
             vec![r3_unres(b, 4, Why::Projection)],
             None,
         ),
         (
             "P5-const-generic",
-            vec![(b, "struct Buf<const N: usize>([std::sync::Mutex<u8>; N]);\nstatic FORM: Buf<4> = X;\n")],
+            vec![(
+                b,
+                "struct Buf<const N: usize>([std::sync::Mutex<u8>; N]);\nstatic FORM: Buf<4> = X;\n",
+            )],
             vec![r3_lock(b, 2)],
             None,
         ),
         (
             "P6-pub-use-rename",
             vec![
-                ("src/a.rs", "use std::sync::Mutex;\npub use Mutex as Gatekeeper;\n"),
+                (
+                    "src/a.rs",
+                    "use std::sync::Mutex;\npub use Mutex as Gatekeeper;\n",
+                ),
                 (b, "static FORM: crate::a::Gatekeeper = X;\n"),
             ],
             vec![r3_lock(b, 1)],
@@ -7675,7 +8349,10 @@ fn earlier_review_forms_stay_red_10293() {
         ),
         (
             "P7-macro-body-static",
-            vec![(b, "macro_rules! mk {\n    ($n:ident) => {\n        static $n: u8 = 0;\n    };\n}\n")],
+            vec![(
+                b,
+                "macro_rules! mk {\n    ($n:ident) => {\n        static $n: u8 = 0;\n    };\n}\n",
+            )],
             vec![StaticFinding::MacroBodyStatic {
                 file: b.into(),
                 name: "$n".into(),
@@ -7685,19 +8362,28 @@ fn earlier_review_forms_stay_red_10293() {
         ),
         (
             "P8-enum-boxed-tokio-lock",
-            vec![(b, "enum Slot {\n    Held(Option<Box<tokio::sync::Mutex<u8>>>),\n    Empty,\n}\nstatic FORM: Slot = X;\n")],
+            vec![(
+                b,
+                "enum Slot {\n    Held(Option<Box<tokio::sync::Mutex<u8>>>),\n    Empty,\n}\nstatic FORM: Slot = X;\n",
+            )],
             vec![r3_lock(b, 5)],
             None,
         ),
         (
             "P9-cfg-split-alias",
-            vec![(b, "#[cfg(unix)]\ntype Guard = u8;\n#[cfg(not(unix))]\ntype Guard = std::sync::Mutex<u8>;\nstatic FORM: Guard = X;\n")],
+            vec![(
+                b,
+                "#[cfg(unix)]\ntype Guard = u8;\n#[cfg(not(unix))]\ntype Guard = std::sync::Mutex<u8>;\nstatic FORM: Guard = X;\n",
+            )],
             vec![r3_lock(b, 5)],
             None,
         ),
         (
             "P9b-cfg-attr-path",
-            vec![(b, "#[cfg_attr(unix, path = \"elsewhere.rs\")]\nmod inner;\n")],
+            vec![(
+                b,
+                "#[cfg_attr(unix, path = \"elsewhere.rs\")]\nmod inner;\n",
+            )],
             vec![],
             with(vec![unwalked(1, "elsewhere.rs")], vec![]),
         ),
@@ -7715,7 +8401,10 @@ fn earlier_review_forms_stay_red_10293() {
         ),
         (
             "P11-include-in-macro-body",
-            vec![(b, "macro_rules! m {\n    ($p:expr) => {\n        include!($p)\n    };\n}\n")],
+            vec![(
+                b,
+                "macro_rules! m {\n    ($p:expr) => {\n        include!($p)\n    };\n}\n",
+            )],
             vec![],
             with(
                 vec![IncludeFinding::IncludeNotLiteral {
@@ -7739,25 +8428,37 @@ fn earlier_review_forms_stay_red_10293() {
         ),
         (
             "P15-union-manually-drop-lock",
-            vec![(b, "union U {\n    a: std::mem::ManuallyDrop<std::sync::Mutex<u8>>,\n    b: u8,\n}\nstatic FORM: U = X;\n")],
+            vec![(
+                b,
+                "union U {\n    a: std::mem::ManuallyDrop<std::sync::Mutex<u8>>,\n    b: u8,\n}\nstatic FORM: U = X;\n",
+            )],
             vec![r3_lock(b, 5)],
             None,
         ),
         (
             "P15b-union-of-lock-holder",
-            vec![(b, "struct Gate {\n    m: std::sync::RwLock<u8>,\n}\nunion W {\n    a: std::mem::ManuallyDrop<Gate>,\n}\nstatic FORM: W = X;\n")],
+            vec![(
+                b,
+                "struct Gate {\n    m: std::sync::RwLock<u8>,\n}\nunion W {\n    a: std::mem::ManuallyDrop<Gate>,\n}\nstatic FORM: W = X;\n",
+            )],
             vec![r3_lock(b, 7)],
             None,
         ),
         (
             "P17-struct-in-fn-body",
-            vec![(b, "fn make() {\n    struct Hidden(std::sync::Mutex<u8>);\n    static FORM: Hidden = X;\n}\n")],
+            vec![(
+                b,
+                "fn make() {\n    struct Hidden(std::sync::Mutex<u8>);\n    static FORM: Hidden = X;\n}\n",
+            )],
             vec![r3_lock(b, 3)],
             None,
         ),
         (
             "P18-inline-mod-homonym",
-            vec![(b, "mod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstruct Gate(u8);\nstatic FORM: inner::Gate = X;\n")],
+            vec![(
+                b,
+                "mod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstruct Gate(u8);\nstatic FORM: inner::Gate = X;\n",
+            )],
             vec![r3_lock(b, 5)],
             None,
         ),
@@ -7769,7 +8470,10 @@ fn earlier_review_forms_stay_red_10293() {
         ),
         (
             "silent-fn-pointer-guard",
-            vec![(b, "static FORM: fn() -> std::sync::MutexGuard<'static, u8> = X;\n")],
+            vec![(
+                b,
+                "static FORM: fn() -> std::sync::MutexGuard<'static, u8> = X;\n",
+            )],
             vec![],
             None,
         ),
@@ -7779,13 +8483,15 @@ fn earlier_review_forms_stay_red_10293() {
 
 /// #10293 rules A and B: each name is judged by its own definition, and a
 /// glob, a second binding, a shadowing parameter or definition and a path
-/// that lands nowhere are each refused with their reason. Then invented
-/// forms of the same class.
+/// that lands nowhere are each refused with their reason.
 #[test]
 fn names_resolve_in_their_own_scope_10293() {
     let b = "src/b.rs";
     let twin_a = ("src/a.rs", "pub struct Twin(u8);\npub struct Plain(u8);\n");
-    let twin_c = ("src/c.rs", "pub struct Twin(std::sync::Mutex<u8>);\npub struct Inner(std::sync::Mutex<u8>);\n");
+    let twin_c = (
+        "src/c.rs",
+        "pub struct Twin(std::sync::Mutex<u8>);\npub struct Inner(std::sync::Mutex<u8>);\n",
+    );
     let cases: Vec<R3Case> = vec![
         (
             "A-same-name-clean-module",
@@ -7801,25 +8507,39 @@ fn names_resolve_in_their_own_scope_10293() {
         ),
         (
             "A-imported-clean-twin",
-            vec![twin_a, twin_c, (b, "use crate::a::Twin;\nstatic FORM: Twin = X;\n")],
+            vec![
+                twin_a,
+                twin_c,
+                (b, "use crate::a::Twin;\nstatic FORM: Twin = X;\n"),
+            ],
             vec![],
             None,
         ),
         (
             "A-imported-lock-twin",
-            vec![twin_a, twin_c, (b, "use crate::c::Twin;\nstatic FORM: Twin = X;\n")],
+            vec![
+                twin_a,
+                twin_c,
+                (b, "use crate::c::Twin;\nstatic FORM: Twin = X;\n"),
+            ],
             vec![r3_lock(b, 2)],
             None,
         ),
         (
             "A-inline-twins",
-            vec![(b, "mod x {\n    pub struct Twin(u8);\n}\nmod y {\n    pub struct Twin(std::sync::Mutex<u8>);\n}\nstatic FORM: y::Twin = X;\n")],
+            vec![(
+                b,
+                "mod x {\n    pub struct Twin(u8);\n}\nmod y {\n    pub struct Twin(std::sync::Mutex<u8>);\n}\nstatic FORM: y::Twin = X;\n",
+            )],
             vec![r3_lock(b, 7)],
             None,
         ),
         (
             "A-outer-clean-over-inline-lock",
-            vec![(b, "mod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstruct Gate(u8);\nstatic FORM: Gate = X;\n")],
+            vec![(
+                b,
+                "mod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstruct Gate(u8);\nstatic FORM: Gate = X;\n",
+            )],
             vec![],
             None,
         ),
@@ -7831,13 +8551,22 @@ fn names_resolve_in_their_own_scope_10293() {
         ),
         (
             "B-two-bindings",
-            vec![twin_a, (b, "use crate::a::Plain;\nstruct Plain(u8);\nstatic FORM: Plain = X;\n")],
+            vec![
+                twin_a,
+                (
+                    b,
+                    "use crate::a::Plain;\nstruct Plain(u8);\nstatic FORM: Plain = X;\n",
+                ),
+            ],
             vec![r3_unres(b, 3, Why::Ambiguous("Plain".into()))],
             None,
         ),
         (
             "B-generic-shadows-prelude",
-            vec![(b, "struct Wrap<String>(String);\nstatic FORM: Wrap<u8> = X;\n")],
+            vec![(
+                b,
+                "struct Wrap<String>(String);\nstatic FORM: Wrap<u8> = X;\n",
+            )],
             vec![r3_unres(b, 2, Why::Shadowed("String".into()))],
             None,
         ),
@@ -7859,6 +8588,22 @@ fn names_resolve_in_their_own_scope_10293() {
             vec![r3_unres(b, 1, Why::PathNotLanded("Thing".into()))],
             None,
         ),
+    ];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10293: invented forms of the scoped-resolution class: std globs, rename
+/// chains, use cycles, fn-body and module scopes, aliases, nested groups,
+/// `#[path]` modules, generic aliases and the binary's own crate root.
+#[test]
+fn invented_scope_forms_are_judged_10293() {
+    let b = "src/b.rs";
+    let twin_a = ("src/a.rs", "pub struct Twin(u8);\npub struct Plain(u8);\n");
+    let twin_c = (
+        "src/c.rs",
+        "pub struct Twin(std::sync::Mutex<u8>);\npub struct Inner(std::sync::Mutex<u8>);\n",
+    );
+    let cases: Vec<R3Case> = vec![
         (
             "I1-std-glob-lock",
             vec![(b, "use std::sync::*;\nstatic FORM: Mutex<u8> = X;\n")],
@@ -7870,32 +8615,47 @@ fn names_resolve_in_their_own_scope_10293() {
             vec![
                 ("src/a.rs", "pub use crate::c::Inner as Middle;\n"),
                 twin_c,
-                (b, "use crate::a::Middle as Outer;\nstatic FORM: Outer = X;\n"),
+                (
+                    b,
+                    "use crate::a::Middle as Outer;\nstatic FORM: Outer = X;\n",
+                ),
             ],
             vec![r3_lock(b, 2)],
             None,
         ),
         (
             "I3-use-cycle",
-            vec![(b, "use crate::b::Q as P;\nuse crate::b::P as Q;\nstatic FORM: P = X;\n")],
+            vec![(
+                b,
+                "use crate::b::Q as P;\nuse crate::b::P as Q;\nstatic FORM: P = X;\n",
+            )],
             vec![r3_unres(b, 3, Why::Cycle("P".into()))],
             None,
         ),
         (
             "I4-fn-body-homonym-not-seen",
-            vec![(b, "struct Gate(u8);\nfn f() {\n    struct Gate(std::sync::Mutex<u8>);\n}\nstatic FORM: Gate = X;\n")],
+            vec![(
+                b,
+                "struct Gate(u8);\nfn f() {\n    struct Gate(std::sync::Mutex<u8>);\n}\nstatic FORM: Gate = X;\n",
+            )],
             vec![],
             None,
         ),
         (
             "I5-fn-body-sees-outer",
-            vec![(b, "struct Gate(std::sync::Mutex<u8>);\nfn f() {\n    static FORM: Gate = X;\n}\n")],
+            vec![(
+                b,
+                "struct Gate(std::sync::Mutex<u8>);\nfn f() {\n    static FORM: Gate = X;\n}\n",
+            )],
             vec![r3_lock(b, 3)],
             None,
         ),
         (
             "I6-module-does-not-see-outer",
-            vec![(b, "struct Gate(std::sync::Mutex<u8>);\nmod m {\n    static FORM: Gate = X;\n}\n")],
+            vec![(
+                b,
+                "struct Gate(std::sync::Mutex<u8>);\nmod m {\n    static FORM: Gate = X;\n}\n",
+            )],
             vec![r3_unres(b, 3, Why::NoDef("Gate".into()))],
             None,
         ),
@@ -7903,26 +8663,41 @@ fn names_resolve_in_their_own_scope_10293() {
             "I7-tests-module-alias",
             vec![
                 ("src/a.rs", FORM_DEFS),
-                ("tests/t.rs", "use ai_memory::a as m;\nstatic FORM: m::Gate = X;\n"),
+                (
+                    "tests/t.rs",
+                    "use ai_memory::a as m;\nstatic FORM: m::Gate = X;\n",
+                ),
             ],
             vec![r3_lock("tests/t.rs", 2)],
             None,
         ),
         (
             "I8-global-foreign-alias",
-            vec![(b, "use ::dashmap as dm;\nstatic FORM: dm::DashMap<u8, u8> = X;\n")],
+            vec![(
+                b,
+                "use ::dashmap as dm;\nstatic FORM: dm::DashMap<u8, u8> = X;\n",
+            )],
             vec![r3_unres(b, 2, r3_foreign("dashmap", "DashMap"))],
             None,
         ),
         (
             "I9-self-use-into-inline-mod",
-            vec![(b, "use self::inner::Gate;\nmod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstatic FORM: Gate = X;\n")],
+            vec![(
+                b,
+                "use self::inner::Gate;\nmod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstatic FORM: Gate = X;\n",
+            )],
             vec![r3_lock(b, 5)],
             None,
         ),
         (
             "I10-glob-in-fn-body",
-            vec![twin_a, (b, "fn f() {\n    use crate::a::*;\n    static FORM: Plain = X;\n}\n")],
+            vec![
+                twin_a,
+                (
+                    b,
+                    "fn f() {\n    use crate::a::*;\n    static FORM: Plain = X;\n}\n",
+                ),
+            ],
             vec![r3_unres(b, 3, Why::Glob("Plain".into()))],
             None,
         ),
@@ -7931,7 +8706,10 @@ fn names_resolve_in_their_own_scope_10293() {
             vec![
                 ("src/a.rs", FORM_DEFS),
                 twin_c,
-                (b, "use crate::{a::Gate as G, c::Twin};\nstatic FORM: (Twin, G) = X;\n"),
+                (
+                    b,
+                    "use crate::{a::Gate as G, c::Twin};\nstatic FORM: (Twin, G) = X;\n",
+                ),
             ],
             vec![r3_lock(b, 2)],
             None,
@@ -7940,15 +8718,41 @@ fn names_resolve_in_their_own_scope_10293() {
             "I12-path-attr-module",
             vec![
                 ("src/x.rs", "pub struct Thing(u8);\n"),
-                (b, "#[path = \"x.rs\"]\nmod px;\nstatic FORM: px::Thing = X;\n"),
+                (
+                    b,
+                    "#[path = \"x.rs\"]\nmod px;\nstatic FORM: px::Thing = X;\n",
+                ),
             ],
             vec![r3_unres(b, 3, Why::PathNotLanded("Thing".into()))],
             None,
         ),
         (
             "I13-generic-alias-to-lock",
-            vec![(b, "type M<T> = std::sync::Mutex<T>;\nstatic FORM: M<u8> = X;\n")],
+            vec![(
+                b,
+                "type M<T> = std::sync::Mutex<T>;\nstatic FORM: M<u8> = X;\n",
+            )],
             vec![r3_lock(b, 2)],
+            None,
+        ),
+        (
+            "I14-binary-root-imports-stay-in-the-binary",
+            vec![
+                twin_a,
+                ("src/main.rs", "use ai_memory::a;\n"),
+                (b, "static FORM: crate::a::Plain = X;\n"),
+            ],
+            vec![],
+            None,
+        ),
+        (
+            "I15-binary-root-sees-the-library-by-name",
+            vec![
+                twin_c,
+                ("src/main.rs", "use ai_memory::c;\n"),
+                (b, "static FORM: crate::c::Inner = X;\n"),
+            ],
+            vec![r3_lock(b, 1)],
             None,
         ),
     ];
@@ -7968,7 +8772,7 @@ const R3_INNER_FIELD: &str = "pub struct Inner {\n    v: Unknown,\n    w: u16,\n
 const R3_OWN_TYPE: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: (Bus, u8) = X;\n";
 
 /// #10295: the pinned digest of `FORM` in [`R3_BUS`].
-const D_BUS: &str = "";
+const D_BUS: &str = "type=ce1d7f3c src::b::Bus=364aa5fe src::b::Inner=a250aabb";
 
 /// #10295: an exception holds only while every definition behind the
 /// static is the one it was pinned against; a change names the type.
@@ -8036,7 +8840,8 @@ fn exceptions_are_pinned_by_content_10295() {
 }
 
 /// #10293: scoped resolution stays linear: a 100 000-step import rename
-/// chain, a 100 000-struct type cycle and 100 000 glob imports are each
+/// chain, a 100 000-struct type cycle, 100 000 glob imports, 100 000
+/// imports of one name and 100 000 `#[path]` modules of one name are each
 /// judged exactly under the ceiling.
 #[test]
 fn scoped_resolution_cost_is_bounded_10293() {
@@ -8045,17 +8850,25 @@ fn scoped_resolution_cost_is_bounded_10293() {
     let mut chain = String::new();
     let mut cycle = String::new();
     let mut globs = String::new();
+    let mut same_use = String::new();
+    let mut same_mod = String::new();
     for i in 0..REPS {
         let _ = writeln!(chain, "pub use crate::a::R{} as R{i};", i + 1);
         let _ = writeln!(cycle, "pub struct T{i}(Box<T{}>);", i + 1);
         let _ = writeln!(globs, "use crate::m{i}::*;");
+        let _ = writeln!(same_use, "use crate::m{i}::Plain;");
+        same_mod.push_str("#[path = \"x.rs\"]\nmod px;\n");
     }
     let _ = writeln!(chain, "pub struct R{REPS}(std::sync::Mutex<u8>);");
     let _ = writeln!(cycle, "pub struct T{REPS}(Box<T0>);");
     globs.push_str("static FORM: Plain = X;\n");
+    same_use.push_str("static FORM: Plain = X;\n");
+    same_mod.push_str("static FORM: px::Plain = X;\n");
     let chain: &'static str = chain.leak();
     let cycle: &'static str = cycle.leak();
     let globs: &'static str = globs.leak();
+    let same_use: &'static str = same_use.leak();
+    let same_mod: &'static str = same_mod.leak();
     let b = "src/b.rs";
     let cases: Vec<R3Case> = vec![
         (
@@ -8074,6 +8887,18 @@ fn scoped_resolution_cost_is_bounded_10293() {
             "many-globs",
             vec![(b, globs)],
             vec![r3_unres(b, REPS + 1, Why::Glob("Plain".into()))],
+            None,
+        ),
+        (
+            "one-name-imported-many-times",
+            vec![(b, same_use)],
+            vec![r3_unres(b, REPS + 1, Why::Ambiguous("Plain".into()))],
+            None,
+        ),
+        (
+            "one-module-name-many-path-attrs",
+            vec![("src/x.rs", "pub struct Plain(u8);\n"), (b, same_mod)],
+            vec![r3_unres(b, 2 * REPS + 1, Why::Ambiguous("px".into()))],
             None,
         ),
     ];
