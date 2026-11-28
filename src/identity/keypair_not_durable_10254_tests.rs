@@ -295,7 +295,11 @@ fn failed_priv_claim_is_an_error_not_not_durable_10333() {
     let err = outcome
         .err()
         .expect("a failed .priv claim must be an error, never a not-durable success");
-    assert_eq!(links, vec![priv_path.clone()], "the claim link goes through the seam");
+    assert_eq!(
+        links,
+        vec![priv_path.clone()],
+        "the claim link goes through the seam"
+    );
     assert_eq!(
         format!("{err:#}"),
         format!(
@@ -307,5 +311,8 @@ fn failed_priv_claim_is_an_error_not_not_durable_10333() {
     assert!(err.downcast_ref::<NotDurableReport>().is_none(), "{err:#}");
     assert!(err.downcast_ref::<NotDurable>().is_none(), "{err:#}");
     assert!(!priv_path.exists(), "no .priv is left after a failed claim");
-    assert!(!pub_path.exists(), "no .pub is written after a failed claim");
+    assert!(
+        !pub_path.exists(),
+        "no .pub is written after a failed claim"
+    );
 }
