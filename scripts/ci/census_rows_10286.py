@@ -939,13 +939,66 @@ def sites_of(t: list[Tok], watched: set[str], env_names: set[str], env_fns: set[
 
 
 LINK_FINDING = "a symbolic link; the census never follows links (#10176)"
+DOTS_FINDING = ("holds an empty, '.' or '..' component; the census opens a path below the root one name at a time "
+                "(#10345)")
+DIR_WALK_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# A test seam (#10345): when set, called with each relative prefix just before
+# the walk opens it, so a test can swap a directory between two walk steps.
+WALK_HOOK = None
+
+
+def _refuse_link(rel: str, part: str, dir_fd: int, name: str, e: OSError) -> None:
+    """Raise the link finding naming `part` when `name` under `dir_fd` is a
+    link (looked up with no link followed); return to re-raise `e` otherwise."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError(f"{rel}: {part} is {LINK_FINDING}") from e
+
+
+def open_in_root(root: pathlib.Path, rel: str, flags: int, mode: int = 0o644) -> int:
+    """An fd of `rel` below `root`, opened by a walk from a root directory fd
+    one name at a time: every directory with O_DIRECTORY | O_NOFOLLOW and the
+    last name with O_NOFOLLOW, each relative to the fd before it, so the
+    in-root decision and the open are the same act and no component below the
+    root is ever a link followed (#10345). ValueError naming the path and the
+    linked component; any other OSError of an open is raised as it is."""
+    parts = rel.split("/")
+    if rel.startswith("/") or any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"{rel}: {DOTS_FINDING}")
+    cur = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for i, name in enumerate(parts):
+            part = "/".join(parts[: i + 1])
+            if WALK_HOOK is not None:
+                WALK_HOOK(part)
+            last = i == len(parts) - 1
+            try:
+                if last:
+                    nxt = os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=cur)
+                else:
+                    nxt = os.open(name, DIR_WALK_FLAGS, dir_fd=cur)
+            except OSError as e:
+                if not last and e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    _refuse_link(rel, part, cur, name, e)
+                raise
+            os.close(cur)
+            cur = nxt
+        fd, cur = cur, -1
+        return fd
+    finally:
+        if cur != -1:
+            os.close(cur)
 
 
 def read_scanned(root: pathlib.Path, rel: str) -> bytes:
-    """The bytes of a file of the walk, opened with no link followed; ValueError
-    naming the relative path and the cause otherwise."""
+    """The bytes of a file of the walk, opened with no link followed in any
+    component (#10345); ValueError naming the relative path and the cause
+    otherwise."""
     try:
-        fd = os.open(root / rel, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = open_in_root(root, rel, os.O_RDONLY)
         with os.fdopen(fd, "rb") as f:
             return f.read()
     except OSError as e:
@@ -1278,7 +1331,7 @@ def read_target(root: pathlib.Path, target: str) -> bytes:
     the finding otherwise."""
     try:
         st = (root / target).lstat()
-        fd = os.open(root / target, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = open_in_root(root, target, os.O_RDONLY)
     except OSError as e:
         raise ValueError(f"{target}: cannot be read (errno {e.errno}) (#10300)") from e
     with os.fdopen(fd, "rb") as f:
@@ -1463,7 +1516,7 @@ def load_rows(root: pathlib.Path) -> dict[str, dict[str, str]]:
     """The committed rows file, opened with no link followed; an absent file is
     three empty tables, so every scanned file is refused (#10311)."""
     try:
-        fd = os.open(root / ROWS_OUT, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = open_in_root(root, ROWS_OUT, os.O_RDONLY)
     except OSError as e:
         if e.errno == errno.ENOENT:
             return {name: {} for name, _prefix, _what in TABLES}
@@ -1496,7 +1549,7 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
     has no committed row (#10311)."""
     committed = load_rows(root)
     # The census must hold its START_ROWS block (#10290); no reason is drawn from it (#10311).
-    start_files((root / CENSUS).read_text(encoding="utf-8"))
+    start_files(read_scanned(root, CENSUS).decode("utf-8"))
     walk_errors: list[str] = []
     config_errors = [f for rel, data in tree_configs(root, walk_errors) for f in config_findings(rel, data)]
     lexed = [(rel, lex(text)) for rel, text in tree_rs(root, walk_errors)]
@@ -1573,15 +1626,12 @@ def first_diff(a: str, b: str) -> str:
 
 
 def write_table(root: pathlib.Path, rel: str, text: str) -> None:
-    """Write one generated table: the parent directory must resolve inside the
-    root and the file is opened with no link followed, so no write goes through
-    a link or outside the root; ValueError naming the path otherwise."""
-    top = root.resolve()
-    parent = (root / rel).parent.resolve()
-    if parent != top and top not in parent.parents:
-        raise ValueError(f"{rel}: resolves outside the root; the census never writes there (#10176)")
+    """Write one generated table, opened by `open_in_root`: the walk from the
+    root fd is the in-root decision and the open in one act, so no write goes
+    through a link in any component or lands outside the root (#10345);
+    ValueError naming the path otherwise."""
     try:
-        fd = os.open(root / rel, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        fd = open_in_root(root, rel, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
     except OSError as e:

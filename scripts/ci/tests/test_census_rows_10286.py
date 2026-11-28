@@ -1048,6 +1048,22 @@ class ParentWalk10345(unittest.TestCase):
             self.m.read_target(self.root, rel)
         self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
 
+    def test_the_census_read_refuses_a_parent_swapped_after_the_rows_read_10345(self) -> None:
+        # load_rows walks `tests` first; the swap lands on the census read's walk.
+        (self.root / CENSUS).write_text(FIXTURE[str(CENSUS)], encoding="utf-8")
+        (self.outside / CENSUS.name).write_text(FIXTURE[str(CENSUS)], encoding="utf-8")
+        seen = []
+
+        def hook(prefix: str) -> None:
+            seen.append(prefix)
+            if seen.count("tests") == 2 and not (self.root / "tests").is_symlink():
+                (self.root / "tests").rename(self.root / "tests-moved")
+                (self.root / "tests").symlink_to(self.outside, target_is_directory=True)
+        self.m.WALK_HOOK = hook
+        with self.assertRaises(ValueError) as cm:
+            self.m.scan(self.root)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=str(CENSUS), part="tests"))
+
     def test_dot_components_are_refused_before_any_open_10345(self) -> None:
         for rel in ("tests/../x.rs", "tests/./x.rs", "tests//x.rs", "../x.rs", "/x.rs"):
             with self.subTest(rel=rel):
