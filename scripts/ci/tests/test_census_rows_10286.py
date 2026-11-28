@@ -532,5 +532,76 @@ class EnvName10299(unittest.TestCase):
         self.assertLess(took, ENV_NAME_BOUND_SECONDS)
 
 
+CONFIG_TABLE = ROOT / "tests/common/census_config_10301.json"
+CONFIG_ROWS_10301 = 21
+CONFIG_BYTE_ROWS_10301 = 1
+CONFIG_BOUND_ENTRIES = 6_000
+CONFIG_BOUND_BYTES = 100_000
+CONFIG_BOUND_SECONDS = 20
+RUST_CARGO = ROOT / "tests/common/census_cargo_10289.rs"
+RUST_CRATES_RE = re.compile(r"^pub\(crate\) const WATCHED_CRATES: &\[&str\] =\n\s*&\[([^\]]*)\];$", re.M)
+CONFIG_PATCH_LINE = (".cargo/config.toml: patch.crates-io.libc patches the watched crate libc; "
+                     "a patched watched crate runs code the census never reads (#10301)")
+
+
+class CargoConfig10301(unittest.TestCase):
+    """#10301: every `.cargo/config.toml` and `.cargo/config` is read; the Python
+    lines of each row of the table the Rust test `every_cargo_config_form_is_read_
+    or_refused_10301` reads are its hand-written lines, and a config finding fails
+    the scan."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+        self.assertTrue(hasattr(self.m, "config_findings"), "the scanner has no config_findings (#10301)")
+
+    def lines(self, rel: str, data: bytes) -> list[str]:
+        return sorted(self.m.config_findings(rel, data)) if self.m.is_config(rel) else []
+
+    def test_config_lines_of_the_shared_table(self) -> None:
+        table = json.loads(CONFIG_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(table["rows"]), CONFIG_ROWS_10301)
+        self.assertEqual(len(table["bytes"]), CONFIG_BYTE_ROWS_10301)
+        bad = []
+        for i, (rel, text, want) in enumerate(table["rows"]):
+            have = self.lines(rel, text.encode("utf-8"))
+            if have != want:
+                bad.append(f"row {i} {rel} {text!r}: {have}")
+        for i, (rel, data, want) in enumerate(table["bytes"]):
+            have = self.lines(rel, bytes(data))
+            if have != want:
+                bad.append(f"byte row {i} {rel} {data!r}: {have}")
+        self.assertEqual(bad, [])
+
+    def test_watched_crates_are_the_rust_list(self) -> None:
+        found = RUST_CRATES_RE.findall(RUST_CARGO.read_text(encoding="utf-8"))
+        self.assertEqual(len(found), 1, "one Rust WATCHED_CRATES list")
+        rust = frozenset(re.findall(r'"([^"\\]+)"', found[0]))
+        self.assertEqual(sorted(self.m.WATCHED_CRATES ^ rust), [])
+
+    def test_a_large_config_is_read_in_linear_time(self) -> None:
+        text = "[alias]\n" + "".join(f'a{i:05} = "test"\n' for i in range(CONFIG_BOUND_ENTRIES))
+        text += '[patch.crates-io.libc]\npath = "l"\n'
+        self.assertGreater(len(text), CONFIG_BOUND_BYTES)
+        started = time.monotonic()
+        have = self.lines(".cargo/config.toml", text.encode("utf-8"))
+        self.assertLess(time.monotonic() - started, CONFIG_BOUND_SECONDS)
+        self.assertEqual(have, [CONFIG_PATCH_LINE])
+
+    def test_a_config_finding_fails_the_scan(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="census-config-10301-", dir=SCRATCH) as tmp:
+            root = Path(tmp)
+            for rel, text in FIXTURE.items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text, encoding="utf-8")
+            (root / "tests/common").mkdir(parents=True, exist_ok=True)
+            (root / ".cargo").mkdir()
+            (root / ".cargo/config.toml").write_text('[patch.crates-io.libc]\npath = "l"\n', encoding="utf-8")
+            r = run("--write", "--root", str(root))
+            self.assertEqual(r.returncode, EXIT_SCAN)
+            self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: " + CONFIG_PATCH_LINE)
+
+
 if __name__ == "__main__":
     unittest.main()
