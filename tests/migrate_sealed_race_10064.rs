@@ -466,6 +466,85 @@ async fn racing_wrapper_without_a_race_migrates_every_row_10064() {
     assert_eq!(got, want, "every row landed");
 }
 
+/// #10082 — MCP `memory_export_reflection` post-read re-check race cell
+/// (SQLite): a source row that is unsealed at pre-read and becomes sealed
+/// inside the injected read step MUST refuse with exact `SEALED_EXPORT_REFUSED`
+/// naming that source and export nothing.
+#[test]
+fn mcp_export_reflection_refuses_source_sealed_inside_read_sqlite_10082() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("mcp-sealed-race-10082.db");
+    let conn = ai_memory::db::open(&db_path).expect("open db");
+    let now = chrono::Utc::now().to_rfc3339();
+    let src = Memory {
+        id: "src-10082".to_string(),
+        namespace: NS.to_string(),
+        tier: Tier::Long,
+        memory_kind: MemoryKind::Observation,
+        title: "source 10082".to_string(),
+        content: SEALED_MARKER.to_string(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        metadata: serde_json::json!({"agent_id": KEY_AGENT, "scope": "collective"}),
+        ..Default::default()
+    };
+    let rfl = Memory {
+        id: "rfl-10082".to_string(),
+        namespace: NS.to_string(),
+        tier: Tier::Mid,
+        memory_kind: MemoryKind::Reflection,
+        title: "reflection 10082".to_string(),
+        content: "reflection summary".to_string(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        metadata: serde_json::json!({"agent_id": KEY_AGENT, "scope": "collective"}),
+        reflection_depth: 1,
+        ..Default::default()
+    };
+    ai_memory::db::insert(&conn, &src).expect("insert src");
+    ai_memory::db::insert(&conn, &rfl).expect("insert rfl");
+    conn.execute(
+        "INSERT INTO memory_links (source_id, target_id, relation, created_at, attest_level) \
+         VALUES (?1, ?2, 'reflects_on', ?3, 'unsigned')",
+        rusqlite::params![&rfl.id, &src.id, &now],
+    )
+    .expect("link reflects_on");
+
+    let mut sealed_in_read = false;
+    let err = ai_memory::mcp::handle_export_reflection_with_reader(
+        &conn,
+        &serde_json::json!({"memory_id": rfl.id, "format": "md"}),
+        Some(KEY_AGENT),
+        |c, member_id, reflection_id, caller| {
+            let mem = ai_memory::mcp::read_reflection_member(c, member_id, reflection_id, caller)?;
+            if member_id == src.id {
+                let changed = c
+                    .execute(
+                        "UPDATE memories SET content = '', encrypted_envelope = ?1 WHERE id = ?2",
+                        rusqlite::params![sealed_envelope(), member_id],
+                    )
+                    .expect("seal source inside injected read");
+                assert_eq!(changed, 1);
+                sealed_in_read = true;
+            }
+            Ok(mem)
+        },
+    )
+    .expect_err("#10082: source sealed inside read must refuse export");
+    assert!(sealed_in_read, "#10082: injected read seam must execute");
+    let want = format!(
+        "SEALED_EXPORT_REFUSED: 1 row(s) of memories are sealed at rest (first id {}); no \
+         export format carries the at-rest envelope, so the export is refused and nothing was \
+         written. Move an encrypted store with backup/restore (#10028)",
+        src.id
+    );
+    assert_eq!(err, want);
+    assert!(
+        !err.contains(SEALED_MARKER),
+        "#10082: refusal must not carry sealed plaintext"
+    );
+}
+
 #[cfg(feature = "sal-postgres")]
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;

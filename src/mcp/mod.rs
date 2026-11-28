@@ -887,6 +887,12 @@ pub use calibrate_confidence::handle_calibrate_confidence;
 pub use dependents_of_invalidated::handle_dependents_of_invalidated;
 pub use export_reflection::handle_export_reflection;
 pub(crate) use export_reflection::handle_export_reflection_for_caller;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use export_reflection::{
+    handle_export_reflection_with_reader,
+    read_reflection_member_for_test as read_reflection_member, row_version_mismatch_msg,
+};
 pub use pending::{DlqListError, handle_subscription_dlq_list, handle_subscription_dlq_list_for};
 pub use reflect::{handle_reflect, handle_reflect_caller};
 // Consumed only by the postgres SAL HTTP branch in `route_1111`, which is
