@@ -3036,7 +3036,7 @@ struct PendingWatermark {
 #[derive(Debug, Clone, Default)]
 pub struct PendingAuditAnchor {
     watermark: Option<PendingWatermark>,
-    head_anchors: Vec<crate::models::Checkpoint>,
+    head_anchors: Vec<crate::models::checkpoint::Checkpoint>,
 }
 
 impl PendingAuditAnchor {

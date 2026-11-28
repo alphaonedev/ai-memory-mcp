@@ -640,6 +640,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::ShutdownGate;
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
