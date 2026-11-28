@@ -9521,9 +9521,12 @@ fn import_through_glob_resolves_after_settle_10325() {
 /// modules, each globbing the next and writing `static FORM: Plain`, the
 /// last binding `Plain`, and one hub module globbing every link. Every
 /// static is judged exactly: `Plain` is glob-supplied in each of them.
-fn glob_chain_visits(n: usize) -> u64 {
+/// With `cycle` the last module globs the first instead and nothing binds
+/// `Plain`: a glob cycle with no definition, where every bare `Plain` has
+/// no definition.
+fn glob_chain_visits(n: usize, cycle: bool) -> u64 {
     let mut files: Vec<(String, String)> = Vec::with_capacity(n + 2);
-    let mut want: Vec<String> = Vec::with_capacity(n + 1);
+    let mut paths: Vec<String> = Vec::with_capacity(n);
     let mut hub = String::new();
     for i in 0..n {
         let path = format!("src/m{i}.rs");
@@ -9532,22 +9535,22 @@ fn glob_chain_visits(n: usize) -> u64 {
             path.clone(),
             format!("use crate::m{next}::*;\nstatic FORM: Plain = X;\n"),
         ));
-        want.push(format!(
-            "{:?}",
-            r3_unres(&path, 2, Why::Glob("Plain".into()))
-        ));
+        paths.push(path);
         let _ = writeln!(hub, "use crate::m{i}::*;");
     }
-    files.push((
-        format!("src/m{n}.rs"),
-        "pub struct Plain(u8);\n".to_string(),
-    ));
+    let (last, why) = if cycle {
+        ("use crate::m0::*;\n", Why::NoDef("Plain".into()))
+    } else {
+        ("pub struct Plain(u8);\n", Why::Glob("Plain".into()))
+    };
+    files.push((format!("src/m{n}.rs"), last.to_string()));
     hub.push_str("static FORM: Plain = X;\n");
     files.push(("src/hub.rs".to_string(), hub));
-    want.push(format!(
-        "{:?}",
-        r3_unres("src/hub.rs", n + 1, Why::Glob("Plain".into()))
-    ));
+    let mut want: Vec<String> = paths
+        .iter()
+        .map(|p| format!("{:?}", r3_unres(p, 2, why.clone())))
+        .collect();
+    want.push(format!("{:?}", r3_unres("src/hub.rs", n + 1, why)));
     let refs: Vec<(&str, &str)> = files
         .iter()
         .map(|(p, t)| (p.as_str(), t.as_str()))
@@ -9556,35 +9559,42 @@ fn glob_chain_visits(n: usize) -> u64 {
     let mut got: Vec<String> = statics.iter().map(|f| format!("{f:?}")).collect();
     got.sort();
     want.sort();
-    assert_eq!(got, want, "glob chain of {n} modules");
-    assert_eq!(includes, no_store_url(), "glob chain of {n} modules");
+    assert_eq!(got, want, "glob chain of {n} modules, cycle {cycle}");
+    assert_eq!(
+        includes,
+        no_store_url(),
+        "glob chain of {n} modules, cycle {cycle}"
+    );
     visits
 }
 
 /// #10324: each scope's glob closure is walked once, not once per lookup:
 /// at four times the modules of a glob chain with fan-out, the resolver
-/// makes at most four times the scope visits, plus a constant. The bound is
+/// makes at most four times the scope visits, plus a constant, for a chain
+/// that ends in a definition and for a glob cycle with none. The bound is
 /// on operation counts, never on wall-clock time.
 #[test]
 fn glob_chain_resolution_cost_is_linear_10324() {
     const CHAIN_SMALL: usize = 250;
     const GROWTH: usize = 4;
     const SLACK: u64 = 64;
-    let small = glob_chain_visits(CHAIN_SMALL);
-    let large = glob_chain_visits(CHAIN_SMALL * GROWTH);
     let growth = u64::try_from(GROWTH).expect("GROWTH fits u64");
     let floor = u64::try_from(CHAIN_SMALL).expect("CHAIN_SMALL fits u64");
-    // Each static is looked up through at least one glob: a counter that
-    // counts nothing proves nothing.
-    assert!(
-        small >= floor,
-        "glob visits: {small} at {CHAIN_SMALL} modules"
-    );
-    assert!(
-        large <= growth * small + SLACK,
-        "glob visits: {small} at {CHAIN_SMALL} modules, {large} at {} modules",
-        CHAIN_SMALL * GROWTH
-    );
+    for cycle in [false, true] {
+        let small = glob_chain_visits(CHAIN_SMALL, cycle);
+        let large = glob_chain_visits(CHAIN_SMALL * GROWTH, cycle);
+        // Each static is looked up through at least one glob: a counter
+        // that counts nothing proves nothing.
+        assert!(
+            small >= floor,
+            "cycle {cycle}: glob visits: {small} at {CHAIN_SMALL} modules"
+        );
+        assert!(
+            large <= growth * small + SLACK,
+            "cycle {cycle}: glob visits: {small} at {CHAIN_SMALL} modules, {large} at {} modules",
+            CHAIN_SMALL * GROWTH
+        );
+    }
 }
 
 /// #10324: a cycle of globs terminates and resolves as before. Through the
