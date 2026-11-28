@@ -876,5 +876,53 @@ class CargoConfig10301(unittest.TestCase):
             self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: crates/x/" + CONFIG_PATCH_LINE)
 
 
+# The rows of the Rust test `a_shape_extern_row_for_a_non_acl_extern_is_red_10311`,
+# written out by hand: (source, the first name the scan refuses, or None).
+EXTERN_ARM_ROWS_10311 = [
+    ('unsafe extern "C" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn acl_get_fd_np(fd: i32, t: i32) -> *mut u8;\n}\n', None),
+    ("extern {\n    pub fn acl_x(f: fn(i32) -> i32);\n}\n", None),
+    ('unsafe extern "C" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn fork() -> i32;\n}\n', "fork"),
+    ('extern "C" {\n    fn posix_spawn() -> i32;\n}\n', "posix_spawn"),
+    ("extern {\n    static mut environ: *const u8;\n}\n", "environ"),
+    ('extern "C" {\n    type acl_t;\n}\n', "acl_t"),
+    ('extern "C" {\n    #[link_name = "fork"]\n    fn acl_free() -> i32;\n}\n', "#[link_name]"),
+    ('extern "C" {\n    m! { fn fork(); }\n}\n', "m"),
+    ('extern "C" {\n    fn acl_a();\n}\nextern "C" {\n    fn execve();\n    safe fn acl_b();\n}\n', "execve"),
+]
+EXTERN_REFUSAL_10311 = "an extern block declares {name}; only acl_* functions may be declared in one (#10311)"
+
+
+class ExternArm10311(unittest.TestCase):
+    """#10311: the extern arm of `shapes_of` accepts an extern block only when it
+    declares nothing but `acl_*` functions; any other item fails the scan with the
+    file and the name, in parity with the Rust census."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_the_extern_arm_refuses_a_non_acl_item_10311(self) -> None:
+        for src, name in EXTERN_ARM_ROWS_10311:
+            toks = self.m.lex(src)
+            if name is None:
+                self.assertEqual(self.m.shapes_of(toks, set()), [("extern", 1)], src)
+                continue
+            with self.assertRaises(ValueError, msg=src) as cm:
+                self.m.shapes_of(toks, set())
+            self.assertEqual(str(cm.exception).split(": ", 1)[1], EXTERN_REFUSAL_10311.format(name=name), src)
+
+    def test_the_scan_names_the_file_of_a_non_acl_extern_10311(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="census-extern-10311-", dir=SCRATCH) as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / CENSUS).write_text(FIXTURE[str(CENSUS)], encoding="utf-8")
+            (root / "src/x.rs").write_text('fn a() {}\nextern "C" {\n    fn fork() -> i32;\n}\n', encoding="utf-8")
+            r = run("--check", "--root", str(root))
+            self.assertEqual(r.returncode, EXIT_SCAN)
+            self.assertEqual(r.stderr.strip(),
+                             "census_rows_10286: scan failed: src/x.rs: line 2: " + EXTERN_REFUSAL_10311.format(name="fork"))
+
+
 if __name__ == "__main__":
     unittest.main()

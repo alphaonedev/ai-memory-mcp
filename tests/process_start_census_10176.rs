@@ -1652,6 +1652,12 @@ fn table_findings(
     out
 }
 
+/// #10311: the findings of a file rowed `R_SHAPE_EXTERN` whose extern blocks
+/// declare anything but `acl_*` functions.
+fn extern_row_findings(_rel: &str, _toks: &[Lexed]) -> Vec<String> {
+    Vec::new()
+}
+
 /// The proptest variable names that a `concat!` builds and that no one of
 /// its literals holds alone.
 fn concat_needles(toks: &[Lexed], needle: &str) -> usize {
@@ -2586,6 +2592,92 @@ fn a_wrong_count_and_a_stale_row_of_the_token_tables_are_red_10176() {
             "tests/common/tls_serve.rs: 0 forms the census does not model, SHAPE_ROWS has 3; each needs its exact row with its reason (#10176)".to_string(),
         ]
     );
+}
+
+/// #10311: a file rowed `R_SHAPE_EXTERN` declares only `acl_*` functions in
+/// its extern blocks; any other function, a static, a type, an attribute
+/// (a `link_name` can bind an `acl_*` name to any symbol) or a macro item is
+/// red with its exact finding. The rows are written out by hand.
+#[test]
+fn a_shape_extern_row_for_a_non_acl_extern_is_red_10311() {
+    let red = |name: &str| format!("a.rs is rowed R_SHAPE_EXTERN but declares {name} (#10311)");
+    let rows: [(&str, Vec<String>); 9] = [
+        (
+            "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn acl_get_fd_np(fd: i32, t: i32) -> *mut u8;\n}\n",
+            vec![],
+        ),
+        ("extern {\n    pub fn acl_x(f: fn(i32) -> i32);\n}\n", vec![]),
+        (
+            "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn fork() -> i32;\n}\n",
+            vec![red("fork")],
+        ),
+        ("extern \"C\" {\n    fn posix_spawn() -> i32;\n}\n", vec![red("posix_spawn")]),
+        ("extern {\n    static mut environ: *const u8;\n}\n", vec![red("environ")]),
+        ("extern \"C\" {\n    type acl_t;\n}\n", vec![red("acl_t")]),
+        (
+            "extern \"C\" {\n    #[link_name = \"fork\"]\n    fn acl_free() -> i32;\n}\n",
+            vec![red("#[link_name]")],
+        ),
+        ("extern \"C\" {\n    m! { fn fork(); }\n}\n", vec![red("m")]),
+        (
+            "extern \"C\" {\n    fn acl_a();\n}\nextern \"C\" {\n    fn execve();\n    safe fn acl_b();\n}\n",
+            vec![red("execve")],
+        ),
+    ];
+    for (src, want) in rows {
+        assert_eq!(extern_row_findings("a.rs", &lex(src)), want, "{src}");
+    }
+}
+
+/// #10311: the census reads the extern reason of a `SHAPE_ROWS` row as a
+/// claim about the file. A rowed `R_SHAPE_EXTERN` file whose extern block
+/// declares a non-`acl_*` function, an `R_SHAPE_EXTERN` row over a form that
+/// is not an extern block, and an extern block under a row with another
+/// reason are each red with the exact line. The files and lines are written
+/// out by hand; the rows are the committed ones.
+#[test]
+fn the_census_truth_checks_the_extern_reason_of_a_shape_row_10311() {
+    let ext = "src/governance/deferred_audit.rs";
+    let imp = "tests/common/tls_serve.rs";
+    let rows: [(&str, &str, Vec<String>); 4] = [
+        (
+            ext,
+            "unsafe extern \"C\" {\n    fn acl_free() -> i32;\n}\nunsafe extern \"C\" {\n    fn acl_get_entry() -> i32;\n}\n",
+            vec![],
+        ),
+        (
+            ext,
+            "unsafe extern \"C\" {\n    fn acl_free() -> i32;\n}\nunsafe extern \"C\" {\n    fn fork() -> i32;\n}\n",
+            vec![format!("{ext} is rowed R_SHAPE_EXTERN but declares fork (#10311)")],
+        ),
+        (
+            ext,
+            "use proptest::prelude::*;\nunsafe extern \"C\" {\n    fn acl_free() -> i32;\n}\n",
+            vec![format!(
+                "{ext}:1: a glob form under an R_SHAPE_EXTERN row, whose reason covers only extern blocks (#10311)"
+            )],
+        ),
+        (
+            imp,
+            "extern \"C\" {\n    fn acl_free() -> i32;\n}\n",
+            vec![format!(
+                "{imp}:1: an extern block under a SHAPE_ROWS row whose reason is not R_SHAPE_EXTERN (#10311)"
+            )],
+        ),
+    ];
+    for (rel, src, want) in rows {
+        let tree = Tree {
+            files: vec![(rel.to_string(), src.as_bytes().to_vec())],
+            links: vec![],
+            packages: vec![],
+            root: None,
+        };
+        let got: Vec<String> = census(&tree)
+            .into_iter()
+            .filter(|l| l.ends_with("(#10311)"))
+            .collect();
+        assert_eq!(got, want, "{rel}:\n{src}");
+    }
 }
 
 /// A row with a short reason, a row out of order and a file held twice are
