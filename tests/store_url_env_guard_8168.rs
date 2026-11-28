@@ -2896,6 +2896,19 @@ struct TypeGraph {
     /// #10324: every scope visit of [`TypeGraph::glob_supplies`], read by
     /// the cost test through [`token_census_counted`].
     glob_visits: std::cell::Cell<u64>,
+    /// #10324: the answer of [`TypeGraph::glob_supplies`] through a scope,
+    /// per name, then per scope; cleared once the globs are settled.
+    glob_memo: std::cell::RefCell<BTreeMap<String, BTreeMap<usize, Supply>>>,
+}
+
+/// #10324: one scope of the glob walk of [`TypeGraph::glob_supplies`]: the
+/// globs of `scope` left to follow (`next` down to 0) and the lowest depth of
+/// a scope in progress that its walk met (its own depth when none).
+#[derive(Debug, Clone, Copy)]
+struct GlobFrame {
+    scope: usize,
+    next: usize,
+    low: usize,
 }
 
 /// One keyword position of a lexed file, for [`TypeGraph::item`].
@@ -3362,33 +3375,126 @@ impl TypeGraph {
     /// module binds, and the names its own globs can supply. #10322: a glob
     /// of a module the census did not read is [`Supply::Unread`] for every
     /// name, never [`Supply::No`].
+    ///
+    /// #10324: the closure is walked depth first, in the order of the
+    /// former stack walk (the last glob first), and the answer through each
+    /// scope other than `scope` is memoised per `(scope, name)` once it does
+    /// not depend on a scope still in progress (a cycle back to one), so a
+    /// glob chain is walked once, not once per lookup.
     fn glob_supplies(&self, scope: usize, name: &str) -> Supply {
-        let mut seen: BTreeSet<usize> = BTreeSet::new();
-        let mut todo = vec![scope];
-        while let Some(s) = todo.pop() {
-            if !seen.insert(s) {
+        // Each scope met: `Some(depth)` while its frame is on the stack.
+        let mut seen: BTreeMap<usize, Option<usize>> = BTreeMap::new();
+        let mut frames: Vec<GlobFrame> = Vec::new();
+        seen.insert(scope, Some(0));
+        self.glob_visit();
+        if let Some(r) = self.glob_own(scope, name, true) {
+            return r;
+        }
+        frames.push(GlobFrame {
+            scope,
+            next: self.scopes[scope].glob_to.len(),
+            low: 0,
+        });
+        while let Some(top) = frames.last_mut() {
+            if top.next == 0 {
+                let done = *top;
+                frames.pop();
+                let depth = frames.len();
+                if let Some(parent) = frames.last_mut() {
+                    if done.low >= depth {
+                        self.glob_memo_put(done.scope, name, Supply::No);
+                    }
+                    parent.low = parent.low.min(done.low);
+                }
+                seen.insert(done.scope, None);
                 continue;
             }
-            self.glob_visits
-                .set(self.glob_visits.get().saturating_add(1));
-            let sc = &self.scopes[s];
-            if s != scope && sc.items.contains_key(name) {
+            top.next -= 1;
+            let Some(child) = self.scopes[top.scope].glob_to[top.next] else {
                 return Supply::Glob;
-            }
-            if s != scope && !sc.read {
-                return Supply::Unread;
-            }
-            if sc.glob_to.len() != sc.globs.len() {
-                return Supply::Glob;
-            }
-            for g in &sc.glob_to {
-                match g {
-                    Some(m) => todo.push(*m),
-                    None => return Supply::Glob,
+            };
+            if let Some(r) = self.glob_memo_get(child, name) {
+                self.glob_visit();
+                if r == Supply::No {
+                    continue;
                 }
+                return self.glob_found(&frames, name, r);
             }
+            if let Some(&at) = seen.get(&child) {
+                // A cycle back to a scope in progress, or a scope finished
+                // under one: whatever reaches it is not memoised.
+                top.low = top.low.min(at.unwrap_or(0));
+                continue;
+            }
+            let depth = frames.len();
+            seen.insert(child, Some(depth));
+            self.glob_visit();
+            if let Some(r) = self.glob_own(child, name, false) {
+                self.glob_memo_put(child, name, r);
+                return self.glob_found(&frames, name, r);
+            }
+            frames.push(GlobFrame {
+                scope: child,
+                next: self.scopes[child].glob_to.len(),
+                low: depth,
+            });
         }
         Supply::No
+    }
+
+    /// #10324: what `s` itself supplies for `name` before its globs are
+    /// followed; `root` is the scope looked up in, whose own items and
+    /// reading are judged by [`TypeGraph::look`].
+    fn glob_own(&self, s: usize, name: &str, root: bool) -> Option<Supply> {
+        let sc = &self.scopes[s];
+        if !root && sc.items.contains_key(name) {
+            return Some(Supply::Glob);
+        }
+        if !root && !sc.read {
+            return Some(Supply::Unread);
+        }
+        if sc.glob_to.len() != sc.globs.len() || sc.glob_to.iter().any(Option::is_none) {
+            return Some(Supply::Glob);
+        }
+        None
+    }
+
+    /// #10324: `r`, found below every frame of `frames`, is the answer of
+    /// each frame other than the root; it is memoised for each frame whose
+    /// walk met no scope in progress above it.
+    fn glob_found(&self, frames: &[GlobFrame], name: &str, r: Supply) -> Supply {
+        let mut low = usize::MAX;
+        for (depth, f) in frames.iter().enumerate().skip(1).rev() {
+            low = low.min(f.low);
+            if low >= depth {
+                self.glob_memo_put(f.scope, name, r);
+            }
+        }
+        r
+    }
+
+    /// #10324: the memoised answer through `s` for `name`, if any.
+    fn glob_memo_get(&self, s: usize, name: &str) -> Option<Supply> {
+        self.glob_memo
+            .borrow()
+            .get(name)
+            .and_then(|m| m.get(&s))
+            .copied()
+    }
+
+    /// #10324: memoises the answer through `s` for `name`.
+    fn glob_memo_put(&self, s: usize, name: &str, r: Supply) {
+        self.glob_memo
+            .borrow_mut()
+            .entry(name.to_string())
+            .or_default()
+            .insert(s, r);
+    }
+
+    /// #10324: counts one scope visit of [`TypeGraph::glob_supplies`].
+    fn glob_visit(&self) {
+        self.glob_visits
+            .set(self.glob_visits.get().saturating_add(1));
     }
 
     /// #10294: settles the module of every glob import once every file is
@@ -3414,6 +3520,8 @@ impl TypeGraph {
             self.scopes[s].glob_to = to;
         }
         self.memo.get_mut().clear();
+        // #10324: an answer memoised while settling read unsettled globs.
+        self.glob_memo.get_mut().clear();
     }
 
     /// A path root that nothing in scope binds: std, this crate's library,
