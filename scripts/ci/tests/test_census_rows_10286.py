@@ -2,10 +2,13 @@
 committed tables and is red, with its exact message, on every tamper."""
 from pathlib import Path
 import importlib.util
+import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -136,6 +139,14 @@ class CensusRows10286(unittest.TestCase):
         self.assertEqual(r.returncode, EXIT_SCAN)
         self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: substring not found")
 
+    def test_an_over_cap_statement_fails_the_scan_10303(self) -> None:
+        m = scanner_module()
+        (self.root / "src/big.rs").write_text("process" + " x" * m.STMT_CAP + ";\n", encoding="utf-8")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/big.rs: "
+                         + OVER_CAP.format(n=m.STMT_CAP + 2, cap=m.STMT_CAP))
+
     def test_check_and_write_are_required_and_exclusive_10290(self) -> None:
         for args in ((), ("--check", "--write")):
             r = run(*args)
@@ -172,6 +183,99 @@ class LexParity10305(unittest.TestCase):
             if have != want:
                 bad.append(f"row {i} {text!r}: lexed {have!r}, want {want!r}")
         self.assertEqual(bad, [])
+
+
+STMT_TABLE = ROOT / "tests/common/census_stmt_parity_10303.json"
+STMT_ROWS = 23
+MUTANT_TABLE = ROOT / "tests/common/census_stmt_mutants_10303.json"
+MUTANT_ROWS = 16
+PINS_RS = ROOT / "tests/common/census_pins_10286.rs"
+STMT_CAP_RE = re.compile(r"^pub\(crate\) const STMT_CAP: usize = ([0-9_]+);$", re.M)
+DIGEST_HEX = 32
+LINEAR_TOKENS = 100_000
+LINEAR_SECONDS = 20
+OVER_CAP = ("line 1: a watched statement of {n} tokens is over STMT_CAP {cap}; "
+            "a pin never cuts a statement (#10303)")
+
+
+def pins(m, text: str) -> list[str]:
+    """The site pins of one text with the seed names (each table text binds no alias)."""
+    return m.sites_of(m.lex(text), set(m.WATCHED_SEED), set(m.ENV_MOD_SEED | m.ENV_FN_SEED),
+                      set(m.ENV_FN_SEED))
+
+
+class StatementPin10303(unittest.TestCase):
+    """#10302, #10303: a pin covers its whole statement, 32 hex digits, the same
+    tables the Rust tests in `tests/common/census_stmt_10303.rs` read."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_statement_table(self) -> None:
+        rows = json.loads(STMT_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), STMT_ROWS)
+        bad = []
+        for i, (text, want) in enumerate(rows):
+            t = self.m.lex(text)
+            have = [self.m.encode(t, a, b) for a, b in self.m.statements(t)]
+            if have != want:
+                bad.append(f"row {i} {text!r}: statements {have!r}, want {want!r}")
+        self.assertEqual(bad, [])
+
+    def test_mutant_table(self) -> None:
+        rows = json.loads(MUTANT_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), MUTANT_ROWS)
+        bad = []
+        for name, want, a, b in rows:
+            da, db = pins(self.m, a), pins(self.m, b)
+            self.assertTrue(da, name)
+            self.assertEqual(len(da), len(db), name)
+            verdict = "same" if da == db else "change"
+            if verdict != want:
+                bad.append(f"{name}: want {want}, the pins {verdict}")
+        self.assertEqual(bad, [])
+
+    def test_a_digest_is_32_hex_digits(self) -> None:
+        self.assertEqual(self.m.DIGEST_HEX, DIGEST_HEX)
+        self.assertEqual(self.m.digest("T", "I1:a"), hashlib.sha256(b"TI1:a").hexdigest()[:DIGEST_HEX])
+        for d in pins(self.m, "fn f() { std::process::exit(1); }"):
+            self.assertRegex(d, r"^[0-9a-f]{32}$")
+
+    def test_the_cap_is_the_rust_cap(self) -> None:
+        found = STMT_CAP_RE.search(PINS_RS.read_text(encoding="utf-8"))
+        self.assertIsNotNone(found)
+        self.assertEqual(int(found.group(1).replace("_", "")), self.m.STMT_CAP)
+
+    def test_a_statement_over_the_cap_is_refused(self) -> None:
+        cap = self.m.STMT_CAP
+        at_cap = self.m.lex("process" + " x" * (cap - 2) + ";")
+        self.assertEqual(len(at_cap), cap)
+        self.assertEqual(len(self.m.sites_of(at_cap, {"process"}, set(), set())), 1)
+        over = self.m.lex("process" + " x" * (cap - 1) + ";")
+        with self.assertRaises(ValueError) as cm:
+            self.m.sites_of(over, {"process"}, set(), set())
+        self.assertEqual(str(cm.exception), OVER_CAP.format(n=cap + 1, cap=cap))
+
+    def test_many_statements_in_linear_time(self) -> None:
+        unit = "std::process::exit(1);\n"
+        reps = LINEAR_TOKENS // len(self.m.lex(unit)) + 1
+        t0 = time.monotonic()
+        d = pins(self.m, unit * reps)
+        self.assertEqual(len(d), reps)
+        self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
+
+    def test_a_long_statement_in_linear_time(self) -> None:
+        cap = self.m.STMT_CAP
+        # One statement of cap tokens with a site on every other token; the
+        # statement is hashed once, not once per site.
+        text = "f(" + " process ," * ((cap - 3) // 2) + ");"
+        t = self.m.lex(text)
+        self.assertLessEqual(len(t), cap)
+        t0 = time.monotonic()
+        d = self.m.sites_of(t, {"process"}, set(), set())
+        self.assertEqual(len(d), (cap - 3) // 2)
+        self.assertEqual(len(set(d)), 1)
+        self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
 
 
 if __name__ == "__main__":

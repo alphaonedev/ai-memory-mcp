@@ -84,6 +84,8 @@ mod census_r4_tests;
 mod census_rows;
 #[path = "common/census_sites_10286.rs"]
 mod census_sites;
+#[path = "common/census_stmt_10303.rs"]
+mod census_stmt;
 #[path = "common/proptest_guard.rs"]
 mod proptest_guard;
 #[path = "common/rust_lex.rs"]

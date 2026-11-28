@@ -16,7 +16,7 @@ const NONE: [String; 0] = [];
 /// One expected site: `(kind, line, what)`.
 type SiteWant<'a> = (&'a str, usize, &'a str);
 
-fn sites(text: &str) -> Vec<census_pins::Site> {
+pub(super) fn sites(text: &str) -> Vec<census_pins::Site> {
     let toks = lex(text);
     let prep = Prep::new(&toks);
     let preps = std::slice::from_ref(&prep);
