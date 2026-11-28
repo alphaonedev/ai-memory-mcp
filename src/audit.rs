@@ -692,7 +692,9 @@ fn open_seq_mark(mark: &Path, existing: Option<u64>, value: u64) -> Result<SeqMa
 }
 
 /// #4086 — (re)write the high-water mark atomically (temp file, fsync,
-/// rename, directory fsync) and open it for in-place updates.
+/// rename, directory fsync) and open it for in-place updates. #10214: the
+/// directory fsync goes through the `snapshot_file` funnel and its failure is
+/// an error.
 fn create_seq_mark(mark: &Path, value: u64) -> Result<SeqMark> {
     let mut tmp_name = mark.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
@@ -710,13 +712,13 @@ fn create_seq_mark(mark: &Path, value: u64) -> Result<SeqMark> {
             .with_context(ctx)?;
     }
     std::fs::rename(&tmp, mark).with_context(ctx)?;
-    if let Some(dir) = mark.parent().filter(|d| !d.as_os_str().is_empty()) {
-        // Best-effort directory fsync so the rename itself is durable; not
-        // every platform can open a directory for sync.
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
+    // #10214: the rename is durable only once the directory is synced. A
+    // failure is "written, not confirmed durable" (the complete new mark is in
+    // place and stays), never swallowed: the audit sink does not open on a
+    // mark a crash could roll back (fail closed).
+    crate::storage::snapshot_file::require_durable(
+        crate::storage::snapshot_file::sync_parent_dir(mark, "audit sequence high-water"),
+    )?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -2186,6 +2188,8 @@ fn mark_append_only(_path: &Path) -> Result<()> {
 // Tests.
 // ---------------------------------------------------------------------------
 
+#[cfg(all(test, unix))]
+mod seq_mark_dir_sync_10214_tests;
 #[cfg(test)]
 mod tail_loss_4086_tests;
 

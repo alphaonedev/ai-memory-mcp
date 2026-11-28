@@ -1581,7 +1581,9 @@ fn run_backup_with(
 /// entries survive a power cut. Neither publish follows or replaces anything
 /// at its name (`snapshot_file::NoFollowStage::publish`).
 ///
-/// Returns the fsync steps that FAILED (empty = durable); a pair that cannot
+/// Returns the fsync steps that FAILED (empty = durable), including a
+/// publish whose directory fsync failed: that file IS in place, so the pair
+/// is finished and nothing is removed (#10253, #10262). A pair that cannot
 /// be published at all is an error instead, and a snapshot published without
 /// its manifest is removed again.
 ///
@@ -1598,28 +1600,69 @@ fn write_backup_pair_durably(
     if let Err(e) = snapshot.file().sync_all() {
         failures.push(format!("fsync {}: {e}", snapshot_path.display()));
     }
-    drop(snapshot.publish()?);
-    let published = (|| -> Result<()> {
+    // #10253: after the publish the snapshot IS in place. A failed directory
+    // fsync makes it "written, not confirmed durable": the pair is still
+    // finished (the manifest is written) and the failure is reported.
+    let (file, durability) = snapshot.publish()?;
+    drop(file);
+    note_not_durable(&mut failures, durability);
+    let published = (|| -> Result<snapshot_file::Durability> {
         let mut stage = snapshot_file::stage_beside(manifest_path, "manifest")?;
         stage.write_all(manifest_text.as_bytes())?;
         stage
             .file()
             .sync_all()
             .with_context(|| format!("fsync the manifest {}", manifest_path.display()))?;
-        drop(stage.publish()?);
-        Ok(())
+        let (file, durability) = stage.publish()?;
+        drop(file);
+        Ok(durability)
     })();
-    if let Err(e) = published {
-        // A snapshot without a manifest is unrestorable, so it is taken back.
-        // Removing by name unlinks the entry and never follows it.
-        let _ = std::fs::remove_file(&snapshot_path);
-        return Err(e);
+    match published {
+        // #10262: the manifest is in place, so nothing is taken back; a
+        // failed directory fsync after its publish is reported, never undone.
+        Ok(durability) => note_not_durable(&mut failures, durability),
+        Err(e) => {
+            // A snapshot without a manifest is unrestorable, so it is taken
+            // back. Removing by name unlinks the entry and never follows it.
+            let _ = std::fs::remove_file(&snapshot_path);
+            return Err(e);
+        }
     }
     let dir = publish_dir(manifest_path);
     if let Err(e) = sync_dir(dir) {
         failures.push(format!("fsync {}: {e}", dir.display()));
     }
     Ok(failures)
+}
+
+/// The warning for a restore whose trust-anchor seal write returned `err`
+/// (#10087, #10263), worded from the state: a seal written but not
+/// confirmed durable IS recorded; any other error left the old seal.
+fn restore_seal_warning(target_db: &Path, err: &anyhow::Error) -> String {
+    if err.downcast_ref::<snapshot_file::NotDurable>().is_some() {
+        format!(
+            "warning: restored {} and recorded it in the trust anchor, but the record is \
+             not confirmed durable ({err:#}); after a crash verify may report it as rolled \
+             back until the restore is run again (#10087)",
+            target_db.display()
+        )
+    } else {
+        format!(
+            "warning: restored {} but could not record it in the trust anchor ({err:#}); \
+             verify reports it as rolled back until the restore is run again (#10087)",
+            target_db.display()
+        )
+    }
+}
+
+/// Add a not-durable publish to the pair's failed fsync steps (#10253).
+fn note_not_durable(failures: &mut Vec<String>, durability: snapshot_file::Durability) {
+    match durability {
+        snapshot_file::Durability::Durable => {}
+        snapshot_file::Durability::NotDurable(not_durable) => {
+            failures.push(not_durable.to_string());
+        }
+    }
 }
 
 /// v1.0.0 #3604 — keep the `keep` newest backups by their SIGNED creation
@@ -2740,12 +2783,7 @@ fn run_restore_with(
         attest_verdict.as_ref()
         && let Err(e) = crate::storage::row_attest::sqlite::seal_restored(&target_db, rec)
     {
-        writeln!(
-            out.stderr,
-            "warning: restored {} but could not record it in the trust anchor ({e:#}); \
-             verify reports it as rolled back until the restore is run again (#10087)",
-            target_db.display()
-        )?;
+        writeln!(out.stderr, "{}", restore_seal_warning(&target_db, &e))?;
     }
 
     let post_sync = io.sync_dir(dir);
@@ -4140,6 +4178,10 @@ mod tests {
     // v1.0.0 #8950 — a planted symlink at the snapshot or manifest name is
     // refused; the table lives in `src/cli/backup/tests/symlink_follow_8950.rs`.
     mod symlink_follow_8950;
+
+    // v1.0.0 #10253 — the backup pair under a failed directory fsync lives in
+    // `src/cli/backup/tests/pair_dir_sync_10253.rs`.
+    mod pair_dir_sync_10253;
 
     /// `stage_and_verify` never touches the target: that is the whole point
     /// of staging. Pinned directly so a future refactor cannot quietly move

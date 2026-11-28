@@ -1164,12 +1164,12 @@ pub(super) fn snapshot_before_migration(
     );
     let snapshot_path = parent.join(snapshot_name);
 
-    // #8679 / #8950: staged privately, mode through the handle, published by
-    // a no-replace link; a failure leaves nothing at the snapshot name.
+    // #8679 / #8950 / #10214: staged privately, published by a no-replace
+    // link; not written leaves nothing, not durable keeps the snapshot.
     snapshot_file::vacuum_into_private(conn, &snapshot_path, &db_path).with_context(|| {
         format!(
-            "pre-migration snapshot (v{from_version}→v{to_version}) failed; \
-             refusing to mutate schema without a recoverable backup"
+            "pre-migration snapshot (v{from_version}→v{to_version}) is not a confirmed \
+             recoverable backup; refusing to mutate schema"
         )
     })?;
 

@@ -323,10 +323,13 @@ pub fn events(
     Ok(events)
 }
 
-/// Publish a public snapshot atomically with mode 0600 on the new inode.
+/// Publish a public snapshot atomically with mode 0600 on the new inode. The
+/// rename is made durable by an fsync of the directory through the
+/// `snapshot_file` funnel (#10214).
 ///
 /// # Errors
-/// Any create, encode, flush or rename failure prevents publication.
+/// Any create, encode, flush or rename failure prevents publication. A failed
+/// directory fsync is returned with the complete new snapshot in place.
 pub fn publish(path: &Path, snapshot: &AllowlistFile) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -340,8 +343,16 @@ pub fn publish(path: &Path, snapshot: &AllowlistFile) -> Result<()> {
     file.write_all(&serde_json::to_vec(snapshot)?)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    // #10214: a failed directory fsync is "written, not confirmed durable";
+    // the new snapshot stays and the error says so.
+    crate::storage::snapshot_file::require_durable(crate::storage::snapshot_file::sync_parent_dir(
+        path,
+        HUB_SNAPSHOT_WHAT,
+    ))
 }
+
+/// The `what` of the hub allowlist snapshot in a publish error (#10214).
+const HUB_SNAPSHOT_WHAT: &str = "hub allowlist snapshot";
 
 #[cfg(test)]
 mod tests {

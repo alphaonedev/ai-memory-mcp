@@ -347,8 +347,11 @@ mod k1_shared_checks_9367_tests {
     /// never a raw by-name write.
     fn file_0600(path: &Path, contents: &[u8]) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
-        crate::storage::snapshot_file::write_replacing(path, "key fixture", contents)
-            .expect("no-follow fixture write");
+        crate::storage::snapshot_file::require_durable(
+            crate::storage::snapshot_file::write_replacing(path, "key fixture", contents)
+                .expect("no-follow fixture write"),
+        )
+        .expect("durable fixture write");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         path.to_path_buf()
     }

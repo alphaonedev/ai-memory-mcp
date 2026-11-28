@@ -465,7 +465,7 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
         // this one takes the next numbered name.
         let original = std::fs::read(&config_path)
             .with_context(|| format!("reading {} to back it up", config_path.display()))?;
-        let written = crate::storage::snapshot_file::write_new_private_unique(
+        let (written, durability) = crate::storage::snapshot_file::write_new_private_unique(
             &backup,
             "install backup",
             &original,
@@ -477,6 +477,15 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
                 backup.display()
             )
         })?;
+        // #10214: a backup not confirmed durable is no safety net, so the
+        // config is not rewritten (it is untouched); the backup stays.
+        match durability {
+            crate::storage::snapshot_file::Durability::Durable => {}
+            crate::storage::snapshot_file::Durability::NotDurable(not_durable) => anyhow::bail!(
+                "{not_durable}; refusing to write {} until its backup is durable (it is untouched)",
+                config_path.display()
+            ),
+        }
         Some(written)
     } else {
         None
@@ -687,8 +696,12 @@ fn write_system_prompt_snippet_to(target: Target, dir: &std::path::Path) -> Resu
     let path = dir.join(format!("system-prompt-{}.md", target.name()));
     let body = snippet_body(target);
     // v1.0.0 #8950 — replaced by a rename; a symlink at the name is refused.
-    crate::storage::snapshot_file::write_replacing(&path, "snippet", body.as_bytes())
-        .with_context(|| format!("writing snippet to {}", path.display()))?;
+    // #10214: a snippet not confirmed durable is reported as such (it is in
+    // place); an `Err` from the funnel means it was not written.
+    let durability =
+        crate::storage::snapshot_file::write_replacing(&path, "snippet", body.as_bytes())
+            .with_context(|| format!("writing snippet to {}", path.display()))?;
+    crate::storage::snapshot_file::require_durable(durability)?;
     Ok(path)
 }
 

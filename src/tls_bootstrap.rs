@@ -40,6 +40,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use crate::storage::snapshot_file::NotDurableReport;
 use anyhow::{Context as _, Result};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -182,29 +183,31 @@ pub fn leaf_subject_alt_names(bind_host: &str) -> Vec<String> {
     sans
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_mode(path, bytes, MODE_PRIVATE)
+/// The `what` of TLS material in a not-durable report (#10214).
+const TLS_MATERIAL_WHAT: &str = "TLS material";
+
+fn write_private(path: &Path, bytes: &[u8], report: &mut NotDurableReport) -> Result<()> {
+    write_mode(path, bytes, MODE_PRIVATE, report)
 }
 
-fn write_public(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_mode(path, bytes, MODE_PUBLIC)
+fn write_public(path: &Path, bytes: &[u8], report: &mut NotDurableReport) -> Result<()> {
+    write_mode(path, bytes, MODE_PUBLIC, report)
 }
 
-fn write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+/// Write one TLS file. An `Err` means NOT written. #10214: a file written but
+/// not confirmed durable is noted in `report` and the caller's sequence goes
+/// on (key, then certificate, then CA), so a set is never left half-written
+/// by this; the caller reports every such file at its end.
+fn write_mode(path: &Path, bytes: &[u8], mode: u32, report: &mut NotDurableReport) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(path)
             .with_context(|| format!("replacing {} (#3709)", path.display()))?;
     }
-    #[cfg(unix)]
-    {
-        crate::identity::keypair::write_with_mode(path, bytes, mode)
-            .with_context(|| format!("writing {} with mode {mode:o} (#3709)", path.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-        std::fs::write(path, bytes).with_context(|| format!("writing {} (#3709)", path.display()))
-    }
+    report.note(
+        crate::identity::keypair::write_with_mode_durable(path, bytes, mode, TLS_MATERIAL_WHAT)
+            .with_context(|| format!("writing {} with mode {mode:o} (#3709)", path.display()))?,
+    );
+    Ok(())
 }
 
 fn ensure_dir(dir: &Path) -> Result<()> {
@@ -554,7 +557,7 @@ pub fn listener_verdict(
     }
 }
 
-fn generate_ca(dir: &Path) -> Result<(String, KeyPair)> {
+fn generate_ca(dir: &Path, report: &mut NotDurableReport) -> Result<(String, KeyPair)> {
     let mut params = CertificateParams::new(Vec::<String>::new())
         .context("building the local CA parameters (#3709)")?;
     params.distinguished_name = dn(CA_COMMON_NAME);
@@ -572,12 +575,22 @@ fn generate_ca(dir: &Path) -> Result<(String, KeyPair)> {
         .self_signed(&key)
         .context("self-signing the local CA (#3709)")?;
     let ca_pem = cert.pem();
-    write_private(&dir.join(LOCAL_CA_KEY_FILE), key.serialize_pem().as_bytes())?;
-    write_public(&dir.join(LOCAL_CA_CERT_FILE), ca_pem.as_bytes())?;
+    write_private(
+        &dir.join(LOCAL_CA_KEY_FILE),
+        key.serialize_pem().as_bytes(),
+        report,
+    )?;
+    write_public(&dir.join(LOCAL_CA_CERT_FILE), ca_pem.as_bytes(), report)?;
     Ok((ca_pem, key))
 }
 
-fn issue_leaf(dir: &Path, ca_pem: &str, ca_key: KeyPair, sans: &[String]) -> Result<()> {
+fn issue_leaf(
+    dir: &Path,
+    ca_pem: &str,
+    ca_key: KeyPair,
+    sans: &[String],
+    report: &mut NotDurableReport,
+) -> Result<()> {
     let issuer = Issuer::from_ca_cert_pem(ca_pem, ca_key)
         .context("re-reading the local CA as an issuer (#3709)")?;
     let mut params = CertificateParams::new(sans.to_vec())
@@ -592,8 +605,12 @@ fn issue_leaf(dir: &Path, ca_pem: &str, ca_key: KeyPair, sans: &[String]) -> Res
     let cert = params
         .signed_by(&key, &issuer)
         .context("signing the server certificate with the local CA (#3709)")?;
-    write_private(&dir.join(SERVER_KEY_FILE), key.serialize_pem().as_bytes())?;
-    write_public(&dir.join(SERVER_CERT_FILE), cert.pem().as_bytes())?;
+    write_private(
+        &dir.join(SERVER_KEY_FILE),
+        key.serialize_pem().as_bytes(),
+        report,
+    )?;
+    write_public(&dir.join(SERVER_CERT_FILE), cert.pem().as_bytes(), report)?;
     Ok(())
 }
 
@@ -621,8 +638,26 @@ fn load_ca(dir: &Path) -> Result<Option<(String, KeyPair)>> {
 /// plaintext fallback (#3705 / #3709).
 ///
 /// # Errors
-/// The key directory is unusable, or generation / renewal / parsing fails.
+/// The key directory is unusable, or generation / renewal / parsing fails,
+/// or (#10214) a file is written but not confirmed durable (the typed
+/// [`NotDurableReport`]).
 pub fn ensure_local_tls(key_dir: &Path, bind_host: &str) -> Result<LocalTls> {
+    let (local, report) = ensure_local_tls_reported(key_dir, bind_host)?;
+    report.finish()?;
+    Ok(local)
+}
+
+/// #10292 — [`ensure_local_tls`] with the durability reported beside the
+/// material, never in place of it: a CA or leaf written but not confirmed
+/// durable is complete on disk, and a caller that serves it acts on the
+/// [`LocalTls`] and reports the durability on its own.
+///
+/// # Errors
+/// The key directory is unusable, or generation / renewal / parsing fails.
+pub(crate) fn ensure_local_tls_reported(
+    key_dir: &Path,
+    bind_host: &str,
+) -> Result<(LocalTls, NotDurableReport)> {
     let dir = key_dir.join(TLS_SUBDIR);
     ensure_dir(&dir)?;
     let cert_path = dir.join(SERVER_CERT_FILE);
@@ -649,20 +684,26 @@ pub fn ensure_local_tls(key_dir: &Path, bind_host: &str) -> Result<LocalTls> {
                     crate::transit_encryption::REMEDY_TLS_RENEW
                 );
             }
-            return Ok(LocalTls {
-                cert_path,
-                key_path,
-                ca_cert_path: dir.join(OPERATOR_CA_CERT_FILE),
-                outcome: Outcome::OperatorSupplied,
-                leaf_days_remaining: days,
-            });
+            return Ok((
+                LocalTls {
+                    cert_path,
+                    key_path,
+                    ca_cert_path: dir.join(OPERATOR_CA_CERT_FILE),
+                    outcome: Outcome::OperatorSupplied,
+                    leaf_days_remaining: days,
+                },
+                NotDurableReport::new(),
+            ));
         }
     }
 
+    // #10214: every file of the CA and leaf is written before a file not
+    // confirmed durable is reported.
+    let mut report = NotDurableReport::new();
     let (ca_pem, ca_key, fresh_ca) = match load_ca(&dir)? {
         Some((pem, key)) => (pem, key, false),
         None => {
-            let (pem, key) = generate_ca(&dir)?;
+            let (pem, key) = generate_ca(&dir, &mut report)?;
             (pem, key, true)
         }
     };
@@ -698,7 +739,7 @@ pub fn ensure_local_tls(key_dir: &Path, bind_host: &str) -> Result<LocalTls> {
 
     let outcome = match renew_reason {
         Some(reason) => {
-            issue_leaf(&dir, &ca_pem, ca_key, &wanted)?;
+            issue_leaf(&dir, &ca_pem, ca_key, &wanted, &mut report)?;
             if fresh_ca {
                 Outcome::Generated
             } else {
@@ -708,13 +749,105 @@ pub fn ensure_local_tls(key_dir: &Path, bind_host: &str) -> Result<LocalTls> {
         None => Outcome::Reused,
     };
     let status = leaf_status(key_dir)?;
-    Ok(LocalTls {
-        cert_path,
-        key_path,
-        ca_cert_path,
-        outcome,
-        leaf_days_remaining: status.days_remaining.unwrap_or_default(),
-    })
+    Ok((
+        LocalTls {
+            cert_path,
+            key_path,
+            ca_cert_path,
+            outcome,
+            leaf_days_remaining: status.days_remaining.unwrap_or_default(),
+        },
+        report,
+    ))
+}
+
+/// #10292 — what one certificate-renewal tick of the daemon did. Every arm
+/// is logged by [`renewal_tick`]; the value is returned so the decision is
+/// testable.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenewalTick {
+    /// The leaf was re-issued and the listener now serves it.
+    Reloaded,
+    /// The leaf was re-issued, is complete on disk and the listener now
+    /// serves it, but a file is not confirmed durable.
+    ReloadedNotDurable,
+    /// The leaf was re-issued but the listener could not load it.
+    ReloadFailed,
+    /// Nothing was re-issued and the leaf is inside its renewal window.
+    InsideWindow,
+    /// Nothing was re-issued and the leaf is current.
+    Current,
+    /// Generation or renewal failed; the listener keeps its certificate.
+    Failed,
+}
+
+/// #10292 — one renewal tick: ensure the local leaf under `key_dir` for
+/// `host` and, when it was re-issued, reload `reload` from it. A leaf
+/// written but not confirmed durable is the complete after-state, so the
+/// listener is reloaded exactly as for a durable one and the tick logs
+/// "renewed, not confirmed durable" with the report — never "FAILED".
+pub(crate) async fn renewal_tick(
+    reload: &axum_server::tls_rustls::RustlsConfig,
+    key_dir: &Path,
+    host: &str,
+) -> RenewalTick {
+    let remedy = crate::transit_encryption::REMEDY_TLS_RENEW;
+    let (local, report) = match ensure_local_tls_reported(key_dir, host) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(
+                target: crate::transit_encryption::TRACING_TARGET,
+                error = %e,
+                "#3709: certificate renewal FAILED; the listener keeps its current certificate \
+                 and will REFUSE at the next boot once it expires — fix now: {remedy}"
+            );
+            return RenewalTick::Failed;
+        }
+    };
+    let reissued = match local.outcome {
+        Outcome::Renewed { .. } | Outcome::Generated => true,
+        Outcome::Reused | Outcome::OperatorSupplied => false,
+    };
+    if !reissued {
+        // Nothing was written, so nothing can be not durable.
+        if local.leaf_days_remaining <= RENEWAL_WINDOW_DAYS {
+            tracing::warn!(
+                target: crate::transit_encryption::TRACING_TARGET,
+                days_remaining = local.leaf_days_remaining,
+                "#3709: the local server certificate is inside its renewal window; {remedy}"
+            );
+            return RenewalTick::InsideWindow;
+        }
+        return RenewalTick::Current;
+    }
+    if let Err(e) = reload
+        .reload_from_pem_file(&local.cert_path, &local.key_path)
+        .await
+    {
+        tracing::error!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            error = %e,
+            "#3709: renewed the certificate but the listener could not reload it; restart \
+             the daemon or {remedy}"
+        );
+        return RenewalTick::ReloadFailed;
+    }
+    let days_valid = local.leaf_days_remaining;
+    if report.is_empty() {
+        tracing::warn!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            days_valid,
+            "#3709: renewed the local server certificate and reloaded the listener"
+        );
+        return RenewalTick::Reloaded;
+    }
+    tracing::warn!(
+        target: crate::transit_encryption::TRACING_TARGET,
+        days_valid,
+        "#3709: renewed, not confirmed durable: {report}; reloaded the listener (#10214)"
+    );
+    RenewalTick::ReloadedNotDurable
 }
 
 /// The local CA certificate this installation wrote, as PEM — for the
@@ -891,16 +1024,18 @@ pub fn import_operator_material(
     ensure_dir(&dir)?;
     let cert_path = dir.join(SERVER_CERT_FILE);
     let key_path = dir.join(SERVER_KEY_FILE);
-    write_private(&key_path, key_pem)?;
-    write_public(&cert_path, cert_pem)?;
+    let mut report = NotDurableReport::new();
+    write_private(&key_path, key_pem, &mut report)?;
+    write_public(&cert_path, cert_pem, &mut report)?;
     let ca_cert_path = match ca_pem {
         Some(ca) => {
-            write_public(&operator_ca_path, ca)?;
+            write_public(&operator_ca_path, ca, &mut report)?;
             Some(operator_ca_path)
         }
         // A retained bundle that verified the new leaf stays the trust root.
         None => operator_ca_path.exists().then_some(operator_ca_path),
     };
+    report.finish()?;
     Ok(ImportReport {
         cert_path,
         key_path,
@@ -918,6 +1053,20 @@ pub fn import_operator_material(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test fixture write that must be written AND durable (#10214).
+    fn put_private(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut report = NotDurableReport::new();
+        write_private(path, bytes, &mut report)?;
+        report.finish()
+    }
+
+    /// A test fixture write that must be written AND durable (#10214).
+    fn put_public(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut report = NotDurableReport::new();
+        write_public(path, bytes, &mut report)?;
+        report.finish()
+    }
 
     fn sandbox() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir under TMPDIR")
@@ -1237,8 +1386,8 @@ mod tests {
             pki.leaf(&["memory.example.test"], now() - time::Duration::days(3));
         let dir = tmp.path().join(TLS_SUBDIR);
         ensure_dir(&dir).unwrap();
-        write_public(&dir.join(SERVER_CERT_FILE), old_cert.as_bytes()).unwrap();
-        write_private(&dir.join(SERVER_KEY_FILE), old_key.as_bytes()).unwrap();
+        put_public(&dir.join(SERVER_CERT_FILE), old_cert.as_bytes()).unwrap();
+        put_private(&dir.join(SERVER_KEY_FILE), old_key.as_bytes()).unwrap();
         let err = ensure_local_tls(tmp.path(), "127.0.0.1")
             .expect_err("expired operator material must refuse")
             .to_string();
@@ -1304,12 +1453,12 @@ mod tests {
         let other = sandbox();
         let theirs = ensure_local_tls(other.path(), "127.0.0.1").unwrap();
         let dir = tmp.path().join(TLS_SUBDIR);
-        write_public(
+        put_public(
             &dir.join(SERVER_CERT_FILE),
             &std::fs::read(&theirs.cert_path).unwrap(),
         )
         .unwrap();
-        write_private(
+        put_private(
             &dir.join(SERVER_KEY_FILE),
             &std::fs::read(&theirs.key_path).unwrap(),
         )
@@ -1324,12 +1473,12 @@ mod tests {
         let bare = sandbox();
         let dir = bare.path().join(TLS_SUBDIR);
         ensure_dir(&dir).unwrap();
-        write_public(
+        put_public(
             &dir.join(SERVER_CERT_FILE),
             &std::fs::read(&ours.cert_path).unwrap(),
         )
         .unwrap();
-        write_private(
+        put_private(
             &dir.join(SERVER_KEY_FILE),
             &std::fs::read(&ours.key_path).unwrap(),
         )
@@ -1456,5 +1605,225 @@ mod tests {
         assert!(sans.iter().any(|s| s == "localhost"));
         let sans = leaf_subject_alt_names("[::1]");
         assert!(sans.iter().any(|s| s == "::1"));
+    }
+
+    /// Clears the thread's seam state on every exit of a test.
+    struct SeamReset;
+
+    impl Drop for SeamReset {
+        fn drop(&mut self) {
+            crate::storage::snapshot_file::seam::reset();
+        }
+    }
+
+    /// #10214 (the #10254 class): a failed directory fsync at any point of
+    /// the first boot never stops the sequence. Every file of the CA and the
+    /// leaf is written, the boot reports "written, not confirmed durable",
+    /// and the next boot reuses the complete material.
+    #[test]
+    fn first_boot_dir_sync_failure_finishes_ca_and_leaf_10214() {
+        use crate::storage::snapshot_file::seam;
+        const NOT_DURABLE: &str = "is written but not confirmed durable";
+        let _reset = SeamReset;
+        let clean = {
+            let tmp = sandbox();
+            seam::reset();
+            ensure_local_tls(tmp.path(), "127.0.0.1").expect("clean first boot");
+            seam::take_dir_syncs().len()
+        };
+        assert!(
+            clean >= 4,
+            "a first boot publishes four files, synced {clean} times"
+        );
+        for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
+            let tmp = sandbox();
+            seam::reset();
+            seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+            let err = ensure_local_tls(tmp.path(), "127.0.0.1")
+                .expect_err("a file not confirmed durable is reported");
+            seam::reset();
+            assert!(
+                err.downcast_ref::<NotDurableReport>().is_some(),
+                "sync {nth}: the typed report, got {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains(NOT_DURABLE),
+                "sync {nth}: {err:#}"
+            );
+            let dir = tmp.path().join(TLS_SUBDIR);
+            for file in [
+                SERVER_CERT_FILE,
+                SERVER_KEY_FILE,
+                LOCAL_CA_CERT_FILE,
+                LOCAL_CA_KEY_FILE,
+            ] {
+                assert!(dir.join(file).exists(), "sync {nth}: {file} is written");
+            }
+            let again = ensure_local_tls(tmp.path(), "127.0.0.1").expect("next boot");
+            assert_eq!(
+                again.outcome,
+                Outcome::Reused,
+                "sync {nth}: the material on disk is complete"
+            );
+        }
+    }
+
+    // ---- #10292: callers of the reported outcome ------------------------------
+
+    /// The listener `reload` serves, as a pointer to compare across a tick.
+    fn served(reload: &axum_server::tls_rustls::RustlsConfig) -> *const rustls::ServerConfig {
+        std::sync::Arc::as_ptr(&reload.get_inner())
+    }
+
+    /// A listener config loaded from the local leaf under `key_dir`.
+    async fn local_listener(key_dir: &Path) -> axum_server::tls_rustls::RustlsConfig {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls = ensure_local_tls(key_dir, "127.0.0.1").expect("first boot");
+        crate::tls::load_rustls_config(&tls.cert_path, &tls.key_path)
+            .await
+            .expect("the listener loads the local leaf")
+    }
+
+    /// #10292 — a renewal whose leaf is written but not confirmed durable is
+    /// the complete after-state: the tick reloads the listener (it now
+    /// serves the new leaf), returns `ReloadedNotDurable`, never `Failed`,
+    /// and the next tick reuses the leaf on disk.
+    #[tokio::test(flavor = "current_thread")]
+    async fn renewal_not_durable_reloads_the_listener_10292() {
+        use crate::storage::snapshot_file::seam;
+        let _reset = SeamReset;
+        let clean = {
+            let tmp = sandbox();
+            let reload = local_listener(tmp.path()).await;
+            seam::reset();
+            let tick = renewal_tick(&reload, tmp.path(), "10.1.2.3").await;
+            assert_eq!(tick, RenewalTick::Reloaded, "a clean renewal is durable");
+            seam::take_dir_syncs().len()
+        };
+        assert!(
+            clean >= 2,
+            "a leaf renewal publishes two files, synced {clean} times"
+        );
+        for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
+            let tmp = sandbox();
+            let reload = local_listener(tmp.path()).await;
+            let before = served(&reload);
+            seam::reset();
+            seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+            let tick = renewal_tick(&reload, tmp.path(), "10.1.2.3").await;
+            seam::reset();
+            assert_eq!(tick, RenewalTick::ReloadedNotDurable, "sync {nth}");
+            assert_ne!(
+                served(&reload),
+                before,
+                "sync {nth}: the listener serves the new leaf"
+            );
+            let status = leaf_status(tmp.path()).expect("the leaf on disk parses");
+            assert!(
+                status.subject_alt_names.iter().any(|s| s == "10.1.2.3"),
+                "sync {nth}: the renewed leaf is on disk"
+            );
+            let again = ensure_local_tls(tmp.path(), "10.1.2.3").expect("next tick's ensure");
+            assert_eq!(
+                again.outcome,
+                Outcome::Reused,
+                "sync {nth}: complete on disk"
+            );
+            let next = renewal_tick(&reload, tmp.path(), "10.1.2.3").await;
+            assert_eq!(
+                next,
+                RenewalTick::Current,
+                "sync {nth}: nothing left to renew"
+            );
+        }
+    }
+
+    /// #10292 — the other tick arms: nothing to renew is `Current`; an
+    /// unusable key directory is `Failed` and the listener is untouched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn renewal_tick_current_and_failed_arms_10292() {
+        let tmp = sandbox();
+        let reload = local_listener(tmp.path()).await;
+        let before = served(&reload);
+        assert_eq!(
+            renewal_tick(&reload, tmp.path(), "127.0.0.1").await,
+            RenewalTick::Current
+        );
+        assert_eq!(
+            served(&reload),
+            before,
+            "nothing re-issued, nothing reloaded"
+        );
+        let not_a_dir = tmp.path().join("plain-file");
+        std::fs::write(&not_a_dir, b"x").expect("plant a file");
+        assert_eq!(
+            renewal_tick(&reload, &not_a_dir, "127.0.0.1").await,
+            RenewalTick::Failed
+        );
+        assert_eq!(
+            served(&reload),
+            before,
+            "a failed tick keeps the certificate"
+        );
+    }
+
+    /// #10214 (finding 5) — an operator import whose files are written but
+    /// not confirmed durable reports the typed state (never success), the
+    /// pair is installed and reads back as operator-supplied, and a rerun
+    /// installs cleanly.
+    #[test]
+    fn import_dir_sync_failure_reports_and_installs_10214() {
+        use crate::storage::snapshot_file::seam;
+        const NOT_DURABLE: &str = "is written but not confirmed durable";
+        let _reset = SeamReset;
+        let pki = OperatorPki::new();
+        let (cert, key) = pki.leaf(&["memory.example.test"], now() + time::Duration::days(200));
+        let import = |dir: &Path| {
+            import_operator_material(
+                dir,
+                cert.as_bytes(),
+                key.as_bytes(),
+                Some(pki.ca_pem.as_bytes()),
+                Some("memory.example.test"),
+            )
+        };
+        let clean = {
+            let tmp = sandbox();
+            seam::reset();
+            import(tmp.path()).expect("clean import");
+            seam::take_dir_syncs().len()
+        };
+        assert!(
+            clean >= 3,
+            "an import publishes three files, synced {clean} times"
+        );
+        for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
+            let tmp = sandbox();
+            seam::reset();
+            seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+            let got = import(tmp.path());
+            seam::reset();
+            let err = got.expect_err("a file not confirmed durable is reported");
+            assert!(
+                err.downcast_ref::<NotDurableReport>().is_some(),
+                "sync {nth}: the typed report, got {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains(NOT_DURABLE),
+                "sync {nth}: {err:#}"
+            );
+            assert_eq!(
+                tls_dir_listing(tmp.path()),
+                vec![
+                    OPERATOR_CA_CERT_FILE.to_string(),
+                    SERVER_KEY_FILE.to_string(),
+                    SERVER_CERT_FILE.to_string()
+                ],
+                "sync {nth}: every file is installed"
+            );
+            let status = leaf_status(tmp.path()).expect("the installed leaf parses");
+            assert!(status.present && status.operator_supplied, "sync {nth}");
+            import(tmp.path()).unwrap_or_else(|e| panic!("sync {nth}: a rerun installs: {e:#}"));
+        }
     }
 }

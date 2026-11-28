@@ -925,14 +925,16 @@ pub fn verify_sqlite(conn: &Connection) -> Result<Report> {
     let (report, attestations) = verify_inner(conn, &anchor, &sealed)?;
     // #10087: a clean verify moves the seal up to what it verified, so a
     // later rollback of those writes is seen. Not inside a transaction (its
-    // rollback could undo what was verified); a failed write only leaves the
-    // seal lower, never a clean verdict that should not be.
+    // rollback could undo what was verified). A write that failed before its
+    // rename leaves the seal lower; one whose directory fsync failed (#10214)
+    // leaves the higher seal on disk, possibly not durable. Neither turns the
+    // verdict into one that should not be, and the warning names which.
     if let Some(path) = seal_file.as_deref()
         && matches!(report.outcome(), super::Outcome::Clean)
         && conn.is_autocommit()
         && let Err(e) = seal::advance(path, &SealRecord::of(&attestations))
     {
-        tracing::warn!("row attestation seal (#10087) not advanced: {e:#}");
+        tracing::warn!("{}", seal::advance_failure_warning(&e));
     }
     Ok(report)
 }

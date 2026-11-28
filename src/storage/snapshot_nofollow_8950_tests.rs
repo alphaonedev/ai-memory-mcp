@@ -202,7 +202,9 @@ fn publish_creates_private_regular_file_8950() {
     let mut stage = stage_beside(&dest, "snapshot").expect("stage");
     stage.write_all(b"payload").expect("write");
     stage.file().sync_all().expect("fsync");
-    drop(stage.publish().expect("publish"));
+    let (file, durability) = stage.publish().expect("publish");
+    drop(file);
+    super::snapshot_file::require_durable(durability).expect("durable publish");
     let meta = std::fs::symlink_metadata(&dest).expect("dest");
     assert!(meta.file_type().is_file());
     assert_eq!(std::fs::read(&dest).expect("read"), b"payload");
@@ -285,7 +287,10 @@ fn write_replacing_refuses_planted_rows_and_replaces_files_8950() {
     let dir = tmp.path();
     let dest = dir.join("system-prompt-claude.md");
     std::fs::write(&dest, b"old").expect("old snippet");
-    write_replacing(&dest, "snippet", b"new-body").expect("replace a regular file");
+    super::snapshot_file::require_durable(
+        write_replacing(&dest, "snippet", b"new-body").expect("replace a regular file"),
+    )
+    .expect("durable replace");
     let meta = std::fs::symlink_metadata(&dest).expect("dest");
     assert!(meta.file_type().is_file());
     assert_eq!(std::fs::read(&dest).expect("read"), b"new-body");
@@ -416,7 +421,17 @@ const RAW_WRITE_CENSUS_8950: &[(&str, usize)] = &[
     // r1 (X-1): the pre-migration VACUUM INTO moved into snapshot_file.rs
     // (migrations.rs 1 -> 0); create_private_target and the by-name settle
     // are gone (snapshot_file.rs 3 -> 2: open_new_private + the VACUUM).
-    ("src/storage/snapshot_file.rs", 2),
+    // #10214 (2 -> 3): the third site is the READ-only `O_DIRECTORY` open of
+    // `sync_dir` (`.read(true)`, no create/truncate/write flag): it fsyncs a
+    // directory and creates or replaces nothing. Guard:
+    // `storage::snapshot_dir_sync_10214_tests::sync_dir_opens_read_only_and_creates_nothing_10214`.
+    ("src/storage/snapshot_file.rs", 3),
+    // #10248: the one production site is the `O_NOFOLLOW | O_CLOEXEC` seal
+    // lock open of `SealLock::acquire` (#10193); the other three are in the file's
+    // inline `mod tests`. Guard:
+    // `storage::row_attest::seal::tests::seal_lock_failure_refuses_the_write_10193`
+    // (a symlink at the lock name refuses the write).
+    ("src/storage/row_attest/seal.rs", 4),
     ("src/storage/sqlite_integrity.rs", 1),
     ("src/store_url.rs", 1),
     ("src/test_support.rs", 6),
@@ -530,8 +545,12 @@ fn vacuum_into_routes_through_the_no_follow_helper_8950() {
 fn unique_backup_keeps_both_same_tick_copies_8950() {
     let dir = scratch();
     let dest = dir.path().join("config.toml.bak.20261114T183444.962Z");
-    let first = write_new_private_unique(&dest, "install backup", b"one").expect("first");
-    let second = write_new_private_unique(&dest, "install backup", b"two").expect("second");
+    let (first, durability) =
+        write_new_private_unique(&dest, "install backup", b"one").expect("first");
+    super::snapshot_file::require_durable(durability).expect("first durable");
+    let (second, durability) =
+        write_new_private_unique(&dest, "install backup", b"two").expect("second");
+    super::snapshot_file::require_durable(durability).expect("second durable");
     assert_eq!(first, dest);
     let mut numbered = dest.as_os_str().to_owned();
     numbered.push(".1");

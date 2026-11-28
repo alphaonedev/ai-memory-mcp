@@ -33,6 +33,9 @@
 //! |      | migrated output does not round-trip through `AppConfig`   |
 //! |      | (refused; no file written, original untouched)           |
 //! |   4  | write error — could not write `.bak` or new file         |
+//! |   6  | (#10263) the `.bak` is written but not confirmed durable |
+//! |      | (its directory fsync failed); the migrated file is NOT   |
+//! |      | written, original untouched                              |
 
 use crate::models::field_names;
 use std::path::{Path, PathBuf};
@@ -639,12 +642,24 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
     // A backup already taken in the same second keeps its copy; this one
     // takes the next numbered name.
     let wanted = path.with_extension(format!("toml.bak.{timestamp}"));
+    // #10263: an `Err` is "not written" (exit 4). A backup whose directory
+    // fsync failed IS written but may not survive a crash, so the migrated
+    // file is not written over the only durable copy of the original (exit 6).
     let backup_path = match crate::storage::snapshot_file::write_new_private_unique(
         &wanted,
         "config backup",
         contents.as_bytes(),
     ) {
-        Ok(written) => written,
+        Ok((written, crate::storage::snapshot_file::Durability::Durable)) => written,
+        Ok((_, crate::storage::snapshot_file::Durability::NotDurable(not_durable))) => {
+            let _ = writeln!(
+                out.stderr,
+                "ERROR: {not_durable}; refusing to write the migrated config {} over the \
+                 original until its backup is durable. Your original config is untouched.",
+                path.display(),
+            );
+            return Ok(6);
+        }
         Err(e) => {
             let _ = writeln!(
                 out.stderr,
@@ -896,11 +911,20 @@ fn clean_claude_json(timestamp: &str) -> Result<Option<String>> {
     let wanted = format!("{}.bak.{}", path.display(), timestamp);
     // v1.0.0 #8950 — never follows or replaces a link at the backup name;
     // a backup already taken in the same second keeps its copy.
-    let written = crate::storage::snapshot_file::write_new_private_unique(
+    let (written, durability) = crate::storage::snapshot_file::write_new_private_unique(
         Path::new(&wanted),
         "config backup",
         contents.as_bytes(),
     )?;
+    // #10214: a backup not confirmed durable is no safety net, so the
+    // original is not rewritten; the backup stays on disk.
+    match durability {
+        crate::storage::snapshot_file::Durability::Durable => {}
+        crate::storage::snapshot_file::Durability::NotDurable(not_durable) => anyhow::bail!(
+            "{not_durable}; refusing to rewrite {} until its backup is durable (it is untouched)",
+            path.display()
+        ),
+    }
     std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
 
     Ok(Some(written.display().to_string()))
@@ -1909,5 +1933,50 @@ model = "grok-4.3"
             !text.contains("default_namespac"),
             "nothing printed on refusal: {text}"
         );
+    }
+
+    /// v1.0.0 #10263 — one row per outcome of the backup write: the exit
+    /// code and the exact first line. A backup whose directory fsync failed
+    /// IS on disk but may not survive a crash, so the migrated file is not
+    /// written over the only durable copy of the original (exit 6); a backup
+    /// that was never written stays exit 4 with its own words.
+    #[test]
+    fn run_migrate_backup_outcome_table_10263() {
+        use crate::storage::snapshot_file::seam;
+        const LEGACY_BODY: &str = "llm_model = \"gemma\"\n";
+        // (failing step, exit code, stderr fragment, original untouched)
+        let rows: [(Option<seam::Step>, i32, &str, bool); 3] = [
+            (None, 0, "OK: migrated", false),
+            (
+                Some(seam::Step::FileSync),
+                4,
+                "ERROR: could not write backup",
+                true,
+            ),
+            (
+                Some(seam::Step::DirSync),
+                6,
+                "is written but not confirmed durable: the fsync of its directory",
+                true,
+            ),
+        ];
+        for (step, want_code, want_text, untouched) in rows {
+            seam::reset();
+            if let Some(step) = step {
+                seam::inject_step_errno_at(step, libc::EIO, 1);
+            }
+            let (code, _stdout, stderr, on_disk) =
+                run_migrate_with_home(Some(LEGACY_BODY), false, false);
+            seam::reset();
+            assert_eq!(code, want_code, "row {step:?}: {stderr}");
+            assert!(stderr.contains(want_text), "row {step:?}: {stderr}");
+            assert_eq!(on_disk == LEGACY_BODY, untouched, "row {step:?}: {on_disk}");
+            if want_code == 6 {
+                assert!(
+                    stderr.contains("refusing to write the migrated config"),
+                    "row {step:?}: {stderr}"
+                );
+            }
+        }
     }
 }

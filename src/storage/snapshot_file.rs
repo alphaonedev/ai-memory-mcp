@@ -57,13 +57,163 @@ pub(super) fn vacuum_into_private(
     seam::fire(seam::Point::Filled, dest);
     stage.verify_identity()?;
     settle_mode_to_source(stage.file(), source)?;
-    stage
-        .file()
-        .sync_all()
-        .with_context(|| format!("fsync {}", stage.path().display()))?;
-    drop(stage.publish()?);
-    Ok(())
+    stage.sync_file()?;
+    let (file, durability) = stage.publish()?;
+    drop(file);
+    // #10214: a snapshot not confirmed durable is no safety net, so the
+    // migration does not proceed (fail closed); the snapshot stays on disk.
+    require_durable(durability)
 }
+
+/// #10214 — the outcome of a publish whose new file IS in place at its final
+/// name. `Err` from the funnel always means "not written"; a written file
+/// whose directory fsync failed is [`Durability::NotDurable`], so no caller
+/// can read it as "not written" (CBC-02, CBC-05). Every caller matches it
+/// exhaustively, never removes the file, finishes its multi-file sequence and
+/// then reports the outcome as an error.
+#[must_use = "a NotDurable outcome must be reported: the file is written but not confirmed durable"]
+#[derive(Debug)]
+pub(crate) enum Durability {
+    /// The new file and its directory entry are fsynced.
+    Durable,
+    /// The new file is in place; its directory fsync failed.
+    NotDurable(NotDurable),
+}
+
+/// #10214 — "written, not confirmed durable": the complete new file is at
+/// `dest`, the fsync of `dir` failed with `source`. Its `Display` names all
+/// three, so [`std::error::Error::source`] is `None` (ERRORS-11).
+#[derive(Debug)]
+pub(crate) struct NotDurable {
+    what: String,
+    dest: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    source: std::io::Error,
+}
+
+impl NotDurable {
+    /// `what` at `dest` is written; the fsync of `dir` failed with `source`.
+    pub(crate) fn new(what: &str, dest: &Path, dir: &Path, source: std::io::Error) -> Self {
+        Self {
+            what: what.to_owned(),
+            dest: dest.to_path_buf(),
+            dir: dir.to_path_buf(),
+            source,
+        }
+    }
+
+    /// The written file.
+    #[cfg(test)]
+    pub(crate) fn dest(&self) -> &Path {
+        &self.dest
+    }
+
+    /// The OS error code of the failed directory fsync, when it has one.
+    #[cfg(test)]
+    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+        self.source.raw_os_error()
+    }
+}
+
+/// #10214 — turn a single publish outcome into the caller's result: `Ok` when
+/// durable, else the [`NotDurable`] report as the error (the file stays).
+///
+/// # Errors
+/// The file is written but not confirmed durable.
+pub(crate) fn require_durable(durability: Durability) -> Result<()> {
+    match durability {
+        Durability::Durable => Ok(()),
+        Durability::NotDurable(not_durable) => Err(anyhow::Error::new(not_durable)),
+    }
+}
+
+impl std::fmt::Display for NotDurable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} is written but not confirmed durable: the fsync of its directory {} failed \
+             ({}), so it may not survive a crash (#10214)",
+            self.what,
+            self.dest.display(),
+            self.dir.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for NotDurable {}
+
+impl From<NotDurable> for std::io::Error {
+    fn from(not_durable: NotDurable) -> Self {
+        Self::new(not_durable.source.kind(), not_durable)
+    }
+}
+
+/// #10214 — the not-durable outcomes of a multi-file sequence, collected
+/// while the sequence runs to its end and reported once at the end, so a
+/// failed directory fsync never stops a later file from being written.
+#[must_use = "finish() the report: a NotDurable outcome must reach the caller"]
+#[derive(Debug, Default)]
+pub(crate) struct NotDurableReport(Vec<NotDurable>);
+
+impl NotDurableReport {
+    /// An empty report.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one publish outcome.
+    pub(crate) fn note(&mut self, durability: Durability) {
+        match durability {
+            Durability::Durable => {}
+            Durability::NotDurable(not_durable) => self.0.push(not_durable),
+        }
+    }
+
+    /// Whether every file noted so far is durable (#10291).
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `Ok` when every file is durable; otherwise the report as the error
+    /// (every file named is written).
+    ///
+    /// # Errors
+    /// At least one file is not confirmed durable.
+    pub(crate) fn finish(self) -> Result<()> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(self))
+        }
+    }
+}
+
+impl std::fmt::Display for NotDurableReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.as_slice() {
+            [] => f.write_str("every file is written and durable"),
+            [one] => one.fmt(f),
+            many => {
+                write!(
+                    f,
+                    "{} files are written but not confirmed durable: ",
+                    many.len()
+                )?;
+                for (i, not_durable) in many.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str("; ")?;
+                    }
+                    not_durable.fmt(f)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for NotDurableReport {}
 
 /// Give the staged snapshot the source database's permission bits, through
 /// its HANDLE (`fchmod`), never by name. An unreadable source mode yields
@@ -163,12 +313,72 @@ pub(crate) mod seam {
         Linked,
     }
 
+    /// #10214 — the steps of a durable replace a test can fail: the staged
+    /// file's fsync, the rename over the destination, and the fsync of the
+    /// destination's directory.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Step {
+        FileSync,
+        Rename,
+        DirSync,
+    }
+
     type Hook = Box<dyn FnMut(Point, &Path)>;
 
     thread_local! {
         static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
         static LINK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
         static LINK_CALLS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static STEP_ERRNO: Cell<Option<(Step, i32)>> = const { Cell::new(None) };
+        static DIR_SYNCS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        static STEP_AT: Cell<Option<(Step, i32, u32)>> = const { Cell::new(None) };
+    }
+
+    /// Fail every later `step` of this thread with `errno` (#10214).
+    pub(crate) fn inject_step_errno(step: Step, errno: i32) {
+        STEP_ERRNO.with(|e| e.set(Some((step, errno))));
+    }
+
+    /// Fail only the `nth` (1-based) later `step` of this thread with
+    /// `errno`; every other one succeeds (#10253: a failure point inside a
+    /// multi-file sequence).
+    pub(crate) fn inject_step_errno_at(step: Step, errno: i32, nth: u32) {
+        STEP_AT.with(|e| e.set(Some((step, errno, nth))));
+    }
+
+    /// The one-shot failure of [`inject_step_errno_at`], counted down.
+    fn step_at(step: Step) -> Option<std::io::Error> {
+        let (failing, errno, nth) = STEP_AT.with(Cell::get)?;
+        if failing != step {
+            return None;
+        }
+        if nth > 1 {
+            STEP_AT.with(|e| e.set(Some((failing, errno, nth - 1))));
+            return None;
+        }
+        STEP_AT.with(|e| e.set(None));
+        Some(std::io::Error::from_raw_os_error(errno))
+    }
+
+    /// The directories fsynced so far on this thread (and forget them).
+    pub(crate) fn take_dir_syncs() -> Vec<PathBuf> {
+        DIR_SYNCS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    /// Record `step` at `path` and return the injected failure, if any.
+    pub(crate) fn on_step(step: Step, path: &Path) -> Option<std::io::Error> {
+        if step == Step::DirSync {
+            DIR_SYNCS.with(|c| c.borrow_mut().push(path.to_path_buf()));
+        }
+        if let Some(injected) = step_at(step) {
+            return Some(injected);
+        }
+        match STEP_ERRNO.with(Cell::get) {
+            Some((failing, errno)) if failing == step => {
+                Some(std::io::Error::from_raw_os_error(errno))
+            }
+            _ => None,
+        }
     }
 
     /// Run `hook(point, dest)` at every [`fire`] of this thread.
@@ -191,6 +401,9 @@ pub(crate) mod seam {
         HOOK.with(|h| h.borrow_mut().take());
         inject_link_errno(None);
         drop(take_link_calls());
+        STEP_ERRNO.with(|e| e.set(None));
+        STEP_AT.with(|e| e.set(None));
+        drop(take_dir_syncs());
     }
 
     pub(crate) fn fire(point: Point, dest: &Path) {
@@ -211,9 +424,17 @@ pub(crate) mod seam {
 
 /// The "name taken" answer of a publish: a symlink there is refused with
 /// [`symlink_refusal`], anything else means try the next name.
-fn name_taken(dest: &Path) -> Result<bool> {
+fn name_taken(dest: &Path) -> Result<PublishAt> {
     refuse_symlink(dest)?;
-    Ok(false)
+    Ok(PublishAt::Taken)
+}
+
+/// The answer of one [`NoFollowStage::publish_at`] that did not fail.
+enum PublishAt {
+    /// The staged file is at the name; its directory fsync gave this.
+    Published(Durability),
+    /// Something already holds the name; nothing was replaced.
+    Taken,
 }
 
 /// A `link(2)` failure that means the filesystem has no hard links, the only
@@ -365,30 +586,30 @@ fn numbered(dest: &Path, n: u32) -> std::path::PathBuf {
 /// `dest.2`, ...: two backups taken in the same clock tick keep both copies
 /// instead of the second failing (or, before #8950, overwriting the first).
 /// A symlink at any tried name is refused, never skipped. Returns the name
-/// written.
+/// written and its [`Durability`] (#10214: a failed directory fsync is
+/// [`Durability::NotDurable`] with the file in place, never an `Err`).
 ///
 /// # Errors
-/// A symlink sits at a tried name, all [`UNIQUE_NAME_ATTEMPTS`] numbered
-/// names are taken, or the stage, write, fsync or publish fails.
+/// Nothing is written: a symlink sits at a tried name, all
+/// [`UNIQUE_NAME_ATTEMPTS`] numbered names are taken, or the stage, write,
+/// fsync or publish fails.
 pub(crate) fn write_new_private_unique(
     dest: &Path,
     what: &'static str,
     bytes: &[u8],
-) -> Result<std::path::PathBuf> {
+) -> Result<(std::path::PathBuf, Durability)> {
     let mut stage = stage_in_private_dir(dest, what)?;
     stage.write_all(bytes)?;
-    stage
-        .file()
-        .sync_all()
-        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    stage.sync_file()?;
     for n in 0..=UNIQUE_NAME_ATTEMPTS {
         let candidate = if n == 0 {
             dest.to_path_buf()
         } else {
             numbered(dest, n)
         };
-        if stage.publish_at(&candidate)? {
-            return Ok(candidate);
+        match stage.publish_at(&candidate)? {
+            PublishAt::Published(durability) => return Ok((candidate, durability)),
+            PublishAt::Taken => {}
         }
     }
     anyhow::bail!(
@@ -400,23 +621,113 @@ pub(crate) fn write_new_private_unique(
 /// Replace the product-owned file at `dest` with `bytes` (owner-only,
 /// fsynced) by a rename, refusing a symlink at the name instead of following
 /// or replacing it. A regular file there is replaced; an absent one created.
+/// #10214: the rename is made durable by an fsync of `dest`'s directory.
+///
+/// `dest` holds exactly the before or the after bytes. An `Err` means NOT
+/// written: a failure up to and including the rename leaves the old file (or
+/// none) and removes the stage. After the rename the new file is in place and
+/// the directory fsync's outcome is returned as [`Durability`]; a failure
+/// there is [`Durability::NotDurable`], never swallowed and never an `Err`.
 ///
 /// # Errors
-/// A symlink sits at `dest`, or the stage, write, fsync or rename fails.
-pub(crate) fn write_replacing(dest: &Path, what: &'static str, bytes: &[u8]) -> Result<()> {
+/// Not written: a symlink sits at `dest`, or the stage, write, fsync or
+/// rename fails.
+pub(crate) fn write_replacing(dest: &Path, what: &'static str, bytes: &[u8]) -> Result<Durability> {
     refuse_symlink(dest)?;
     let mut stage = stage_in_private_dir(dest, what)?;
     stage.write_all(bytes)?;
-    stage
-        .file()
-        .sync_all()
-        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    stage.sync_file()?;
     stage.verify_identity()?;
     refuse_symlink(dest)?;
-    std::fs::rename(&stage.name.path, dest)
-        .with_context(|| format!("replacing {}", dest.display()))?;
+    rename_replacing(&stage.name.path, dest)
+        .with_context(|| format!("replacing {what} {} (#10214)", dest.display()))?;
     stage.name.armed = false;
-    Ok(())
+    Ok(sync_parent_dir(dest, what))
+}
+
+/// The ONE staged-file fsync of the funnel (the test seam sees it).
+fn sync_staged(file: &std::fs::File, staged: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_step(seam::Step::FileSync, staged) {
+        return Err(injected);
+    }
+    #[cfg(not(test))]
+    let _ = staged;
+    file.sync_all()
+}
+
+/// The ONE replacing `rename(2)` of the funnel (the test seam sees it).
+fn rename_replacing(staged: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_step(seam::Step::Rename, dest) {
+        return Err(injected);
+    }
+    std::fs::rename(staged, dest)
+}
+
+/// The directory that holds `dest` (`.` for a bare file name).
+fn parent_dir(dest: &Path) -> &Path {
+    match dest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// #10214 — the ONE directory fsync of the product: a rename or link is
+/// durable only once the directory that holds the new name is synced. Unix
+/// opens the directory read-only (`O_DIRECTORY`, so a non-directory is
+/// refused) and `fsync`s it. Every error is returned, `EINVAL` from a
+/// filesystem that cannot sync a directory included (fail closed: a rename
+/// lost to a crash is lost data). Non-unix has no directory handle to sync
+/// and returns `Ok(())`, as `erasure::store::fsync_dir` does.
+///
+/// # Errors
+/// The directory cannot be opened or its fsync fails.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(dir)?;
+        fsync_dir_handle(&handle, dir)
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(test)]
+        if let Some(injected) = seam::on_step(seam::Step::DirSync, dir) {
+            return Err(injected);
+        }
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// The directory `fsync(2)` itself. The test seam stands in for this one
+/// syscall (the open before it is real), so an injected errno, `EINVAL`
+/// included, takes exactly the path a real one takes (#10265).
+#[cfg(unix)]
+fn fsync_dir_handle(handle: &std::fs::File, dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_step(seam::Step::DirSync, dir) {
+        return Err(injected);
+    }
+    #[cfg(not(test))]
+    let _ = dir;
+    handle.sync_all()
+}
+
+/// Fsync the directory of the just-published `dest` ([`sync_dir`]). The new
+/// file is in place whatever the answer: a failure is
+/// [`Durability::NotDurable`] ("written, not confirmed durable"), and the
+/// caller must not remove the file.
+pub(crate) fn sync_parent_dir(dest: &Path, what: &str) -> Durability {
+    let dir = parent_dir(dest);
+    match sync_dir(dir) {
+        Ok(()) => Durability::Durable,
+        Err(source) => Durability::NotDurable(NotDurable::new(what, dest, dir, source)),
+    }
 }
 
 /// The staging step shared by [`stage_beside`] and [`write_replacing`].
@@ -424,10 +735,7 @@ fn stage_in_private_dir(dest: &Path, what: &'static str) -> Result<NoFollowStage
     let name = dest
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{} has no file name", dest.display()))?;
-    let dir = match dest.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
+    let dir = parent_dir(dest);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -468,6 +776,21 @@ impl NoFollowStage {
     /// from a name.
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.file
+    }
+
+    /// Fsync the staged file through its handle (#10214: the one file-sync
+    /// step of the funnel, seen by the test seam).
+    ///
+    /// # Errors
+    /// The fsync fails.
+    pub(crate) fn sync_file(&self) -> Result<()> {
+        sync_staged(&self.file, &self.name.path).with_context(|| {
+            format!(
+                "fsync the staged {} for {} (#10214)",
+                self.what,
+                self.dest.display()
+            )
+        })
     }
 
     /// Write `bytes` through the handle.
@@ -524,27 +847,31 @@ impl NoFollowStage {
     /// dropped (best effort). Only a link failure that means "no hard links
     /// here" (`EPERM`, `EOPNOTSUPP`, `ENOSYS`) falls back, and only to an
     /// atomic no-replace rename ([`rename_no_replace`]); a platform without
-    /// one, and every other errno, is refused. The caller fsyncs the
-    /// directory. Returns the handle.
+    /// one, and every other errno, is refused. #10214: the publish then
+    /// fsyncs the destination's directory ([`sync_parent_dir`]). Returns the
+    /// handle and that fsync's [`Durability`].
     ///
     /// # Errors
-    /// The identity check fails, something sits at the destination, or the
-    /// link (or its no-replace fallback) fails; the staging name is removed.
-    pub(crate) fn publish(mut self) -> Result<std::fs::File> {
+    /// Not published: the identity check fails, something sits at the
+    /// destination, or the link (or its no-replace fallback) fails; the
+    /// staging name is removed. A failed directory fsync is not an `Err`: it
+    /// is [`Durability::NotDurable`] with the complete new file in place.
+    pub(crate) fn publish(mut self) -> Result<(std::fs::File, Durability)> {
         let dest = self.dest.clone();
-        if !self.publish_at(&dest)? {
-            anyhow::bail!(
+        match self.publish_at(&dest)? {
+            PublishAt::Published(durability) => Ok((self.file, durability)),
+            PublishAt::Taken => anyhow::bail!(
                 "refusing to overwrite existing {} {}",
                 self.what,
                 dest.display()
-            );
+            ),
         }
-        Ok(self.file)
     }
 
-    /// ONE no-follow, create-new `link(2)` at `dest`; `Ok(false)`: name taken.
-    /// I-2: nothing that exists at `dest` is replaced, for any errno.
-    fn publish_at(&mut self, dest: &Path) -> Result<bool> {
+    /// ONE no-follow, create-new `link(2)` at `dest`. I-2: nothing that
+    /// exists at `dest` is replaced, for any errno. A publish fsyncs `dest`'s
+    /// directory and carries the outcome (#10214).
+    fn publish_at(&mut self, dest: &Path) -> Result<PublishAt> {
         self.verify_identity()?;
         match link_no_replace(&self.name.path, dest) {
             Ok(()) => {
@@ -555,13 +882,13 @@ impl NoFollowStage {
                 if std::fs::remove_file(&self.name.path).is_ok() {
                     self.name.armed = false;
                 }
-                Ok(true)
+                Ok(PublishAt::Published(sync_parent_dir(dest, self.what)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),
             Err(e) if no_hard_links(&e) => match rename_no_replace(&self.name.path, dest) {
                 Ok(()) => {
                     self.name.armed = false;
-                    Ok(true)
+                    Ok(PublishAt::Published(sync_parent_dir(dest, self.what)))
                 }
                 Err(r) if r.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),
                 Err(r) => Err(anyhow::Error::new(r).context(format!(

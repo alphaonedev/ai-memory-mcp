@@ -649,7 +649,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
         store_refusal(&store.load_current(NS).expect_err(what))
     };
     let restore = || {
-        store.write_record(&record).expect("restore");
+        crate::storage::snapshot_file::require_durable(
+            store.write_record(&record).expect("restore"),
+        )
+        .expect("durable");
         store.refresh_from_ledger().expect("refresh");
         assert_eq!(
             store.load_current(NS).expect("healed"),
@@ -675,7 +678,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
     // envelope key compare.
     let mut forged = record.clone();
     forged.key_id = ScopeKeyId::random().to_hex();
-    store.write_record(&forged).expect("write forged");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&forged).expect("write forged"),
+    )
+    .expect("durable");
     store.refresh_from_ledger().expect("refresh");
     let err = store
         .load_by_key_id(NS, &record.key_ref().expect("ref"))
@@ -693,7 +699,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
         kek_fingerprint: kek_fp(&test_node("node-intruder")),
         wrapped: record.recipients[0].wrapped.clone(),
     });
-    store.write_record(&widened).expect("write widened");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&widened).expect("write widened"),
+    )
+    .expect("durable");
     assert!(matches!(
         refreshed_refusal("reader set off the log"),
         ScopeKeyStoreError::AuditChainMismatch { .. }
@@ -744,7 +753,10 @@ fn scope_key_record_tamper_and_gaps_fail_closed_8278() {
     // A missing generation is a lost key, never flattened.
     let mut third = record.clone();
     third.epoch = 3;
-    store.write_record(&third).expect("write epoch 3");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&third).expect("write epoch 3"),
+    )
+    .expect("durable");
     store.refresh_from_ledger().expect("refresh");
     assert!(matches!(
         store_refusal(&store.history(NS).expect_err("gap at epoch 2")),
@@ -846,7 +858,10 @@ fn scope_key_audit_refuses_whole_record_substitution_8278() {
         )
         .expect("substitute from public inputs");
         assert_ne!(substitute.key_check, record.key_check);
-        store.write_record(&substitute).expect("write substitute");
+        crate::storage::snapshot_file::require_durable(
+            store.write_record(&substitute).expect("write substitute"),
+        )
+        .expect("durable");
         store.refresh_from_ledger().expect("refresh");
         let err = store
             .load_current(NS)
@@ -855,7 +870,10 @@ fn scope_key_audit_refuses_whole_record_substitution_8278() {
             store_refusal(&err),
             ScopeKeyStoreError::AuditChainMismatch { .. }
         ));
-        store.write_record(&record).expect("restore");
+        crate::storage::snapshot_file::require_durable(
+            store.write_record(&record).expect("restore"),
+        )
+        .expect("durable");
         store.refresh_from_ledger().expect("refresh");
         assert_eq!(
             store.load_current(NS).expect("healed"),
@@ -1161,7 +1179,10 @@ fn scope_key_record_with_another_recovery_fingerprint_is_refused_8278() {
         moved.escrow.recovery_fingerprint,
         record.escrow.recovery_fingerprint
     );
-    store.write_record(&moved).expect("write record");
+    crate::storage::snapshot_file::require_durable(
+        store.write_record(&moved).expect("write record"),
+    )
+    .expect("durable");
     store.refresh_from_ledger().expect("refresh");
     let err = store
         .load_current(NS)
@@ -1299,4 +1320,123 @@ fn note_marker_failure_caps_the_set_8315() {
         MarkerFailureLog::Repeat
     );
     assert_eq!(warned.len(), 2, "a saturated slug is not inserted");
+}
+
+/// Clears the thread's seam state on every exit of a test.
+struct SeamReset;
+
+impl Drop for SeamReset {
+    fn drop(&mut self) {
+        crate::storage::snapshot_file::seam::reset();
+    }
+}
+
+/// #10214 (the #10254 class): a scope-key record written but not confirmed
+/// durable never stops the commit. At every directory fsync of a supersede
+/// the failure is reported as "written, not confirmed durable", and both
+/// records, the audit line and the cache are in place: a fresh store loads
+/// the new generation from disk.
+#[test]
+fn supersede_dir_sync_failure_finishes_the_commit_10214() {
+    use crate::storage::snapshot_file::{NotDurableReport, seam};
+    const NOT_DURABLE: &str = "is written but not confirmed durable";
+    let _reset = SeamReset;
+    let stays = test_node("node-stays-10214");
+    let readers = [ReaderKek::from_keypair(&stays)];
+    let clean = {
+        let dir = sandbox();
+        let _recovery = enrol_test_recovery(dir.path());
+        let store = open_store(dir.path());
+        minted(&store, &[&stays]);
+        seam::reset();
+        store.supersede(NS, &readers).expect("clean supersede");
+        seam::take_dir_syncs().len()
+    };
+    assert!(
+        clean >= 2,
+        "a supersede writes two records, synced {clean} times"
+    );
+    for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
+        let dir = sandbox();
+        let _recovery = enrol_test_recovery(dir.path());
+        let store = open_store(dir.path());
+        let first = minted(&store, &[&stays]);
+        seam::reset();
+        seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, nth);
+        let err = store
+            .supersede(NS, &readers)
+            .expect_err("a record not confirmed durable is reported");
+        seam::reset();
+        assert!(
+            err.downcast_ref::<NotDurableReport>().is_some(),
+            "sync {nth}: the typed report, got {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains(NOT_DURABLE),
+            "sync {nth}: {err:#}"
+        );
+        let current = store
+            .load_current(NS)
+            .expect("current")
+            .expect("a current generation");
+        assert_eq!(
+            current.epoch, 2,
+            "sync {nth}: the cache holds the new generation"
+        );
+        assert_ne!(current.key_id, first.key_id);
+        let reopened = open_store(dir.path());
+        assert_eq!(
+            reopened.load_current(NS).expect("reload from disk"),
+            Some(current),
+            "sync {nth}: both records and the audit line are on disk"
+        );
+        assert_eq!(reopened.history(NS).expect("history").len(), 2);
+    }
+}
+
+/// #10214 (finding 3) — when the audit line fails after records that are
+/// written but not confirmed durable, the error keeps both: the audit
+/// failure and the report of which records are not durable.
+#[test]
+fn audit_line_failure_keeps_the_not_durable_report_10214() {
+    use crate::storage::snapshot_file::seam;
+    const NOT_DURABLE: &str = "is written but not confirmed durable";
+    const AUDIT_FAILED: &str = "opening scope-key audit log";
+    let _reset = SeamReset;
+    let stays = test_node("node-audit-10214");
+    let readers = [ReaderKek::from_keypair(&stays)];
+    let setup = |dir: &std::path::Path| {
+        let _recovery = enrol_test_recovery(dir);
+        let store = open_store(dir);
+        minted(&store, &[&stays]);
+        // Owner read-only: the audit log still reads and verifies, but the
+        // append cannot open it for writing.
+        use std::os::unix::fs::PermissionsExt as _;
+        let audit = store.audit_path(NS);
+        std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o400))
+            .expect("make the audit log read-only");
+        store
+    };
+    let dir = sandbox();
+    let store = setup(dir.path());
+    let err = store
+        .supersede(NS, &readers)
+        .expect_err("the audit line cannot be appended");
+    assert!(format!("{err:#}").contains(AUDIT_FAILED), "{err:#}");
+    assert!(!format!("{err:#}").contains(NOT_DURABLE), "clean: {err:#}");
+
+    let dir = sandbox();
+    let store = setup(dir.path());
+    seam::reset();
+    seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+    let got = store.supersede(NS, &readers);
+    seam::reset();
+    let err = got.expect_err("the audit line cannot be appended");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(AUDIT_FAILED), "the audit failure: {msg}");
+    assert!(
+        msg.starts_with("records written before the audit line failed: "),
+        "{msg}"
+    );
+    assert!(msg.contains(NOT_DURABLE), "the report survives: {msg}");
 }
