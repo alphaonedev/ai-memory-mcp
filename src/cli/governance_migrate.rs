@@ -48,9 +48,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::CliOutput;
 
-/// Repeated `.expect` label for args validated earlier in the same fn
-/// (#1558 batch 6).
-const EXPECT_CHECKED_ABOVE: &str = "checked above";
+/// Object label passed to `snapshot_file::write_replacing` for config writes (#10257).
+const CONFIG_WRITE_WHAT: &str = "config";
+/// Object label passed to `snapshot_file::write_new_private_unique` for pre-replace backups (#10257).
+const CONFIG_BACKUP_WHAT: &str = "config backup";
+/// UTC timestamp format matching `config migrate` backup naming (`<file>.bak.<UTC %Y%m%d-%H%M%S>`).
+const BACKUP_TIMESTAMP_FMT: &str = "%Y%m%d-%H%M%S";
 
 // ---------------------------------------------------------------------------
 // CLI arg surface
@@ -273,6 +276,65 @@ pub fn merge_in_place(existing: &str, rendered: &str) -> String {
     out
 }
 
+/// Build `<dest>.bak.<UTC %Y%m%d-%H%M%S>` preserving any existing suffix (#10257).
+fn backup_path_for(dest: &Path) -> PathBuf {
+    let timestamp = chrono::Utc::now().format(BACKUP_TIMESTAMP_FMT).to_string();
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(format!(".bak.{timestamp}"));
+    PathBuf::from(name)
+}
+
+/// Write a durable owner-only pre-replace backup of `original_bytes` beside
+/// `dest` via `snapshot_file::write_new_private_unique` (#10257, per
+/// ERRORS-02 / CBC-04 / CBC-05). A backup `Err` or `Durability::NotDurable`
+/// refuses the replace and leaves `dest` untouched.
+fn write_backup_before_replace(dest: &Path, original_bytes: &[u8]) -> Result<PathBuf> {
+    let wanted = backup_path_for(dest);
+    let (written, durability) = crate::storage::snapshot_file::write_new_private_unique(
+        &wanted,
+        CONFIG_BACKUP_WHAT,
+        original_bytes,
+    )
+    .with_context(|| format!("could not write backup {}", wanted.display()))?;
+    crate::storage::snapshot_file::require_durable(durability)?;
+    Ok(written)
+}
+
+/// Replace or create `out_path` through `snapshot_file::write_replacing`
+/// (#10257, per ERRORS-02 / CBC-04 / CBC-05):
+///
+/// 1. Refuse a symlink at `out_path` before any backup or staging write (#8950).
+/// 2. Back up `out_path` before replacing when writing in place
+///    (`in_place_original = Some(bytes)`) or when `--config-out` already exists.
+/// 3. Stage, fsync file, atomically rename, and fsync parent directory via
+///    `snapshot_file::write_replacing` + `require_durable`.
+fn write_config_safely(
+    out_path: &Path,
+    new_bytes: &[u8],
+    in_place_original: Option<&[u8]>,
+) -> Result<()> {
+    crate::storage::snapshot_file::refuse_symlink(out_path)?;
+    if let Some(original) = in_place_original {
+        let _backup_path = write_backup_before_replace(out_path, original)?;
+    } else {
+        match std::fs::read(out_path) {
+            Ok(existing_bytes) => {
+                let _backup_path = write_backup_before_replace(out_path, &existing_bytes)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "read existing output {} before backup",
+                    out_path.display()
+                )));
+            }
+        }
+    }
+    let durability =
+        crate::storage::snapshot_file::write_replacing(out_path, CONFIG_WRITE_WHAT, new_bytes)?;
+    crate::storage::snapshot_file::require_durable(durability)
+}
+
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
@@ -296,24 +358,24 @@ pub fn run(args: MigrateToPermissionsArgs, out: &mut CliOutput<'_>) -> Result<()
 
     // Dry-run is the default. We treat "no --config-out AND no
     // --dry-run" as dry-run too, matching the K11 spec.
-    let dry_run = args.dry_run || args.config_out.is_none();
-    if dry_run {
+    let Some(out_path) = (!args.dry_run)
+        .then_some(args.config_out.as_deref())
+        .flatten()
+    else {
         // Print to stdout. The rendered block already ends in a
         // newline, so no extra `\n` here.
         write!(out.stdout, "{rendered}")?;
         return Ok(());
-    }
+    };
 
     // Write path. Either standalone (different file) or in-place merge
     // (same file as the input). Compare canonical paths so a relative
     // and absolute reference to the same file still take the merge
     // branch.
-    let out_path = args.config_out.clone().expect(EXPECT_CHECKED_ABOVE);
-    let same_file = same_path(&in_path, &out_path);
+    let same_file = same_path(&in_path, out_path);
     if same_file {
         let merged = merge_in_place(&raw, &rendered);
-        std::fs::write(&out_path, merged)
-            .with_context(|| format!("write merged config to {}", out_path.display()))?;
+        write_config_safely(out_path, merged.as_bytes(), Some(raw.as_bytes()))?;
         writeln!(
             out.stdout,
             "merged {} migrated rule(s) into {}",
@@ -321,8 +383,7 @@ pub fn run(args: MigrateToPermissionsArgs, out: &mut CliOutput<'_>) -> Result<()
             out_path.display()
         )?;
     } else {
-        std::fs::write(&out_path, &rendered)
-            .with_context(|| format!("write rendered block to {}", out_path.display()))?;
+        write_config_safely(out_path, rendered.as_bytes(), None)?;
         writeln!(
             out.stdout,
             "wrote {} migrated rule(s) to {}",
@@ -374,28 +435,23 @@ pub fn run_with_paths(
     let block = translate(&legacy);
     let rendered = render_permissions_block(&block);
 
-    let dry = dry_run || config_out.is_none();
-    if dry {
+    let Some(out_path) = (!dry_run).then_some(config_out).flatten() else {
         write!(out.stdout, "{rendered}")?;
         return Ok(rendered);
-    }
+    };
 
-    let out_path = config_out.expect(EXPECT_CHECKED_ABOVE);
     if same_path(in_path, out_path) {
         let merged = merge_in_place(&raw, &rendered);
-        std::fs::write(out_path, merged)
-            .with_context(|| format!("write merged to {}", out_path.display()))?;
-    } else if let Some(parent) = out_path.parent()
-        && !parent.as_os_str().is_empty()
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create parent of {}", out_path.display()))?;
-        std::fs::write(out_path, &rendered)
-            .with_context(|| format!("write rendered to {}", out_path.display()))?;
+        write_config_safely(out_path, merged.as_bytes(), Some(raw.as_bytes()))?;
     } else {
-        std::fs::write(out_path, &rendered)
-            .with_context(|| format!("write rendered to {}", out_path.display()))?;
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent of {}", out_path.display()))?;
+        }
+        write_config_safely(out_path, rendered.as_bytes(), None)?;
     }
     writeln!(
         out.stdout,
