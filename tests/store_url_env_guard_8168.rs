@@ -3958,7 +3958,6 @@ fn pin_reads(why: &Why) -> bool {
         // #10356: by position, then by whole name. A `NoDef` is a crate
         // type the walk cannot see, whatever its name.
         Why::MarkerBound(name) => is_std_marker(name),
-        Why::NoDef(_) => false,
         Why::TraitObject
         | Why::OpaqueType
         | Why::RawPointer
@@ -3972,7 +3971,8 @@ fn pin_reads(why: &Why) -> bool {
         | Why::Shadowed(_)
         | Why::PathNotLanded(_)
         | Why::NoValue(_)
-        | Why::MacroFragment(_) => false,
+        | Why::MacroFragment(_)
+        | Why::NoDef(_) => false,
     }
 }
 
@@ -10194,7 +10194,7 @@ type ArmRow10351 = (
 const PLAIN_A_10351: (&str, &str) = ("src/a.rs", "pub struct Plain(u8);\n");
 
 /// #10351: every refusing arm of [`pin_reads`] the reviewer's mutants left
-/// green (Projection, MacroType, Ambiguous, Shadowed), each as the static's
+/// green (`Projection`, `MacroType`, `Ambiguous`, `Shadowed`), each as the static's
 /// own reason (`top`) and as a reason reached through a struct whose
 /// least reason is the read `TraitObject` (`behind`). Each row is pinned
 /// at the digest a taken row would match, so the only thing that refuses
