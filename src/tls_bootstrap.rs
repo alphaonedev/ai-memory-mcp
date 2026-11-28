@@ -858,9 +858,11 @@ fn reissued_tick(
             days_valid,
             "{message}"
         ),
+        // #10330: every cause of the chain. `std::io::Error` ignores `{:#}`,
+        // so the anyhow form renders its `source()` chain.
         Err(e) => tracing::error!(
             target: crate::transit_encryption::TRACING_TARGET,
-            error = %e,
+            error = %format_args!("{:#}", anyhow::Error::from(e)),
             "{message}"
         ),
     }
@@ -883,9 +885,11 @@ pub(crate) async fn renewal_tick(
         Err(e) => {
             let message = renewal_tick_message(RenewalTick::Failed, &NotDurableReport::new())
                 .unwrap_or_default();
+            // #10330 / #10335: `{e:#}` prints every cause, so the failed
+            // write and its root cause follow the kept-files report.
             tracing::error!(
                 target: crate::transit_encryption::TRACING_TARGET,
-                error = %e,
+                error = %format_args!("{e:#}"),
                 "{message}"
             );
             return RenewalTick::Failed;
