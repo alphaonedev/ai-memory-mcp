@@ -30,6 +30,30 @@ FIXTURE = {
         "// START_ROWS_BEGIN\nconst START_ROWS: &[(&str, usize)] = &[(\"src/run.rs\", 1)];\n// START_ROWS_END\n",
 }
 CENSUS = Path("tests/process_start_census_10176.rs")
+# #10311: `--write` keeps the reasons of the committed rows file and never adds a
+# row, so the fixture starts from a committed file that rows src/run.rs (count 0:
+# the first write sets it).
+TABLE_TYPE = ": &[(&str, usize, &str)] = &["
+SEED_ROWS = (
+    f"pub(crate) const TOKEN_ROWS{TABLE_TYPE}\n    (\"src/run.rs\", 0, R_TOK_START),\n];\n"
+    f"pub(crate) const SHAPE_ROWS{TABLE_TYPE}\n];\n"
+    f"pub(crate) const ENV_NAME_ROWS{TABLE_TYPE}\n];\n"
+)
+NO_ROW_TAIL = (", and {table} has no committed row for it; --write never adds a row or a reason, so add the row "
+               "by hand with a reason that is true for the file (#10311)")
+# (kind, text of src/new.rs, the exact refusal). Written out by hand: one row per
+# table, each source reaching that table only.
+NEW_FILE_ROWS = (
+    ("TOKEN", "use std::process;\n",
+     "census_rows_10286: src/new.rs: 1 watched process, libc, nix or proptest tokens"
+     + NO_ROW_TAIL.format(table="TOKEN_ROWS")),
+    ("SHAPE", "extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n}\n",
+     "census_rows_10286: src/new.rs: 1 forms the census does not model" + NO_ROW_TAIL.format(table="SHAPE_ROWS")),
+    ("ENV", "fn f(n: &str) {\n    let _ = std::env::var(n);\n}\n",
+     "census_rows_10286: src/new.rs: 1 environment names that are not one string literal or one named constant"
+     + NO_ROW_TAIL.format(table="ENV_NAME_ROWS")),
+)
+ROWS_PREFIX = f"census_rows_10286: scan failed: {ROWS}"
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -49,6 +73,7 @@ class CensusRows10286(unittest.TestCase):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding="utf-8")
         (self.root / "tests/common").mkdir(parents=True, exist_ok=True)
+        (self.root / ROWS).write_text(SEED_ROWS, encoding="utf-8")
         w = run("--write", "--root", str(self.root))
         self.assertEqual(w.returncode, EXIT_OK, w.stderr)
 
@@ -57,6 +82,81 @@ class CensusRows10286(unittest.TestCase):
 
     def check(self) -> subprocess.CompletedProcess[str]:
         return run("--check", "--root", str(self.root))
+
+    def tables(self) -> dict[Path, bytes]:
+        return {p: (self.root / p).read_bytes() for p in (ROWS, SITES)}
+
+    def test_write_refuses_a_new_file_without_a_row_10311(self) -> None:
+        before = self.tables()
+        (self.root / "src/new.rs").write_text(NEW_FILE_ROWS[1][1], encoding="utf-8")
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual(r.returncode, EXIT_DIFF, r.stderr)
+        self.assertIn("src/new.rs", r.stderr)
+        self.assertIn("no committed row", r.stderr)
+        self.assertEqual(self.tables(), before)
+
+    def test_each_row_kind_refuses_a_file_without_a_committed_row_10311(self) -> None:
+        self.assertEqual([k for k, _s, _w in NEW_FILE_ROWS], ["TOKEN", "SHAPE", "ENV"])
+        before = self.tables()
+        new = self.root / "src/new.rs"
+        for kind, text, want in NEW_FILE_ROWS:
+            new.write_text(text, encoding="utf-8")
+            for mode in ("--write", "--check"):
+                r = run(mode, "--root", str(self.root))
+                self.assertEqual((r.returncode, r.stderr.strip(), r.stdout), (EXIT_DIFF, want, ""), (kind, mode))
+                self.assertEqual(self.tables(), before, (kind, mode))
+        new.unlink()
+        self.assertEqual(self.check().returncode, EXIT_OK)
+
+    def test_write_updates_a_count_and_keeps_the_reason_10311(self) -> None:
+        p = self.root / ROWS
+        p.write_text(p.read_text(encoding="utf-8").replace(
+            '("src/run.rs", 2, R_TOK_START),', '("src/run.rs", 2, R_TOK_NAME),'), encoding="utf-8")
+        src = self.root / "src/run.rs"
+        src.write_text(src.read_text(encoding="utf-8") + "use std::process;\n", encoding="utf-8")
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual((r.returncode, r.stderr), (EXIT_OK, ""))
+        rows = p.read_text(encoding="utf-8")
+        self.assertIn('    ("src/run.rs", 3, R_TOK_NAME),\n', rows)
+        self.assertNotIn("R_TOK_START),", rows)
+
+    def test_an_absent_rows_file_is_an_empty_table_10311(self) -> None:
+        (self.root / ROWS).unlink()
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual((r.returncode, r.stderr.strip()), (
+            EXIT_DIFF, "census_rows_10286: src/run.rs: 2 watched process, libc, nix or proptest tokens"
+            + NO_ROW_TAIL.format(table="TOKEN_ROWS")))
+        self.assertFalse((self.root / ROWS).exists())
+
+    def test_a_rows_file_the_scanner_cannot_read_row_by_row_is_refused_10311(self) -> None:
+        good = (self.root / ROWS).read_text(encoding="utf-8")
+        row = '    ("src/run.rs", 2, R_TOK_START),\n'
+        self.assertIn(row, good)
+        line = good.splitlines(keepends=True).index(row) + 1
+        cases = (
+            (good.replace(row, '    ("src/run.rs", 2, R_TOK_NOPE),\n'),
+             f":{line}: R_TOK_NOPE is not a reason of TOKEN_ROWS; a row keeps one of the R_TOK_ reasons (#10311)"),
+            (good.replace(row, '    ("src/run.rs", 2, R_ENV_NAME),\n'),
+             f":{line}: R_ENV_NAME is not a reason of TOKEN_ROWS; a row keeps one of the R_TOK_ reasons (#10311)"),
+            (good.replace(row, '    ("src/run.rs", 2, R_TOK_START), // note\n'),
+             f":{line}: not a row of TOKEN_ROWS; the committed table is read row by row and an unread line is "
+             "not clean (#10311)"),
+            (good.replace(row, row + row),
+             f":{line + 1}: TOKEN_ROWS holds src/run.rs twice (#10311)"),
+            (good.replace("pub(crate) const SHAPE_ROWS", "pub(crate) const SHAPE_ROWZ"),
+             ": holds no SHAPE_ROWS table; the committed table is read before the scan (#10311)"),
+            (good + f"pub(crate) const ENV_NAME_ROWS{TABLE_TYPE}\n];\n",
+             f":{len(good.splitlines()) + 1}: a second ENV_NAME_ROWS table (#10311)"),
+            (good[:good.rindex("];")],
+             ": ENV_NAME_ROWS is not closed by `];` (#10311)"),
+        )
+        for text, want in cases:
+            (self.root / ROWS).write_text(text, encoding="utf-8")
+            before = self.tables()
+            for mode in ("--write", "--check"):
+                r = run(mode, "--root", str(self.root))
+                self.assertEqual((r.returncode, r.stderr.strip()), (EXIT_SCAN, ROWS_PREFIX + want), (want, mode))
+                self.assertEqual(self.tables(), before, (want, mode))
 
     def test_the_committed_tables_match_a_fresh_scan_10290(self) -> None:
         r = run("--check")
