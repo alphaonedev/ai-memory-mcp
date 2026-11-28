@@ -1,0 +1,1089 @@
+"""Run the census row scanner (#10290) as CI runs it: `--check` passes on the
+committed tables and is red, with its exact message, on every tamper."""
+from pathlib import Path
+import importlib.util
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parents[3]
+SCANNER = ROOT / "scripts/ci/census_rows_10286.py"
+ROWS = Path("tests/common/census_rows_10176.rs")
+SITES = Path("tests/common/census_sites_10286.rs")
+SCRATCH = ROOT / ".local-runs"
+OK_LINE = "census_rows_10286: 2 tables match a fresh scan"
+REWRITE = "; run scripts/ci/census_rows_10286.py --write and review the change"
+EXIT_OK = 0
+EXIT_DIFF = 1
+EXIT_SCAN = 2
+FIXTURE = {
+    "src/run.rs": "fn f() {\n    let _ = std::process::Command::new(\"sh\");\n}\n",
+    "src/clean.rs": "fn g() -> u8 {\n    1\n}\n",
+    # The scanner reads which files start a process from the census START_ROWS.
+    "tests/process_start_census_10176.rs":
+        "// START_ROWS_BEGIN\nconst START_ROWS: &[(&str, usize)] = &[(\"src/run.rs\", 1)];\n// START_ROWS_END\n",
+}
+CENSUS = Path("tests/process_start_census_10176.rs")
+# #10311: `--write` keeps the reasons of the committed rows file and never adds a
+# row, so the fixture starts from a committed file that rows src/run.rs (count 0:
+# the first write sets it).
+TABLE_TYPE = ": &[(&str, usize, &str)] = &["
+SEED_ROWS = (
+    f"pub(crate) const TOKEN_ROWS{TABLE_TYPE}\n    (\"src/run.rs\", 0, R_TOK_START),\n];\n"
+    f"pub(crate) const SHAPE_ROWS{TABLE_TYPE}\n];\n"
+    f"pub(crate) const ENV_NAME_ROWS{TABLE_TYPE}\n];\n"
+)
+NO_ROW_TAIL = (", and {table} has no committed row for it; --write never adds a row or a reason, so add the row "
+               "by hand with a reason that is true for the file (#10311)")
+# (kind, text of src/new.rs, the exact refusal). Written out by hand: one row per
+# table, each source reaching that table only.
+NEW_FILE_ROWS = (
+    ("TOKEN", "use std::process;\n",
+     "census_rows_10286: src/new.rs: 1 watched process, libc, nix or proptest tokens"
+     + NO_ROW_TAIL.format(table="TOKEN_ROWS")),
+    ("SHAPE", "extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n}\n",
+     "census_rows_10286: src/new.rs: 1 forms the census does not model" + NO_ROW_TAIL.format(table="SHAPE_ROWS")),
+    ("ENV", "fn f(n: &str) {\n    let _ = std::env::var(n);\n}\n",
+     "census_rows_10286: src/new.rs: 1 environment names that are not one string literal or one named constant"
+     + NO_ROW_TAIL.format(table="ENV_NAME_ROWS")),
+)
+ROWS_PREFIX = f"census_rows_10286: scan failed: {ROWS}"
+# The rows reader's size bound: 20 000 rows, over 100K bytes.
+ROWS_BOUND_ROWS = 20_000
+ROWS_BOUND_BYTES = 100_000
+
+
+def run(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-I", str(SCANNER), *args],
+        capture_output=True, text=True, check=False, timeout=600,
+    )
+
+
+class CensusRows10286(unittest.TestCase):
+    def setUp(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(prefix="census-rows-10286-", dir=SCRATCH)
+        self.root = Path(self._tmp.name)
+        for rel, text in FIXTURE.items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        (self.root / "tests/common").mkdir(parents=True, exist_ok=True)
+        (self.root / ROWS).write_text(SEED_ROWS, encoding="utf-8")
+        w = run("--write", "--root", str(self.root))
+        self.assertEqual(w.returncode, EXIT_OK, w.stderr)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def check(self) -> subprocess.CompletedProcess[str]:
+        return run("--check", "--root", str(self.root))
+
+    def tables(self) -> dict[Path, bytes]:
+        return {p: (self.root / p).read_bytes() for p in (ROWS, SITES)}
+
+    def test_write_refuses_a_new_file_without_a_row_10311(self) -> None:
+        before = self.tables()
+        (self.root / "src/new.rs").write_text(NEW_FILE_ROWS[1][1], encoding="utf-8")
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual(r.returncode, EXIT_DIFF, r.stderr)
+        self.assertIn("src/new.rs", r.stderr)
+        self.assertIn("no committed row", r.stderr)
+        self.assertEqual(self.tables(), before)
+
+    def test_each_row_kind_refuses_a_file_without_a_committed_row_10311(self) -> None:
+        self.assertEqual([k for k, _s, _w in NEW_FILE_ROWS], ["TOKEN", "SHAPE", "ENV"])
+        before = self.tables()
+        new = self.root / "src/new.rs"
+        for kind, text, want in NEW_FILE_ROWS:
+            new.write_text(text, encoding="utf-8")
+            for mode in ("--write", "--check"):
+                r = run(mode, "--root", str(self.root))
+                self.assertEqual((r.returncode, r.stderr.strip(), r.stdout), (EXIT_DIFF, want, ""), (kind, mode))
+                self.assertEqual(self.tables(), before, (kind, mode))
+        new.unlink()
+        self.assertEqual(self.check().returncode, EXIT_OK)
+
+    def test_write_updates_a_count_and_keeps_the_reason_10311(self) -> None:
+        p = self.root / ROWS
+        p.write_text(p.read_text(encoding="utf-8").replace(
+            '("src/run.rs", 2, R_TOK_START),', '("src/run.rs", 2, R_TOK_NAME),'), encoding="utf-8")
+        src = self.root / "src/run.rs"
+        src.write_text(src.read_text(encoding="utf-8") + "use std::process;\n", encoding="utf-8")
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual((r.returncode, r.stderr), (EXIT_OK, ""))
+        rows = p.read_text(encoding="utf-8")
+        self.assertIn('    ("src/run.rs", 3, R_TOK_NAME),\n', rows)
+        self.assertNotIn("R_TOK_START),", rows)
+
+    def test_each_row_kind_keeps_its_committed_reason_10311(self) -> None:
+        # (table, a committed reason the scan would never pick for this source).
+        # SHAPE: an extern block, which the old scan named R_SHAPE_EXTERN.
+        # ENV: R_ENV_NAME is the only reason of its table; it is kept, not added.
+        keep = (("SHAPE_ROWS", "R_SHAPE_IMPL"), ("ENV_NAME_ROWS", "R_ENV_NAME"))
+        p = self.root / ROWS
+        seeded = p.read_text(encoding="utf-8")
+        before = self.tables()
+        new = self.root / "src/new.rs"
+        for (kind, text, _want), (name, reason) in zip(NEW_FILE_ROWS[1:], keep):
+            new.write_text(text, encoding="utf-8")
+            opener = f"pub(crate) const {name}{TABLE_TYPE}\n"
+            self.assertEqual(seeded.count(opener), 1, kind)
+            p.write_text(seeded.replace(opener, opener + f'    ("src/new.rs", 0, {reason}),\n'), encoding="utf-8")
+            r = run("--write", "--root", str(self.root))
+            self.assertEqual((r.returncode, r.stderr), (EXIT_OK, ""), kind)
+            self.assertIn(f'    ("src/new.rs", 1, {reason}),\n', p.read_text(encoding="utf-8"), kind)
+            for rel, data in before.items():  # --write rewrote both tables
+                (self.root / rel).write_bytes(data)
+        new.unlink()
+        self.assertEqual(self.check().returncode, EXIT_OK)
+
+    def test_an_absent_rows_file_is_an_empty_table_10311(self) -> None:
+        (self.root / ROWS).unlink()
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual((r.returncode, r.stderr.strip()), (
+            EXIT_DIFF, "census_rows_10286: src/run.rs: 2 watched process, libc, nix or proptest tokens"
+            + NO_ROW_TAIL.format(table="TOKEN_ROWS")))
+        self.assertFalse((self.root / ROWS).exists())
+
+    def test_a_rows_file_the_scanner_cannot_read_row_by_row_is_refused_10311(self) -> None:
+        good = (self.root / ROWS).read_text(encoding="utf-8")
+        row = '    ("src/run.rs", 2, R_TOK_START),\n'
+        self.assertIn(row, good)
+        line = good.splitlines(keepends=True).index(row) + 1
+        cases = (
+            (good.replace(row, '    ("src/run.rs", 2, R_TOK_NOPE),\n'),
+             f":{line}: R_TOK_NOPE is not a reason of TOKEN_ROWS; a row keeps one of the R_TOK_ reasons (#10311)"),
+            (good.replace(row, '    ("src/run.rs", 2, R_ENV_NAME),\n'),
+             f":{line}: R_ENV_NAME is not a reason of TOKEN_ROWS; a row keeps one of the R_TOK_ reasons (#10311)"),
+            (good.replace(row, '    ("src/run.rs", 2, R_TOK_START), // note\n'),
+             f":{line}: not a row of TOKEN_ROWS; the committed table is read row by row and an unread line is "
+             "not clean (#10311)"),
+            (good.replace(row, row + row),
+             f":{line + 1}: TOKEN_ROWS holds src/run.rs twice (#10311)"),
+            (good.replace("pub(crate) const SHAPE_ROWS", "pub(crate) const SHAPE_ROWZ"),
+             ": holds no SHAPE_ROWS table; the committed table is read before the scan (#10311)"),
+            (good + f"pub(crate) const ENV_NAME_ROWS{TABLE_TYPE}\n];\n",
+             f":{len(good.splitlines()) + 1}: a second ENV_NAME_ROWS table (#10311)"),
+            (good[:good.rindex("];")],
+             ": ENV_NAME_ROWS is not closed by `];` (#10311)"),
+        )
+        for text, want in cases:
+            (self.root / ROWS).write_text(text, encoding="utf-8")
+            before = self.tables()
+            for mode in ("--write", "--check"):
+                r = run(mode, "--root", str(self.root))
+                self.assertEqual((r.returncode, r.stderr.strip()), (EXIT_SCAN, ROWS_PREFIX + want), (want, mode))
+                self.assertEqual(self.tables(), before, (want, mode))
+
+    def test_a_linked_rows_file_is_refused_10311(self) -> None:
+        p = self.root / ROWS
+        real = p.with_name("real_rows.rs")
+        p.rename(real)
+        p.symlink_to(real.name)
+        for mode in ("--write", "--check"):
+            r = run(mode, "--root", str(self.root))
+            self.assertEqual((r.returncode, r.stderr.strip()), (
+                EXIT_SCAN, ROWS_PREFIX + ": a symbolic link; the census never follows links (#10176)"), mode)
+            self.assertTrue(p.is_symlink(), mode)
+
+    def test_the_rows_reader_is_linear_on_large_inputs_10311(self) -> None:
+        m = scanner_module()
+        n = ROWS_BOUND_ROWS
+        body = "".join(f'    ("src/f{i}.rs", {i}, R_TOK_NAME),\n' for i in range(n))
+        text = SEED_ROWS.replace('    ("src/run.rs", 0, R_TOK_START),\n', body)
+        self.assertGreaterEqual(len(text), ROWS_BOUND_BYTES)
+        t0 = time.monotonic()
+        got = m.parse_rows(text)
+        self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
+        self.assertEqual((len(got["TOKEN_ROWS"]), got["SHAPE_ROWS"], got["ENV_NAME_ROWS"]), (n, {}, {}))
+
+    def test_the_committed_tables_match_a_fresh_scan_10290(self) -> None:
+        r = run("--check")
+        self.assertEqual((r.returncode, r.stdout.strip(), r.stderr), (EXIT_OK, OK_LINE, ""))
+
+    def test_a_fresh_write_checks_clean_10290(self) -> None:
+        r = self.check()
+        self.assertEqual((r.returncode, r.stdout.strip()), (EXIT_OK, OK_LINE))
+        sites = (self.root / SITES).read_text(encoding="utf-8")
+        self.assertIn('("src/run.rs", &[', sites)
+        self.assertNotIn("src/clean.rs", sites)
+
+    def test_a_changed_count_is_red_10290(self) -> None:
+        p = self.root / ROWS
+        text = p.read_text(encoding="utf-8")
+        # Two watched tokens: `process` and `Command`.
+        old = '("src/run.rs", 2, R_TOK_START),'
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, '("src/run.rs", 3, R_TOK_START),'), encoding="utf-8")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_DIFF)
+        self.assertEqual(
+            r.stderr.strip(),
+            f"census_rows_10286: {ROWS} differs from a fresh scan at line "
+            f"{text.splitlines().index('    ' + old) + 1}: committed "
+            f"{chr(39)}(\"src/run.rs\", 3, R_TOK_START),{chr(39)}, scan {old!r}{REWRITE}",
+        )
+
+    def test_a_changed_site_digest_is_red_10290(self) -> None:
+        p = self.root / SITES
+        lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+        i = next(n for n, x in enumerate(lines) if x.startswith('        "'))
+        digest = lines[i].strip()[1:-2]
+        swapped = ("0" if digest[0] != "0" else "1") + digest[1:]
+        lines[i] = f'        "{swapped}",\n'
+        p.write_text("".join(lines), encoding="utf-8")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_DIFF)
+        self.assertEqual(
+            r.stderr.strip(),
+            f"census_rows_10286: {SITES} differs from a fresh scan at line {i + 1}: committed "
+            f"{repr(chr(34) + swapped + chr(34) + ',')}, scan {repr(chr(34) + digest + chr(34) + ',')}{REWRITE}",
+        )
+
+    def test_an_edit_next_to_a_watched_token_is_red_10290(self) -> None:
+        src = self.root / "src/run.rs"
+        src.write_text(src.read_text(encoding="utf-8").replace("::new(", "::other("), encoding="utf-8")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_DIFF)
+        self.assertTrue(r.stderr.startswith(f"census_rows_10286: {SITES} differs from a fresh scan at line "),
+                        r.stderr)
+
+    def test_a_new_watched_file_is_red_10290(self) -> None:
+        (self.root / "src/clean.rs").write_text("use std::process;\n", encoding="utf-8")
+        r = self.check()
+        # #10311: a new watched file with no committed row is refused by name
+        # before either table is compared.
+        self.assertEqual((r.returncode, r.stderr.strip()), (
+            EXIT_DIFF, "census_rows_10286: src/clean.rs: 1 watched process, libc, nix or proptest tokens"
+            + NO_ROW_TAIL.format(table="TOKEN_ROWS")))
+
+    def test_a_missing_table_is_red_10290(self) -> None:
+        (self.root / SITES).unlink()
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_DIFF)
+        self.assertTrue(r.stderr.startswith(f"census_rows_10286: {SITES}: unreadable ("), r.stderr)
+
+    def test_a_table_that_is_not_utf8_fails_the_scan_10290(self) -> None:
+        # The tables are .rs files in the walked tree, so the scan reads them first.
+        (self.root / ROWS).write_bytes(b"\xff\xfe")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertTrue(r.stderr.startswith("census_rows_10286: scan failed: "), r.stderr)
+
+    def test_a_source_that_is_not_utf8_fails_the_scan_10290(self) -> None:
+        (self.root / "src/bad.rs").write_bytes(b"fn f() {}\xff\n")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/bad.rs: not UTF-8 "
+                         "(invalid start byte); the census cannot read it (#10176)")
+
+    def test_a_non_utf8_source_names_its_file_10316(self) -> None:
+        (self.root / "src/deep").mkdir()
+        (self.root / "src/deep/bad.rs").write_bytes(b"fn f() {}\xff\n")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/deep/bad.rs: not UTF-8 "
+                         "(invalid start byte); the census cannot read it (#10176)")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 file")
+    def test_an_unreadable_file_names_its_file_10316(self) -> None:
+        for rel, exp in (("src/locked.rs", "src/locked.rs"), (".cargo/config.toml", ".cargo/config.toml")):
+            p = self.root / rel
+            p.parent.mkdir(exist_ok=True)
+            p.write_text("x = 1\n" if rel.endswith("toml") else "fn h() {}\n", encoding="utf-8")
+            p.chmod(0)
+            try:
+                r = self.check()
+            finally:
+                p.chmod(0o644)
+                p.unlink()
+            self.assertEqual(r.returncode, EXIT_SCAN, rel)
+            self.assertEqual(r.stderr.strip(), f"census_rows_10286: scan failed: {exp}: unreadable "
+                             "(Permission denied)")
+
+    def test_a_symlink_in_the_tree_fails_the_scan_10315(self) -> None:
+        (self.root / "src/l.rs").symlink_to("clean.rs")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/l.rs: a symbolic link; "
+                         "the census never follows links (#10176)")
+
+    def test_a_symlink_to_a_directory_and_to_a_non_rs_file_fail_the_scan_10315(self) -> None:
+        (self.root / "src/d").symlink_to(".", target_is_directory=True)
+        (self.root / "notes.txt").symlink_to("src/clean.rs")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: notes.txt: a symbolic link; "
+                         "the census never follows links (#10176)\nsrc/d: a symbolic link; "
+                         "the census never follows links (#10176)")
+
+    def test_the_source_walk_refuses_a_link_by_itself_10315(self) -> None:
+        # Both walks report a link, so the CLI test cannot tell them apart.
+        m = scanner_module()
+        (self.root / "src/l.rs").symlink_to("clean.rs")
+        with self.assertRaises(ValueError) as cm:
+            m.tree_rs(self.root)
+        self.assertEqual(str(cm.exception), "src/l.rs: a symbolic link; the census never follows links (#10176)")
+
+    def test_the_config_walk_refuses_a_link_10315(self) -> None:
+        m = scanner_module()
+        (self.root / ".cargo").mkdir()
+        (self.root / ".cargo/config.toml").symlink_to("../src/clean.rs")
+        with self.assertRaises(ValueError) as cm:
+            m.tree_configs(self.root)
+        self.assertEqual(str(cm.exception), ".cargo/config.toml: a symbolic link; "
+                         "the census never follows links (#10176)")
+
+    def test_write_never_follows_a_link_to_the_rows_file_10315(self) -> None:
+        outside = self.root.parent / (self.root.name + "-outside.rs")
+        outside.write_text("// outside\n", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        (self.root / ROWS).unlink()
+        (self.root / ROWS).symlink_to(outside)
+        r = run("--write", "--root", str(self.root))
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "// outside\n")
+
+    def test_the_writer_refuses_a_link_and_a_path_outside_the_root_10315(self) -> None:
+        m = scanner_module()
+        outside = self.root.parent / (self.root.name + "-outside.rs")
+        outside.write_text("// outside\n", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        (self.root / "tests/common/l.rs").symlink_to(outside)
+        with self.assertRaises(ValueError) as cm:
+            m.write_table(self.root, "tests/common/l.rs", "// changed\n")
+        self.assertEqual(str(cm.exception), "tests/common/l.rs: a symbolic link; "
+                         "the census never follows links (#10176)")
+        (self.root / "up").symlink_to(self.root.parent, target_is_directory=True)
+        with self.assertRaises(ValueError) as cm:
+            m.write_table(self.root, "up/x.rs", "// changed\n")
+        # #10345: the walk from the root fd refuses the link itself, so the
+        # refusal names the linked component, not a resolved path.
+        self.assertEqual(str(cm.exception), "up/x.rs: up is a symbolic link; "
+                         "the census never follows links (#10176)")
+        self.assertEqual(outside.read_text(encoding="utf-8"), "// outside\n")
+        self.assertFalse((self.root.parent / "x.rs").exists())
+
+    def test_a_check_read_of_a_linked_table_names_the_table_10315(self) -> None:
+        # The table is a link only after the scan: read it directly.
+        m = scanner_module()
+        (self.root / "t.rs").symlink_to("src/clean.rs")
+        with self.assertRaises(ValueError) as cm:
+            m.read_scanned(self.root, "t.rs")
+        self.assertEqual(str(cm.exception), "t.rs: a symbolic link; the census never follows links (#10176)")
+
+    def test_a_census_without_start_rows_fails_the_scan_10290(self) -> None:
+        (self.root / CENSUS).write_text("const START_ROWS: &[(&str, usize)] = &[];\n", encoding="utf-8")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: substring not found")
+
+    def test_an_over_cap_statement_fails_the_scan_10303(self) -> None:
+        m = scanner_module()
+        (self.root / "src/big.rs").write_text("process" + " x" * m.STMT_CAP + ";\n", encoding="utf-8")
+        r = self.check()
+        self.assertEqual(r.returncode, EXIT_SCAN)
+        self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: src/big.rs: "
+                         + OVER_CAP.format(n=m.STMT_CAP + 2, cap=m.STMT_CAP))
+
+    def test_check_and_write_are_required_and_exclusive_10290(self) -> None:
+        for args in ((), ("--check", "--write")):
+            r = run(*args)
+            self.assertEqual(r.returncode, EXIT_SCAN, args)
+            self.assertIn("usage: census_rows_10286.py", r.stderr)
+
+
+LEX_TABLE = ROOT / "tests/common/census_lex_parity_10305.json"
+LEX_ROWS = 36
+
+
+def scanner_module():
+    """The scanner loaded as a module (its CLI runs only under __main__)."""
+    spec = importlib.util.spec_from_file_location("census_rows_10286", SCANNER)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {SCANNER}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class LexParity10305(unittest.TestCase):
+    """#10305: the rows the Rust test `lexer_parity_table_10305` reads, with
+    the same hand-written expected token strings, lexed by the Python side."""
+
+    def test_lexer_parity_table(self) -> None:
+        rows = json.loads(LEX_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), LEX_ROWS)
+        m = scanner_module()
+        bad = []
+        for i, (text, want) in enumerate(rows):
+            toks = m.lex(text)
+            have = m.encode(toks, 0, len(toks) - 1)
+            if have != want:
+                bad.append(f"row {i} {text!r}: lexed {have!r}, want {want!r}")
+        self.assertEqual(bad, [])
+
+
+STMT_TABLE = ROOT / "tests/common/census_stmt_parity_10303.json"
+STMT_ROWS = 23
+MUTANT_TABLE = ROOT / "tests/common/census_stmt_mutants_10303.json"
+MUTANT_ROWS = 16
+PINS_RS = ROOT / "tests/common/census_pins_10286.rs"
+STMT_CAP_RE = re.compile(r"^pub\(crate\) const STMT_CAP: usize = ([0-9_]+);$", re.M)
+DIGEST_HEX = 32
+LINEAR_TOKENS = 100_000
+LINEAR_SECONDS = 20
+OVER_CAP = ("line 1: a watched statement of {n} tokens is over STMT_CAP {cap}; "
+            "a pin never cuts a statement (#10303)")
+
+
+def pins(m, text: str) -> list[str]:
+    """The site pins of one text with the seed names (each table text binds no alias)."""
+    return m.sites_of(m.lex(text), set(m.WATCHED_SEED), set(m.ENV_MOD_SEED | m.ENV_FN_SEED),
+                      set(m.ENV_FN_SEED))
+
+
+class StatementPin10303(unittest.TestCase):
+    """#10302, #10303: a pin covers its whole statement, 32 hex digits, the same
+    tables the Rust tests in `tests/common/census_stmt_10303.rs` read."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_statement_table(self) -> None:
+        rows = json.loads(STMT_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), STMT_ROWS)
+        bad = []
+        for i, (text, want) in enumerate(rows):
+            t = self.m.lex(text)
+            have = [self.m.encode(t, a, b) for a, b in self.m.statements(t)]
+            if have != want:
+                bad.append(f"row {i} {text!r}: statements {have!r}, want {want!r}")
+        self.assertEqual(bad, [])
+
+    def test_mutant_table(self) -> None:
+        rows = json.loads(MUTANT_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), MUTANT_ROWS)
+        bad = []
+        for name, want, a, b in rows:
+            da, db = pins(self.m, a), pins(self.m, b)
+            self.assertTrue(da, name)
+            self.assertEqual(len(da), len(db), name)
+            verdict = "same" if da == db else "change"
+            if verdict != want:
+                bad.append(f"{name}: want {want}, the pins {verdict}")
+        self.assertEqual(bad, [])
+
+    def test_a_digest_is_32_hex_digits(self) -> None:
+        self.assertEqual(self.m.DIGEST_HEX, DIGEST_HEX)
+        self.assertEqual(self.m.digest("T", "I1:a"), hashlib.sha256(b"TI1:a").hexdigest()[:DIGEST_HEX])
+        for d in pins(self.m, "fn f() { std::process::exit(1); }"):
+            self.assertRegex(d, r"^[0-9a-f]{32}$")
+
+    def test_the_cap_is_the_rust_cap(self) -> None:
+        found = STMT_CAP_RE.search(PINS_RS.read_text(encoding="utf-8"))
+        self.assertIsNotNone(found)
+        self.assertEqual(int(found.group(1).replace("_", "")), self.m.STMT_CAP)
+
+    def test_a_statement_over_the_cap_is_refused(self) -> None:
+        cap = self.m.STMT_CAP
+        at_cap = self.m.lex("process" + " x" * (cap - 2) + ";")
+        self.assertEqual(len(at_cap), cap)
+        self.assertEqual(len(self.m.sites_of(at_cap, {"process"}, set(), set())), 1)
+        over = self.m.lex("process" + " x" * (cap - 1) + ";")
+        with self.assertRaises(ValueError) as cm:
+            self.m.sites_of(over, {"process"}, set(), set())
+        self.assertEqual(str(cm.exception), OVER_CAP.format(n=cap + 1, cap=cap))
+
+    def test_many_statements_in_linear_time(self) -> None:
+        unit = "std::process::exit(1);\n"
+        reps = LINEAR_TOKENS // len(self.m.lex(unit)) + 1
+        t0 = time.monotonic()
+        d = pins(self.m, unit * reps)
+        self.assertEqual(len(d), reps)
+        self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
+
+    def test_a_long_statement_in_linear_time(self) -> None:
+        cap = self.m.STMT_CAP
+        # One statement of cap tokens with a site on every other token; the
+        # statement is hashed once, not once per site.
+        text = "f(" + " process ," * ((cap - 3) // 2) + ");"
+        t = self.m.lex(text)
+        self.assertLessEqual(len(t), cap)
+        t0 = time.monotonic()
+        d = self.m.sites_of(t, {"process"}, set(), set())
+        self.assertEqual(len(d), (cap - 3) // 2)
+        self.assertEqual(len(set(d)), 1)
+        self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
+
+
+CLOSURE_TABLE = ROOT / "tests/common/census_closure_parity_10304.json"
+CLOSURE_ROWS = 25
+CHAIN_BYTES = 100_000
+CHAIN_SECONDS = 5
+RING_HOPS = 64
+CHAIN_HOPS = {
+    "use": ("a", "use a{i} as a{j};\n"),
+    "type": ("T", "type T{j} = T{i};\n"),
+    "macro": ("m", "macro_rules! m{j} {{ () => {{ m{i} }} }}\n"),
+}
+
+
+def closure_of(m, text: str, seed: list[str]) -> set[str]:
+    return m.closure(m.prepare([("t.rs", m.lex(text))]), frozenset(seed))
+
+
+class RenameClosure10304(unittest.TestCase):
+    """#10304: the rename closure is one worklist over a graph built once; the
+    same table the Rust tests in `tests/common/census_closure_10304.rs` read."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_closure_table(self) -> None:
+        rows = json.loads(CLOSURE_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), CLOSURE_ROWS)
+        bad = []
+        for i, (text, seed, want) in enumerate(rows):
+            have = closure_of(self.m, text, seed)
+            if have != set(want):
+                bad.append(f"row {i} {text!r}: closure {sorted(have)!r}, want {sorted(want)!r}")
+        self.assertEqual(bad, [])
+
+    def test_reversed_rename_chains_are_linear(self) -> None:
+        for kind, (first, hop) in CHAIN_HOPS.items():
+            lines: list[str] = []
+            size = 0
+            while size < CHAIN_BYTES:
+                i = len(lines)
+                lines.append(hop.format(i=i, j=i + 1))
+                size += len(lines[-1])
+            hops = len(lines)
+            text = "".join(reversed(lines))
+            t0 = time.monotonic()
+            got = closure_of(self.m, text, [f"{first}0"])
+            dt = time.monotonic() - t0
+            self.assertEqual(len(got), hops + 1, kind)
+            self.assertIn(f"{first}{hops}", got, kind)
+            self.assertLess(dt, CHAIN_SECONDS, f"reversed {kind} chain of {hops} hops took {dt:.1f} s (#10304)")
+
+    def test_the_worklist_pushes_each_node_once(self) -> None:
+        rows = json.loads(CLOSURE_TABLE.read_text(encoding="utf-8"))
+        ring = "".join(f"use r{i} as r{(i + 1) % RING_HOPS};\n" for i in range(RING_HOPS))
+        rows.append([ring, ["r0"], [f"r{i}" for i in range(RING_HOPS)]])
+        bad = []
+        for i, (text, seed, want) in enumerate(rows):
+            g = self.m.RenameGraph(self.m.prepare([("t.rs", self.m.lex(text))]))
+            names, pushes = g.walk(frozenset(seed))
+            if pushes > g.nodes():
+                bad.append(f"row {i}: {pushes} pushes over {g.nodes()} nodes")
+            if names != set(want):
+                bad.append(f"row {i}: closure {sorted(names)!r}")
+        self.assertEqual(bad, [], "#10304 worklist pushes")
+
+
+INCLUDE_START = "fn f() { std::process::Command::new(\"x\"); }\n"
+
+
+class IncludeSites10300(unittest.TestCase):
+    """#10300: every include and #[path] site of a walked file is resolved; a code
+    target is lexed whatever its extension or directory and a site that cannot be
+    resolved stops the scan with its exact line (the Rust census gives the same
+    lines, `tests/common/census_include_10300.rs`)."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+        SCRATCH.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(prefix="census-include-10300-", dir=SCRATCH)
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def tree(self, files: dict[str, str], links: dict[str, str] | None = None) -> None:
+        files = {**files, str(CENSUS): FIXTURE[str(CENSUS)]}
+        for rel, text in files.items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        for rel, to in (links or {}).items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.symlink_to(to)
+
+    def refused(self, want: str) -> None:
+        with self.assertRaises(ValueError) as cm:
+            self.m.scan(self.root)
+        self.assertIn(want, str(cm.exception).splitlines())
+
+    def seed_row(self, rel: str) -> None:
+        """#10311: the scan keeps committed reasons and never adds a row, so the
+        target is rowed with count 0; the count the scan writes proves it was lexed."""
+        (self.root / ROWS).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / ROWS).write_text(SEED_ROWS.replace('("src/run.rs", 0, R_TOK_START)', f'("{rel}", 0, R_TOK_NAME)'),
+                                      encoding="utf-8")
+
+    def test_an_include_of_a_non_rs_file_is_lexed(self) -> None:
+        self.tree({"src/a.rs": "include!(\"gen.txt\");\n", "src/gen.txt": INCLUDE_START})
+        self.seed_row("src/gen.txt")
+        rows, _sites, _totals = self.m.scan(self.root)
+        self.assertIn('("src/gen.txt", 2, R_TOK_NAME),', rows)
+
+    def test_a_path_module_in_a_skipped_dir_is_lexed(self) -> None:
+        self.tree({"src/a.rs": "#[path = \"../target/m.rs\"]\nmod m;\n", "target/m.rs": INCLUDE_START})
+        self.seed_row("target/m.rs")
+        rows, _sites, _totals = self.m.scan(self.root)
+        self.assertIn('("target/m.rs", 2, R_TOK_NAME),', rows)
+
+    def test_a_non_literal_argument_is_refused(self) -> None:
+        self.tree({"src/a.rs": "include!(concat!(\"b\", \".rs\"));\n"})
+        self.refused("src/a.rs:1: include! with an argument that is not one string literal; "
+                     "the census cannot resolve it (#10300)")
+
+    def test_a_target_outside_the_root_is_refused(self) -> None:
+        self.tree({"src/a.rs": "include!(\"../../x\");\n"})
+        self.refused("src/a.rs:1: include! \"../../x\" leaves the repository root (#10300)")
+
+    def test_a_link_target_is_refused(self) -> None:
+        self.tree({"src/a.rs": "include!(\"l.rs\");\n", "src/real.txt": INCLUDE_START}, {"src/l.rs": "real.txt"})
+        self.refused("src/a.rs:1: include! \"l.rs\" names src/l.rs, a symbolic link or a path through one; "
+                     "the census never follows links (#10300)")
+
+    def test_an_include_str_target_is_not_lexed(self) -> None:
+        self.tree({"src/a.rs": "const X: &str = include_str!(\"d.txt\");\n", "src/d.txt": INCLUDE_START})
+        rows, _sites, _totals = self.m.scan(self.root)
+        self.assertNotIn("src/d.txt", rows)
+
+    def test_sites_match_the_parity_table(self) -> None:
+        table = json.loads(INCLUDE_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(table), INCLUDE_ROWS)
+        bad = []
+        for i, (text, want) in enumerate(table):
+            t = self.m.lex(text)
+            got = [[line, form, arg] for _k, form, line, arg in self.m.include_sites(t, self.m.brackets(t))]
+            if got != want:
+                bad.append(f"row {i}: {text!r} gave {got!r}")
+        self.assertEqual(bad, [], "#10300 site table")
+
+    def test_sites_are_linear_on_large_inputs(self) -> None:
+        flat = "include!(\"a.rs\");\n" * (INCLUDE_BOUND_BYTES // 18 + 1)
+        depth = INCLUDE_BOUND_BYTES // 12
+        nested = "#[" + "cfg_attr(a, " * depth + "path = \"p.rs\"" + ")" * depth + "]\nmod m;\n"
+        for text, want in ((flat, INCLUDE_BOUND_BYTES // 18 + 1), (nested, 1)):
+            self.assertGreaterEqual(len(text), INCLUDE_BOUND_BYTES)
+            t0 = time.monotonic()
+            t = self.m.lex(text)
+            got = self.m.include_sites(t, self.m.brackets(t))
+            self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
+            self.assertEqual(len(got), want)
+
+
+INCLUDE_TABLE = ROOT / "tests/common/census_include_parity_10300.json"
+INCLUDE_ROWS = 22
+INCLUDE_BOUND_BYTES = 100_000
+
+
+ASSERT_CMD_TABLE = ROOT / "tests/common/census_assert_cmd_10314.json"
+ASSERT_CMD_ROWS = 8
+# The assert_cmd start names, written out (never read from either scanner).
+ASSERT_CMD_NAMES = frozenset({"cargo_bin", "cargo_bin_cmd"})
+RUST_WATCHED_RE = re.compile(r"^const WATCHED: &\[&str\] = &\[\n(.*?)^\];$", re.M | re.S)
+RUST_NAME_RE = re.compile(r'^    "([^"\\]+)",$', re.M)
+
+
+def rust_watched() -> frozenset[str]:
+    """The Rust census WATCHED list, read from its source (one list, one name a line)."""
+    src = (ROOT / CENSUS).read_text(encoding="utf-8")
+    found = RUST_WATCHED_RE.findall(src)
+    if len(found) != 1:
+        raise AssertionError(f"{CENSUS}: {len(found)} WATCHED lists, want 1")
+    body = found[0]
+    names = RUST_NAME_RE.findall(body)
+    if len(names) != len(body.splitlines()):
+        raise AssertionError(f"{CENSUS}: a WATCHED line is not one quoted name")
+    return frozenset(names)
+
+
+class AssertCmd10314(unittest.TestCase):
+    """#10314: `cargo_bin` and `cargo_bin_cmd` are watched names on both sides,
+    the two watched lists are one list, and the Python token count of each
+    row of the table the Rust test `the_assert_cmd_forms_are_start_sites_and_
+    watched_tokens_10314` reads is its hand-written count."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_watched_seed_is_the_rust_watched_list(self) -> None:
+        self.assertEqual(sorted(self.m.WATCHED_SEED ^ rust_watched()), [])
+
+    def test_the_assert_cmd_names_are_watched(self) -> None:
+        self.assertEqual(sorted(ASSERT_CMD_NAMES - self.m.WATCHED_SEED), [])
+
+    def test_token_counts_of_the_shared_table(self) -> None:
+        rows = json.loads(ASSERT_CMD_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), ASSERT_CMD_ROWS)
+        bad = []
+        for i, (text, tokens, _sites, _lines) in enumerate(rows):
+            prepared = self.m.prepare([("src/e.rs", self.m.lex(text))])
+            watched = self.m.RenameGraph(prepared).reach(self.m.WATCHED_SEED)
+            have = sum(1 for t in self.m.lex(text) if t.kind == self.m.IDENT and t.text in watched)
+            if have != tokens:
+                bad.append(f"row {i} {text!r}: {have} watched tokens, want {tokens}")
+        self.assertEqual(bad, [])
+
+
+ENV_NAME_TABLE = ROOT / "tests/common/census_env_name_10299.json"
+ENV_NAME_ROWS_10299 = 28
+ENV_NAME_BOUND_BYTES = 100_000
+ENV_NAME_BOUND_ITEMS = 2_500
+ENV_NAME_BOUND_SECONDS = 20
+
+
+class EnvName10299(unittest.TestCase):
+    """#10299: an environment-name argument that is a name is a named constant
+    only when a `const` or `static` with one string literal binds it and nothing
+    else binds it anywhere; the Python count of each row of the table the Rust
+    test `an_env_name_is_a_constant_only_when_a_literal_const_binds_it_10299`
+    reads is its hand-written count."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def count(self, text: str) -> int:
+        self.assertTrue(hasattr(self.m, "env_counts"), "the scanner has no env_counts (#10299)")
+        prepared = self.m.prepare([("src/e.rs", self.m.lex(text))])
+        env_fns = self.m.RenameGraph(prepared).reach(self.m.ENV_FN_SEED)
+        return self.m.env_counts(prepared, env_fns).get("src/e.rs", 0)
+
+    def test_env_counts_of_the_shared_table(self) -> None:
+        rows = json.loads(ENV_NAME_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), ENV_NAME_ROWS_10299)
+        bad = []
+        for i, (text, want) in enumerate(rows):
+            have = self.count(text)
+            if have != want:
+                bad.append(f"row {i} {text!r}: {have} env names, want {want}")
+        self.assertEqual(bad, [])
+
+    def test_the_bound_name_pass_is_linear_on_a_100k_file(self) -> None:
+        n = ENV_NAME_BOUND_ITEMS
+        text = "use std::env::set_var;\nconst A7: &str = \"x\";\n"
+        text += "".join(f"const C{i}: &str = \"PROPTEST_FORK\";\n" for i in range(n))
+        text += "fn f(o: u8) {\n" + "".join(f"    set_var(C{i}, \"1\");\n" for i in range(n))
+        text += "    match o {\n" + "".join(f"        A{i} => match o {{ _ => {{}} }}\n" for i in range(n))
+        text += "    }\n    set_var(A7, \"1\");\n}\n"
+        self.assertGreaterEqual(len(text), ENV_NAME_BOUND_BYTES)
+        started = time.monotonic()
+        have = self.count(text)
+        took = time.monotonic() - started
+        self.assertEqual(have, 1)
+        self.assertLess(took, ENV_NAME_BOUND_SECONDS)
+
+
+CONFIG_TABLE = ROOT / "tests/common/census_config_10301.json"
+CONFIG_ROWS_10301 = 23
+CONFIG_BYTE_ROWS_10301 = 1
+CONFIG_BOUND_ENTRIES = 7_000
+CONFIG_BOUND_BYTES = 100_000
+CONFIG_BOUND_SECONDS = 20
+RUST_CARGO = ROOT / "tests/common/census_cargo_10289.rs"
+RUST_CRATES_RE = re.compile(r"^pub\(crate\) const WATCHED_CRATES: &\[&str\] =\n\s*&\[([^\]]*)\];$", re.M)
+CONFIG_PATCH_LINE = (".cargo/config.toml: patch.crates-io.libc patches the watched crate libc; "
+                     "a patched watched crate runs code the census never reads (#10301)")
+# A nested cargo config directory for the tree-walk test (the Rust test uses the same path).
+CONFIG_NESTED_DIR = "crates/x/.cargo"
+
+
+class CargoConfig10301(unittest.TestCase):
+    """#10301: every `.cargo/config.toml` and `.cargo/config` is read; the Python
+    lines of each row of the table the Rust test `every_cargo_config_form_is_read_
+    or_refused_10301` reads are its hand-written lines, and a config finding fails
+    the scan."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+        self.assertTrue(hasattr(self.m, "config_findings"), "the scanner has no config_findings (#10301)")
+
+    def lines(self, rel: str, data: bytes) -> list[str]:
+        return sorted(self.m.config_findings(rel, data)) if self.m.is_config(rel) else []
+
+    def test_config_lines_of_the_shared_table(self) -> None:
+        table = json.loads(CONFIG_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(table["rows"]), CONFIG_ROWS_10301)
+        self.assertEqual(len(table["bytes"]), CONFIG_BYTE_ROWS_10301)
+        bad = []
+        for i, (rel, text, want) in enumerate(table["rows"]):
+            have = self.lines(rel, text.encode("utf-8"))
+            if have != want:
+                bad.append(f"row {i} {rel} {text!r}: {have}")
+        for i, (rel, data, want) in enumerate(table["bytes"]):
+            have = self.lines(rel, bytes(data))
+            if have != want:
+                bad.append(f"byte row {i} {rel} {data!r}: {have}")
+        self.assertEqual(bad, [])
+
+    def test_watched_crates_are_the_rust_list(self) -> None:
+        found = RUST_CRATES_RE.findall(RUST_CARGO.read_text(encoding="utf-8"))
+        self.assertEqual(len(found), 1, "one Rust WATCHED_CRATES list")
+        rust = frozenset(re.findall(r'"([^"\\]+)"', found[0]))
+        self.assertEqual(sorted(self.m.WATCHED_CRATES ^ rust), [])
+
+    def test_a_large_config_is_read_in_linear_time(self) -> None:
+        text = "[alias]\n" + "".join(f'a{i:05} = "test"\n' for i in range(CONFIG_BOUND_ENTRIES))
+        text += '[patch.crates-io.libc]\npath = "l"\n'
+        self.assertGreater(len(text), CONFIG_BOUND_BYTES)
+        started = time.monotonic()
+        have = self.lines(".cargo/config.toml", text.encode("utf-8"))
+        self.assertLess(time.monotonic() - started, CONFIG_BOUND_SECONDS)
+        self.assertEqual(have, [CONFIG_PATCH_LINE])
+
+    def test_a_config_finding_fails_the_scan(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="census-config-10301-", dir=SCRATCH) as tmp:
+            root = Path(tmp)
+            for rel, text in FIXTURE.items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text, encoding="utf-8")
+            (root / "tests/common").mkdir(parents=True, exist_ok=True)
+            (root / ".cargo").mkdir()
+            (root / ".cargo/config.toml").write_text('[patch.crates-io.libc]\npath = "l"\n', encoding="utf-8")
+            r = run("--write", "--root", str(root))
+            self.assertEqual(r.returncode, EXIT_SCAN)
+            self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: " + CONFIG_PATCH_LINE)
+
+    def test_a_nested_config_fails_the_scan(self) -> None:
+        """A config in a nested `.cargo` directory is found by the tree walk; the
+        table rows call config_findings directly, so only this test reaches it."""
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="census-config-10301-", dir=SCRATCH) as tmp:
+            root = Path(tmp)
+            for rel, text in FIXTURE.items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text, encoding="utf-8")
+            (root / "tests/common").mkdir(parents=True, exist_ok=True)
+            (root / CONFIG_NESTED_DIR).mkdir(parents=True)
+            (root / CONFIG_NESTED_DIR / "config.toml").write_text('[patch.crates-io.libc]\npath = "l"\n', encoding="utf-8")
+            r = run("--write", "--root", str(root))
+            self.assertEqual(r.returncode, EXIT_SCAN)
+            self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: crates/x/" + CONFIG_PATCH_LINE)
+
+
+# The rows of the Rust test `a_shape_extern_row_for_a_non_acl_extern_is_red_10311`,
+# written out by hand: (source, the first name the scan refuses, or None).
+EXTERN_ARM_ROWS_10311 = [
+    ('unsafe extern "C" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn acl_get_fd_np(fd: i32, t: i32) -> *mut u8;\n}\n', None),
+    ("extern {\n    pub fn acl_x(f: fn(i32) -> i32);\n}\n", None),
+    ('unsafe extern "C" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn fork() -> i32;\n}\n', "fork"),
+    ('extern "C" {\n    fn posix_spawn() -> i32;\n}\n', "posix_spawn"),
+    ("extern {\n    static mut environ: *const u8;\n}\n", "environ"),
+    ('extern "C" {\n    type acl_t;\n}\n', "acl_t"),
+    ('extern "C" {\n    #[link_name = "fork"]\n    fn acl_free() -> i32;\n}\n', "#[link_name]"),
+    ('extern "C" {\n    m! { fn fork(); }\n}\n', "m"),
+    ('extern "C" {\n    fn acl_a();\n}\nextern "C" {\n    fn execve();\n    safe fn acl_b();\n}\n', "execve"),
+]
+# The wall-clock ceiling of the extern arm on one 100K+ input.
+EXTERN_SCAN_CEILING_SECS_10311 = 5.0
+EXTERN_REFUSAL_10311 ="an extern block declares {name}; only acl_* functions may be declared in one (#10311)"
+
+
+class ExternArm10311(unittest.TestCase):
+    """#10311: the extern arm of `shapes_of` accepts an extern block only when it
+    declares nothing but `acl_*` functions; any other item fails the scan with the
+    file and the name, in parity with the Rust census."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_the_extern_arm_refuses_a_non_acl_item_10311(self) -> None:
+        for src, name in EXTERN_ARM_ROWS_10311:
+            toks = self.m.lex(src)
+            if name is None:
+                self.assertEqual(self.m.shapes_of(toks, set()), [("extern", 1)], src)
+                continue
+            with self.assertRaises(ValueError, msg=src) as cm:
+                self.m.shapes_of(toks, set())
+            self.assertEqual(str(cm.exception).split(": ", 1)[1], EXTERN_REFUSAL_10311.format(name=name), src)
+
+    def test_the_extern_arm_is_linear_on_large_input_10311(self) -> None:
+        clean = 'unsafe extern "C" {\n    fn acl_free(p: *mut u8) -> i32;\n}\n' * 10_000
+        nested = "extern {\n" * 60_000
+        for src in (clean, nested):
+            self.assertGreater(len(src), 100_000)
+        toks = self.m.lex(clean)
+        t0 = time.monotonic()
+        self.assertEqual(len(self.m.shapes_of(toks, set())), 10_000)
+        self.assertLess(time.monotonic() - t0, EXTERN_SCAN_CEILING_SECS_10311)
+        toks = self.m.lex(nested)
+        t0 = time.monotonic()
+        with self.assertRaises(ValueError) as cm:
+            self.m.shapes_of(toks, set())
+        self.assertEqual(str(cm.exception), "line 1: " + EXTERN_REFUSAL_10311.format(name="extern"))
+        self.assertLess(time.monotonic() - t0, EXTERN_SCAN_CEILING_SECS_10311)
+
+    def test_the_scan_names_the_file_of_a_non_acl_extern_10311(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="census-extern-10311-", dir=SCRATCH) as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / CENSUS).write_text(FIXTURE[str(CENSUS)], encoding="utf-8")
+            (root / "src/x.rs").write_text('fn a() {}\nextern "C" {\n    fn fork() -> i32;\n}\n', encoding="utf-8")
+            r = run("--check", "--root", str(root))
+            self.assertEqual(r.returncode, EXIT_SCAN)
+            self.assertEqual(r.stderr.strip(),
+                             "census_rows_10286: scan failed: src/x.rs: line 2: " + EXTERN_REFUSAL_10311.format(name="fork"))
+
+
+# #10345: every open of the census walks from a root directory fd one name at a
+# time with no link followed, so a link in any component below the root (made
+# before the call or swapped in between two walk steps) is refused by the open
+# itself. Exact refusals, written out by hand.
+LINK_10345 = "{rel}: {part} is a symbolic link; the census never follows links (#10176)"
+DOTS_10345 = ("{rel}: holds an empty, '.' or '..' component; the census opens a path below the root one name at "
+              "a time (#10345)")
+OUTSIDE_TEXT_10345 = "// outside\n"
+
+
+class ParentWalk10345(unittest.TestCase):
+    def setUp(self) -> None:
+        SCRATCH.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(prefix="census-walk-10345-", dir=SCRATCH)
+        self.root = Path(self._tmp.name)
+        self._out = tempfile.TemporaryDirectory(prefix="census-walk-10345-outside-", dir=SCRATCH)
+        self.outside = Path(self._out.name)
+        (self.outside / "census_rows_10176.rs").write_text(OUTSIDE_TEXT_10345, encoding="utf-8")
+        (self.outside / "x.rs").write_text(OUTSIDE_TEXT_10345, encoding="utf-8")
+        (self.root / "tests/common").mkdir(parents=True)
+        (self.root / "src/inner").mkdir(parents=True)
+        (self.root / "src/inner/x.rs").write_text("// inside\n", encoding="utf-8")
+        self.m = scanner_module()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        self._out.cleanup()
+
+    def outside_untouched(self) -> None:
+        self.assertEqual(sorted(p.name for p in self.outside.iterdir()), ["census_rows_10176.rs", "x.rs"])
+        for p in self.outside.iterdir():
+            self.assertEqual(p.read_text(encoding="utf-8"), OUTSIDE_TEXT_10345)
+
+    def link_common(self) -> None:
+        (self.root / "tests/common").rmdir()
+        (self.root / "tests/common").symlink_to(self.outside, target_is_directory=True)
+
+    def swap_common_on(self, part: str) -> None:
+        """A seam: the parent directory becomes a link to the outside directory
+        just before the walk opens `part`, after any check made by path."""
+        def hook(prefix: str) -> None:
+            if prefix == part and not (self.root / "tests/common").is_symlink():
+                self.link_common()
+        self.m.WALK_HOOK = hook
+
+    def test_write_refuses_a_middle_link_to_an_outside_directory_10345(self) -> None:
+        self.link_common()
+        rel = "tests/common/new_10345.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+        self.outside_untouched()
+
+    def test_write_refuses_a_middle_link_to_a_directory_inside_the_root_10345(self) -> None:
+        (self.root / "tests/common").rmdir()
+        (self.root / "tests/common").symlink_to("../src/inner", target_is_directory=True)
+        rel = "tests/common/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+        self.assertEqual((self.root / "src/inner/x.rs").read_text(encoding="utf-8"), "// inside\n")
+
+    def test_write_refuses_a_parent_swapped_after_the_in_root_check_10345(self) -> None:
+        self.swap_common_on("tests/common")
+        rel = "tests/common/census_rows_10176.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+        self.outside_untouched()
+
+    def test_write_refuses_a_top_component_swapped_between_walk_steps_10345(self) -> None:
+        # The swap lands on the first component, before the walk reaches it.
+        def hook(prefix: str) -> None:
+            if prefix == "tests" and not (self.root / "tests").is_symlink():
+                (self.root / "tests").rename(self.root / "tests-moved")
+                (self.root / "tests").symlink_to(self.outside, target_is_directory=True)
+        self.m.WALK_HOOK = hook
+        rel = "tests/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.write_table(self.root, rel, "// changed\n")
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests"))
+        self.outside_untouched()
+
+    def test_read_scanned_refuses_a_middle_link_10345(self) -> None:
+        self.link_common()
+        rel = "tests/common/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.read_scanned(self.root, rel)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+
+    def test_load_rows_refuses_a_parent_swapped_between_walk_steps_10345(self) -> None:
+        self.swap_common_on("tests/common")
+        with self.assertRaises(ValueError) as cm:
+            self.m.load_rows(self.root)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=str(ROWS), part="tests/common"))
+        self.outside_untouched()
+
+    def test_read_target_refuses_a_middle_link_10345(self) -> None:
+        self.link_common()
+        rel = "tests/common/x.rs"
+        with self.assertRaises(ValueError) as cm:
+            self.m.read_target(self.root, rel)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=rel, part="tests/common"))
+
+    def test_the_census_read_refuses_a_parent_swapped_after_the_rows_read_10345(self) -> None:
+        # load_rows walks `tests` first; the swap lands on the census read's walk.
+        (self.root / CENSUS).write_text(FIXTURE[str(CENSUS)], encoding="utf-8")
+        (self.outside / CENSUS.name).write_text(FIXTURE[str(CENSUS)], encoding="utf-8")
+        seen = []
+
+        def hook(prefix: str) -> None:
+            seen.append(prefix)
+            if seen.count("tests") == 2 and not (self.root / "tests").is_symlink():
+                (self.root / "tests").rename(self.root / "tests-moved")
+                (self.root / "tests").symlink_to(self.outside, target_is_directory=True)
+        self.m.WALK_HOOK = hook
+        with self.assertRaises(ValueError) as cm:
+            self.m.scan(self.root)
+        self.assertEqual(str(cm.exception), LINK_10345.format(rel=str(CENSUS), part="tests"))
+
+    def test_dot_components_are_refused_before_any_open_10345(self) -> None:
+        for rel in ("tests/../x.rs", "tests/./x.rs", "tests//x.rs", "../x.rs", "/x.rs"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(ValueError) as cm:
+                    self.m.write_table(self.root, rel, "// changed\n")
+                self.assertEqual(str(cm.exception), DOTS_10345.format(rel=rel))
+        self.assertFalse((self.root / "x.rs").exists())
+        self.assertFalse((self.root.parent / "x.rs").exists())
+
+    def test_a_plain_nested_path_is_written_and_read_10345(self) -> None:
+        (self.root / "a/b/c").mkdir(parents=True)
+        rel = "a/b/c/t.rs"
+        self.m.write_table(self.root, rel, "// nested\n")
+        self.assertEqual((self.root / rel).read_text(encoding="utf-8"), "// nested\n")
+        self.assertEqual(self.m.read_scanned(self.root, rel), b"// nested\n")
+        self.assertEqual(self.m.read_target(self.root, rel), b"// nested\n")
+        self.m.write_table(self.root, "top.rs", "// top\n")
+        self.assertEqual(self.m.read_scanned(self.root, "top.rs"), b"// top\n")
+        self.outside_untouched()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1464,7 +1464,9 @@ fn lint_paths(toks: &[Lexed], a: usize, b: usize, close: &[usize]) -> Vec<String
                 k = close[k];
             }
             Tok::Punct(c) => cur.push(*c),
-            Tok::Str(_) | Tok::Char => cur.push('"'),
+            Tok::Str(_) | Tok::Char(_) => cur.push('"'),
+            // A number was no token before #10302; a lint path holds none.
+            Tok::Num(_) => {}
         }
         k += 1;
     }

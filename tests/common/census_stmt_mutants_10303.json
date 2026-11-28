@@ -1,0 +1,18 @@
+[
+  ["program literal", "change", "fn f() { let _ = Command::new(\"true\").status(); }", "fn f() { let _ = Command::new(\"sh\").status(); }"],
+  ["exit code", "change", "fn f() { std::process::exit(1); }", "fn f() { std::process::exit(2); }"],
+  ["char argument", "change", "fn f() { let _ = Command::new(\"x\").arg(c('P')); }", "fn f() { let _ = Command::new(\"x\").arg(c('Q')); }"],
+  ["tuple index", "change", "fn f() { let _ = Command::new(P.0); }", "fn f() { let _ = Command::new(P.1); }"],
+  ["signal number", "change", "fn f() { libc::kill(pid, 15); }", "fn f() { libc::kill(pid, 9); }"],
+  ["name table index", "change", "fn f() { let _ = Command::new(NAMES[0]); }", "fn f() { let _ = Command::new(NAMES[1]); }"],
+  ["arg after a long chain", "change", "fn f() { let _ = Command::new(\"a\").arg(\"b\").arg(\"c\").arg(\"d\"); }", "fn f() { let _ = Command::new(\"a\").arg(\"b\").arg(\"c\").arg(\"e\"); }"],
+  ["if inside call parens", "change", "fn f() { let _ = Command::new(if a { \"x\" } else { \"y\" }); }", "fn f() { let _ = Command::new(if a { \"x\" } else { \"z\" }); }"],
+  ["closure body inside call parens", "change", "fn f() { run(|| { let _ = Command::new(\"x\"); }, 1); }", "fn f() { run(|| { let _ = Command::new(\"x\"); }, 2); }"],
+  ["item head rename", "change", "fn f(c: Command) {}", "fn g(c: Command) {}"],
+  ["raw string program", "change", "fn f() { let _ = Command::new(r\"a\").status(); }", "fn f() { let _ = Command::new(r\"b\").status(); }"],
+  ["float suffix argument", "change", "fn f() { let _ = Command::new(\"x\").arg(t(1.5f64)); }", "fn f() { let _ = Command::new(\"x\").arg(t(1.5f32)); }"],
+  ["use group member", "change", "use std::{env, process::{exit, abort}};", "use std::{env, process::{exit, id}};"],
+  ["statement before", "same", "fn f() { let x = 1; let _ = Command::new(\"true\"); }", "fn f() { let x = 2; let _ = Command::new(\"true\"); }"],
+  ["statement after", "same", "fn f() { let _ = Command::new(\"true\"); let y = 'a'; }", "fn f() { let _ = Command::new(\"true\"); let y = 'b'; }"],
+  ["other item head", "same", "fn f() { std::process::exit(1); }", "fn g() { std::process::exit(1); }"]
+]

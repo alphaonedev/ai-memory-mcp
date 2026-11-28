@@ -3,9 +3,17 @@
 
 //! #10176: the Rust token lexer layer 2 shares. Comments (nested block
 //! comments included) are dropped; string, raw string, byte string and C string
-//! literals become one `Str` token holding the decoded text; char and byte
-//! literals become `Char`; numbers are dropped; `::` is `PathSep`; a lifetime
-//! is `Punct('\'')`. Used by `tests/test_child_spawner_isolation_10176.rs` and
+//! literals become one `Str` token holding the decoded text; a char or byte
+//! literal becomes `Char` holding its source text, quotes and prefix included;
+//! a numeric literal becomes `Num` holding its source text, suffix included
+//! (#10302); `::` is `PathSep`; a lifetime is `Punct('\'')`.
+//!
+//! Characters (#10305): the blanks are the Unicode `Pattern_White_Space` set
+//! ([`PATTERN_WHITE_SPACE`], the set rustc skips), and every other non-ASCII
+//! character is an identifier character, so the lexer gives the same tokens
+//! as the Python mirror (`scripts/ci/census_rows_10286.py`) on every text,
+//! with no standard-library Unicode table on either side. Used by
+//! `tests/test_child_spawner_isolation_10176.rs` and
 //! `tests/process_start_census_10176.rs` through `#[path]`.
 
 #![allow(dead_code)]
@@ -16,7 +24,31 @@ pub enum Tok {
     Punct(char),
     PathSep,
     Str(String),
-    Char,
+    Char(String),
+    Num(String),
+}
+
+/// The Unicode `Pattern_White_Space` characters (UAX #31), the blanks of a
+/// Rust source file.
+pub const PATTERN_WHITE_SPACE: [char; 11] = [
+    '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '\u{85}', '\u{200e}', '\u{200f}', '\u{2028}',
+    '\u{2029}',
+];
+
+/// Whether `x` is a blank of a Rust source file.
+pub fn is_blank(x: char) -> bool {
+    PATTERN_WHITE_SPACE.contains(&x)
+}
+
+/// Whether `x` can start an identifier: an ASCII letter, `_` or any
+/// non-ASCII character that is not a blank.
+pub fn is_ident_start(x: char) -> bool {
+    x.is_ascii_alphabetic() || x == '_' || (!x.is_ascii() && !is_blank(x))
+}
+
+/// Whether `x` can continue an identifier.
+pub fn is_ident_char(x: char) -> bool {
+    x.is_ascii_digit() || is_ident_start(x)
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +107,7 @@ pub fn decode_quoted(c: &[char], mut i: usize, line: &mut usize) -> (String, usi
             }
             '\n' => {
                 *line += 1;
-                while i < c.len() && c[i].is_whitespace() {
+                while i < c.len() && is_blank(c[i]) {
                     if c[i] == '\n' {
                         *line += 1;
                     }
@@ -90,8 +122,7 @@ pub fn decode_quoted(c: &[char], mut i: usize, line: &mut usize) -> (String, usi
 
 pub fn lex(src: &str) -> Vec<Lexed> {
     let chars: Vec<char> = src.chars().collect();
-    let is_ident_start = |x: char| x.is_alphabetic() || x == '_';
-    let is_ident = |x: char| x.is_alphanumeric() || x == '_';
+    let is_ident = is_ident_char;
     let mut out = Vec::new();
     let mut line = 1usize;
     let mut i = 0usize;
@@ -103,7 +134,7 @@ pub fn lex(src: &str) -> Vec<Lexed> {
             i += 1;
             continue;
         }
-        if ch.is_whitespace() {
+        if is_blank(ch) {
             i += 1;
             continue;
         }
@@ -194,12 +225,21 @@ pub fn lex(src: &str) -> Vec<Lexed> {
                 continue;
             }
             if word == "b" && chars.get(j) == Some(&'\'') {
-                let close = chars[j + 1..]
+                // An escaped quote (b'\'') is not the closing quote (#10305).
+                let from = if chars.get(j + 1) == Some(&'\\') {
+                    j + 3
+                } else {
+                    j + 1
+                };
+                let close = chars
+                    .get(from..)
+                    .unwrap_or_default()
                     .iter()
                     .position(|&x| x == '\'')
-                    .map_or(chars.len(), |p| j + 1 + p);
+                    .map_or(chars.len(), |p| from + p);
+                let end = (close + 1).min(chars.len());
                 out.push(Lexed {
-                    tok: Tok::Char,
+                    tok: Tok::Char(chars[i..end].iter().collect()),
                     line: at,
                 });
                 i = close + 1;
@@ -213,12 +253,17 @@ pub fn lex(src: &str) -> Vec<Lexed> {
             continue;
         }
         if ch.is_ascii_digit() {
+            let start = i;
             while i < chars.len()
                 && (is_ident(chars[i])
                     || chars[i] == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit))
             {
                 i += 1;
             }
+            out.push(Lexed {
+                tok: Tok::Num(chars[start..i].iter().collect()),
+                line,
+            });
             continue;
         }
         if ch == '"' {
@@ -234,10 +279,13 @@ pub fn lex(src: &str) -> Vec<Lexed> {
         if ch == '\'' {
             // Char literal or lifetime.
             let close = if next == Some('\\') {
-                chars[i + 2..]
+                // The escaped character is never the closing quote (#10305).
+                chars
+                    .get(i + 3..)
+                    .unwrap_or_default()
                     .iter()
                     .position(|&x| x == '\'')
-                    .map(|p| i + 2 + p)
+                    .map(|p| i + 3 + p)
             } else if chars.get(i + 2) == Some(&'\'') {
                 Some(i + 2)
             } else {
@@ -245,7 +293,7 @@ pub fn lex(src: &str) -> Vec<Lexed> {
             };
             if let Some(end) = close {
                 out.push(Lexed {
-                    tok: Tok::Char,
+                    tok: Tok::Char(chars[i..=end.min(chars.len() - 1)].iter().collect()),
                     line,
                 });
                 i = end + 1;

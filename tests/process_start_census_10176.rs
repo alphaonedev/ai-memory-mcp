@@ -43,20 +43,69 @@
 //!   variable name joined by `concat!` counts against [`ENV_ROWS`]. The tables
 //!   are in `tests/common/census_rows_10176.rs`.
 //!
-//! What this census does not see: a variable name built at run time from
-//! parts (a `format!` or a `String` push) is counted by `ENV_NAME_ROWS` only
-//! where it is passed, not by its value; the run-time refusal (A3) is the guard
-//! there. Code of a dependency is not read; A2 is the reasoned list of those
-//! crates.
+//! * R4 (#10286-#10290, deny by default): every watched site of every file
+//!   (a watched token, a `use` that brings `env` or one of its functions in
+//!   under any name, an env reach whose name is not one literal or one
+//!   constant) is pinned by content in `SITE_ROWS`
+//!   (`tests/common/census_sites_10286.rs`, see
+//!   `tests/common/census_pins_10286.rs` for what a pin proves); every macro
+//!   form that can carry a watched name past the token scan (a metavariable
+//!   in macro, type or path position, a macro whose arguments name a watched,
+//!   runner or env name, a proc or declarative macro, a redefined or renamed
+//!   std macro) is a row of `MACRO_ROWS` (`tests/common/census_macros_10287.rs`);
+//!   every `Cargo.toml` of the tree is parsed and a rename, patch, replace or
+//!   target name of a watched crate is red, and so is a manifest the parser
+//!   cannot read (`tests/common/census_cargo_10289.rs`). The row tables are
+//!   written by `scripts/ci/census_rows_10286.py`, which shares no code with
+//!   this census; its `--check` mode is red when a table differs from a
+//!   fresh scan.
+//!
+//! The fork config (A1, #10287): every file is read for the fork and timeout
+//! forms, whether or not it names proptest, and a proptest `Config` bound to
+//! another name (`as` or `type`) is itself a form, so a `Config` literal with
+//! fork or timeout on outside a guarded `proptest!` block is red unless it is
+//! an exact row of [`A1_ROWS`]. What this census does not see: the value of an
+//! environment name built at run time; such a name is red where it is passed
+//! (`ENV_NAME_ROWS` and its site pin), and the run-time refusal (A3) is the
+//! guard on its value. Code of a dependency is not read; A2 is the reasoned
+//! list of those crates.
 
+#[path = "common/census_assert_cmd_10314.rs"]
+mod census_assert_cmd;
+#[path = "common/census_cargo_10289.rs"]
+mod census_cargo;
+#[path = "common/census_closure_10304.rs"]
+mod census_closure;
+#[path = "common/census_config_10301.rs"]
+mod census_config;
+#[path = "common/census_consts_10299.rs"]
+mod census_consts;
+#[path = "common/census_env_name_10299.rs"]
+mod census_env_name;
+#[path = "common/census_include_10300.rs"]
+mod census_include;
+#[path = "common/census_macros_10287.rs"]
+mod census_macros;
+#[path = "common/census_pins_10286.rs"]
+mod census_pins;
+#[path = "common/census_r4_red_10286.rs"]
+mod census_r4_red;
+#[path = "common/census_r4_tests_10286.rs"]
+mod census_r4_tests;
 #[path = "common/census_rows_10176.rs"]
 mod census_rows;
+#[path = "common/census_sites_10286.rs"]
+mod census_sites;
+#[path = "common/census_stmt_10303.rs"]
+mod census_stmt;
 #[path = "common/proptest_guard.rs"]
 mod proptest_guard;
 #[path = "common/rust_lex.rs"]
 mod rust_lex;
 
+use census_pins::Prep;
 use census_rows::{ENV_NAME_ROWS, SHAPE_ROWS, TOKEN_ROWS};
+use census_sites::SITE_ROWS;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -87,11 +136,15 @@ const SKIPPED: &[(&str, &str)] = &[
 // ---------------------------------------------------------------- B: starts
 
 /// The chokepoint and cargo-binary names that are a site wherever they appear
-/// outside a `use` or a `fn` definition.
+/// outside a `use` or a `fn` definition. `cargo_bin` and `cargo_bin_cmd` are
+/// the `assert_cmd` constructor, trait method and macros (#10314); a
+/// `Command ::` or `<alias> ::` start through `cargo_bin` is one site.
 const DIRECT: &[&str] = &[
     "audited_command",
     "audited_tokio_command",
     "CommandCargoExt",
+    "cargo_bin",
+    "cargo_bin_cmd",
 ];
 
 /// Names whose renaming with `as` is a site (an alias hides later calls).
@@ -102,6 +155,8 @@ const ALIASED: &[&str] = &[
     "audited_command",
     "audited_tokio_command",
     "CommandCargoExt",
+    "cargo_bin",
+    "cargo_bin_cmd",
 ];
 
 /// The refusal for a site with no silence attribute in reach.
@@ -177,7 +232,7 @@ const START_ROWS: &[(&str, usize)] = &[
     ("tests/cli_stopper_anchor_race_4044.rs", 1),
     ("tests/cli_store_sign_unbound_3409.rs", 1),
     ("tests/cli_verify_chain.rs", 1),
-    ("tests/cli_write_verb_pg_refuse_ceiling_2572.rs", 1),
+    ("tests/cli_write_verb_pg_refuse_ceiling_2572.rs", 3),
     ("tests/common/mcp_stdio_child.rs", 1),
     ("tests/common/tls_serve.rs", 1),
     ("tests/config_auto_tag_endpoint_3808_3819.rs", 2),
@@ -267,12 +322,12 @@ const START_ROWS: &[(&str, usize)] = &[
     ("tests/skill_promote_visibility_3551/mod.rs", 1),
     ("tests/skill_test.rs", 1),
     ("tests/spawn_audit_gate_1937.rs", 1),
-    ("tests/spawn_gate_pins_10176.rs", 9),
+    ("tests/spawn_gate_pins_10176.rs", 10),
     ("tests/sqlite_write_txn_immediate_gate_5084.rs", 1),
     ("tests/stop_signal_8193.rs", 1),
     ("tests/store_url_ambiguous_userinfo_6096.rs", 2),
-    ("tests/store_url_fail_closed_2679.rs", 2),
-    ("tests/symlink_follow_8950.rs", 1),
+    ("tests/store_url_fail_closed_2679.rs", 5),
+    ("tests/symlink_follow_8950.rs", 2),
     ("tests/tls_serve_helper_8293.rs", 1),
     ("tests/tls_verbs_3709.rs", 1),
     ("tests/toon_meta_budget_3802.rs", 1),
@@ -409,6 +464,9 @@ fn type_alias_end(toks: &[Lexed], k: usize) -> Option<usize> {
 /// Every site of the token stream.
 fn starts(toks: &[Lexed], aliases: &BTreeSet<String>, libc_names: &BTreeSet<&str>) -> Vec<Start> {
     let mut out = Vec::new();
+    // The constructor token of each `Command ::` / `<alias> ::` start: a
+    // `cargo_bin` there is the same start, never a second Direct (#10314).
+    let mut ctors: BTreeSet<usize> = BTreeSet::new();
     for k in 0..toks.len() {
         let Some(val) = ident(toks, k) else { continue };
         let line = toks[k].line;
@@ -420,8 +478,9 @@ fn starts(toks: &[Lexed], aliases: &BTreeSet<String>, libc_names: &BTreeSet<&str
         };
         if val == "Command" && is_sep(toks, j) && is_ctor(toks, j + 1) {
             push(Kind::CommandPath);
+            ctors.insert(j + 1);
         }
-        if DIRECT.contains(&val) {
+        if DIRECT.contains(&val) && !ctors.contains(&k) {
             push(Kind::Direct);
         }
         if ALIASED.contains(&val) && ident(toks, k + 1) == Some("as") {
@@ -442,6 +501,7 @@ fn starts(toks: &[Lexed], aliases: &BTreeSet<String>, libc_names: &BTreeSet<&str
         }
         if aliases.contains(val) && is_sep(toks, k + 1) && is_ctor(toks, k + 2) {
             push(Kind::AliasCall);
+            ctors.insert(k + 2);
         }
     }
     out
@@ -604,8 +664,15 @@ const FORM_FIELD: &str = "a fork or timeout field in a proptest Config literal";
 const FORM_UPDATE: &str = "a proptest Config update from a base that is not Config::default()";
 const FORM_BUILDER: &str = "with_fork or with_timeout on a proptest Config";
 const FORM_ASSIGN: &str = "an assignment to a proptest config's fork or timeout";
+const FORM_FIELD_WRITE: &str = "a field form of fork or timeout (a literal or pattern field outside a proptest Config literal, field shorthand, a compound assignment or a &mut borrow)";
+const FORM_META_FIELD: &str = "a macro metavariable in field position (a literal or pattern field, an assignment, a compound assignment or a &mut borrow), which may name fork or timeout";
 const FORM_RUNNER: &str = "TestRunner, rusty_fork, wait_timeout or property_test, which run cases outside a guarded proptest! block";
 const FORM_RENAME: &str = "proptest renamed with as, which hides its blocks from this scan";
+const FORM_CONFIG_NAME: &str =
+    "a proptest Config bound to another name (as or type), which hides its literals from this scan";
+
+/// The names a proptest config literal is read under, before renames.
+const CONFIG_SEED: &[&str] = &["Config", "ProptestConfig"];
 
 /// Idents that run cases without a guarded block.
 const RUNNER_IDENTS: &[&str] = &[
@@ -617,11 +684,35 @@ const RUNNER_IDENTS: &[&str] = &[
 ];
 
 /// Files allowed to hold A1 forms, with the exact count and the reason.
-const A1_ROWS: &[(&str, usize, &str)] = &[(
-    "tests/process_start_census_10176.rs",
-    2,
-    "the A3 table proves proptest_guarded refuses a Config with fork on and one with a timeout",
-)];
+/// Every file is read (#10287), so a name that only spells like a proptest
+/// form is a row too, with the reason it is not one.
+const A1_ROWS: &[(&str, usize, &str)] = &[
+    (
+        "loadtest/src/main.rs",
+        2,
+        "the load generator's own Config struct has a request timeout field; it is not proptest's Config and the crate has no proptest dependency",
+    ),
+    (
+        "src/cli/commands/inbox.rs",
+        5,
+        "the CLI's own InboxArgs struct has a --timeout field for the inbox wait (#10312 field forms); its unit tests build it, it is not proptest's Config",
+    ),
+    (
+        "src/reranker.rs",
+        1,
+        "candle's bert Config imported as BertConfig; a model config, not proptest's Config",
+    ),
+    (
+        "tests/common/atomise_gate.rs",
+        1,
+        "Condvar::wait_timeout on a std mutex guard; a lock wait with a deadline, not the wait_timeout crate",
+    ),
+    (
+        "tests/process_start_census_10176.rs",
+        2,
+        "the A3 table proves proptest_guarded refuses a Config with fork on and one with a timeout",
+    ),
+];
 
 /// Whether the `proptest !` at `k` opens a guarded block.
 fn guarded_block(toks: &[Lexed], k: usize) -> bool {
@@ -672,10 +763,23 @@ fn default_base(toks: &[Lexed], a: usize, end: usize) -> bool {
             .all(|c| matches!(c, [Tok::Ident(_), Tok::PathSep]))
 }
 
-/// The A1 findings of a file that names proptest: unguarded blocks first
-/// (never allowlisted), then the fork and timeout forms.
-fn proptest_findings(rel: &str, toks: &[Lexed]) -> (Vec<String>, Vec<String>) {
+/// The A1 findings of every file (#10287: no file is skipped for not naming
+/// proptest): unguarded blocks first (never allowlisted), then the fork and
+/// timeout forms. `config` is the closure of [`CONFIG_SEED`]; a literal of
+/// any of its names is read, and every binding of a seed name to another
+/// name is itself a form.
+fn proptest_findings(
+    rel: &str,
+    p: &Prep<'_>,
+    config: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let toks = p.toks;
     let (mut blocks, mut forms) = (Vec::new(), Vec::new());
+    let mut seeds = vec![0usize; toks.len() + 1];
+    for (k, t) in toks.iter().enumerate() {
+        let hit = matches!(&t.tok, Tok::Ident(s) if CONFIG_SEED.contains(&s.as_str()));
+        seeds[k + 1] = seeds[k] + usize::from(hit);
+    }
     for k in 0..toks.len() {
         let line = toks[k].line;
         let Some(val) = ident(toks, k) else { continue };
@@ -699,35 +803,400 @@ fn proptest_findings(rel: &str, toks: &[Lexed]) -> (Vec<String>, Vec<String>) {
         {
             forms.push(fork_form(rel, line, FORM_ASSIGN));
         }
-        if matches!(val, "Config" | "ProptestConfig") && is_p(toks, k + 1, '{') {
-            literal_forms(rel, toks, k + 1, &mut forms);
+        if CONFIG_SEED.contains(&val) && ident(toks, k + 1) == Some("as") {
+            forms.push(fork_form(rel, line, FORM_CONFIG_NAME));
+        }
+        if val == "type" && !(k > 0 && is_sep(toks, k - 1)) {
+            let e = p.stop[k + 1];
+            if e > k + 2 && seeds[e] > seeds[k + 2] {
+                forms.push(fork_form(rel, line, FORM_CONFIG_NAME));
+            }
+        }
+        if config.contains(val) && is_p(toks, k + 1, '{') {
+            literal_forms(rel, p, k + 1, &mut forms);
         }
     }
+    field_forms(rel, p, config, &mut forms);
     (blocks, forms)
 }
 
-/// The forms inside the `Config { .. }` literal opened at `open`.
-fn literal_forms(rel: &str, toks: &[Lexed], open: usize, out: &mut Vec<String>) {
-    let end = group_end(toks, open).min(toks.len());
-    let mut depth = 0usize;
+// ------------------------------------------------- A1: field forms (#10312)
+
+/// The fields of proptest's `Config` that switch fork or timeout on.
+const FORK_FIELDS: &[&str] = &["fork", "timeout"];
+
+/// Words before a `{` that open a block (`else {`, `unsafe {`), never a
+/// literal.
+const BLOCK_HEADS: &[&str] = &["async", "const", "else", "loop", "move", "try", "unsafe"];
+
+/// Words in the head of a `{` (at its own depth) that make it an item,
+/// function or match body, which holds no field.
+const BODY_WORDS: &[&str] = &[
+    "extern",
+    "fn",
+    "impl",
+    "macro_rules",
+    "match",
+    "mod",
+    "struct",
+    "trait",
+    "union",
+    "where",
+];
+
+/// What a `{` opens, for the fields directly inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Brace {
+    /// A struct literal or pattern, or a macro body (unclassifiable, so read
+    /// as a literal): a `fork` or `timeout` field in it is a form.
+    Literal,
+    /// A block, an item body or a declaration: its fields are not writes.
+    Block,
+    /// An `enum` body: a `{` directly in it declares a variant.
+    Variants,
+}
+
+/// For every token the opener of the group directly around it, and for
+/// every closer its opener (one pass).
+fn group_tables(toks: &[Lexed]) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut inside = vec![None; toks.len()];
+    let mut open_of = vec![None; toks.len()];
+    let mut stack = Vec::new();
+    for (k, t) in toks.iter().enumerate() {
+        inside[k] = stack.last().copied();
+        match t.tok {
+            Tok::Punct('(' | '[' | '{') => stack.push(k),
+            Tok::Punct(')' | ']' | '}') => open_of[k] = stack.pop(),
+            _ => {}
+        }
+    }
+    (inside, open_of)
+}
+
+/// The path that names the type of the `{` at `o`:
+/// `[$] Ident (:: Ident)* [::] [<..>]`, as (its first token, its last
+/// ident). `None` when no path ends at `o` (after `)`, `=>`, `->`, `::`).
+fn literal_path(toks: &[Lexed], o: usize) -> Option<(usize, &str)> {
+    let mut j = o.checked_sub(1)?;
+    if is_p(toks, j, '>') {
+        let mut depth = 0usize;
+        loop {
+            let arrow = j > 0 && (is_p(toks, j - 1, '-') || is_p(toks, j - 1, '='));
+            if is_p(toks, j, '>') && arrow {
+                return None;
+            }
+            if is_p(toks, j, '>') {
+                depth += 1;
+            } else if is_p(toks, j, '<') {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    break;
+                }
+            } else if matches!(tok(toks, j), Some(Tok::Punct(';' | '{' | '}'))) {
+                return None;
+            }
+            j = j.checked_sub(1)?;
+        }
+        j = j.checked_sub(1)?;
+        if is_sep(toks, j) {
+            j = j.checked_sub(1)?;
+        }
+    }
+    let last = ident(toks, j)?;
+    let mut s = j;
+    while s >= 2 && is_sep(toks, s - 1) && ident(toks, s - 2).is_some() {
+        s -= 2;
+    }
+    if s >= 1 && (is_sep(toks, s - 1) || is_p(toks, s - 1, '$')) {
+        s -= 1;
+    }
+    Some((s, last))
+}
+
+/// Whether the `=` at `i` is a plain `=` (not `==`, `=>`, `!=`, `<=`, `>=`).
+fn plain_eq(toks: &[Lexed], i: usize) -> bool {
+    is_p(toks, i, '=')
+        && !is_p(toks, i + 1, '=')
+        && !is_p(toks, i + 1, '>')
+        && (i == 0 || !['=', '!', '<', '>'].iter().any(|c| is_p(toks, i - 1, *c)))
+}
+
+/// What the `{` at `o` opens, read from its own head only: the tokens at its
+/// depth back to the `;`, `{` or `}` before it, nested groups skipped whole.
+/// Anything not shown to be a block is a literal (fail closed).
+fn brace_head(
+    toks: &[Lexed],
+    inside: &[Option<usize>],
+    open_of: &[Option<usize>],
+    o: usize,
+) -> Brace {
+    if o > 0 && is_p(toks, o - 1, '!') {
+        return Brace::Literal;
+    }
+    let Some((s, last)) = literal_path(toks, o) else {
+        return Brace::Block;
+    };
+    if BLOCK_HEADS.contains(&last) || (s > 0 && is_p(toks, s - 1, '.')) {
+        return Brace::Block;
+    }
+    let lo = inside[o];
+    let (mut eq_seen, mut in_seen) = (false, false);
+    let mut j = s;
+    while let Some(i) = j.checked_sub(1) {
+        if Some(i) == lo {
+            break;
+        }
+        match tok(toks, i) {
+            Some(Tok::Punct(';' | '{' | '}')) => break,
+            Some(Tok::Punct(')' | ']')) => {
+                j = open_of[i].unwrap_or(i);
+                continue;
+            }
+            Some(Tok::Punct('=')) if plain_eq(toks, i) => eq_seen = true,
+            Some(Tok::Ident(w)) => match w.as_str() {
+                "enum" => return Brace::Variants,
+                "if" | "while" => return Brace::Block,
+                "let" if !eq_seen => return Brace::Literal,
+                "in" => in_seen = true,
+                "for" if in_seen => return Brace::Block,
+                w if BODY_WORDS.contains(&w) => return Brace::Block,
+                _ => {}
+            },
+            _ => {}
+        }
+        j = i;
+    }
+    Brace::Literal
+}
+
+/// What the `{` at `o` opens, with a variant of an enum body as a block.
+fn brace_kind(
+    toks: &[Lexed],
+    inside: &[Option<usize>],
+    open_of: &[Option<usize>],
+    o: usize,
+) -> Brace {
+    match brace_head(toks, inside, open_of, o) {
+        Brace::Literal => match inside[o] {
+            Some(l)
+                if is_p(toks, l, '{')
+                    && brace_head(toks, inside, open_of, l) == Brace::Variants =>
+            {
+                Brace::Block
+            }
+            _ => Brace::Literal,
+        },
+        other => other,
+    }
+}
+
+/// The first token of the place expression that ends with the field at `k`
+/// (after its `.`): segments (an ident, a number or a `(..)`/`[..]` group,
+/// with the ident before a group) joined by `.` or `::`. `memo` holds the
+/// place start of every earlier field, so a chain is walked once.
+fn place_start(
+    toks: &[Lexed],
+    open_of: &[Option<usize>],
+    memo: &[Option<usize>],
+    k: usize,
+) -> usize {
+    let mut s = k.saturating_sub(1);
+    while let Some(e) = s.checked_sub(1) {
+        if let Some(m) = memo[e] {
+            return m;
+        }
+        let mut start = match tok(toks, e) {
+            Some(Tok::Ident(w)) if w != "mut" => e,
+            Some(Tok::Num(_)) => e,
+            Some(Tok::Punct(')' | ']')) => {
+                let g = open_of[e].unwrap_or(e);
+                if g > 0 && ident(toks, g - 1).is_some_and(|w| w != "mut") {
+                    g - 1
+                } else {
+                    g
+                }
+            }
+            _ => break,
+        };
+        if start > 0 && is_p(toks, start - 1, '$') {
+            start -= 1;
+        }
+        s = start;
+        match start.checked_sub(1) {
+            Some(p)
+                if is_sep(toks, p)
+                    || (is_p(toks, p, '.') && !(p > 0 && is_p(toks, p - 1, '.'))) =>
+            {
+                s = p;
+            }
+            _ => break,
+        }
+    }
+    s
+}
+
+/// Whether the place starting at `s` is borrowed mutably: `&mut`,
+/// `&raw mut` or `addr_of_mut!(`.
+fn borrowed_mut(toks: &[Lexed], s: usize) -> bool {
+    let back = |n: usize| s.checked_sub(n);
+    let at = |n: usize, c: char| back(n).is_some_and(|i| is_p(toks, i, c));
+    let word = |n: usize, w: &str| back(n).is_some_and(|i| ident(toks, i) == Some(w));
+    (word(1, "mut") && (at(2, '&') || (word(2, "raw") && at(3, '&'))))
+        || (at(1, '(') && at(2, '!') && word(3, "addr_of_mut"))
+}
+
+/// Whether the field at `k` (after its `.`) is the target of a compound
+/// assignment (`+=`, `-=`, `*=`, `/=`, `%=`, `^=`, `&=`, `|=`, `<<=`, `>>=`).
+fn compound_assigned(toks: &[Lexed], k: usize) -> bool {
+    let one = ['+', '-', '*', '/', '%', '^', '&', '|']
+        .iter()
+        .any(|c| is_p(toks, k + 1, *c))
+        && is_p(toks, k + 2, '=')
+        && !is_p(toks, k + 3, '=');
+    let two = ['<', '>']
+        .iter()
+        .any(|c| is_p(toks, k + 1, *c) && is_p(toks, k + 2, *c))
+        && is_p(toks, k + 3, '=')
+        && !is_p(toks, k + 4, '=');
+    one || two
+}
+
+/// Whether the ident at `k` starts a field of the `{` at `o`: after the
+/// `{` or a `,`, with an optional `ref` and `mut` before it.
+fn field_start(toks: &[Lexed], o: usize, k: usize) -> bool {
+    let mut j = k;
+    for w in ["mut", "ref"] {
+        if j > 0 && ident(toks, j - 1) == Some(w) {
+            j -= 1;
+        }
+    }
+    j > 0 && (j - 1 == o || is_p(toks, j - 1, ',') || rep_open(toks, j - 1))
+}
+
+/// The finding text of a field form: a metavariable or a `fork`/`timeout`.
+fn field_form(meta: bool) -> &'static str {
+    if meta {
+        FORM_META_FIELD
+    } else {
+        FORM_FIELD_WRITE
+    }
+}
+
+/// Whether the token at `i` opens a macro repetition, `$(`.
+fn rep_open(toks: &[Lexed], i: usize) -> bool {
+    is_p(toks, i, '(') && i > 0 && is_p(toks, i - 1, '$')
+}
+
+/// For every token the group whose field list holds it: the group directly
+/// around it, through any macro repetitions `$( .. )` between them. One
+/// forward pass (an opener comes before what it holds), so linear.
+fn field_groups(toks: &[Lexed], inside: &[Option<usize>]) -> Vec<Option<usize>> {
+    let mut out: Vec<Option<usize>> = Vec::with_capacity(toks.len());
+    for &around in inside {
+        let g = match around {
+            Some(g) if rep_open(toks, g) => out[g],
+            other => other,
+        };
+        out.push(g);
+    }
+    out
+}
+
+/// The #10312 forms: every `fork` or `timeout` ident in a field or
+/// assignment position that is not a method call or a path. A field
+/// `fork:` or shorthand `fork` of any literal or pattern (a `{` that is not
+/// shown to be a block), except a `fork:` of a proptest Config literal,
+/// which [`literal_forms`] reads; and a field access `.fork` that is the
+/// target of a compound assignment or borrowed mutably. A plain `.fork =`
+/// is [`FORM_ASSIGN`]. One pass, each `{` head and each place read once.
+fn field_forms(rel: &str, p: &Prep<'_>, config: &BTreeSet<String>, out: &mut Vec<String>) {
+    let toks = p.toks;
+    let (inside, open_of) = group_tables(toks);
+    let groups = field_groups(toks, &inside);
+    let mut kinds: BTreeMap<usize, Brace> = BTreeMap::new();
+    let mut memo = vec![None; toks.len()];
+    for k in 0..toks.len() {
+        let Some(val) = ident(toks, k) else { continue };
+        // A metavariable (`$f`) may name any field, fork included, so it is
+        // read like `fork` (fail closed); `$crate` is a path.
+        let dollar = k > 0 && is_p(toks, k - 1, '$');
+        let meta = dollar && val != "crate";
+        if !(meta || (!dollar && FORK_FIELDS.contains(&val))) {
+            continue;
+        }
+        // `f` is the field's first token: the `$` of a metavariable.
+        let f = if meta { k - 1 } else { k };
+        let line = toks[k].line;
+        let after_dot = f > 0 && is_p(toks, f - 1, '.');
+        if after_dot {
+            if f > 1 && is_p(toks, f - 2, '.') {
+                continue;
+            }
+            if is_p(toks, k + 1, '(') || is_sep(toks, k + 1) {
+                continue;
+            }
+            let s = place_start(toks, &open_of, &memo, f);
+            memo[f] = Some(s);
+            // A plain `.fork =` is FORM_ASSIGN; a plain `.$f =` is read here.
+            let assigned = meta && plain_eq(toks, k + 1);
+            if assigned || compound_assigned(toks, k) || borrowed_mut(toks, s) {
+                out.push(fork_form(rel, line, field_form(meta)));
+            }
+            continue;
+        }
+        let Some(o) = groups[f].filter(|o| is_p(toks, *o, '{')) else {
+            continue;
+        };
+        let colon = is_p(toks, k + 1, ':') && !is_p(toks, k + 2, ':');
+        let shorthand = is_p(toks, k + 1, ',') || is_p(toks, k + 1, '}');
+        let rep_end = meta && is_p(toks, k + 1, ')') && inside[f] != Some(o);
+        if !(colon || shorthand || rep_end) || !field_start(toks, o, f) {
+            continue;
+        }
+        let kind = *kinds
+            .entry(o)
+            .or_insert_with(|| brace_kind(toks, &inside, &open_of, o));
+        if kind != Brace::Literal {
+            continue;
+        }
+        let read_by_literal_forms =
+            !meta && colon && o > 0 && ident(toks, o - 1).is_some_and(|h| config.contains(h));
+        if !read_by_literal_forms {
+            out.push(fork_form(rel, line, field_form(meta)));
+        }
+    }
+}
+
+/// The forms inside the `Config { .. }` literal opened at `open`. Nested
+/// groups are skipped whole, and the scan ends at the struct update, so a
+/// token is read by at most one literal (linear over the file).
+fn literal_forms(rel: &str, p: &Prep<'_>, open: usize, out: &mut Vec<String>) {
+    let toks = p.toks;
+    let end = p
+        .close
+        .get(open)
+        .copied()
+        .flatten()
+        .unwrap_or(toks.len())
+        .min(toks.len());
     let mut m = open + 1;
     while m < end {
         match tok(toks, m) {
-            Some(Tok::Punct('(' | '[' | '{')) => depth += 1,
-            Some(Tok::Punct(')' | ']' | '}')) => depth = depth.saturating_sub(1),
+            Some(Tok::Punct('(' | '[' | '{')) => {
+                m = p.close.get(m).copied().flatten().unwrap_or(end).max(m);
+            }
             Some(Tok::Ident(s))
-                if depth == 0
-                    && (s == "fork" || s == "timeout")
+                if (s == "fork" || s == "timeout")
                     && is_p(toks, m + 1, ':')
                     && !is_sep(toks, m + 1) =>
             {
                 out.push(fork_form(rel, toks[m].line, FORM_FIELD));
             }
-            Some(Tok::Punct('.')) if depth == 0 && is_p(toks, m + 1, '.') => {
+            Some(Tok::Punct('.')) if is_p(toks, m + 1, '.') => {
                 if !default_base(toks, m + 2, end) {
                     out.push(fork_form(rel, toks[m].line, FORM_UPDATE));
                 }
-                m += 1;
+                return;
             }
             _ => {}
         }
@@ -742,6 +1211,26 @@ const ENV_ROWS: &[(&str, usize, &str)] = &[
         "changelog.d/10176.fixed.md",
         2,
         "release note naming the two variables the guard refuses",
+    ),
+    (
+        "scripts/ci/tests/test_census_rows_10286.py",
+        1,
+        "#10299 Python bound fixture: the literal each generated constant binds",
+    ),
+    (
+        "tests/common/census_config_10301.json",
+        4,
+        "#10301 shared table: the env rows and lines a cargo config refusal names",
+    ),
+    (
+        "tests/common/census_env_name_10299.json",
+        23,
+        "#10299 shared table: the literal the fixture constants and calls name",
+    ),
+    (
+        "tests/common/census_env_name_10299.rs",
+        1,
+        "#10299 Rust bound fixture: the literal each generated constant binds",
     ),
     (
         "tests/common/proptest_guard.rs",
@@ -773,6 +1262,9 @@ struct Tree {
     links: Vec<String>,
     /// Directories (relative) holding a `Cargo.toml`, the root excluded.
     packages: Vec<String>,
+    /// The directory the tree was read from; `None` for a tree built in
+    /// memory. Include targets are looked up under it (#10300).
+    root: Option<PathBuf>,
 }
 
 fn crate_root() -> PathBuf {
@@ -823,6 +1315,7 @@ fn read_tree(root: &Path) -> Tree {
         files: Vec::new(),
         links: Vec::new(),
         packages: Vec::new(),
+        root: Some(root.to_path_buf()),
     };
     walk(root, root, &mut tree);
     tree
@@ -870,6 +1363,8 @@ const WATCHED: &[&str] = &[
     "TestRunner",
     "audited_command",
     "audited_tokio_command",
+    "cargo_bin",
+    "cargo_bin_cmd",
     "libc",
     "nix",
     "process",
@@ -926,90 +1421,9 @@ const ACCEPTED_PREDICATES: &[&str] = &[];
 /// The one file that may define `proptest_guarded`.
 const GUARD_FILE: &str = "tests/common/proptest_guard.rs";
 
-/// The end of the `use` declaration at `k` (its `;`, or the end).
-fn decl_end(toks: &[Lexed], k: usize) -> usize {
-    (k..toks.len())
-        .find(|&m| is_p(toks, m, ';'))
-        .unwrap_or(toks.len())
-}
-
 /// Whether the token at `k` is an identifier of the set.
 fn ident_in(toks: &[Lexed], k: usize, set: &BTreeSet<String>) -> bool {
     ident(toks, k).is_some_and(|s| set.contains(s))
-}
-
-/// The names one file binds to a name of `watched`: `X as Y` and
-/// `self as Y` in a `use`, `extern crate X as Y`, `type Y = .. X ..`, and
-/// a `macro_rules!` whose body names one.
-fn names_bound_in(toks: &[Lexed], watched: &BTreeSet<String>, add: &mut BTreeSet<String>) {
-    for k in 0..toks.len() {
-        match ident(toks, k) {
-            Some("use") => {
-                let end = decl_end(toks, k);
-                let mut seen = false;
-                for j in k..end {
-                    seen |= ident_in(toks, j, watched);
-                    let Some(y) = ident(toks, j + 2).filter(|y| *y != "_") else {
-                        continue;
-                    };
-                    if j + 2 >= end || ident(toks, j + 1) != Some("as") {
-                        continue;
-                    }
-                    let src =
-                        ident_in(toks, j, watched) || (ident(toks, j) == Some("self") && seen);
-                    if src {
-                        add.insert(y.to_string());
-                    }
-                }
-            }
-            Some("extern")
-                if ident(toks, k + 1) == Some("crate")
-                    && ident(toks, k + 3) == Some("as")
-                    && ident_in(toks, k + 2, watched) =>
-            {
-                if let Some(y) = ident(toks, k + 4).filter(|y| *y != "_") {
-                    add.insert(y.to_string());
-                }
-            }
-            Some("type") if !(k > 0 && is_sep(toks, k - 1)) => {
-                let Some(y) = ident(toks, k + 1) else {
-                    continue;
-                };
-                let end = (k + 1..toks.len())
-                    .find(|&m| matches!(tok(toks, m), Some(Tok::Punct(';' | '{' | '}'))))
-                    .unwrap_or(toks.len());
-                if (k + 2..end).any(|m| ident_in(toks, m, watched)) {
-                    add.insert(y.to_string());
-                }
-            }
-            Some("macro_rules") if is_p(toks, k + 1, '!') => {
-                let Some(y) = ident(toks, k + 2) else {
-                    continue;
-                };
-                let end = group_end(toks, k + 3).min(toks.len());
-                if (k + 3..end).any(|m| ident_in(toks, m, watched)) {
-                    add.insert(y.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// The seed and every name bound to a member, to a fixpoint over the tree.
-fn watched_closure(files: &[(String, Vec<Lexed>)], seed: &[&str]) -> BTreeSet<String> {
-    let mut watched: BTreeSet<String> = seed.iter().map(|s| (*s).to_string()).collect();
-    loop {
-        let mut add = BTreeSet::new();
-        for (_, toks) in files {
-            names_bound_in(toks, &watched, &mut add);
-        }
-        let before = watched.len();
-        watched.extend(add);
-        if watched.len() == before {
-            return watched;
-        }
-    }
 }
 
 const SHAPE_IMPL: &str = "an impl whose header names a watched process, libc, nix or proptest name";
@@ -1019,54 +1433,17 @@ const SHAPE_PASTE: &str = "a pasted or concatenated identifier";
 const SHAPE_ASM: &str = "inline assembly";
 const SHAPE_EXTERN: &str = "an extern block";
 
-/// Every shape of one file that the census does not model: (line, shape).
-fn shapes_of(toks: &[Lexed], watched: &BTreeSet<String>) -> Vec<(usize, &'static str)> {
-    let mut out = Vec::new();
-    for k in 0..toks.len() {
-        let line = toks[k].line;
-        let val = ident(toks, k);
-        if val == Some("impl") {
-            let mut depth = 0usize;
-            let mut hit = false;
-            for m in k + 1..toks.len() {
-                match tok(toks, m) {
-                    Some(Tok::Punct('<' | '(' | '[')) => depth += 1,
-                    Some(Tok::Punct('>' | ')' | ']')) => depth = depth.saturating_sub(1),
-                    Some(Tok::Punct('{' | ';')) if depth == 0 => break,
-                    _ => hit |= ident_in(toks, m, watched),
-                }
-            }
-            if hit {
-                out.push((line, SHAPE_IMPL));
-            }
-        }
-        if ident_in(toks, k, watched) && is_sep(toks, k + 1) && is_p(toks, k + 2, '$') {
-            out.push((line, SHAPE_METAVAR));
-        }
-        if val == Some("use") && !(k > 0 && is_sep(toks, k - 1)) {
-            let end = decl_end(toks, k);
-            if (k..end).any(|m| is_p(toks, m, '*')) && (k..end).any(|m| ident_in(toks, m, watched))
-            {
-                out.push((line, SHAPE_GLOB));
-            }
-        }
-        if is_p(toks, k, '[') && is_p(toks, k + 1, '<') {
-            out.push((line, SHAPE_PASTE));
-        }
-        if matches!(val, Some("paste" | "concat_idents")) && is_p(toks, k + 1, '!') {
-            out.push((line, SHAPE_PASTE));
-        }
-        if matches!(val, Some("asm" | "global_asm" | "naked_asm")) && is_p(toks, k + 1, '!') {
-            out.push((line, SHAPE_ASM));
-        }
-        if val == Some("extern")
-            && (is_p(toks, k + 1, '{')
-                || (matches!(tok(toks, k + 1), Some(Tok::Str(_))) && is_p(toks, k + 2, '{')))
-        {
-            out.push((line, SHAPE_EXTERN));
-        }
+/// The message of one shape kind of [`census_pins::shapes_of`].
+fn shape_what(kind: &str) -> &'static str {
+    match kind {
+        "impl" => SHAPE_IMPL,
+        "metavar" => SHAPE_METAVAR,
+        "glob" => SHAPE_GLOB,
+        "paste" => SHAPE_PASTE,
+        "asm" => SHAPE_ASM,
+        "extern" => SHAPE_EXTERN,
+        _ => "a shape kind the census does not name",
     }
-    out
 }
 
 /// The finding for one shape of a file that has no [`SHAPE_ROWS`] row.
@@ -1175,7 +1552,7 @@ fn predicate_text(toks: &[Lexed]) -> String {
     let mut s = String::new();
     for t in toks {
         match &t.tok {
-            Tok::Ident(v) => {
+            Tok::Ident(v) | Tok::Num(v) => {
                 if s.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
                     s.push(' ');
                 }
@@ -1188,7 +1565,7 @@ fn predicate_text(toks: &[Lexed]) -> String {
                 s.push_str(v);
                 s.push('"');
             }
-            Tok::Char => s.push_str("'?'"),
+            Tok::Char(v) => s.push_str(v),
         }
     }
     s
@@ -1275,77 +1652,142 @@ fn table_findings(
     out
 }
 
-const ENV_FNS: &[&str] = &["remove_var", "set_var", "var", "var_os"];
-
-/// The first argument of the group opened at `open`.
-fn first_arg(toks: &[Lexed], open: usize) -> &[Lexed] {
-    let end = group_end(toks, open).min(toks.len());
-    let mut depth = 0usize;
-    for m in open + 1..end {
-        match tok(toks, m) {
-            Some(Tok::Punct('(' | '[' | '{')) => depth += 1,
-            Some(Tok::Punct(')' | ']' | '}')) => depth = depth.saturating_sub(1),
-            Some(Tok::Punct(',')) if depth == 0 => return &toks[open + 1..m],
-            _ => {}
-        }
-    }
-    toks.get(open + 1..end).unwrap_or(&[])
-}
-
-/// Whether an env-name argument is one string literal or one named
-/// constant (`[&] [path ::] NAME`, NAME in upper case).
-fn name_ok(arg: &[Lexed]) -> bool {
-    if let [one] = arg
-        && matches!(one.tok, Tok::Str(_))
-    {
-        return true;
-    }
-    let arg = match arg.first() {
-        Some(t) if matches!(t.tok, Tok::Punct('&')) => &arg[1..],
-        _ => arg,
-    };
-    let Some(Tok::Ident(last)) = arg.last().map(|t| &t.tok) else {
-        return false;
-    };
-    let mut chars = last.chars();
-    let caps = chars.next().is_some_and(|c| c.is_ascii_uppercase())
-        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    caps && arg.iter().enumerate().all(|(i, t)| {
-        if i % 2 == 0 {
-            matches!(t.tok, Tok::Ident(_))
-        } else {
-            matches!(t.tok, Tok::PathSep)
-        }
-    })
-}
-
-/// The environment-name arguments of one file that are not one literal and
-/// not one named constant (`env::var` and its siblings, `.env(..)`,
-/// `.env_remove(..)`, `env!` and `option_env!`).
-fn env_name_sites(toks: &[Lexed]) -> usize {
-    let mut n = 0;
-    for k in 0..toks.len() {
-        let Some(val) = ident(toks, k) else { continue };
-        let path_call = ENV_FNS.contains(&val)
-            && k > 1
-            && is_sep(toks, k - 1)
-            && ident(toks, k - 2) == Some("env");
-        let method_call = matches!(val, "env" | "env_remove") && k > 0 && is_p(toks, k - 1, '.');
-        let arg = if (path_call || method_call) && is_p(toks, k + 1, '(') {
-            Some(first_arg(toks, k + 1))
-        } else if matches!(val, "env" | "option_env")
-            && is_p(toks, k + 1, '!')
-            && matches!(tok(toks, k + 2), Some(Tok::Punct('(' | '[' | '{')))
-        {
-            Some(first_arg(toks, k + 2))
+/// #10311: the findings of a file rowed `R_SHAPE_EXTERN` whose extern blocks
+/// declare anything but `acl_*` functions.
+/// The blocks are found with the predicate of the extern arm of
+/// [`census_pins::shapes_of`] (`extern {` or `extern "abi" {`). Each item of
+/// a block is read at depth 0: `pub`, `pub(..)`, `unsafe` and `safe` are
+/// skipped; `fn acl_*` is the one permitted item; an attribute is named
+/// `#[name]`, a `static`, `type` or other `fn` by its name, and any other
+/// item (a macro call among them) by its first token. Each block is read
+/// once and the scan resumes after it, so the cost is linear.
+fn extern_row_findings(rel: &str, toks: &[Lexed]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k < toks.len() {
+        let open = if ident(toks, k) != Some("extern") {
+            None
+        } else if is_p(toks, k + 1, '{') {
+            Some(k + 1)
+        } else if matches!(tok(toks, k + 1), Some(Tok::Str(_))) && is_p(toks, k + 2, '{') {
+            Some(k + 2)
         } else {
             None
         };
-        if arg.is_some_and(|a| !name_ok(a)) {
-            n += 1;
+        let Some(open) = open else {
+            k += 1;
+            continue;
+        };
+        let end = group_end(toks, open);
+        extern_items(toks, open + 1, end, &mut names);
+        k = end + 1;
+    }
+    names
+        .into_iter()
+        .map(|n| format!("{rel} is rowed R_SHAPE_EXTERN but declares {n} (#10311)"))
+        .collect()
+}
+
+/// The index after the `;` that ends the item at `k` (groups skipped whole),
+/// or `end`.
+fn item_end(toks: &[Lexed], mut k: usize, end: usize) -> usize {
+    while k < end {
+        if is_p(toks, k, '(') || is_p(toks, k, '[') || is_p(toks, k, '{') {
+            k = group_end(toks, k) + 1;
+        } else if is_p(toks, k, ';') {
+            return k + 1;
+        } else {
+            k += 1;
         }
     }
-    n
+    end
+}
+
+/// The text of one token, for the name of an unexpected item.
+fn tok_text(t: &Tok) -> String {
+    match t {
+        Tok::Ident(s) | Tok::Char(s) | Tok::Num(s) => s.clone(),
+        Tok::Punct(c) => c.to_string(),
+        Tok::PathSep => "::".to_string(),
+        Tok::Str(s) => format!("{s:?}"),
+    }
+}
+
+/// The names of the items of one extern block body, `toks[k..end]`, that are
+/// not `acl_*` functions.
+fn extern_items(toks: &[Lexed], mut k: usize, end: usize, names: &mut Vec<String>) {
+    while k < end {
+        match ident(toks, k) {
+            Some("pub") if is_p(toks, k + 1, '(') => k = group_end(toks, k + 1) + 1,
+            Some("pub" | "unsafe" | "safe") => k += 1,
+            Some("fn") => {
+                match ident(toks, k + 1) {
+                    Some(n) if n.len() > "acl_".len() && n.starts_with("acl_") => {}
+                    Some(n) => names.push(n.to_string()),
+                    None => names.push("fn".to_string()),
+                }
+                k = item_end(toks, k + 1, end);
+            }
+            Some(kw @ ("static" | "type")) => {
+                let at = if kw == "static" && ident(toks, k + 1) == Some("mut") {
+                    k + 2
+                } else {
+                    k + 1
+                };
+                names.push(ident(toks, at).unwrap_or(kw).to_string());
+                k = item_end(toks, at, end);
+            }
+            _ if is_p(toks, k, ';') => k += 1,
+            _ if is_p(toks, k, '#') => {
+                let br = if is_p(toks, k + 1, '!') { k + 2 } else { k + 1 };
+                if is_p(toks, br, '[') {
+                    names.push(format!("#[{}]", ident(toks, br + 1).unwrap_or("?")));
+                    k = group_end(toks, br) + 1;
+                } else {
+                    names.push("#".to_string());
+                    k += 1;
+                }
+            }
+            _ => {
+                names.push(toks.get(k).map_or_else(String::new, |t| tok_text(&t.tok)));
+                k = item_end(toks, k, end);
+            }
+        }
+    }
+}
+
+/// #10311: the extern reason of a `SHAPE_ROWS` row read as a claim about the
+/// file. Under `R_SHAPE_EXTERN` every form is an extern block that declares
+/// only `acl_*` functions; under any other reason no form is an extern block.
+fn extern_reason_findings(
+    rel: &str,
+    toks: &[Lexed],
+    found: &[(&'static str, usize)],
+    reason: &str,
+) -> Vec<String> {
+    if reason == census_rows::R_SHAPE_EXTERN {
+        let mut out: Vec<String> = found
+            .iter()
+            .filter(|(kind, _)| *kind != "extern")
+            .map(|(kind, line)| {
+                format!(
+                    "{rel}:{line}: a {kind} form under an R_SHAPE_EXTERN row, whose reason covers only extern blocks (#10311)"
+                )
+            })
+            .collect();
+        out.extend(extern_row_findings(rel, toks));
+        out
+    } else {
+        found
+            .iter()
+            .filter(|(kind, _)| *kind == "extern")
+            .map(|(_, line)| {
+                format!(
+                    "{rel}:{line}: an extern block under a SHAPE_ROWS row whose reason is not R_SHAPE_EXTERN (#10311)"
+                )
+            })
+            .collect()
+    }
 }
 
 /// The proptest variable names that a `concat!` builds and that no one of
@@ -1380,12 +1822,30 @@ fn census(tree: &Tree) -> Vec<String> {
         .iter()
         .map(|l| format!("{l}: a symbolic link; the census never follows links (#10176)"))
         .collect();
-    let lexed = rust_files(tree, &mut out);
+    let mut lexed = rust_files(tree, &mut out);
+    census_include::join_includes(tree, &mut lexed, &mut out);
     let names = libc_start_names();
     let aliases: BTreeSet<String> = lexed.iter().flat_map(|(_, t)| aliases_in(t)).collect();
-    let watched = watched_closure(&lexed, WATCHED);
-    let pt = watched_closure(&lexed, RUNNER_FAMILY);
-    let shape_rowed: BTreeSet<&str> = SHAPE_ROWS.iter().map(|r| r.0).collect();
+    let preps: Vec<Prep<'_>> = lexed.iter().map(|(_, t)| Prep::new(t)).collect();
+    let consts = census_consts::const_names(&preps);
+    let graph = census_pins::RenameGraph::of(&preps);
+    let watched = graph.reach(WATCHED).names;
+    let pt = graph.reach(RUNNER_FAMILY).names;
+    let env_mod = graph.reach(census_pins::ENV_MOD_SEED).names;
+    let env_fns = graph.reach(census_pins::ENV_FN_SEED).names;
+    let config = graph.reach(CONFIG_SEED).names;
+    let env_reach: BTreeSet<String> = env_mod.union(&env_fns).cloned().collect();
+    let hot: BTreeSet<String> = watched
+        .iter()
+        .chain(&pt)
+        .chain(&env_reach)
+        .cloned()
+        .chain(census_macros::FORK_NAMES.iter().map(|s| (*s).to_string()))
+        .collect();
+    let site_rows: BTreeMap<&str, &[&str]> = SITE_ROWS.iter().map(|(r, d)| (*r, *d)).collect();
+    let mut site_have: BTreeSet<&str> = BTreeSet::new();
+    let mut macros: BTreeMap<(String, &'static str), Vec<usize>> = BTreeMap::new();
+    let shape_rowed: BTreeMap<&str, &str> = SHAPE_ROWS.iter().map(|r| (r.0, r.2)).collect();
     let needle = env_needle();
     let mut counts = BTreeMap::new();
     let mut outside = BTreeMap::new();
@@ -1394,15 +1854,16 @@ fn census(tree: &Tree) -> Vec<String> {
     let mut shapes = BTreeMap::new();
     let mut env_names = BTreeMap::new();
     let mut joined = BTreeMap::new();
-    for (rel, toks) in &lexed {
+    for ((rel, toks), prep) in lexed.iter().zip(&preps) {
         let n = (0..toks.len())
             .filter(|&k| ident_in(toks, k, &watched))
             .count();
         if n > 0 {
             tokens.insert(rel.clone(), n);
         }
-        let found = shapes_of(toks, &watched);
-        if shape_rowed.contains(rel.as_str()) {
+        let found = census_pins::shapes_of(prep, &watched);
+        if let Some(reason) = shape_rowed.get(rel.as_str()) {
+            out.extend(extern_reason_findings(rel, toks, &found, reason));
             if !found.is_empty() {
                 shapes.insert(rel.clone(), found.len());
             }
@@ -1410,13 +1871,28 @@ fn census(tree: &Tree) -> Vec<String> {
             out.extend(
                 found
                     .iter()
-                    .map(|(line, what)| shape_finding(rel, *line, what)),
+                    .map(|(kind, line)| shape_finding(rel, *line, shape_what(kind))),
             );
         }
         out.extend(guard_findings(rel, toks, &pt));
-        let n = env_name_sites(toks);
+        let n = census_pins::env_calls(prep, &env_fns, &consts).len();
         if n > 0 {
             env_names.insert(rel.clone(), n);
+        }
+        let row = site_rows.get(rel.as_str()).copied();
+        match census_pins::sites_of(prep, &watched, &env_reach, &env_fns, &consts) {
+            Ok(sites) if !sites.is_empty() => {
+                site_have.insert(rel.as_str());
+                out.extend(census_pins::site_findings(rel, &sites, row));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                site_have.insert(rel.as_str());
+                out.push(format!("{rel}: {e}"));
+            }
+        }
+        for (form, line) in census_macros::macro_forms(prep, &hot) {
+            macros.entry((rel.clone(), form)).or_default().push(line);
         }
         let n = concat_needles(toks, &needle);
         if n > 0 {
@@ -1431,12 +1907,22 @@ fn census(tree: &Tree) -> Vec<String> {
             }
         }
         out.extend(start_findings(rel, toks, &sites, pkg));
-        if toks.iter().any(|t| is_ident_tok(t, "proptest")) {
-            let (blocks, forms) = proptest_findings(rel, toks);
-            out.extend(blocks);
-            if !forms.is_empty() {
-                a1.insert(rel.clone(), forms);
-            }
+        let (blocks, forms) = proptest_findings(rel, prep, &config);
+        out.extend(blocks);
+        if !forms.is_empty() {
+            a1.insert(rel.clone(), forms);
+        }
+    }
+    out.extend(census_pins::site_table_findings(SITE_ROWS, &site_have));
+    out.extend(census_macros::macro_findings(
+        &macros,
+        census_macros::MACRO_ROWS,
+    ));
+    for (rel, bytes) in &tree.files {
+        if rel.rsplit('/').next() == Some("Cargo.toml") {
+            out.extend(census_cargo::manifest_findings(rel, bytes));
+        } else if census_config::is_config(rel) {
+            out.extend(census_config::config_findings(rel, bytes));
         }
     }
     out.extend(compare_counts(
@@ -1722,6 +2208,7 @@ fn a_nested_package_file_and_a_link_are_seen_10176() {
         files: vec![],
         links: vec!["src/l.rs".to_string()],
         packages: vec![],
+        root: None,
     };
     let got = census(&tree);
     assert_eq!(
@@ -1750,8 +2237,7 @@ fn the_census_is_linear_on_large_input_10176() {
     assert!(text.len() > 100_000);
     let t0 = std::time::Instant::now();
     let got = b_fixture("src/big.rs", &text);
-    let toks = lex(&text);
-    let _ = proptest_findings("src/big.rs", &toks);
+    let _ = pt_findings("src/big.rs", &text);
     assert_eq!(
         got.len(),
         20_001,
@@ -1764,7 +2250,51 @@ fn the_census_is_linear_on_large_input_10176() {
     );
 }
 
+/// The #10312 field-form scan is linear: 20,000 literal fields in one
+/// argument list, a metavariable field under 20,000 nested repetitions, a
+/// 20,000-segment `&mut` place and 20,000 reads of a shared chain give the
+/// exact finding counts within the ceiling.
+#[test]
+fn the_field_form_scan_is_linear_on_a_large_file_10312() {
+    const N: usize = 20_000;
+    let mut text = String::from("fn lits() { x(");
+    text.push_str(&"X { fork: 1 }, ".repeat(N));
+    text.push_str("); }\nmacro_rules! m { () => { Cfg { ");
+    text.push_str(&"$( ".repeat(N));
+    text.push_str("$f: 1");
+    text.push_str(&" )*".repeat(N));
+    text.push_str(" } } }\nfn chain() { let r = &mut a");
+    text.push_str(&".a".repeat(N));
+    text.push_str(".fork; let t = ");
+    text.push_str(&"a.b.fork + ".repeat(N));
+    text.push_str("0; }\n");
+    assert!(text.len() > 100_000);
+    let t0 = std::time::Instant::now();
+    let (_, forms) = pt_findings("src/big.rs", &text);
+    let elapsed = t0.elapsed();
+    let count = |what: &str| forms.iter().filter(|f| f.contains(what)).count();
+    assert_eq!(
+        count(FORM_FIELD_WRITE),
+        N + 1,
+        "the literal fields and the &mut place"
+    );
+    assert_eq!(count(FORM_META_FIELD), 1, "the metavariable field");
+    assert_eq!(forms.len(), N + 2, "no other finding");
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "field forms took {elapsed:?}"
+    );
+}
+
 // ---------------------------------------------------------------- A1 mutants
+
+/// The A1 findings of one fixture file, with the config closure of that file.
+fn pt_findings(rel: &str, text: &str) -> (Vec<String>, Vec<String>) {
+    let toks = lex(text);
+    let prep = Prep::new(&toks);
+    let config = census_pins::closure(std::slice::from_ref(&prep), CONFIG_SEED);
+    proptest_findings(rel, &prep, &config)
+}
 
 #[test]
 fn every_unguarded_proptest_block_form_is_red_10176() {
@@ -1776,7 +2306,7 @@ fn every_unguarded_proptest_block_form_is_red_10176() {
         "proptest!(|(x in 0..1u8)| { prop_assert!(x < 1); });\n",
         "proptest! [ ]\n",
     ] {
-        let (blocks, _) = proptest_findings(rel, &lex(text));
+        let (blocks, _) = pt_findings(rel, text);
         assert_eq!(blocks, vec![unguarded_block(rel, 1)], "fixture:\n{text}");
     }
     for text in [
@@ -1784,7 +2314,7 @@ fn every_unguarded_proptest_block_form_is_red_10176() {
         "proptest::proptest! {\n    #![proptest_config(crate::test_support::proptest_guard::proptest_guarded(Config::with_cases(64)))]\n}\n",
         "macro_rules! m { () => {} }\n",
     ] {
-        let (blocks, forms) = proptest_findings(rel, &lex(text));
+        let (blocks, forms) = pt_findings(rel, text);
         assert!(blocks.is_empty() && forms.is_empty(), "fixture:\n{text}");
     }
 }
@@ -1816,7 +2346,7 @@ fn every_fork_or_timeout_form_is_red_10176() {
         ("#[property_test]\nfn t() {}", FORM_RUNNER),
     ];
     for (text, what) in red {
-        let (_, forms) = proptest_findings(rel, &lex(text));
+        let (_, forms) = pt_findings(rel, text);
         assert_eq!(forms, vec![fork_form(rel, 1, what)], "fixture: {text}");
     }
     for text in [
@@ -1825,7 +2355,113 @@ fn every_fork_or_timeout_form_is_red_10176() {
         "let ok = c.timeout == 0 && !c.fork();",
         "struct S { timeout: u32 }",
     ] {
-        let (_, forms) = proptest_findings(rel, &lex(text));
+        let (_, forms) = pt_findings(rel, text);
+        assert!(forms.is_empty(), "fixture: {text}: {forms:?}");
+    }
+}
+
+/// Every write to a `fork` or `timeout` field that #10312 found green: a
+/// literal field under `Self`, a metavariable or any other type, field
+/// shorthand, a pattern field, any compound assignment and a `&mut` borrow.
+/// Each row is one exact finding, and the `timeout` twin of each row too.
+/// The expected line is written out here, never built by the census.
+#[test]
+fn every_fork_or_timeout_field_form_is_red_10312() {
+    let rel = "tests/p.rs";
+    let want = "tests/p.rs:1: a field form of fork or timeout (a literal or pattern field outside a proptest Config literal, field shorthand, a compound assignment or a &mut borrow); a proptest config with fork or timeout on re-runs this test binary outside the sandbox (#10176)";
+    let red: &[&str] = &[
+        "macro_rules! m { ($t:expr) => { Cfg { fork: $t } } }",
+        "macro_rules! m { ($t:ident) => { $t { fork: true } } }",
+        "macro_rules! m { ($t:ty) => { type C = $t; let c = C { fork: true }; } }",
+        "impl Default for ProptestConfig { fn default() -> Self { Self { fork: true, ..base() } } }",
+        "impl ProptestConfig { fn f(fork: bool) -> Self { Self { fork } } }",
+        "let c = ProptestConfig { fork, ..ProptestConfig::default() };",
+        "let c = Cfg { cases: 1, fork };",
+        "let Cfg { ref mut fork, .. } = c;",
+        "if let Cfg { fork, .. } = c {}",
+        "let d = Outer { inner: Inner { fork: true } };",
+        "c.fork += 1;",
+        "c.fork |= true;",
+        "c.fork <<= 1;",
+        "c.fork >>= 1;",
+        "c.fork -= 1;",
+        "let r = &mut c.fork;",
+        "core::mem::replace(&mut c.fork, true);",
+        "let r = &mut self.cfg.fork;",
+        "let r = &mut (*p).fork;",
+        "let r = &mut v[0].fork;",
+        "let r = &raw mut c.fork;",
+        "let r = core::ptr::addr_of_mut!(c.fork);",
+    ];
+    for row in red {
+        for text in [row.to_string(), row.replace("fork", "timeout")] {
+            let (_, forms) = pt_findings(rel, &text);
+            assert_eq!(forms, vec![want.to_string()], "fixture: {text}");
+        }
+    }
+    let green: &[&str] = &[
+        "let c = Config { cases: 8, ..Config::default() };",
+        "let ok = c.fork == 0 && !c.fork();",
+        "let t = c.fork;",
+        "let ok = c.fork <= 5 || c.fork >= 1 || c.fork != 2 || c.fork < 3;",
+        "struct S { fork: u32 }",
+        "pub struct S<T> where T: Copy { fork: T }",
+        "enum E { A, V { fork: u32 } }",
+        "fn f(fork: u32) -> u32 { fork }",
+        "fn f() { let fork: u32 = 5; let g = |a, fork: u32| a; }",
+        "let t = if x { fork } else { fork };",
+        "while running { fork }",
+        "for i in 0..fork { fork }",
+        "loop { fork }",
+        "let v = unsafe { fork };",
+        "match x { fork => 1, _ => fork }",
+        "use x::{fork, y};",
+        "let f = Cfg::fork;",
+        "let d = c.fork.clone();",
+    ];
+    for row in green {
+        for text in [row.to_string(), row.replace("fork", "timeout")] {
+            let (_, forms) = pt_findings(rel, &text);
+            assert!(forms.is_empty(), "fixture: {text}: {forms:?}");
+        }
+    }
+}
+
+/// The sibling of #10312 through a macro: a metavariable in a field
+/// position may name `fork` or `timeout` (`m!(fork)`), so it is one exact
+/// finding of its own; a metavariable in a value, matcher or path position
+/// is not. The expected line is written out here.
+#[test]
+fn every_metavariable_field_form_is_red_10312() {
+    let rel = "tests/p.rs";
+    let want = "tests/p.rs:1: a macro metavariable in field position (a literal or pattern field, an assignment, a compound assignment or a &mut borrow), which may name fork or timeout; a proptest config with fork or timeout on re-runs this test binary outside the sandbox (#10176)";
+    let red: &[&str] = &[
+        "macro_rules! m { ($f:ident) => { Cfg { $f: true } } }",
+        "macro_rules! m { ($f:ident) => { Config { $f: true, ..Config::default() } } }",
+        "macro_rules! m { ($f:ident) => { Cfg { cases: 1, $f } } }",
+        "macro_rules! m { ($($f:ident),*) => { Cfg { $($f: true),* } } }",
+        "macro_rules! m { ($($f:ident),*) => { Cfg { $($f),* } } }",
+        "macro_rules! m { ($f:ident) => { c.$f = true; } }",
+        "macro_rules! m { ($f:ident) => { c.$f += 1; } }",
+        "macro_rules! m { ($f:ident) => { let r = &mut c.$f; } }",
+        "macro_rules! m { ($c:expr, $f:ident) => { $c.$f = true; } }",
+    ];
+    for text in red {
+        let (_, forms) = pt_findings(rel, text);
+        assert_eq!(forms, vec![want.to_string()], "fixture: {text}");
+    }
+    let green: &[&str] = &[
+        "macro_rules! m { ($t:expr) => { Cfg { cases: $t } } }",
+        "macro_rules! m { ($t:expr) => { let x = $t; } }",
+        "macro_rules! m { ($c:expr) => { let t = $c.cases; } }",
+        "macro_rules! m { ($f:ident) => { let ok = c.$f == 1; } }",
+        "macro_rules! m { ($f:ident) => { let t = c.$f; } }",
+        "macro_rules! m { ($f:ident) => { c.$f(); } }",
+        "macro_rules! m { () => { $crate::f(); } }",
+        "macro_rules! m { ($t:ty) => { impl X for $t { fn f() {} } } }",
+    ];
+    for text in green {
+        let (_, forms) = pt_findings(rel, text);
         assert!(forms.is_empty(), "fixture: {text}: {forms:?}");
     }
 }
@@ -1847,6 +2483,7 @@ fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
         ],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let got = env_findings(&tree, &BTreeMap::new());
     let line = |rel: &str, h: usize, w: usize| {
@@ -1860,7 +2497,15 @@ fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
             line(".cargo/config.toml", 1, 0),
             line(".github/workflows/x.yml", 1, 0),
             line("changelog.d/10176.fixed.md", 0, ENV_ROWS[0].1),
-            line("tests/common/proptest_guard.rs", 0, ENV_ROWS[1].1),
+            line(
+                "scripts/ci/tests/test_census_rows_10286.py",
+                0,
+                ENV_ROWS[1].1
+            ),
+            line("tests/common/census_config_10301.json", 0, ENV_ROWS[2].1),
+            line("tests/common/census_env_name_10299.json", 0, ENV_ROWS[3].1),
+            line("tests/common/census_env_name_10299.rs", 0, ENV_ROWS[4].1),
+            line("tests/common/proptest_guard.rs", 0, ENV_ROWS[5].1),
         ]
     );
 }
@@ -1873,11 +2518,31 @@ fn r3_fixture(rel: &str, text: &str) -> Vec<String> {
         files: vec![(rel.to_string(), text.as_bytes().to_vec())],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let head = format!("{rel}:");
     census(&tree)
         .into_iter()
-        .filter(|l| l.starts_with(&head))
+        .filter(|l| l.starts_with(&head) && !R4_TAGS.iter().any(|t| l.ends_with(t)))
+        .collect()
+}
+
+/// The tags of the round-four rules; the round-three table reads the rest,
+/// and [`r4_fixture`] reads these.
+const R4_TAGS: &[&str] = &["(#10286)", "(#10287)", "(#10289)"];
+
+/// The round-four lines of the census of one file.
+fn r4_fixture(rel: &str, text: &str) -> Vec<String> {
+    let tree = Tree {
+        files: vec![(rel.to_string(), text.as_bytes().to_vec())],
+        links: vec![],
+        packages: vec![],
+        root: None,
+    };
+    let head = format!("{rel}:");
+    census(&tree)
+        .into_iter()
+        .filter(|l| l.starts_with(&head) && R4_TAGS.iter().any(|t| l.ends_with(t)))
         .collect()
 }
 
@@ -2015,9 +2680,15 @@ fn every_round_three_form_is_red_10176() {
         (
             "I13 a proptest_guard module from another file",
             "#[path = \"evil.rs\"]\nmod proptest_guard;\n",
-            vec![format!(
-                "{rel}:2: a proptest_guard module not loaded from tests/common/proptest_guard.rs by #[path] (#10176)"
-            )],
+            vec![
+                // #10300: the #[path] site is followed, and this tree has no evil.rs.
+                format!(
+                    "{rel}:1: #[path] \"evil.rs\" names src/evil.rs, which is not a regular file (#10300)"
+                ),
+                format!(
+                    "{rel}:2: a proptest_guard module not loaded from tests/common/proptest_guard.rs by #[path] (#10176)"
+                ),
+            ],
         ),
     ];
     for (form, text, want) in rows {
@@ -2036,6 +2707,7 @@ fn a_wrong_count_and_a_stale_row_of_the_token_tables_are_red_10176() {
         )],
         links: vec![],
         packages: vec![],
+        root: None,
     };
     let got: Vec<String> = census(&tree)
         .into_iter()
@@ -2053,6 +2725,133 @@ fn a_wrong_count_and_a_stale_row_of_the_token_tables_are_red_10176() {
             "tests/common/tls_serve.rs: 0 forms the census does not model, SHAPE_ROWS has 3; each needs its exact row with its reason (#10176)".to_string(),
         ]
     );
+}
+
+/// #10311: a file rowed `R_SHAPE_EXTERN` declares only `acl_*` functions in
+/// its extern blocks; any other function, a static, a type, an attribute
+/// (a `link_name` can bind an `acl_*` name to any symbol) or a macro item is
+/// red with its exact finding. The rows are written out by hand.
+#[test]
+fn a_shape_extern_row_for_a_non_acl_extern_is_red_10311() {
+    let red = |name: &str| format!("a.rs is rowed R_SHAPE_EXTERN but declares {name} (#10311)");
+    let rows: [(&str, Vec<String>); 9] = [
+        (
+            "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn acl_get_fd_np(fd: i32, t: i32) -> *mut u8;\n}\n",
+            vec![],
+        ),
+        (
+            "extern {\n    pub fn acl_x(f: fn(i32) -> i32);\n}\n",
+            vec![],
+        ),
+        (
+            "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n    fn fork() -> i32;\n}\n",
+            vec![red("fork")],
+        ),
+        (
+            "extern \"C\" {\n    fn posix_spawn() -> i32;\n}\n",
+            vec![red("posix_spawn")],
+        ),
+        (
+            "extern {\n    static mut environ: *const u8;\n}\n",
+            vec![red("environ")],
+        ),
+        ("extern \"C\" {\n    type acl_t;\n}\n", vec![red("acl_t")]),
+        (
+            "extern \"C\" {\n    #[link_name = \"fork\"]\n    fn acl_free() -> i32;\n}\n",
+            vec![red("#[link_name]")],
+        ),
+        ("extern \"C\" {\n    m! { fn fork(); }\n}\n", vec![red("m")]),
+        (
+            "extern \"C\" {\n    fn acl_a();\n}\nextern \"C\" {\n    fn execve();\n    safe fn acl_b();\n}\n",
+            vec![red("execve")],
+        ),
+    ];
+    for (src, want) in rows {
+        assert_eq!(extern_row_findings("a.rs", &lex(src)), want, "{src}");
+    }
+}
+
+/// The wall-clock ceiling of the extern-row scan on one 100K+ input (#10311).
+const EXTERN_SCAN_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #10311: the extern-row scan is linear: 10 000 acl-only blocks are clean,
+/// and 60 000 nested unclosed `extern {` openings are one finding, each over
+/// 100K bytes and under [`EXTERN_SCAN_CEILING`].
+#[test]
+fn the_extern_row_scan_is_linear_on_large_input_10311() {
+    let clean = "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n}\n".repeat(10_000);
+    let nested = "extern {\n".repeat(60_000);
+    let cases = [
+        (clean, Vec::<String>::new()),
+        (
+            nested,
+            vec!["a.rs is rowed R_SHAPE_EXTERN but declares extern (#10311)".to_string()],
+        ),
+    ];
+    for (src, want) in cases {
+        assert!(src.len() > 100_000);
+        let toks = lex(&src);
+        let t0 = std::time::Instant::now();
+        assert_eq!(extern_row_findings("a.rs", &toks), want);
+        assert!(
+            t0.elapsed() < EXTERN_SCAN_CEILING,
+            "took {:?}",
+            t0.elapsed()
+        );
+    }
+}
+
+/// #10311: the census reads the extern reason of a `SHAPE_ROWS` row as a
+/// claim about the file. A rowed `R_SHAPE_EXTERN` file whose extern block
+/// declares a non-`acl_*` function, an `R_SHAPE_EXTERN` row over a form that
+/// is not an extern block, and an extern block under a row with another
+/// reason are each red with the exact line. The files and lines are written
+/// out by hand; the rows are the committed ones.
+#[test]
+fn the_census_truth_checks_the_extern_reason_of_a_shape_row_10311() {
+    let ext = "src/governance/deferred_audit.rs";
+    let imp = "tests/common/tls_serve.rs";
+    let rows: [(&str, &str, Vec<String>); 4] = [
+        (
+            ext,
+            "unsafe extern \"C\" {\n    fn acl_free() -> i32;\n}\nunsafe extern \"C\" {\n    fn acl_get_entry() -> i32;\n}\n",
+            vec![],
+        ),
+        (
+            ext,
+            "unsafe extern \"C\" {\n    fn acl_free() -> i32;\n}\nunsafe extern \"C\" {\n    fn fork() -> i32;\n}\n",
+            vec![format!(
+                "{ext} is rowed R_SHAPE_EXTERN but declares fork (#10311)"
+            )],
+        ),
+        (
+            ext,
+            "use proptest::prelude::*;\nunsafe extern \"C\" {\n    fn acl_free() -> i32;\n}\n",
+            vec![format!(
+                "{ext}:1: a glob form under an R_SHAPE_EXTERN row, whose reason covers only extern blocks (#10311)"
+            )],
+        ),
+        (
+            imp,
+            "extern \"C\" {\n    fn acl_free() -> i32;\n}\n",
+            vec![format!(
+                "{imp}:1: an extern block under a SHAPE_ROWS row whose reason is not R_SHAPE_EXTERN (#10311)"
+            )],
+        ),
+    ];
+    for (rel, src, want) in rows {
+        let tree = Tree {
+            files: vec![(rel.to_string(), src.as_bytes().to_vec())],
+            links: vec![],
+            packages: vec![],
+            root: None,
+        };
+        let got: Vec<String> = census(&tree)
+            .into_iter()
+            .filter(|l| l.ends_with("(#10311)"))
+            .collect();
+        assert_eq!(got, want, "{rel}:\n{src}");
+    }
 }
 
 /// A row with a short reason, a row out of order and a file held twice are

@@ -1,0 +1,68 @@
+{
+  "rows": [
+    [".cargo/config.toml", "[patch.crates-io.libc]\npath = \"../libc\"\n", [
+      ".cargo/config.toml: patch.crates-io.libc patches the watched crate libc; a patched watched crate runs code the census never reads (#10301)"
+    ]],
+    [".cargo/config", "[patch.crates-io]\nproptest = { path = \"p\" }\nserde = { path = \"s\" }\n", [
+      ".cargo/config: patch.crates-io.proptest patches the watched crate proptest; a patched watched crate runs code the census never reads (#10301)"
+    ]],
+    ["crates/x/.cargo/config.toml", "[patch.crates-io]\nmine = { package = \"nix\", path = \"n\" }\n", [
+      "crates/x/.cargo/config.toml: patch.crates-io.mine patches the watched crate nix; a patched watched crate runs code the census never reads (#10301)"
+    ]],
+    [".cargo/config.toml", "[patch.crates-io]\nRusty-Fork = { path = \"r\" }\n", [
+      ".cargo/config.toml: patch.crates-io.Rusty-Fork patches the watched crate Rusty-Fork; a patched watched crate runs code the census never reads (#10301)"
+    ]],
+    ["crates/x/.cargo/config.toml", "paths = [\"../nix\"]\n", [
+      "crates/x/.cargo/config.toml: paths overrides crates with local copies; a path override can replace a watched crate with code the census never reads (#10301)"
+    ]],
+    [".cargo/config.toml", "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"vendor\"\n", [
+      ".cargo/config.toml: source.crates-io replaces a crate source; a replaced source can serve a watched crate the census never reads (#10301)",
+      ".cargo/config.toml: source.vendored replaces a crate source; a replaced source can serve a watched crate the census never reads (#10301)"
+    ]],
+    [".cargo/config.toml", "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"--extern\", \"libc=/x/liblibc.rlib\"]\n", [
+      ".cargo/config.toml: target.x86_64-unknown-linux-gnu.rustflags.#0 names a watched crate or an extern in a compiler flag; a flag can replace a watched crate with code the census never reads (#10301)",
+      ".cargo/config.toml: target.x86_64-unknown-linux-gnu.rustflags.#1 names a watched crate or an extern in a compiler flag; a flag can replace a watched crate with code the census never reads (#10301)"
+    ]],
+    [".cargo/config.toml", "[build]\nrustflags = \"-L /opt/nix\"\n", [
+      ".cargo/config.toml: build.rustflags names a watched crate or an extern in a compiler flag; a flag can replace a watched crate with code the census never reads (#10301)"
+    ]],
+    [".cargo/config.toml", "[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\njobs = 4\n", []],
+    [".cargo/config.toml", "[build]\nrustc-wrapper = \"w\"\n", [
+      ".cargo/config.toml: build.rustc-wrapper is a cargo config form the census does not understand; a form it does not read is a process start nobody counted (#10301)"
+    ]],
+    [".cargo/config.toml", "[target.'cfg(unix)']\nrunner = \"r\"\n", [
+      ".cargo/config.toml: target.cfg(unix).runner is a cargo config form the census does not understand; a form it does not read is a process start nobody counted (#10301)"
+    ]],
+    [".cargo/config.toml", "[target.x86_64-unknown-linux-gnu]\nlinker = \"cc\"\n", [
+      ".cargo/config.toml: target.x86_64-unknown-linux-gnu.linker is a cargo config form the census does not understand; a form it does not read is a process start nobody counted (#10301)"
+    ]],
+    [".cargo/config.toml", "[env]\nPROPTEST_FORK = \"true\"\nOTHER = \"1\"\n", [
+      ".cargo/config.toml: env.PROPTEST_FORK sets a proptest variable for every cargo command; a config can switch proptest fork on (#10301)"
+    ]],
+    [".cargo/config.toml", "[env]\nPROPTEST_TIMEOUT = { value = \"0\", force = true }\n", [
+      ".cargo/config.toml: env.PROPTEST_TIMEOUT sets a proptest variable for every cargo command; a config can switch proptest fork on (#10301)"
+    ]],
+    [".cargo/config.toml", "include = \"other.toml\"\n", [
+      ".cargo/config.toml: include is a cargo config form the census does not understand; a form it does not read is a process start nobody counted (#10301)"
+    ]],
+    [".cargo/config.toml", "[unstable]\nbuild-std = [\"std\"]\n", [
+      ".cargo/config.toml: unstable is a cargo config form the census does not understand; a form it does not read is a process start nobody counted (#10301)"
+    ]],
+    [".cargo/config.toml", "[alias]\nt = \"test\"\n\n[term]\nverbose = true\n\n[net]\noffline = true\n", []],
+    [".cargo/config.toml", "[build\n", [
+      ".cargo/config.toml: not TOML the census reads; an unparseable cargo config is not clean (#10301)"
+    ]],
+    [".cargo/config.toml", "[build]\njobs = 1.5\n", [
+      ".cargo/config.toml: not TOML the census reads; an unparseable cargo config is not clean (#10301)"
+    ]],
+    ["crates/x/cargo/config.toml", "[patch.crates-io.libc]\npath = \"../libc\"\n", []],
+    [".cargo/config.toml.bak", "[patch.crates-io.libc]\npath = \"../libc\"\n", []],
+    [".cargo/config.toml", "[patch.crates-io]\n\"rusty_forK\" = { path = \"r\" }\n", []],
+    [".cargo/config.toml", "[env]\n\"PROPTEſT_FORK\" = \"true\"\n", []]
+  ],
+  "bytes": [
+    [".cargo/config.toml", [255, 254], [
+      ".cargo/config.toml: not UTF-8; an unreadable cargo config is not clean (#10301)"
+    ]]
+  ]
+}
