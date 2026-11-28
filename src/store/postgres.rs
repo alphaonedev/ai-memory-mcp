@@ -27066,16 +27066,24 @@ impl MemoryStore for PostgresStore {
             .map(str::to_string);
 
         // Append/check history BEFORE changing the flat row. The helper
-        // rechecks the exact witness tuple against locked storage state.
-        self.append_pubkey_version_tx(
-            &mut tx,
-            agent_id,
-            &pubkey_b64,
-            flat_pubkey.as_deref(),
-            &proof,
-            &now,
-        )
-        .await?;
+        // rechecks the exact witness tuple against locked storage state;
+        // `KeyUnchanged` short-circuits before any UPDATE memories (#10109).
+        let crate::identity::pubkey_bind::LineageKeySync::KeyWritten(_write_cap) = self
+            .append_pubkey_version_tx(
+                &mut tx,
+                agent_id,
+                &pubkey_b64,
+                flat_pubkey.as_deref(),
+                &proof,
+                &now,
+            )
+            .await?
+        else {
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("bind_agent_pubkey commit tx", e))?;
+            return Ok(());
+        };
 
         if let Some(obj) = meta.as_object_mut() {
             obj.insert(
@@ -27764,29 +27772,16 @@ impl MemoryStore for PostgresStore {
         let successor_pubkey =
             crate::identity::keypair::canonical_public_base64(&record.successor_pubkey_b64)
                 .map_err(|e| invalid(format!("canonicalize lineage successor: {e:#}")))?;
-        self.append_pubkey_version_tx(
-            &mut tx,
-            agent_id,
-            &successor_pubkey,
-            flat_pubkey.as_deref(),
-            &proof,
-            &now_rfc,
-        )
-        .await?;
-        if let Some(obj) = meta.as_object_mut() {
-            obj.insert(
-                field_names::AGENT_PUBKEY.to_string(),
-                serde_json::Value::String(successor_pubkey),
-            );
-            obj.insert(
-                META_PUBKEY_BOUND_AT.to_string(),
-                serde_json::Value::String(now_rfc.clone()),
-            );
-        }
-        crate::storage::downgrade_registration_attestation(&mut meta);
-        let content = serde_json::to_string(&meta).map_err(|e| StoreError::IntegrityFailed {
-            detail: format!("serialize agent metadata for lineage append: {e}"),
-        })?;
+        let key_sync = self
+            .append_pubkey_version_tx(
+                &mut tx,
+                agent_id,
+                &successor_pubkey,
+                flat_pubkey.as_deref(),
+                &proof,
+                &now_rfc,
+            )
+            .await?;
 
         let epoch_i64 = i64::try_from(record.epoch)
             .map_err(|_| invalid("lineage epoch exceeds i64".to_string()))?;
@@ -27830,42 +27825,66 @@ impl MemoryStore for PostgresStore {
             )
         })?;
 
-        // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the flat
-        // agent_pubkey sync rewrites the registration row's content in
-        // the SAME tx as the lineage body + witness (C4/C6 — the
-        // untouched attest_write gate keeps reading this key). Same
-        // UPDATE shape as bind_agent_pubkey, including the flag-gated
-        // identity-only supersede leaf below.
-        sqlx::query(
-            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
-             WHERE namespace = $1 AND title = $2",
-        )
-        .bind(AGENTS_NAMESPACE)
-        .bind(&title)
-        .bind(&meta)
-        .bind(&content)
-        .bind(&now_rfc)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err(crate::handlers::BIND_AGENT_PUBKEY_ACTION, e))?;
-        if crate::config::append_only_enabled() {
-            let (mid,): (String,) = sqlx::query_as(SQL_SELECT_ID_BY_NS_TITLE)
+        // #10196/#10197: update the flat `_agents` row ONLY when the key
+        // actually changed (`LineageKeySync::KeyWritten(cap)`). Same-key
+        // genesis / self-succession (`KeyUnchanged`) records the lineage row
+        // and leaves `_agents` (`write_signature`, `attest_level`, `updated_at`,
+        // `pubkey_bound_at`) and `memory_revisions` untouched.
+        match key_sync {
+            crate::identity::pubkey_bind::LineageKeySync::KeyWritten(_write_cap) => {
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.insert(
+                        field_names::AGENT_PUBKEY.to_string(),
+                        serde_json::Value::String(successor_pubkey),
+                    );
+                    obj.insert(
+                        META_PUBKEY_BOUND_AT.to_string(),
+                        serde_json::Value::String(now_rfc.clone()),
+                    );
+                }
+                crate::storage::downgrade_registration_attestation(&mut meta);
+                let content =
+                    serde_json::to_string(&meta).map_err(|e| StoreError::IntegrityFailed {
+                        detail: format!("serialize agent metadata for lineage append: {e}"),
+                    })?;
+
+                // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the flat
+                // agent_pubkey sync rewrites the registration row's content in
+                // the SAME tx as the lineage body + witness (C4/C6 — the
+                // untouched attest_write gate keeps reading this key).
+                sqlx::query(
+                    "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
+                     WHERE namespace = $1 AND title = $2",
+                )
                 .bind(AGENTS_NAMESPACE)
                 .bind(&title)
-                .fetch_one(&mut *tx)
+                .bind(&meta)
+                .bind(&content)
+                .bind(&now_rfc)
+                .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err(CTX_READ_AGENT_ID_FOR_LEAF, e))?;
-            pg_emit_revision_leaf_if_enabled(
-                &mut tx,
-                &mid,
-                crate::revisions::RecordKind::Supersede,
-                None,
-                AGENTS_NAMESPACE,
-                None,
-                &now_rfc,
-            )
-            .await
-            .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
+                .map_err(|e| to_store_err(crate::handlers::BIND_AGENT_PUBKEY_ACTION, e))?;
+                if crate::config::append_only_enabled() {
+                    let (mid,): (String,) = sqlx::query_as(SQL_SELECT_ID_BY_NS_TITLE)
+                        .bind(AGENTS_NAMESPACE)
+                        .bind(&title)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err(CTX_READ_AGENT_ID_FOR_LEAF, e))?;
+                    pg_emit_revision_leaf_if_enabled(
+                        &mut tx,
+                        &mid,
+                        crate::revisions::RecordKind::Supersede,
+                        None,
+                        AGENTS_NAMESPACE,
+                        None,
+                        &now_rfc,
+                    )
+                    .await
+                    .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
+                }
+            }
+            crate::identity::pubkey_bind::LineageKeySync::KeyUnchanged(_) => {}
         }
 
         // C1/C3 witness — the IN-TX signed_events append (clone of the

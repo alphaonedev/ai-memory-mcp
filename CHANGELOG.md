@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#10109, #10196, #10197, #10198, #10199 — same-key pubkey rebind and lineage genesis skip redundant `_agents` writes on both backends)
+
+- `PUT /api/v1/agents/{id}/pubkey` and the shared `bind_agent_pubkey` / `append_lineage_record` funnel now return typed `LineageKeySync::{KeyWritten(BindWriteCap), KeyUnchanged(KeyUnchangedSource)}` across both SQLite and PostgreSQL so idempotent same-key rebinds and same-key lineage genesis/self-succession preserve `_agents` (`write_signature`, `attest_level`, `updated_at`, `pubkey_bound_at`), `agent_pubkey_history`, `memory_revisions`, and `row_attestations` byte-for-byte on both armed and unarmed stores while recording the lineage record when requested (#10109, #10196, #10197, #10198, #10199). Refusals keep the opaque HTTP 403 `BIND_PROOF_REFUSED` wire contract while emitting an exact per-cause operator warning and forensic audit reason. Fragment: `changelog.d/10109.fixed.md`.
+
 ### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
 
 - `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.

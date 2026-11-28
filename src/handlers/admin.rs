@@ -361,6 +361,78 @@ fn bind_refused_response() -> axum::response::Response {
         .into_response()
 }
 
+/// #10109 (r1 item 5) / #10227 — operator log + forensic audit + opaque #3464
+/// wire refusal when an HTTP bind is refused by storage authorization. Matches
+/// the typed [`crate::identity::pubkey_bind::StorageAuthRefusal`] exhaustively
+/// (zero wildcard string match) and emits an `ERROR`-level log + distinct
+/// `unclassified_refusal` audit slug when a backend refusal carries no
+/// recognized cause. Logs `agent_id` and `cause` only (never key bytes, nonce,
+/// or proof), while keeping the HTTP 403 wire response identically opaque
+/// (`BIND_PROOF_REFUSED`).
+fn refuse_existing_identity_rebind(
+    caller: &str,
+    agent_id: &str,
+    pubkey: &str,
+    cause: Option<crate::identity::pubkey_bind::StorageAuthRefusal>,
+) -> axum::response::Response {
+    use crate::identity::pubkey_bind::StorageAuthRefusal;
+
+    let audit_reason: &'static str = match cause {
+        Some(StorageAuthRefusal::ExistingIdentityRequiresLineage) => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = StorageAuthRefusal::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE,
+                "{}",
+                StorageAuthRefusal::LOG_EXISTING_IDENTITY_REQUIRES_LINEAGE,
+            );
+            StorageAuthRefusal::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE
+        }
+        Some(StorageAuthRefusal::ClosedIdentityRequiresRecovery) => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY,
+                "{}",
+                StorageAuthRefusal::LOG_CLOSED_IDENTITY_REQUIRES_RECOVERY,
+            );
+            StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY
+        }
+        Some(StorageAuthRefusal::NonCanonicalStoredKey) => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = StorageAuthRefusal::AUDIT_NON_CANONICAL_STORED_KEY,
+                "{}",
+                StorageAuthRefusal::LOG_NON_CANONICAL_STORED_KEY,
+            );
+            StorageAuthRefusal::AUDIT_NON_CANONICAL_STORED_KEY
+        }
+        Some(StorageAuthRefusal::BindingNotAuthorized) => {
+            tracing::warn!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = StorageAuthRefusal::AUDIT_BINDING_NOT_AUTHORIZED,
+                "{}",
+                StorageAuthRefusal::LOG_BINDING_NOT_AUTHORIZED,
+            );
+            StorageAuthRefusal::AUDIT_BINDING_NOT_AUTHORIZED
+        }
+        None => {
+            tracing::error!(
+                target: "identity.bind.requires_succession",
+                agent_id = %agent_id,
+                cause = StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL,
+                "{}",
+                StorageAuthRefusal::LOG_UNCLASSIFIED_REFUSAL,
+            );
+            StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL
+        }
+    };
+    record_pubkey_bind_decision(caller, "refuse", agent_id, pubkey, audit_reason);
+    bind_refused_response()
+}
+
 /// #8494 — the bind routes' refusal vocabulary for the shared
 /// [`crate::handlers::admin_role::require_key_bound_admin`] gate.
 const BIND_PRINCIPAL_GATE: crate::handlers::admin_role::PrincipalGate =
@@ -517,17 +589,15 @@ pub async fn bind_agent_pubkey(
                 )
                     .into_response()
             }
-            Err(crate::store::StoreError::PermissionDenied { action, .. })
+            Err(crate::store::StoreError::PermissionDenied { action, reason, .. })
                 if action == BIND_AGENT_PUBKEY_ACTION =>
             {
-                record_pubkey_bind_decision(
+                refuse_existing_identity_rebind(
                     &caller,
-                    "refuse",
                     &agent_id,
                     &pubkey,
-                    "existing_identity_requires_lineage",
-                );
-                bind_refused_response()
+                    crate::identity::pubkey_bind::StorageAuthRefusal::from_audit_reason(&reason),
+                )
             }
             Err(e) => {
                 record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");
@@ -560,14 +630,10 @@ pub async fn bind_agent_pubkey(
                 if e.downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
                     .is_some() =>
             {
-                record_pubkey_bind_decision(
-                    &caller,
-                    "refuse",
-                    &agent_id,
-                    &pubkey,
-                    "existing_identity_requires_lineage",
-                );
-                bind_refused_response()
+                let cause = e
+                    .downcast_ref::<crate::identity::pubkey_bind::StorageAuthRefusal>()
+                    .copied();
+                refuse_existing_identity_rebind(&caller, &agent_id, &pubkey, cause)
             }
             Err(e) => {
                 record_pubkey_bind_decision(&caller, "warn", &agent_id, &pubkey, "backend_error");
@@ -2150,6 +2216,166 @@ mod pubkey_bind_audit_tests {
         assert_eq!(
             rows[1].payload["reason"],
             "bootstrap_or_idempotent_reassertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuse_existing_identity_rebind_exact_log_and_audit_per_variant_10229() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        struct GuardWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for GuardWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = GuardWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                GuardWriter(std::sync::Arc::clone(&self.0))
+            }
+        }
+
+        let _guard = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join("admin-bind-audit-10229");
+        std::fs::create_dir_all(&root).expect("audit scratch dir");
+        let dir = tempfile::tempdir_in(&root).expect("audit tempdir");
+        crate::governance::audit::shutdown();
+        crate::governance::audit::init(dir.path(), None).expect("init audit");
+
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(buf.clone())
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
+
+        use crate::identity::pubkey_bind::StorageAuthRefusal;
+
+        let all_slugs = [
+            StorageAuthRefusal::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE,
+            StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY,
+            StorageAuthRefusal::AUDIT_NON_CANONICAL_STORED_KEY,
+            StorageAuthRefusal::AUDIT_BINDING_NOT_AUTHORIZED,
+            StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL,
+        ];
+        let mut cases: Vec<(Option<StorageAuthRefusal>, &str, &str, &str)> =
+            StorageAuthRefusal::ALL
+                .into_iter()
+                .map(|variant| {
+                    (
+                        Some(variant),
+                        "WARN",
+                        variant.audit_reason(),
+                        variant.log_message(),
+                    )
+                })
+                .collect();
+        // Verify unknown / wire-message strings parse to None (unclassified_refusal, ERROR).
+        assert_eq!(
+            StorageAuthRefusal::from_audit_reason("unknown_future_cause_10227"),
+            None
+        );
+        assert_eq!(
+            StorageAuthRefusal::from_audit_reason(crate::errors::msg::BIND_PROOF_REFUSED),
+            None
+        );
+        cases.push((
+            None,
+            "ERROR",
+            StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL,
+            StorageAuthRefusal::LOG_UNCLASSIFIED_REFUSAL,
+        ));
+
+        let actor = "ai:bind-audit-10229";
+        for (input, expected_level, expected_slug, expected_msg) in &cases {
+            buf.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let resp =
+                refuse_existing_identity_rebind(actor, "ai:target-10229", "pk-10229", *input);
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+                .await
+                .expect("wire body");
+            let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+            assert_eq!(
+                wire,
+                serde_json::json!({ "error": crate::errors::msg::BIND_PROOF_REFUSED }),
+                "wire refusal must remain opaque for {input:?}"
+            );
+
+            let captured = String::from_utf8(
+                buf.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )
+            .expect("utf8");
+            let lines: Vec<&str> = captured
+                .lines()
+                .filter(|l| l.contains("identity.bind.requires_succession"))
+                .collect();
+            let [line] = lines.as_slice() else {
+                panic!("expected exactly one tracing line for {input:?}, got: {captured}");
+            };
+            assert!(
+                line.contains(expected_level),
+                "expected log level {expected_level} for {input:?}, got: {line}"
+            );
+            let expected_cause = format!("cause=\"{expected_slug}\"");
+            assert!(
+                line.contains(&expected_cause),
+                "expected exact {expected_cause} for {input:?}, got: {line}"
+            );
+            assert!(
+                line.contains(expected_msg),
+                "expected exact message '{expected_msg}' for {input:?}, got: {line}"
+            );
+            for other in all_slugs.iter().filter(|s| **s != *expected_slug) {
+                assert!(
+                    !line.contains(&format!("cause=\"{other}\"")),
+                    "log line for {input:?} must not emit foreign cause {other}: {line}"
+                );
+            }
+        }
+        crate::governance::audit::shutdown();
+
+        let body = std::fs::read_dir(dir.path())
+            .expect("read audit dir")
+            .filter_map(Result::ok)
+            .map(|entry| std::fs::read_to_string(entry.path()).expect("read audit file"))
+            .collect::<String>();
+        let reasons: Vec<String> = body
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<crate::governance::audit::ForensicDecision>(line).ok()
+            })
+            .filter(|row| {
+                row.actor == actor
+                    && row.decision == "refuse"
+                    && row.kind == BIND_AGENT_PUBKEY_ACTION
+            })
+            .filter_map(|row| row.payload["reason"].as_str().map(str::to_string))
+            .collect();
+        let expected_reasons: Vec<String> = cases.iter().map(|c| c.2.to_string()).collect();
+        assert_eq!(
+            reasons, expected_reasons,
+            "#10227/#10229: forensic audit reasons must match exact per-variant slugs including unclassified_refusal"
         );
     }
 }
