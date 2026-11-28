@@ -55,6 +55,8 @@ mod census_rows;
 mod proptest_guard;
 #[path = "common/rust_lex.rs"]
 mod rust_lex;
+#[path = "common/census_r4_red_10286.rs"]
+mod census_r4_red;
 
 use census_rows::{ENV_NAME_ROWS, SHAPE_ROWS, TOKEN_ROWS};
 
