@@ -2893,6 +2893,9 @@ struct TypeGraph {
     decls: Vec<Decl>,
     /// #10323: each walked path to the scope of its file.
     files: BTreeMap<String, usize>,
+    /// #10324: every scope visit of [`TypeGraph::glob_supplies`], read by
+    /// the cost test through [`token_census_counted`].
+    glob_visits: std::cell::Cell<u64>,
 }
 
 /// One keyword position of a lexed file, for [`TypeGraph::item`].
@@ -3366,6 +3369,8 @@ impl TypeGraph {
             if !seen.insert(s) {
                 continue;
             }
+            self.glob_visits
+                .set(self.glob_visits.get().saturating_add(1));
             let sc = &self.scopes[s];
             if s != scope && sc.items.contains_key(name) {
                 return Supply::Glob;
@@ -4684,6 +4689,16 @@ fn token_census_with(
     files: &[(String, String)],
     tables: &Tables,
 ) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
+    let (statics, includes, _) = token_census_counted(files, tables);
+    (statics, includes)
+}
+
+/// #10324: [`token_census_with`], with the number of scope visits that
+/// [`TypeGraph::glob_supplies`] made.
+fn token_census_counted(
+    files: &[(String, String)],
+    tables: &Tables,
+) -> (Vec<StaticFinding>, Vec<IncludeFinding>, u64) {
     let (rows, bad) = parse_table(tables.statics);
     let mut statics: Vec<StaticFinding> = bad.into_iter().map(StaticFinding::Table).collect();
     let mut includes = Vec::new();
@@ -4872,7 +4887,7 @@ fn token_census_with(
         }
     }
     includes.extend(include_counts(&lexed, tables.includes));
-    (statics, includes)
+    (statics, includes, graph.glob_visits.get())
 }
 
 /// #10276: every identifier token of [`COUNTED_IDENTS`] (a raw `r#` form
@@ -8281,6 +8296,12 @@ fn r3_foreign(root: &str, name: &str) -> Why {
 /// The census of `files`, every file that writes `static FORM` carrying a
 /// `once` row for it.
 fn r3_census(files: &[(&str, &str)]) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
+    let (statics, includes, _) = r3_census_counted(files);
+    (statics, includes)
+}
+
+/// #10324: [`r3_census`], with the scope visits of the glob resolver.
+fn r3_census_counted(files: &[(&str, &str)]) -> (Vec<StaticFinding>, Vec<IncludeFinding>, u64) {
     let mut table = String::new();
     for (file, text) in files {
         if text.contains("static FORM") {
@@ -8292,7 +8313,7 @@ fn r3_census(files: &[(&str, &str)]) -> (Vec<StaticFinding>, Vec<IncludeFinding>
         .iter()
         .map(|(f, t)| ((*f).to_string(), (*t).to_string()))
         .collect();
-    token_census_with(&owned, &bare(&table))
+    token_census_counted(&owned, &bare(&table))
 }
 
 /// Runs every case and returns one line per case whose findings differ.
@@ -9383,6 +9404,110 @@ fn import_through_glob_resolves_after_settle_10325() {
             ),
         ],
         vec![r3_lock(b, 3)],
+        None,
+    )];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10324: the scope visits of the glob resolver over a chain of `n` walked
+/// modules, each globbing the next and writing `static FORM: Plain`, the
+/// last binding `Plain`, and one hub module globbing every link. Every
+/// static is judged exactly: `Plain` is glob-supplied in each of them.
+fn glob_chain_visits(n: usize) -> u64 {
+    let mut files: Vec<(String, String)> = Vec::with_capacity(n + 2);
+    let mut want: Vec<String> = Vec::with_capacity(n + 1);
+    let mut hub = String::new();
+    for i in 0..n {
+        let path = format!("src/m{i}.rs");
+        let next = i + 1;
+        files.push((
+            path.clone(),
+            format!("use crate::m{next}::*;\nstatic FORM: Plain = X;\n"),
+        ));
+        want.push(format!(
+            "{:?}",
+            r3_unres(&path, 2, Why::Glob("Plain".into()))
+        ));
+        let _ = writeln!(hub, "use crate::m{i}::*;");
+    }
+    files.push((
+        format!("src/m{n}.rs"),
+        "pub struct Plain(u8);\n".to_string(),
+    ));
+    hub.push_str("static FORM: Plain = X;\n");
+    files.push(("src/hub.rs".to_string(), hub));
+    want.push(format!(
+        "{:?}",
+        r3_unres("src/hub.rs", n + 1, Why::Glob("Plain".into()))
+    ));
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let (statics, includes, visits) = r3_census_counted(&refs);
+    let mut got: Vec<String> = statics.iter().map(|f| format!("{f:?}")).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "glob chain of {n} modules");
+    assert_eq!(includes, no_store_url(), "glob chain of {n} modules");
+    visits
+}
+
+/// #10324: each scope's glob closure is walked once, not once per lookup:
+/// at four times the modules of a glob chain with fan-out, the resolver
+/// makes at most four times the scope visits, plus a constant. The bound is
+/// on operation counts, never on wall-clock time.
+#[test]
+fn glob_chain_resolution_cost_is_linear_10324() {
+    const CHAIN_SMALL: usize = 250;
+    const GROWTH: usize = 4;
+    const SLACK: u64 = 64;
+    let small = glob_chain_visits(CHAIN_SMALL);
+    let large = glob_chain_visits(CHAIN_SMALL * GROWTH);
+    let growth = u64::try_from(GROWTH).expect("GROWTH fits u64");
+    let floor = u64::try_from(CHAIN_SMALL).expect("CHAIN_SMALL fits u64");
+    // Each static is looked up through at least one glob: a counter that
+    // counts nothing proves nothing.
+    assert!(
+        small >= floor,
+        "glob visits: {small} at {CHAIN_SMALL} modules"
+    );
+    assert!(
+        large <= growth * small + SLACK,
+        "glob visits: {small} at {CHAIN_SMALL} modules, {large} at {} modules",
+        CHAIN_SMALL * GROWTH
+    );
+}
+
+/// #10324: a cycle of globs terminates and resolves as before. Through the
+/// cycle `ca` <-> `cb`, with `cb` globbing `cd` that binds `Plain`, both
+/// statics are glob-supplied; the cycle `ce` <-> `cf` binds no `Plain`, so
+/// its bare `Plain` has no definition and its bare `Mutex` is the lock; `cg`
+/// globs `ch`, which binds no `Plain`. One name looked up from scopes whose
+/// glob closures differ resolves per scope.
+#[test]
+fn glob_cycle_terminates_and_resolves_10324() {
+    let cases: Vec<R3Case> = vec![(
+        "glob-cycles",
+        vec![
+            ("src/ca.rs", "use crate::cb::*;\nstatic FORM: Plain = X;\n"),
+            (
+                "src/cb.rs",
+                "use crate::ca::*;\nuse crate::cd::*;\nstatic FORM: Plain = X;\n",
+            ),
+            ("src/cd.rs", "pub struct Plain(u8);\n"),
+            ("src/ce.rs", "use crate::cf::*;\nstatic FORM: Plain = X;\n"),
+            ("src/cf.rs", "use crate::ce::*;\nstatic FORM: Mutex = X;\n"),
+            ("src/cg.rs", "use crate::ch::*;\nstatic FORM: Plain = X;\n"),
+            ("src/ch.rs", "pub struct Other(u8);\n"),
+        ],
+        vec![
+            r3_unres("src/ca.rs", 2, Why::Glob("Plain".into())),
+            r3_unres("src/cb.rs", 3, Why::Glob("Plain".into())),
+            r3_unres("src/ce.rs", 2, Why::NoDef("Plain".into())),
+            r3_lock("src/cf.rs", 2),
+            r3_unres("src/cg.rs", 2, Why::NoDef("Plain".into())),
+        ],
         None,
     )];
     assert_eq!(r3_misses(cases), Vec::<String>::new());
