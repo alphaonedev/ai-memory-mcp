@@ -1,6 +1,8 @@
 """Run the census row scanner (#10290) as CI runs it: `--check` passes on the
 committed tables and is red, with its exact message, on every tamper."""
 from pathlib import Path
+import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -139,6 +141,37 @@ class CensusRows10286(unittest.TestCase):
             r = run(*args)
             self.assertEqual(r.returncode, EXIT_SCAN, args)
             self.assertIn("usage: census_rows_10286.py", r.stderr)
+
+
+LEX_TABLE = ROOT / "tests/common/census_lex_parity_10305.json"
+LEX_ROWS = 35
+
+
+def scanner_module():
+    """The scanner loaded as a module (its CLI runs only under __main__)."""
+    spec = importlib.util.spec_from_file_location("census_rows_10286", SCANNER)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {SCANNER}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class LexParity10305(unittest.TestCase):
+    """#10305: the rows the Rust test `lexer_parity_table_10305` reads, with
+    the same hand-written expected token strings, lexed by the Python side."""
+
+    def test_lexer_parity_table(self) -> None:
+        rows = json.loads(LEX_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), LEX_ROWS)
+        m = scanner_module()
+        bad = []
+        for i, (text, want) in enumerate(rows):
+            toks = m.lex(text)
+            have = m.encode(toks, 0, len(toks) - 1)
+            if have != want:
+                bad.append(f"row {i} {text!r}: lexed {have!r}, want {want!r}")
+        self.assertEqual(bad, [])
 
 
 if __name__ == "__main__":

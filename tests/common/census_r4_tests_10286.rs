@@ -419,3 +419,139 @@ fn the_round_four_scans_are_linear_on_large_input_10286() {
         "round-four scans took {dt:?}"
     );
 }
+
+/// #10305: the lexer parity table. The Python scanner test
+/// (`scripts/ci/tests/test_census_rows_10286.py`) reads the same file, and
+/// every expected token string in it is written by hand in the pin encoding
+/// (`<kind><byte length>:<text>` per token), never read back from a lexer.
+const LEX_PARITY_10305: &str = include_str!("census_lex_parity_10305.json");
+/// The number of rows of [`LEX_PARITY_10305`].
+const LEX_PARITY_ROWS_10305: usize = 35;
+
+/// The pin encoding of every token of `text`.
+fn encoded_10305(text: &str) -> String {
+    let toks = lex(text);
+    let hi = i64::try_from(toks.len()).unwrap_or(i64::MAX) - 1;
+    census_pins::encode(&toks, 0, hi)
+}
+
+#[test]
+fn lexer_parity_table_10305() {
+    let rows: Vec<(String, String)> =
+        serde_json::from_str(LEX_PARITY_10305).expect("the #10305 table is a JSON list of pairs");
+    assert_eq!(rows.len(), LEX_PARITY_ROWS_10305, "rows of the #10305 table");
+    let bad: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (text, want))| {
+            let have = encoded_10305(text);
+            (have != *want).then(|| format!("row {i} {text:?}: lexed {have:?}, want {want:?}"))
+        })
+        .collect();
+    assert_eq!(bad, Vec::<String>::new(), "#10305 lexer rows");
+}
+
+/// #10305: a char or numeric literal inside a site window is part of its pin.
+#[test]
+fn literal_edit_changes_pin_10305() {
+    let digests = |text: &str| -> Vec<String> { sites(text).into_iter().map(|s| s.digest).collect() };
+    let pairs = [
+        ("fn f() { let _ = Command('a'); }", "fn f() { let _ = Command('b'); }"),
+        ("fn f() { let _ = Command(1); }", "fn f() { let _ = Command(2); }"),
+        ("fn f() { let _ = Command(1u8); }", "fn f() { let _ = Command(1u16); }"),
+        ("fn f() { let _ = Command(b'a'); }", "fn f() { let _ = Command(b'b'); }"),
+        ("fn f() { let _ = Command('\\''); }", "fn f() { let _ = Command('\\\\'); }"),
+    ];
+    let same: Vec<&str> = pairs
+        .iter()
+        .filter(|(a, b)| digests(a) == digests(b))
+        .map(|(a, _)| *a)
+        .collect();
+    assert_eq!(same, Vec::<&str>::new(), "a literal edit kept the pin");
+}
+
+/// #10306: the published FIPS 180-4 vectors, and the padding block
+/// boundaries with the values Python's `hashlib.sha256` gives.
+#[test]
+fn census_sha256_fips_180_4_vectors_10306() {
+    const FIPS_448: &[u8] = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    const FIPS_896: &[u8] = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    const MILLION: usize = 1_000_000;
+    let hex = |d: [u8; 32]| {
+        d.iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    };
+    let a = |n: usize| vec![b'a'; n];
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        (
+            "empty",
+            Vec::new(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            "abc",
+            b"abc".to_vec(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            "448-bit",
+            FIPS_448.to_vec(),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+        (
+            "896-bit",
+            FIPS_896.to_vec(),
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+        ),
+        (
+            "million a",
+            a(MILLION),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+        ),
+        (
+            "a*55",
+            a(55),
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+        ),
+        (
+            "a*56",
+            a(56),
+            "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+        ),
+        (
+            "a*63",
+            a(63),
+            "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+        ),
+        (
+            "a*64",
+            a(64),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+        ),
+        (
+            "a*65",
+            a(65),
+            "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+        ),
+        (
+            "a*119",
+            a(119),
+            "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb",
+        ),
+        (
+            "a*120",
+            a(120),
+            "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c",
+        ),
+    ];
+    let bad: Vec<String> = cases
+        .iter()
+        .filter_map(|(name, data, want)| {
+            let have = hex(census_pins::sha256(data));
+            (have != *want).then(|| format!("{name}: {have}, want {want}"))
+        })
+        .collect();
+    assert_eq!(bad, Vec::<String>::new(), "#10306 SHA-256 vectors");
+}
