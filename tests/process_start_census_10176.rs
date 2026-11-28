@@ -1146,7 +1146,7 @@ fn predicate_text(toks: &[Lexed]) -> String {
     let mut s = String::new();
     for t in toks {
         match &t.tok {
-            Tok::Ident(v) => {
+            Tok::Ident(v) | Tok::Num(v) => {
                 if s.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
                     s.push(' ');
                 }
@@ -1159,7 +1159,7 @@ fn predicate_text(toks: &[Lexed]) -> String {
                 s.push_str(v);
                 s.push('"');
             }
-            Tok::Char => s.push_str("'?'"),
+            Tok::Char(v) => s.push_str(v),
         }
     }
     s

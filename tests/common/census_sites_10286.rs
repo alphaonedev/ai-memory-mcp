@@ -637,7 +637,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "affaa4da88c7cff9",
         "07660d534ebbbe7e",
         "affaa4da88c7cff9",
-        "e3b4d89dc8d98af3",
+        "2155448af8df5178",
         "3e84393c93db2261",
     ]),
     ("src/enterprise_federation_posture.rs", &[
@@ -708,7 +708,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "420a92c53afbbce4",
         "90b573ca4143bd6d",
         "61babb020bc85216",
-        "6993c7716a79032a",
+        "a32c7ed7af47cf59",
         "0eaa61ae11b25ea4",
         "029d97025bcb547c",
         "823dd936ec935299",
@@ -719,7 +719,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "b80008df1403771b",
         "543aa64ae8a7af91",
         "5c111e6943857036",
-        "af2db2b352467f40",
+        "f6468a240840e9d0",
         "91771798dcf3fbea",
         "ef8ac12cdebb04a0",
         "1b737f40dddc7e7c",
@@ -784,7 +784,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "2ec61df784d663f2",
         "0b52541deeba18dc",
         "10acda9f21fb1ae1",
-        "a400b5b8443c311a",
+        "675b7c06f3a51026",
         "14e2b2b0dc21c098",
         "f1ce19a2cf926b8b",
         "8cfdeb432d154fc7",
@@ -1107,7 +1107,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "e064fc1cca28be71",
         "00e142847372a6ee",
         "4726f33c316fc0cc",
-        "d577fb6c6fd1cded",
+        "01f7b7870dcf3a1e",
         "e71835e219429b66",
         "00e142847372a6ee",
         "e14a729600f90b43",
@@ -1687,8 +1687,8 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "7b1d7d1d371e345b",
         "4f9ebfba8b6bffa6",
         "4f9ebfba8b6bffa6",
-        "e674a36ca1699997",
-        "6fa0d0aa8eb827b4",
+        "4436179a55ed8a75",
+        "b5878475a8c02af7",
     ]),
     ("tests/federation_causal_order_3699.rs", &[
         "2ce35254d598c575",
@@ -1954,7 +1954,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
     ]),
     ("tests/issue_4357_reflect_approval_gate_parity.rs", &[
         "7b1d7d1d371e345b",
-        "f20101c0cef5378c",
+        "17572dbf5ffcbb98",
     ]),
     ("tests/key_dir_guard_not_in_binary_3516.rs", &[
         "4d868b6e0b32e960",
@@ -2787,7 +2787,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "d34de922297f123f",
     ]),
     ("vendor/paste/tests/ui/env-non-string.rs", &[
-        "d34de922297f123f",
+        "8aeade08b4f5e42d",
     ]),
     ("vendor/paste/tests/ui/env-suffix.rs", &[
         "3b9162d7c231f688",

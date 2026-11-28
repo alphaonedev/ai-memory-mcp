@@ -144,7 +144,7 @@ class CensusRows10286(unittest.TestCase):
 
 
 LEX_TABLE = ROOT / "tests/common/census_lex_parity_10305.json"
-LEX_ROWS = 35
+LEX_ROWS = 36
 
 
 def scanner_module():

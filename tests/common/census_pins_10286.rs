@@ -40,9 +40,11 @@
 //! [`SITE_RADIUS`] neighbours on each side, keeping the order of the file's
 //! sites, keeps its pin: the pin binds the reach and its neighbours, not the
 //! enclosing item (the start rules of the census bind the item). Sixteen hex
-//! digits are 64 bits of SHA-256: an
-//! accidental collision is not a concern, and the pin is a review signal,
-//! not a secret.
+//! digits are 64 bits of SHA-256: for n pins the chance of any accidental
+//! collision is about n^2 / 2^65, about 1.3e-13 for the ~2200 pins of the
+//! tree (#10306), and the pin is a review signal, not a secret. The hash is
+//! checked against the FIPS 180-4 vectors by
+//! `census_sha256_fips_180_4_vectors_10306`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -627,7 +629,8 @@ pub(crate) fn encode(t: &[Lexed], lo: i64, hi: i64) -> String {
             Tok::Punct(c) => ('P', c.to_string()),
             Tok::PathSep => ('S', "::".to_string()),
             Tok::Str(s) => ('Q', s.clone()),
-            Tok::Char => ('C', String::new()),
+            Tok::Char(v) => ('C', v.clone()),
+            Tok::Num(v) => ('N', v.clone()),
         };
         let _ = write!(out, "{kind}{}:{text}", text.len());
     }

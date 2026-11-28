@@ -183,12 +183,6 @@ pub(crate) const MACRO_ROWS: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "vendor/paste/tests/test_expr.rs",
-        "<$t",
-        1,
-        "the vendored paste crate's own tests; the workspace never builds them",
-    ),
-    (
-        "vendor/paste/tests/test_expr.rs",
         "hot-arg",
         6,
         "the vendored paste crate's own tests of env! pasting; the workspace never builds them",

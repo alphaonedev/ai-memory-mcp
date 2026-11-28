@@ -426,7 +426,7 @@ fn the_round_four_scans_are_linear_on_large_input_10286() {
 /// (`<kind><byte length>:<text>` per token), never read back from a lexer.
 const LEX_PARITY_10305: &str = include_str!("census_lex_parity_10305.json");
 /// The number of rows of [`LEX_PARITY_10305`].
-const LEX_PARITY_ROWS_10305: usize = 35;
+const LEX_PARITY_ROWS_10305: usize = 36;
 
 /// The pin encoding of every token of `text`.
 fn encoded_10305(text: &str) -> String {
@@ -439,7 +439,11 @@ fn encoded_10305(text: &str) -> String {
 fn lexer_parity_table_10305() {
     let rows: Vec<(String, String)> =
         serde_json::from_str(LEX_PARITY_10305).expect("the #10305 table is a JSON list of pairs");
-    assert_eq!(rows.len(), LEX_PARITY_ROWS_10305, "rows of the #10305 table");
+    assert_eq!(
+        rows.len(),
+        LEX_PARITY_ROWS_10305,
+        "rows of the #10305 table"
+    );
     let bad: Vec<String> = rows
         .iter()
         .enumerate()
@@ -454,13 +458,29 @@ fn lexer_parity_table_10305() {
 /// #10305: a char or numeric literal inside a site window is part of its pin.
 #[test]
 fn literal_edit_changes_pin_10305() {
-    let digests = |text: &str| -> Vec<String> { sites(text).into_iter().map(|s| s.digest).collect() };
+    let digests =
+        |text: &str| -> Vec<String> { sites(text).into_iter().map(|s| s.digest).collect() };
     let pairs = [
-        ("fn f() { let _ = Command('a'); }", "fn f() { let _ = Command('b'); }"),
-        ("fn f() { let _ = Command(1); }", "fn f() { let _ = Command(2); }"),
-        ("fn f() { let _ = Command(1u8); }", "fn f() { let _ = Command(1u16); }"),
-        ("fn f() { let _ = Command(b'a'); }", "fn f() { let _ = Command(b'b'); }"),
-        ("fn f() { let _ = Command('\\''); }", "fn f() { let _ = Command('\\\\'); }"),
+        (
+            "fn f() { let _ = Command('a'); }",
+            "fn f() { let _ = Command('b'); }",
+        ),
+        (
+            "fn f() { let _ = Command(1); }",
+            "fn f() { let _ = Command(2); }",
+        ),
+        (
+            "fn f() { let _ = Command(1u8); }",
+            "fn f() { let _ = Command(1u16); }",
+        ),
+        (
+            "fn f() { let _ = Command(b'a'); }",
+            "fn f() { let _ = Command(b'b'); }",
+        ),
+        (
+            "fn f() { let _ = Command('\\''); }",
+            "fn f() { let _ = Command('\\\\'); }",
+        ),
     ];
     let same: Vec<&str> = pairs
         .iter()

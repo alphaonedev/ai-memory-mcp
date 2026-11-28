@@ -76,18 +76,17 @@ ENV_MOD_SEED = frozenset({"env"})
 ENV_FN_SEED = frozenset({"remove_var", "set_var", "var", "var_os"})
 CONST_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 
-# Rust's char::is_whitespace (the Unicode White_Space property).
-RUST_WHITESPACE = frozenset(
-    "\t\n\x0b\x0c\r \x85\xa0         "
-    "       　"
-)
+# The Unicode Pattern_White_Space set (UAX #31), the blanks rustc skips; the
+# Rust lexer holds the same eleven characters (#10305). Every other non-ASCII
+# character is an identifier character on both sides.
+PATTERN_WHITE_SPACE = frozenset("\t\n\x0b\x0c\r \x85\u200e\u200f\u2028\u2029")
 HEX = frozenset("0123456789abcdefABCDEF")
 
-IDENT, PUNCT, SEP, STR, CHAR = "I", "P", "S", "Q", "C"
+IDENT, PUNCT, SEP, STR, CHAR, NUM = "I", "P", "S", "Q", "C", "N"
 
 
 class Tok:
-    """One token: kind (IDENT, PUNCT, SEP, STR, CHAR), text, 1-based line."""
+    """One token: kind (IDENT, PUNCT, SEP, STR, CHAR, NUM), text, 1-based line."""
 
     __slots__ = ("kind", "text", "line")
 
@@ -101,11 +100,13 @@ class Tok:
 
 
 def _ident_start(c: str) -> bool:
-    return c.isalpha() or c == "_"
+    if c.isascii():
+        return c.isalpha() or c == "_"
+    return c not in PATTERN_WHITE_SPACE
 
 
 def _ident_char(c: str) -> bool:
-    return c.isalnum() or c == "_"
+    return ("0" <= c <= "9") or _ident_start(c)
 
 
 def _hex_value(text: str) -> int | None:
@@ -164,7 +165,7 @@ def _quoted(s: str, i: int, line: int) -> tuple[str, int, int]:
                 i = close + 1
             case "\n":
                 line += 1
-                while i < n and s[i] in RUST_WHITESPACE:
+                while i < n and s[i] in PATTERN_WHITE_SPACE:
                     if s[i] == "\n":
                         line += 1
                     i += 1
@@ -174,7 +175,7 @@ def _quoted(s: str, i: int, line: int) -> tuple[str, int, int]:
 
 
 def lex(s: str) -> list[Tok]:
-    """Tokens of Rust source; comments and numbers are dropped."""
+    """Tokens of Rust source; comments are dropped, a number or char keeps its source text."""
     toks: list[Tok] = []
     i, n, line = 0, len(s), 1
     while i < n:
@@ -184,7 +185,7 @@ def lex(s: str) -> list[Tok]:
             line += 1
             i += 1
             continue
-        if c in RUST_WHITESPACE:
+        if c in PATTERN_WHITE_SPACE:
             i += 1
             continue
         if c == "/" and nx == "/":
@@ -242,17 +243,20 @@ def lex(s: str) -> list[Tok]:
                 i = end
                 continue
             if word == "b" and j < n and s[j] == "'":
-                close = s.find("'", j + 1)
+                # An escaped quote (b'\'') is not the closing quote (#10305).
+                close = s.find("'", j + 3 if s[j + 1:j + 2] == "\\" else j + 1)
                 close = n if close < 0 else close
-                toks.append(Tok(CHAR, "", at))
+                toks.append(Tok(CHAR, s[i:close + 1], at))
                 i = close + 1
                 continue
             toks.append(Tok(IDENT, word, at))
             i = j
             continue
         if "0" <= c <= "9":
+            start = i
             while i < n and (_ident_char(s[i]) or (s[i] == "." and i + 1 < n and "0" <= s[i + 1] <= "9")):
                 i += 1
+            toks.append(Tok(NUM, s[start:i], line))
             continue
         if c == '"':
             at = line
@@ -263,12 +267,13 @@ def lex(s: str) -> list[Tok]:
         if c == "'":
             close = None
             if nx == "\\":
-                p = s.find("'", i + 2)
+                # The escaped character is never the closing quote (#10305).
+                p = s.find("'", i + 3)
                 close = p if p >= 0 else None
             elif i + 2 < n and s[i + 2] == "'":
                 close = i + 2
             if close is not None:
-                toks.append(Tok(CHAR, "", line))
+                toks.append(Tok(CHAR, s[i:close + 1], line))
                 i = close + 1
                 continue
             toks.append(Tok(PUNCT, "'", line))
