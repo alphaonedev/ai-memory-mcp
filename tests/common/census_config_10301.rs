@@ -226,9 +226,7 @@ fn every_cargo_config_form_is_read_or_refused_10301() {
 #[test]
 fn a_large_cargo_config_is_read_in_linear_time_10301() {
     let mut text = String::from("[alias]\n");
-    for i in 0..BOUND_ENTRIES {
-        text.push_str(&format!("a{i:05} = \"test\"\n"));
-    }
+    text.extend((0..BOUND_ENTRIES).map(|i| format!("a{i:05} = \"test\"\n")));
     text.push_str("[patch.crates-io.libc]\npath = \"l\"\n");
     assert!(text.len() > BOUND_BYTES, "#10301 bound fixture size");
     let rel = ".cargo/config.toml";
