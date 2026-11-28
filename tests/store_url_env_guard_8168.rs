@@ -2014,6 +2014,14 @@ enum StaticFinding {
     /// An [`EXCEPTIONS`] row with fewer than [`MIN_REASON_CHARS`] visible
     /// characters of reason.
     ExceptionReasonless { file: String, name: String },
+    /// #10295: an [`EXCEPTIONS`] row whose pinned digest no longer matches
+    /// the static's type: `ty` is the type whose definition changed (its
+    /// module path and name, or `type` for the static's own written type).
+    ExceptionDigest {
+        file: String,
+        name: String,
+        ty: String,
+    },
 }
 
 /// #10275, #10283: why a type is not proven to hold no lock. The order is
@@ -2032,6 +2040,17 @@ enum Why {
     Projection,
     /// A crate type name with no definition in the walked tree.
     NoDef(String),
+    /// #10294: a name reached only through a glob import (`use x::*`),
+    /// of this crate or another: what it names is not read.
+    Glob(String),
+    /// #10293: a name with more than one definition in reach.
+    Ambiguous(String),
+    /// #10293: a name a local definition or a generic parameter shadows,
+    /// where the name is a lock, a proven type or a prelude type.
+    Shadowed(String),
+    /// #10293: a `self`, `super` or `crate` path that lands on no walked
+    /// definition.
+    PathNotLanded(String),
     /// A `std`, `core` or `alloc` type that is not in [`LEAF_TYPES`].
     StdNotProven(String),
     /// A type of another crate that is not in [`LEAF_TYPES`].
@@ -3611,205 +3630,245 @@ fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
 /// #10275, #10285: `(path, static name, reason)` for each static whose
 /// type does not resolve to [`LEAF_TYPES`], or that sits in a
 /// `macro_rules!` body, and is judged by hand. Every row must be used.
-const EXCEPTIONS: &[(&str, &str, &str)] = &[
+const EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
     (
         "src/approvals.rs",
         "APPROVAL_BUS",
+        "",
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/config.rs",
         "DISABLED",
+        "",
         "an Arc of CapabilityConfig whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/config/unknown_keys.rs",
         "SCHEMA",
+        "",
         "a schemars RootSchema: plain schema data built once",
     ),
     (
         "src/enterprise_federation_posture/hardened_env_fixture.rs",
         "POSTURE_AUDIT_DIR",
+        "",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/governance/audit.rs",
         "DAEMON_AUDIT_KEY",
+        "",
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "RECORDER_KEY",
+        "",
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "WRITER",
+        "",
         "a std mpsc Sender of WriteOp: a channel handle, never acquired as a lock",
     ),
     (
         "src/governance/wire_check.rs",
         "GOVERNANCE_PRE_ACTION",
+        "",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/handlers/federation_signing_check.rs",
         "BUNDLE",
+        "",
         "a TrustBundle whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/identity/session_signer.rs",
         "SESSION_SIGNER",
+        "",
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/identity/test_key_dir.rs",
         "DIRECTORY",
+        "",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/inbox_wake.rs",
         "INBOX_WAKE_BUS",
+        "",
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/logging.rs",
         "CENSUS_DUMMY_METADATA_3650",
+        "",
         "a tracing Metadata: static callsite data",
     ),
     (
         "src/logging.rs",
         "INSTALLED_PIPELINE",
+        "",
         "the log pipeline; its foreign leaf is a tracing_appender ErrorCounter, an atomic count",
     ),
     (
         "src/mcp/mod.rs",
         "POST_SIGNAL_ACK_SINK",
+        "",
         "a tokio UnboundedSender of serde_json Value: a channel handle",
     ),
     (
         "src/metrics.rs",
         "HANDLE",
+        "",
         "the prometheus Metrics handle; its vectors are updated through their own API, never held",
     ),
     (
         "src/storage/escalation_deferral.rs",
         "TXN_FRAMES",
+        "",
         "a thread-local RefCell of frames; the foreign leaf is a serde_json Value",
     ),
     (
         "src/storage/escalation_frame_reporting_8184_tests.rs",
         "WRITE_PAUSE",
+        "",
         "a thread-local pair of std mpsc channel ends: a test pause, not a lock",
     ),
     (
         "src/storage/mod.rs",
         "BPE",
+        "",
         "a tiktoken CoreBPE: tokenizer tables built once",
     ),
     (
         "src/storage/mod.rs",
         "GOVERNANCE_PRE_WRITE",
+        "",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/storage/snapshot_file.rs",
         "HOOK",
+        "",
         "a thread-local boxed dyn FnMut test seam, set by one test on its own thread",
     ),
     (
         "src/storage/txn_immediate_5084_tests.rs",
         "HOOK_5084",
+        "",
         "a thread-local boxed dyn FnOnce test seam, set by one test on its own thread",
     ),
     (
         "src/subscriptions.rs",
         "DISPATCH_ROOT_CA",
+        "",
         "a reqwest Certificate: certificate bytes, no lock",
     ),
     (
         "src/subscriptions/webhook_ssrf_8203_tests.rs",
         "DNS_ANSWER",
+        "",
         "a thread-local one-shot DNS answer: a String and an io Result of SocketAddr",
     ),
     (
         "src/test_support.rs",
         "TLS_TEST_PKI",
+        "",
         "the test PKI paths; its foreign leaf is a tempfile TempDir",
     ),
     (
         "tests/agent_projection_txn_9405_9406.rs",
         "RACE",
+        "",
         "a thread-local RefCell of Race: std mpsc channel ends and an Outcome",
     ),
     (
         "tests/append_only_spine_flagon_g6.rs",
         "AUDIT_DIR",
+        "",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/append_only_upsert_supersede_2948.rs",
         "AUDIT_DIR",
+        "",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/auto_atomise/core.rs",
         "Q",
+        "",
         "an AtomiseQueue: a std mpsc SyncSender, a channel handle",
     ),
     (
         "tests/common/mod.rs",
         "CLIENT",
+        "",
         "a reqwest Client: a connection pool handle, never acquired as a lock",
     ),
     (
         "tests/curator_conserves_contradiction_g7.rs",
         "AUDIT_DIR",
+        "",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/entity_register_owner_8497.rs",
         "TRAIL",
+        "",
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/fed_checkpoint_lane_3075_pg.rs",
         "DIR",
+        "",
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_1936_checkpoint_fed.rs",
         "DIR",
+        "",
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_checkpoint_ns_scope_2708.rs",
         "DIR",
+        "",
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/form_1_synthesis.rs",
         "RT",
+        "",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/form_1_synthesis_verdict_matrix.rs",
         "RT",
+        "",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/issue_2122_synthesis_provenance_enforce.rs",
         "RT",
+        "",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_legacy_classifier_paths.rs",
         "RT",
+        "",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_synthesis_error_paths.rs",
         "RT",
+        "",
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
 ];
@@ -3829,7 +3888,7 @@ const INCLUDE_ROWS: &[(&str, &str, usize, &str)] = &[(
 /// The hand-written tables the token census judges against.
 struct Tables<'a> {
     statics: &'a str,
-    exceptions: &'a [(&'a str, &'a str, &'a str)],
+    exceptions: &'a [(&'a str, &'a str, &'a str, &'a str)],
     includes: &'a [(&'a str, &'a str, usize, &'a str)],
 }
 
@@ -3922,7 +3981,7 @@ fn token_census_with(
         .map(|r| (r.path.clone(), r.name.clone()))
         .collect();
     let mut excepted: BTreeMap<(String, String), bool> = BTreeMap::new();
-    for &(file, name, reason) in tables.exceptions {
+    for &(file, name, _digest, reason) in tables.exceptions {
         let key = (file.to_string(), name.to_string());
         if excepted.insert(key, false).is_some() {
             statics.push(StaticFinding::ExceptionDuplicate {
@@ -6188,6 +6247,12 @@ const FORM_ROW: &str = "\tFORM\tonce: a value computed once, no lock\n";
 /// A reason long enough for an exception or an include row.
 const FORM_WHY: &str = "judged by hand for the form table";
 
+/// #10295: the pinned digest of `static FORM: Unknown = X;` in `src/b.rs`.
+const D_UNRES: &str = "";
+
+/// #10295: the pinned digest of the macro-body `INNER` static's type.
+const D_INNER: &str = "";
+
 /// What the deny-by-default census must decide for one form.
 #[derive(Debug)]
 enum Want {
@@ -6206,8 +6271,8 @@ pub type One = Two;\npub type Two = std::sync::RwLock<u8>;\npub struct S;\n\
 pub trait Tr {\n    type Out;\n}\npub type Erased = Box<dyn Fn() + Sync>;\n\
 pub struct Plain {\n    v: u8,\n}\n";
 
-/// An exception row as the tests write it: `(file, name, reason)`.
-type ExceptionRow<'a> = (&'a str, &'a str, &'a str);
+/// An exception row as the tests write it: `(file, name, digest, reason)`.
+type ExceptionRow<'a> = (&'a str, &'a str, &'a str, &'a str);
 
 /// One exception case: `(id, text, exceptions, findings written by hand)`.
 type ExceptionCase<'a> = (&'a str, &'a str, Vec<ExceptionRow<'a>>, Vec<StaticFinding>);
@@ -6243,7 +6308,14 @@ fn type_forms() -> Vec<Form> {
     };
     let mut forms = vec![
         // #10275: types defined in another file of the library.
-        ("cross-file-bare", b, "static FORM: Gate = X;\n", Want::Lock),
+        // #10293: a bare name another file defines is not in this
+        // file's scope.
+        (
+            "cross-file-bare",
+            b,
+            "static FORM: Gate = X;\n",
+            Want::Unres(Why::NoDef("Gate".into())),
+        ),
         (
             "cross-file-path",
             b,
@@ -6548,19 +6620,19 @@ fn type_forms_rest() -> Vec<Form> {
             "static FORM: core::sync::atomic::AtomicBool = X;\n",
             Want::Clean,
         ),
-        // #10275: a file of another crate reads a name it does not define
-        // through every definition of that name (lock wins).
+        // #10293: a file reads only the names its own scope binds; a bare
+        // name another crate defines is not one of them.
         (
             "other-crate-bare-lock",
             "tests/b.rs",
             "static FORM: Gate = X;\n",
-            Want::Lock,
+            Want::Unres(Why::NoDef("Gate".into())),
         ),
         (
             "other-crate-bare-clean",
             "tests/b.rs",
             "static FORM: Plain = X;\n",
-            Want::Clean,
+            Want::Unres(Why::NoDef("Plain".into())),
         ),
     ]
 }
@@ -6629,48 +6701,48 @@ fn exceptions_are_judged_exactly_10275() {
         why: Why::NoDef("Unknown".into()),
     };
     let rows: Vec<ExceptionCase<'_>> = vec![
-        ("taken", UNRES, vec![(b, "FORM", FORM_WHY)], vec![]),
+        ("taken", UNRES, vec![(b, "FORM", D_UNRES, FORM_WHY)], vec![]),
         ("absent", UNRES, vec![], vec![unres.clone()]),
         (
             "other-file",
             UNRES,
-            vec![("src/c.rs", "FORM", FORM_WHY)],
+            vec![("src/c.rs", "FORM", D_UNRES, FORM_WHY)],
             vec![unres.clone(), named(stale, "src/c.rs", "FORM")],
         ),
         (
             "other-name",
             CLEAN,
-            vec![(b, "OTHER", FORM_WHY)],
+            vec![(b, "OTHER", D_UNRES, FORM_WHY)],
             vec![named(stale, b, "OTHER")],
         ),
         (
             "on-a-clean-static",
             CLEAN,
-            vec![(b, "FORM", FORM_WHY)],
+            vec![(b, "FORM", D_UNRES, FORM_WHY)],
             vec![named(stale, b, "FORM")],
         ),
         (
             "duplicate",
             UNRES,
-            vec![(b, "FORM", FORM_WHY), (b, "FORM", FORM_WHY)],
+            vec![(b, "FORM", D_UNRES, FORM_WHY), (b, "FORM", D_UNRES, FORM_WHY)],
             vec![named(dup, b, "FORM")],
         ),
         (
             "short-reason",
             UNRES,
-            vec![(b, "FORM", "too short")],
+            vec![(b, "FORM", D_UNRES, "too short")],
             vec![named(reasonless, b, "FORM")],
         ),
         (
             "blank-reason",
             UNRES,
-            vec![(b, "FORM", "            ")],
+            vec![(b, "FORM", D_UNRES, "            ")],
             vec![named(reasonless, b, "FORM")],
         ),
         (
             "on-a-lock",
             LOCK,
-            vec![(b, "FORM", FORM_WHY)],
+            vec![(b, "FORM", D_UNRES, FORM_WHY)],
             vec![
                 StaticFinding::LockNotLabelled {
                     file: b.into(),
@@ -6730,7 +6802,7 @@ fn static_in_a_macro_body_is_red_10285() {
             "excepted",
             LOCK_BODY,
             "",
-            vec![(b, "INNER", FORM_WHY)],
+            vec![(b, "INNER", D_INNER, FORM_WHY)],
             vec![],
         ),
     ];
@@ -7385,4 +7457,635 @@ fn token_census_cost_is_bounded_10213() {
         ]
     );
     assert_eq!(includes, no_store_url());
+}
+
+// ---------------------------------------------------------------------------
+// #10274 round 3 (#10293, #10294, #10295): a name is judged by where it
+// resolves in the scope that wrote it, and an exception by the content of
+// the definitions behind it.
+// ---------------------------------------------------------------------------
+
+/// One round-3 case: `(id, files (path, text), static findings, include
+/// findings or `None` for exactly [`no_store_url`])`.
+type R3Case = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    Vec<StaticFinding>,
+    Option<Vec<IncludeFinding>>,
+);
+
+/// `LockNotLabelled` for the `FORM` static at `line` of `file`.
+fn r3_lock(file: &str, line: usize) -> StaticFinding {
+    StaticFinding::LockNotLabelled {
+        file: file.into(),
+        name: "FORM".into(),
+        line,
+    }
+}
+
+/// `Unresolvable` for the `FORM` static at `line` of `file`.
+fn r3_unres(file: &str, line: usize, why: Why) -> StaticFinding {
+    StaticFinding::Unresolvable {
+        file: file.into(),
+        name: "FORM".into(),
+        line,
+        why,
+    }
+}
+
+/// `Foreign` for a type of another crate.
+fn r3_foreign(root: &str, name: &str) -> Why {
+    Why::Foreign {
+        root: root.into(),
+        name: name.into(),
+    }
+}
+
+/// The census of `files`, every file that writes `static FORM` carrying a
+/// `once` row for it.
+fn r3_census(files: &[(&str, &str)]) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
+    let mut table = String::new();
+    for (file, text) in files {
+        if text.contains("static FORM") {
+            table.push_str(file);
+            table.push_str(FORM_ROW);
+        }
+    }
+    let owned: Vec<(String, String)> = files
+        .iter()
+        .map(|(f, t)| ((*f).to_string(), (*t).to_string()))
+        .collect();
+    token_census_with(&owned, &bare(&table))
+}
+
+/// Runs every case and returns one line per case whose findings differ.
+fn r3_misses(cases: Vec<R3Case>) -> Vec<String> {
+    let mut miss = Vec::new();
+    for (id, files, want, inc) in cases {
+        let (statics, includes) = r3_census(&files);
+        let want_inc = inc.unwrap_or_else(no_store_url);
+        if statics != want || includes != want_inc {
+            miss.push(format!(
+                "{id}: got {statics:?} {includes:?}, want {want:?} {want_inc:?}"
+            ));
+        }
+    }
+    miss
+}
+
+/// A macro that writes a lock-holding struct `W` in `src/a.rs` (#10293 P1).
+const R3_MACRO_W: &str = "macro_rules! mk {\n    () => {\n        pub struct W {\n            m: std::sync::Mutex<u8>,\n        }\n    };\n}\nmk!();\n";
+
+/// #10293, #10294: the six round-2 review probes. A clean homonym elsewhere
+/// in the tree never vouches for a name, and a glob never supplies one.
+#[test]
+fn review_r2_probes_are_red_10293() {
+    let b = "src/b.rs";
+    let reexport = "pub use dashmap::DashMap;\n";
+    let user = "use crate::a::DashMap;\nstatic FORM: DashMap<u8, u8> = X;\n";
+    let homonym = "pub struct DashMap;\n";
+    let cases: Vec<R3Case> = vec![
+        (
+            "P1-macro-holder-and-homonym",
+            vec![
+                ("src/a.rs", R3_MACRO_W),
+                ("tests/c.rs", "pub struct W;\n"),
+                (b, "static FORM: W = X;\n"),
+            ],
+            vec![r3_unres(b, 1, Why::NoDef("W".into()))],
+            None,
+        ),
+        (
+            "P2-reexport-and-tests-homonym",
+            vec![("src/a.rs", reexport), (b, user), ("tests/c.rs", homonym)],
+            vec![r3_unres(b, 2, r3_foreign("dashmap", "DashMap"))],
+            None,
+        ),
+        (
+            "P2b-reexport-and-src-homonym",
+            vec![("src/a.rs", reexport), (b, user), ("src/c.rs", homonym)],
+            vec![r3_unres(b, 2, r3_foreign("dashmap", "DashMap"))],
+            None,
+        ),
+        (
+            "P2-control-reexport-alone",
+            vec![("src/a.rs", reexport), (b, user)],
+            vec![r3_unres(b, 2, r3_foreign("dashmap", "DashMap"))],
+            None,
+        ),
+        (
+            "P1-control-macro-type-alone",
+            vec![("src/a.rs", R3_MACRO_W), (b, "static FORM: W = X;\n")],
+            vec![r3_unres(b, 1, Why::NoDef("W".into()))],
+            None,
+        ),
+        (
+            "P13-foreign-glob-bare-leaf",
+            vec![(b, "use foreign::*;\nstatic FORM: Cell<u8> = X;\n")],
+            vec![r3_unres(b, 2, Why::Glob("Cell".into()))],
+            None,
+        ),
+        (
+            "P13b-reexported-glob-path",
+            vec![
+                ("src/a.rs", "pub use foreign::*;\n"),
+                (b, "static FORM: crate::a::Cell<u8> = X;\n"),
+            ],
+            vec![r3_unres(b, 1, Why::Glob("Cell".into()))],
+            None,
+        ),
+    ];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10293: the earlier review forms, rewritten, each with its exact finding
+/// under scoped resolution.
+#[test]
+fn earlier_review_forms_stay_red_10293() {
+    let b = "src/b.rs";
+    let count = IncludeFinding::IncludeCount {
+        file: b.into(),
+        ident: "include".into(),
+        rowed: 0,
+        found: 1,
+    };
+    let with = |pre: Vec<IncludeFinding>, post: Vec<IncludeFinding>| {
+        let mut v = pre;
+        v.extend(no_store_url());
+        v.extend(post);
+        Some(v)
+    };
+    let unwalked = |line: usize, value: &str| IncludeFinding::Unwalked {
+        file: "src/b.rs".into(),
+        line,
+        value: value.into(),
+    };
+    let cases: Vec<R3Case> = vec![
+        (
+            "P1b-macro-named-struct",
+            vec![(b, "macro_rules! mk {\n    ($n:ident) => {\n        struct $n(std::sync::Mutex<u8>);\n    };\n}\nmk!(W);\nstatic FORM: W = X;\n")],
+            vec![r3_unres(b, 7, Why::NoDef("W".into()))],
+            None,
+        ),
+        (
+            "P2c-foreign-rename",
+            vec![(b, "use parking::Gate as G;\nstatic FORM: G = X;\n")],
+            vec![r3_unres(b, 2, r3_foreign("parking", "Gate"))],
+            None,
+        ),
+        (
+            "P3-three-file-alias-chain",
+            vec![
+                ("src/a.rs", "pub type A = crate::c::C;\n"),
+                ("src/c.rs", "pub type C = Option<(u8, [parking_lot::Mutex<u8>; 2])>;\n"),
+                (b, "static FORM: crate::a::A = X;\n"),
+            ],
+            vec![r3_lock(b, 1)],
+            None,
+        ),
+        (
+            "P4-qualified-projection",
+            vec![(b, "trait T {\n    type X;\n}\nstatic FORM: <u8 as T>::X = X;\n")],
+            vec![r3_unres(b, 4, Why::Projection)],
+            None,
+        ),
+        (
+            "P5-const-generic",
+            vec![(b, "struct Buf<const N: usize>([std::sync::Mutex<u8>; N]);\nstatic FORM: Buf<4> = X;\n")],
+            vec![r3_lock(b, 2)],
+            None,
+        ),
+        (
+            "P6-pub-use-rename",
+            vec![
+                ("src/a.rs", "use std::sync::Mutex;\npub use Mutex as Gatekeeper;\n"),
+                (b, "static FORM: crate::a::Gatekeeper = X;\n"),
+            ],
+            vec![r3_lock(b, 1)],
+            None,
+        ),
+        (
+            "P6b-bare-lock-rename",
+            vec![
+                ("src/a.rs", "pub use Mutex as Gatekeeper;\n"),
+                (b, "static FORM: crate::a::Gatekeeper = X;\n"),
+            ],
+            vec![r3_lock(b, 1)],
+            None,
+        ),
+        (
+            "P7-macro-body-static",
+            vec![(b, "macro_rules! mk {\n    ($n:ident) => {\n        static $n: u8 = 0;\n    };\n}\n")],
+            vec![StaticFinding::MacroBodyStatic {
+                file: b.into(),
+                name: "$n".into(),
+                line: 3,
+            }],
+            None,
+        ),
+        (
+            "P8-enum-boxed-tokio-lock",
+            vec![(b, "enum Slot {\n    Held(Option<Box<tokio::sync::Mutex<u8>>>),\n    Empty,\n}\nstatic FORM: Slot = X;\n")],
+            vec![r3_lock(b, 5)],
+            None,
+        ),
+        (
+            "P9-cfg-split-alias",
+            vec![(b, "#[cfg(unix)]\ntype Guard = u8;\n#[cfg(not(unix))]\ntype Guard = std::sync::Mutex<u8>;\nstatic FORM: Guard = X;\n")],
+            vec![r3_lock(b, 5)],
+            None,
+        ),
+        (
+            "P9b-cfg-attr-path",
+            vec![(b, "#[cfg_attr(unix, path = \"elsewhere.rs\")]\nmod inner;\n")],
+            vec![],
+            with(vec![unwalked(1, "elsewhere.rs")], vec![]),
+        ),
+        (
+            "P10-foreign-map",
+            vec![(b, "static FORM: dashmap::DashMap<u8, u8> = X;\n")],
+            vec![r3_unres(b, 1, r3_foreign("dashmap", "DashMap"))],
+            None,
+        ),
+        (
+            "P10b-std-sender",
+            vec![(b, "static FORM: std::sync::mpsc::Sender<u8> = X;\n")],
+            vec![r3_unres(b, 1, Why::StdNotProven("Sender".into()))],
+            None,
+        ),
+        (
+            "P11-include-in-macro-body",
+            vec![(b, "macro_rules! m {\n    ($p:expr) => {\n        include!($p)\n    };\n}\n")],
+            vec![],
+            with(
+                vec![IncludeFinding::IncludeNotLiteral {
+                    file: b.into(),
+                    line: 3,
+                }],
+                vec![count.clone()],
+            ),
+        ),
+        (
+            "P11b-raw-include",
+            vec![(b, "// raw\nr#include!(\"gone.rs\");\n")],
+            vec![],
+            with(vec![unwalked(2, "gone.rs")], vec![count.clone()]),
+        ),
+        (
+            "P12-path-out-of-root",
+            vec![(b, "#[path = \"../../outside.rs\"]\nmod outside;\n")],
+            vec![],
+            with(vec![unwalked(1, "../../outside.rs")], vec![]),
+        ),
+        (
+            "P15-union-manually-drop-lock",
+            vec![(b, "union U {\n    a: std::mem::ManuallyDrop<std::sync::Mutex<u8>>,\n    b: u8,\n}\nstatic FORM: U = X;\n")],
+            vec![r3_lock(b, 5)],
+            None,
+        ),
+        (
+            "P15b-union-of-lock-holder",
+            vec![(b, "struct Gate {\n    m: std::sync::RwLock<u8>,\n}\nunion W {\n    a: std::mem::ManuallyDrop<Gate>,\n}\nstatic FORM: W = X;\n")],
+            vec![r3_lock(b, 7)],
+            None,
+        ),
+        (
+            "P17-struct-in-fn-body",
+            vec![(b, "fn make() {\n    struct Hidden(std::sync::Mutex<u8>);\n    static FORM: Hidden = X;\n}\n")],
+            vec![r3_lock(b, 3)],
+            None,
+        ),
+        (
+            "P18-inline-mod-homonym",
+            vec![(b, "mod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstruct Gate(u8);\nstatic FORM: inner::Gate = X;\n")],
+            vec![r3_lock(b, 5)],
+            None,
+        ),
+        (
+            "silent-include-bytes",
+            vec![(b, "const B: &[u8] = include_bytes!(\"blob.bin\");\n")],
+            vec![],
+            None,
+        ),
+        (
+            "silent-fn-pointer-guard",
+            vec![(b, "static FORM: fn() -> std::sync::MutexGuard<'static, u8> = X;\n")],
+            vec![],
+            None,
+        ),
+    ];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10293 rules A and B: each name is judged by its own definition, and a
+/// glob, a second binding, a shadowing parameter or definition and a path
+/// that lands nowhere are each refused with their reason. Then invented
+/// forms of the same class.
+#[test]
+fn names_resolve_in_their_own_scope_10293() {
+    let b = "src/b.rs";
+    let twin_a = ("src/a.rs", "pub struct Twin(u8);\npub struct Plain(u8);\n");
+    let twin_c = ("src/c.rs", "pub struct Twin(std::sync::Mutex<u8>);\npub struct Inner(std::sync::Mutex<u8>);\n");
+    let cases: Vec<R3Case> = vec![
+        (
+            "A-same-name-clean-module",
+            vec![twin_a, twin_c, (b, "static FORM: crate::a::Twin = X;\n")],
+            vec![],
+            None,
+        ),
+        (
+            "A-same-name-lock-module",
+            vec![twin_a, twin_c, (b, "static FORM: crate::c::Twin = X;\n")],
+            vec![r3_lock(b, 1)],
+            None,
+        ),
+        (
+            "A-imported-clean-twin",
+            vec![twin_a, twin_c, (b, "use crate::a::Twin;\nstatic FORM: Twin = X;\n")],
+            vec![],
+            None,
+        ),
+        (
+            "A-imported-lock-twin",
+            vec![twin_a, twin_c, (b, "use crate::c::Twin;\nstatic FORM: Twin = X;\n")],
+            vec![r3_lock(b, 2)],
+            None,
+        ),
+        (
+            "A-inline-twins",
+            vec![(b, "mod x {\n    pub struct Twin(u8);\n}\nmod y {\n    pub struct Twin(std::sync::Mutex<u8>);\n}\nstatic FORM: y::Twin = X;\n")],
+            vec![r3_lock(b, 7)],
+            None,
+        ),
+        (
+            "A-outer-clean-over-inline-lock",
+            vec![(b, "mod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstruct Gate(u8);\nstatic FORM: Gate = X;\n")],
+            vec![],
+            None,
+        ),
+        (
+            "B-own-crate-glob",
+            vec![twin_a, (b, "use crate::a::*;\nstatic FORM: Plain = X;\n")],
+            vec![r3_unres(b, 2, Why::Glob("Plain".into()))],
+            None,
+        ),
+        (
+            "B-two-bindings",
+            vec![twin_a, (b, "use crate::a::Plain;\nstruct Plain(u8);\nstatic FORM: Plain = X;\n")],
+            vec![r3_unres(b, 3, Why::Ambiguous("Plain".into()))],
+            None,
+        ),
+        (
+            "B-generic-shadows-prelude",
+            vec![(b, "struct Wrap<String>(String);\nstatic FORM: Wrap<u8> = X;\n")],
+            vec![r3_unres(b, 2, Why::Shadowed("String".into()))],
+            None,
+        ),
+        (
+            "B-local-def-shadows-prelude",
+            vec![(b, "struct Vec(u8);\nstatic FORM: Vec = X;\n")],
+            vec![r3_unres(b, 2, Why::Shadowed("Vec".into()))],
+            None,
+        ),
+        (
+            "B-crate-path-lands-nowhere",
+            vec![(b, "static FORM: crate::nowhere::Thing = X;\n")],
+            vec![r3_unres(b, 1, Why::PathNotLanded("nowhere".into()))],
+            None,
+        ),
+        (
+            "B-super-path-lands-nowhere",
+            vec![(b, "static FORM: super::Thing = X;\n")],
+            vec![r3_unres(b, 1, Why::PathNotLanded("Thing".into()))],
+            None,
+        ),
+        (
+            "I1-std-glob-lock",
+            vec![(b, "use std::sync::*;\nstatic FORM: Mutex<u8> = X;\n")],
+            vec![r3_lock(b, 2)],
+            None,
+        ),
+        (
+            "I2-rename-chain",
+            vec![
+                ("src/a.rs", "pub use crate::c::Inner as Middle;\n"),
+                twin_c,
+                (b, "use crate::a::Middle as Outer;\nstatic FORM: Outer = X;\n"),
+            ],
+            vec![r3_lock(b, 2)],
+            None,
+        ),
+        (
+            "I3-use-cycle",
+            vec![(b, "use crate::b::Q as P;\nuse crate::b::P as Q;\nstatic FORM: P = X;\n")],
+            vec![r3_unres(b, 3, Why::Cycle("P".into()))],
+            None,
+        ),
+        (
+            "I4-fn-body-homonym-not-seen",
+            vec![(b, "struct Gate(u8);\nfn f() {\n    struct Gate(std::sync::Mutex<u8>);\n}\nstatic FORM: Gate = X;\n")],
+            vec![],
+            None,
+        ),
+        (
+            "I5-fn-body-sees-outer",
+            vec![(b, "struct Gate(std::sync::Mutex<u8>);\nfn f() {\n    static FORM: Gate = X;\n}\n")],
+            vec![r3_lock(b, 3)],
+            None,
+        ),
+        (
+            "I6-module-does-not-see-outer",
+            vec![(b, "struct Gate(std::sync::Mutex<u8>);\nmod m {\n    static FORM: Gate = X;\n}\n")],
+            vec![r3_unres(b, 3, Why::NoDef("Gate".into()))],
+            None,
+        ),
+        (
+            "I7-tests-module-alias",
+            vec![
+                ("src/a.rs", FORM_DEFS),
+                ("tests/t.rs", "use ai_memory::a as m;\nstatic FORM: m::Gate = X;\n"),
+            ],
+            vec![r3_lock("tests/t.rs", 2)],
+            None,
+        ),
+        (
+            "I8-global-foreign-alias",
+            vec![(b, "use ::dashmap as dm;\nstatic FORM: dm::DashMap<u8, u8> = X;\n")],
+            vec![r3_unres(b, 2, r3_foreign("dashmap", "DashMap"))],
+            None,
+        ),
+        (
+            "I9-self-use-into-inline-mod",
+            vec![(b, "use self::inner::Gate;\nmod inner {\n    pub struct Gate(std::sync::Mutex<u8>);\n}\nstatic FORM: Gate = X;\n")],
+            vec![r3_lock(b, 5)],
+            None,
+        ),
+        (
+            "I10-glob-in-fn-body",
+            vec![twin_a, (b, "fn f() {\n    use crate::a::*;\n    static FORM: Plain = X;\n}\n")],
+            vec![r3_unres(b, 3, Why::Glob("Plain".into()))],
+            None,
+        ),
+        (
+            "I11-nested-use-group",
+            vec![
+                ("src/a.rs", FORM_DEFS),
+                twin_c,
+                (b, "use crate::{a::Gate as G, c::Twin};\nstatic FORM: (Twin, G) = X;\n"),
+            ],
+            vec![r3_lock(b, 2)],
+            None,
+        ),
+        (
+            "I12-path-attr-module",
+            vec![
+                ("src/x.rs", "pub struct Thing(u8);\n"),
+                (b, "#[path = \"x.rs\"]\nmod px;\nstatic FORM: px::Thing = X;\n"),
+            ],
+            vec![r3_unres(b, 3, Why::PathNotLanded("Thing".into()))],
+            None,
+        ),
+        (
+            "I13-generic-alias-to-lock",
+            vec![(b, "type M<T> = std::sync::Mutex<T>;\nstatic FORM: M<u8> = X;\n")],
+            vec![r3_lock(b, 2)],
+            None,
+        ),
+    ];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10295: a struct reached from `Bus`, then `Bus` itself.
+const R3_BUS: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
+
+/// #10295 P14b: `Bus` gains a foreign field after its exception was pinned.
+const R3_BUS_FIELD: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n    m: dashmap::DashMap<u8, u8>,\n}\nstatic FORM: Bus = X;\n";
+
+/// #10295: `Inner`, reached from `Bus`, gains a field.
+const R3_INNER_FIELD: &str = "pub struct Inner {\n    v: Unknown,\n    w: u16,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
+
+/// #10295: the static's own written type changes.
+const R3_OWN_TYPE: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: (Bus, u8) = X;\n";
+
+/// #10295: the pinned digest of `FORM` in [`R3_BUS`].
+const D_BUS: &str = "";
+
+/// #10295: an exception holds only while every definition behind the
+/// static is the one it was pinned against; a change names the type.
+#[test]
+fn exceptions_are_pinned_by_content_10295() {
+    let b = "src/b.rs";
+    let digest = |name: &str, ty: &str| StaticFinding::ExceptionDigest {
+        file: b.into(),
+        name: name.into(),
+        ty: ty.into(),
+    };
+    let lock_body = "macro_rules! m {\n    () => {\n        static INNER: std::sync::Mutex<u8> = X;\n    };\n}\n";
+    let rows: Vec<ExceptionCase<'_>> = vec![
+        ("same", R3_BUS, vec![(b, "FORM", D_BUS, FORM_WHY)], vec![]),
+        (
+            "P14b-field-added",
+            R3_BUS_FIELD,
+            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![digest("FORM", "src::b::Bus")],
+        ),
+        (
+            "reached-definition-changed",
+            R3_INNER_FIELD,
+            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![digest("FORM", "src::b::Inner")],
+        ),
+        (
+            "own-type-changed",
+            R3_OWN_TYPE,
+            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![digest("FORM", "type")],
+        ),
+        (
+            "empty-digest",
+            R3_BUS,
+            vec![(b, "FORM", "", FORM_WHY)],
+            vec![digest("FORM", "type")],
+        ),
+        (
+            "macro-body-wrong-digest",
+            lock_body,
+            vec![(b, "INNER", "type=00000000", FORM_WHY)],
+            vec![digest("INNER", "type")],
+        ),
+    ];
+    let mut miss = Vec::new();
+    for (id, text, exceptions, want) in rows {
+        let files = vec![(b.to_string(), text.to_string())];
+        let table = if text.contains("static FORM") {
+            format!("{b}{FORM_ROW}")
+        } else {
+            String::new()
+        };
+        let tables = Tables {
+            statics: &table,
+            exceptions: &exceptions,
+            includes: &[],
+        };
+        let (statics, _) = token_census_with(&files, &tables);
+        if statics != want {
+            miss.push(format!("{id}: got {statics:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10293: scoped resolution stays linear: a 100 000-step import rename
+/// chain, a 100 000-struct type cycle and 100 000 glob imports are each
+/// judged exactly under the ceiling.
+#[test]
+fn scoped_resolution_cost_is_bounded_10293() {
+    const REPS: usize = 100_000;
+    const CEILING_SECS: u64 = 20;
+    let mut chain = String::new();
+    let mut cycle = String::new();
+    let mut globs = String::new();
+    for i in 0..REPS {
+        let _ = writeln!(chain, "pub use crate::a::R{} as R{i};", i + 1);
+        let _ = writeln!(cycle, "pub struct T{i}(Box<T{}>);", i + 1);
+        let _ = writeln!(globs, "use crate::m{i}::*;");
+    }
+    let _ = writeln!(chain, "pub struct R{REPS}(std::sync::Mutex<u8>);");
+    let _ = writeln!(cycle, "pub struct T{REPS}(Box<T0>);");
+    globs.push_str("static FORM: Plain = X;\n");
+    let chain: &'static str = chain.leak();
+    let cycle: &'static str = cycle.leak();
+    let globs: &'static str = globs.leak();
+    let b = "src/b.rs";
+    let cases: Vec<R3Case> = vec![
+        (
+            "rename-chain",
+            vec![("src/a.rs", chain), (b, "static FORM: crate::a::R0 = X;\n")],
+            vec![r3_lock(b, 1)],
+            None,
+        ),
+        (
+            "type-cycle",
+            vec![("src/a.rs", cycle), (b, "static FORM: crate::a::T0 = X;\n")],
+            vec![],
+            None,
+        ),
+        (
+            "many-globs",
+            vec![(b, globs)],
+            vec![r3_unres(b, REPS + 1, Why::Glob("Plain".into()))],
+            None,
+        ),
+    ];
+    for case in cases {
+        let id = case.0;
+        let start = std::time::Instant::now();
+        let miss = r3_misses(vec![case]);
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(CEILING_SECS),
+            "{id}: {took:?}"
+        );
+        assert_eq!(miss, Vec::<String>::new());
+    }
 }
