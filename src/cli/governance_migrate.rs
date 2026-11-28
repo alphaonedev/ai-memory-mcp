@@ -406,6 +406,10 @@ pub fn run_with_paths(
     Ok(rendered)
 }
 
+#[cfg(test)]
+#[path = "governance_migrate_10257_tests.rs"]
+mod governance_migrate_10257_tests;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
