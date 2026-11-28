@@ -75,7 +75,11 @@
 //!    alias cycle). Where definitions disagree, lock wins. A lock static
 //!    whose row is not `lock` is `LockNotLabelled`; an unresolvable static
 //!    whose row is not `lock` is `Unresolvable` with the reason, unless
-//!    `EXCEPTIONS` names it with a reason and a pinned digest. An exception
+//!    `EXCEPTIONS` names it with the exact reason it was granted for (its
+//!    `Why`), a pinned digest and a written reason. #10295: a row is
+//!    taken only when its `Why` is the static's live one and every name
+//!    the type reaches is one the pin reads ([`pin_reads`]); otherwise the
+//!    static is `Unresolvable` and the row is stale. An exception
 //!    that matches nothing (`ExceptionStale`), a second one
 //!    (`ExceptionDuplicate`), one with a short reason (`ExceptionReasonless`)
 //!    or one whose pinned digest is not the live one (`ExceptionDigest`,
@@ -2028,7 +2032,9 @@ enum StaticFinding {
         name: String,
         line: usize,
     },
-    /// An [`EXCEPTIONS`] row no static used.
+    /// An [`EXCEPTIONS`] row no static used. #10295: a row whose `why` is
+    /// not its static's live reason, or whose static's type reaches a name
+    /// the pin cannot read, is not used.
     ExceptionStale { file: String, name: String },
     /// An [`EXCEPTIONS`] key written twice.
     ExceptionDuplicate { file: String, name: String },
@@ -3845,6 +3851,40 @@ struct Resolved<'g> {
 /// #10295: the digest entry key of a static's own written type.
 const OWN_TYPE_KEY: &str = "type";
 
+/// #10295: the `why` column of an [`EXCEPTIONS`] row for a static in a
+/// `macro_rules!` body, which has no resolved reason.
+const MACRO_BODY_WHY: &str = "MacroBody";
+
+/// #10295: the `why` column text of a reason: its `Debug` form, exact.
+fn why_text(why: &Why) -> String {
+    format!("{why:?}")
+}
+
+/// #10295: whether the pin reads everything a type with this reason
+/// depends on. A name behind a glob, a type in an unread module, a macro's
+/// expansion, an associated type's value and an ambiguous or shadowed
+/// name are not in the digest, so a change there would leave the pin
+/// green: a static whose type reaches one never takes a row. Every
+/// variant is named, so a new reason must be judged here.
+fn pin_reads(why: &Why) -> bool {
+    match why {
+        Why::TraitObject
+        | Why::OpaqueType
+        | Why::RawPointer
+        | Why::NoDef(_)
+        | Why::StdNotProven(_)
+        | Why::Foreign { .. }
+        | Why::Cycle(_)
+        | Why::NoValue(_) => true,
+        Why::MacroType(_)
+        | Why::Projection
+        | Why::Glob(_)
+        | Why::Ambiguous(_)
+        | Why::Shadowed(_)
+        | Why::PathNotLanded(_) => false,
+    }
+}
+
 /// A 64-bit hash shown as 8 hex digits: the two halves folded together.
 fn hex8(h: u64) -> String {
     let folded = (h >> 32) ^ (h & 0xffff_ffff);
@@ -3864,20 +3904,30 @@ impl Resolved<'_> {
 
     /// #10295: the digest of a static's type: `type=<hash>` of its own
     /// written tokens, then `<module path>::<name>=<hash>` of every
-    /// definition reached from it, each once, sorted. Linear in the nodes
-    /// and edges reached.
-    fn digest(&self, scope: usize, atoms: &[Atom], own: u64) -> String {
+    /// definition reached from it, each once, sorted; and whether every
+    /// name the type and those definitions write is one the pin reads
+    /// ([`pin_reads`]). Linear in the nodes, atoms and edges reached.
+    fn digest(&self, scope: usize, atoms: &[Atom], own: u64) -> (String, bool) {
+        let g = self.graph;
+        let mut reads = true;
         let mut seen: BTreeSet<usize> = BTreeSet::new();
-        let mut todo: Vec<usize> = atoms
-            .iter()
-            .filter_map(|a| self.graph.atom(scope, a).err())
-            .collect();
+        let mut todo: Vec<usize> = Vec::new();
+        let mut look = |scope: usize, a: &Atom, todo: &mut Vec<usize>| match g.atom(scope, a) {
+            Err(n) => todo.push(n),
+            Ok(Res::Unres(why)) if !pin_reads(&why) => reads = false,
+            Ok(_) => {}
+        };
+        for a in atoms {
+            look(scope, a, &mut todo);
+        }
         while let Some(n) = todo.pop() {
             if seen.insert(n) {
+                for a in &g.nodes[n].atoms {
+                    look(g.nodes[n].scope, a, &mut todo);
+                }
                 todo.extend(self.edges[n].iter().copied().filter(|w| !seen.contains(w)));
             }
         }
-        let g = self.graph;
         let mut entries: Vec<String> = seen
             .iter()
             .map(|&n| {
@@ -3892,7 +3942,7 @@ impl Resolved<'_> {
             .collect();
         entries.sort();
         entries.insert(0, format!("{OWN_TYPE_KEY}={}", hex8(own)));
-        entries.join(" ")
+        (entries.join(" "), reads)
     }
 }
 
@@ -4483,7 +4533,7 @@ fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
     (close, in_attr)
 }
 
-/// #10275, #10285, #10295: `(path, static name, digest, reason)` for each
+/// #10275, #10285, #10295: `(path, static name, digest, why, reason)` for each
 /// static whose type does not resolve to [`LEAF_TYPES`], or that sits in a
 /// `macro_rules!` body, and is judged by hand. Every row must be used. The
 /// digest is `type=<hex8>` (the FNV-1a hash of the written type tokens)
@@ -4492,258 +4542,289 @@ fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
 /// proves the judged text is unchanged since the pin, not that the text is
 /// safe, and it is not collision-resistant against a deliberate edit; a
 /// foreign or std type's source and a macro's expansion are not in it. A change shows as `ExceptionDigest` naming the first changed entry;
-/// re-judge the static, then pin the new digest.
-const EXCEPTIONS: &[(&str, &str, &str, &str)] = &[
+/// re-judge the static, then pin the new digest. `why` is the exact reason
+/// the row admits ([`why_text`] of the static's `Why`, or
+/// [`MACRO_BODY_WHY`]); a static whose live reason is another, or whose
+/// type reaches a name the pin cannot read, does not take the row.
+const EXCEPTIONS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "src/approvals.rs",
         "APPROVAL_BUS",
         "type=54574677 src::approvals::ApprovalEvent=551a13b1",
+        r#"Foreign { root: "tokio", name: "Sender" }"#,
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/config.rs",
         "DISABLED",
         "type=381fd1dd src::governance::capability::CapabilityConfig=1c73fcb7 src::governance::capability::IssuerConfig=4a856305 src::governance::capability::OpLevel=985b095c",
+        r#"Foreign { root: "ed25519_dalek", name: "VerifyingKey" }"#,
         "an Arc of CapabilityConfig whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/config/unknown_keys.rs",
         "SCHEMA",
         "type=d42394ee",
+        r#"Foreign { root: "schemars", name: "RootSchema" }"#,
         "a schemars RootSchema: plain schema data built once",
     ),
     (
         "src/enterprise_federation_posture/hardened_env_fixture.rs",
         "POSTURE_AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/governance/audit.rs",
         "DAEMON_AUDIT_KEY",
         "type=feacdeed",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "RECORDER_KEY",
         "type=feacdeed",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/governance/audit.rs",
         "WRITER",
         "type=3e57fb9c src::governance::audit::PendingRow=120d9247 src::governance::audit::WriteOp=3c1463d5",
+        r#"StdNotProven("Sender")"#,
         "a std mpsc Sender of WriteOp: a channel handle, never acquired as a lock",
     ),
     (
         "src/governance/wire_check.rs",
         "GOVERNANCE_PRE_ACTION",
         "type=71217376 src::governance::agent_action::AgentAction=39cefa84 src::governance::wire_check::WireCheckHook=a65c2e63",
+        "TraitObject",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/handlers/federation_signing_check.rs",
         "BUNDLE",
         "type=948eda2d src::federation::identity::trust_bundle::TrustBundle=64fb7356",
+        r#"Foreign { root: "ed25519_dalek", name: "VerifyingKey" }"#,
         "a TrustBundle whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
     ),
     (
         "src/identity/session_signer.rs",
         "SESSION_SIGNER",
         "type=ee355834 src::identity::keypair::AgentKeypair=e5642726 src::identity::session_signer::SessionSigner=7c8667f6",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "an ed25519 SigningKey: key bytes, no lock",
     ),
     (
         "src/identity/test_key_dir.rs",
         "DIRECTORY",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "src/inbox_wake.rs",
         "INBOX_WAKE_BUS",
         "type=deb19289 src::inbox_wake::InboxEvent=109e5130",
+        r#"Foreign { root: "tokio", name: "Sender" }"#,
         "a tokio broadcast Sender: a channel handle, never acquired as a lock",
     ),
     (
         "src/logging.rs",
         "CENSUS_DUMMY_METADATA_3650",
         "type=4b4bb898",
+        r#"Foreign { root: "tracing", name: "Metadata" }"#,
         "a tracing Metadata: static callsite data",
     ),
     (
         "src/logging.rs",
         "INSTALLED_PIPELINE",
         "type=5ea7aa50 src::config::LogSink=bf13c837 src::logging::DeliveryStats=b3b0a375 src::logging::InstalledPipeline=f096f93a",
+        r#"Foreign { root: "tracing_appender", name: "ErrorCounter" }"#,
         "the log pipeline; its foreign leaf is a tracing_appender ErrorCounter, an atomic count",
     ),
     (
         "src/mcp/mod.rs",
         "POST_SIGNAL_ACK_SINK",
         "type=1c9aa41e",
+        r#"Foreign { root: "serde_json", name: "Value" }"#,
         "a tokio UnboundedSender of serde_json Value: a channel handle",
-    ),
-    (
-        "src/mcp/shutdown.rs",
-        "GATE_STUCK",
-        "type=d5eb792a",
-        "a ShutdownGate named through `use super::*`: one AtomicU8 state, no lock",
-    ),
-    (
-        "src/mcp/shutdown.rs",
-        "GATE_UNDER_TEST",
-        "type=d5eb792a",
-        "a ShutdownGate named through `use super::*`: one AtomicU8 state, no lock",
     ),
     (
         "src/metrics.rs",
         "HANDLE",
         "type=0b452c42 src::metrics::Metrics=bc17d7d2",
+        r#"Foreign { root: "prometheus", name: "HistogramVec" }"#,
         "the prometheus Metrics handle; its vectors are updated through their own API, never held",
     ),
     (
         "src/storage/escalation_deferral.rs",
         "TXN_FRAMES",
-        "type=4af0ce2f src::governance::audit::PendingAuditAnchor=10c2b32e src::governance::audit::PendingWatermark=7061bdc8 src::storage::escalation_deferral::DeferredEscalation=75a03a25 src::storage::escalation_deferral::Frames=a5a77e15 src::storage::escalation_deferral::TxnFrame=13954030",
+        "type=4af0ce2f src::governance::audit::PendingAuditAnchor=f6124fa3 src::governance::audit::PendingWatermark=7061bdc8 src::models::checkpoint::Checkpoint=d8fee8d3 src::models::checkpoint::CheckpointState=2990ace0 src::models::checkpoint::ConditionType=7cebdbd3 src::models::namespace::GovernedAction=0991cec5 src::storage::escalation_deferral::DeferredEscalation=75a03a25 src::storage::escalation_deferral::Frames=a5a77e15 src::storage::escalation_deferral::TxnFrame=13954030",
+        r#"Foreign { root: "serde_json", name: "Value" }"#,
         "a thread-local RefCell of frames; the foreign leaf is a serde_json Value",
     ),
     (
         "src/storage/escalation_frame_reporting_8184_tests.rs",
         "WRITE_PAUSE",
         "type=dc90c7c0 src::storage::escalation_frame_reporting_8184_tests::WritePause=0a6b82f0",
+        r#"StdNotProven("Receiver")"#,
         "a thread-local pair of std mpsc channel ends: a test pause, not a lock",
     ),
     (
         "src/storage/mod.rs",
         "BPE",
         "type=16315d13",
+        r#"Foreign { root: "tiktoken_rs", name: "CoreBPE" }"#,
         "a tiktoken CoreBPE: tokenizer tables built once",
     ),
     (
         "src/storage/mod.rs",
         "GOVERNANCE_PRE_WRITE",
-        "type=d6b472da",
+        "type=cb90d06c src::models::memory::Citation=08fa7958 src::models::memory::ConfidenceSignals=0158db0c src::models::memory::ConfidenceSource=df4862e7 src::models::memory::LifecycleState=d4d75c03 src::models::memory::Memory=9c680e1a src::models::memory::MemoryKind=5c963448 src::models::memory::SourceSpan=299aecab src::models::memory::Tier=7773f0eb",
+        "TraitObject",
         "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
     ),
     (
         "src/storage/snapshot_file.rs",
         "HOOK",
         "type=71d95840 src::storage::snapshot_file::seam::Hook=8a434667 src::storage::snapshot_file::seam::Point=3f4c9617",
+        "TraitObject",
         "a thread-local boxed dyn FnMut test seam, set by one test on its own thread",
     ),
     (
         "src/storage/txn_immediate_5084_tests.rs",
         "HOOK_5084",
         "type=e9493773",
+        "TraitObject",
         "a thread-local boxed dyn FnOnce test seam, set by one test on its own thread",
     ),
     (
         "src/subscriptions.rs",
         "DISPATCH_ROOT_CA",
         "type=9f706e3e",
+        r#"Foreign { root: "reqwest", name: "Certificate" }"#,
         "a reqwest Certificate: certificate bytes, no lock",
     ),
     (
         "src/subscriptions/webhook_ssrf_8203_tests.rs",
         "DNS_ANSWER",
         "type=d3c053c6 src::subscriptions::webhook_ssrf_8203_tests::DnsAnswer=4a0413d0",
+        r#"StdNotProven("SocketAddr")"#,
         "a thread-local one-shot DNS answer: a String and an io Result of SocketAddr",
     ),
     (
         "src/test_support.rs",
         "TLS_TEST_PKI",
         "type=486b0f1c src::test_support::TlsTestPki=bf02fb43",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "the test PKI paths; its foreign leaf is a tempfile TempDir",
     ),
     (
         "tests/agent_projection_txn_9405_9406.rs",
         "RACE",
         "type=188bdf73 tests/agent_projection_txn_9405_9406.rs::Outcome=600430fe tests/agent_projection_txn_9405_9406.rs::Race=490373cf",
+        r#"StdNotProven("Receiver")"#,
         "a thread-local RefCell of Race: std mpsc channel ends and an Outcome",
     ),
     (
         "tests/append_only_spine_flagon_g6.rs",
         "AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/append_only_upsert_supersede_2948.rs",
         "AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/auto_atomise/core.rs",
         "Q",
         "type=6877f3c7 src::background::atomise_worker::AtomiseJob=3c9ace28 src::background::atomise_worker::AtomiseQueue=e38c5ba8",
+        r#"StdNotProven("SyncSender")"#,
         "an AtomiseQueue: a std mpsc SyncSender, a channel handle",
     ),
     (
         "tests/common/mod.rs",
         "CLIENT",
         "type=d258f2f9",
+        r#"Foreign { root: "reqwest", name: "Client" }"#,
         "a reqwest Client: a connection pool handle, never acquired as a lock",
     ),
     (
         "tests/curator_conserves_contradiction_g7.rs",
         "AUDIT_DIR",
         "type=69062c13",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/entity_register_owner_8497.rs",
         "TRAIL",
         "type=ce0988eb",
+        r#"Foreign { root: "tempfile", name: "TempDir" }"#,
         "a tempfile TempDir: a path that is removed on drop, no lock",
     ),
     (
         "tests/fed_checkpoint_lane_3075_pg.rs",
         "DIR",
         "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_1936_checkpoint_fed.rs",
         "DIR",
         "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/federation_checkpoint_ns_scope_2708.rs",
         "DIR",
         "type=2f6c6e47 src::identity::keypair::AgentKeypair=e5642726",
+        r#"Foreign { root: "ed25519_dalek", name: "SigningKey" }"#,
         "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
     ),
     (
         "tests/form_1_synthesis.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/form_1_synthesis_verdict_matrix.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/issue_2122_synthesis_provenance_enforce.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_legacy_classifier_paths.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
     (
         "tests/store_synthesis_error_paths.rs",
         "RT",
         "type=74e759ab",
+        r#"Foreign { root: "tokio", name: "Runtime" }"#,
         "a tokio Runtime: a caller cannot acquire it as a lock",
     ),
 ];
@@ -4763,7 +4844,7 @@ const INCLUDE_ROWS: &[(&str, &str, usize, &str)] = &[(
 /// The hand-written tables the token census judges against.
 struct Tables<'a> {
     statics: &'a str,
-    exceptions: &'a [(&'a str, &'a str, &'a str, &'a str)],
+    exceptions: &'a [(&'a str, &'a str, &'a str, &'a str, &'a str)],
     includes: &'a [(&'a str, &'a str, usize, &'a str)],
 }
 
@@ -4872,11 +4953,12 @@ fn token_census_counted(
         .filter(|r| r.category != Category::Lock)
         .map(|r| (r.path.clone(), r.name.clone()))
         .collect();
-    // #10295: each row, whether a static took it, and its pinned digest.
-    let mut excepted: BTreeMap<(String, String), (bool, &str)> = BTreeMap::new();
-    for &(file, name, digest, reason) in tables.exceptions {
+    // #10295: each row, whether a static took it, its pinned digest and
+    // the reason it admits.
+    let mut excepted: BTreeMap<(String, String), (bool, &str, &str)> = BTreeMap::new();
+    for &(file, name, digest, why, reason) in tables.exceptions {
         let key = (file.to_string(), name.to_string());
-        if excepted.insert(key, (false, digest)).is_some() {
+        if excepted.insert(key, (false, digest, why)).is_some() {
             statics.push(StaticFinding::ExceptionDuplicate {
                 file: file.to_string(),
                 name: name.to_string(),
@@ -4908,23 +4990,29 @@ fn token_census_counted(
             if !in_macro {
                 type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
             }
-            // #10295: taking a row checks its pin against the live digest; a
-            // macro-body static's digest is its own written type only.
-            // `None` when no row names the static, else the digest finding.
-            let take = |excepted: &mut BTreeMap<(String, String), (bool, &str)>| {
-                let (used, pinned) = excepted.get_mut(&key)?;
-                *used = true;
+            // #10295: a row is taken only by the static whose live reason is
+            // the row's `why` and whose type the pin reads in full; taking it
+            // checks its pin against the live digest. A macro-body static's
+            // digest is its own written type only. `None` when no row is
+            // taken (the row then stays stale), else the digest finding.
+            let take = |excepted: &mut BTreeMap<(String, String), (bool, &str, &str)>,
+                        why: &str| {
+                let (used, pinned, admits) = excepted.get_mut(&key)?;
                 let own = token_hash(&f.toks, ty);
-                let live = if in_macro {
-                    format!("{OWN_TYPE_KEY}={}", hex8(own))
+                let (live, reads) = if in_macro {
+                    (format!("{OWN_TYPE_KEY}={}", hex8(own)), true)
                 } else {
                     resolved.digest(scope, &atoms, own)
                 };
+                if *admits != why || !reads {
+                    return None;
+                }
+                *used = true;
                 Some(digest_finding(path, &name, pinned, &live))
             };
             if in_macro {
                 // #10285: never a row; judged only by hand.
-                match take(&mut excepted) {
+                match take(&mut excepted, MACRO_BODY_WHY) {
                     Some(stale) => statics.extend(stale),
                     None => statics.push(StaticFinding::MacroBodyStatic {
                         file: path.to_string(),
@@ -4944,15 +5032,17 @@ fn token_census_counted(
                     });
                 }
                 // #10275, #10283: a static not proven lock-free.
-                Res::Unres(why) if not_lock.contains(&key) => match take(&mut excepted) {
-                    Some(stale) => statics.extend(stale),
-                    None => statics.push(StaticFinding::Unresolvable {
-                        file: path.to_string(),
-                        name: name.clone(),
-                        line,
-                        why,
-                    }),
-                },
+                Res::Unres(why) if not_lock.contains(&key) => {
+                    match take(&mut excepted, &why_text(&why)) {
+                        Some(stale) => statics.extend(stale),
+                        None => statics.push(StaticFinding::Unresolvable {
+                            file: path.to_string(),
+                            name: name.clone(),
+                            line,
+                            why,
+                        }),
+                    }
+                }
                 _ => {}
             }
             match left.get_mut(path).and_then(|m| m.get_mut(name.as_str())) {
@@ -4992,7 +5082,7 @@ fn token_census_counted(
             });
         }
     }
-    for ((file, name), (used, _)) in excepted {
+    for ((file, name), (used, _, _)) in excepted {
         if !used {
             statics.push(StaticFinding::ExceptionStale { file, name });
         }
@@ -7179,8 +7269,13 @@ pub type One = Two;\npub type Two = std::sync::RwLock<u8>;\npub struct S;\n\
 pub trait Tr {\n    type Out;\n}\npub type Erased = Box<dyn Fn() + Sync>;\n\
 pub struct Plain {\n    v: u8,\n}\n";
 
-/// An exception row as the tests write it: `(file, name, digest, reason)`.
-type ExceptionRow<'a> = (&'a str, &'a str, &'a str, &'a str);
+/// An exception row as the tests write it: `(file, name, digest, why,
+/// reason)`.
+type ExceptionRow<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+
+/// #10295: the `why` of a static whose type is the bare unknown name
+/// `Unknown`.
+const W_UNRES: &str = r#"NoDef("Unknown")"#;
 
 /// One exception case: `(id, text, exceptions, findings written by hand)`.
 type ExceptionCase<'a> = (&'a str, &'a str, Vec<ExceptionRow<'a>>, Vec<StaticFinding>);
@@ -7609,51 +7704,56 @@ fn exceptions_are_judged_exactly_10275() {
         why: Why::NoDef("Unknown".into()),
     };
     let rows: Vec<ExceptionCase<'_>> = vec![
-        ("taken", UNRES, vec![(b, "FORM", D_UNRES, FORM_WHY)], vec![]),
+        (
+            "taken",
+            UNRES,
+            vec![(b, "FORM", D_UNRES, W_UNRES, FORM_WHY)],
+            vec![],
+        ),
         ("absent", UNRES, vec![], vec![unres.clone()]),
         (
             "other-file",
             UNRES,
-            vec![("src/c.rs", "FORM", D_UNRES, FORM_WHY)],
+            vec![("src/c.rs", "FORM", D_UNRES, W_UNRES, FORM_WHY)],
             vec![unres.clone(), named(stale, "src/c.rs", "FORM")],
         ),
         (
             "other-name",
             CLEAN,
-            vec![(b, "OTHER", D_UNRES, FORM_WHY)],
+            vec![(b, "OTHER", D_UNRES, W_UNRES, FORM_WHY)],
             vec![named(stale, b, "OTHER")],
         ),
         (
             "on-a-clean-static",
             CLEAN,
-            vec![(b, "FORM", D_UNRES, FORM_WHY)],
+            vec![(b, "FORM", D_UNRES, W_UNRES, FORM_WHY)],
             vec![named(stale, b, "FORM")],
         ),
         (
             "duplicate",
             UNRES,
             vec![
-                (b, "FORM", D_UNRES, FORM_WHY),
-                (b, "FORM", D_UNRES, FORM_WHY),
+                (b, "FORM", D_UNRES, W_UNRES, FORM_WHY),
+                (b, "FORM", D_UNRES, W_UNRES, FORM_WHY),
             ],
             vec![named(dup, b, "FORM")],
         ),
         (
             "short-reason",
             UNRES,
-            vec![(b, "FORM", D_UNRES, "too short")],
+            vec![(b, "FORM", D_UNRES, W_UNRES, "too short")],
             vec![named(reasonless, b, "FORM")],
         ),
         (
             "blank-reason",
             UNRES,
-            vec![(b, "FORM", D_UNRES, "            ")],
+            vec![(b, "FORM", D_UNRES, W_UNRES, "            ")],
             vec![named(reasonless, b, "FORM")],
         ),
         (
             "on-a-lock",
             LOCK,
-            vec![(b, "FORM", D_UNRES, FORM_WHY)],
+            vec![(b, "FORM", D_UNRES, W_UNRES, FORM_WHY)],
             vec![
                 StaticFinding::LockNotLabelled {
                     file: b.into(),
@@ -7713,7 +7813,7 @@ fn static_in_a_macro_body_is_red_10285() {
             "excepted",
             LOCK_BODY,
             "",
-            vec![(b, "INNER", D_INNER, FORM_WHY)],
+            vec![(b, "INNER", D_INNER, MACRO_BODY_WHY, FORM_WHY)],
             vec![],
         ),
     ];
@@ -9086,35 +9186,40 @@ fn exceptions_are_pinned_by_content_10295() {
     };
     let lock_body = "macro_rules! m {\n    () => {\n        static INNER: std::sync::Mutex<u8> = X;\n    };\n}\n";
     let rows: Vec<ExceptionCase<'_>> = vec![
-        ("same", R3_BUS, vec![(b, "FORM", D_BUS, FORM_WHY)], vec![]),
+        (
+            "same",
+            R3_BUS,
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
+            vec![],
+        ),
         (
             "P14b-field-added",
             R3_BUS_FIELD,
-            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
             vec![digest("FORM", "src::b::Bus")],
         ),
         (
             "reached-definition-changed",
             R3_INNER_FIELD,
-            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
             vec![digest("FORM", "src::b::Inner")],
         ),
         (
             "own-type-changed",
             R3_OWN_TYPE,
-            vec![(b, "FORM", D_BUS, FORM_WHY)],
+            vec![(b, "FORM", D_BUS, W_UNRES, FORM_WHY)],
             vec![digest("FORM", "type")],
         ),
         (
             "empty-digest",
             R3_BUS,
-            vec![(b, "FORM", "", FORM_WHY)],
+            vec![(b, "FORM", "", W_UNRES, FORM_WHY)],
             vec![digest("FORM", "type")],
         ),
         (
             "macro-body-wrong-digest",
             lock_body,
-            vec![(b, "INNER", "type=00000000", FORM_WHY)],
+            vec![(b, "INNER", "type=00000000", MACRO_BODY_WHY, FORM_WHY)],
             vec![digest("INNER", "type")],
         ),
     ];
@@ -9178,13 +9283,18 @@ const D_W_GLOB_HIDDEN: &str = "type=06bb9d35";
 const D_W_UNREAD_HIDDEN: &str = "type=60e7ad09";
 
 /// One #10295 type-change form: `(id, files after the change, the digest
-/// pinned before it, findings written by hand)`.
+/// and the `why` pinned before it, findings written by hand)`.
 type WhyCase<'a> = (
     &'a str,
     Vec<(&'a str, &'a str)>,
-    &'a str,
+    (&'a str, &'a str),
     Vec<StaticFinding>,
 );
+
+/// #10295: the `why` of a type whose least reason is a tokio `Sender`.
+const W_TOKIO: &str = r#"Foreign { root: "tokio", name: "Sender" }"#;
+/// #10295: the `why` of a type whose least reason is a `DashMap`.
+const W_DASH: &str = r#"Foreign { root: "dashmap", name: "DashMap" }"#;
 
 /// #10295: an exception is pinned to what it was granted for. When the type
 /// of an excepted static changes under the same `(file, name)` key, in any
@@ -9216,19 +9326,19 @@ fn exception_is_pinned_to_its_why_10295() {
                 (a, W_BUS),
                 (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
             ],
-            D_W_USE,
+            (D_W_USE, W_TOKIO),
             vec![],
         ),
         (
             "field-added-directly",
             vec![(b, &direct_field)],
-            D_W_DIRECT,
+            (D_W_DIRECT, W_TOKIO),
             both(5, dash()),
         ),
         (
             "field-added-in-a-nested-local-type",
             vec![(b, W_NESTED_FIELD)],
-            D_W_NESTED,
+            (D_W_NESTED, W_TOKIO),
             both(10, dash()),
         ),
         (
@@ -9237,7 +9347,7 @@ fn exception_is_pinned_to_its_why_10295() {
                 (a, W_BUS_FIELD),
                 (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
             ],
-            D_W_USE,
+            (D_W_USE, W_TOKIO),
             both(2, dash()),
         ),
         (
@@ -9246,7 +9356,7 @@ fn exception_is_pinned_to_its_why_10295() {
                 (a, W_BUS_FIELD),
                 (b, "use crate::a::*;\nstatic FORM: Bus = X;\n"),
             ],
-            D_W_GLOB,
+            (D_W_GLOB, r#"Glob("Bus")"#),
             both(2, Why::Glob("Bus".into())),
         ),
         (
@@ -9255,7 +9365,7 @@ fn exception_is_pinned_to_its_why_10295() {
                 (a, W_BUS_FIELD),
                 (b, "use crate::a::Bus as Chan;\nstatic FORM: Chan = X;\n"),
             ],
-            D_W_ALIAS,
+            (D_W_ALIAS, W_TOKIO),
             both(2, dash()),
         ),
         (
@@ -9264,7 +9374,7 @@ fn exception_is_pinned_to_its_why_10295() {
                 (a, W_BUS_FIELD),
                 (b, "static FORM: Option<crate::a::Bus> = X;\n"),
             ],
-            D_W_GENERIC,
+            (D_W_GENERIC, W_TOKIO),
             both(1, dash()),
         ),
         (
@@ -9273,13 +9383,13 @@ fn exception_is_pinned_to_its_why_10295() {
                 (a, W_BUS),
                 (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
             ],
-            D_W_REMOVED,
+            (D_W_REMOVED, W_DASH),
             both(2, tokio()),
         ),
         (
             "swapped-for-a-type-of-the-same-why",
             vec![(a, W_BUS_TWO), (b, "static FORM: crate::a::Bus2 = X;\n")],
-            D_W_SWAPPED,
+            (D_W_SWAPPED, W_TOKIO),
             vec![StaticFinding::ExceptionDigest {
                 file: b.into(),
                 name: "FORM".into(),
@@ -9292,8 +9402,8 @@ fn exception_is_pinned_to_its_why_10295() {
                 b,
                 "#[path = \"x.rs\"]\nmod px;\nstatic FORM: px::Bus = X;\n",
             )],
-            D_W_UNREAD,
-            both(3, Why::PathNotLanded("px::Bus".into())),
+            (D_W_UNREAD, r#"PathNotLanded("Bus")"#),
+            both(3, Why::PathNotLanded("Bus".into())),
         ),
         (
             "glob-behind-a-smaller-why",
@@ -9304,7 +9414,7 @@ fn exception_is_pinned_to_its_why_10295() {
                     "use crate::a::*;\nstatic FORM: (Box<dyn Fn() + Sync>, Bus) = X;\n",
                 ),
             ],
-            D_W_GLOB_HIDDEN,
+            (D_W_GLOB_HIDDEN, "TraitObject"),
             both(2, Why::TraitObject),
         ),
         (
@@ -9313,18 +9423,18 @@ fn exception_is_pinned_to_its_why_10295() {
                 b,
                 "#[path = \"x.rs\"]\nmod px;\nstatic FORM: (Box<dyn Fn() + Sync>, px::Bus) = X;\n",
             )],
-            D_W_UNREAD_HIDDEN,
+            (D_W_UNREAD_HIDDEN, "TraitObject"),
             both(3, Why::TraitObject),
         ),
     ];
     let table = format!("{b}{FORM_ROW}");
     let mut miss = Vec::new();
-    for (id, files, pinned, want) in cases {
+    for (id, files, (pinned, why), want) in cases {
         let files: Vec<(String, String)> = files
             .into_iter()
             .map(|(p, t)| (p.to_string(), t.to_string()))
             .collect();
-        let exceptions = vec![(b, "FORM", pinned, FORM_WHY)];
+        let exceptions = vec![(b, "FORM", pinned, why, FORM_WHY)];
         let tables = Tables {
             statics: &table,
             exceptions: &exceptions,
@@ -9648,7 +9758,7 @@ fn pinned_census(files: &[(&str, &str)], pin: &str) -> Vec<StaticFinding> {
         .map(|(p, t)| ((*p).to_string(), (*t).to_string()))
         .collect();
     let table = format!("{b}{FORM_ROW}");
-    let exceptions: Vec<ExceptionRow<'_>> = vec![(b, "FORM", pin, FORM_WHY)];
+    let exceptions: Vec<ExceptionRow<'_>> = vec![(b, "FORM", pin, W_UNRES, FORM_WHY)];
     let tables = Tables {
         statics: &table,
         exceptions: &exceptions,
