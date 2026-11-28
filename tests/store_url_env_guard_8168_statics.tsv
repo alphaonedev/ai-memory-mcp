@@ -4,6 +4,9 @@
 # A new static needs a new row with its reason; a removed static removes its row.
 # #10251: a reason is `<category>: <text>`, category one of lock, atomic, once, thread-local,
 # immutable, crate-type; every row of a static whose type names a lock says `lock`.
+# #10283: a static whose type the census cannot prove lock-free (a trait object, an opaque or
+# macro type, a raw pointer, a foreign or unproven std type, an undefined name, an alias cycle)
+# says `lock` or is named with its reason in EXCEPTIONS of the test file.
 src/a2a.rs	REPLICATION_PENDING	atomic: atomic value; single atomic operations, not a lock over the environment (Process-wide count of A2A messages whose federation fan-out missed quorum.)
 src/a2a.rs	CARD_BASE_URL	once: value computed once; no lock is held after init
 src/approvals.rs	SYNTHETIC_RULES	lock: shared state behind a lock; guards data, not the process environment (Process-wide registry of `remember=session` rules.)
@@ -85,7 +88,7 @@ src/sizes.rs	VERBOSE_TABLE	once: value computed once; no lock is held after init
 src/sizes.rs	TRIMMED_TABLE	once: value computed once; no lock is held after init (pm-v3.1 PR8 (issue #1174) — shared cache for the trimmed (wire- form) table, matching `VERBOSE_TABLE` above.)
 src/spawn_audit.rs	SPAWN_AUDIT_DB_PATH	once: value computed once; no lock is held after init (Process-wide audit DB path, seeded once at boot by [`seed_spawn_audit_db_path`].)
 src/subscriptions.rs	DISPATCH_IN_FLIGHT	atomic: atomic value; single atomic operations, not a lock over the environment
-src/subscriptions.rs	DISPATCH_IDLE	crate-type: value of a crate type; holds program state, not a lock over the process environment (Woken when the last admitted webhook worker drops.)
+src/subscriptions.rs	DISPATCH_IDLE	lock: a tokio Notify, woken when the last admitted webhook worker drops; it holds no lock over the process environment
 src/subscriptions.rs	DISPATCH_SEMAPHORE	lock: value computed once that holds a lock; guards data, not the process environment (PERF-3 (FX-10) — module-level shared semaphore that bounds the in-flight webhook delivery count across every ...)
 src/subscriptions.rs	TEST_DISPATCH_CONCURRENCY_OVERRIDE	once: value computed once; no lock is held after init (Test-only override for the dispatch concurrency bound.)
 src/subscriptions.rs	KICK	once: value computed once; no lock is held after init
@@ -217,7 +220,7 @@ src/mcp/mod.rs	PRE_SIGNAL_SEND_GATE	lock: value computed once that holds a lock;
 src/mcp/mod.rs	PRE_EVENT_ENFORCE_GATE	lock: value computed once that holds a lock; guards data, not the process environment
 src/mcp/mod.rs	TOOL_DISPATCH_TABLE	immutable: immutable data; holds no lock (The canonical `tools/call` dispatch table.)
 src/mcp/mod.rs	MAP	once: value computed once; no lock is held after init (v0.7.0 #1105 — O(1) HashMap-based lookup against [`TOOL_DISPATCH_TABLE`].)
-src/mcp/mod.rs	MCP_EMBED_SKIP_AMORT	once: value computed once; no lock is held after init (#3344 — rusqlite MCP backfill skip-walk timer.)
+src/mcp/mod.rs	MCP_EMBED_SKIP_AMORT	lock: EmbedSkipAmortisation holds last_walk, a Mutex (#3344 rusqlite MCP backfill skip-walk timer)
 src/mcp/registry.rs	CACHE	lock: shared state behind a lock; guards data, not the process environment (v0.7.0 #1077 — memoize per-Profile so repeat `tools/list` calls are a single `Value::clone()` of the cached ...)
 src/mcp/registry.rs	CACHED	once: value computed once; no lock is held after init (Round-4 — process-level escape hatch from the C4 trim used by [`tool_definitions_for_profile`].)
 src/mcp/registry.rs	CACHE	lock: value computed once that holds a lock; guards data, not the process environment (v0.7.0 #1077 — cache the deterministic catalog Value in a `OnceLock<Value>`.)
@@ -330,9 +333,9 @@ tests/cli_surface_cluster_r405.rs	ENV_GUARD	lock: test-binary lock; a tests/ bin
 tests/cluster_f_perf_regressions.rs	TRACE_LOG	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads
 tests/cluster_f_perf_regressions.rs	TRACE_GUARD	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads
 tests/conformance_export_roundtrip_2030.rs	INIT	once: value computed once; no lock is held after init (Pin the process federation node identity to [`FIXTURE_NODE_IDENTITY`] BEFORE any DB write stamps a ...)
-tests/containment_relational_3946.rs	WARMED	once: value computed once; no lock is held after init
-tests/contaminated_stamp_f1_fixes_pg_item3_3266.rs	WARMED	once: value computed once; no lock is held after init
-tests/contaminated_stamp_pg_item3_3266.rs	WARMED	once: value computed once; no lock is held after init
+tests/containment_relational_3946.rs	WARMED	lock: a tokio OnceCell; get_or_init holds its semaphore while the first caller initialises
+tests/contaminated_stamp_f1_fixes_pg_item3_3266.rs	WARMED	lock: a tokio OnceCell; get_or_init holds its semaphore while the first caller initialises
+tests/contaminated_stamp_pg_item3_3266.rs	WARMED	lock: a tokio OnceCell; get_or_init holds its semaphore while the first caller initialises
 tests/corrupt_governance_escape_4285.rs	SERIAL	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads (Cells mutate process env (attestation / `why_trace` postures);)
 tests/corrupt_governance_severed_4285.rs	STAR	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads (A corrupt GLOBAL `*` standard:)
 tests/cov3_handlers_postgres.rs	ONCE	once: value computed once; no lock is held after init (#1751 — pin this test binary to the explicit permissive agent-attestation opt-out;)
@@ -592,8 +595,8 @@ tests/store_legacy_classifier_paths.rs	ONCE	once: value computed once; no lock i
 tests/store_legacy_classifier_paths.rs	RT	once: value computed once; no lock is held after init
 tests/store_synthesis_error_paths.rs	ONCE	once: value computed once; no lock is held after init (#1751 — pin this test binary (and any spawned `ai-memory` child, which inherits the process env) to the ...)
 tests/store_synthesis_error_paths.rs	RT	once: value computed once; no lock is held after init
-tests/swarm_rewind_pg_item3_3266.rs	WARMED	once: value computed once; no lock is held after init
-tests/swarm_rewind_route_item3_3266.rs	WARMED	once: value computed once; no lock is held after init (On a FRESH database, parallel first-touch AGE label creation can defer one `derives_from` edge's graph ...)
+tests/swarm_rewind_pg_item3_3266.rs	WARMED	lock: a tokio OnceCell; get_or_init holds its semaphore while the first caller initialises
+tests/swarm_rewind_route_item3_3266.rs	WARMED	lock: a tokio OnceCell; get_or_init holds its semaphore while the first caller initialises
 tests/sync_since_visibility_gate_948.rs	ENV_LOCK	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads (Process-global async mutex so the env-var manipulations don't race on parallel `cargo test`.)
 tests/synthesis_ownership_gate_3173.rs	LOCK	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads
 tests/synthesis_ownership_gate_3173.rs	ONCE	once: value computed once; no lock is held after init
@@ -616,7 +619,7 @@ tests/atomisation/core.rs	M	lock: test-binary lock; a tests/ binary is its own p
 tests/auto_atomise/core.rs	SLOT	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads
 tests/auto_atomise/core.rs	M	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads (Serialise tests.)
 tests/auto_atomise/core.rs	INSTALLED	once: value computed once; no lock is held after init (v1.0.0 #3523 — INSTALL-FIRST fixture for the store-side governance hook.)
-tests/auto_atomise/core.rs	A	once: value computed once; no lock is held after init (v1.0.0 #2983 — the process-global `AUTO_ATOMISE_DISPATCH` slot this suite used to install is GONE (it had ...)
+tests/auto_atomise/core.rs	A	lock: Arc<Atomiser> whose dyn Curator is MockCurator, holding the Arc<Mutex<MockState>> of SLOT
 tests/auto_atomise/core.rs	Q	once: value computed once; no lock is held after init (The bounded, single-consumer worker (#2986) the deferred path now enqueues onto instead of ...)
 tests/auto_atomise/core.rs	SHARED	once: value computed once; no lock is held after init (The dispatch's `db_path` is fixed at install time.)
 tests/common/mod.rs	ENV_LOCK	lock: test-binary lock; a tests/ binary is its own process, so it orders only that binary's threads (Process-wide lock that serializes env-var mutation across parallel tests in the same integration binary.)

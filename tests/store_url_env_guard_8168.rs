@@ -24,7 +24,7 @@
 //! that stops taking the outer proof fails here. Comment text is judged as text, not skipped.
 //!
 //! #10208 adds a census of whole item sets, because text pins of chosen
-//! lines let a new item through. `census_all` runs five parts:
+//! lines let a new item through. `census_all` runs six parts:
 //!
 //! 1. the line census above;
 //! 2. the item census: every item of the guard file, nested items of `impl`
@@ -43,15 +43,31 @@
 //!    its own row `path<TAB>name<TAB>reason` in
 //!    `tests/store_url_env_guard_8168_statics.tsv`. A static with no row
 //!    left is `Unlisted` with its path, name and line; a row with no static
-//!    is `Missing`; a bad row is refused with its line; `static $x` in a
-//!    macro body is `MacroStatic`, because its name is unknown until
-//!    expansion. #10251: a reason starts with `<category>: `, the category
-//!    one word of `Category::ALL`, or the row is refused; a static whose
-//!    type names a lock (`BASE_LOCKS`, or a type, struct, enum, union or
-//!    `use … as` of the same file built from one) with a row that does not
-//!    say `lock` is `LockNotLabelled`; the row count is pinned to
-//!    `STATICS_TABLE_ROWS` and the `lock` keys to the hand-written
-//!    `LOCK_ROWS`. The table may only shrink, each row with its reason;
+//!    is `Missing`; a bad row is refused with its line. #10285: a static
+//!    inside a `macro_rules!` body never takes a row: it is
+//!    `MacroBodyStatic` unless `EXCEPTIONS` names it, and `static $x`
+//!    outside such a body is `MacroStatic`, because its name is unknown
+//!    until expansion. #10251: a reason starts with `<category>: `, the
+//!    category one word of `Category::ALL`, or the row is refused; the row
+//!    count is pinned to `STATICS_TABLE_ROWS` (627) and the `lock` keys to
+//!    the hand-written `LOCK_ROWS` (307), both exact: a change that adds or
+//!    removes a row moves the pin under a `Count-Declared` trailer, and a
+//!    new static needs a new row with its reason. #10275, #10283: the type of every static is
+//!    resolved over the whole tree (every walked file's `type`, `struct`,
+//!    `enum`, `union` and `use`, generic defaults included, by one linear
+//!    strongly-connected-component walk). A type is one of three values:
+//!    a lock (it is or holds one of `LOCK_TYPES`: std, tokio and
+//!    `parking_lot`, fair and raw locks and their guards included), proven
+//!    clean (every leaf is a std type of `LEAF_TYPES` or a crate type
+//!    built only from them), or unresolvable (a `dyn` or `impl` type, a
+//!    type made by a macro, a raw pointer, a `<T as Tr>::Out` projection,
+//!    a name with no definition, a std or foreign type not proven, or an
+//!    alias cycle). Where definitions disagree, lock wins. A lock static
+//!    whose row is not `lock` is `LockNotLabelled`; an unresolvable static
+//!    whose row is not `lock` is `Unresolvable` with the reason, unless
+//!    `EXCEPTIONS` names it with a reason. An exception that matches
+//!    nothing (`ExceptionStale`), a second one (`ExceptionDuplicate`) or
+//!    one with a short reason (`ExceptionReasonless`) is red;
 //! 5. the inclusion census (#10204): the guard file may be compiled once.
 //!    `#[path = …]` (in `cfg_attr` too) and `include!`, `include_str!` or
 //!    `include_bytes!` naming `env_guard.rs` or its parent `store_url.rs`
@@ -67,16 +83,32 @@
 //!    the module's directory, which this census does not model), and
 //!    anything else that names no walked file (absolute, a backslash, a
 //!    `..` out of the root, a skipped directory, an absent file) is
-//!    `Unwalked`.
+//!    `Unwalked`. #10276: an include macro is recognised in every call
+//!    form (`!(…)`, `![…]`, `!{…}`, a path such as `core::include!`, a raw
+//!    `r#include` and a `use … as` rename), and the identifier `include`
+//!    is counted per file against `INCLUDE_ROWS`: a count that differs
+//!    from its row (no row means zero) is `IncludeCount`, and a stale,
+//!    duplicate or bad row is red;
+//! 6. the build-target census (#10277): `Cargo.toml` is read (never
+//!    written) and every target it compiles must be a walked `.rs` file:
+//!    the library, each `[[bin]]`, `[[test]]`, `[[bench]]` and
+//!    `[[example]]` (its `path`, or Cargo's default places for its name),
+//!    `package.build` and every `path =` dependency. A target that does not
+//!    end in `.rs` (exact case) is `NotRs`, one the walk did not read is
+//!    `Unwalked`, and a manifest that cannot be read or parsed, a value of
+//!    the wrong type, a `[workspace]` table or a `[lib] name` that is not
+//!    the crate's is red.
 //!
 //! The walk refuses a symbolic link in the tree. The lexer is std only and
 //! fails closed (an unterminated string or comment is a finding). A file it
 //! cannot lex is reported once by the static census and skipped by the
-//! inclusion census. Its limits: it does not expand macros, so an item
+//! inclusion census. #10284: every scan for the end of a type, a generic
+//! list or an item body stops at the next item keyword (`ITEM_STOPS`), and
+//! the type graph is settled by one linear walk, so the census is linear in
+//! the tree (the cost tests hold 100 000-unit inputs under 20 s). Its limits: it does not expand macros, so an item
 //! built by a macro from pieces is not seen by parts 2 and 3 (part 4 reports
-//! `static $x`); `concat!` or escaped spellings of the variable names are
-//! not decoded by part 1; a lock type defined in another file and named
-//! through a wrapper of its own file only is not seen as a lock by part 4.
+//! `static $x` and every macro-body static); `concat!` or escaped spellings
+//! of the variable names are not decoded by part 1.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1958,32 +1990,174 @@ enum StaticFinding {
         name: String,
         line: usize,
     },
+    /// #10275, #10283: a static with a row that is not `lock`, whose type
+    /// does not resolve completely to [`LEAF_TYPES`] and is not in
+    /// [`EXCEPTIONS`]; `why` is the first reason in [`Why`] order.
+    Unresolvable {
+        file: String,
+        name: String,
+        line: usize,
+        why: Why,
+    },
+    /// #10285: a `static` item inside a `macro_rules!` body, whose count
+    /// is not known until expansion; `name` is the literal name, or `$x`
+    /// for a metavariable. Red unless the key is in [`EXCEPTIONS`].
+    MacroBodyStatic {
+        file: String,
+        name: String,
+        line: usize,
+    },
+    /// An [`EXCEPTIONS`] row no static used.
+    ExceptionStale { file: String, name: String },
+    /// An [`EXCEPTIONS`] key written twice.
+    ExceptionDuplicate { file: String, name: String },
+    /// An [`EXCEPTIONS`] row with fewer than [`MIN_REASON_CHARS`] visible
+    /// characters of reason.
+    ExceptionReasonless { file: String, name: String },
+}
+
+/// #10275, #10283: why a type is not proven to hold no lock. The order is
+/// the order of report when a type has more than one reason.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Why {
+    /// `dyn Trait`: the value behind it is not known.
+    TraitObject,
+    /// `impl Trait` in a type alias.
+    OpaqueType,
+    /// A macro in type position, by its name.
+    MacroType(String),
+    /// `*const T` or `*mut T`.
+    RawPointer,
+    /// `<T as Trait>::Out` or `Self::Out`: an associated type.
+    Projection,
+    /// A crate type name with no definition in the walked tree.
+    NoDef(String),
+    /// A `std`, `core` or `alloc` type that is not in [`LEAF_TYPES`].
+    StdNotProven(String),
+    /// A type of another crate that is not in [`LEAF_TYPES`].
+    Foreign { root: String, name: String },
+    /// A cycle of aliases with no struct, enum or union in it.
+    Cycle(String),
+    /// An associated `type NAME;` with no value.
+    NoValue(String),
 }
 
 /// One `static` item of a lexed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaticItem {
+    /// The name, or `$x` for a metavariable name.
     name: String,
     line: usize,
-    /// #10251: every identifier of its declared type.
-    type_idents: Vec<String>,
+    /// #10251: the token range of its declared type.
+    ty: (usize, usize),
+    /// #10285: whether it sits inside a `macro_rules!` body.
+    in_macro: bool,
 }
 
-/// The identifiers from `from` up to the first `=` or `;` outside every
-/// bracket, `<…>` included (`->` is not a closer), or to the end.
-fn type_idents(t: &[Tok], from: usize) -> Vec<String> {
-    let mut out = Vec::new();
+/// Whether `t[i]` opens a bracket group.
+fn is_open(t: &[Tok], i: usize) -> bool {
+    is_p(t, i, "(") || is_p(t, i, "[") || is_p(t, i, "{")
+}
+
+/// #10284: keywords that start an item and never occur inside a type, a
+/// `use` tree or a `where` clause. A scan for the end of one item stops at
+/// the first of them outside every group, so every scan ends where the next
+/// item starts and the scans of a file are linear in its length together.
+const ITEM_STOPS: [&str; 9] = [
+    "enum", "let", "mod", "pub", "static", "struct", "trait", "type", "use",
+];
+
+/// Whether `t[i]` is one of [`ITEM_STOPS`].
+fn is_item_stop(t: &[Tok], i: usize) -> bool {
+    t.get(i)
+        .is_some_and(|x| x.kind == TokKind::Ident && ITEM_STOPS.contains(&x.text.as_str()))
+}
+
+/// The end of the type that starts at `from`: the first `=` or `;`
+/// outside every group and every `<…>` (`->` is not a closer), the first
+/// unmatched closer, the first of [`ITEM_STOPS`] outside every group, or
+/// the end. Groups are jumped through `close`, so the scan is linear in the
+/// span, and the span never reaches past the next item.
+fn type_end(t: &[Tok], close: &[Option<usize>], from: usize) -> usize {
+    let mut angle = 0usize;
+    let mut i = from;
+    while let Some(k) = t.get(i) {
+        if is_item_stop(t, i) {
+            return i;
+        }
+        if k.kind == TokKind::Punct {
+            match k.text.as_str() {
+                "(" | "[" | "{" => match close[i] {
+                    Some(c) => {
+                        i = c + 1;
+                        continue;
+                    }
+                    None => return i,
+                },
+                "<" => angle += 1,
+                ">" if is_p(t, i.wrapping_sub(1), "-") => {}
+                ">" => match angle.checked_sub(1) {
+                    Some(a) => angle = a,
+                    None => return i,
+                },
+                ")" | "]" | "}" => return i,
+                ";" | "=" if angle == 0 => return i,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    i
+}
+
+/// #10285: for each token, whether it sits inside the body of a
+/// `macro_rules!` definition. One pass, linear in the token count.
+fn macro_bodies(t: &[Tok], close: &[Option<usize>]) -> Vec<bool> {
+    let mut opens = vec![0usize; t.len() + 1];
+    let mut ends = vec![0usize; t.len() + 1];
+    for k in 0..t.len() {
+        if is_w(t, k, "macro_rules")
+            && is_p(t, k + 1, "!")
+            && t.get(k + 2).is_some_and(|x| x.kind == TokKind::Ident)
+            && is_open(t, k + 3)
+            && let Some(c) = close[k + 3]
+        {
+            opens[k + 4] += 1;
+            ends[c] += 1;
+        }
+    }
     let mut depth = 0usize;
-    for (i, k) in t.iter().enumerate().skip(from) {
-        match (k.kind, k.text.as_str()) {
-            (TokKind::Ident, w) => out.push(w.to_string()),
-            (TokKind::Punct, "(" | "[" | "{" | "<") => depth += 1,
-            (TokKind::Punct, ">") if is_p(t, i.wrapping_sub(1), "-") => {}
-            (TokKind::Punct, ")" | "]" | "}" | ">") => match depth.checked_sub(1) {
-                Some(d) => depth = d,
-                None => break,
-            },
-            (TokKind::Punct, "=" | ";") if depth == 0 => break,
+    (0..t.len())
+        .map(|i| {
+            depth = depth + opens[i] - ends[i].min(depth + opens[i]);
+            depth > 0
+        })
+        .collect()
+}
+
+/// For the `;` of each `[T; N]`, the index of its `]`: the length `N` is an
+/// expression, not a type. One pass with a stack.
+fn array_lengths(t: &[Tok], close: &[Option<usize>]) -> Vec<Option<usize>> {
+    let mut out = vec![None; t.len()];
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    for (i, k) in t.iter().enumerate() {
+        if k.kind != TokKind::Punct {
+            continue;
+        }
+        match k.text.as_str() {
+            "(" | "{" => stack.push((i, false)),
+            "[" => stack.push((i, true)),
+            ")" | "]" | "}" => {
+                stack.pop();
+            }
+            ";" => {
+                if let Some(top) = stack.last_mut()
+                    && top.1
+                {
+                    top.1 = false;
+                    out[i] = close[top.0];
+                }
+            }
             _ => {}
         }
     }
@@ -1991,8 +2165,12 @@ fn type_idents(t: &[Tok], from: usize) -> Vec<String> {
 }
 
 /// Every `static` item of a lexed file, plus the lines of `static $x`
-/// macro forms.
-fn statics_of(t: &[Tok]) -> (Vec<StaticItem>, Vec<usize>) {
+/// forms outside a `macro_rules!` body.
+fn statics_of(
+    t: &[Tok],
+    close: &[Option<usize>],
+    in_macro: &[bool],
+) -> (Vec<StaticItem>, Vec<usize>) {
     let mut named = Vec::new();
     let mut macros = Vec::new();
     for k in (0..t.len()).filter(|&k| is_w(t, k, "static")) {
@@ -2000,118 +2178,921 @@ fn statics_of(t: &[Tok]) -> (Vec<StaticItem>, Vec<usize>) {
         while is_w(t, n, "mut") || is_w(t, n, "ref") {
             n += 1;
         }
-        if is_p(t, n, "$") {
-            macros.push(t[k].line);
-            continue;
-        }
-        let Some(name) = t.get(n).filter(|x| x.kind == TokKind::Ident) else {
+        let meta = is_p(t, n, "$");
+        let name_at = n + usize::from(meta);
+        let Some(name) = t.get(name_at).filter(|x| x.kind == TokKind::Ident) else {
             continue;
         };
-        if is_p(t, n + 1, ":") {
+        let name = if meta {
+            format!("${}", name.text)
+        } else {
+            name.text.clone()
+        };
+        if in_macro[k] {
             named.push(StaticItem {
-                name: name.text.clone(),
-                line: name.line,
-                type_idents: type_idents(t, n + 2),
+                name,
+                line: t[k].line,
+                ty: (k, k),
+                in_macro: true,
+            });
+        } else if meta {
+            macros.push(t[k].line);
+        } else if is_p(t, name_at + 1, ":") {
+            let from = name_at + 2;
+            named.push(StaticItem {
+                name,
+                line: t[name_at].line,
+                ty: (from, type_end(t, close, from)),
+                in_macro: false,
             });
         }
     }
     (named, macros)
 }
 
-/// #10251: the lock types every file starts from.
-const BASE_LOCKS: [&str; 6] = [
+/// #10251, #10279: the final path segments that name a lock, a lock guard
+/// or a lock-built primitive, in std, tokio and `parking_lot` (fair and
+/// raw forms included). A name here makes the static a lock whatever crate
+/// it comes from; a lock type missing here is still not a pass, because it
+/// is not in [`LEAF_TYPES`] either.
+const LOCK_TYPES: [&str; 23] = [
     "Mutex",
     "RwLock",
     "Condvar",
     "ReentrantLock",
     "ReentrantMutex",
     "Semaphore",
+    "Barrier",
+    "Notify",
+    "OnceCell",
+    "SetOnce",
+    "FairMutex",
+    "RawMutex",
+    "RawFairMutex",
+    "RawRwLock",
+    "RawReentrantMutex",
+    "MutexGuard",
+    "RwLockReadGuard",
+    "RwLockWriteGuard",
+    "MappedMutexGuard",
+    "ReentrantMutexGuard",
+    "OwnedMutexGuard",
+    "SemaphorePermit",
+    "OwnedSemaphorePermit",
 ];
 
-/// #10251: `(name, identifiers it is built from)` for each type alias,
-/// struct, enum and union of a file, and each `use … as NAME` rename.
-fn type_defs(t: &[Tok]) -> Vec<(String, Vec<String>)> {
-    let ident = |i: usize| t.get(i).filter(|x| x.kind == TokKind::Ident);
-    let mut out = Vec::new();
-    // Whether the walk is inside a `use … ;` statement: one forward pass.
-    let mut in_use = false;
-    for k in 0..t.len() {
-        if is_w(t, k, "use") {
-            in_use = true;
-        } else if is_p(t, k, ";") {
-            in_use = false;
-        }
-        if is_w(t, k, "type")
-            && let Some(name) = ident(k + 1)
-        {
-            // The body after the `=` at depth 0, if any.
-            let mut depth = 0usize;
-            let mut j = k + 2;
-            while let Some(x) = t.get(j) {
-                match (x.kind, x.text.as_str()) {
-                    (TokKind::Punct, "(" | "[" | "{" | "<") => depth += 1,
-                    (TokKind::Punct, ">") if is_p(t, j - 1, "-") => {}
-                    (TokKind::Punct, ")" | "]" | "}" | ">") => depth = depth.saturating_sub(1),
-                    (TokKind::Punct, ";") if depth == 0 => break,
-                    (TokKind::Punct, "=") if depth == 0 => {
-                        out.push((name.text.clone(), type_idents(t, j + 1)));
-                        break;
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-        } else if (is_w(t, k, "struct") || is_w(t, k, "enum") || is_w(t, k, "union"))
-            && let Some(name) = ident(k + 1)
-        {
-            let mut j = k + 2;
-            while t
-                .get(j)
-                .is_some_and(|x| !matches!(x.text.as_str(), "{" | "(" | ";"))
-            {
-                j += 1;
-            }
-            if let Some(c) = t
-                .get(j)
-                .filter(|x| x.kind == TokKind::Punct && x.text != ";")
-                .and_then(|_| close_of(t, j))
-            {
-                let body = t[j..c]
-                    .iter()
-                    .filter(|x| x.kind == TokKind::Ident)
-                    .map(|x| x.text.clone())
-                    .collect();
-                out.push((name.text.clone(), body));
-            }
-        } else if is_w(t, k, "as")
-            && in_use
-            && let (Some(from), Some(to)) = (ident(k.wrapping_sub(1)), ident(k + 1))
-        {
-            out.push((to.text.clone(), vec![from.text.clone()]));
-        }
-    }
-    out
+/// #10275, #10283: the closed set of leaf types proven to hold no lock of
+/// their own (a container's arguments are judged in their own right). A
+/// type outside it, and outside the crate's own definitions, is
+/// unresolvable.
+const LEAF_TYPES: [&str; 58] = [
+    "bool",
+    "char",
+    "str",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "f32",
+    "f64",
+    "String",
+    "Vec",
+    "VecDeque",
+    "Box",
+    "Option",
+    "Result",
+    "Arc",
+    "Rc",
+    "Weak",
+    "HashMap",
+    "HashSet",
+    "BTreeMap",
+    "BTreeSet",
+    "BinaryHeap",
+    "LinkedList",
+    "PathBuf",
+    "Path",
+    "OsString",
+    "OsStr",
+    "Duration",
+    "Instant",
+    "SystemTime",
+    "Cell",
+    "RefCell",
+    "Once",
+    "OnceLock",
+    "LazyLock",
+    "LazyCell",
+    "AtomicBool",
+    "AtomicU8",
+    "AtomicU16",
+    "AtomicU32",
+    "AtomicU64",
+    "AtomicUsize",
+    "AtomicI8",
+    "AtomicI16",
+    "AtomicI32",
+    "AtomicI64",
+    "AtomicIsize",
+    "PhantomData",
+    "Cow",
+];
+
+/// Keywords in type position that name no type unless a path follows.
+const NEUTRAL_WORDS: [&str; 15] = [
+    "fn", "unsafe", "extern", "mut", "const", "pub", "crate", "super", "self", "Self", "for",
+    "where", "in", "as", "ref",
+];
+
+/// The path roots that name this crate.
+const LOCAL_ROOTS: [&str; 4] = ["crate", "self", "super", CRATE_NAME];
+
+/// The path roots of the standard library.
+const STD_ROOTS: [&str; 3] = ["std", "core", "alloc"];
+
+/// One piece of a type before resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Atom {
+    /// A name of [`LOCK_TYPES`].
+    Lock,
+    /// A form that names no knowable type.
+    Unres(Why),
+    /// A path: its root segment (`None` for a single segment), its last,
+    /// and the crate scope of the file that wrote it (see [`scope_of`]).
+    Ref {
+        name: String,
+        root: Option<String>,
+        scope: String,
+    },
 }
 
-/// #10251: the names of a file that are a lock: [`BASE_LOCKS`] closed
-/// through [`type_defs`]. Linear in the size of the definitions.
-fn lock_names(t: &[Tok]) -> BTreeSet<String> {
-    let mut users: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, body) in type_defs(t) {
-        for b in body {
-            users.entry(b).or_default().push(name.clone());
+/// What a type holds, ordered: a lock wins, then an unresolvable reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Res {
+    Clean,
+    Unres(Why),
+    Lock,
+}
+
+impl Res {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Lock, _) | (_, Self::Lock) => Self::Lock,
+            (Self::Unres(a), Self::Unres(b)) => Self::Unres(a.min(b)),
+            (Self::Unres(a), Self::Clean) | (Self::Clean, Self::Unres(a)) => Self::Unres(a),
+            (Self::Clean, Self::Clean) => Self::Clean,
         }
     }
-    let mut locks: BTreeSet<String> = BASE_LOCKS.iter().map(|s| (*s).to_string()).collect();
-    let mut todo: Vec<String> = locks.iter().cloned().collect();
-    while let Some(n) = todo.pop() {
-        for u in users.get(&n).into_iter().flatten() {
-            if locks.insert(u.clone()) {
-                todo.push(u.clone());
+}
+
+/// The atoms of the type tokens `t[from..to]`, appended to `out`. `params`
+/// are the generic parameters in scope, which name no type of their own
+/// (their arguments are judged where the type is used). Every token is
+/// visited at most once: linear in the span.
+fn type_atoms(
+    t: &[Tok],
+    close: &[Option<usize>],
+    lens: &[Option<usize>],
+    span: (usize, usize),
+    params: &BTreeSet<&str>,
+    out: &mut Vec<Atom>,
+) {
+    let ident = |i: usize| t.get(i).filter(|x| x.kind == TokKind::Ident);
+    let (mut i, to) = span;
+    while i < to {
+        if let Some(c) = lens[i] {
+            i = c + 1;
+            continue;
+        }
+        let k = &t[i];
+        match k.kind {
+            TokKind::Lifetime | TokKind::Str | TokKind::Char | TokKind::Num => i += 1,
+            TokKind::Punct => match k.text.as_str() {
+                "#" if is_p(t, i + 1, "[") => i = close[i + 1].map_or(to, |c| c + 1),
+                "*" if is_w(t, i + 1, "const") || is_w(t, i + 1, "mut") => {
+                    out.push(Atom::Unres(Why::RawPointer));
+                    i += 2;
+                }
+                ">" if is_p(t, i + 1, ":") && is_p(t, i + 2, ":") => {
+                    out.push(Atom::Unres(Why::Projection));
+                    i += 3;
+                }
+                _ => i += 1,
+            },
+            TokKind::Ident => {
+                let word = k.text.as_str();
+                let colon2 = |j: usize| is_p(t, j, ":") && is_p(t, j + 1, ":");
+                if is_p(t, i + 1, "!") && !is_p(t, i + 2, "=") {
+                    out.push(Atom::Unres(Why::MacroType(word.to_string())));
+                    i = if is_open(t, i + 2) {
+                        close[i + 2].map_or(to, |c| c + 1)
+                    } else {
+                        i + 2
+                    };
+                } else if word == "fn" && is_p(t, i + 1, "(") {
+                    // A function pointer holds code, not its argument or
+                    // return types.
+                    i = close[i + 1].map_or(to, |c| c + 1);
+                    if is_p(t, i, "-") && is_p(t, i + 1, ">") {
+                        i = fn_return_end(t, close, i + 2).min(to);
+                    }
+                } else if word == "dyn" {
+                    out.push(Atom::Unres(Why::TraitObject));
+                    i += 1;
+                } else if word == "impl" {
+                    out.push(Atom::Unres(Why::OpaqueType));
+                    i += 1;
+                } else if i + 1 < to
+                    && (is_p(t, i + 1, "=") || (is_p(t, i + 1, ":") && !colon2(i + 1)))
+                {
+                    // An associated binding name, a field name or a bound
+                    // parameter inside the span: the type follows it. The
+                    // `=` that ends the span is the static's initialiser.
+                    i += 1;
+                } else if NEUTRAL_WORDS.contains(&word) && !colon2(i + 1) {
+                    i += 1;
+                } else {
+                    let mut j = i;
+                    while colon2(j + 1) && ident(j + 3).is_some() {
+                        j += 3;
+                    }
+                    let last = t[j].text.as_str();
+                    if j > i && (word == "Self" || params.contains(word)) {
+                        out.push(Atom::Unres(Why::Projection));
+                    } else if j == i && params.contains(word) {
+                    } else if LOCK_TYPES.contains(&last) {
+                        out.push(Atom::Lock);
+                    } else {
+                        out.push(Atom::Ref {
+                            name: last.to_string(),
+                            root: (j > i).then(|| word.to_string()),
+                            scope: String::new(),
+                        });
+                    }
+                    i = j + 1;
+                }
             }
         }
     }
-    locks
+}
+
+/// The end of a function pointer's return type that starts at `from`: the
+/// first `,`, `;` or `=` outside angle brackets, or the bracket that closes
+/// the enclosing group.
+fn fn_return_end(t: &[Tok], close: &[Option<usize>], from: usize) -> usize {
+    let mut angle = 0usize;
+    let mut i = from;
+    while let Some(k) = t.get(i) {
+        if k.kind == TokKind::Punct {
+            match k.text.as_str() {
+                "(" | "[" | "{" => match close[i] {
+                    Some(c) => {
+                        i = c + 1;
+                        continue;
+                    }
+                    None => return i,
+                },
+                "<" => angle += 1,
+                ">" if is_p(t, i.wrapping_sub(1), "-") => {}
+                ">" => match angle.checked_sub(1) {
+                    Some(a) => angle = a,
+                    None => return i,
+                },
+                ")" | "]" | "}" => return i,
+                "," | ";" | "=" if angle == 0 => return i,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    i
+}
+
+/// The generic parameter list that opens at `open` (a `<`): the index after
+/// its `>`, the type parameter names and the token range of each default.
+/// An unclosed list ends at the first of [`ITEM_STOPS`] outside every group.
+fn generics(
+    t: &[Tok],
+    close: &[Option<usize>],
+    open: usize,
+) -> (usize, Vec<String>, Vec<(usize, usize)>) {
+    let mut names = Vec::new();
+    let mut defaults = Vec::new();
+    let mut param = |seg: usize, end: usize, eq: Option<usize>| {
+        if let Some(x) = t
+            .get(seg)
+            .filter(|x| x.kind == TokKind::Ident && x.text != "const")
+        {
+            names.push(x.text.clone());
+            if let Some(e) = eq {
+                defaults.push((e + 1, end));
+            }
+        }
+    };
+    let mut depth = 1usize;
+    let mut i = open + 1;
+    let mut seg = i;
+    let mut eq = None;
+    while let Some(k) = t.get(i) {
+        if is_item_stop(t, i) {
+            // #10284: an unclosed list ends where the next item starts.
+            param(seg, i, eq);
+            return (i, names, defaults);
+        }
+        if k.kind == TokKind::Punct {
+            match k.text.as_str() {
+                "(" | "[" | "{" => {
+                    i = close[i].map_or(i + 1, |c| c + 1);
+                    continue;
+                }
+                "<" => depth += 1,
+                ">" if is_p(t, i.wrapping_sub(1), "-") => {}
+                ">" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        param(seg, i, eq);
+                        return (i + 1, names, defaults);
+                    }
+                }
+                "," if depth == 1 => {
+                    param(seg, i, eq);
+                    seg = i + 1;
+                    eq = None;
+                }
+                "=" if depth == 1 => eq = Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    (t.len(), names, defaults)
+}
+
+/// The body group of a struct, enum or union whose generics end before
+/// `j`: `{…}` or `(…)`, skipping a `where` clause. `None` for a unit form
+/// and where the next item starts first (#10284: [`ITEM_STOPS`]).
+fn adt_body(t: &[Tok], close: &[Option<usize>], mut j: usize) -> Option<(usize, usize)> {
+    if is_p(t, j, "(") || is_p(t, j, "{") {
+        return close[j].map(|c| (j, c));
+    }
+    while let Some(k) = t.get(j) {
+        if is_item_stop(t, j) {
+            return None;
+        }
+        if k.kind == TokKind::Punct {
+            match k.text.as_str() {
+                "{" => return close[j].map(|c| (j, c)),
+                ";" => return None,
+                "(" | "[" => {
+                    j = close[j].map_or(j + 1, |c| c + 1);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// The imports of one file: local name to `(root, source name)`.
+type FileImports = BTreeMap<String, (String, String)>;
+
+/// The crate scope of a walked file: every file under `src/` is the
+/// package's own crate, and every other file is a crate (or a module
+/// shared by several) of its own.
+fn scope_of(path: &str) -> String {
+    if path.starts_with("src/") {
+        LIB_SCOPE.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// The scope of the files under `src/`, which [`CRATE_NAME`] names.
+const LIB_SCOPE: &str = "src";
+
+/// The node key of a name defined in a scope.
+fn scoped(scope: &str, name: &str) -> String {
+    format!("{scope}\u{0}{name}")
+}
+
+/// The node key that joins every definition of a name in any scope: what a
+/// name not defined in its own scope reads.
+fn any_scope(name: &str) -> String {
+    scoped("*", name)
+}
+
+/// Reads the bare names and path roots of `atoms` through the file's own
+/// imports: an imported lock name is a lock, an imported name is the path
+/// it was imported from, and an imported module root is that module's root.
+/// Every name keeps the file's scope.
+fn localise(atoms: &mut [Atom], own: &FileImports, file_scope: &str) {
+    for a in atoms {
+        let Atom::Ref { name, root, scope } = a else {
+            continue;
+        };
+        file_scope.clone_into(scope);
+        match root {
+            None => {
+                if let Some((r, src)) = own.get(name.as_str()) {
+                    if LOCK_TYPES.contains(&src.as_str()) {
+                        *a = Atom::Lock;
+                    } else {
+                        *a = Atom::Ref {
+                            name: src.clone(),
+                            root: Some(r.clone()),
+                            scope: file_scope.to_string(),
+                        };
+                    }
+                }
+            }
+            Some(m) => {
+                if let Some((r, _)) = own.get(m.as_str()) {
+                    *m = r.clone();
+                }
+            }
+        }
+    }
+}
+
+/// One named type of the walked tree: every definition of the name, merged.
+#[derive(Debug, Default)]
+struct Node {
+    atoms: Vec<Atom>,
+    /// Whether some definition is a struct, enum or union, so a cycle
+    /// through it is recursion, not an alias loop.
+    adt: bool,
+}
+
+/// #10275: the type definitions, modules and imports of the whole tree.
+#[derive(Debug, Default)]
+struct TypeGraph {
+    nodes: BTreeMap<String, Node>,
+    mods: BTreeSet<String>,
+    /// `(root, source name, local name)` of each `use` leaf.
+    imports: Vec<(String, String, String)>,
+    local_roots: BTreeSet<String>,
+    std_roots: BTreeSet<String>,
+    /// A name imported unrenamed from outside the crate: why it is not
+    /// proven, when no definition of the name exists.
+    imported: BTreeMap<String, Why>,
+    /// #10276: a local name `use`d for one of [`INCLUDE_MACROS`].
+    include_aliases: BTreeMap<String, &'static str>,
+}
+
+/// How a path root is read.
+enum RootKind {
+    Local,
+    Std,
+    Foreign,
+}
+
+impl TypeGraph {
+    fn root_kind(&self, root: &str) -> RootKind {
+        if LOCAL_ROOTS.contains(&root)
+            || self.mods.contains(root)
+            || self.local_roots.contains(root)
+        {
+            RootKind::Local
+        } else if STD_ROOTS.contains(&root) || self.std_roots.contains(root) {
+            RootKind::Std
+        } else {
+            RootKind::Foreign
+        }
+    }
+
+    fn node(&mut self, key: &str) -> &mut Node {
+        self.nodes.entry(key.to_string()).or_default()
+    }
+
+    /// The node of a definition of `name` in `scope`, joined into the
+    /// node of the name in any scope.
+    fn define(&mut self, scope: &str, name: &str) -> &mut Node {
+        let key = scoped(scope, name);
+        if !self.nodes.contains_key(&key) {
+            self.node(&any_scope(name)).atoms.push(Atom::Ref {
+                name: name.to_string(),
+                root: None,
+                scope: scope.to_string(),
+            });
+        }
+        self.node(&key)
+    }
+
+    /// Collects the definitions of one lexed file, outside `macro_rules!`
+    /// bodies, and returns the file's own imports. A name the file imports
+    /// is read through that import, never through another file's
+    /// definition of the same name. Linear in the token count.
+    fn file(
+        &mut self,
+        crate_scope: &str,
+        t: &[Tok],
+        close: &[Option<usize>],
+        lens: &[Option<usize>],
+        in_macro: &[bool],
+    ) -> FileImports {
+        let ident = |i: usize| t.get(i).filter(|x| x.kind == TokKind::Ident);
+        let first = self.imports.len();
+        for (k, &inside) in in_macro.iter().enumerate() {
+            if !inside && is_w(t, k, "use") {
+                self.use_tree(t, close, k + 1);
+            }
+        }
+        let mut own = FileImports::new();
+        for (root, src, alias) in &self.imports[first..] {
+            if alias != "_" && src != "self" {
+                own.insert(alias.clone(), (root.clone(), src.clone()));
+            }
+        }
+        for k in 0..t.len() {
+            if in_macro[k] || t[k].kind != TokKind::Ident {
+                continue;
+            }
+            let Some(name) = ident(k + 1).map(|x| x.text.clone()) else {
+                continue;
+            };
+            match t[k].text.as_str() {
+                "mod" => {
+                    self.mods.insert(name);
+                }
+                "type" => {
+                    let (j, params, defaults) = if is_p(t, k + 2, "<") {
+                        generics(t, close, k + 2)
+                    } else {
+                        (k + 2, Vec::new(), Vec::new())
+                    };
+                    let scope: BTreeSet<&str> = params.iter().map(String::as_str).collect();
+                    let mut atoms = Vec::new();
+                    for d in defaults {
+                        type_atoms(t, close, lens, d, &scope, &mut atoms);
+                    }
+                    if is_p(t, j, "=") {
+                        type_atoms(
+                            t,
+                            close,
+                            lens,
+                            (j + 1, type_end(t, close, j + 1)),
+                            &scope,
+                            &mut atoms,
+                        );
+                    } else {
+                        atoms.push(Atom::Unres(Why::NoValue(name.clone())));
+                    }
+                    localise(&mut atoms, &own, crate_scope);
+                    self.define(crate_scope, &name).atoms.extend(atoms);
+                }
+                w @ ("struct" | "enum" | "union") => {
+                    if w == "union" && !(is_p(t, k + 2, "{") || is_p(t, k + 2, "<")) {
+                        continue;
+                    }
+                    let (j, params, defaults) = if is_p(t, k + 2, "<") {
+                        generics(t, close, k + 2)
+                    } else {
+                        (k + 2, Vec::new(), Vec::new())
+                    };
+                    let scope: BTreeSet<&str> = params.iter().map(String::as_str).collect();
+                    let mut atoms = Vec::new();
+                    for d in defaults {
+                        type_atoms(t, close, lens, d, &scope, &mut atoms);
+                    }
+                    if let Some((open, c)) = adt_body(t, close, j) {
+                        if w == "enum" {
+                            enum_atoms(t, close, lens, (open, c), &scope, &mut atoms);
+                        } else {
+                            type_atoms(t, close, lens, (open + 1, c), &scope, &mut atoms);
+                        }
+                    }
+                    localise(&mut atoms, &own, crate_scope);
+                    let node = self.define(crate_scope, &name);
+                    node.adt = true;
+                    node.atoms.extend(atoms);
+                }
+                _ => {}
+            }
+        }
+        own
+    }
+
+    /// Records every leaf of the `use` tree that starts at `from`. An
+    /// explicit stack keeps any nesting depth off the call stack, and each
+    /// leaf costs O(1).
+    fn use_tree(&mut self, t: &[Tok], close: &[Option<usize>], from: usize) {
+        let end = type_end(t, close, from);
+        // (position, end of this level, the prefix root at this level).
+        let mut stack: Vec<(usize, usize, Option<String>)> = vec![(from, end, None)];
+        while let Some((mut i, end, base)) = stack.pop() {
+            while is_p(t, i, ",") && i < end {
+                i += 1;
+            }
+            if i >= end {
+                continue;
+            }
+            let start = i;
+            if is_p(t, i, ":") && is_p(t, i + 1, ":") {
+                i += 2;
+            }
+            let mut root = base.clone();
+            let mut last: Option<String> = None;
+            while let Some(x) = t.get(i).filter(|x| x.kind == TokKind::Ident && i < end) {
+                if x.text == "as" {
+                    break;
+                }
+                root.get_or_insert_with(|| x.text.clone());
+                last = Some(x.text.clone());
+                i += 1;
+                if is_p(t, i, ":") && is_p(t, i + 1, ":") {
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            if is_p(t, i, "{") {
+                let c = close[i].unwrap_or(end);
+                stack.push((c + 1, end, base));
+                stack.push((i + 1, c, root));
+                continue;
+            }
+            if is_p(t, i, "*") {
+                stack.push((i + 1, end, base));
+                continue;
+            }
+            let alias = if is_w(t, i, "as") {
+                i += 2;
+                t.get(i - 1)
+                    .filter(|x| x.kind == TokKind::Ident)
+                    .map(|x| x.text.clone())
+            } else {
+                last.clone()
+            };
+            if let (Some(r), Some(src), Some(a)) = (root, last, alias) {
+                self.imports.push((r, src, a));
+            }
+            stack.push((i.max(start + 1), end, base));
+        }
+    }
+
+    /// Turns the imports into names, once every module is known.
+    fn settle_imports(&mut self) {
+        let imports = std::mem::take(&mut self.imports);
+        for (root, _, alias) in &imports {
+            match self.root_kind(root) {
+                RootKind::Local => self.local_roots.insert(alias.clone()),
+                RootKind::Std => self.std_roots.insert(alias.clone()),
+                RootKind::Foreign => false,
+            };
+        }
+        for (root, src, alias) in imports {
+            if alias == "_" || src == "self" {
+                continue;
+            }
+            if let Some(m) = INCLUDE_MACROS.iter().find(|m| **m == src)
+                && alias != src
+            {
+                self.include_aliases.insert(alias.clone(), m);
+            }
+            if LOCK_TYPES.contains(&src.as_str()) {
+                self.node(&any_scope(&alias)).atoms.push(Atom::Lock);
+                continue;
+            }
+            let kind = self.root_kind(&root);
+            let why = match kind {
+                RootKind::Std if LEAF_TYPES.contains(&src.as_str()) => None,
+                RootKind::Std => Some(Why::StdNotProven(src.clone())),
+                RootKind::Foreign => Some(Why::Foreign {
+                    root: root.clone(),
+                    name: src.clone(),
+                }),
+                RootKind::Local => {
+                    if alias != src {
+                        self.node(&any_scope(&alias)).atoms.push(Atom::Ref {
+                            name: src,
+                            root: None,
+                            scope: String::new(),
+                        });
+                    }
+                    continue;
+                }
+            };
+            match why {
+                Some(w) if alias == src => {
+                    self.imported.entry(alias).or_insert(w);
+                }
+                Some(w) => self.node(&any_scope(&alias)).atoms.push(Atom::Unres(w)),
+                None if alias != src => {
+                    self.node(&any_scope(&alias));
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// One atom: its value now, or the node it waits on.
+    fn atom(&self, a: &Atom, index: &BTreeMap<&str, usize>) -> Result<Res, usize> {
+        let (name, root, scope) = match a {
+            Atom::Lock => return Ok(Res::Lock),
+            Atom::Unres(w) => return Ok(Res::Unres(w.clone())),
+            Atom::Ref { name, root, scope } => (name, root, scope),
+        };
+        let kind = root
+            .as_deref()
+            .map_or(RootKind::Local, |r| self.root_kind(r));
+        match kind {
+            RootKind::Local => {
+                let scope = if root.as_deref() == Some(CRATE_NAME) {
+                    LIB_SCOPE
+                } else {
+                    scope.as_str()
+                };
+                if let Some(&n) = index
+                    .get(scoped(scope, name).as_str())
+                    .or_else(|| index.get(any_scope(name).as_str()))
+                {
+                    Err(n)
+                } else if let Some(w) = self.imported.get(name) {
+                    Ok(Res::Unres(w.clone()))
+                } else if LEAF_TYPES.contains(&name.as_str()) {
+                    Ok(Res::Clean)
+                } else {
+                    Ok(Res::Unres(Why::NoDef(name.clone())))
+                }
+            }
+            RootKind::Std if LEAF_TYPES.contains(&name.as_str()) => Ok(Res::Clean),
+            RootKind::Std => Ok(Res::Unres(Why::StdNotProven(name.clone()))),
+            RootKind::Foreign => Ok(Res::Unres(Why::Foreign {
+                root: root.clone().unwrap_or_default(),
+                name: name.clone(),
+            })),
+        }
+    }
+
+    /// The value of every node: strongly connected components by an
+    /// iterative Tarjan walk (no recursion), each settled after the ones it
+    /// reaches. Linear in nodes plus atoms. A cycle with no struct, enum or
+    /// union in it is an alias loop: [`Why::Cycle`].
+    fn values(&self) -> Resolved<'_> {
+        let names: Vec<&str> = self.nodes.keys().map(String::as_str).collect();
+        let index: BTreeMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        let n = names.len();
+        let mut base = vec![Res::Clean; n];
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (v, node) in self.nodes.values().enumerate() {
+            for a in &node.atoms {
+                match self.atom(a, &index) {
+                    Ok(r) => base[v] = std::mem::replace(&mut base[v], Res::Clean).join(r),
+                    Err(w) => edges[v].push(w),
+                }
+            }
+        }
+        let adt: Vec<bool> = self.nodes.values().map(|x| x.adt).collect();
+        let unset = usize::MAX;
+        let mut order = vec![unset; n];
+        let mut low = vec![0usize; n];
+        let mut on = vec![false; n];
+        let mut comp = vec![unset; n];
+        let mut comp_val: Vec<Res> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut counter = 0usize;
+        for s in 0..n {
+            if order[s] != unset {
+                continue;
+            }
+            let mut call: Vec<(usize, usize)> = vec![(s, 0)];
+            order[s] = counter;
+            low[s] = counter;
+            counter += 1;
+            stack.push(s);
+            on[s] = true;
+            while let Some(&(v, e)) = call.last() {
+                if let Some(&w) = edges[v].get(e) {
+                    if let Some(top) = call.last_mut() {
+                        top.1 += 1;
+                    }
+                    if order[w] == unset {
+                        order[w] = counter;
+                        low[w] = counter;
+                        counter += 1;
+                        stack.push(w);
+                        on[w] = true;
+                        call.push((w, 0));
+                    } else if on[w] {
+                        low[v] = low[v].min(order[w]);
+                    }
+                    continue;
+                }
+                call.pop();
+                if let Some(&(u, _)) = call.last() {
+                    low[u] = low[u].min(low[v]);
+                }
+                if low[v] != order[v] {
+                    continue;
+                }
+                let id = comp_val.len();
+                let mut members = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on[w] = false;
+                    comp[w] = id;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                let mut val = Res::Clean;
+                let mut cyclic = members.len() > 1;
+                for &m in &members {
+                    val = val.join(base[m].clone());
+                    for &w in &edges[m] {
+                        if comp[w] == id {
+                            cyclic = true;
+                        } else {
+                            val = val.join(comp_val[comp[w]].clone());
+                        }
+                    }
+                }
+                if cyclic && !members.iter().any(|&m| adt[m]) {
+                    let first = members
+                        .iter()
+                        .filter_map(|&m| names[m].rsplit('\u{0}').next())
+                        .min()
+                        .unwrap_or_default();
+                    val = val.join(Res::Unres(Why::Cycle(first.to_string())));
+                }
+                comp_val.push(val);
+            }
+        }
+        Resolved {
+            graph: self,
+            index,
+            value: comp.iter().map(|&c| comp_val[c].clone()).collect(),
+        }
+    }
+}
+
+/// The settled value of every named type.
+struct Resolved<'g> {
+    graph: &'g TypeGraph,
+    index: BTreeMap<&'g str, usize>,
+    value: Vec<Res>,
+}
+
+impl Resolved<'_> {
+    /// What the type with these atoms holds.
+    fn of(&self, atoms: &[Atom]) -> Res {
+        atoms.iter().fold(Res::Clean, |acc, a| {
+            acc.join(match self.graph.atom(a, &self.index) {
+                Ok(r) => r,
+                Err(n) => self.value[n].clone(),
+            })
+        })
+    }
+}
+
+/// The atoms of an enum body `t[open..=c]`: variant names and
+/// discriminants are skipped, each variant's fields are judged.
+fn enum_atoms(
+    t: &[Tok],
+    close: &[Option<usize>],
+    lens: &[Option<usize>],
+    (open, c): (usize, usize),
+    params: &BTreeSet<&str>,
+    out: &mut Vec<Atom>,
+) {
+    let mut i = open + 1;
+    while i < c {
+        if is_p(t, i, "#") && is_p(t, i + 1, "[") {
+            i = close[i + 1].map_or(c, |e| e + 1);
+        } else if t[i].kind == TokKind::Ident {
+            i += 1;
+            if (is_p(t, i, "(") || is_p(t, i, "{"))
+                && let Some(e) = close[i]
+            {
+                type_atoms(t, close, lens, (i + 1, e), params, out);
+                i = e + 1;
+            }
+        } else if is_p(t, i, "=") {
+            i += 1;
+            while i < c && !is_p(t, i, ",") {
+                i = close[i].map_or(i + 1, |e| e + 1);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Visible characters of a reason: letters, digits and ASCII punctuation.
+fn visible(s: &str) -> usize {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_ascii_punctuation())
+        .count()
 }
 
 /// The names the guard file can be compiled under: the file itself and its
@@ -2190,6 +3171,22 @@ enum IncludeFinding {
         name: &'static str,
         found: usize,
     },
+    /// #10276: a walked file whose count of identifier tokens `ident` (one
+    /// of [`COUNTED_IDENTS`]) differs from its [`INCLUDE_ROWS`] row; a file
+    /// with no row has `rowed: 0`.
+    IncludeCount {
+        file: String,
+        ident: String,
+        rowed: usize,
+        found: usize,
+    },
+    /// An [`INCLUDE_ROWS`] row for a file the walk did not read.
+    IncludeRowStale { file: String, ident: String },
+    /// An [`INCLUDE_ROWS`] key written twice.
+    IncludeRowDuplicate { file: String, ident: String },
+    /// An [`INCLUDE_ROWS`] row with a short reason, a zero count or an
+    /// identifier outside [`COUNTED_IDENTS`].
+    IncludeRowBad { file: String, ident: String },
 }
 
 /// Why an include or path value is not judged.
@@ -2480,6 +3477,7 @@ fn inclusions_of(
     path: &str,
     t: &[Tok],
     walked: &BTreeSet<&str>,
+    aliases: &BTreeMap<String, &'static str>,
     mods: &mut [usize; 2],
     found: &mut Vec<IncludeFinding>,
 ) {
@@ -2518,7 +3516,16 @@ fn inclusions_of(
                 },
             }
         }
-        if INCLUDE_MACROS.contains(&tok.text.as_str()) && is_p(t, k + 1, "!") && is_p(t, k + 2, "(")
+        // #10276: any of the three delimiters, and a name `use`d as one of
+        // the include macros.
+        let mac = INCLUDE_MACROS
+            .iter()
+            .copied()
+            .find(|m| *m == tok.text)
+            .or_else(|| aliases.get(&tok.text).copied());
+        if let Some(mac) = mac
+            && is_p(t, k + 1, "!")
+            && is_open(t, k + 2)
         {
             let value =
                 close[k + 2].map_or(Err(ValueError::NotLiteral), |c| include_value(&t[k + 3..c]));
@@ -2532,7 +3539,7 @@ fn inclusions_of(
                 }
                 // `include_str!` and `include_bytes!` yield a literal, not
                 // code: only `include!` must name a walked `.rs` file.
-                Ok((value, anchored)) if tok.text == "include" => found.extend(unread_inclusion(
+                Ok((value, anchored)) if mac == "include" => found.extend(unread_inclusion(
                     path,
                     tok.line,
                     Names::Include,
@@ -2601,15 +3608,304 @@ fn brackets(t: &[Tok]) -> (Vec<Option<usize>>, Vec<bool>) {
     (close, in_attr)
 }
 
-/// #10213 and #10204: the static census against [`STATICS_TABLE`] and the
-/// inclusion census, over one lex of every walked file.
+/// #10275, #10285: `(path, static name, reason)` for each static whose
+/// type does not resolve to [`LEAF_TYPES`], or that sits in a
+/// `macro_rules!` body, and is judged by hand. Every row must be used.
+const EXCEPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "src/approvals.rs",
+        "APPROVAL_BUS",
+        "a tokio broadcast Sender: a channel handle, never acquired as a lock",
+    ),
+    (
+        "src/config.rs",
+        "DISABLED",
+        "an Arc of CapabilityConfig whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
+    ),
+    (
+        "src/config/unknown_keys.rs",
+        "SCHEMA",
+        "a schemars RootSchema: plain schema data built once",
+    ),
+    (
+        "src/enterprise_federation_posture/hardened_env_fixture.rs",
+        "POSTURE_AUDIT_DIR",
+        "a tempfile TempDir: a path that is removed on drop, no lock",
+    ),
+    (
+        "src/governance/audit.rs",
+        "DAEMON_AUDIT_KEY",
+        "an ed25519 SigningKey: key bytes, no lock",
+    ),
+    (
+        "src/governance/audit.rs",
+        "RECORDER_KEY",
+        "an ed25519 SigningKey: key bytes, no lock",
+    ),
+    (
+        "src/governance/audit.rs",
+        "WRITER",
+        "a std mpsc Sender of WriteOp: a channel handle, never acquired as a lock",
+    ),
+    (
+        "src/governance/wire_check.rs",
+        "GOVERNANCE_PRE_ACTION",
+        "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
+    ),
+    (
+        "src/handlers/federation_signing_check.rs",
+        "BUNDLE",
+        "a TrustBundle whose only foreign leaf is an ed25519 VerifyingKey (key bytes)",
+    ),
+    (
+        "src/identity/session_signer.rs",
+        "SESSION_SIGNER",
+        "an ed25519 SigningKey: key bytes, no lock",
+    ),
+    (
+        "src/identity/test_key_dir.rs",
+        "DIRECTORY",
+        "a tempfile TempDir: a path that is removed on drop, no lock",
+    ),
+    (
+        "src/inbox_wake.rs",
+        "INBOX_WAKE_BUS",
+        "a tokio broadcast Sender: a channel handle, never acquired as a lock",
+    ),
+    (
+        "src/logging.rs",
+        "CENSUS_DUMMY_METADATA_3650",
+        "a tracing Metadata: static callsite data",
+    ),
+    (
+        "src/logging.rs",
+        "INSTALLED_PIPELINE",
+        "the log pipeline; its foreign leaf is a tracing_appender ErrorCounter, an atomic count",
+    ),
+    (
+        "src/mcp/mod.rs",
+        "POST_SIGNAL_ACK_SINK",
+        "a tokio UnboundedSender of serde_json Value: a channel handle",
+    ),
+    (
+        "src/metrics.rs",
+        "HANDLE",
+        "the prometheus Metrics handle; its vectors are updated through their own API, never held",
+    ),
+    (
+        "src/storage/escalation_deferral.rs",
+        "TXN_FRAMES",
+        "a thread-local RefCell of frames; the foreign leaf is a serde_json Value",
+    ),
+    (
+        "src/storage/escalation_frame_reporting_8184_tests.rs",
+        "WRITE_PAUSE",
+        "a thread-local pair of std mpsc channel ends: a test pause, not a lock",
+    ),
+    (
+        "src/storage/mod.rs",
+        "BPE",
+        "a tiktoken CoreBPE: tokenizer tables built once",
+    ),
+    (
+        "src/storage/mod.rs",
+        "GOVERNANCE_PRE_WRITE",
+        "a boxed dyn Fn hook installed once by serve; the closures read config, they hold no lock",
+    ),
+    (
+        "src/storage/snapshot_file.rs",
+        "HOOK",
+        "a thread-local boxed dyn FnMut test seam, set by one test on its own thread",
+    ),
+    (
+        "src/storage/txn_immediate_5084_tests.rs",
+        "HOOK_5084",
+        "a thread-local boxed dyn FnOnce test seam, set by one test on its own thread",
+    ),
+    (
+        "src/subscriptions.rs",
+        "DISPATCH_ROOT_CA",
+        "a reqwest Certificate: certificate bytes, no lock",
+    ),
+    (
+        "src/subscriptions/webhook_ssrf_8203_tests.rs",
+        "DNS_ANSWER",
+        "a thread-local one-shot DNS answer: a String and an io Result of SocketAddr",
+    ),
+    (
+        "src/test_support.rs",
+        "TLS_TEST_PKI",
+        "the test PKI paths; its foreign leaf is a tempfile TempDir",
+    ),
+    (
+        "tests/agent_projection_txn_9405_9406.rs",
+        "RACE",
+        "a thread-local RefCell of Race: std mpsc channel ends and an Outcome",
+    ),
+    (
+        "tests/append_only_spine_flagon_g6.rs",
+        "AUDIT_DIR",
+        "a tempfile TempDir: a path that is removed on drop, no lock",
+    ),
+    (
+        "tests/append_only_upsert_supersede_2948.rs",
+        "AUDIT_DIR",
+        "a tempfile TempDir: a path that is removed on drop, no lock",
+    ),
+    (
+        "tests/auto_atomise/core.rs",
+        "Q",
+        "an AtomiseQueue: a std mpsc SyncSender, a channel handle",
+    ),
+    (
+        "tests/common/mod.rs",
+        "CLIENT",
+        "a reqwest Client: a connection pool handle, never acquired as a lock",
+    ),
+    (
+        "tests/curator_conserves_contradiction_g7.rs",
+        "AUDIT_DIR",
+        "a tempfile TempDir: a path that is removed on drop, no lock",
+    ),
+    (
+        "tests/entity_register_owner_8497.rs",
+        "TRAIL",
+        "a tempfile TempDir: a path that is removed on drop, no lock",
+    ),
+    (
+        "tests/fed_checkpoint_lane_3075_pg.rs",
+        "DIR",
+        "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
+    ),
+    (
+        "tests/federation_1936_checkpoint_fed.rs",
+        "DIR",
+        "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
+    ),
+    (
+        "tests/federation_checkpoint_ns_scope_2708.rs",
+        "DIR",
+        "a PathBuf and an AgentKeypair whose foreign leaf is an ed25519 SigningKey",
+    ),
+    (
+        "tests/form_1_synthesis.rs",
+        "RT",
+        "a tokio Runtime: a caller cannot acquire it as a lock",
+    ),
+    (
+        "tests/form_1_synthesis_verdict_matrix.rs",
+        "RT",
+        "a tokio Runtime: a caller cannot acquire it as a lock",
+    ),
+    (
+        "tests/issue_2122_synthesis_provenance_enforce.rs",
+        "RT",
+        "a tokio Runtime: a caller cannot acquire it as a lock",
+    ),
+    (
+        "tests/store_legacy_classifier_paths.rs",
+        "RT",
+        "a tokio Runtime: a caller cannot acquire it as a lock",
+    ),
+    (
+        "tests/store_synthesis_error_paths.rs",
+        "RT",
+        "a tokio Runtime: a caller cannot acquire it as a lock",
+    ),
+];
+
+/// #10276: the identifiers counted per walked file.
+const COUNTED_IDENTS: [&str; 1] = ["include"];
+
+/// #10276: `(path, identifier, count, reason)` for each walked file that
+/// holds an identifier of [`COUNTED_IDENTS`]; every other file holds none.
+const INCLUDE_ROWS: &[(&str, &str, usize, &str)] = &[(
+    "src/store/postgres.rs",
+    "include",
+    1,
+    "include! of the walked src/store/postgres_inbox_tests.rs, judged by part 5",
+)];
+
+/// The hand-written tables the token census judges against.
+struct Tables<'a> {
+    statics: &'a str,
+    exceptions: &'a [(&'a str, &'a str, &'a str)],
+    includes: &'a [(&'a str, &'a str, usize, &'a str)],
+}
+
+/// The statics table `statics` with no exception and no include row, for
+/// synthetic trees.
+fn bare(statics: &str) -> Tables<'_> {
+    Tables {
+        statics,
+        exceptions: &[],
+        includes: &[],
+    }
+}
+
+/// The token census of a tree with the live [`EXCEPTIONS`] and
+/// [`INCLUDE_ROWS`] and the statics table `table`.
 fn token_census(
     files: &[(String, String)],
     table: &str,
 ) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
-    let (rows, bad) = parse_table(table);
+    token_census_with(
+        files,
+        &Tables {
+            statics: table,
+            exceptions: EXCEPTIONS,
+            includes: INCLUDE_ROWS,
+        },
+    )
+}
+
+/// One lexed file with the maps every part of the token census reads.
+struct Lexed<'f> {
+    path: &'f str,
+    toks: Vec<Tok>,
+    close: Vec<Option<usize>>,
+    in_macro: Vec<bool>,
+    lens: Vec<Option<usize>>,
+}
+
+/// #10213 and #10204: the static census against [`STATICS_TABLE`] and the
+/// inclusion census, over one lex of every walked file. #10275: the types
+/// are resolved across the whole tree before any static is judged.
+fn token_census_with(
+    files: &[(String, String)],
+    tables: &Tables,
+) -> (Vec<StaticFinding>, Vec<IncludeFinding>) {
+    let (rows, bad) = parse_table(tables.statics);
     let mut statics: Vec<StaticFinding> = bad.into_iter().map(StaticFinding::Table).collect();
     let mut includes = Vec::new();
+    let mut lexed = Vec::new();
+    for (path, text) in files {
+        match lex(text) {
+            Ok(toks) => {
+                let close = brackets(&toks).0;
+                let in_macro = macro_bodies(&toks, &close);
+                let lens = array_lengths(&toks, &close);
+                lexed.push(Lexed {
+                    path,
+                    toks,
+                    close,
+                    in_macro,
+                    lens,
+                });
+            }
+            Err(error) => statics.push(StaticFinding::Lex {
+                file: path.clone(),
+                error,
+            }),
+        }
+    }
+    let mut graph = TypeGraph::default();
+    let own: Vec<FileImports> = lexed
+        .iter()
+        .map(|f| graph.file(&scope_of(f.path), &f.toks, &f.close, &f.lens, &f.in_macro))
+        .collect();
+    graph.settle_imports();
+    let resolved = graph.values();
     // Rows left per file, then per name: a static takes one row.
     let mut left: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
     for r in &rows {
@@ -2620,49 +3916,82 @@ fn token_census(
             .or_default() += 1;
     }
     // #10251: the keys with a row whose category is not `lock`.
-    let not_lock: BTreeSet<(&str, &str)> = rows
+    let not_lock: BTreeSet<(String, String)> = rows
         .iter()
         .filter(|r| r.category != Category::Lock)
-        .map(|r| (r.path.as_str(), r.name.as_str()))
+        .map(|r| (r.path.clone(), r.name.clone()))
         .collect();
+    let mut excepted: BTreeMap<(String, String), bool> = BTreeMap::new();
+    for &(file, name, reason) in tables.exceptions {
+        let key = (file.to_string(), name.to_string());
+        if excepted.insert(key, false).is_some() {
+            statics.push(StaticFinding::ExceptionDuplicate {
+                file: file.to_string(),
+                name: name.to_string(),
+            });
+        }
+        if visible(reason) < MIN_REASON_CHARS {
+            statics.push(StaticFinding::ExceptionReasonless {
+                file: file.to_string(),
+                name: name.to_string(),
+            });
+        }
+    }
     let walked: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
     let mut mods = [0usize; 2];
-    for (path, text) in files {
-        let toks = match lex(text) {
-            Ok(t) => t,
-            Err(error) => {
-                statics.push(StaticFinding::Lex {
-                    file: path.clone(),
-                    error,
-                });
-                continue;
-            }
-        };
-        let (named, macros) = statics_of(&toks);
-        let locks = lock_names(&toks);
+    let none = BTreeSet::new();
+    for (f, own) in lexed.iter().zip(&own) {
+        let path = f.path;
+        let (named, macros) = statics_of(&f.toks, &f.close, &f.in_macro);
         for StaticItem {
             name,
             line,
-            type_idents,
+            ty,
+            in_macro,
         } in named
         {
-            // #10251: a lock static's rows must all say `lock`.
-            if type_idents.iter().any(|i| locks.contains(i))
-                && not_lock.contains(&(path.as_str(), name.as_str()))
-            {
-                statics.push(StaticFinding::LockNotLabelled {
-                    file: path.clone(),
-                    name: name.clone(),
-                    line,
-                });
+            let key = (path.to_string(), name.clone());
+            let take = |excepted: &mut BTreeMap<(String, String), bool>| {
+                excepted.get_mut(&key).map(|used| *used = true).is_some()
+            };
+            if in_macro {
+                // #10285: never a row; judged only by hand.
+                if !take(&mut excepted) {
+                    statics.push(StaticFinding::MacroBodyStatic {
+                        file: path.to_string(),
+                        name,
+                        line,
+                    });
+                }
+                continue;
             }
-            match left
-                .get_mut(path.as_str())
-                .and_then(|m| m.get_mut(name.as_str()))
-            {
+            let mut atoms = Vec::new();
+            type_atoms(&f.toks, &f.close, &f.lens, ty, &none, &mut atoms);
+            localise(&mut atoms, own, &scope_of(path));
+            match resolved.of(&atoms) {
+                // #10251: a lock static's rows must all say `lock`.
+                Res::Lock if not_lock.contains(&key) => {
+                    statics.push(StaticFinding::LockNotLabelled {
+                        file: path.to_string(),
+                        name: name.clone(),
+                        line,
+                    });
+                }
+                // #10275, #10283: a static not proven lock-free.
+                Res::Unres(why) if not_lock.contains(&key) && !take(&mut excepted) => {
+                    statics.push(StaticFinding::Unresolvable {
+                        file: path.to_string(),
+                        name: name.clone(),
+                        line,
+                        why,
+                    });
+                }
+                _ => {}
+            }
+            match left.get_mut(path).and_then(|m| m.get_mut(name.as_str())) {
                 Some(n) if *n > 0 => *n -= 1,
                 _ => statics.push(StaticFinding::Unlisted {
-                    file: path.clone(),
+                    file: path.to_string(),
                     name,
                     line,
                 }),
@@ -2670,11 +3999,18 @@ fn token_census(
         }
         for line in macros {
             statics.push(StaticFinding::MacroStatic {
-                file: path.clone(),
+                file: path.to_string(),
                 line,
             });
         }
-        inclusions_of(path, &toks, &walked, &mut mods, &mut includes);
+        inclusions_of(
+            path,
+            &f.toks,
+            &walked,
+            &graph.include_aliases,
+            &mut mods,
+            &mut includes,
+        );
     }
     for r in &rows {
         if let Some(n) = left
@@ -2689,6 +4025,11 @@ fn token_census(
             });
         }
     }
+    for ((file, name), used) in excepted {
+        if !used {
+            statics.push(StaticFinding::ExceptionStale { file, name });
+        }
+    }
     for ((name, home), n) in GUARDED_MODS.iter().zip(mods) {
         if n != 1 {
             includes.push(IncludeFinding::ModCount {
@@ -2698,7 +4039,63 @@ fn token_census(
             });
         }
     }
+    includes.extend(include_counts(&lexed, tables.includes));
     (statics, includes)
+}
+
+/// #10276: every identifier token of [`COUNTED_IDENTS`] (a raw `r#` form
+/// lexes to the same token), counted per lexed file and held against the
+/// hand-written rows. A file with no row must hold none.
+fn include_counts(lexed: &[Lexed], table: &[(&str, &str, usize, &str)]) -> Vec<IncludeFinding> {
+    let mut out = Vec::new();
+    let mut rowed: BTreeMap<(&str, &str), (usize, bool)> = BTreeMap::new();
+    for &(file, ident, count, reason) in table {
+        let finding =
+            |f: fn(String, String) -> IncludeFinding| f(file.to_string(), ident.to_string());
+        if rowed.insert((file, ident), (count, false)).is_some() {
+            out.push(finding(|file, ident| IncludeFinding::IncludeRowDuplicate {
+                file,
+                ident,
+            }));
+        }
+        if count == 0 || visible(reason) < MIN_REASON_CHARS || !COUNTED_IDENTS.contains(&ident) {
+            out.push(finding(|file, ident| IncludeFinding::IncludeRowBad {
+                file,
+                ident,
+            }));
+        }
+    }
+    for f in lexed {
+        for ident in COUNTED_IDENTS {
+            let found = f
+                .toks
+                .iter()
+                .filter(|k| k.kind == TokKind::Ident && k.text == ident)
+                .count();
+            let row = rowed.get_mut(&(f.path, ident));
+            let want = row.map_or(0, |(n, seen)| {
+                *seen = true;
+                *n
+            });
+            if found != want {
+                out.push(IncludeFinding::IncludeCount {
+                    file: f.path.to_string(),
+                    ident: ident.to_string(),
+                    rowed: want,
+                    found,
+                });
+            }
+        }
+    }
+    for ((file, ident), (_, seen)) in rowed {
+        if !seen {
+            out.push(IncludeFinding::IncludeRowStale {
+                file: file.to_string(),
+                ident: ident.to_string(),
+            });
+        }
+    }
+    out
 }
 
 /// One finding of [`census_all`], tagged by the part that found it.
@@ -2709,11 +4106,328 @@ enum Finding {
     Use(UseFinding),
     Static(StaticFinding),
     Include(IncludeFinding),
+    Cargo(CargoFinding),
 }
 
-/// All five parts of the census over the whole tree.
+/// The name `[lib]` must compile this crate under.
+const CRATE_NAME: &str = "ai_memory";
+
+/// #10277: a finding of the build-target census of `Cargo.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoFinding {
+    /// The manifest cannot be read.
+    Unreadable(String),
+    /// The manifest is not TOML.
+    Unparseable(String),
+    /// A key the census reads holds a value of a type Cargo does not take there.
+    BadType { key: String },
+    /// A target source that does not end in `.rs` (exact case).
+    NotRs {
+        kind: &'static str,
+        name: String,
+        path: String,
+    },
+    /// A target source the walk did not read.
+    Unwalked {
+        kind: &'static str,
+        name: String,
+        path: String,
+    },
+    /// A `[workspace]` table: members are not modelled.
+    Workspace,
+    /// A `path =` dependency directory that holds no walked file.
+    DependencyPathUnwalked { key: String, path: String },
+    /// `[lib] name` is not [`CRATE_NAME`].
+    LibName { found: String },
+}
+
+impl std::fmt::Display for CargoFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(e) => write!(f, "Cargo.toml cannot be read: {e}"),
+            Self::Unparseable(e) => write!(f, "Cargo.toml does not parse: {e}"),
+            Self::BadType { key } => {
+                write!(f, "Cargo.toml `{key}` is not of the type Cargo reads there")
+            }
+            Self::NotRs { kind, name, path } => write!(
+                f,
+                "Cargo.toml {kind} target `{name}` names `{path}`, which does not end in `.rs` (exact case), so the census never reads it"
+            ),
+            Self::Unwalked { kind, name, path } => write!(
+                f,
+                "Cargo.toml {kind} target `{name}` names `{path}`, which the census did not read"
+            ),
+            Self::Workspace => write!(
+                f,
+                "Cargo.toml has a [workspace] table, whose members the census does not model"
+            ),
+            Self::DependencyPathUnwalked { key, path } => write!(
+                f,
+                "Cargo.toml `{key}` names the directory `{path}`, which holds no file the census read"
+            ),
+            Self::LibName { found } => {
+                write!(f, "Cargo.toml [lib] name is `{found}`, not `{CRATE_NAME}`")
+            }
+        }
+    }
+}
+
+/// #10277: the build-target kinds of a manifest, as `(array key, the
+/// word in a finding, the directory of its default sources)`.
+const TARGET_KINDS: [(&str, &str, &str); 4] = [
+    ("bin", "bin", "src/bin"),
+    ("test", "test", "tests"),
+    ("bench", "bench", "benches"),
+    ("example", "example", "examples"),
+];
+
+/// The dependency tables whose `path =` entries Cargo compiles.
+const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+/// #10277: one target source against the walked set.
+fn target_source(
+    kind: &'static str,
+    name: &str,
+    path: &str,
+    walked: &BTreeSet<&str>,
+) -> Option<CargoFinding> {
+    let rel = path.strip_prefix("./").unwrap_or(path);
+    if Path::new(rel).extension().is_none_or(|e| e != "rs") {
+        return Some(CargoFinding::NotRs {
+            kind,
+            name: name.to_string(),
+            path: path.to_string(),
+        });
+    }
+    (!walked.contains(rel)).then(|| CargoFinding::Unwalked {
+        kind,
+        name: name.to_string(),
+        path: path.to_string(),
+    })
+}
+
+/// The string at `key` of `table`: `Ok(None)` when absent, a finding when
+/// it is there but not a string.
+fn string_key<'t>(
+    table: &'t toml::Table,
+    key: &str,
+    full: &str,
+) -> Result<Option<&'t str>, CargoFinding> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(toml::Value::String(s)) => Ok(Some(s)),
+        Some(_) => Err(CargoFinding::BadType {
+            key: full.to_string(),
+        }),
+    }
+}
+
+/// The table at `key` of `doc`: `None` when absent, and a finding when it
+/// is there but not a table (#10277: never read as an empty table).
+fn table_key<'t>(
+    doc: &'t toml::Table,
+    key: &str,
+    out: &mut Vec<CargoFinding>,
+) -> Option<&'t toml::Table> {
+    if let toml::Value::Table(t) = doc.get(key)? {
+        Some(t)
+    } else {
+        out.push(CargoFinding::BadType {
+            key: key.to_string(),
+        });
+        None
+    }
+}
+
+/// #10277: every `path =` entry of one dependency table.
+fn dependency_paths(
+    deps: &toml::Value,
+    prefix: &str,
+    walked: &BTreeSet<&str>,
+    out: &mut Vec<CargoFinding>,
+) {
+    let Some(deps) = deps.as_table() else {
+        out.push(CargoFinding::BadType {
+            key: prefix.to_string(),
+        });
+        return;
+    };
+    for (dep, spec) in deps {
+        let Some(spec) = spec.as_table() else {
+            continue;
+        };
+        let key = format!("{prefix}.{dep}.path");
+        match string_key(spec, "path", &key) {
+            Ok(Some(dir)) => {
+                let dir = dir.strip_prefix("./").unwrap_or(dir).trim_end_matches('/');
+                // `.` is this package itself: its root is walked when any
+                // file of it is.
+                let under = if dir.is_empty() || dir == "." {
+                    String::new()
+                } else {
+                    format!("{dir}/")
+                };
+                if !walked.iter().any(|w| w.starts_with(&under)) {
+                    out.push(CargoFinding::DependencyPathUnwalked {
+                        key,
+                        path: dir.to_string(),
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(f) => out.push(f),
+        }
+    }
+}
+
+/// #10277: the build targets of a manifest against the walked set: the
+/// library, every `[[bin]]`, `[[test]]`, `[[bench]]` and `[[example]]`
+/// (its `path`, or else Cargo's default places for its name), the build
+/// script and every `path =` entry (dependencies, `[target.*]`, `[patch.*]`
+/// and `[replace]`). A key the census reads that holds a value of another
+/// type is a finding, never skipped. The auto-discovered directories are
+/// walked whole (see `auto_target_dirs_are_walked_10277`).
+fn cargo_census(manifest: Result<String, String>, walked: &BTreeSet<&str>) -> Vec<CargoFinding> {
+    let text = match manifest {
+        Ok(t) => t,
+        Err(e) => return vec![CargoFinding::Unreadable(e)],
+    };
+    let doc = match text.parse::<toml::Table>() {
+        Ok(d) => d,
+        Err(e) => return vec![CargoFinding::Unparseable(e.message().to_string())],
+    };
+    let mut out = Vec::new();
+    if doc.contains_key("workspace") {
+        out.push(CargoFinding::Workspace);
+    }
+    let empty = toml::Table::new();
+    let lib = table_key(&doc, "lib", &mut out).unwrap_or(&empty);
+    match string_key(lib, "name", "lib.name") {
+        Ok(Some(n)) if n != CRATE_NAME => out.push(CargoFinding::LibName {
+            found: n.to_string(),
+        }),
+        Ok(_) => {}
+        Err(f) => out.push(f),
+    }
+    match string_key(lib, "path", "lib.path") {
+        Ok(p) => out.extend(target_source(
+            "lib",
+            CRATE_NAME,
+            p.unwrap_or("src/lib.rs"),
+            walked,
+        )),
+        Err(f) => out.push(f),
+    }
+    for (key, kind, dir) in TARGET_KINDS {
+        let Some(list) = doc.get(key) else {
+            continue;
+        };
+        let Some(list) = list.as_array() else {
+            out.push(CargoFinding::BadType {
+                key: key.to_string(),
+            });
+            continue;
+        };
+        for (i, entry) in list.iter().enumerate() {
+            let Some(entry) = entry.as_table() else {
+                out.push(CargoFinding::BadType {
+                    key: format!("{key}[{i}]"),
+                });
+                continue;
+            };
+            let name = match string_key(entry, "name", &format!("{key}[{i}].name")) {
+                Ok(n) => n.unwrap_or_default(),
+                Err(f) => {
+                    out.push(f);
+                    continue;
+                }
+            };
+            match string_key(entry, "path", &format!("{key}[{i}].path")) {
+                Ok(Some(p)) => out.extend(target_source(kind, name, p, walked)),
+                Ok(None) => {
+                    let flat = format!("{dir}/{name}.rs");
+                    let nested = format!("{dir}/{name}/main.rs");
+                    let main = (kind == "bin").then_some("src/main.rs");
+                    let found = [Some(flat.as_str()), Some(nested.as_str()), main]
+                        .into_iter()
+                        .flatten()
+                        .any(|c| walked.contains(c));
+                    if !found {
+                        out.push(CargoFinding::Unwalked {
+                            kind,
+                            name: name.to_string(),
+                            path: flat,
+                        });
+                    }
+                }
+                Err(f) => out.push(f),
+            }
+        }
+    }
+    let package = table_key(&doc, "package", &mut out).unwrap_or(&empty);
+    match package.get("build") {
+        None | Some(toml::Value::Boolean(false)) => {}
+        Some(toml::Value::Boolean(true)) => {
+            out.extend(target_source("build", "build", "build.rs", walked));
+        }
+        Some(toml::Value::String(p)) => out.extend(target_source("build", "build", p, walked)),
+        Some(toml::Value::Array(a)) => {
+            for (i, p) in a.iter().enumerate() {
+                match p.as_str() {
+                    Some(p) => out.extend(target_source("build", "build", p, walked)),
+                    None => out.push(CargoFinding::BadType {
+                        key: format!("package.build[{i}]"),
+                    }),
+                }
+            }
+        }
+        Some(_) => out.push(CargoFinding::BadType {
+            key: "package.build".to_string(),
+        }),
+    }
+    for t in DEPENDENCY_TABLES {
+        if let Some(d) = doc.get(t) {
+            dependency_paths(d, t, walked, &mut out);
+        }
+    }
+    // `[replace]` entries take `path =` as a dependency does.
+    if let Some(d) = doc.get("replace") {
+        dependency_paths(d, "replace", walked, &mut out);
+    }
+    if let Some(targets) = table_key(&doc, "target", &mut out) {
+        for (cfg, body) in targets {
+            let Some(body) = body.as_table() else {
+                out.push(CargoFinding::BadType {
+                    key: format!("target.{cfg}"),
+                });
+                continue;
+            };
+            for t in DEPENDENCY_TABLES {
+                if let Some(d) = body.get(t) {
+                    dependency_paths(d, &format!("target.{cfg}.{t}"), walked, &mut out);
+                }
+            }
+        }
+    }
+    if let Some(patches) = table_key(&doc, "patch", &mut out) {
+        for (source, body) in patches {
+            dependency_paths(body, &format!("patch.{source}"), walked, &mut out);
+        }
+    }
+    out
+}
+
+/// The live manifest text, or why it cannot be read.
+fn live_manifest() -> Result<String, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    fs::read_to_string(&path).map_err(|e| e.kind().to_string())
+}
+
+/// All six parts of the census over the whole tree.
 fn census_all(files: &[(String, String)]) -> Vec<Finding> {
     let (statics, includes) = token_census(files, STATICS_TABLE);
+    let walked: BTreeSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    let cargo = cargo_census(live_manifest(), &walked);
     census(files)
         .into_iter()
         .map(Finding::Line)
@@ -2721,6 +4435,7 @@ fn census_all(files: &[(String, String)]) -> Vec<Finding> {
         .chain(use_census(files).into_iter().map(Finding::Use))
         .chain(statics.into_iter().map(Finding::Static))
         .chain(includes.into_iter().map(Finding::Include))
+        .chain(cargo.into_iter().map(Finding::Cargo))
         .collect()
 }
 
@@ -3070,8 +4785,9 @@ fn mutant_static_built_by_macro_is_red_10213() {
     let (got, f) = run(&M_MACRO);
     assert_eq!(
         got,
-        vec![Finding::Static(StaticFinding::MacroStatic {
+        vec![Finding::Static(StaticFinding::MacroBodyStatic {
             file: SUPPORT.into(),
+            name: "$n".into(),
             line: f[0] + 2,
         })],
         "{}",
@@ -3193,12 +4909,26 @@ fn mutant_guard_parent_module_path_is_red_10204() {
     );
 }
 
+/// #10276: the [`COUNTED_IDENTS`] finding of one `include` token added to
+/// [`SUPPORT`], which has no row.
+fn support_include_count(found: usize) -> Finding {
+    Finding::Include(IncludeFinding::IncludeCount {
+        file: SUPPORT.into(),
+        ident: "include".into(),
+        rowed: 0,
+        found,
+    })
+}
+
 #[test]
 fn mutant_guard_file_include_is_red_10204() {
     let (got, f) = run(&M_INCLUDE);
     assert_eq!(
         got,
-        vec![include_hit(f[0], "store_url/env_guard.rs")],
+        vec![
+            include_hit(f[0], "store_url/env_guard.rs"),
+            support_include_count(1)
+        ],
         "{}",
         M_INCLUDE.id
     );
@@ -3209,7 +4939,10 @@ fn mutant_guard_file_include_concat_env_is_red_10204() {
     let (got, f) = run(&M_INCLUDE_CONCAT);
     assert_eq!(
         got,
-        vec![include_hit(f[0], "/src/store_url/env_guard.rs")],
+        vec![
+            include_hit(f[0], "/src/store_url/env_guard.rs"),
+            support_include_count(1)
+        ],
         "{}",
         M_INCLUDE_CONCAT.id
     );
@@ -3220,7 +4953,10 @@ fn mutant_guard_file_include_split_concat_is_red_10204() {
     let (got, f) = run(&M_INCLUDE_SPLIT);
     assert_eq!(
         got,
-        vec![include_hit(f[0], "store_url/env_guard.rs")],
+        vec![
+            include_hit(f[0], "store_url/env_guard.rs"),
+            support_include_count(1)
+        ],
         "{}",
         M_INCLUDE_SPLIT.id
     );
@@ -3231,10 +4967,13 @@ fn mutant_include_not_literal_is_red_10204() {
     let (got, f) = run(&M_INCLUDE_NOT_LITERAL);
     assert_eq!(
         got,
-        vec![Finding::Include(IncludeFinding::IncludeNotLiteral {
-            file: SUPPORT.into(),
-            line: f[0],
-        })],
+        vec![
+            Finding::Include(IncludeFinding::IncludeNotLiteral {
+                file: SUPPORT.into(),
+                line: f[0],
+            }),
+            support_include_count(1)
+        ],
         "{}",
         M_INCLUDE_NOT_LITERAL.id
     );
@@ -3348,7 +5087,7 @@ fn table_rows_are_refused_exactly_10213() {
             },
         ]
     );
-    let (statics, _) = token_census(&[], "src/a.rs\tA\tshort\n");
+    let (statics, _) = token_census_with(&[], &bare("src/a.rs\tA\tshort\n"));
     assert_eq!(
         statics,
         vec![
@@ -3421,9 +5160,9 @@ fn category_outside_the_vocabulary_is_refused_10251() {
 
 /// #10251: the `(path, name)` keys of the `lock` rows, written by hand from
 /// an independent reading of each static's type (every static whose type
-/// is or holds a `Mutex`, `RwLock`, `Condvar`, `ReentrantLock`,
-/// `ReentrantMutex` or `Semaphore`, directly or through a type of its own
-/// file). A row relabelled away from `lock`, or a lock row added, is red.
+/// is or holds a lock of [`LOCK_TYPES`] (std, tokio or `parking_lot`, a
+/// tokio `OnceCell` included), directly or through a type of the tree).
+/// A row relabelled away from `lock`, or a lock row added, is red.
 const LOCK_ROWS: &[(&str, &str)] = &[
     ("src/approvals.rs", "EXECUTION_EXEMPTIONS"),
     ("src/approvals.rs", "LOCK"),
@@ -3483,6 +5222,7 @@ const LOCK_ROWS: &[(&str, &str)] = &[
     ("src/inbox_wake.rs", "RECIPIENT_SEQS"),
     ("src/llm.rs", "ENV_GUARD_1143"),
     ("src/main.rs", "LOCK"),
+    ("src/mcp/mod.rs", "MCP_EMBED_SKIP_AMORT"),
     ("src/mcp/mod.rs", "PRE_EVENT_ENFORCE_GATE"),
     ("src/mcp/mod.rs", "PRE_SIGNAL_SEND_GATE"),
     ("src/mcp/mod.rs", "SHARED_PERMISSION_RULES_GUARD"),
@@ -3503,6 +5243,7 @@ const LOCK_ROWS: &[(&str, &str)] = &[
     ("src/store/postgres.rs", "PG_BOOTSTRAP_TEST_LOCK"),
     ("src/store/sqlite.rs", "OWNER_GATE_TEST_HOOK"),
     ("src/store_url/env_guard.rs", "LOCK"),
+    ("src/subscriptions.rs", "DISPATCH_IDLE"),
     ("src/subscriptions.rs", "DISPATCH_SEMAPHORE"),
     ("src/subscriptions.rs", "SSRF_ENV_GUARD"),
     ("src/subscriptions/unstarted.rs", "REGISTRY"),
@@ -3535,6 +5276,7 @@ const LOCK_ROWS: &[(&str, &str)] = &[
     ),
     ("tests/audit_witness_rollback_7241.rs", "CELL_LOCK"),
     ("tests/audit_witness_truncation_1822.rs", "LOCK"),
+    ("tests/auto_atomise/core.rs", "A"),
     ("tests/auto_atomise/core.rs", "M"),
     ("tests/auto_atomise/core.rs", "SLOT"),
     ("tests/b4_config_cleanup.rs", "LOCK"),
@@ -3556,6 +5298,12 @@ const LOCK_ROWS: &[(&str, &str)] = &[
     ("tests/cluster_f_perf_regressions.rs", "TRACE_LOG"),
     ("tests/common/mod.rs", "ENV_LOCK"),
     ("tests/common/pg_isolate.rs", "PROCESS_CLONE"),
+    ("tests/containment_relational_3946.rs", "WARMED"),
+    (
+        "tests/contaminated_stamp_f1_fixes_pg_item3_3266.rs",
+        "WARMED",
+    ),
+    ("tests/contaminated_stamp_pg_item3_3266.rs", "WARMED"),
     ("tests/corrupt_governance_escape_4285.rs", "SERIAL"),
     ("tests/corrupt_governance_severed_4285.rs", "STAR"),
     ("tests/cov3_handlers_postgres.rs", "FED_ENV_LOCK"),
@@ -3776,6 +5524,8 @@ const LOCK_ROWS: &[(&str, &str)] = &[
     ("tests/signal_recipient_validation_4408.rs", "ENV_LOCK"),
     ("tests/skill_scope_integrity_8832_8834.rs", "ENV_GUARD"),
     ("tests/skills_jail_caller_text_3762.rs", "SERIAL"),
+    ("tests/swarm_rewind_pg_item3_3266.rs", "WARMED"),
+    ("tests/swarm_rewind_route_item3_3266.rs", "WARMED"),
     ("tests/sync_since_visibility_gate_948.rs", "ENV_LOCK"),
     ("tests/synthesis_ownership_gate_3173.rs", "LOCK"),
     ("tests/tls_import_daemon_3709.rs", "SANDBOX_LOCK"),
@@ -3884,23 +5634,27 @@ fn lock_static_not_labelled_lock_is_red_10251() {
         };
         let mut table =
             format!("{STATICS_TABLE}{SUPPORT}\t{name}\tatomic: an atomic value of the form\n");
+        let mut want = Vec::new();
         if *id == "generic-assoc-binding" {
-            // `Box<dyn Iterator<Item = u8>>` holds no lock: a `once` row
-            // is accepted for it, and the `=` of the binding does not end the
-            // type of the next static early.
+            // #10283: `Box<dyn Iterator<Item = u8>>` is a trait object, not
+            // proven lock-free, so a `once` row is `Unresolvable`; the `=`
+            // of the binding does not end the type of the next static early.
             table.push_str(SUPPORT);
             table.push_str("\tFORM_L\tonce: a value computed once, no lock\n");
-        }
-        let (statics, includes) = token_census(&files, &table);
-        assert_eq!(
-            statics,
-            vec![StaticFinding::LockNotLabelled {
+            want.push(StaticFinding::Unresolvable {
                 file: SUPPORT.into(),
-                name: name.into(),
-                line: first + at,
-            }],
-            "{id}"
-        );
+                name: "FORM_L".into(),
+                line: first,
+                why: Why::TraitObject,
+            });
+        }
+        want.push(StaticFinding::LockNotLabelled {
+            file: SUPPORT.into(),
+            name: name.into(),
+            line: first + at,
+        });
+        let (statics, includes) = token_census(&files, &table);
+        assert_eq!(statics, want, "{id}");
         assert_eq!(includes, Vec::<IncludeFinding>::new(), "{id}");
     }
     // The same statics labelled `lock` are clean.
@@ -3932,15 +5686,20 @@ fn live_lock_row_relabelled_is_red_10251() {
             }
         })
         .collect();
+    // #10281: the exact finding, its line read by hand from
+    // src/approvals.rs (one static of that name, one row).
+    assert_eq!(
+        (key_path, key_name),
+        ("src/approvals.rs", "EXECUTION_EXEMPTIONS")
+    );
     let (statics, _) = token_census(&tree(), &table);
-    assert!(
-        !statics.is_empty()
-            && statics.iter().all(|f| matches!(
-                f,
-                StaticFinding::LockNotLabelled { file, name, .. }
-                    if file == key_path && name == key_name
-            )),
-        "{statics:?}"
+    assert_eq!(
+        statics,
+        vec![StaticFinding::LockNotLabelled {
+            file: "src/approvals.rs".into(),
+            name: "EXECUTION_EXEMPTIONS".into(),
+            line: 1131,
+        }]
     );
 }
 
@@ -4052,7 +5811,14 @@ fn undecodable_and_not_literal_are_red_10204() {
         let toks = lex(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
         let mut mods = [0usize; 2];
         let mut got = Vec::new();
-        inclusions_of("src/x.rs", &toks, &BTreeSet::new(), &mut mods, &mut got);
+        inclusions_of(
+            "src/x.rs",
+            &toks,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut mods,
+            &mut got,
+        );
         let shape: Vec<IncludeFinding> = got
             .into_iter()
             .map(|f| match f {
@@ -4083,7 +5849,14 @@ fn undecodable_and_not_literal_are_red_10204() {
     }
     let toks = lex("#[path = \"a\\qb.rs\"]\nmod m;\n").expect("lexes");
     let mut got = Vec::new();
-    inclusions_of("src/x.rs", &toks, &BTreeSet::new(), &mut [0; 2], &mut got);
+    inclusions_of(
+        "src/x.rs",
+        &toks,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &mut [0; 2],
+        &mut got,
+    );
     assert_eq!(
         got,
         vec![IncludeFinding::Undecodable {
@@ -4317,7 +6090,12 @@ fn inclusion_of_an_unread_file_is_red_10250() {
             .into_iter()
             .filter(|f| matches!(f, Finding::Include(_)))
             .collect();
-        assert_eq!(got, vec![inc(first + at, *kind, value)], "{id}");
+        let mut want = vec![inc(first + at, *kind, value)];
+        if id.starts_with("include-") {
+            // #10276: the added `include` token is also off its row.
+            want.push(support_include_count(1));
+        }
+        assert_eq!(got, want, "{id}");
     }
     let clean: &[(&str, &str)] = &[
         ("path-sibling", "#[path = \"lib.rs\"]\nmod again_lib;\n"),
@@ -4353,7 +6131,15 @@ fn inclusion_of_an_unread_file_is_red_10250() {
             .into_iter()
             .filter(|f| matches!(f, Finding::Include(_)))
             .collect();
-        assert_eq!(got, Vec::<Finding>::new(), "{id}");
+        // #10276: a clean `include!` is still one more `include` token than
+        // the file's row allows; `include_str!` and `include_bytes!` are not
+        // counted.
+        let want = if matches!(*id, "include-sibling" | "include-manifest") {
+            vec![support_include_count(1)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(got, want, "{id}");
     }
 }
 
@@ -4369,130 +6155,743 @@ fn manifest_dir_after_the_first_piece_is_not_literal_10250() {
         .collect();
     assert_eq!(
         got,
-        vec![Finding::Include(IncludeFinding::IncludeNotLiteral {
-            file: SUPPORT.into(),
-            line: first,
-        })]
-    );
-}
-
-/// The token census is linear: a 200 000-line file of every form it parses
-/// is judged in well under the ceiling, with every hit reported.
-#[test]
-fn token_census_cost_is_bounded_10213() {
-    const LINES: usize = 200_000;
-    const CEILING_SECS: u64 = 20;
-    let mut big = String::new();
-    for i in 0..LINES / 4 {
-        let _ = writeln!(big, "static S{i}: u8 = 0;");
-        big.push_str("let path = x;\n");
-        big.push_str("#[path = \"other.rs\"]\n");
-        big.push_str("const X: &str = include_str!(\"y.md\");\n");
-    }
-    // `#[path = "other.rs"]` resolves to a walked file, so it is no finding.
-    let files = vec![
-        ("src/big.rs".to_string(), big),
-        ("src/other.rs".to_string(), String::new()),
-    ];
-    let start = std::time::Instant::now();
-    let (statics, includes) = token_census(&files, "");
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(CEILING_SECS),
-        "{:?}",
-        start.elapsed()
-    );
-    assert_eq!(statics.len(), LINES / 4);
-    assert_eq!(
-        statics[7],
-        StaticFinding::Unlisted {
-            file: "src/big.rs".into(),
-            name: "S7".into(),
-            line: 29
-        }
-    );
-    assert_eq!(
-        includes,
         vec![
-            IncludeFinding::ModCount {
-                file: "src/store_url.rs",
-                name: "env_guard",
-                found: 0
-            },
-            IncludeFinding::ModCount {
-                file: "src/lib.rs",
-                name: "store_url",
-                found: 0
-            },
+            Finding::Include(IncludeFinding::IncludeNotLiteral {
+                file: SUPPORT.into(),
+                line: first,
+            }),
+            support_include_count(1)
         ]
     );
 }
-const CRATE_NAME: &str = "ai_memory";
 
-/// #10277: a finding of the build-target census of `Cargo.toml`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CargoFinding {
-    /// The manifest cannot be read.
-    Unreadable(String),
-    /// The manifest is not TOML.
-    Unparseable(String),
-    /// A key the census reads holds a value of a type Cargo does not take there.
-    BadType { key: String },
-    /// A target source that does not end in `.rs` (exact case).
-    NotRs {
-        kind: &'static str,
-        name: String,
-        path: String,
-    },
-    /// A target source the walk did not read.
-    Unwalked {
-        kind: &'static str,
-        name: String,
-        path: String,
-    },
-    /// A `[workspace]` table: members are not modelled.
-    Workspace,
-    /// A `path =` dependency directory that holds no walked file.
-    DependencyPathUnwalked { key: String, path: String },
-    /// `[lib] name` is not [`CRATE_NAME`].
-    LibName { found: String },
+/// The two [`GUARDED_MODS`] findings of a synthetic tree with no
+/// store-url module.
+fn no_store_url() -> Vec<IncludeFinding> {
+    vec![
+        IncludeFinding::ModCount {
+            file: "src/store_url.rs",
+            name: "env_guard",
+            found: 0,
+        },
+        IncludeFinding::ModCount {
+            file: "src/lib.rs",
+            name: "store_url",
+            found: 0,
+        },
+    ]
 }
 
-impl std::fmt::Display for CargoFinding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unreadable(e) => write!(f, "Cargo.toml cannot be read: {e}"),
-            Self::Unparseable(e) => write!(f, "Cargo.toml does not parse: {e}"),
-            Self::BadType { key } => {
-                write!(f, "Cargo.toml `{key}` is not of the type Cargo reads there")
-            }
-            Self::NotRs { kind, name, path } => write!(
-                f,
-                "Cargo.toml {kind} target `{name}` names `{path}`, which does not end in `.rs` (exact case), so the census never reads it"
-            ),
-            Self::Unwalked { kind, name, path } => write!(
-                f,
-                "Cargo.toml {kind} target `{name}` names `{path}`, which the census did not read"
-            ),
-            Self::Workspace => write!(
-                f,
-                "Cargo.toml has a [workspace] table, whose members the census does not model"
-            ),
-            Self::DependencyPathUnwalked { key, path } => write!(
-                f,
-                "Cargo.toml `{key}` names the directory `{path}`, which holds no file the census read"
-            ),
-            Self::LibName { found } => {
-                write!(f, "Cargo.toml [lib] name is `{found}`, not `{CRATE_NAME}`")
-            }
+/// The `once` row every form static of the tables below carries.
+const FORM_ROW: &str = "\tFORM\tonce: a value computed once, no lock\n";
+
+/// A reason long enough for an exception or an include row.
+const FORM_WHY: &str = "judged by hand for the form table";
+
+/// What the deny-by-default census must decide for one form.
+#[derive(Debug)]
+enum Want {
+    /// The type holds a lock: a `once` row is `LockNotLabelled`.
+    Lock,
+    /// The type is proven lock-free: no finding.
+    Clean,
+    /// The type is not proven: a `once` row is `Unresolvable` for this reason.
+    Unres(Why),
+}
+
+/// The types `src/a.rs` defines for the forms that name a type in another
+/// file of the library (#10275).
+const FORM_DEFS: &str = "pub struct Gate {\n    m: std::sync::Mutex<u8>,\n}\n\
+pub type One = Two;\npub type Two = std::sync::RwLock<u8>;\npub struct S;\n\
+pub trait Tr {\n    type Out;\n}\npub type Erased = Box<dyn Fn() + Sync>;\n\
+pub struct Plain {\n    v: u8,\n}\n";
+
+/// An exception row as the tests write it: `(file, name, reason)`.
+type ExceptionRow<'a> = (&'a str, &'a str, &'a str);
+
+/// One exception case: `(id, text, exceptions, findings written by hand)`.
+type ExceptionCase<'a> = (&'a str, &'a str, Vec<ExceptionRow<'a>>, Vec<StaticFinding>);
+
+/// One macro-body case: `(id, text, table, exceptions, findings)`.
+type MacroBodyCase<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    Vec<ExceptionRow<'a>>,
+    Vec<StaticFinding>,
+);
+
+/// One include-row case: `(id, rows (file, ident, count, reason), findings)`.
+type IncludeRowCase<'a> = (
+    &'a str,
+    Vec<(&'a str, &'a str, usize, &'a str)>,
+    Vec<IncludeFinding>,
+);
+
+/// One form: `(id, file, text, the decision written by hand)`.
+type Form = (&'static str, &'static str, &'static str, Want);
+
+/// #10275, #10278, #10279, #10283: every type form, with its decision
+/// written by hand. Reviewer forms, then invented ones.
+fn type_forms() -> Vec<Form> {
+    let b = "src/b.rs";
+    let foreign = |root: &str, name: &str| {
+        Want::Unres(Why::Foreign {
+            root: root.into(),
+            name: name.into(),
+        })
+    };
+    let mut forms = vec![
+        // #10275: types defined in another file of the library.
+        ("cross-file-bare", b, "static FORM: Gate = X;\n", Want::Lock),
+        (
+            "cross-file-path",
+            b,
+            "static FORM: crate::a::Gate = X;\n",
+            Want::Lock,
+        ),
+        (
+            "cross-file-use-rename",
+            b,
+            "use crate::a::Gate as Door;\nstatic FORM: Door = X;\n",
+            Want::Lock,
+        ),
+        (
+            "cross-file-alias-chain",
+            b,
+            "static FORM: crate::a::One = X;\n",
+            Want::Lock,
+        ),
+        (
+            "cross-file-clean",
+            b,
+            "static FORM: crate::a::Plain = X;\n",
+            Want::Clean,
+        ),
+        (
+            "tests-crate-path",
+            "tests/x.rs",
+            "static FORM: ai_memory::a::Gate = X;\n",
+            Want::Lock,
+        ),
+        (
+            "tests-own-scope",
+            "tests/x.rs",
+            "struct Gate {\n    v: u8,\n}\nstatic FORM: Gate = X;\n",
+            Want::Clean,
+        ),
+        (
+            "import-overrides-scope",
+            b,
+            "use other::Thing as Gate;\nstatic FORM: Gate = X;\n",
+            foreign("other", "Thing"),
+        ),
+        // #10283: type-erased, opaque, macro and boxed forms.
+        (
+            "dyn-boxed",
+            b,
+            "static FORM: Box<dyn std::any::Any + Sync> = X;\n",
+            Want::Unres(Why::TraitObject),
+        ),
+        (
+            "dyn-lazy-boxed",
+            b,
+            "static FORM: std::sync::LazyLock<Box<dyn Send + Sync>> = X;\n",
+            Want::Unres(Why::TraitObject),
+        ),
+        (
+            "dyn-cross-file-alias",
+            b,
+            "static FORM: crate::a::Erased = X;\n",
+            Want::Unres(Why::TraitObject),
+        ),
+        (
+            "impl-alias",
+            b,
+            "type Hidden = impl Sized;\nstatic FORM: Hidden = X;\n",
+            Want::Unres(Why::OpaqueType),
+        ),
+        (
+            "impl-arg",
+            b,
+            "static FORM: Box<impl Sized> = X;\n",
+            Want::Unres(Why::OpaqueType),
+        ),
+        (
+            "macro-type",
+            b,
+            "static FORM: my_type!() = X;\n",
+            Want::Unres(Why::MacroType("my_type".into())),
+        ),
+        (
+            "raw-pointer",
+            b,
+            "struct SendPtr(*const u8);\nstatic FORM: SendPtr = X;\n",
+            Want::Unres(Why::RawPointer),
+        ),
+        (
+            "projection",
+            b,
+            "static FORM: <crate::a::S as crate::a::Tr>::Out = X;\n",
+            Want::Unres(Why::Projection),
+        ),
+        (
+            "atomic-ptr",
+            b,
+            "static FORM: std::sync::atomic::AtomicPtr<u8> = X;\n",
+            Want::Unres(Why::StdNotProven("AtomicPtr".into())),
+        ),
+        (
+            "unsafe-cell",
+            b,
+            "static FORM: std::cell::UnsafeCell<u8> = X;\n",
+            Want::Unres(Why::StdNotProven("UnsafeCell".into())),
+        ),
+        (
+            "mpsc-sender",
+            b,
+            "static FORM: std::sync::mpsc::Sender<u8> = X;\n",
+            Want::Unres(Why::StdNotProven("Sender".into())),
+        ),
+        (
+            "foreign-path",
+            b,
+            "static FORM: other_crate::Mutexy = X;\n",
+            foreign("other_crate", "Mutexy"),
+        ),
+        (
+            "foreign-import",
+            b,
+            "use dashmap::DashMap;\nstatic FORM: DashMap<u8, u8> = X;\n",
+            foreign("dashmap", "DashMap"),
+        ),
+        (
+            "no-def",
+            b,
+            "static FORM: Unknown = X;\n",
+            Want::Unres(Why::NoDef("Unknown".into())),
+        ),
+        (
+            "alias-no-value",
+            b,
+            "type Nv;\nstatic FORM: Nv = X;\n",
+            Want::Unres(Why::NoValue("Nv".into())),
+        ),
+    ];
+    forms.extend(type_forms_rest());
+    forms
+}
+
+/// The rest of [`type_forms`]: alias cycles, recursive types and the forms
+/// that are proven clean or read through another crate.
+fn type_forms_rest() -> Vec<Form> {
+    let b = "src/b.rs";
+    vec![
+        // #10284: a cycle is unresolvable, never clean.
+        (
+            "alias-cycle",
+            b,
+            "type C0 = C1;\ntype C1 = C0;\nstatic FORM: C0 = X;\n",
+            Want::Unres(Why::Cycle("C0".into())),
+        ),
+        (
+            "adt-recursive-clean",
+            b,
+            "struct List {\n    next: Option<Box<List>>,\n    v: u8,\n}\nstatic FORM: List = X;\n",
+            Want::Clean,
+        ),
+        (
+            "adt-recursive-lock",
+            b,
+            "struct Node {\n    next: Option<Box<Node>>,\n    m: std::sync::Mutex<u8>,\n}\nstatic FORM: Node = X;\n",
+            Want::Lock,
+        ),
+        // #10278: a lock in a generic default.
+        (
+            "generic-default",
+            b,
+            "struct Holder<T = std::sync::Mutex<u8>>(T);\nstatic FORM: Holder = X;\n",
+            Want::Lock,
+        ),
+        (
+            "generic-alias",
+            b,
+            "type L<T> = std::sync::Mutex<T>;\nstatic FORM: L<u8> = X;\n",
+            Want::Lock,
+        ),
+        (
+            "generic-arg",
+            b,
+            "struct Wrap<T>(T);\nstatic FORM: Wrap<std::sync::Mutex<u8>> = X;\n",
+            Want::Lock,
+        ),
+        // #10279: fair and raw locks.
+        (
+            "parking-lot-fair",
+            b,
+            "static FORM: parking_lot::FairMutex<u8> = X;\n",
+            Want::Lock,
+        ),
+        (
+            "lock-api-raw",
+            b,
+            "static FORM: lock_api::Mutex<parking_lot::RawMutex, u8> = X;\n",
+            Want::Lock,
+        ),
+        (
+            "parking-lot-raw-rwlock",
+            b,
+            "static FORM: parking_lot::RawRwLock = X;\n",
+            Want::Lock,
+        ),
+        (
+            "parking-lot-raw-fair",
+            b,
+            "static FORM: parking_lot::RawFairMutex = X;\n",
+            Want::Lock,
+        ),
+        ("spin", b, "static FORM: spin::Mutex<u8> = X;\n", Want::Lock),
+        // Invented forms.
+        (
+            "bare-notify-init",
+            b,
+            "static FORM: tokio::sync::Notify = tokio::sync::Notify::const_new();\n",
+            Want::Lock,
+        ),
+        (
+            "imported-notify",
+            b,
+            "use tokio::sync::Notify;\nstatic FORM: Notify = Notify::const_new();\n",
+            Want::Lock,
+        ),
+        (
+            "use-std-rename",
+            b,
+            "use std::sync::Barrier as B;\nstatic FORM: B = X;\n",
+            Want::Lock,
+        ),
+        (
+            "enum-struct-variant",
+            b,
+            "enum E {\n    V { m: std::sync::Mutex<u8> },\n}\nstatic FORM: E = X;\n",
+            Want::Lock,
+        ),
+        (
+            "union",
+            b,
+            "union U {\n    m: std::mem::ManuallyDrop<std::sync::Mutex<u8>>,\n}\nstatic FORM: U = X;\n",
+            Want::Lock,
+        ),
+        (
+            "array",
+            b,
+            "static FORM: [std::sync::Mutex<u8>; 4] = X;\n",
+            Want::Lock,
+        ),
+        (
+            "tuple",
+            b,
+            "static FORM: (u8, std::sync::Condvar) = X;\n",
+            Want::Lock,
+        ),
+        (
+            "static-ref",
+            b,
+            "static FORM: &'static std::sync::Mutex<u8> = X;\n",
+            Want::Lock,
+        ),
+        (
+            "absolute-path",
+            b,
+            "static FORM: ::std::sync::Mutex<u8> = X;\n",
+            Want::Lock,
+        ),
+        (
+            "nested-generic",
+            b,
+            "static FORM: std::sync::Arc<Vec<Option<std::sync::Mutex<u8>>>> = X;\n",
+            Want::Lock,
+        ),
+        (
+            "inline-mod",
+            b,
+            "mod inner {\n    pub type T = std::sync::Mutex<u8>;\n}\nstatic FORM: inner::T = X;\n",
+            Want::Lock,
+        ),
+        (
+            "self-path",
+            b,
+            "type T2 = std::sync::Mutex<u8>;\nstatic FORM: self::T2 = X;\n",
+            Want::Lock,
+        ),
+        (
+            "once-lock-of-tokio-mutex",
+            b,
+            "static FORM: std::sync::OnceLock<tokio::sync::Mutex<u8>> = X;\n",
+            Want::Lock,
+        ),
+        (
+            "fn-pointer",
+            b,
+            "static FORM: fn(std::sync::Mutex<u8>) -> u8 = X;\n",
+            Want::Clean,
+        ),
+        (
+            "once-lock-of-string",
+            b,
+            "static FORM: std::sync::OnceLock<String> = X;\n",
+            Want::Clean,
+        ),
+        (
+            "core-atomic",
+            b,
+            "static FORM: core::sync::atomic::AtomicBool = X;\n",
+            Want::Clean,
+        ),
+        // #10275: a file of another crate reads a name it does not define
+        // through every definition of that name (lock wins).
+        (
+            "other-crate-bare-lock",
+            "tests/b.rs",
+            "static FORM: Gate = X;\n",
+            Want::Lock,
+        ),
+        (
+            "other-crate-bare-clean",
+            "tests/b.rs",
+            "static FORM: Plain = X;\n",
+            Want::Clean,
+        ),
+    ]
+}
+
+/// #10275, #10278, #10279, #10283: deny by default. A static whose type is
+/// not proven lock-free is `Unresolvable` with its reason, a lock is never
+/// accepted under a `once` row, and only a proven type is clean. Every form
+/// that misses is listed, so one red run shows them all.
+#[test]
+fn type_forms_are_judged_deny_by_default_10283() {
+    let mut miss = Vec::new();
+    for (id, file, text, want) in type_forms() {
+        let line = text
+            .lines()
+            .position(|l| l.contains("static FORM"))
+            .expect("form static")
+            + 1;
+        let files = vec![
+            ("src/a.rs".to_string(), FORM_DEFS.to_string()),
+            (file.to_string(), text.to_string()),
+        ];
+        let table = format!("{file}{FORM_ROW}");
+        let (statics, includes) = token_census_with(&files, &bare(&table));
+        let expect = match want {
+            Want::Lock => vec![StaticFinding::LockNotLabelled {
+                file: file.into(),
+                name: "FORM".into(),
+                line,
+            }],
+            Want::Clean => vec![],
+            Want::Unres(why) => vec![StaticFinding::Unresolvable {
+                file: file.into(),
+                name: "FORM".into(),
+                line,
+                why,
+            }],
+        };
+        if statics != expect || includes != no_store_url() {
+            miss.push(format!(
+                "{id}: got {statics:?} {includes:?}, want {expect:?}"
+            ));
         }
     }
+    assert_eq!(miss, Vec::<String>::new());
 }
 
-/// #10277 red: at this commit the census does not read `Cargo.toml`, so it
-/// reports no finding for any manifest.
-fn cargo_census(manifest: Result<String, String>, walked: &BTreeSet<&str>) -> Vec<CargoFinding> {
-    let _ = (manifest, walked);
-    Vec::new()
+/// #10275: an exception is taken only by the static it names that is not
+/// proven; a stale, duplicate or reasonless exception is red, and a lock is
+/// never excepted.
+#[test]
+fn exceptions_are_judged_exactly_10275() {
+    const UNRES: &str = "static FORM: Unknown = X;\n";
+    const LOCK: &str = "static FORM: std::sync::Mutex<u8> = X;\n";
+    const CLEAN: &str = "static FORM: u8 = 0;\n";
+    let b = "src/b.rs";
+    let named = |f: fn(String, String) -> StaticFinding, file: &str, name: &str| {
+        f(file.into(), name.into())
+    };
+    let stale = |file: String, name: String| StaticFinding::ExceptionStale { file, name };
+    let dup = |file: String, name: String| StaticFinding::ExceptionDuplicate { file, name };
+    let reasonless = |file: String, name: String| StaticFinding::ExceptionReasonless { file, name };
+    let unres = StaticFinding::Unresolvable {
+        file: b.into(),
+        name: "FORM".into(),
+        line: 1,
+        why: Why::NoDef("Unknown".into()),
+    };
+    let rows: Vec<ExceptionCase<'_>> = vec![
+        ("taken", UNRES, vec![(b, "FORM", FORM_WHY)], vec![]),
+        ("absent", UNRES, vec![], vec![unres.clone()]),
+        (
+            "other-file",
+            UNRES,
+            vec![("src/c.rs", "FORM", FORM_WHY)],
+            vec![unres.clone(), named(stale, "src/c.rs", "FORM")],
+        ),
+        (
+            "other-name",
+            CLEAN,
+            vec![(b, "OTHER", FORM_WHY)],
+            vec![named(stale, b, "OTHER")],
+        ),
+        (
+            "on-a-clean-static",
+            CLEAN,
+            vec![(b, "FORM", FORM_WHY)],
+            vec![named(stale, b, "FORM")],
+        ),
+        (
+            "duplicate",
+            UNRES,
+            vec![(b, "FORM", FORM_WHY), (b, "FORM", FORM_WHY)],
+            vec![named(dup, b, "FORM")],
+        ),
+        (
+            "short-reason",
+            UNRES,
+            vec![(b, "FORM", "too short")],
+            vec![named(reasonless, b, "FORM")],
+        ),
+        (
+            "blank-reason",
+            UNRES,
+            vec![(b, "FORM", "            ")],
+            vec![named(reasonless, b, "FORM")],
+        ),
+        (
+            "on-a-lock",
+            LOCK,
+            vec![(b, "FORM", FORM_WHY)],
+            vec![
+                StaticFinding::LockNotLabelled {
+                    file: b.into(),
+                    name: "FORM".into(),
+                    line: 1,
+                },
+                named(stale, b, "FORM"),
+            ],
+        ),
+    ];
+    let table = format!("{b}{FORM_ROW}");
+    let mut miss = Vec::new();
+    for (id, text, exceptions, want) in rows {
+        let files = vec![(b.to_string(), text.to_string())];
+        let tables = Tables {
+            statics: &table,
+            exceptions: &exceptions,
+            includes: &[],
+        };
+        let (statics, includes) = token_census_with(&files, &tables);
+        if statics != want || includes != no_store_url() {
+            miss.push(format!("{id}: got {statics:?} {includes:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10285: a static in a `macro_rules!` body is red whatever its type, a
+/// row never accepts it, and only an exception does.
+#[test]
+fn static_in_a_macro_body_is_red_10285() {
+    const LOCK_BODY: &str = "macro_rules! m {\n    () => {\n        static INNER: std::sync::Mutex<u8> = X;\n    };\n}\n";
+    const CLEAN_BODY: &str =
+        "macro_rules! m {\n    () => {\n        static INNER: u8 = 0;\n    };\n}\n";
+    const LOCK_ROW: &str = "src/b.rs\tINNER\tlock: a lock written in the macro body\n";
+    let b = "src/b.rs";
+    let body = StaticFinding::MacroBodyStatic {
+        file: b.into(),
+        name: "INNER".into(),
+        line: 3,
+    };
+    let missing = StaticFinding::Missing {
+        file: b.into(),
+        name: "INNER".into(),
+    };
+    let rows: Vec<MacroBodyCase<'_>> = vec![
+        ("lock", LOCK_BODY, "", vec![], vec![body.clone()]),
+        ("clean", CLEAN_BODY, "", vec![], vec![body.clone()]),
+        (
+            "with-a-row",
+            LOCK_BODY,
+            LOCK_ROW,
+            vec![],
+            vec![body.clone(), missing],
+        ),
+        (
+            "excepted",
+            LOCK_BODY,
+            "",
+            vec![(b, "INNER", FORM_WHY)],
+            vec![],
+        ),
+    ];
+    let mut miss = Vec::new();
+    for (id, text, table, exceptions, want) in rows {
+        let files = vec![(b.to_string(), text.to_string())];
+        let tables = Tables {
+            statics: table,
+            exceptions: &exceptions,
+            includes: &[],
+        };
+        let (statics, _) = token_census_with(&files, &tables);
+        if statics != want {
+            miss.push(format!("{id}: got {statics:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10276: every spelling of an `include!` of a file the walk did not read
+/// is red, and each leaves an `include` token the per-file count holds
+/// against its row, so a spelling the recogniser misses is still red.
+#[test]
+fn include_forms_are_red_10276() {
+    let b = "src/b.rs";
+    let forms: [(&str, &str, Option<usize>); 9] = [
+        ("plain", "include!(\"missing.rs\");\n", Some(1)),
+        ("raw-ident", "r#include!(\"missing.rs\");\n", Some(1)),
+        ("core-path", "core::include!(\"missing.rs\");\n", Some(1)),
+        (
+            "std-absolute-path",
+            "::std::include!(\"missing.rs\");\n",
+            Some(1),
+        ),
+        ("brackets", "include![\"missing.rs\"];\n", Some(1)),
+        ("braces", "include! {\"missing.rs\"}\n", Some(1)),
+        (
+            "use-rename",
+            "use std::include as pull;\npull!(\"missing.rs\");\n",
+            Some(2),
+        ),
+        (
+            "in-macro-body",
+            "macro_rules! m {\n    () => {\n        include!(\"missing.rs\")\n    };\n}\n",
+            Some(3),
+        ),
+        (
+            "macro-argument",
+            "macro_rules! m {\n    ($i:ident) => {\n        $i!(\"missing.rs\")\n    };\n}\nm!(include);\n",
+            None,
+        ),
+    ];
+    let mut miss = Vec::new();
+    for (id, text, hit) in forms {
+        let files = vec![(b.to_string(), text.to_string())];
+        let (_, includes) = token_census_with(&files, &bare(""));
+        let mut want: Vec<IncludeFinding> = hit
+            .map(|line| IncludeFinding::Unwalked {
+                file: b.into(),
+                line,
+                value: "missing.rs".into(),
+            })
+            .into_iter()
+            .collect();
+        want.extend(no_store_url());
+        want.push(IncludeFinding::IncludeCount {
+            file: b.into(),
+            ident: "include".into(),
+            rowed: 0,
+            found: 1,
+        });
+        if includes != want {
+            miss.push(format!("{id}: got {includes:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10276: the include-count rows are judged exactly: a wrong count, a
+/// duplicate, a zero count, a short reason, an identifier not counted and a
+/// row for a file with none are each red.
+#[test]
+fn include_rows_are_judged_exactly_10276() {
+    let b = "src/b.rs";
+    let files = vec![
+        (b.to_string(), "include!(\"x.rs\");\n".to_string()),
+        ("src/x.rs".to_string(), String::new()),
+    ];
+    let count = |file: &str, rowed: usize, found: usize| IncludeFinding::IncludeCount {
+        file: file.into(),
+        ident: "include".into(),
+        rowed,
+        found,
+    };
+    let bad = |file: &str, ident: &str| IncludeFinding::IncludeRowBad {
+        file: file.into(),
+        ident: ident.into(),
+    };
+    let stale = |file: &str, ident: &str| IncludeFinding::IncludeRowStale {
+        file: file.into(),
+        ident: ident.into(),
+    };
+    let rows: Vec<IncludeRowCase<'_>> = vec![
+        ("exact", vec![(b, "include", 1, FORM_WHY)], vec![]),
+        ("no-row", vec![], vec![count(b, 0, 1)]),
+        (
+            "wrong-count",
+            vec![(b, "include", 2, FORM_WHY)],
+            vec![count(b, 2, 1)],
+        ),
+        (
+            "duplicate",
+            vec![(b, "include", 1, FORM_WHY), (b, "include", 1, FORM_WHY)],
+            vec![IncludeFinding::IncludeRowDuplicate {
+                file: b.into(),
+                ident: "include".into(),
+            }],
+        ),
+        (
+            "zero",
+            vec![(b, "include", 0, FORM_WHY)],
+            vec![bad(b, "include"), count(b, 0, 1)],
+        ),
+        (
+            "short-reason",
+            vec![(b, "include", 1, "short")],
+            vec![bad(b, "include")],
+        ),
+        (
+            "not-counted",
+            vec![(b, "include_str", 1, FORM_WHY)],
+            vec![
+                bad(b, "include_str"),
+                count(b, 0, 1),
+                stale(b, "include_str"),
+            ],
+        ),
+        (
+            "stale",
+            vec![
+                (b, "include", 1, FORM_WHY),
+                ("src/gone.rs", "include", 1, FORM_WHY),
+            ],
+            vec![stale("src/gone.rs", "include")],
+        ),
+    ];
+    let mut miss = Vec::new();
+    for (id, table, extra) in rows {
+        let tables = Tables {
+            statics: "",
+            exceptions: &[],
+            includes: &table,
+        };
+        let (_, includes) = token_census_with(&files, &tables);
+        let mut want = no_store_url();
+        want.extend(extra);
+        if includes != want {
+            miss.push(format!("{id}: got {includes:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
 }
 
 /// #10277: every manifest form that names a source the census did not
@@ -4761,6 +7160,43 @@ fn cargo_findings_print_exactly_10277() {
     }
 }
 
+/// #10277: the directories Cargo discovers targets in are walked whole, so
+/// a default target source is always read; the walked set is written out.
+#[test]
+fn auto_target_dirs_are_walked_10277() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("store_url_env_guard_8168_autodirs");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("clear scratch");
+    }
+    let made = [
+        "benches/c.rs",
+        "build.rs",
+        "examples/e/main.rs",
+        "src/bin/a.rs",
+        "src/bin/b/main.rs",
+        "src/lib.rs",
+        "tests/d/m.rs",
+        "tests/t.rs",
+    ];
+    for rel in made {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(&path, "").expect("write");
+    }
+    let mut files = Vec::new();
+    let mut links = Vec::new();
+    walk(&root, &root, &mut files, &mut links);
+    let mut got: Vec<String> = files.into_iter().map(|(p, _)| p).collect();
+    got.sort();
+    assert_eq!(got, made.map(String::from).to_vec());
+    let walked: BTreeSet<&str> = got.iter().map(String::as_str).collect();
+    let manifest = "[package]\nbuild = true\n[[bin]]\nname = \"a\"\n[[bin]]\nname = \"b\"\n\
+                    [[test]]\nname = \"t\"\n[[bench]]\nname = \"c\"\n[[example]]\nname = \"e\"\n";
+    assert_eq!(cargo_census(Ok(manifest.into()), &walked), vec![]);
+    assert_eq!(links, Vec::<String>::new());
+    fs::remove_dir_all(&root).expect("clean scratch");
+}
+
 /// The types `src/a.rs` defines for the round-2 reviewer forms (#10275).
 const R2_DEFS: &str = "pub struct Gate {\n    m: std::sync::Mutex<u8>,\n}\n\
 pub type One = Two;\npub type Two = std::sync::RwLock<u8>;\npub type Erased = Box<dyn Fn() + Sync>;\n";
@@ -4858,16 +7294,27 @@ fn review_r1_forms_are_red_10274() {
 /// #10284: the definition scan is linear for every lexable input, including
 /// one that does not compile: 100 000 repetitions of each item keyword left
 /// without the tokens that would end its scan are judged under the ceiling
-/// (the round-1 scan took 22 s to 76 s at 50 000).
+/// (the round-1 scan took 22 s to 76 s at 50 000, and the round-2 struct
+/// body scan 74 s at 100 000).
 #[test]
 fn type_definition_cost_is_bounded_10284() {
     const REPS: usize = 100_000;
     const CEILING_SECS: u64 = 20;
-    const UNITS: [&str; 4] = ["type x ", "struct x ", "struct x { ", "enum x < "];
+    const UNITS: [&str; 9] = [
+        "type x ",
+        "struct x ",
+        "struct x { ",
+        "enum x < ",
+        "struct x < ",
+        "type x = < ",
+        "struct x where < ",
+        "use x < ",
+        "type x = ( ",
+    ];
     for unit in UNITS {
         let files = vec![("src/hostile.rs".to_string(), unit.repeat(REPS))];
         let start = std::time::Instant::now();
-        let (statics, _) = token_census(&files, "");
+        let (statics, _) = token_census_with(&files, &bare(""));
         let took = start.elapsed();
         assert!(
             took < std::time::Duration::from_secs(CEILING_SECS),
@@ -4875,4 +7322,67 @@ fn type_definition_cost_is_bounded_10284() {
         );
         assert_eq!(statics, Vec::<StaticFinding>::new(), "{unit:?}");
     }
+}
+
+/// #10284: the token census is linear in the tree. 100K+ lines of alias
+/// chains, wrappers and enums 20 000 deep across files, an alias cycle and
+/// 10 000 statics that name them are judged under the ceiling, with every
+/// finding exact (a quadratic definition table took minutes here).
+#[test]
+fn token_census_cost_is_bounded_10213() {
+    const DEPTH: usize = 20_000;
+    const STATICS: usize = 10_000;
+    const CEILING_SECS: u64 = 20;
+    let mut types = String::new();
+    for i in 0..DEPTH {
+        let _ = writeln!(types, "pub type A{i} = A{};", i + 1);
+        let _ = writeln!(types, "pub type L{i} = L{};", i + 1);
+        let _ = writeln!(types, "pub struct W{i}(A{i});");
+        let _ = writeln!(types, "pub enum E{i} {{ V(W{i}) }}");
+    }
+    let _ = writeln!(types, "pub type A{DEPTH} = u8;");
+    let _ = writeln!(types, "pub type L{DEPTH} = std::sync::Mutex<u8>;");
+    types.push_str("pub type C0 = C1;\npub type C1 = C0;\n");
+    let mut statics = String::new();
+    let mut table = String::new();
+    for i in 0..STATICS {
+        let _ = writeln!(statics, "static S{i}: crate::types::E{i} = X;");
+        statics.push_str("#[path = \"other.rs\"]\n");
+        statics.push_str("const X: &str = include_str!(\"y.md\");\n");
+        let _ = write!(table, "src/statics.rs\tS{i}{}", &FORM_ROW[5..]);
+    }
+    statics.push_str("static K: crate::types::L0 = X;\nstatic Y: crate::types::C0 = X;\n");
+    let _ = write!(table, "src/statics.rs\tK{}", &FORM_ROW[5..]);
+    let _ = write!(table, "src/statics.rs\tY{}", &FORM_ROW[5..]);
+    let lines = types.lines().count() + statics.lines().count();
+    assert!(lines > 100_000, "{lines} lines");
+    let files = vec![
+        ("src/types.rs".to_string(), types),
+        ("src/statics.rs".to_string(), statics),
+        ("src/other.rs".to_string(), String::new()),
+    ];
+    let start = std::time::Instant::now();
+    let (found, includes) = token_census_with(&files, &bare(&table));
+    let took = start.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(CEILING_SECS),
+        "{took:?}"
+    );
+    assert_eq!(
+        found,
+        vec![
+            StaticFinding::LockNotLabelled {
+                file: "src/statics.rs".into(),
+                name: "K".into(),
+                line: 3 * STATICS + 1,
+            },
+            StaticFinding::Unresolvable {
+                file: "src/statics.rs".into(),
+                name: "Y".into(),
+                line: 3 * STATICS + 2,
+                why: Why::Cycle("C0".into()),
+            },
+        ]
+    );
+    assert_eq!(includes, no_store_url());
 }
