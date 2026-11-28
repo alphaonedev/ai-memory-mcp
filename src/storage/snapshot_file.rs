@@ -465,7 +465,7 @@ pub(crate) mod seam {
         }
     }
 
-    pub(super) fn on_link(dest: &Path) -> Option<std::io::Error> {
+    pub(crate) fn on_link(dest: &Path) -> Option<std::io::Error> {
         LINK_CALLS.with(|c| c.borrow_mut().push(dest.to_path_buf()));
         LINK_ERRNO
             .with(Cell::get)
