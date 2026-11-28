@@ -137,3 +137,147 @@ fn durable_files_leave_later_error_unchanged_10310() {
         );
     }
 }
+
+// #10330 / #10335 — every log line of a failed reissue or renewal prints
+// every cause of its error chain, at both arms: the `reissued_tick` reload
+// error arm and the `renewal_tick` `Failed` arm. The expected error text is
+// written out by hand; only the tick message comes from
+// `renewal_tick_message`, which `renewal_tick_message_texts_10308` pins.
+
+/// The tracing target of both arms (written out, not taken from the code).
+const TARGET_10330: &str = "security.transit";
+/// The outer error of the two-level reload chain.
+const RELOAD_OUTER_10330: &str = "the listener refused the pair";
+/// The root cause under it: `EACCES`, rendered by `std::io::Error`.
+const RELOAD_ROOT_10330: &str = "Permission denied (os error 13)";
+/// The rendered root cause of a TLS file name that is a directory.
+const EISDIR_TEXT_10330: &str = "Is a directory (os error 21)";
+
+/// A reload error with one cause under it.
+#[derive(Debug)]
+struct ReloadOuter10330(std::io::Error);
+
+impl std::fmt::Display for ReloadOuter10330 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(RELOAD_OUTER_10330)
+    }
+}
+
+impl std::error::Error for ReloadOuter10330 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// An in-memory tracing sink (precedent `src/mcp/span_capture_4088_tests.rs`).
+#[derive(Clone, Default)]
+struct LogSink10330(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink10330 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log sink").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink10330 {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl LogSink10330 {
+    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + use<> {
+        tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .finish()
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log sink").clone()).expect("utf-8 log")
+    }
+}
+
+/// The one ERROR line both arms emit, with `error` the rendered chain.
+fn error_line_10330(message: &str, error: &str) -> String {
+    format!("ERROR {TARGET_10330}: {message} error={error}\n")
+}
+
+/// Arm `reissued_tick` (reload error): a two-level reload chain logs both
+/// levels, outer first.
+#[test]
+fn reissued_tick_reload_error_logs_whole_chain_10330() {
+    if crate::config::run_env_isolated_child_or_spawn(
+        "tls_bootstrap::not_durable_10310_tests::reissued_tick_reload_error_logs_whole_chain_10330",
+    ) {
+        return;
+    }
+    let sink = LogSink10330::default();
+    let report = NotDurableReport::new();
+    let reload = Err(std::io::Error::other(ReloadOuter10330(
+        std::io::Error::from_raw_os_error(libc::EACCES),
+    )));
+    let tick = tracing::subscriber::with_default(sink.subscriber(), || {
+        reissued_tick(reload, &report, 90)
+    });
+    assert_eq!(tick, RenewalTick::ReloadFailed);
+    let message = renewal_tick_message(tick, &report).expect("a failed reload logs");
+    assert_eq!(
+        sink.text(),
+        error_line_10330(
+            &message,
+            &format!("{RELOAD_OUTER_10330}: {RELOAD_ROOT_10330}")
+        )
+    );
+}
+
+/// Arm `renewal_tick` `Failed`: the CA key is written (not confirmed
+/// durable), then the CA certificate write fails. The log names the kept
+/// file, the failed write and its root cause (#10335's exact case).
+#[tokio::test(flavor = "current_thread")]
+async fn renewal_tick_failed_logs_whole_chain_10330() {
+    if crate::config::run_env_isolated_child_or_spawn(
+        "tls_bootstrap::not_durable_10310_tests::renewal_tick_failed_logs_whole_chain_10330",
+    ) {
+        return;
+    }
+    let _reset = SeamReset;
+    let listener_dir = tempfile::tempdir().expect("tempdir under TMPDIR");
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let tls = ensure_local_tls(listener_dir.path(), HOST_10310).expect("first boot");
+    let reload = crate::tls::load_rustls_config(&tls.cert_path, &tls.key_path)
+        .await
+        .expect("the listener loads the local leaf");
+    let tmp = tempfile::tempdir().expect("tempdir under TMPDIR");
+    let dir = tmp.path().join(TLS_SUBDIR);
+    std::fs::create_dir_all(dir.join(LOCAL_CA_CERT_FILE)).expect("the blocking directory");
+    seam::reset();
+    seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+    let sink = LogSink10330::default();
+    let tick = {
+        let _guard = tracing::subscriber::set_default(sink.subscriber());
+        renewal_tick(&reload, tmp.path(), HOST_10310).await
+    };
+    seam::reset();
+    assert_eq!(tick, RenewalTick::Failed);
+    let message = renewal_tick_message(RenewalTick::Failed, &NotDurableReport::new())
+        .expect("a failed tick logs");
+    assert_eq!(
+        sink.text(),
+        error_line_10330(
+            &message,
+            &format!(
+                "{WRITTEN_BEFORE_10310}: {}: replacing {} (#3709): {EISDIR_TEXT_10330}",
+                ca_key_report_10310(&dir),
+                dir.join(LOCAL_CA_CERT_FILE).display()
+            )
+        )
+    );
+}
