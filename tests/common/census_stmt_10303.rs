@@ -126,7 +126,13 @@ fn cap_sites(text: &str) -> Result<Vec<census_pins::Site>, String> {
     let toks = lex(text);
     let prep = Prep::new(&toks);
     let watched: BTreeSet<String> = ["process".to_string()].into_iter().collect();
-    census_pins::sites_of(&prep, &watched, &BTreeSet::new(), &BTreeSet::new())
+    census_pins::sites_of(
+        &prep,
+        &watched,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
 }
 
 /// A statement of [`census_pins::STMT_CAP`] tokens is pinned; one more token is refused with

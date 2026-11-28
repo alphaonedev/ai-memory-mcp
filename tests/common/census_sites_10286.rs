@@ -122,6 +122,13 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "84d689e70724f8043376feb961cfd39d",
         "0dbd44a00c46ea29faf8461fa3cc1590",
     ]),
+    ("src/cli/boot.rs", &[
+        "9e64a637a30f24e7aa3d7bbd86aaef23",
+        "9e64a637a30f24e7aa3d7bbd86aaef23",
+        "9e64a637a30f24e7aa3d7bbd86aaef23",
+        "9e64a637a30f24e7aa3d7bbd86aaef23",
+        "9e64a637a30f24e7aa3d7bbd86aaef23",
+    ]),
     ("src/cli/commands/export_reflections/private_file.rs", &[
         "b05e84307e662e9c7e099c2924a7255b",
         "01ed4ab7cf269dd533ff7da503fe1a2a",
@@ -643,6 +650,8 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
     ("src/enterprise_federation_posture.rs", &[
         "21724847ad969f5bd0154ff3e433071c",
         "21724847ad969f5bd0154ff3e433071c",
+        "6305aebac336d355ed3d43a45449d3c9",
+        "61f539b71bdb88701e919003a442bda5",
     ]),
     ("src/erasure/archive_sync.rs", &[
         "7a4e6cb38770fda874e23d49d19ce2c6",
@@ -742,6 +751,8 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "3ca1ecc8ef8d6c9b0806cf1e681bc962",
         "ca8f7feb62772c5c0b731e188602cf8d",
         "ca8f7feb62772c5c0b731e188602cf8d",
+        "5f7e99f76302dac6358a94aefbb48707",
+        "275084ba3c0f37c3f918b3032a5207ec",
     ]),
     ("src/hnsw.rs", &[
         "f04968adc603a99417d3daeb10bfc257",
@@ -828,6 +839,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "bc088af0bd2d5e00e73913a25239bcc9",
     ]),
     ("src/logging.rs", &[
+        "e2c1f167b45b7fc04118e2e1cd421e6a",
         "978acaff4a0eba8d60775bbc4547ecb0",
         "74ab3da4c256332747de510d47004414",
     ]),
@@ -1005,6 +1017,7 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "beab8916408782f75f0c5dacd7fb91dd",
     ]),
     ("src/stop_signal.rs", &[
+        "19d2f667eb02dce27d25a5d65fc479d0",
         "7bf08c7d30b8cafab0c00d4e2f368099",
         "9602844958cbf94f4097c63a1503fa89",
         "48808ce7d19d6bd14ee4d44edee32ec2",
@@ -1021,8 +1034,17 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "c132e965ca149dcd17543a8c2d96ffa3",
         "c132e965ca149dcd17543a8c2d96ffa3",
     ]),
+    ("src/storage/migrations.rs", &[
+        "9e64a637a30f24e7aa3d7bbd86aaef23",
+    ]),
     ("src/storage/row_attest/seal.rs", &[
         "c7f2b7dc8ae484de365240db7a1050b7",
+    ]),
+    ("src/storage/schema_guard.rs", &[
+        "5a2b196065d1b345724867628e2762a8",
+        "2a1623f748fa98057d854d9296c93d2c",
+        "2a1623f748fa98057d854d9296c93d2c",
+        "56f1504e5da97bba74c9837114eb1501",
     ]),
     ("src/storage/snapshot_file.rs", &[
         "11457fa537c1555fb41dc524b5c3b099",
@@ -1631,6 +1653,9 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "52dd20b734679fd14d48cf688cf12354",
         "52dd20b734679fd14d48cf688cf12354",
         "bda7f6f40f95bb16d6574d848090c105",
+    ]),
+    ("tests/cross_build_db_compat_8677.rs", &[
+        "56f1504e5da97bba74c9837114eb1501",
     ]),
     ("tests/deployment_shape_posture_3700.rs", &[
         "a7d0da7362a1db8ff474bab2ba9256a5",
@@ -2262,6 +2287,18 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "2136d8f170cb0507298f986b037ae74a",
         "2136d8f170cb0507298f986b037ae74a",
     ]),
+    ("tests/postgres_cross_build_db_compat_8677.rs", &[
+        "56f1504e5da97bba74c9837114eb1501",
+        "56f1504e5da97bba74c9837114eb1501",
+        "56f1504e5da97bba74c9837114eb1501",
+    ]),
+    ("tests/postgres_schema_downgrade_guard_2445.rs", &[
+        "56f1504e5da97bba74c9837114eb1501",
+        "56f1504e5da97bba74c9837114eb1501",
+        "f560c762ad51ff6e835f083c64c3a337",
+        "106522052f3f6c1fb393b101a5f799d0",
+        "56f1504e5da97bba74c9837114eb1501",
+    ]),
     ("tests/posture_control15_pg_resolution_3106.rs", &[
         "7fe03f7bf9a0408366a07028d71ae896",
         "52dd20b734679fd14d48cf688cf12354",
@@ -2533,6 +2570,18 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "337f61c809e7ea7a82df6609d981ef07",
         "891c0c5ce640de96c7023b6aaa3b57e9",
     ]),
+    ("tests/schema_downgrade_guard_2445.rs", &[
+        "56f1504e5da97bba74c9837114eb1501",
+        "56f1504e5da97bba74c9837114eb1501",
+        "56f1504e5da97bba74c9837114eb1501",
+        "56f1504e5da97bba74c9837114eb1501",
+        "106522052f3f6c1fb393b101a5f799d0",
+        "56f1504e5da97bba74c9837114eb1501",
+        "f43b64fb16ce02e8b61fbdf6fc1bde84",
+        "3d2adca9d8b4feddc0b1d4d05d482b01",
+        "56f1504e5da97bba74c9837114eb1501",
+        "56f1504e5da97bba74c9837114eb1501",
+    ]),
     ("tests/secret_screen_g29.rs", &[
         "26701a8ba13ae01d1323e3ff5a186dd4",
         "26701a8ba13ae01d1323e3ff5a186dd4",
@@ -2563,8 +2612,10 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
         "fa2442aa6c0d92aa382b4cf6a2de9093",
     ]),
     ("tests/serve_postgres_continuation2.rs", &[
+        "8672a3228c13efcda79e3bcc52f6d126",
         "e1b70abd4ae980c42199bd3d553d9fbd",
         "e1b70abd4ae980c42199bd3d553d9fbd",
+        "526cddb9f33f1a30218ecc7abe90ecdd",
     ]),
     ("tests/serve_postgres_handler_parity.rs", &[
         "8d19d147901502e59a0d89cdb7547302",

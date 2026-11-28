@@ -76,6 +76,8 @@ mod census_assert_cmd;
 mod census_cargo;
 #[path = "common/census_closure_10304.rs"]
 mod census_closure;
+#[path = "common/census_consts_10299.rs"]
+mod census_consts;
 #[path = "common/census_env_name_10299.rs"]
 mod census_env_name;
 #[path = "common/census_include_10300.rs"]
@@ -854,6 +856,21 @@ const ENV_ROWS: &[(&str, usize, &str)] = &[
         "release note naming the two variables the guard refuses",
     ),
     (
+        "scripts/ci/tests/test_census_rows_10286.py",
+        1,
+        "#10299 Python bound fixture: the literal each generated constant binds",
+    ),
+    (
+        "tests/common/census_env_name_10299.json",
+        23,
+        "#10299 shared table: the literal the fixture constants and calls name",
+    ),
+    (
+        "tests/common/census_env_name_10299.rs",
+        1,
+        "#10299 Rust bound fixture: the literal each generated constant binds",
+    ),
+    (
         "tests/common/proptest_guard.rs",
         4,
         "the run-time guard: its doc (twice) and the two variable-name constants",
@@ -1310,6 +1327,7 @@ fn census(tree: &Tree) -> Vec<String> {
     let names = libc_start_names();
     let aliases: BTreeSet<String> = lexed.iter().flat_map(|(_, t)| aliases_in(t)).collect();
     let preps: Vec<Prep<'_>> = lexed.iter().map(|(_, t)| Prep::new(t)).collect();
+    let consts = census_consts::const_names(&preps);
     let graph = census_pins::RenameGraph::of(&preps);
     let watched = graph.reach(WATCHED).names;
     let pt = graph.reach(RUNNER_FAMILY).names;
@@ -1356,12 +1374,12 @@ fn census(tree: &Tree) -> Vec<String> {
             );
         }
         out.extend(guard_findings(rel, toks, &pt));
-        let n = census_pins::env_calls(prep, &env_fns).len();
+        let n = census_pins::env_calls(prep, &env_fns, &consts).len();
         if n > 0 {
             env_names.insert(rel.clone(), n);
         }
         let row = site_rows.get(rel.as_str()).copied();
-        match census_pins::sites_of(prep, &watched, &env_reach, &env_fns) {
+        match census_pins::sites_of(prep, &watched, &env_reach, &env_fns, &consts) {
             Ok(sites) if !sites.is_empty() => {
                 site_have.insert(rel.as_str());
                 out.extend(census_pins::site_findings(rel, &sites, row));
@@ -1834,7 +1852,14 @@ fn a_proptest_variable_in_any_file_is_an_exact_row_10176() {
             line(".cargo/config.toml", 1, 0),
             line(".github/workflows/x.yml", 1, 0),
             line("changelog.d/10176.fixed.md", 0, ENV_ROWS[0].1),
-            line("tests/common/proptest_guard.rs", 0, ENV_ROWS[1].1),
+            line(
+                "scripts/ci/tests/test_census_rows_10286.py",
+                0,
+                ENV_ROWS[1].1
+            ),
+            line("tests/common/census_env_name_10299.json", 0, ENV_ROWS[2].1),
+            line("tests/common/census_env_name_10299.rs", 0, ENV_ROWS[3].1),
+            line("tests/common/proptest_guard.rs", 0, ENV_ROWS[4].1),
         ]
     );
 }

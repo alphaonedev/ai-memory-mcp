@@ -77,7 +77,6 @@ RUNNER_SEED = frozenset({
 })
 ENV_MOD_SEED = frozenset({"env"})
 ENV_FN_SEED = frozenset({"remove_var", "set_var", "var", "var_os"})
-CONST_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 
 # The Unicode Pattern_White_Space set (UAX #31), the blanks rustc skips; the
 # Rust lexer holds the same eleven characters (#10305). Every other non-ASCII
@@ -359,15 +358,160 @@ def first_arg(t: list[Tok], open_: int, close: list[int]) -> list[Tok]:
     return t[open_ + 1:end]
 
 
-def name_ok(arg: list[Tok]) -> bool:
-    """One string literal, or `[&] [path ::] NAME` with NAME in upper case."""
+def name_ok(arg: list[Tok], consts: frozenset[str]) -> bool:
+    """One string literal, or `[&] [path ::] NAME` with NAME in `consts` (#10299)."""
     if len(arg) == 1 and arg[0].kind == STR:
         return True
     if arg and arg[0].kind == PUNCT and arg[0].text == "&":
         arg = arg[1:]
-    if not arg or arg[-1].kind != IDENT or not CONST_RE.fullmatch(arg[-1].text):
+    if not arg or arg[-1].kind != IDENT or arg[-1].text not in consts:
         return False
     return all(x.kind == (IDENT if i % 2 == 0 else SEP) for i, x in enumerate(arg))
+
+
+def item_binding(t: list[Tok], k: int, close: list[int]) -> tuple[int, bool] | None:
+    """At a `const` or `static` token: the index of the NAME of `const|static [mut] NAME :` and
+    whether its initializer is one string literal (`= "..." ;`); None when no NAME follows."""
+    j = k + 1
+    if t[k].text == "static" and ident_at(t, j) == "mut":
+        j += 1
+    if ident_at(t, j) is None or not is_p(t, j + 1, ":"):
+        return None
+    m = j + 2
+    while m < len(t):
+        x = t[m]
+        if x.kind == PUNCT:
+            if x.text in "([{":
+                m = close[m] + 1
+                continue
+            if x.text == "=":
+                break
+            if x.text in ";}),]>":
+                return j, False
+        m += 1
+    return j, m + 2 < len(t) and t[m + 1].kind == STR and is_p(t, m + 2, ";")
+
+
+CLOSURE_AFTER_KEYWORD = frozenset({"move", "return", "in", "else", "match", "if", "while"})
+
+
+def closure_open(t: list[Tok], k: int) -> bool:
+    """A `|` at `k` that opens closure parameters: the token before it ends no operand."""
+    if k == 0:
+        return True
+    p = t[k - 1]
+    if p.kind == IDENT:
+        return p.text in CLOSURE_AFTER_KEYWORD
+    if p.kind in (STR, NUM, CHAR):
+        return False
+    return not (p.kind == PUNCT and p.text in ")]|")
+
+
+def binder_names(t: list[Tok], close: list[int], defs: set[int]) -> set[str]:
+    """Every name `t` binds other than at an item NAME in `defs`: a `let` or `for` pattern, fn
+    and closure parameters, a match-arm pattern, a `NAME @` binding, and every `NAME :` (a struct
+    field, a typed parameter or binding, a field pattern). One pass; each span is walked once."""
+    n = len(t)
+    out: set[str] = set()
+    opener = [-1] * n
+    for o, c in enumerate(close):
+        if 0 <= c < n:
+            opener[c] = o
+
+    def mark(a: int, b: int) -> None:
+        out.update(x.text for x in t[max(a, 0):min(b, n)] if x.kind == IDENT)
+
+    def forward(a: int, is_let: bool) -> int:
+        """From `a` to the first top-level `=` (a `let`) or `in` (a `for`), `;` or closer; a
+        `for` also ends at a `{` that is not a pattern's (one not followed by `in`)."""
+        m = a
+        while m < n:
+            x = t[m]
+            if x.kind == PUNCT:
+                if x.text in "([{":
+                    if x.text == "{" and not is_let and ident_at(t, close[m] + 1) != "in":
+                        return m
+                    m = close[m] + 1
+                    continue
+                if x.text in ";)]}" or (is_let and x.text == "="):
+                    return m
+            elif not is_let and x.kind == IDENT and x.text == "in":
+                return m
+            m += 1
+        return n
+
+    k = 0
+    while k < n:
+        x = t[k]
+        if x.kind == IDENT:
+            if k not in defs and (is_p(t, k + 1, ":") or is_p(t, k + 1, "@")):
+                out.add(x.text)
+            if x.text in ("let", "for"):
+                mark(k + 1, forward(k + 1, x.text == "let"))
+            elif x.text == "fn" and ident_at(t, k + 1) is not None:
+                j, depth = k + 2, 0
+                while j < n and not (depth == 0 and is_p(t, j, "(")):
+                    if is_p(t, j, "<"):
+                        depth += 1
+                    elif is_p(t, j, ">") and not is_p(t, j - 1, "-"):
+                        depth -= 1
+                    elif t[j].kind == PUNCT and t[j].text in ";{}":
+                        break
+                    j += 1
+                if is_p(t, j, "("):
+                    mark(j + 1, close[j])
+        elif x.kind == PUNCT and x.text == "|" and closure_open(t, k):
+            m = k + 1
+            while m < n and not is_p(t, m, "|"):
+                if t[m].kind == PUNCT and t[m].text in "([{":
+                    m = close[m] + 1
+                    continue
+                if t[m].kind == PUNCT and t[m].text in ";)]}":
+                    break
+                m += 1
+            mark(k + 1, m)
+            k = m + 1 if is_p(t, m, "|") else m
+            continue
+        elif x.kind == PUNCT and x.text == "=" and is_p(t, k + 1, ">"):
+            j = k - 1
+            while j >= 0:
+                y = t[j]
+                if y.kind == PUNCT:
+                    if y.text in ",;{([" or (y.text == ">" and is_p(t, j - 1, "=")):
+                        break
+                    if y.text in ")]" and opener[j] >= 0:
+                        j = opener[j] - 1
+                        continue
+                    if y.text == "}":
+                        o = opener[j]
+                        if o > 0 and t[o - 1].kind == IDENT:
+                            j = o - 1
+                            continue
+                        break
+                j -= 1
+            mark(j + 1, k)
+        k += 1
+    return out
+
+
+def const_names(files: list[list[Tok]]) -> frozenset[str]:
+    """#10299: the names bound in the tree by a `const` or `static [mut]` item whose initializer
+    is one string literal, minus every name bound anywhere else (another initializer, a pattern,
+    a parameter, a field). The census has no scope model, so a name bound twice is refused."""
+    literal: set[str] = set()
+    other: set[str] = set()
+    for t in files:
+        close = brackets(t)
+        defs: set[int] = set()
+        for k, x in enumerate(t):
+            if x.kind == IDENT and x.text in ("const", "static"):
+                got = item_binding(t, k, close)
+                if got is not None:
+                    j, lit = got
+                    defs.add(j)
+                    (literal if lit else other).add(t[j].text)
+        other |= binder_names(t, close, defs)
+    return frozenset(literal - other)
 
 
 Prepared = list[tuple[str, list[Tok], list[int], list[int], list[int]]]
@@ -583,7 +727,7 @@ def shapes_of(t: list[Tok], watched: set[str]) -> list[tuple[str, int]]:
     return out
 
 
-def env_calls(t: list[Tok], env_fns: set[str], close: list[int]) -> list[int]:
+def env_calls(t: list[Tok], env_fns: set[str], close: list[int], consts: frozenset[str]) -> list[int]:
     """The name index of every environment reach whose name
     is not ok: a call of an environment function (by any name bound to one) whose
     first argument is not one literal or one constant, `.env(`/`.env_remove(` and
@@ -616,8 +760,21 @@ def env_calls(t: list[Tok], env_fns: set[str], close: list[int]) -> list[int]:
             open_ = k + 2
         if open_ is None:
             continue
-        if always or not name_ok(first_arg(t, open_, close)):
+        if always or not name_ok(first_arg(t, open_, close), consts):
             out.append(k)
+    return out
+
+
+def env_counts(prepared: Prepared, env_fns: set[str], consts: frozenset[str] | None = None) -> dict[str, int]:
+    """The number of environment reaches whose name is not ok, per file that has one; the
+    constant names are those of all of `prepared` (#10299)."""
+    if consts is None:
+        consts = const_names([t for _rel, t, *_rest in prepared])
+    out: dict[str, int] = {}
+    for rel, t, close, *_rest in prepared:
+        e = env_calls(t, env_fns, close, consts)
+        if e:
+            out[rel] = len(e)
     return out
 
 
@@ -678,7 +835,8 @@ def digest(kind: str, body: str) -> str:
     return hashlib.sha256((kind + body).encode()).hexdigest()[:DIGEST_HEX]
 
 
-def sites_of(t: list[Tok], watched: set[str], env_names: set[str], env_fns: set[str]) -> list[str]:
+def sites_of(t: list[Tok], watched: set[str], env_names: set[str], env_fns: set[str],
+             consts: frozenset[str] | None = None) -> list[str]:
     """The pin of every site in token order: the digest of the site kind and the
     whole statement that holds the site. Each statement is written and hashed
     once per kind, so the cost is linear. A site in a statement over STMT_CAP
@@ -708,7 +866,9 @@ def sites_of(t: list[Tok], watched: set[str], env_names: set[str], env_fns: set[
             found.append((k, 0, pin(k, "T")))
     for k in use_sites(t, env_names):
         found.append((k, 1, pin(k, "U")))
-    for k in env_calls(t, env_fns, close):
+    if consts is None:
+        consts = const_names([t])
+    for k in env_calls(t, env_fns, close, consts):
         found.append((k, 2, pin(k, "E")))
     found.sort()
     return [d for _k, _o, d in found]
@@ -976,7 +1136,7 @@ pub(crate) const R_SHAPE_PASTE: &str =
 /// An environment name that is a parameter or a built string.
 #[rustfmt::skip]
 pub(crate) const R_ENV_NAME: &str =
-    "an environment name passed as a parameter or built at run time, or a local named like an environment function; none is a proptest variable";
+    "an environment name passed as a parameter or built at run time, a constant not bound to one string literal (#10299), or a local named like an environment function; none is a proptest variable";
 '''
 
 SITES_HEADER = '''// Copyright 2026 AlphaOne LLC
@@ -1016,11 +1176,12 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
     env_mod = graph.reach(ENV_MOD_SEED)
     env_fns = graph.reach(ENV_FN_SEED)
     env_names = env_mod | env_fns
+    consts = const_names([t for _rel, t in lexed])
+    env = env_counts(prepared, env_fns, consts)
     tok: dict[str, int] = {}
     tok_reason: dict[str, str] = {}
     shape: dict[str, int] = {}
     shape_reason: dict[str, str] = {}
-    env: dict[str, int] = {}
     sites: dict[str, list[str]] = {}
     for rel, t in lexed:
         counts = collections.Counter(x.text for x in t if x.kind == IDENT and x.text in watched)
@@ -1043,11 +1204,8 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
             shape_reason[rel] = "R_SHAPE_PASTE" if rel.startswith("vendor/paste/") else (
                 "R_SHAPE_" + "_".join(kinds).upper()
             )
-        e = env_calls(t, env_fns, brackets(t))
-        if e:
-            env[rel] = len(e)
         try:
-            pins = sites_of(t, watched, env_names, env_fns)
+            pins = sites_of(t, watched, env_names, env_fns, consts)
         except ValueError as e:
             raise ValueError(f"{rel}: {e}") from e
         if pins:

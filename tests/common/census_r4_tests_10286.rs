@@ -24,7 +24,8 @@ pub(super) fn sites(text: &str) -> Vec<census_pins::Site> {
     let env_mod = census_pins::closure(preps, census_pins::ENV_MOD_SEED);
     let env_fns = census_pins::closure(preps, census_pins::ENV_FN_SEED);
     let reach: BTreeSet<String> = env_mod.union(&env_fns).cloned().collect();
-    census_pins::sites_of(&prep, &watched, &reach, &env_fns)
+    let consts = crate::census_consts::const_names(preps);
+    census_pins::sites_of(&prep, &watched, &reach, &env_fns, &consts)
         .expect("every test text is under STMT_CAP")
 }
 

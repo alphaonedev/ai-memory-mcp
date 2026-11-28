@@ -43,7 +43,7 @@ pub(crate) const R_SHAPE_PASTE: &str =
 /// An environment name that is a parameter or a built string.
 #[rustfmt::skip]
 pub(crate) const R_ENV_NAME: &str =
-    "an environment name passed as a parameter or built at run time, or a local named like an environment function; none is a proptest variable";
+    "an environment name passed as a parameter or built at run time, a constant not bound to one string literal (#10299), or a local named like an environment function; none is a proptest variable";
 
 /// Every file that holds a watched process, libc, nix or proptest token, with the count.
 #[rustfmt::skip]
@@ -335,6 +335,7 @@ pub(crate) const SHAPE_ROWS: &[(&str, usize, &str)] = &[
 #[rustfmt::skip]
 pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("src/cli/backup/tests/publish_3550.rs", 2, R_ENV_NAME),
+    ("src/cli/boot.rs", 5, R_ENV_NAME),
     ("src/cli/doctor.rs", 8, R_ENV_NAME),
     ("src/cli/store.rs", 4, R_ENV_NAME),
     ("src/cli/wrap.rs", 1, R_ENV_NAME),
@@ -342,20 +343,23 @@ pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("src/config/shape.rs", 2, R_ENV_NAME),
     ("src/daemon_runtime.rs", 5, R_ENV_NAME),
     ("src/embeddings.rs", 4, R_ENV_NAME),
-    ("src/enterprise_federation_posture.rs", 2, R_ENV_NAME),
+    ("src/enterprise_federation_posture.rs", 4, R_ENV_NAME),
     ("src/erasure/mod.rs", 2, R_ENV_NAME),
     ("src/federation/receive_auth.rs", 2, R_ENV_NAME),
     ("src/governance/audit.rs", 3, R_ENV_NAME),
-    ("src/handlers/tests.rs", 4, R_ENV_NAME),
+    ("src/handlers/tests.rs", 6, R_ENV_NAME),
     ("src/hnsw.rs", 1, R_ENV_NAME),
     ("src/identity/test_key_dir.rs", 2, R_ENV_NAME),
     ("src/llm.rs", 2, R_ENV_NAME),
     ("src/log_paths.rs", 1, R_ENV_NAME),
-    ("src/logging.rs", 1, R_ENV_NAME),
+    ("src/logging.rs", 2, R_ENV_NAME),
     ("src/recover/in_tx_fault.rs", 1, R_ENV_NAME),
     ("src/recover/nag.rs", 1, R_ENV_NAME),
     ("src/reranker.rs", 2, R_ENV_NAME),
     ("src/security_profile.rs", 10, R_ENV_NAME),
+    ("src/stop_signal.rs", 1, R_ENV_NAME),
+    ("src/storage/migrations.rs", 1, R_ENV_NAME),
+    ("src/storage/schema_guard.rs", 4, R_ENV_NAME),
     ("src/test_support.rs", 11, R_ENV_NAME),
     ("src/transit_encryption.rs", 1, R_ENV_NAME),
     ("tests/a2a_campaign_round1.rs", 2, R_ENV_NAME),
@@ -370,6 +374,7 @@ pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("tests/cov_ga2_pg_federation.rs", 2, R_ENV_NAME),
     ("tests/cov_ga2_r4_federation.rs", 2, R_ENV_NAME),
     ("tests/credential_to_sink_3711.rs", 1, R_ENV_NAME),
+    ("tests/cross_build_db_compat_8677.rs", 1, R_ENV_NAME),
     ("tests/doctor_pg_floor_4333.rs", 7, R_ENV_NAME),
     ("tests/egress_audit_honors_db_1991.rs", 1, R_ENV_NAME),
     ("tests/embed_lane_egress_gap_3933.rs", 1, R_ENV_NAME),
@@ -394,14 +399,18 @@ pub(crate) const ENV_NAME_ROWS: &[(&str, usize, &str)] = &[
     ("tests/migration_ladder_integrity.rs", 1, R_ENV_NAME),
     ("tests/node_local_containment_item3_r2_3266.rs", 3, R_ENV_NAME),
     ("tests/permissions_mode_gate.rs", 4, R_ENV_NAME),
+    ("tests/postgres_cross_build_db_compat_8677.rs", 3, R_ENV_NAME),
+    ("tests/postgres_schema_downgrade_guard_2445.rs", 5, R_ENV_NAME),
     ("tests/posture_control15_pg_resolution_3106.rs", 2, R_ENV_NAME),
     ("tests/provisioning_pgvector_pin_parity.rs", 1, R_ENV_NAME),
     ("tests/r40_airgapped_approval.rs", 1, R_ENV_NAME),
     ("tests/recall_stderr_lock_deadlock_4284.rs", 2, R_ENV_NAME),
     ("tests/retired_provider_aliases.rs", 8, R_ENV_NAME),
     ("tests/role_separation_1826.rs", 2, R_ENV_NAME),
+    ("tests/schema_downgrade_guard_2445.rs", 10, R_ENV_NAME),
     ("tests/security_profile_dispatch_1961.rs", 1, R_ENV_NAME),
     ("tests/serve_integration.rs", 1, R_ENV_NAME),
+    ("tests/serve_postgres_continuation2.rs", 2, R_ENV_NAME),
     ("tests/serve_store_url_explicit_3431.rs", 1, R_ENV_NAME),
     ("tests/signal_recipient_validation_4408.rs", 3, R_ENV_NAME),
     ("tests/skill_scope_integrity_8832_8834.rs", 2, R_ENV_NAME),

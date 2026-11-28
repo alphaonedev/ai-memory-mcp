@@ -773,8 +773,9 @@ pub(crate) fn first_arg<'t>(p: &Prep<'t>, open: usize) -> &'t [Lexed] {
 }
 
 /// Whether an environment-name argument is one string literal or one named
-/// constant (`[&] [path ::] NAME`, NAME upper case).
-pub(crate) fn name_ok(arg: &[Lexed]) -> bool {
+/// constant (`[&] [path ::] NAME`, NAME in `consts`: bound by a `const` or
+/// `static` to one string literal and nowhere else, #10299).
+pub(crate) fn name_ok(arg: &[Lexed], consts: &BTreeSet<String>) -> bool {
     if let [one] = arg
         && matches!(one.tok, Tok::Str(_))
     {
@@ -787,16 +788,14 @@ pub(crate) fn name_ok(arg: &[Lexed]) -> bool {
     let Some(Tok::Ident(last)) = arg.last().map(|x| &x.tok) else {
         return false;
     };
-    let mut chars = last.chars();
-    let caps = chars.next().is_some_and(|c| c.is_ascii_uppercase())
-        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    caps && arg.iter().enumerate().all(|(i, x)| {
-        if i % 2 == 0 {
-            matches!(x.tok, Tok::Ident(_))
-        } else {
-            matches!(x.tok, Tok::PathSep)
-        }
-    })
+    consts.contains(last)
+        && arg.iter().enumerate().all(|(i, x)| {
+            if i % 2 == 0 {
+                matches!(x.tok, Tok::Ident(_))
+            } else {
+                matches!(x.tok, Tok::PathSep)
+            }
+        })
 }
 
 /// Every environment reach of one file whose name is not ok: a call of an
@@ -807,7 +806,11 @@ pub(crate) fn name_ok(arg: &[Lexed]) -> bool {
 /// not a definition, not in a `use`).
 ///
 /// Returns the index of each reach's name token.
-pub(crate) fn env_calls(p: &Prep<'_>, env_fns: &BTreeSet<String>) -> Vec<usize> {
+pub(crate) fn env_calls(
+    p: &Prep<'_>,
+    env_fns: &BTreeSet<String>,
+    consts: &BTreeSet<String>,
+) -> Vec<usize> {
     let t = p.toks;
     let n = t.len();
     let mut out = Vec::new();
@@ -838,7 +841,7 @@ pub(crate) fn env_calls(p: &Prep<'_>, env_fns: &BTreeSet<String>) -> Vec<usize> 
             (None, false)
         };
         let Some(open) = open else { continue };
-        if always || !name_ok(first_arg(p, open)) {
+        if always || !name_ok(first_arg(p, open), consts) {
             out.push(k);
         }
     }
@@ -945,6 +948,7 @@ pub(crate) fn sites_of(
     watched: &BTreeSet<String>,
     env_names: &BTreeSet<String>,
     env_fns: &BTreeSet<String>,
+    consts: &BTreeSet<String>,
 ) -> Result<Vec<Site>, String> {
     let t = p.toks;
     let spans = statements(t);
@@ -979,7 +983,7 @@ pub(crate) fn sites_of(
     for k in use_sites(p, env_names) {
         found.push((k, 1, pin(k, "U")?));
     }
-    for k in env_calls(p, env_fns) {
+    for k in env_calls(p, env_fns, consts) {
         found.push((k, 2, pin(k, "E")?));
     }
     found.sort();
