@@ -10267,6 +10267,135 @@ fn refusing_arms_keep_no_row_10351() {
     assert_eq!(miss, Vec::<String>::new());
 }
 
+/// #10356: an item macro in `src/a.rs` that writes a lock-holding crate
+/// struct named like the marker trait `Send` (review probe P1 shape). The
+/// census cannot see the struct, so the bare name `Send` has no walked
+/// definition.
+const SEND_MACRO_10356: &str = "macro_rules! mk {\n    () => {\n        pub struct Send {\n            m: std::sync::Mutex<u8>,\n        }\n    };\n}\nmk!();\n";
+
+/// #10356: a lock-holding `struct Send` declared in a file the walk does
+/// not read (a `tests/` file), so in `src/` the bare name has no walked
+/// definition either.
+const SEND_DECL_10356: &str = "pub struct Send {\n    m: std::sync::Mutex<u8>,\n}\n";
+
+/// #10356: one row of the position table: a case id, the files, the row's
+/// pinned digest and `why`, and the findings written out.
+type PosRow10356 = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    &'static str,
+    &'static str,
+    Vec<StaticFinding>,
+);
+
+/// #10356: the position table. A marker-trait name with no walked
+/// definition counts as read only in bound position (after `dyn`, `impl`,
+/// `+` or `?`). In type position (the static's own type, a field type, a
+/// generic argument, a reference) it is a crate type, here one an item
+/// macro or an unwalked file declares holding a lock, and the row pinned
+/// to it is never taken. Each type-position row is pinned at the digest a
+/// taken row matches, so only the position rule refuses it.
+fn marker_position_rows_10356() -> Vec<PosRow10356> {
+    let b = "src/b.rs";
+    let a = ("src/a.rs", SEND_MACRO_10356);
+    let refused = |line: usize| {
+        vec![
+            r3_unres(b, line, Why::NoDef("Send".into())),
+            StaticFinding::ExceptionStale {
+                file: b.into(),
+                name: "FORM".into(),
+            },
+        ]
+    };
+    let send = r#"NoDef("Send")"#;
+    vec![
+        (
+            "type-bare-item-macro",
+            vec![a, (b, "static FORM: Send = X;\n")],
+            "type=bb817eeb",
+            send,
+            refused(1),
+        ),
+        (
+            "type-bare-declared-out-of-walk",
+            vec![
+                ("tests/c.rs", SEND_DECL_10356),
+                (b, "static FORM: Send = X;\n"),
+            ],
+            "type=bb817eeb",
+            send,
+            refused(1),
+        ),
+        (
+            "type-field",
+            vec![
+                a,
+                (b, "pub struct H {\n    s: Send,\n}\nstatic FORM: H = X;\n"),
+            ],
+            "type=bc9c6b72 src::b::H=cd2f8d00",
+            send,
+            refused(4),
+        ),
+        (
+            "type-generic-argument",
+            vec![a, (b, "static FORM: Option<Send> = X;\n")],
+            "type=f3fee676",
+            send,
+            refused(1),
+        ),
+        (
+            "type-reference",
+            vec![a, (b, "static FORM: &'static Send = X;\n")],
+            "type=986e6bab",
+            send,
+            refused(1),
+        ),
+        (
+            "bound-dyn",
+            vec![a, (b, "static FORM: Box<dyn Send> = X;\n")],
+            "type=52e027f4",
+            "TraitObject",
+            vec![],
+        ),
+        (
+            "bound-impl",
+            vec![a, (b, "type Op = impl Send;\nstatic FORM: Op = X;\n")],
+            "type=8f76c987 src::b::Op=b7a99d01",
+            "OpaqueType",
+            vec![],
+        ),
+        (
+            "bound-plus",
+            vec![a, (b, "static FORM: Box<dyn Fn() + Send> = X;\n")],
+            "type=47312b8a",
+            "TraitObject",
+            vec![],
+        ),
+        (
+            "bound-question",
+            vec![a, (b, "static FORM: Box<dyn Fn() + ?Sync> = X;\n")],
+            "type=2f0ed6e9",
+            "TraitObject",
+            vec![],
+        ),
+    ]
+}
+
+/// #10356: a marker-trait name in type position is a crate type: an item
+/// macro's `struct Send` (or one in an unwalked file) is unread, so its
+/// pinned row is refused; the same name in bound position stays read.
+#[test]
+fn marker_name_reads_only_in_bound_position_10356() {
+    let mut miss = Vec::new();
+    for (id, files, pin, why, want) in marker_position_rows_10356() {
+        let got = pinned_census_why(&files, pin, why);
+        if got != want {
+            miss.push(format!("{id}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
 /// #10346: a struct an item macro writes is no walked definition, so its
 /// name is a `NoDef` the pin cannot read: the row is never taken, before
 /// or after the macro gives the struct a lock.
