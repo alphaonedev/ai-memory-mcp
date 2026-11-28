@@ -832,7 +832,7 @@ pub(crate) fn ensure_daemon_signing_key_in(
     Option<crate::identity::keypair::EnsureOutcome>,
 )> {
     let (outcome, report) =
-        crate::identity::keypair::ensure_keypair(agent_id, dir, false).map(|o| (o, NotDurableReport::new()))?;
+        crate::identity::keypair::ensure_keypair_reported(agent_id, dir, false)?;
     if !report.is_empty() {
         if asi_hard {
             return Err(anyhow::Error::new(report));
@@ -854,7 +854,7 @@ pub(crate) fn ensure_daemon_signing_key_in(
 /// other cause keeps [`unsigned_ledger_refusal`].
 #[must_use]
 pub fn boot_key_refusal(agent_id: &str, e: &anyhow::Error) -> String {
-    match None::<&NotDurableReport> {
+    match e.downcast_ref::<NotDurableReport>() {
         Some(report) => format!(
             "{UNSIGNED_LEDGER_ISSUE}: refusing to start a ledger-writing command as \
              `{agent_id}`: {}",

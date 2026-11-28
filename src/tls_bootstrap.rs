@@ -793,7 +793,7 @@ pub(crate) async fn renewal_tick(
     host: &str,
 ) -> RenewalTick {
     let remedy = crate::transit_encryption::REMEDY_TLS_RENEW;
-    let (local, report) = match ensure_local_tls(key_dir, host).map(|l| (l, NotDurableReport::new())) {
+    let (local, report) = match ensure_local_tls_reported(key_dir, host) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::error!(

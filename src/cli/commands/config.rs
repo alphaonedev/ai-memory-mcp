@@ -918,11 +918,12 @@ fn clean_claude_json(timestamp: &str) -> Result<Option<String>> {
     )?;
     // #10214: a backup not confirmed durable is no safety net, so the
     // original is not rewritten; the backup stays on disk.
-    if let crate::storage::snapshot_file::Durability::NotDurable(not_durable) = durability {
-        anyhow::bail!(
+    match durability {
+        crate::storage::snapshot_file::Durability::Durable => {}
+        crate::storage::snapshot_file::Durability::NotDurable(not_durable) => anyhow::bail!(
             "{not_durable}; refusing to rewrite {} until its backup is durable (it is untouched)",
             path.display()
-        );
+        ),
     }
     std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
 

@@ -6184,7 +6184,7 @@ pub fn resolve_tls_material(
 /// admitted the boot: mint / renew / reuse the local leaf, or hand back the
 /// operator-supplied pair as unmanaged.
 fn resolve_local_material(key_dir: &Path, bind_host: &str) -> Result<TlsMaterial> {
-    let (local, report) = crate::tls_bootstrap::ensure_local_tls(key_dir, bind_host).map(|l| (l, crate::storage::snapshot_file::NotDurableReport::new()))
+    let (local, report) = crate::tls_bootstrap::ensure_local_tls_reported(key_dir, bind_host)
         .with_context(|| {
             format!(
                 "{}: could not generate or renew the local TLS certificate in {} — \

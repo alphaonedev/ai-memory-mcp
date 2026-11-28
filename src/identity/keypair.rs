@@ -1155,7 +1155,7 @@ pub(crate) fn ensure_and_load_daemon_keypair_at(
     // The `[identity].disabled` config field is not yet wired in v0.7.0; pass
     // `false` so the helper auto-generates unless the operator pre-staged a
     // keypair. A future config field can opt out without changing this call.
-    let (outcome, report) = match ensure_keypair(DAEMON_KEYPAIR_LABEL, dir, false).map(|o| (o, NotDurableReport::new())) {
+    let (outcome, report) = match ensure_keypair_reported(DAEMON_KEYPAIR_LABEL, dir, false) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("identity: keypair auto-gen failed: {e:#}");

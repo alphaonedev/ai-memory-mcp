@@ -479,11 +479,12 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
         })?;
         // #10214: a backup not confirmed durable is no safety net, so the
         // config is not rewritten (it is untouched); the backup stays.
-        if let crate::storage::snapshot_file::Durability::NotDurable(not_durable) = durability {
-            anyhow::bail!(
+        match durability {
+            crate::storage::snapshot_file::Durability::Durable => {}
+            crate::storage::snapshot_file::Durability::NotDurable(not_durable) => anyhow::bail!(
                 "{not_durable}; refusing to write {} until its backup is durable (it is untouched)",
                 config_path.display()
-            );
+            ),
         }
         Some(written)
     } else {

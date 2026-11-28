@@ -1358,7 +1358,7 @@ impl FileScopeKeyStore {
         // A failed audit line must not drop the report: the records are on
         // disk either way, and the caller learns which are not durable.
         if let Err(e) = self.append_audit_line(namespace, &line) {
-            return Err(if true || report.is_empty() {
+            return Err(if report.is_empty() {
                 e
             } else {
                 e.context(format!("records written before the audit line failed: {report}"))
