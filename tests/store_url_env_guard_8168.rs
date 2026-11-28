@@ -9273,3 +9273,117 @@ fn module_link_ignores_walk_order_10323() {
     }
     assert_eq!(miss, Vec::<String>::new());
 }
+
+/// #10323 (mutant A2): `tree()` hands every census the files sorted by
+/// path, strictly ascending, so no census depends on the `read_dir` order.
+#[test]
+fn tree_is_sorted_by_path_10323() {
+    let files = tree();
+    let unsorted: Vec<String> = files
+        .windows(2)
+        .filter(|w| w[0].0 >= w[1].0)
+        .map(|w| format!("{} then {}", w[0].0, w[1].0))
+        .collect();
+    assert_eq!(unsorted, Vec::<String>::new());
+}
+
+/// #10323: `T` is defined in both `src/a.rs` and `src/a/mod.rs`, so its
+/// node folds two bodies; `FORM` in `src/b.rs` reaches it.
+const TWO_FILE_T: [(&str, &str); 3] = [
+    ("src/a.rs", "pub struct T(Unknown);\n"),
+    ("src/a/mod.rs", "pub struct T(Unknown, u16);\n"),
+    ("src/b.rs", "use crate::a::T;\nstatic FORM: T = X;\n"),
+];
+
+/// #10323: the pinned digest of `FORM` in [`TWO_FILE_T`], taken from one
+/// green run with the files in path order.
+const D_TWO_FILE_T: &str = "type=bcf2301e src::a::T=5fc443f0";
+
+/// #10295: the static findings of `files` with one exception row for
+/// `FORM` in `src/b.rs` pinned at `pin`.
+fn pinned_census(files: &[(&str, &str)], pin: &str) -> Vec<StaticFinding> {
+    let b = "src/b.rs";
+    let owned: Vec<(String, String)> = files
+        .iter()
+        .map(|(p, t)| ((*p).to_string(), (*t).to_string()))
+        .collect();
+    let table = format!("{b}{FORM_ROW}");
+    let exceptions: Vec<ExceptionRow<'_>> = vec![(b, "FORM", pin, FORM_WHY)];
+    let tables = Tables {
+        statics: &table,
+        exceptions: &exceptions,
+        includes: &[],
+    };
+    token_census_with(&owned, &tables).0
+}
+
+/// #10323 (mutant A2): a node folded from two files keeps one digest in
+/// either walk order, so its pinned exception holds in both.
+#[test]
+fn merged_node_digest_ignores_walk_order_10323() {
+    let mut back = TWO_FILE_T.to_vec();
+    back.reverse();
+    let mut miss = Vec::new();
+    for (id, files) in [("written", TWO_FILE_T.to_vec()), ("reversed", back)] {
+        let got = pinned_census(&files, D_TWO_FILE_T);
+        if !got.is_empty() {
+            miss.push(format!("{id}: got {got:?}, want []"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10325 (mutant X1): a pinned entry the live digest no longer holds is
+/// reported by its key, even when every live entry is pinned.
+#[test]
+fn pinned_entry_gone_from_live_digest_is_reported_10325() {
+    let pin = format!("{D_BUS} src::b::Gone=0badc0de");
+    let got = pinned_census(&[("src/b.rs", R3_BUS)], &pin);
+    let want = vec![StaticFinding::ExceptionDigest {
+        file: "src/b.rs".into(),
+        name: "FORM".into(),
+        ty: "src::b::Gone".into(),
+    }];
+    assert_eq!(got, want);
+}
+
+/// #10325 (mutant X7): a type parameter that hides a type the scope
+/// itself defines is refused as shadowed.
+#[test]
+fn parameter_hiding_a_bound_name_is_shadowed_10325() {
+    let b = "src/b.rs";
+    let cases: Vec<R3Case> = vec![(
+        "X7-param-hides-local-struct",
+        vec![(
+            b,
+            "pub struct Plain(u8);\nstruct Wrap<Plain>(Plain);\nstatic FORM: Wrap<u8> = X;\n",
+        )],
+        vec![r3_unres(b, 3, Why::Shadowed("Plain".into()))],
+        None,
+    )];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10325 (mutant X8): an import first resolved while the globs are being
+/// settled (here by the glob of `src/e.rs`, while the glob of `src/b.rs` is
+/// not settled and so may supply any name) is resolved again once every
+/// glob is settled: `crate::d` binds no `Mutex`, so the bare `Mutex` that
+/// `Gate` renames is the lock.
+#[test]
+fn import_through_glob_resolves_after_settle_10325() {
+    let b = "src/b.rs";
+    let cases: Vec<R3Case> = vec![(
+        "X8-import-resolved-again-after-settle",
+        vec![
+            ("src/d.rs", "pub struct Other(u8);\n"),
+            ("src/e.rs", "use crate::b::Gate::*;\n"),
+            (
+                b,
+                "use crate::d::*;\nuse Mutex as Gate;\nstatic FORM: Gate = X;\n",
+            ),
+        ],
+        vec![r3_lock(b, 3)],
+        None,
+    )];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
