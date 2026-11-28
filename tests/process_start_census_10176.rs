@@ -2771,6 +2771,36 @@ fn a_shape_extern_row_for_a_non_acl_extern_is_red_10311() {
     }
 }
 
+/// The wall-clock ceiling of the extern-row scan on one 100K+ input (#10311).
+const EXTERN_SCAN_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #10311: the extern-row scan is linear: 10 000 acl-only blocks are clean,
+/// and 60 000 nested unclosed `extern {` openings are one finding, each over
+/// 100K bytes and under [`EXTERN_SCAN_CEILING`].
+#[test]
+fn the_extern_row_scan_is_linear_on_large_input_10311() {
+    let clean = "unsafe extern \"C\" {\n    fn acl_free(p: *mut u8) -> i32;\n}\n".repeat(10_000);
+    let nested = "extern {\n".repeat(60_000);
+    let cases = [
+        (clean, Vec::<String>::new()),
+        (
+            nested,
+            vec!["a.rs is rowed R_SHAPE_EXTERN but declares extern (#10311)".to_string()],
+        ),
+    ];
+    for (src, want) in cases {
+        assert!(src.len() > 100_000);
+        let toks = lex(&src);
+        let t0 = std::time::Instant::now();
+        assert_eq!(extern_row_findings("a.rs", &toks), want);
+        assert!(
+            t0.elapsed() < EXTERN_SCAN_CEILING,
+            "took {:?}",
+            t0.elapsed()
+        );
+    }
+}
+
 /// #10311: the census reads the extern reason of a `SHAPE_ROWS` row as a
 /// claim about the file. A rowed `R_SHAPE_EXTERN` file whose extern block
 /// declares a non-`acl_*` function, an `R_SHAPE_EXTERN` row over a form that

@@ -889,7 +889,9 @@ EXTERN_ARM_ROWS_10311 = [
     ('extern "C" {\n    m! { fn fork(); }\n}\n', "m"),
     ('extern "C" {\n    fn acl_a();\n}\nextern "C" {\n    fn execve();\n    safe fn acl_b();\n}\n', "execve"),
 ]
-EXTERN_REFUSAL_10311 = "an extern block declares {name}; only acl_* functions may be declared in one (#10311)"
+# The wall-clock ceiling of the extern arm on one 100K+ input.
+EXTERN_SCAN_CEILING_SECS_10311 = 5.0
+EXTERN_REFUSAL_10311 ="an extern block declares {name}; only acl_* functions may be declared in one (#10311)"
 
 
 class ExternArm10311(unittest.TestCase):
@@ -909,6 +911,22 @@ class ExternArm10311(unittest.TestCase):
             with self.assertRaises(ValueError, msg=src) as cm:
                 self.m.shapes_of(toks, set())
             self.assertEqual(str(cm.exception).split(": ", 1)[1], EXTERN_REFUSAL_10311.format(name=name), src)
+
+    def test_the_extern_arm_is_linear_on_large_input_10311(self) -> None:
+        clean = 'unsafe extern "C" {\n    fn acl_free(p: *mut u8) -> i32;\n}\n' * 10_000
+        nested = "extern {\n" * 60_000
+        for src in (clean, nested):
+            self.assertGreater(len(src), 100_000)
+        toks = self.m.lex(clean)
+        t0 = time.monotonic()
+        self.assertEqual(len(self.m.shapes_of(toks, set())), 10_000)
+        self.assertLess(time.monotonic() - t0, EXTERN_SCAN_CEILING_SECS_10311)
+        toks = self.m.lex(nested)
+        t0 = time.monotonic()
+        with self.assertRaises(ValueError) as cm:
+            self.m.shapes_of(toks, set())
+        self.assertEqual(str(cm.exception), "line 1: " + EXTERN_REFUSAL_10311.format(name="extern"))
+        self.assertLess(time.monotonic() - t0, EXTERN_SCAN_CEILING_SECS_10311)
 
     def test_the_scan_names_the_file_of_a_non_acl_extern_10311(self) -> None:
         SCRATCH.mkdir(exist_ok=True)
