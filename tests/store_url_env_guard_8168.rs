@@ -10132,6 +10132,141 @@ fn pin_reads_is_default_deny_10346() {
     assert_eq!(miss, Vec::<String>::new());
 }
 
+/// #10351: one row of [`refusing_arms_keep_no_row_10351`]: a case id, the
+/// files, the row's pinned digest and `why`, the static's line, and the
+/// reason the finding names.
+type ArmRow10351 = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+    &'static str,
+    usize,
+    Why,
+);
+
+/// #10351: the file that supplies `crate::a::Plain` for the ambiguous rows.
+const PLAIN_A_10351: (&str, &str) = ("src/a.rs", "pub struct Plain(u8);\n");
+
+/// #10351: every refusing arm of [`pin_reads`] the reviewer's mutants left
+/// green (Projection, MacroType, Ambiguous, Shadowed), each as the static's
+/// own reason (`top`) and as a reason reached through a struct whose
+/// least reason is the read `TraitObject` (`behind`). Each row is pinned
+/// at the digest a taken row would match, so the only thing that refuses
+/// it is the arm: flipping the arm to `true` takes the row and the census
+/// reports nothing. The expected findings are written out.
+#[test]
+fn refusing_arms_keep_no_row_10351() {
+    let b = "src/b.rs";
+    let rows: [ArmRow10351; 8] = [
+        (
+            "projection-top",
+            &[(
+                "src/b.rs",
+                "pub struct W<T> {\n    v: T::Out,\n}\nstatic FORM: W<u8> = X;\n",
+            )],
+            "type=e2dc0d97 src::b::W=b985cfbf",
+            "Projection",
+            4,
+            Why::Projection,
+        ),
+        (
+            "projection-behind",
+            &[(
+                "src/b.rs",
+                "pub struct W<T> {\n    v: T::Out,\n}\npub struct H {\n    a: Box<dyn Fn()>,\n    b: W<u8>,\n}\nstatic FORM: H = X;\n",
+            )],
+            "type=bc9c6b72 src::b::H=9d7beb1a src::b::W=b985cfbf",
+            "TraitObject",
+            8,
+            Why::TraitObject,
+        ),
+        (
+            "macro-type-top",
+            &[("src/b.rs", "static FORM: my_type!() = X;\n")],
+            "type=6e9341c8",
+            r#"MacroType("my_type")"#,
+            1,
+            Why::MacroType("my_type".into()),
+        ),
+        (
+            "macro-type-behind",
+            &[(
+                "src/b.rs",
+                "pub struct H {\n    a: Box<dyn Fn()>,\n    b: my_type!(),\n}\nstatic FORM: H = X;\n",
+            )],
+            "type=bc9c6b72 src::b::H=ead6dc79",
+            "TraitObject",
+            5,
+            Why::TraitObject,
+        ),
+        (
+            "ambiguous-top",
+            &[
+                PLAIN_A_10351,
+                (
+                    "src/b.rs",
+                    "use crate::a::Plain;\nstruct Plain(u8);\nstatic FORM: Plain = X;\n",
+                ),
+            ],
+            "type=39727b68",
+            r#"Ambiguous("Plain")"#,
+            3,
+            Why::Ambiguous("Plain".into()),
+        ),
+        (
+            "ambiguous-behind",
+            &[
+                PLAIN_A_10351,
+                (
+                    "src/b.rs",
+                    "use crate::a::Plain;\nstruct Plain(u8);\npub struct H {\n    a: Box<dyn Fn()>,\n    b: Plain,\n}\nstatic FORM: H = X;\n",
+                ),
+            ],
+            "type=bc9c6b72 src::b::H=fc577af4",
+            "TraitObject",
+            7,
+            Why::TraitObject,
+        ),
+        (
+            "shadowed-top",
+            &[(
+                "src/b.rs",
+                "pub struct Send {\n    v: u8,\n}\nstatic FORM: Send = X;\n",
+            )],
+            "type=bb817eeb",
+            r#"Shadowed("Send")"#,
+            4,
+            Why::Shadowed("Send".into()),
+        ),
+        (
+            "shadowed-behind",
+            &[(
+                "src/b.rs",
+                "pub struct Send {\n    v: u8,\n}\npub struct H {\n    a: Box<dyn Fn()>,\n    b: Send,\n}\nstatic FORM: H = X;\n",
+            )],
+            "type=bc9c6b72 src::b::H=6445b588",
+            "TraitObject",
+            8,
+            Why::TraitObject,
+        ),
+    ];
+    let mut miss = Vec::new();
+    for (id, files, pin, why, line, reason) in rows {
+        let want = vec![
+            r3_unres(b, line, reason),
+            StaticFinding::ExceptionStale {
+                file: b.into(),
+                name: "FORM".into(),
+            },
+        ];
+        let got = pinned_census_why(files, pin, why);
+        if got != want {
+            miss.push(format!("{id}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
 /// #10346: a struct an item macro writes is no walked definition, so its
 /// name is a `NoDef` the pin cannot read: the row is never taken, before
 /// or after the macro gives the struct a lock.
