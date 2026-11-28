@@ -832,7 +832,7 @@ fn reissued_tick(
         (Ok(()), true) => RenewalTick::Reloaded,
         (Ok(()), false) => RenewalTick::ReloadedNotDurable,
         (Err(_), true) => RenewalTick::ReloadFailed,
-        (Err(_), false) => RenewalTick::ReloadFailed,
+        (Err(_), false) => RenewalTick::ReloadFailedNotDurable,
     };
     let message = renewal_tick_message(tick, report).unwrap_or_default();
     match reload {

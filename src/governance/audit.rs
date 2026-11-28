@@ -885,10 +885,7 @@ pub fn boot_signing_key(
 ) -> Result<BootSigningKey> {
     match ensured {
         Ok(pair) => Ok(pair),
-        Err(e) if ledger_writer => Err(anyhow::anyhow!(unsigned_ledger_refusal(
-            agent_id,
-            &format!("{e:#}")
-        ))),
+        Err(e) if ledger_writer => Err(anyhow::anyhow!(boot_key_refusal(agent_id, &e))),
         Err(_) => Ok((None, None)),
     }
 }
