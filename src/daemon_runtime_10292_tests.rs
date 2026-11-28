@@ -31,7 +31,10 @@ fn local_material_not_durable_is_served_10292() {
         assert!(m.managed);
         seam::take_dir_syncs().len()
     };
-    assert!(clean >= 4, "a first boot publishes four files, synced {clean} times");
+    assert!(
+        clean >= 4,
+        "a first boot publishes four files, synced {clean} times"
+    );
     for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
         let tmp = tempfile::tempdir().expect("tempdir");
         seam::reset();

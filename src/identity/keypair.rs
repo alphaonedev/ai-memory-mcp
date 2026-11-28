@@ -1325,7 +1325,10 @@ pub(crate) fn ensure_keypair_reported(
             // durable is reported, never read as "not repaired".
             let mut report = NotDurableReport::new();
             report.note(durability);
-            Ok((EnsureOutcome::RepairedPublicFromPrivate { pub_path }, report))
+            Ok((
+                EnsureOutcome::RepairedPublicFromPrivate { pub_path },
+                report,
+            ))
         }
 
         // Public half present, private half missing — DEGRADED, and NOT

@@ -1361,7 +1361,9 @@ impl FileScopeKeyStore {
             return Err(if report.is_empty() {
                 e
             } else {
-                e.context(format!("records written before the audit line failed: {report}"))
+                e.context(format!(
+                    "records written before the audit line failed: {report}"
+                ))
             });
         }
         let mut cache = self.cache.write().map_err(|_| poisoned())?;

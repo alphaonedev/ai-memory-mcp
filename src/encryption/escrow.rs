@@ -872,8 +872,15 @@ mod tests {
             seam::reset();
             assert_not_durable_10214(&got.expect_err("reported"), nth);
             let (pub_path, _) = super::super::x25519_key_paths(&agent, dir.path());
-            assert_eq!(std::fs::read(&pub_path).expect("read .pub"), public, "row {nth}");
-            assert!(!repair_public_half(&agent, dir.path()).expect("rerun"), "row {nth}");
+            assert_eq!(
+                std::fs::read(&pub_path).expect("read .pub"),
+                public,
+                "row {nth}"
+            );
+            assert!(
+                !repair_public_half(&agent, dir.path()).expect("rerun"),
+                "row {nth}"
+            );
             evict_cached_keypair(&agent);
         }
     }

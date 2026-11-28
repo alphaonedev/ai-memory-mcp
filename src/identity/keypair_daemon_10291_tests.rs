@@ -46,7 +46,10 @@ fn first_boot_dir_syncs(agent: &str) -> u32 {
     let dir = TempDir::new().expect("tempdir");
     seam::reset();
     let (outcome, report) = ensure_keypair_reported(agent, dir.path(), false).expect("clean");
-    assert!(matches!(outcome, EnsureOutcome::Generated { .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, EnsureOutcome::Generated { .. }),
+        "{outcome:?}"
+    );
     assert!(report.is_empty(), "a clean run is durable: {report}");
     let n = seam::take_dir_syncs().len();
     let n = u32::try_from(n).expect("a handful of directory syncs");
@@ -114,7 +117,10 @@ fn daemon_refuses_a_not_durable_key_under_asi_hard_with_its_state_10291() {
             )),
             "row {nth}: {msg}"
         );
-        assert!(msg.contains(NOT_DURABLE), "row {nth}: names the state: {msg}");
+        assert!(
+            msg.contains(NOT_DURABLE),
+            "row {nth}: names the state: {msg}"
+        );
         assert!(
             msg.ends_with("restart once the filesystem syncs the key directory (#10214)."),
             "row {nth}: {msg}"
@@ -236,9 +242,12 @@ fn ledger_writer_clean_run_and_other_causes_10291() {
     for asi_hard in [false, true] {
         let dir = TempDir::new().expect("tempdir");
         seam::reset();
-        let (key, outcome) =
-            crate::governance::audit::ensure_daemon_signing_key_in(LEDGER_AGENT, dir.path(), asi_hard)
-                .expect("clean");
+        let (key, outcome) = crate::governance::audit::ensure_daemon_signing_key_in(
+            LEDGER_AGENT,
+            dir.path(),
+            asi_hard,
+        )
+        .expect("clean");
         assert!(key.is_some(), "asi_hard={asi_hard}");
         assert!(
             matches!(outcome, Some(EnsureOutcome::Generated { .. })),

@@ -1700,7 +1700,10 @@ mod tests {
             assert_eq!(tick, RenewalTick::Reloaded, "a clean renewal is durable");
             seam::take_dir_syncs().len()
         };
-        assert!(clean >= 2, "a leaf renewal publishes two files, synced {clean} times");
+        assert!(
+            clean >= 2,
+            "a leaf renewal publishes two files, synced {clean} times"
+        );
         for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
             let tmp = sandbox();
             let reload = local_listener(tmp.path()).await;
@@ -1710,16 +1713,28 @@ mod tests {
             let tick = renewal_tick(&reload, tmp.path(), "10.1.2.3").await;
             seam::reset();
             assert_eq!(tick, RenewalTick::ReloadedNotDurable, "sync {nth}");
-            assert_ne!(served(&reload), before, "sync {nth}: the listener serves the new leaf");
+            assert_ne!(
+                served(&reload),
+                before,
+                "sync {nth}: the listener serves the new leaf"
+            );
             let status = leaf_status(tmp.path()).expect("the leaf on disk parses");
             assert!(
                 status.subject_alt_names.iter().any(|s| s == "10.1.2.3"),
                 "sync {nth}: the renewed leaf is on disk"
             );
             let again = ensure_local_tls(tmp.path(), "10.1.2.3").expect("next tick's ensure");
-            assert_eq!(again.outcome, Outcome::Reused, "sync {nth}: complete on disk");
+            assert_eq!(
+                again.outcome,
+                Outcome::Reused,
+                "sync {nth}: complete on disk"
+            );
             let next = renewal_tick(&reload, tmp.path(), "10.1.2.3").await;
-            assert_eq!(next, RenewalTick::Current, "sync {nth}: nothing left to renew");
+            assert_eq!(
+                next,
+                RenewalTick::Current,
+                "sync {nth}: nothing left to renew"
+            );
         }
     }
 
@@ -1734,14 +1749,22 @@ mod tests {
             renewal_tick(&reload, tmp.path(), "127.0.0.1").await,
             RenewalTick::Current
         );
-        assert_eq!(served(&reload), before, "nothing re-issued, nothing reloaded");
+        assert_eq!(
+            served(&reload),
+            before,
+            "nothing re-issued, nothing reloaded"
+        );
         let not_a_dir = tmp.path().join("plain-file");
         std::fs::write(&not_a_dir, b"x").expect("plant a file");
         assert_eq!(
             renewal_tick(&reload, &not_a_dir, "127.0.0.1").await,
             RenewalTick::Failed
         );
-        assert_eq!(served(&reload), before, "a failed tick keeps the certificate");
+        assert_eq!(
+            served(&reload),
+            before,
+            "a failed tick keeps the certificate"
+        );
     }
 
     /// #10214 (finding 5) — an operator import whose files are written but
@@ -1770,7 +1793,10 @@ mod tests {
             import(tmp.path()).expect("clean import");
             seam::take_dir_syncs().len()
         };
-        assert!(clean >= 3, "an import publishes three files, synced {clean} times");
+        assert!(
+            clean >= 3,
+            "an import publishes three files, synced {clean} times"
+        );
         for nth in 1..=u32::try_from(clean).expect("a handful of directory syncs") {
             let tmp = sandbox();
             seam::reset();
@@ -1782,7 +1808,10 @@ mod tests {
                 err.downcast_ref::<NotDurableReport>().is_some(),
                 "sync {nth}: the typed report, got {err:#}"
             );
-            assert!(format!("{err:#}").contains(NOT_DURABLE), "sync {nth}: {err:#}");
+            assert!(
+                format!("{err:#}").contains(NOT_DURABLE),
+                "sync {nth}: {err:#}"
+            );
             assert_eq!(
                 tls_dir_listing(tmp.path()),
                 vec![
