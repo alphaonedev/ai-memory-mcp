@@ -1902,6 +1902,11 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<Durab
         drop(file);
         // Atomic exclusive-create of the FINAL name pointing at the complete
         // inode: `hard_link` fails with `AlreadyExists` if the name is taken.
+        // #10333: a test can fail this claim through the link seam.
+        #[cfg(test)]
+        if let Some(e) = crate::storage::snapshot_file::seam::on_link(path) {
+            return Err(e);
+        }
         fs::hard_link(&staged, path)
     };
     let result = commit();
@@ -1934,6 +1939,11 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<Dura
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
+        // #10333: the same link seam as the Unix claim.
+        #[cfg(test)]
+        if let Some(e) = crate::storage::snapshot_file::seam::on_link(path) {
+            return Err(e);
+        }
         fs::hard_link(&staged, path)
     };
     let result = commit();
