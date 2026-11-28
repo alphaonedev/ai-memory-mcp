@@ -2624,6 +2624,16 @@ const PRIMITIVES: [&str; 17] = [
     "i128", "isize", "f32", "f64",
 ];
 
+/// #10346: the std marker traits whose bare names a pin may read as a
+/// `NoDef` (a trait object or a bound names them, and they hold no
+/// data). Matched on the whole name only.
+const STD_MARKER_TRAITS: [&str; 5] = ["Fn", "FnMut", "FnOnce", "Send", "Sync"];
+
+/// #10346: whether `name` is, as a whole, one of [`STD_MARKER_TRAITS`].
+fn is_std_marker(name: &str) -> bool {
+    STD_MARKER_TRAITS.contains(&name)
+}
+
 /// Whether a bare name means a std type when nothing in scope binds it.
 fn is_prelude(name: &str) -> bool {
     PRELUDE_TYPES.contains(&name) || PRIMITIVES.contains(&name)
@@ -3560,12 +3570,14 @@ impl TypeGraph {
         }
     }
 
-    /// The step a binding takes. A bare prelude or primitive name bound
-    /// to a local definition is shadowed.
+    /// The step a binding takes. A bare prelude, primitive or std marker
+    /// trait name bound to a local definition is shadowed (#10346: a
+    /// pin reads a marker name, so a crate item of that name must not
+    /// pass for it).
     fn hop(b: Bind, name: &str, bare: bool) -> Hop {
         match b {
             Bind::Module(m) => Hop::To(Target::Scope(m)),
-            Bind::Def(_) if bare && is_prelude(name) => {
+            Bind::Def(_) if bare && (is_prelude(name) || is_std_marker(name)) => {
                 Hop::To(unres(Why::Shadowed(name.to_string())))
             }
             Bind::Def(n) => Hop::To(Target::Node(n)),
@@ -3703,7 +3715,7 @@ impl TypeGraph {
                 let known = [&LOCK_TYPES[..], &LEAF_TYPES[..]]
                     .iter()
                     .any(|set| set.contains(&n.as_str()));
-                if bound || known || is_prelude(n) {
+                if bound || known || is_prelude(n) || is_std_marker(n) {
                     Ok(Res::Unres(Why::Shadowed(n.clone())))
                 } else {
                     Ok(Res::Clean)
@@ -3865,23 +3877,28 @@ fn why_text(why: &Why) -> String {
 /// expansion, an associated type's value and an ambiguous or shadowed
 /// name are not in the digest, so a change there would leave the pin
 /// green: a static whose type reaches one never takes a row. Every
-/// variant is named, so a new reason must be judged here.
+/// variant is named in an arm and there is no wildcard, so a new reason must
+/// be judged here. #10346: default deny. A name with no walked definition
+/// (`NoDef`: an item a macro writes, a missing file) and an associated
+/// type with no value (`NoValue`) are not read, except a `NoDef` that is
+/// as a whole a std marker trait (a crate item of that name is
+/// `Shadowed`, see `TypeGraph::hop`).
 fn pin_reads(why: &Why) -> bool {
     match why {
+        Why::NoDef(name) => is_std_marker(name),
         Why::TraitObject
         | Why::OpaqueType
         | Why::RawPointer
-        | Why::NoDef(_)
         | Why::StdNotProven(_)
         | Why::Foreign { .. }
-        | Why::Cycle(_)
-        | Why::NoValue(_) => true,
+        | Why::Cycle(_) => true,
         Why::MacroType(_)
         | Why::Projection
         | Why::Glob(_)
         | Why::Ambiguous(_)
         | Why::Shadowed(_)
-        | Why::PathNotLanded(_) => false,
+        | Why::PathNotLanded(_)
+        | Why::NoValue(_) => false,
     }
 }
 
@@ -7245,8 +7262,10 @@ const FORM_ROW: &str = "\tFORM\tonce: a value computed once, no lock\n";
 /// A reason long enough for an exception or an include row.
 const FORM_WHY: &str = "judged by hand for the form table";
 
-/// #10295: the pinned digest of `static FORM: Unknown = X;` in `src/b.rs`.
-const D_UNRES: &str = "type=57dcbc6c";
+/// #10295: the pinned digest of `static FORM: anyhow::Unknown = X;` in
+/// `src/b.rs` (#10346: a foreign type, a reason the pin reads; a bare
+/// `Unknown` is a `NoDef`, which never takes a row).
+const D_UNRES: &str = "type=83d1c796";
 
 /// #10295: the pinned digest of the macro-body `INNER` static's type.
 const D_INNER: &str = "type=4fd0bfc1";
@@ -7273,9 +7292,9 @@ pub struct Plain {\n    v: u8,\n}\n";
 /// reason)`.
 type ExceptionRow<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
 
-/// #10295: the `why` of a static whose type is the bare unknown name
-/// `Unknown`.
-const W_UNRES: &str = r#"NoDef("Unknown")"#;
+/// #10295: the `why` of a static whose type reaches the foreign name
+/// `anyhow::Unknown` (#10346: read, unlike the `NoDef` of a bare name).
+const W_UNRES: &str = r#"Foreign { root: "anyhow", name: "Unknown" }"#;
 
 /// One exception case: `(id, text, exceptions, findings written by hand)`.
 type ExceptionCase<'a> = (&'a str, &'a str, Vec<ExceptionRow<'a>>, Vec<StaticFinding>);
@@ -7687,7 +7706,7 @@ fn type_forms_are_judged_deny_by_default_10283() {
 /// never excepted.
 #[test]
 fn exceptions_are_judged_exactly_10275() {
-    const UNRES: &str = "static FORM: Unknown = X;\n";
+    const UNRES: &str = "static FORM: anyhow::Unknown = X;\n";
     const LOCK: &str = "static FORM: std::sync::Mutex<u8> = X;\n";
     const CLEAN: &str = "static FORM: u8 = 0;\n";
     let b = "src/b.rs";
@@ -7701,7 +7720,10 @@ fn exceptions_are_judged_exactly_10275() {
         file: b.into(),
         name: "FORM".into(),
         line: 1,
-        why: Why::NoDef("Unknown".into()),
+        why: Why::Foreign {
+            root: "anyhow".into(),
+            name: "Unknown".into(),
+        },
     };
     let rows: Vec<ExceptionCase<'_>> = vec![
         (
@@ -9160,16 +9182,16 @@ fn invented_scope_forms_are_judged_10293() {
 }
 
 /// #10295: a struct reached from `Bus`, then `Bus` itself.
-const R3_BUS: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
+const R3_BUS: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
 
 /// #10295 P14b: `Bus` gains a foreign field after its exception was pinned.
-const R3_BUS_FIELD: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n    m: dashmap::DashMap<u8, u8>,\n}\nstatic FORM: Bus = X;\n";
+const R3_BUS_FIELD: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n    m: dashmap::DashMap<u8, u8>,\n}\nstatic FORM: Bus = X;\n";
 
 /// #10295: `Inner`, reached from `Bus`, gains a field.
-const R3_INNER_FIELD: &str = "pub struct Inner {\n    v: Unknown,\n    w: u16,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
+const R3_INNER_FIELD: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n    w: u16,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: Bus = X;\n";
 
 /// #10295: the static's own written type changes.
-const R3_OWN_TYPE: &str = "pub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: (Bus, u8) = X;\n";
+const R3_OWN_TYPE: &str = "use anyhow::Unknown;\npub struct Inner {\n    v: Unknown,\n}\npub struct Bus {\n    tx: Inner,\n}\nstatic FORM: (Bus, u8) = X;\n";
 
 /// #10295: the pinned digest of `FORM` in [`R3_BUS`].
 const D_BUS: &str = "type=ce1d7f3c src::b::Bus=364aa5fe src::b::Inner=a250aabb";
@@ -9740,7 +9762,7 @@ fn tree_is_sorted_by_path_10323() {
 /// #10323: `T` is defined in both `src/a.rs` and `src/a/mod.rs`, so its
 /// node folds two bodies; `FORM` in `src/b.rs` reaches it.
 const TWO_FILE_T: [(&str, &str); 3] = [
-    ("src/a.rs", "pub struct T(Unknown);\n"),
+    ("src/a.rs", "use anyhow::Unknown;\npub struct T(Unknown);\n"),
     ("src/a/mod.rs", "pub struct T(Unknown, u16);\n"),
     ("src/b.rs", "use crate::a::T;\nstatic FORM: T = X;\n"),
 ];
@@ -9861,8 +9883,16 @@ fn pin_reads_is_default_deny_10346() {
         (Why::NoValue("Out".into()), false),
         (Why::NoValue("Send".into()), false),
     ];
-    cases.extend(MARKER_NAMES_10346.iter().map(|n| (Why::NoDef((*n).into()), true)));
-    cases.extend(NEAR_MARKER_NAMES_10346.iter().map(|n| (Why::NoDef((*n).into()), false)));
+    cases.extend(
+        MARKER_NAMES_10346
+            .iter()
+            .map(|n| (Why::NoDef((*n).into()), true)),
+    );
+    cases.extend(
+        NEAR_MARKER_NAMES_10346
+            .iter()
+            .map(|n| (Why::NoDef((*n).into()), false)),
+    );
     let miss: Vec<String> = cases
         .iter()
         .filter(|(w, want)| pin_reads(w) != *want)
@@ -9885,7 +9915,10 @@ fn item_macro_struct_gaining_a_lock_is_refused_10346() {
         },
     ];
     let mut miss = Vec::new();
-    for (id, text) in [("before", GEN_BEFORE_10346), ("after-lock", GEN_AFTER_10346)] {
+    for (id, text) in [
+        ("before", GEN_BEFORE_10346),
+        ("after-lock", GEN_AFTER_10346),
+    ] {
         let got = pinned_census_why(&[(b, text)], D_GEN_10346, r#"NoDef("Gen")"#);
         if got != want {
             miss.push(format!("{id}: got {got:?}, want {want:?}"));
@@ -9988,6 +10021,46 @@ fn parameter_hiding_a_bound_name_is_shadowed_10325() {
         vec![r3_unres(b, 3, Why::Shadowed("Plain".into()))],
         None,
     )];
+    assert_eq!(r3_misses(cases), Vec::<String>::new());
+}
+
+/// #10346: a type parameter named like a std marker trait hides the name
+/// the pin reads, so it is refused as shadowed, never taken for the
+/// marker trait.
+#[test]
+fn parameter_named_like_a_marker_trait_is_shadowed_10346() {
+    const TEXTS: [(&str, &str); 5] = [
+        ("Fn", "struct Wrap<Fn>(Fn);\nstatic FORM: Wrap<u8> = X;\n"),
+        (
+            "FnMut",
+            "struct Wrap<FnMut>(FnMut);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+        (
+            "FnOnce",
+            "struct Wrap<FnOnce>(FnOnce);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+        (
+            "Send",
+            "struct Wrap<Send>(Send);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+        (
+            "Sync",
+            "struct Wrap<Sync>(Sync);\nstatic FORM: Wrap<u8> = X;\n",
+        ),
+    ];
+    let b = "src/b.rs";
+    assert_eq!(TEXTS.map(|(n, _)| n), MARKER_NAMES_10346);
+    let cases: Vec<R3Case> = TEXTS
+        .iter()
+        .map(|(n, text)| {
+            (
+                *n,
+                vec![(b, *text)],
+                vec![r3_unres(b, 2, Why::Shadowed((*n).into()))],
+                None,
+            )
+        })
+        .collect();
     assert_eq!(r3_misses(cases), Vec::<String>::new());
 }
 
