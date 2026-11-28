@@ -2032,6 +2032,15 @@ enum StaticFinding {
         name: String,
         line: usize,
     },
+    /// #10350: a static in a `macro_rules!` body with a
+    /// [`MACRO_BODY_WHY`] row, whose type holds a name the pin cannot read
+    /// ([`pin_reads`]); `why` is the least such reason. The row is not used.
+    MacroBodyUnread {
+        file: String,
+        name: String,
+        line: usize,
+        why: Why,
+    },
     /// An [`EXCEPTIONS`] row no static used. #10295: a row whose `why` is
     /// not its static's live reason, or whose static's type reaches a name
     /// the pin cannot read, is not used.
@@ -2087,6 +2096,10 @@ enum Why {
     Cycle(String),
     /// An associated `type NAME;` with no value.
     NoValue(String),
+    /// #10350: a metavariable in the type of a static in a `macro_rules!`
+    /// body (`$t`, or `$crate` of a path), or `""` when the static there
+    /// writes no type: what it names is not known until expansion.
+    MacroFragment(String),
 }
 
 /// One `static` item of a lexed file.
@@ -3898,7 +3911,8 @@ fn pin_reads(why: &Why) -> bool {
         | Why::Ambiguous(_)
         | Why::Shadowed(_)
         | Why::PathNotLanded(_)
-        | Why::NoValue(_) => false,
+        | Why::NoValue(_)
+        | Why::MacroFragment(_) => false,
     }
 }
 
@@ -9470,6 +9484,168 @@ fn exception_is_pinned_to_its_why_10295() {
     assert_eq!(miss, Vec::<String>::new());
 }
 
+/// #10350: [`W_BUS`] with a `std::sync::Mutex` field added: the change a
+/// macro-body row whose type reaches `Bus` must see.
+const W_BUS_LOCK_10350: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n    m: std::sync::Mutex<u8>,\n}\n";
+
+// #10350: the pinned digests of a macro-body `static FORM`. Each `type`
+// hash is the FNV-1a fold of the written type tokens, computed outside the
+// census (scratch digests.py over the token texts); `src::a::Bus=969d3b6a`
+// is the walked `Bus` of [`W_BUS`], as in [`D_W_USE`].
+/// #10350: `crate::a::Bus`.
+const D_M_PATH_10350: &str = "type=8399cc9c src::a::Bus=969d3b6a";
+/// #10350: `&'static crate::a::Bus`.
+const D_M_REF_10350: &str = "type=baeabbb4 src::a::Bus=969d3b6a";
+/// #10350: `(u8, crate::a::Bus)`.
+const D_M_TUPLE_10350: &str = "type=bf0254d4 src::a::Bus=969d3b6a";
+/// #10350: `[crate::a::Bus; 2]`.
+const D_M_ARRAY_10350: &str = "type=f1502328 src::a::Bus=969d3b6a";
+/// #10350: `$t`.
+const D_M_META_10350: &str = "type=b0404eb6";
+/// #10350: `$crate::a::Bus`.
+const D_M_CRATE_META_10350: &str = "type=c52d27d2";
+/// #10350: `Unknown`.
+const D_M_UNKNOWN_10350: &str = "type=57dcbc6c";
+/// #10350: no written type (the empty token list).
+const D_M_NONE_10350: &str = "type=4fd0bfc1";
+
+/// #10350: a `macro_rules!` whose one arm has the matcher `matcher` and
+/// the body `static FORM<decl> = X;` on line 3.
+fn macro_static_10350(matcher: &str, decl: &str) -> String {
+    format!("macro_rules! m {{\n    ({matcher}) => {{\n        static FORM{decl} = X;\n    }};\n}}\n")
+}
+
+/// One #10350 case: `(id, src/a.rs text, src/b.rs text, pinned digest,
+/// why, findings)`.
+type MacroReachCase<'a> = (String, &'a str, String, &'a str, &'a str, Vec<StaticFinding>);
+
+/// #10350: a macro-body row is pinned to every definition its written type
+/// reaches, as a row outside a macro is: a lock field added to a reached
+/// struct moves the digest. A type that holds a metavariable, writes no
+/// type, or names what does not resolve is unread: the row is not taken
+/// and the finding names the reason. Every expected value is written out.
+#[test]
+fn macro_body_row_reads_what_its_type_reaches_10350() {
+    let (a, b) = ("src/a.rs", "src/b.rs");
+    let changed = vec![StaticFinding::ExceptionDigest {
+        file: b.into(),
+        name: "FORM".into(),
+        ty: "src::a::Bus".into(),
+    }];
+    let stale = || StaticFinding::ExceptionStale {
+        file: b.into(),
+        name: "FORM".into(),
+    };
+    let unread = |why: Why| {
+        vec![
+            StaticFinding::MacroBodyUnread {
+                file: b.into(),
+                name: "FORM".into(),
+                line: 3,
+                why,
+            },
+            stale(),
+        ]
+    };
+    let reached: [(&str, &str, &str); 5] = [
+        ("path", ": crate::a::Bus", D_M_PATH_10350),
+        ("generic-argument", ": Option<crate::a::Bus>", D_W_GENERIC),
+        ("reference", ": &'static crate::a::Bus", D_M_REF_10350),
+        ("tuple", ": (u8, crate::a::Bus)", D_M_TUPLE_10350),
+        ("array", ": [crate::a::Bus; 2]", D_M_ARRAY_10350),
+    ];
+    let mut cases: Vec<MacroReachCase<'_>> = Vec::new();
+    for (form, decl, pinned) in reached {
+        let text = macro_static_10350("", decl);
+        cases.push((
+            format!("{form}-same"),
+            W_BUS,
+            text.clone(),
+            pinned,
+            MACRO_BODY_WHY,
+            vec![],
+        ));
+        cases.push((
+            format!("{form}-lock-field-added"),
+            W_BUS_LOCK_10350,
+            text,
+            pinned,
+            MACRO_BODY_WHY,
+            changed.clone(),
+        ));
+    }
+    let not_read: [(&str, &str, &str, &str, Why); 4] = [
+        (
+            "metavariable",
+            "$t:ty",
+            ": $t",
+            D_M_META_10350,
+            Why::MacroFragment("$t".into()),
+        ),
+        (
+            "dollar-crate-path",
+            "",
+            ": $crate::a::Bus",
+            D_M_CRATE_META_10350,
+            Why::MacroFragment("$crate".into()),
+        ),
+        (
+            "unresolvable",
+            "",
+            ": Unknown",
+            D_M_UNKNOWN_10350,
+            Why::NoDef("Unknown".into()),
+        ),
+        (
+            "no-written-type",
+            "",
+            "",
+            D_M_NONE_10350,
+            Why::MacroFragment(String::new()),
+        ),
+    ];
+    for (form, matcher, decl, pinned, why) in not_read {
+        cases.push((
+            form.to_string(),
+            W_BUS,
+            macro_static_10350(matcher, decl),
+            pinned,
+            MACRO_BODY_WHY,
+            unread(why),
+        ));
+    }
+    cases.push((
+        "row-of-another-why".to_string(),
+        W_BUS,
+        macro_static_10350("", ": crate::a::Bus"),
+        D_M_PATH_10350,
+        W_TOKIO,
+        vec![
+            StaticFinding::MacroBodyStatic {
+                file: b.into(),
+                name: "FORM".into(),
+                line: 3,
+            },
+            stale(),
+        ],
+    ));
+    let mut miss = Vec::new();
+    for (id, a_text, b_text, pinned, why, want) in cases {
+        let files = vec![(a.to_string(), a_text.to_string()), (b.to_string(), b_text)];
+        let exceptions = vec![(b, "FORM", pinned, why, FORM_WHY)];
+        let tables = Tables {
+            statics: "",
+            exceptions: &exceptions,
+            includes: &[],
+        };
+        let (statics, _) = token_census_with(&files, &tables);
+        if statics != want {
+            miss.push(format!("{id}: got {statics:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
 /// #10293: scoped resolution stays linear: a 100 000-step import rename
 /// chain, a 100 000-struct type cycle, 100 000 glob imports, 100 000
 /// imports of one name and 100 000 `#[path]` modules of one name are each
@@ -9882,6 +10058,8 @@ fn pin_reads_is_default_deny_10346() {
         (Why::Cycle(s()), true),
         (Why::NoValue("Out".into()), false),
         (Why::NoValue("Send".into()), false),
+        (Why::MacroFragment("$t".into()), false),
+        (Why::MacroFragment(s()), false),
     ];
     cases.extend(
         MARKER_NAMES_10346
