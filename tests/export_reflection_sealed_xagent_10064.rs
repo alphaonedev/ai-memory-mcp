@@ -469,10 +469,7 @@ fn seal_then_unseal_inside_injected_read_is_refused_10180() {
     let err = res.expect_err("#10180: seal-then-unseal inside read window must refuse export");
     assert_eq!(
         err,
-        format!(
-            "reflection export row version mismatch for {}: row changed across read window",
-            fx.reflection_id
-        ),
+        ai_memory::mcp::row_version_mismatch_msg(&fx.reflection_id),
         "#10235: seal-then-unseal must emit exact row version mismatch refusal"
     );
     assert_no_marker(&err, "seal-then-unseal 10180");

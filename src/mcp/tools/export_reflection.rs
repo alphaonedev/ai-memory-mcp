@@ -29,6 +29,12 @@ use crate::cli::commands::export_reflections::{self, ExportFormat};
 use crate::db;
 use crate::models::MemoryKind;
 
+/// Map internal handler errors onto the MCP wire error envelope (single helper
+/// shared by [`handle_export_reflection`] and the test-support reader seam).
+fn map_export_error(error: anyhow::Error) -> String {
+    crate::mcp::error_text::mcp_foreign_err("resolve_mcp_read_visibility_caller", error)
+}
+
 /// Wire shape:
 ///
 /// ```json
@@ -45,12 +51,6 @@ use crate::models::MemoryKind;
 /// * `memory is not a reflection: <id>` — caller passed an observation.
 /// * `unsupported export format '<x>'` — `format` was neither
 ///   `md` nor `json`.
-/// Map internal handler errors onto the MCP wire error envelope (single helper
-/// shared by `handle_export_reflection` and the test-support reader seam).
-fn map_export_error(error: anyhow::Error) -> String {
-    crate::mcp::error_text::mcp_foreign_err("resolve_mcp_read_visibility_caller", error)
-}
-
 pub fn handle_export_reflection(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -243,9 +243,33 @@ pub fn read_reflection_member_for_test(
     read_reflection_member(conn, member_id, reflection_id, caller)
 }
 
-/// Row-version fingerprint compared across pre-check, read, and post-check
-/// (#10180) so any mutation — including a seal-then-unseal inside the read
-/// window that restores `updated_at` and `version` — fails closed.
+/// Exact refusal prefix when the reader returns a row whose `id` differs from
+/// the requested `member_id` (#10181, #10234).
+pub(crate) const ROW_IDENTITY_MISMATCH_PREFIX: &str = "reflection export row identity mismatch";
+
+/// Format the exact row-identity mismatch refusal (#10181, #10234).
+#[must_use]
+pub(crate) fn row_identity_mismatch_msg(requested: &str, got: &str) -> String {
+    format!("{ROW_IDENTITY_MISMATCH_PREFIX}: requested {requested}, got {got}")
+}
+
+/// Exact refusal prefix when pre-check, read, and post-check disagree on
+/// [`RowVersion`] (#10180, #10235).
+pub(crate) const ROW_VERSION_MISMATCH_PREFIX: &str = "reflection export row version mismatch";
+
+/// Format the exact row-version mismatch refusal (#10180, #10235).
+#[must_use]
+pub fn row_version_mismatch_msg(member_id: &str) -> String {
+    format!("{ROW_VERSION_MISMATCH_PREFIX} for {member_id}: row changed across read window")
+}
+
+/// Unsealed row-version fingerprint compared across pre-check, read, and
+/// post-check (#10180, #10236) over `(id, owner, updated_at, version,
+/// content_blake3)`. Sealed rows carrying an `encrypted_envelope` are
+/// classified as [`RowClassification::Sealed`] (or refused as absent/hidden)
+/// before `RowVersion` comparison, so a seal-then-unseal inside the read window
+/// that restores `updated_at` and `version` still fails closed on
+/// `content_blake3`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RowVersion {
     id: String,
@@ -253,7 +277,6 @@ struct RowVersion {
     updated_at: String,
     version: i64,
     content_blake3: [u8; 32],
-    envelope_blake3: Option<[u8; 32]>,
 }
 
 impl RowVersion {
@@ -264,7 +287,6 @@ impl RowVersion {
             updated_at: memory.updated_at.clone(),
             version: memory.version,
             content_blake3: *blake3::hash(memory.content.as_bytes()).as_bytes(),
-            envelope_blake3: None,
         }
     }
 }
@@ -367,17 +389,18 @@ mod sealed_recheck {
         let memory = read_result?;
         // #10181 (F2): confirm the returned row is the requested member_id.
         if memory.id != member_id {
-            return Err(crate::errors::refusal(format!(
-                "reflection export row identity mismatch: requested {member_id}, got {}",
-                memory.id
+            return Err(crate::errors::refusal(super::row_identity_mismatch_msg(
+                member_id, &memory.id,
             )));
         }
-        // #10180 (F1): bind pre-check, read row, and post-check to ONE exact
-        // row version (id, owner, updated_at, version, content/seal digest).
+        // #10180 (F1) / #10236: bind pre-check, read row, and post-check to ONE
+        // exact unsealed row version (id, owner, updated_at, version,
+        // content_blake3); enveloped rows are refused via `RowClassification::Sealed`
+        // before reaching `RowVersion` comparison.
         let read_version = RowVersion::from_unsealed_memory(&memory);
         if post_version != pre_version || read_version != pre_version {
-            return Err(crate::errors::refusal(format!(
-                "reflection export row version mismatch for {member_id}: row changed across read window"
+            return Err(crate::errors::refusal(super::row_version_mismatch_msg(
+                member_id,
             )));
         }
         Ok(RecheckedRow { memory })
@@ -463,7 +486,6 @@ fn classify_visible_sealed_state(
         updated_at,
         version,
         content_blake3: *blake3::hash(content.as_bytes()).as_bytes(),
-        envelope_blake3: None,
     }))
 }
 
@@ -796,7 +818,7 @@ mod tests {
         let err = res.expect_err("#10181: reader returning a different memory.id must be refused");
         assert_eq!(
             err,
-            format!("reflection export row identity mismatch: requested {rfl_id}, got {other_id}"),
+            super::row_identity_mismatch_msg(&rfl_id, &other_id),
             "#10234: identity check must emit exact row identity mismatch refusal"
         );
         assert!(
