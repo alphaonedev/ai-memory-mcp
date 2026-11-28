@@ -9139,6 +9139,205 @@ fn exceptions_are_pinned_by_content_10295() {
     assert_eq!(miss, Vec::<String>::new());
 }
 
+/// #10295: the `Bus` of `src/a.rs` an excepted static reaches, before its
+/// type changes: one foreign channel handle.
+const W_BUS: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n}\n";
+
+/// #10295: [`W_BUS`] after a foreign lock-holding field is added beside it.
+const W_BUS_FIELD: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n    m: dashmap::DashMap<u8, u8>,\n}\n";
+
+/// #10295: [`W_BUS`] with a second type of the same reason beside it.
+const W_BUS_TWO: &str = "pub struct Bus {\n    tx: tokio::sync::broadcast::Sender<u8>,\n}\npub struct Bus2 {\n    tx: tokio::sync::broadcast::Sender<u16>,\n}\n";
+
+/// #10295: a nested local type of `src/b.rs` after `Cell` gains a foreign
+/// lock-holding field.
+const W_NESTED_FIELD: &str = "mod inner {\n    pub struct Cell {\n        tx: tokio::sync::broadcast::Sender<u8>,\n        m: dashmap::DashMap<u8, u8>,\n    }\n    pub struct Bus {\n        c: Cell,\n    }\n}\nstatic FORM: inner::Bus = X;\n";
+
+/// #10295: the pinned digest of `FORM` over [`W_BUS`] in `src/b.rs`.
+const D_W_DIRECT: &str = "type=ce1d7f3c src::b::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM` in [`W_NESTED_FIELD`] before `Cell`
+/// gained its `m` field.
+const D_W_NESTED: &str = "type=68593f65 src::b::inner::Bus=9dd740f4 src::b::inner::Cell=c02f1c7b";
+/// #10295: the pinned digest of `FORM: Bus` behind `use crate::a::Bus`.
+const D_W_USE: &str = "type=ce1d7f3c src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: Bus` behind `use crate::a::*`.
+const D_W_GLOB: &str = "type=ce1d7f3c";
+/// #10295: the pinned digest of `FORM: Chan` behind `use crate::a::Bus as Chan`.
+const D_W_ALIAS: &str = "type=d8d3b6b7 src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: Option<crate::a::Bus>`.
+const D_W_GENERIC: &str = "type=a8972500 src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: Bus` over [`W_BUS_FIELD`].
+const D_W_REMOVED: &str = "type=ce1d7f3c src::a::Bus=c341dd03";
+/// #10295: the pinned digest of `FORM: crate::a::Bus` over [`W_BUS_TWO`].
+const D_W_SWAPPED: &str = "type=8399cc9c src::a::Bus=969d3b6a";
+/// #10295: the pinned digest of `FORM: px::Bus` of an unread `#[path]` module.
+const D_W_UNREAD: &str = "type=ffb0c4f4";
+/// #10295: the pinned digest of `FORM: (Box<dyn Fn() + Sync>, Bus)` behind a glob.
+const D_W_GLOB_HIDDEN: &str = "type=06bb9d35";
+/// #10295: the pinned digest of `FORM: (Box<dyn Fn() + Sync>, px::Bus)`.
+const D_W_UNREAD_HIDDEN: &str = "type=60e7ad09";
+
+/// One #10295 type-change form: `(id, files after the change, the digest
+/// pinned before it, findings written by hand)`.
+type WhyCase<'a> = (
+    &'a str,
+    Vec<(&'a str, &'a str)>,
+    &'a str,
+    Vec<StaticFinding>,
+);
+
+/// #10295: an exception is pinned to what it was granted for. When the type
+/// of an excepted static changes under the same `(file, name)` key, in any
+/// form, the row is not taken: the static is `Unresolvable` for its live
+/// reason and the row is `ExceptionStale`. A type the pin cannot fully read
+/// (a glob, an unread module) never takes a row. A change the reason does
+/// not show stays an `ExceptionDigest`.
+#[test]
+fn exception_is_pinned_to_its_why_10295() {
+    let (a, b) = ("src/a.rs", "src/b.rs");
+    let dash = || Why::Foreign {
+        root: "dashmap".into(),
+        name: "DashMap".into(),
+    };
+    let tokio = || Why::Foreign {
+        root: "tokio".into(),
+        name: "Sender".into(),
+    };
+    let stale = || StaticFinding::ExceptionStale {
+        file: b.into(),
+        name: "FORM".into(),
+    };
+    let both = |line: usize, why: Why| vec![r3_unres(b, line, why), stale()];
+    let direct_field = format!("{W_BUS_FIELD}static FORM: Bus = X;\n");
+    let cases: Vec<WhyCase<'_>> = vec![
+        (
+            "same",
+            vec![
+                (a, W_BUS),
+                (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
+            ],
+            D_W_USE,
+            vec![],
+        ),
+        (
+            "field-added-directly",
+            vec![(b, &direct_field)],
+            D_W_DIRECT,
+            both(5, dash()),
+        ),
+        (
+            "field-added-in-a-nested-local-type",
+            vec![(b, W_NESTED_FIELD)],
+            D_W_NESTED,
+            both(10, dash()),
+        ),
+        (
+            "field-added-behind-use",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
+            ],
+            D_W_USE,
+            both(2, dash()),
+        ),
+        (
+            "field-added-behind-a-glob",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "use crate::a::*;\nstatic FORM: Bus = X;\n"),
+            ],
+            D_W_GLOB,
+            both(2, Why::Glob("Bus".into())),
+        ),
+        (
+            "field-added-behind-an-alias",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "use crate::a::Bus as Chan;\nstatic FORM: Chan = X;\n"),
+            ],
+            D_W_ALIAS,
+            both(2, dash()),
+        ),
+        (
+            "field-added-behind-a-generic-argument",
+            vec![
+                (a, W_BUS_FIELD),
+                (b, "static FORM: Option<crate::a::Bus> = X;\n"),
+            ],
+            D_W_GENERIC,
+            both(1, dash()),
+        ),
+        (
+            "field-removed",
+            vec![
+                (a, W_BUS),
+                (b, "use crate::a::Bus;\nstatic FORM: Bus = X;\n"),
+            ],
+            D_W_REMOVED,
+            both(2, tokio()),
+        ),
+        (
+            "swapped-for-a-type-of-the-same-why",
+            vec![(a, W_BUS_TWO), (b, "static FORM: crate::a::Bus2 = X;\n")],
+            D_W_SWAPPED,
+            vec![StaticFinding::ExceptionDigest {
+                file: b.into(),
+                name: "FORM".into(),
+                ty: "type".into(),
+            }],
+        ),
+        (
+            "type-in-an-unread-module",
+            vec![(
+                b,
+                "#[path = \"x.rs\"]\nmod px;\nstatic FORM: px::Bus = X;\n",
+            )],
+            D_W_UNREAD,
+            both(3, Why::PathNotLanded("px::Bus".into())),
+        ),
+        (
+            "glob-behind-a-smaller-why",
+            vec![
+                (a, W_BUS_FIELD),
+                (
+                    b,
+                    "use crate::a::*;\nstatic FORM: (Box<dyn Fn() + Sync>, Bus) = X;\n",
+                ),
+            ],
+            D_W_GLOB_HIDDEN,
+            both(2, Why::TraitObject),
+        ),
+        (
+            "unread-module-behind-a-smaller-why",
+            vec![(
+                b,
+                "#[path = \"x.rs\"]\nmod px;\nstatic FORM: (Box<dyn Fn() + Sync>, px::Bus) = X;\n",
+            )],
+            D_W_UNREAD_HIDDEN,
+            both(3, Why::TraitObject),
+        ),
+    ];
+    let table = format!("{b}{FORM_ROW}");
+    let mut miss = Vec::new();
+    for (id, files, pinned, want) in cases {
+        let files: Vec<(String, String)> = files
+            .into_iter()
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+        let exceptions = vec![(b, "FORM", pinned, FORM_WHY)];
+        let tables = Tables {
+            statics: &table,
+            exceptions: &exceptions,
+            includes: &[],
+        };
+        let (statics, _) = token_census_with(&files, &tables);
+        if statics != want {
+            miss.push(format!("{id}: got {statics:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
 /// #10293: scoped resolution stays linear: a 100 000-step import rename
 /// chain, a 100 000-struct type cycle, 100 000 glob imports, 100 000
 /// imports of one name and 100 000 `#[path]` modules of one name are each
