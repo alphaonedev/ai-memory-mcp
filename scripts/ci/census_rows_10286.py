@@ -45,7 +45,6 @@ digits of SHA-256 over the site kind letter and the written tokens (#10302).
 from __future__ import annotations
 
 import argparse
-import collections
 import errno
 import hashlib
 import os
@@ -71,11 +70,6 @@ WATCHED_SEED = frozenset({
     "prop_assert_eq", "prop_assert_ne", "prop_assume", "prop_compose", "prop_oneof",
     "property_test", "proptest", "proptest_helper", "rusty_fork", "rusty_fork_test",
     "wait_timeout",
-})
-RUNNER_SEED = frozenset({
-    "TestRunner", "prop", "prop_assert", "prop_assert_eq", "prop_assert_ne", "prop_assume",
-    "prop_compose", "prop_oneof", "property_test", "proptest", "proptest_helper",
-    "rusty_fork", "rusty_fork_test", "wait_timeout",
 })
 ENV_MOD_SEED = frozenset({"env"})
 ENV_FN_SEED = frozenset({"remove_var", "set_var", "var", "var_os"})
@@ -1334,6 +1328,95 @@ pub(crate) const SITE_ROWS: &[(&str, &[&str])] = &[
 '''
 
 
+# #10311: the reasons are the R_ constants of HEADER; a table's rows keep one of
+# the constants with that table's prefix. `--write` never assigns a reason: it
+# keeps the committed one and refuses a scanned file that has no committed row.
+REASONS = frozenset(re.findall(r"^pub\(crate\) const (R_[A-Z_]+): &str =$", HEADER, re.M))
+TABLES = (
+    ("TOKEN_ROWS", "R_TOK_", "watched process, libc, nix or proptest tokens"),
+    ("SHAPE_ROWS", "R_SHAPE_", "forms the census does not model"),
+    ("ENV_NAME_ROWS", "R_ENV_", "environment names that are not one string literal or one named constant"),
+)
+TABLE_OPEN_RE = re.compile(r"pub\(crate\) const ([A-Z_]+): &\[\(&str, usize, &str\)\] = &\[")
+ROW_RE = re.compile(r'    \("([^"\\]+)", (\d+), ([A-Za-z_][A-Za-z0-9_]*)\),')
+TABLE_CLOSE = "];"
+NO_ROW = ("{rel}: {n} {what}, and {table} has no committed row for it; --write never adds a row or a reason, so "
+          "add the row by hand with a reason that is true for the file (#10311)")
+
+
+class NoCommittedRow(Exception):
+    """#10311: scanned files with no committed row, one refusal line each."""
+
+    def __init__(self, lines: list[str]) -> None:
+        super().__init__("\n".join(lines))
+        self.lines = lines
+
+
+def parse_rows(text: str) -> dict[str, dict[str, str]]:
+    """The committed reason of every row of the three tables, read row by row;
+    ValueError naming the rows file and the line otherwise (#10311)."""
+    prefixes = {name: prefix for name, prefix, _what in TABLES}
+    out: dict[str, dict[str, str]] = {}
+    current: str | None = None
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()  # the end of the file after its last newline, not a line
+    for no, line in enumerate(lines, 1):
+        if current is None:
+            m = TABLE_OPEN_RE.fullmatch(line)
+            if m is None or m.group(1) not in prefixes:
+                continue
+            if m.group(1) in out:
+                raise ValueError(f"{ROWS_OUT}:{no}: a second {m.group(1)} table (#10311)")
+            current = m.group(1)
+            out[current] = {}
+            continue
+        if line == TABLE_CLOSE:
+            current = None
+            continue
+        r = ROW_RE.fullmatch(line)
+        if r is None:
+            raise ValueError(f"{ROWS_OUT}:{no}: not a row of {current}; the committed table is read row by row "
+                             "and an unread line is not clean (#10311)")
+        rel, reason = r.group(1), r.group(3)
+        if reason not in REASONS or not reason.startswith(prefixes[current]):
+            raise ValueError(f"{ROWS_OUT}:{no}: {reason} is not a reason of {current}; a row keeps one of the "
+                             f"{prefixes[current]} reasons (#10311)")
+        if rel in out[current]:
+            raise ValueError(f"{ROWS_OUT}:{no}: {current} holds {rel} twice (#10311)")
+        out[current][rel] = reason
+    if current is not None:
+        raise ValueError(f"{ROWS_OUT}: {current} is not closed by `{TABLE_CLOSE}` (#10311)")
+    for name, _prefix, _what in TABLES:
+        if name not in out:
+            raise ValueError(f"{ROWS_OUT}: holds no {name} table; the committed table is read before the scan "
+                             "(#10311)")
+    return out
+
+
+def load_rows(root: pathlib.Path) -> dict[str, dict[str, str]]:
+    """The committed rows file, opened with no link followed; an absent file is
+    three empty tables, so every scanned file is refused (#10311)."""
+    try:
+        fd = os.open(root / ROWS_OUT, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return {name: {} for name, _prefix, _what in TABLES}
+        if e.errno == errno.ELOOP:
+            raise ValueError(f"{ROWS_OUT}: {LINK_FINDING}") from e
+        raise ValueError(f"{ROWS_OUT}: unreadable ({e.strerror or e})") from e
+    try:
+        with os.fdopen(fd, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise ValueError(f"{ROWS_OUT}: unreadable ({e.strerror or e})") from e
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{ROWS_OUT}: not UTF-8 ({e.reason}); the census cannot read it (#10176)") from e
+    return parse_rows(text)
+
+
 def table(name: str, doc: str, items: dict[str, int], reason: dict[str, str]) -> str:
     out = [doc, "#[rustfmt::skip]", f"pub(crate) const {name}: &[(&str, usize, &str)] = &["]
     for rel, n in sorted(items.items()):
@@ -1343,8 +1426,12 @@ def table(name: str, doc: str, items: dict[str, int], reason: dict[str, str]) ->
 
 
 def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
-    """The two generated files' text and a few totals."""
-    starts = start_files((root / CENSUS).read_text(encoding="utf-8"))
+    """The two generated files' text and a few totals. The committed rows file is
+    read first and every reason comes from it; NoCommittedRow when a scanned file
+    has no committed row (#10311)."""
+    committed = load_rows(root)
+    # The census must hold its START_ROWS block (#10290); no reason is drawn from it (#10311).
+    start_files((root / CENSUS).read_text(encoding="utf-8"))
     walk_errors: list[str] = []
     config_errors = [f for rel, data in tree_configs(root, walk_errors) for f in config_findings(rel, data)]
     lexed = [(rel, lex(text)) for rel, text in tree_rs(root, walk_errors)]
@@ -1357,52 +1444,41 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
     prepared = prepare(lexed)
     graph = RenameGraph(prepared)
     watched = graph.reach(WATCHED_SEED)
-    runner = graph.reach(RUNNER_SEED)
     env_mod = graph.reach(ENV_MOD_SEED)
     env_fns = graph.reach(ENV_FN_SEED)
     env_names = env_mod | env_fns
     consts = const_names([t for _rel, t in lexed])
     env = env_counts(prepared, env_fns, consts)
     tok: dict[str, int] = {}
-    tok_reason: dict[str, str] = {}
     shape: dict[str, int] = {}
-    shape_reason: dict[str, str] = {}
     sites: dict[str, list[str]] = {}
     for rel, t in lexed:
-        counts = collections.Counter(x.text for x in t if x.kind == IDENT and x.text in watched)
-        if counts:
-            tok[rel] = sum(counts.values())
-            if rel in starts:
-                tok_reason[rel] = "R_TOK_START"
-            elif any(k in runner and k != "prop" for k in counts):
-                tok_reason[rel] = "R_TOK_PROPTEST"
-            elif "prop" in counts and not any(k in ("libc", "nix") for k in counts):
-                tok_reason[rel] = "R_TOK_PROP_NAME"
-            elif any(k in ("libc", "nix") for k in counts):
-                tok_reason[rel] = "R_TOK_LIBC"
-            else:
-                tok_reason[rel] = "R_TOK_NAME"
+        n_tok = sum(1 for x in t if x.kind == IDENT and x.text in watched)
+        if n_tok:
+            tok[rel] = n_tok
         s = shapes_of(t, watched)
         if s:
             shape[rel] = len(s)
-            kinds = sorted({k for k, _ln in s})
-            shape_reason[rel] = "R_SHAPE_PASTE" if rel.startswith("vendor/paste/") else (
-                "R_SHAPE_" + "_".join(kinds).upper()
-            )
         try:
             pins = sites_of(t, watched, env_names, env_fns, consts)
         except ValueError as e:
             raise ValueError(f"{rel}: {e}") from e
         if pins:
             sites[rel] = pins
+    scanned = {"TOKEN_ROWS": tok, "SHAPE_ROWS": shape, "ENV_NAME_ROWS": env}
+    missing = [NO_ROW.format(rel=rel, n=n, what=what, table=name)
+               for name, _prefix, what in TABLES
+               for rel, n in sorted(scanned[name].items()) if rel not in committed[name]]
+    if missing:
+        raise NoCommittedRow(missing)
     rows = "\n\n".join([
         table("TOKEN_ROWS", "/// Every file that holds a watched process, libc, nix or proptest token, with the count.",
-              tok, tok_reason),
+              tok, committed["TOKEN_ROWS"]),
         table("SHAPE_ROWS", "/// Every file that holds a form the census does not model, with the count.",
-              shape, shape_reason),
+              shape, committed["SHAPE_ROWS"]),
         table("ENV_NAME_ROWS",
               "/// Every file that names an environment variable by anything but one literal or constant.",
-              env, {r: "R_ENV_NAME" for r in env}),
+              env, committed["ENV_NAME_ROWS"]),
     ])
     site_lines = [SITES_HEADER.rstrip("\n")]
     for rel in sorted(sites):
@@ -1457,6 +1533,10 @@ def main(argv: list[str] | None = None) -> int:
     root = a.root.resolve()
     try:
         rows, sites, totals = scan(root)
+    except NoCommittedRow as e:
+        for line in e.lines:
+            print(f"census_rows_10286: {line}", file=sys.stderr)
+        return 1
     except (OSError, UnicodeDecodeError, ValueError) as e:
         print(f"census_rows_10286: scan failed: {e}", file=sys.stderr)
         return 2

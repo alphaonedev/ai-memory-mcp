@@ -54,6 +54,9 @@ NEW_FILE_ROWS = (
      + NO_ROW_TAIL.format(table="ENV_NAME_ROWS")),
 )
 ROWS_PREFIX = f"census_rows_10286: scan failed: {ROWS}"
+# The rows reader's size bound: 20 000 rows, over 100K bytes.
+ROWS_BOUND_ROWS = 20_000
+ROWS_BOUND_BYTES = 100_000
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -158,6 +161,28 @@ class CensusRows10286(unittest.TestCase):
                 self.assertEqual((r.returncode, r.stderr.strip()), (EXIT_SCAN, ROWS_PREFIX + want), (want, mode))
                 self.assertEqual(self.tables(), before, (want, mode))
 
+    def test_a_linked_rows_file_is_refused_10311(self) -> None:
+        p = self.root / ROWS
+        real = p.with_name("real_rows.rs")
+        p.rename(real)
+        p.symlink_to(real.name)
+        for mode in ("--write", "--check"):
+            r = run(mode, "--root", str(self.root))
+            self.assertEqual((r.returncode, r.stderr.strip()), (
+                EXIT_SCAN, ROWS_PREFIX + ": a symbolic link; the census never follows links (#10176)"), mode)
+            self.assertTrue(p.is_symlink(), mode)
+
+    def test_the_rows_reader_is_linear_on_large_inputs_10311(self) -> None:
+        m = scanner_module()
+        n = ROWS_BOUND_ROWS
+        body = "".join(f'    ("src/f{i}.rs", {i}, R_TOK_NAME),\n' for i in range(n))
+        text = SEED_ROWS.replace('    ("src/run.rs", 0, R_TOK_START),\n', body)
+        self.assertGreaterEqual(len(text), ROWS_BOUND_BYTES)
+        t0 = time.monotonic()
+        got = m.parse_rows(text)
+        self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
+        self.assertEqual((len(got["TOKEN_ROWS"]), got["SHAPE_ROWS"], got["ENV_NAME_ROWS"]), (n, {}, {}))
+
     def test_the_committed_tables_match_a_fresh_scan_10290(self) -> None:
         r = run("--check")
         self.assertEqual((r.returncode, r.stdout.strip(), r.stderr), (EXIT_OK, OK_LINE, ""))
@@ -212,8 +237,11 @@ class CensusRows10286(unittest.TestCase):
     def test_a_new_watched_file_is_red_10290(self) -> None:
         (self.root / "src/clean.rs").write_text("use std::process;\n", encoding="utf-8")
         r = self.check()
-        self.assertEqual(r.returncode, EXIT_DIFF)
-        self.assertEqual(r.stderr.count("differs from a fresh scan"), 2, r.stderr)
+        # #10311: a new watched file with no committed row is refused by name
+        # before either table is compared.
+        self.assertEqual((r.returncode, r.stderr.strip()), (
+            EXIT_DIFF, "census_rows_10286: src/clean.rs: 1 watched process, libc, nix or proptest tokens"
+            + NO_ROW_TAIL.format(table="TOKEN_ROWS")))
 
     def test_a_missing_table_is_red_10290(self) -> None:
         (self.root / SITES).unlink()
@@ -572,13 +600,22 @@ class IncludeSites10300(unittest.TestCase):
             self.m.scan(self.root)
         self.assertIn(want, str(cm.exception).splitlines())
 
+    def seed_row(self, rel: str) -> None:
+        """#10311: the scan keeps committed reasons and never adds a row, so the
+        target is rowed with count 0; the count the scan writes proves it was lexed."""
+        (self.root / ROWS).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / ROWS).write_text(SEED_ROWS.replace('("src/run.rs", 0, R_TOK_START)', f'("{rel}", 0, R_TOK_NAME)'),
+                                      encoding="utf-8")
+
     def test_an_include_of_a_non_rs_file_is_lexed(self) -> None:
         self.tree({"src/a.rs": "include!(\"gen.txt\");\n", "src/gen.txt": INCLUDE_START})
+        self.seed_row("src/gen.txt")
         rows, _sites, _totals = self.m.scan(self.root)
         self.assertIn('("src/gen.txt", 2, R_TOK_NAME),', rows)
 
     def test_a_path_module_in_a_skipped_dir_is_lexed(self) -> None:
         self.tree({"src/a.rs": "#[path = \"../target/m.rs\"]\nmod m;\n", "target/m.rs": INCLUDE_START})
+        self.seed_row("target/m.rs")
         rows, _sites, _totals = self.m.scan(self.root)
         self.assertIn('("target/m.rs", 2, R_TOK_NAME),', rows)
 
