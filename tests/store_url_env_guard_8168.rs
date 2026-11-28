@@ -273,6 +273,9 @@ fn tree() -> Vec<(String, String)> {
     let mut links = Vec::new();
     walk(root, root, &mut files, &mut links);
     assert_eq!(links, Vec::<String>::new(), "{SYMLINK_REFUSAL}");
+    // #10323: `read_dir` order is not specified; every census sees the
+    // files sorted by path.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }
 
@@ -2067,7 +2070,8 @@ enum Why {
     /// where the name is a lock, a proven type or a prelude type.
     Shadowed(String),
     /// #10293: a `self`, `super` or `crate` path that lands on no walked
-    /// definition.
+    /// definition. #10322: also a name only a glob of an unread module (a
+    /// `#[path]` module, a declared module with no walked file) can supply.
     PathNotLanded(String),
     /// A `std`, `core` or `alloc` type that is not in [`LEAF_TYPES`].
     StdNotProven(String),
@@ -2676,6 +2680,44 @@ fn module_of(path: &str) -> (String, Vec<String>) {
     (root, segs)
 }
 
+/// #10323: the walked paths `mod NAME;` can name, written in `file` inside
+/// the inline modules `inline` (`""` or `::a::b`), by the Rust rules for
+/// that file kind: a `mod.rs`, `lib.rs` or `main.rs` file reads `DIR/NAME`,
+/// any other module file `DIR/STEM/NAME`, and a crate root of another name
+/// (`tests/foo.rs`) both. Each base gives `NAME.rs` and `NAME/mod.rs`.
+fn decl_candidates(file: &str, inline: &str, name: &str) -> Vec<String> {
+    if !inline.is_empty() && !inline.starts_with("::") {
+        return Vec::new();
+    }
+    let (dir, fname) = file.rsplit_once('/').unwrap_or(("", file));
+    let stem = fname.strip_suffix(".rs").unwrap_or(fname);
+    let stem_dir = if dir.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{dir}/{stem}")
+    };
+    let bases: Vec<String> = if matches!(stem, "mod" | "lib" | "main") {
+        vec![dir.to_string()]
+    } else if module_of(file).1.is_empty() {
+        vec![dir.to_string(), stem_dir]
+    } else {
+        vec![stem_dir]
+    };
+    let mut out = Vec::with_capacity(2 * bases.len());
+    for base in bases {
+        let mut parts: Vec<&str> = Vec::new();
+        if !base.is_empty() {
+            parts.push(&base);
+        }
+        parts.extend(inline.split("::").filter(|s| !s.is_empty()));
+        parts.push(name);
+        let stub = parts.join("/");
+        out.push(format!("{stub}.rs"));
+        out.push(format!("{stub}/mod.rs"));
+    }
+    out
+}
+
 /// #10293: the bindings of one name kept in a scope: one resolves, a second
 /// makes the name `Ambiguous`, and a third changes nothing.
 const MAX_BINDINGS: usize = 2;
@@ -2721,6 +2763,34 @@ struct Scope {
     /// `None` for std, another crate or a prefix that lands nowhere, whose
     /// names are not known.
     glob_to: Vec<Option<usize>>,
+    /// #10322: whether the census read this module's body (a walked file
+    /// or an inline `mod NAME { … }`). A `#[path]` module, a declared module
+    /// that links to no walked file and a directory made only as a parent
+    /// are unread: a glob of one supplies names the census cannot see.
+    read: bool,
+}
+
+/// #10322: what the glob imports of a scope can supply for one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Supply {
+    /// No glob in reach can bind the name.
+    No,
+    /// A glob of a read module, or of std or another crate, may bind it.
+    Glob,
+    /// A glob of a module the census did not read is in reach.
+    Unread,
+}
+
+/// #10323: one `mod NAME;` declaration, linked once every file is read.
+#[derive(Debug)]
+struct Decl {
+    /// The scope the declaration is written in.
+    scope: usize,
+    /// The scope of the declaring file.
+    top: usize,
+    /// The walked path of the declaring file.
+    file: String,
+    name: String,
 }
 
 /// #10293: one leaf of a `use` tree.
@@ -2782,6 +2852,8 @@ enum Look {
     Bound(Bind),
     Many,
     Glob,
+    /// #10322: only a glob of an unread module can supply the name.
+    Unread,
     Empty,
 }
 
@@ -2815,6 +2887,11 @@ struct TypeGraph {
     memo: std::cell::RefCell<BTreeMap<usize, Target>>,
     /// #10276: a local name `use`d for one of [`INCLUDE_MACROS`].
     include_aliases: BTreeMap<String, &'static str>,
+    /// #10323: every `mod NAME;` of the tree, linked by
+    /// [`TypeGraph::link_modules`] after the last file.
+    decls: Vec<Decl>,
+    /// #10323: each walked path to the scope of its file.
+    files: BTreeMap<String, usize>,
 }
 
 /// One keyword position of a lexed file, for [`TypeGraph::item`].
@@ -2825,6 +2902,9 @@ struct At<'t> {
     k: usize,
     scope: usize,
     binds: bool,
+    /// #10323: the walked path of the file and the scope of its file.
+    file: &'t str,
+    top: usize,
 }
 
 impl TypeGraph {
@@ -2917,6 +2997,8 @@ impl TypeGraph {
         in_macro: &[bool],
     ) -> Vec<(usize, usize)> {
         let top = self.file_module(path);
+        self.scopes[top].read = true;
+        self.files.insert(path.to_string(), top);
         let mut spans = vec![(0, top)];
         // (index of the closing brace, scope inside, whether types bind).
         let mut stack: Vec<(usize, usize, bool)> = Vec::new();
@@ -2949,6 +3031,8 @@ impl TypeGraph {
                 k,
                 scope,
                 binds,
+                file: path,
+                top,
             };
             self.item(&at, &mut opens, &mut path_attr);
         }
@@ -2972,6 +3056,7 @@ impl TypeGraph {
                 if let Some(name) = ident(k + 1) {
                     if is_p(t, k + 2, "{") {
                         let m = self.child(scope, &name);
+                        self.scopes[m].read = true;
                         opens.entry(k + 2).or_insert((m, true));
                     } else if *path_attr {
                         // #10293: a `#[path]` module is not followed; a
@@ -2980,7 +3065,13 @@ impl TypeGraph {
                         let m = self.new_scope(None, Some(scope), key);
                         self.bind(scope, &name, Bind::Module(m));
                     } else {
-                        self.declared(scope, &name);
+                        // #10323: linked after the last file is read.
+                        self.decls.push(Decl {
+                            scope,
+                            top: at.top,
+                            file: at.file.to_string(),
+                            name,
+                        });
                     }
                 }
                 *path_attr = false;
@@ -3021,21 +3112,32 @@ impl TypeGraph {
         }
     }
 
-    /// `mod name;` in `scope`: the walked file of that module when the
-    /// declaring file is a crate root outside `src/` and a directory module
-    /// of that name was walked (`tests/common/mod.rs`), else the module
-    /// under `scope`.
-    fn declared(&mut self, scope: usize, name: &str) {
-        let here = &self.scopes[scope];
-        if here.parent.is_none()
-            && here.outer.is_none()
-            && let Some((dir, _)) = here.path.rsplit_once('/')
-            && let Some(&m) = self.modules.get(&format!("{dir}/{name}"))
-        {
-            self.bind(scope, name, Bind::Module(m));
-            return;
+    /// #10323: links every `mod NAME;` once every file is read, so no link
+    /// depends on the order the files were walked in. A declaration binds
+    /// the scope of each walked file [`decl_candidates`] names (two make the
+    /// name `Ambiguous`); with none walked it binds the module under its
+    /// scope, which stays unread (#10322) unless a walked file is that
+    /// module. Linear in the declarations.
+    fn link_modules(&mut self) {
+        let decls = std::mem::take(&mut self.decls);
+        for d in &decls {
+            let inline = self.scopes[d.scope]
+                .path
+                .strip_prefix(self.scopes[d.top].path.as_str())
+                .filter(|_| self.scopes[d.scope].outer.is_none());
+            let found: Vec<usize> = inline
+                .map(|rest| decl_candidates(&d.file, rest, &d.name))
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|c| self.files.get(c).copied())
+                .collect();
+            if found.is_empty() {
+                self.child(d.scope, &d.name);
+            }
+            for m in found {
+                self.bind(d.scope, &d.name, Bind::Module(m));
+            }
         }
-        self.child(scope, name);
     }
 
     /// A `type`, `struct`, `enum` or `union` definition at `at.k`.
@@ -3240,8 +3342,10 @@ impl TypeGraph {
                     _ => Look::Many,
                 };
             }
-            if self.glob_supplies(id, name) {
-                return Look::Glob;
+            match self.glob_supplies(id, name) {
+                Supply::Glob => return Look::Glob,
+                Supply::Unread => return Look::Unread,
+                Supply::No => {}
             }
             at = if outward { s.outer } else { None };
         }
@@ -3251,8 +3355,10 @@ impl TypeGraph {
     /// #10294: whether a glob import of `scope` can supply `name`: a glob
     /// whose module is not known (std, another crate, not settled) can
     /// supply any name; one of a walked module supplies the names that
-    /// module binds, and the names its own globs can supply.
-    fn glob_supplies(&self, scope: usize, name: &str) -> bool {
+    /// module binds, and the names its own globs can supply. #10322: a glob
+    /// of a module the census did not read is [`Supply::Unread`] for every
+    /// name, never [`Supply::No`].
+    fn glob_supplies(&self, scope: usize, name: &str) -> Supply {
         let mut seen: BTreeSet<usize> = BTreeSet::new();
         let mut todo = vec![scope];
         while let Some(s) = todo.pop() {
@@ -3261,19 +3367,22 @@ impl TypeGraph {
             }
             let sc = &self.scopes[s];
             if s != scope && sc.items.contains_key(name) {
-                return true;
+                return Supply::Glob;
+            }
+            if s != scope && !sc.read {
+                return Supply::Unread;
             }
             if sc.glob_to.len() != sc.globs.len() {
-                return true;
+                return Supply::Glob;
             }
             for g in &sc.glob_to {
                 match g {
                     Some(m) => todo.push(*m),
-                    None => return true,
+                    None => return Supply::Glob,
                 }
             }
         }
-        false
+        Supply::No
     }
 
     /// #10294: settles the module of every glob import once every file is
@@ -3347,6 +3456,7 @@ impl TypeGraph {
             Look::Bound(b) => Self::hop(b, seg, last),
             Look::Many => Hop::To(unres(Why::Ambiguous(seg.to_string()))),
             Look::Glob => Hop::To(unres(Why::Glob(seg.to_string()))),
+            Look::Unread => Hop::To(unres(Why::PathNotLanded(seg.to_string()))),
             // P6: `use Mutex as Gatekeeper` names a lock by its bare name.
             Look::Empty if last && LOCK_TYPES.contains(&seg) => Hop::To(Target::Done(Res::Lock)),
             Look::Empty if last && is_prelude(seg) => Hop::To(Target::Done(Res::Clean)),
@@ -3366,7 +3476,7 @@ impl TypeGraph {
             Look::Bound(b) => Self::hop(b, seg, false),
             Look::Many => Hop::To(unres(Why::Ambiguous(seg.to_string()))),
             Look::Glob => Hop::To(unres(Why::Glob(seg.to_string()))),
-            Look::Empty => Hop::To(unres(Why::PathNotLanded(seg.to_string()))),
+            Look::Unread | Look::Empty => Hop::To(unres(Why::PathNotLanded(seg.to_string()))),
         }
     }
 
@@ -4598,10 +4708,17 @@ fn token_census_with(
         }
     }
     let mut graph = TypeGraph::default();
-    let spans: Vec<Vec<(usize, usize)>> = lexed
-        .iter()
-        .map(|f| graph.file(f.path, &f.toks, &f.close, &f.lens, &f.in_macro))
-        .collect();
+    // #10323: the graph is built over the files sorted by path, so no
+    // scope, binding or digest depends on the walk order; the spans keep
+    // the walk order of `lexed`.
+    let mut order: Vec<usize> = (0..lexed.len()).collect();
+    order.sort_by(|&a, &b| lexed[a].path.cmp(lexed[b].path));
+    let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); lexed.len()];
+    for i in order {
+        let f = &lexed[i];
+        spans[i] = graph.file(f.path, &f.toks, &f.close, &f.lens, &f.in_macro);
+    }
+    graph.link_modules();
     graph.settle_globs();
     let resolved = graph.values();
     // Rows left per file, then per name: a static takes one row.
