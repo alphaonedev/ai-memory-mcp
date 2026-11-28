@@ -188,7 +188,7 @@ pub(crate) struct OwnerInitOutcome {
     /// A fresh `owner.caproot` mint secret was written this call.
     created_root_secret: bool,
     /// #10309 — the files written this call but not confirmed durable; the
-    /// command prints them as a stderr warning and still succeeds.
+    /// command fails closed on them (#10329).
     pub(crate) not_durable: NotDurableReport,
 }
 
@@ -216,7 +216,7 @@ impl OwnerInitOutcome {
 pub(crate) fn init_owner(dir: &std::path::Path) -> Result<OwnerInitOutcome> {
     use keypair::EnsureOutcome;
     // #10309 — a keypair written but not confirmed durable is reported to
-    // the caller (a stderr warning), never turned into a failed init.
+    // the caller, which fails closed on it (#10329) after the whole sequence.
     let (ensured, not_durable) = keypair::ensure_keypair_reported(OWNER_ISSUER, dir, false)
         .context("ensuring the owner capability keypair")?;
     let created_keypair = match ensured {
@@ -291,7 +291,8 @@ pub fn run(
         CapabilityAction::Init => {
             let dir = resolve_key_dir(args.key_dir)?;
             let mut outcome = init_owner(&dir)?;
-            std::mem::take(&mut outcome.not_durable).warn_on(out.stderr)?;
+            // #10329 — not durable: a stderr note, then the report as the error.
+            std::mem::take(&mut outcome.not_durable).fail_on(out.stderr)?;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -858,8 +859,9 @@ mod tests {
     }
 }
 
-// v1.0.0 #10309 — a written-but-not-durable file is a stderr warning built
-// from the durability report; the command still succeeds.
+// v1.0.0 #10309 / #10329 — a written-but-not-durable file fails the command
+// closed: a stderr note names the kept files and the durability report is
+// the error.
 #[cfg(test)]
 #[path = "capability_not_durable_10309_tests.rs"]
 mod not_durable_10309_tests;

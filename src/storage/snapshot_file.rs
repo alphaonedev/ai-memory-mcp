@@ -209,25 +209,32 @@ impl NotDurableReport {
         self.0.extend(other.0);
     }
 
-    /// #10309 — the CLI end of a sequence: one [`NOT_DURABLE_WARNING`] line on
-    /// `stderr` (never stdout, which callers parse) when a file is written but
-    /// not confirmed durable; nothing when every file is durable. The command
-    /// keeps its success exit: the files are written and kept.
+    /// #10329 — the CLI end of a sequence, called before any stdout: `Ok`
+    /// with nothing written when every file is durable. Otherwise one
+    /// best-effort [`KEPT_ON_DISK_NOTE`] line on `stderr` (never stdout,
+    /// which callers parse) names the files kept on disk, and the report
+    /// itself is the error, so the command exits non-zero (fail closed, the
+    /// posture of #10214).
+    ///
+    /// #10343 — a failed write of that note is ignored: it never replaces
+    /// the report as the error, and a durable run writes nothing to fail.
     ///
     /// # Errors
-    /// Writing the warning to `stderr` fails.
-    pub(crate) fn warn_on(self, stderr: &mut dyn std::io::Write) -> std::io::Result<()> {
+    /// At least one file is not confirmed durable (the typed report).
+    pub(crate) fn fail_on(self, stderr: &mut dyn std::io::Write) -> Result<()> {
         if self.0.is_empty() {
             return Ok(());
         }
-        writeln!(stderr, "{NOT_DURABLE_WARNING} {self}")
+        // Best effort (#10343): the report below is the outcome either way.
+        let _note_write_ignored = writeln!(stderr, "{KEPT_ON_DISK_NOTE} {self}");
+        Err(anyhow::Error::new(self))
     }
 }
 
-/// #10309 — the head of the stderr warning [`NotDurableReport::warn_on`]
-/// prints when a command succeeds with a file not confirmed durable.
-pub(crate) const NOT_DURABLE_WARNING: &str =
-    "warning: the command succeeded and its files are kept, but";
+/// #10329 — the head of the stderr note [`NotDurableReport::fail_on`]
+/// prints when a command fails with files written but not confirmed durable.
+pub(crate) const KEPT_ON_DISK_NOTE: &str =
+    "note: the command failed, and its files are kept on disk:";
 
 /// #10310 — the head of the context [`NotDurableReport::context_on`] puts on
 /// a later error: the files it names are on disk, not confirmed durable.

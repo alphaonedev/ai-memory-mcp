@@ -234,8 +234,8 @@ fn run_init(
     use crate::keys::roles::{self, Action};
     let (before, shape) = observe_for(dir, caller_agent_id, app_config)?;
     let plan = roles::plan(&before, &opts);
-    // #10309 — files written but not confirmed durable: a stderr warning,
-    // and `keys init` keeps its success exit.
+    // #10309 / #10329 — files written but not confirmed durable: a stderr
+    // note, and `keys init` fails closed with the report as its error.
     let mut not_durable = crate::storage::snapshot_file::NotDurableReport::new();
     let (words, rows): (Vec<(&'static str, String)>, Vec<serde_json::Value>) = if dry_run {
         if let Some(text) = roles::loose_text(&before) {
@@ -274,7 +274,8 @@ fn run_init(
             Err(e) => return Err(not_durable.context_on(e)),
         }
     };
-    not_durable.warn_on(out.stderr)?;
+    // #10329 — not durable: a stderr note, then the report as the error.
+    not_durable.fail_on(out.stderr)?;
     if json {
         writeln!(
             out.stdout,
@@ -587,8 +588,9 @@ fn postgres(
     })?
 }
 
-// v1.0.0 #10309 — a written-but-not-durable file is a stderr warning built
-// from the durability report; the command still succeeds.
+// v1.0.0 #10309 / #10329 — a written-but-not-durable file fails the command
+// closed: a stderr note names the kept files and the durability report is
+// the error.
 #[cfg(test)]
 #[path = "keys_not_durable_10309_tests.rs"]
 mod not_durable_10309_tests;

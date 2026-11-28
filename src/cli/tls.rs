@@ -183,8 +183,9 @@ fn run_init(
         );
     }
     let host = host.unwrap_or(DEFAULT_INIT_HOST);
-    // #10309 — TLS material written but not confirmed durable is a stderr
-    // warning; `tls init` keeps its success exit.
+    // #10309 / #10329 — TLS material written but not confirmed durable fails
+    // `tls init` closed: a stderr note names the kept files, then the report
+    // is the error (non-zero exit), before any stdout.
     let (local, not_durable) = tls_bootstrap::ensure_local_tls_reported(key_dir, host)?;
     let outcome = match &local.outcome {
         Outcome::Generated => "generated".to_string(),
@@ -198,7 +199,7 @@ fn run_init(
         Ok(status) => status,
         Err(e) => return Err(not_durable.context_on(e)),
     };
-    not_durable.warn_on(out.stderr)?;
+    not_durable.fail_on(out.stderr)?;
     if json {
         writeln!(
             out.stdout,
@@ -663,8 +664,9 @@ mod tests {
     }
 }
 
-// v1.0.0 #10309 — a written-but-not-durable file is a stderr warning built
-// from the durability report; the command still succeeds.
+// v1.0.0 #10309 / #10329 — a written-but-not-durable file fails the command
+// closed: a stderr note names the kept files and the durability report is
+// the error.
 #[cfg(test)]
 #[path = "tls_not_durable_10309_tests.rs"]
 mod not_durable_10309_tests;
