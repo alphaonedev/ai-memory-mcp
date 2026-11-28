@@ -39,6 +39,7 @@ use crate::governance::capability::{
     mint_with_secret, read_root_secret, verify, write_root_secret,
 };
 use crate::identity::keypair;
+use crate::storage::snapshot_file::NotDurableReport;
 
 /// Shared caveat flags for `mint` / `attenuate`. Every provided flag
 /// becomes one first-party [`Caveat`]; each further NARROWS the grant
@@ -186,6 +187,9 @@ pub(crate) struct OwnerInitOutcome {
     created_keypair: bool,
     /// A fresh `owner.caproot` mint secret was written this call.
     created_root_secret: bool,
+    /// #10309 — the files written this call but not confirmed durable; the
+    /// command prints them as a stderr warning and still succeeds.
+    pub(crate) not_durable: NotDurableReport,
 }
 
 impl OwnerInitOutcome {
@@ -211,9 +215,11 @@ impl OwnerInitOutcome {
 /// `owner.priv`) REFUSES rather than minting a different owner.
 pub(crate) fn init_owner(dir: &std::path::Path) -> Result<OwnerInitOutcome> {
     use keypair::EnsureOutcome;
-    let created_keypair = match keypair::ensure_keypair(OWNER_ISSUER, dir, false)
-        .context("ensuring the owner capability keypair")?
-    {
+    // #10309 — a keypair written but not confirmed durable is reported to
+    // the caller (a stderr warning), never turned into a failed init.
+    let (ensured, not_durable) = keypair::ensure_keypair_reported(OWNER_ISSUER, dir, false)
+        .context("ensuring the owner capability keypair")?;
+    let created_keypair = match ensured {
         EnsureOutcome::Generated { .. } => true,
         EnsureOutcome::AlreadyExists { .. } | EnsureOutcome::RepairedPublicFromPrivate { .. } => {
             false
@@ -237,13 +243,16 @@ pub(crate) fn init_owner(dir: &std::path::Path) -> Result<OwnerInitOutcome> {
     let created_root_secret = if has_caproot {
         false
     } else {
-        write_root_secret(dir, OWNER_ISSUER).context("writing owner root secret")?;
+        if let Err(e) = write_root_secret(dir, OWNER_ISSUER).context("writing owner root secret") {
+            return Err(not_durable.context_on(e));
+        }
         true
     };
 
     Ok(OwnerInitOutcome {
         created_keypair,
         created_root_secret,
+        not_durable,
     })
 }
 
@@ -281,7 +290,8 @@ pub fn run(
     match args.action {
         CapabilityAction::Init => {
             let dir = resolve_key_dir(args.key_dir)?;
-            let outcome = init_owner(&dir)?;
+            let mut outcome = init_owner(&dir)?;
+            std::mem::take(&mut outcome.not_durable).warn_on(out.stderr)?;
             if json_out {
                 writeln!(
                     out.stdout,

@@ -23,6 +23,7 @@
 use crate::config::AppConfig;
 use crate::config::shape::{AtRestPolicy, DeploymentShape};
 use crate::encryption::escrow;
+use crate::storage::snapshot_file::NotDurableReport;
 use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -939,8 +940,26 @@ pub fn loose_text(posture: &Posture) -> Option<String> {
 ///
 /// # Errors
 /// The plan refuses, the directory leaks, or a generator fails (every
-/// generator refuses on its own partial states as well — belt and braces).
+/// generator refuses on its own partial states as well — belt and braces),
+/// or a file is written but not confirmed durable (#10214).
 pub fn execute(posture: &Posture, plan: &Plan, opts: &PlanOptions) -> Result<Vec<Outcome>> {
+    let (out, report) = execute_reported(posture, plan, opts)?;
+    report.finish()?;
+    Ok(out)
+}
+
+/// #10309 — [`execute`] that hands back the files written but not confirmed
+/// durable (#10214) instead of failing on them, so `keys init` can print
+/// them as a warning and keep its success exit. A failed step after such a
+/// file keeps the report as text context on its error (#10310).
+///
+/// # Errors
+/// As [`execute`], except a written-but-not-durable file is in the report.
+pub(crate) fn execute_reported(
+    posture: &Posture,
+    plan: &Plan,
+    opts: &PlanOptions,
+) -> Result<(Vec<Outcome>, NotDurableReport)> {
     if let Some(text) = loose_text(posture) {
         bail!(text);
     }
@@ -950,6 +969,7 @@ pub fn execute(posture: &Posture, plan: &Plan, opts: &PlanOptions) -> Result<Vec
     let dir = posture.key_dir.as_path();
     let host = opts.host.as_deref().unwrap_or(DEFAULT_TLS_HOST);
     let mut out = Vec::with_capacity(plan.steps.len());
+    let mut report = NotDurableReport::new();
     for step in &plan.steps {
         let outcome = match step.action {
             Action::Present => MintOutcome::Present,
@@ -958,7 +978,17 @@ pub fn execute(posture: &Posture, plan: &Plan, opts: &PlanOptions) -> Result<Vec
             Action::OperatorSupplied => MintOutcome::OperatorSupplied,
             Action::Refuse => unreachable!("refusals bail above"),
             Action::Mint | Action::Repair => {
-                run_step(posture, step, dir, host, opts.recovery_key_out.as_deref())?
+                match run_step(
+                    posture,
+                    step,
+                    dir,
+                    host,
+                    opts.recovery_key_out.as_deref(),
+                    &mut report,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(e) => return Err(report.context_on(e)),
+                }
             }
         };
         out.push(Outcome {
@@ -967,7 +997,7 @@ pub fn execute(posture: &Posture, plan: &Plan, opts: &PlanOptions) -> Result<Vec
             reason: step.reason.clone(),
         });
     }
-    Ok(out)
+    Ok((out, report))
 }
 
 /// The bind host `keys init` covers for the local TLS leaf when none is
@@ -980,8 +1010,9 @@ fn run_step(
     dir: &Path,
     host: &str,
     recovery_key_out: Option<&Path>,
+    report: &mut NotDurableReport,
 ) -> Result<MintOutcome> {
-    use crate::identity::keypair::{DAEMON_KEYPAIR_LABEL, EnsureOutcome, ensure_keypair};
+    use crate::identity::keypair::{DAEMON_KEYPAIR_LABEL, EnsureOutcome, ensure_keypair_reported};
     let repairing = step.action == Action::Repair;
     let agent_id = posture.agent_id.as_str();
     match step.role {
@@ -997,9 +1028,10 @@ fn run_step(
             } else {
                 DAEMON_KEYPAIR_LABEL
             };
-            match ensure_keypair(label, dir, false)
-                .with_context(|| format!("ensuring the {} keypair", step.role.label()))?
-            {
+            let (ensured, not_durable) = ensure_keypair_reported(label, dir, false)
+                .with_context(|| format!("ensuring the {} keypair", step.role.label()))?;
+            report.absorb(not_durable);
+            match ensured {
                 EnsureOutcome::Generated { .. } => Ok(MintOutcome::Minted),
                 EnsureOutcome::RepairedPublicFromPrivate { .. } => Ok(MintOutcome::Repaired),
                 EnsureOutcome::AlreadyExists { .. } => Ok(if repairing {
@@ -1039,8 +1071,9 @@ fn run_step(
             }
         }
         RoleId::Tls => {
-            let tls = crate::tls_bootstrap::ensure_local_tls(dir, host)
+            let (tls, not_durable) = crate::tls_bootstrap::ensure_local_tls_reported(dir, host)
                 .context("minting the local TLS certificate")?;
+            report.absorb(not_durable);
             Ok(match tls.outcome {
                 crate::tls_bootstrap::Outcome::Generated => MintOutcome::Minted,
                 crate::tls_bootstrap::Outcome::Renewed { .. }
@@ -1052,8 +1085,9 @@ fn run_step(
             })
         }
         RoleId::CapabilityOwner => {
-            let outcome = crate::cli::capability::init_owner(dir)
+            let mut outcome = crate::cli::capability::init_owner(dir)
                 .context("minting the capability owner custody")?;
+            report.absorb(std::mem::take(&mut outcome.not_durable));
             Ok(if outcome.already_initialized() {
                 if repairing {
                     MintOutcome::Repaired

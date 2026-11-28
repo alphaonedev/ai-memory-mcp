@@ -202,7 +202,32 @@ impl NotDurableReport {
             err.context(format!("{WRITTEN_BEFORE_THE_ERROR}: {self}"))
         }
     }
+
+    /// #10309 — move every outcome of `other` (a sub-sequence) into this
+    /// report.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// #10309 — the CLI end of a sequence: one [`NOT_DURABLE_WARNING`] line on
+    /// `stderr` (never stdout, which callers parse) when a file is written but
+    /// not confirmed durable; nothing when every file is durable. The command
+    /// keeps its success exit: the files are written and kept.
+    ///
+    /// # Errors
+    /// Writing the warning to `stderr` fails.
+    pub(crate) fn warn_on(self, stderr: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        writeln!(stderr, "{NOT_DURABLE_WARNING} {self}")
+    }
 }
+
+/// #10309 — the head of the stderr warning [`NotDurableReport::warn_on`]
+/// prints when a command succeeds with a file not confirmed durable.
+pub(crate) const NOT_DURABLE_WARNING: &str =
+    "warning: the command succeeded and its files are kept, but";
 
 /// #10310 — the head of the context [`NotDurableReport::context_on`] puts on
 /// a later error: the files it names are on disk, not confirmed durable.

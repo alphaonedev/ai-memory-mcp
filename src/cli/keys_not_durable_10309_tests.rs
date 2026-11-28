@@ -139,7 +139,11 @@ fn nth_for_10309(site: Site, dir: &Path, syncs: &[PathBuf]) -> u32 {
 /// state the code under test notes.
 fn expected_stderr_10309(site: Site, agent: &str, dir: &Path) -> String {
     let (what, file_dir, file) = match site {
-        Site::Identity => (PRIVATE_KEY_10309, dir.to_path_buf(), format!("{agent}.priv")),
+        Site::Identity => (
+            PRIVATE_KEY_10309,
+            dir.to_path_buf(),
+            format!("{agent}.priv"),
+        ),
         Site::LocalCa => (
             TLS_MATERIAL_10309,
             dir.join(TLS_DIR_10309),
@@ -175,17 +179,19 @@ fn keys_init_not_durable_warns_per_site_and_succeeds_10309() {
         let (clean, clean_dir, clean_out, clean_err, syncs) =
             init_10309(&agent, "clean", false, None);
         clean.unwrap_or_else(|e| panic!("{site:?}: a durable keys init succeeds: {e:#}"));
-        assert_eq!(clean_err, "", "{site:?}: a durable keys init prints no warning");
+        assert_eq!(
+            clean_err, "",
+            "{site:?}: a durable keys init prints no warning"
+        );
         let nth = nth_for_10309(site, &clean_dir, &syncs);
 
         let (res, dir, stdout, stderr, _) = init_10309(&agent, "faulty", false, Some(nth));
-        res.unwrap_or_else(|e| panic!("{site:?}: a written, not durable keys init succeeds: {e:#}"));
+        res.unwrap_or_else(|e| {
+            panic!("{site:?}: a written, not durable keys init succeeds: {e:#}")
+        });
         assert_eq!(
             stdout,
-            clean_out.replace(
-                &clean_dir.display().to_string(),
-                &dir.display().to_string()
-            ),
+            clean_out.replace(&clean_dir.display().to_string(), &dir.display().to_string()),
             "{site:?}: stdout is the durable run's stdout"
         );
         assert_eq!(

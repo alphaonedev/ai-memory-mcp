@@ -234,6 +234,9 @@ fn run_init(
     use crate::keys::roles::{self, Action};
     let (before, shape) = observe_for(dir, caller_agent_id, app_config)?;
     let plan = roles::plan(&before, &opts);
+    // #10309 — files written but not confirmed durable: a stderr warning,
+    // and `keys init` keeps its success exit.
+    let mut not_durable = crate::storage::snapshot_file::NotDurableReport::new();
     let (words, rows): (Vec<(&'static str, String)>, Vec<serde_json::Value>) = if dry_run {
         if let Some(text) = roles::loose_text(&before) {
             bail!(text);
@@ -251,7 +254,9 @@ fn run_init(
             })
             .unzip()
     } else {
-        roles::execute(&before, &plan, &opts)?
+        let (outcomes, report) = roles::execute_reported(&before, &plan, &opts)?;
+        not_durable = report;
+        outcomes
             .into_iter()
             .map(|o| {
                 (
@@ -264,8 +269,12 @@ fn run_init(
     let after = if dry_run {
         before
     } else {
-        observe_for(dir, caller_agent_id, app_config)?.0
+        match observe_for(dir, caller_agent_id, app_config) {
+            Ok((after, _)) => after,
+            Err(e) => return Err(not_durable.context_on(e)),
+        }
     };
+    not_durable.warn_on(out.stderr)?;
     if json {
         writeln!(
             out.stdout,

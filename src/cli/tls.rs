@@ -183,7 +183,9 @@ fn run_init(
         );
     }
     let host = host.unwrap_or(DEFAULT_INIT_HOST);
-    let local = tls_bootstrap::ensure_local_tls(key_dir, host)?;
+    // #10309 — TLS material written but not confirmed durable is a stderr
+    // warning; `tls init` keeps its success exit.
+    let (local, not_durable) = tls_bootstrap::ensure_local_tls_reported(key_dir, host)?;
     let outcome = match &local.outcome {
         Outcome::Generated => "generated".to_string(),
         Outcome::Renewed { reason } => format!("renewed ({reason})"),
@@ -192,7 +194,11 @@ fn run_init(
         // truthfully rather than as a mint.
         Outcome::OperatorSupplied => tls_bootstrap::SOURCE_OPERATOR_SUPPLIED.to_string(),
     };
-    let status = tls_bootstrap::leaf_status(key_dir)?;
+    let status = match tls_bootstrap::leaf_status(key_dir) {
+        Ok(status) => status,
+        Err(e) => return Err(not_durable.context_on(e)),
+    };
+    not_durable.warn_on(out.stderr)?;
     if json {
         writeln!(
             out.stdout,
