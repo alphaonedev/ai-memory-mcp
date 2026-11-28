@@ -484,5 +484,53 @@ class AssertCmd10314(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+ENV_NAME_TABLE = ROOT / "tests/common/census_env_name_10299.json"
+ENV_NAME_ROWS_10299 = 28
+ENV_NAME_BOUND_BYTES = 100_000
+ENV_NAME_BOUND_ITEMS = 2_500
+ENV_NAME_BOUND_SECONDS = 20
+
+
+class EnvName10299(unittest.TestCase):
+    """#10299: an environment-name argument that is a name is a named constant
+    only when a `const` or `static` with one string literal binds it and nothing
+    else binds it anywhere; the Python count of each row of the table the Rust
+    test `an_env_name_is_a_constant_only_when_a_literal_const_binds_it_10299`
+    reads is its hand-written count."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def count(self, text: str) -> int:
+        self.assertTrue(hasattr(self.m, "env_counts"), "the scanner has no env_counts (#10299)")
+        prepared = self.m.prepare([("src/e.rs", self.m.lex(text))])
+        env_fns = self.m.RenameGraph(prepared).reach(self.m.ENV_FN_SEED)
+        return self.m.env_counts(prepared, env_fns).get("src/e.rs", 0)
+
+    def test_env_counts_of_the_shared_table(self) -> None:
+        rows = json.loads(ENV_NAME_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), ENV_NAME_ROWS_10299)
+        bad = []
+        for i, (text, want) in enumerate(rows):
+            have = self.count(text)
+            if have != want:
+                bad.append(f"row {i} {text!r}: {have} env names, want {want}")
+        self.assertEqual(bad, [])
+
+    def test_the_bound_name_pass_is_linear_on_a_100k_file(self) -> None:
+        n = ENV_NAME_BOUND_ITEMS
+        text = "use std::env::set_var;\nconst A7: &str = \"x\";\n"
+        text += "".join(f"const C{i}: &str = \"PROPTEST_FORK\";\n" for i in range(n))
+        text += "fn f(o: u8) {\n" + "".join(f"    set_var(C{i}, \"1\");\n" for i in range(n))
+        text += "    match o {\n" + "".join(f"        A{i} => match o {{ _ => {{}} }}\n" for i in range(n))
+        text += "    }\n    set_var(A7, \"1\");\n}\n"
+        self.assertGreaterEqual(len(text), ENV_NAME_BOUND_BYTES)
+        started = time.monotonic()
+        have = self.count(text)
+        took = time.monotonic() - started
+        self.assertEqual(have, 1)
+        self.assertLess(took, ENV_NAME_BOUND_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()

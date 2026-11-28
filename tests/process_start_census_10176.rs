@@ -76,6 +76,8 @@ mod census_assert_cmd;
 mod census_cargo;
 #[path = "common/census_closure_10304.rs"]
 mod census_closure;
+#[path = "common/census_env_name_10299.rs"]
+mod census_env_name;
 #[path = "common/census_include_10300.rs"]
 mod census_include;
 #[path = "common/census_macros_10287.rs"]
