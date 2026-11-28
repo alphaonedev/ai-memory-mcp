@@ -9642,3 +9642,40 @@ fn glob_cycle_terminates_and_resolves_10324() {
     )];
     assert_eq!(r3_misses(cases), Vec::<String>::new());
 }
+
+/// #10324: settling the globs drops every glob answer memoised before it,
+/// since such an answer read unsettled globs. A lookup made before the
+/// globs settle (as one made while settling) memoises `No` for the
+/// glob-less `src/c.rs`; after `settle_globs` the memo is empty, and each
+/// scope answers from its settled globs.
+#[test]
+fn settle_drops_glob_answers_memoised_before_10324() {
+    let files = [
+        ("src/a.rs", "use crate::b::*;\nstatic FORM: Plain = X;\n"),
+        ("src/b.rs", "pub struct Plain(u8);\n"),
+        ("src/c.rs", "static FORM: Plain = X;\n"),
+    ];
+    let mut graph = TypeGraph::default();
+    for (path, text) in files {
+        let toks = lex(text).expect("fixture lexes");
+        let close = brackets(&toks).0;
+        let in_macro = macro_bodies(&toks, &close);
+        let lens = array_lengths(&toks, &close);
+        graph.file(path, &toks, &close, &lens, &in_macro);
+    }
+    graph.link_modules();
+    let a = graph.files["src/a.rs"];
+    let c = graph.files["src/c.rs"];
+    // Unsettled: a glob of `a` may supply anything (fail closed).
+    assert_eq!(graph.glob_supplies(a, "Plain"), Supply::Glob);
+    assert_eq!(graph.glob_supplies(c, "Plain"), Supply::No);
+    assert_eq!(graph.glob_memo_get(c, "Plain"), Some(Supply::No));
+    graph.settle_globs();
+    assert!(
+        graph.glob_memo.borrow().is_empty(),
+        "glob answers memoised before settling: {:?}",
+        graph.glob_memo.borrow()
+    );
+    assert_eq!(graph.glob_supplies(a, "Plain"), Supply::Glob);
+    assert_eq!(graph.glob_supplies(c, "Plain"), Supply::No);
+}
