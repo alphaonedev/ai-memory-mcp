@@ -664,6 +664,8 @@ const FORM_FIELD: &str = "a fork or timeout field in a proptest Config literal";
 const FORM_UPDATE: &str = "a proptest Config update from a base that is not Config::default()";
 const FORM_BUILDER: &str = "with_fork or with_timeout on a proptest Config";
 const FORM_ASSIGN: &str = "an assignment to a proptest config's fork or timeout";
+const FORM_FIELD_WRITE: &str = "a field form of fork or timeout (a literal or pattern field outside a proptest Config literal, field shorthand, a compound assignment or a &mut borrow)";
+const FORM_META_FIELD: &str = "a macro metavariable in field position (a literal or pattern field, an assignment, a compound assignment or a &mut borrow), which may name fork or timeout";
 const FORM_RUNNER: &str = "TestRunner, rusty_fork, wait_timeout or property_test, which run cases outside a guarded proptest! block";
 const FORM_RENAME: &str = "proptest renamed with as, which hides its blocks from this scan";
 const FORM_CONFIG_NAME: &str =
@@ -689,6 +691,11 @@ const A1_ROWS: &[(&str, usize, &str)] = &[
         "loadtest/src/main.rs",
         2,
         "the load generator's own Config struct has a request timeout field; it is not proptest's Config and the crate has no proptest dependency",
+    ),
+    (
+        "src/cli/commands/inbox.rs",
+        5,
+        "the CLI's own InboxArgs struct has a --timeout field for the inbox wait (#10312 field forms); its unit tests build it, it is not proptest's Config",
     ),
     (
         "src/reranker.rs",
@@ -809,7 +816,355 @@ fn proptest_findings(
             literal_forms(rel, p, k + 1, &mut forms);
         }
     }
+    field_forms(rel, p, config, &mut forms);
     (blocks, forms)
+}
+
+// ------------------------------------------------- A1: field forms (#10312)
+
+/// The fields of proptest's `Config` that switch fork or timeout on.
+const FORK_FIELDS: &[&str] = &["fork", "timeout"];
+
+/// Words before a `{` that open a block (`else {`, `unsafe {`), never a
+/// literal.
+const BLOCK_HEADS: &[&str] = &["async", "const", "else", "loop", "move", "try", "unsafe"];
+
+/// Words in the head of a `{` (at its own depth) that make it an item,
+/// function or match body, which holds no field.
+const BODY_WORDS: &[&str] = &[
+    "extern",
+    "fn",
+    "impl",
+    "macro_rules",
+    "match",
+    "mod",
+    "struct",
+    "trait",
+    "union",
+    "where",
+];
+
+/// What a `{` opens, for the fields directly inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Brace {
+    /// A struct literal or pattern, or a macro body (unclassifiable, so read
+    /// as a literal): a `fork` or `timeout` field in it is a form.
+    Literal,
+    /// A block, an item body or a declaration: its fields are not writes.
+    Block,
+    /// An `enum` body: a `{` directly in it declares a variant.
+    Variants,
+}
+
+/// For every token the opener of the group directly around it, and for
+/// every closer its opener (one pass).
+fn group_tables(toks: &[Lexed]) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut inside = vec![None; toks.len()];
+    let mut open_of = vec![None; toks.len()];
+    let mut stack = Vec::new();
+    for (k, t) in toks.iter().enumerate() {
+        inside[k] = stack.last().copied();
+        match t.tok {
+            Tok::Punct('(' | '[' | '{') => stack.push(k),
+            Tok::Punct(')' | ']' | '}') => open_of[k] = stack.pop(),
+            _ => {}
+        }
+    }
+    (inside, open_of)
+}
+
+/// The path that names the type of the `{` at `o`:
+/// `[$] Ident (:: Ident)* [::] [<..>]`, as (its first token, its last
+/// ident). `None` when no path ends at `o` (after `)`, `=>`, `->`, `::`).
+fn literal_path(toks: &[Lexed], o: usize) -> Option<(usize, &str)> {
+    let mut j = o.checked_sub(1)?;
+    if is_p(toks, j, '>') {
+        let mut depth = 0usize;
+        loop {
+            let arrow = j > 0 && (is_p(toks, j - 1, '-') || is_p(toks, j - 1, '='));
+            if is_p(toks, j, '>') && arrow {
+                return None;
+            }
+            if is_p(toks, j, '>') {
+                depth += 1;
+            } else if is_p(toks, j, '<') {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    break;
+                }
+            } else if matches!(tok(toks, j), Some(Tok::Punct(';' | '{' | '}'))) {
+                return None;
+            }
+            j = j.checked_sub(1)?;
+        }
+        j = j.checked_sub(1)?;
+        if is_sep(toks, j) {
+            j = j.checked_sub(1)?;
+        }
+    }
+    let last = ident(toks, j)?;
+    let mut s = j;
+    while s >= 2 && is_sep(toks, s - 1) && ident(toks, s - 2).is_some() {
+        s -= 2;
+    }
+    if s >= 1 && (is_sep(toks, s - 1) || is_p(toks, s - 1, '$')) {
+        s -= 1;
+    }
+    Some((s, last))
+}
+
+/// Whether the `=` at `i` is a plain `=` (not `==`, `=>`, `!=`, `<=`, `>=`).
+fn plain_eq(toks: &[Lexed], i: usize) -> bool {
+    is_p(toks, i, '=')
+        && !is_p(toks, i + 1, '=')
+        && !is_p(toks, i + 1, '>')
+        && (i == 0 || !['=', '!', '<', '>'].iter().any(|c| is_p(toks, i - 1, *c)))
+}
+
+/// What the `{` at `o` opens, read from its own head only: the tokens at its
+/// depth back to the `;`, `{` or `}` before it, nested groups skipped whole.
+/// Anything not shown to be a block is a literal (fail closed).
+fn brace_head(
+    toks: &[Lexed],
+    inside: &[Option<usize>],
+    open_of: &[Option<usize>],
+    o: usize,
+) -> Brace {
+    if o > 0 && is_p(toks, o - 1, '!') {
+        return Brace::Literal;
+    }
+    let Some((s, last)) = literal_path(toks, o) else {
+        return Brace::Block;
+    };
+    if BLOCK_HEADS.contains(&last) || (s > 0 && is_p(toks, s - 1, '.')) {
+        return Brace::Block;
+    }
+    let lo = inside[o];
+    let (mut eq_seen, mut in_seen) = (false, false);
+    let mut j = s;
+    while let Some(i) = j.checked_sub(1) {
+        if Some(i) == lo {
+            break;
+        }
+        match tok(toks, i) {
+            Some(Tok::Punct(';' | '{' | '}')) => break,
+            Some(Tok::Punct(')' | ']')) => {
+                j = open_of[i].unwrap_or(i);
+                continue;
+            }
+            Some(Tok::Punct('=')) if plain_eq(toks, i) => eq_seen = true,
+            Some(Tok::Ident(w)) => match w.as_str() {
+                "enum" => return Brace::Variants,
+                "if" | "while" => return Brace::Block,
+                "let" if !eq_seen => return Brace::Literal,
+                "in" => in_seen = true,
+                "for" if in_seen => return Brace::Block,
+                w if BODY_WORDS.contains(&w) => return Brace::Block,
+                _ => {}
+            },
+            _ => {}
+        }
+        j = i;
+    }
+    Brace::Literal
+}
+
+/// What the `{` at `o` opens, with a variant of an enum body as a block.
+fn brace_kind(
+    toks: &[Lexed],
+    inside: &[Option<usize>],
+    open_of: &[Option<usize>],
+    o: usize,
+) -> Brace {
+    match brace_head(toks, inside, open_of, o) {
+        Brace::Literal => match inside[o] {
+            Some(l)
+                if is_p(toks, l, '{')
+                    && brace_head(toks, inside, open_of, l) == Brace::Variants =>
+            {
+                Brace::Block
+            }
+            _ => Brace::Literal,
+        },
+        other => other,
+    }
+}
+
+/// The first token of the place expression that ends with the field at `k`
+/// (after its `.`): segments (an ident, a number or a `(..)`/`[..]` group,
+/// with the ident before a group) joined by `.` or `::`. `memo` holds the
+/// place start of every earlier field, so a chain is walked once.
+fn place_start(
+    toks: &[Lexed],
+    open_of: &[Option<usize>],
+    memo: &[Option<usize>],
+    k: usize,
+) -> usize {
+    let mut s = k.saturating_sub(1);
+    while let Some(e) = s.checked_sub(1) {
+        if let Some(m) = memo[e] {
+            return m;
+        }
+        let mut start = match tok(toks, e) {
+            Some(Tok::Ident(w)) if w != "mut" => e,
+            Some(Tok::Num(_)) => e,
+            Some(Tok::Punct(')' | ']')) => {
+                let g = open_of[e].unwrap_or(e);
+                if g > 0 && ident(toks, g - 1).is_some_and(|w| w != "mut") {
+                    g - 1
+                } else {
+                    g
+                }
+            }
+            _ => break,
+        };
+        if start > 0 && is_p(toks, start - 1, '$') {
+            start -= 1;
+        }
+        s = start;
+        match start.checked_sub(1) {
+            Some(p)
+                if is_sep(toks, p)
+                    || (is_p(toks, p, '.') && !(p > 0 && is_p(toks, p - 1, '.'))) =>
+            {
+                s = p;
+            }
+            _ => break,
+        }
+    }
+    s
+}
+
+/// Whether the place starting at `s` is borrowed mutably: `&mut`,
+/// `&raw mut` or `addr_of_mut!(`.
+fn borrowed_mut(toks: &[Lexed], s: usize) -> bool {
+    let back = |n: usize| s.checked_sub(n);
+    let at = |n: usize, c: char| back(n).is_some_and(|i| is_p(toks, i, c));
+    let word = |n: usize, w: &str| back(n).is_some_and(|i| ident(toks, i) == Some(w));
+    (word(1, "mut") && (at(2, '&') || (word(2, "raw") && at(3, '&'))))
+        || (at(1, '(') && at(2, '!') && word(3, "addr_of_mut"))
+}
+
+/// Whether the field at `k` (after its `.`) is the target of a compound
+/// assignment (`+=`, `-=`, `*=`, `/=`, `%=`, `^=`, `&=`, `|=`, `<<=`, `>>=`).
+fn compound_assigned(toks: &[Lexed], k: usize) -> bool {
+    let one = ['+', '-', '*', '/', '%', '^', '&', '|']
+        .iter()
+        .any(|c| is_p(toks, k + 1, *c))
+        && is_p(toks, k + 2, '=')
+        && !is_p(toks, k + 3, '=');
+    let two = ['<', '>']
+        .iter()
+        .any(|c| is_p(toks, k + 1, *c) && is_p(toks, k + 2, *c))
+        && is_p(toks, k + 3, '=')
+        && !is_p(toks, k + 4, '=');
+    one || two
+}
+
+/// Whether the ident at `k` starts a field of the `{` at `o`: after the
+/// `{` or a `,`, with an optional `ref` and `mut` before it.
+fn field_start(toks: &[Lexed], o: usize, k: usize) -> bool {
+    let mut j = k;
+    for w in ["mut", "ref"] {
+        if j > 0 && ident(toks, j - 1) == Some(w) {
+            j -= 1;
+        }
+    }
+    j > 0 && (j - 1 == o || is_p(toks, j - 1, ',') || rep_open(toks, j - 1))
+}
+
+/// The finding text of a field form: a metavariable or a `fork`/`timeout`.
+fn field_form(meta: bool) -> &'static str {
+    if meta {
+        FORM_META_FIELD
+    } else {
+        FORM_FIELD_WRITE
+    }
+}
+
+/// Whether the token at `i` opens a macro repetition, `$(`.
+fn rep_open(toks: &[Lexed], i: usize) -> bool {
+    is_p(toks, i, '(') && i > 0 && is_p(toks, i - 1, '$')
+}
+
+/// For every token the group whose field list holds it: the group directly
+/// around it, through any macro repetitions `$( .. )` between them. One
+/// forward pass (an opener comes before what it holds), so linear.
+fn field_groups(toks: &[Lexed], inside: &[Option<usize>]) -> Vec<Option<usize>> {
+    let mut out: Vec<Option<usize>> = Vec::with_capacity(toks.len());
+    for &around in inside {
+        let g = match around {
+            Some(g) if rep_open(toks, g) => out[g],
+            other => other,
+        };
+        out.push(g);
+    }
+    out
+}
+
+/// The #10312 forms: every `fork` or `timeout` ident in a field or
+/// assignment position that is not a method call or a path. A field
+/// `fork:` or shorthand `fork` of any literal or pattern (a `{` that is not
+/// shown to be a block), except a `fork:` of a proptest Config literal,
+/// which [`literal_forms`] reads; and a field access `.fork` that is the
+/// target of a compound assignment or borrowed mutably. A plain `.fork =`
+/// is [`FORM_ASSIGN`]. One pass, each `{` head and each place read once.
+fn field_forms(rel: &str, p: &Prep<'_>, config: &BTreeSet<String>, out: &mut Vec<String>) {
+    let toks = p.toks;
+    let (inside, open_of) = group_tables(toks);
+    let groups = field_groups(toks, &inside);
+    let mut kinds: BTreeMap<usize, Brace> = BTreeMap::new();
+    let mut memo = vec![None; toks.len()];
+    for k in 0..toks.len() {
+        let Some(val) = ident(toks, k) else { continue };
+        // A metavariable (`$f`) may name any field, fork included, so it is
+        // read like `fork` (fail closed); `$crate` is a path.
+        let dollar = k > 0 && is_p(toks, k - 1, '$');
+        let meta = dollar && val != "crate";
+        if !(meta || (!dollar && FORK_FIELDS.contains(&val))) {
+            continue;
+        }
+        // `f` is the field's first token: the `$` of a metavariable.
+        let f = if meta { k - 1 } else { k };
+        let line = toks[k].line;
+        let after_dot = f > 0 && is_p(toks, f - 1, '.');
+        if after_dot {
+            if f > 1 && is_p(toks, f - 2, '.') {
+                continue;
+            }
+            if is_p(toks, k + 1, '(') || is_sep(toks, k + 1) {
+                continue;
+            }
+            let s = place_start(toks, &open_of, &memo, f);
+            memo[f] = Some(s);
+            // A plain `.fork =` is FORM_ASSIGN; a plain `.$f =` is read here.
+            let assigned = meta && plain_eq(toks, k + 1);
+            if assigned || compound_assigned(toks, k) || borrowed_mut(toks, s) {
+                out.push(fork_form(rel, line, field_form(meta)));
+            }
+            continue;
+        }
+        let Some(o) = groups[f].filter(|o| is_p(toks, *o, '{')) else {
+            continue;
+        };
+        let colon = is_p(toks, k + 1, ':') && !is_p(toks, k + 2, ':');
+        let shorthand = is_p(toks, k + 1, ',') || is_p(toks, k + 1, '}');
+        let rep_end = meta && is_p(toks, k + 1, ')') && inside[f] != Some(o);
+        if !(colon || shorthand || rep_end) || !field_start(toks, o, f) {
+            continue;
+        }
+        let kind = *kinds
+            .entry(o)
+            .or_insert_with(|| brace_kind(toks, &inside, &open_of, o));
+        if kind != Brace::Literal {
+            continue;
+        }
+        let read_by_literal_forms =
+            !meta && colon && o > 0 && ident(toks, o - 1).is_some_and(|h| config.contains(h));
+        if !read_by_literal_forms {
+            out.push(fork_form(rel, line, field_form(meta)));
+        }
+    }
 }
 
 /// The forms inside the `Config { .. }` literal opened at `open`. Nested
@@ -1756,6 +2111,42 @@ fn the_census_is_linear_on_large_input_10176() {
     );
 }
 
+/// The #10312 field-form scan is linear: 20,000 literal fields in one
+/// argument list, a metavariable field under 20,000 nested repetitions, a
+/// 20,000-segment `&mut` place and 20,000 reads of a shared chain give the
+/// exact finding counts within the ceiling.
+#[test]
+fn the_field_form_scan_is_linear_on_a_large_file_10312() {
+    const N: usize = 20_000;
+    let mut text = String::from("fn lits() { x(");
+    text.push_str(&"X { fork: 1 }, ".repeat(N));
+    text.push_str("); }\nmacro_rules! m { () => { Cfg { ");
+    text.push_str(&"$( ".repeat(N));
+    text.push_str("$f: 1");
+    text.push_str(&" )*".repeat(N));
+    text.push_str(" } } }\nfn chain() { let r = &mut a");
+    text.push_str(&".a".repeat(N));
+    text.push_str(".fork; let t = ");
+    text.push_str(&"a.b.fork + ".repeat(N));
+    text.push_str("0; }\n");
+    assert!(text.len() > 100_000);
+    let t0 = std::time::Instant::now();
+    let (_, forms) = pt_findings("src/big.rs", &text);
+    let elapsed = t0.elapsed();
+    let count = |what: &str| forms.iter().filter(|f| f.contains(what)).count();
+    assert_eq!(
+        count(FORM_FIELD_WRITE),
+        N + 1,
+        "the literal fields and the &mut place"
+    );
+    assert_eq!(count(FORM_META_FIELD), 1, "the metavariable field");
+    assert_eq!(forms.len(), N + 2, "no other finding");
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "field forms took {elapsed:?}"
+    );
+}
+
 // ---------------------------------------------------------------- A1 mutants
 
 /// The A1 findings of one fixture file, with the config closure of that file.
@@ -1894,6 +2285,45 @@ fn every_fork_or_timeout_field_form_is_red_10312() {
             let (_, forms) = pt_findings(rel, &text);
             assert!(forms.is_empty(), "fixture: {text}: {forms:?}");
         }
+    }
+}
+
+/// The sibling of #10312 through a macro: a metavariable in a field
+/// position may name `fork` or `timeout` (`m!(fork)`), so it is one exact
+/// finding of its own; a metavariable in a value, matcher or path position
+/// is not. The expected line is written out here.
+#[test]
+fn every_metavariable_field_form_is_red_10312() {
+    let rel = "tests/p.rs";
+    let want = "tests/p.rs:1: a macro metavariable in field position (a literal or pattern field, an assignment, a compound assignment or a &mut borrow), which may name fork or timeout; a proptest config with fork or timeout on re-runs this test binary outside the sandbox (#10176)";
+    let red: &[&str] = &[
+        "macro_rules! m { ($f:ident) => { Cfg { $f: true } } }",
+        "macro_rules! m { ($f:ident) => { Config { $f: true, ..Config::default() } } }",
+        "macro_rules! m { ($f:ident) => { Cfg { cases: 1, $f } } }",
+        "macro_rules! m { ($($f:ident),*) => { Cfg { $($f: true),* } } }",
+        "macro_rules! m { ($($f:ident),*) => { Cfg { $($f),* } } }",
+        "macro_rules! m { ($f:ident) => { c.$f = true; } }",
+        "macro_rules! m { ($f:ident) => { c.$f += 1; } }",
+        "macro_rules! m { ($f:ident) => { let r = &mut c.$f; } }",
+        "macro_rules! m { ($c:expr, $f:ident) => { $c.$f = true; } }",
+    ];
+    for text in red {
+        let (_, forms) = pt_findings(rel, text);
+        assert_eq!(forms, vec![want.to_string()], "fixture: {text}");
+    }
+    let green: &[&str] = &[
+        "macro_rules! m { ($t:expr) => { Cfg { cases: $t } } }",
+        "macro_rules! m { ($t:expr) => { let x = $t; } }",
+        "macro_rules! m { ($c:expr) => { let t = $c.cases; } }",
+        "macro_rules! m { ($f:ident) => { let ok = c.$f == 1; } }",
+        "macro_rules! m { ($f:ident) => { let t = c.$f; } }",
+        "macro_rules! m { ($f:ident) => { c.$f(); } }",
+        "macro_rules! m { () => { $crate::f(); } }",
+        "macro_rules! m { ($t:ty) => { impl X for $t { fn f() {} } } }",
+    ];
+    for text in green {
+        let (_, forms) = pt_findings(rel, text);
+        assert!(forms.is_empty(), "fixture: {text}: {forms:?}");
     }
 }
 
