@@ -21,23 +21,25 @@ shows as a mismatch in the census, never as a silent pass.
 Site pins (one digest per site, in token order):
 
 * T: every identifier token of a watched name (the seed below and every name
-  bound to one); the digest covers the token and SITE_RADIUS tokens each side.
+  bound to one).
 * U: every `use` declaration that names `env` or an environment function, or a
-  name bound to one; the digest covers the declaration from `use` to `;`.
+  name bound to one.
 * E: every environment call whose name argument is not one string literal or
-  one named constant, and every `.envs(` call; the digest covers SITE_RADIUS
-  tokens before the name and the call up to its close, at most ARG_CAP tokens
-  after the open bracket. An environment function named as a value (not
-  called) is an E site too; its digest covers SITE_RADIUS tokens each side.
+  one named constant, every `.envs(` call, and every environment function
+  named as a value (not called).
+
+Every pin covers every token of the statement that holds the site (#10303):
+the tokens from the end of the previous statement to the closing `;` or the
+`{` that opens a body; see `statements`. A statement over STMT_CAP tokens is
+refused, the scan fails, and a pin never cuts a statement.
 
 Every scan is linear in the tokens: brackets, `;` and `;{}` ends are tables
 built once, counts over a range are prefix sums, and an impl header is read at
 most IMPL_CAP tokens (a longer one counts as an impl form).
 
-A token is written as its kind letter (I, P, S, Q, C), its UTF-8 byte length,
-`:` and its text; a window position before the file is `^`, after it `$`. The
-digest is the first 16 hex digits of SHA-256 over the site kind letter and the
-written tokens.
+A token is written as its kind letter (I, P, S, Q, C, N), its UTF-8 byte
+length, `:` and its full text. The digest is the first DIGEST_HEX (32) hex
+digits of SHA-256 over the site kind letter and the written tokens (#10302).
 """
 
 from __future__ import annotations
@@ -50,11 +52,9 @@ import re
 import sys
 
 SKIPPED = frozenset({"target", ".git", ".local-runs", ".codegraph", "node_modules"})
-SITE_RADIUS = 2
-ARG_CAP = 64
-USE_CAP = 256
 IMPL_CAP = 512
-DIGEST_HEX = 16
+DIGEST_HEX = 32
+STMT_CAP = 2_048
 
 CENSUS = "tests/process_start_census_10176.rs"
 ROWS_OUT = "tests/common/census_rows_10176.rs"
@@ -476,8 +476,8 @@ def shapes_of(t: list[Tok], watched: set[str]) -> list[tuple[str, int]]:
     return out
 
 
-def env_calls(t: list[Tok], env_fns: set[str], close: list[int]) -> list[tuple[int, int, int]]:
-    """(name index, window start, window end) of every environment reach whose name
+def env_calls(t: list[Tok], env_fns: set[str], close: list[int]) -> list[int]:
+    """The name index of every environment reach whose name
     is not ok: a call of an environment function (by any name bound to one) whose
     first argument is not one literal or one constant, `.env(`/`.env_remove(` and
     `env!`/`option_env!` likewise, every `.envs(`, and every environment function
@@ -495,7 +495,7 @@ def env_calls(t: list[Tok], env_fns: set[str], close: list[int]) -> list[tuple[i
         always = False
         after_fn = is_p(t, k - 1, ".") or ident_at(t, k - 1) == "fn"
         if v in env_fns and not after_fn and not is_p(t, k + 1, "(") and k > in_use_until:
-            out.append((k, k - SITE_RADIUS, k + SITE_RADIUS))
+            out.append(k)
             continue
         if is_p(t, k + 1, "(") and v in env_fns and not after_fn:
             open_ = k + 1
@@ -510,29 +510,61 @@ def env_calls(t: list[Tok], env_fns: set[str], close: list[int]) -> list[tuple[i
         if open_ is None:
             continue
         if always or not name_ok(first_arg(t, open_, close)):
-            out.append((k, k - SITE_RADIUS, min(close[open_], open_ + ARG_CAP, len(t) - 1)))
+            out.append(k)
     return out
 
 
-def use_sites(t: list[Tok], env_names: set[str]) -> list[tuple[int, int]]:
-    """(use index, end index) of every `use` declaration that names an env name."""
+def use_sites(t: list[Tok], env_names: set[str]) -> list[int]:
+    """The `use` index of every `use` declaration that names an env name."""
     semi = semis(t)
     named = prefix(t, lambda x: x.kind == IDENT and x.text in env_names)
-    return [(k, semi[k]) for k in range(len(t)) if is_use(t, k) and named[semi[k]] > named[k]]
+    return [k for k in range(len(t)) if is_use(t, k) and named[semi[k]] > named[k]]
+
+
+def statements(t: list[Tok]) -> list[tuple[int, int]]:
+    """(first, last) of every statement, in order; together they hold every token once.
+
+    A statement ends, inclusive, at a `;`, `{` or `}` with no `(` or `[` open, so a
+    call's whole argument list (closures and blocks in it too) is in one statement,
+    and a body's `{` ends the statement or item head before it. Inside a `use`
+    declaration (from a `use` with no `(` or `[` open to its `;`) braces do not end
+    it. A closer pops the top opener whatever it is, as `brackets` does. The last
+    statement may end at the file end. One pass, linear."""
+    out = []
+    stack: list[str] = []
+    groups = 0
+    in_use = False
+    start = 0
+    for k, x in enumerate(t):
+        end = False
+        if x.kind == PUNCT:
+            c = x.text
+            if c in "([":
+                stack.append(c)
+                groups += 1
+            elif c == "{":
+                stack.append(c)
+                end = groups == 0 and not in_use
+            elif c in ")]}":
+                if stack and stack.pop() != "{":
+                    groups -= 1
+                end = c == "}" and groups == 0 and not in_use
+            elif c == ";" and groups == 0:
+                in_use = False
+                end = True
+        elif groups == 0 and is_use(t, k):
+            in_use = True
+        if end:
+            out.append((start, k))
+            start = k + 1
+    if start < len(t):
+        out.append((start, len(t) - 1))
+    return out
 
 
 def encode(t: list[Tok], lo: int, hi: int) -> str:
-    """The written tokens lo..=hi, with ^ and $ for positions outside the file."""
-    parts = []
-    for m in range(lo, hi + 1):
-        if m < 0:
-            parts.append("^")
-        elif m >= len(t):
-            parts.append("$")
-        else:
-            x = t[m]
-            parts.append(f"{x.kind}{len(x.text.encode())}:{x.text}")
-    return "".join(parts)
+    """The written tokens lo..=hi, each `<kind><byte len>:<full text>`."""
+    return "".join(f"{x.kind}{len(x.text.encode())}:{x.text}" for x in t[lo:hi + 1])
 
 
 def digest(kind: str, body: str) -> str:
@@ -540,15 +572,37 @@ def digest(kind: str, body: str) -> str:
 
 
 def sites_of(t: list[Tok], watched: set[str], env_names: set[str], env_fns: set[str]) -> list[str]:
+    """The pin of every site in token order: the digest of the site kind and the
+    whole statement that holds the site. Each statement is written and hashed
+    once per kind, so the cost is linear. A site in a statement over STMT_CAP
+    tokens raises ValueError (#10303)."""
     close = brackets(t)
+    spans = statements(t)
+    of = [0] * len(t)
+    for i, (a, b) in enumerate(spans):
+        for m in range(a, b + 1):
+            of[m] = i
+    memo: dict[tuple[int, str], str] = {}
+
+    def pin(k: int, kind: str) -> str:
+        i = of[k]
+        if (i, kind) not in memo:
+            a, b = spans[i]
+            n = b - a + 1
+            if n > STMT_CAP:
+                raise ValueError(f"line {t[a].line}: a watched statement of {n} tokens is over STMT_CAP "
+                                 f"{STMT_CAP}; a pin never cuts a statement (#10303)")
+            memo[(i, kind)] = digest(kind, encode(t, a, b))
+        return memo[(i, kind)]
+
     found: list[tuple[int, int, str]] = []
     for k, x in enumerate(t):
         if x.kind == IDENT and x.text in watched:
-            found.append((k, 0, digest("T", encode(t, k - SITE_RADIUS, k + SITE_RADIUS))))
-    for k, end in use_sites(t, env_names):
-        found.append((k, 1, digest("U", encode(t, k, min(end, k + USE_CAP)))))
-    for k, lo, hi in env_calls(t, env_fns, close):
-        found.append((k, 2, digest("E", encode(t, lo, hi))))
+            found.append((k, 0, pin(k, "T")))
+    for k in use_sites(t, env_names):
+        found.append((k, 1, pin(k, "U")))
+    for k in env_calls(t, env_fns, close):
+        found.append((k, 2, pin(k, "E")))
     found.sort()
     return [d for _k, _o, d in found]
 
@@ -690,7 +744,10 @@ def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
         e = env_calls(t, env_fns, brackets(t))
         if e:
             env[rel] = len(e)
-        pins = sites_of(t, watched, env_names, env_fns)
+        try:
+            pins = sites_of(t, watched, env_names, env_fns)
+        except ValueError as e:
+            raise ValueError(f"{rel}: {e}") from e
         if pins:
             sites[rel] = pins
     rows = "\n\n".join([

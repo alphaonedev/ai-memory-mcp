@@ -42,7 +42,11 @@ fn digests(text: &str) -> Vec<String> {
 #[test]
 fn every_site_pins_its_whole_statement_10303() {
     let rows = stmt_rows();
-    assert_eq!(rows.len(), STMT_PARITY_ROWS_10303, "rows of the #10303 table");
+    assert_eq!(
+        rows.len(),
+        STMT_PARITY_ROWS_10303,
+        "rows of the #10303 table"
+    );
     let mut bad = Vec::new();
     let mut seen = 0usize;
     for (i, (text, stmts)) in rows.iter().enumerate() {
@@ -53,7 +57,9 @@ fn every_site_pins_its_whole_statement_10303() {
         for d in digests(text) {
             seen += 1;
             if !allowed.contains(&d) {
-                bad.push(format!("row {i} {text:?}: site pin {d} is not a pin of a whole statement"));
+                bad.push(format!(
+                    "row {i} {text:?}: site pin {d} is not a pin of a whole statement"
+                ));
             }
         }
     }
@@ -66,7 +72,11 @@ fn every_site_pins_its_whole_statement_10303() {
 fn statement_pin_mutants_10303() {
     let rows: Vec<(String, String, String, String)> =
         serde_json::from_str(STMT_MUTANTS_10303).expect("the #10303 mutant table is a JSON list");
-    assert_eq!(rows.len(), STMT_MUTANT_ROWS_10303, "rows of the #10303 mutant table");
+    assert_eq!(
+        rows.len(),
+        STMT_MUTANT_ROWS_10303,
+        "rows of the #10303 mutant table"
+    );
     let mut bad = Vec::new();
     for (name, want, a, b) in &rows {
         let (da, db) = (digests(a), digests(b));
@@ -87,6 +97,77 @@ fn a_digest_is_32_hex_digits_10302() {
     for d in digests("fn f() { std::process::exit(1); }") {
         assert_eq!(d.len(), 32, "pin {d}");
     }
+}
+
+/// The statement partition of every table row is its hand-written list.
+#[test]
+fn statement_partition_table_10303() {
+    let mut bad = Vec::new();
+    for (i, (text, want)) in stmt_rows().iter().enumerate() {
+        let toks = lex(text);
+        let have: Vec<String> = census_pins::statements(&toks)
+            .into_iter()
+            .map(|(a, b)| census_pins::encode(&toks[a..=b]))
+            .collect();
+        if &have != want {
+            bad.push(format!(
+                "row {i} {text:?}: statements {have:?}, want {want:?}"
+            ));
+        }
+    }
+    assert_eq!(bad, Vec::<String>::new(), "#10303 statement partition");
+}
+
+fn cap_text(tokens: usize) -> String {
+    format!("process{};", " x".repeat(tokens - 2))
+}
+
+fn cap_sites(text: &str) -> Result<Vec<census_pins::Site>, String> {
+    let toks = lex(text);
+    let prep = Prep::new(&toks);
+    let watched: BTreeSet<String> = ["process".to_string()].into_iter().collect();
+    census_pins::sites_of(&prep, &watched, &BTreeSet::new(), &BTreeSet::new())
+}
+
+/// A statement of [`census_pins::STMT_CAP`] tokens is pinned; one more token is refused with
+/// the exact message, never cut (#10303).
+#[test]
+fn a_statement_over_the_cap_is_refused_10303() {
+    let cap = census_pins::STMT_CAP;
+    let at = cap_text(cap);
+    assert_eq!(lex(&at).len(), cap);
+    assert_eq!(cap_sites(&at).map(|s| s.len()), Ok(1));
+    let over = cap_text(cap + 1);
+    assert_eq!(
+        cap_sites(&over).map(|s| s.len()),
+        Err(format!(
+            "line 1: a watched statement of {} tokens is over STMT_CAP {cap}; a pin never cuts a statement (#10303)",
+            cap + 1
+        ))
+    );
+}
+
+/// One statement of [`census_pins::STMT_CAP`] tokens holding a site on every other token is
+/// hashed once, not once per site.
+#[test]
+fn a_long_statement_pins_in_linear_time_10303() {
+    let cap = census_pins::STMT_CAP;
+    let n = (cap - 3) / 2;
+    let text = format!("f({});", " process ,".repeat(n));
+    assert!(lex(&text).len() <= cap);
+    let t0 = std::time::Instant::now();
+    let d: Vec<String> = cap_sites(&text)
+        .expect("under the cap")
+        .into_iter()
+        .map(|s| s.digest)
+        .collect();
+    let dt = t0.elapsed();
+    assert_eq!(d.len(), n);
+    assert_eq!(d.iter().collect::<BTreeSet<_>>().len(), 1);
+    assert!(
+        dt < std::time::Duration::from_secs(20),
+        "pins of one long statement took {dt:?}"
+    );
 }
 
 /// 100K tokens of short statements, each with a site, in linear time.

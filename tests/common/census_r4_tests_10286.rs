@@ -25,6 +25,7 @@ pub(super) fn sites(text: &str) -> Vec<census_pins::Site> {
     let env_fns = census_pins::closure(preps, census_pins::ENV_FN_SEED);
     let reach: BTreeSet<String> = env_mod.union(&env_fns).cloned().collect();
     census_pins::sites_of(&prep, &watched, &reach, &env_fns)
+        .expect("every test text is under STMT_CAP")
 }
 
 fn site_count(rel: &str, have: usize, want: usize) -> String {
@@ -35,7 +36,7 @@ fn site_count(rel: &str, have: usize, want: usize) -> String {
 
 fn site_pin(rel: &str, i: usize, line: usize, what: &str, pin: &str, want: &str) -> String {
     format!(
-        "{rel}: site {i} (line {line}, {what}) pins {pin}, SITE_ROWS has {want}; an edit at or next to a watched token needs its row (#10286)"
+        "{rel}: site {i} (line {line}, {what}) pins {pin}, SITE_ROWS has {want}; an edit of a watched statement needs its row (#10286)"
     )
 }
 
@@ -48,8 +49,8 @@ fn macro_line(rel: &str, line: usize, form: &str, what: &str) -> String {
 const EXIT: &str = "fn f() {\n    std::process::exit(1);\n}\n";
 const ABORT: &str = "fn f() {\n    std::process::abort(1);\n}\n";
 /// The scanner's digests of [`EXIT`] and [`ABORT`].
-const EXIT_PIN: &str = "c7ea80509606d240";
-const ABORT_PIN: &str = "3d3efeb6714e96ef";
+const EXIT_PIN: &str = "544c82b037f2b620790b45ea0bd7c0e7";
+const ABORT_PIN: &str = "2b3de01b252064ea1316f9a587783845";
 
 #[test]
 fn a_swap_that_keeps_the_count_is_red_by_its_site_pin_10286() {
@@ -83,7 +84,7 @@ fn a_bad_stale_or_unsorted_site_row_is_red_10286() {
     let have: BTreeSet<&str> = ["a.rs", "b.rs"].into_iter().collect();
     let good: &[&str] = &[EXIT_PIN];
     let short: &[&str] = &["c7ea"];
-    let upper: &[&str] = &["C7EA80509606D240"];
+    let upper: &[&str] = &["544C82B037F2B620790B45EA0BD7C0E7"];
     let rows: &[(&str, &[&str])] = &[
         ("b.rs", good),
         ("a.rs", short),
@@ -93,8 +94,8 @@ fn a_bad_stale_or_unsorted_site_row_is_red_10286() {
     assert_eq!(
         census_pins::site_table_findings(rows, &have),
         vec![
-            "a.rs: SITE_ROWS digest \"c7ea\" is not 16 lower-case hex digits (#10286)".to_string(),
-            "a.rs: SITE_ROWS digest \"C7EA80509606D240\" is not 16 lower-case hex digits (#10286)"
+            "a.rs: SITE_ROWS digest \"c7ea\" is not 32 lower-case hex digits (#10286)".to_string(),
+            "a.rs: SITE_ROWS digest \"544C82B037F2B620790B45EA0BD7C0E7\" is not 32 lower-case hex digits (#10286)"
                 .to_string(),
             "z.rs: 0 watched sites, SITE_ROWS has 1; a stale row is red (#10286)".to_string(),
             "a.rs: SITE_ROWS is not sorted or holds the file twice (#10286)".to_string(),
@@ -116,15 +117,15 @@ fn every_env_reach_form_is_a_pinned_site_10286() {
         (
             n3,
             &[
-                ("c86384c840d0b218", 1, "a use of env"),
-                ("e2d61c03c43b7aaa", 3, "env reach set_var"),
+                ("c86384c840d0b218d8d9b29085c07bf7", 1, "a use of env"),
+                ("213bd11d2a2228c80d5cedc36d1225cb", 3, "env reach set_var"),
             ],
         ),
         (
             n3b,
             &[
-                ("2f6cd4457dc1befd", 1, "a use of env"),
-                ("6d96c2e1ffbfc428", 3, "env reach set_var"),
+                ("2f6cd4457dc1befdf179e797ada2d6ef", 1, "a use of env"),
+                ("d0dd65233ec62cd1f12b191dd9eebb1e", 3, "env reach set_var"),
             ],
         ),
     ];
@@ -431,8 +432,7 @@ const LEX_PARITY_ROWS_10305: usize = 36;
 /// The pin encoding of every token of `text`.
 fn encoded_10305(text: &str) -> String {
     let toks = lex(text);
-    let hi = i64::try_from(toks.len()).unwrap_or(i64::MAX) - 1;
-    census_pins::encode(&toks, 0, hi)
+    census_pins::encode(&toks)
 }
 
 #[test]

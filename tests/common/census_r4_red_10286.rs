@@ -42,7 +42,7 @@ const FORMS: &[(&str, &str, &str, &[&str])] = &[
         &[
             "src/n2b.rs: 2 watched process, libc, nix or proptest tokens, TOKEN_ROWS has 0; every reference under any cfg, in any macro or by any path needs its exact row (#10176)",
             "src/n2b.rs: 2 watched sites, SITE_ROWS has 0; a new or removed site needs its row (#10286)",
-            "src/n2b.rs: site 0 (line 6, process) pins 4d868b6e0b32e960, SITE_ROWS has nothing; an edit at or next to a watched token needs its row (#10286)",
+            "src/n2b.rs: site 0 (line 6, process) pins 8f057ec87e479168900f6960a54ccc5f, SITE_ROWS has nothing; an edit of a watched statement needs its row (#10286)",
             "src/n2b.rs:3: <$t: a macro metavariable in type position; a macro form that can carry a watched name past the census needs a MACRO_ROWS row with its reason (#10287)",
             "src/n2b.rs:6: hot-arg: a macro invocation whose arguments name a watched, proptest, env or fork name; a macro form that can carry a watched name past the census needs a MACRO_ROWS row with its reason (#10287)",
         ],
@@ -54,7 +54,7 @@ const FORMS: &[(&str, &str, &str, &[&str])] = &[
         &[
             "src/n3.rs: 1 environment names that are not one string literal or one named constant, ENV_NAME_ROWS has 0; a built name can switch proptest fork on (#10176)",
             "src/n3.rs: 2 watched sites, SITE_ROWS has 0; a new or removed site needs its row (#10286)",
-            "src/n3.rs: site 0 (line 1, a use of env) pins c86384c840d0b218, SITE_ROWS has nothing; an edit at or next to a watched token needs its row (#10286)",
+            "src/n3.rs: site 0 (line 1, a use of env) pins c86384c840d0b218d8d9b29085c07bf7, SITE_ROWS has nothing; an edit of a watched statement needs its row (#10286)",
         ],
     ),
     (
@@ -64,7 +64,7 @@ const FORMS: &[(&str, &str, &str, &[&str])] = &[
         &[
             "src/n3b.rs: 1 environment names that are not one string literal or one named constant, ENV_NAME_ROWS has 0; a built name can switch proptest fork on (#10176)",
             "src/n3b.rs: 2 watched sites, SITE_ROWS has 0; a new or removed site needs its row (#10286)",
-            "src/n3b.rs: site 0 (line 1, a use of env) pins 2f6cd4457dc1befd, SITE_ROWS has nothing; an edit at or next to a watched token needs its row (#10286)",
+            "src/n3b.rs: site 0 (line 1, a use of env) pins 2f6cd4457dc1befdf179e797ada2d6ef, SITE_ROWS has nothing; an edit of a watched statement needs its row (#10286)",
         ],
     ),
     (
@@ -74,7 +74,7 @@ const FORMS: &[(&str, &str, &str, &[&str])] = &[
         &[
             "tests/n6b.rs: 1 watched process, libc, nix or proptest tokens, TOKEN_ROWS has 0; every reference under any cfg, in any macro or by any path needs its exact row (#10176)",
             "tests/n6b.rs: 1 watched sites, SITE_ROWS has 0; a new or removed site needs its row (#10286)",
-            "tests/n6b.rs: site 0 (line 4, proptest) pins fd6b7830972933f9, SITE_ROWS has nothing; an edit at or next to a watched token needs its row (#10286)",
+            "tests/n6b.rs: site 0 (line 4, proptest) pins a8633061910b0efc6cc26e2dcadd15ff, SITE_ROWS has nothing; an edit of a watched statement needs its row (#10286)",
             "tests/n6b.rs:2: $m!: a macro metavariable in invocation position; a macro form that can carry a watched name past the census needs a MACRO_ROWS row with its reason (#10287)",
             "tests/n6b.rs:4: hot-arg: a macro invocation whose arguments name a watched, proptest, env or fork name; a macro form that can carry a watched name past the census needs a MACRO_ROWS row with its reason (#10287)",
         ],
@@ -86,7 +86,7 @@ const FORMS: &[(&str, &str, &str, &[&str])] = &[
         &[
             "tests/n11.rs: 1 watched process, libc, nix or proptest tokens, TOKEN_ROWS has 0; every reference under any cfg, in any macro or by any path needs its exact row (#10176)",
             "tests/n11.rs: 1 watched sites, SITE_ROWS has 0; a new or removed site needs its row (#10286)",
-            "tests/n11.rs: site 0 (line 1, proptest) pins 52493e3845000a12, SITE_ROWS has nothing; an edit at or next to a watched token needs its row (#10286)",
+            "tests/n11.rs: site 0 (line 1, proptest) pins 526dcf14d126662eaa42815082ba44ae, SITE_ROWS has nothing; an edit of a watched statement needs its row (#10286)",
             "tests/n11.rs:1: a proptest Config bound to another name (as or type), which hides its literals from this scan; a proptest config with fork or timeout on re-runs this test binary outside the sandbox (#10176)",
             "tests/n11.rs:2: a fork or timeout field in a proptest Config literal; a proptest config with fork or timeout on re-runs this test binary outside the sandbox (#10176)",
         ],

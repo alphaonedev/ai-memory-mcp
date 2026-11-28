@@ -1333,11 +1333,17 @@ fn census(tree: &Tree) -> Vec<String> {
         if n > 0 {
             env_names.insert(rel.clone(), n);
         }
-        let sites = census_pins::sites_of(prep, &watched, &env_reach, &env_fns);
         let row = site_rows.get(rel.as_str()).copied();
-        if !sites.is_empty() {
-            site_have.insert(rel.as_str());
-            out.extend(census_pins::site_findings(rel, &sites, row));
+        match census_pins::sites_of(prep, &watched, &env_reach, &env_fns) {
+            Ok(sites) if !sites.is_empty() => {
+                site_have.insert(rel.as_str());
+                out.extend(census_pins::site_findings(rel, &sites, row));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                site_have.insert(rel.as_str());
+                out.push(format!("{rel}: {e}"));
+            }
         }
         for (form, line) in census_macros::macro_forms(prep, &hot) {
             macros.entry((rel.clone(), form)).or_default().push(line);

@@ -9,58 +9,66 @@
 //! A site is one place in a file where a watched name is reached:
 //!
 //! * `T`: every identifier token of a watched process, libc, nix or proptest
-//!   name (or of a name bound to one), with [`SITE_RADIUS`] tokens on each
-//!   side;
+//!   name (or of a name bound to one);
 //! * `U`: every `use` declaration that names `env`, an environment function
-//!   or a name bound to either, from `use` to its `;` (at most [`USE_CAP`]
-//!   tokens);
+//!   or a name bound to either;
 //! * `E`: every environment reach whose name is not one literal or one named
-//!   constant (see [`env_calls`]), from two tokens before the name to the end
-//!   of the first group (at most [`ARG_CAP`] tokens after its opener).
+//!   constant (see [`env_calls`]).
 //!
-//! Each site's tokens are written as kind, UTF-8 byte length, `:` and text
-//! (`^` and `$` for positions before and after the file), prefixed with the
-//! site kind, hashed with SHA-256 ([`sha256`], hand-written, no dependency)
-//! and cut to [`DIGEST_HEX`] hex digits. `SITE_ROWS` holds every file's
-//! ordered digests.
+//! The pin of a site covers every token of the statement that holds it
+//! (#10303), as [`statements`] cuts a file: from the end of the previous
+//! statement to the closing `;`, or to the `{` that opens a body (so an item
+//! head such as `fn f(c: Command) -> u8 {` is one statement). A `;`, `{` or
+//! `}` inside `(` or `[` does not end a statement, so a call's whole argument
+//! list, closures and blocks in it too, is in the statement of the call; a
+//! `use` declaration is one statement from `use` to `;`. Each token is written
+//! as kind, UTF-8 byte length, `:` and its full text (a literal keeps its
+//! source text, #10305), the whole is prefixed with the site kind, hashed with
+//! SHA-256 ([`sha256`], hand-written, no dependency) and cut to [`DIGEST_HEX`]
+//! (32) hex digits (#10302). `SITE_ROWS` holds every file's ordered digests. A
+//! statement longer than [`STMT_CAP`] tokens is refused with a finding naming
+//! its line and length; a pin never cuts a statement to fit.
 //!
-//! What a pin proves: any edit of a token inside a site window (a swap of
-//! one watched call for another, a changed argument, a renamed path segment,
-//! a token added or removed next to a watched token) changes that site's
-//! digest, so the file is red with the site index, line and token until its
-//! row changes, even when the per-file count stays the same. A new or
-//! removed site shifts the list and is red the same way.
+//! What a pin proves: any edit of any token of a statement that holds a site
+//! changes that site's digest. That covers the program literal of
+//! `Command::new("true")`, an exit code, a signal number, a char argument, a
+//! tuple index, every argument of the call however far from the watched
+//! token, a closure body inside the call's brackets, and a renamed item head.
+//! The file is then red with the site index, line and token until its row
+//! changes, even when the per-file count stays the same. A new or removed site
+//! shifts the list and is red the same way.
 //!
-//! What a pin does not prove: that a change is safe. A pin only makes every
-//! change at a watched site visible in review, as a changed row. An edit
-//! wholly outside every window (a value computed elsewhere and passed in by a
-//! name that is not watched) does not change a pin; the env rules of part C
-//! and the macro rules of part B (`census_macros_10287.rs`) are the checks
-//! for those forms. A whole site moved to another place with the same
-//! [`SITE_RADIUS`] neighbours on each side, keeping the order of the file's
-//! sites, keeps its pin: the pin binds the reach and its neighbours, not the
-//! enclosing item (the start rules of the census bind the item). Sixteen hex
-//! digits are 64 bits of SHA-256: for n pins the chance of any accidental
-//! collision is about n^2 / 2^65, about 1.3e-13 for the ~2200 pins of the
-//! tree (#10306), and the pin is a review signal, not a secret. The hash is
-//! checked against the FIPS 180-4 vectors by
+//! What a pin does not prove: that a change is safe; it makes every change in
+//! a watched statement visible in review, as a changed row. An edit wholly
+//! outside every statement that holds a site (a value computed in an earlier
+//! statement and passed in by a name that is not watched, or a body line after
+//! the `{` of a watched item head) does not change a pin; the env rules of
+//! part C and the macro rules of part B (`census_macros_10287.rs`) are the
+//! checks for those forms, and the start rules of the census bind the
+//! enclosing item. A whole statement moved to another place in the file,
+//! keeping the order of the file's sites, keeps its pin.
+//!
+//! Collision bounds at 32 hex digits (128 bits of SHA-256): for n pins the
+//! chance of any accidental collision is about n^2 / 2^129, about 7e-33 for
+//! the ~2200 pins of the tree. An engineered collision (two statements chosen
+//! together with one pin) costs about 2^64 SHA-256 evaluations by a birthday
+//! search, and a second statement matching one given pin (a second preimage)
+//! costs about 2^128. The pin is a review signal, not a secret or a signature.
+//! The hash is checked against the FIPS 180-4 vectors by
 //! `census_sha256_fips_180_4_vectors_10306`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::rust_lex::{Lexed, Tok};
 
-/// Tokens on each side of a watched token in a `T` site.
-pub(crate) const SITE_RADIUS: usize = 2;
-/// The most tokens of an `E` site after its group opener.
-pub(crate) const ARG_CAP: usize = 64;
-/// The most tokens of a `U` site after its `use`.
-pub(crate) const USE_CAP: usize = 256;
 /// The most tokens of an impl header read; a longer one is an impl form.
 pub(crate) const IMPL_CAP: usize = 512;
-/// Hex digits of a site digest.
-pub(crate) const DIGEST_HEX: usize = 16;
+/// Hex digits of a site digest (#10302).
+pub(crate) const DIGEST_HEX: usize = 32;
+/// The most tokens of a statement that holds a site; a longer one is refused,
+/// never cut (#10303). The longest such statement of the tree is 811 tokens.
+pub(crate) const STMT_CAP: usize = 2_048;
 
 /// The seed of the module name of the environment functions.
 pub(crate) const ENV_MOD_SEED: &[&str] = &["env"];
@@ -529,26 +537,15 @@ pub(crate) fn name_ok(arg: &[Lexed]) -> bool {
     })
 }
 
-/// One environment reach whose name is not one literal or one constant: the
-/// name token and the window of its `E` site (`lo` may be before the file).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EnvCall {
-    pub(crate) k: usize,
-    pub(crate) lo: i64,
-    pub(crate) hi: i64,
-}
-
-fn signed(k: usize) -> i64 {
-    i64::try_from(k).unwrap_or(i64::MAX)
-}
-
 /// Every environment reach of one file whose name is not ok: a call of an
 /// environment function (by any name bound to one, through any import form)
 /// whose first argument is not one literal or one constant, `.env(` and
 /// `.env_remove(` and `env!` and `option_env!` likewise, every `.envs(`, and
 /// every environment function named as a value (not called, not a method,
 /// not a definition, not in a `use`).
-pub(crate) fn env_calls(p: &Prep<'_>, env_fns: &BTreeSet<String>) -> Vec<EnvCall> {
+///
+/// Returns the index of each reach's name token.
+pub(crate) fn env_calls(p: &Prep<'_>, env_fns: &BTreeSet<String>) -> Vec<usize> {
     let t = p.toks;
     let n = t.len();
     let mut out = Vec::new();
@@ -562,14 +559,8 @@ pub(crate) fn env_calls(p: &Prep<'_>, env_fns: &BTreeSet<String>) -> Vec<EnvCall
             is_p_before(t, k, '.') || k.checked_sub(1).and_then(|j| ident_at(t, j)) == Some("fn");
         let is_fn = env_fns.contains(v);
         let call = is_p(t, k + 1, '(');
-        let ks = signed(k);
-        let radius = signed(SITE_RADIUS);
         if is_fn && !after_fn && !call && in_use_until.is_none_or(|u| k > u) {
-            out.push(EnvCall {
-                k,
-                lo: ks - radius,
-                hi: ks + radius,
-            });
+            out.push(k);
             continue;
         }
         let dot = is_p_before(t, k, '.');
@@ -586,44 +577,77 @@ pub(crate) fn env_calls(p: &Prep<'_>, env_fns: &BTreeSet<String>) -> Vec<EnvCall
         };
         let Some(open) = open else { continue };
         if always || !name_ok(first_arg(p, open)) {
-            let hi = p
-                .close_of(open)
-                .min(open + ARG_CAP)
-                .min(n.saturating_sub(1));
-            out.push(EnvCall {
-                k,
-                lo: ks - radius,
-                hi: signed(hi),
-            });
+            out.push(k);
         }
     }
     out
 }
 
-/// `(use index, end index)` of every `use` declaration naming an env name.
-fn use_sites(p: &Prep<'_>, env_names: &BTreeSet<String>) -> Vec<(usize, usize)> {
+/// The `use` index of every `use` declaration naming an env name.
+fn use_sites(p: &Prep<'_>, env_names: &BTreeSet<String>) -> Vec<usize> {
     let t = p.toks;
     let named = named_prefix(t, env_names);
     (0..t.len())
         .filter(|&k| is_use(t, k) && named[p.semi[k]] > named[k])
-        .map(|k| (k, p.semi[k]))
         .collect()
+}
+
+/// `(first, last)` of every statement of `t`, in order; together they hold
+/// every token once (#10303). A statement ends, inclusive, at a `;`, `{` or
+/// `}` with no `(` or `[` open, except that braces do not end a `use`
+/// declaration (from a `use` with no `(` or `[` open to its `;`). A closer
+/// pops the top opener whatever it is, as the bracket table does. The last
+/// statement may end at the file end. One pass, linear.
+pub(crate) fn statements(t: &[Lexed]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<char> = Vec::new();
+    let mut groups = 0usize;
+    let mut in_use = false;
+    let mut start = 0usize;
+    for (k, x) in t.iter().enumerate() {
+        let end = match &x.tok {
+            Tok::Punct(c @ ('(' | '[')) => {
+                stack.push(*c);
+                groups += 1;
+                false
+            }
+            Tok::Punct('{') => {
+                stack.push('{');
+                groups == 0 && !in_use
+            }
+            Tok::Punct(c @ (')' | ']' | '}')) => {
+                if stack.pop().is_some_and(|o| o != '{') {
+                    groups = groups.saturating_sub(1);
+                }
+                *c == '}' && groups == 0 && !in_use
+            }
+            Tok::Punct(';') if groups == 0 => {
+                in_use = false;
+                true
+            }
+            Tok::Ident(_) if groups == 0 && is_use(t, k) => {
+                in_use = true;
+                false
+            }
+            _ => false,
+        };
+        if end {
+            out.push((start, k));
+            start = k + 1;
+        }
+    }
+    if start < t.len() {
+        out.push((start, t.len() - 1));
+    }
+    out
 }
 
 // ---------------------------------------------------------------- pins
 
-/// The written tokens `lo..=hi`, with `^` and `$` for positions outside.
-pub(crate) fn encode(t: &[Lexed], lo: i64, hi: i64) -> String {
+/// The written tokens of `t`, each `<kind><byte length>:<full text>`.
+pub(crate) fn encode(t: &[Lexed]) -> String {
     let mut out = String::new();
-    for m in lo..=hi {
-        let Ok(i) = usize::try_from(m) else {
-            out.push('^');
-            continue;
-        };
-        let Some(x) = t.get(i) else {
-            out.push('$');
-            continue;
-        };
+    for x in t {
         let (kind, text): (char, String) = match &x.tok {
             Tok::Ident(s) => ('I', s.clone()),
             Tok::Punct(c) => ('P', c.to_string()),
@@ -646,31 +670,58 @@ pub(crate) struct Site {
     pub(crate) digest: String,
 }
 
-/// The ordered sites of one file (by token index, then T, U, E).
+/// The ordered sites of one file (by token index, then T, U, E). The pin of a
+/// site is the digest of its kind and the whole statement that holds it; each
+/// statement is written and hashed once per kind, so the cost is linear.
+///
+/// # Errors
+///
+/// A site in a statement of more than [`STMT_CAP`] tokens is refused with the
+/// statement's line and length (#10303); a pin never cuts a statement.
 pub(crate) fn sites_of(
     p: &Prep<'_>,
     watched: &BTreeSet<String>,
     env_names: &BTreeSet<String>,
     env_fns: &BTreeSet<String>,
-) -> Vec<Site> {
+) -> Result<Vec<Site>, String> {
     let t = p.toks;
+    let spans = statements(t);
+    let mut of = vec![0usize; t.len()];
+    for (si, &(lo, hi)) in spans.iter().enumerate() {
+        of[lo..=hi].fill(si);
+    }
+    let mut memo: BTreeMap<(usize, &str), String> = BTreeMap::new();
+    let mut pin = |k: usize, kind: &'static str| -> Result<String, String> {
+        let si = of[k];
+        if let Some(have) = memo.get(&(si, kind)) {
+            return Ok(have.clone());
+        }
+        let (lo, hi) = spans[si];
+        let len = hi - lo + 1;
+        if len > STMT_CAP {
+            return Err(format!(
+                "line {}: a watched statement of {len} tokens is over STMT_CAP {STMT_CAP}; a pin never cuts a statement (#10303)",
+                t[lo].line
+            ));
+        }
+        let pinned = digest(kind, &encode(&t[lo..=hi]));
+        memo.insert((si, kind), pinned.clone());
+        Ok(pinned)
+    };
     let mut found: Vec<(usize, u8, String)> = Vec::new();
-    let radius = signed(SITE_RADIUS);
     for k in 0..t.len() {
         if in_set(t, k, watched) {
-            let ks = signed(k);
-            found.push((k, 0, digest("T", &encode(t, ks - radius, ks + radius))));
+            found.push((k, 0, pin(k, "T")?));
         }
     }
-    for (k, end) in use_sites(p, env_names) {
-        let hi = end.min(k + USE_CAP);
-        found.push((k, 1, digest("U", &encode(t, signed(k), signed(hi)))));
+    for k in use_sites(p, env_names) {
+        found.push((k, 1, pin(k, "U")?));
     }
-    for c in env_calls(p, env_fns) {
-        found.push((c.k, 2, digest("E", &encode(t, c.lo, c.hi))));
+    for k in env_calls(p, env_fns) {
+        found.push((k, 2, pin(k, "E")?));
     }
     found.sort();
-    found
+    Ok(found
         .into_iter()
         .map(|(k, kind, digest)| {
             let name = match &t[k].tok {
@@ -689,7 +740,7 @@ pub(crate) fn sites_of(
                 digest,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// The site findings of one file against its `SITE_ROWS` row (`None`: no row).
@@ -709,7 +760,7 @@ pub(crate) fn site_findings(rel: &str, sites: &[Site], row: Option<&[&str]>) -> 
         .find(|(i, s)| want.get(*i) != Some(&s.digest.as_str()))
     {
         out.push(format!(
-            "{rel}: site {i} (line {}, {}) pins {}, SITE_ROWS has {}; an edit at or next to a watched token needs its row (#10286)",
+            "{rel}: site {i} (line {}, {}) pins {}, SITE_ROWS has {}; an edit of a watched statement needs its row (#10286)",
             s.line,
             s.what,
             s.digest,
