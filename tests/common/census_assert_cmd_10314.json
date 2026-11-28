@@ -1,0 +1,10 @@
+[
+  ["fn f() {\n    let _ = assert_cmd::cargo::cargo_bin_cmd!(\"x\").output();\n}\n", 1, 1, [2]],
+  ["use assert_cmd::cargo::cargo_bin_cmd;\nfn f() {\n    let _ = cargo_bin_cmd!(\"x\").output();\n}\n", 2, 2, [3]],
+  ["fn f() {\n    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin!(\"x\"));\n}\n", 3, 2, [2]],
+  ["fn f() {\n    let _ = assert_cmd::cargo::cargo_bin(\"x\");\n}\n", 1, 1, [2]],
+  ["use assert_cmd::cargo::cargo_bin_cmd as run;\n", 2, 2, []],
+  ["fn f() {\n    let _ = assert_cmd::Command::cargo_bin(\"x\");\n}\n", 2, 1, [2]],
+  ["fn f() {\n    let _ = std::process::Command::cargo_bin(\"x\");\n}\n", 3, 1, [2]],
+  ["use assert_cmd::Command as Run;\nfn f() {\n    let _ = Run::cargo_bin(\"x\");\n}\n", 4, 2, [3]]
+]

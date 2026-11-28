@@ -435,5 +435,54 @@ INCLUDE_ROWS = 22
 INCLUDE_BOUND_BYTES = 100_000
 
 
+ASSERT_CMD_TABLE = ROOT / "tests/common/census_assert_cmd_10314.json"
+ASSERT_CMD_ROWS = 8
+# The assert_cmd start names, written out (never read from either scanner).
+ASSERT_CMD_NAMES = frozenset({"cargo_bin", "cargo_bin_cmd"})
+RUST_WATCHED_RE = re.compile(r"^const WATCHED: &\[&str\] = &\[\n(.*?)^\];$", re.M | re.S)
+RUST_NAME_RE = re.compile(r'^    "([^"\\]+)",$', re.M)
+
+
+def rust_watched() -> frozenset[str]:
+    """The Rust census WATCHED list, read from its source (one list, one name a line)."""
+    src = (ROOT / CENSUS).read_text(encoding="utf-8")
+    found = RUST_WATCHED_RE.findall(src)
+    if len(found) != 1:
+        raise AssertionError(f"{CENSUS}: {len(found)} WATCHED lists, want 1")
+    body = found[0]
+    names = RUST_NAME_RE.findall(body)
+    if len(names) != len(body.splitlines()):
+        raise AssertionError(f"{CENSUS}: a WATCHED line is not one quoted name")
+    return frozenset(names)
+
+
+class AssertCmd10314(unittest.TestCase):
+    """#10314: `cargo_bin` and `cargo_bin_cmd` are watched names on both sides,
+    the two watched lists are one list, and the Python token count of each
+    row of the table the Rust test `the_assert_cmd_forms_are_start_sites_and_
+    watched_tokens_10314` reads is its hand-written count."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_watched_seed_is_the_rust_watched_list(self) -> None:
+        self.assertEqual(sorted(self.m.WATCHED_SEED ^ rust_watched()), [])
+
+    def test_the_assert_cmd_names_are_watched(self) -> None:
+        self.assertEqual(sorted(ASSERT_CMD_NAMES - self.m.WATCHED_SEED), [])
+
+    def test_token_counts_of_the_shared_table(self) -> None:
+        rows = json.loads(ASSERT_CMD_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), ASSERT_CMD_ROWS)
+        bad = []
+        for i, (text, tokens, _sites, _lines) in enumerate(rows):
+            prepared = self.m.prepare([("src/e.rs", self.m.lex(text))])
+            watched = self.m.RenameGraph(prepared).reach(self.m.WATCHED_SEED)
+            have = sum(1 for t in self.m.lex(text) if t.kind == self.m.IDENT and t.text in watched)
+            if have != tokens:
+                bad.append(f"row {i} {text!r}: {have} watched tokens, want {tokens}")
+        self.assertEqual(bad, [])
+
+
 if __name__ == "__main__":
     unittest.main()

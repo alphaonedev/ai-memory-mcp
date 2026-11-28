@@ -70,6 +70,8 @@
 //! guard on its value. Code of a dependency is not read; A2 is the reasoned
 //! list of those crates.
 
+#[path = "common/census_assert_cmd_10314.rs"]
+mod census_assert_cmd;
 #[path = "common/census_cargo_10289.rs"]
 mod census_cargo;
 #[path = "common/census_closure_10304.rs"]
