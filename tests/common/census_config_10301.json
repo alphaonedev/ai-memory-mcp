@@ -56,7 +56,9 @@
       ".cargo/config.toml: not TOML the census reads; an unparseable cargo config is not clean (#10301)"
     ]],
     ["crates/x/cargo/config.toml", "[patch.crates-io.libc]\npath = \"../libc\"\n", []],
-    [".cargo/config.toml.bak", "[patch.crates-io.libc]\npath = \"../libc\"\n", []]
+    [".cargo/config.toml.bak", "[patch.crates-io.libc]\npath = \"../libc\"\n", []],
+    [".cargo/config.toml", "[patch.crates-io]\n\"rusty_forK\" = { path = \"r\" }\n", []],
+    [".cargo/config.toml", "[env]\n\"PROPTEſT_FORK\" = \"true\"\n", []]
   ],
   "bytes": [
     [".cargo/config.toml", [255, 254], [

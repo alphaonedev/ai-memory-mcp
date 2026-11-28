@@ -166,7 +166,7 @@ pub(crate) fn config_findings(rel: &str, bytes: &[u8]) -> Vec<String> {
 /// The table both scanners read, written by hand.
 const TABLE_10301: &str = include_str!("census_config_10301.json");
 /// The number of text rows and of byte rows of [`TABLE_10301`].
-const ROWS_10301: usize = 21;
+const ROWS_10301: usize = 23;
 const BYTE_ROWS_10301: usize = 1;
 /// Alias entries in the size-bound fixture (over 100K bytes) and its
 /// wall-clock ceiling.
