@@ -4076,7 +4076,6 @@ pub fn spawn_vector_index_boot_load(
 // Round-3 F12 — the daemon's fixed signing-key label. Canonical const
 // (with the full F12 rationale) now lives at
 // `crate::identity::keypair::DAEMON_KEYPAIR_LABEL` (#1558).
-use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
 
 /// Round-3 F12 — ensure the daemon's signing keypair exists on disk and
 /// load it for the serve [`AppState`]. Returns the in-memory keypair
@@ -4149,79 +4148,13 @@ fn ensure_and_load_daemon_keypair() -> Result<(
             return Ok((None, None));
         }
     };
-    // The `[identity].disabled` config field is not yet wired in
-    // v0.7.0; pass `false` so the helper auto-generates unless the
-    // operator pre-staged a keypair. A future config field can opt
-    // out without changing this call site.
-    let outcome = match crate::identity::keypair::ensure_keypair(DAEMON_KEYPAIR_LABEL, &dir, false)
-    {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!("identity: keypair auto-gen failed: {e:#}");
-            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
-                crate::security_profile::is_asi_hard(),
-                &format!("{e:#}"),
-            ) {
-                anyhow::bail!(reason);
-            }
-            return Ok((None, None));
-        }
-    };
-    // #3147 — public-key-without-private-key is refused under `asi-hard` and
-    // WARNed (inside `ensure_keypair`) under every other posture.
-    if let Some(reason) = crate::identity::keypair::public_only_refusal(
-        &outcome,
+    // #10291 — the ensure, posture and load decision lives beside the key
+    // code; a pair written but not confirmed durable signs (WARN) or, under
+    // `asi-hard`, refuses with text built from the report.
+    crate::identity::keypair::ensure_and_load_daemon_keypair_at(
+        &dir,
         crate::security_profile::is_asi_hard(),
-    ) {
-        anyhow::bail!(reason);
-    }
-    if matches!(
-        outcome,
-        crate::identity::keypair::EnsureOutcome::SkippedDisabled
-    ) {
-        return Ok((None, Some(outcome)));
-    }
-    let kp = match crate::identity::keypair::load(DAEMON_KEYPAIR_LABEL, &dir) {
-        Ok(kp) if kp.can_sign() => {
-            tracing::info!(
-                "identity: loaded signing keypair for {DAEMON_KEYPAIR_LABEL} from {}",
-                dir.display()
-            );
-            Some(kp)
-        }
-        Ok(_) => {
-            // #3147 — WARN, not INFO. "This daemon will sign nothing until an
-            // operator intervenes" is not an informational note: at INFO it sat
-            // below the default log filter of most deployments, so a lost
-            // `daemon.priv` produced no operator-visible signal at all.
-            tracing::warn!(
-                "identity: only the PUBLIC key is on disk for {DAEMON_KEYPAIR_LABEL} in {} — \
-                 link/persona/witness signing is DISABLED and will stay disabled across \
-                 restarts. See `ai-memory doctor` -> Identity (#3147).",
-                dir.display()
-            );
-            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
-                crate::security_profile::is_asi_hard(),
-                "only the public key is on disk",
-            ) {
-                anyhow::bail!(reason);
-            }
-            None
-        }
-        Err(e) => {
-            tracing::warn!(
-                "identity: keypair load failed for {DAEMON_KEYPAIR_LABEL}: {e:#}; link signing disabled"
-            );
-            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
-                crate::security_profile::is_asi_hard(),
-                &format!("{e:#}"),
-            ) {
-                anyhow::bail!(reason);
-            }
-            None
-        }
-    };
-    Ok((kp, Some(outcome)))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -6251,15 +6184,25 @@ pub fn resolve_tls_material(
 /// admitted the boot: mint / renew / reuse the local leaf, or hand back the
 /// operator-supplied pair as unmanaged.
 fn resolve_local_material(key_dir: &Path, bind_host: &str) -> Result<TlsMaterial> {
-    let local = crate::tls_bootstrap::ensure_local_tls(key_dir, bind_host).with_context(|| {
-        format!(
-            "{}: could not generate or renew the local TLS certificate in {} — \
+    let (local, report) = crate::tls_bootstrap::ensure_local_tls(key_dir, bind_host).map(|l| (l, crate::storage::snapshot_file::NotDurableReport::new()))
+        .with_context(|| {
+            format!(
+                "{}: could not generate or renew the local TLS certificate in {} — \
                          refusing to bind rather than serve plaintext. Fix: {}",
-            crate::transit_encryption::ISSUE_TAG,
-            key_dir.join(crate::tls_bootstrap::TLS_SUBDIR).display(),
-            crate::transit_encryption::REMEDY_SUPPLY_TLS
-        )
-    })?;
+                crate::transit_encryption::ISSUE_TAG,
+                key_dir.join(crate::tls_bootstrap::TLS_SUBDIR).display(),
+                crate::transit_encryption::REMEDY_SUPPLY_TLS
+            )
+        })?;
+    // #10292 — the material is complete on disk; serve it and say it is not
+    // confirmed durable (no control is disabled by serving it).
+    if !report.is_empty() {
+        tracing::warn!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            "#3709: the local TLS material is written but not confirmed durable: {report}; \
+             serving it (#10214)"
+        );
+    }
     match &local.outcome {
         crate::tls_bootstrap::Outcome::OperatorSupplied => {
             tracing::info!(
@@ -8410,53 +8353,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                                 continue;
                             }
                         };
-                        match crate::tls_bootstrap::ensure_local_tls(&key_dir, &host) {
-                            Ok(local) => {
-                                let reissued = matches!(
-                                    local.outcome,
-                                    crate::tls_bootstrap::Outcome::Renewed { .. }
-                                        | crate::tls_bootstrap::Outcome::Generated
-                                );
-                                if reissued {
-                                    match reload
-                                        .reload_from_pem_file(&local.cert_path, &local.key_path)
-                                        .await
-                                    {
-                                        Ok(()) => tracing::warn!(
-                                            target: crate::transit_encryption::TRACING_TARGET,
-                                            days_valid = local.leaf_days_remaining,
-                                            "#3709: renewed the local server certificate and \
-                                             reloaded the listener"
-                                        ),
-                                        Err(e) => tracing::error!(
-                                            target: crate::transit_encryption::TRACING_TARGET,
-                                            error = %e,
-                                            "#3709: renewed the certificate but the listener \
-                                             could not reload it; restart the daemon or {}",
-                                            crate::transit_encryption::REMEDY_TLS_RENEW
-                                        ),
-                                    }
-                                } else if local.leaf_days_remaining
-                                    <= crate::tls_bootstrap::RENEWAL_WINDOW_DAYS
-                                {
-                                    tracing::warn!(
-                                        target: crate::transit_encryption::TRACING_TARGET,
-                                        days_remaining = local.leaf_days_remaining,
-                                        "#3709: the local server certificate is inside its \
-                                         renewal window; {}",
-                                        crate::transit_encryption::REMEDY_TLS_RENEW
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::error!(
-                                target: crate::transit_encryption::TRACING_TARGET,
-                                error = %e,
-                                "#3709: certificate renewal FAILED; the listener keeps its \
-                                 current certificate and will REFUSE at the next boot once it \
-                                 expires — fix now: {}",
-                                crate::transit_encryption::REMEDY_TLS_RENEW
-                            ),
-                        }
+                        // #10292 — a renewal not confirmed durable reloads
+                        // the listener and is logged as such, never FAILED.
+                        let _tick =
+                            crate::tls_bootstrap::renewal_tick(&reload, &key_dir, &host).await;
                     }
                 });
                 server_aux_tasks_for_run
@@ -9623,6 +9523,10 @@ mod daemon_runtime_shutdown_tests;
 #[cfg(test)]
 #[path = "daemon_runtime_1579_tests.rs"]
 mod daemon_runtime_1579_tests;
+
+#[cfg(test)]
+#[path = "daemon_runtime_10292_tests.rs"]
+mod daemon_runtime_10292_tests;
 
 #[cfg(test)]
 #[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields

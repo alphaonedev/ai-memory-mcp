@@ -170,6 +170,12 @@ impl NotDurableReport {
         }
     }
 
+    /// Whether every file noted so far is durable (#10291).
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// `Ok` when every file is durable; otherwise the report as the error
     /// (every file named is written).
     ///

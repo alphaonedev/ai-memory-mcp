@@ -809,9 +809,10 @@ fn init_forensic_audit(
                 Ok(pair) => pair,
                 Err(e) => {
                     if ledger_writer {
-                        anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
-                            &agent_id,
-                            &format!("{e:#}")
+                        // #10291 — the refusal text is computed from the
+                        // error's state (a not-durable key is not "unwritable").
+                        anyhow::bail!(ai_memory::governance::audit::boot_key_refusal(
+                            &agent_id, &e
                         ));
                     }
                     (None, None)

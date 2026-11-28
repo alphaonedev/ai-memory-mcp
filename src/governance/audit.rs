@@ -62,6 +62,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::storage::snapshot_file::NotDurableReport;
+
 /// Tracing target for the forensic audit sink (#1558 tracing-target SSOT).
 pub(crate) const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
 
@@ -798,7 +800,9 @@ pub fn unsigned_ledger_warning(agent_id: &str, key_dir: &Path) -> String {
 /// claimed a guarantee it did not provide.
 ///
 /// # Errors
-/// The key directory cannot be resolved, or generation / persistence fails.
+/// The key directory cannot be resolved, or generation / persistence fails,
+/// or (#10291, `asi-hard` only) the key is not confirmed durable: the typed
+/// [`NotDurableReport`] that [`boot_key_refusal`] turns into its refusal.
 pub fn ensure_daemon_signing_key(
     agent_id: &str,
 ) -> Result<(
@@ -809,9 +813,55 @@ pub fn ensure_daemon_signing_key(
         return Ok((Some(key), None));
     }
     let dir = crate::identity::keypair::default_key_dir()?;
-    let outcome = crate::identity::keypair::ensure_keypair(agent_id, &dir, false)?;
-    let key = load_daemon_signing_key(agent_id)?;
+    ensure_daemon_signing_key_in(agent_id, &dir, crate::security_profile::is_asi_hard())
+}
+
+/// #10291 — [`ensure_daemon_signing_key`] under `dir`, pure in `asi_hard`.
+/// A key written but not confirmed durable is the complete after-state:
+/// outside `asi-hard` it is loaded and signs, with a WARN naming the files;
+/// under `asi-hard` the typed report is the error (fail-closed, unchanged).
+///
+/// # Errors
+/// Generation or persistence fails, or the `asi-hard` not-durable report.
+pub(crate) fn ensure_daemon_signing_key_in(
+    agent_id: &str,
+    dir: &Path,
+    asi_hard: bool,
+) -> Result<(
+    Option<SigningKey>,
+    Option<crate::identity::keypair::EnsureOutcome>,
+)> {
+    let (outcome, report) =
+        crate::identity::keypair::ensure_keypair(agent_id, dir, false).map(|o| (o, NotDurableReport::new()))?;
+    if !report.is_empty() {
+        if asi_hard {
+            return Err(anyhow::Error::new(report));
+        }
+        tracing::warn!(
+            agent_id,
+            "{}",
+            crate::identity::keypair::not_durable_key_warning(&report)
+        );
+    }
+    let key = load_daemon_signing_key_at(agent_id, dir)?;
     Ok((key, Some(outcome)))
+}
+
+/// #10291 — the boot refusal for a ledger writer whose key ensure failed,
+/// computed from the error's state: a key written but not confirmed durable
+/// gets [`crate::identity::keypair::not_durable_key_refusal`] (never the
+/// "make the key directory writable" remedy, which would be false); every
+/// other cause keeps [`unsigned_ledger_refusal`].
+#[must_use]
+pub fn boot_key_refusal(agent_id: &str, e: &anyhow::Error) -> String {
+    match None::<&NotDurableReport> {
+        Some(report) => format!(
+            "{UNSIGNED_LEDGER_ISSUE}: refusing to start a ledger-writing command as \
+             `{agent_id}`: {}",
+            crate::identity::keypair::not_durable_key_refusal(report)
+        ),
+        None => unsigned_ledger_refusal(agent_id, &format!("{e:#}")),
+    }
 }
 
 /// #3354 — the refusal for a ledger-writing process whose resolved agent
@@ -2819,16 +2869,21 @@ fn signing_key_load_is_absent(err: &anyhow::Error) -> bool {
 /// - The key dir cannot be resolved.
 pub fn load_daemon_signing_key(agent_id: &str) -> Result<Option<SigningKey>> {
     let dir = crate::identity::keypair::default_key_dir()?;
+    load_daemon_signing_key_at(agent_id, &dir)
+}
+
+/// [`load_daemon_signing_key`] under `dir` (#10291).
+fn load_daemon_signing_key_at(agent_id: &str, dir: &Path) -> Result<Option<SigningKey>> {
     if !dir.exists() {
         return Ok(None);
     }
-    let kp = match crate::identity::keypair::load(agent_id, &dir) {
+    let kp = match crate::identity::keypair::load(agent_id, dir) {
         Ok(k) => k,
         Err(e) => {
             if signing_key_load_is_absent(&e) {
                 // #3354 — LOUD, never debug: a process that will write
                 // unsigned ledger rows says so once, with the fix.
-                tracing::warn!(agent_id, "{}", unsigned_ledger_warning(agent_id, &dir));
+                tracing::warn!(agent_id, "{}", unsigned_ledger_warning(agent_id, dir));
             } else {
                 tracing::warn!(
                     agent_id,

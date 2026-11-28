@@ -1109,6 +1109,113 @@ pub fn no_signing_identity_refusal(asi_hard: bool, cause: &str) -> Option<String
     ))
 }
 
+/// #10291 — the WARN a daemon logs when it signs with a key pair that is
+/// written but not confirmed durable. Built from the report, so it names
+/// exactly the files whose directory fsync failed.
+#[must_use]
+pub(crate) fn not_durable_key_warning(report: &NotDurableReport) -> String {
+    format!(
+        "identity: the signing keypair is complete on disk and this daemon signs with it, \
+         but {report}; back up the key directory, a crash before it is synced may lose \
+         this identity (#10214)"
+    )
+}
+
+/// #10291 — the `asi-hard` boot refusal for a signing key pair that is
+/// written but not confirmed durable. Built from the report; it never names
+/// the "key directory not writable" remedy, because the directory was
+/// writable and every byte is written.
+#[must_use]
+pub(crate) fn not_durable_key_refusal(report: &NotDurableReport) -> String {
+    format!(
+        "{} refuses to boot on a signing key that is not confirmed durable: {report}. The \
+         key files are complete, so nothing is lost yet, but a crash before their directory \
+         is synced could lose this identity; restart once the filesystem syncs the key \
+         directory (#10214).",
+        crate::security_profile::ASI_HARD_REFUSAL_PREFIX,
+    )
+}
+
+/// The daemon's boot-time identity under `dir`: ensure the pair, apply the
+/// posture gates and load it. Pure in `asi_hard` so the daemon wiring and its
+/// tests share one decision.
+///
+/// #10291: a pair written but not confirmed durable is the complete
+/// after-state, so outside `asi-hard` it is loaded and signs, with a WARN
+/// naming the files; under `asi-hard` boot refuses with
+/// [`not_durable_key_refusal`] (the fail-closed posture is unchanged).
+/// Every other error keeps its own arm ([`no_signing_identity_refusal`]).
+///
+/// # Errors
+/// The `asi-hard` refusals; every other failure degrades to `Ok((None, _))`.
+pub(crate) fn ensure_and_load_daemon_keypair_at(
+    dir: &Path,
+    asi_hard: bool,
+) -> Result<(Option<AgentKeypair>, Option<EnsureOutcome>)> {
+    // The `[identity].disabled` config field is not yet wired in v0.7.0; pass
+    // `false` so the helper auto-generates unless the operator pre-staged a
+    // keypair. A future config field can opt out without changing this call.
+    let (outcome, report) = match ensure_keypair(DAEMON_KEYPAIR_LABEL, dir, false).map(|o| (o, NotDurableReport::new())) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("identity: keypair auto-gen failed: {e:#}");
+            if let Some(reason) = no_signing_identity_refusal(asi_hard, &format!("{e:#}")) {
+                bail!(reason);
+            }
+            return Ok((None, None));
+        }
+    };
+    if !report.is_empty() {
+        if asi_hard {
+            bail!(not_durable_key_refusal(&report));
+        }
+        tracing::warn!(target: KEYPAIR_TRACE_TARGET, "{}", not_durable_key_warning(&report));
+    }
+    // #3147 — public-key-without-private-key is refused under `asi-hard` and
+    // WARNed (inside `ensure_keypair_reported`) under every other posture.
+    if let Some(reason) = public_only_refusal(&outcome, asi_hard) {
+        bail!(reason);
+    }
+    if matches!(outcome, EnsureOutcome::SkippedDisabled) {
+        return Ok((None, Some(outcome)));
+    }
+    let kp = match load(DAEMON_KEYPAIR_LABEL, dir) {
+        Ok(kp) if kp.can_sign() => {
+            tracing::info!(
+                "identity: loaded signing keypair for {DAEMON_KEYPAIR_LABEL} from {}",
+                dir.display()
+            );
+            Some(kp)
+        }
+        Ok(_) => {
+            // #3147 — WARN, not INFO: a lost `daemon.priv` signs nothing until
+            // an operator intervenes.
+            tracing::warn!(
+                "identity: only the PUBLIC key is on disk for {DAEMON_KEYPAIR_LABEL} in {} — \
+                 link/persona/witness signing is DISABLED and will stay disabled across \
+                 restarts. See `ai-memory doctor` -> Identity (#3147).",
+                dir.display()
+            );
+            if let Some(reason) =
+                no_signing_identity_refusal(asi_hard, "only the public key is on disk")
+            {
+                bail!(reason);
+            }
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "identity: keypair load failed for {DAEMON_KEYPAIR_LABEL}: {e:#}; link signing disabled"
+            );
+            if let Some(reason) = no_signing_identity_refusal(asi_hard, &format!("{e:#}")) {
+                bail!(reason);
+            }
+            None
+        }
+    };
+    Ok((kp, Some(outcome)))
+}
+
 /// Round-2 F12 — auto-generate a signing keypair for `agent_id` under
 /// `dir` if one does not already exist.
 ///
@@ -1127,12 +1234,33 @@ pub fn no_signing_identity_refusal(asi_hard: bool, cause: &str) -> Option<String
 /// level via `tracing` so the operator notices the new key in
 /// daemon logs. The same line is also surfaced by the F12 startup
 /// banner — see [`crate::cli::serve_banner`].
+///
+/// # Errors
+/// Every error of [`ensure_keypair_reported`], and #10214 a pair written
+/// but not confirmed durable (the typed [`NotDurableReport`]).
 pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<EnsureOutcome> {
+    let (outcome, report) = ensure_keypair_reported(agent_id, dir, disabled)?;
+    report.finish()?;
+    Ok(outcome)
+}
+
+/// #10291 — [`ensure_keypair`] with the durability reported beside the
+/// outcome, never in place of it: a pair written but not confirmed durable
+/// is the complete after-state on disk, and a caller that must keep signing
+/// acts on the outcome and reports the durability on its own.
+///
+/// # Errors
+/// The shape check, the key-directory posture, a read or a write fails.
+pub(crate) fn ensure_keypair_reported(
+    agent_id: &str,
+    dir: &Path,
+    disabled: bool,
+) -> Result<(EnsureOutcome, NotDurableReport)> {
     if disabled {
         tracing::info!(
             "identity: auto-gen disabled by config; link signing will be skipped at boot"
         );
-        return Ok(EnsureOutcome::SkippedDisabled);
+        return Ok((EnsureOutcome::SkippedDisabled, NotDurableReport::new()));
     }
     // #977 — shape-only here: `ensure_keypair` is called from the
     // daemon's own startup path (`src/daemon_runtime.rs:1760`) with
@@ -1159,7 +1287,10 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
         // Both halves present — idempotent. A daemon restart must keep the
         // operator's existing key (regenerating would silently invalidate every
         // signed link the prior key produced).
-        (true, true) => Ok(EnsureOutcome::AlreadyExists { pub_path }),
+        (true, true) => Ok((
+            EnsureOutcome::AlreadyExists { pub_path },
+            NotDurableReport::new(),
+        )),
 
         // Public half missing, private half present — SELF-HEAL. The public key
         // is a deterministic function of the private key, so re-deriving it
@@ -1194,8 +1325,7 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
             // durable is reported, never read as "not repaired".
             let mut report = NotDurableReport::new();
             report.note(durability);
-            report.finish()?;
-            Ok(EnsureOutcome::RepairedPublicFromPrivate { pub_path })
+            Ok((EnsureOutcome::RepairedPublicFromPrivate { pub_path }, report))
         }
 
         // Public half present, private half missing — DEGRADED, and NOT
@@ -1214,10 +1344,13 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
                 pub_path.display(),
                 priv_path.display(),
             );
-            Ok(EnsureOutcome::PublicOnlyDegraded {
-                pub_path,
-                priv_path,
-            })
+            Ok((
+                EnsureOutcome::PublicOnlyDegraded {
+                    pub_path,
+                    priv_path,
+                },
+                NotDurableReport::new(),
+            ))
         }
 
         // Neither half present — first run.
@@ -1227,7 +1360,11 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
 
 /// First-run branch of [`ensure_keypair`], split out so the gate above reads as
 /// a four-way state table.
-fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<EnsureOutcome> {
+fn ensure_generate(
+    agent_id: &str,
+    dir: &Path,
+    pub_path: PathBuf,
+) -> Result<(EnsureOutcome, NotDurableReport)> {
     let kp = generate(agent_id)?;
     let priv_path = agent_priv_path(dir, agent_id);
     // #3772 — CONCURRENT-GENERATE RACE. `serve`, `curator`, and one-shot CLI
@@ -1274,7 +1411,6 @@ fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<Ensu
                 write_with_mode_durable(&pub_path, &kp.public.to_bytes(), 0o644, PUBLIC_KEY_WHAT)
                     .with_context(|| writing_public_key_context(&pub_path))?,
             );
-            report.finish()?;
             // COVERAGE: tracing::info! lazy-format closure — the format args are
             //           constructed lazily; the closure body runs when the INFO
             //           subscriber is enabled. Documented per L0.7 playbook §3c.
@@ -1282,7 +1418,7 @@ fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<Ensu
                 "auto-generated identity keypair at {} — consider backing up",
                 pub_path.display()
             );
-            Ok(EnsureOutcome::Generated { pub_path })
+            Ok((EnsureOutcome::Generated { pub_path }, report))
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             // Lost the race: another caller claimed `.priv` first. Discard the
@@ -1299,7 +1435,7 @@ fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<Ensu
                 agent_id,
                 priv_path.display(),
             );
-            ensure_keypair(agent_id, dir, false)
+            ensure_keypair_reported(agent_id, dir, false)
         }
         Err(e) => {
             Err(anyhow!(e)).with_context(|| format!("claiming private key {}", priv_path.display()))
@@ -3040,3 +3176,8 @@ mod tests {
 #[cfg(test)]
 #[path = "keypair_not_durable_10254_tests.rs"]
 mod not_durable_10254_tests;
+
+// v1.0.0 #10291 — the boot-time signing identity under a failed directory fsync.
+#[cfg(test)]
+#[path = "keypair_daemon_10291_tests.rs"]
+mod daemon_10291_tests;

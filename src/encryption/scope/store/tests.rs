@@ -1393,3 +1393,50 @@ fn supersede_dir_sync_failure_finishes_the_commit_10214() {
         assert_eq!(reopened.history(NS).expect("history").len(), 2);
     }
 }
+
+/// #10214 (finding 3) — when the audit line fails after records that are
+/// written but not confirmed durable, the error keeps both: the audit
+/// failure and the report of which records are not durable.
+#[test]
+fn audit_line_failure_keeps_the_not_durable_report_10214() {
+    use crate::storage::snapshot_file::seam;
+    const NOT_DURABLE: &str = "is written but not confirmed durable";
+    const AUDIT_FAILED: &str = "opening scope-key audit log";
+    let _reset = SeamReset;
+    let stays = test_node("node-audit-10214");
+    let readers = [ReaderKek::from_keypair(&stays)];
+    let setup = |dir: &std::path::Path| {
+        let _recovery = enrol_test_recovery(dir);
+        let store = open_store(dir);
+        minted(&store, &[&stays]);
+        // Owner read-only: the audit log still reads and verifies, but the
+        // append cannot open it for writing.
+        use std::os::unix::fs::PermissionsExt as _;
+        let audit = store.audit_path(NS);
+        std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o400))
+            .expect("make the audit log read-only");
+        store
+    };
+    let dir = sandbox();
+    let store = setup(dir.path());
+    let err = store
+        .supersede(NS, &readers)
+        .expect_err("the audit line cannot be appended");
+    assert!(format!("{err:#}").contains(AUDIT_FAILED), "{err:#}");
+    assert!(!format!("{err:#}").contains(NOT_DURABLE), "clean: {err:#}");
+
+    let dir = sandbox();
+    let store = setup(dir.path());
+    seam::reset();
+    seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+    let got = store.supersede(NS, &readers);
+    seam::reset();
+    let err = got.expect_err("the audit line cannot be appended");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(AUDIT_FAILED), "the audit failure: {msg}");
+    assert!(
+        msg.starts_with("records written before the audit line failed: "),
+        "{msg}"
+    );
+    assert!(msg.contains(NOT_DURABLE), "the report survives: {msg}");
+}

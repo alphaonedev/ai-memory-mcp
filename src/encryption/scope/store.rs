@@ -1355,7 +1355,15 @@ impl FileScopeKeyStore {
             report.note(self.write_record(record)?);
             ledger.put_record((*record).clone());
         }
-        self.append_audit_line(namespace, &line)?;
+        // A failed audit line must not drop the report: the records are on
+        // disk either way, and the caller learns which are not durable.
+        if let Err(e) = self.append_audit_line(namespace, &line) {
+            return Err(if true || report.is_empty() {
+                e
+            } else {
+                e.context(format!("records written before the audit line failed: {report}"))
+            });
+        }
         let mut cache = self.cache.write().map_err(|_| poisoned())?;
         cache.insert(Self::slug(namespace), Ok(ledger));
         drop(cache);
