@@ -1911,6 +1911,83 @@ mod tests {
         );
     }
 
+    /// The `settings.json.bak.*` siblings of `path`.
+    fn install_backups_10317(path: &Path) -> Vec<PathBuf> {
+        let parent = path.parent().expect("config parent");
+        let mut found: Vec<PathBuf> = fs::read_dir(parent)
+            .expect("read config dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("settings.json.bak."))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// #10317 — a backup written but not confirmed durable (its directory
+    /// fsync fails with a real `EIO` from the seam) refuses the install with
+    /// the exact report: the original is NOT rewritten over that backup, and
+    /// the backup holds the original bytes. A clean run rewrites.
+    #[test]
+    fn install_refuses_over_a_not_durable_backup_10317() {
+        use crate::storage::snapshot_file::{NotDurable, seam};
+        const ORIGINAL: &str = "{\"keep\": true}\n";
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                seam::reset();
+            }
+        }
+        let _reset = Reset;
+
+        let mut env = TestEnv::fresh();
+        let path = config_path(&env, "settings.json");
+        seed(&path, ORIGINAL);
+        let args = args_for_apply(Target::ClaudeCode, path.clone());
+        let mut out = env.output();
+        seam::reset();
+        seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+        let got = run(&args, &mut out);
+        seam::reset();
+        let err = got.expect_err("a backup not confirmed durable refuses the rewrite");
+        let backups = install_backups_10317(&path);
+        assert_eq!(backups.len(), 1, "one backup: {backups:?}");
+        let backup = &backups[0];
+        let expected = format!(
+            "{}; refusing to write {} until its backup is durable (it is untouched)",
+            NotDurable::new(
+                "install backup",
+                backup,
+                path.parent().expect("config parent"),
+                std::io::Error::from_raw_os_error(libc::EIO),
+            ),
+            path.display()
+        );
+        assert_eq!(format!("{err:#}"), expected);
+        assert_eq!(
+            fs::read_to_string(&path).expect("original"),
+            ORIGINAL,
+            "the original is not rewritten"
+        );
+        assert_eq!(
+            fs::read_to_string(backup).expect("backup"),
+            ORIGINAL,
+            "the backup holds the original bytes"
+        );
+
+        // A clean run over the same config rewrites it.
+        let mut out = env.output();
+        run(&args, &mut out).expect("a clean install");
+        assert_ne!(
+            fs::read_to_string(&path).expect("rewritten"),
+            ORIGINAL,
+            "a durable backup lets the rewrite proceed"
+        );
+    }
+
     // --------------------------------------------------------------
     // cursor
     // --------------------------------------------------------------
