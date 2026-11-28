@@ -3380,7 +3380,10 @@ impl TypeGraph {
     /// former stack walk (the last glob first), and the answer through each
     /// scope other than `scope` is memoised per `(scope, name)` once it does
     /// not depend on a scope still in progress (a cycle back to one), so a
-    /// glob chain is walked once, not once per lookup.
+    /// glob chain is walked once, not once per lookup. A walk that ends in
+    /// [`Supply::No`] memoises every scope it met, `scope` too, when `scope`
+    /// supplies nothing as a glob target, so a glob cycle with no
+    /// definition is walked once as well.
     fn glob_supplies(&self, scope: usize, name: &str) -> Supply {
         // Each scope met: `Some(depth)` while its frame is on the stack.
         let mut seen: BTreeMap<usize, Option<usize>> = BTreeMap::new();
@@ -3438,6 +3441,15 @@ impl TypeGraph {
                 next: self.scopes[child].glob_to.len(),
                 low: depth,
             });
+        }
+        // Every scope met supplies nothing itself and globs only scopes met
+        // or memoised `No`; when `scope` itself supplies nothing as a glob
+        // target either, each of them (and `scope`) is `No` from anywhere.
+        // Memoising them so walks a glob cycle with no definition once.
+        if self.glob_own(scope, name, false).is_none() {
+            for &s in seen.keys() {
+                self.glob_memo_put(s, name, Supply::No);
+            }
         }
         Supply::No
     }
