@@ -78,7 +78,11 @@ fn the_assert_cmd_forms_are_start_sites_and_watched_tokens_10314() {
             ));
         }
     }
-    assert!(bad.is_empty(), "#10314 assert_cmd forms:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "#10314 assert_cmd forms:\n{}",
+        bad.join("\n")
+    );
 }
 
 /// Every name that is a site by itself is renamable and a watched token, and
@@ -89,8 +93,14 @@ fn every_direct_name_is_aliased_and_watched_10314() {
         assert!(DIRECT.contains(&name), "{name} is in DIRECT (#10314)");
     }
     for name in DIRECT {
-        assert!(ALIASED.contains(name), "{name} of DIRECT is in ALIASED (#10314)");
-        assert!(WATCHED.contains(name), "{name} of DIRECT is in WATCHED (#10314)");
+        assert!(
+            ALIASED.contains(name),
+            "{name} of DIRECT is in ALIASED (#10314)"
+        );
+        assert!(
+            WATCHED.contains(name),
+            "{name} of DIRECT is in WATCHED (#10314)"
+        );
     }
 }
 

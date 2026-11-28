@@ -130,11 +130,15 @@ const SKIPPED: &[(&str, &str)] = &[
 // ---------------------------------------------------------------- B: starts
 
 /// The chokepoint and cargo-binary names that are a site wherever they appear
-/// outside a `use` or a `fn` definition.
+/// outside a `use` or a `fn` definition. `cargo_bin` and `cargo_bin_cmd` are
+/// the `assert_cmd` constructor, trait method and macros (#10314); a
+/// `Command ::` or `<alias> ::` start through `cargo_bin` is one site.
 const DIRECT: &[&str] = &[
     "audited_command",
     "audited_tokio_command",
     "CommandCargoExt",
+    "cargo_bin",
+    "cargo_bin_cmd",
 ];
 
 /// Names whose renaming with `as` is a site (an alias hides later calls).
@@ -145,6 +149,8 @@ const ALIASED: &[&str] = &[
     "audited_command",
     "audited_tokio_command",
     "CommandCargoExt",
+    "cargo_bin",
+    "cargo_bin_cmd",
 ];
 
 /// The refusal for a site with no silence attribute in reach.
@@ -220,7 +226,7 @@ const START_ROWS: &[(&str, usize)] = &[
     ("tests/cli_stopper_anchor_race_4044.rs", 1),
     ("tests/cli_store_sign_unbound_3409.rs", 1),
     ("tests/cli_verify_chain.rs", 1),
-    ("tests/cli_write_verb_pg_refuse_ceiling_2572.rs", 1),
+    ("tests/cli_write_verb_pg_refuse_ceiling_2572.rs", 3),
     ("tests/common/mcp_stdio_child.rs", 1),
     ("tests/common/tls_serve.rs", 1),
     ("tests/config_auto_tag_endpoint_3808_3819.rs", 2),
@@ -310,12 +316,12 @@ const START_ROWS: &[(&str, usize)] = &[
     ("tests/skill_promote_visibility_3551/mod.rs", 1),
     ("tests/skill_test.rs", 1),
     ("tests/spawn_audit_gate_1937.rs", 1),
-    ("tests/spawn_gate_pins_10176.rs", 9),
+    ("tests/spawn_gate_pins_10176.rs", 10),
     ("tests/sqlite_write_txn_immediate_gate_5084.rs", 1),
     ("tests/stop_signal_8193.rs", 1),
     ("tests/store_url_ambiguous_userinfo_6096.rs", 2),
-    ("tests/store_url_fail_closed_2679.rs", 2),
-    ("tests/symlink_follow_8950.rs", 1),
+    ("tests/store_url_fail_closed_2679.rs", 5),
+    ("tests/symlink_follow_8950.rs", 2),
     ("tests/tls_serve_helper_8293.rs", 1),
     ("tests/tls_verbs_3709.rs", 1),
     ("tests/toon_meta_budget_3802.rs", 1),
@@ -452,6 +458,9 @@ fn type_alias_end(toks: &[Lexed], k: usize) -> Option<usize> {
 /// Every site of the token stream.
 fn starts(toks: &[Lexed], aliases: &BTreeSet<String>, libc_names: &BTreeSet<&str>) -> Vec<Start> {
     let mut out = Vec::new();
+    // The constructor token of each `Command ::` / `<alias> ::` start: a
+    // `cargo_bin` there is the same start, never a second Direct (#10314).
+    let mut ctors: BTreeSet<usize> = BTreeSet::new();
     for k in 0..toks.len() {
         let Some(val) = ident(toks, k) else { continue };
         let line = toks[k].line;
@@ -463,8 +472,9 @@ fn starts(toks: &[Lexed], aliases: &BTreeSet<String>, libc_names: &BTreeSet<&str
         };
         if val == "Command" && is_sep(toks, j) && is_ctor(toks, j + 1) {
             push(Kind::CommandPath);
+            ctors.insert(j + 1);
         }
-        if DIRECT.contains(&val) {
+        if DIRECT.contains(&val) && !ctors.contains(&k) {
             push(Kind::Direct);
         }
         if ALIASED.contains(&val) && ident(toks, k + 1) == Some("as") {
@@ -485,6 +495,7 @@ fn starts(toks: &[Lexed], aliases: &BTreeSet<String>, libc_names: &BTreeSet<&str
         }
         if aliases.contains(val) && is_sep(toks, k + 1) && is_ctor(toks, k + 2) {
             push(Kind::AliasCall);
+            ctors.insert(k + 2);
         }
     }
     out
@@ -971,6 +982,8 @@ const WATCHED: &[&str] = &[
     "TestRunner",
     "audited_command",
     "audited_tokio_command",
+    "cargo_bin",
+    "cargo_bin_cmd",
     "libc",
     "nix",
     "process",

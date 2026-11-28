@@ -64,7 +64,8 @@ SITES_OUT = "tests/common/census_sites_10286.rs"
 
 WATCHED_SEED = frozenset({
     "Command", "CommandCargoExt", "CommandExt", "TestRunner", "audited_command",
-    "audited_tokio_command", "libc", "nix", "process", "prop", "prop_assert",
+    "audited_tokio_command", "cargo_bin", "cargo_bin_cmd", "libc", "nix", "process",
+    "prop", "prop_assert",
     "prop_assert_eq", "prop_assert_ne", "prop_assume", "prop_compose", "prop_oneof",
     "property_test", "proptest", "proptest_helper", "rusty_fork", "rusty_fork_test",
     "wait_timeout",
