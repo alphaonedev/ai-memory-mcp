@@ -9797,6 +9797,183 @@ fn pinned_entry_gone_from_live_digest_is_reported_10325() {
     assert_eq!(got, want);
 }
 
+/// #10346: the std marker traits a `NoDef` may name and still be read,
+/// written out by hand (never taken from the census under test).
+const MARKER_NAMES_10346: [&str; 5] = ["Fn", "FnMut", "FnOnce", "Send", "Sync"];
+
+/// #10346: names that hold a marker trait name as a suffix, a prefix, a
+/// substring or in another case; each is a crate name and must be unread.
+const NEAR_MARKER_NAMES_10346: [&str; 9] = [
+    "NotSend", "UnSync", "MyFnOnce", "SyncX", "Sendable", "send", "FNMUT", "Fn_", "",
+];
+
+/// #10346: a struct an item macro writes, before it gains a lock field.
+const GEN_BEFORE_10346: &str = "macro_rules! mk {\n    () => {\n        pub struct Gen {\n            v: u8,\n        }\n    };\n}\nmk!();\nstatic FORM: Gen = X;\n";
+/// #10346: the same struct after the macro gives it a lock field.
+const GEN_AFTER_10346: &str = "macro_rules! mk {\n    () => {\n        pub struct Gen {\n            v: std::sync::Mutex<u8>,\n        }\n    };\n}\nmk!();\nstatic FORM: Gen = X;\n";
+/// #10346: the digest a green run reads for `FORM: Gen` (the macro's
+/// struct is not a walked definition, so only the written type counts).
+const D_GEN_10346: &str = "type=60e23212";
+
+/// #10346: the static findings of `files` with one `FORM` row in
+/// `src/b.rs` pinned at `(digest, why)`.
+fn pinned_census_why(files: &[(&str, &str)], pin: &str, why: &str) -> Vec<StaticFinding> {
+    let b = "src/b.rs";
+    let owned: Vec<(String, String)> = files
+        .iter()
+        .map(|(p, t)| ((*p).to_string(), (*t).to_string()))
+        .collect();
+    let table = format!("{b}{FORM_ROW}");
+    let exceptions: Vec<ExceptionRow<'_>> = vec![(b, "FORM", pin, why, FORM_WHY)];
+    let tables = Tables {
+        statics: &table,
+        exceptions: &exceptions,
+        includes: &[],
+    };
+    token_census_with(&owned, &tables).0
+}
+
+/// #10346: every reason is judged by name; the expected value of each
+/// variant is written out. `NoDef` reads only for a whole marker name.
+#[test]
+fn pin_reads_is_default_deny_10346() {
+    let s = String::new;
+    let mut cases: Vec<(Why, bool)> = vec![
+        (Why::TraitObject, true),
+        (Why::OpaqueType, true),
+        (Why::MacroType(s()), false),
+        (Why::RawPointer, true),
+        (Why::Projection, false),
+        (Why::NoDef("Unknown".into()), false),
+        (Why::Glob(s()), false),
+        (Why::Ambiguous(s()), false),
+        (Why::Shadowed("Send".into()), false),
+        (Why::PathNotLanded(s()), false),
+        (Why::StdNotProven(s()), true),
+        (
+            Why::Foreign {
+                root: "tokio".into(),
+                name: "Sender".into(),
+            },
+            true,
+        ),
+        (Why::Cycle(s()), true),
+        (Why::NoValue("Out".into()), false),
+        (Why::NoValue("Send".into()), false),
+    ];
+    cases.extend(MARKER_NAMES_10346.iter().map(|n| (Why::NoDef((*n).into()), true)));
+    cases.extend(NEAR_MARKER_NAMES_10346.iter().map(|n| (Why::NoDef((*n).into()), false)));
+    let miss: Vec<String> = cases
+        .iter()
+        .filter(|(w, want)| pin_reads(w) != *want)
+        .map(|(w, want)| format!("{w:?}: got {}, want {want}", !want))
+        .collect();
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a struct an item macro writes is no walked definition, so its
+/// name is a `NoDef` the pin cannot read: the row is never taken, before
+/// or after the macro gives the struct a lock.
+#[test]
+fn item_macro_struct_gaining_a_lock_is_refused_10346() {
+    let b = "src/b.rs";
+    let want = vec![
+        r3_unres(b, 9, Why::NoDef("Gen".into())),
+        StaticFinding::ExceptionStale {
+            file: b.into(),
+            name: "FORM".into(),
+        },
+    ];
+    let mut miss = Vec::new();
+    for (id, text) in [("before", GEN_BEFORE_10346), ("after-lock", GEN_AFTER_10346)] {
+        let got = pinned_census_why(&[(b, text)], D_GEN_10346, r#"NoDef("Gen")"#);
+        if got != want {
+            miss.push(format!("{id}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a trait object over a std marker trait keeps its row: the
+/// marker name is the one `NoDef` the pin reads.
+#[test]
+fn marker_trait_object_is_read_10346() {
+    let b = "src/b.rs";
+    let digests = [
+        ("Fn", "type=1c5886dd"),
+        ("FnMut", "type=252c0bbc"),
+        ("FnOnce", "type=302fc615"),
+        ("Send", "type=52e027f4"),
+        ("Sync", "type=9e9a3104"),
+    ];
+    assert_eq!(digests.map(|(n, _)| n), MARKER_NAMES_10346);
+    let mut miss = Vec::new();
+    for (n, d) in digests {
+        let text = format!("static FORM: Box<dyn {n}> = X;\n");
+        let got = pinned_census_why(&[(b, &text)], d, "TraitObject");
+        if !got.is_empty() {
+            miss.push(format!("{n}: got {got:?}, want []"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a crate item named like a marker trait is the crate's item, so
+/// the bare name is shadowed and unread.
+#[test]
+fn crate_item_named_like_a_marker_trait_is_unread_10346() {
+    let b = "src/b.rs";
+    let mut miss = Vec::new();
+    for n in MARKER_NAMES_10346 {
+        let text = format!("pub struct {n} {{\n    v: u8,\n}}\nstatic FORM: {n} = X;\n");
+        let files = vec![(b.to_string(), text)];
+        let table = format!("{b}{FORM_ROW}");
+        let tables = Tables {
+            statics: &table,
+            exceptions: &[],
+            includes: &[],
+        };
+        let (got, _) = token_census_with(&files, &tables);
+        let want = vec![r3_unres(b, 4, Why::Shadowed(n.into()))];
+        if got != want {
+            miss.push(format!("{n}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
+/// #10346: a name that holds a marker name only as a suffix, a prefix or
+/// a substring is a crate name with no definition: unread, so its row is
+/// never taken.
+#[test]
+fn near_marker_name_is_unread_10346() {
+    let b = "src/b.rs";
+    let digests = [
+        ("NotSend", "type=8d3c35c5"),
+        ("UnSync", "type=e7013421"),
+        ("MyFnOnce", "type=cf03c668"),
+        ("SyncX", "type=3d81f351"),
+        ("Sendable", "type=855ff2e6"),
+    ];
+    let mut miss = Vec::new();
+    for (n, d) in digests {
+        let text = format!("static FORM: {n} = X;\n");
+        let why = format!("NoDef({n:?})");
+        let got = pinned_census_why(&[(b, &text)], d, &why);
+        let want = vec![
+            r3_unres(b, 1, Why::NoDef(n.into())),
+            StaticFinding::ExceptionStale {
+                file: b.into(),
+                name: "FORM".into(),
+            },
+        ];
+        if got != want {
+            miss.push(format!("{n}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert_eq!(miss, Vec::<String>::new());
+}
+
 /// #10325 (mutant X7): a type parameter that hides a type the scope
 /// itself defines is refused as shadowed.
 #[test]
