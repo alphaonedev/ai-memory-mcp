@@ -343,5 +343,69 @@ class RenameClosure10304(unittest.TestCase):
         self.assertEqual(bad, [], "#10304 worklist pushes")
 
 
+INCLUDE_START = "fn f() { std::process::Command::new(\"x\"); }\n"
+
+
+class IncludeSites10300(unittest.TestCase):
+    """#10300: every include and #[path] site of a walked file is resolved; a code
+    target is lexed whatever its extension or directory and a site that cannot be
+    resolved stops the scan with its exact line (the Rust census gives the same
+    lines, `tests/common/census_include_10300.rs`)."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+        SCRATCH.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(prefix="census-include-10300-", dir=SCRATCH)
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def tree(self, files: dict[str, str], links: dict[str, str] | None = None) -> None:
+        files = {**files, str(CENSUS): FIXTURE[str(CENSUS)]}
+        for rel, text in files.items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        for rel, to in (links or {}).items():
+            p = self.root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.symlink_to(to)
+
+    def refused(self, want: str) -> None:
+        with self.assertRaises(ValueError) as cm:
+            self.m.scan(self.root)
+        self.assertIn(want, str(cm.exception).splitlines())
+
+    def test_an_include_of_a_non_rs_file_is_lexed(self) -> None:
+        self.tree({"src/a.rs": "include!(\"gen.txt\");\n", "src/gen.txt": INCLUDE_START})
+        rows, _sites, _totals = self.m.scan(self.root)
+        self.assertIn('("src/gen.txt", 2, R_TOK_NAME),', rows)
+
+    def test_a_path_module_in_a_skipped_dir_is_lexed(self) -> None:
+        self.tree({"src/a.rs": "#[path = \"../target/m.rs\"]\nmod m;\n", "target/m.rs": INCLUDE_START})
+        rows, _sites, _totals = self.m.scan(self.root)
+        self.assertIn('("target/m.rs", 2, R_TOK_NAME),', rows)
+
+    def test_a_non_literal_argument_is_refused(self) -> None:
+        self.tree({"src/a.rs": "include!(concat!(\"b\", \".rs\"));\n"})
+        self.refused("src/a.rs:1: include! with an argument that is not one string literal; "
+                     "the census cannot resolve it (#10300)")
+
+    def test_a_target_outside_the_root_is_refused(self) -> None:
+        self.tree({"src/a.rs": "const X: &[u8] = include_bytes!(\"../../x\");\n"})
+        self.refused("src/a.rs:1: include_bytes! \"../../x\" leaves the repository root (#10300)")
+
+    def test_a_link_target_is_refused(self) -> None:
+        self.tree({"src/a.rs": "include!(\"l.rs\");\n", "src/real.txt": INCLUDE_START}, {"src/l.rs": "real.txt"})
+        self.refused("src/a.rs:1: include! \"l.rs\" names src/l.rs, a symbolic link or a path through one; "
+                     "the census never follows links (#10300)")
+
+    def test_an_include_str_target_is_a_data_candidate(self) -> None:
+        self.tree({"src/a.rs": "const X: &str = include_str!(\"d.txt\");\n", "src/d.txt": "data\n"})
+        _rows, _sites, totals = self.m.scan(self.root)
+        self.assertEqual(totals["include_data"], {("src/a.rs", "include_str!"): (1, "7b2e103513d3575000027cc3cee87521")})
+
+
 if __name__ == "__main__":
     unittest.main()
