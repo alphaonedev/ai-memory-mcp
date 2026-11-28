@@ -72,6 +72,8 @@
 
 #[path = "common/census_cargo_10289.rs"]
 mod census_cargo;
+#[path = "common/census_closure_10304.rs"]
+mod census_closure;
 #[path = "common/census_macros_10287.rs"]
 mod census_macros;
 #[path = "common/census_pins_10286.rs"]

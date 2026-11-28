@@ -278,5 +278,55 @@ class StatementPin10303(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, LINEAR_SECONDS)
 
 
+CLOSURE_TABLE = ROOT / "tests/common/census_closure_parity_10304.json"
+CLOSURE_ROWS = 25
+CHAIN_BYTES = 100_000
+CHAIN_SECONDS = 5
+CHAIN_HOPS = {
+    "use": ("a", "use a{i} as a{j};\n"),
+    "type": ("T", "type T{j} = T{i};\n"),
+    "macro": ("m", "macro_rules! m{j} {{ () => {{ m{i} }} }}\n"),
+}
+
+
+def closure_of(m, text: str, seed: list[str]) -> set[str]:
+    return m.closure(m.prepare([("t.rs", m.lex(text))]), frozenset(seed))
+
+
+class RenameClosure10304(unittest.TestCase):
+    """#10304: the rename closure is one worklist over a graph built once; the
+    same table the Rust tests in `tests/common/census_closure_10304.rs` read."""
+
+    def setUp(self) -> None:
+        self.m = scanner_module()
+
+    def test_closure_table(self) -> None:
+        rows = json.loads(CLOSURE_TABLE.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), CLOSURE_ROWS)
+        bad = []
+        for i, (text, seed, want) in enumerate(rows):
+            have = closure_of(self.m, text, seed)
+            if have != set(want):
+                bad.append(f"row {i} {text!r}: closure {sorted(have)!r}, want {sorted(want)!r}")
+        self.assertEqual(bad, [])
+
+    def test_reversed_rename_chains_are_linear(self) -> None:
+        for kind, (first, hop) in CHAIN_HOPS.items():
+            lines: list[str] = []
+            size = 0
+            while size < CHAIN_BYTES:
+                i = len(lines)
+                lines.append(hop.format(i=i, j=i + 1))
+                size += len(lines[-1])
+            hops = len(lines)
+            text = "".join(reversed(lines))
+            t0 = time.monotonic()
+            got = closure_of(self.m, text, [f"{first}0"])
+            dt = time.monotonic() - t0
+            self.assertEqual(len(got), hops + 1, kind)
+            self.assertIn(f"{first}{hops}", got, kind)
+            self.assertLess(dt, CHAIN_SECONDS, f"reversed {kind} chain of {hops} hops took {dt:.1f} s (#10304)")
+
+
 if __name__ == "__main__":
     unittest.main()

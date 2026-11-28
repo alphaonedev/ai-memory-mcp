@@ -355,6 +355,25 @@ pub(crate) fn closure(files: &[Prep<'_>], seed: &[&str]) -> BTreeSet<String> {
     }
 }
 
+/// #10304: the old fixpoint, kept as the oracle of the closure tests: each
+/// pass adds the names bound to the names of the pass before, so a chain of
+/// `n` renames takes `n` passes.
+#[cfg(test)]
+pub(crate) fn closure_fixpoint(files: &[Prep<'_>], seed: &[&str]) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = seed.iter().map(|s| (*s).to_string()).collect();
+    loop {
+        let mut add = BTreeSet::new();
+        for p in files {
+            bound_in(p, &names, &mut add);
+        }
+        let before = names.len();
+        names.extend(add);
+        if names.len() == before {
+            return names;
+        }
+    }
+}
+
 #[expect(
     clippy::many_single_char_names,
     reason = "token-walk indices (p, t, n, k, e) follow the lexer convention of every census scan"
