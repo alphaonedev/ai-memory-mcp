@@ -90,7 +90,7 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 
 use super::connection::NoWaitWriteTxn;
-use crate::models::GovernedAction;
+use crate::models::namespace::GovernedAction;
 
 /// One escalation routing deferred to the caller's open write transaction.
 #[derive(Debug, Clone)]
