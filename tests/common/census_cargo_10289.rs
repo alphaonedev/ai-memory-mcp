@@ -168,22 +168,21 @@ impl Parser<'_> {
         let mut parts = Vec::new();
         loop {
             self.ws();
-            let part = match self.peek() {
-                Some('"' | '\'') => self.string()?,
-                _ => {
-                    let mut b = String::new();
-                    while let Some(c) = self
-                        .peek()
-                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                    {
-                        b.push(c);
-                        self.bump();
-                    }
-                    if b.is_empty() {
-                        return Err(self.err("an empty or unreadable key"));
-                    }
-                    b
+            let part = if let Some('"' | '\'') = self.peek() {
+                self.string()?
+            } else {
+                let mut b = String::new();
+                while let Some(c) = self
+                    .peek()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                {
+                    b.push(c);
+                    self.bump();
                 }
+                if b.is_empty() {
+                    return Err(self.err("an empty or unreadable key"));
+                }
+                b
             };
             parts.push(part);
             self.ws();
@@ -293,7 +292,7 @@ impl Parser<'_> {
                         return Err(format!("line {line}: an unclosed table header"));
                     }
                 }
-                table = k.clone();
+                table.clone_from(&k);
                 if array {
                     let n = arrays.entry(k).or_insert(0);
                     table.push(format!("#{n}"));

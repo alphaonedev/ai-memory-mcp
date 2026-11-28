@@ -10,6 +10,12 @@ use super::*;
 use std::fmt::Write as _;
 
 /// The sites of one file, with the closures of that file alone.
+/// No finding lines: the expected value of a clean scan.
+const NONE: [String; 0] = [];
+
+/// One expected site: `(kind, line, what)`.
+type SiteWant<'a> = (&'a str, usize, &'a str);
+
 fn sites(text: &str) -> Vec<census_pins::Site> {
     let toks = lex(text);
     let prep = Prep::new(&toks);
@@ -62,7 +68,7 @@ fn a_swap_that_keeps_the_count_is_red_by_its_site_pin_10286() {
         vec![site_pin(rel, 0, 2, "process", ABORT_PIN, EXIT_PIN)]
     );
     let row_b = [ABORT_PIN];
-    assert!(census_pins::site_findings(rel, &b, Some(&row_b)).is_empty());
+    assert_eq!(census_pins::site_findings(rel, &b, Some(&row_b)), NONE);
     assert_eq!(
         census_pins::site_findings(rel, &b, None),
         vec![
@@ -96,7 +102,7 @@ fn a_bad_stale_or_unsorted_site_row_is_red_10286() {
         ]
     );
     let sorted: &[(&str, &[&str])] = &[("a.rs", good), ("b.rs", good)];
-    assert!(census_pins::site_table_findings(sorted, &have).is_empty());
+    assert_eq!(census_pins::site_table_findings(sorted, &have), NONE);
 }
 
 #[test]
@@ -106,7 +112,7 @@ fn every_env_reach_form_is_a_pinned_site_10286() {
     // imported by name, each with a run-time-built name.
     let n3 = "use std::env as e;\nfn f() {\n    e::set_var(format!(\"{}{}\", \"PROP\", \"TEST_FORK\"), \"true\");\n}\n";
     let n3b = "use std::env::set_var;\nfn f() {\n    set_var(format!(\"{}{}\", \"PROP\", \"TEST_FORK\"), \"true\");\n}\n";
-    let rows: &[(&str, &[(&str, usize, &str)])] = &[
+    let rows: &[(&str, &[SiteWant])] = &[
         (
             n3,
             &[
@@ -254,7 +260,7 @@ fn a_wrong_stale_unknown_or_reasonless_macro_row_is_red_10287() {
     );
     let good: &[(&str, &str, usize, &str)] =
         &[("a.rs", "$m!", 2, why), ("b.rs", "hot-arg", 1, why)];
-    assert!(census_macros::macro_findings(&have, good).is_empty());
+    assert_eq!(census_macros::macro_findings(&have, good), NONE);
 }
 
 #[test]
@@ -402,7 +408,7 @@ fn the_round_four_scans_are_linear_on_large_input_10286() {
     let got = r4_fixture("src/big4.rs", &text);
     let found = census_cargo::manifest_findings("Cargo.toml", toml.as_bytes());
     let dt = t0.elapsed();
-    assert!(found.is_empty());
+    assert_eq!(found, NONE);
     assert_eq!(
         got.iter().filter(|l| l.ends_with("(#10287)")).count(),
         24_000,

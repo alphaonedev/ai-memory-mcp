@@ -275,6 +275,10 @@ fn is_sep(t: &[Lexed], k: usize) -> bool {
 }
 
 /// Every macro form of one file, `(form, line)`, in token order.
+#[expect(
+    clippy::many_single_char_names,
+    reason = "token-walk indices (p, t, n, k, e) follow the lexer convention of every census scan"
+)]
 pub(crate) fn macro_forms(p: &Prep<'_>, hot: &BTreeSet<String>) -> Vec<(&'static str, usize)> {
     let t = p.toks;
     let n = t.len();

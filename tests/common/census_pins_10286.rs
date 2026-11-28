@@ -157,10 +157,10 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bits.to_be_bytes());
     let mut h = H0;
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (slot, b) in w.iter_mut().zip(chunk.chunks_exact(4)) {
-            *slot = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        for (slot, b) in w.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *slot = u32::from_be_bytes(*b);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -198,8 +198,8 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
         }
     }
     let mut out = [0u8; 32];
-    for (dst, word) in out.chunks_exact_mut(4).zip(h) {
-        dst.copy_from_slice(&word.to_be_bytes());
+    for (dst, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
+        *dst = word.to_be_bytes();
     }
     out
 }
@@ -345,10 +345,14 @@ pub(crate) fn closure(files: &[Prep<'_>], seed: &[&str]) -> BTreeSet<String> {
     }
 }
 
+#[expect(
+    clippy::many_single_char_names,
+    reason = "token-walk indices (p, t, n, k, e) follow the lexer convention of every census scan"
+)]
 fn bound_in(p: &Prep<'_>, names: &BTreeSet<String>, add: &mut BTreeSet<String>) {
     let t = p.toks;
     let n = t.len();
-    let named = named_prefix(t, names);
+    let prefixed = named_prefix(t, names);
     let mut use_until = 0usize;
     for k in 0..n {
         match ident_at(t, k) {
@@ -387,7 +391,7 @@ fn bound_in(p: &Prep<'_>, names: &BTreeSet<String>, add: &mut BTreeSet<String>) 
                     continue;
                 };
                 let e = p.stop[k + 1];
-                if e > k + 2 && named[e] > named[k + 2] {
+                if e > k + 2 && prefixed[e] > prefixed[k + 2] {
                     add.insert(y.to_string());
                 }
             }
@@ -400,7 +404,7 @@ fn bound_in(p: &Prep<'_>, names: &BTreeSet<String>, add: &mut BTreeSet<String>) 
                     Some(c) => c,
                     None => open,
                 };
-                if named[end.min(n)] > named[open.min(n)] {
+                if prefixed[end.min(n)] > prefixed[open.min(n)] {
                     add.insert(y.to_string());
                 }
             }
@@ -414,6 +418,10 @@ fn bound_in(p: &Prep<'_>, names: &BTreeSet<String>, add: &mut BTreeSet<String>) 
 /// Every form of one file the census does not model, `(kind, line)`; linear
 /// (an impl header is read at most [`IMPL_CAP`] tokens, and a longer one
 /// counts as an impl form).
+#[expect(
+    clippy::many_single_char_names,
+    reason = "token-walk indices (p, t, n, k, e) follow the lexer convention of every census scan"
+)]
 pub(crate) fn shapes_of(p: &Prep<'_>, watched: &BTreeSet<String>) -> Vec<(&'static str, usize)> {
     let t = p.toks;
     let n = t.len();
@@ -563,9 +571,9 @@ pub(crate) fn env_calls(p: &Prep<'_>, env_fns: &BTreeSet<String>) -> Vec<EnvCall
             continue;
         }
         let dot = is_p_before(t, k, '.');
-        let (open, always) = if call && is_fn && !after_fn {
-            (Some(k + 1), false)
-        } else if matches!(v, "env" | "env_remove") && dot && call {
+        let (open, always) = if (call && is_fn && !after_fn)
+            || (matches!(v, "env" | "env_remove") && dot && call)
+        {
             (Some(k + 1), false)
         } else if v == "envs" && dot && call {
             (Some(k + 1), true)
