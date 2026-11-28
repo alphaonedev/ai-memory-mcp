@@ -8594,7 +8594,9 @@ fn names_resolve_in_their_own_scope_10293() {
 
 /// #10293: invented forms of the scoped-resolution class: std globs, rename
 /// chains, use cycles, fn-body and module scopes, aliases, nested groups,
-/// `#[path]` modules, generic aliases and the binary's own crate root.
+/// `#[path]` modules, generic aliases, the binary's own crate root, a glob
+/// prefix met while settling, a projection off a type, a module named as a
+/// type, `super` above the root and the crate name with no library walked.
 #[test]
 fn invented_scope_forms_are_judged_10293() {
     let b = "src/b.rs";
@@ -8753,6 +8755,45 @@ fn invented_scope_forms_are_judged_10293() {
                 (b, "static FORM: crate::c::Inner = X;\n"),
             ],
             vec![r3_lock(b, 1)],
+            None,
+        ),
+        (
+            // A glob's prefix is looked up while globs are being settled,
+            // when any glob may still supply it, so it stays unknown.
+            "I16-glob-prefix-met-while-settling",
+            vec![
+                ("src/a.rs", "pub struct Other;\n"),
+                (b, "use ai_memory::a::*;\nstatic FORM: Plain = X;\n"),
+            ],
+            vec![r3_unres(b, 2, Why::Glob("Plain".into()))],
+            None,
+        ),
+        (
+            "I17-path-runs-on-past-a-type",
+            vec![twin_a, (b, "static FORM: crate::a::Plain::Inner = X;\n")],
+            vec![r3_unres(b, 1, Why::Projection)],
+            None,
+        ),
+        (
+            "I18-module-named-as-a-type",
+            vec![twin_a, (b, "static FORM: crate::a = X;\n")],
+            vec![r3_unres(b, 1, Why::PathNotLanded("a".into()))],
+            None,
+        ),
+        (
+            "I19-super-above-the-crate-root",
+            vec![(b, "static FORM: super::super::Thing = X;\n")],
+            vec![r3_unres(b, 1, Why::PathNotLanded("super".into()))],
+            None,
+        ),
+        (
+            "I20-crate-name-with-no-library-walked",
+            vec![("tests/t.rs", "static FORM: ai_memory::Thing = X;\n")],
+            vec![r3_unres(
+                "tests/t.rs",
+                1,
+                Why::PathNotLanded("ai_memory".into()),
+            )],
             None,
         ),
     ];
