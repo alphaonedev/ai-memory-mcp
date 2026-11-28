@@ -150,13 +150,14 @@ class CensusRows10286(unittest.TestCase):
             p.parent.mkdir(exist_ok=True)
             p.write_text("x = 1\n" if rel.endswith("toml") else "fn h() {}\n", encoding="utf-8")
             p.chmod(0)
-            self.addCleanup(p.chmod, 0o644)
-            r = self.check()
+            try:
+                r = self.check()
+            finally:
+                p.chmod(0o644)
+                p.unlink()
             self.assertEqual(r.returncode, EXIT_SCAN, rel)
             self.assertEqual(r.stderr.strip(), f"census_rows_10286: scan failed: {exp}: unreadable "
                              "(Permission denied)")
-            p.chmod(0o644)
-            p.unlink()
 
     def test_a_symlink_in_the_tree_fails_the_scan_10315(self) -> None:
         (self.root / "src/l.rs").symlink_to("clean.rs")
@@ -173,6 +174,14 @@ class CensusRows10286(unittest.TestCase):
         self.assertEqual(r.stderr.strip(), "census_rows_10286: scan failed: notes.txt: a symbolic link; "
                          "the census never follows links (#10176)\nsrc/d: a symbolic link; "
                          "the census never follows links (#10176)")
+
+    def test_the_source_walk_refuses_a_link_by_itself_10315(self) -> None:
+        # Both walks report a link, so the CLI test cannot tell them apart.
+        m = scanner_module()
+        (self.root / "src/l.rs").symlink_to("clean.rs")
+        with self.assertRaises(ValueError) as cm:
+            m.tree_rs(self.root)
+        self.assertEqual(str(cm.exception), "src/l.rs: a symbolic link; the census never follows links (#10176)")
 
     def test_the_config_walk_refuses_a_link_10315(self) -> None:
         m = scanner_module()

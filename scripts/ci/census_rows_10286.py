@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import errno
 import hashlib
 import os
 import pathlib
@@ -878,20 +879,54 @@ def sites_of(t: list[Tok], watched: set[str], env_names: set[str], env_fns: set[
 # ---------------------------------------------------------------- tree
 
 
-def tree_rs(root: pathlib.Path) -> list[tuple[str, str]]:
-    """(relative path, text) of every regular .rs file outside SKIPPED; links not followed."""
+LINK_FINDING = "a symbolic link; the census never follows links (#10176)"
+
+
+def read_scanned(root: pathlib.Path, rel: str) -> bytes:
+    """The bytes of a file of the walk, opened with no link followed; ValueError
+    naming the relative path and the cause otherwise."""
+    try:
+        fd = os.open(root / rel, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as f:
+            return f.read()
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ValueError(f"{rel}: {LINK_FINDING}") from e
+        raise ValueError(f"{rel}: unreadable ({e.strerror or e})") from e
+
+
+def tree_rs(root: pathlib.Path, found: list[str] | None = None) -> list[tuple[str, str]]:
+    """(relative path, text) of every regular .rs file outside SKIPPED. A link
+    anywhere in the walk is a finding, as in the Rust census; every failure
+    names the relative path and the cause. The findings go to `found` when
+    given, else ValueError (one finding per line)."""
     out = []
+    errors = [] if found is None else found
     stack = [root]
     while stack:
         d = stack.pop()
-        for p in sorted(d.iterdir()):
+        try:
+            entries = sorted(d.iterdir())
+        except OSError as e:
+            errors.append(f"{d.relative_to(root).as_posix()}: unreadable ({e.strerror or e})")
+            continue
+        for p in entries:
             rel = p.relative_to(root).as_posix()
-            if rel in SKIPPED or p.is_symlink():
+            if rel in SKIPPED:
                 continue
-            if p.is_dir():
+            if p.is_symlink():
+                errors.append(f"{rel}: {LINK_FINDING}")
+            elif p.is_dir():
                 stack.append(p)
             elif p.is_file() and p.suffix.lower() == ".rs":
-                out.append((rel, p.read_bytes().decode("utf-8")))
+                try:
+                    out.append((rel, read_scanned(root, rel).decode("utf-8")))
+                except UnicodeDecodeError as e:
+                    errors.append(f"{rel}: not UTF-8 ({e.reason}); the census cannot read it (#10176)")
+                except ValueError as e:
+                    errors.append(str(e))
+    if errors and found is None:
+        raise ValueError("\n".join(sorted(errors)))
     return sorted(out)
 
 
@@ -1007,20 +1042,35 @@ def config_findings(rel: str, data: bytes) -> list[str]:
     return sorted(out)
 
 
-def tree_configs(root: pathlib.Path) -> list[tuple[str, bytes]]:
-    """(relative path, bytes) of every regular cargo config file outside SKIPPED; links not followed."""
+def tree_configs(root: pathlib.Path, found: list[str] | None = None) -> list[tuple[str, bytes]]:
+    """(relative path, bytes) of every regular cargo config file outside SKIPPED.
+    A link anywhere in the walk is a finding and every failure names the
+    relative path and the cause, as in `tree_rs`."""
     out = []
+    errors = [] if found is None else found
     stack = [root]
     while stack:
         d = stack.pop()
-        for p in sorted(d.iterdir()):
+        try:
+            entries = sorted(d.iterdir())
+        except OSError as e:
+            errors.append(f"{d.relative_to(root).as_posix()}: unreadable ({e.strerror or e})")
+            continue
+        for p in entries:
             rel = p.relative_to(root).as_posix()
-            if rel in SKIPPED or p.is_symlink():
+            if rel in SKIPPED:
                 continue
-            if p.is_dir():
+            if p.is_symlink():
+                errors.append(f"{rel}: {LINK_FINDING}")
+            elif p.is_dir():
                 stack.append(p)
             elif p.is_file() and is_config(rel):
-                out.append((rel, p.read_bytes()))
+                try:
+                    out.append((rel, read_scanned(root, rel)))
+                except ValueError as e:
+                    errors.append(str(e))
+    if errors and found is None:
+        raise ValueError("\n".join(sorted(errors)))
     return sorted(out)
 
 
@@ -1295,13 +1345,15 @@ def table(name: str, doc: str, items: dict[str, int], reason: dict[str, str]) ->
 def scan(root: pathlib.Path) -> tuple[str, str, dict[str, int]]:
     """The two generated files' text and a few totals."""
     starts = start_files((root / CENSUS).read_text(encoding="utf-8"))
-    config_errors = [f for rel, data in tree_configs(root) for f in config_findings(rel, data)]
+    walk_errors: list[str] = []
+    config_errors = [f for rel, data in tree_configs(root, walk_errors) for f in config_findings(rel, data)]
+    lexed = [(rel, lex(text)) for rel, text in tree_rs(root, walk_errors)]
+    walk_errors = sorted(set(walk_errors))
     if config_errors:
-        raise ValueError("\n".join(config_errors))
-    lexed = [(rel, lex(text)) for rel, text in tree_rs(root)]
+        raise ValueError("\n".join(config_errors + walk_errors))
     include_sites_all, include_errors = join_includes(root, lexed)
-    if include_errors:
-        raise ValueError("\n".join(include_errors))
+    if walk_errors or include_errors:
+        raise ValueError("\n".join(walk_errors + include_errors))
     prepared = prepare(lexed)
     graph = RenameGraph(prepared)
     watched = graph.reach(WATCHED_SEED)
@@ -1376,6 +1428,24 @@ def first_diff(a: str, b: str) -> str:
     return f"line {min(len(al), len(bl)) + 1}: committed has {len(al)} lines, scan has {len(bl)}"
 
 
+def write_table(root: pathlib.Path, rel: str, text: str) -> None:
+    """Write one generated table: the parent directory must resolve inside the
+    root and the file is opened with no link followed, so no write goes through
+    a link or outside the root; ValueError naming the path otherwise."""
+    top = root.resolve()
+    parent = (root / rel).parent.resolve()
+    if parent != top and top not in parent.parents:
+        raise ValueError(f"{rel}: resolves outside the root; the census never writes there (#10176)")
+    try:
+        fd = os.open(root / rel, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ValueError(f"{rel}: {LINK_FINDING}") from e
+        raise ValueError(f"{rel}: not writable ({e.strerror or e})") from e
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = ap.add_mutually_exclusive_group(required=True)
@@ -1394,15 +1464,24 @@ def main(argv: list[str] | None = None) -> int:
         print(" ".join(f"{k}={v}" for k, v in totals.items()))
     want = {ROWS_OUT: rows, SITES_OUT: sites}
     if a.write:
-        for rel, text in want.items():
-            (root / rel).write_text(text, encoding="utf-8")
+        try:
+            for rel, text in want.items():
+                write_table(root, rel, text)
+        except ValueError as e:
+            print(f"census_rows_10286: write failed: {e}", file=sys.stderr)
+            return 2
         return 0
     bad = 0
     for rel, text in want.items():
         try:
-            have = (root / rel).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as e:
-            print(f"census_rows_10286: {rel}: unreadable ({e})", file=sys.stderr)
+            have = read_scanned(root, rel).decode("utf-8")
+        except UnicodeDecodeError as e:
+            print(f"census_rows_10286: {rel}: not UTF-8 ({e.reason}); the census cannot read it (#10176)",
+                  file=sys.stderr)
+            bad += 1
+            continue
+        except ValueError as e:
+            print(f"census_rows_10286: {e}", file=sys.stderr)
             bad += 1
             continue
         if have != text:
