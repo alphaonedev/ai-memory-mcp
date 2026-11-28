@@ -2076,6 +2076,11 @@ enum Why {
     Projection,
     /// A crate type name with no definition in the walked tree.
     NoDef(String),
+    /// #10356: a name that is, as a whole, one of [`STD_MARKER_TRAITS`],
+    /// has no walked definition and is written in bound position (right
+    /// after `dyn`, `impl`, `+` or `?`), so it names the std trait. The only
+    /// no-definition name the pin reads.
+    MarkerBound(String),
     /// #10294: a name reached only through a glob import (`use x::*`),
     /// of this crate or another: what it names is not read.
     Glob(String),
@@ -2391,8 +2396,14 @@ enum Atom {
     /// A form that names no knowable type.
     Unres(Why),
     /// #10293: a path as written, resolved later through the scope that
-    /// wrote it; `global` when it starts with a leading `::`.
-    Path { segs: Vec<String>, global: bool },
+    /// wrote it; `global` when it starts with a leading `::`. #10356:
+    /// `bound` when it is written in bound position (right after `dyn`,
+    /// `impl`, `+` or `?`), where a name can only be a trait.
+    Path {
+        segs: Vec<String>,
+        global: bool,
+        bound: bool,
+    },
     /// #10293: a single-segment name of a generic parameter in scope.
     Param(String),
 }
@@ -2515,9 +2526,18 @@ fn type_atoms(
                             && colon2(i - 2)
                             && (i < 3 || !matches!(t[i - 3].kind, TokKind::Ident))
                             && (i < 3 || !is_p(t, i - 3, ">"));
+                        // #10356: a bound position is right after `dyn`,
+                        // `impl`, `+` or `?`; anywhere else the path is in
+                        // type position.
+                        let bound = i >= 1
+                            && (is_w(t, i - 1, "dyn")
+                                || is_w(t, i - 1, "impl")
+                                || is_p(t, i - 1, "+")
+                                || is_p(t, i - 1, "?"));
                         out.push(Atom::Path {
                             segs: (i..=j).step_by(3).map(|x| t[x].text.clone()).collect(),
                             global,
+                            bound,
                         });
                     }
                     i = j + 1;
@@ -3756,9 +3776,23 @@ impl TypeGraph {
                     Ok(Res::Clean)
                 }
             }
-            Atom::Path { segs, global } => {
+            Atom::Path {
+                segs,
+                global,
+                bound,
+            } => {
                 let last = segs.last().cloned().unwrap_or_default();
                 match self.resolve(scope, segs, *global) {
+                    // #10356: a marker-trait name with no walked definition,
+                    // written in bound position, is that trait; the pin
+                    // judges it as `MarkerBound`. In type position it stays
+                    // `NoDef`: a crate type the walk cannot see (an item
+                    // macro's `struct Send`), which the pin never reads.
+                    Target::Done(Res::Unres(Why::NoDef(name)))
+                        if *bound && is_std_marker(&name) =>
+                    {
+                        Ok(Res::Unres(Why::MarkerBound(name)))
+                    }
                     Target::Node(n) => Err(n),
                     Target::Scope(_) => Ok(Res::Unres(Why::PathNotLanded(last))),
                     Target::Std(name) | Target::Foreign { name, .. }
@@ -3915,12 +3949,16 @@ fn why_text(why: &Why) -> String {
 /// variant is named in an arm and there is no wildcard, so a new reason must
 /// be judged here. #10346: default deny. A name with no walked definition
 /// (`NoDef`: an item a macro writes, a missing file) and an associated
-/// type with no value (`NoValue`) are not read, except a `NoDef` that is
-/// as a whole a std marker trait (a crate item of that name is
-/// `Shadowed`, see `TypeGraph::hop`).
+/// type with no value (`NoValue`) are not read. #10356: the one exception
+/// is `MarkerBound`, a whole std marker trait name in bound position (a
+/// crate item of that name in reach is `Shadowed`, see `TypeGraph::hop`;
+/// the same name in type position is a crate type and stays `NoDef`).
 fn pin_reads(why: &Why) -> bool {
     match why {
-        Why::NoDef(name) => is_std_marker(name),
+        // #10356: by position, then by whole name. A `NoDef` is a crate
+        // type the walk cannot see, whatever its name.
+        Why::MarkerBound(name) => is_std_marker(name),
+        Why::NoDef(_) => false,
         Why::TraitObject
         | Why::OpaqueType
         | Why::RawPointer
@@ -10114,16 +10152,24 @@ fn pin_reads_is_default_deny_10346() {
         (Why::MacroFragment("$t".into()), false),
         (Why::MacroFragment(s()), false),
     ];
+    // #10356: a marker name reads only in bound position (`MarkerBound`);
+    // as a `NoDef` (type position) it is a crate type and never reads.
     cases.extend(
         MARKER_NAMES_10346
             .iter()
-            .map(|n| (Why::NoDef((*n).into()), true)),
+            .map(|n| (Why::MarkerBound((*n).into()), true)),
     );
     cases.extend(
-        NEAR_MARKER_NAMES_10346
+        MARKER_NAMES_10346
             .iter()
             .map(|n| (Why::NoDef((*n).into()), false)),
     );
+    cases.extend(NEAR_MARKER_NAMES_10346.iter().flat_map(|n| {
+        [
+            (Why::NoDef((*n).into()), false),
+            (Why::MarkerBound((*n).into()), false),
+        ]
+    }));
     let miss: Vec<String> = cases
         .iter()
         .filter(|(w, want)| pin_reads(w) != *want)
