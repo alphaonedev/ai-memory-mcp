@@ -233,3 +233,46 @@ fn create_and_claim_dir_sync_failure_is_not_durable_10265() {
         );
     }
 }
+
+/// The head of the context a later error carries (#10310; written out here,
+/// not taken from the code under test).
+const WRITTEN_BEFORE_10310: &str = "files written before this error are kept on disk";
+
+/// #10310 — `ensure_generate`: the `.priv` claim is written but not
+/// confirmed durable, then the `.pub` write fails. The error names both, the
+/// claimed `.priv` stays, and the error never reads as written-but-not-durable.
+#[test]
+fn pub_failure_keeps_priv_claim_report_10310() {
+    let _reset = SeamReset;
+    let agent = "agent-10310-generate";
+    let dir = TempDir::new().expect("tempdir");
+    let pub_path = agent_pub_path(dir.path(), agent);
+    std::fs::create_dir(&pub_path).expect("the blocking directory");
+    seam::reset();
+    seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+    let err = ensure_generate(agent, dir.path(), pub_path.clone())
+        .err()
+        .expect("a .pub name that is a directory fails the generate");
+    seam::reset();
+    let priv_path = agent_priv_path(dir.path(), agent);
+    let mut report = NotDurableReport::new();
+    report.note(Durability::NotDurable(NotDurable::new(
+        "private key",
+        &priv_path,
+        dir.path(),
+        io::Error::from_raw_os_error(libc::EIO),
+    )));
+    let later: Vec<String> = err.chain().skip(1).map(ToString::to_string).collect();
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "{WRITTEN_BEFORE_10310}: {report}: writing public key {}: {}",
+            pub_path.display(),
+            io::Error::from_raw_os_error(libc::EISDIR)
+        ),
+        "later layers: {later:?}"
+    );
+    assert!(priv_path.is_file(), "the claimed .priv is kept");
+    assert!(err.downcast_ref::<NotDurableReport>().is_none(), "{err:#}");
+    assert!(err.downcast_ref::<NotDurable>().is_none(), "{err:#}");
+}

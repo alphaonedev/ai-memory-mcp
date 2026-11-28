@@ -2029,3 +2029,9 @@ mod tests {
         );
     }
 }
+
+// v1.0.0 #10310 — a later error keeps the durability report of the files
+// written before it.
+#[cfg(test)]
+#[path = "tls_bootstrap_not_durable_10310_tests.rs"]
+mod not_durable_10310_tests;
