@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
+use ai_memory::identity::pubkey_bind::StorageAuthRefusal;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tempfile::{NamedTempFile, TempDir};
@@ -1474,6 +1475,29 @@ async fn postgres_genesis_after_bind_succeeds_and_preserves_agent_row_10196() {
     );
 }
 
+type HistRow = (i64, String, String, String, Option<String>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct AttestRowSnap {
+    id: i64,
+    table_name: String,
+    row_key: Vec<u8>,
+    seq: i64,
+    op: String,
+    row_digest: Option<Vec<u8>>,
+    prior_digest: Vec<u8>,
+    agent_id: String,
+    key_id: String,
+    attested_at: String,
+    format_version: i64,
+    covered_columns: String,
+    store_id: String,
+    table_seq: i64,
+    table_acc: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    attestation_digest: Vec<u8>,
+}
+
 /// #10228 / #10109 (SQLite armed twin): arm the SQLite store with real
 /// `row_attest::sqlite::arm_with_key` (signed cutovers + signed baseline for
 /// `_agents` + live TEMP triggers), then verify admin same-key rebind (200),
@@ -1484,7 +1508,7 @@ async fn postgres_genesis_after_bind_succeeds_and_preserves_agent_row_10196() {
 #[tokio::test]
 async fn sqlite_armed_bind_matrix_admin_and_non_admin_10109() {
     let _dir = fresh_dir();
-    let (mut state, file) = build_app_fixture();
+    let (state, file) = build_app_fixture();
     let non_admin_caller = "ai:non-admin-sqlite-10109";
     let non_admin_key_fixture = "fixture-non-admin-sqlite-10109";
     state.enrolled_agent_keys.mutate(|m| {
@@ -1584,27 +1608,6 @@ async fn sqlite_armed_bind_matrix_admin_and_non_admin_10109() {
     });
     let router = router_for_state(armed_state);
 
-    type HistRow = (i64, String, String, String, Option<String>);
-    #[derive(Debug, PartialEq, Eq)]
-    struct AttestRowSnap {
-        id: i64,
-        table_name: String,
-        row_key: Vec<u8>,
-        seq: i64,
-        op: String,
-        row_digest: Option<Vec<u8>>,
-        prior_digest: Vec<u8>,
-        agent_id: String,
-        key_id: String,
-        attested_at: String,
-        format_version: i64,
-        covered_columns: String,
-        store_id: String,
-        table_seq: i64,
-        table_acc: Vec<u8>,
-        signature: Option<Vec<u8>>,
-        attestation_digest: Vec<u8>,
-    }
     let snap = || -> ((String, String, String), Vec<HistRow>, i64, Vec<AttestRowSnap>) {
         let ro = rusqlite::Connection::open_with_flags(
             &db_path,
@@ -1927,31 +1930,10 @@ async fn postgres_armed_bind_matrix_admin_and_non_admin_10109() {
         .expect("seed signed row_attestations entry on PG");
     }
 
-    type PgHistRow = (i64, String, String, String, Option<String>);
-    #[derive(Debug, PartialEq, Eq)]
-    struct PgAttestRowSnap {
-        id: i64,
-        table_name: String,
-        row_key: Vec<u8>,
-        seq: i64,
-        op: String,
-        row_digest: Option<Vec<u8>>,
-        prior_digest: Vec<u8>,
-        agent_id: String,
-        key_id: String,
-        attested_at: String,
-        format_version: i64,
-        covered_columns: String,
-        store_id: String,
-        table_seq: i64,
-        table_acc: Vec<u8>,
-        signature: Option<Vec<u8>>,
-        attestation_digest: Vec<u8>,
-    }
-    let read_pg_attestations = |rows: Vec<sqlx::postgres::PgRow>| -> Vec<PgAttestRowSnap> {
+    let read_pg_attestations = |rows: Vec<sqlx::postgres::PgRow>| -> Vec<AttestRowSnap> {
         use sqlx::Row as _;
         rows.into_iter()
-            .map(|r| PgAttestRowSnap {
+            .map(|r| AttestRowSnap {
                 id: r.get(0),
                 table_name: r.get(1),
                 row_key: r.get(2),
@@ -1980,7 +1962,7 @@ async fn postgres_armed_bind_matrix_admin_and_non_admin_10109() {
     .fetch_one(&pool)
     .await
     .expect("before _agents");
-    let before_hist: Vec<PgHistRow> = sqlx::query_as(
+    let before_hist: Vec<HistRow> = sqlx::query_as(
         "SELECT version, pubkey_b64, bind_authority, bound_at::text, superseded_at::text
          FROM agent_pubkey_history WHERE agent_id = $1 ORDER BY version",
     )
@@ -2073,7 +2055,7 @@ async fn postgres_armed_bind_matrix_admin_and_non_admin_10109() {
     .fetch_one(&pool)
     .await
     .expect("after _agents");
-    let after_hist: Vec<PgHistRow> = sqlx::query_as(
+    let after_hist: Vec<HistRow> = sqlx::query_as(
         "SELECT version, pubkey_b64, bind_authority, bound_at::text, superseded_at::text
          FROM agent_pubkey_history WHERE agent_id = $1 ORDER BY version",
     )
@@ -2171,7 +2153,8 @@ async fn sqlite_sal_lineage_refusal_preserves_typed_cause_10227() {
             assert_eq!(action, ai_memory::handlers::BIND_AGENT_PUBKEY_ACTION);
             assert_eq!(target, TARGET_AGENT);
             assert_eq!(
-                reason, "closed_identity_requires_recovery",
+                reason,
+                ai_memory::identity::pubkey_bind::StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY,
                 "#10227: SQLite SAL lineage refusal must emit exact cause slug"
             );
         }
@@ -2254,13 +2237,15 @@ async fn bind_pubkey_route_closed_history_log_child_10109() {
     assert_eq!(ok_resp.status(), StatusCode::OK);
 
     let all_slugs = [
-        "existing_identity_requires_lineage",
-        "closed_identity_requires_recovery",
-        "non_canonical_stored_key",
-        "binding_not_authorized",
-        "unclassified_refusal",
+        StorageAuthRefusal::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE,
+        StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY,
+        StorageAuthRefusal::AUDIT_NON_CANONICAL_STORED_KEY,
+        StorageAuthRefusal::AUDIT_BINDING_NOT_AUTHORIZED,
+        StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL,
     ];
-    let assert_exact_log = |expected_slug: &str, expected_msg: &str| {
+    let assert_exact_log = |expected_variant: StorageAuthRefusal| {
+        let expected_slug = expected_variant.audit_reason();
+        let expected_msg = expected_variant.log_message();
         let captured = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
         buf.0.lock().expect("lock").clear();
         let matching_lines: Vec<&str> = captured
@@ -2307,10 +2292,7 @@ async fn bind_pubkey_route_closed_history_log_child_10109() {
         diff_body,
         serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED })
     );
-    assert_exact_log(
-        "existing_identity_requires_lineage",
-        "agent already has a bound key",
-    );
+    assert_exact_log(StorageAuthRefusal::ExistingIdentityRequiresLineage);
 
     // Case 2: closed history head -> closed_identity_requires_recovery.
     let conn = ai_memory::db::open(file.path()).expect("open db");
@@ -2338,10 +2320,7 @@ async fn bind_pubkey_route_closed_history_log_child_10109() {
         serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED }),
         "closed-history refusal wire body must stay opaque BIND_PROOF_REFUSED"
     );
-    assert_exact_log(
-        "closed_identity_requires_recovery",
-        "agent key history is closed or revoked",
-    );
+    assert_exact_log(StorageAuthRefusal::ClosedIdentityRequiresRecovery);
 
     // Case 3: non-canonical stored key -> non_canonical_stored_key.
     // Pick a 32-byte base64url string (passes SQL length/alphabet CHECK) that is
@@ -2386,10 +2365,7 @@ async fn bind_pubkey_route_closed_history_log_child_10109() {
         noncanon_body,
         serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED })
     );
-    assert_exact_log(
-        "non_canonical_stored_key",
-        "stored agent public key is non-canonical",
-    );
+    assert_exact_log(StorageAuthRefusal::NonCanonicalStoredKey);
 
     ai_memory::governance::audit::shutdown();
     let audit_text = std::fs::read_dir(audit_dir.path())
@@ -2413,9 +2389,9 @@ async fn bind_pubkey_route_closed_history_log_child_10109() {
     assert_eq!(
         refused_reasons,
         vec![
-            "existing_identity_requires_lineage".to_string(),
-            "closed_identity_requires_recovery".to_string(),
-            "non_canonical_stored_key".to_string(),
+            StorageAuthRefusal::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE.to_string(),
+            StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY.to_string(),
+            StorageAuthRefusal::AUDIT_NON_CANONICAL_STORED_KEY.to_string(),
         ],
         "#10229: SQLite forensic audit sink must record exact per-cause refusal reasons"
     );
@@ -2531,13 +2507,15 @@ async fn postgres_bind_pubkey_route_refusal_causes_and_audit_child_10229() {
     );
 
     let all_slugs = [
-        "existing_identity_requires_lineage",
-        "closed_identity_requires_recovery",
-        "non_canonical_stored_key",
-        "binding_not_authorized",
-        "unclassified_refusal",
+        StorageAuthRefusal::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE,
+        StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY,
+        StorageAuthRefusal::AUDIT_NON_CANONICAL_STORED_KEY,
+        StorageAuthRefusal::AUDIT_BINDING_NOT_AUTHORIZED,
+        StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL,
     ];
-    let assert_exact_log = |expected_slug: &str, expected_msg: &str| {
+    let assert_exact_log = |expected_variant: StorageAuthRefusal| {
+        let expected_slug = expected_variant.audit_reason();
+        let expected_msg = expected_variant.log_message();
         let captured = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
         buf.0.lock().expect("lock").clear();
         let matching_lines: Vec<&str> = captured
@@ -2583,10 +2561,7 @@ async fn postgres_bind_pubkey_route_refusal_causes_and_audit_child_10229() {
         diff_body,
         serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED })
     );
-    assert_exact_log(
-        "existing_identity_requires_lineage",
-        "agent already has a bound key",
-    );
+    assert_exact_log(StorageAuthRefusal::ExistingIdentityRequiresLineage);
 
     // Case 2: closed history -> closed_identity_requires_recovery.
     sqlx::query(
@@ -2612,10 +2587,7 @@ async fn postgres_bind_pubkey_route_refusal_causes_and_audit_child_10229() {
         closed_body,
         serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED })
     );
-    assert_exact_log(
-        "closed_identity_requires_recovery",
-        "agent key history is closed or revoked",
-    );
+    assert_exact_log(StorageAuthRefusal::ClosedIdentityRequiresRecovery);
 
     // Case 3: non-canonical stored key -> non_canonical_stored_key.
     let non_canonical_point = {
@@ -2654,10 +2626,7 @@ async fn postgres_bind_pubkey_route_refusal_causes_and_audit_child_10229() {
         noncanon_body,
         serde_json::json!({ "error": ai_memory::errors::msg::BIND_PROOF_REFUSED })
     );
-    assert_exact_log(
-        "non_canonical_stored_key",
-        "stored agent public key is non-canonical",
-    );
+    assert_exact_log(StorageAuthRefusal::NonCanonicalStoredKey);
 
     ai_memory::governance::audit::shutdown();
     let audit_text = std::fs::read_dir(audit_dir.path())
@@ -2681,9 +2650,9 @@ async fn postgres_bind_pubkey_route_refusal_causes_and_audit_child_10229() {
     assert_eq!(
         refused_reasons,
         vec![
-            "existing_identity_requires_lineage".to_string(),
-            "closed_identity_requires_recovery".to_string(),
-            "non_canonical_stored_key".to_string(),
+            StorageAuthRefusal::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE.to_string(),
+            StorageAuthRefusal::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY.to_string(),
+            StorageAuthRefusal::AUDIT_NON_CANONICAL_STORED_KEY.to_string(),
         ],
         "#10229: PG forensic audit sink must record exact per-cause refusal reasons"
     );

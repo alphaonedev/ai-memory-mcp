@@ -285,10 +285,10 @@ pub(crate) enum LineageKeySync {
 }
 
 /// Exact internal refusal cause from [`PossessionProof::authorize_storage_state_with_cause`]
-/// (#10109 r1 item 5). Used ONLY for operator logs and forensic audit reasons;
+/// (#10109 r1 item 5, #10227). Used ONLY for operator logs and forensic audit reasons;
 /// every variant maps onto the exact same opaque HTTP 403 `BIND_PROOF_REFUSED` wire body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StorageAuthRefusal {
+pub enum StorageAuthRefusal {
     /// Target agent already has an open live bound key (requires `identity succeed`).
     ExistingIdentityRequiresLineage,
     /// Target agent's key history head is closed/revoked (requires guardian recovery).
@@ -300,14 +300,81 @@ pub(crate) enum StorageAuthRefusal {
 }
 
 impl StorageAuthRefusal {
+    /// Forensic audit slug for [`Self::ExistingIdentityRequiresLineage`].
+    pub const AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE: &'static str =
+        "existing_identity_requires_lineage";
+    /// Forensic audit slug for [`Self::ClosedIdentityRequiresRecovery`].
+    pub const AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY: &'static str =
+        "closed_identity_requires_recovery";
+    /// Forensic audit slug for [`Self::NonCanonicalStoredKey`].
+    pub const AUDIT_NON_CANONICAL_STORED_KEY: &'static str = "non_canonical_stored_key";
+    /// Forensic audit slug for [`Self::BindingNotAuthorized`].
+    pub const AUDIT_BINDING_NOT_AUTHORIZED: &'static str = "binding_not_authorized";
+    /// Forensic audit slug when a backend refusal carries no recognized
+    /// [`StorageAuthRefusal`] slug (#10227: never silently relabeled as
+    /// `binding_not_authorized`).
+    pub const AUDIT_UNCLASSIFIED_REFUSAL: &'static str = "unclassified_refusal";
+
+    /// Operator log message for [`Self::ExistingIdentityRequiresLineage`].
+    pub const LOG_EXISTING_IDENTITY_REQUIRES_LINEAGE: &'static str = "pubkey bind refused: agent already has a bound key; rotate via \
+         `ai-memory identity succeed --agent-id <id>` (#10109)";
+    /// Operator log message for [`Self::ClosedIdentityRequiresRecovery`].
+    pub const LOG_CLOSED_IDENTITY_REQUIRES_RECOVERY: &'static str = "pubkey bind refused: agent key history is closed or revoked; recover via \
+         guardian recovery (`ai-memory identity recover`) (#10109)";
+    /// Operator log message for [`Self::NonCanonicalStoredKey`].
+    pub const LOG_NON_CANONICAL_STORED_KEY: &'static str = "pubkey bind refused: stored agent public key is non-canonical; inspect and \
+         recover via lineage (#10109)";
+    /// Operator log message for [`Self::BindingNotAuthorized`].
+    pub const LOG_BINDING_NOT_AUTHORIZED: &'static str = "pubkey bind refused: bind requires lineage succession or recovery \
+         (`ai-memory identity succeed --agent-id <id>`) (#10109)";
+    /// Operator error log message when a refusal cause is absent or unknown (#10227).
+    pub const LOG_UNCLASSIFIED_REFUSAL: &'static str = "pubkey bind refused: unclassified storage authorization refusal; inspect \
+         backend refusal mapping (#10109)";
+
+    /// Exhaustive list of every classified [`StorageAuthRefusal`] variant.
+    pub const ALL: [Self; 4] = [
+        Self::ExistingIdentityRequiresLineage,
+        Self::ClosedIdentityRequiresRecovery,
+        Self::NonCanonicalStoredKey,
+        Self::BindingNotAuthorized,
+    ];
+
     /// Stable forensic audit reason slug (internal only; never returned on the wire).
     #[must_use]
-    pub(crate) const fn audit_reason(&self) -> &'static str {
+    pub const fn audit_reason(&self) -> &'static str {
         match self {
-            Self::ExistingIdentityRequiresLineage => "existing_identity_requires_lineage",
-            Self::ClosedIdentityRequiresRecovery => "closed_identity_requires_recovery",
-            Self::NonCanonicalStoredKey => "non_canonical_stored_key",
-            Self::BindingNotAuthorized => "binding_not_authorized",
+            Self::ExistingIdentityRequiresLineage => Self::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE,
+            Self::ClosedIdentityRequiresRecovery => Self::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY,
+            Self::NonCanonicalStoredKey => Self::AUDIT_NON_CANONICAL_STORED_KEY,
+            Self::BindingNotAuthorized => Self::AUDIT_BINDING_NOT_AUTHORIZED,
+        }
+    }
+
+    /// Operator diagnostic log message paired with this cause (internal only).
+    #[must_use]
+    pub const fn log_message(&self) -> &'static str {
+        match self {
+            Self::ExistingIdentityRequiresLineage => Self::LOG_EXISTING_IDENTITY_REQUIRES_LINEAGE,
+            Self::ClosedIdentityRequiresRecovery => Self::LOG_CLOSED_IDENTITY_REQUIRES_RECOVERY,
+            Self::NonCanonicalStoredKey => Self::LOG_NON_CANONICAL_STORED_KEY,
+            Self::BindingNotAuthorized => Self::LOG_BINDING_NOT_AUTHORIZED,
+        }
+    }
+
+    /// Parse a backend `StoreError::PermissionDenied.reason` slug into the
+    /// exact typed cause. Unknown or generic strings return `None` (#10227).
+    #[must_use]
+    pub fn from_audit_reason(reason: &str) -> Option<Self> {
+        match reason {
+            Self::AUDIT_EXISTING_IDENTITY_REQUIRES_LINEAGE => {
+                Some(Self::ExistingIdentityRequiresLineage)
+            }
+            Self::AUDIT_CLOSED_IDENTITY_REQUIRES_RECOVERY => {
+                Some(Self::ClosedIdentityRequiresRecovery)
+            }
+            Self::AUDIT_NON_CANONICAL_STORED_KEY => Some(Self::NonCanonicalStoredKey),
+            Self::AUDIT_BINDING_NOT_AUTHORIZED => Some(Self::BindingNotAuthorized),
+            _ => None,
         }
     }
 }
@@ -317,6 +384,8 @@ impl std::fmt::Display for StorageAuthRefusal {
         f.write_str(self.audit_reason())
     }
 }
+
+impl std::error::Error for StorageAuthRefusal {}
 
 impl PossessionProof {
     /// The authority that admitted this binding.
@@ -853,6 +922,27 @@ mod tests {
             rotate.authorize_storage_state("ai:alice", &other_pk, Some(&pk), Some((&pk, true))),
             Ok(BindAuthorization::WriteRequired(_))
         ));
+    }
+
+    #[test]
+    fn storage_auth_refusal_slugs_round_trip_and_reject_unknown_10227() {
+        for variant in StorageAuthRefusal::ALL {
+            assert_eq!(
+                StorageAuthRefusal::from_audit_reason(variant.audit_reason()),
+                Some(variant)
+            );
+            assert_eq!(variant.to_string(), variant.audit_reason());
+            assert!(!variant.log_message().is_empty());
+        }
+        assert_eq!(
+            StorageAuthRefusal::from_audit_reason(StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL),
+            None
+        );
+        assert_eq!(
+            StorageAuthRefusal::from_audit_reason(crate::errors::msg::BIND_PROOF_REFUSED),
+            None
+        );
+        assert_eq!(StorageAuthRefusal::from_audit_reason("arbitrary"), None);
     }
 
     #[test]

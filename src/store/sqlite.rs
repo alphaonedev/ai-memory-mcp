@@ -297,16 +297,21 @@ fn models_governed_action(action: super::GovernedAction) -> crate::models::Gover
 /// callers receive the same typed 403 as PostgreSQL, never a backend-shaped
 /// 500. Every other storage failure retains the established mapping.
 fn pubkey_bind_err(error: anyhow::Error, agent_id: &str) -> StoreError {
-    if error
-        .downcast_ref::<crate::identity::pubkey_bind::BindProofError>()
-        .is_some()
+    use crate::identity::pubkey_bind::{BindProofError, StorageAuthRefusal};
+    if error.downcast_ref::<BindProofError>().is_some()
+        || error.downcast_ref::<StorageAuthRefusal>().is_some()
     {
         let reason = error
-            .downcast_ref::<crate::identity::pubkey_bind::StorageAuthRefusal>()
-            .map_or(
-                crate::errors::msg::BIND_PROOF_REFUSED,
-                crate::identity::pubkey_bind::StorageAuthRefusal::audit_reason,
-            );
+            .downcast_ref::<StorageAuthRefusal>()
+            .copied()
+            .or_else(|| {
+                error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<StorageAuthRefusal>().copied())
+            })
+            .map_or(StorageAuthRefusal::AUDIT_UNCLASSIFIED_REFUSAL, |cause| {
+                cause.audit_reason()
+            });
         StoreError::PermissionDenied {
             action: crate::handlers::BIND_AGENT_PUBKEY_ACTION.to_string(),
             target: agent_id.to_string(),
@@ -1874,7 +1879,8 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::append_lineage_record(&conn, agent_id, record, signature).map_err(box_err)
+        db::append_lineage_record(&conn, agent_id, record, signature)
+            .map_err(|error| pubkey_bind_err(error, agent_id))
     }
 
     async fn read_lineage(
