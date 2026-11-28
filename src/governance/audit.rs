@@ -864,6 +864,32 @@ pub fn boot_key_refusal(agent_id: &str, e: &anyhow::Error) -> String {
     }
 }
 
+/// The signing key and the ensure outcome the boot carries on.
+pub type BootSigningKey = (
+    Option<SigningKey>,
+    Option<crate::identity::keypair::EnsureOutcome>,
+);
+
+/// #10318 — the boot mapping of the key ensure for `agent_id` (the
+/// `BootKeySetup::Ensure` arm of `main`): a ledger writer whose ensure
+/// failed refuses with [`boot_key_refusal`] (computed from the error's
+/// state); any other process carries on with no key, so the read-only
+/// verbs stay reachable.
+///
+/// # Errors
+/// The boot refusal, for a ledger writer whose ensure failed.
+pub fn boot_signing_key(
+    agent_id: &str,
+    ensured: Result<BootSigningKey>,
+    ledger_writer: bool,
+) -> Result<BootSigningKey> {
+    match ensured {
+        Ok(pair) => Ok(pair),
+        Err(e) if ledger_writer => Err(anyhow::anyhow!(boot_key_refusal(agent_id, &e))),
+        Err(_) => Ok((None, None)),
+    }
+}
+
 /// #3354 — the refusal for a ledger-writing process whose resolved agent
 /// id has no signing key and could not be given one: the process must not
 /// append an unsigned row, so it does not start. Names the id, the cause

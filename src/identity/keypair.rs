@@ -1410,10 +1410,13 @@ fn ensure_generate(
             // `.pub` is written before the outcome is reported.
             let mut report = NotDurableReport::new();
             report.note(claim_durability);
-            report.note(
-                write_with_mode_durable(&pub_path, &kp.public.to_bytes(), 0o644, PUBLIC_KEY_WHAT)
-                    .with_context(|| writing_public_key_context(&pub_path))?,
-            );
+            // #10310: a failed `.pub` write keeps the claim's report.
+            match write_with_mode_durable(&pub_path, &kp.public.to_bytes(), 0o644, PUBLIC_KEY_WHAT)
+                .with_context(|| writing_public_key_context(&pub_path))
+            {
+                Ok(pub_durability) => report.note(pub_durability),
+                Err(e) => return Err(report.context_on(e)),
+            }
             // COVERAGE: tracing::info! lazy-format closure — the format args are
             //           constructed lazily; the closure body runs when the INFO
             //           subscriber is enabled. Documented per L0.7 playbook §3c.
@@ -1899,6 +1902,11 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<Durab
         drop(file);
         // Atomic exclusive-create of the FINAL name pointing at the complete
         // inode: `hard_link` fails with `AlreadyExists` if the name is taken.
+        // #10333: a test can fail this claim through the link seam.
+        #[cfg(test)]
+        if let Some(e) = crate::storage::snapshot_file::seam::on_link(path) {
+            return Err(e);
+        }
         fs::hard_link(&staged, path)
     };
     let result = commit();
@@ -1931,6 +1939,11 @@ fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<Dura
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
+        // #10333: the same link seam as the Unix claim.
+        #[cfg(test)]
+        if let Some(e) = crate::storage::snapshot_file::seam::on_link(path) {
+            return Err(e);
+        }
         fs::hard_link(&staged, path)
     };
     let result = commit();

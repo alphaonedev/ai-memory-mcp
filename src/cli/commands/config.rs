@@ -1979,4 +1979,91 @@ model = "grok-4.3"
             }
         }
     }
+
+    /// Run `clean_claude_json("TS")` with `$HOME` at a tempdir holding
+    /// `.claude.json` = `body`, the nth directory fsync failing with a real
+    /// `EIO` when `fail_dir_sync` is set. Returns the result (as text), the
+    /// path of `.claude.json`, its bytes after the call and the backup path.
+    fn clean_claude_json_with_home_10317(
+        body: &str,
+        fail_dir_sync: bool,
+    ) -> (
+        Result<Option<String>, String>,
+        String,
+        String,
+        Option<String>,
+    ) {
+        use crate::storage::snapshot_file::seam;
+        let _g = env_lock();
+        let home = tempfile::tempdir().expect("tempdir");
+        let path = home.path().join(".claude.json");
+        std::fs::write(&path, body).expect("seed .claude.json");
+        let prev_home = std::env::var("HOME").ok();
+        // SAFETY: serialised via `env_lock()`; restored before the lock is
+        // released so no other test observes the tempdir HOME.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        seam::reset();
+        if fail_dir_sync {
+            seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+        }
+        let got = clean_claude_json("TS").map_err(|e| format!("{e:#}"));
+        seam::reset();
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let after = std::fs::read_to_string(&path).unwrap_or_default();
+        let backup = std::fs::read_dir(home.path())
+            .expect("read home")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(".claude.json.bak."))
+            })
+            .map(|p| p.display().to_string());
+        let backup_bytes = backup
+            .as_ref()
+            .map(|b| std::fs::read_to_string(b).unwrap_or_default());
+        if let Some(bytes) = &backup_bytes {
+            assert_eq!(bytes, body, "the backup holds the original bytes");
+        }
+        (got, path.display().to_string(), after, backup)
+    }
+
+    /// #10317 — `clean_claude_json` over a backup written but not confirmed
+    /// durable refuses with the exact report and leaves `.claude.json`
+    /// untouched; a clean run strips the `env` block and names the backup.
+    #[test]
+    fn clean_claude_json_refuses_over_a_not_durable_backup_10317() {
+        use crate::storage::snapshot_file::NotDurable;
+        const BODY: &str = "{\"mcpServers\":{\"memory\":{\"command\":\"/usr/local/bin/ai-memory\",\
+                            \"env\":{\"AI_MEMORY_TIER\":\"keyword\"}}}}\n";
+
+        let (got, path, after, backup) = clean_claude_json_with_home_10317(BODY, true);
+        let backup = backup.expect("the backup is written");
+        let dir = std::path::Path::new(&path)
+            .parent()
+            .expect("home")
+            .to_path_buf();
+        let expected = format!(
+            "{}; refusing to rewrite {path} until its backup is durable (it is untouched)",
+            NotDurable::new(
+                "config backup",
+                std::path::Path::new(&backup),
+                &dir,
+                std::io::Error::from_raw_os_error(libc::EIO),
+            )
+        );
+        assert_eq!(got, Err(expected));
+        assert_eq!(after, BODY, "the original is not rewritten");
+
+        let (got, _path, after, backup) = clean_claude_json_with_home_10317(BODY, false);
+        assert_eq!(got, Ok(backup), "a clean run names its backup");
+        assert!(!after.contains("AI_MEMORY_TIER"), "env stripped: {after}");
+    }
 }

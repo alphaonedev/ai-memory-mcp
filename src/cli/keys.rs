@@ -234,6 +234,9 @@ fn run_init(
     use crate::keys::roles::{self, Action};
     let (before, shape) = observe_for(dir, caller_agent_id, app_config)?;
     let plan = roles::plan(&before, &opts);
+    // #10309 / #10329 — files written but not confirmed durable: a stderr
+    // note, and `keys init` fails closed with the report as its error.
+    let mut not_durable = crate::storage::snapshot_file::NotDurableReport::new();
     let (words, rows): (Vec<(&'static str, String)>, Vec<serde_json::Value>) = if dry_run {
         if let Some(text) = roles::loose_text(&before) {
             bail!(text);
@@ -251,7 +254,9 @@ fn run_init(
             })
             .unzip()
     } else {
-        roles::execute(&before, &plan, &opts)?
+        let (outcomes, report) = roles::execute_reported(&before, &plan, &opts)?;
+        not_durable = report;
+        outcomes
             .into_iter()
             .map(|o| {
                 (
@@ -264,8 +269,13 @@ fn run_init(
     let after = if dry_run {
         before
     } else {
-        observe_for(dir, caller_agent_id, app_config)?.0
+        match observe_for(dir, caller_agent_id, app_config) {
+            Ok((after, _)) => after,
+            Err(e) => return Err(not_durable.context_on(e)),
+        }
     };
+    // #10329 — not durable: a stderr note, then the report as the error.
+    not_durable.fail_on(out.stderr)?;
     if json {
         writeln!(
             out.stdout,
@@ -577,3 +587,10 @@ fn postgres(
             .context("key registry inspection timed out")?
     })?
 }
+
+// v1.0.0 #10309 / #10329 — a written-but-not-durable file fails the command
+// closed: a stderr note names the kept files and the durability report is
+// the error.
+#[cfg(test)]
+#[path = "keys_not_durable_10309_tests.rs"]
+mod not_durable_10309_tests;

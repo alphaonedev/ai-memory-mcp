@@ -233,3 +233,86 @@ fn create_and_claim_dir_sync_failure_is_not_durable_10265() {
         );
     }
 }
+
+/// The head of the context a later error carries (#10310; written out here,
+/// not taken from the code under test).
+const WRITTEN_BEFORE_10310: &str = "files written before this error are kept on disk";
+
+/// #10310 — `ensure_generate`: the `.priv` claim is written but not
+/// confirmed durable, then the `.pub` write fails. The error names both, the
+/// claimed `.priv` stays, and the error never reads as written-but-not-durable.
+#[test]
+fn pub_failure_keeps_priv_claim_report_10310() {
+    let _reset = SeamReset;
+    let agent = "agent-10310-generate";
+    let dir = TempDir::new().expect("tempdir");
+    let pub_path = agent_pub_path(dir.path(), agent);
+    std::fs::create_dir(&pub_path).expect("the blocking directory");
+    seam::reset();
+    seam::inject_step_errno_at(seam::Step::DirSync, libc::EIO, 1);
+    let err = ensure_generate(agent, dir.path(), pub_path.clone())
+        .err()
+        .expect("a .pub name that is a directory fails the generate");
+    seam::reset();
+    let priv_path = agent_priv_path(dir.path(), agent);
+    let mut report = NotDurableReport::new();
+    report.note(Durability::NotDurable(NotDurable::new(
+        "private key",
+        &priv_path,
+        dir.path(),
+        io::Error::from_raw_os_error(libc::EIO),
+    )));
+    let later: Vec<String> = err.chain().skip(1).map(ToString::to_string).collect();
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "{WRITTEN_BEFORE_10310}: {report}: writing public key {}: {}",
+            pub_path.display(),
+            io::Error::from_raw_os_error(libc::EISDIR)
+        ),
+        "later layers: {later:?}"
+    );
+    assert!(priv_path.is_file(), "the claimed .priv is kept");
+    assert!(err.downcast_ref::<NotDurableReport>().is_none(), "{err:#}");
+    assert!(err.downcast_ref::<NotDurable>().is_none(), "{err:#}");
+}
+
+/// #10333 — a failed `.priv` claim that is not `AlreadyExists` (the hard
+/// link of the claim fails with EIO) is an error that names the claim, never
+/// a not-durable success, and leaves neither key file behind.
+#[test]
+fn failed_priv_claim_is_an_error_not_not_durable_10333() {
+    let _reset = SeamReset;
+    let agent = "agent-10333-claim";
+    let dir = TempDir::new().expect("tempdir");
+    let priv_path = agent_priv_path(dir.path(), agent);
+    let pub_path = agent_pub_path(dir.path(), agent);
+    seam::reset();
+    seam::inject_link_errno(Some(libc::EIO));
+    let outcome = ensure_keypair_reported(agent, dir.path(), false);
+    let links = seam::take_link_calls();
+    seam::reset();
+    let err = outcome
+        .err()
+        .expect("a failed .priv claim must be an error, never a not-durable success");
+    assert_eq!(
+        links,
+        vec![priv_path.clone()],
+        "the claim link goes through the seam"
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "claiming private key {}: {}",
+            priv_path.display(),
+            io::Error::from_raw_os_error(libc::EIO)
+        )
+    );
+    assert!(err.downcast_ref::<NotDurableReport>().is_none(), "{err:#}");
+    assert!(err.downcast_ref::<NotDurable>().is_none(), "{err:#}");
+    assert!(!priv_path.exists(), "no .priv is left after a failed claim");
+    assert!(
+        !pub_path.exists(),
+        "no .pub is written after a failed claim"
+    );
+}

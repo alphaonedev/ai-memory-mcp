@@ -804,21 +804,14 @@ fn init_forensic_audit(
             ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None),
             None,
         ),
-        BootKeySetup::Ensure => {
-            match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    if ledger_writer {
-                        // #10291 — the refusal text is computed from the
-                        // error's state (a not-durable key is not "unwritable").
-                        anyhow::bail!(ai_memory::governance::audit::boot_key_refusal(
-                            &agent_id, &e
-                        ));
-                    }
-                    (None, None)
-                }
-            }
-        }
+        // #10291 / #10318 — the refusal text is computed from the error's
+        // state (a not-durable key is not "unwritable"), in the library so
+        // a test pins it.
+        BootKeySetup::Ensure => ai_memory::governance::audit::boot_signing_key(
+            &agent_id,
+            ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id),
+            ledger_writer,
+        )?,
     };
     if let Some(ai_memory::identity::keypair::EnsureOutcome::Generated { pub_path }) = &generated {
         let notice =

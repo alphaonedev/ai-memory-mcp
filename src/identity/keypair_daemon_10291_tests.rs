@@ -260,3 +260,112 @@ fn ledger_writer_clean_run_and_other_causes_10291() {
         crate::governance::audit::unsigned_ledger_refusal(LEDGER_AGENT, "permission denied")
     );
 }
+
+/// The ensure causes of the #10318 table.
+#[derive(Clone, Copy, Debug)]
+enum EnsureCause10318 {
+    NotDurable,
+    PermissionDenied,
+    ChainedContext,
+}
+
+/// The error of each cause, built by hand.
+fn ensure_error_10318(cause: EnsureCause10318, dir: &Path) -> anyhow::Error {
+    match cause {
+        EnsureCause10318::NotDurable => {
+            let mut report = NotDurableReport::new();
+            report.note(crate::storage::snapshot_file::Durability::NotDurable(
+                crate::storage::snapshot_file::NotDurable::new(
+                    "signing key",
+                    &dir.join("ledger.key"),
+                    dir,
+                    std::io::Error::from_raw_os_error(libc::EIO),
+                ),
+            ));
+            anyhow::Error::new(report)
+        }
+        EnsureCause10318::PermissionDenied => anyhow::anyhow!("permission denied"),
+        EnsureCause10318::ChainedContext => {
+            anyhow::anyhow!("read-only file system").context("generate the key pair")
+        }
+    }
+}
+
+/// #10318 — the boot mapping of `main`'s key ensure, over a hand-written
+/// table: a not-durable cause refuses a ledger writer with the not-durable
+/// text and never the "make the key directory writable" remedy; every other
+/// cause refuses with the `unsigned_ledger_refusal` text; a process that
+/// writes no ledger carries on with no key whatever the cause; a key that
+/// was ensured passes through.
+#[test]
+fn boot_signing_key_mapping_table_10318() {
+    use crate::governance::audit::boot_signing_key;
+    let dir = TempDir::new().expect("tempdir");
+    // #10341: every expected text is written out here, never built by the
+    // code under test. Only the tempdir path and std's EIO text are runtime.
+    let eio = std::io::Error::from_raw_os_error(libc::EIO);
+    let not_durable_text = format!(
+        "#3354: refusing to start a ledger-writing command as `ai:ledger-10291`: security \
+         posture \"asi-hard\" refuses to boot on a signing key that is not confirmed durable: \
+         signing key {} is written but not confirmed durable: the fsync of its directory {} \
+         failed ({eio}), so it may not survive a crash (#10214). The key files are complete, so \
+         nothing is lost yet, but a crash before their directory is synced could lose this \
+         identity; restart once the filesystem syncs the key directory (#10214).",
+        dir.path().join("ledger.key").display(),
+        dir.path().display(),
+    );
+    let unsigned_text = |cause: &str| {
+        format!(
+            "#3354: refusing to start a ledger-writing command as `ai:ledger-10291`: no signing \
+             key for that id is loadable and one could not be generated ({cause}). An unsigned \
+             signed_events row is a guarantee the ledger did not provide, so none is written. \
+             Fix: make the key directory writable by this user (or set AI_MEMORY_KEY_DIR to a \
+             directory that is), then retry — the key is generated on the next start; or, once \
+             the directory is writable, provision it explicitly with `ai-memory identity \
+             generate --agent-id ai:ledger-10291`. Read-only verbs (`doctor`, `stats`, `recall`, \
+             the `verify-*` family) stay reachable."
+        )
+    };
+    // (cause, the exact refusal of a ledger writer)
+    let rows: [(EnsureCause10318, String); 3] = [
+        (EnsureCause10318::NotDurable, not_durable_text),
+        (
+            EnsureCause10318::PermissionDenied,
+            unsigned_text("permission denied"),
+        ),
+        (
+            EnsureCause10318::ChainedContext,
+            unsigned_text("generate the key pair: read-only file system"),
+        ),
+    ];
+    for (cause, want) in rows {
+        let got = boot_signing_key(
+            LEDGER_AGENT,
+            Err(ensure_error_10318(cause, dir.path())),
+            true,
+        )
+        .expect_err("a ledger writer refuses");
+        let text = format!("{got:#}");
+        assert_eq!(text, want, "{cause:?}");
+        assert_eq!(
+            text.contains(UNWRITABLE_REMEDY),
+            !matches!(cause, EnsureCause10318::NotDurable),
+            "{cause:?}: the remedy only where it is true: {text}"
+        );
+        let (key, outcome) = boot_signing_key(
+            LEDGER_AGENT,
+            Err(ensure_error_10318(cause, dir.path())),
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{cause:?}: a non-writer carries on, got {e:#}"));
+        assert!(key.is_none() && outcome.is_none(), "{cause:?}");
+    }
+    let ensured =
+        crate::governance::audit::ensure_daemon_signing_key_in(LEDGER_AGENT, dir.path(), false)
+            .expect("clean ensure");
+    let public = ensured.0.as_ref().map(|k| k.verifying_key().to_bytes());
+    let (key, outcome) =
+        boot_signing_key(LEDGER_AGENT, Ok(ensured), true).expect("an ensured key passes");
+    assert_eq!(key.map(|k| k.verifying_key().to_bytes()), public);
+    assert!(matches!(outcome, Some(EnsureOutcome::Generated { .. })));
+}

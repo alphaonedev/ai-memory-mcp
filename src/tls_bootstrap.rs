@@ -698,12 +698,38 @@ pub(crate) fn ensure_local_tls_reported(
     }
 
     // #10214: every file of the CA and leaf is written before a file not
-    // confirmed durable is reported.
+    // confirmed durable is reported. #10310: an error after a file was
+    // noted keeps the report as its context.
     let mut report = NotDurableReport::new();
-    let (ca_pem, ca_key, fresh_ca) = match load_ca(&dir)? {
+    match mint_or_reuse(key_dir, &dir, &wanted, &mut report) {
+        Ok((outcome, leaf_days_remaining)) => Ok((
+            LocalTls {
+                cert_path,
+                key_path,
+                ca_cert_path,
+                outcome,
+                leaf_days_remaining,
+            },
+            report,
+        )),
+        Err(e) => Err(report.context_on(e)),
+    }
+}
+
+/// The CA and leaf steps of [`ensure_local_tls_reported`]: every file
+/// written is noted in `report`, which the caller keeps on an `Err` (#10310).
+fn mint_or_reuse(
+    key_dir: &Path,
+    dir: &Path,
+    wanted: &[String],
+    report: &mut NotDurableReport,
+) -> Result<(Outcome, i64)> {
+    let cert_path = dir.join(SERVER_CERT_FILE);
+    let key_path = dir.join(SERVER_KEY_FILE);
+    let (ca_pem, ca_key, fresh_ca) = match load_ca(dir)? {
         Some((pem, key)) => (pem, key, false),
         None => {
-            let (pem, key) = generate_ca(&dir, &mut report)?;
+            let (pem, key) = generate_ca(dir, report)?;
             (pem, key, true)
         }
     };
@@ -739,7 +765,7 @@ pub(crate) fn ensure_local_tls_reported(
 
     let outcome = match renew_reason {
         Some(reason) => {
-            issue_leaf(&dir, &ca_pem, ca_key, &wanted, &mut report)?;
+            issue_leaf(dir, &ca_pem, ca_key, wanted, report)?;
             if fresh_ca {
                 Outcome::Generated
             } else {
@@ -749,16 +775,7 @@ pub(crate) fn ensure_local_tls_reported(
         None => Outcome::Reused,
     };
     let status = leaf_status(key_dir)?;
-    Ok((
-        LocalTls {
-            cert_path,
-            key_path,
-            ca_cert_path,
-            outcome,
-            leaf_days_remaining: status.days_remaining.unwrap_or_default(),
-        },
-        report,
-    ))
+    Ok((outcome, status.days_remaining.unwrap_or_default()))
 }
 
 /// #10292 — what one certificate-renewal tick of the daemon did. Every arm
@@ -772,8 +789,12 @@ pub(crate) enum RenewalTick {
     /// The leaf was re-issued, is complete on disk and the listener now
     /// serves it, but a file is not confirmed durable.
     ReloadedNotDurable,
-    /// The leaf was re-issued but the listener could not load it.
+    /// The leaf was re-issued and is durable, but the listener could not
+    /// load it.
     ReloadFailed,
+    /// #10308 — the leaf was re-issued and is complete on disk, but a file
+    /// is not confirmed durable and the listener could not load it.
+    ReloadFailedNotDurable,
     /// Nothing was re-issued and the leaf is inside its renewal window.
     InsideWindow,
     /// Nothing was re-issued and the leaf is current.
@@ -782,25 +803,94 @@ pub(crate) enum RenewalTick {
     Failed,
 }
 
+/// #10308 — the log text of each [`RenewalTick`] arm, computed from the
+/// arm and the durability `report` of the files the tick wrote. A re-issued
+/// leaf whose files are not confirmed durable says so whatever the reload
+/// did. `None` for `Current`, which logs nothing.
+#[must_use]
+pub(crate) fn renewal_tick_message(tick: RenewalTick, report: &NotDurableReport) -> Option<String> {
+    let remedy = crate::transit_encryption::REMEDY_TLS_RENEW;
+    match tick {
+        RenewalTick::Reloaded => {
+            Some("#3709: renewed the local server certificate and reloaded the listener".to_owned())
+        }
+        RenewalTick::ReloadedNotDurable => Some(format!(
+            "#3709: renewed, not confirmed durable: {report}; reloaded the listener (#10214)"
+        )),
+        RenewalTick::ReloadFailed => Some(format!(
+            "#3709: renewed the certificate but the listener could not reload it; restart \
+             the daemon or {remedy}"
+        )),
+        RenewalTick::ReloadFailedNotDurable => Some(format!(
+            "#3709: renewed, not confirmed durable: {report}; the listener could not reload \
+             it; restart the daemon or {remedy} (#10308)"
+        )),
+        RenewalTick::InsideWindow => Some(format!(
+            "#3709: the local server certificate is inside its renewal window; {remedy}"
+        )),
+        RenewalTick::Current => None,
+        RenewalTick::Failed => Some(format!(
+            "#3709: certificate renewal FAILED; the listener keeps its current certificate \
+             and will REFUSE at the next boot once it expires — fix now: {remedy}"
+        )),
+    }
+}
+
+/// #10308 — the tick of a re-issued leaf, from the listener `reload` result
+/// and the durability `report` of the files written, logged with
+/// [`renewal_tick_message`]. Durability is reported apart from the reload
+/// outcome on both reload arms (the #10292 settled decision).
+fn reissued_tick(
+    reload: std::io::Result<()>,
+    report: &NotDurableReport,
+    days_valid: i64,
+) -> RenewalTick {
+    let tick = match (&reload, report.is_empty()) {
+        (Ok(()), true) => RenewalTick::Reloaded,
+        (Ok(()), false) => RenewalTick::ReloadedNotDurable,
+        (Err(_), true) => RenewalTick::ReloadFailed,
+        (Err(_), false) => RenewalTick::ReloadFailedNotDurable,
+    };
+    let message = renewal_tick_message(tick, report).unwrap_or_default();
+    match reload {
+        Ok(()) => tracing::warn!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            days_valid,
+            "{message}"
+        ),
+        // #10330: every cause of the chain. `std::io::Error` ignores `{:#}`,
+        // so the anyhow form renders its `source()` chain.
+        Err(e) => tracing::error!(
+            target: crate::transit_encryption::TRACING_TARGET,
+            error = %format_args!("{:#}", anyhow::Error::from(e)),
+            "{message}"
+        ),
+    }
+    tick
+}
+
 /// #10292 — one renewal tick: ensure the local leaf under `key_dir` for
 /// `host` and, when it was re-issued, reload `reload` from it. A leaf
 /// written but not confirmed durable is the complete after-state, so the
 /// listener is reloaded exactly as for a durable one and the tick logs
-/// "renewed, not confirmed durable" with the report — never "FAILED".
+/// "renewed, not confirmed durable" with the report — never "FAILED"; a
+/// reload that fails names the report too (#10308).
 pub(crate) async fn renewal_tick(
     reload: &axum_server::tls_rustls::RustlsConfig,
     key_dir: &Path,
     host: &str,
 ) -> RenewalTick {
-    let remedy = crate::transit_encryption::REMEDY_TLS_RENEW;
     let (local, report) = match ensure_local_tls_reported(key_dir, host) {
         Ok(pair) => pair,
         Err(e) => {
+            let message = renewal_tick_message(RenewalTick::Failed, &NotDurableReport::new())
+                .unwrap_or_default();
+            // #10330 / #10335: `{e:#}` prints every cause, so the failed
+            // write and its root cause follow the kept-files report.
             tracing::error!(
                 target: crate::transit_encryption::TRACING_TARGET,
-                error = %e,
-                "#3709: certificate renewal FAILED; the listener keeps its current certificate \
-                 and will REFUSE at the next boot once it expires — fix now: {remedy}"
+                error = %format_args!("{e:#}"),
+                "{message}"
             );
             return RenewalTick::Failed;
         }
@@ -812,42 +902,21 @@ pub(crate) async fn renewal_tick(
     if !reissued {
         // Nothing was written, so nothing can be not durable.
         if local.leaf_days_remaining <= RENEWAL_WINDOW_DAYS {
+            let message =
+                renewal_tick_message(RenewalTick::InsideWindow, &report).unwrap_or_default();
             tracing::warn!(
                 target: crate::transit_encryption::TRACING_TARGET,
                 days_remaining = local.leaf_days_remaining,
-                "#3709: the local server certificate is inside its renewal window; {remedy}"
+                "{message}"
             );
             return RenewalTick::InsideWindow;
         }
         return RenewalTick::Current;
     }
-    if let Err(e) = reload
+    let reloaded = reload
         .reload_from_pem_file(&local.cert_path, &local.key_path)
-        .await
-    {
-        tracing::error!(
-            target: crate::transit_encryption::TRACING_TARGET,
-            error = %e,
-            "#3709: renewed the certificate but the listener could not reload it; restart \
-             the daemon or {remedy}"
-        );
-        return RenewalTick::ReloadFailed;
-    }
-    let days_valid = local.leaf_days_remaining;
-    if report.is_empty() {
-        tracing::warn!(
-            target: crate::transit_encryption::TRACING_TARGET,
-            days_valid,
-            "#3709: renewed the local server certificate and reloaded the listener"
-        );
-        return RenewalTick::Reloaded;
-    }
-    tracing::warn!(
-        target: crate::transit_encryption::TRACING_TARGET,
-        days_valid,
-        "#3709: renewed, not confirmed durable: {report}; reloaded the listener (#10214)"
-    );
-    RenewalTick::ReloadedNotDurable
+        .await;
+    reissued_tick(reloaded, &report, local.leaf_days_remaining)
 }
 
 /// The local CA certificate this installation wrote, as PEM — for the
@@ -1826,4 +1895,164 @@ mod tests {
             import(tmp.path()).unwrap_or_else(|e| panic!("sync {nth}: a rerun installs: {e:#}"));
         }
     }
+
+    /// A report holding one leaf file written but not confirmed durable.
+    fn not_durable_report_10308(dir: &Path) -> NotDurableReport {
+        let mut report = NotDurableReport::new();
+        report.note(crate::storage::snapshot_file::Durability::NotDurable(
+            crate::storage::snapshot_file::NotDurable::new(
+                "server certificate",
+                &dir.join(SERVER_CERT_FILE),
+                dir,
+                std::io::Error::from_raw_os_error(libc::EIO),
+            ),
+        ));
+        report
+    }
+
+    /// Every [`RenewalTick`]; the `match` with no wildcard makes a new
+    /// variant a compile error here until its row exists.
+    fn all_ticks_10308() -> [RenewalTick; 7] {
+        let all = [
+            RenewalTick::Reloaded,
+            RenewalTick::ReloadedNotDurable,
+            RenewalTick::ReloadFailed,
+            RenewalTick::ReloadFailedNotDurable,
+            RenewalTick::InsideWindow,
+            RenewalTick::Current,
+            RenewalTick::Failed,
+        ];
+        for tick in all {
+            match tick {
+                RenewalTick::Reloaded
+                | RenewalTick::ReloadedNotDurable
+                | RenewalTick::ReloadFailed
+                | RenewalTick::ReloadFailedNotDurable
+                | RenewalTick::InsideWindow
+                | RenewalTick::Current
+                | RenewalTick::Failed => {}
+            }
+        }
+        all
+    }
+
+    /// #10308 — the exact log text of every tick arm, hand-written from the
+    /// remedy constant and the report's own words.
+    #[test]
+    fn renewal_tick_message_table_10308() {
+        let tmp = sandbox();
+        let report = not_durable_report_10308(tmp.path());
+        let remedy = crate::transit_encryption::REMEDY_TLS_RENEW;
+        for tick in all_ticks_10308() {
+            let want = match tick {
+                RenewalTick::Reloaded => Some(
+                    "#3709: renewed the local server certificate and reloaded the listener"
+                        .to_owned(),
+                ),
+                RenewalTick::ReloadedNotDurable => Some(format!(
+                    "#3709: renewed, not confirmed durable: {report}; reloaded the listener \
+                     (#10214)"
+                )),
+                RenewalTick::ReloadFailed => Some(format!(
+                    "#3709: renewed the certificate but the listener could not reload it; \
+                     restart the daemon or {remedy}"
+                )),
+                RenewalTick::ReloadFailedNotDurable => Some(format!(
+                    "#3709: renewed, not confirmed durable: {report}; the listener could not \
+                     reload it; restart the daemon or {remedy} (#10308)"
+                )),
+                RenewalTick::InsideWindow => Some(format!(
+                    "#3709: the local server certificate is inside its renewal window; {remedy}"
+                )),
+                RenewalTick::Current => None,
+                RenewalTick::Failed => Some(format!(
+                    "#3709: certificate renewal FAILED; the listener keeps its current \
+                     certificate and will REFUSE at the next boot once it expires — fix now: \
+                     {remedy}"
+                )),
+            };
+            assert_eq!(renewal_tick_message(tick, &report), want, "{tick:?}");
+        }
+        assert!(
+            format!("{report}").contains("is written but not confirmed durable"),
+            "{report}"
+        );
+    }
+
+    /// #10308 — a re-issued leaf whose reload fails names the durability of
+    /// its files: durable is `ReloadFailed`, not durable is
+    /// `ReloadFailedNotDurable` with the report in its text. The reload
+    /// outcome and the durability are reported apart on both reload arms.
+    #[test]
+    fn reload_failed_reports_durability_10308() {
+        let tmp = sandbox();
+        let not_durable = not_durable_report_10308(tmp.path());
+        let durable = NotDurableReport::new();
+        let refused = || Err(std::io::Error::other("the listener refused the pair"));
+        // (reload succeeded, report not durable, expected tick)
+        let rows: [(bool, bool, RenewalTick); 4] = [
+            (true, false, RenewalTick::Reloaded),
+            (true, true, RenewalTick::ReloadedNotDurable),
+            (false, false, RenewalTick::ReloadFailed),
+            (false, true, RenewalTick::ReloadFailedNotDurable),
+        ];
+        for (reloaded, is_not_durable, want) in rows {
+            let report = if is_not_durable {
+                &not_durable
+            } else {
+                &durable
+            };
+            let reload = if reloaded { Ok(()) } else { refused() };
+            let tick = reissued_tick(reload, report, 90);
+            assert_eq!(
+                tick, want,
+                "reloaded={reloaded} not_durable={is_not_durable}"
+            );
+            let text = renewal_tick_message(tick, report).expect("a re-issue logs");
+            assert_eq!(
+                text.contains(&format!("{not_durable}")),
+                is_not_durable,
+                "reloaded={reloaded}: {text}"
+            );
+        }
+    }
+
+    /// #10308 — an operator leaf inside its renewal window is never
+    /// re-issued: the tick is `InsideWindow` with its exact text and the
+    /// listener keeps its certificate; outside the window it is `Current`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn renewal_tick_inside_window_10308() {
+        const INSIDE_DAYS: i64 = 10;
+        const OUTSIDE_DAYS: i64 = 200;
+        let listener_dir = sandbox();
+        let reload = local_listener(listener_dir.path()).await;
+        let before = served(&reload);
+        let pki = OperatorPki::new();
+        for (days, want) in [
+            (INSIDE_DAYS, RenewalTick::InsideWindow),
+            (OUTSIDE_DAYS, RenewalTick::Current),
+        ] {
+            let tmp = sandbox();
+            let (cert, key) =
+                pki.leaf(&["memory.example.test"], now() + time::Duration::days(days));
+            import_operator_material(tmp.path(), cert.as_bytes(), key.as_bytes(), None, None)
+                .expect("operator import");
+            let tick = renewal_tick(&reload, tmp.path(), "127.0.0.1").await;
+            assert_eq!(tick, want, "{days} days left");
+            assert_eq!(served(&reload), before, "{days} days: nothing reloaded");
+        }
+        assert_eq!(
+            renewal_tick_message(RenewalTick::InsideWindow, &NotDurableReport::new()),
+            Some(format!(
+                "#3709: the local server certificate is inside its renewal window; {}",
+                crate::transit_encryption::REMEDY_TLS_RENEW
+            ))
+        );
+    }
 }
+
+// v1.0.0 #10310 — a later error keeps the durability report of the files
+// written before it.
+#[cfg(test)]
+#[path = "tls_bootstrap_not_durable_10310_tests.rs"]
+mod not_durable_10310_tests;

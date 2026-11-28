@@ -188,7 +188,58 @@ impl NotDurableReport {
             Err(anyhow::Error::new(self))
         }
     }
+
+    /// #10310 — keep this report on a LATER error of the same sequence:
+    /// `err` unchanged when every file noted so far is durable, otherwise
+    /// `err` with the report as text context (precedent: the records of
+    /// `scope::store` written before a failed audit line). The context is a
+    /// `String`, never this type, so the combined error never downcasts to a
+    /// [`NotDurableReport`] and is never read as "complete but not durable".
+    pub(crate) fn context_on(self, err: anyhow::Error) -> anyhow::Error {
+        if self.0.is_empty() {
+            err
+        } else {
+            err.context(format!("{WRITTEN_BEFORE_THE_ERROR}: {self}"))
+        }
+    }
+
+    /// #10309 — move every outcome of `other` (a sub-sequence) into this
+    /// report.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// #10329 — the CLI end of a sequence, called before any stdout: `Ok`
+    /// with nothing written when every file is durable. Otherwise one
+    /// best-effort [`KEPT_ON_DISK_NOTE`] line on `stderr` (never stdout,
+    /// which callers parse) names the files kept on disk, and the report
+    /// itself is the error, so the command exits non-zero (fail closed, the
+    /// posture of #10214).
+    ///
+    /// #10343 — a failed write of that note is ignored: it never replaces
+    /// the report as the error, and a durable run writes nothing to fail.
+    ///
+    /// # Errors
+    /// At least one file is not confirmed durable (the typed report).
+    pub(crate) fn fail_on(self, stderr: &mut dyn std::io::Write) -> Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        // Best effort (#10343): the report below is the outcome either way.
+        let _note_write_ignored = writeln!(stderr, "{KEPT_ON_DISK_NOTE} {self}");
+        Err(anyhow::Error::new(self))
+    }
 }
+
+/// #10329 — the head of the stderr note [`NotDurableReport::fail_on`]
+/// prints when a command fails with files written but not confirmed durable.
+pub(crate) const KEPT_ON_DISK_NOTE: &str =
+    "note: the command failed, and its files are kept on disk:";
+
+/// #10310 — the head of the context [`NotDurableReport::context_on`] puts on
+/// a later error: the files it names are on disk, not confirmed durable.
+pub(crate) const WRITTEN_BEFORE_THE_ERROR: &str =
+    "files written before this error are kept on disk";
 
 impl std::fmt::Display for NotDurableReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -414,7 +465,7 @@ pub(crate) mod seam {
         }
     }
 
-    pub(super) fn on_link(dest: &Path) -> Option<std::io::Error> {
+    pub(crate) fn on_link(dest: &Path) -> Option<std::io::Error> {
         LINK_CALLS.with(|c| c.borrow_mut().push(dest.to_path_buf()));
         LINK_ERRNO
             .with(Cell::get)
