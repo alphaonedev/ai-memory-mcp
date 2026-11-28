@@ -393,18 +393,13 @@ class IncludeSites10300(unittest.TestCase):
                      "the census cannot resolve it (#10300)")
 
     def test_a_target_outside_the_root_is_refused(self) -> None:
-        self.tree({"src/a.rs": "const X: &[u8] = include_bytes!(\"../../x\");\n"})
-        self.refused("src/a.rs:1: include_bytes! \"../../x\" leaves the repository root (#10300)")
+        self.tree({"src/a.rs": "include!(\"../../x\");\n"})
+        self.refused("src/a.rs:1: include! \"../../x\" leaves the repository root (#10300)")
 
     def test_a_link_target_is_refused(self) -> None:
         self.tree({"src/a.rs": "include!(\"l.rs\");\n", "src/real.txt": INCLUDE_START}, {"src/l.rs": "real.txt"})
         self.refused("src/a.rs:1: include! \"l.rs\" names src/l.rs, a symbolic link or a path through one; "
                      "the census never follows links (#10300)")
-
-    def test_an_include_str_target_is_a_data_candidate(self) -> None:
-        self.tree({"src/a.rs": "const X: &str = include_str!(\"d.txt\");\n", "src/d.txt": "data\n"})
-        _rows, _sites, totals = self.m.scan(self.root)
-        self.assertEqual(totals["include_data"], {("src/a.rs", "include_str!"): (1, "7b2e103513d3575000027cc3cee87521")})
 
 
 if __name__ == "__main__":

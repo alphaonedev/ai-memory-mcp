@@ -1,8 +1,9 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #10300: every `include!`, `include_str!`, `include_bytes!` and `#[path]`
-//! of a walked file is a site of the census. Each fixture below is a small
+//! #10300: every `include!` and `#[path]` of a walked file is a site of the
+//! census (`include_str!` and `include_bytes!` name data that is never
+//! compiled as Rust, so they are not sites). Each fixture below is a small
 //! tree written on disk under `CARGO_TARGET_TMPDIR` (never `/tmp`), read with
 //! [`read_tree`] and run through [`census`]; every expected line is written
 //! out here by hand, never built by the census.
@@ -81,22 +82,6 @@ fn a_path_module_in_a_skipped_dir_is_lexed_10300() {
 }
 
 #[test]
-fn an_include_str_with_no_row_is_red_10300() {
-    let got = include_case(
-        "include_str_norow",
-        &[
-            ("src/a.rs", "const X: &str = include_str!(\"d.txt\");\n"),
-            ("src/d.txt", "data\n"),
-        ],
-        &[],
-    );
-    has(
-        &got,
-        "src/a.rs: 1 include_str! site with digest 7b2e103513d3575000027cc3cee87521 and no INCLUDE_ROWS row (#10300)",
-    );
-}
-
-#[test]
 fn a_non_literal_include_argument_is_red_10300() {
     let got = include_case(
         "non_literal",
@@ -113,15 +98,12 @@ fn a_non_literal_include_argument_is_red_10300() {
 fn an_include_outside_the_root_is_red_10300() {
     let got = include_case(
         "outside_root",
-        &[(
-            "src/a.rs",
-            "const X: &[u8] = include_bytes!(\"../../x\");\n",
-        )],
+        &[("src/a.rs", "include!(\"../../x\");\n")],
         &[],
     );
     has(
         &got,
-        "src/a.rs:1: include_bytes! \"../../x\" leaves the repository root (#10300)",
+        "src/a.rs:1: include! \"../../x\" leaves the repository root (#10300)",
     );
 }
 
